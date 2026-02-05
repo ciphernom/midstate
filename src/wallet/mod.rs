@@ -371,11 +371,12 @@ mod tests {
 
         let mut w = Wallet::create(&path, b"pass").unwrap();
         let wc = w.generate(None).unwrap();
-        let full_hex = hex::encode(wc.coin);
+        let coin = wc.coin; // copy to drop borrow
+        let full_hex = hex::encode(coin);
         let prefix = &full_hex[..10];
 
         let resolved = w.resolve_coin(prefix).unwrap();
-        assert_eq!(resolved, wc.coin);
+        assert_eq!(resolved, coin);
     }
 
     #[test]
