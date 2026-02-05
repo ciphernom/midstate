@@ -6,5 +6,6 @@ pub mod node;
 pub mod rpc;
 pub mod metrics;
 pub mod sync;
+pub mod wallet;
 
 pub use core::types::*;
