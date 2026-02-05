@@ -1,14 +1,31 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SendTransactionRequest {
-    pub secrets: Vec<String>,  // Changed from single secret
+pub struct CommitRequest {
+    /// Coin IDs being spent (hex)
+    pub coins: Vec<String>,
+    /// Destination coin commitments (hex, 32 bytes each)
     pub destinations: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct CommitResponse {
+    pub commitment: String,
+    pub salt: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SendTransactionRequest {
+    pub secrets: Vec<String>,
+    pub destinations: Vec<String>,
+    /// Salt from the commit phase (hex)
+    pub salt: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SendTransactionResponse {
-    pub input_coins: Vec<String>,  // Changed from single input
+    pub input_coins: Vec<String>,
     pub output_coins: Vec<String>,
     pub status: String,
 }
@@ -19,6 +36,7 @@ pub struct GetStateResponse {
     pub depth: u64,
     pub midstate: String,
     pub num_coins: usize,
+    pub num_commitments: usize,
     pub target: String,
 }
 
@@ -41,8 +59,12 @@ pub struct GetMempoolResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TransactionInfo {
-    pub input_coins: Vec<String>,  // Changed from single input
-    pub output_coins: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commitment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_coins: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_coins: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
