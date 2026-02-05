@@ -34,19 +34,35 @@ pub fn verify_extension(midstate: [u8; 32], ext: &Extension, target: &[u8; 32]) 
     Ok(())
 }
 
-/// Mine a batch by finding a valid extension
+/// Mine with WORK-FIRST approach
+/// Each attempt costs EXTENSION_ITERATIONS of sequential work
 pub fn mine_extension(midstate: [u8; 32], target: [u8; 32]) -> Extension {
+    let mut attempts = 0u64;
+    
     loop {
+        attempts += 1;
         let nonce: u64 = rand::random();
-        let ext = create_extension(midstate, nonce);
         
-        if ext.final_hash < target {
-            tracing::info!(
-                "Found valid extension! nonce={} hash={}",
-                nonce,
-                hex::encode(ext.final_hash)
-            );
-            return ext;
+        // STEP 1: Pay the sequential work cost (EXPENSIVE - can't parallelize)
+        let mut x = hash_concat(&midstate, &nonce.to_le_bytes());
+        for _ in 0..EXTENSION_ITERATIONS {
+            x = hash(&x);
         }
+        
+        // STEP 2: Check if this ticket won the lottery
+        if x < target {
+            tracing::info!(
+                "Found valid extension! nonce={} attempts={} hash={}",
+                nonce,
+                attempts,
+                hex::encode(x)
+            );
+            return Extension {
+                nonce,
+                final_hash: x,
+            };
+        }
+        
+        // No win - must pay full sequential cost again for next ticket
     }
 }
