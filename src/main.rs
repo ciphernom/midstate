@@ -691,6 +691,38 @@ async fn wallet_send(
 
     let _result: rpc::SendTransactionResponse = response.json().await?;
 
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let mut revealed = false;
+
+    let input_coin_hex = hex::encode(input_coins[0]);
+
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        if let Ok(resp) = client
+            .post(&format!("http://127.0.0.1:{}/check", rpc_port))
+            .json(&rpc::CheckCoinRequest { coin: input_coin_hex.clone() })
+            .send()
+            .await
+        {
+            if let Ok(check) = resp.json::<rpc::CheckCoinResponse>().await {
+                if !check.exists {
+                    revealed = true;
+                    break;
+                }
+            }
+        }
+        eprint!(".");
+    }
+    eprintln!();
+
+    if !revealed {
+        println!("⏳ Reveal submitted but not yet mined.");
+        println!("   Secrets are safe. Run `wallet reveal` to retry.");
+        return Ok(());
+    }
+
+
     wallet.complete_reveal(&server_commitment)?;
 
     println!("✓ Transfer complete!");
