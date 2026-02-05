@@ -1,15 +1,21 @@
+// ========================================
+// --- FILE: src/network/peer.rs
+// ========================================
 use super::protocol::{Message, PROTOCOL_VERSION};
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time;
 
 pub struct PeerConnection {
     addr: SocketAddr,
-    stream: Option<TcpStream>,
+    // We only keep the writer. The reader is moved to a background task.
+    writer: Option<WriteHalf<TcpStream>>, 
+    // Channel to receive messages from the background reader task
+    msg_rx: mpsc::UnboundedReceiver<Result<Message>>,
     reconnect_attempts: u32,
     last_ping: SystemTime,
     last_pong: SystemTime,
@@ -17,25 +23,20 @@ pub struct PeerConnection {
 }
 
 impl PeerConnection {
-    pub async fn connect(addr: SocketAddr, our_addr: SocketAddr) -> Result<Self> {
-        let mut stream = TcpStream::connect(addr).await?;
+    pub async fn connect(addr: SocketAddr, _our_addr: SocketAddr) -> Result<Self> {
+        let stream = TcpStream::connect(addr).await?;
         tracing::info!("Connected to peer: {}", addr);
         
-        let version = Message::Version {
-            version: PROTOCOL_VERSION,
-            services: 1,
-            timestamp: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)?
-                .as_secs(),
-            addr_recv: addr,
-            addr_from: our_addr,
-        };
+        // Spawn the reader task immediately
+        let (reader, writer) = tokio::io::split(stream);
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
         
-        Self::send_msg(&mut stream, &version).await?;
+        tokio::spawn(Self::read_loop(reader, msg_tx));
         
         Ok(Self {
             addr,
-            stream: Some(stream),
+            writer: Some(writer),
+            msg_rx,
             reconnect_attempts: 0,
             last_ping: SystemTime::now(),
             last_pong: SystemTime::now(),
@@ -44,13 +45,58 @@ impl PeerConnection {
     }
     
     pub fn from_stream(stream: TcpStream, addr: SocketAddr) -> Self {
+        let (reader, writer) = tokio::io::split(stream);
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+        
+        tokio::spawn(Self::read_loop(reader, msg_tx));
+        
         Self {
             addr,
-            stream: Some(stream),
+            writer: Some(writer),
+            msg_rx,
             reconnect_attempts: 0,
             last_ping: SystemTime::now(),
             last_pong: SystemTime::now(),
             handshake_complete: false,
+        }
+    }
+    
+    /// Background task to read messages from the stream
+    async fn read_loop(mut reader: ReadHalf<TcpStream>, tx: mpsc::UnboundedSender<Result<Message>>) {
+        loop {
+            let mut len_bytes = [0u8; 4];
+            // Read length prefix
+            if let Err(e) = reader.read_exact(&mut len_bytes).await {
+                // If stream closed (unexpected EOF) or error, send error and exit
+                let _ = tx.send(Err(e.into()));
+                break;
+            }
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            
+            if len > 10_000_000 {
+                let _ = tx.send(Err(anyhow::anyhow!("Message too large: {} bytes", len)));
+                break;
+            }
+            
+            let mut msg_bytes = vec![0u8; len];
+            // Read body
+            if let Err(e) = reader.read_exact(&mut msg_bytes).await {
+                let _ = tx.send(Err(e.into()));
+                break;
+            }
+            
+            // Deserialize
+            match Message::deserialize(&msg_bytes) {
+                Ok(msg) => {
+                    if tx.send(Ok(msg)).is_err() {
+                        break; // Receiver dropped
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    break;
+                }
+            }
         }
     }
     
@@ -59,6 +105,8 @@ impl PeerConnection {
             return Ok(());
         }
         
+        tracing::info!("Starting handshake with {}", self.addr);
+
         let version = Message::Version {
             version: PROTOCOL_VERSION,
             services: 1,
@@ -69,30 +117,33 @@ impl PeerConnection {
             addr_from: our_addr,
         };
         
-        // Send version first
+        // 1. Send our Version
         self.send_message(&version).await?;
         
-        // Then receive their version
-        match self.receive_message().await? {
+        // 2. Receive their Version
+        let msg = self.receive_message().await?;
+        
+        match msg {
             Message::Version { version, .. } => {
                 if version != PROTOCOL_VERSION {
                     anyhow::bail!("Protocol version mismatch");
                 }
                 
-                // Send verack
+                // 3. Send Verack
                 self.send_message(&Message::Verack).await?;
                 
-                // Wait for their verack
-                match self.receive_message().await? {
+                // 4. Wait for their Verack
+                let msg2 = self.receive_message().await?;
+                match msg2 {
                     Message::Verack => {
                         self.handshake_complete = true;
                         tracing::info!("Handshake complete with {}", self.addr);
                         Ok(())
                     }
-                    _ => anyhow::bail!("Expected Verack"),
+                    _ => anyhow::bail!("Expected Verack, got {:?}", msg2),
                 }
             }
-            _ => anyhow::bail!("Expected Version"),
+            _ => anyhow::bail!("Expected Version, got {:?}", msg),
         }
     }
     
@@ -106,50 +157,46 @@ impl PeerConnection {
         
         time::sleep(backoff).await;
         
-        match Self::connect(self.addr, our_addr).await {
-            Ok(new_conn) => {
-                *self = new_conn;
-                tracing::info!("Reconnected to {}", self.addr);
-                Ok(())
-            }
-            Err(e) => {
-                self.reconnect_attempts += 1;
-                Err(e)
-            }
-        }
-    }
-    
-    async fn send_msg(stream: &mut TcpStream, msg: &Message) -> Result<()> {
-        let bytes = msg.serialize();
-        let len = bytes.len() as u32;
+        // Re-connect logic needs to reset the reader loop
+        let stream = TcpStream::connect(self.addr).await?;
+        let (reader, writer) = tokio::io::split(stream);
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
         
-        stream.write_all(&len.to_le_bytes()).await?;
-        stream.write_all(&bytes).await?;
-        stream.flush().await?;
+        tokio::spawn(Self::read_loop(reader, msg_tx));
+        
+        self.writer = Some(writer);
+        self.msg_rx = msg_rx;
+        self.handshake_complete = false;
+        
+        tracing::info!("TCP Reconnected to {}", self.addr);
+        
+        // FIX: Actually perform the handshake!
+        // This uses 'our_addr', fixing the warning and the protocol logic.
+        self.complete_handshake(our_addr).await?;
         
         Ok(())
     }
     
     pub async fn send_message(&mut self, msg: &Message) -> Result<()> {
-        let stream = self.stream.as_mut().ok_or_else(|| anyhow::anyhow!("Not connected"))?;
-        Self::send_msg(stream, msg).await
+        let writer = self.writer.as_mut().ok_or_else(|| anyhow::anyhow!("Not connected"))?;
+        
+        let bytes = msg.serialize();
+        let len = bytes.len() as u32;
+        
+        writer.write_all(&len.to_le_bytes()).await?;
+        writer.write_all(&bytes).await?;
+        writer.flush().await?;
+        
+        Ok(())
     }
     
     pub async fn receive_message(&mut self) -> Result<Message> {
-        let stream = self.stream.as_mut().ok_or_else(|| anyhow::anyhow!("Not connected"))?;
-        
-        let mut len_bytes = [0u8; 4];
-        stream.read_exact(&mut len_bytes).await?;
-        let len = u32::from_le_bytes(len_bytes) as usize;
-        
-        if len > 10_000_000 {
-            anyhow::bail!("Message too large: {} bytes", len);
+        // Safe to cancel: just awaits the channel
+        match self.msg_rx.recv().await {
+            Some(Ok(msg)) => Ok(msg),
+            Some(Err(e)) => Err(e),
+            None => Err(anyhow::anyhow!("Connection closed")),
         }
-        
-        let mut msg_bytes = vec![0u8; len];
-        stream.read_exact(&mut msg_bytes).await?;
-        
-        Message::deserialize(&msg_bytes)
     }
     
     pub async fn send_ping(&mut self) -> Result<()> {
@@ -175,11 +222,12 @@ impl PeerConnection {
     }
     
     pub fn is_connected(&self) -> bool {
-        self.stream.is_some() && self.handshake_complete
+        self.writer.is_some() && self.handshake_complete
     }
     
     pub fn disconnect(&mut self) {
-        self.stream = None;
+        self.writer = None;
+        // Dropping msg_rx will eventually close the sender in the background task
         self.handshake_complete = false;
     }
 }
@@ -194,7 +242,6 @@ pub struct PeerManager {
 impl PeerManager {
     pub fn new(our_addr: SocketAddr) -> Self {
         let (broadcast_tx, broadcast_rx) = mpsc::unbounded_channel();
-        
         Self {
             peers: Vec::new(),
             broadcast_tx,
@@ -205,15 +252,9 @@ impl PeerManager {
     
     pub async fn connect_to_peer(&mut self, addr: SocketAddr) -> Result<()> {
         let mut peer = PeerConnection::connect(addr, self.our_addr).await?;
-        
-        match peer.receive_message().await? {
-            Message::Verack => {
-                peer.handshake_complete = true;
-                self.peers.push(peer);
-                Ok(())
-            }
-            _ => anyhow::bail!("Handshake failed"),
-        }
+        peer.complete_handshake(self.our_addr).await?;
+        self.peers.push(peer);
+        Ok(())
     }
     
     pub async fn add_peer(&mut self, mut peer: PeerConnection) -> Result<()> {
