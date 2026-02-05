@@ -121,7 +121,7 @@ impl Transaction {
     }
 }
 
-/// Proof of sequential work
+/// Proof of sequential work with checkpoint witnesses
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Extension {
     /// Mining nonce
@@ -129,6 +129,12 @@ pub struct Extension {
 
     /// Result of sequential hashing
     pub final_hash: [u8; 32],
+
+    /// Intermediate hashes at every CHECKPOINT_INTERVAL steps.
+    /// checkpoints[0] = initial hash (from midstate+nonce)
+    /// checkpoints[i] = hash after i*CHECKPOINT_INTERVAL iterations
+    /// checkpoints[last] = final_hash
+    pub checkpoints: Vec<[u8; 32]>,
 }
 
 /// A batch of transactions plus proof of work
@@ -140,11 +146,24 @@ pub struct Batch {
 
 /// Protocol constants
 #[cfg(not(feature = "fast-mining"))]
-pub const EXTENSION_ITERATIONS: u64 = 1_000_000; // ~1 second @ 1 GHz (faster for testing)
+pub const EXTENSION_ITERATIONS: u64 = 1_000_000;
 
-// TESTING: Only 100 iterations (10,000x faster)
 #[cfg(feature = "fast-mining")]
 pub const EXTENSION_ITERATIONS: u64 = 100;
+
+/// Checkpoint interval: save a witness hash every this many iterations
+#[cfg(not(feature = "fast-mining"))]
+pub const CHECKPOINT_INTERVAL: u64 = 1_000;
+
+#[cfg(feature = "fast-mining")]
+pub const CHECKPOINT_INTERVAL: u64 = 10;
+
+/// Number of random segments to spot-check during verification
+#[cfg(not(feature = "fast-mining"))]
+pub const SPOT_CHECK_COUNT: usize = 16;
+
+#[cfg(feature = "fast-mining")]
+pub const SPOT_CHECK_COUNT: usize = 3;
 
 pub const MAX_BATCH_SIZE: usize = 100;
 
@@ -152,3 +171,8 @@ pub const MAX_BATCH_SIZE: usize = 100;
 pub const TARGET_BLOCK_TIME: u64 = 10; // seconds
 pub const DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 10; // blocks
 pub const MAX_ADJUSTMENT_FACTOR: u64 = 4; // max 4x change per adjustment
+
+const _: () = assert!(
+    EXTENSION_ITERATIONS % CHECKPOINT_INTERVAL == 0,
+    "EXTENSION_ITERATIONS must be divisible by CHECKPOINT_INTERVAL"
+);
