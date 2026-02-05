@@ -262,6 +262,7 @@ async fn test_extension_wrong_nonce_rejected() {
     let bad_ext = Extension {
         nonce: 43,
         final_hash: ext.final_hash,
+        checkpoints: ext.checkpoints.clone(),
     };
 
     let easy_target = [0xff; 32];
@@ -342,6 +343,7 @@ async fn test_batch_with_invalid_tx_rejected() {
     let dummy_ext = Extension {
         nonce: 0,
         final_hash: [0u8; 32],
+        checkpoints: vec![],
     };
     let batch = Batch {
         transactions: vec![bad_tx],
@@ -922,4 +924,44 @@ async fn test_storage_overwrites() {
 
     let loaded = storage.load_state().unwrap().unwrap();
     assert_eq!(loaded.height, 99);
+}
+#[tokio::test]
+async fn test_tampered_checkpoint_rejected() {
+    let midstate = hash(b"checkpoint_test");
+    let ext = create_extension(midstate, 42);
+    let easy_target = [0xff; 32];
+
+    assert!(verify_extension(midstate, &ext, &easy_target).is_ok());
+
+    let mut bad_ext = ext.clone();
+    for i in 1..bad_ext.checkpoints.len() - 1 {
+        bad_ext.checkpoints[i] = [0xde; 32];
+    }
+    assert!(verify_extension(midstate, &bad_ext, &easy_target).is_err());
+}
+
+#[tokio::test]
+async fn test_wrong_checkpoint_count_rejected() {
+    let midstate = hash(b"count_test");
+    let ext = create_extension(midstate, 42);
+    let easy_target = [0xff; 32];
+
+    let mut short_ext = ext.clone();
+    short_ext.checkpoints.pop();
+    assert!(verify_extension(midstate, &short_ext, &easy_target).is_err());
+}
+
+#[tokio::test]
+async fn test_all_junk_checkpoints_rejected() {
+    let midstate = hash(b"junk_test");
+    let ext = create_extension(midstate, 42);
+    let easy_target = [0xff; 32];
+
+    // Attacker: right structure, all random data
+    let junk_ext = Extension {
+        nonce: ext.nonce,
+        final_hash: ext.final_hash,
+        checkpoints: vec![[0xab; 32]; ext.checkpoints.len()],
+    };
+    assert!(verify_extension(midstate, &junk_ext, &easy_target).is_err());
 }
