@@ -43,6 +43,15 @@ pub enum Message {
     
     /// Version acknowledgment
     Verack,
+    
+    /// Request batches in range
+    GetBatches {
+        start_height: u64,
+        count: u64,
+    },
+    
+    /// Send batches
+    Batches(Vec<Batch>),
 }
 
 impl Message {
