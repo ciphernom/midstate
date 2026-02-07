@@ -55,9 +55,13 @@ fn make_reveal(
     salt: &[u8; 32],
 ) -> Transaction {
     let commitment = compute_commitment(input_coins, new_coins, salt);
-    let signatures: Vec<Vec<[u8; 32]>> = seeds
+    // CHANGE: Type is now Vec<Vec<u8>>
+    let signatures: Vec<Vec<u8>> = seeds
         .iter()
-        .map(|seed| core::wots::sign(seed, &commitment))
+        .map(|seed| {
+            let sig = core::wots::sign(seed, &commitment);
+            core::wots::sig_to_bytes(&sig) // CHANGE: Convert chunks to bytes
+        })
         .collect();
 
     Transaction::Reveal {
@@ -242,7 +246,8 @@ async fn test_reveal_input_output_count_mismatch() {
     // Signatures length != Inputs length
     let tx = Transaction::Reveal {
         input_coins: vec![[1u8; 32], [2u8; 32]],
-        signatures: vec![vec![[0u8; 32]; core::wots::CHAINS]], // only 1 sig for 2 inputs
+        // CHANGE: Use byte vectors of correct size
+        signatures: vec![vec![0u8; core::wots::SIG_SIZE]], 
         new_coins: vec![[3u8; 32]],
         salt: [0u8; 32],
     };
@@ -296,7 +301,8 @@ async fn test_reveal_empty_outputs_rejected() {
 
     let tx = Transaction::Reveal {
         input_coins: vec![[1u8; 32], [2u8; 32]],
-        signatures: vec![vec![[0u8; 32]; core::wots::CHAINS]; 2],
+        // CHANGE: Use byte vectors of correct size
+        signatures: vec![vec![0u8; core::wots::SIG_SIZE]; 2],
         new_coins: vec![],
         salt: [0u8; 32],
     };
@@ -351,14 +357,18 @@ async fn test_wots_sig_wrong_message_rejected() {
     let batch = mine_batch(&state, vec![commit_tx]).await;
     apply_batch(&mut state, &batch).unwrap();
 
-    // Sign against a completely different message
+// Sign against a completely different message
     let wrong_message: [u8; 32] = rand::random();
     let bad_sig0 = core::wots::sign(&seeds[0], &wrong_message);
     let bad_sig1 = core::wots::sign(&seeds[1], &wrong_message);
 
     let bad_reveal = Transaction::Reveal {
         input_coins: input_coins.to_vec(),
-        signatures: vec![bad_sig0, bad_sig1],
+        // CHANGE: Convert raw sigs to bytes
+        signatures: vec![
+            core::wots::sig_to_bytes(&bad_sig0),
+            core::wots::sig_to_bytes(&bad_sig1)
+        ],
         new_coins: new_coins.to_vec(),
         salt,
     };
