@@ -17,7 +17,7 @@ pub fn hash_concat(a: &[u8], b: &[u8]) -> [u8; 32] {
 
 /// Compute a commitment hash that binds inputs to outputs
 ///
-/// commitment = SHA256(coin_id_1 || coin_id_2 || ... || new_coin_1 || new_coin_2 || ... || salt)
+/// commitment = SHA256(coin_id_1 || ... || new_coin_1 || ... || salt)
 pub fn compute_commitment(
     input_coins: &[[u8; 32]],
     new_coins: &[[u8; 32]],
@@ -37,38 +37,26 @@ pub fn compute_commitment(
 /// The global consensus state
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct State {
-    /// Cumulative hash of all history
     pub midstate: [u8; 32],
-
-    /// Set of unspent coin commitments
     pub coins: HashSet<[u8; 32]>,
-
-    /// Set of registered commitments (pending reveals)
     pub commitments: HashSet<[u8; 32]>,
-
-    /// Cumulative sequential work (number of hash iterations)
     pub depth: u64,
-
-    /// Current difficulty target
     pub target: [u8; 32],
-
-    /// Number of batches processed
     pub height: u64,
-
-    /// Unix timestamp of this state (for difficulty adjustment)
     pub timestamp: u64,
 }
 
 impl State {
-    /// Create genesis state
     pub fn genesis() -> Self {
-        let genesis_coins = vec![
+        use super::wots;
+
+        let seeds: [[u8; 32]; 3] = [
             hash(b"genesis_coin_1"),
             hash(b"genesis_coin_2"),
             hash(b"genesis_coin_3"),
         ];
+        let genesis_coins: Vec<[u8; 32]> = seeds.iter().map(|s| wots::keygen(s)).collect();
 
-        // Initial difficulty: ~1 in 10 (easy for testing)
         let target = [
             0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -88,20 +76,20 @@ impl State {
     }
 }
 
-/// A transaction is either a Commit (register intent) or a Reveal (execute spend)
+/// A transaction is either a Commit or a Reveal
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Transaction {
     /// Phase 1: Register a commitment binding inputs to outputs.
-    /// The commitment is opaque — it hides which coins and destinations are involved.
     Commit {
         commitment: [u8; 32],
     },
 
-    /// Phase 2: Reveal secrets and destinations, proving they match a prior commitment.
-    /// The commitment must already exist in state (from a previous batch).
+    /// Phase 2: Reveal and execute the spend with WOTS signatures.
     Reveal {
-        /// The secret preimages that unlock the old coins
-        secrets: Vec<Vec<u8>>,
+        /// The coin IDs being spent (public, in the UTXO set).
+        input_coins: Vec<[u8; 32]>,
+        /// WOTS signatures proving ownership of each input coin (one per input).
+        signatures: Vec<Vec<[u8; 32]>>,
         /// New coin commitments to create
         new_coins: Vec<[u8; 32]>,
         /// Salt used when computing the commitment
@@ -110,12 +98,20 @@ pub enum Transaction {
 }
 
 impl Transaction {
-    /// Get the coins this transaction is spending (empty for Commit)
+    /// Get the coins this transaction is spending (empty for Commit).
     pub fn input_coins(&self) -> Vec<[u8; 32]> {
         match self {
             Transaction::Commit { .. } => vec![],
-            Transaction::Reveal { secrets, .. } => {
-                secrets.iter().map(|s| hash(s)).collect()
+            Transaction::Reveal { input_coins, .. } => input_coins.clone(),
+        }
+    }
+
+    /// Fee = number of inputs - number of outputs. Zero for Commit.
+    pub fn fee(&self) -> usize {
+        match self {
+            Transaction::Commit { .. } => 0,
+            Transaction::Reveal { input_coins, new_coins, .. } => {
+                input_coins.len().saturating_sub(new_coins.len())
             }
         }
     }
@@ -124,16 +120,8 @@ impl Transaction {
 /// Proof of sequential work with checkpoint witnesses
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Extension {
-    /// Mining nonce
     pub nonce: u64,
-
-    /// Result of sequential hashing
     pub final_hash: [u8; 32],
-
-    /// Intermediate hashes at every CHECKPOINT_INTERVAL steps.
-    /// checkpoints[0] = initial hash (from midstate+nonce)
-    /// checkpoints[i] = hash after i*CHECKPOINT_INTERVAL iterations
-    /// checkpoints[last] = final_hash
     pub checkpoints: Vec<[u8; 32]>,
 }
 
@@ -142,35 +130,53 @@ pub struct Extension {
 pub struct Batch {
     pub transactions: Vec<Transaction>,
     pub extension: Extension,
+    /// Coinbase coins created as mining reward + fees
+    #[serde(default)]
+    pub coinbase: Vec<[u8; 32]>,
 }
 
-/// Protocol constants
+// ── Protocol constants ──────────────────────────────────────────────────────
+
 #[cfg(not(feature = "fast-mining"))]
 pub const EXTENSION_ITERATIONS: u64 = 1_000_000;
-
 #[cfg(feature = "fast-mining")]
 pub const EXTENSION_ITERATIONS: u64 = 100;
 
-/// Checkpoint interval: save a witness hash every this many iterations
 #[cfg(not(feature = "fast-mining"))]
 pub const CHECKPOINT_INTERVAL: u64 = 1_000;
-
 #[cfg(feature = "fast-mining")]
 pub const CHECKPOINT_INTERVAL: u64 = 10;
 
-/// Number of random segments to spot-check during verification
 #[cfg(not(feature = "fast-mining"))]
 pub const SPOT_CHECK_COUNT: usize = 16;
-
 #[cfg(feature = "fast-mining")]
 pub const SPOT_CHECK_COUNT: usize = 3;
 
 pub const MAX_BATCH_SIZE: usize = 100;
 
-/// Difficulty adjustment parameters
-pub const TARGET_BLOCK_TIME: u64 = 10; // seconds
-pub const DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 10; // blocks
-pub const MAX_ADJUSTMENT_FACTOR: u64 = 4; // max 4x change per adjustment
+// ── Difficulty adjustment ───────────────────────────────────────────────────
+
+pub const TARGET_BLOCK_TIME: u64 = 10;
+pub const DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 10;
+pub const MAX_ADJUSTMENT_FACTOR: u64 = 4;
+
+// ── Economics ───────────────────────────────────────────────────────────────
+
+/// Blocks per year at TARGET_BLOCK_TIME seconds per block.
+pub const BLOCKS_PER_YEAR: u64 = 365 * 24 * 3600 / TARGET_BLOCK_TIME; // 3_153_600
+
+/// Initial block reward in coins.
+pub const INITIAL_REWARD: u64 = 256;
+
+/// Block reward at a given height. Halves every BLOCKS_PER_YEAR, minimum 1.
+pub fn block_reward(height: u64) -> u64 {
+    let halvings = height / BLOCKS_PER_YEAR;
+    if halvings >= 8 {
+        1
+    } else {
+        (INITIAL_REWARD >> halvings).max(1)
+    }
+}
 
 const _: () = assert!(
     EXTENSION_ITERATIONS % CHECKPOINT_INTERVAL == 0,
