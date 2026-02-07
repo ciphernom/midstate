@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use rayon::prelude::*; 
 
 fn default_wallet_path() -> PathBuf {
     wallet::default_path()
@@ -128,6 +129,16 @@ enum WalletAction {
         path: PathBuf,
         #[arg(long, short, default_value = "1")]
         count: usize,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Generate a reusable MSS address (Merkle Tree)
+    GenerateMss {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+        /// Tree height (e.g. 10 = 1024 sigs). Warning: >14 is slow.
+        #[arg(long, default_value = "10")]
+        height: u32,
         #[arg(long)]
         label: Option<String>,
     },
@@ -290,6 +301,9 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         WalletAction::ImportRewards { path, coinbase_file } => {
             wallet_import_rewards(&path, &coinbase_file)
         }
+        WalletAction::GenerateMss { path, height, label } => {
+            wallet_generate_mss(&path, height, label)
+        }
     }
 }
 
@@ -433,14 +447,11 @@ async fn wallet_send(
 
             // Replace pending with server's commitment
             wallet.data.pending.retain(|p| p.commitment != commitment);
-            let input_seeds: Vec<[u8; 32]> = inputs.iter()
-                .map(|c| wallet.find_coin(c).expect("own coin").seed)
-                .collect();
+
 
             wallet.data.pending.push(wallet::PendingCommit {
                 commitment: server_commitment,
                 salt: server_salt,
-                input_seeds,
                 input_coin_ids: inputs.clone(),
                 destinations: outputs.clone(),
                 created_at: now_secs(),
@@ -524,14 +535,11 @@ async fn wallet_send(
         let server_salt = parse_hex32(&commit_resp.salt)?;
 
         wallet.data.pending.retain(|p| p.commitment != commitment);
-        let input_seeds: Vec<[u8; 32]> = input_coins.iter()
-            .map(|c| wallet.find_coin(c).expect("own coin").seed)
-            .collect();
+
 
         wallet.data.pending.push(wallet::PendingCommit {
             commitment: server_commitment,
             salt: server_salt,
-            input_seeds,
             input_coin_ids: input_coins.clone(),
             destinations: destinations.clone(),
             created_at: now_secs(),
@@ -594,12 +602,12 @@ async fn do_reveal(
         .clone();
 
     // Build WOTS signatures
-    let signatures = wallet.sign_reveal(&pending);
+    let signatures = wallet.sign_reveal(&pending)?;
 
     let reveal_url = format!("http://127.0.0.1:{}/send", rpc_port);
     let reveal_req = rpc::SendTransactionRequest {
         input_coins: pending.input_coin_ids.iter().map(|c| hex::encode(c)).collect(),
-        signatures: signatures.iter().map(|s| hex::encode(wots::sig_to_bytes(s))).collect(),
+        signatures: signatures.iter().map(|s| hex::encode(s)).collect(),
         destinations: pending.destinations.iter().map(|d| hex::encode(d)).collect(),
         salt: hex::encode(pending.salt),
     };
@@ -681,7 +689,9 @@ fn wallet_pending(path: &PathBuf) -> Result<()> {
         println!(
             "  [{}] {} — {} in, {} out, {}",
             i, short_hex(&p.commitment),
-            p.input_seeds.len(), p.destinations.len(), format_age(age),
+            p.input_coin_ids.len(), 
+            p.destinations.len(), 
+            format_age(age),
         );
     }
     Ok(())
@@ -745,12 +755,12 @@ async fn wallet_reveal(
             tokio::time::sleep(Duration::from_secs(wait)).await;
         }
 
-        let signatures = wallet.sign_reveal(&pending);
+        let signatures = wallet.sign_reveal(&pending)?;
 
         let url = format!("http://127.0.0.1:{}/send", rpc_port);
         let req = rpc::SendTransactionRequest {
             input_coins: pending.input_coin_ids.iter().map(|c| hex::encode(c)).collect(),
-            signatures: signatures.iter().map(|s| hex::encode(wots::sig_to_bytes(s))).collect(),
+            signatures: signatures.iter().map(|s| hex::encode(s)).collect(),
             destinations: pending.destinations.iter().map(|d| hex::encode(d)).collect(),
             salt: hex::encode(pending.salt),
         };
@@ -772,31 +782,85 @@ fn wallet_import_rewards(path: &PathBuf, coinbase_file: &PathBuf) -> Result<()> 
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
 
+    println!("Reading coinbase log...");
     let contents = std::fs::read_to_string(coinbase_file)?;
+    
+    // Define the struct locally for deserialization
+    #[derive(serde::Deserialize)]
+    struct CoinbaseEntry {
+        height: u64,
+        index: u64,
+        seed: String,
+        #[serde(rename = "coin")]
+        _coin: String,
+    }
+
+    // 1. Parse all lines first
+    let entries: Vec<CoinbaseEntry> = contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+
+    println!("Found {} rewards. Calculating keys in parallel...", entries.len());
+
+    // 2. Generate keys in PARALLEL (Uses all cores)
+    // This crunches the 300 million hashes instantly
+    let new_coins: Vec<midstate::wallet::WalletCoin> = entries
+        .into_par_iter() 
+        .map(|entry| {
+            let seed = parse_hex32(&entry.seed).unwrap(); // We assume log is valid
+            let coin = wots::keygen(&seed); // Heavy lifting happens here
+            midstate::wallet::WalletCoin {
+                seed,
+                coin,
+                label: Some(format!("coinbase h={} i={}", entry.height, entry.index)),
+            }
+        })
+        .collect();
+
+    // 3. Batch Insert (Sequential, but fast memory operation)
     let mut imported = 0usize;
+    let existing_coins: std::collections::HashSet<_> = wallet.data.coins
+        .iter()
+        .map(|c| c.coin)
+        .collect();
 
-    for line in contents.lines() {
-        if line.trim().is_empty() { continue; }
-
-        #[derive(serde::Deserialize)]
-        struct CoinbaseEntry {
-            height: u64,
-            index: u64,
-            seed: String,
-            #[serde(rename = "coin")]
-            _coin: String,
-        }
-
-        let entry: CoinbaseEntry = serde_json::from_str(line)?;
-        let seed = parse_hex32(&entry.seed)?;
-
-        match wallet.import_seed(seed, Some(format!("coinbase h={} i={}", entry.height, entry.index))) {
-            Ok(_) => imported += 1,
-            Err(_) => {} // already imported
+    for wc in new_coins {
+        if !existing_coins.contains(&wc.coin) {
+            wallet.data.coins.push(wc);
+            imported += 1;
         }
     }
 
+    // 4. Save ONCE at the end
+    println!("Saving wallet...");
+    wallet.save()?;
+
     println!("Imported {} coinbase reward(s). Total coins: {}", imported, wallet.coin_count());
+    Ok(())
+}
+
+fn wallet_generate_mss(path: &PathBuf, height: u32, label: Option<String>) -> Result<()> {
+    let password = read_password("Password: ")?;
+    let mut wallet = Wallet::open(path, &password)?;
+
+    let capacity = 1u64 << height;
+    println!("Generating MSS tree (Height {} = {} signatures)...", height, capacity);
+    if height > 12 {
+        println!("(This might take a minute...)");
+    }
+
+    let root = wallet.generate_mss(height, label.clone())?;
+
+    println!("\n✓ MSS Address Generated!");
+    if let Some(l) = label {
+        println!("  Label:    {}", l);
+    }
+    println!("  Capacity: {} signatures", capacity);
+    println!("  Address:  {}", hex::encode(root));
+    println!("\nThis address is reusable until the capacity is exhausted.");
+    
     Ok(())
 }
 

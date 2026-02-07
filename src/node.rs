@@ -16,6 +16,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio::time;
+use rayon::prelude::*;
 
 const MAX_ORPHAN_BATCHES: usize = 256;
 
@@ -203,7 +204,7 @@ impl Node {
         loop {
             tokio::select! {
                 _ = mine_interval.tick() => {
-                    if self.is_mining && self.mempool.len() > 0 {
+                if self.is_mining {
                         if let Err(e) = self.try_mine().await {
                             tracing::error!("Mining error: {}", e);
                         }
@@ -445,7 +446,7 @@ impl Node {
     fn generate_coinbase(&self, height: u64, total_fees: u64) -> Vec<[u8; 32]> {
         let reward = block_reward(height);
         let count = reward + total_fees;
-        (0..count)
+        (0..count).into_par_iter() 
             .map(|i| {
                 let seed = coinbase_seed(&self.mining_seed, height, i);
                 wots::keygen(&seed)
@@ -459,24 +460,30 @@ impl Node {
         let count = reward + total_fees;
         let log_path = self.data_dir.join("coinbase_seeds.jsonl");
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path);
-
-        if let Ok(mut file) = file {
-            use std::io::Write;
-            for i in 0..count {
+        // STEP 1: Generate the JSON strings in PARALLEL (Fast)
+        let entries: Vec<String> = (0..count).into_par_iter()
+            .map(|i| {
                 let seed = coinbase_seed(&self.mining_seed, height, i);
                 let coin = wots::keygen(&seed);
-                let _ = writeln!(
-                    file,
+                format!(
                     r#"{{"height":{},"index":{},"seed":"{}","coin":"{}"}}"#,
                     height,
                     i,
                     hex::encode(seed),
                     hex::encode(coin)
-                );
+                )
+            })
+            .collect();
+
+        // STEP 2: Write to file SEQUENTIALLY (Fast enough for I/O)
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path) 
+        {
+            use std::io::Write;
+            for entry in entries {
+                let _ = writeln!(file, "{}", entry);
             }
         }
     }

@@ -25,6 +25,7 @@ rpassword = "7.3"
 dirs = "5.0"
 rand_chacha = "0.3"
 blake3 = "1.5"
+rayon = "1.8"
 
 [features]
 fast-mining = []

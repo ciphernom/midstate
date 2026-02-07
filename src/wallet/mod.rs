@@ -1,6 +1,8 @@
 pub mod crypto;
 
 use crate::core::{hash_concat, compute_commitment, wots};
+// [MSS-ENABLE] Import MSS modules
+use crate::core::mss::{self, MssKeypair};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -19,14 +21,11 @@ pub fn short_hex(bytes: &[u8; 32]) -> String {
     format!("{}…{}", &h[..8], &h[60..])
 }
 
-/// A coin the wallet controls.
+/// A coin the wallet controls (WOTS Legacy).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WalletCoin {
-    /// The WOTS seed (private key). 32 bytes.
     pub seed: [u8; 32],
-    /// wots::keygen(seed) — the on-chain coin ID
     pub coin: [u8; 32],
-    /// Optional human label
     pub label: Option<String>,
 }
 
@@ -35,20 +34,14 @@ pub struct WalletCoin {
 pub struct PendingCommit {
     pub commitment: [u8; 32],
     pub salt: [u8; 32],
-    /// Seeds for the coins being spent (needed for WOTS signing at reveal)
-    pub input_seeds: Vec<[u8; 32]>,
-    /// The input coin IDs (needed to build the Reveal tx)
+    // [MSS-ENABLE] Removed 'input_seeds'. We look up keys at sign time.
     pub input_coin_ids: Vec<[u8; 32]>,
-    /// Destination coins for the reveal
     pub destinations: Vec<[u8; 32]>,
-    /// Unix timestamp when committed
     pub created_at: u64,
-    /// Earliest time to reveal (for privacy delay). 0 = no delay.
     #[serde(default)]
     pub reveal_not_before: u64,
 }
 
-/// Record of a completed transaction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub inputs: Vec<[u8; 32]>,
@@ -56,10 +49,12 @@ pub struct HistoryEntry {
     pub timestamp: u64,
 }
 
-/// The wallet file contents (serialized to JSON, then encrypted).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WalletData {
     pub coins: Vec<WalletCoin>,
+    // [MSS-ENABLE] Store MSS Trees
+    #[serde(default)]
+    pub mss_keys: Vec<MssKeypair>, 
     pub pending: Vec<PendingCommit>,
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
@@ -69,6 +64,7 @@ impl WalletData {
     fn empty() -> Self {
         Self {
             coins: Vec::new(),
+            mss_keys: Vec::new(),
             pending: Vec::new(),
             history: Vec::new(),
         }
@@ -119,7 +115,7 @@ impl Wallet {
         Ok(())
     }
 
-    /// Generate a new random coin (WOTS keygen).
+    /// Generate a new random WOTS coin (Legacy).
     pub fn generate(&mut self, label: Option<String>) -> Result<&WalletCoin> {
         let seed: [u8; 32] = rand::random();
         let coin = wots::keygen(&seed);
@@ -129,7 +125,18 @@ impl Wallet {
         Ok(self.data.coins.last().unwrap())
     }
 
-    /// Import an existing seed.
+    /// [MSS-ENABLE] Generate a new MSS Tree (Reusable Address).
+    pub fn generate_mss(&mut self, height: u32, _label: Option<String>) -> Result<[u8; 32]> {
+        let seed: [u8; 32] = rand::random();
+        // Generate the full tree (this may take seconds for height > 14)
+        let keypair = mss::keygen(&seed, height)?;
+        let root = keypair.master_pk;
+        
+        self.data.mss_keys.push(keypair);
+        self.save()?;
+        Ok(root)
+    }
+
     pub fn import_seed(&mut self, seed: [u8; 32], label: Option<String>) -> Result<[u8; 32]> {
         let coin = wots::keygen(&seed);
         if self.data.coins.iter().any(|c| c.coin == coin) {
@@ -140,17 +147,15 @@ impl Wallet {
         Ok(coin)
     }
 
-    /// Look up a coin by its coin ID.
     pub fn find_coin(&self, coin: &[u8; 32]) -> Option<&WalletCoin> {
         self.data.coins.iter().find(|c| &c.coin == coin)
     }
 
-    /// Backward-compat alias.
-    pub fn find_secret(&self, coin: &[u8; 32]) -> Option<&WalletCoin> {
-        self.find_coin(coin)
+    // [MSS-ENABLE] Find an MSS key by its root (coin ID)
+    pub fn find_mss(&self, coin: &[u8; 32]) -> Option<&MssKeypair> {
+        self.data.mss_keys.iter().find(|k| &k.master_pk == coin)
     }
 
-    /// Resolve a coin reference: numeric index or hex prefix.
     pub fn resolve_coin(&self, reference: &str) -> Result<[u8; 32]> {
         if let Ok(idx) = reference.parse::<usize>() {
             if idx < self.data.coins.len() {
@@ -158,32 +163,33 @@ impl Wallet {
             }
         }
         let reference_lower = reference.to_lowercase();
-        let matches: Vec<_> = self
-            .data
-            .coins
-            .iter()
-            .filter(|c| hex::encode(c.coin).starts_with(&reference_lower))
-            .collect();
-        match matches.len() {
-            0 => bail!("no coin matching '{}'", reference),
-            1 => Ok(matches[0].coin),
-            n => bail!("'{}' is ambiguous ({} matches)", reference, n),
+        
+        // Search WOTS coins
+        for c in &self.data.coins {
+            if hex::encode(c.coin).starts_with(&reference_lower) {
+                return Ok(c.coin);
+            }
         }
+        // Search MSS keys
+        for k in &self.data.mss_keys {
+            if hex::encode(k.master_pk).starts_with(&reference_lower) {
+                return Ok(k.master_pk);
+            }
+        }
+        bail!("no matching coin found");
     }
 
-    /// Prepare a commit and store pending state.
     pub fn prepare_commit(
         &mut self,
         input_coin_ids: &[[u8; 32]],
         destinations: &[[u8; 32]],
         privacy_delay: bool,
     ) -> Result<([u8; 32], [u8; 32])> {
-        let mut input_seeds = Vec::new();
+        // [MSS-ENABLE] Verify we own all inputs (WOTS or MSS)
         for coin_id in input_coin_ids {
-            let wc = self
-                .find_coin(coin_id)
-                .ok_or_else(|| anyhow::anyhow!("coin {} not in wallet", short_hex(coin_id)))?;
-            input_seeds.push(wc.seed);
+            if self.find_coin(coin_id).is_none() && self.find_mss(coin_id).is_none() {
+                bail!("coin {} not in wallet", short_hex(coin_id));
+            }
         }
 
         let salt: [u8; 32] = rand::random();
@@ -195,7 +201,6 @@ impl Wallet {
             .as_secs();
 
         let reveal_not_before = if privacy_delay {
-            // Random delay 10–50 seconds (1–5 blocks)
             now + 10 + (rand::random::<u64>() % 41)
         } else {
             0
@@ -204,7 +209,6 @@ impl Wallet {
         self.data.pending.push(PendingCommit {
             commitment,
             salt,
-            input_seeds,
             input_coin_ids: input_coin_ids.to_vec(),
             destinations: destinations.to_vec(),
             created_at: now,
@@ -215,18 +219,42 @@ impl Wallet {
         Ok((commitment, salt))
     }
 
-    /// Build WOTS signatures for a reveal. The signed message is the commitment hash.
-    pub fn sign_reveal(&self, pending: &PendingCommit) -> Vec<Vec<[u8; 32]>> {
+    /// [MSS-ENABLE] Sign a reveal. Now requires &mut self to update MSS state.
+    pub fn sign_reveal(&mut self, pending: &PendingCommit) -> Result<Vec<Vec<u8>>> {
         let commitment = compute_commitment(
             &pending.input_coin_ids,
             &pending.destinations,
             &pending.salt,
         );
-        pending
-            .input_seeds
-            .iter()
-            .map(|seed| wots::sign(seed, &commitment))
-            .collect()
+        
+        let mut signatures = Vec::new();
+
+        for coin_id in &pending.input_coin_ids {
+            // 1. Try WOTS
+            if let Some(wc) = self.find_coin(coin_id) {
+                let sig = wots::sign(&wc.seed, &commitment);
+                signatures.push(wots::sig_to_bytes(&sig));
+            } 
+            // 2. Try MSS
+            else if let Some(pos) = self.data.mss_keys.iter().position(|k| k.master_pk == *coin_id) {
+                // We need mutable access to increment the leaf index
+                let keypair = &mut self.data.mss_keys[pos];
+                
+                if keypair.remaining() == 0 {
+                    bail!("MSS key {} exhausted", short_hex(coin_id));
+                }
+                
+                // Sign and advance state
+                let sig = keypair.sign(&commitment)?;
+                signatures.push(sig.to_bytes());
+            } else {
+                bail!("key for {} not found during signing", short_hex(coin_id));
+            }
+        }
+
+        // Save wallet because MSS indices might have incremented
+        self.save()?;
+        Ok(signatures)
     }
 
     pub fn find_pending(&self, commitment: &[u8; 32]) -> Option<&PendingCommit> {
@@ -237,7 +265,6 @@ impl Wallet {
         &self.data.pending
     }
 
-    /// Remove a pending commit after successful reveal.
     pub fn complete_reveal(&mut self, commitment: &[u8; 32]) -> Result<()> {
         let pending = self
             .data
@@ -248,7 +275,13 @@ impl Wallet {
             .clone();
 
         let spent_coins = pending.input_coin_ids.clone();
+        
+        // Remove spent WOTS coins
         self.data.coins.retain(|c| !spent_coins.contains(&c.coin));
+        
+        // [MSS-ENABLE] Do NOT remove MSS keys. They are reusable (until exhausted).
+        // However, if an MSS key is fully exhausted, you *could* remove it, 
+        // but it's safer to keep it for history/verification.
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -270,40 +303,27 @@ impl Wallet {
         &self.data.history
     }
 
-    pub fn remove_coin(&mut self, coin: &[u8; 32]) -> Result<()> {
-        let before = self.data.coins.len();
-        self.data.coins.retain(|c| &c.coin != coin);
-        if self.data.coins.len() == before {
-            bail!("coin not found in wallet");
-        }
-        self.save()?;
-        Ok(())
-    }
-
     pub fn coin_count(&self) -> usize {
-        self.data.coins.len()
+        self.data.coins.len() + self.data.mss_keys.len()
     }
 
     pub fn coins(&self) -> &[WalletCoin] {
         &self.data.coins
     }
+    
+    // [MSS-ENABLE]
+    pub fn mss_keys(&self) -> &[MssKeypair] {
+        &self.data.mss_keys
+    }
 
-    /// Plan a private send: split into independent 2-in-1-out pairs.
-    /// Each pair uses 2 input coins (1 for value transfer, 1 for fee) → 1 output.
-    /// Returns Vec of (input_coin_ids, destinations) pairs.
     pub fn plan_private_send(
         &self,
         live_coins: &[[u8; 32]],
         destinations: &[[u8; 32]],
     ) -> Result<Vec<(Vec<[u8; 32]>, Vec<[u8; 32]>)>> {
-        let needed = destinations.len() * 2; // 2 inputs per destination (1 value + 1 fee)
+        let needed = destinations.len() * 2; 
         if live_coins.len() < needed {
-            bail!(
-                "private send needs {} live coins for {} destinations, have {}",
-                needed,
-                destinations.len(),
-                live_coins.len()
-            );
+            bail!("private send needs {} live coins", needed);
         }
 
         let mut pairs = Vec::with_capacity(destinations.len());
@@ -316,8 +336,6 @@ impl Wallet {
     }
 }
 
-/// Deterministic coinbase seed derivation.
-/// coinbase_seed(mining_seed, height, index) = hash(hash(mining_seed || height) || index)
 pub fn coinbase_seed(mining_seed: &[u8; 32], height: u64, index: u64) -> [u8; 32] {
     let height_key = hash_concat(mining_seed, &height.to_le_bytes());
     hash_concat(&height_key, &index.to_le_bytes())
