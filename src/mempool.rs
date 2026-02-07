@@ -87,6 +87,50 @@ impl Mempool {
         Ok(())
     }
 
+    /// Re-add transactions that were drained but whose block was not applied
+    /// (e.g. stale mining result). Only re-adds those still valid against current state.
+    pub fn re_add(&mut self, txs: Vec<Transaction>, state: &State) {
+        let mut restored = 0usize;
+        for tx in txs {
+            if validate_transaction(state, &tx).is_err() {
+                continue;
+            }
+
+            let dominated = match &tx {
+                Transaction::Commit { commitment } => self.seen_commitments.contains(commitment),
+                Transaction::Reveal { .. } => {
+                    tx.input_coins().iter().any(|i| self.seen_inputs.contains(i))
+                }
+            };
+            if dominated {
+                continue;
+            }
+
+            // Re-persist
+            if let Ok(tx_bytes) = bincode::serialize(&tx) {
+                let tx_hash = hash(&tx_bytes);
+                let _ = self.storage.insert(&tx_hash[..], tx_bytes);
+            }
+
+            match &tx {
+                Transaction::Commit { commitment } => {
+                    self.seen_commitments.insert(*commitment);
+                }
+                Transaction::Reveal { .. } => {
+                    for input in tx.input_coins() {
+                        self.seen_inputs.insert(input);
+                    }
+                }
+            }
+            self.transactions.push(tx);
+            restored += 1;
+        }
+
+        if restored > 0 {
+            tracing::info!("Restored {} transactions to mempool", restored);
+        }
+    }
+
     pub fn drain(&mut self, max: usize) -> Vec<Transaction> {
         let count = max.min(self.transactions.len());
         let drained: Vec<_> = self.transactions.drain(..count).collect();
