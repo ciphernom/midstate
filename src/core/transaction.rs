@@ -1,6 +1,22 @@
 use super::types::*;
 use super::wots;
+use super::mss;
 use anyhow::{bail, Result};
+
+ /// Verify a signature that may be either raw WOTS (576 bytes) or MSS (longer).
+ fn verify_signature(sig_bytes: &[u8], message: &[u8; 32], coin_id: &[u8; 32]) -> bool {
+     if sig_bytes.len() == wots::SIG_SIZE {
+         match wots::sig_from_bytes(sig_bytes) {
+             Some(sig) => wots::verify(&sig, message, coin_id),
+             None => false,
+         }
+     } else {
+         match mss::MssSignature::from_bytes(sig_bytes) {
+             Ok(mss_sig) => mss::verify(&mss_sig, message, coin_id),
+             Err(_) => false,
+         }
+     }
+ }
 
 /// Apply a transaction to the state
 pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
@@ -42,12 +58,12 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             }
 
             // Verify WOTS signatures and remove coins
-            for (i, (coin_id, sig)) in input_coins.iter().zip(signatures.iter()).enumerate() {
+            for (i, (coin_id, sig_bytes)) in input_coins.iter().zip(signatures.iter()).enumerate() {
                 if !state.coins.contains(coin_id) {
                     bail!("Coin {} not found or already spent", hex::encode(coin_id));
                 }
-                if !wots::verify(sig, &expected, coin_id) {
-                    bail!("Invalid WOTS signature for input {}", i);
+                if !verify_signature(sig_bytes, &expected, coin_id) {
+                    bail!("Invalid signature for input {}", i);
                 }
             }
 
@@ -101,12 +117,12 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                 bail!("No matching commitment found");
             }
 
-            for (i, (coin_id, sig)) in input_coins.iter().zip(signatures.iter()).enumerate() {
+            for (i, (coin_id, sig_bytes)) in input_coins.iter().zip(signatures.iter()).enumerate() {
                 if !state.coins.contains(coin_id) {
                     bail!("Coin {} not found", hex::encode(coin_id));
                 }
-                if !wots::verify(sig, &expected, coin_id) {
-                    bail!("Invalid WOTS signature for input {}", i);
+                if !verify_signature(sig_bytes, &expected, coin_id) {
+                    bail!("Invalid signature for input {}", i);
                 }
             }
 

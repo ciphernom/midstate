@@ -100,11 +100,9 @@ pub async fn send_transaction(
     for sig_hex in &req.signatures {
         let sig_bytes = hex::decode(sig_hex)
             .map_err(|e| ErrorResponse { error: format!("Invalid signature hex: {}", e) })?;
-        let sig = wots::sig_from_bytes(&sig_bytes)
-            .ok_or_else(|| ErrorResponse { error: "Invalid WOTS signature length".into() })?;
-        signatures.push(sig);
+        signatures.push(sig_bytes);
     }
-
+    
     let destinations: Vec<[u8; 32]> = req.destinations.iter()
         .map(|h| parse_hex32(h, "destination"))
         .collect::<Result<_, _>>()?;
