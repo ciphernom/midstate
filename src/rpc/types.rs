@@ -17,7 +17,10 @@ pub struct CommitResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SendTransactionRequest {
-    pub secrets: Vec<String>,
+    /// Input coin IDs (hex, 32 bytes each)
+    pub input_coins: Vec<String>,
+    /// WOTS signatures (hex, one per input, each CHAINS*32 bytes)
+    pub signatures: Vec<String>,
     pub destinations: Vec<String>,
     /// Salt from the commit phase (hex)
     pub salt: String,
@@ -38,6 +41,7 @@ pub struct GetStateResponse {
     pub num_coins: usize,
     pub num_commitments: usize,
     pub target: String,
+    pub block_reward: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -69,7 +73,7 @@ pub struct TransactionInfo {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GenerateKeyResponse {
-    pub secret: String,
+    pub seed: String,
     pub coin: String,
 }
 
