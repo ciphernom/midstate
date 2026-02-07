@@ -4,7 +4,7 @@ use crate::core::extension::mine_extension;
 use crate::core::transaction::{apply_transaction, validate_transaction};
 use crate::mempool::Mempool;
 use crate::metrics::Metrics;
-use crate::network::{Message, PeerConnection, PeerManager};
+use crate::network::{Message, PeerConnection, PeerManager, PeerIndex, MAX_GETBATCHES_COUNT};
 use crate::storage::Storage;
 use anyhow::Result;
 use std::net::SocketAddr;
@@ -20,6 +20,7 @@ pub struct Node {
     mempool: Mempool,
     storage: Storage,
     peer_manager: PeerManager,
+    peer_msg_rx: tokio::sync::mpsc::UnboundedReceiver<(PeerIndex, Result<Message>)>,
     metrics: Metrics,
     is_mining: bool,
     our_addr: SocketAddr,
@@ -61,10 +62,8 @@ impl NodeHandle {
     }
 
     pub async fn send_transaction(&self, tx: Transaction) -> Result<()> {
-        // Validation Logic Added Here
         let state_guard = self.state.read().await;
-        // Validate against current state (rejects bad nonces, insufficient funds, etc.)
-        validate_transaction(&state_guard, &tx)?; 
+        validate_transaction(&state_guard, &tx)?;
         drop(state_guard);
 
         self.tx_sender.send(NodeCommand::SendTransaction(tx))?;
@@ -91,14 +90,15 @@ impl Node {
         );
 
         let mempool = Mempool::new(data_dir.join("mempool"))?;
-
+        let (peer_manager, peer_msg_rx) = PeerManager::new(our_addr);
         let (incoming_peers_tx, incoming_peers_rx) = tokio::sync::mpsc::unbounded_channel();
 
         Ok(Self {
             state,
             mempool,
             storage,
-            peer_manager: PeerManager::new(our_addr),
+            peer_manager,
+            peer_msg_rx,
             metrics: Metrics::new(),
             is_mining,
             our_addr,
@@ -127,7 +127,8 @@ impl Node {
     }
 
     pub async fn connect_to_peer(&mut self, addr: SocketAddr) -> Result<()> {
-        self.peer_manager.connect_to_peer(addr).await
+        self.peer_manager.connect_to_peer(addr).await?;
+        Ok(())
     }
 
     pub async fn listen(&mut self, bind_addr: SocketAddr) -> Result<()> {
@@ -149,7 +150,6 @@ impl Node {
                         tokio::spawn(async move {
                             let mut peer = PeerConnection::from_stream(stream, addr);
 
-                            // Complete handshake first
                             if let Err(e) = peer.complete_handshake(our_addr_clone).await {
                                 tracing::warn!("Handshake failed with {}: {}", addr, e);
                                 return;
@@ -157,7 +157,6 @@ impl Node {
 
                             tracing::info!("Handshake complete with {}", addr);
 
-                            // Send the completed peer connection back to the main loop
                             if incoming_tx.send(peer).is_err() {
                                 tracing::warn!("Failed to register peer {}", addr);
                             }
@@ -173,14 +172,14 @@ impl Node {
         Ok(())
     }
 
-pub async fn run(
+    pub async fn run(
         mut self,
         handle: NodeHandle,
         mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<NodeCommand>,
     ) -> Result<()> {
         let mut mine_interval = time::interval(Duration::from_secs(5));
         let mut save_interval = time::interval(Duration::from_secs(10));
-        let mut ui_interval = time::interval(Duration::from_secs(1)); 
+        let mut ui_interval = time::interval(Duration::from_secs(1));
         let mut metrics_interval = time::interval(Duration::from_secs(30));
         let mut peer_maintenance = time::interval(Duration::from_secs(60));
         let mut ping_interval = time::interval(Duration::from_secs(30));
@@ -224,7 +223,7 @@ pub async fn run(
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
                         NodeCommand::SendTransaction(tx) => {
-                            if let Err(e) = self.handle_new_transaction(tx) {
+                            if let Err(e) = self.handle_new_transaction(tx, None).await {
                                 tracing::error!("Failed to handle transaction: {}", e);
                             }
                         }
@@ -233,64 +232,44 @@ pub async fn run(
 
                 Some(peer) = self.incoming_peers_rx.recv() => {
                     tracing::info!("Adding incoming peer: {}", peer.addr());
-                    if let Err(e) = self.peer_manager.add_peer(peer).await {
+                    if let Err(e) = self.peer_manager.add_inbound_peer(peer) {
                         tracing::warn!("Failed to add incoming peer: {}", e);
                     }
                 }
 
-                _ = time::sleep(Duration::from_millis(100)) => {
-                    if let Err(e) = self.process_peer_messages().await {
-                        tracing::error!("Error processing peer messages: {}", e);
-                    }
-                    self.peer_manager.process_broadcasts().await;
-                }
-            }
-        }
-    }
-
-    async fn process_peer_messages(&mut self) -> Result<()> {
-        let mut messages = Vec::new();
-
-        for peer in self.peer_manager.peers_mut() {
-            if !peer.is_connected() {
-                continue;
-            }
-
-            tokio::select! {
-                msg_result = peer.receive_message() => {
+                Some((peer_idx, msg_result)) = self.peer_msg_rx.recv() => {
                     match msg_result {
                         Ok(msg) => {
-                            messages.push(msg);
+                            // Rate limit check
+                            if !self.peer_manager.check_rate(peer_idx) {
+                                tracing::warn!("Rate limit exceeded for peer {}, banning", peer_idx);
+                                self.peer_manager.ban_peer(peer_idx);
+                                continue;
+                            }
+
+                            if let Err(e) = self.handle_message(peer_idx, msg).await {
+                                tracing::warn!("Error handling message from peer {}: {}", peer_idx, e);
+                                self.peer_manager.record_misbehavior(peer_idx, 10);
+                            }
                         }
                         Err(e) => {
-                            tracing::warn!("Error receiving from {}: {}", peer.addr(), e);
-                            peer.disconnect();
+                            tracing::debug!("Peer {} disconnected: {}", peer_idx, e);
+                            self.peer_manager.remove_peer(peer_idx);
                         }
                     }
                 }
-                _ = time::sleep(Duration::from_millis(10)) => {
-                    continue;
-                }
             }
         }
-
-        for msg in messages {
-            if let Err(e) = self.handle_message(msg).await {
-                tracing::warn!("Error handling message: {}", e);
-            }
-        }
-
-        Ok(())
     }
 
-    async fn handle_message(&mut self, msg: Message) -> Result<()> {
+    async fn handle_message(&mut self, from: PeerIndex, msg: Message) -> Result<()> {
         match msg {
             Message::Transaction(tx) => {
-                self.handle_new_transaction(tx)?;
+                self.handle_new_transaction(tx, Some(from)).await?;
             }
 
             Message::Batch(batch) => {
-                self.handle_new_batch(batch)?;
+                self.handle_new_batch(batch, Some(from)).await?;
             }
 
             Message::GetState => {
@@ -299,42 +278,48 @@ pub async fn run(
                     depth: self.state.depth,
                     midstate: self.state.midstate,
                 };
-                self.peer_manager.broadcast(response);
+                self.peer_manager.send_to(from, &response).await;
             }
 
             Message::StateInfo { height, depth, midstate } => {
                 tracing::debug!(
-                    "Peer state: height={} depth={} midstate={}",
-                    height,
-                    depth,
-                    hex::encode(midstate)
+                    "Peer {} state: height={} depth={} midstate={}",
+                    from, height, depth, hex::encode(midstate)
                 );
             }
 
             Message::Ping { nonce } => {
-                self.peer_manager.broadcast(Message::Pong { nonce });
+                self.peer_manager.send_to(from, &Message::Pong { nonce }).await;
             }
 
-            Message::Pong { .. } => {}
+            Message::Pong { .. } => {
+                self.peer_manager.handle_pong(from);
+            }
 
             Message::GetAddr => {
                 let addrs = self.peer_manager.peer_addrs();
-                self.peer_manager.broadcast(Message::Addr(addrs));
+                self.peer_manager.send_to(from, &Message::Addr(addrs)).await;
             }
 
             Message::Addr(addrs) => {
-                tracing::debug!("Received {} peer addresses", addrs.len());
+                tracing::debug!("Received {} peer addresses from peer {}", addrs.len(), from);
             }
 
             Message::Version { .. } | Message::Verack => {}
 
             Message::GetBatches { start_height, count } => {
-                tracing::info!("Peer requesting batches {}-{}", start_height, start_height + count - 1);
+                let count = count.min(MAX_GETBATCHES_COUNT);
+                tracing::info!("Peer {} requesting batches {}-{}", from, start_height, start_height + count - 1);
 
                 let end = (start_height + count).min(self.state.height);
-                let batches = self.storage.load_batches(start_height, end)?;
-
-                self.peer_manager.broadcast(Message::Batches(batches));
+                match self.storage.load_batches(start_height, end) {
+                    Ok(batches) => {
+                        self.peer_manager.send_to(from, &Message::Batches(batches)).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load batches for peer {}: {}", from, e);
+                    }
+                }
             }
 
             Message::Batches(_batches) => {}
@@ -343,7 +328,7 @@ pub async fn run(
         Ok(())
     }
 
-    fn handle_new_transaction(&mut self, tx: Transaction) -> Result<()> {
+    async fn handle_new_transaction(&mut self, tx: Transaction, from: Option<PeerIndex>) -> Result<()> {
         match &tx {
             Transaction::Commit { commitment } => {
                 tracing::info!("Received commit: {}", hex::encode(commitment));
@@ -357,7 +342,7 @@ pub async fn run(
         match self.mempool.add(tx.clone(), &self.state) {
             Ok(_) => {
                 self.metrics.inc_transactions_processed();
-                self.peer_manager.broadcast(Message::Transaction(tx));
+                self.peer_manager.broadcast_except(from, &Message::Transaction(tx)).await;
                 Ok(())
             }
             Err(e) => {
@@ -368,7 +353,7 @@ pub async fn run(
         }
     }
 
-    fn handle_new_batch(&mut self, batch: Batch) -> Result<()> {
+    async fn handle_new_batch(&mut self, batch: Batch, from: Option<PeerIndex>) -> Result<()> {
         tracing::info!("Received batch with {} txs", batch.transactions.len());
 
         let mut candidate_state = self.state.clone();
@@ -396,7 +381,7 @@ pub async fn run(
 
                     self.metrics.inc_batches_processed();
                     self.mempool.prune_invalid(&self.state);
-                    self.peer_manager.broadcast(Message::Batch(batch));
+                    self.peer_manager.broadcast_except(from, &Message::Batch(batch)).await;
                 }
 
                 Ok(())
@@ -404,6 +389,9 @@ pub async fn run(
             Err(e) => {
                 self.metrics.inc_invalid_batches();
                 tracing::warn!("Invalid batch: {}", e);
+                if let Some(idx) = from {
+                    self.peer_manager.record_misbehavior(idx, 20);
+                }
                 Err(e)
             }
         }
@@ -443,7 +431,8 @@ pub async fn run(
         self.state.target = adjust_difficulty(&self.state, &self.recent_states);
 
         self.metrics.inc_batches_mined();
-        self.peer_manager.broadcast(Message::Batch(batch));
+        // Mined locally — broadcast to all peers
+        self.peer_manager.broadcast(&Message::Batch(batch)).await;
 
         tracing::info!("Mined batch! height={} target={}", self.state.height, hex::encode(self.state.target));
 

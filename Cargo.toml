@@ -23,6 +23,7 @@ reqwest = { version = "0.11", features = ["json"] }
 aes-gcm = "0.10"
 rpassword = "7.3"
 dirs = "5.0"
+rand_chacha = "0.3"
 
 [features]
 fast-mining = []
