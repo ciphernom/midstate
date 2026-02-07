@@ -3,17 +3,16 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use anyhow::{bail, Result};
-use sha2::{Digest, Sha256};
 
 const KDF_ITERATIONS: u32 = 100_000;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 
-/// Derive a 32-byte key from password + salt via iterated SHA-256.
+/// Derive a 32-byte key from password + salt via iterated BLAKE3.
 fn derive_key(password: &[u8], salt: &[u8]) -> [u8; 32] {
-    let mut key = Sha256::digest([password, salt].concat()).into();
+    let mut key = *blake3::hash(&[password, salt].concat()).as_bytes();
     for _ in 1..KDF_ITERATIONS {
-        key = Sha256::digest(key).into();
+        key = *blake3::hash(&key).as_bytes();
     }
     key
 }

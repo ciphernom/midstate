@@ -96,7 +96,11 @@ async fn generate_chain(num_spends: u64) -> (State, Vec<Batch>) {
 
         let reveal_tx = Transaction::Reveal {
             input_coins,
-            signatures: vec![sig1, sig2],
+            // CHANGE: Convert to bytes
+            signatures: vec![
+                midstate::core::wots::sig_to_bytes(&sig1),
+                midstate::core::wots::sig_to_bytes(&sig2)
+            ],
             new_coins,
             salt,
         };
