@@ -1,29 +1,29 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use super::mmr::UtxoAccumulator;
 
-/// Hash a byte slice with SHA-256
+
+/// Hash a byte slice with BLAKE3 (truncated to 32 bytes — BLAKE3 native output).
 pub fn hash(data: &[u8]) -> [u8; 32] {
-    Sha256::digest(data).into()
+    *blake3::hash(data).as_bytes()
 }
 
-/// Concatenate two byte slices and hash them
+/// Concatenate two byte slices and hash them with BLAKE3.
 pub fn hash_concat(a: &[u8], b: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     hasher.update(a);
     hasher.update(b);
-    hasher.finalize().into()
+    *hasher.finalize().as_bytes()
 }
 
-/// Compute a commitment hash that binds inputs to outputs
+/// Compute a commitment hash that binds inputs to outputs.
 ///
-/// commitment = SHA256(coin_id_1 || ... || new_coin_1 || ... || salt)
+/// commitment = BLAKE3(coin_id_1 || ... || new_coin_1 || ... || salt)
 pub fn compute_commitment(
     input_coins: &[[u8; 32]],
     new_coins: &[[u8; 32]],
     salt: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     for coin in input_coins {
         hasher.update(coin);
     }
@@ -31,15 +31,15 @@ pub fn compute_commitment(
         hasher.update(coin);
     }
     hasher.update(salt);
-    hasher.finalize().into()
+    *hasher.finalize().as_bytes()
 }
 
 /// The global consensus state
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct State {
     pub midstate: [u8; 32],
-    pub coins: HashSet<[u8; 32]>,
-    pub commitments: HashSet<[u8; 32]>,
+    pub coins: UtxoAccumulator,
+    pub commitments: UtxoAccumulator,
     pub depth: u64,
     pub target: [u8; 32],
     pub height: u64,
@@ -65,9 +65,9 @@ impl State {
         ];
 
         Self {
-            midstate: hash(b"midstate_genesis_2026"),
-            coins: genesis_coins.into_iter().collect(),
-            commitments: HashSet::new(),
+            midstate: hash(b"midstate_genesis_v2_blake3"),
+            coins: UtxoAccumulator::from_set(genesis_coins),
+            commitments: UtxoAccumulator::new(),
             depth: 0,
             target,
             height: 0,
@@ -89,7 +89,7 @@ pub enum Transaction {
         /// The coin IDs being spent (public, in the UTXO set).
         input_coins: Vec<[u8; 32]>,
         /// WOTS signatures proving ownership of each input coin (one per input).
-        signatures: Vec<Vec<[u8; 32]>>,
+        signatures: Vec<Vec<u8>>,
         /// New coin commitments to create
         new_coins: Vec<[u8; 32]>,
         /// Salt used when computing the commitment
