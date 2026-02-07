@@ -1,34 +1,39 @@
 use super::types::*;
+use super::wots;
 use anyhow::{bail, Result};
 
 /// Apply a transaction to the state
 pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
     match tx {
         Transaction::Commit { commitment } => {
-            // Register the commitment
             if !state.commitments.insert(*commitment) {
                 bail!("Duplicate commitment");
             }
-
-            // Update midstate
             state.midstate = hash_concat(&state.midstate, commitment);
-
             Ok(())
         }
 
-        Transaction::Reveal { secrets, new_coins, salt } => {
-            if secrets.is_empty() {
+        Transaction::Reveal { input_coins, signatures, new_coins, salt } => {
+            if input_coins.is_empty() {
                 bail!("Transaction must spend at least one coin");
             }
             if new_coins.is_empty() {
                 bail!("Transaction must create at least one new coin");
             }
-
-            // Compute the coins being spent
-            let old_coins: Vec<[u8; 32]> = secrets.iter().map(|s| hash(s)).collect();
+            if signatures.len() != input_coins.len() {
+                bail!("Signature count must match input count");
+            }
+            // Fee enforcement: inputs > outputs
+            if input_coins.len() <= new_coins.len() {
+                bail!(
+                    "Inputs ({}) must exceed outputs ({}) to pay fee",
+                    input_coins.len(),
+                    new_coins.len()
+                );
+            }
 
             // Verify commitment exists and matches
-            let expected = compute_commitment(&old_coins, new_coins, salt);
+            let expected = compute_commitment(input_coins, new_coins, salt);
             if !state.commitments.remove(&expected) {
                 bail!(
                     "No matching commitment found (expected {})",
@@ -36,11 +41,19 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 );
             }
 
-            // Check all coins exist and remove them
-            for old_coin in &old_coins {
-                if !state.coins.remove(old_coin) {
-                    bail!("Coin {:?} not found or already spent", hex::encode(old_coin));
+            // Verify WOTS signatures and remove coins
+            for (i, (coin_id, sig)) in input_coins.iter().zip(signatures.iter()).enumerate() {
+                if !state.coins.contains(coin_id) {
+                    bail!("Coin {} not found or already spent", hex::encode(coin_id));
                 }
+                if !wots::verify(sig, &expected, coin_id) {
+                    bail!("Invalid WOTS signature for input {}", i);
+                }
+            }
+
+            // Remove spent coins
+            for coin_id in input_coins {
+                state.coins.remove(coin_id);
             }
 
             // Add new coins
@@ -50,7 +63,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 }
             }
 
-            // Update midstate with transaction data
+            // Update midstate
             let tx_bytes = bincode::serialize(tx)?;
             state.midstate = hash_concat(&state.midstate, &tx_bytes);
 
@@ -69,26 +82,31 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
             Ok(())
         }
 
-        Transaction::Reveal { secrets, new_coins, salt } => {
-            if secrets.is_empty() {
+        Transaction::Reveal { input_coins, signatures, new_coins, salt } => {
+            if input_coins.is_empty() {
                 bail!("Must spend at least one coin");
             }
             if new_coins.is_empty() {
                 bail!("Must create at least one coin");
             }
+            if signatures.len() != input_coins.len() {
+                bail!("Signature count must match input count");
+            }
+            if input_coins.len() <= new_coins.len() {
+                bail!("Inputs must exceed outputs to pay fee");
+            }
 
-            let old_coins: Vec<[u8; 32]> = secrets.iter().map(|s| hash(s)).collect();
-
-            // Verify commitment exists
-            let expected = compute_commitment(&old_coins, new_coins, salt);
+            let expected = compute_commitment(input_coins, new_coins, salt);
             if !state.commitments.contains(&expected) {
                 bail!("No matching commitment found");
             }
 
-            // Verify coins exist
-            for old_coin in &old_coins {
-                if !state.coins.contains(old_coin) {
-                    bail!("Coin {:?} not found", hex::encode(old_coin));
+            for (i, (coin_id, sig)) in input_coins.iter().zip(signatures.iter()).enumerate() {
+                if !state.coins.contains(coin_id) {
+                    bail!("Coin {} not found", hex::encode(coin_id));
+                }
+                if !wots::verify(sig, &expected, coin_id) {
+                    bail!("Invalid WOTS signature for input {}", i);
                 }
             }
 

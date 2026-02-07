@@ -14,20 +14,20 @@ impl Storage {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
-        
+
         let db = sled::open(path.join("state"))?;
         let batches = BatchStore::new(path.join("batches"))?;
-        
+
         Ok(Self { db, batches })
     }
-    
+
     pub fn save_state(&self, state: &State) -> Result<()> {
         let bytes = bincode::serialize(state)?;
         self.db.insert(b"state", bytes)?;
         self.db.flush()?;
         Ok(())
     }
-    
+
     pub fn load_state(&self) -> Result<Option<State>> {
         match self.db.get(b"state")? {
             Some(bytes) => {
@@ -37,20 +37,37 @@ impl Storage {
             None => Ok(None),
         }
     }
-    
-    // Batch storage methods
+
+    pub fn save_mining_seed(&self, seed: &[u8; 32]) -> Result<()> {
+        self.db.insert(b"mining_seed", seed.as_slice())?;
+        self.db.flush()?;
+        Ok(())
+    }
+
+    pub fn load_mining_seed(&self) -> Result<Option<[u8; 32]>> {
+        match self.db.get(b"mining_seed")? {
+            Some(bytes) => {
+                if bytes.len() != 32 {
+                    anyhow::bail!("corrupt mining seed");
+                }
+                Ok(Some(<[u8; 32]>::try_from(bytes.as_ref()).unwrap()))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn save_batch(&self, height: u64, batch: &crate::core::Batch) -> Result<()> {
         self.batches.save(height, batch)
     }
-    
+
     pub fn load_batch(&self, height: u64) -> Result<Option<crate::core::Batch>> {
         self.batches.load(height)
     }
-    
+
     pub fn load_batches(&self, start: u64, end: u64) -> Result<Vec<crate::core::Batch>> {
         self.batches.load_range(start, end)
     }
-    
+
     pub fn highest_batch(&self) -> Result<u64> {
         self.batches.highest()
     }
