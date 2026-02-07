@@ -24,6 +24,7 @@ aes-gcm = "0.10"
 rpassword = "7.3"
 dirs = "5.0"
 rand_chacha = "0.3"
+blake3 = "1.5"
 
 [features]
 fast-mining = []
