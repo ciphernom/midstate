@@ -3,6 +3,7 @@ use super::discovery::AddressBook;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
@@ -228,14 +229,14 @@ async fn forward_messages(
         match local_rx.recv().await {
             Some(Ok(msg)) => {
                 if shared_tx.send((idx, Ok(msg))).is_err() {
-                    return; // shared channel closed
+                    return;
                 }
             }
             Some(Err(e)) => {
                 let _ = shared_tx.send((idx, Err(e)));
                 return;
             }
-            None => break, // local channel closed
+            None => break,
         }
     }
     let _ = shared_tx.send((idx, Err(anyhow::anyhow!("peer reader closed"))));
@@ -247,6 +248,7 @@ pub struct PeerManager {
     our_addr: SocketAddr,
     peer_msg_tx: mpsc::UnboundedSender<(PeerIndex, Result<Message>)>,
     address_book: AddressBook,
+    address_book_path: Option<PathBuf>,
     inbound_count: usize,
     outbound_count: usize,
 }
@@ -260,10 +262,40 @@ impl PeerManager {
             our_addr,
             peer_msg_tx,
             address_book: AddressBook::new(),
+            address_book_path: None,
             inbound_count: 0,
             outbound_count: 0,
         };
         (mgr, peer_msg_rx)
+    }
+
+    /// Create a PeerManager that persists its address book to `path`.
+    pub fn with_persistence(
+        our_addr: SocketAddr,
+        peers_path: PathBuf,
+    ) -> (Self, mpsc::UnboundedReceiver<(PeerIndex, Result<Message>)>) {
+        let (peer_msg_tx, peer_msg_rx) = mpsc::unbounded_channel();
+        let address_book = AddressBook::load(&peers_path);
+        let mgr = Self {
+            peers: HashMap::new(),
+            next_index: 0,
+            our_addr,
+            peer_msg_tx,
+            address_book,
+            address_book_path: Some(peers_path),
+            inbound_count: 0,
+            outbound_count: 0,
+        };
+        (mgr, peer_msg_rx)
+    }
+
+    /// Flush the address book to disk (call periodically or on shutdown).
+    pub fn save_address_book(&self) {
+        if let Some(ref path) = self.address_book_path {
+            if let Err(e) = self.address_book.save(path) {
+                tracing::warn!("Failed to save address book: {}", e);
+            }
+        }
     }
 
     pub async fn connect_to_peer(&mut self, addr: SocketAddr) -> Result<PeerIndex> {
@@ -284,6 +316,7 @@ impl PeerManager {
         let idx = self.register_peer(peer);
         self.outbound_count += 1;
         self.address_book.mark_connected(addr);
+        self.address_book.mark_tried(addr);
         tracing::info!("Connected to outbound peer {}: {} (total: {})", idx, addr, self.peers.len());
         Ok(idx)
     }
@@ -404,13 +437,11 @@ impl PeerManager {
         }
     }
 
-    /// Internal cleanup that also updates address book and counts.
     fn cleanup_peer(&mut self, idx: PeerIndex) {
         self.remove_peer(idx);
     }
 
     /// Check rate limit for a peer. Returns false if exceeded.
-    /// Returns true for unknown peers (stale messages from already-removed peers).
     pub fn check_rate(&mut self, idx: PeerIndex) -> bool {
         match self.peers.get_mut(&idx) {
             Some(peer) => peer.record_message(),
@@ -455,5 +486,14 @@ impl PeerManager {
 
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    /// Return a random connected peer index (for requesting missing batches).
+    pub fn random_peer(&self) -> Option<PeerIndex> {
+        use rand::seq::IteratorRandom;
+        self.peers.iter()
+            .filter(|(_, p)| p.is_connected())
+            .map(|(&idx, _)| idx)
+            .choose(&mut rand::thread_rng())
     }
 }
