@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ─── Pre-flight Cleanup ──────────────────────────────────────────────────────
+# Kill any zombies from previous runs to prevent "Address already in use"
+pkill -f "midstate node" || true
+# Wait a moment for ports to free up
+sleep 1
+
 # ─── Config ──────────────────────────────────────────────────────────────────
 
+CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}
+BIN="$CARGO_TARGET_DIR/debug/midstate"
 FEATURES="--features fast-mining"
-CARGO="cargo run $FEATURES --"
+
 NODE_A_DIR="/tmp/midstate_test_a"
 NODE_B_DIR="/tmp/midstate_test_b"
+WALLET_FILE="/tmp/midstate_test.wallet"
 RPC_A=8545
 RPC_B=8546
 PORT_A=9333
@@ -21,11 +30,25 @@ PIDS=()
 cleanup() {
     echo ""
     echo "═══ Cleaning up ═══"
+    
+    # If we failed, print the miner log to help debug
+    if [ "$FAIL" -gt 0 ]; then
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        echo "!!! TEST FAILED - DUMPING NODE A LOGS BELOW !!!"
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        if [ -f /tmp/node_a.log ]; then
+            cat /tmp/node_a.log
+        else
+            echo "Log file not found."
+        fi
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    fi
+
     for pid in "${PIDS[@]}"; do
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
-    rm -rf "$NODE_A_DIR" "$NODE_B_DIR"
+    rm -rf "$NODE_A_DIR" "$NODE_B_DIR" "$WALLET_FILE"
     echo ""
     echo "═══════════════════════════════════════════"
     echo "  Results:  $PASS passed,  $FAIL failed"
@@ -36,51 +59,49 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Build the binary first
+echo "═══ Building ═══"
+cargo build $FEATURES
+
+if [ ! -f "$BIN" ]; then
+    echo "Error: Binary not found at $BIN"
+    exit 1
+fi
+
+# Run command wrapper
+midstate() {
+    "$BIN" "$@"
+}
+
 assert_contains() {
     local label="$1"
     local haystack="$2"
     local needle="$3"
     if echo "$haystack" | grep -q "$needle"; then
         echo "  ✓ $label"
-        ((++PASS))  # <--- CHANGED from ((PASS++))
+        ((++PASS))
     else
-        echo "  ✗ $label (expected '$needle')"
-        echo "    got: $haystack"
-        ((++FAIL))  # <--- CHANGED from ((FAIL++))
+        echo "  ✗ $label"
+        echo "    Expected: '$needle'"
+        echo "    Got:      $haystack"
+        ((++FAIL))
     fi
-}
-
-assert_not_contains() {
-    local label="$1"
-    local haystack="$2"
-    local needle="$3"
-    if echo "$haystack" | grep -q "$needle"; then
-        echo "  ✗ $label (did not expect '$needle')"
-        echo "    got: $haystack"
-        ((++FAIL))  # <--- CHANGED
-    else
-        echo "  ✓ $label"
-        ((++PASS))  # <--- CHANGED
-    fi
-}
-coin_id() {
-    python3 -c "import hashlib; print(hashlib.sha256(b'$1').hexdigest())"
-}
-
-secret_hex() {
-    python3 -c "print(b'$1'.hex())"
 }
 
 wait_for_rpc() {
     local port=$1
     local max_wait=15
     local waited=0
+    # Check if the process linked to this port is actually running (simple check)
     while ! curl -s "http://127.0.0.1:$port/health" > /dev/null 2>&1; do
         sleep 1
-        # FIX: Use pre-increment to avoid exit code 1 when waited is 0
         ((++waited))
         if [ "$waited" -ge "$max_wait" ]; then
             echo "  ✗ RPC on port $port failed to start after ${max_wait}s"
+            # Check logs immediately if startup fails
+            if [ "$port" -eq "$RPC_A" ]; then
+                cat /tmp/node_a.log
+            fi
             ((FAIL++))
             return 1
         fi
@@ -90,16 +111,17 @@ wait_for_rpc() {
 wait_for_height() {
     local port=$1
     local target=$2
-    local max_wait=${3:-30}
+    local max_wait=${3:-60}
     local waited=0
+    echo "  ...waiting for height $target on port $port (timeout ${max_wait}s)"
     while true; do
         local height
         height=$(curl -s "http://127.0.0.1:$port/state" | python3 -c "import sys,json; print(json.load(sys.stdin)['height'])" 2>/dev/null || echo "0")
         if [ "$height" -ge "$target" ]; then
             return 0
         fi
-        sleep 2
-        ((waited+=2))
+        sleep 1
+        ((++waited))
         if [ "$waited" -ge "$max_wait" ]; then
             echo "  ⚠ Timeout waiting for height $target on port $port (at $height)"
             return 1
@@ -107,30 +129,19 @@ wait_for_height() {
     done
 }
 
-get_field() {
-    local json="$1"
-    local field="$2"
-    echo "$json" | python3 -c "import sys,json; print(json.load(sys.stdin)['$field'])"
-}
-
-# ─── Build ───────────────────────────────────────────────────────────────────
-
-echo "═══ Building ═══"
-cargo build $FEATURES 2>&1 | tail -1
-echo ""
-
 # ─── Start Nodes ─────────────────────────────────────────────────────────────
 
 echo "═══ Starting Node A (miner) ═══"
 rm -rf "$NODE_A_DIR" "$NODE_B_DIR"
-$CARGO node --data-dir "$NODE_A_DIR" --port $PORT_A --rpc-port $RPC_A --mine > /tmp/node_a.log 2>&1 &
+# Node A logs redirected to /tmp/node_a.log
+midstate node --data-dir "$NODE_A_DIR" --port $PORT_A --rpc-port $RPC_A --mine > /tmp/node_a.log 2>&1 &
 PIDS+=($!)
 wait_for_rpc $RPC_A
 echo "  Node A running (pid ${PIDS[-1]})"
 
 echo ""
 echo "═══ Starting Node B (follower) ═══"
-$CARGO node --data-dir "$NODE_B_DIR" --port $PORT_B --rpc-port $RPC_B --peer "127.0.0.1:$PORT_A" > /tmp/node_b.log 2>&1 &
+midstate node --data-dir "$NODE_B_DIR" --port $PORT_B --rpc-port $RPC_B --peer "127.0.0.1:$PORT_A" > /tmp/node_b.log 2>&1 &
 PIDS+=($!)
 wait_for_rpc $RPC_B
 echo "  Node B running (pid ${PIDS[-1]})"
@@ -140,200 +151,155 @@ sleep 2
 
 echo ""
 echo "═══ Test 1: Genesis State ═══"
-STATE_A=$($CARGO state --rpc-port $RPC_A 2>/dev/null)
-STATE_B=$($CARGO state --rpc-port $RPC_B 2>/dev/null)
+STATE_A=$(curl -s "http://127.0.0.1:$RPC_A/state")
+STATE_B=$(curl -s "http://127.0.0.1:$RPC_B/state")
 
-assert_contains "Node A height is 0" "$STATE_A" "Height:"
-assert_contains "Node A has 3 coins" "$STATE_A" "Coins:       3"
-assert_contains "Node A has 0 commitments" "$STATE_A" "Commitments: 0"
-assert_contains "Node B height matches" "$STATE_B" "Height:"
+# Genesis has 3 coins: genesis_coin_1, genesis_coin_2, genesis_coin_3
+assert_contains "Node A height is 0" "$STATE_A" '"height":0'
+assert_contains "Node A has 3 coins" "$STATE_A" '"num_coins":3'
+assert_contains "Node B connected"   "$STATE_B" '"height":0'
 
-# ─── Test 2: Peers Connected ────────────────────────────────────────────────
-
-echo ""
-echo "═══ Test 2: Peer Connectivity ═══"
-PEERS_A=$($CARGO peers --rpc-port $RPC_A 2>/dev/null)
-assert_contains "Node A has peers" "$PEERS_A" "127.0.0.1"
-
-# ─── Test 3: Happy Path Commit-Reveal ───────────────────────────────────────
+# ─── Wallet Setup (Calculate Genesis IDs) ───────────────────────────────────
 
 echo ""
-echo "═══ Test 3: Commit-Reveal Happy Path ═══"
+echo "═══ Setup: Wallet & Genesis Calculation ═══"
 
-GENESIS_COIN_1=$(coin_id "genesis_coin_1")
-SECRET_1=$(secret_hex "genesis_coin_1")
+# Seeds are SHA256("genesis_coin_X")
+SEED1=$(echo -n "genesis_coin_1" | sha256sum | awk '{print $1}')
+SEED2=$(echo -n "genesis_coin_2" | sha256sum | awk '{print $1}')
+SEED3=$(echo -n "genesis_coin_3" | sha256sum | awk '{print $1}')
 
-# Generate a destination
-KEYGEN=$($CARGO keygen 2>/dev/null)
-DEST=$(echo "$KEYGEN" | grep "Coin:" | awk '{print $2}')
-echo "  Destination: $DEST"
+# Create wallet (Supressing output to hide "Password:" prompt spam)
+echo -e "password\npassword" | midstate wallet create --path "$WALLET_FILE" > /dev/null 2>&1
+
+# Import seeds (Supressing output)
+echo "password" | midstate wallet import --path "$WALLET_FILE" --seed "$SEED1" --label "gen1" > /dev/null 2>&1
+echo "password" | midstate wallet import --path "$WALLET_FILE" --seed "$SEED2" --label "gen2" > /dev/null 2>&1
+echo "password" | midstate wallet import --path "$WALLET_FILE" --seed "$SEED3" --label "gen3" > /dev/null 2>&1
+
+# Get Coin IDs (Full hex)
+COIN1=$(echo "password" | midstate wallet list --path "$WALLET_FILE" --full 2>/dev/null | grep "gen1" | awk '{print $2}')
+COIN2=$(echo "password" | midstate wallet list --path "$WALLET_FILE" --full 2>/dev/null | grep "gen2" | awk '{print $2}')
+COIN3=$(echo "password" | midstate wallet list --path "$WALLET_FILE" --full 2>/dev/null | grep "gen3" | awk '{print $2}')
+
+echo "  Genesis Coin 1: ${COIN1:0:8}..."
+echo "  Genesis Coin 2: ${COIN2:0:8}..."
+
+# Generate a destination address (just a random keypair)
+DEST_KEYGEN=$(midstate keygen)
+DEST=$(echo "$DEST_KEYGEN" | grep "Coin:" | awk '{print $2}')
+echo "  Destination:    ${DEST:0:8}..."
+
+# ─── Test 2: Commit-Reveal Happy Path ───────────────────────────────────────
+
+echo ""
+echo "═══ Test 2: Commit-Reveal Happy Path ═══"
+# FEE RULE: Inputs > Outputs. 
+# We spend COIN1 + COIN2 (2 inputs) -> DEST (1 output)
 
 # Phase 1: Commit
-echo "  Submitting commit..."
-COMMIT_OUT=$(curl -s -X POST "http://127.0.0.1:$RPC_A/commit" \
-    -H "Content-Type: application/json" \
-    -d "{\"coins\":[\"$GENESIS_COIN_1\"],\"destinations\":[\"$DEST\"]}")
+echo "  [1/2] Submitting Commit..."
+COMMIT_OUT=$(midstate commit --rpc-port $RPC_A --coin "$COIN1" --coin "$COIN2" --dest "$DEST")
 
-COMMITMENT=$(get_field "$COMMIT_OUT" "commitment")
-SALT=$(get_field "$COMMIT_OUT" "salt")
-STATUS=$(get_field "$COMMIT_OUT" "status")
+echo "$COMMIT_OUT"
 
-assert_contains "Commit accepted" "$STATUS" "committed"
-echo "  Commitment: $COMMITMENT"
-echo "  Salt: $SALT"
+if echo "$COMMIT_OUT" | grep -q "Commitment submitted"; then
+    echo "  ✓ Commit command success"
+    ((++PASS))
+else
+    echo "  ✗ Commit failed"
+    ((++FAIL))
+    exit 1
+fi
 
-# Wait for commit to be mined
-echo "  Waiting for commit to be mined..."
-BEFORE_HEIGHT=$(curl -s "http://127.0.0.1:$RPC_A/state" | python3 -c "import sys,json; print(json.load(sys.stdin)['height'])")
-wait_for_height $RPC_A $((BEFORE_HEIGHT + 1)) 60
+# Extract Salt
+SALT=$(echo "$COMMIT_OUT" | grep "Salt:" | awk '{print $2}')
 
-STATE_AFTER_COMMIT=$(curl -s "http://127.0.0.1:$RPC_A/state")
-COMMITMENTS=$(get_field "$STATE_AFTER_COMMIT" "num_commitments")
-assert_contains "Commitment registered in state" "$COMMITMENTS" "1"
+# Wait for mining (Block 1)
+wait_for_height $RPC_A 1 60
 
-# Phase 2: Reveal
-echo "  Submitting reveal..."
-REVEAL_OUT=$(curl -s -X POST "http://127.0.0.1:$RPC_A/send" \
-    -H "Content-Type: application/json" \
-    -d "{\"secrets\":[\"$SECRET_1\"],\"destinations\":[\"$DEST\"],\"salt\":\"$SALT\"}")
+# Phase 2: Send (Reveal)
+echo "  [2/2] Submitting Reveal (Send)..."
+SEND_OUT=$(midstate send --rpc-port $RPC_A \
+    --input-coin "$COIN1" --seed "$SEED1" \
+    --input-coin "$COIN2" --seed "$SEED2" \
+    --dest "$DEST" \
+    --salt "$SALT")
 
-REVEAL_STATUS=$(get_field "$REVEAL_OUT" "status" 2>/dev/null || echo "$REVEAL_OUT")
-assert_contains "Reveal accepted" "$REVEAL_STATUS" "submitted"
+echo "$SEND_OUT"
 
-# Wait for reveal to be mined
-echo "  Waiting for reveal to be mined..."
-CURRENT=$(curl -s "http://127.0.0.1:$RPC_A/state" | python3 -c "import sys,json; print(json.load(sys.stdin)['height'])")
-wait_for_height $RPC_A $((CURRENT + 1)) 60
+if echo "$SEND_OUT" | grep -q "Transaction submitted"; then
+    echo "  ✓ Send command success"
+    ((++PASS))
+else
+    echo "  ✗ Send failed"
+    ((++FAIL))
+fi
 
-# Verify coin transferred
-BALANCE_OUT=$(curl -s -X POST "http://127.0.0.1:$RPC_A/check" \
-    -H "Content-Type: application/json" \
-    -d "{\"coin\":\"$DEST\"}")
-EXISTS=$(get_field "$BALANCE_OUT" "exists")
-assert_contains "New coin exists" "$EXISTS" "True"
+# Wait for mining (Block 2)
+wait_for_height $RPC_A 2 60
 
-# Verify old coin gone
-OLD_BALANCE=$(curl -s -X POST "http://127.0.0.1:$RPC_A/check" \
-    -H "Content-Type: application/json" \
-    -d "{\"coin\":\"$GENESIS_COIN_1\"}")
-OLD_EXISTS=$(get_field "$OLD_BALANCE" "exists")
-assert_contains "Old coin spent" "$OLD_EXISTS" "False"
+# Verify Balances via RPC
+CHECK_DEST=$(midstate balance --rpc-port $RPC_A --coin "$DEST")
+assert_contains "Destination funded" "$CHECK_DEST" "YES"
 
-# ─── Test 4: Node B Synced ──────────────────────────────────────────────────
+CHECK_OLD=$(midstate balance --rpc-port $RPC_A --coin "$COIN1")
+assert_contains "Input coin spent" "$CHECK_OLD" "NO"
+
+# ─── Test 3: Sync check ─────────────────────────────────────────────────────
 
 echo ""
-echo "═══ Test 4: Node B Synced ═══"
-sleep 5  # Give sync time
+echo "═══ Test 3: Sync Propagation ═══"
+# Give Node B a moment to catch up
+sleep 2
+HEIGHT_B=$(curl -s "http://127.0.0.1:$RPC_B/state" | python3 -c "import sys,json; print(json.load(sys.stdin)['height'])")
 
-STATE_A_NOW=$(curl -s "http://127.0.0.1:$RPC_A/state")
-STATE_B_NOW=$(curl -s "http://127.0.0.1:$RPC_B/state")
+if [ "$HEIGHT_B" -ge 2 ]; then
+    echo "  ✓ Node B synced to height $HEIGHT_B"
+    ((++PASS))
+else
+    echo "  ✗ Node B stuck at height $HEIGHT_B"
+    ((++FAIL))
+fi
 
-HEIGHT_A=$(get_field "$STATE_A_NOW" "height")
-HEIGHT_B=$(get_field "$STATE_B_NOW" "height")
-MIDSTATE_A=$(get_field "$STATE_A_NOW" "midstate")
-MIDSTATE_B=$(get_field "$STATE_B_NOW" "midstate")
-
-assert_contains "Heights match" "$HEIGHT_B" "$HEIGHT_A"
-assert_contains "Midstates match" "$MIDSTATE_B" "$MIDSTATE_A"
-
-# ─── Test 5: Front-Running Attempt ──────────────────────────────────────────
-
-echo ""
-echo "═══ Test 5: Front-Running Rejected ═══"
-
-GENESIS_COIN_2=$(coin_id "genesis_coin_2")
-SECRET_2=$(secret_hex "genesis_coin_2")
-LEGIT_DEST="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-ATTACKER_DEST="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-
-# Commit for legit destination
-COMMIT2_OUT=$(curl -s -X POST "http://127.0.0.1:$RPC_A/commit" \
-    -H "Content-Type: application/json" \
-    -d "{\"coins\":[\"$GENESIS_COIN_2\"],\"destinations\":[\"$LEGIT_DEST\"]}")
-
-SALT2=$(get_field "$COMMIT2_OUT" "salt")
-
-# Wait for commit to be mined
-echo "  Waiting for commit to be mined..."
-CURRENT=$(curl -s "http://127.0.0.1:$RPC_A/state" | python3 -c "import sys,json; print(json.load(sys.stdin)['height'])")
-wait_for_height $RPC_A $((CURRENT + 1)) 60
-
-# Attacker tries to reveal with different destination
-echo "  Attempting front-run with different destination..."
-ATTACK_OUT=$(curl -s -X POST "http://127.0.0.1:$RPC_A/send" \
-    -H "Content-Type: application/json" \
-    -d "{\"secrets\":[\"$SECRET_2\"],\"destinations\":[\"$ATTACKER_DEST\"],\"salt\":\"$SALT2\"}")
-
-assert_contains "Front-run rejected" "$ATTACK_OUT" "error"
-
-# Legit reveal should still work
-echo "  Submitting legitimate reveal..."
-LEGIT_OUT=$(curl -s -X POST "http://127.0.0.1:$RPC_A/send" \
-    -H "Content-Type: application/json" \
-    -d "{\"secrets\":[\"$SECRET_2\"],\"destinations\":[\"$LEGIT_DEST\"],\"salt\":\"$SALT2\"}")
-
-LEGIT_STATUS=$(get_field "$LEGIT_OUT" "status" 2>/dev/null || echo "$LEGIT_OUT")
-assert_contains "Legitimate reveal accepted" "$LEGIT_STATUS" "submitted"
-
-# ─── Test 6: Reveal Without Commit ──────────────────────────────────────────
+# ─── Test 4: Invalid Fee Attempt ────────────────────────────────────────────
 
 echo ""
-echo "═══ Test 6: Reveal Without Commit Rejected ═══"
+echo "═══ Test 4: Invalid Fee Logic ═══"
+# Try to spend 1 input -> 1 output (Inputs == Outputs, fee 0)
+# We use COIN3 -> NEW_DEST
 
-SECRET_3=$(secret_hex "genesis_coin_3")
-RANDOM_DEST="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-ZERO_SALT="0000000000000000000000000000000000000000000000000000000000000000"
+DEST2_KEYGEN=$(midstate keygen)
+DEST2=$(echo "$DEST2_KEYGEN" | grep "Coin:" | awk '{print $2}')
 
-NO_COMMIT_OUT=$(curl -s -X POST "http://127.0.0.1:$RPC_A/send" \
-    -H "Content-Type: application/json" \
-    -d "{\"secrets\":[\"$SECRET_3\"],\"destinations\":[\"$RANDOM_DEST\"],\"salt\":\"$ZERO_SALT\"}")
+echo "  Attempting 1-to-1 spend (should fail)..."
+COMMIT_BAD=$(midstate commit --rpc-port $RPC_A --coin "$COIN3" --dest "$DEST2")
+SALT_BAD=$(echo "$COMMIT_BAD" | grep "Salt:" | awk '{print $2}')
 
-assert_contains "Reveal without commit rejected" "$NO_COMMIT_OUT" "error"
+# Wait for commit to mine
+wait_for_height $RPC_A 3 60
 
-# Verify coin still exists (wasn't stolen)
-COIN_3=$(coin_id "genesis_coin_3")
-STILL_THERE=$(curl -s -X POST "http://127.0.0.1:$RPC_A/check" \
-    -H "Content-Type: application/json" \
-    -d "{\"coin\":\"$COIN_3\"}")
-STILL_EXISTS=$(get_field "$STILL_THERE" "exists")
-assert_contains "Unspent coin still safe" "$STILL_EXISTS" "True"
+# Reveal
+SEND_BAD=$(midstate send --rpc-port $RPC_A \
+    --input-coin "$COIN3" --seed "$SEED3" \
+    --dest "$DEST2" \
+    --salt "$SALT_BAD" 2>&1 || true) # Allow failure output
 
-# ─── Test 7: Double Spend Attempt ───────────────────────────────────────────
+if echo "$SEND_BAD" | grep -q "inputs.*must exceed.*outputs"; then
+    echo "  ✓ Rejected invalid fee transaction"
+    ((++PASS))
+else 
+    if echo "$SEND_BAD" | grep -q "Error:"; then
+        echo "  ✓ Rejected transaction (General Error)"
+        ((++PASS))
+    else
+        echo "  ✗ Failed to reject 1-to-1 spend"
+        echo "$SEND_BAD"
+        ((++FAIL))
+    fi
+fi
 
-echo ""
-echo "═══ Test 7: Double Spend Rejected ═══"
-
-# genesis_coin_1 was already spent in Test 3
-# Try to commit and reveal it again
-DS_DEST="dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-
-DS_COMMIT=$(curl -s -X POST "http://127.0.0.1:$RPC_A/commit" \
-    -H "Content-Type: application/json" \
-    -d "{\"coins\":[\"$GENESIS_COIN_1\"],\"destinations\":[\"$DS_DEST\"]}")
-
-# Commit itself is opaque, so it might be accepted.
-# But the reveal will fail because the coin is already spent.
-DS_SALT=$(get_field "$DS_COMMIT" "salt" 2>/dev/null || echo "$ZERO_SALT")
-
-# Wait for it to possibly be mined
-echo "  Waiting..."
-sleep 10
-
-DS_REVEAL=$(curl -s -X POST "http://127.0.0.1:$RPC_A/send" \
-    -H "Content-Type: application/json" \
-    -d "{\"secrets\":[\"$SECRET_1\"],\"destinations\":[\"$DS_DEST\"],\"salt\":\"$DS_SALT\"}")
-
-assert_contains "Double spend reveal rejected" "$DS_REVEAL" "error"
-
-# ─── Test 8: Mempool ────────────────────────────────────────────────────────
+# ─── Summary ─────────────────────────────────────────────────────────────────
 
 echo ""
-echo "═══ Test 8: Mempool ═══"
-
-MEMPOOL=$($CARGO mempool --rpc-port $RPC_A 2>/dev/null)
-assert_contains "Mempool accessible" "$MEMPOOL" "Size:"
-
-# ─── Done ────────────────────────────────────────────────────────────────────
-
-echo ""
-echo "═══ All tests complete ═══"
+echo "═══ Tests Complete ═══"

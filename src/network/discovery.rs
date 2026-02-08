@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 use anyhow::Result;
 
@@ -12,9 +13,11 @@ pub struct PeerInfo {
     pub services: u64,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct AddressBook {
     tried: HashMap<SocketAddr, PeerInfo>,
     new: HashMap<SocketAddr, PeerInfo>,
+    #[serde(skip)]
     connected: HashSet<SocketAddr>,
     banned: HashSet<SocketAddr>,
 }
@@ -28,7 +31,41 @@ impl AddressBook {
             banned: HashSet::new(),
         }
     }
-    
+
+    /// Load from disk, falling back to empty if missing or corrupt.
+    pub fn load(path: &Path) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                match serde_json::from_slice::<AddressBook>(&bytes) {
+                    Ok(book) => {
+                        tracing::info!(
+                            "Loaded address book: {} tried, {} new, {} banned",
+                            book.tried.len(),
+                            book.new.len(),
+                            book.banned.len()
+                        );
+                        book
+                    }
+                    Err(e) => {
+                        tracing::warn!("Corrupt address book, starting fresh: {}", e);
+                        Self::new()
+                    }
+                }
+            }
+            Err(_) => Self::new(),
+        }
+    }
+
+    /// Persist to disk.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec(self)?;
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
     pub fn add_address(&mut self, addr: SocketAddr) {
         if self.banned.contains(&addr) {
             return;

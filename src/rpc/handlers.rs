@@ -1,5 +1,5 @@
 use super::types::*;
-use crate::core::{hash, compute_commitment, Transaction};
+use crate::core::{compute_commitment, wots, block_reward, Transaction};
 use crate::node::NodeHandle;
 use axum::{
     extract::State,
@@ -30,7 +30,17 @@ pub async fn get_state(State(node): State<AppState>) -> Json<GetStateResponse> {
         num_coins: state.coins.len(),
         num_commitments: state.commitments.len(),
         target: hex::encode(state.target),
+        block_reward: block_reward(state.height),
     })
+}
+
+fn parse_hex32(hex_str: &str, label: &str) -> Result<[u8; 32], ErrorResponse> {
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| ErrorResponse { error: format!("Invalid {} hex: {}", label, e) })?;
+    if bytes.len() != 32 {
+        return Err(ErrorResponse { error: format!("{} must be 32 bytes", label) });
+    }
+    Ok(<[u8; 32]>::try_from(bytes).unwrap())
 }
 
 /// Phase 1: Register a commitment
@@ -39,47 +49,24 @@ pub async fn commit_transaction(
     Json(req): Json<CommitRequest>,
 ) -> Result<Json<CommitResponse>, ErrorResponse> {
     if req.coins.is_empty() {
-        return Err(ErrorResponse {
-            error: "Must provide at least one coin".to_string(),
-        });
+        return Err(ErrorResponse { error: "Must provide at least one coin".into() });
     }
     if req.destinations.is_empty() {
-        return Err(ErrorResponse {
-            error: "Must provide at least one destination".to_string(),
-        });
+        return Err(ErrorResponse { error: "Must provide at least one destination".into() });
     }
 
-    // Parse coin IDs
-    let mut input_coins = Vec::new();
-    for coin_hex in &req.coins {
-        let coin = hex::decode(coin_hex)
-            .map_err(|e| ErrorResponse { error: format!("Invalid coin hex: {}", e) })?;
-        if coin.len() != 32 {
-            return Err(ErrorResponse { error: "Coin must be 32 bytes".to_string() });
-        }
-        input_coins.push(<[u8; 32]>::try_from(coin).unwrap());
-    }
+    let input_coins: Vec<[u8; 32]> = req.coins.iter()
+        .map(|h| parse_hex32(h, "coin"))
+        .collect::<Result<_, _>>()?;
 
-    // Parse destinations
-    let mut destinations = Vec::new();
-    for dest_hex in &req.destinations {
-        let dest = hex::decode(dest_hex)
-            .map_err(|e| ErrorResponse { error: format!("Invalid destination hex: {}", e) })?;
-        if dest.len() != 32 {
-            return Err(ErrorResponse { error: "Destination must be 32 bytes".to_string() });
-        }
-        destinations.push(<[u8; 32]>::try_from(dest).unwrap());
-    }
+    let destinations: Vec<[u8; 32]> = req.destinations.iter()
+        .map(|h| parse_hex32(h, "destination"))
+        .collect::<Result<_, _>>()?;
 
-    // Generate salt
     let salt: [u8; 32] = rand::random();
-
-    // Compute commitment
     let commitment = compute_commitment(&input_coins, &destinations, &salt);
 
-    // Submit commit transaction
     let tx = Transaction::Commit { commitment };
-
     node.send_transaction(tx)
         .await
         .map_err(|e| ErrorResponse { error: e.to_string() })?;
@@ -96,47 +83,40 @@ pub async fn send_transaction(
     State(node): State<AppState>,
     Json(req): Json<SendTransactionRequest>,
 ) -> Result<Json<SendTransactionResponse>, ErrorResponse> {
-    if req.secrets.is_empty() {
+    if req.input_coins.is_empty() {
+        return Err(ErrorResponse { error: "Must provide at least one input coin".into() });
+    }
+    if req.signatures.len() != req.input_coins.len() {
         return Err(ErrorResponse {
-            error: "Must provide at least one secret".to_string(),
+            error: "Signature count must match input coin count".into(),
         });
     }
 
-    let mut secrets = Vec::new();
-    for secret_hex in &req.secrets {
-        let secret = hex::decode(secret_hex)
-            .map_err(|e| ErrorResponse { error: format!("Invalid secret hex: {}", e) })?;
-        secrets.push(secret);
+    let input_coins: Vec<[u8; 32]> = req.input_coins.iter()
+        .map(|h| parse_hex32(h, "input_coin"))
+        .collect::<Result<_, _>>()?;
+
+    let mut signatures = Vec::new();
+    for sig_hex in &req.signatures {
+        let sig_bytes = hex::decode(sig_hex)
+            .map_err(|e| ErrorResponse { error: format!("Invalid signature hex: {}", e) })?;
+        let sig = wots::sig_from_bytes(&sig_bytes)
+            .ok_or_else(|| ErrorResponse { error: "Invalid WOTS signature length".into() })?;
+        signatures.push(sig);
     }
 
-    let mut destinations = Vec::new();
-    for dest_hex in &req.destinations {
-        let dest = hex::decode(dest_hex)
-            .map_err(|e| ErrorResponse { error: format!("Invalid destination hex: {}", e) })?;
-        if dest.len() != 32 {
-            return Err(ErrorResponse {
-                error: "Destination must be 32 bytes".to_string(),
-            });
-        }
-        destinations.push(<[u8; 32]>::try_from(dest).unwrap());
-    }
+    let destinations: Vec<[u8; 32]> = req.destinations.iter()
+        .map(|h| parse_hex32(h, "destination"))
+        .collect::<Result<_, _>>()?;
 
-    let salt = hex::decode(&req.salt)
-        .map_err(|e| ErrorResponse { error: format!("Invalid salt hex: {}", e) })?;
-    if salt.len() != 32 {
-        return Err(ErrorResponse {
-            error: "Salt must be 32 bytes".to_string(),
-        });
-    }
-    let salt: [u8; 32] = salt.try_into().unwrap();
+    let salt = parse_hex32(&req.salt, "salt")?;
 
     let tx = Transaction::Reveal {
-        secrets,
+        input_coins: input_coins.clone(),
+        signatures,
         new_coins: destinations.clone(),
         salt,
     };
-
-    let input_coins = tx.input_coins();
 
     node.send_transaction(tx)
         .await
@@ -153,16 +133,7 @@ pub async fn check_coin(
     State(node): State<AppState>,
     Json(req): Json<CheckCoinRequest>,
 ) -> Result<Json<CheckCoinResponse>, ErrorResponse> {
-    let coin = hex::decode(&req.coin)
-        .map_err(|e| ErrorResponse { error: format!("Invalid coin hex: {}", e) })?;
-
-    if coin.len() != 32 {
-        return Err(ErrorResponse {
-            error: "Coin must be 32 bytes".to_string(),
-        });
-    }
-
-    let coin: [u8; 32] = coin.try_into().unwrap();
+    let coin = parse_hex32(&req.coin, "coin")?;
     let exists = node.check_coin(coin).await;
 
     Ok(Json(CheckCoinResponse {
@@ -182,33 +153,29 @@ pub async fn get_mempool(State(node): State<AppState>) -> Json<GetMempoolRespons
                 input_coins: None,
                 output_coins: None,
             },
-            Transaction::Reveal { new_coins, .. } => TransactionInfo {
+            Transaction::Reveal { input_coins, new_coins, .. } => TransactionInfo {
                 commitment: None,
-                input_coins: Some(tx.input_coins().iter().map(|c| hex::encode(c)).collect()),
+                input_coins: Some(input_coins.iter().map(|c| hex::encode(c)).collect()),
                 output_coins: Some(new_coins.iter().map(|c| hex::encode(c)).collect()),
             },
         })
         .collect();
 
-    Json(GetMempoolResponse {
-        size,
-        transactions: tx_info,
-    })
+    Json(GetMempoolResponse { size, transactions: tx_info })
 }
 
 pub async fn generate_key() -> Json<GenerateKeyResponse> {
-    let secret: [u8; 32] = rand::random();
-    let coin = hash(&secret);
+    let seed: [u8; 32] = rand::random();
+    let coin = wots::keygen(&seed);
 
     Json(GenerateKeyResponse {
-        secret: hex::encode(secret),
+        seed: hex::encode(seed),
         coin: hex::encode(coin),
     })
 }
 
 pub async fn get_peers(State(node): State<AppState>) -> Json<GetPeersResponse> {
     let peers = node.get_peers().await;
-
     Json(GetPeersResponse {
         peers: peers.iter().map(|p| p.to_string()).collect(),
     })

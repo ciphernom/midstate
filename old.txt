@@ -1,0 +1,4586 @@
+========================================
+--- FILE: Cargo.toml
+========================================
+[package]
+name = "midstate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+anyhow = "1.0"
+thiserror = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.35", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+sled = "0.34"
+hex = "0.4"
+axum = "0.7"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+reqwest = { version = "0.11", features = ["json"] }
+aes-gcm = "0.10"
+rpassword = "7.3"
+dirs = "5.0"
+rand_chacha = "0.3"
+
+[features]
+fast-mining = []
+
+[dev-dependencies]
+tempfile = "3.8"
+
+
+========================================
+--- FILE: src/lib.rs
+========================================
+pub mod core;
+pub mod storage;
+pub mod mempool;
+pub mod network;
+pub mod node;
+pub mod rpc;
+pub mod metrics;
+pub mod sync;
+pub mod wallet;
+
+pub use core::types::*;
+
+
+========================================
+--- FILE: src/main.rs
+========================================
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use midstate::*;
+use midstate::wallet::{self, Wallet, short_hex};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+fn default_wallet_path() -> PathBuf {
+    wallet::default_path()
+}
+
+#[derive(Parser)]
+#[command(name = "midstate")]
+#[command(about = "A minimal sequential-time cryptocurrency", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run a node
+    Node {
+        /// Data directory
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
+
+        /// Port to listen on for P2P
+        #[arg(long, default_value = "9333")]
+        port: u16,
+
+        /// Port for RPC server
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+
+        /// Peer addresses to connect to
+        #[arg(long)]
+        peer: Vec<SocketAddr>,
+
+        /// Enable mining
+        #[arg(long)]
+        mine: bool,
+    },
+
+    /// Wallet operations
+    Wallet {
+        #[command(subcommand)]
+        action: WalletAction,
+    },
+
+    /// Phase 1: Commit to a spend (binds inputs to outputs)
+    Commit {
+        /// RPC port
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+
+        /// Coin IDs being spent (hex)
+        #[arg(long)]
+        coin: Vec<String>,
+
+        /// Destination coins (hex)
+        #[arg(long)]
+        dest: Vec<String>,
+    },
+
+    /// Phase 2: Reveal secrets and execute the spend
+    Send {
+        /// RPC port
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+
+        /// Secrets (hex, can specify multiple to merge coins)
+        #[arg(long)]
+        secret: Vec<String>,
+
+        /// Destination coins (hex, can specify multiple)
+        #[arg(long)]
+        dest: Vec<String>,
+
+        /// Salt from the commit phase (hex)
+        #[arg(long)]
+        salt: String,
+    },
+
+    /// Check if a coin exists
+    Balance {
+        /// RPC port
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+
+        /// Coin commitment (hex)
+        #[arg(long)]
+        coin: String,
+    },
+
+    /// Get current state
+    State {
+        /// RPC port
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+    },
+
+    /// Get mempool info
+    Mempool {
+        /// RPC port
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+    },
+
+    /// Get peer list
+    Peers {
+        /// RPC port
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+    },
+
+    /// Generate a random secret and its commitment
+    Keygen {
+        /// RPC port (optional, will generate locally if not specified)
+        #[arg(long)]
+        rpc_port: Option<u16>,
+    },
+
+    /// Sync from genesis (trustless)
+    Sync {
+        /// Data directory
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
+
+        /// Peer to sync from
+        #[arg(long)]
+        peer: SocketAddr,
+    },
+}
+
+#[derive(Subcommand)]
+enum WalletAction {
+    /// Create a new encrypted wallet
+    Create {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+    },
+
+    /// Generate a receiving address to share with a sender
+    Receive {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+
+        /// Label for this address
+        #[arg(long)]
+        label: Option<String>,
+    },
+
+    /// Generate one or more coin keypairs
+    Generate {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+
+        /// Number of coins to generate
+        #[arg(long, short, default_value = "1")]
+        count: usize,
+
+        /// Label for the coin(s)
+        #[arg(long)]
+        label: Option<String>,
+    },
+
+    /// List all coins in the wallet
+    List {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+
+        /// RPC port to check on-chain status
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+
+        /// Show full 64-char hex IDs
+        #[arg(long)]
+        full: bool,
+    },
+
+    /// Show wallet balance summary
+    Balance {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+
+        /// RPC port
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+    },
+
+    /// Send coins (automated commit → mine → reveal)
+    Send {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+
+        /// RPC port
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+
+        /// Coin to spend (index like "0", hex prefix, or full hex). Omit to auto-pick.
+        #[arg(long)]
+        coin: Vec<String>,
+
+        /// Destination address (hex, from recipient's `wallet receive`)
+        #[arg(long)]
+        to: Vec<String>,
+
+        /// Max seconds to wait for commit to be mined
+        #[arg(long, default_value = "120")]
+        timeout: u64,
+    },
+
+    /// Import a secret into the wallet
+    Import {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+
+        /// Secret (hex)
+        #[arg(long)]
+        secret: String,
+
+        /// Label
+        #[arg(long)]
+        label: Option<String>,
+    },
+
+    /// Export a coin's secret (dangerous!)
+    Export {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+
+        /// Coin (index, hex prefix, or full hex)
+        #[arg(long)]
+        coin: String,
+    },
+
+    /// Show pending (unrevealed) commits
+    Pending {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+    },
+
+    /// Retry reveal for a pending commit
+    Reveal {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+
+        /// RPC port
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+
+        /// Commitment to reveal (hex). If omitted, tries all pending.
+        #[arg(long)]
+        commitment: Option<String>,
+    },
+
+    /// Show transaction history
+    History {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+
+        /// Number of recent entries to show
+        #[arg(long, short, default_value = "20")]
+        count: usize,
+    },
+}
+
+// ── Password helpers (masked input) ─────────────────────────────────────────
+
+fn read_password(prompt: &str) -> Result<Vec<u8>> {
+    let input = rpassword::prompt_password(prompt)?;
+    if input.is_empty() {
+        anyhow::bail!("password cannot be empty");
+    }
+    Ok(input.into_bytes())
+}
+
+fn read_password_confirm() -> Result<Vec<u8>> {
+    let p1 = read_password("Password: ")?;
+    let p2 = read_password("Confirm:  ")?;
+    if p1 != p2 {
+        anyhow::bail!("passwords do not match");
+    }
+    Ok(p1)
+}
+
+fn parse_hex32(s: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(s)?;
+    if bytes.len() != 32 {
+        anyhow::bail!("expected 32 bytes, got {}", bytes.len());
+    }
+    Ok(<[u8; 32]>::try_from(bytes).unwrap())
+}
+
+fn format_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s ago", secs)
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "midstate=info,tower_http=debug".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    let cli = Cli::parse();
+
+    match cli.command {
+        Command::Node { data_dir, port, rpc_port, peer, mine } => {
+            run_node(data_dir, port, rpc_port, peer, mine).await
+        }
+
+        Command::Wallet { action } => handle_wallet(action).await,
+
+        Command::Commit { rpc_port, coin, dest } => {
+            commit_transaction(rpc_port, coin, dest).await
+        }
+
+        Command::Send { rpc_port, secret, dest, salt } => {
+            send_transaction(rpc_port, secret, dest, salt).await
+        }
+
+        Command::Balance { rpc_port, coin } => {
+            check_balance(rpc_port, coin).await
+        }
+
+        Command::State { rpc_port } => {
+            get_state(rpc_port).await
+        }
+
+        Command::Mempool { rpc_port } => {
+            get_mempool(rpc_port).await
+        }
+
+        Command::Peers { rpc_port } => {
+            get_peers(rpc_port).await
+        }
+
+        Command::Keygen { rpc_port } => {
+            keygen(rpc_port).await
+        }
+
+        Command::Sync { data_dir, peer } => {
+            sync_from_genesis(data_dir, peer).await
+        }
+    }
+}
+
+// ── Wallet commands ─────────────────────────────────────────────────────────
+
+async fn handle_wallet(action: WalletAction) -> Result<()> {
+    match action {
+        WalletAction::Create { path } => wallet_create(&path),
+
+        WalletAction::Receive { path, label } => wallet_receive(&path, label),
+
+        WalletAction::Generate { path, count, label } => wallet_generate(&path, count, label),
+
+        WalletAction::List { path, rpc_port, full } => wallet_list(&path, rpc_port, full).await,
+
+        WalletAction::Balance { path, rpc_port } => wallet_balance(&path, rpc_port).await,
+
+        WalletAction::Send { path, rpc_port, coin, to, timeout } => {
+            wallet_send(&path, rpc_port, coin, to, timeout).await
+        }
+
+        WalletAction::Import { path, secret, label } => wallet_import(&path, &secret, label),
+
+        WalletAction::Export { path, coin } => wallet_export(&path, &coin),
+
+        WalletAction::Pending { path } => wallet_pending(&path),
+
+        WalletAction::Reveal { path, rpc_port, commitment } => {
+            wallet_reveal(&path, rpc_port, commitment).await
+        }
+
+        WalletAction::History { path, count } => wallet_history(&path, count),
+    }
+}
+
+fn wallet_create(path: &PathBuf) -> Result<()> {
+    let password = read_password_confirm()?;
+    Wallet::create(path, &password)?;
+    println!("Wallet created: {}", path.display());
+    Ok(())
+}
+
+fn wallet_receive(path: &PathBuf, label: Option<String>) -> Result<()> {
+    let password = read_password("Password: ")?;
+    let mut wallet = Wallet::open(path, &password)?;
+
+    let label = label.unwrap_or_else(|| format!("receive #{}", wallet.coin_count() + 1));
+    let wc = wallet.generate(Some(label.clone()))?;
+
+    println!();
+    println!("  Your receiving address ({}):", label);
+    println!();
+    println!("  {}", hex::encode(wc.coin));
+    println!();
+    println!("  Share this with the sender.");
+    Ok(())
+}
+
+fn wallet_generate(path: &PathBuf, count: usize, label: Option<String>) -> Result<()> {
+    let password = read_password("Password: ")?;
+    let mut wallet = Wallet::open(path, &password)?;
+
+    for i in 0..count {
+        let lbl = if count == 1 {
+            label.clone()
+        } else {
+            label.as_ref().map(|l| format!("{} #{}", l, i + 1))
+        };
+        let wc = wallet.generate(lbl)?;
+        let coin = wc.coin; // Copy the coin data to drop the borrow on wallet
+        let idx = wallet.coin_count() - 1;
+        println!("  [{}] {}", idx, hex::encode(coin));
+    }
+
+    println!("\nGenerated {} coin(s). Total: {}", count, wallet.coin_count());
+    Ok(())
+}
+
+async fn wallet_list(path: &PathBuf, rpc_port: u16, full: bool) -> Result<()> {
+    let password = read_password("Password: ")?;
+    let wallet = Wallet::open(path, &password)?;
+
+    if wallet.coin_count() == 0 {
+        println!("Wallet is empty. Use `wallet receive` to create an address.");
+        return Ok(());
+    }
+
+    let client = reqwest::Client::new();
+
+    if full {
+        println!(
+            "{:<5} {:<66} {:<10} {}",
+            "#", "COIN", "STATUS", "LABEL"
+        );
+        println!("{}", "-".repeat(95));
+    } else {
+        println!(
+            "{:<5} {:<15} {:<10} {}",
+            "#", "COIN", "STATUS", "LABEL"
+        );
+        println!("{}", "-".repeat(50));
+    }
+
+    for (i, wc) in wallet.coins().iter().enumerate() {
+        let coin_hex = hex::encode(wc.coin);
+        let status = check_coin_rpc(&client, rpc_port, &coin_hex).await;
+        let label = wc.label.as_deref().unwrap_or("");
+        let status_str = match status {
+            Ok(true) => "✓ live",
+            Ok(false) => "✗ unset",
+            Err(_) => "? error",
+        };
+        let display = if full {
+            coin_hex
+        } else {
+            short_hex(&wc.coin)
+        };
+        println!("{:<5} {:<15} {:<10} {}", i, display, status_str, label);
+    }
+
+    if !full {
+        println!("\nUse --full to show complete coin IDs.");
+    }
+
+    Ok(())
+}
+
+async fn wallet_balance(path: &PathBuf, rpc_port: u16) -> Result<()> {
+    let password = read_password("Password: ")?;
+    let wallet = Wallet::open(path, &password)?;
+
+    let client = reqwest::Client::new();
+    let mut live = 0usize;
+
+    for wc in wallet.coins() {
+        if let Ok(true) = check_coin_rpc(&client, rpc_port, &hex::encode(wc.coin)).await {
+            live += 1;
+        }
+    }
+
+    println!("Coins in wallet: {}", wallet.coin_count());
+    println!("Live on-chain:   {}", live);
+    println!("Pending commits: {}", wallet.pending().len());
+    Ok(())
+}
+
+async fn wallet_send(
+    path: &PathBuf,
+    rpc_port: u16,
+    coin_args: Vec<String>,
+    to_args: Vec<String>,
+    timeout_secs: u64,
+) -> Result<()> {
+    if to_args.is_empty() {
+        anyhow::bail!("must specify at least one --to destination");
+    }
+
+    let password = read_password("Password: ")?;
+    let mut wallet = Wallet::open(path, &password)?;
+
+    // Parse destinations
+    let destinations: Vec<[u8; 32]> = to_args
+        .iter()
+        .map(|s| parse_hex32(s))
+        .collect::<Result<Vec<_>>>()?;
+
+    // Select input coins (support index, prefix, or full hex)
+    let input_coins: Vec<[u8; 32]> = if !coin_args.is_empty() {
+        coin_args
+            .iter()
+            .map(|s| wallet.resolve_coin(s))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        // Auto-pick: need as many inputs as destinations
+        let client = reqwest::Client::new();
+        let needed = destinations.len();
+        let mut picked = Vec::new();
+
+        for wc in wallet.coins() {
+            if picked.len() >= needed {
+                break;
+            }
+            if let Ok(true) = check_coin_rpc(&client, rpc_port, &hex::encode(wc.coin)).await {
+                picked.push(wc.coin);
+            }
+        }
+
+        if picked.len() < needed {
+            anyhow::bail!(
+                "not enough live coins: need {}, found {}",
+                needed,
+                picked.len()
+            );
+        }
+        picked
+    };
+
+    println!(
+        "Spending {} coin(s) → {} destination(s)",
+        input_coins.len(),
+        destinations.len()
+    );
+    for c in &input_coins {
+        println!("  input:  {}", short_hex(c));
+    }
+    for d in &destinations {
+        println!("  output: {}", short_hex(d));
+    }
+
+    // ── Phase 1: Commit ─────────────────────────────────────────────────────
+    let (commitment, _salt) = wallet.prepare_commit(&input_coins, &destinations)?;
+
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/commit", rpc_port);
+
+    let req = rpc::CommitRequest {
+        coins: input_coins.iter().map(|c| hex::encode(c)).collect(),
+        destinations: destinations.iter().map(|d| hex::encode(d)).collect(),
+    };
+
+    // The /commit RPC generates its own salt, so we submit via /commit
+    // and then update our pending entry with the server's salt.
+    let response = client.post(&url).json(&req).send().await?;
+
+    if !response.status().is_success() {
+        let error: rpc::ErrorResponse = response.json().await?;
+        anyhow::bail!("commit failed: {}", error.error);
+    }
+
+    let commit_resp: rpc::CommitResponse = response.json().await?;
+
+    // The server used its own salt+commitment. Update our pending entry.
+    let server_commitment = parse_hex32(&commit_resp.commitment)?;
+    let server_salt = parse_hex32(&commit_resp.salt)?;
+
+    // Replace wallet's pending with server's actual commitment
+    wallet.data.pending.retain(|p| p.commitment != commitment);
+
+    let input_secrets: Vec<Vec<u8>> = input_coins
+        .iter()
+        .map(|c| {
+            wallet
+                .find_secret(c)
+                .expect("we already verified ownership")
+                .secret
+                .clone()
+        })
+        .collect();
+
+    wallet.data.pending.push(wallet::PendingCommit {
+        commitment: server_commitment,
+        salt: server_salt,
+        input_secrets,
+        destinations: destinations.clone(),
+        created_at: now_secs(),
+    });
+    wallet.save()?;
+
+    println!("\n✓ Commit submitted ({})", short_hex(&server_commitment));
+    println!("  Waiting for commit to be mined...");
+
+    // ── Wait for commit to be mined ─────────────────────────────────────────
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let mut mined = false;
+
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let state_url = format!("http://127.0.0.1:{}/state", rpc_port);
+        if let Ok(resp) = client.get(&state_url).send().await {
+            if let Ok(state) = resp.json::<rpc::GetStateResponse>().await {
+                let mempool_url = format!("http://127.0.0.1:{}/mempool", rpc_port);
+                if let Ok(mp_resp) = client.get(&mempool_url).send().await {
+                    if let Ok(mp) = mp_resp.json::<rpc::GetMempoolResponse>().await {
+                        let still_pending = mp.transactions.iter().any(|tx| {
+                            tx.commitment.as_deref() == Some(&commit_resp.commitment)
+                        });
+                        if !still_pending && state.num_commitments > 0 {
+                            mined = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        eprint!(".");
+    }
+    eprintln!();
+
+    if !mined {
+        println!("⏳ Commit not yet mined after {}s.", timeout_secs);
+        println!("   Run `wallet reveal` later to complete the transfer.");
+        return Ok(());
+    }
+
+    println!("✓ Commit mined!");
+
+    // ── Phase 2: Reveal ─────────────────────────────────────────────────────
+    let pending = wallet
+        .find_pending(&server_commitment)
+        .expect("we just saved it")
+        .clone();
+
+    let reveal_url = format!("http://127.0.0.1:{}/send", rpc_port);
+    let reveal_req = rpc::SendTransactionRequest {
+        secrets: pending
+            .input_secrets
+            .iter()
+            .map(|s| hex::encode(s))
+            .collect(),
+        destinations: pending
+            .destinations
+            .iter()
+            .map(|d| hex::encode(d))
+            .collect(),
+        salt: hex::encode(pending.salt),
+    };
+
+    let response = client.post(&reveal_url).json(&reveal_req).send().await?;
+
+    if !response.status().is_success() {
+        let error: rpc::ErrorResponse = response.json().await?;
+        anyhow::bail!("reveal failed: {}", error.error);
+    }
+
+    let _result: rpc::SendTransactionResponse = response.json().await?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let mut revealed = false;
+
+    let input_coin_hex = hex::encode(input_coins[0]);
+
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        if let Ok(resp) = client
+            .post(&format!("http://127.0.0.1:{}/check", rpc_port))
+            .json(&rpc::CheckCoinRequest { coin: input_coin_hex.clone() })
+            .send()
+            .await
+        {
+            if let Ok(check) = resp.json::<rpc::CheckCoinResponse>().await {
+                if !check.exists {
+                    revealed = true;
+                    break;
+                }
+            }
+        }
+        eprint!(".");
+    }
+    eprintln!();
+
+    if !revealed {
+        println!("⏳ Reveal submitted but not yet mined.");
+        println!("   Secrets are safe. Run `wallet reveal` to retry.");
+        return Ok(());
+    }
+
+
+    wallet.complete_reveal(&server_commitment)?;
+
+    println!("✓ Transfer complete!");
+    for c in &input_coins {
+        println!("  spent:   {}", short_hex(c));
+    }
+    for d in &destinations {
+        println!("  created: {}", short_hex(d));
+    }
+
+    Ok(())
+}
+
+fn wallet_import(path: &PathBuf, secret_hex: &str, label: Option<String>) -> Result<()> {
+    let password = read_password("Password: ")?;
+    let mut wallet = Wallet::open(path, &password)?;
+
+    let secret = hex::decode(secret_hex)?;
+    let coin = wallet.import_secret(secret, label)?;
+    println!("Imported: [{}] {}", wallet.coin_count() - 1, short_hex(&coin));
+    Ok(())
+}
+
+fn wallet_export(path: &PathBuf, coin_ref: &str) -> Result<()> {
+    let password = read_password("Password: ")?;
+    let wallet = Wallet::open(path, &password)?;
+
+    let coin = wallet.resolve_coin(coin_ref)?;
+    let wc = wallet
+        .find_secret(&coin)
+        .ok_or_else(|| anyhow::anyhow!("coin not found in wallet"))?;
+
+    println!("Secret: {}", hex::encode(&wc.secret));
+    println!("Coin:   {}", hex::encode(wc.coin));
+    println!("\n⚠️  Anyone with the secret can spend this coin.");
+    Ok(())
+}
+
+fn wallet_pending(path: &PathBuf) -> Result<()> {
+    let password = read_password("Password: ")?;
+    let wallet = Wallet::open(path, &password)?;
+
+    let pending = wallet.pending();
+    if pending.is_empty() {
+        println!("No pending commits.");
+        return Ok(());
+    }
+
+    println!("{} pending commit(s):\n", pending.len());
+    for (i, p) in pending.iter().enumerate() {
+        let age = now_secs().saturating_sub(p.created_at);
+        println!(
+            "  [{}] {} — {} in, {} out, {}",
+            i,
+            short_hex(&p.commitment),
+            p.input_secrets.len(),
+            p.destinations.len(),
+            format_age(age),
+        );
+    }
+    Ok(())
+}
+
+fn wallet_history(path: &PathBuf, count: usize) -> Result<()> {
+    let password = read_password("Password: ")?;
+    let wallet = Wallet::open(path, &password)?;
+
+    let history = wallet.history();
+    if history.is_empty() {
+        println!("No transaction history.");
+        return Ok(());
+    }
+
+    let start = history.len().saturating_sub(count);
+    let entries = &history[start..];
+
+    println!(
+        "Transaction history ({} of {}):\n",
+        entries.len(),
+        history.len()
+    );
+    for (i, entry) in entries.iter().enumerate() {
+        let age = now_secs().saturating_sub(entry.timestamp);
+        println!("  [{}] {}", start + i, format_age(age));
+        for c in &entry.inputs {
+            println!("    spent:   {}", short_hex(c));
+        }
+        for c in &entry.outputs {
+            println!("    created: {}", short_hex(c));
+        }
+        println!();
+    }
+
+    Ok(())
+}
+
+async fn wallet_reveal(
+    path: &PathBuf,
+    rpc_port: u16,
+    commitment_hex: Option<String>,
+) -> Result<()> {
+    let password = read_password("Password: ")?;
+    let mut wallet = Wallet::open(path, &password)?;
+
+    let targets: Vec<[u8; 32]> = if let Some(hex) = commitment_hex {
+        vec![parse_hex32(&hex)?]
+    } else {
+        wallet.pending().iter().map(|p| p.commitment).collect()
+    };
+
+    if targets.is_empty() {
+        println!("No pending commits to reveal.");
+        return Ok(());
+    }
+
+    let client = reqwest::Client::new();
+
+    for commitment in targets {
+        let pending = match wallet.find_pending(&commitment) {
+            Some(p) => p.clone(),
+            None => {
+                println!("  {} — not found, skipping", short_hex(&commitment));
+                continue;
+            }
+        };
+
+        let url = format!("http://127.0.0.1:{}/send", rpc_port);
+        let req = rpc::SendTransactionRequest {
+            secrets: pending
+                .input_secrets
+                .iter()
+                .map(|s| hex::encode(s))
+                .collect(),
+            destinations: pending
+                .destinations
+                .iter()
+                .map(|d| hex::encode(d))
+                .collect(),
+            salt: hex::encode(pending.salt),
+        };
+
+        let response = client.post(&url).json(&req).send().await?;
+
+        if response.status().is_success() {
+            let _result: rpc::SendTransactionResponse = response.json().await?;
+            wallet.complete_reveal(&commitment)?;
+            println!("  {} — revealed ✓", short_hex(&commitment));
+            for c in &pending.destinations {
+                println!("    created: {}", short_hex(c));
+            }
+        } else {
+            let error: rpc::ErrorResponse = response.json().await?;
+            println!(
+                "  {} — failed: {}",
+                short_hex(&commitment),
+                error.error
+            );
+        }
+    }
+
+    Ok(())
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+async fn check_coin_rpc(
+    client: &reqwest::Client,
+    rpc_port: u16,
+    coin_hex: &str,
+) -> Result<bool> {
+    let url = format!("http://127.0.0.1:{}/check", rpc_port);
+    let req = rpc::CheckCoinRequest {
+        coin: coin_hex.to_string(),
+    };
+    let resp: rpc::CheckCoinResponse =
+        client.post(&url).json(&req).send().await?.json().await?;
+    Ok(resp.exists)
+}
+
+// ── Original commands (unchanged) ───────────────────────────────────────────
+
+async fn run_node(
+    data_dir: PathBuf,
+    port: u16,
+    rpc_port: u16,
+    peers: Vec<SocketAddr>,
+    mine: bool,
+) -> Result<()> {
+    let bind_addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let mut node = node::Node::new(data_dir, mine, bind_addr)?;
+
+    node.listen(bind_addr).await?;
+
+    for peer_addr in peers {
+        if let Err(e) = node.connect_to_peer(peer_addr).await {
+            tracing::warn!("Failed to connect to {}: {}", peer_addr, e);
+        }
+    }
+
+    let (handle, cmd_rx) = node.create_handle();
+
+    let rpc_server = rpc::RpcServer::new(rpc_port);
+    let handle_clone = handle.clone();
+    tokio::spawn(async move {
+        if let Err(e) = rpc_server.run(handle_clone).await {
+            tracing::error!("RPC server error: {}", e);
+        }
+    });
+
+    tracing::info!("Node started (mining: {}, rpc: {})", mine, rpc_port);
+
+    node.run(handle, cmd_rx).await
+}
+
+async fn commit_transaction(
+    rpc_port: u16,
+    coins: Vec<String>,
+    destinations: Vec<String>,
+) -> Result<()> {
+    if coins.is_empty() {
+        anyhow::bail!("Must provide at least one coin");
+    }
+    if destinations.is_empty() {
+        anyhow::bail!("Must provide at least one destination");
+    }
+
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/commit", rpc_port);
+
+    let req = rpc::CommitRequest {
+        coins,
+        destinations,
+    };
+
+    let response = client.post(&url).json(&req).send().await?;
+
+    if response.status().is_success() {
+        let result: rpc::CommitResponse = response.json().await?;
+        println!("Commitment submitted!");
+        println!("  Commitment: {}", result.commitment);
+        println!("  Salt:       {}", result.salt);
+        println!();
+        println!("⚠️  Save the salt! You need it for the reveal (send) phase.");
+        println!("⏳ Wait for the commitment to be mined before sending.");
+    } else {
+        let error: rpc::ErrorResponse = response.json().await?;
+        println!("Error: {}", error.error);
+    }
+
+    Ok(())
+}
+
+async fn send_transaction(
+    rpc_port: u16,
+    secrets: Vec<String>,
+    destinations: Vec<String>,
+    salt: String,
+) -> Result<()> {
+    if secrets.is_empty() {
+        anyhow::bail!("Must provide at least one secret");
+    }
+
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/send", rpc_port);
+
+    let req = rpc::SendTransactionRequest {
+        secrets,
+        destinations,
+        salt,
+    };
+
+    let response = client.post(&url).json(&req).send().await?;
+
+    if response.status().is_success() {
+        let result: rpc::SendTransactionResponse = response.json().await?;
+        println!("Transaction submitted!");
+        for (i, input) in result.input_coins.iter().enumerate() {
+            println!("  Input {}: {}", i, input);
+        }
+        for (i, output) in result.output_coins.iter().enumerate() {
+            println!("  Output {}: {}", i, output);
+        }
+    } else {
+        let error: rpc::ErrorResponse = response.json().await?;
+        println!("Error: {}", error.error);
+    }
+
+    Ok(())
+}
+
+async fn check_balance(rpc_port: u16, coin: String) -> Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/check", rpc_port);
+
+    let req = rpc::CheckCoinRequest { coin };
+
+    let response = client.post(&url).json(&req).send().await?;
+
+    if response.status().is_success() {
+        let result: rpc::CheckCoinResponse = response.json().await?;
+        println!("Coin: {}", result.coin);
+        println!(
+            "Exists: {}",
+            if result.exists { "YES ✓" } else { "NO ✗" }
+        );
+    } else {
+        let error: rpc::ErrorResponse = response.json().await?;
+        println!("Error: {}", error.error);
+    }
+
+    Ok(())
+}
+
+async fn get_state(rpc_port: u16) -> Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/state", rpc_port);
+
+    let response: rpc::GetStateResponse = client.get(&url).send().await?.json().await?;
+
+    println!("State:");
+    println!("  Height:      {}", response.height);
+    println!("  Depth:       {}", response.depth);
+    println!("  Coins:       {}", response.num_coins);
+    println!("  Commitments: {}", response.num_commitments);
+    println!("  Midstate:    {}", response.midstate);
+    println!("  Target:      {}", response.target);
+
+    Ok(())
+}
+
+async fn get_mempool(rpc_port: u16) -> Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/mempool", rpc_port);
+
+    let response: rpc::GetMempoolResponse = client.get(&url).send().await?.json().await?;
+
+    println!("Mempool:");
+    println!("  Size: {}", response.size);
+
+    if !response.transactions.is_empty() {
+        println!("\nTransactions:");
+        for (i, tx) in response.transactions.iter().enumerate() {
+            if let Some(ref commitment) = tx.commitment {
+                println!("  {} [COMMIT]: {}", i + 1, commitment);
+            }
+            if let Some(ref inputs) = tx.input_coins {
+                println!("  {} [REVEAL]:", i + 1);
+                for (j, input) in inputs.iter().enumerate() {
+                    println!("    Input {}: {}", j, input);
+                }
+            }
+            if let Some(ref outputs) = tx.output_coins {
+                for (j, output) in outputs.iter().enumerate() {
+                    println!("    Output {}: {}", j, output);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn get_peers(rpc_port: u16) -> Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/peers", rpc_port);
+
+    let response: rpc::GetPeersResponse = client.get(&url).send().await?.json().await?;
+
+    println!("Peers: {}", response.peers.len());
+    for peer in response.peers {
+        println!("  {}", peer);
+    }
+
+    Ok(())
+}
+
+async fn keygen(rpc_port: Option<u16>) -> Result<()> {
+    if let Some(port) = rpc_port {
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/keygen", port);
+
+        let response: rpc::GenerateKeyResponse = client.get(&url).send().await?.json().await?;
+
+        println!("Generated keypair:");
+        println!("  Secret: {}", response.secret);
+        println!("  Coin:   {}", response.coin);
+    } else {
+        let secret: [u8; 32] = rand::random();
+        let coin = core::hash(&secret);
+
+        println!("Generated keypair:");
+        println!("  Secret: {}", hex::encode(secret));
+        println!("  Coin:   {}", hex::encode(coin));
+    }
+
+    println!("\n⚠️  Keep the secret safe! Anyone with it can spend the coin.");
+
+    Ok(())
+}
+
+async fn sync_from_genesis(data_dir: PathBuf, peer_addr: SocketAddr) -> Result<()> {
+    let storage = storage::Storage::open(data_dir.join("db"))?;
+    let syncer = sync::Syncer::new(storage);
+
+    let mut peer =
+        network::PeerConnection::connect(peer_addr, ([127, 0, 0, 1], 0).into()).await?;
+
+    let state = syncer.sync_from_genesis(&mut peer).await?;
+
+    println!("Sync complete!");
+    println!("  Height:      {}", state.height);
+    println!("  Depth:       {}", state.depth);
+    println!("  Coins:       {}", state.coins.len());
+    println!("  Commitments: {}", state.commitments.len());
+    println!("  Midstate:    {}", hex::encode(state.midstate));
+
+    Ok(())
+}
+
+
+========================================
+--- FILE: src/mempool.rs
+========================================
+use crate::core::{hash, State, Transaction};
+use crate::core::transaction::validate_transaction;
+use anyhow::Result;
+use std::collections::HashSet;
+use std::path::Path;
+
+pub struct Mempool {
+    transactions: Vec<Transaction>,
+    seen_inputs: HashSet<[u8; 32]>,
+    seen_commitments: HashSet<[u8; 32]>,
+    storage: sled::Db,
+}
+
+impl Mempool {
+    pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
+        let storage = sled::open(db_path)?;
+
+        // Load persisted transactions
+        let mut transactions = Vec::new();
+        let mut seen_inputs = HashSet::new();
+        let mut seen_commitments = HashSet::new();
+
+        for item in storage.iter() {
+            let (_, value) = item?;
+            let tx: Transaction = bincode::deserialize(&value)?;
+            match &tx {
+                Transaction::Commit { commitment } => {
+                    seen_commitments.insert(*commitment);
+                }
+                Transaction::Reveal { .. } => {
+                    for input in tx.input_coins() {
+                        seen_inputs.insert(input);
+                    }
+                }
+            }
+            transactions.push(tx);
+        }
+
+        tracing::info!("Loaded {} transactions from mempool storage", transactions.len());
+
+        Ok(Self {
+            transactions,
+            seen_inputs,
+            seen_commitments,
+            storage,
+        })
+    }
+
+    pub fn add(&mut self, tx: Transaction, state: &State) -> Result<()> {
+        // Validate against current state
+        validate_transaction(state, &tx)?;
+
+        match &tx {
+            Transaction::Commit { commitment } => {
+                if self.seen_commitments.contains(commitment) {
+                    anyhow::bail!("Commitment already in mempool");
+                }
+            }
+            Transaction::Reveal { .. } => {
+                for input in tx.input_coins() {
+                    if self.seen_inputs.contains(&input) {
+                        anyhow::bail!("Transaction input already in mempool");
+                    }
+                }
+            }
+        }
+
+        // Persist
+        let tx_bytes = bincode::serialize(&tx)?;
+        let tx_hash = hash(&tx_bytes);
+        self.storage.insert(&tx_hash[..], tx_bytes)?;
+
+        match &tx {
+            Transaction::Commit { commitment } => {
+                self.seen_commitments.insert(*commitment);
+            }
+            Transaction::Reveal { .. } => {
+                for input in tx.input_coins() {
+                    self.seen_inputs.insert(input);
+                }
+            }
+        }
+        self.transactions.push(tx);
+
+        tracing::debug!("Added transaction to mempool (size: {})", self.transactions.len());
+
+        Ok(())
+    }
+
+    /// Re-add transactions that were drained but whose block was not applied
+    /// (e.g. stale mining result). Only re-adds those still valid against current state.
+    pub fn re_add(&mut self, txs: Vec<Transaction>, state: &State) {
+        let mut restored = 0usize;
+        for tx in txs {
+            if validate_transaction(state, &tx).is_err() {
+                continue;
+            }
+
+            let dominated = match &tx {
+                Transaction::Commit { commitment } => self.seen_commitments.contains(commitment),
+                Transaction::Reveal { .. } => {
+                    tx.input_coins().iter().any(|i| self.seen_inputs.contains(i))
+                }
+            };
+            if dominated {
+                continue;
+            }
+
+            // Re-persist
+            if let Ok(tx_bytes) = bincode::serialize(&tx) {
+                let tx_hash = hash(&tx_bytes);
+                let _ = self.storage.insert(&tx_hash[..], tx_bytes);
+            }
+
+            match &tx {
+                Transaction::Commit { commitment } => {
+                    self.seen_commitments.insert(*commitment);
+                }
+                Transaction::Reveal { .. } => {
+                    for input in tx.input_coins() {
+                        self.seen_inputs.insert(input);
+                    }
+                }
+            }
+            self.transactions.push(tx);
+            restored += 1;
+        }
+
+        if restored > 0 {
+            tracing::info!("Restored {} transactions to mempool", restored);
+        }
+    }
+
+    pub fn drain(&mut self, max: usize) -> Vec<Transaction> {
+        let count = max.min(self.transactions.len());
+        let drained: Vec<_> = self.transactions.drain(..count).collect();
+
+        // Remove from storage and tracking
+        for tx in &drained {
+            match tx {
+                Transaction::Commit { commitment } => {
+                    self.seen_commitments.remove(commitment);
+                }
+                Transaction::Reveal { .. } => {
+                    for input in tx.input_coins() {
+                        self.seen_inputs.remove(&input);
+                    }
+                }
+            }
+            let tx_bytes = bincode::serialize(tx).unwrap();
+            let tx_hash = hash(&tx_bytes);
+            let _ = self.storage.remove(&tx_hash[..]);
+        }
+
+        drained
+    }
+
+    pub fn len(&self) -> usize {
+        self.transactions.len()
+    }
+
+    pub fn transactions(&self) -> &[Transaction] {
+        &self.transactions
+    }
+
+    /// Remove transactions that conflict with current state
+    pub fn prune_invalid(&mut self, state: &State) {
+        let mut inputs_to_remove = Vec::new();
+        let mut commitments_to_remove = Vec::new();
+
+        for tx in &self.transactions {
+            if validate_transaction(state, tx).is_err() {
+                match tx {
+                    Transaction::Commit { commitment } => {
+                        commitments_to_remove.push(*commitment);
+                    }
+                    Transaction::Reveal { .. } => {
+                        inputs_to_remove.extend(tx.input_coins());
+                    }
+                }
+            }
+        }
+
+        if !inputs_to_remove.is_empty() || !commitments_to_remove.is_empty() {
+            tracing::info!(
+                "Pruning invalid transactions from mempool (inputs: {}, commitments: {})",
+                inputs_to_remove.len(),
+                commitments_to_remove.len()
+            );
+
+            self.transactions.retain(|tx| {
+                let should_remove = match tx {
+                    Transaction::Commit { commitment } => {
+                        commitments_to_remove.contains(commitment)
+                    }
+                    Transaction::Reveal { .. } => {
+                        let inputs = tx.input_coins();
+                        inputs.iter().any(|input| inputs_to_remove.contains(input))
+                    }
+                };
+
+                if should_remove {
+                    match tx {
+                        Transaction::Commit { commitment } => {
+                            self.seen_commitments.remove(commitment);
+                        }
+                        Transaction::Reveal { .. } => {
+                            for input in tx.input_coins() {
+                                self.seen_inputs.remove(&input);
+                            }
+                        }
+                    }
+                    let tx_bytes = bincode::serialize(tx).unwrap();
+                    let tx_hash = hash(&tx_bytes);
+                    let _ = self.storage.remove(&tx_hash[..]);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+}
+
+
+========================================
+--- FILE: src/metrics.rs
+========================================
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct Metrics {
+    transactions_processed: Arc<AtomicU64>,
+    batches_processed: Arc<AtomicU64>,
+    batches_mined: Arc<AtomicU64>,
+    invalid_batches: Arc<AtomicU64>,
+    invalid_transactions: Arc<AtomicU64>,
+    reorgs: Arc<AtomicU64>,
+}
+
+impl Metrics {
+    pub fn new() -> Self {
+        Self {
+            transactions_processed: Arc::new(AtomicU64::new(0)),
+            batches_processed: Arc::new(AtomicU64::new(0)),
+            batches_mined: Arc::new(AtomicU64::new(0)),
+            invalid_batches: Arc::new(AtomicU64::new(0)),
+            invalid_transactions: Arc::new(AtomicU64::new(0)),
+            reorgs: Arc::new(AtomicU64::new(0)),
+        }
+    }
+    
+    pub fn inc_transactions_processed(&self) {
+        self.transactions_processed.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    pub fn inc_batches_processed(&self) {
+        self.batches_processed.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    pub fn inc_batches_mined(&self) {
+        self.batches_mined.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    pub fn inc_invalid_batches(&self) {
+        self.invalid_batches.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    pub fn inc_invalid_transactions(&self) {
+        self.invalid_transactions.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    pub fn inc_reorgs(&self) {
+        self.reorgs.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    pub fn report(&self) {
+        tracing::info!(
+            "Metrics: txs={} batches={} mined={} invalid_batches={} invalid_txs={} reorgs={}",
+            self.transactions_processed.load(Ordering::Relaxed),
+            self.batches_processed.load(Ordering::Relaxed),
+            self.batches_mined.load(Ordering::Relaxed),
+            self.invalid_batches.load(Ordering::Relaxed),
+            self.invalid_transactions.load(Ordering::Relaxed),
+            self.reorgs.load(Ordering::Relaxed),
+        );
+    }
+}
+
+
+========================================
+--- FILE: src/node.rs
+========================================
+use crate::core::*;
+use crate::core::state::{apply_batch, choose_best_state};
+use crate::core::extension::mine_extension;
+use crate::core::transaction::{apply_transaction, validate_transaction};
+use crate::mempool::Mempool;
+use crate::metrics::Metrics;
+use crate::network::{Message, PeerConnection, PeerManager, PeerIndex, MAX_GETBATCHES_COUNT};
+use crate::storage::Storage;
+use anyhow::Result;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::sync::RwLock;
+use tokio::time;
+
+/// Maximum number of orphan batches to hold in memory.
+const MAX_ORPHAN_BATCHES: usize = 256;
+
+pub struct Node {
+    state: State,
+    mempool: Mempool,
+    storage: Storage,
+    peer_manager: PeerManager,
+    peer_msg_rx: tokio::sync::mpsc::UnboundedReceiver<(PeerIndex, Result<Message>)>,
+    metrics: Metrics,
+    is_mining: bool,
+    our_addr: SocketAddr,
+    recent_states: Vec<State>,
+    incoming_peers_rx: tokio::sync::mpsc::UnboundedReceiver<PeerConnection>,
+    incoming_peers_tx: tokio::sync::mpsc::UnboundedSender<PeerConnection>,
+    /// Batches received out of order, keyed by the height we *think* they belong to.
+    /// Populated when we receive batches via GetBatches gap-fill responses.
+    orphan_batches: HashMap<u64, Batch>,
+    /// Track whether we already have an outstanding gap-fill request.
+    sync_in_progress: bool,
+    /// The height we last requested up to (avoid duplicate requests).
+    sync_requested_up_to: u64,
+}
+
+#[derive(Clone)]
+pub struct NodeHandle {
+    state: Arc<RwLock<State>>,
+    mempool_size: Arc<RwLock<usize>>,
+    mempool_txs: Arc<RwLock<Vec<Transaction>>>,
+    peer_addrs: Arc<RwLock<Vec<SocketAddr>>>,
+    tx_sender: tokio::sync::mpsc::UnboundedSender<NodeCommand>,
+}
+
+pub enum NodeCommand {
+    SendTransaction(Transaction),
+}
+
+impl NodeHandle {
+    pub async fn get_state(&self) -> State {
+        self.state.read().await.clone()
+    }
+
+    pub async fn check_coin(&self, coin: [u8; 32]) -> bool {
+        self.state.read().await.coins.contains(&coin)
+    }
+
+    pub async fn get_mempool_info(&self) -> (usize, Vec<Transaction>) {
+        let size = *self.mempool_size.read().await;
+        let txs = self.mempool_txs.read().await.clone();
+        (size, txs)
+    }
+
+    pub async fn get_peers(&self) -> Vec<SocketAddr> {
+        self.peer_addrs.read().await.clone()
+    }
+
+    pub async fn send_transaction(&self, tx: Transaction) -> Result<()> {
+        let state_guard = self.state.read().await;
+        validate_transaction(&state_guard, &tx)?;
+        drop(state_guard);
+
+        self.tx_sender.send(NodeCommand::SendTransaction(tx))?;
+        Ok(())
+    }
+}
+
+impl Node {
+    pub fn new(data_dir: PathBuf, is_mining: bool, our_addr: SocketAddr) -> Result<Self> {
+        std::fs::create_dir_all(&data_dir)?;
+
+        let storage = Storage::open(data_dir.join("db"))?;
+        let state = storage.load_state()?.unwrap_or_else(|| {
+            tracing::info!("No saved state, using genesis");
+            State::genesis()
+        });
+
+        tracing::info!(
+            "Loaded state: height={} depth={} coins={} commitments={}",
+            state.height,
+            state.depth,
+            state.coins.len(),
+            state.commitments.len()
+        );
+
+        let mempool = Mempool::new(data_dir.join("mempool"))?;
+
+        let peers_path = data_dir.join("peers.json");
+        let (peer_manager, peer_msg_rx) =
+            PeerManager::with_persistence(our_addr, peers_path);
+
+        let (incoming_peers_tx, incoming_peers_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        Ok(Self {
+            state,
+            mempool,
+            storage,
+            peer_manager,
+            peer_msg_rx,
+            metrics: Metrics::new(),
+            is_mining,
+            our_addr,
+            recent_states: Vec::new(),
+            incoming_peers_rx,
+            incoming_peers_tx,
+            orphan_batches: HashMap::new(),
+            sync_in_progress: false,
+            sync_requested_up_to: 0,
+        })
+    }
+
+    pub fn our_addr(&self) -> SocketAddr {
+        self.our_addr
+    }
+
+    pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver<NodeCommand>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let handle = NodeHandle {
+            state: Arc::new(RwLock::new(self.state.clone())),
+            mempool_size: Arc::new(RwLock::new(self.mempool.len())),
+            mempool_txs: Arc::new(RwLock::new(self.mempool.transactions().to_vec())),
+            peer_addrs: Arc::new(RwLock::new(Vec::new())),
+            tx_sender: tx,
+        };
+
+        (handle, rx)
+    }
+
+    pub async fn connect_to_peer(&mut self, addr: SocketAddr) -> Result<()> {
+        self.peer_manager.connect_to_peer(addr).await?;
+        Ok(())
+    }
+
+    pub async fn listen(&mut self, bind_addr: SocketAddr) -> Result<()> {
+        let listener = TcpListener::bind(bind_addr).await?;
+        tracing::info!("Listening on {}", bind_addr);
+
+        let incoming_tx = self.incoming_peers_tx.clone();
+        let our_addr = self.our_addr;
+
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        tracing::info!("Accepted connection from {}", addr);
+
+                        let incoming_tx = incoming_tx.clone();
+                        let our_addr_clone = our_addr;
+
+                        tokio::spawn(async move {
+                            let mut peer = PeerConnection::from_stream(stream, addr);
+
+                            if let Err(e) = peer.complete_handshake(our_addr_clone).await {
+                                tracing::warn!("Handshake failed with {}: {}", addr, e);
+                                return;
+                            }
+
+                            tracing::info!("Handshake complete with {}", addr);
+
+                            if incoming_tx.send(peer).is_err() {
+                                tracing::warn!("Failed to register peer {}", addr);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("Accept error: {}", e);
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    pub async fn run(
+        mut self,
+        handle: NodeHandle,
+        mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<NodeCommand>,
+    ) -> Result<()> {
+        let mut mine_interval = time::interval(Duration::from_secs(5));
+        let mut save_interval = time::interval(Duration::from_secs(10));
+        let mut ui_interval = time::interval(Duration::from_secs(1));
+        let mut metrics_interval = time::interval(Duration::from_secs(30));
+        let mut peer_maintenance = time::interval(Duration::from_secs(60));
+        let mut ping_interval = time::interval(Duration::from_secs(30));
+
+        loop {
+            tokio::select! {
+                _ = mine_interval.tick() => {
+                    if self.is_mining && self.mempool.len() > 0 {
+                        if let Err(e) = self.try_mine().await {
+                            tracing::error!("Mining error: {}", e);
+                        }
+                    }
+                }
+
+                _ = save_interval.tick() => {
+                    if let Err(e) = self.storage.save_state(&self.state) {
+                        tracing::error!("Failed to save state: {}", e);
+                    }
+                    // Persist address book alongside state
+                    self.peer_manager.save_address_book();
+                }
+
+                _ = ui_interval.tick() => {
+                    *handle.state.write().await = self.state.clone();
+                    *handle.mempool_size.write().await = self.mempool.len();
+                    *handle.mempool_txs.write().await = self.mempool.transactions().to_vec();
+                    *handle.peer_addrs.write().await = self.peer_manager.peer_addrs();
+                }
+
+                _ = metrics_interval.tick() => {
+                    self.metrics.report();
+                }
+
+                _ = peer_maintenance.tick() => {
+                    self.mempool.prune_invalid(&self.state);
+                    self.peer_manager.remove_dead_peers();
+                }
+
+                _ = ping_interval.tick() => {
+                    self.peer_manager.send_pings().await;
+                }
+
+                Some(cmd) = cmd_rx.recv() => {
+                    match cmd {
+                        NodeCommand::SendTransaction(tx) => {
+                            if let Err(e) = self.handle_new_transaction(tx, None).await {
+                                tracing::error!("Failed to handle transaction: {}", e);
+                            }
+                        }
+                    }
+                }
+
+                Some(peer) = self.incoming_peers_rx.recv() => {
+                    tracing::info!("Adding incoming peer: {}", peer.addr());
+                    if let Err(e) = self.peer_manager.add_inbound_peer(peer) {
+                        tracing::warn!("Failed to add incoming peer: {}", e);
+                    }
+                }
+
+                Some((peer_idx, msg_result)) = self.peer_msg_rx.recv() => {
+                    match msg_result {
+                        Ok(msg) => {
+                            // Rate limit check
+                            if !self.peer_manager.check_rate(peer_idx) {
+                                tracing::warn!("Rate limit exceeded for peer {}, banning", peer_idx);
+                                self.peer_manager.ban_peer(peer_idx);
+                                continue;
+                            }
+
+                            if let Err(e) = self.handle_message(peer_idx, msg).await {
+                                tracing::warn!("Error handling message from peer {}: {}", peer_idx, e);
+                                self.peer_manager.record_misbehavior(peer_idx, 10);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Peer {} disconnected: {}", peer_idx, e);
+                            self.peer_manager.remove_peer(peer_idx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_message(&mut self, from: PeerIndex, msg: Message) -> Result<()> {
+        match msg {
+            Message::Transaction(tx) => {
+                self.handle_new_transaction(tx, Some(from)).await?;
+            }
+
+            Message::Batch(batch) => {
+                self.handle_new_batch(batch, Some(from)).await?;
+            }
+
+            Message::GetState => {
+                let response = Message::StateInfo {
+                    height: self.state.height,
+                    depth: self.state.depth,
+                    midstate: self.state.midstate,
+                };
+                self.peer_manager.send_to(from, &response).await;
+            }
+
+            Message::StateInfo { height, depth, midstate } => {
+                tracing::debug!(
+                    "Peer {} state: height={} depth={} midstate={}",
+                    from, height, depth, hex::encode(midstate)
+                );
+
+                // If the peer is ahead and we aren't already syncing, request the gap.
+                if height > self.state.height && !self.sync_in_progress {
+                    self.request_missing_batches(from, height).await;
+                }
+            }
+
+            Message::Ping { nonce } => {
+                self.peer_manager.send_to(from, &Message::Pong { nonce }).await;
+            }
+
+            Message::Pong { .. } => {
+                self.peer_manager.handle_pong(from);
+            }
+
+            Message::GetAddr => {
+                let addrs = self.peer_manager.peer_addrs();
+                self.peer_manager.send_to(from, &Message::Addr(addrs)).await;
+            }
+
+            Message::Addr(addrs) => {
+                tracing::debug!("Received {} peer addresses from peer {}", addrs.len(), from);
+            }
+
+            Message::Version { .. } | Message::Verack => {}
+
+            Message::GetBatches { start_height, count } => {
+                let count = count.min(MAX_GETBATCHES_COUNT);
+                tracing::info!("Peer {} requesting batches {}-{}", from, start_height, start_height + count - 1);
+
+                let end = (start_height + count).min(self.state.height);
+                match self.storage.load_batches(start_height, end) {
+                    Ok(batches) => {
+                        self.peer_manager.send_to(from, &Message::Batches(batches)).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load batches for peer {}: {}", from, e);
+                    }
+                }
+            }
+
+            Message::Batches(batches) => {
+                self.handle_batches_response(batches, from).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_new_transaction(&mut self, tx: Transaction, from: Option<PeerIndex>) -> Result<()> {
+        match &tx {
+            Transaction::Commit { commitment } => {
+                tracing::info!("Received commit: {}", hex::encode(commitment));
+            }
+            Transaction::Reveal { .. } => {
+                let inputs: Vec<String> = tx.input_coins().iter().map(|c| hex::encode(c)).collect();
+                tracing::info!("Received reveal: inputs={}", inputs.join(", "));
+            }
+        }
+
+        match self.mempool.add(tx.clone(), &self.state) {
+            Ok(_) => {
+                self.metrics.inc_transactions_processed();
+                self.peer_manager.broadcast_except(from, &Message::Transaction(tx)).await;
+                Ok(())
+            }
+            Err(e) => {
+                self.metrics.inc_invalid_transactions();
+                tracing::warn!("Invalid transaction: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    async fn handle_new_batch(&mut self, batch: Batch, from: Option<PeerIndex>) -> Result<()> {
+        tracing::info!("Received batch with {} txs", batch.transactions.len());
+
+        let mut candidate_state = self.state.clone();
+        match apply_batch(&mut candidate_state, &batch) {
+            Ok(_) => {
+                let best = choose_best_state(&self.state, &candidate_state);
+
+                if best.height > self.state.height {
+                    tracing::info!("Accepted batch: new height={}", best.height);
+
+                    if best.midstate != candidate_state.midstate {
+                        self.metrics.inc_reorgs();
+                        tracing::warn!("Chain reorganization detected!");
+                    }
+
+                    self.recent_states.push(self.state.clone());
+                    if self.recent_states.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
+                        self.recent_states.remove(0);
+                    }
+
+                    self.state = candidate_state;
+                    self.storage.save_batch(self.state.height - 1, &batch)?;
+
+                    self.state.target = adjust_difficulty(&self.state, &self.recent_states);
+
+                    self.metrics.inc_batches_processed();
+                    self.mempool.prune_invalid(&self.state);
+                    self.peer_manager.broadcast_except(from, &Message::Batch(batch)).await;
+
+                    // Try to apply any orphan batches that now connect.
+                    self.try_apply_orphans().await;
+                }
+
+                Ok(())
+            }
+            Err(e) => {
+                // The batch didn't apply. This could be a gap — request missing batches.
+                tracing::debug!("Batch did not apply to current state: {}", e);
+
+                if let Some(peer_idx) = from {
+                    // Ask the peer what height they are at so we can gap-fill.
+                    self.peer_manager
+                        .send_to(peer_idx, &Message::GetState)
+                        .await;
+                }
+
+                // Don't penalize for this — it's usually just a gap, not misbehavior.
+                Ok(())
+            }
+        }
+    }
+
+    /// Request batches we are missing between our height and `peer_height`.
+    async fn request_missing_batches(&mut self, from: PeerIndex, peer_height: u64) {
+        let gap = peer_height - self.state.height;
+        if gap == 0 {
+            return;
+        }
+
+        let start = self.state.height;
+        let count = gap.min(MAX_GETBATCHES_COUNT);
+
+        if start + count <= self.sync_requested_up_to {
+            // Already requested this range.
+            return;
+        }
+
+        tracing::info!(
+            "Requesting missing batches {}-{} from peer {}",
+            start,
+            start + count - 1,
+            from
+        );
+
+        self.sync_in_progress = true;
+        self.sync_requested_up_to = start + count;
+        self.peer_manager
+            .send_to(from, &Message::GetBatches { start_height: start, count })
+            .await;
+    }
+
+    /// Handle a Batches response (gap-fill). Apply them sequentially.
+    async fn handle_batches_response(
+        &mut self,
+        batches: Vec<Batch>,
+        from: PeerIndex,
+    ) -> Result<()> {
+        tracing::info!("Received {} batches from peer {}", batches.len(), from);
+
+        let mut applied = 0u64;
+
+        for batch in batches {
+            let mut candidate = self.state.clone();
+            match apply_batch(&mut candidate, &batch) {
+                Ok(_) => {
+                    self.recent_states.push(self.state.clone());
+                    if self.recent_states.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
+                        self.recent_states.remove(0);
+                    }
+
+                    self.storage.save_batch(candidate.height - 1, &batch)?;
+                    self.state = candidate;
+                    self.state.target = adjust_difficulty(&self.state, &self.recent_states);
+                    self.metrics.inc_batches_processed();
+                    applied += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Gap-fill batch failed at height {}: {}",
+                        self.state.height,
+                        e
+                    );
+                    self.peer_manager.record_misbehavior(from, 20);
+                    break;
+                }
+            }
+        }
+
+        self.sync_in_progress = false;
+
+        if applied > 0 {
+            tracing::info!("Applied {} gap-fill batches, now at height {}", applied, self.state.height);
+            self.mempool.prune_invalid(&self.state);
+            self.try_apply_orphans().await;
+        }
+
+        Ok(())
+    }
+
+    /// Try to apply orphan batches that might now connect to our tip.
+    async fn try_apply_orphans(&mut self) {
+        loop {
+            let height = self.state.height;
+            let batch = match self.orphan_batches.remove(&height) {
+                Some(b) => b,
+                None => break,
+            };
+
+            let mut candidate = self.state.clone();
+            match apply_batch(&mut candidate, &batch) {
+                Ok(_) => {
+                    tracing::info!("Applied orphan batch at height {}", height);
+                    self.recent_states.push(self.state.clone());
+                    if self.recent_states.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
+                        self.recent_states.remove(0);
+                    }
+                    self.storage.save_batch(candidate.height - 1, &batch).ok();
+                    self.state = candidate;
+                    self.state.target = adjust_difficulty(&self.state, &self.recent_states);
+                    self.metrics.inc_batches_processed();
+                    self.mempool.prune_invalid(&self.state);
+                }
+                Err(e) => {
+                    tracing::debug!("Orphan batch at height {} still invalid: {}", height, e);
+                    break;
+                }
+            }
+        }
+
+        // Evict old orphans if the pool is too large.
+        while self.orphan_batches.len() > MAX_ORPHAN_BATCHES {
+            if let Some(&oldest) = self.orphan_batches.keys().min() {
+                self.orphan_batches.remove(&oldest);
+            }
+        }
+    }
+
+    async fn try_mine(&mut self) -> Result<()> {
+        tracing::info!("Mining batch with {} transactions...", self.mempool.len());
+
+        let transactions = self.mempool.drain(MAX_BATCH_SIZE);
+
+        // Snapshot the pre-mine state so we can detect staleness.
+        let pre_mine_height = self.state.height;
+        let pre_mine_midstate = self.state.midstate;
+
+        let mut candidate_state = self.state.clone();
+
+        for tx in &transactions {
+            apply_transaction(&mut candidate_state, tx)?;
+        }
+
+        let midstate = candidate_state.midstate;
+        let target = self.state.target;
+
+        let extension = tokio::task::spawn_blocking(move || {
+            mine_extension(midstate, target)
+        })
+        .await?;
+
+        // Check if state advanced while we were mining (stale block).
+        if self.state.height != pre_mine_height || self.state.midstate != pre_mine_midstate {
+            tracing::warn!(
+                "State advanced during mining (was height {}, now {}). Restoring transactions.",
+                pre_mine_height,
+                self.state.height,
+            );
+            // Put the transactions back if they are still valid.
+            self.mempool.re_add(transactions, &self.state);
+            return Ok(());
+        }
+
+        let batch = Batch {
+            transactions,
+            extension,
+        };
+
+        self.recent_states.push(self.state.clone());
+        if self.recent_states.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
+            self.recent_states.remove(0);
+        }
+
+        match apply_batch(&mut self.state, &batch) {
+            Ok(_) => {
+                self.storage.save_batch(self.state.height - 1, &batch)?;
+                self.state.target = adjust_difficulty(&self.state, &self.recent_states);
+                self.metrics.inc_batches_mined();
+                self.peer_manager.broadcast(&Message::Batch(batch)).await;
+                tracing::info!(
+                    "Mined batch! height={} target={}",
+                    self.state.height,
+                    hex::encode(self.state.target)
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to apply our own mined batch: {}", e);
+                // Restore the transactions we drained.
+                self.mempool.re_add(batch.transactions, &self.state);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+
+========================================
+--- FILE: src/storage.rs
+========================================
+mod batch_store;
+pub use batch_store::BatchStore;
+
+use crate::core::State;
+use anyhow::Result;
+use std::path::Path;
+
+pub struct Storage {
+    db: sled::Db,
+    batches: BatchStore,
+}
+
+impl Storage {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        std::fs::create_dir_all(path)?;
+        
+        let db = sled::open(path.join("state"))?;
+        let batches = BatchStore::new(path.join("batches"))?;
+        
+        Ok(Self { db, batches })
+    }
+    
+    pub fn save_state(&self, state: &State) -> Result<()> {
+        let bytes = bincode::serialize(state)?;
+        self.db.insert(b"state", bytes)?;
+        self.db.flush()?;
+        Ok(())
+    }
+    
+    pub fn load_state(&self) -> Result<Option<State>> {
+        match self.db.get(b"state")? {
+            Some(bytes) => {
+                let state = bincode::deserialize(&bytes)?;
+                Ok(Some(state))
+            }
+            None => Ok(None),
+        }
+    }
+    
+    // Batch storage methods
+    pub fn save_batch(&self, height: u64, batch: &crate::core::Batch) -> Result<()> {
+        self.batches.save(height, batch)
+    }
+    
+    pub fn load_batch(&self, height: u64) -> Result<Option<crate::core::Batch>> {
+        self.batches.load(height)
+    }
+    
+    pub fn load_batches(&self, start: u64, end: u64) -> Result<Vec<crate::core::Batch>> {
+        self.batches.load_range(start, end)
+    }
+    
+    pub fn highest_batch(&self) -> Result<u64> {
+        self.batches.highest()
+    }
+}
+
+
+========================================
+--- FILE: src/sync.rs
+========================================
+use crate::core::State;
+use crate::core::state::apply_batch;
+use crate::storage::Storage;
+use crate::network::{Message, PeerConnection};
+use anyhow::Result;
+
+pub struct Syncer {
+    storage: Storage,
+}
+
+impl Syncer {
+    pub fn new(storage: Storage) -> Self {
+        Self { storage }
+    }
+    
+    /// Sync from genesis (trustless)
+    pub async fn sync_from_genesis(&self, peer: &mut PeerConnection) -> Result<State> {
+        tracing::info!("Starting trustless sync from genesis...");
+        
+        // 1. Ask peer for their height
+        peer.send_message(&Message::GetState).await?;
+        
+        let peer_height = match peer.receive_message().await? {
+            Message::StateInfo { height, .. } => height,
+            _ => anyhow::bail!("Expected state info"),
+        };
+        
+        tracing::info!("Peer is at height {}, downloading batches...", peer_height);
+        
+        // 2. Download all batches
+        let batch_size = 100u64;
+        let mut current = 0u64;
+        
+        while current < peer_height {
+            let count = batch_size.min(peer_height - current);
+            
+            tracing::info!("Requesting batches {}-{}", current, current + count - 1);
+            
+            peer.send_message(&Message::GetBatches {
+                start_height: current,
+                count,
+            }).await?;
+            
+            match peer.receive_message().await? {
+                Message::Batches(batches) => {
+                    // Save batches
+                    for (i, batch) in batches.iter().enumerate() {
+                        let height = current + i as u64;
+                        self.storage.save_batch(height, batch)?;
+                    }
+                    
+                    current += batches.len() as u64;
+                }
+                _ => anyhow::bail!("Expected batches"),
+            }
+        }
+        
+        tracing::info!("Downloaded all batches, verifying...");
+        
+        // 3. Verify and apply all batches
+        let state = self.verify_chain(peer_height)?;
+        
+        tracing::info!("Sync complete! Height: {}", state.height);
+        
+        Ok(state)
+    }
+    
+    /// Verify entire chain from genesis
+    fn verify_chain(&self, target_height: u64) -> Result<State> {
+        let mut state = State::genesis();
+        
+        for height in 0..target_height {
+            if height % 100 == 0 {
+                tracing::info!("Verified {}/{} batches", height, target_height);
+            }
+            
+            let batch = self.storage.load_batch(height)?
+                .ok_or_else(|| anyhow::anyhow!("Missing batch at height {}", height))?;
+            
+            // This verifies the extension (redoes sequential work)
+            apply_batch(&mut state, &batch)?;
+        }
+        
+        Ok(state)
+    }
+    
+    /// Quick catchup for returning nodes
+    pub async fn catchup(&self, current_height: u64, peer: &mut PeerConnection) -> Result<State> {
+        tracing::info!("Catching up from height {}", current_height);
+        
+        // Load current state
+        let mut state = self.storage.load_state()?
+            .ok_or_else(|| anyhow::anyhow!("No saved state"))?;
+        
+        // Request missing batches
+        peer.send_message(&Message::GetState).await?;
+        
+        let peer_height = match peer.receive_message().await? {
+            Message::StateInfo { height, .. } => height,
+            _ => anyhow::bail!("Expected state info"),
+        };
+        
+        if peer_height <= current_height {
+            tracing::info!("Already up to date");
+            return Ok(state);
+        }
+        
+        let needed = peer_height - current_height;
+        tracing::info!("Need {} batches to catch up", needed);
+        
+        // Download and apply
+        peer.send_message(&Message::GetBatches {
+            start_height: current_height,
+            count: needed,
+        }).await?;
+        
+        match peer.receive_message().await? {
+            Message::Batches(batches) => {
+                for batch in batches {
+                    apply_batch(&mut state, &batch)?;
+                    self.storage.save_batch(state.height - 1, &batch)?;
+                }
+            }
+            _ => anyhow::bail!("Expected batches"),
+        }
+        
+        tracing::info!("Caught up to height {}", state.height);
+        
+        Ok(state)
+    }
+}
+
+
+========================================
+--- FILE: src/core/extension.rs
+========================================
+use super::types::*;
+use anyhow::{bail, Result};
+
+/// Compute the sequential hash chain, collecting checkpoints along the way.
+/// Used by both create_extension and mine_extension.
+fn compute_chain(midstate: &[u8; 32], nonce: u64) -> ([u8; 32], Vec<[u8; 32]>) {
+    let mut x = hash_concat(midstate, &nonce.to_le_bytes());
+    let mut checkpoints = Vec::with_capacity((EXTENSION_ITERATIONS / CHECKPOINT_INTERVAL) as usize + 1);
+    checkpoints.push(x);
+
+    for i in 1..=EXTENSION_ITERATIONS {
+        x = hash(&x);
+        if i % CHECKPOINT_INTERVAL == 0 {
+            checkpoints.push(x);
+        }
+    }
+
+    (x, checkpoints)
+}
+
+/// Derive which segments to spot-check from the final hash.
+/// Deterministic: all nodes check the same segments for the same block.
+/// Unpredictable: attacker must complete the full chain to learn which are checked.
+fn spot_check_indices(final_hash: &[u8; 32], num_segments: usize, count: usize) -> Vec<usize> {
+    let count = count.min(num_segments);
+    let mut indices = Vec::with_capacity(count);
+    let mut seed = *final_hash;
+
+    while indices.len() < count {
+        seed = hash(&seed);
+        let raw = u64::from_le_bytes(seed[..8].try_into().unwrap());
+        let idx = (raw as usize) % num_segments;
+        if !indices.contains(&idx) {
+            indices.push(idx);
+        }
+    }
+
+    indices
+}
+
+/// Create an extension by doing sequential work
+pub fn create_extension(midstate: [u8; 32], nonce: u64) -> Extension {
+    let (final_hash, checkpoints) = compute_chain(&midstate, nonce);
+    Extension { nonce, final_hash, checkpoints }
+}
+
+/// Verify an extension by spot-checking random checkpoint segments.
+/// Cost: O(SPOT_CHECK_COUNT * CHECKPOINT_INTERVAL) instead of O(EXTENSION_ITERATIONS).
+pub fn verify_extension(midstate: [u8; 32], ext: &Extension, target: &[u8; 32]) -> Result<()> {
+    // 1. Difficulty check (instant)
+    if ext.final_hash >= *target {
+        bail!("Extension doesn't meet difficulty target");
+    }
+
+    let num_segments = (EXTENSION_ITERATIONS / CHECKPOINT_INTERVAL) as usize;
+    let expected_checkpoints = num_segments + 1;
+
+    // 2. Structural check
+    if ext.checkpoints.len() != expected_checkpoints {
+        bail!(
+            "Wrong checkpoint count: got {}, expected {}",
+            ext.checkpoints.len(),
+            expected_checkpoints
+        );
+    }
+
+    // 3. First checkpoint must match midstate + nonce
+    let expected_start = hash_concat(&midstate, &ext.nonce.to_le_bytes());
+    if ext.checkpoints[0] != expected_start {
+        bail!("First checkpoint doesn't match midstate+nonce");
+    }
+
+    // 4. Last checkpoint must equal final_hash
+    if ext.checkpoints[num_segments] != ext.final_hash {
+        bail!("Last checkpoint doesn't match final_hash");
+    }
+
+    // 5. Spot-check segments
+    let indices = spot_check_indices(&ext.final_hash, num_segments, SPOT_CHECK_COUNT);
+
+    for seg in indices {
+        let mut x = ext.checkpoints[seg];
+        for _ in 0..CHECKPOINT_INTERVAL {
+            x = hash(&x);
+        }
+        if x != ext.checkpoints[seg + 1] {
+            bail!("Checkpoint verification failed at segment {}", seg);
+        }
+    }
+
+    Ok(())
+}
+
+/// Mine: try nonces until one produces a final_hash below target.
+/// Each attempt pays the full sequential work cost.
+pub fn mine_extension(midstate: [u8; 32], target: [u8; 32]) -> Extension {
+    let mut attempts = 0u64;
+
+    loop {
+        attempts += 1;
+        let nonce: u64 = rand::random();
+
+        let (final_hash, checkpoints) = compute_chain(&midstate, nonce);
+
+        if final_hash < target {
+            tracing::info!(
+                "Found valid extension! nonce={} attempts={} hash={}",
+                nonce,
+                attempts,
+                hex::encode(final_hash)
+            );
+            return Extension { nonce, final_hash, checkpoints };
+        }
+    }
+}
+
+
+========================================
+--- FILE: src/core/mod.rs
+========================================
+pub mod types;
+pub mod transaction;
+pub mod extension;
+pub mod state;
+
+pub use types::*;
+pub use state::adjust_difficulty; 
+
+
+========================================
+--- FILE: src/core/state.rs
+========================================
+use super::types::*;
+use super::transaction::apply_transaction;
+use super::extension::verify_extension;
+use anyhow::Result;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Calculate new difficulty target based on recent block times
+pub fn adjust_difficulty(state: &State, previous_states: &[State]) -> [u8; 32] {
+    if state.height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0 || state.height == 0 {
+        return state.target;
+    }
+    
+    if previous_states.len() < DIFFICULTY_ADJUSTMENT_INTERVAL as usize {
+        return state.target;
+    }
+    
+    let interval_start_time = previous_states[previous_states.len() - DIFFICULTY_ADJUSTMENT_INTERVAL as usize].timestamp;
+    let interval_end_time = state.timestamp;
+    let actual_time = interval_end_time.saturating_sub(interval_start_time);
+    
+    let expected_time = TARGET_BLOCK_TIME * DIFFICULTY_ADJUSTMENT_INTERVAL;
+    
+    if actual_time == 0 {
+        return state.target;
+    }
+    
+    let ratio = actual_time as f64 / expected_time as f64;
+    let clamped_ratio = ratio.clamp(1.0 / MAX_ADJUSTMENT_FACTOR as f64, MAX_ADJUSTMENT_FACTOR as f64);
+    
+    let current_target = target_to_u256(&state.target);
+    let new_target_f64 = current_target as f64 * clamped_ratio;
+    let new_target = new_target_f64 as u128;
+    let new_target = new_target.min(u128::MAX);
+    
+    let result = u256_to_target(new_target);
+    
+    tracing::info!(
+        "Difficulty adjustment at height {}: actual={}s expected={}s ratio={:.2} old_target={} new_target={}",
+        state.height,
+        actual_time,
+        expected_time,
+        clamped_ratio,
+        hex::encode(state.target),
+        hex::encode(result)
+    );
+    
+    result
+}
+
+fn target_to_u256(target: &[u8; 32]) -> u128 {
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&target[0..16]);
+    u128::from_be_bytes(bytes)
+}
+
+fn u256_to_target(value: u128) -> [u8; 32] {
+    let mut result = [0xffu8; 32];
+    let bytes = value.to_be_bytes();
+    result[0..16].copy_from_slice(&bytes);
+    result
+}
+
+pub fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Apply a batch to the state
+pub fn apply_batch(state: &mut State, batch: &Batch) -> Result<()> {
+    for tx in &batch.transactions {
+        apply_transaction(state, tx)?;
+    }
+    
+    verify_extension(state.midstate, &batch.extension, &state.target)?;
+    
+    state.midstate = batch.extension.final_hash;
+    state.depth += EXTENSION_ITERATIONS;
+    state.height += 1;
+    state.timestamp = current_timestamp();
+    
+    tracing::info!(
+        "Applied batch: height={} depth={} coins={} commitments={} timestamp={}",
+        state.height,
+        state.depth,
+        state.coins.len(),
+        state.commitments.len(),
+        state.timestamp
+    );
+    
+    Ok(())
+}
+
+/// Choose the better of two states (fork resolution)
+pub fn choose_best_state<'a>(a: &'a State, b: &'a State) -> &'a State {
+    match a.depth.cmp(&b.depth) {
+        std::cmp::Ordering::Greater => {
+            tracing::debug!("Chose state A (depth {} > {})", a.depth, b.depth);
+            a
+        }
+        std::cmp::Ordering::Less => {
+            tracing::debug!("Chose state B (depth {} > {})", b.depth, a.depth);
+            b
+        }
+        std::cmp::Ordering::Equal => {
+            if a.midstate < b.midstate {
+                tracing::debug!("Chose state A (tiebreaker)");
+                a
+            } else {
+                tracing::debug!("Chose state B (tiebreaker)");
+                b
+            }
+        }
+    }
+}
+
+
+========================================
+--- FILE: src/core/transaction.rs
+========================================
+use super::types::*;
+use anyhow::{bail, Result};
+
+/// Apply a transaction to the state
+pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
+    match tx {
+        Transaction::Commit { commitment } => {
+            // Register the commitment
+            if !state.commitments.insert(*commitment) {
+                bail!("Duplicate commitment");
+            }
+
+            // Update midstate
+            state.midstate = hash_concat(&state.midstate, commitment);
+
+            Ok(())
+        }
+
+        Transaction::Reveal { secrets, new_coins, salt } => {
+            if secrets.is_empty() {
+                bail!("Transaction must spend at least one coin");
+            }
+            if new_coins.is_empty() {
+                bail!("Transaction must create at least one new coin");
+            }
+
+            // Compute the coins being spent
+            let old_coins: Vec<[u8; 32]> = secrets.iter().map(|s| hash(s)).collect();
+
+            // Verify commitment exists and matches
+            let expected = compute_commitment(&old_coins, new_coins, salt);
+            if !state.commitments.remove(&expected) {
+                bail!(
+                    "No matching commitment found (expected {})",
+                    hex::encode(expected)
+                );
+            }
+
+            // Check all coins exist and remove them
+            for old_coin in &old_coins {
+                if !state.coins.remove(old_coin) {
+                    bail!("Coin {:?} not found or already spent", hex::encode(old_coin));
+                }
+            }
+
+            // Add new coins
+            for new_coin in new_coins {
+                if !state.coins.insert(*new_coin) {
+                    bail!("Duplicate coin created");
+                }
+            }
+
+            // Update midstate with transaction data
+            let tx_bytes = bincode::serialize(tx)?;
+            state.midstate = hash_concat(&state.midstate, &tx_bytes);
+
+            Ok(())
+        }
+    }
+}
+
+/// Validate a transaction without applying it
+pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
+    match tx {
+        Transaction::Commit { commitment } => {
+            if state.commitments.contains(commitment) {
+                bail!("Duplicate commitment");
+            }
+            Ok(())
+        }
+
+        Transaction::Reveal { secrets, new_coins, salt } => {
+            if secrets.is_empty() {
+                bail!("Must spend at least one coin");
+            }
+            if new_coins.is_empty() {
+                bail!("Must create at least one coin");
+            }
+
+            let old_coins: Vec<[u8; 32]> = secrets.iter().map(|s| hash(s)).collect();
+
+            // Verify commitment exists
+            let expected = compute_commitment(&old_coins, new_coins, salt);
+            if !state.commitments.contains(&expected) {
+                bail!("No matching commitment found");
+            }
+
+            // Verify coins exist
+            for old_coin in &old_coins {
+                if !state.coins.contains(old_coin) {
+                    bail!("Coin {:?} not found", hex::encode(old_coin));
+                }
+            }
+
+            Ok(())
+        }
+    }
+}
+
+
+========================================
+--- FILE: src/core/types.rs
+========================================
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+
+/// Hash a byte slice with SHA-256
+pub fn hash(data: &[u8]) -> [u8; 32] {
+    Sha256::digest(data).into()
+}
+
+/// Concatenate two byte slices and hash them
+pub fn hash_concat(a: &[u8], b: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(a);
+    hasher.update(b);
+    hasher.finalize().into()
+}
+
+/// Compute a commitment hash that binds inputs to outputs
+///
+/// commitment = SHA256(coin_id_1 || coin_id_2 || ... || new_coin_1 || new_coin_2 || ... || salt)
+pub fn compute_commitment(
+    input_coins: &[[u8; 32]],
+    new_coins: &[[u8; 32]],
+    salt: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for coin in input_coins {
+        hasher.update(coin);
+    }
+    for coin in new_coins {
+        hasher.update(coin);
+    }
+    hasher.update(salt);
+    hasher.finalize().into()
+}
+
+/// The global consensus state
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct State {
+    /// Cumulative hash of all history
+    pub midstate: [u8; 32],
+
+    /// Set of unspent coin commitments
+    pub coins: HashSet<[u8; 32]>,
+
+    /// Set of registered commitments (pending reveals)
+    pub commitments: HashSet<[u8; 32]>,
+
+    /// Cumulative sequential work (number of hash iterations)
+    pub depth: u64,
+
+    /// Current difficulty target
+    pub target: [u8; 32],
+
+    /// Number of batches processed
+    pub height: u64,
+
+    /// Unix timestamp of this state (for difficulty adjustment)
+    pub timestamp: u64,
+}
+
+impl State {
+    /// Create genesis state
+    pub fn genesis() -> Self {
+        let genesis_coins = vec![
+            hash(b"genesis_coin_1"),
+            hash(b"genesis_coin_2"),
+            hash(b"genesis_coin_3"),
+        ];
+
+        // Initial difficulty: ~1 in 10 (easy for testing)
+        let target = [
+            0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        ];
+
+        Self {
+            midstate: hash(b"midstate_genesis_2026"),
+            coins: genesis_coins.into_iter().collect(),
+            commitments: HashSet::new(),
+            depth: 0,
+            target,
+            height: 0,
+            timestamp: 0,
+        }
+    }
+}
+
+/// A transaction is either a Commit (register intent) or a Reveal (execute spend)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum Transaction {
+    /// Phase 1: Register a commitment binding inputs to outputs.
+    /// The commitment is opaque — it hides which coins and destinations are involved.
+    Commit {
+        commitment: [u8; 32],
+    },
+
+    /// Phase 2: Reveal secrets and destinations, proving they match a prior commitment.
+    /// The commitment must already exist in state (from a previous batch).
+    Reveal {
+        /// The secret preimages that unlock the old coins
+        secrets: Vec<Vec<u8>>,
+        /// New coin commitments to create
+        new_coins: Vec<[u8; 32]>,
+        /// Salt used when computing the commitment
+        salt: [u8; 32],
+    },
+}
+
+impl Transaction {
+    /// Get the coins this transaction is spending (empty for Commit)
+    pub fn input_coins(&self) -> Vec<[u8; 32]> {
+        match self {
+            Transaction::Commit { .. } => vec![],
+            Transaction::Reveal { secrets, .. } => {
+                secrets.iter().map(|s| hash(s)).collect()
+            }
+        }
+    }
+}
+
+/// Proof of sequential work with checkpoint witnesses
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Extension {
+    /// Mining nonce
+    pub nonce: u64,
+
+    /// Result of sequential hashing
+    pub final_hash: [u8; 32],
+
+    /// Intermediate hashes at every CHECKPOINT_INTERVAL steps.
+    /// checkpoints[0] = initial hash (from midstate+nonce)
+    /// checkpoints[i] = hash after i*CHECKPOINT_INTERVAL iterations
+    /// checkpoints[last] = final_hash
+    pub checkpoints: Vec<[u8; 32]>,
+}
+
+/// A batch of transactions plus proof of work
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Batch {
+    pub transactions: Vec<Transaction>,
+    pub extension: Extension,
+}
+
+/// Protocol constants
+#[cfg(not(feature = "fast-mining"))]
+pub const EXTENSION_ITERATIONS: u64 = 1_000_000;
+
+#[cfg(feature = "fast-mining")]
+pub const EXTENSION_ITERATIONS: u64 = 100;
+
+/// Checkpoint interval: save a witness hash every this many iterations
+#[cfg(not(feature = "fast-mining"))]
+pub const CHECKPOINT_INTERVAL: u64 = 1_000;
+
+#[cfg(feature = "fast-mining")]
+pub const CHECKPOINT_INTERVAL: u64 = 10;
+
+/// Number of random segments to spot-check during verification
+#[cfg(not(feature = "fast-mining"))]
+pub const SPOT_CHECK_COUNT: usize = 16;
+
+#[cfg(feature = "fast-mining")]
+pub const SPOT_CHECK_COUNT: usize = 3;
+
+pub const MAX_BATCH_SIZE: usize = 100;
+
+/// Difficulty adjustment parameters
+pub const TARGET_BLOCK_TIME: u64 = 10; // seconds
+pub const DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 10; // blocks
+pub const MAX_ADJUSTMENT_FACTOR: u64 = 4; // max 4x change per adjustment
+
+const _: () = assert!(
+    EXTENSION_ITERATIONS % CHECKPOINT_INTERVAL == 0,
+    "EXTENSION_ITERATIONS must be divisible by CHECKPOINT_INTERVAL"
+);
+
+
+========================================
+--- FILE: src/network/discovery.rs
+========================================
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::path::Path;
+use std::time::{Duration, SystemTime};
+use anyhow::Result;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerInfo {
+    pub addr: SocketAddr,
+    pub last_seen: SystemTime,
+    pub misbehavior_score: u32,
+    pub services: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AddressBook {
+    tried: HashMap<SocketAddr, PeerInfo>,
+    new: HashMap<SocketAddr, PeerInfo>,
+    #[serde(skip)]
+    connected: HashSet<SocketAddr>,
+    banned: HashSet<SocketAddr>,
+}
+
+impl AddressBook {
+    pub fn new() -> Self {
+        Self {
+            tried: HashMap::new(),
+            new: HashMap::new(),
+            connected: HashSet::new(),
+            banned: HashSet::new(),
+        }
+    }
+
+    /// Load from disk, falling back to empty if missing or corrupt.
+    pub fn load(path: &Path) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                match serde_json::from_slice::<AddressBook>(&bytes) {
+                    Ok(book) => {
+                        tracing::info!(
+                            "Loaded address book: {} tried, {} new, {} banned",
+                            book.tried.len(),
+                            book.new.len(),
+                            book.banned.len()
+                        );
+                        book
+                    }
+                    Err(e) => {
+                        tracing::warn!("Corrupt address book, starting fresh: {}", e);
+                        Self::new()
+                    }
+                }
+            }
+            Err(_) => Self::new(),
+        }
+    }
+
+    /// Persist to disk.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec(self)?;
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    pub fn add_address(&mut self, addr: SocketAddr) {
+        if self.banned.contains(&addr) {
+            return;
+        }
+        
+        if !self.tried.contains_key(&addr) && !self.connected.contains(&addr) {
+            self.new.insert(addr, PeerInfo {
+                addr,
+                last_seen: SystemTime::now(),
+                misbehavior_score: 0,
+                services: 0,
+            });
+        }
+    }
+    
+    pub fn mark_tried(&mut self, addr: SocketAddr) {
+        if let Some(info) = self.new.remove(&addr) {
+            self.tried.insert(addr, info);
+        }
+    }
+    
+    pub fn mark_connected(&mut self, addr: SocketAddr) {
+        self.connected.insert(addr);
+    }
+    
+    pub fn mark_disconnected(&mut self, addr: SocketAddr) {
+        self.connected.remove(&addr);
+    }
+    
+    pub fn mark_misbehavior(&mut self, addr: SocketAddr, score: u32) {
+        if let Some(info) = self.tried.get_mut(&addr) {
+            info.misbehavior_score += score;
+            
+            if info.misbehavior_score >= 100 {
+                self.ban_peer(addr);
+            }
+        }
+    }
+    
+    pub fn ban_peer(&mut self, addr: SocketAddr) {
+        tracing::warn!("Banning peer: {}", addr);
+        self.banned.insert(addr);
+        self.tried.remove(&addr);
+        self.new.remove(&addr);
+        self.connected.remove(&addr);
+    }
+    
+    pub fn is_banned(&self, addr: SocketAddr) -> bool {
+        self.banned.contains(&addr)
+    }
+    
+    pub fn get_peers_to_try(&self, count: usize) -> Vec<SocketAddr> {
+        use rand::seq::SliceRandom;
+        
+        let mut rng = rand::thread_rng();
+        
+        let from_new = count / 2;
+        let from_tried = count - from_new;
+        
+        let mut result = Vec::new();
+        
+        let new_addrs: Vec<_> = self.new.keys()
+            .filter(|addr| !self.connected.contains(addr))
+            .copied()
+            .collect();
+        
+        let mut new_sample: Vec<_> = new_addrs.choose_multiple(&mut rng, from_new).copied().collect();
+        result.append(&mut new_sample);
+        
+        let tried_addrs: Vec<_> = self.tried.keys()
+            .filter(|addr| !self.connected.contains(addr))
+            .copied()
+            .collect();
+        
+        let mut tried_sample: Vec<_> = tried_addrs.choose_multiple(&mut rng, from_tried).copied().collect();
+        result.append(&mut tried_sample);
+        
+        result
+    }
+    
+    pub fn get_random_peers(&self, count: usize) -> Vec<SocketAddr> {
+        use rand::seq::SliceRandom;
+        
+        let all: Vec<_> = self.tried.keys()
+            .chain(self.new.keys())
+            .filter(|addr| !self.banned.contains(addr))
+            .copied()
+            .collect();
+        
+        all.choose_multiple(&mut rand::thread_rng(), count)
+            .copied()
+            .collect()
+    }
+    
+    pub fn prune_old(&mut self, max_age: Duration) {
+        let cutoff = SystemTime::now() - max_age;
+        
+        self.new.retain(|_, info| info.last_seen > cutoff);
+        self.tried.retain(|_, info| info.last_seen > cutoff);
+    }
+}
+
+pub const SEED_NODES: &[&str] = &[
+    // For local testing - add real DNS names for production
+];
+
+pub async fn discover_peers(address_book: &mut AddressBook) -> Result<()> {
+    for seed in SEED_NODES {
+        match seed.parse::<SocketAddr>() {
+            Ok(addr) => {
+                address_book.add_address(addr);
+            }
+            Err(_) => {
+                match tokio::net::lookup_host(seed).await {
+                    Ok(addrs) => {
+                        for addr in addrs {
+                            address_book.add_address(addr);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to resolve seed {}: {}", seed, e);
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+
+========================================
+--- FILE: src/network/mod.rs
+========================================
+pub mod protocol;
+pub mod peer;
+pub mod discovery;
+
+pub use protocol::*;
+pub use peer::*;
+pub use discovery::*;
+
+
+========================================
+--- FILE: src/network/peer.rs
+========================================
+use super::protocol::{Message, PROTOCOL_VERSION};
+use super::discovery::AddressBook;
+use anyhow::{bail, Result};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+
+pub type PeerIndex = u64;
+
+// Peer limits
+pub const MAX_INBOUND: usize = 32;
+pub const MAX_OUTBOUND: usize = 8;
+pub const MAX_PEERS: usize = 40;
+pub const MAX_GETBATCHES_COUNT: u64 = 100;
+
+// Rate limiting
+const RATE_WINDOW: Duration = Duration::from_secs(60);
+const RATE_MAX_MSGS: u64 = 500;
+
+pub struct PeerConnection {
+    index: Option<PeerIndex>,
+    addr: SocketAddr,
+    writer: Option<WriteHalf<TcpStream>>,
+    msg_rx: Option<mpsc::UnboundedReceiver<Result<Message>>>,
+    last_ping: SystemTime,
+    last_pong: SystemTime,
+    handshake_complete: bool,
+    inbound: bool,
+    // Rate limiting
+    msg_count: u64,
+    rate_window_start: Instant,
+}
+
+impl PeerConnection {
+    pub async fn connect(addr: SocketAddr, _our_addr: SocketAddr) -> Result<Self> {
+        let stream = TcpStream::connect(addr).await?;
+        tracing::info!("Connected to peer: {}", addr);
+
+        let (reader, writer) = tokio::io::split(stream);
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+        tokio::spawn(Self::read_loop(reader, msg_tx));
+
+        Ok(Self {
+            index: None,
+            addr,
+            writer: Some(writer),
+            msg_rx: Some(msg_rx),
+            last_ping: SystemTime::now(),
+            last_pong: SystemTime::now(),
+            handshake_complete: false,
+            inbound: false,
+            msg_count: 0,
+            rate_window_start: Instant::now(),
+        })
+    }
+
+    pub fn from_stream(stream: TcpStream, addr: SocketAddr) -> Self {
+        let (reader, writer) = tokio::io::split(stream);
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+        tokio::spawn(Self::read_loop(reader, msg_tx));
+
+        Self {
+            index: None,
+            addr,
+            writer: Some(writer),
+            msg_rx: Some(msg_rx),
+            last_ping: SystemTime::now(),
+            last_pong: SystemTime::now(),
+            handshake_complete: false,
+            inbound: true,
+            msg_count: 0,
+            rate_window_start: Instant::now(),
+        }
+    }
+
+    async fn read_loop(mut reader: ReadHalf<TcpStream>, tx: mpsc::UnboundedSender<Result<Message>>) {
+        loop {
+            let mut len_bytes = [0u8; 4];
+            if let Err(e) = reader.read_exact(&mut len_bytes).await {
+                let _ = tx.send(Err(e.into()));
+                break;
+            }
+            let len = u32::from_le_bytes(len_bytes) as usize;
+
+            if len > 10_000_000 {
+                let _ = tx.send(Err(anyhow::anyhow!("Message too large: {} bytes", len)));
+                break;
+            }
+
+            let mut msg_bytes = vec![0u8; len];
+            if let Err(e) = reader.read_exact(&mut msg_bytes).await {
+                let _ = tx.send(Err(e.into()));
+                break;
+            }
+
+            match Message::deserialize(&msg_bytes) {
+                Ok(msg) => {
+                    if tx.send(Ok(msg)).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    break;
+                }
+            }
+        }
+    }
+
+    pub async fn complete_handshake(&mut self, our_addr: SocketAddr) -> Result<()> {
+        if self.handshake_complete {
+            return Ok(());
+        }
+
+        let version = Message::Version {
+            version: PROTOCOL_VERSION,
+            services: 1,
+            timestamp: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs(),
+            addr_recv: self.addr,
+            addr_from: our_addr,
+        };
+
+        self.send_message(&version).await?;
+
+        let msg = self.receive_message().await?;
+        match msg {
+            Message::Version { version, .. } => {
+                if version != PROTOCOL_VERSION {
+                    bail!("Protocol version mismatch");
+                }
+                self.send_message(&Message::Verack).await?;
+
+                let msg2 = self.receive_message().await?;
+                match msg2 {
+                    Message::Verack => {
+                        self.handshake_complete = true;
+                        tracing::info!("Handshake complete with {}", self.addr);
+                        Ok(())
+                    }
+                    _ => bail!("Expected Verack, got {:?}", msg2),
+                }
+            }
+            _ => bail!("Expected Version, got {:?}", msg),
+        }
+    }
+
+    pub async fn send_message(&mut self, msg: &Message) -> Result<()> {
+        let writer = self.writer.as_mut().ok_or_else(|| anyhow::anyhow!("Not connected"))?;
+        let bytes = msg.serialize();
+        let len = bytes.len() as u32;
+        writer.write_all(&len.to_le_bytes()).await?;
+        writer.write_all(&bytes).await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
+    /// Receive a message directly (used during handshake and standalone sync).
+    /// After the peer is registered with PeerManager, messages arrive via the shared channel instead.
+    pub async fn receive_message(&mut self) -> Result<Message> {
+        let rx = self.msg_rx.as_mut().ok_or_else(|| anyhow::anyhow!("msg_rx taken"))?;
+        match rx.recv().await {
+            Some(Ok(msg)) => Ok(msg),
+            Some(Err(e)) => Err(e),
+            None => Err(anyhow::anyhow!("Connection closed")),
+        }
+    }
+
+    /// Take the message receiver so PeerManager can forward it to the shared channel.
+    pub fn take_msg_rx(&mut self) -> Option<mpsc::UnboundedReceiver<Result<Message>>> {
+        self.msg_rx.take()
+    }
+
+    pub async fn send_ping(&mut self) -> Result<()> {
+        let nonce: u64 = rand::random();
+        self.send_message(&Message::Ping { nonce }).await?;
+        self.last_ping = SystemTime::now();
+        Ok(())
+    }
+
+    pub fn handle_pong(&mut self) {
+        self.last_pong = SystemTime::now();
+    }
+
+    pub fn is_alive(&self) -> bool {
+        SystemTime::now()
+            .duration_since(self.last_pong)
+            .map(|d| d < Duration::from_secs(60))
+            .unwrap_or(false)
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.writer.is_some() && self.handshake_complete
+    }
+
+    pub fn disconnect(&mut self) {
+        self.writer = None;
+        self.handshake_complete = false;
+    }
+
+    /// Record an incoming message for rate limiting. Returns false if limit exceeded.
+    pub fn record_message(&mut self) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.rate_window_start) > RATE_WINDOW {
+            self.msg_count = 0;
+            self.rate_window_start = now;
+        }
+        self.msg_count += 1;
+        self.msg_count <= RATE_MAX_MSGS
+    }
+}
+
+/// Forward messages from a peer's local channel to the shared channel.
+async fn forward_messages(
+    idx: PeerIndex,
+    mut local_rx: mpsc::UnboundedReceiver<Result<Message>>,
+    shared_tx: mpsc::UnboundedSender<(PeerIndex, Result<Message>)>,
+) {
+    loop {
+        match local_rx.recv().await {
+            Some(Ok(msg)) => {
+                if shared_tx.send((idx, Ok(msg))).is_err() {
+                    return;
+                }
+            }
+            Some(Err(e)) => {
+                let _ = shared_tx.send((idx, Err(e)));
+                return;
+            }
+            None => break,
+        }
+    }
+    let _ = shared_tx.send((idx, Err(anyhow::anyhow!("peer reader closed"))));
+}
+
+pub struct PeerManager {
+    peers: HashMap<PeerIndex, PeerConnection>,
+    next_index: PeerIndex,
+    our_addr: SocketAddr,
+    peer_msg_tx: mpsc::UnboundedSender<(PeerIndex, Result<Message>)>,
+    address_book: AddressBook,
+    address_book_path: Option<PathBuf>,
+    inbound_count: usize,
+    outbound_count: usize,
+}
+
+impl PeerManager {
+    pub fn new(our_addr: SocketAddr) -> (Self, mpsc::UnboundedReceiver<(PeerIndex, Result<Message>)>) {
+        let (peer_msg_tx, peer_msg_rx) = mpsc::unbounded_channel();
+        let mgr = Self {
+            peers: HashMap::new(),
+            next_index: 0,
+            our_addr,
+            peer_msg_tx,
+            address_book: AddressBook::new(),
+            address_book_path: None,
+            inbound_count: 0,
+            outbound_count: 0,
+        };
+        (mgr, peer_msg_rx)
+    }
+
+    /// Create a PeerManager that persists its address book to `path`.
+    pub fn with_persistence(
+        our_addr: SocketAddr,
+        peers_path: PathBuf,
+    ) -> (Self, mpsc::UnboundedReceiver<(PeerIndex, Result<Message>)>) {
+        let (peer_msg_tx, peer_msg_rx) = mpsc::unbounded_channel();
+        let address_book = AddressBook::load(&peers_path);
+        let mgr = Self {
+            peers: HashMap::new(),
+            next_index: 0,
+            our_addr,
+            peer_msg_tx,
+            address_book,
+            address_book_path: Some(peers_path),
+            inbound_count: 0,
+            outbound_count: 0,
+        };
+        (mgr, peer_msg_rx)
+    }
+
+    /// Flush the address book to disk (call periodically or on shutdown).
+    pub fn save_address_book(&self) {
+        if let Some(ref path) = self.address_book_path {
+            if let Err(e) = self.address_book.save(path) {
+                tracing::warn!("Failed to save address book: {}", e);
+            }
+        }
+    }
+
+    pub async fn connect_to_peer(&mut self, addr: SocketAddr) -> Result<PeerIndex> {
+        if self.outbound_count >= MAX_OUTBOUND {
+            bail!("outbound peer limit reached ({}/{})", self.outbound_count, MAX_OUTBOUND);
+        }
+        if self.peers.len() >= MAX_PEERS {
+            bail!("total peer limit reached ({}/{})", self.peers.len(), MAX_PEERS);
+        }
+        if self.address_book.is_banned(addr) {
+            bail!("peer {} is banned", addr);
+        }
+
+        let mut peer = PeerConnection::connect(addr, self.our_addr).await?;
+        peer.complete_handshake(self.our_addr).await?;
+        peer.inbound = false;
+
+        let idx = self.register_peer(peer);
+        self.outbound_count += 1;
+        self.address_book.mark_connected(addr);
+        self.address_book.mark_tried(addr);
+        tracing::info!("Connected to outbound peer {}: {} (total: {})", idx, addr, self.peers.len());
+        Ok(idx)
+    }
+
+    /// Add an already-handshaked inbound peer.
+    pub fn add_inbound_peer(&mut self, peer: PeerConnection) -> Result<PeerIndex> {
+        if self.inbound_count >= MAX_INBOUND {
+            bail!("inbound peer limit reached ({}/{})", self.inbound_count, MAX_INBOUND);
+        }
+        if self.peers.len() >= MAX_PEERS {
+            bail!("total peer limit reached ({}/{})", self.peers.len(), MAX_PEERS);
+        }
+        let addr = peer.addr();
+        if self.address_book.is_banned(addr) {
+            bail!("peer {} is banned", addr);
+        }
+
+        let mut peer = peer;
+        peer.inbound = true;
+        let idx = self.register_peer(peer);
+        self.inbound_count += 1;
+        self.address_book.mark_connected(addr);
+        tracing::info!("Added inbound peer {}: {} (total: {})", idx, addr, self.peers.len());
+        Ok(idx)
+    }
+
+    /// Assign an index, take the local msg_rx, start forwarding to shared channel.
+    fn register_peer(&mut self, mut peer: PeerConnection) -> PeerIndex {
+        let idx = self.next_index;
+        self.next_index += 1;
+        peer.index = Some(idx);
+
+        if let Some(local_rx) = peer.take_msg_rx() {
+            let shared_tx = self.peer_msg_tx.clone();
+            tokio::spawn(forward_messages(idx, local_rx, shared_tx));
+        }
+
+        self.peers.insert(idx, peer);
+        idx
+    }
+
+    /// Send a message to a specific peer (unicast).
+    pub async fn send_to(&mut self, idx: PeerIndex, msg: &Message) {
+        if let Some(peer) = self.peers.get_mut(&idx) {
+            if let Err(e) = peer.send_message(msg).await {
+                tracing::warn!("Failed to send to peer {} ({}): {}", idx, peer.addr(), e);
+                peer.disconnect();
+            }
+        }
+    }
+
+    /// Broadcast to all connected peers.
+    pub async fn broadcast(&mut self, msg: &Message) {
+        self.broadcast_except(None, msg).await;
+    }
+
+    /// Broadcast to all connected peers except `exclude`.
+    pub async fn broadcast_except(&mut self, exclude: Option<PeerIndex>, msg: &Message) {
+        let mut dead = Vec::new();
+
+        for (&idx, peer) in self.peers.iter_mut() {
+            if Some(idx) == exclude || !peer.is_connected() {
+                continue;
+            }
+            if let Err(e) = peer.send_message(msg).await {
+                tracing::warn!("Broadcast failed to peer {} ({}): {}", idx, peer.addr(), e);
+                peer.disconnect();
+                dead.push(idx);
+            }
+        }
+
+        for idx in dead {
+            self.cleanup_peer(idx);
+        }
+    }
+
+    pub async fn send_pings(&mut self) {
+        let mut dead = Vec::new();
+        for (&idx, peer) in self.peers.iter_mut() {
+            if peer.is_connected() {
+                if let Err(_) = peer.send_ping().await {
+                    dead.push(idx);
+                }
+            }
+        }
+        for idx in dead {
+            if let Some(peer) = self.peers.get_mut(&idx) {
+                peer.disconnect();
+            }
+            self.cleanup_peer(idx);
+        }
+    }
+
+    pub fn remove_dead_peers(&mut self) {
+        let dead: Vec<PeerIndex> = self.peers.iter()
+            .filter(|(_, p)| !p.is_alive())
+            .map(|(&idx, _)| idx)
+            .collect();
+
+        for idx in dead {
+            tracing::info!("Removing dead peer {}", idx);
+            self.cleanup_peer(idx);
+        }
+    }
+
+    /// Remove a peer by index (e.g. on disconnect or error).
+    pub fn remove_peer(&mut self, idx: PeerIndex) {
+        if let Some(mut peer) = self.peers.remove(&idx) {
+            tracing::info!("Removed peer {} ({})", idx, peer.addr());
+            let addr = peer.addr();
+            peer.disconnect();
+            self.address_book.mark_disconnected(addr);
+            if peer.inbound {
+                self.inbound_count = self.inbound_count.saturating_sub(1);
+            } else {
+                self.outbound_count = self.outbound_count.saturating_sub(1);
+            }
+        }
+    }
+
+    fn cleanup_peer(&mut self, idx: PeerIndex) {
+        self.remove_peer(idx);
+    }
+
+    /// Check rate limit for a peer. Returns false if exceeded.
+    pub fn check_rate(&mut self, idx: PeerIndex) -> bool {
+        match self.peers.get_mut(&idx) {
+            Some(peer) => peer.record_message(),
+            None => true,
+        }
+    }
+
+    /// Ban a peer: remove and add to address book ban list.
+    pub fn ban_peer(&mut self, idx: PeerIndex) {
+        if let Some(peer) = self.peers.get(&idx) {
+            let addr = peer.addr();
+            tracing::warn!("Banning peer {} ({})", idx, addr);
+            self.address_book.ban_peer(addr);
+        }
+        self.remove_peer(idx);
+    }
+
+    /// Record misbehavior. Bans at threshold.
+    pub fn record_misbehavior(&mut self, idx: PeerIndex, score: u32) {
+        if let Some(peer) = self.peers.get(&idx) {
+            let addr = peer.addr();
+            self.address_book.mark_misbehavior(addr, score);
+            if self.address_book.is_banned(addr) {
+                self.remove_peer(idx);
+            }
+        }
+    }
+
+    pub fn peer_addrs(&self) -> Vec<SocketAddr> {
+        self.peers.values().map(|p| p.addr()).collect()
+    }
+
+    pub fn handle_pong(&mut self, idx: PeerIndex) {
+        if let Some(peer) = self.peers.get_mut(&idx) {
+            peer.handle_pong();
+        }
+    }
+
+    pub fn connected_count(&self) -> usize {
+        self.peers.values().filter(|p| p.is_connected()).count()
+    }
+
+    pub fn peer_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// Return a random connected peer index (for requesting missing batches).
+    pub fn random_peer(&self) -> Option<PeerIndex> {
+        use rand::seq::IteratorRandom;
+        self.peers.iter()
+            .filter(|(_, p)| p.is_connected())
+            .map(|(&idx, _)| idx)
+            .choose(&mut rand::thread_rng())
+    }
+}
+
+
+========================================
+--- FILE: src/network/protocol.rs
+========================================
+use crate::core::{Batch, Transaction};
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Message {
+    /// Announce a new transaction
+    Transaction(Transaction),
+    
+    /// Announce a new batch
+    Batch(Batch),
+    
+    /// Request current state info
+    GetState,
+    
+    /// Response with state info
+    StateInfo {
+        height: u64,
+        depth: u64,
+        midstate: [u8; 32],
+    },
+    
+    /// Request peer addresses
+    GetAddr,
+    
+    /// Share peer addresses
+    Addr(Vec<SocketAddr>),
+    
+    /// Ping (heartbeat)
+    Ping { nonce: u64 },
+    
+    /// Pong (heartbeat response)
+    Pong { nonce: u64 },
+    
+    /// Version handshake
+    Version {
+        version: u32,
+        services: u64,
+        timestamp: u64,
+        addr_recv: SocketAddr,
+        addr_from: SocketAddr,
+    },
+    
+    /// Version acknowledgment
+    Verack,
+    
+    /// Request batches in range
+    GetBatches {
+        start_height: u64,
+        count: u64,
+    },
+    
+    /// Send batches
+    Batches(Vec<Batch>),
+}
+
+impl Message {
+    pub fn serialize(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("Serialization failed")
+    }
+    
+    pub fn deserialize(bytes: &[u8]) -> anyhow::Result<Self> {
+        Ok(bincode::deserialize(bytes)?)
+    }
+}
+
+pub const PROTOCOL_VERSION: u32 = 1;
+
+
+========================================
+--- FILE: src/rpc/handlers.rs
+========================================
+use super::types::*;
+use crate::core::{hash, compute_commitment, Transaction};
+use crate::node::NodeHandle;
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
+
+type AppState = NodeHandle;
+
+impl IntoResponse for ErrorResponse {
+    fn into_response(self) -> Response {
+        (StatusCode::BAD_REQUEST, Json(self)).into_response()
+    }
+}
+
+pub async fn health() -> &'static str {
+    "OK"
+}
+
+pub async fn get_state(State(node): State<AppState>) -> Json<GetStateResponse> {
+    let state = node.get_state().await;
+
+    Json(GetStateResponse {
+        height: state.height,
+        depth: state.depth,
+        midstate: hex::encode(state.midstate),
+        num_coins: state.coins.len(),
+        num_commitments: state.commitments.len(),
+        target: hex::encode(state.target),
+    })
+}
+
+/// Phase 1: Register a commitment
+pub async fn commit_transaction(
+    State(node): State<AppState>,
+    Json(req): Json<CommitRequest>,
+) -> Result<Json<CommitResponse>, ErrorResponse> {
+    if req.coins.is_empty() {
+        return Err(ErrorResponse {
+            error: "Must provide at least one coin".to_string(),
+        });
+    }
+    if req.destinations.is_empty() {
+        return Err(ErrorResponse {
+            error: "Must provide at least one destination".to_string(),
+        });
+    }
+
+    // Parse coin IDs
+    let mut input_coins = Vec::new();
+    for coin_hex in &req.coins {
+        let coin = hex::decode(coin_hex)
+            .map_err(|e| ErrorResponse { error: format!("Invalid coin hex: {}", e) })?;
+        if coin.len() != 32 {
+            return Err(ErrorResponse { error: "Coin must be 32 bytes".to_string() });
+        }
+        input_coins.push(<[u8; 32]>::try_from(coin).unwrap());
+    }
+
+    // Parse destinations
+    let mut destinations = Vec::new();
+    for dest_hex in &req.destinations {
+        let dest = hex::decode(dest_hex)
+            .map_err(|e| ErrorResponse { error: format!("Invalid destination hex: {}", e) })?;
+        if dest.len() != 32 {
+            return Err(ErrorResponse { error: "Destination must be 32 bytes".to_string() });
+        }
+        destinations.push(<[u8; 32]>::try_from(dest).unwrap());
+    }
+
+    // Generate salt
+    let salt: [u8; 32] = rand::random();
+
+    // Compute commitment
+    let commitment = compute_commitment(&input_coins, &destinations, &salt);
+
+    // Submit commit transaction
+    let tx = Transaction::Commit { commitment };
+
+    node.send_transaction(tx)
+        .await
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    Ok(Json(CommitResponse {
+        commitment: hex::encode(commitment),
+        salt: hex::encode(salt),
+        status: "committed".to_string(),
+    }))
+}
+
+/// Phase 2: Reveal and execute the spend
+pub async fn send_transaction(
+    State(node): State<AppState>,
+    Json(req): Json<SendTransactionRequest>,
+) -> Result<Json<SendTransactionResponse>, ErrorResponse> {
+    if req.secrets.is_empty() {
+        return Err(ErrorResponse {
+            error: "Must provide at least one secret".to_string(),
+        });
+    }
+
+    let mut secrets = Vec::new();
+    for secret_hex in &req.secrets {
+        let secret = hex::decode(secret_hex)
+            .map_err(|e| ErrorResponse { error: format!("Invalid secret hex: {}", e) })?;
+        secrets.push(secret);
+    }
+
+    let mut destinations = Vec::new();
+    for dest_hex in &req.destinations {
+        let dest = hex::decode(dest_hex)
+            .map_err(|e| ErrorResponse { error: format!("Invalid destination hex: {}", e) })?;
+        if dest.len() != 32 {
+            return Err(ErrorResponse {
+                error: "Destination must be 32 bytes".to_string(),
+            });
+        }
+        destinations.push(<[u8; 32]>::try_from(dest).unwrap());
+    }
+
+    let salt = hex::decode(&req.salt)
+        .map_err(|e| ErrorResponse { error: format!("Invalid salt hex: {}", e) })?;
+    if salt.len() != 32 {
+        return Err(ErrorResponse {
+            error: "Salt must be 32 bytes".to_string(),
+        });
+    }
+    let salt: [u8; 32] = salt.try_into().unwrap();
+
+    let tx = Transaction::Reveal {
+        secrets,
+        new_coins: destinations.clone(),
+        salt,
+    };
+
+    let input_coins = tx.input_coins();
+
+    node.send_transaction(tx)
+        .await
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    Ok(Json(SendTransactionResponse {
+        input_coins: input_coins.iter().map(|c| hex::encode(c)).collect(),
+        output_coins: destinations.iter().map(|d| hex::encode(d)).collect(),
+        status: "submitted".to_string(),
+    }))
+}
+
+pub async fn check_coin(
+    State(node): State<AppState>,
+    Json(req): Json<CheckCoinRequest>,
+) -> Result<Json<CheckCoinResponse>, ErrorResponse> {
+    let coin = hex::decode(&req.coin)
+        .map_err(|e| ErrorResponse { error: format!("Invalid coin hex: {}", e) })?;
+
+    if coin.len() != 32 {
+        return Err(ErrorResponse {
+            error: "Coin must be 32 bytes".to_string(),
+        });
+    }
+
+    let coin: [u8; 32] = coin.try_into().unwrap();
+    let exists = node.check_coin(coin).await;
+
+    Ok(Json(CheckCoinResponse {
+        exists,
+        coin: hex::encode(coin),
+    }))
+}
+
+pub async fn get_mempool(State(node): State<AppState>) -> Json<GetMempoolResponse> {
+    let (size, transactions) = node.get_mempool_info().await;
+
+    let tx_info: Vec<_> = transactions
+        .iter()
+        .map(|tx| match tx {
+            Transaction::Commit { commitment } => TransactionInfo {
+                commitment: Some(hex::encode(commitment)),
+                input_coins: None,
+                output_coins: None,
+            },
+            Transaction::Reveal { new_coins, .. } => TransactionInfo {
+                commitment: None,
+                input_coins: Some(tx.input_coins().iter().map(|c| hex::encode(c)).collect()),
+                output_coins: Some(new_coins.iter().map(|c| hex::encode(c)).collect()),
+            },
+        })
+        .collect();
+
+    Json(GetMempoolResponse {
+        size,
+        transactions: tx_info,
+    })
+}
+
+pub async fn generate_key() -> Json<GenerateKeyResponse> {
+    let secret: [u8; 32] = rand::random();
+    let coin = hash(&secret);
+
+    Json(GenerateKeyResponse {
+        secret: hex::encode(secret),
+        coin: hex::encode(coin),
+    })
+}
+
+pub async fn get_peers(State(node): State<AppState>) -> Json<GetPeersResponse> {
+    let peers = node.get_peers().await;
+
+    Json(GetPeersResponse {
+        peers: peers.iter().map(|p| p.to_string()).collect(),
+    })
+}
+
+
+========================================
+--- FILE: src/rpc/mod.rs
+========================================
+pub mod server;
+pub mod handlers;
+pub mod types;
+
+pub use server::RpcServer;
+pub use types::*;
+
+
+========================================
+--- FILE: src/rpc/server.rs
+========================================
+use super::handlers::*;
+use crate::node::NodeHandle;
+use anyhow::Result;
+use axum::{
+    routing::{get, post},
+    Router,
+};
+use std::net::SocketAddr;
+use tower_http::trace::TraceLayer;
+
+pub struct RpcServer {
+    addr: SocketAddr,
+}
+
+impl RpcServer {
+    pub fn new(port: u16) -> Self {
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        Self { addr }
+    }
+
+    pub async fn run(self, node_handle: NodeHandle) -> Result<()> {
+        let app = Router::new()
+            .route("/health", get(health))
+            .route("/state", get(get_state))
+            .route("/commit", post(commit_transaction))
+            .route("/send", post(send_transaction))
+            .route("/check", post(check_coin))
+            .route("/mempool", get(get_mempool))
+            .route("/keygen", get(generate_key))
+            .route("/peers", get(get_peers))
+            .layer(TraceLayer::new_for_http())
+            .with_state(node_handle);
+
+        tracing::info!("RPC server listening on {}", self.addr);
+
+        let listener = tokio::net::TcpListener::bind(self.addr).await?;
+        axum::serve(listener, app).await?;
+
+        Ok(())
+    }
+}
+
+
+========================================
+--- FILE: src/rpc/types.rs
+========================================
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CommitRequest {
+    /// Coin IDs being spent (hex)
+    pub coins: Vec<String>,
+    /// Destination coin commitments (hex, 32 bytes each)
+    pub destinations: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CommitResponse {
+    pub commitment: String,
+    pub salt: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SendTransactionRequest {
+    pub secrets: Vec<String>,
+    pub destinations: Vec<String>,
+    /// Salt from the commit phase (hex)
+    pub salt: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SendTransactionResponse {
+    pub input_coins: Vec<String>,
+    pub output_coins: Vec<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetStateResponse {
+    pub height: u64,
+    pub depth: u64,
+    pub midstate: String,
+    pub num_coins: usize,
+    pub num_commitments: usize,
+    pub target: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckCoinRequest {
+    pub coin: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckCoinResponse {
+    pub exists: bool,
+    pub coin: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetMempoolResponse {
+    pub size: usize,
+    pub transactions: Vec<TransactionInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TransactionInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commitment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_coins: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_coins: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GenerateKeyResponse {
+    pub secret: String,
+    pub coin: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetPeersResponse {
+    pub peers: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ErrorResponse {
+    pub error: String,
+}
+
+
+========================================
+--- FILE: src/storage/batch_store.rs
+========================================
+use crate::core::Batch;
+use anyhow::Result;
+use std::path::{Path, PathBuf};
+use std::fs;
+
+pub struct BatchStore {
+    base_path: PathBuf,
+}
+
+impl BatchStore {
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let base_path = path.as_ref().to_path_buf();
+        fs::create_dir_all(&base_path)?;
+        Ok(Self { base_path })
+    }
+    
+    /// Save a batch
+    pub fn save(&self, height: u64, batch: &Batch) -> Result<()> {
+        let folder = height / 1000; // 1000 batches per folder
+        let folder_path = self.base_path.join(format!("{:06}", folder));
+        fs::create_dir_all(&folder_path)?;
+        
+        let file_path = folder_path.join(format!("batch_{}.bin", height));
+        let bytes = bincode::serialize(batch)?;
+        fs::write(file_path, bytes)?;
+        
+        Ok(())
+    }
+    
+    /// Load a batch
+    pub fn load(&self, height: u64) -> Result<Option<Batch>> {
+        let folder = height / 1000;
+        let file_path = self.base_path
+            .join(format!("{:06}", folder))
+            .join(format!("batch_{}.bin", height));
+        
+        if !file_path.exists() {
+            return Ok(None);
+        }
+        
+        let bytes = fs::read(file_path)?;
+        let batch = bincode::deserialize(&bytes)?;
+        Ok(Some(batch))
+    }
+    
+    /// Get all batches from height range
+    pub fn load_range(&self, start: u64, end: u64) -> Result<Vec<Batch>> {
+        let mut batches = Vec::new();
+        
+        for height in start..end {
+            if let Some(batch) = self.load(height)? {
+                batches.push(batch);
+            } else {
+                break;
+            }
+        }
+        
+        Ok(batches)
+    }
+    
+    /// Get highest batch we have
+    pub fn highest(&self) -> Result<u64> {
+        let mut max = 0u64;
+        
+        for entry in fs::read_dir(&self.base_path)? {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.is_dir() {
+                for file in fs::read_dir(path)? {
+                    let file = file?;
+                    let name = file.file_name();
+                    let name_str = name.to_string_lossy();
+                    
+                    if let Some(height_str) = name_str.strip_prefix("batch_").and_then(|s| s.strip_suffix(".bin")) {
+                        if let Ok(height) = height_str.parse::<u64>() {
+                            max = max.max(height);
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(max)
+    }
+}
+
+
+========================================
+--- FILE: src/wallet/crypto.rs
+========================================
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
+use anyhow::{bail, Result};
+use sha2::{Digest, Sha256};
+
+const KDF_ITERATIONS: u32 = 100_000;
+const SALT_LEN: usize = 16;
+const NONCE_LEN: usize = 12;
+
+/// Derive a 32-byte key from password + salt via iterated SHA-256.
+fn derive_key(password: &[u8], salt: &[u8]) -> [u8; 32] {
+    let mut key = Sha256::digest([password, salt].concat()).into();
+    for _ in 1..KDF_ITERATIONS {
+        key = Sha256::digest(key).into();
+    }
+    key
+}
+
+/// Encrypt plaintext with a password.
+/// Output: salt (16) || nonce (12) || ciphertext+tag
+pub fn encrypt(plaintext: &[u8], password: &[u8]) -> Result<Vec<u8>> {
+    let salt: [u8; SALT_LEN] = rand::random();
+    let nonce_bytes: [u8; NONCE_LEN] = rand::random();
+
+    let key = derive_key(password, &salt);
+    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| anyhow::anyhow!("encryption failed: {}", e))?;
+
+    let mut out = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Decrypt ciphertext with a password.
+pub fn decrypt(data: &[u8], password: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < SALT_LEN + NONCE_LEN + 16 {
+        bail!("wallet file too short or corrupted");
+    }
+
+    let salt = &data[..SALT_LEN];
+    let nonce_bytes = &data[SALT_LEN..SALT_LEN + NONCE_LEN];
+    let ciphertext = &data[SALT_LEN + NONCE_LEN..];
+
+    let key = derive_key(password, salt);
+    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| anyhow::anyhow!("wrong password or corrupted wallet"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip() {
+        let data = b"test wallet data";
+        let password = b"hunter2";
+        let encrypted = encrypt(data, password).unwrap();
+        let decrypted = decrypt(&encrypted, password).unwrap();
+        assert_eq!(data.as_slice(), &decrypted);
+    }
+
+    #[test]
+    fn wrong_password() {
+        let encrypted = encrypt(b"secret", b"correct").unwrap();
+        assert!(decrypt(&encrypted, b"wrong").is_err());
+    }
+}
+
+
+========================================
+--- FILE: src/wallet/mod.rs
+========================================
+pub mod crypto;
+
+use crate::core::{hash, compute_commitment};
+use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// Default wallet location: ~/.midstate/wallet.dat
+pub fn default_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".midstate")
+        .join("wallet.dat")
+}
+
+/// Short display: first 8 hex chars + "…" + last 4 hex chars
+pub fn short_hex(bytes: &[u8; 32]) -> String {
+    let h = hex::encode(bytes);
+    format!("{}…{}", &h[..8], &h[60..])
+}
+
+/// A coin the wallet controls.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WalletCoin {
+    /// The secret preimage (knowing this = owning the coin)
+    pub secret: Vec<u8>,
+    /// hash(secret) — the on-chain coin ID
+    pub coin: [u8; 32],
+    /// Optional human label
+    pub label: Option<String>,
+}
+
+/// A commit that has been submitted but not yet revealed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingCommit {
+    pub commitment: [u8; 32],
+    pub salt: [u8; 32],
+    /// Secrets for the coins being spent (needed for reveal)
+    pub input_secrets: Vec<Vec<u8>>,
+    /// Destination coins for the reveal
+    pub destinations: Vec<[u8; 32]>,
+    /// Unix timestamp when committed
+    pub created_at: u64,
+}
+
+/// Record of a completed transaction.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    /// Coins that were spent
+    pub inputs: Vec<[u8; 32]>,
+    /// Coins that were created
+    pub outputs: Vec<[u8; 32]>,
+    /// Unix timestamp when completed
+    pub timestamp: u64,
+}
+
+/// The wallet file contents (serialized to JSON, then encrypted).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WalletData {
+    pub coins: Vec<WalletCoin>,
+    pub pending: Vec<PendingCommit>,
+    /// Transaction history (backward-compatible: missing = empty)
+    #[serde(default)]
+    pub history: Vec<HistoryEntry>,
+}
+
+impl WalletData {
+    fn empty() -> Self {
+        Self {
+            coins: Vec::new(),
+            pending: Vec::new(),
+            history: Vec::new(),
+        }
+    }
+}
+
+pub struct Wallet {
+    path: PathBuf,
+    password: Vec<u8>,
+    pub data: WalletData,
+}
+
+impl Wallet {
+    /// Create a new wallet file. Fails if the file already exists.
+    pub fn create(path: &Path, password: &[u8]) -> Result<Self> {
+        if path.exists() {
+            bail!("wallet file already exists: {}", path.display());
+        }
+
+        let wallet = Self {
+            path: path.to_path_buf(),
+            password: password.to_vec(),
+            data: WalletData::empty(),
+        };
+        wallet.save()?;
+        Ok(wallet)
+    }
+
+    /// Open an existing wallet.
+    pub fn open(path: &Path, password: &[u8]) -> Result<Self> {
+        if !path.exists() {
+            bail!("wallet file not found: {}", path.display());
+        }
+
+        let encrypted = std::fs::read(path)?;
+        let plaintext = crypto::decrypt(&encrypted, password)?;
+        let data: WalletData = serde_json::from_slice(&plaintext)?;
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            password: password.to_vec(),
+            data,
+        })
+    }
+
+    /// Write current state to disk (encrypted).
+    pub fn save(&self) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let plaintext = serde_json::to_vec(&self.data)?;
+        let encrypted = crypto::encrypt(&plaintext, &self.password)?;
+        std::fs::write(&self.path, encrypted)?;
+        Ok(())
+    }
+
+    /// Generate a new random coin and add it to the wallet.
+    pub fn generate(&mut self, label: Option<String>) -> Result<&WalletCoin> {
+        let secret: [u8; 32] = rand::random();
+        let coin = hash(&secret);
+
+        self.data.coins.push(WalletCoin {
+            secret: secret.to_vec(),
+            coin,
+            label,
+        });
+        self.save()?;
+        Ok(self.data.coins.last().unwrap())
+    }
+
+    /// Import an existing secret.
+    pub fn import_secret(&mut self, secret: Vec<u8>, label: Option<String>) -> Result<[u8; 32]> {
+        let coin = hash(&secret);
+
+        if self.data.coins.iter().any(|c| c.coin == coin) {
+            bail!("coin already in wallet");
+        }
+
+        self.data.coins.push(WalletCoin {
+            secret,
+            coin,
+            label,
+        });
+        self.save()?;
+        Ok(coin)
+    }
+
+    /// Look up a coin's secret by its coin ID.
+    pub fn find_secret(&self, coin: &[u8; 32]) -> Option<&WalletCoin> {
+        self.data.coins.iter().find(|c| &c.coin == coin)
+    }
+
+    /// Resolve a coin reference: numeric index ("0", "2") or hex prefix ("f8de45").
+    pub fn resolve_coin(&self, reference: &str) -> Result<[u8; 32]> {
+        // Try as index first
+        if let Ok(idx) = reference.parse::<usize>() {
+            if idx < self.data.coins.len() {
+                return Ok(self.data.coins[idx].coin);
+            }
+        }
+
+        // Try as hex prefix
+        let reference_lower = reference.to_lowercase();
+        let matches: Vec<_> = self
+            .data
+            .coins
+            .iter()
+            .filter(|c| hex::encode(c.coin).starts_with(&reference_lower))
+            .collect();
+
+        match matches.len() {
+            0 => bail!("no coin matching '{}'", reference),
+            1 => Ok(matches[0].coin),
+            n => bail!(
+                "'{}' is ambiguous ({} matches) — use more characters",
+                reference,
+                n
+            ),
+        }
+    }
+
+    /// Prepare a commit: picks coins from the wallet, computes the commitment,
+    /// and stores the pending state so we can reveal later.
+    pub fn prepare_commit(
+        &mut self,
+        input_coin_ids: &[[u8; 32]],
+        destinations: &[[u8; 32]],
+    ) -> Result<([u8; 32], [u8; 32])> {
+        // Verify we own all input coins
+        let mut input_secrets = Vec::new();
+        for coin_id in input_coin_ids {
+            let wc = self
+                .find_secret(coin_id)
+                .ok_or_else(|| anyhow::anyhow!("coin {} not in wallet", short_hex(coin_id)))?;
+            input_secrets.push(wc.secret.clone());
+        }
+
+        let salt: [u8; 32] = rand::random();
+        let commitment = compute_commitment(input_coin_ids, destinations, &salt);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        self.data.pending.push(PendingCommit {
+            commitment,
+            salt,
+            input_secrets,
+            destinations: destinations.to_vec(),
+            created_at: now,
+        });
+        self.save()?;
+
+        Ok((commitment, salt))
+    }
+
+    /// Find a pending commit by its commitment hash.
+    pub fn find_pending(&self, commitment: &[u8; 32]) -> Option<&PendingCommit> {
+        self.data.pending.iter().find(|p| &p.commitment == commitment)
+    }
+
+    /// Get all pending commits.
+    pub fn pending(&self) -> &[PendingCommit] {
+        &self.data.pending
+    }
+
+    /// Remove a pending commit after successful reveal.
+    /// Also removes the spent coins and records history.
+    pub fn complete_reveal(&mut self, commitment: &[u8; 32]) -> Result<()> {
+        let pending = self
+            .data
+            .pending
+            .iter()
+            .find(|p| &p.commitment == commitment)
+            .ok_or_else(|| anyhow::anyhow!("pending commit not found"))?
+            .clone();
+
+        // Compute spent coin IDs
+        let spent_coins: Vec<[u8; 32]> = pending
+            .input_secrets
+            .iter()
+            .map(|s| hash(s))
+            .collect();
+
+        // Remove spent coins from wallet
+        self.data.coins.retain(|c| !spent_coins.contains(&c.coin));
+
+        // Record in history
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        self.data.history.push(HistoryEntry {
+            inputs: spent_coins,
+            outputs: pending.destinations.clone(),
+            timestamp: now,
+        });
+
+        // Remove the pending entry
+        self.data.pending.retain(|p| &p.commitment != commitment);
+
+        self.save()?;
+        Ok(())
+    }
+
+    /// Transaction history.
+    pub fn history(&self) -> &[HistoryEntry] {
+        &self.data.history
+    }
+
+    /// Remove a coin from the wallet (e.g. if spent externally).
+    pub fn remove_coin(&mut self, coin: &[u8; 32]) -> Result<()> {
+        let before = self.data.coins.len();
+        self.data.coins.retain(|c| &c.coin != coin);
+        if self.data.coins.len() == before {
+            bail!("coin not found in wallet");
+        }
+        self.save()?;
+        Ok(())
+    }
+
+    /// Number of coins in the wallet.
+    pub fn coin_count(&self) -> usize {
+        self.data.coins.len()
+    }
+
+    /// All coins.
+    pub fn coins(&self) -> &[WalletCoin] {
+        &self.data.coins
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn create_and_reopen() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        w.generate(Some("test".into())).unwrap();
+        assert_eq!(w.coin_count(), 1);
+
+        let w2 = Wallet::open(&path, b"pass").unwrap();
+        assert_eq!(w2.coin_count(), 1);
+        assert_eq!(w2.coins()[0].label.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn commit_reveal_records_history() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let coin_id = {
+            let wc = w.generate(None).unwrap();
+            wc.coin
+        };
+
+        let dest: [u8; 32] = rand::random();
+        let (commitment, _salt) = w.prepare_commit(&[coin_id], &[dest]).unwrap();
+
+        assert_eq!(w.pending().len(), 1);
+
+        w.complete_reveal(&commitment).unwrap();
+
+        assert_eq!(w.pending().len(), 0);
+        assert_eq!(w.coin_count(), 0);
+        assert_eq!(w.history().len(), 1);
+        assert_eq!(w.history()[0].inputs, vec![coin_id]);
+        assert_eq!(w.history()[0].outputs, vec![dest]);
+    }
+
+    #[test]
+    fn resolve_by_index() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c0 = w.generate(None).unwrap().coin;
+        let c1 = w.generate(None).unwrap().coin;
+
+        assert_eq!(w.resolve_coin("0").unwrap(), c0);
+        assert_eq!(w.resolve_coin("1").unwrap(), c1);
+        assert!(w.resolve_coin("99").is_err());
+    }
+
+    #[test]
+    fn resolve_by_hex_prefix() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let wc = w.generate(None).unwrap();
+        let coin = wc.coin; // copy to drop borrow
+        let full_hex = hex::encode(coin);
+        let prefix = &full_hex[..10];
+
+        let resolved = w.resolve_coin(prefix).unwrap();
+        assert_eq!(resolved, coin);
+    }
+
+    #[test]
+    fn short_hex_format() {
+        let bytes = [0xab; 32];
+        let s = short_hex(&bytes);
+        assert_eq!(s, "abababab…abab");
+    }
+
+    #[test]
+    fn backward_compat_no_history() {
+        // Old wallet files won't have the history field
+        let data_json = r#"{"coins":[],"pending":[]}"#;
+        let data: WalletData = serde_json::from_str(data_json).unwrap();
+        assert!(data.history.is_empty());
+    }
+}
+
+
