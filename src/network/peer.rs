@@ -375,16 +375,30 @@ impl PeerManager {
 
     /// Broadcast to all connected peers except `exclude`.
     pub async fn broadcast_except(&mut self, exclude: Option<PeerIndex>, msg: &Message) {
+        tracing::warn!("DEBUG: broadcast_except called, peers={}, connected={}", 
+        self.peers.len(),
+        self.peers.values().filter(|p| p.is_connected()).count());
+        
         let mut dead = Vec::new();
 
         for (&idx, peer) in self.peers.iter_mut() {
-            if Some(idx) == exclude || !peer.is_connected() {
+            if Some(idx) == exclude {
+                tracing::warn!("DEBUG: Skipping peer {} (excluded)", idx);
                 continue;
             }
+            if !peer.is_connected() {
+                tracing::warn!("DEBUG: Skipping peer {} (not connected): writer={} handshake={}", 
+                    idx, peer.writer.is_some(), peer.handshake_complete);
+                continue;
+            }
+            
+            tracing::warn!("DEBUG: Sending to peer {}", idx);
             if let Err(e) = peer.send_message(msg).await {
-                tracing::warn!("Broadcast failed to peer {} ({}): {}", idx, peer.addr(), e);
+                tracing::warn!("DEBUG: Send failed to peer {}: {}", idx, e);
                 peer.disconnect();
                 dead.push(idx);
+            } else {
+                tracing::warn!("DEBUG: Successfully sent to peer {}", idx);
             }
         }
 
