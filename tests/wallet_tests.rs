@@ -296,7 +296,8 @@ fn test_sign_reveal_produces_valid_wots_sigs() {
     let signatures = w.sign_reveal(pending);
 
     assert_eq!(signatures.len(), 2);
-    assert_eq!(signatures[0].len(), wots::CHAINS);
+    // CHANGE: Check against byte size, not chain count
+    assert_eq!(signatures[0].len(), wots::SIG_SIZE);
 
     // Verify the signatures are actually valid WOTS sigs
     let recomputed_commitment = compute_commitment(
@@ -304,8 +305,13 @@ fn test_sign_reveal_produces_valid_wots_sigs() {
         &pending.destinations,
         &pending.salt,
     );
-    assert!(wots::verify(&signatures[0], &recomputed_commitment, &c1));
-    assert!(wots::verify(&signatures[1], &recomputed_commitment, &c2));
+    
+    // CHANGE: Deserialize bytes back to WOTS chunks for verification
+    let sig0 = wots::sig_from_bytes(&signatures[0]).expect("valid sig bytes");
+    let sig1 = wots::sig_from_bytes(&signatures[1]).expect("valid sig bytes");
+
+    assert!(wots::verify(&sig0, &recomputed_commitment, &c1));
+    assert!(wots::verify(&sig1, &recomputed_commitment, &c2));
 }
 
 #[test]
