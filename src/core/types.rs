@@ -166,7 +166,7 @@ pub const MAX_ADJUSTMENT_FACTOR: u64 = 4;
 pub const BLOCKS_PER_YEAR: u64 = 365 * 24 * 3600 / TARGET_BLOCK_TIME; // 3_153_600
 
 /// Initial block reward in coins.
-pub const INITIAL_REWARD: u64 = 256;
+pub const INITIAL_REWARD: u64 = 16;
 
 /// Block reward at a given height. Halves every BLOCKS_PER_YEAR, minimum 1.
 pub fn block_reward(height: u64) -> u64 {

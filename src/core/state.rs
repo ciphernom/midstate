@@ -81,21 +81,23 @@ pub fn apply_batch(state: &mut State, batch: &Batch) -> Result<()> {
         apply_transaction(state, tx)?;
     }
 
-    // Validate coinbase
+    // Validate coinbase count
     let reward = block_reward(state.height);
     let expected_coinbase = reward + total_fees;
-
     if batch.coinbase.len() as u64 != expected_coinbase {
-        bail!(
-            "Invalid coinbase count: got {}, expected {} (reward={} + fees={})",
-            batch.coinbase.len(),
-            expected_coinbase,
-            reward,
-            total_fees
-        );
+        bail!("Invalid coinbase count...");
     }
 
-    // Add coinbase coins to state and fold into midstate
+    // CALCULATE what the midstate WILL BE after adding coinbase
+    let mut future_midstate = state.midstate;
+    for coin in &batch.coinbase {
+        future_midstate = hash_concat(&future_midstate, coin);
+    }
+
+    // Verify extension against the FUTURE midstate
+    verify_extension(future_midstate, &batch.extension, &state.target)?;
+
+    // NOW add coinbase coins
     for coin in &batch.coinbase {
         if !state.coins.insert(*coin) {
             bail!("Duplicate coinbase coin");
@@ -103,22 +105,11 @@ pub fn apply_batch(state: &mut State, batch: &Batch) -> Result<()> {
         state.midstate = hash_concat(&state.midstate, coin);
     }
 
-    // Verify extension
-    verify_extension(state.midstate, &batch.extension, &state.target)?;
-
+    // Update rest of state
     state.midstate = batch.extension.final_hash;
     state.depth += EXTENSION_ITERATIONS;
     state.height += 1;
     state.timestamp = current_timestamp();
-
-    tracing::info!(
-        "Applied batch: height={} depth={} coins={} commitments={} coinbase={}",
-        state.height,
-        state.depth,
-        state.coins.len(),
-        state.commitments.len(),
-        batch.coinbase.len()
-    );
 
     Ok(())
 }
