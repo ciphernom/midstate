@@ -15,7 +15,7 @@ tokio = { version = "1.35", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
-sled = "0.34"
+redb = "2.0"
 hex = "0.4"
 axum = "0.7"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
@@ -26,6 +26,8 @@ dirs = "5.0"
 rand_chacha = "0.3"
 blake3 = "1.5"
 rayon = "1.8"
+libp2p = { version = "0.54", features = ["tokio", "noise", "tcp", "yamux", "kad", "identify", "request-response", "macros"] }
+futures = "0.3"
 
 [features]
 fast-mining = []
