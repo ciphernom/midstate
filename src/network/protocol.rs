@@ -28,7 +28,10 @@ pub enum Message {
         start_height: u64,
         count: u64,
     },
-    Batches(Vec<Batch>),
+    Batches {
+        start_height: u64,
+        batches: Vec<Batch>,
+    },
 }
 
 impl Message {
