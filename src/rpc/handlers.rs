@@ -43,7 +43,6 @@ fn parse_hex32(hex_str: &str, label: &str) -> Result<[u8; 32], ErrorResponse> {
     Ok(<[u8; 32]>::try_from(bytes).unwrap())
 }
 
-/// Phase 1: Register a commitment
 pub async fn commit_transaction(
     State(node): State<AppState>,
     Json(req): Json<CommitRequest>,
@@ -78,7 +77,6 @@ pub async fn commit_transaction(
     }))
 }
 
-/// Phase 2: Reveal and execute the spend
 pub async fn send_transaction(
     State(node): State<AppState>,
     Json(req): Json<SendTransactionRequest>,
@@ -188,7 +186,5 @@ pub async fn generate_key() -> Json<GenerateKeyResponse> {
 
 pub async fn get_peers(State(node): State<AppState>) -> Json<GetPeersResponse> {
     let peers = node.get_peers().await;
-    Json(GetPeersResponse {
-        peers: peers.iter().map(|p| p.to_string()).collect(),
-    })
+    Json(GetPeersResponse { peers })
 }
