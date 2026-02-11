@@ -1,103 +1,93 @@
-# Midstate: Complete Sequential-Time Cryptocurrency
+# Midstate
 
-A production-ready implementation of the Midstate protocol with full P2P networking, RPC API, metrics, and persistence.
+A minimal, post-quantum sequential-time cryptocurrency written in Rust.
 
 ## Features
+* **Proof of Sequential Work:** Blake3-based sequential work.
+* **Signatures:** Post-quantum WOTS (Winternitz One-Time Signatures) and MSS (Merkle Signature Scheme).
+* **Consensus:** Nakamoto consensus with reorg handling.
+* **Storage:** `redb` database.
+* **Networking:** `libp2p` (noise encryption, yamux).
 
-✅ Pure SHA-256 consensus (quantum-safe)
-✅ Sequential time-based mining
-✅ Bearer asset model (no accounts)
-✅ Complete RPC API
-✅ Full P2P networking with handshakes
-✅ Mempool persistence
-✅ Automatic peer reconnection
-✅ Ping/pong heartbeat
-✅ Metrics and monitoring
-✅ Comprehensive tests
-✅ Multi-node support
+## Build
 
-## Quick Start
-
-### Terminal 1: Mining node
 ```bash
-cargo run --release -- node \
-    --port 9333 \
-    --rpc-port 8545 \
-    --mine \
-    --data-dir ./data1
+cargo build --release
+
 ```
 
-### Terminal 2: Peer node
+## Running a Local Testnet
+
+**Terminal 1: Miner**
+Starts a node, mines blocks, and listens on port 9333.
+
 ```bash
-cargo run --release -- node \
-    --port 9334 \
-    --rpc-port 8546 \
-    --peer 127.0.0.1:9333 \
-    --data-dir ./data2
+./target/release/midstate node --data-dir ./node1 --port 9333 --rpc-port 8545 --mine
+
 ```
 
-### Terminal 3: Another peer
+**Terminal 2: Peer**
+Connects to the miner, syncs the chain, and listens on port 9334.
+
 ```bash
-cargo run --release -- node \
-    --port 9335 \
-    --rpc-port 8547 \
-    --peer 127.0.0.1:9333 \
-    --peer 127.0.0.1:9334 \
-    --data-dir ./data3
+./target/release/midstate node --data-dir ./node2 --port 9334 --rpc-port 8546 --peer 127.0.0.1:9333
+
 ```
 
-## Using the System
+## Wallet Usage
 
-### Generate a keypair
+All wallet commands require a password.
+
+**1. Create a Wallet**
+
 ```bash
-cargo run -- keygen
+./target/release/midstate wallet create --path wallet.dat
+
 ```
 
-### Check state
+**2. Generate Receiving Address**
+
 ```bash
-cargo run -- state --rpc-port 8545
+./target/release/midstate wallet receive --path wallet.dat
+
 ```
 
-### Check mempool
+**3. Check Balance**
+
 ```bash
-cargo run -- mempool --rpc-port 8545
+./target/release/midstate wallet list --path wallet.dat --rpc-port 8545
+
 ```
 
-### Check if a coin exists
+**4. Send Coins**
+Send amount `4` to an address.
+
 ```bash
-cargo run -- balance --coin <COIN_HEX> --rpc-port 8545
+./target/release/midstate wallet send --path wallet.dat --rpc-port 8545 --to <ADDRESS_HEX>:4
+
 ```
 
-### Send a transaction
+**5. Receive Incoming Coins**
+The wallet does not auto-scan. If you are expecting funds, you must scan the node's database.
+
 ```bash
-# Genesis secrets for testing:
-# genesis_coin_1: 67656e657369735f636f696e5f31
-# genesis_coin_2: 67656e657369735f636f696e5f32
-# genesis_coin_3: 67656e657369735f636f696e5f33
+# Stop the node first to release the DB lock
+./target/release/midstate wallet scan --path wallet.dat --node-data-dir ./node1
 
-# Generate destination
-cargo run -- keygen
-
-# Send
-cargo run -- send \
-    --secret 67656e657369735f636f696e5f31 \
-    --dest <NEW_COIN_HEX> \
-    --rpc-port 8545
 ```
 
-## Testing
+**6. Import Mining Rewards**
+If you ran with `--mine`, import your coinbase rewards.
+
 ```bash
-cargo test
+./target/release/midstate wallet import-rewards --path wallet.dat --coinbase-file ./node1/coinbase_seeds.jsonl
+
 ```
 
-## Architecture
+## CLI Reference
 
-- **Pure SHA-256** - No elliptic curves, quantum-safe
-- **Sequential mining** - 1M iterations per extension (~1 second)
-- **UTXO model** - No accounts, bearer assets
-- **Difficulty lottery** - Like Bitcoin PoW
-- **Longest depth** - Fork resolution
-
-## License
-
-GNU
+* `node`: Run the full node.
+* `wallet`: Manage keys and transactions.
+* `peers`: List connected peers.
+* `state`: Show chain height and difficulty.
+* `mempool`: Show pending transactions.
