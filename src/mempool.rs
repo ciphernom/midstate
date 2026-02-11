@@ -1,53 +1,24 @@
-use crate::core::{hash, State, Transaction};
+use crate::core::{State, Transaction};
 use crate::core::transaction::validate_transaction;
 use anyhow::Result;
 use std::collections::HashSet;
-use std::path::Path;
 
 pub struct Mempool {
     transactions: Vec<Transaction>,
     seen_inputs: HashSet<[u8; 32]>,
     seen_commitments: HashSet<[u8; 32]>,
-    storage: sled::Db,
 }
 
 impl Mempool {
-    pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
-        let storage = sled::open(db_path)?;
-
-        // Load persisted transactions
-        let mut transactions = Vec::new();
-        let mut seen_inputs = HashSet::new();
-        let mut seen_commitments = HashSet::new();
-
-        for item in storage.iter() {
-            let (_, value) = item?;
-            let tx: Transaction = bincode::deserialize(&value)?;
-            match &tx {
-                Transaction::Commit { commitment } => {
-                    seen_commitments.insert(*commitment);
-                }
-                Transaction::Reveal { .. } => {
-                    for input in tx.input_coins() {
-                        seen_inputs.insert(input);
-                    }
-                }
-            }
-            transactions.push(tx);
+    pub fn new() -> Self {
+        Self {
+            transactions: Vec::new(),
+            seen_inputs: HashSet::new(),
+            seen_commitments: HashSet::new(),
         }
-
-        tracing::info!("Loaded {} transactions from mempool storage", transactions.len());
-
-        Ok(Self {
-            transactions,
-            seen_inputs,
-            seen_commitments,
-            storage,
-        })
     }
 
     pub fn add(&mut self, tx: Transaction, state: &State) -> Result<()> {
-        // Validate against current state
         validate_transaction(state, &tx)?;
 
         match &tx {
@@ -57,7 +28,7 @@ impl Mempool {
                 }
             }
             Transaction::Reveal { .. } => {
-                for input in tx.input_coins() {
+                for input in tx.input_coin_ids() {
                     if self.seen_inputs.contains(&input) {
                         anyhow::bail!("Transaction input already in mempool");
                     }
@@ -65,17 +36,12 @@ impl Mempool {
             }
         }
 
-        // Persist
-        let tx_bytes = bincode::serialize(&tx)?;
-        let tx_hash = hash(&tx_bytes);
-        self.storage.insert(&tx_hash[..], tx_bytes)?;
-
         match &tx {
             Transaction::Commit { commitment } => {
                 self.seen_commitments.insert(*commitment);
             }
             Transaction::Reveal { .. } => {
-                for input in tx.input_coins() {
+                for input in tx.input_coin_ids() {
                     self.seen_inputs.insert(input);
                 }
             }
@@ -87,8 +53,6 @@ impl Mempool {
         Ok(())
     }
 
-    /// Re-add transactions that were drained but whose block was not applied
-    /// (e.g. stale mining result). Only re-adds those still valid against current state.
     pub fn re_add(&mut self, txs: Vec<Transaction>, state: &State) {
         let mut restored = 0usize;
         for tx in txs {
@@ -99,17 +63,11 @@ impl Mempool {
             let dominated = match &tx {
                 Transaction::Commit { commitment } => self.seen_commitments.contains(commitment),
                 Transaction::Reveal { .. } => {
-                    tx.input_coins().iter().any(|i| self.seen_inputs.contains(i))
+                    tx.input_coin_ids().iter().any(|i| self.seen_inputs.contains(i))
                 }
             };
             if dominated {
                 continue;
-            }
-
-            // Re-persist
-            if let Ok(tx_bytes) = bincode::serialize(&tx) {
-                let tx_hash = hash(&tx_bytes);
-                let _ = self.storage.insert(&tx_hash[..], tx_bytes);
             }
 
             match &tx {
@@ -117,7 +75,7 @@ impl Mempool {
                     self.seen_commitments.insert(*commitment);
                 }
                 Transaction::Reveal { .. } => {
-                    for input in tx.input_coins() {
+                    for input in tx.input_coin_ids() {
                         self.seen_inputs.insert(input);
                     }
                 }
@@ -135,21 +93,17 @@ impl Mempool {
         let count = max.min(self.transactions.len());
         let drained: Vec<_> = self.transactions.drain(..count).collect();
 
-        // Remove from storage and tracking
         for tx in &drained {
             match tx {
                 Transaction::Commit { commitment } => {
                     self.seen_commitments.remove(commitment);
                 }
                 Transaction::Reveal { .. } => {
-                    for input in tx.input_coins() {
+                    for input in tx.input_coin_ids() {
                         self.seen_inputs.remove(&input);
                     }
                 }
             }
-            let tx_bytes = bincode::serialize(tx).unwrap();
-            let tx_hash = hash(&tx_bytes);
-            let _ = self.storage.remove(&tx_hash[..]);
         }
 
         drained
@@ -163,7 +117,6 @@ impl Mempool {
         &self.transactions
     }
 
-    /// Remove transactions that conflict with current state
     pub fn prune_invalid(&mut self, state: &State) {
         let mut inputs_to_remove = Vec::new();
         let mut commitments_to_remove = Vec::new();
@@ -175,7 +128,7 @@ impl Mempool {
                         commitments_to_remove.push(*commitment);
                     }
                     Transaction::Reveal { .. } => {
-                        inputs_to_remove.extend(tx.input_coins());
+                        inputs_to_remove.extend(tx.input_coin_ids());
                     }
                 }
             }
@@ -194,7 +147,7 @@ impl Mempool {
                         commitments_to_remove.contains(commitment)
                     }
                     Transaction::Reveal { .. } => {
-                        let inputs = tx.input_coins();
+                        let inputs = tx.input_coin_ids();
                         inputs.iter().any(|input| inputs_to_remove.contains(input))
                     }
                 };
@@ -205,14 +158,11 @@ impl Mempool {
                             self.seen_commitments.remove(commitment);
                         }
                         Transaction::Reveal { .. } => {
-                            for input in tx.input_coins() {
+                            for input in tx.input_coin_ids() {
                                 self.seen_inputs.remove(&input);
                             }
                         }
                     }
-                    let tx_bytes = bincode::serialize(tx).unwrap();
-                    let tx_hash = hash(&tx_bytes);
-                    let _ = self.storage.remove(&tx_hash[..]);
                     false
                 } else {
                     true
