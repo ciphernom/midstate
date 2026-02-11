@@ -72,8 +72,69 @@ pub fn current_timestamp() -> u64 {
         .as_secs()
 }
 
+/// Validate a block's timestamp against the chain.
+/// Returns an error if the timestamp is invalid.
+pub fn validate_timestamp(
+    new_timestamp: u64,
+    previous_states: &[State],
+    current_time: u64,
+) -> Result<()> {
+    // Rule 1: Block timestamp must not be more than 2 hours in the future
+    const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60; // 2 hours
+    
+    if new_timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
+        bail!(
+            "Block timestamp too far in future: {} > {} (max future: {}s)",
+            new_timestamp,
+            current_time,
+            MAX_FUTURE_BLOCK_TIME
+        );
+    }
+
+    // Rule 2: Block timestamp must be greater than median of last 11 blocks
+    if previous_states.len() >= 11 {
+        let mut recent_timestamps: Vec<u64> = previous_states
+            .iter()
+            .rev()
+            .take(11)
+            .map(|s| s.timestamp)
+            .collect();
+        
+        recent_timestamps.sort_unstable();
+        let median = recent_timestamps[5]; // Middle of 11 elements
+        
+        if new_timestamp <= median {
+            bail!(
+                "Block timestamp {} must be greater than median of last 11 blocks ({})",
+                new_timestamp,
+                median
+            );
+        }
+    } else if let Some(last_state) = previous_states.last() {
+        // If we don't have 11 blocks yet, just check it's after the previous block
+        if new_timestamp <= last_state.timestamp {
+            bail!(
+                "Block timestamp {} must be greater than previous block timestamp {}",
+                new_timestamp,
+                last_state.timestamp
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Apply a batch to the state
 pub fn apply_batch(state: &mut State, batch: &Batch) -> Result<()> {
+    // 1. Check parent linkage immediately
+    if batch.prev_midstate != state.midstate {
+        // This specific error string can be caught by the node to trigger orphan logic
+        bail!("Block parent mismatch: expected {}, got {}", 
+              hex::encode(state.midstate), 
+              hex::encode(batch.prev_midstate));
+    }
+       
+    
     // Apply transactions and tally fees
     let mut total_fees: u64 = 0;
     for tx in &batch.transactions {
@@ -95,7 +156,8 @@ pub fn apply_batch(state: &mut State, batch: &Batch) -> Result<()> {
     }
 
     // Verify extension against the FUTURE midstate
-    verify_extension(future_midstate, &batch.extension, &state.target)?;
+    verify_extension(future_midstate, &batch.extension, &batch.target)?;
+    
 
     // NOW add coinbase coins
     for coin in &batch.coinbase {
@@ -109,7 +171,9 @@ pub fn apply_batch(state: &mut State, batch: &Batch) -> Result<()> {
     state.midstate = batch.extension.final_hash;
     state.depth += EXTENSION_ITERATIONS;
     state.height += 1;
-    state.timestamp = current_timestamp();
+    
+    // Use the timestamp from the batch (set by miner)
+    state.timestamp = batch.timestamp;
 
     Ok(())
 }
