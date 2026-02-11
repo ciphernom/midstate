@@ -42,7 +42,7 @@ impl Syncer {
             }).await?;
             
             match peer.receive_message().await? {
-                Message::Batches(batches) => {
+                Message::Batches { batches, .. } => {
                     // Save batches
                     for (i, batch) in batches.iter().enumerate() {
                         let height = current + i as u64;
@@ -115,7 +115,7 @@ impl Syncer {
         }).await?;
         
         match peer.receive_message().await? {
-            Message::Batches(batches) => {
+            Message::Batches { batches, .. } => {
                 for batch in batches {
                     apply_batch(&mut state, &batch)?;
                     self.storage.save_batch(state.height, &batch)?;
