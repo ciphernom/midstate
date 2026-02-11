@@ -3,10 +3,14 @@ pub use batch_store::BatchStore;
 
 use crate::core::State;
 use anyhow::Result;
+use redb::{Database, TableDefinition};
 use std::path::Path;
 
+const STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
+const MINING_SEED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("mining_seed");
+
 pub struct Storage {
-    db: sled::Db,
+    db: Database,
     batches: BatchStore,
 }
 
@@ -15,7 +19,16 @@ impl Storage {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
 
-        let db = sled::open(path.join("state"))?;
+        let db = Database::create(path.join("state.redb"))?;
+
+        // Initialize tables
+        let write_txn = db.begin_write()?;
+        {
+            let _ = write_txn.open_table(STATE_TABLE)?;
+            let _ = write_txn.open_table(MINING_SEED_TABLE)?;
+        }
+        write_txn.commit()?;
+
         let batches = BatchStore::new(path.join("batches"))?;
 
         Ok(Self { db, batches })
@@ -23,15 +36,21 @@ impl Storage {
 
     pub fn save_state(&self, state: &State) -> Result<()> {
         let bytes = bincode::serialize(state)?;
-        self.db.insert(b"state", bytes)?;
-        self.db.flush()?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(STATE_TABLE)?;
+            table.insert("current", bytes.as_slice())?;
+        }
+        write_txn.commit()?;
         Ok(())
     }
 
     pub fn load_state(&self) -> Result<Option<State>> {
-        match self.db.get(b"state")? {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(STATE_TABLE)?;
+        match table.get("current")? {
             Some(bytes) => {
-                let state = bincode::deserialize(&bytes)?;
+                let state = bincode::deserialize(bytes.value())?;
                 Ok(Some(state))
             }
             None => Ok(None),
@@ -39,18 +58,25 @@ impl Storage {
     }
 
     pub fn save_mining_seed(&self, seed: &[u8; 32]) -> Result<()> {
-        self.db.insert(b"mining_seed", seed.as_slice())?;
-        self.db.flush()?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(MINING_SEED_TABLE)?;
+            table.insert("seed", seed.as_slice())?;
+        }
+        write_txn.commit()?;
         Ok(())
     }
 
     pub fn load_mining_seed(&self) -> Result<Option<[u8; 32]>> {
-        match self.db.get(b"mining_seed")? {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(MINING_SEED_TABLE)?;
+        match table.get("seed")? {
             Some(bytes) => {
-                if bytes.len() != 32 {
+                let val = bytes.value();
+                if val.len() != 32 {
                     anyhow::bail!("corrupt mining seed");
                 }
-                Ok(Some(<[u8; 32]>::try_from(bytes.as_ref()).unwrap()))
+                Ok(Some(<[u8; 32]>::try_from(val).unwrap()))
             }
             None => Ok(None),
         }
@@ -64,7 +90,7 @@ impl Storage {
         self.batches.load(height)
     }
 
-    pub fn load_batches(&self, start: u64, end: u64) -> Result<Vec<crate::core::Batch>> {
+    pub fn load_batches(&self, start: u64, end: u64) -> Result<Vec<(u64, crate::core::Batch)>> {
         self.batches.load_range(start, end)
     }
 

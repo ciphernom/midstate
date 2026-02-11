@@ -1,7 +1,6 @@
 pub mod crypto;
 
-use crate::core::{hash_concat, compute_commitment, wots};
-// [MSS-ENABLE] Import MSS modules
+use crate::core::{hash_concat, compute_commitment, compute_coin_id, decompose_value, wots, OutputData, InputReveal};
 use crate::core::mss::{self, MssKeypair};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -21,11 +20,22 @@ pub fn short_hex(bytes: &[u8; 32]) -> String {
     format!("{}…{}", &h[..8], &h[60..])
 }
 
-/// A coin the wallet controls (WOTS Legacy).
+/// A receiving key (seed + public key). No value assigned yet.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WalletKey {
+    pub seed: [u8; 32],
+    pub owner_pk: [u8; 32],
+    pub label: Option<String>,
+}
+
+/// A coin the wallet controls, with known value.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WalletCoin {
     pub seed: [u8; 32],
-    pub coin: [u8; 32],
+    pub owner_pk: [u8; 32],
+    pub value: u64,
+    pub salt: [u8; 32],
+    pub coin_id: [u8; 32],
     pub label: Option<String>,
 }
 
@@ -34,9 +44,11 @@ pub struct WalletCoin {
 pub struct PendingCommit {
     pub commitment: [u8; 32],
     pub salt: [u8; 32],
-    // [MSS-ENABLE] Removed 'input_seeds'. We look up keys at sign time.
     pub input_coin_ids: Vec<[u8; 32]>,
-    pub destinations: Vec<[u8; 32]>,
+    /// Full output data needed for the reveal transaction.
+    pub outputs: Vec<OutputData>,
+    /// (output_index, wots_seed) for change outputs we control.
+    pub change_seeds: Vec<(usize, [u8; 32])>,
     pub created_at: u64,
     #[serde(default)]
     pub reveal_not_before: u64,
@@ -46,15 +58,19 @@ pub struct PendingCommit {
 pub struct HistoryEntry {
     pub inputs: Vec<[u8; 32]>,
     pub outputs: Vec<[u8; 32]>,
+    pub fee: u64,
     pub timestamp: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WalletData {
-    pub coins: Vec<WalletCoin>,
-    // [MSS-ENABLE] Store MSS Trees
+    /// Receiving keys (not yet associated with a value).
     #[serde(default)]
-    pub mss_keys: Vec<MssKeypair>, 
+    pub keys: Vec<WalletKey>,
+    /// Coins with known values that we can spend.
+    pub coins: Vec<WalletCoin>,
+    #[serde(default)]
+    pub mss_keys: Vec<MssKeypair>,
     pub pending: Vec<PendingCommit>,
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
@@ -63,6 +79,7 @@ pub struct WalletData {
 impl WalletData {
     fn empty() -> Self {
         Self {
+            keys: Vec::new(),
             coins: Vec::new(),
             mss_keys: Vec::new(),
             pending: Vec::new(),
@@ -115,85 +132,176 @@ impl Wallet {
         Ok(())
     }
 
-    /// Generate a new random WOTS coin (Legacy).
-    pub fn generate(&mut self, label: Option<String>) -> Result<&WalletCoin> {
-        let seed: [u8; 32] = rand::random();
-        let coin = wots::keygen(&seed);
+    // ── Key generation ──────────────────────────────────────────────────────
 
-        self.data.coins.push(WalletCoin { seed, coin, label });
+    /// Generate a new receiving key. Returns the owner_pk to share with the sender.
+    pub fn generate_key(&mut self, label: Option<String>) -> Result<[u8; 32]> {
+        let seed: [u8; 32] = rand::random();
+        let owner_pk = wots::keygen(&seed);
+        self.data.keys.push(WalletKey { seed, owner_pk, label });
         self.save()?;
-        Ok(self.data.coins.last().unwrap())
+        Ok(owner_pk)
     }
 
-    /// [MSS-ENABLE] Generate a new MSS Tree (Reusable Address).
+    /// Generate a new MSS tree (reusable address).
     pub fn generate_mss(&mut self, height: u32, _label: Option<String>) -> Result<[u8; 32]> {
         let seed: [u8; 32] = rand::random();
-        // Generate the full tree (this may take seconds for height > 14)
         let keypair = mss::keygen(&seed, height)?;
         let root = keypair.master_pk;
-        
         self.data.mss_keys.push(keypair);
         self.save()?;
         Ok(root)
     }
 
-    pub fn import_seed(&mut self, seed: [u8; 32], label: Option<String>) -> Result<[u8; 32]> {
-        let coin = wots::keygen(&seed);
-        if self.data.coins.iter().any(|c| c.coin == coin) {
+    // ── Coin management ─────────────────────────────────────────────────────
+
+    /// Import a coin with known seed, value, and salt.
+    pub fn import_coin(
+        &mut self,
+        seed: [u8; 32],
+        value: u64,
+        salt: [u8; 32],
+        label: Option<String>,
+    ) -> Result<[u8; 32]> {
+        let owner_pk = wots::keygen(&seed);
+        let coin_id = compute_coin_id(&owner_pk, value, &salt);
+        if self.data.coins.iter().any(|c| c.coin_id == coin_id) {
             bail!("coin already in wallet");
         }
-        self.data.coins.push(WalletCoin { seed, coin, label });
+        self.data.coins.push(WalletCoin {
+            seed, owner_pk, value, salt, coin_id, label,
+        });
+        // Remove matching key from unused keys if present
+        self.data.keys.retain(|k| k.owner_pk != owner_pk);
         self.save()?;
-        Ok(coin)
+        Ok(coin_id)
     }
 
-    pub fn find_coin(&self, coin: &[u8; 32]) -> Option<&WalletCoin> {
-        self.data.coins.iter().find(|c| &c.coin == coin)
+    /// Find a coin by coin_id.
+    pub fn find_coin(&self, coin_id: &[u8; 32]) -> Option<&WalletCoin> {
+        self.data.coins.iter().find(|c| &c.coin_id == coin_id)
     }
 
-    // [MSS-ENABLE] Find an MSS key by its root (coin ID)
-    pub fn find_mss(&self, coin: &[u8; 32]) -> Option<&MssKeypair> {
-        self.data.mss_keys.iter().find(|k| &k.master_pk == coin)
+    /// Find an MSS key by master_pk.
+    pub fn find_mss(&self, pk: &[u8; 32]) -> Option<&MssKeypair> {
+        self.data.mss_keys.iter().find(|k| &k.master_pk == pk)
     }
 
+    /// Resolve a coin reference (index, hex prefix, or full hex).
     pub fn resolve_coin(&self, reference: &str) -> Result<[u8; 32]> {
         if let Ok(idx) = reference.parse::<usize>() {
             if idx < self.data.coins.len() {
-                return Ok(self.data.coins[idx].coin);
+                return Ok(self.data.coins[idx].coin_id);
             }
         }
         let reference_lower = reference.to_lowercase();
-        
-        // Search WOTS coins
         for c in &self.data.coins {
-            if hex::encode(c.coin).starts_with(&reference_lower) {
-                return Ok(c.coin);
-            }
-        }
-        // Search MSS keys
-        for k in &self.data.mss_keys {
-            if hex::encode(k.master_pk).starts_with(&reference_lower) {
-                return Ok(k.master_pk);
+            if hex::encode(c.coin_id).starts_with(&reference_lower) {
+                return Ok(c.coin_id);
             }
         }
         bail!("no matching coin found");
     }
 
+    pub fn coins(&self) -> &[WalletCoin] {
+        &self.data.coins
+    }
+
+    pub fn keys(&self) -> &[WalletKey] {
+        &self.data.keys
+    }
+
+    pub fn mss_keys(&self) -> &[MssKeypair] {
+        &self.data.mss_keys
+    }
+
+    pub fn coin_count(&self) -> usize {
+        self.data.coins.len()
+    }
+
+    pub fn total_value(&self) -> u64 {
+        self.data.coins.iter().map(|c| c.value).sum()
+    }
+
+    // ── Transaction building ────────────────────────────────────────────────
+
+    /// Select coins whose total value >= needed. Returns selected coin_ids.
+    pub fn select_coins(&self, needed: u64, live_coins: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
+        let mut selected = Vec::new();
+        let mut total = 0u64;
+        // Sort by value descending to minimize number of inputs
+        let mut available: Vec<&WalletCoin> = self.data.coins.iter()
+            .filter(|c| live_coins.contains(&c.coin_id))
+            .collect();
+        available.sort_by(|a, b| b.value.cmp(&a.value));
+
+        for coin in available {
+            if total >= needed { break; }
+            selected.push(coin.coin_id);
+            total += coin.value;
+        }
+
+        if total < needed {
+            bail!("insufficient funds: have {}, need {}", total, needed);
+        }
+        Ok(selected)
+    }
+
+    /// Build outputs for a send: recipient outputs + change outputs.
+    /// Returns (all_outputs, change_seeds).
+    pub fn build_outputs(
+        &mut self,
+        recipient_pk: &[u8; 32],
+        recipient_denominations: &[u64],
+        change_value: u64,
+    ) -> Result<(Vec<OutputData>, Vec<(usize, [u8; 32])>)> {
+        let mut outputs = Vec::new();
+        let mut change_seeds = Vec::new();
+
+        // Recipient outputs
+        for &denom in recipient_denominations {
+            let salt: [u8; 32] = rand::random();
+            outputs.push(OutputData {
+                owner_pk: *recipient_pk,
+                value: denom,
+                salt,
+            });
+        }
+
+        // Change outputs (decompose into power-of-2 denominations to self)
+        if change_value > 0 {
+            let change_denoms = decompose_value(change_value);
+            for denom in change_denoms {
+                let seed: [u8; 32] = rand::random();
+                let owner_pk = wots::keygen(&seed);
+                let salt: [u8; 32] = rand::random();
+                let idx = outputs.len();
+                outputs.push(OutputData { owner_pk, value: denom, salt });
+                change_seeds.push((idx, seed));
+            }
+        }
+
+        Ok((outputs, change_seeds))
+    }
+
+    /// Prepare a commit for given inputs and outputs.
     pub fn prepare_commit(
         &mut self,
         input_coin_ids: &[[u8; 32]],
-        destinations: &[[u8; 32]],
+        outputs: &[OutputData],
+        change_seeds: Vec<(usize, [u8; 32])>,
         privacy_delay: bool,
     ) -> Result<([u8; 32], [u8; 32])> {
-        // [MSS-ENABLE] Verify we own all inputs (WOTS or MSS)
+        // Verify we own all inputs
         for coin_id in input_coin_ids {
-            if self.find_coin(coin_id).is_none() && self.find_mss(coin_id).is_none() {
+            if self.find_coin(coin_id).is_none() {
                 bail!("coin {} not in wallet", short_hex(coin_id));
             }
         }
 
+        let output_coin_ids: Vec<[u8; 32]> = outputs.iter().map(|o| o.coin_id()).collect();
         let salt: [u8; 32] = rand::random();
-        let commitment = compute_commitment(input_coin_ids, destinations, &salt);
+        let commitment = compute_commitment(input_coin_ids, &output_coin_ids, &salt);
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -210,7 +318,8 @@ impl Wallet {
             commitment,
             salt,
             input_coin_ids: input_coin_ids.to_vec(),
-            destinations: destinations.to_vec(),
+            outputs: outputs.to_vec(),
+            change_seeds,
             created_at: now,
             reveal_not_before,
         });
@@ -219,42 +328,54 @@ impl Wallet {
         Ok((commitment, salt))
     }
 
-    /// [MSS-ENABLE] Sign a reveal. Now requires &mut self to update MSS state.
-    pub fn sign_reveal(&mut self, pending: &PendingCommit) -> Result<Vec<Vec<u8>>> {
+    /// Build InputReveals and signatures for a pending commit.
+    pub fn sign_reveal(&mut self, pending: &PendingCommit) -> Result<(Vec<InputReveal>, Vec<Vec<u8>>)> {
+        let output_coin_ids: Vec<[u8; 32]> = pending.outputs.iter().map(|o| o.coin_id()).collect();
         let commitment = compute_commitment(
             &pending.input_coin_ids,
-            &pending.destinations,
+            &output_coin_ids,
             &pending.salt,
         );
-        
+
+        let mut input_reveals = Vec::new();
         let mut signatures = Vec::new();
 
         for coin_id in &pending.input_coin_ids {
-            // 1. Try WOTS
-            if let Some(wc) = self.find_coin(coin_id) {
+            // Try WOTS coin
+            if let Some(wc) = self.find_coin(coin_id).cloned() {
+                input_reveals.push(InputReveal {
+                    owner_pk: wc.owner_pk,
+                    value: wc.value,
+                    salt: wc.salt,
+                });
                 let sig = wots::sign(&wc.seed, &commitment);
                 signatures.push(wots::sig_to_bytes(&sig));
-            } 
-            // 2. Try MSS
-            else if let Some(pos) = self.data.mss_keys.iter().position(|k| k.master_pk == *coin_id) {
-                // We need mutable access to increment the leaf index
-                let keypair = &mut self.data.mss_keys[pos];
-                
-                if keypair.remaining() == 0 {
-                    bail!("MSS key {} exhausted", short_hex(coin_id));
+            }
+            // Try MSS key (coin's owner_pk matches an MSS master_pk)
+            else if let Some(wc) = self.data.coins.iter().find(|c| &c.coin_id == coin_id) {
+                // Found the coin data, but the seed might be for an MSS key
+                if let Some(pos) = self.data.mss_keys.iter().position(|k| k.master_pk == wc.owner_pk) {
+                    input_reveals.push(InputReveal {
+                        owner_pk: wc.owner_pk,
+                        value: wc.value,
+                        salt: wc.salt,
+                    });
+                    let keypair = &mut self.data.mss_keys[pos];
+                    if keypair.remaining() == 0 {
+                        bail!("MSS key {} exhausted", short_hex(&wc.owner_pk));
+                    }
+                    let sig = keypair.sign(&commitment)?;
+                    signatures.push(sig.to_bytes());
+                } else {
+                    bail!("key for {} not found", short_hex(coin_id));
                 }
-                
-                // Sign and advance state
-                let sig = keypair.sign(&commitment)?;
-                signatures.push(sig.to_bytes());
             } else {
-                bail!("key for {} not found during signing", short_hex(coin_id));
+                bail!("coin {} not found in wallet", short_hex(coin_id));
             }
         }
 
-        // Save wallet because MSS indices might have incremented
         self.save()?;
-        Ok(signatures)
+        Ok((input_reveals, signatures))
     }
 
     pub fn find_pending(&self, commitment: &[u8; 32]) -> Option<&PendingCommit> {
@@ -265,23 +386,41 @@ impl Wallet {
         &self.data.pending
     }
 
+    /// Complete a reveal: remove spent coins, add change coins.
     pub fn complete_reveal(&mut self, commitment: &[u8; 32]) -> Result<()> {
-        let pending = self
-            .data
-            .pending
-            .iter()
+        let pending = self.data.pending.iter()
             .find(|p| &p.commitment == commitment)
             .ok_or_else(|| anyhow::anyhow!("pending commit not found"))?
             .clone();
 
-        let spent_coins = pending.input_coin_ids.clone();
-        
-        // Remove spent WOTS coins
-        self.data.coins.retain(|c| !spent_coins.contains(&c.coin));
-        
-        // [MSS-ENABLE] Do NOT remove MSS keys. They are reusable (until exhausted).
-        // However, if an MSS key is fully exhausted, you *could* remove it, 
-        // but it's safer to keep it for history/verification.
+        let spent_coin_ids = pending.input_coin_ids.clone();
+        let fee: u64 = {
+            let in_sum: u64 = spent_coin_ids.iter()
+                .filter_map(|id| self.find_coin(id))
+                .map(|c| c.value)
+                .sum();
+            let out_sum: u64 = pending.outputs.iter().map(|o| o.value).sum();
+            in_sum.saturating_sub(out_sum)
+        };
+
+        // Remove spent coins
+        self.data.coins.retain(|c| !spent_coin_ids.contains(&c.coin_id));
+
+        // Add change coins
+        for (idx, seed) in &pending.change_seeds {
+            let out = &pending.outputs[*idx];
+            let coin_id = out.coin_id();
+            if !self.data.coins.iter().any(|c| c.coin_id == coin_id) {
+                self.data.coins.push(WalletCoin {
+                    seed: *seed,
+                    owner_pk: out.owner_pk,
+                    value: out.value,
+                    salt: out.salt,
+                    coin_id,
+                    label: Some(format!("change ({})", out.value)),
+                });
+            }
+        }
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -289,8 +428,9 @@ impl Wallet {
             .as_secs();
 
         self.data.history.push(HistoryEntry {
-            inputs: spent_coins,
-            outputs: pending.destinations.clone(),
+            inputs: spent_coin_ids,
+            outputs: pending.outputs.iter().map(|o| o.coin_id()).collect(),
+            fee,
             timestamp: now,
         });
 
@@ -303,42 +443,78 @@ impl Wallet {
         &self.data.history
     }
 
-    pub fn coin_count(&self) -> usize {
-        self.data.coins.len() + self.data.mss_keys.len()
-    }
-
-    pub fn coins(&self) -> &[WalletCoin] {
-        &self.data.coins
-    }
-    
-    // [MSS-ENABLE]
-    pub fn mss_keys(&self) -> &[MssKeypair] {
-        &self.data.mss_keys
-    }
-
+    /// Plan a private send: split into independent 2-in-1-out pairs.
     pub fn plan_private_send(
         &self,
         live_coins: &[[u8; 32]],
-        destinations: &[[u8; 32]],
-    ) -> Result<Vec<(Vec<[u8; 32]>, Vec<[u8; 32]>)>> {
-        let needed = destinations.len() * 2; 
-        if live_coins.len() < needed {
-            bail!("private send needs {} live coins", needed);
+        recipient_pk: &[u8; 32],
+        denominations: &[u64],
+    ) -> Result<Vec<(Vec<[u8; 32]>, Vec<OutputData>, Vec<(usize, [u8; 32])>)>> {
+        // Each denomination gets its own independent transaction.
+        // Each tx: 1+ inputs → 1 recipient output + change outputs.
+        // Inputs must sum to > denomination.
+        let mut used = std::collections::HashSet::new();
+        let mut pairs = Vec::new();
+
+        for &denom in denominations {
+            // Find inputs covering denom + 1 (minimum fee)
+            let needed = denom + 1;
+            let mut selected = Vec::new();
+            let mut total = 0u64;
+
+            let mut available: Vec<&WalletCoin> = self.data.coins.iter()
+                .filter(|c| live_coins.contains(&c.coin_id) && !used.contains(&c.coin_id))
+                .collect();
+            available.sort_by(|a, b| b.value.cmp(&a.value));
+
+            for coin in available {
+                if total >= needed { break; }
+                selected.push(coin.coin_id);
+                used.insert(coin.coin_id);
+                total += coin.value;
+            }
+
+            if total < needed {
+                bail!("insufficient funds for private send denomination {}", denom);
+            }
+
+            let change = total - denom - 1; // fee = 1
+            let salt: [u8; 32] = rand::random();
+            let mut outputs = vec![OutputData {
+                owner_pk: *recipient_pk,
+                value: denom,
+                salt,
+            }];
+            let mut change_seeds = Vec::new();
+
+            if change > 0 {
+                for cd in decompose_value(change) {
+                    let seed: [u8; 32] = rand::random();
+                    let pk = wots::keygen(&seed);
+                    let cs: [u8; 32] = rand::random();
+                    let idx = outputs.len();
+                    outputs.push(OutputData { owner_pk: pk, value: cd, salt: cs });
+                    change_seeds.push((idx, seed));
+                }
+            }
+
+            pairs.push((selected, outputs, change_seeds));
         }
 
-        let mut pairs = Vec::with_capacity(destinations.len());
-        for (i, dest) in destinations.iter().enumerate() {
-            let inputs = vec![live_coins[i * 2], live_coins[i * 2 + 1]];
-            let outputs = vec![*dest];
-            pairs.push((inputs, outputs));
-        }
         Ok(pairs)
     }
 }
 
+/// Deterministic coinbase seed derivation.
 pub fn coinbase_seed(mining_seed: &[u8; 32], height: u64, index: u64) -> [u8; 32] {
     let height_key = hash_concat(mining_seed, &height.to_le_bytes());
     hash_concat(&height_key, &index.to_le_bytes())
+}
+
+/// Deterministic coinbase salt derivation (different domain from seed).
+pub fn coinbase_salt(mining_seed: &[u8; 32], height: u64, index: u64) -> [u8; 32] {
+    let height_key = hash_concat(mining_seed, &height.to_le_bytes());
+    hash_concat(&height_key, &(index | 0x8000000000000000).to_le_bytes())
 }
 
 #[cfg(test)]
@@ -353,55 +529,40 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         let mut w = Wallet::create(&path, b"pass").unwrap();
-        w.generate(Some("test".into())).unwrap();
-        assert_eq!(w.coin_count(), 1);
+        let pk = w.generate_key(Some("test".into())).unwrap();
+        assert_eq!(w.keys().len(), 1);
+        assert_eq!(w.keys()[0].owner_pk, pk);
 
         let w2 = Wallet::open(&path, b"pass").unwrap();
-        assert_eq!(w2.coin_count(), 1);
-        assert_eq!(w2.coins()[0].label.as_deref(), Some("test"));
+        assert_eq!(w2.keys().len(), 1);
     }
 
     #[test]
-    fn commit_reveal_records_history() {
+    fn import_coin_and_find() {
         let file = NamedTempFile::new().unwrap();
         let path = file.path().to_path_buf();
         std::fs::remove_file(&path).unwrap();
 
         let mut w = Wallet::create(&path, b"pass").unwrap();
-        let coin_id = {
-            let wc = w.generate(None).unwrap();
-            wc.coin
-        };
-        // Need 2 inputs for fee (inputs > outputs)
-        let coin_id2 = {
-            let wc = w.generate(None).unwrap();
-            wc.coin
-        };
+        let seed: [u8; 32] = [0x42; 32];
+        let salt: [u8; 32] = [0x11; 32];
+        let coin_id = w.import_coin(seed, 16, salt, Some("test coin".into())).unwrap();
 
-        let dest: [u8; 32] = wots::keygen(&rand::random());
-        let (commitment, _salt) = w.prepare_commit(&[coin_id, coin_id2], &[dest], false).unwrap();
-
-        assert_eq!(w.pending().len(), 1);
-
-        w.complete_reveal(&commitment).unwrap();
-
-        assert_eq!(w.pending().len(), 0);
-        assert_eq!(w.coin_count(), 0);
-        assert_eq!(w.history().len(), 1);
+        assert_eq!(w.coin_count(), 1);
+        let found = w.find_coin(&coin_id).unwrap();
+        assert_eq!(found.value, 16);
     }
 
     #[test]
-    fn resolve_by_index() {
+    fn total_value() {
         let file = NamedTempFile::new().unwrap();
         let path = file.path().to_path_buf();
         std::fs::remove_file(&path).unwrap();
 
         let mut w = Wallet::create(&path, b"pass").unwrap();
-        let c0 = w.generate(None).unwrap().coin;
-        let c1 = w.generate(None).unwrap().coin;
-
-        assert_eq!(w.resolve_coin("0").unwrap(), c0);
-        assert_eq!(w.resolve_coin("1").unwrap(), c1);
+        w.import_coin([1u8; 32], 8, [2u8; 32], None).unwrap();
+        w.import_coin([3u8; 32], 4, [4u8; 32], None).unwrap();
+        assert_eq!(w.total_value(), 12);
     }
 
     #[test]
@@ -409,12 +570,5 @@ mod tests {
         let bytes = [0xab; 32];
         let s = short_hex(&bytes);
         assert_eq!(s, "abababab…abab");
-    }
-
-    #[test]
-    fn backward_compat_no_history() {
-        let data_json = r#"{"coins":[],"pending":[]}"#;
-        let data: WalletData = serde_json::from_str(data_json).unwrap();
-        assert!(data.history.is_empty());
     }
 }
