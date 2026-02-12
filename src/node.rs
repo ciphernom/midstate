@@ -1,12 +1,14 @@
 use crate::core::*;
 use crate::core::state::{apply_batch, choose_best_state};
-use crate::core::extension::mine_extension;
+use crate::core::extension::{mine_extension, create_extension};
+
 use crate::core::transaction::{apply_transaction, validate_transaction};
 use crate::mempool::Mempool;
 use crate::metrics::Metrics;
 use crate::network::{Message, PeerConnection, PeerManager, PeerIndex, MAX_GETBATCHES_COUNT};
 use crate::storage::Storage;
 use crate::wallet::coinbase_seed;
+
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -87,17 +89,56 @@ impl NodeHandle {
 impl Node {
     pub fn new(data_dir: PathBuf, is_mining: bool, our_addr: SocketAddr) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
-
         let storage = Storage::open(data_dir.join("db"))?;
         let state = storage.load_state()?.unwrap_or_else(|| {
             tracing::info!("No saved state, using genesis");
-            State::genesis()
+            State::genesis().0
         });
 
         tracing::info!(
             "Loaded state: height={} depth={} coins={} commitments={}",
             state.height, state.depth, state.coins.len(), state.commitments.len()
         );
+
+        if state.height == 0 {
+            match storage.load_batch(0)? {
+                None => {
+                    tracing::info!("Creating genesis batch (batch_0)");
+                    
+                    let genesis_coins = State::genesis().1;
+                    
+                    // Deterministic mining loop. 
+                    // We verify the PoW requirement, but we start from nonce 0 
+                    // so every node finds the EXACT same valid block.
+                    let mut nonce = 0u64;
+                    let extension = loop {
+                        // create_extension calculates the hash for a specific nonce
+                        let ext = create_extension(state.midstate, nonce);
+                        
+                        // Check if this specific nonce satisfies the target
+                        if ext.final_hash < state.target {
+                            tracing::info!("Found deterministic genesis nonce: {}", nonce);
+                            break ext;
+                        }
+                        nonce += 1;
+                    };
+                    
+                    let genesis_batch = Batch {
+                        prev_midstate: state.midstate,
+                        transactions: vec![],
+                        extension: extension,
+                        coinbase: genesis_coins,
+                        timestamp: state.timestamp,
+                        target: state.target,
+                    };
+                    storage.save_batch(0, &genesis_batch)?;
+                    tracing::info!("Genesis batch saved at height 0");
+                }
+                Some(_) => {
+                    tracing::debug!("Genesis batch already exists");
+                }
+            }
+        }
 
         // Load or generate mining seed
         let mining_seed = match storage.load_mining_seed()? {
@@ -341,29 +382,39 @@ impl Node {
                 };
                 self.peer_manager.send_to(from, &response).await;
             }
-            Message::StateInfo { height, depth, midstate } => {
+           Message::StateInfo { height, depth, midstate } => {
                 tracing::debug!("Peer {} state: height={} depth={}", from, height, depth);
                 
-                // Check if peer has a competing chain with more work
-                if depth > self.state.depth && midstate != self.state.midstate {
-                    tracing::warn!(
-                        "Peer {} has competing chain with more work! depth {} > {} (height {} vs {})",
-                        from, depth, self.state.depth, height, self.state.height
-                    );
-                    
-                    // Find potential fork point (simplified: request from genesis or recent checkpoint)
-                    let fork_start = self.state.height.saturating_sub(self.max_reorg_depth).max(0);
-                    let count = (height - fork_start).min(MAX_GETBATCHES_COUNT);
-                    
-                    tracing::info!("Requesting alternative chain from height {} (count {})", fork_start, count);
-                    self.request_missing_batches(from, height).await;
-                } else if height > self.state.height {
-                    // Normal sync (same chain, we're just behind)
-                    if !self.sync_in_progress {
-                        self.request_missing_batches(from, height).await;
+                if midstate != self.state.midstate {
+                    if self.state.height < 100 {
+                        // We're far behind, request full sync from 0
+                        tracing::warn!("Incompatible chain detected, requesting full sync from genesis");
+                        self.peer_manager.send_to(from, &Message::GetBatches { 
+                            start_height: 0, 
+                            count: height.min(MAX_GETBATCHES_COUNT) 
+                        }).await;
+                    } else if depth > self.state.depth {
+                        // Competing chain - request with overlap to find fork
+                        let rewind = 100.min(self.state.height);
+                        let start = self.state.height.saturating_sub(rewind);
+                        let count = (height - start).min(MAX_GETBATCHES_COUNT);
+                        
+                        self.sync_in_progress = true;
+                        
+                        tracing::warn!(
+                            "Peer {} has competing chain! Requesting {} batches from {} (with overlap)",
+                            from, count, start
+                        );
+                        
+                        self.peer_manager
+                            .send_to(from, &Message::GetBatches { start_height: start, count })
+                            .await;
                     }
+                } else if height > self.state.height {
+                    // Same chain, just behind - normal sync
+                    self.request_missing_batches(from, height).await;
                 } else {
-                    // We're caught up or ahead
+                    // We're up to date
                     self.sync_in_progress = false;
                 }
             }
@@ -389,64 +440,109 @@ impl Node {
                     Err(e) => tracing::warn!("Failed to load batches: {}", e),
                 }
             }
-            Message::Batches(batches) => {
-                // Check if this is a competing chain (fork)
+Message::Batches(batches) => {
                 if !batches.is_empty() {
-                    // Assume batches are sequential starting from some height
-                    // We need to detect if they fork from our current chain
-                    
-                    let first_batch_height = self.state.height; // Simplified: assume they start where we requested
-                    
-                    // If the first batch doesn't apply on our current state, it might be a fork
                     let mut test_state = self.state.clone();
-                    if apply_batch(&mut test_state, &batches[0]).is_err() {
-                        // This might be a fork, evaluate the alternative chain
-                        tracing::info!("Received alternative chain, evaluating for reorg...");
-                        
-                        match self.evaluate_alternative_chain(first_batch_height, &batches, from).await {
-                            Ok(Some((new_state, new_history))) => {
-                                // Perform the reorg!
-                                tracing::warn!(
-                                    "PERFORMING REORG: height {} -> {}, depth {} -> {}",
-                                    self.state.height, new_state.height,
-                                    self.state.depth, new_state.depth
-                                );
-                                
-                                // Replace our state and history
-                                self.state = new_state;
-                                
-                                // Replace recent chain history
-                                let keep_old = self.chain_history.iter()
-                                    .take_while(|(h, _, _)| *h < first_batch_height)
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                
-                                self.chain_history = keep_old;
-                                self.chain_history.extend(new_history);
-                                
-                                // Prune mempool
-                                self.mempool.prune_invalid(&self.state);
-                                
-                                self.metrics.inc_reorgs();
-                                
-                                // Save the new state
-                                self.storage.save_state(&self.state)?;
-                                
-                                return Ok(());
+
+                    // 1. Fast path: Does the first batch extend our tip?
+                    if apply_batch(&mut test_state, &batches[0]).is_ok() {
+                        self.handle_batches_response(batches, from).await?;
+                    } else {
+                        // 2. Overlap Scan: Does ANY batch in the list extend our tip?
+                        // This fixes the "Gap-fill batch failed" error when syncing with overlap.
+                        let mut found_extension = false;
+                        for (i, batch) in batches.iter().enumerate() {
+                            let mut candidate = self.state.clone();
+                            if apply_batch(&mut candidate, batch).is_ok() {
+                                tracing::info!("Found batch extending current chain at index {}", i);
+                                // We found the point where their history meets our tip.
+                                // Apply everything from this point onward.
+                                let valid_batches = batches[i..].to_vec();
+                                self.handle_batches_response(valid_batches, from).await?;
+                                found_extension = true;
+                                break;
                             }
-                            Ok(None) => {
-                                // Alternative chain rejected, fall through to normal handling
-                            }
-                            Err(e) => {
-                                tracing::error!("Error evaluating alternative chain: {}", e);
-                                // Fall through to normal handling
+                        }
+
+                        // 3. Reorg Check: If no linear extension was found, it might be a fork.
+                        if !found_extension {
+                            // This is a competing chain. Assume fork is somewhere in the overlap window.
+                            let fork_height = self.state.height.saturating_sub(20).max(0);
+
+                            tracing::info!(
+                                "Received alternative chain, evaluating from height {}...",
+                                fork_height
+                            );
+
+                            match self.evaluate_alternative_chain(fork_height, &batches, from).await {
+                                Ok(Some((new_state, new_history))) => {
+                                    tracing::warn!(
+                                        "PERFORMING REORG: height {} -> {}, depth {} -> {}",
+                                        self.state.height,
+                                        new_state.height,
+                                        self.state.depth,
+                                        new_state.depth
+                                    );
+
+                                    let fork_height =
+                                        new_history.first().map(|(h, _, _)| *h).unwrap_or(0);
+                                    let abandoned_history: Vec<_> = self
+                                        .chain_history
+                                        .iter()
+                                        .skip_while(|(h, _, _)| *h < fork_height)
+                                        .cloned()
+                                        .collect();
+
+                                    // 2. Replace state and history
+                                    self.state = new_state;
+                                    let keep_old = self
+                                        .chain_history
+                                        .iter()
+                                        .take_while(|(h, _, _)| *h < fork_height)
+                                        .cloned()
+                                        .collect::<Vec<_>>();
+                                    self.chain_history = keep_old;
+                                    self.chain_history.extend(new_history);
+
+                                    // 2b. Rebuild recent_states from the new chain
+                                    self.recent_states.clear();
+                                    let window_start = self.state.height.saturating_sub(
+                                        (DIFFICULTY_ADJUSTMENT_INTERVAL * 2) as u64,
+                                    );
+                                    for h in window_start..self.state.height {
+                                        if let Ok(Some(batch)) = self.storage.load_batch(h) {
+                                            let mut temp_state = if h == 0 {
+                                                 State::genesis().0
+                                            } else {
+                                                self.recent_states
+                                                    .last()
+                                                    .cloned()
+                                                    .unwrap_or(State::genesis().0)
+                                            };
+                                            if apply_batch(&mut temp_state, &batch).is_ok() {
+                                                self.recent_states.push(temp_state);
+                                            }
+                                        }
+                                    }
+                                    self.recent_states.push(self.state.clone());
+
+                                    // 3. Resubmit transactions from abandoned chain
+                                    for (_, _, batch) in abandoned_history {
+                                        self.mempool.re_add(batch.transactions, &self.state);
+                                    }
+
+                                    self.mempool.prune_invalid(&self.state);
+                                    self.metrics.inc_reorgs();
+                                    self.storage.save_state(&self.state)?;
+
+                                    return Ok(());
+                                }
+                                Ok(None) => {} // Not better, ignore
+                                Err(e) => tracing::error!("Error evaluating reorg: {}", e),
                             }
                         }
                     }
                 }
-                
-                // Try normal sequential sync
-                self.handle_batches_response(batches, from).await?;
             }
         }
         Ok(())
@@ -478,25 +574,33 @@ async fn evaluate_alternative_chain(
     
     // Find the fork point in our history
     let fork_state = if fork_height == 0 {
-        State::genesis()
+         State::genesis().0
     } else {
         // Find the state at fork_height - 1
         match self.chain_history.iter().find(|(h, _, _)| *h == fork_height - 1) {
             Some((_, _midstate, _)) => {
-                // Rebuild state at fork point by replaying from genesis
-                // (For now, simplified: just check if we have it in history)
                 if fork_height > self.state.height.saturating_sub(self.max_reorg_depth) {
-                    // We have this in history, need to rebuild state
                     self.rebuild_state_at_height(fork_height - 1)?
                 } else {
-                    // Fork is too deep, reject
                     tracing::warn!("Rejecting reorg: fork at {} is deeper than max_reorg_depth", fork_height);
                     return Ok(None);
                 }
             }
             None => {
-                tracing::warn!("Cannot find fork point at height {}", fork_height);
-                return Ok(None);
+                // PATCH: Fallback to storage if not in memory (e.g. after restart)
+                if fork_height > self.state.height.saturating_sub(self.max_reorg_depth) {
+                    // Try to rebuild from storage. rebuild_state_at_height handles loading batches.
+                    match self.rebuild_state_at_height(fork_height - 1) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            tracing::warn!("Cannot find fork point at height {}", fork_height);
+                            return Ok(None);
+                        }
+                    }
+                } else {
+                    tracing::warn!("Cannot find fork point at height {}", fork_height);
+                    return Ok(None);
+                }
             }
         }
     };
@@ -504,10 +608,57 @@ async fn evaluate_alternative_chain(
     // Try applying the alternative chain
     let mut candidate_state = fork_state;
     let mut new_history = Vec::new();
-    
+    let mut recent_states = Vec::new();
+
+    // Only rebuild recent_states for the window we actually need
+    // We only need DIFFICULTY_ADJUSTMENT_INTERVAL * 2 blocks before fork_height
+    let window_size = (DIFFICULTY_ADJUSTMENT_INTERVAL as usize) * 2;
+    let start_height = fork_height.saturating_sub(window_size as u64);
+
+    for h in start_height..fork_height {
+        if let Some(batch) = self.storage.load_batch(h)? {
+            let mut temp_state = if h == start_height {
+                // For the first block in our window, rebuild its state
+                if start_height == 0 {
+                     State::genesis().0
+                } else {
+                    self.rebuild_state_at_height(start_height)?
+                }
+            } else {
+                recent_states.last().cloned().unwrap()
+            };
+            
+            apply_batch(&mut temp_state, &batch)?;
+            temp_state.target = adjust_difficulty(&temp_state, &recent_states);
+            recent_states.push(temp_state);
+        }
+    }
+
     for (i, batch) in alternative_batches.iter().enumerate() {
+        // Track state before this batch for difficulty
+        recent_states.push(candidate_state.clone());
+        if recent_states.len() > window_size {
+            recent_states.remove(0);
+        }
+        
+        // CRITICAL FIX: The batch's prev_midstate MUST match candidate_state.midstate
+        // We perform this check manually here to provide better error logging
+        if batch.prev_midstate != candidate_state.midstate {
+            tracing::warn!(
+                "Alternative chain broken at batch index {} (height {}). Expected parent {}, got {}", 
+                i, fork_height + i as u64,
+                hex::encode(candidate_state.midstate),
+                hex::encode(batch.prev_midstate)
+            );
+            return Ok(None); // Chain is invalid, discard
+        }       
+        
+        
         match apply_batch(&mut candidate_state, batch) {
             Ok(_) => {
+                // Update difficulty based on alternative chain's history
+                candidate_state.target = adjust_difficulty(&candidate_state, &recent_states);
+                
                 new_history.push((
                     fork_height + i as u64,
                     candidate_state.midstate,
@@ -543,13 +694,20 @@ async fn evaluate_alternative_chain(
 
 /// Rebuild state at a specific height by replaying from genesis or nearest checkpoint
 fn rebuild_state_at_height(&self, target_height: u64) -> Result<State> {
-    let mut state = State::genesis();
+      let mut state = State::genesis().0;
+    let mut recent_states = Vec::new();
     
     // Replay batches from storage up to target_height
     for h in 0..target_height {
         if let Some(batch) = self.storage.load_batch(h)? {
+            // Track recent states for difficulty adjustment
+            recent_states.push(state.clone());
+            if recent_states.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
+                recent_states.remove(0);
+            }
+            
             apply_batch(&mut state, &batch)?;
-            state.target = adjust_difficulty(&state, &self.recent_states);
+            state.target = adjust_difficulty(&state, &recent_states);
         } else {
             anyhow::bail!("Missing batch at height {} needed for reorg", h);
         }
@@ -558,7 +716,7 @@ fn rebuild_state_at_height(&self, target_height: u64) -> Result<State> {
     Ok(state)
 }
 
- async fn handle_new_batch(&mut self, batch: Batch, from: Option<PeerIndex>) -> Result<()> {
+async fn handle_new_batch(&mut self, batch: Batch, from: Option<PeerIndex>) -> Result<()> {
     tracing::warn!("DEBUG: handle_new_batch called, from={:?}, current_height={}", 
         from, self.state.height);
     
@@ -589,14 +747,14 @@ fn rebuild_state_at_height(&self, target_height: u64) -> Result<State> {
                     self.recent_states.remove(0);
                 }
                 self.state = candidate_state;
-                self.storage.save_batch(self.state.height - 1, &batch)?;
+                self.storage.save_batch(self.state.height, &batch)?;
                 self.state.target = adjust_difficulty(&self.state, &self.recent_states);
                 self.metrics.inc_batches_processed();
                 self.mempool.prune_invalid(&self.state);
                 
-                // Store in chain history BEFORE broadcasting (which moves batch)
+                // Store in chain history BEFORE broadcasting
                 self.chain_history.push((
-                    self.state.height - 1, 
+                    self.state.height, 
                     self.state.midstate,
                     batch.clone()
                 ));
@@ -606,8 +764,10 @@ fn rebuild_state_at_height(&self, target_height: u64) -> Result<State> {
                     self.chain_history.remove(0);
                 }
                 
-                // Now broadcast (this moves batch)
+                // Now broadcast
                 self.peer_manager.broadcast_except(from, &Message::Batch(batch)).await;
+                
+                // Try to apply any orphans that might now connect
                 self.try_apply_orphans().await;
                 
             } else {
@@ -616,25 +776,51 @@ fn rebuild_state_at_height(&self, target_height: u64) -> Result<State> {
             Ok(())
         }
         Err(e) => {
-            tracing::error!("DEBUG: Batch apply_batch() failed: {}", e);
+            let err_str = e.to_string();
+            tracing::error!("DEBUG: Batch apply_batch() failed: {}", err_str);
             
-            // Check if this is a future batch (gap in chain)
-            // We detect this by checking if the batch extends beyond our current height
-            // This happens when apply_batch fails because commitments/coins don't exist yet
-            if e.to_string().contains("not found") || e.to_string().contains("No matching commitment") {
-                // Store as orphan for later application
-                let expected_height = self.state.height; // Next batch should be at current height
-                if self.orphan_batches.len() < MAX_ORPHAN_BATCHES {
-                    self.orphan_batches.insert(expected_height + 1, batch);
-                    tracing::info!("Stored orphan batch, total orphans: {}", self.orphan_batches.len());
-                    
-                    // Request missing batches from this peer
-                    if let Some(peer_idx) = from {
-                        self.peer_manager.send_to(peer_idx, &Message::GetState).await;
-                    }
+            // ─── ORPHANAGE SETUP ─────────────────────────────────────────────
+            // If the parent midstate doesn't match, this is a future block or fork.
+            if err_str.contains("Block parent mismatch") || 
+               err_str.contains("not found") || 
+               err_str.contains("No matching commitment") 
+            {
+                tracing::info!("Received orphan/fork block (parent mismatch). Storing for reorg evaluation.");
+
+                // 1. Safety Limit: Don't hoard too many orphans (Limit to ~6 blocks / 1 min)
+                const ORPHAN_LIMIT: usize = 64;
+                if self.orphan_batches.len() >= ORPHAN_LIMIT {
+                    tracing::warn!("Orphan limit reached ({}), clearing buffer to force fresh sync", ORPHAN_LIMIT);
+                    self.orphan_batches.clear();
                 }
-            } else {
-                // Actually invalid batch
+
+                // 2. Store the orphan
+                // Since `Batch` doesn't have an explicit height field, we guess it belongs 
+                // to the next slot. If it's a deep fork, the Sync request below will fix it.
+                let estimated_height = self.state.height + 1;
+                self.orphan_batches.insert(estimated_height, batch);
+                
+                tracing::info!("Stored orphan batch at est. height {}, total orphans: {}", 
+                    estimated_height, self.orphan_batches.len());
+
+                // 3. Trigger Sync/Reorg Evaluation
+                // We ask the peer for their state. If they are ahead or on a fork, 
+                // `handle_message` -> `StateInfo` will trigger `evaluate_alternative_chain`.
+                // Request history overlap directly instead of GetState
+                if let Some(peer_idx) = from {
+                    // Ask for the last 50 blocks to find where we diverged significantly faster
+                    let start_h = self.state.height.saturating_sub(50).max(0);
+                    tracing::info!("Requesting overlap history from peer {} starting at {}", peer_idx, start_h);
+                    
+                    self.peer_manager.send_to(peer_idx, &Message::GetBatches {
+                        start_height: start_h,
+                        count: 100 // Fetch 100 to cover the gap and extend
+                    }).await;
+                }
+            }
+            // ─────────────────────────────────────────────────────────────────
+            else {
+                // Genuine invalid batch (bad signature, bad PoW, etc.)
                 if let Some(peer_idx) = from {
                     self.peer_manager.record_misbehavior(peer_idx, 10);
                 }
@@ -648,16 +834,13 @@ async fn request_missing_batches(&mut self, from: PeerIndex, peer_height: u64) {
     let gap = peer_height - self.state.height;
     if gap == 0 { return; }
     
-    let start = self.state.height;
+    let start = self.state.height+1;  // ← Remove the rewind
     let count = gap.min(MAX_GETBATCHES_COUNT);
     
-    // Don't re-request if we already asked for these batches
     if self.sync_in_progress && start + count <= self.sync_requested_up_to { 
         return; 
     }
     
-    
-    // Set sync flag to block mining
     self.sync_in_progress = true;
     self.sync_requested_up_to = start + count;
     
@@ -670,30 +853,149 @@ async fn request_missing_batches(&mut self, from: PeerIndex, peer_height: u64) {
 }
 
 async fn handle_batches_response(&mut self, batches: Vec<Batch>, from: PeerIndex) -> Result<()> {
-    let mut applied = 0u64;
+    if batches.is_empty() { return Ok(()); }
+
     let batch_count = batches.len();
-    
     tracing::info!("Received {} batch(es) from peer {}", batch_count, from);
+
+    // 1. Fast Path: Does the first batch extend our current tip?
+    let mut test_state = self.state.clone();
+    if apply_batch(&mut test_state, &batches[0]).is_ok() {
+        return self.process_linear_extension(batches, from).await;
+    }
+
+    // 2. Overlap Scan: Does ANY batch in the list extend our tip?
+    for (i, batch) in batches.iter().enumerate() {
+        let mut candidate = self.state.clone();
+        if apply_batch(&mut candidate, batch).is_ok() {
+            tracing::info!("Found linear extension starting at batch index {}", i);
+            return self.process_linear_extension(batches[i..].to_vec(), from).await;
+        }
+    }
+
+    // 3. Reorg Check: Find the Common Ancestor
+    // We cannot guess the fork height. We must find where these batches attach to our history.
     
+    let mut connection_found = false;
+
+    // We scan the incoming batches to see if any of them link to a block we already have.
+    for (i, batch) in batches.iter().enumerate() {
+        let attach_height_opt = if batch.prev_midstate == State::genesis().0.midstate {
+            Some(0) // Connects to genesis
+        } else {
+            // Check if this batch connects to any block in our history
+            self.chain_history.iter()
+                .find(|(_, mid, _)| *mid == batch.prev_midstate)
+                .map(|(h, _, _)| *h)
+        };
+
+        if let Some(attach_height) = attach_height_opt {
+            tracing::info!("Found fork connection point at height {} (batch index {})", attach_height, i);
+            
+            // We found the zipper point! 
+            // Try to evaluate the chain starting from this specific batch.
+            let relevant_batches = &batches[i..];
+            
+            match self.evaluate_alternative_chain(attach_height, relevant_batches, from).await {
+                Ok(Some((new_state, new_history))) => {
+                    tracing::warn!(
+                        "PERFORMING REORG: height {} -> {}, depth {} -> {}",
+                        self.state.height, new_state.height,
+                        self.state.depth, new_state.depth
+                    );
+
+                    let fork_height = new_history.first().map(|(h, _, _)| *h).unwrap_or(0);
+                    
+                    // 1. Recover transactions from abandoned chain
+                    let abandoned_history: Vec<_> = self.chain_history.iter()
+                        .skip_while(|(h, _, _)| *h < fork_height)
+                        .cloned()
+                        .collect();
+
+                    // 2. Rewrite History
+                    self.chain_history.retain(|(h, _, _)| *h < fork_height);
+                    self.chain_history.extend(new_history);
+
+                    // 3. Rebuild Recent States (Critical for difficulty adjustment)
+                    self.recent_states.clear();
+                    let window_start = new_state.height.saturating_sub((DIFFICULTY_ADJUSTMENT_INTERVAL * 2) as u64);
+                    
+                    // Replay history to rebuild recent_states window
+                    // (We can optimize this later, but this ensures correctness)
+                    for h in window_start..new_state.height {
+                        if let Ok(Some(b)) = self.storage.load_batch(h) {
+                            let mut temp_state = if h == 0 { State::genesis().0 } else {
+                                self.recent_states.last().cloned().unwrap_or(State::genesis().0)
+                            };
+                            if apply_batch(&mut temp_state, &b).is_ok() {
+                                self.recent_states.push(temp_state);
+                            }
+                        }
+                    }
+                    self.recent_states.push(new_state.clone());
+
+                    // 4. Update Global State
+                    self.state = new_state;
+                    self.state.target = adjust_difficulty(&self.state, &self.recent_states);
+                    
+                    // 5. Restore Mempool
+                    for (_, _, batch) in abandoned_history {
+                        self.mempool.re_add(batch.transactions, &self.state);
+                    }
+                    self.mempool.prune_invalid(&self.state);
+                    
+                    // 6. Save & Metrics
+                    self.storage.save_state(&self.state)?;
+                    self.metrics.inc_reorgs();
+                    
+                    connection_found = true;
+                    break; // Stop scanning, we successfully reorged
+                }
+                Ok(None) => {
+                    // This specific attachment point didn't result in a better chain.
+                    // Continue scanning in case a later batch attaches to a later point?
+                    // Usually unlikely, but safe to continue.
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to evaluate fork at height {}: {}", attach_height, e);
+                }
+            }
+        }
+    }
+
+    if !connection_found {
+        tracing::debug!("Orphan batch chain received (could not find attachment point in history)");
+        // Optional: Trigger a deeper GetState or just wait
+    }
+
+    Ok(())
+}
+
+// Helper to dedup the linear extension logic
+async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerIndex) -> Result<()> {
+    let mut applied = 0;
     for batch in batches {
         let mut candidate = self.state.clone();
-        match apply_batch(&mut candidate, &batch) {
-            Ok(_) => {
-                self.recent_states.push(self.state.clone());
-                if self.recent_states.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
-                    self.recent_states.remove(0);
-                }
-                self.storage.save_batch(candidate.height - 1, &batch)?;
-                self.state = candidate;
-                self.state.target = adjust_difficulty(&self.state, &self.recent_states);
-                self.metrics.inc_batches_processed();
-                applied += 1;
+        if apply_batch(&mut candidate, &batch).is_ok() {
+            // .. (Standard apply logic you already had) ..
+            self.recent_states.push(self.state.clone());
+            if self.recent_states.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
+                self.recent_states.remove(0);
             }
-            Err(e) => {
-                tracing::warn!("Gap-fill batch failed at height {}: {}", self.state.height, e);
-                self.peer_manager.record_misbehavior(from, 20);
-                break;
+            self.storage.save_batch(candidate.height - 1, &batch)?;
+            self.state = candidate;
+            self.state.target = adjust_difficulty(&self.state, &self.recent_states);
+            self.metrics.inc_batches_processed();
+            
+            // Add to history
+            self.chain_history.push((self.state.height, self.state.midstate, batch.clone()));
+            if self.chain_history.len() > self.max_reorg_depth as usize {
+                self.chain_history.remove(0);
             }
+            
+            applied += 1;
+        } else {
+            break;
         }
     }
     
@@ -702,13 +1004,9 @@ async fn handle_batches_response(&mut self, batches: Vec<Batch>, from: PeerIndex
         self.mempool.prune_invalid(&self.state);
         self.try_apply_orphans().await;
         
-        // Check if we need more batches by asking for peer state
+        // Check if we need more
         self.peer_manager.send_to(from, &Message::GetState).await;
-    } else {
-        // No progress made, clear sync flag
-        self.sync_in_progress = false;
     }
-    
     Ok(())
 }
 
@@ -807,6 +1105,11 @@ async fn try_apply_orphans(&mut self) {
     }
 
     async fn try_mine(&mut self) -> Result<()> {
+    // 1. pause mine if sync in progress
+        if self.sync_in_progress {
+            tracing::debug!("Skipping mining to allow sync to complete.");
+            return Ok(());
+        }
         tracing::info!("Mining batch with {} transactions...", self.mempool.len());
 
         let transactions = self.mempool.drain(MAX_BATCH_SIZE);
@@ -845,10 +1148,17 @@ async fn try_apply_orphans(&mut self) {
             return Ok(());
         }
 
+        // NEW: Set timestamp to max(current_time, prev_timestamp + 1)
+        let current_time = state::current_timestamp();
+        let block_timestamp = current_time.max(self.state.timestamp + 1);
+
         let batch = Batch {
+            prev_midstate: pre_mine_midstate,
             transactions,
             extension,
             coinbase: coinbase.clone(),
+            timestamp: block_timestamp,  // NEW: Include timestamp in batch
+            target: self.state.target,
         };
 
         self.recent_states.push(self.state.clone());
@@ -858,7 +1168,8 @@ async fn try_apply_orphans(&mut self) {
 
         match apply_batch(&mut self.state, &batch) {
             Ok(_) => {
-                self.storage.save_batch(self.state.height - 1, &batch)?;
+                self.storage.save_batch(self.state.height, &batch)?;
+                self.storage.save_state(&self.state)?;
                 self.state.target = adjust_difficulty(&self.state, &self.recent_states);
                 self.metrics.inc_batches_mined();
                 self.peer_manager.broadcast(&Message::Batch(batch)).await;
@@ -866,7 +1177,7 @@ async fn try_apply_orphans(&mut self) {
                                
                 
                 tracing::warn!("DEBUG: Broadcasting batch at height={} to {} peers", 
-                    self.state.height - 1,
+                    self.state.height,
                     self.peer_manager.peer_count());
                 tracing::info!(
                     "Mined batch! height={} coinbase={} target={}",
