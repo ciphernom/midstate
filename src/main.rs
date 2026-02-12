@@ -337,11 +337,42 @@ async fn wallet_scan(path: &PathBuf, rpc_port: u16) -> Result<()> {
     }
 
     wallet.data.last_scan_height = chain_height;
+    
+    // Sync MSS key indices (stateful recovery)
+    if !wallet.data.mss_keys.is_empty() {
+        println!("Syncing MSS key indices...");
+        let mss_url = format!("http://127.0.0.1:{}/mss_state", rpc_port);
+        for mss_key in &mut wallet.data.mss_keys {
+            let req = rpc::GetMssStateRequest {
+                master_pk: hex::encode(mss_key.master_pk),
+            };
+            match client.post(&mss_url).json(&req).send().await {
+                Ok(resp) => {
+                    if let Ok(mss_resp) = resp.json::<rpc::GetMssStateResponse>().await {
+                        if mss_resp.next_index >= mss_key.next_leaf {
+                            const SAFETY_MARGIN: u64 = 20;
+                            let new_leaf = mss_resp.next_index + SAFETY_MARGIN;
+                            println!("  MSS {}: advancing leaf {} -> {}",
+                                short_hex(&mss_key.master_pk), mss_key.next_leaf, new_leaf);
+                            mss_key.next_leaf = new_leaf;
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("  MSS {} sync failed: {}", short_hex(&mss_key.master_pk), e);
+                }
+            }
+        }
+    }
+    
+    
     wallet.save()?;
 
     println!("Scan complete. {} new coin(s) found. Scanned to height {}.", imported, chain_height);
     Ok(())
 }
+
+
 async fn handle_wallet(action: WalletAction) -> Result<()> {
     match action {
         WalletAction::Create { path } => wallet_create(&path),

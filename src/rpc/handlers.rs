@@ -1,5 +1,5 @@
 use super::types::*;
-use crate::core::{compute_commitment, compute_address, wots, block_reward, Transaction, InputReveal, OutputData};
+use crate::core::{compute_commitment, compute_address, hash_concat, wots, block_reward, Transaction, InputReveal, OutputData};
 use crate::node::NodeHandle;
 use axum::{
     extract::State,
@@ -19,7 +19,25 @@ impl IntoResponse for ErrorResponse {
 pub async fn health() -> &'static str {
     "OK"
 }
+pub async fn get_mss_state(
+    State(node): State<AppState>,
+    Json(req): Json<GetMssStateRequest>,
+) -> Result<Json<GetMssStateResponse>, ErrorResponse> {
+    let master_pk = parse_hex32(&req.master_pk, "master_pk")?;
+    let state = node.get_state().await;
 
+    // Scan chain history
+    let chain_max = node.scan_mss_index(&master_pk, state.height)
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    // Scan mempool
+    let (_, mempool_txs) = node.get_mempool_info().await;
+    let mempool_max = crate::node::scan_txs_for_mss_index(&mempool_txs, &master_pk);
+
+    let next_index = chain_max.max(mempool_max);
+
+    Ok(Json(GetMssStateResponse { next_index }))
+}
 pub async fn get_state(State(node): State<AppState>) -> Json<GetStateResponse> {
     let state = node.get_state().await;
 
@@ -65,7 +83,20 @@ pub async fn commit_transaction(
     let salt: [u8; 32] = rand::random();
     let commitment = compute_commitment(&input_coins, &destinations, &salt);
 
-    let tx = Transaction::Commit { commitment };
+    // Mine PoW nonce for anti-spam
+    let spam_nonce = {
+        let mut n = 0u64;
+        loop {
+            let h = hash_concat(&commitment, &n.to_le_bytes());
+            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 {
+                break n;
+            }
+            n += 1;
+        }
+    };
+
+    let tx = Transaction::Commit { commitment, spam_nonce };
+    
     node.send_transaction(tx)
         .await
         .map_err(|e| ErrorResponse { error: e.to_string() })?;
@@ -156,7 +187,7 @@ pub async fn get_mempool(State(node): State<AppState>) -> Json<GetMempoolRespons
     let tx_info: Vec<_> = transactions
         .iter()
         .map(|tx| match tx {
-            Transaction::Commit { commitment } => TransactionInfo {
+            Transaction::Commit { commitment, .. } => TransactionInfo  {
                 commitment: Some(hex::encode(commitment)),
                 input_coins: None,
                 output_coins: None,
