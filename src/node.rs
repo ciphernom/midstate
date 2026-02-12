@@ -1,4 +1,5 @@
 use crate::core::*;
+use crate::core::types::compute_address;
 use crate::core::types::CoinbaseOutput;
 use crate::core::state::{apply_batch, choose_best_state};
 use crate::core::extension::{mine_extension, create_extension};
@@ -315,26 +316,19 @@ impl Node {
                 };
                 self.send_response(channel, response);
             }
+            // ── Fix C (Fix 1): Replaced StateInfo handler ────────────────
             Message::StateInfo { height, depth, midstate } => {
                 self.ack(channel);
                 tracing::debug!("Peer {} state: height={} depth={}", from, height, depth);
 
-                if midstate != self.state.midstate {
-                    if depth > self.state.depth {
-                        let rewind = 100.min(self.state.height);
-                        let start = self.state.height.saturating_sub(rewind);
-                        let count = (height - start).min(MAX_GETBATCHES_COUNT);
-                        self.sync_in_progress = true;
-                        tracing::warn!(
-                            "Peer {} has competing chain! Requesting {} batches from {}",
-                            from, count, start
-                        );
-                        self.network.send(from, Message::GetBatches { start_height: start, count });
-                    }
-                } else if height > self.state.height {
-                    self.request_missing_batches(from, height);
-                } else {
+                if midstate == self.state.midstate && height == self.state.height {
                     self.sync_in_progress = false;
+                } else if !self.sync_in_progress && (depth > self.state.depth || height > self.state.height) {
+                    self.sync_in_progress = true;
+                    let start = self.state.height.saturating_sub(self.max_reorg_depth.min(self.state.height));
+                    let count = (height.saturating_sub(start) + 1).min(MAX_GETBATCHES_COUNT);
+                    tracing::info!("Syncing from peer {} (requesting {} batches from {})", from, count, start);
+                    self.network.send(from, Message::GetBatches { start_height: start, count });
                 }
             }
             Message::Ping { nonce } => {
@@ -379,33 +373,7 @@ impl Node {
             Message::Batches { start_height: batch_start, batches } => {
                 self.ack(channel);
                 if !batches.is_empty() {
-                    let mut test_state = self.state.clone();
-                    if apply_batch(&mut test_state, &batches[0]).is_ok() {
-                        self.handle_batches_response(batch_start, batches, from).await?;
-                    } else {
-                        let mut found_extension = false;
-                        for (i, batch) in batches.iter().enumerate() {
-                            let mut candidate = self.state.clone();
-                            if apply_batch(&mut candidate, batch).is_ok() {
-                                tracing::info!("Found batch extending current chain at index {}", i);
-                                let valid_batches = batches[i..].to_vec();
-                                self.handle_batches_response(batch_start + i as u64, valid_batches, from).await?;
-                                found_extension = true;
-                                break;
-                            }
-                        }
-                        if !found_extension {
-                            let fork_height = batch_start;
-                            tracing::info!("Received alternative chain, evaluating from height {}...", fork_height);
-                            match self.evaluate_alternative_chain(fork_height, &batches, from).await {
-                                Ok(Some((new_state, new_history))) => {
-                                    self.perform_reorg(new_state, new_history)?;
-                                }
-                                Ok(None) => {}
-                                Err(e) => tracing::error!("Error evaluating reorg: {}", e),
-                            }
-                        }
-                    }
+                    self.handle_batches_response(batch_start, batches, from).await?;
                 }
             }
         }
@@ -426,39 +394,49 @@ impl Node {
         }
     }
 
+    // ── Fix A: New find_fork_point method ────────────────────────────────
+    /// Find the height where our chain and the alternative chain diverge
+    /// by comparing batches side-by-side.
+    fn find_fork_point(&self, alternative_batches: &[Batch], alt_start_height: u64) -> Result<u64> {
+        for (i, alt_batch) in alternative_batches.iter().enumerate() {
+            let height = alt_start_height + i as u64;
+            match self.storage.load_batch(height)? {
+                Some(our_batch) => {
+                    if our_batch.extension.final_hash != alt_batch.extension.final_hash {
+                        tracing::info!(
+                            "Fork point: height {} — our final_hash={} alt final_hash={}",
+                            height,
+                            hex::encode(&our_batch.extension.final_hash[..8]),
+                            hex::encode(&alt_batch.extension.final_hash[..8])
+                        );
+                        return Ok(height);
+                    }
+                }
+                None => {
+                    tracing::info!("Fork point: height {} — we have no batch here (alt extends us)", height);
+                    return Ok(height);
+                }
+            }
+        }
+
+        anyhow::bail!("No divergence found — chains are identical over the received range")
+    }
+
+    // ── Fix D: Simplified evaluate_alternative_chain ─────────────────────
     async fn evaluate_alternative_chain(
         &mut self,
         fork_height: u64,
         alternative_batches: &[Batch],
         _from: PeerId,
     ) -> Result<Option<(State, Vec<(u64, [u8; 32], Batch)>)>> {
+        // Simplified fork_state derivation
         let fork_state = if fork_height == 0 {
             State::genesis().0
+        } else if fork_height <= self.state.height.saturating_sub(self.max_reorg_depth) {
+            tracing::warn!("Fork at {} exceeds max reorg depth, rejecting", fork_height);
+            return Ok(None);
         } else {
-            match self.chain_history.iter().find(|(h, _, _)| *h == fork_height - 1) {
-                Some(_) => {
-                    if fork_height > self.state.height.saturating_sub(self.max_reorg_depth) {
-                        self.rebuild_state_at_height(fork_height - 1)?
-                    } else {
-                        tracing::warn!("Rejecting reorg: fork at {} is deeper than max_reorg_depth", fork_height);
-                        return Ok(None);
-                    }
-                }
-                None => {
-                    if fork_height > self.state.height.saturating_sub(self.max_reorg_depth) {
-                        match self.rebuild_state_at_height(fork_height - 1) {
-                            Ok(s) => s,
-                            Err(_) => {
-                                tracing::warn!("Cannot find fork point at height {}", fork_height);
-                                return Ok(None);
-                            }
-                        }
-                    } else {
-                        tracing::warn!("Cannot find fork point at height {}", fork_height);
-                        return Ok(None);
-                    }
-                }
-            }
+            self.rebuild_state_at_height(fork_height)?
         };
 
         let mut candidate_state = fork_state;
@@ -530,6 +508,7 @@ impl Node {
         }
     }
 
+    // ── Fix C (Fix 3): Added sync_in_progress = false at end ────────────
     fn perform_reorg(
         &mut self,
         new_state: State,
@@ -582,6 +561,8 @@ impl Node {
         self.mempool.prune_invalid(&self.state);
         self.metrics.inc_reorgs();
         self.storage.save_state(&self.state)?;
+
+        self.sync_in_progress = false;
 
         Ok(())
     }
@@ -662,12 +643,11 @@ impl Node {
                     let estimated_height = self.state.height + 1;
                     self.orphan_batches.insert(estimated_height, batch);
 
-                    if let Some(peer) = from {
-                        let start_h = self.state.height.saturating_sub(50);
-                        self.network.send(peer, Message::GetBatches {
-                            start_height: start_h,
-                            count: 100,
-                        });
+                    if !self.sync_in_progress {
+                        if let Some(peer) = from {
+                            self.sync_in_progress = true;
+                            self.network.send(peer, Message::GetState);
+                        }
                     }
                 }
                 Ok(())
@@ -675,83 +655,56 @@ impl Node {
         }
     }
 
-    fn request_missing_batches(&mut self, from: PeerId, peer_height: u64) {
-        if peer_height <= self.state.height { return; }
-        let gap = peer_height - self.state.height;
-        let start = self.state.height;
-        let count = gap.min(MAX_GETBATCHES_COUNT);
-
-        if self.sync_in_progress && start + count <= self.sync_requested_up_to {
-            return;
-        }
-
-        self.sync_in_progress = true;
-        self.sync_requested_up_to = start + count;
-
-        tracing::info!("Requesting {} batches from peer {} (height {} -> {})",
-            count, from, start, start + count - 1);
-
-        self.network.send(from, Message::GetBatches { start_height: start, count });
-    }
-
+    // ── Fix B: Rewritten handle_batches_response ─────────────────────────
     async fn handle_batches_response(&mut self, batch_start_height: u64, batches: Vec<Batch>, from: PeerId) -> Result<()> {
         if batches.is_empty() { return Ok(()); }
+        tracing::info!("Received {} batch(es) starting at height {} from peer {}", batches.len(), batch_start_height, from);
 
-        let batch_count = batches.len();
-        tracing::info!("Received {} batch(es) from peer {}", batch_count, from);
-
+        // Try 1: Do they extend our current chain directly?
         let mut test_state = self.state.clone();
         if apply_batch(&mut test_state, &batches[0]).is_ok() {
             return self.process_linear_extension(batches, from).await;
         }
 
+        // Try 2: Do any of them extend our chain? (we might already have some)
         for (i, batch) in batches.iter().enumerate() {
             let mut candidate = self.state.clone();
             if apply_batch(&mut candidate, batch).is_ok() {
-                tracing::info!("Found linear extension starting at batch index {}", i);
+                tracing::info!("Found linear extension at batch index {}", i);
                 return self.process_linear_extension(batches[i..].to_vec(), from).await;
             }
         }
 
-        let mut connection_found = false;
+        // Try 3: This is a fork. Find the fork point.
+        match self.find_fork_point(&batches, batch_start_height) {
+            Ok(fork_height) => {
+                tracing::info!("Fork detected at height {}", fork_height);
+                let offset = fork_height.saturating_sub(batch_start_height) as usize;
+                let relevant = if offset < batches.len() { &batches[offset..] } else { &batches };
 
-        for (i, batch) in batches.iter().enumerate() {
-            let fork_height = batch_start_height + i as u64;
-
-            let connects = batch.prev_midstate == State::genesis().0.midstate
-                || self.chain_history.iter().any(|(_, mid, _)| *mid == batch.prev_midstate)
-                || self.storage.load_batch(fork_height.saturating_sub(1))
-                    .ok()
-                    .flatten()
-                    .is_some();
-
-            if connects {
-                let attach_height = fork_height;
-                tracing::info!("Found fork connection point at height {} (batch index {})", attach_height, i);
-
-                let relevant_batches = &batches[i..];
-
-                match self.evaluate_alternative_chain(attach_height, relevant_batches, from).await {
+                match self.evaluate_alternative_chain(fork_height, relevant, from).await {
                     Ok(Some((new_state, new_history))) => {
                         self.perform_reorg(new_state, new_history)?;
-                        connection_found = true;
-                        break;
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        tracing::debug!("Alternative chain rejected (insufficient work)");
+                    }
                     Err(e) => {
-                        tracing::warn!("Failed to evaluate fork at height {}: {}", attach_height, e);
+                        tracing::warn!("Error evaluating fork: {}", e);
                     }
                 }
             }
+            Err(e) => {
+                tracing::debug!("Could not find fork point: {}", e);
+            }
         }
 
-        if !connection_found {
-            tracing::debug!("Orphan batch chain received (could not find attachment point)");
-        }
-
+        // Always clear sync flag after processing batch response
+        self.sync_in_progress = false;
         Ok(())
     }
 
+    // ── Fix C (Fix 2): Added sync_in_progress clear at end ──────────────
     async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) -> Result<()> {
         let mut applied = 0;
         for batch in batches {
@@ -783,6 +736,11 @@ impl Node {
             self.try_apply_orphans().await;
             self.network.send(from, Message::GetState);
         }
+
+        if self.sync_requested_up_to <= self.state.height {
+            self.sync_in_progress = false;
+        }
+
         Ok(())
     }
 
@@ -842,8 +800,9 @@ impl Node {
             .map(move |(i, value)| { // Add move
                 let seed = coinbase_seed(&mining_seed, height, i as u64); // Use local variable
                 let owner_pk = wots::keygen(&seed);
+                let address = compute_address(&owner_pk);
                 let salt = coinbase_salt(&mining_seed, height, i as u64); // Use local variable
-                CoinbaseOutput { owner_pk, value, salt }
+                CoinbaseOutput { address, value, salt }
             })
             .collect()
     }
@@ -859,10 +818,11 @@ impl Node {
         let entries: Vec<String> = denominations.into_par_iter()
             .enumerate()
             .map(move |(i, value)| { // Add move
-                let seed = coinbase_seed(&mining_seed, height, i as u64); // Use local variable
+                let seed = coinbase_seed(&mining_seed, height, i as u64);
                 let owner_pk = wots::keygen(&seed);
-                let salt = coinbase_salt(&mining_seed, height, i as u64); // Use local variable
-                let coin_id = compute_coin_id(&owner_pk, value, &salt);
+                let address = compute_address(&owner_pk);
+                let salt = coinbase_salt(&mining_seed, height, i as u64);
+                let coin_id = compute_coin_id(&address, value, &salt);
                 format!(
                     r#"{{"height":{},"index":{},"seed":"{}","coin":"{}","value":{},"salt":"{}"}}"#,
                     height, i,
