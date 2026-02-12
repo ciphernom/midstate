@@ -46,10 +46,20 @@ pub struct NodeHandle {
     mempool_txs: Arc<RwLock<Vec<Transaction>>>,
     peer_addrs: Arc<RwLock<Vec<String>>>,
     tx_sender: tokio::sync::mpsc::UnboundedSender<NodeCommand>,
+    batches_path: PathBuf,
 }
 
 pub enum NodeCommand {
     SendTransaction(Transaction),
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ScannedCoin {
+    pub address: [u8; 32],
+    pub value: u64,
+    pub salt: [u8; 32],
+    pub coin_id: [u8; 32],
+    pub height: u64,
 }
 
 impl NodeHandle {
@@ -78,6 +88,43 @@ impl NodeHandle {
         self.tx_sender.send(NodeCommand::SendTransaction(tx))?;
         Ok(())
     }
+
+    pub fn scan_addresses(&self, addresses: &[[u8; 32]], start: u64, end: u64) -> Result<Vec<ScannedCoin>> {
+        let store = crate::storage::BatchStore::new(&self.batches_path)?;
+        let mut found = Vec::new();
+        for height in start..end {
+            if let Some(batch) = store.load(height)? {
+                for tx in &batch.transactions {
+                    if let Transaction::Reveal { outputs, .. } = tx {
+                        for out in outputs {
+                            if addresses.contains(&out.address) {
+                                found.push(ScannedCoin {
+                                    address: out.address,
+                                    value: out.value,
+                                    salt: out.salt,
+                                    coin_id: out.coin_id(),
+                                    height,
+                                });
+                            }
+                        }
+                    }
+                }
+                for cb in &batch.coinbase {
+                    if addresses.contains(&cb.address) {
+                        found.push(ScannedCoin {
+                            address: cb.address,
+                            value: cb.value,
+                            salt: cb.salt,
+                            coin_id: cb.coin_id(),
+                            height,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(found)
+    }
+    
 }
 
 impl Node {
@@ -197,6 +244,7 @@ impl Node {
             mempool_txs: Arc::new(RwLock::new(self.mempool.transactions().to_vec())),
             peer_addrs: Arc::new(RwLock::new(Vec::new())),
             tx_sender: tx,
+            batches_path: self.data_dir.join("db").join("batches"),
         };
         (handle, rx)
     }
