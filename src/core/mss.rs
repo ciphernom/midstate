@@ -347,4 +347,27 @@ mod tests {
         // 8 + 32 + 576 + 4 + 2*33 = 686
         assert_eq!(sig.size(), 686);
     }
+    #[test]
+    fn keygen_rejects_zero_height() {
+        assert!(keygen(&test_seed(), 0).is_err());
+    }
+
+    #[test]
+    fn keygen_rejects_excessive_height() {
+        assert!(keygen(&test_seed(), MAX_HEIGHT + 1).is_err());
+    }
+
+    #[test]
+    fn from_bytes_truncated_fails() {
+        let mut kp = keygen(&test_seed(), 4).unwrap();
+        let sig = kp.sign(&hash(b"test")).unwrap();
+        let bytes = sig.to_bytes();
+        assert!(MssSignature::from_bytes(&bytes[..bytes.len() - 10]).is_err());
+    }
+
+    #[test]
+    fn from_bytes_too_short_fails() {
+        assert!(MssSignature::from_bytes(&[0u8; 10]).is_err());
+    }
+    
 }
