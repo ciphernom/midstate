@@ -90,9 +90,17 @@ The wallet handles coin selection, change output creation, and the full commit-r
 midstate wallet send --path wallet.dat --rpc-port 8545 --to <ADDRESS_HEX>:4 --private
 ```
 
-**6. Receive Incoming Coins**
+**6. Receive Coins**
 
-The chain only stores hashed coin IDs (`BLAKE3(address || value || salt)`), so you cannot scan for payments. The sender must provide you with the **Seed**, **Value**, and **Salt** off-chain.
+Share your address with the sender (from `wallet receive`). Once their transaction is mined, scan the chain:
+
+```bash
+midstate wallet scan --path wallet.dat --rpc-port 8545
+```
+
+The wallet automatically detects incoming coins by matching on-chain reveal outputs to your addresses. Run periodically or after expecting a payment.
+
+Manual import is still available if needed (e.g., for offline wallets):
 
 ```bash
 midstate wallet import --path wallet.dat --seed <SEED_HEX> --value <AMOUNT> --salt <SALT_HEX>
@@ -128,6 +136,7 @@ midstate wallet history --path wallet.dat --count 20     # Transaction history
 | `wallet list` | List coins and keys (with on-chain status) |
 | `wallet balance` | Show aggregate balance |
 | `wallet send` | Send coins (handles commit-reveal automatically) |
+| `wallet scan` | Scan chain for incoming coins to your addresses |
 | `wallet import` | Import a coin from seed + value + salt |
 | `wallet export` | Export coin details for off-chain transfer |
 | `wallet import-rewards` | Import coinbase rewards from mining log |
