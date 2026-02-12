@@ -1,5 +1,5 @@
 use super::types::*;
-use crate::core::{compute_commitment, wots, block_reward, Transaction};
+use crate::core::{compute_commitment, wots, block_reward, Transaction, InputReveal, OutputData};
 use crate::node::NodeHandle;
 use axum::{
     extract::State,
@@ -83,18 +83,22 @@ pub async fn send_transaction(
     State(node): State<AppState>,
     Json(req): Json<SendTransactionRequest>,
 ) -> Result<Json<SendTransactionResponse>, ErrorResponse> {
-    if req.input_coins.is_empty() {
-        return Err(ErrorResponse { error: "Must provide at least one input coin".into() });
+    if req.inputs.is_empty() {
+        return Err(ErrorResponse { error: "Must provide at least one input".into() });
     }
-    if req.signatures.len() != req.input_coins.len() {
+    if req.signatures.len() != req.inputs.len() {
         return Err(ErrorResponse {
-            error: "Signature count must match input coin count".into(),
+            error: "Signature count must match input count".into(),
         });
     }
 
-    let input_coins: Vec<[u8; 32]> = req.input_coins.iter()
-        .map(|h| parse_hex32(h, "input_coin"))
-        .collect::<Result<_, _>>()?;
+    let inputs: Vec<InputReveal> = req.inputs.iter().map(|i| {
+        Ok(InputReveal {
+            owner_pk: parse_hex32(&i.owner_pk, "owner_pk")?,
+            value: i.value,
+            salt: parse_hex32(&i.salt, "input_salt")?,
+        })
+    }).collect::<Result<_, ErrorResponse>>()?;
 
     let mut signatures = Vec::new();
     for sig_hex in &req.signatures {
@@ -102,27 +106,35 @@ pub async fn send_transaction(
             .map_err(|e| ErrorResponse { error: format!("Invalid signature hex: {}", e) })?;
         signatures.push(sig_bytes);
     }
-    
-    let destinations: Vec<[u8; 32]> = req.destinations.iter()
-        .map(|h| parse_hex32(h, "destination"))
-        .collect::<Result<_, _>>()?;
+
+    let outputs: Vec<OutputData> = req.outputs.iter().map(|o| {
+        Ok(OutputData {
+            owner_pk: parse_hex32(&o.owner_pk, "owner_pk")?,
+            value: o.value,
+            salt: parse_hex32(&o.salt, "output_salt")?,
+        })
+    }).collect::<Result<_, ErrorResponse>>()?;
 
     let salt = parse_hex32(&req.salt, "salt")?;
 
-    let tx = Transaction::Reveal {
-        input_coins: input_coins.clone(),
-        signatures,
-        new_coins: destinations.clone(),
-        salt,
+    let input_coin_ids: Vec<String> = inputs.iter().map(|i| hex::encode(i.coin_id())).collect();
+    let output_coin_ids: Vec<String> = outputs.iter().map(|o| hex::encode(o.coin_id())).collect();
+    let fee = {
+        let in_sum: u64 = inputs.iter().map(|i| i.value).sum();
+        let out_sum: u64 = outputs.iter().map(|o| o.value).sum();
+        in_sum.saturating_sub(out_sum)
     };
+
+    let tx = Transaction::Reveal { inputs, signatures, outputs, salt };
 
     node.send_transaction(tx)
         .await
         .map_err(|e| ErrorResponse { error: e.to_string() })?;
 
     Ok(Json(SendTransactionResponse {
-        input_coins: input_coins.iter().map(|c| hex::encode(c)).collect(),
-        output_coins: destinations.iter().map(|d| hex::encode(d)).collect(),
+        input_coins: input_coin_ids,
+        output_coins: output_coin_ids,
+        fee,
         status: "submitted".to_string(),
     }))
 }
@@ -150,11 +162,13 @@ pub async fn get_mempool(State(node): State<AppState>) -> Json<GetMempoolRespons
                 commitment: Some(hex::encode(commitment)),
                 input_coins: None,
                 output_coins: None,
+                fee: None,
             },
-            Transaction::Reveal { input_coins, new_coins, .. } => TransactionInfo {
+            Transaction::Reveal { inputs, outputs, .. } => TransactionInfo {
                 commitment: None,
-                input_coins: Some(input_coins.iter().map(|c| hex::encode(c)).collect()),
-                output_coins: Some(new_coins.iter().map(|c| hex::encode(c)).collect()),
+                input_coins: Some(inputs.iter().map(|i| hex::encode(i.coin_id())).collect()),
+                output_coins: Some(outputs.iter().map(|o| hex::encode(o.coin_id())).collect()),
+                fee: Some(tx.fee()),
             },
         })
         .collect();

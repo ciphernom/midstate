@@ -15,9 +15,20 @@ pub fn hash_concat(a: &[u8], b: &[u8]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+/// Compute a coin ID that commits to owner, value, and salt.
+/// CoinID = BLAKE3(owner_pk || value_le_bytes || salt)
+/// The UTXO set stores ONLY this 32-byte hash.
+pub fn compute_coin_id(owner_pk: &[u8; 32], value: u64, salt: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(owner_pk);
+    hasher.update(&value.to_le_bytes());
+    hasher.update(salt);
+    *hasher.finalize().as_bytes()
+}
+
 /// Compute a commitment hash that binds inputs to outputs.
 ///
-/// commitment = BLAKE3(coin_id_1 || ... || new_coin_1 || ... || salt)
+/// commitment = BLAKE3(coin_id_1 || ... || new_coin_id_1 || ... || salt)
 pub fn compute_commitment(
     input_coins: &[[u8; 32]],
     new_coins: &[[u8; 32]],
@@ -34,6 +45,20 @@ pub fn compute_commitment(
     *hasher.finalize().as_bytes()
 }
 
+/// Decompose a value into power-of-2 denominations (its binary representation).
+pub fn decompose_value(mut value: u64) -> Vec<u64> {
+    let mut parts = Vec::new();
+    let mut bit = 1u64;
+    while value > 0 {
+        if value & 1 == 1 {
+            parts.push(bit);
+        }
+        value >>= 1;
+        bit <<= 1;
+    }
+    parts
+}
+
 /// The global consensus state
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct State {
@@ -44,68 +69,42 @@ pub struct State {
     pub target: [u8; 32],
     pub height: u64,
     pub timestamp: u64,
+    #[serde(default)]
+    pub commitment_heights: std::collections::HashMap<[u8; 32], u64>,  
 }
 
 impl State {
-    pub fn genesis() -> (Self, Vec<[u8; 32]>) {
+    pub fn genesis() -> (Self, Vec<CoinbaseOutput>) {
         use super::wots;
 
-        // Bitcoin block anchor 
+        // Bitcoin block anchor
         // Height: 935897
         // Hash: 00000000000000000000329a84d79877397ec0fa7c5aaa706a88e545daf599a5
         // Time: 2026-02-10 10:37:27 UTC
-        // This anchors our chain's genesis to a specific point in Bitcoin's chain
         const BITCOIN_BLOCK_HASH: &str = "00000000000000000000329a84d79877397ec0fa7c5aaa706a88e545daf599a5";
         const BITCOIN_BLOCK_HEIGHT: u64 = 935897;
         const BITCOIN_BLOCK_TIME: u64 = 1770719847;
 
-        let message = b"Midstate Genesis: Feb 10 2026 Leslie Wexner, Sultan Ahmed bin Sulayem, Salvatore Nuara, Zurab Mikeladze, Leonid Leonov, and Nicola Caputo have been proven to be involved with paedophile Mossad Asset Jeffery Epstein, Kash Patel perjured."; 
-        
-
-        // Deterministically derive genesis parameters from Bitcoin anchor
         let anchor = hash(BITCOIN_BLOCK_HASH.as_bytes());
-        
-        // Genesis coins derived from merkle root for extra entropy
+
         const MERKLE_ROOT: &str = "6def077d292edb863bd64d2a8d8803ab12caf1eef9c76823ee01e9e47fce7d0d";
         let merkle_hash = hash(MERKLE_ROOT.as_bytes());
-        
-        let seeds: [[u8; 32]; 1] = [
-            hash_concat(&anchor, &merkle_hash),
-        ];
-        
-        // Iterate over the message in 32-byte chunks.
-        // If the last chunk is shorter than 32 bytes, we pad it with spaces (0x20) or nulls (0).
-        // Initialize the vector
-        let mut genesis_coins: Vec<[u8; 32]> = seeds.iter().map(|s| wots::keygen(s)).collect();
 
-        // 2. The Chunking Loop
-        // This splits the long message into 32-byte segments and creates a coin for each.
-        for chunk in message.chunks(32) {
-            let mut coin = [0u8; 32]; // Initialize with zeros
-            
-            // Copy the chunk into the coin
-            // This is safe because chunk.len() is guaranteed to be <= 32 by the iterator
-            coin[0..chunk.len()].copy_from_slice(chunk);
-            
-            // Pad with spaces (0x20) if the last chunk is short (for better readability in xxd)
-            if chunk.len() < 32 {
-                for i in chunk.len()..32 {
-                    coin[i] = 0x20; 
-                }
-            }
-            genesis_coins.push(coin);
-        }
+        // Genesis coinbase: INITIAL_REWARD decomposed into power-of-2 outputs.
+        // Each output gets a deterministic seed and salt.
+        let base_seed = hash_concat(&anchor, &merkle_hash);
+        let denominations = decompose_value(INITIAL_REWARD);
 
-        // Pad with dummy coins to satisfy the INITIAL_REWARD (16) requirement.
-        // The current message only creates 9 coins, so we add 7 more.
-        while genesis_coins.len() < 16 {
-            let i = genesis_coins.len();
-            let mut pad_coin = [0u8; 32];
-            // Create a unique pattern so they don't get deduplicated
-            pad_coin[0..9].copy_from_slice(b"PADDING__");
-            pad_coin[31] = i as u8; 
-            genesis_coins.push(hash(&pad_coin));
-        }
+        let genesis_coinbase: Vec<CoinbaseOutput> = denominations
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| {
+                let seed = hash_concat(&base_seed, &(i as u64).to_le_bytes());
+                let owner_pk = wots::keygen(&seed);
+                let salt = hash_concat(&seed, &[0xCBu8; 32]);
+                CoinbaseOutput { owner_pk, value, salt }
+            })
+            .collect();
 
         // Initial difficulty target (very easy for testing)
         let target = [
@@ -114,25 +113,72 @@ impl State {
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
         ];
-        
-        
-        // Start with an empty midstate and empty coin set.
-        // The midstate should only reflect the Bitcoin anchor at this moment.
+
         let initial_midstate = hash_concat(&anchor, &BITCOIN_BLOCK_HEIGHT.to_le_bytes());
 
         let state = Self {
-            midstate: initial_midstate,    // NO genesis coins hashed in yet
-            coins: UtxoAccumulator::new(), // Start EMPTY
+            midstate: initial_midstate,
+            coins: UtxoAccumulator::new(),
             commitments: UtxoAccumulator::new(),
             depth: 0,
             target,
             height: 0,
             timestamp: BITCOIN_BLOCK_TIME,
+            commitment_heights: std::collections::HashMap::new(),
         };
-        // Return the state and the coins we WANT the first batch to create
-        (state, genesis_coins)
+
+        (state, genesis_coinbase)
     }
 }
+
+// ── Value-bearing data structures ───────────────────────────────────────────
+
+/// Cleartext output data carried in a transaction.
+/// Transmitted in the block, validated (value is power of 2), then discarded from state.
+/// Only the resulting coin_id is stored in the UTXO set.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct OutputData {
+    pub owner_pk: [u8; 32],
+    pub value: u64,
+    pub salt: [u8; 32],
+}
+
+impl OutputData {
+    pub fn coin_id(&self) -> [u8; 32] {
+        compute_coin_id(&self.owner_pk, self.value, &self.salt)
+    }
+}
+
+/// Cleartext input preimage carried in a reveal transaction.
+/// Proves what value a coin holds by revealing the preimage of its coin_id.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct InputReveal {
+    pub owner_pk: [u8; 32],
+    pub value: u64,
+    pub salt: [u8; 32],
+}
+
+impl InputReveal {
+    pub fn coin_id(&self) -> [u8; 32] {
+        compute_coin_id(&self.owner_pk, self.value, &self.salt)
+    }
+}
+
+/// Coinbase output carried in a Batch. Same validation rules as OutputData.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CoinbaseOutput {
+    pub owner_pk: [u8; 32],
+    pub value: u64,
+    pub salt: [u8; 32],
+}
+
+impl CoinbaseOutput {
+    pub fn coin_id(&self) -> [u8; 32] {
+        compute_coin_id(&self.owner_pk, self.value, &self.salt)
+    }
+}
+
+// ── Transaction ─────────────────────────────────────────────────────────────
 
 /// A transaction is either a Commit or a Reveal
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -142,34 +188,44 @@ pub enum Transaction {
         commitment: [u8; 32],
     },
 
-    /// Phase 2: Reveal and execute the spend with WOTS signatures.
+    /// Phase 2: Reveal and execute the spend with signatures.
     Reveal {
-        /// The coin IDs being spent (public, in the UTXO set).
-        input_coins: Vec<[u8; 32]>,
-        /// WOTS signatures proving ownership of each input coin (one per input).
+        /// Preimages proving what each input coin contains.
+        inputs: Vec<InputReveal>,
+        /// Signatures proving ownership (one per input, verified against input.owner_pk).
         signatures: Vec<Vec<u8>>,
-        /// New coin commitments to create
-        new_coins: Vec<[u8; 32]>,
-        /// Salt used when computing the commitment
+        /// New coins to create. Value + salt revealed for validation, then discarded.
+        outputs: Vec<OutputData>,
+        /// Salt used when computing the commitment.
         salt: [u8; 32],
     },
 }
 
 impl Transaction {
-    /// Get the coins this transaction is spending (empty for Commit).
-    pub fn input_coins(&self) -> Vec<[u8; 32]> {
+    /// Coin IDs this transaction spends.
+    pub fn input_coin_ids(&self) -> Vec<[u8; 32]> {
         match self {
             Transaction::Commit { .. } => vec![],
-            Transaction::Reveal { input_coins, .. } => input_coins.clone(),
+            Transaction::Reveal { inputs, .. } => inputs.iter().map(|i| i.coin_id()).collect(),
         }
     }
 
-    /// Fee = number of inputs - number of outputs. Zero for Commit.
-    pub fn fee(&self) -> usize {
+    /// Output coin IDs this transaction creates.
+    pub fn output_coin_ids(&self) -> Vec<[u8; 32]> {
+        match self {
+            Transaction::Commit { .. } => vec![],
+            Transaction::Reveal { outputs, .. } => outputs.iter().map(|o| o.coin_id()).collect(),
+        }
+    }
+
+    /// Fee = sum(input values) - sum(output values). Zero for Commit.
+    pub fn fee(&self) -> u64 {
         match self {
             Transaction::Commit { .. } => 0,
-            Transaction::Reveal { input_coins, new_coins, .. } => {
-                input_coins.len().saturating_sub(new_coins.len())
+            Transaction::Reveal { inputs, outputs, .. } => {
+                let in_sum: u64 = inputs.iter().map(|i| i.value).sum();
+                let out_sum: u64 = outputs.iter().map(|o| o.value).sum();
+                in_sum.saturating_sub(out_sum)
             }
         }
     }
@@ -187,16 +243,16 @@ pub struct Extension {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Batch {
     /// The midstate of the previous batch this one extends
-    pub prev_midstate: [u8; 32],    
+    pub prev_midstate: [u8; 32],
     pub transactions: Vec<Transaction>,
     pub extension: Extension,
-    /// Coinbase coins created as mining reward + fees
+    /// Coinbase outputs with revealed values. Each must be a power of 2.
     #[serde(default)]
-    pub coinbase: Vec<[u8; 32]>,
+    pub coinbase: Vec<CoinbaseOutput>,
     /// Block timestamp (seconds since Unix epoch)
     pub timestamp: u64,
     /// Target this batch was mined against
-    pub target: [u8; 32],  
+    pub target: [u8; 32],
 }
 
 // ── Protocol constants ──────────────────────────────────────────────────────
@@ -220,19 +276,22 @@ pub const MAX_BATCH_SIZE: usize = 100;
 
 // ── Difficulty adjustment ───────────────────────────────────────────────────
 
-pub const TARGET_BLOCK_TIME: u64 = 10;
-pub const DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 10;
+pub const TARGET_BLOCK_TIME: u64 = 600;
+pub const DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 2016;
 pub const MAX_ADJUSTMENT_FACTOR: u64 = 4;
-
+pub const COMMITMENT_TTL: u64 = 100; 
 // ── Economics ───────────────────────────────────────────────────────────────
 
 /// Blocks per year at TARGET_BLOCK_TIME seconds per block.
 pub const BLOCKS_PER_YEAR: u64 = 365 * 24 * 3600 / TARGET_BLOCK_TIME; // 3_153_600
 
-/// Initial block reward in coins.
+/// Initial block reward in value units.
 pub const INITIAL_REWARD: u64 = 16;
 
-/// Block reward at a given height. Halves every BLOCKS_PER_YEAR, minimum 1.
+pub const MAX_TX_INPUTS: usize = 256;
+pub const MAX_TX_OUTPUTS: usize = 256;
+
+/// Block reward value at a given height. Halves every BLOCKS_PER_YEAR, minimum 1.
 pub fn block_reward(height: u64) -> u64 {
     let halvings = height / BLOCKS_PER_YEAR;
     if halvings >= 8 {
