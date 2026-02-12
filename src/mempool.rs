@@ -307,4 +307,175 @@ mod tests {
         assert!(mp.add(tx, &state).is_err());
     }
 
+    // ── Reveal path ─────────────────────────────────────────────────────
+
+    fn state_with_committed_coin() -> (State, [u8; 32], [u8; 32], [u8; 32], [u8; 32], OutputData) {
+        // Returns (state, seed, coin_id, input_salt, commit_salt, output)
+        use crate::core::{wots, types::*};
+
+        let mut state = empty_state();
+        let seed: [u8; 32] = [0x42; 32];
+        let owner_pk = wots::keygen(&seed);
+        let address = compute_address(&owner_pk);
+        let input_salt = hash(b"test salt");
+        let coin_id = compute_coin_id(&address, 16, &input_salt);
+        state.coins.insert(coin_id);
+
+        let output = OutputData { address: hash(b"recipient"), value: 8, salt: [0x11; 32] };
+        let commit_salt: [u8; 32] = [0x22; 32];
+        let commitment = compute_commitment(&[coin_id], &[output.coin_id()], &commit_salt);
+
+        // Mine PoW and add commitment
+        let mut n = 0u64;
+        loop {
+            let h = hash_concat(&commitment, &n.to_le_bytes());
+            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 { break; }
+            n += 1;
+        }
+        let commit_tx = Transaction::Commit { commitment, spam_nonce: n };
+        crate::core::transaction::apply_transaction(&mut state, &commit_tx).unwrap();
+
+        (state, seed, coin_id, input_salt, commit_salt, output)
+    }
+
+    fn make_reveal_tx(seed: &[u8; 32], value: u64, input_salt: [u8; 32], commit_salt: [u8; 32], output: OutputData) -> Transaction {
+        use crate::core::wots;
+
+        let owner_pk = wots::keygen(seed);
+        let address = compute_address(&owner_pk);
+        let coin_id = compute_coin_id(&address, value, &input_salt);
+
+        let commitment = compute_commitment(&[coin_id], &[output.coin_id()], &commit_salt);
+        let sig = wots::sign(seed, &commitment);
+
+        Transaction::Reveal {
+            inputs: vec![InputReveal { owner_pk, value, salt: input_salt }],
+            signatures: vec![wots::sig_to_bytes(&sig)],
+            outputs: vec![output],
+            salt: commit_salt,
+        }
+    }
+
+    #[test]
+    fn mempool_accepts_valid_reveal() {
+        let (state, seed, _coin_id, input_salt, commit_salt, output) = state_with_committed_coin();
+        let mut mp = Mempool::new();
+        let tx = make_reveal_tx(&seed, 16, input_salt, commit_salt, output);
+        assert!(mp.add(tx, &state).is_ok());
+        assert_eq!(mp.len(), 1);
+    }
+
+    #[test]
+    fn mempool_rejects_duplicate_input() {
+        let (state, seed, _coin_id, input_salt, commit_salt, output) = state_with_committed_coin();
+        let mut mp = Mempool::new();
+        let tx = make_reveal_tx(&seed, 16, input_salt, commit_salt, output);
+        mp.add(tx.clone(), &state).unwrap();
+        assert!(mp.add(tx, &state).is_err());
+    }
+
+    #[test]
+    fn mempool_rejects_low_fee_reveal() {
+        let mut state = empty_state();
+        let seed: [u8; 32] = [0x42; 32];
+        let owner_pk = crate::core::wots::keygen(&seed);
+        let address = compute_address(&owner_pk);
+        let input_salt = [0u8; 32];
+        let coin_id = compute_coin_id(&address, 1, &input_salt);
+        state.coins.insert(coin_id);
+
+        let output = OutputData { address: hash(b"r"), value: 1, salt: [0; 32] };
+        let commit_salt = [1u8; 32];
+        let commitment = compute_commitment(&[coin_id], &[output.coin_id()], &commit_salt);
+
+        let mut n = 0u64;
+        loop {
+            let h = hash_concat(&commitment, &n.to_le_bytes());
+            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 { break; }
+            n += 1;
+        }
+        crate::core::transaction::apply_transaction(&mut state, &Transaction::Commit { commitment, spam_nonce: n }).unwrap();
+
+        let sig = crate::core::wots::sign(&seed, &commitment);
+        // in=1, out=1 → fee=0 < MIN_REVEAL_FEE
+        let tx = Transaction::Reveal {
+            inputs: vec![InputReveal { owner_pk, value: 1, salt: input_salt }],
+            signatures: vec![crate::core::wots::sig_to_bytes(&sig)],
+            outputs: vec![output],
+            salt: commit_salt,
+        };
+
+        let mut mp = Mempool::new();
+        let err = mp.add(tx, &state).unwrap_err();
+        assert!(err.to_string().contains("Fee too low"));
+    }
+
+    // ── drain ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn drain_returns_and_removes() {
+        let state = empty_state();
+        let mut mp = Mempool::new();
+        for i in 0..5 {
+            let commitment = hash(&(i as u64).to_le_bytes());
+            mp.transactions.push(Transaction::Commit { commitment, spam_nonce: 0 });
+            mp.seen_commitments.insert(commitment);
+        }
+        assert_eq!(mp.len(), 5);
+
+        let drained = mp.drain(3);
+        assert_eq!(drained.len(), 3);
+        assert_eq!(mp.len(), 2);
+        assert_eq!(mp.seen_commitments.len(), 2);
+    }
+
+    #[test]
+    fn drain_more_than_available() {
+        let mut mp = Mempool::new();
+        mp.transactions.push(Transaction::Commit { commitment: [1; 32], spam_nonce: 0 });
+        mp.seen_commitments.insert([1; 32]);
+        let drained = mp.drain(100);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(mp.len(), 0);
+    }
+
+    // ── prune_invalid ───────────────────────────────────────────────────
+
+    #[test]
+    fn prune_removes_invalid_commits() {
+        let state = empty_state();
+        let mut mp = Mempool::new();
+        let commitment = hash(b"prune test");
+        // Directly push a commit with a bad PoW nonce
+        mp.transactions.push(Transaction::Commit { commitment, spam_nonce: u64::MAX });
+        mp.seen_commitments.insert(commitment);
+        assert_eq!(mp.len(), 1);
+        mp.prune_invalid(&state);
+        assert_eq!(mp.len(), 0);
+    }
+
+    // ── re_add ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn re_add_skips_invalid() {
+        let state = empty_state();
+        let mut mp = Mempool::new();
+        // Bad PoW commit won't re-add
+        let bad_tx = Transaction::Commit { commitment: hash(b"bad"), spam_nonce: u64::MAX };
+        mp.re_add(vec![bad_tx], &state);
+        assert_eq!(mp.len(), 0);
+    }
+
+    #[test]
+    fn re_add_skips_duplicates() {
+        let state = empty_state();
+        let mut mp = Mempool::new();
+        let commitment = hash(b"dup re-add");
+        mp.transactions.push(Transaction::Commit { commitment, spam_nonce: 0 });
+        mp.seen_commitments.insert(commitment);
+
+        // Try to re_add the same commitment
+        mp.re_add(vec![Transaction::Commit { commitment, spam_nonce: 0 }], &state);
+        assert_eq!(mp.len(), 1); // still just 1
+    }
 }

@@ -226,3 +226,238 @@ pub fn choose_best_state<'a>(a: &'a State, b: &'a State) -> &'a State {
         }
     }
 }
+// ============================================================
+// ADD THIS ENTIRE BLOCK at the bottom of src/core/state.rs
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::extension::create_extension;
+    use crate::core::mmr::UtxoAccumulator;
+    use crate::core::wots;
+
+    fn easy_target() -> [u8; 32] {
+        [0xff; 32]
+    }
+
+    fn genesis_state() -> State {
+        State::genesis().0
+    }
+
+    /// Build a valid batch on top of the given state (no transactions).
+    fn make_empty_batch(state: &State, reward: u64, timestamp: u64) -> Batch {
+        let coinbase = make_coinbase(state, reward);
+        let mut mining_midstate = state.midstate;
+        for cb in &coinbase {
+            mining_midstate = hash_concat(&mining_midstate, &cb.coin_id());
+        }
+        // Search for a nonce that meets the target
+        let mut nonce = 0u64;
+        let extension = loop {
+            let ext = create_extension(mining_midstate, nonce);
+            if ext.final_hash < state.target {
+                break ext;
+            }
+            nonce += 1;
+        };
+        Batch {
+            prev_midstate: state.midstate,
+            transactions: vec![],
+            extension,
+            coinbase,
+            timestamp,
+            target: state.target,
+        }
+    }
+
+    fn make_coinbase(state: &State, total_value: u64) -> Vec<CoinbaseOutput> {
+        let denoms = decompose_value(total_value);
+        denoms.iter().enumerate().map(|(i, &value)| {
+            let seed = hash_concat(&state.midstate, &(i as u64).to_le_bytes());
+            let pk = wots::keygen(&seed);
+            let address = compute_address(&pk);
+            let salt = hash_concat(&seed, &[0xCBu8; 32]);
+            CoinbaseOutput { address, value, salt }
+        }).collect()
+    }
+
+    // ── apply_batch ─────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_batch_advances_height() {
+        let mut state = genesis_state();
+        let reward = block_reward(state.height);
+        let batch = make_empty_batch(&state, reward, state.timestamp + 1);
+        apply_batch(&mut state, &batch).unwrap();
+        assert_eq!(state.height, 1);
+    }
+
+    #[test]
+    fn apply_batch_advances_depth() {
+        let mut state = genesis_state();
+        let initial_depth = state.depth;
+        let reward = block_reward(state.height);
+        let batch = make_empty_batch(&state, reward, state.timestamp + 1);
+        apply_batch(&mut state, &batch).unwrap();
+        assert_eq!(state.depth, initial_depth + EXTENSION_ITERATIONS);
+    }
+
+    #[test]
+    fn apply_batch_updates_midstate() {
+        let mut state = genesis_state();
+        let old_midstate = state.midstate;
+        let reward = block_reward(state.height);
+        let batch = make_empty_batch(&state, reward, state.timestamp + 1);
+        apply_batch(&mut state, &batch).unwrap();
+        assert_ne!(state.midstate, old_midstate);
+        assert_eq!(state.midstate, batch.extension.final_hash);
+    }
+
+    #[test]
+    fn apply_batch_adds_coinbase_coins() {
+        let mut state = genesis_state();
+        let reward = block_reward(state.height);
+        let batch = make_empty_batch(&state, reward, state.timestamp + 1);
+        let coinbase_ids: Vec<[u8; 32]> = batch.coinbase.iter().map(|c| c.coin_id()).collect();
+        apply_batch(&mut state, &batch).unwrap();
+        for id in &coinbase_ids {
+            assert!(state.coins.contains(id), "coinbase coin should be in state");
+        }
+    }
+
+    #[test]
+    fn apply_batch_rejects_wrong_prev_midstate() {
+        let state = genesis_state();
+        let reward = block_reward(state.height);
+        let mut batch = make_empty_batch(&state, reward, state.timestamp + 1);
+        batch.prev_midstate = [0xFFu8; 32]; // wrong parent
+        let mut state2 = state;
+        assert!(apply_batch(&mut state2, &batch).is_err());
+    }
+
+    #[test]
+    fn apply_batch_rejects_wrong_target() {
+        let mut state = genesis_state();
+        let reward = block_reward(state.height);
+        let mut batch = make_empty_batch(&state, reward, state.timestamp + 1);
+        batch.target = [0x00; 32]; // wrong target
+        assert!(apply_batch(&mut state, &batch).is_err());
+    }
+
+    #[test]
+    fn apply_batch_rejects_wrong_coinbase_total() {
+        let mut state = genesis_state();
+        // Coinbase with too much value
+        let batch = make_empty_batch(&state, block_reward(state.height) + 100, state.timestamp + 1);
+        assert!(apply_batch(&mut state, &batch).is_err());
+    }
+
+    #[test]
+    fn apply_batch_rejects_non_power_of_two_coinbase() {
+        let mut state = genesis_state();
+        let mut batch = make_empty_batch(&state, block_reward(state.height), state.timestamp + 1);
+        // Corrupt a coinbase value to be non-power-of-2
+        if let Some(cb) = batch.coinbase.first_mut() {
+            cb.value = 3; // not a power of 2
+        }
+        assert!(apply_batch(&mut state, &batch).is_err());
+    }
+
+    #[test]
+    fn apply_batch_rejects_past_timestamp() {
+        let mut state = genesis_state();
+        // Apply genesis batch first to get height > 0
+        let reward = block_reward(state.height);
+        let batch0 = make_empty_batch(&state, reward, state.timestamp + 1);
+        apply_batch(&mut state, &batch0).unwrap();
+
+        // Now try a batch with timestamp <= previous
+        let reward = block_reward(state.height);
+        let batch1 = make_empty_batch(&state, reward, state.timestamp); // same timestamp
+        assert!(apply_batch(&mut state, &batch1).is_err());
+    }
+
+    // ── choose_best_state ───────────────────────────────────────────────
+
+    #[test]
+    fn choose_best_state_higher_depth_wins() {
+        let mut a = genesis_state();
+        let mut b = genesis_state();
+        a.depth = 100;
+        b.depth = 200;
+        assert_eq!(choose_best_state(&a, &b).depth, 200);
+        assert_eq!(choose_best_state(&b, &a).depth, 200);
+    }
+
+    #[test]
+    fn choose_best_state_equal_depth_uses_midstate() {
+        let mut a = genesis_state();
+        let mut b = genesis_state();
+        a.depth = 100;
+        b.depth = 100;
+        a.midstate = [0x01; 32];
+        b.midstate = [0x02; 32];
+        // Lower midstate wins
+        assert_eq!(choose_best_state(&a, &b).midstate, [0x01; 32]);
+    }
+
+    // ── adjust_difficulty ───────────────────────────────────────────────
+
+    #[test]
+    fn adjust_difficulty_no_change_before_interval() {
+        let mut state = genesis_state();
+        state.height = 1; // not at adjustment interval
+        let result = adjust_difficulty(&state, &[]);
+        assert_eq!(result, state.target);
+    }
+
+    #[test]
+    fn adjust_difficulty_no_change_at_height_zero() {
+        let state = genesis_state();
+        let result = adjust_difficulty(&state, &[]);
+        assert_eq!(result, state.target);
+    }
+
+    #[test]
+    fn adjust_difficulty_not_enough_history() {
+        let mut state = genesis_state();
+        state.height = DIFFICULTY_ADJUSTMENT_INTERVAL;
+        let few_states = vec![genesis_state()]; // not enough
+        let result = adjust_difficulty(&state, &few_states);
+        assert_eq!(result, state.target);
+    }
+
+    // ── validate_timestamp ──────────────────────────────────────────────
+
+    #[test]
+    fn validate_timestamp_accepts_recent() {
+        let current_time = 1_000_000;
+        let result = validate_timestamp(current_time - 10, &[], current_time);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_timestamp_rejects_far_future() {
+        let current_time = 1_000_000;
+        let far_future = current_time + 3 * 60 * 60; // 3 hours ahead
+        let result = validate_timestamp(far_future, &[], current_time);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_timestamp_rejects_before_previous() {
+        let prev = State {
+            midstate: [0; 32],
+            coins: UtxoAccumulator::new(),
+            commitments: UtxoAccumulator::new(),
+            depth: 0,
+            target: easy_target(),
+            height: 1,
+            timestamp: 1000,
+            commitment_heights: std::collections::HashMap::new(),
+        };
+        let result = validate_timestamp(999, &[prev], 2000);
+        assert!(result.is_err());
+    }
+}

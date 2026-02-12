@@ -313,3 +313,274 @@ const _: () = assert!(
     EXTENSION_ITERATIONS % CHECKPOINT_INTERVAL == 0,
     "EXTENSION_ITERATIONS must be divisible by CHECKPOINT_INTERVAL"
 );
+// ============================================================
+// ADD THIS ENTIRE BLOCK at the bottom of src/core/types.rs
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── hash / hash_concat ──────────────────────────────────────────────
+
+    #[test]
+    fn hash_deterministic() {
+        assert_eq!(hash(b"hello"), hash(b"hello"));
+    }
+
+    #[test]
+    fn hash_different_inputs_differ() {
+        assert_ne!(hash(b"hello"), hash(b"world"));
+    }
+
+    #[test]
+    fn hash_empty_input() {
+        let h = hash(b"");
+        assert_ne!(h, [0u8; 32]); // BLAKE3 of empty is defined, not zero
+    }
+
+    #[test]
+    fn hash_concat_not_commutative() {
+        let a = b"alpha";
+        let b = b"beta";
+        assert_ne!(hash_concat(a, b), hash_concat(b, a));
+    }
+
+    #[test]
+    fn hash_concat_vs_manual() {
+        // hash_concat(a,b) should equal BLAKE3(a || b)
+        let a = b"foo";
+        let b = b"bar";
+        let expected = {
+            let mut h = blake3::Hasher::new();
+            h.update(a);
+            h.update(b);
+            *h.finalize().as_bytes()
+        };
+        assert_eq!(hash_concat(a, b), expected);
+    }
+
+    // ── compute_address ─────────────────────────────────────────────────
+
+    #[test]
+    fn compute_address_deterministic() {
+        let pk = [0xAA; 32];
+        assert_eq!(compute_address(&pk), compute_address(&pk));
+    }
+
+    #[test]
+    fn compute_address_is_hash_of_pk() {
+        let pk = [0xBB; 32];
+        assert_eq!(compute_address(&pk), hash(&pk));
+    }
+
+    // ── compute_coin_id ─────────────────────────────────────────────────
+
+    #[test]
+    fn coin_id_deterministic() {
+        let addr = [1u8; 32];
+        let salt = [2u8; 32];
+        assert_eq!(
+            compute_coin_id(&addr, 16, &salt),
+            compute_coin_id(&addr, 16, &salt),
+        );
+    }
+
+    #[test]
+    fn coin_id_differs_by_value() {
+        let addr = [1u8; 32];
+        let salt = [2u8; 32];
+        assert_ne!(
+            compute_coin_id(&addr, 8, &salt),
+            compute_coin_id(&addr, 16, &salt),
+        );
+    }
+
+    #[test]
+    fn coin_id_differs_by_salt() {
+        let addr = [1u8; 32];
+        assert_ne!(
+            compute_coin_id(&addr, 8, &[0u8; 32]),
+            compute_coin_id(&addr, 8, &[1u8; 32]),
+        );
+    }
+
+    #[test]
+    fn coin_id_differs_by_address() {
+        let salt = [2u8; 32];
+        assert_ne!(
+            compute_coin_id(&[0u8; 32], 8, &salt),
+            compute_coin_id(&[1u8; 32], 8, &salt),
+        );
+    }
+
+    // ── compute_commitment ──────────────────────────────────────────────
+
+    #[test]
+    fn commitment_deterministic() {
+        let inputs = vec![[1u8; 32]];
+        let outputs = vec![[2u8; 32]];
+        let salt = [3u8; 32];
+        assert_eq!(
+            compute_commitment(&inputs, &outputs, &salt),
+            compute_commitment(&inputs, &outputs, &salt),
+        );
+    }
+
+    #[test]
+    fn commitment_differs_with_different_salt() {
+        let inputs = vec![[1u8; 32]];
+        let outputs = vec![[2u8; 32]];
+        assert_ne!(
+            compute_commitment(&inputs, &outputs, &[0u8; 32]),
+            compute_commitment(&inputs, &outputs, &[1u8; 32]),
+        );
+    }
+
+    // ── decompose_value ─────────────────────────────────────────────────
+
+    #[test]
+    fn decompose_zero() {
+        assert!(decompose_value(0).is_empty());
+    }
+
+    #[test]
+    fn decompose_power_of_two() {
+        assert_eq!(decompose_value(16), vec![16]);
+        assert_eq!(decompose_value(1), vec![1]);
+    }
+
+    #[test]
+    fn decompose_sums_correctly() {
+        for v in [1, 7, 15, 100, 255, 1023, 65535] {
+            let parts = decompose_value(v);
+            assert_eq!(parts.iter().sum::<u64>(), v);
+            for &p in &parts {
+                assert!(p.is_power_of_two());
+            }
+        }
+    }
+
+    #[test]
+    fn decompose_all_unique() {
+        let parts = decompose_value(255);
+        let mut sorted = parts.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(parts.len(), sorted.len(), "decomposition should have unique denominations");
+    }
+
+    // ── block_reward ────────────────────────────────────────────────────
+
+    #[test]
+    fn block_reward_initial() {
+        assert_eq!(block_reward(0), INITIAL_REWARD);
+    }
+
+    #[test]
+    fn block_reward_first_halving() {
+        assert_eq!(block_reward(BLOCKS_PER_YEAR), INITIAL_REWARD / 2);
+    }
+
+    #[test]
+    fn block_reward_floor_at_one() {
+        assert_eq!(block_reward(u64::MAX), 1);
+        assert_eq!(block_reward(BLOCKS_PER_YEAR * 100), 1);
+    }
+
+    #[test]
+    fn block_reward_monotonically_decreasing() {
+        let mut prev = block_reward(0);
+        for era in 1..=10 {
+            let r = block_reward(BLOCKS_PER_YEAR * era);
+            assert!(r <= prev);
+            prev = r;
+        }
+    }
+
+    // ── OutputData / InputReveal / CoinbaseOutput coin_id ───────────────
+
+    #[test]
+    fn output_data_coin_id() {
+        let o = OutputData { address: [1u8; 32], value: 8, salt: [2u8; 32] };
+        assert_eq!(o.coin_id(), compute_coin_id(&[1u8; 32], 8, &[2u8; 32]));
+    }
+
+    #[test]
+    fn input_reveal_coin_id_uses_address() {
+        let pk = [0xAA; 32];
+        let ir = InputReveal { owner_pk: pk, value: 4, salt: [0u8; 32] };
+        let expected_addr = compute_address(&pk);
+        assert_eq!(ir.coin_id(), compute_coin_id(&expected_addr, 4, &[0u8; 32]));
+    }
+
+    #[test]
+    fn coinbase_output_coin_id() {
+        let cb = CoinbaseOutput { address: [5u8; 32], value: 16, salt: [6u8; 32] };
+        assert_eq!(cb.coin_id(), compute_coin_id(&[5u8; 32], 16, &[6u8; 32]));
+    }
+
+    // ── Transaction methods ─────────────────────────────────────────────
+
+    #[test]
+    fn commit_fee_is_zero() {
+        let tx = Transaction::Commit { commitment: [0u8; 32], spam_nonce: 0 };
+        assert_eq!(tx.fee(), 0);
+        assert!(tx.input_coin_ids().is_empty());
+        assert!(tx.output_coin_ids().is_empty());
+    }
+
+    #[test]
+    fn reveal_fee_computed() {
+        let tx = Transaction::Reveal {
+            inputs: vec![InputReveal { owner_pk: [0u8; 32], value: 10, salt: [0u8; 32] }],
+            signatures: vec![vec![]],
+            outputs: vec![OutputData { address: [0u8; 32], value: 8, salt: [0u8; 32] }],
+            salt: [0u8; 32],
+        };
+        assert_eq!(tx.fee(), 2);
+    }
+
+    #[test]
+    fn reveal_input_output_coin_ids() {
+        let input = InputReveal { owner_pk: [1u8; 32], value: 8, salt: [2u8; 32] };
+        let output = OutputData { address: [3u8; 32], value: 4, salt: [4u8; 32] };
+        let tx = Transaction::Reveal {
+            inputs: vec![input.clone()],
+            signatures: vec![vec![]],
+            outputs: vec![output.clone()],
+            salt: [0u8; 32],
+        };
+        assert_eq!(tx.input_coin_ids(), vec![input.coin_id()]);
+        assert_eq!(tx.output_coin_ids(), vec![output.coin_id()]);
+    }
+
+    // ── State::genesis ──────────────────────────────────────────────────
+
+    #[test]
+    fn genesis_deterministic() {
+        let (s1, cb1) = State::genesis();
+        let (s2, cb2) = State::genesis();
+        assert_eq!(s1.midstate, s2.midstate);
+        assert_eq!(s1.height, 0);
+        assert_eq!(cb1.len(), cb2.len());
+        for (a, b) in cb1.iter().zip(cb2.iter()) {
+            assert_eq!(a.coin_id(), b.coin_id());
+        }
+    }
+
+    #[test]
+    fn genesis_coinbase_values_sum_to_initial_reward() {
+        let (_, cb) = State::genesis();
+        let total: u64 = cb.iter().map(|c| c.value).sum();
+        assert_eq!(total, INITIAL_REWARD);
+    }
+
+    #[test]
+    fn genesis_coinbase_all_power_of_two() {
+        let (_, cb) = State::genesis();
+        for c in &cb {
+            assert!(c.value.is_power_of_two(), "coinbase value {} not power of 2", c.value);
+        }
+    }
+}

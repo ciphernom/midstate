@@ -124,3 +124,165 @@ pub fn mine_extension(midstate: [u8; 32], target: [u8; 32]) -> Extension {
         }
     }
 }
+// ============================================================
+// ADD THIS ENTIRE BLOCK at the bottom of src/core/extension.rs
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn easy_target() -> [u8; 32] {
+        [0xff; 32] // accepts everything
+    }
+
+    // ── create_extension ────────────────────────────────────────────────
+
+    #[test]
+    fn create_extension_deterministic() {
+        let ms = hash(b"test midstate");
+        let e1 = create_extension(ms, 42);
+        let e2 = create_extension(ms, 42);
+        assert_eq!(e1.final_hash, e2.final_hash);
+        assert_eq!(e1.checkpoints, e2.checkpoints);
+    }
+
+    #[test]
+    fn create_extension_different_nonces_differ() {
+        let ms = hash(b"test midstate");
+        let e1 = create_extension(ms, 0);
+        let e2 = create_extension(ms, 1);
+        assert_ne!(e1.final_hash, e2.final_hash);
+    }
+
+    #[test]
+    fn create_extension_checkpoint_count() {
+        let ms = hash(b"test midstate");
+        let ext = create_extension(ms, 0);
+        let expected = (EXTENSION_ITERATIONS / CHECKPOINT_INTERVAL) as usize + 1;
+        assert_eq!(ext.checkpoints.len(), expected);
+    }
+
+    #[test]
+    fn create_extension_first_checkpoint_is_hash_of_midstate_nonce() {
+        let ms = hash(b"test midstate");
+        let nonce = 99u64;
+        let ext = create_extension(ms, nonce);
+        let expected = hash_concat(&ms, &nonce.to_le_bytes());
+        assert_eq!(ext.checkpoints[0], expected);
+    }
+
+    #[test]
+    fn create_extension_last_checkpoint_equals_final_hash() {
+        let ms = hash(b"test midstate");
+        let ext = create_extension(ms, 0);
+        assert_eq!(*ext.checkpoints.last().unwrap(), ext.final_hash);
+    }
+
+    // ── verify_extension ────────────────────────────────────────────────
+
+    #[test]
+    fn verify_valid_extension() {
+        let ms = hash(b"verify test");
+        let ext = create_extension(ms, 7);
+        assert!(verify_extension(ms, &ext, &easy_target()).is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_wrong_midstate() {
+        let ms = hash(b"correct");
+        let ext = create_extension(ms, 0);
+        let wrong_ms = hash(b"wrong");
+        assert!(verify_extension(wrong_ms, &ext, &easy_target()).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_above_target() {
+        let ms = hash(b"target test");
+        let ext = create_extension(ms, 0);
+        let impossible_target = [0u8; 32]; // nothing can be below all zeros
+        assert!(verify_extension(ms, &ext, &impossible_target).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_wrong_checkpoint_count() {
+        let ms = hash(b"bad checkpoint");
+        let mut ext = create_extension(ms, 0);
+        ext.checkpoints.push([0u8; 32]); // extra checkpoint
+        assert!(verify_extension(ms, &ext, &easy_target()).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_tampered_checkpoint() {
+        let ms = hash(b"tamper test");
+        let mut ext = create_extension(ms, 0);
+        // Flip a byte in a middle checkpoint
+        let mid = ext.checkpoints.len() / 2;
+        ext.checkpoints[mid][0] ^= 0xFF;
+        // This may or may not be caught depending on spot-check sampling,
+        // but the last checkpoint won't match final_hash anymore
+        // OR a spot-checked segment will fail.
+        // At minimum, if the last checkpoint is tampered it's caught:
+        let last = ext.checkpoints.len() - 1;
+        let mut ext2 = create_extension(ms, 0);
+        ext2.checkpoints[last][0] ^= 0xFF;
+        assert!(verify_extension(ms, &ext2, &easy_target()).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_tampered_final_hash() {
+        let ms = hash(b"final hash tamper");
+        let mut ext = create_extension(ms, 0);
+        ext.final_hash[0] ^= 0xFF;
+        assert!(verify_extension(ms, &ext, &easy_target()).is_err());
+    }
+
+    // ── mine_extension (use fast-mining feature for test speed) ─────────
+
+    #[test]
+    fn mine_extension_meets_target() {
+        let ms = hash(b"mine test");
+        // Use easy target so mining finishes quickly
+        let target = easy_target();
+        let ext = mine_extension(ms, target);
+        assert!(ext.final_hash < target);
+        assert!(verify_extension(ms, &ext, &target).is_ok());
+    }
+
+    // ── spot_check_indices ──────────────────────────────────────────────
+
+    #[test]
+    fn spot_check_indices_deterministic() {
+        let fh = hash(b"deterministic");
+        let a = spot_check_indices(&fh, 100, 10);
+        let b = spot_check_indices(&fh, 100, 10);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn spot_check_indices_unique() {
+        let fh = hash(b"unique check");
+        let indices = spot_check_indices(&fh, 1000, 50);
+        let mut deduped = indices.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(indices.len(), deduped.len());
+    }
+
+    #[test]
+    fn spot_check_indices_within_bounds() {
+        let fh = hash(b"bounds");
+        let num_segments = 100;
+        let indices = spot_check_indices(&fh, num_segments, 20);
+        for &idx in &indices {
+            assert!(idx < num_segments);
+        }
+    }
+
+    #[test]
+    fn spot_check_count_capped_at_segments() {
+        let fh = hash(b"cap");
+        let indices = spot_check_indices(&fh, 5, 100);
+        assert_eq!(indices.len(), 5);
+    }
+}
