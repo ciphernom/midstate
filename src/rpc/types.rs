@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CommitRequest {
-    /// Coin IDs being spent (hex)
+    /// Input coin IDs being spent (hex, 32 bytes each)
     pub coins: Vec<String>,
-    /// Destination coin commitments (hex, 32 bytes each)
+    /// Output coin IDs (hex, 32 bytes each)
     pub destinations: Vec<String>,
 }
 
@@ -16,13 +16,25 @@ pub struct CommitResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct InputRevealJson {
+    pub owner_pk: String,
+    pub value: u64,
+    pub salt: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OutputDataJson {
+    pub owner_pk: String,
+    pub value: u64,
+    pub salt: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SendTransactionRequest {
-    /// Input coin IDs (hex, 32 bytes each)
-    pub input_coins: Vec<String>,
-    /// WOTS signatures (hex, one per input, each CHAINS*32 bytes)
+    pub inputs: Vec<InputRevealJson>,
     pub signatures: Vec<String>,
-    pub destinations: Vec<String>,
-    /// Salt from the commit phase (hex)
+    pub outputs: Vec<OutputDataJson>,
+    /// Commitment salt (hex)
     pub salt: String,
 }
 
@@ -30,6 +42,7 @@ pub struct SendTransactionRequest {
 pub struct SendTransactionResponse {
     pub input_coins: Vec<String>,
     pub output_coins: Vec<String>,
+    pub fee: u64,
     pub status: String,
 }
 
@@ -69,6 +82,8 @@ pub struct TransactionInfo {
     pub input_coins: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_coins: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

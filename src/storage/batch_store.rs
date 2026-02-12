@@ -44,14 +44,22 @@ impl BatchStore {
     }
     
     /// Get all batches from height range
-    pub fn load_range(&self, start: u64, end: u64) -> Result<Vec<Batch>> {
+    pub fn load_range(&self, start: u64, end: u64) -> Result<Vec<(u64, Batch)>> {
+
         let mut batches = Vec::new();
         
         for height in start..end {
-            if let Some(batch) = self.load(height)? {
-                batches.push(batch);
-            } else {
-                break;
+            match self.load(height) {
+                Ok(Some(batch)) => batches.push((height, batch)),
+
+                Ok(None) => {
+                    tracing::warn!("Gap in batch store at height {}, returning {} contiguous batches", height, batches.len());
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("[WARN] Error loading batch at height {}: {}, continuing", height, e);
+                    break;
+                }
             }
         }
         
