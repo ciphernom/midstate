@@ -1,6 +1,5 @@
 pub mod crypto;
-
-use crate::core::{hash_concat, compute_commitment, compute_coin_id, decompose_value, wots, OutputData, InputReveal};
+use crate::core::{hash_concat, compute_commitment, compute_coin_id, compute_address, decompose_value, wots, OutputData, InputReveal};
 use crate::core::mss::{self, MssKeypair};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -25,6 +24,7 @@ pub fn short_hex(bytes: &[u8; 32]) -> String {
 pub struct WalletKey {
     pub seed: [u8; 32],
     pub owner_pk: [u8; 32],
+    pub address: [u8; 32],
     pub label: Option<String>,
 }
 
@@ -33,6 +33,7 @@ pub struct WalletKey {
 pub struct WalletCoin {
     pub seed: [u8; 32],
     pub owner_pk: [u8; 32],
+    pub address: [u8; 32],
     pub value: u64,
     pub salt: [u8; 32],
     pub coin_id: [u8; 32],
@@ -138,9 +139,10 @@ impl Wallet {
     pub fn generate_key(&mut self, label: Option<String>) -> Result<[u8; 32]> {
         let seed: [u8; 32] = rand::random();
         let owner_pk = wots::keygen(&seed);
-        self.data.keys.push(WalletKey { seed, owner_pk, label });
+        let address = compute_address(&owner_pk);
+        self.data.keys.push(WalletKey { seed, owner_pk, address, label });
         self.save()?;
-        Ok(owner_pk)
+        Ok(address)
     }
 
     /// Generate a new MSS tree (reusable address).
@@ -164,15 +166,16 @@ impl Wallet {
         label: Option<String>,
     ) -> Result<[u8; 32]> {
         let owner_pk = wots::keygen(&seed);
-        let coin_id = compute_coin_id(&owner_pk, value, &salt);
+        let address = compute_address(&owner_pk);
+        let coin_id = compute_coin_id(&address, value, &salt);
         if self.data.coins.iter().any(|c| c.coin_id == coin_id) {
             bail!("coin already in wallet");
         }
         self.data.coins.push(WalletCoin {
-            seed, owner_pk, value, salt, coin_id, label,
+            seed, owner_pk, address, value, salt, coin_id, label,
         });
         // Remove matching key from unused keys if present
-        self.data.keys.retain(|k| k.owner_pk != owner_pk);
+        self.data.keys.retain(|k| k.address != address);
         self.save()?;
         Ok(coin_id)
     }
@@ -251,7 +254,7 @@ impl Wallet {
     /// Returns (all_outputs, change_seeds).
     pub fn build_outputs(
         &mut self,
-        recipient_pk: &[u8; 32],
+        recipient_address: &[u8; 32],
         recipient_denominations: &[u64],
         change_value: u64,
     ) -> Result<(Vec<OutputData>, Vec<(usize, [u8; 32])>)> {
@@ -262,7 +265,7 @@ impl Wallet {
         for &denom in recipient_denominations {
             let salt: [u8; 32] = rand::random();
             outputs.push(OutputData {
-                owner_pk: *recipient_pk,
+                address: *recipient_address,
                 value: denom,
                 salt,
             });
@@ -274,9 +277,10 @@ impl Wallet {
             for denom in change_denoms {
                 let seed: [u8; 32] = rand::random();
                 let owner_pk = wots::keygen(&seed);
+                let address = compute_address(&owner_pk);
                 let salt: [u8; 32] = rand::random();
                 let idx = outputs.len();
-                outputs.push(OutputData { owner_pk, value: denom, salt });
+                outputs.push(OutputData { address, value: denom, salt });
                 change_seeds.push((idx, seed));
             }
         }
@@ -411,9 +415,11 @@ impl Wallet {
             let out = &pending.outputs[*idx];
             let coin_id = out.coin_id();
             if !self.data.coins.iter().any(|c| c.coin_id == coin_id) {
+                let owner_pk = wots::keygen(seed);
                 self.data.coins.push(WalletCoin {
                     seed: *seed,
-                    owner_pk: out.owner_pk,
+                    owner_pk,
+                    address: out.address,
                     value: out.value,
                     salt: out.salt,
                     coin_id,
@@ -447,7 +453,7 @@ impl Wallet {
     pub fn plan_private_send(
         &self,
         live_coins: &[[u8; 32]],
-        recipient_pk: &[u8; 32],
+        recipient_address: &[u8; 32],
         denominations: &[u64],
     ) -> Result<Vec<(Vec<[u8; 32]>, Vec<OutputData>, Vec<(usize, [u8; 32])>)>> {
         // Each denomination gets its own independent transaction.
@@ -481,7 +487,7 @@ impl Wallet {
             let change = total - denom - 1; // fee = 1
             let salt: [u8; 32] = rand::random();
             let mut outputs = vec![OutputData {
-                owner_pk: *recipient_pk,
+                address: *recipient_address,
                 value: denom,
                 salt,
             }];
@@ -491,9 +497,10 @@ impl Wallet {
                 for cd in decompose_value(change) {
                     let seed: [u8; 32] = rand::random();
                     let pk = wots::keygen(&seed);
+                    let addr = compute_address(&pk);
                     let cs: [u8; 32] = rand::random();
                     let idx = outputs.len();
-                    outputs.push(OutputData { owner_pk: pk, value: cd, salt: cs });
+                    outputs.push(OutputData { address: addr, value: cd, salt: cs });
                     change_seeds.push((idx, seed));
                 }
             }
@@ -529,9 +536,9 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         let mut w = Wallet::create(&path, b"pass").unwrap();
-        let pk = w.generate_key(Some("test".into())).unwrap();
+        let addr = w.generate_key(Some("test".into())).unwrap();
         assert_eq!(w.keys().len(), 1);
-        assert_eq!(w.keys()[0].owner_pk, pk);
+        assert_eq!(w.keys()[0].address, addr);
 
         let w2 = Wallet::open(&path, b"pass").unwrap();
         assert_eq!(w2.keys().len(), 1);
