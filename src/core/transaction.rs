@@ -3,6 +3,16 @@ use super::wots;
 use super::mss;
 use anyhow::{bail, Result};
 
+const COMMIT_POW_TARGET: u16 = 0x0000;
+
+fn validate_commit_pow(commitment: &[u8; 32], nonce: u64) -> Result<()> {
+    let h = super::types::hash_concat(commitment, &nonce.to_le_bytes());
+    if u16::from_be_bytes([h[0], h[1]]) != COMMIT_POW_TARGET {
+        bail!("Insufficient Commit PoW");
+    }
+    Ok(())
+}
+
 /// Verify a signature that may be either raw WOTS (576 bytes) or MSS (longer).
 fn verify_signature(sig_bytes: &[u8], message: &[u8; 32], owner_pk: &[u8; 32]) -> bool {
     if sig_bytes.len() == wots::SIG_SIZE {
@@ -21,7 +31,8 @@ fn verify_signature(sig_bytes: &[u8], message: &[u8; 32], owner_pk: &[u8; 32]) -
 /// Apply a transaction to the state
 pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
     match tx {
-        Transaction::Commit { commitment } => {
+        Transaction::Commit { commitment, spam_nonce } => {
+            validate_commit_pow(commitment, *spam_nonce)?;
             if !state.commitments.insert(*commitment) {
                 bail!("Duplicate commitment");
             }
@@ -133,7 +144,8 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
 /// Validate a transaction without applying it
 pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
     match tx {
-        Transaction::Commit { commitment } => {
+        Transaction::Commit { commitment, spam_nonce } => {
+            validate_commit_pow(commitment, *spam_nonce)?;
             if state.commitments.contains(commitment) {
                 bail!("Duplicate commitment");
             }
