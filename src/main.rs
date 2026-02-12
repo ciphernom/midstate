@@ -207,6 +207,12 @@ enum WalletAction {
         #[arg(long)]
         coinbase_file: PathBuf,
     },
+    Scan {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+    },
 }
 
 fn read_password(prompt: &str) -> Result<Vec<u8>> {
@@ -289,7 +295,53 @@ async fn main() -> Result<()> {
 }
 
 // ── Wallet commands ─────────────────────────────────────────────────────────
+async fn wallet_scan(path: &PathBuf, rpc_port: u16) -> Result<()> {
+    let password = read_password("Password: ")?;
+    let mut wallet = Wallet::open(path, &password)?;
+    let client = reqwest::Client::new();
 
+    let addresses = wallet.watched_addresses();
+    if addresses.is_empty() {
+        println!("No addresses to scan for. Generate keys first.");
+        return Ok(());
+    }
+
+    let state_url = format!("http://127.0.0.1:{}/state", rpc_port);
+    let state: rpc::GetStateResponse = client.get(&state_url).send().await?.json().await?;
+    let chain_height = state.height;
+    let start = wallet.data.last_scan_height;
+
+    if start >= chain_height {
+        println!("Already scanned to height {}. Chain is at {}.", start, chain_height);
+        return Ok(());
+    }
+
+    println!("Scanning blocks {}..{} for {} address(es)...", start, chain_height, addresses.len());
+
+    let scan_url = format!("http://127.0.0.1:{}/scan", rpc_port);
+    let req = rpc::ScanRequest {
+        addresses: addresses.iter().map(|a| hex::encode(a)).collect(),
+        start_height: start,
+        end_height: chain_height,
+    };
+    let resp: rpc::ScanResponse = client.post(&scan_url).json(&req).send().await?.json().await?;
+
+    let mut imported = 0usize;
+    for sc in &resp.coins {
+        let address = parse_hex32(&sc.address)?;
+        let salt = parse_hex32(&sc.salt)?;
+        if let Some(coin_id) = wallet.import_scanned(address, sc.value, salt)? {
+            println!("  found: {} (value {}, height {})", short_hex(&coin_id), sc.value, sc.height);
+            imported += 1;
+        }
+    }
+
+    wallet.data.last_scan_height = chain_height;
+    wallet.save()?;
+
+    println!("Scan complete. {} new coin(s) found. Scanned to height {}.", imported, chain_height);
+    Ok(())
+}
 async fn handle_wallet(action: WalletAction) -> Result<()> {
     match action {
         WalletAction::Create { path } => wallet_create(&path),
@@ -297,6 +349,7 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         WalletAction::Generate { path, count, label } => wallet_generate(&path, count, label),
         WalletAction::List { path, rpc_port, full } => wallet_list(&path, rpc_port, full).await,
         WalletAction::Balance { path, rpc_port } => wallet_balance(&path, rpc_port).await,
+        WalletAction::Scan { path, rpc_port } => wallet_scan(&path, rpc_port).await,
         WalletAction::Send { path, rpc_port, coin, to, timeout, private } => {
             wallet_send(&path, rpc_port, coin, to, timeout, private).await
         }
@@ -315,6 +368,7 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         WalletAction::GenerateMss { path, height, label } => {
             wallet_generate_mss(&path, height, label)
         }
+        
     }
 }
 
