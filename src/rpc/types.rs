@@ -45,7 +45,26 @@ pub struct SendTransactionResponse {
     pub fee: u64,
     pub status: String,
 }
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScanRequest {
+    pub addresses: Vec<String>,
+    pub start_height: u64,
+    pub end_height: u64,
+}
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScanResponse {
+    pub coins: Vec<ScanCoin>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScanCoin {
+    pub address: String,
+    pub value: u64,
+    pub salt: String,
+    pub coin_id: String,
+    pub height: u64,
+}
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetStateResponse {
     pub height: u64,
