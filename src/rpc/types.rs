@@ -75,7 +75,15 @@ pub struct GetStateResponse {
     pub target: String,
     pub block_reward: u64,
 }
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetMssStateRequest {
+    pub master_pk: String,
+}
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetMssStateResponse {
+    pub next_index: u64,
+}
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CheckCoinRequest {
     pub coin: String,

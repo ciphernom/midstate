@@ -44,7 +44,7 @@ impl Mempool {
         validate_transaction(state, &tx)?;
 
         match &tx {
-            Transaction::Commit { commitment } => {
+            Transaction::Commit { commitment, .. } => {
                 if self.seen_commitments.contains(commitment) {
                     anyhow::bail!("Commitment already in mempool");
                 }
@@ -59,7 +59,7 @@ impl Mempool {
         }
 
         match &tx {
-            Transaction::Commit { commitment } => {
+            Transaction::Commit { commitment, .. } => {
                 self.seen_commitments.insert(*commitment);
             }
             Transaction::Reveal { .. } => {
@@ -83,7 +83,7 @@ impl Mempool {
             }
 
             let dominated = match &tx {
-                Transaction::Commit { commitment } => self.seen_commitments.contains(commitment),
+                Transaction::Commit { commitment, .. } => self.seen_commitments.contains(commitment),
                 Transaction::Reveal { .. } => {
                     tx.input_coin_ids().iter().any(|i| self.seen_inputs.contains(i))
                 }
@@ -93,7 +93,7 @@ impl Mempool {
             }
 
             match &tx {
-                Transaction::Commit { commitment } => {
+                Transaction::Commit { commitment, .. } => {
                     self.seen_commitments.insert(*commitment);
                 }
                 Transaction::Reveal { .. } => {
@@ -117,7 +117,7 @@ impl Mempool {
 
         for tx in &drained {
             match tx {
-                Transaction::Commit { commitment } => {
+                Transaction::Commit { commitment, .. } => {
                     self.seen_commitments.remove(commitment);
                 }
                 Transaction::Reveal { .. } => {
@@ -146,7 +146,7 @@ impl Mempool {
         for tx in &self.transactions {
             if validate_transaction(state, tx).is_err() {
                 match tx {
-                    Transaction::Commit { commitment } => {
+                    Transaction::Commit { commitment, .. } =>{
                         commitments_to_remove.push(*commitment);
                     }
                     Transaction::Reveal { .. } => {
@@ -165,7 +165,7 @@ impl Mempool {
 
             self.transactions.retain(|tx| {
                 let should_remove = match tx {
-                    Transaction::Commit { commitment } => {
+                    Transaction::Commit { commitment, .. } => {
                         commitments_to_remove.contains(commitment)
                     }
                     Transaction::Reveal { .. } => {
@@ -176,7 +176,7 @@ impl Mempool {
 
                 if should_remove {
                     match tx {
-                        Transaction::Commit { commitment } => {
+                        Transaction::Commit { commitment, .. } => {
                             self.seen_commitments.remove(commitment);
                         }
                         Transaction::Reveal { .. } => {
