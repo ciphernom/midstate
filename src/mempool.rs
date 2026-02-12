@@ -193,3 +193,118 @@ impl Mempool {
         }
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::*;
+    use crate::core::mmr::UtxoAccumulator;
+
+    fn empty_state() -> State {
+        State {
+            midstate: [0u8; 32],
+            coins: UtxoAccumulator::new(),
+            commitments: UtxoAccumulator::new(),
+            depth: 0,
+            target: [0xff; 32],
+            height: 1,
+            timestamp: 1000,
+            commitment_heights: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn mempool_rejects_bad_commit_pow() {
+        let mut mp = Mempool::new();
+        let state = empty_state();
+        let commitment = hash(b"mempool test");
+        // Find a bad nonce
+        let mut bad = 0u64;
+        loop {
+            let h = hash_concat(&commitment, &bad.to_le_bytes());
+            if u16::from_be_bytes([h[0], h[1]]) != 0x0000 { break; }
+            bad += 1;
+        }
+        let tx = Transaction::Commit { commitment, spam_nonce: bad };
+        assert!(mp.add(tx, &state).is_err());
+        assert_eq!(mp.len(), 0);
+    }
+
+    #[test]
+    fn mempool_accepts_good_commit_pow() {
+        let mut mp = Mempool::new();
+        let state = empty_state();
+        let commitment = hash(b"mempool test good");
+        let mut n = 0u64;
+        loop {
+            let h = hash_concat(&commitment, &n.to_le_bytes());
+            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 { break; }
+            n += 1;
+        }
+        let tx = Transaction::Commit { commitment, spam_nonce: n };
+        assert!(mp.add(tx, &state).is_ok());
+        assert_eq!(mp.len(), 1);
+    }
+    
+#[test]
+    fn mempool_full_rejects() {
+        let state = empty_state();
+        let mut mp = Mempool::new();
+        // Fill to capacity — bypass add() so no PoW needed
+        for i in 0..MAX_MEMPOOL_SIZE {
+            let commitment = hash(&(i as u64).to_le_bytes());
+            mp.transactions.push(Transaction::Commit { commitment, spam_nonce: 0 });
+            mp.seen_commitments.insert(commitment);
+        }
+        assert_eq!(mp.len(), MAX_MEMPOOL_SIZE);
+
+        let extra = hash(b"one more");
+        let mut n = 0u64;
+        loop {
+            let h = hash_concat(&extra, &n.to_le_bytes());
+            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 { break; }
+            n += 1;
+        }
+        let tx = Transaction::Commit { commitment: extra, spam_nonce: n };
+        let err = mp.add(tx, &state).unwrap_err();
+        assert!(err.to_string().contains("Mempool full"));
+    }
+
+    #[test]
+    fn max_pending_commits_enforced() {
+        let state = empty_state();
+        let mut mp = Mempool::new();
+        for i in 0..MAX_PENDING_COMMITS {
+            let commitment = hash(&(i as u64).to_le_bytes());
+            mp.transactions.push(Transaction::Commit { commitment, spam_nonce: 0 });
+            mp.seen_commitments.insert(commitment);
+        }
+
+        let extra = hash(b"commit overflow");
+        let mut n = 0u64;
+        loop {
+            let h = hash_concat(&extra, &n.to_le_bytes());
+            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 { break; }
+            n += 1;
+        }
+        let tx = Transaction::Commit { commitment: extra, spam_nonce: n };
+        let err = mp.add(tx, &state).unwrap_err();
+        assert!(err.to_string().contains("Too many pending commits"));
+    }
+
+    #[test]
+    fn duplicate_commitment_rejected() {
+        let mut mp = Mempool::new();
+        let state = empty_state();
+        let commitment = hash(b"dup test");
+        let mut n = 0u64;
+        loop {
+            let h = hash_concat(&commitment, &n.to_le_bytes());
+            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 { break; }
+            n += 1;
+        }
+        let tx = Transaction::Commit { commitment, spam_nonce: n };
+        assert!(mp.add(tx.clone(), &state).is_ok());
+        assert!(mp.add(tx, &state).is_err());
+    }
+
+}
