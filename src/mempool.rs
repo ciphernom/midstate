@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn drain_returns_and_removes() {
-        let state = empty_state();
+        let _state = empty_state();
         let mut mp = Mempool::new();
         for i in 0..5 {
             let commitment = hash(&(i as u64).to_le_bytes());
