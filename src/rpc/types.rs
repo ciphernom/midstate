@@ -17,14 +17,14 @@ pub struct CommitResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InputRevealJson {
-    pub owner_pk: String,
+    pub owner_pk: String,  
     pub value: u64,
     pub salt: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OutputDataJson {
-    pub owner_pk: String,
+    pub address: String, 
     pub value: u64,
     pub salt: String,
 }
@@ -89,7 +89,7 @@ pub struct TransactionInfo {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GenerateKeyResponse {
     pub seed: String,
-    pub coin: String,
+    pub address: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -15,16 +15,21 @@ pub fn hash_concat(a: &[u8], b: &[u8]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// Compute a coin ID that commits to owner, value, and salt.
-/// CoinID = BLAKE3(owner_pk || value_le_bytes || salt)
-/// The UTXO set stores ONLY this 32-byte hash.
-pub fn compute_coin_id(owner_pk: &[u8; 32], value: u64, salt: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(owner_pk);
-    hasher.update(&value.to_le_bytes());
-    hasher.update(salt);
-    *hasher.finalize().as_bytes()
+/// Compute a P2PKH address: address = BLAKE3(owner_pk).
+pub fn compute_address(owner_pk: &[u8; 32]) -> [u8; 32] {
+    hash(owner_pk)
 }
+
+/// Compute a coin ID that commits to address, value, and salt.
+/// CoinID = BLAKE3(address || value_le_bytes || salt)
+ /// The UTXO set stores ONLY this 32-byte hash.
+pub fn compute_coin_id(address: &[u8; 32], value: u64, salt: &[u8; 32]) -> [u8; 32] {
+     let mut hasher = blake3::Hasher::new();
+     hasher.update(address);
+     hasher.update(&value.to_le_bytes());
+     hasher.update(salt);
+     *hasher.finalize().as_bytes()
+ }
 
 /// Compute a commitment hash that binds inputs to outputs.
 ///
@@ -101,8 +106,9 @@ impl State {
             .map(|(i, &value)| {
                 let seed = hash_concat(&base_seed, &(i as u64).to_le_bytes());
                 let owner_pk = wots::keygen(&seed);
+                let address = compute_address(&owner_pk);
                 let salt = hash_concat(&seed, &[0xCBu8; 32]);
-                CoinbaseOutput { owner_pk, value, salt }
+                CoinbaseOutput { address, value, salt }
             })
             .collect();
 
@@ -138,14 +144,14 @@ impl State {
 /// Only the resulting coin_id is stored in the UTXO set.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct OutputData {
-    pub owner_pk: [u8; 32],
+    pub address: [u8; 32],
     pub value: u64,
     pub salt: [u8; 32],
 }
 
 impl OutputData {
     pub fn coin_id(&self) -> [u8; 32] {
-        compute_coin_id(&self.owner_pk, self.value, &self.salt)
+        compute_coin_id(&self.address, self.value, &self.salt)
     }
 }
 
@@ -160,21 +166,22 @@ pub struct InputReveal {
 
 impl InputReveal {
     pub fn coin_id(&self) -> [u8; 32] {
-        compute_coin_id(&self.owner_pk, self.value, &self.salt)
+        let address = compute_address(&self.owner_pk);
+        compute_coin_id(&address, self.value, &self.salt)
     }
 }
 
 /// Coinbase output carried in a Batch. Same validation rules as OutputData.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CoinbaseOutput {
-    pub owner_pk: [u8; 32],
+    pub address: [u8; 32],
     pub value: u64,
     pub salt: [u8; 32],
 }
 
 impl CoinbaseOutput {
     pub fn coin_id(&self) -> [u8; 32] {
-        compute_coin_id(&self.owner_pk, self.value, &self.salt)
+        compute_coin_id(&self.address, self.value, &self.salt)
     }
 }
 
