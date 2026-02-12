@@ -342,9 +342,9 @@ mod tests {
 
     #[test]
     fn sig_size_reasonable() {
-        let mut kp = keygen(&test_seed(), 10).unwrap();
+        let mut kp = keygen(&test_seed(), 2).unwrap();
         let sig = kp.sign(&hash(b"t")).unwrap();
-        // 8 + 32 + 576 + 4 + 10*33 = 950
-        assert_eq!(sig.size(), 950);
+        // 8 + 32 + 576 + 4 + 2*33 = 686
+        assert_eq!(sig.size(), 686);
     }
 }
