@@ -28,6 +28,7 @@ blake3 = "1.5"
 rayon = "1.8"
 libp2p = { version = "0.54", features = ["tokio", "noise", "tcp", "yamux", "kad", "identify", "request-response", "macros"] }
 futures = "0.3"
+async-trait = "0.1"
 
 [features]
 fast-mining = []
