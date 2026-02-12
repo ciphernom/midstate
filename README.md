@@ -6,6 +6,7 @@ A minimal, post-quantum sequential-time cryptocurrency written in Rust.
 * **Proof of Sequential Work:** Blake3-based sequential work.
 * **Signatures:** Post-quantum WOTS (Winternitz One-Time Signatures) and MSS (Merkle Signature Scheme).
 * **Consensus:** Nakamoto consensus with reorg handling.
+* **State:** Merkle-based UTXO Accumulator.
 * **Storage:** `redb` database.
 * **Networking:** `libp2p` (noise encryption, yamux).
 
@@ -52,7 +53,8 @@ All wallet commands require a password.
 
 ```
 
-**3. Check Balance**
+**3. Check Balance & Status**
+Checks the local wallet coins against the running node to see if they are live.
 
 ```bash
 ./target/release/midstate wallet list --path wallet.dat --rpc-port 8545
@@ -61,6 +63,7 @@ All wallet commands require a password.
 
 **4. Send Coins**
 Send amount `4` to an address.
+*Note: This is a privacy coin. The sender must communicate the resulting Coin details (Seed, Value, Salt) to the recipient off-chain, otherwise the recipient cannot detect the funds.*
 
 ```bash
 ./target/release/midstate wallet send --path wallet.dat --rpc-port 8545 --to <ADDRESS_HEX>:4
@@ -68,16 +71,15 @@ Send amount `4` to an address.
 ```
 
 **5. Receive Incoming Coins**
-The wallet does not auto-scan. If you are expecting funds, you must scan the node's database.
+Because the chain only stores hashed commitments (`CoinID`), you cannot scan the chain for payments. The sender must provide you with the **Seed**, **Value**, and **Salt**.
 
 ```bash
-# Stop the node first to release the DB lock
-./target/release/midstate wallet scan --path wallet.dat --node-data-dir ./node1
+./target/release/midstate wallet import --path wallet.dat --seed <SEED_HEX> --value <AMOUNT> --salt <SALT_HEX>
 
 ```
 
 **6. Import Mining Rewards**
-If you ran with `--mine`, import your coinbase rewards.
+If you ran with `--mine`, import your coinbase rewards from the miner's log.
 
 ```bash
 ./target/release/midstate wallet import-rewards --path wallet.dat --coinbase-file ./node1/coinbase_seeds.jsonl
