@@ -1,5 +1,5 @@
 use super::types::*;
-use crate::core::{compute_commitment, wots, block_reward, Transaction, InputReveal, OutputData};
+use crate::core::{compute_commitment, compute_address, wots, block_reward, Transaction, InputReveal, OutputData};
 use crate::node::NodeHandle;
 use axum::{
     extract::State,
@@ -107,7 +107,7 @@ pub async fn send_transaction(
 
     let outputs: Vec<OutputData> = req.outputs.iter().map(|o| {
         Ok(OutputData {
-            owner_pk: parse_hex32(&o.owner_pk, "owner_pk")?,
+            address: parse_hex32(&o.address, "address")?,
             value: o.value,
             salt: parse_hex32(&o.salt, "output_salt")?,
         })
@@ -176,11 +176,12 @@ pub async fn get_mempool(State(node): State<AppState>) -> Json<GetMempoolRespons
 
 pub async fn generate_key() -> Json<GenerateKeyResponse> {
     let seed: [u8; 32] = rand::random();
-    let coin = wots::keygen(&seed);
+    let owner_pk = wots::keygen(&seed);
+    let address = compute_address(&owner_pk);
 
     Json(GenerateKeyResponse {
         seed: hex::encode(seed),
-        coin: hex::encode(coin),
+        address: hex::encode(address),
     })
 }
 
