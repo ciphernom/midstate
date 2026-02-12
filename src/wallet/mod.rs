@@ -75,6 +75,8 @@ pub struct WalletData {
     pub pending: Vec<PendingCommit>,
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
+    #[serde(default)]
+    pub last_scan_height: u64,
 }
 
 impl WalletData {
@@ -85,6 +87,7 @@ impl WalletData {
             mss_keys: Vec::new(),
             pending: Vec::new(),
             history: Vec::new(),
+            last_scan_height: 0,
         }
     }
 }
@@ -108,7 +111,54 @@ impl Wallet {
         wallet.save()?;
         Ok(wallet)
     }
+/// All addresses the wallet watches for (keys + coin addresses).
+pub fn watched_addresses(&self) -> Vec<[u8; 32]> {
+    let mut addrs: Vec<[u8; 32]> = self.data.keys.iter().map(|k| k.address).collect();
+    addrs.extend(self.data.mss_keys.iter().map(|k| k.master_pk));
+    addrs.sort();
+    addrs.dedup();
+    addrs
+}
 
+/// Import a scanned coin, matching it to a wallet key. Returns true if new.
+pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) -> Result<Option<[u8; 32]>> {
+    let coin_id = compute_coin_id(&address, value, &salt);
+
+    if self.data.coins.iter().any(|c| c.coin_id == coin_id) {
+        return Ok(None); // already have it
+    }
+
+    // Find matching key
+    if let Some(pos) = self.data.keys.iter().position(|k| k.address == address) {
+        let key = self.data.keys.remove(pos);
+        self.data.coins.push(WalletCoin {
+            seed: key.seed,
+            owner_pk: key.owner_pk,
+            address: key.address,
+            value,
+            salt,
+            coin_id,
+            label: key.label,
+        });
+        return Ok(Some(coin_id));
+    }
+
+    // MSS key match — keep key, just add coin
+    if let Some(mss) = self.data.mss_keys.iter().find(|k| k.master_pk == address) {
+        self.data.coins.push(WalletCoin {
+            seed: mss.master_seed,
+            owner_pk: mss.master_pk,
+            address,
+            value,
+            salt,
+            coin_id,
+            label: Some(format!("received ({})", value)),
+        });
+        return Ok(Some(coin_id));
+    }
+
+    Ok(None) // address not ours
+}
     pub fn open(path: &Path, password: &[u8]) -> Result<Self> {
         if !path.exists() {
             bail!("wallet file not found: {}", path.display());
