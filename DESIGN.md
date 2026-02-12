@@ -2,9 +2,9 @@
 
 ## 1. Fundamentals
 
-* **Hash Function**: BLAKE3 (32-byte output). 
+* **Hash Function**: BLAKE3 (32-byte output).
 * **Architecture**: Sequential-time blockchain (effectively Nakamoto consensus).
-* **State Model**: UTXO (Unspent Transaction Output) set.
+* **State Model**: UTXO Accumulator (Merkle-committed sorted vector).
 * **Time**: Unix timestamp (seconds).
 
 ## 2. Cryptography
@@ -71,7 +71,7 @@ Transactions use a two-phase Commit-Reveal scheme to separate intent from execut
     * Commitment must exist in state.
     * Inputs must exist in UTXO set.
     * Signatures must be valid.
-    * `Input Value > Output Value`.
+    * `Input Value > Output Value` (conservation of value + fee).
 
 ## 6. Networking
 
