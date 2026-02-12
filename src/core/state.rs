@@ -131,6 +131,18 @@ pub fn apply_batch(state: &mut State, batch: &Batch) -> Result<()> {
               hex::encode(batch.target));
     }
 
+    //timewarp prevention: Validate timestamp
+    if state.height > 0 {
+        if batch.timestamp <= state.timestamp {
+            bail!("Block timestamp {} must be greater than previous {}", batch.timestamp, state.timestamp);
+        }
+        let current_time = current_timestamp();
+        const MAX_FUTURE: u64 = 2 * 60 * 60;
+        if batch.timestamp > current_time + MAX_FUTURE {
+            bail!("Block timestamp {} too far in future (now: {})", batch.timestamp, current_time);
+        }
+    }
+
     // 2. Apply transactions and tally fees
     let mut total_fees: u64 = 0;
     for tx in &batch.transactions {
