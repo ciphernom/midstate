@@ -628,4 +628,310 @@ mod tests {
         let s = short_hex(&bytes);
         assert_eq!(s, "abababab…abab");
     }
+
+    // ── resolve_coin ────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_coin_by_index() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let seed = [0x42u8; 32];
+        let salt = [0x11; 32];
+        let coin_id = w.import_coin(seed, 16, salt, None).unwrap();
+        assert_eq!(w.resolve_coin("0").unwrap(), coin_id);
+    }
+
+    #[test]
+    fn resolve_coin_by_hex_prefix() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let coin_id = w.import_coin([0x42; 32], 8, [0x11; 32], None).unwrap();
+        let prefix = &hex::encode(coin_id)[..8];
+        assert_eq!(w.resolve_coin(prefix).unwrap(), coin_id);
+    }
+
+    #[test]
+    fn resolve_coin_not_found() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let w = Wallet::create(&path, b"pass").unwrap();
+        assert!(w.resolve_coin("99").is_err());
+        assert!(w.resolve_coin("deadbeef").is_err());
+    }
+
+    // ── select_coins ────────────────────────────────────────────────────
+
+    #[test]
+    fn select_coins_minimal() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
+        let c2 = w.import_coin([2; 32], 8, [20; 32], None).unwrap();
+        let c3 = w.import_coin([3; 32], 16, [30; 32], None).unwrap();
+
+        let live = vec![c1, c2, c3];
+        // Need 9 → should select the 16-coin (largest first)
+        let selected = w.select_coins(9, &live).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0], c3);
+    }
+
+    #[test]
+    fn select_coins_insufficient() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
+        assert!(w.select_coins(100, &[c1]).is_err());
+    }
+
+    #[test]
+    fn select_coins_ignores_non_live() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
+        let _c2 = w.import_coin([2; 32], 8, [20; 32], None).unwrap(); // not live
+
+        let selected = w.select_coins(4, &[c1]).unwrap();
+        assert_eq!(selected, vec![c1]);
+    }
+
+    // ── build_outputs ───────────────────────────────────────────────────
+
+    #[test]
+    fn build_outputs_with_change() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let dest = [0xAA; 32];
+        let (outputs, change_seeds) = w.build_outputs(&dest, &[4, 2], 3).unwrap();
+
+        // 2 recipient + decompose(3) = 1+2 = 2 change = 4 total
+        let recipient_count = 2;
+        let change_count = decompose_value(3).len(); // [1, 2]
+        assert_eq!(outputs.len(), recipient_count + change_count);
+        assert_eq!(change_seeds.len(), change_count);
+
+        // First two are to recipient
+        assert_eq!(outputs[0].address, dest);
+        assert_eq!(outputs[0].value, 4);
+        assert_eq!(outputs[1].address, dest);
+        assert_eq!(outputs[1].value, 2);
+
+        // Change values sum correctly
+        let change_total: u64 = change_seeds.iter().map(|(idx, _)| outputs[*idx].value).sum();
+        assert_eq!(change_total, 3);
+    }
+
+    #[test]
+    fn build_outputs_no_change() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let (outputs, change_seeds) = w.build_outputs(&[0xBB; 32], &[8], 0).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(change_seeds.is_empty());
+    }
+
+    // ── coinbase_seed / coinbase_salt derivation ────────────────────────
+
+    #[test]
+    fn coinbase_seed_deterministic() {
+        let ms = [0xAA; 32];
+        assert_eq!(coinbase_seed(&ms, 100, 0), coinbase_seed(&ms, 100, 0));
+    }
+
+    #[test]
+    fn coinbase_seed_varies_by_height() {
+        let ms = [0xAA; 32];
+        assert_ne!(coinbase_seed(&ms, 1, 0), coinbase_seed(&ms, 2, 0));
+    }
+
+    #[test]
+    fn coinbase_seed_varies_by_index() {
+        let ms = [0xAA; 32];
+        assert_ne!(coinbase_seed(&ms, 1, 0), coinbase_seed(&ms, 1, 1));
+    }
+
+    #[test]
+    fn coinbase_seed_differs_from_salt() {
+        let ms = [0xAA; 32];
+        assert_ne!(coinbase_seed(&ms, 1, 0), coinbase_salt(&ms, 1, 0));
+    }
+
+    // ── watched_addresses ───────────────────────────────────────────────
+
+    #[test]
+    fn watched_addresses_includes_keys_and_mss() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let addr1 = w.generate_key(None).unwrap();
+        let mss_addr = w.generate_mss(4, None).unwrap();
+
+        let watched = w.watched_addresses();
+        assert!(watched.contains(&addr1));
+        assert!(watched.contains(&mss_addr));
+    }
+
+    #[test]
+    fn watched_addresses_deduped() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        w.generate_key(None).unwrap();
+        w.generate_key(None).unwrap();
+        let watched = w.watched_addresses();
+        let mut sorted = watched.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(watched.len(), sorted.len());
+    }
+
+    // ── import_scanned ──────────────────────────────────────────────────
+
+    #[test]
+    fn import_scanned_matches_key() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let addr = w.generate_key(Some("scan test".into())).unwrap();
+
+        let salt = [0x55; 32];
+        let value = 8u64;
+        let result = w.import_scanned(addr, value, salt).unwrap();
+        assert!(result.is_some());
+        assert_eq!(w.coin_count(), 1);
+        assert_eq!(w.keys().len(), 0); // key consumed
+    }
+
+    #[test]
+    fn import_scanned_ignores_unknown_address() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let result = w.import_scanned([0xFF; 32], 8, [0; 32]).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn import_scanned_dedup() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let addr = w.generate_key(None).unwrap();
+        let salt = [0x55; 32];
+
+        w.import_scanned(addr, 8, salt).unwrap();
+        // Second import same coin → None
+        let result = w.import_scanned(addr, 8, salt).unwrap();
+        assert!(result.is_none());
+        assert_eq!(w.coin_count(), 1);
+    }
+
+    // ── generate_mss ────────────────────────────────────────────────────
+
+    #[test]
+    fn generate_mss_creates_key() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let root = w.generate_mss(4, Some("test mss".into())).unwrap();
+        assert_ne!(root, [0u8; 32]);
+        assert_eq!(w.mss_keys().len(), 1);
+        assert_eq!(w.mss_keys()[0].height, 4);
+    }
+
+    // ── plan_private_send ───────────────────────────────────────────────
+
+    #[test]
+    fn plan_private_send_independent_pairs() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
+        let c2 = w.import_coin([2; 32], 4, [20; 32], None).unwrap();
+        let c3 = w.import_coin([3; 32], 16, [30; 32], None).unwrap();
+
+        let live = vec![c1, c2, c3];
+        let dest = [0xAA; 32];
+        let pairs = w.plan_private_send(&live, &dest, &[4, 2]).unwrap();
+
+        assert_eq!(pairs.len(), 2);
+        // Each pair should have non-overlapping inputs
+        let all_inputs: Vec<[u8; 32]> = pairs.iter()
+            .flat_map(|(ins, _, _)| ins.clone())
+            .collect();
+        let mut deduped = all_inputs.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(all_inputs.len(), deduped.len(), "inputs should not overlap between pairs");
+    }
+
+    #[test]
+    fn plan_private_send_insufficient_funds() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 2, [10; 32], None).unwrap();
+        assert!(w.plan_private_send(&[c1], &[0xAA; 32], &[4, 4]).is_err());
+    }
+
+    // ── wrong password ──────────────────────────────────────────────────
+
+    #[test]
+    fn open_wrong_password() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        Wallet::create(&path, b"correct").unwrap();
+        assert!(Wallet::open(&path, b"wrong").is_err());
+    }
+
+    #[test]
+    fn create_duplicate_path_fails() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        Wallet::create(&path, b"pass").unwrap();
+        assert!(Wallet::create(&path, b"pass").is_err());
+    }
 }
