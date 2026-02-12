@@ -219,21 +219,34 @@ pub fn verify_mmr_proof(leaf_hash: &[u8; 32], proof: &MmrProof, expected_root: &
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  UTXO Accumulator  (drop-in replacement for HashSet<[u8;32]>)
+//  UTXO Accumulator  (Sparse Merkle Tree)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Merkle-committed UTXO set.  Sorted vec for correctness;
-/// swap internals for Sparse Merkle Tree / Utreexo at scale.
+static EMPTY_HASHES: std::sync::OnceLock<Vec<[u8; 32]>> = std::sync::OnceLock::new();
+
+fn get_empty_hash(height: usize) -> [u8; 32] {
+    let hashes = EMPTY_HASHES.get_or_init(|| {
+        let mut h = Vec::with_capacity(257);
+        h.push([0u8; 32]);
+        for i in 0..257 {
+            h.push(hash_concat(&h[i], &h[i]));
+        }
+        h
+    });
+    hashes[height]
+}
+
+/// Sparse Merkle Tree backed UTXO accumulator.
+/// Sorted vec kept in parallel for iteration/contains.
+/// SMT nodes stored as (height, path_key) -> hash.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UtxoAccumulator {
     coins: Vec<[u8; 32]>,
-    #[serde(skip)]
-    cached_root: Option<[u8; 32]>,
+    nodes: std::collections::HashMap<(u16, [u8; 32]), [u8; 32]>,
 }
 
 impl PartialEq for UtxoAccumulator {
     fn eq(&self, other: &Self) -> bool {
-        // Only compare the coins (the persistent state), ignoring the cached_root
         self.coins == other.coins
     }
 }
@@ -241,13 +254,14 @@ impl PartialEq for UtxoAccumulator {
 impl Eq for UtxoAccumulator {}
 
 impl UtxoAccumulator {
-    pub fn new() -> Self { Self { coins: Vec::new(), cached_root: None } }
+    pub fn new() -> Self {
+        Self { coins: Vec::new(), nodes: std::collections::HashMap::new() }
+    }
 
     pub fn from_set(coins: impl IntoIterator<Item = [u8; 32]>) -> Self {
-        let mut v: Vec<[u8; 32]> = coins.into_iter().collect();
-        v.sort();
-        v.dedup();
-        Self { coins: v, cached_root: None }
+        let mut acc = Self::new();
+        for c in coins { acc.insert(c); }
+        acc
     }
 
     pub fn len(&self) -> usize { self.coins.len() }
@@ -258,80 +272,121 @@ impl UtxoAccumulator {
     }
 
     pub fn insert(&mut self, coin: [u8; 32]) -> bool {
-        match self.coins.binary_search(&coin) {
-            Ok(_) => false,
-            Err(idx) => { self.coins.insert(idx, coin); self.cached_root = None; true }
-        }
+        if self.contains(&coin) { return false; }
+        let idx = self.coins.binary_search(&coin).unwrap_err();
+        self.coins.insert(idx, coin);
+        self.update_path(coin, true);
+        true
     }
 
     pub fn remove(&mut self, coin: &[u8; 32]) -> bool {
-        match self.coins.binary_search(coin) {
-            Ok(idx) => { self.coins.remove(idx); self.cached_root = None; true }
-            Err(_) => false,
+        if let Ok(idx) = self.coins.binary_search(coin) {
+            self.coins.remove(idx);
+            self.update_path(*coin, false);
+            true
+        } else {
+            false
         }
     }
 
-    /// Balanced Merkle root over sorted coins.
     pub fn root(&mut self) -> [u8; 32] {
-        if let Some(r) = self.cached_root { return r; }
-        let r = merkle_root(&self.coins);
-        self.cached_root = Some(r);
-        r
+        self.get_node(256, [0u8; 32])
     }
 
-    /// Merkle inclusion proof for `coin`.
     pub fn prove(&self, coin: &[u8; 32]) -> Result<UtxoProof> {
-        let idx = self.coins.binary_search(coin)
-            .map_err(|_| anyhow::anyhow!("coin not in accumulator"))?;
+        if !self.contains(coin) {
+            bail!("coin not in accumulator");
+        }
+
+        let mut siblings = Vec::with_capacity(256);
+        let mut current_path = *coin;
+
+        for h in 0usize..256 {
+            let bit = get_bit(coin, h);
+            let mut sibling_path = current_path;
+            flip_bit(&mut sibling_path, h);
+            mask_lower_bits(&mut sibling_path, h);
+
+            let sibling_hash = self.get_node(h as u16, sibling_path);
+            siblings.push(ProofElement {
+                hash: sibling_hash,
+                is_right: bit == 0,
+            });
+
+            mask_lower_bits(&mut current_path, h + 1);
+        }
+
         Ok(UtxoProof {
-            leaf_index: idx,
+            leaf_index: 0,
             leaf_count: self.coins.len(),
-            siblings: merkle_proof(&self.coins, idx),
+            siblings,
         })
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &[u8; 32]> { self.coins.iter() }
     pub fn into_vec(self) -> Vec<[u8; 32]> { self.coins }
+
+    fn get_node(&self, height: u16, path: [u8; 32]) -> [u8; 32] {
+        self.nodes.get(&(height, path))
+            .copied()
+            .unwrap_or_else(|| get_empty_hash(height as usize))
+    }
+
+    fn update_path(&mut self, coin: [u8; 32], inserting: bool) {
+        if inserting {
+            self.nodes.insert((0u16, coin), coin);
+        } else {
+            self.nodes.remove(&(0u16, coin));
+        }
+
+        let mut current_path = coin;
+
+        for h in 0usize..256 {
+            let bit = get_bit(&coin, h);
+
+            let mut sibling_path = current_path;
+            flip_bit(&mut sibling_path, h);
+            mask_lower_bits(&mut sibling_path, h);
+
+            let current_hash = self.get_node(h as u16, current_path);
+            let sibling_hash = self.get_node(h as u16, sibling_path);
+
+            let parent_hash = if bit == 0 {
+                hash_concat(&current_hash, &sibling_hash)
+            } else {
+                hash_concat(&sibling_hash, &current_hash)
+            };
+
+            mask_lower_bits(&mut current_path, h + 1);
+
+            let empty = get_empty_hash(h + 1);
+            if parent_hash == empty {
+                self.nodes.remove(&((h + 1) as u16, current_path));
+            } else {
+                self.nodes.insert(((h + 1) as u16, current_path), parent_hash);
+            }
+        }
+    }
 }
 
-fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
-    if leaves.is_empty() { return [0u8; 32]; }
-    if leaves.len() == 1 { return leaves[0]; }
-
-    let mut layer: Vec<[u8; 32]> = leaves.to_vec();
-    let n = layer.len().next_power_of_two();
-    layer.resize(n, [0u8; 32]);
-
-    while layer.len() > 1 {
-        layer = layer.chunks(2)
-            .map(|pair| hash_concat(&pair[0], &pair[1]))
-            .collect();
-    }
-    layer[0]
+fn get_bit(bytes: &[u8; 32], bit_index: usize) -> u8 {
+    let byte_idx = 31 - (bit_index / 8);
+    let bit_offset = bit_index % 8;
+    (bytes[byte_idx] >> bit_offset) & 1
 }
 
-fn merkle_proof(leaves: &[[u8; 32]], index: usize) -> Vec<ProofElement> {
-    if leaves.len() <= 1 { return vec![]; }
+fn flip_bit(bytes: &mut [u8; 32], bit_index: usize) {
+    let byte_idx = 31 - (bit_index / 8);
+    let bit_offset = bit_index % 8;
+    bytes[byte_idx] ^= 1 << bit_offset;
+}
 
-    let mut layer: Vec<[u8; 32]> = leaves.to_vec();
-    let n = layer.len().next_power_of_two();
-    layer.resize(n, [0u8; 32]);
-
-    let mut proof = Vec::new();
-    let mut idx = index;
-
-    while layer.len() > 1 {
-        let sib = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
-        proof.push(ProofElement {
-            hash: layer[sib],
-            is_right: idx % 2 == 0,
-        });
-        layer = layer.chunks(2)
-            .map(|pair| hash_concat(&pair[0], &pair[1]))
-            .collect();
-        idx /= 2;
+fn mask_lower_bits(path: &mut [u8; 32], height: usize) {
+    for i in 0..height {
+        let byte_idx = 31 - (i / 8);
+        let bit_offset = i % 8;
+        path[byte_idx] &= !(1 << bit_offset);
     }
-    proof
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -341,10 +396,16 @@ pub struct UtxoProof {
     pub siblings: Vec<ProofElement>,
 }
 
-/// Verify a UTXO inclusion proof.
+/// Verify a UTXO inclusion proof against the SMT root.
 pub fn verify_utxo_proof(coin: &[u8; 32], proof: &UtxoProof, expected_root: &[u8; 32]) -> bool {
+    if proof.siblings.len() != 256 { return false; }
+
     let mut current = *coin;
-    for elem in &proof.siblings {
+    for (h, elem) in proof.siblings.iter().enumerate() {
+        let bit = get_bit(coin, h);
+        let should_be_right = bit == 0;
+        if elem.is_right != should_be_right { return false; }
+
         current = if elem.is_right {
             hash_concat(&current, &elem.hash)
         } else {
@@ -362,6 +423,8 @@ pub fn verify_utxo_proof(coin: &[u8; 32], proof: &UtxoProof, expected_root: &[u8
 mod tests {
     use super::*;
     use crate::core::types::hash;
+
+    // ── MMR tests ───────────────────────────────────────────────────────
 
     #[test]
     fn mmr_append_and_root() {
@@ -386,7 +449,6 @@ mod tests {
         for leaf in &leaves { mmr.append(leaf); }
         let root = mmr.root();
 
-        // Leaf positions for 8-leaf MMR: 0,1,3,4,7,8,10,11
         let positions = [0u64, 1, 3, 4, 7, 8, 10, 11];
         for (i, leaf) in leaves.iter().enumerate() {
             let proof = mmr.prove(positions[i]).unwrap();
@@ -411,6 +473,8 @@ mod tests {
         assert_eq!(peaks(7), vec![6]);
     }
 
+    // ── UTXO Accumulator (SMT) tests ────────────────────────────────────
+
     #[test]
     fn utxo_accumulator_basics() {
         let mut acc = UtxoAccumulator::new();
@@ -429,6 +493,30 @@ mod tests {
         let r1 = acc.root();
         assert!(acc.remove(&c2));
         assert_ne!(r1, acc.root());
+    }
+
+    #[test]
+    fn utxo_insert_remove_reinsert_same_root() {
+        let mut acc = UtxoAccumulator::new();
+        let c1 = hash(b"coin1");
+        let c2 = hash(b"coin2");
+
+        acc.insert(c1);
+        acc.insert(c2);
+        let root_before = acc.root();
+
+        acc.remove(&c1);
+        assert_ne!(root_before, acc.root());
+
+        acc.insert(c1);
+        assert_eq!(root_before, acc.root());
+    }
+
+    #[test]
+    fn utxo_empty_root_is_deterministic() {
+        let mut a = UtxoAccumulator::new();
+        let mut b = UtxoAccumulator::new();
+        assert_eq!(a.root(), b.root());
     }
 
     #[test]
@@ -453,5 +541,28 @@ mod tests {
 
         let proof = acc.prove(&hash(b"coin1")).unwrap();
         assert!(!verify_utxo_proof(&hash(b"fake"), &proof, &root));
+    }
+
+    #[test]
+    fn utxo_proof_against_wrong_root_fails() {
+        let mut acc = UtxoAccumulator::new();
+        let c = hash(b"coin1");
+        acc.insert(c);
+        let proof = acc.prove(&c).unwrap();
+        let fake_root = hash(b"not the root");
+        assert!(!verify_utxo_proof(&c, &proof, &fake_root));
+    }
+
+    #[test]
+    fn utxo_from_set() {
+        let coins: Vec<[u8; 32]> = (0..5u8).map(|i| hash(&[i])).collect();
+        let mut acc = UtxoAccumulator::from_set(coins.clone());
+        assert_eq!(acc.len(), 5);
+        for c in &coins { assert!(acc.contains(c)); }
+
+        // Compare root with manual insert
+        let mut acc2 = UtxoAccumulator::new();
+        for c in &coins { acc2.insert(*c); }
+        assert_eq!(acc.root(), acc2.root());
     }
 }
