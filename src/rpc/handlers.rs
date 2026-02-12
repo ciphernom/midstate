@@ -173,7 +173,27 @@ pub async fn get_mempool(State(node): State<AppState>) -> Json<GetMempoolRespons
 
     Json(GetMempoolResponse { size, transactions: tx_info })
 }
+pub async fn scan_addresses(
+    State(node): State<AppState>,
+    Json(req): Json<ScanRequest>,
+) -> Result<Json<ScanResponse>, ErrorResponse> {
+    let addresses: Vec<[u8; 32]> = req.addresses.iter()
+        .map(|h| parse_hex32(h, "address"))
+        .collect::<Result<_, _>>()?;
 
+    let coins = node.scan_addresses(&addresses, req.start_height, req.end_height)
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    Ok(Json(ScanResponse {
+        coins: coins.into_iter().map(|c| ScanCoin {
+            address: hex::encode(c.address),
+            value: c.value,
+            salt: hex::encode(c.salt),
+            coin_id: hex::encode(c.coin_id),
+            height: c.height,
+        }).collect(),
+    }))
+}
 pub async fn generate_key() -> Json<GenerateKeyResponse> {
     let seed: [u8; 32] = rand::random();
     let owner_pk = wots::keygen(&seed);
