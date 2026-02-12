@@ -934,4 +934,40 @@ mod tests {
         Wallet::create(&path, b"pass").unwrap();
         assert!(Wallet::create(&path, b"pass").is_err());
     }
+    
+    #[test]
+    fn test_mss_safety_recovery_persistence() {
+        // 1. Setup: Create a wallet with an MSS key
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap(); // ensure it doesn't exist
+
+        let mut w = Wallet::create(&path, b"password").unwrap();
+        w.generate_mss(4, Some("test_mss".to_string())).unwrap();
+        
+        // Initial state: leaf index should be 0
+        assert_eq!(w.mss_keys()[0].next_leaf, 0);
+
+        // 2. Simulate the Fix:
+        // The "network" tells us the index is actually 50.
+        // We apply the fix logic: update internal state + safety margin.
+        let remote_index = 50;
+        let safety_margin = 20;
+        let new_index = remote_index + safety_margin;
+
+        // Apply fix directly to the data structure
+        w.data.mss_keys[0].set_next_leaf(new_index);
+        w.save().unwrap();
+
+        // 3. Verify Persistence:
+        // Close the wallet and reopen it from disk.
+        let w_reloaded = Wallet::open(&path, b"password").unwrap();
+        
+        // The loaded wallet must have the updated index.
+        assert_eq!(w_reloaded.mss_keys()[0].next_leaf, 70);
+        
+        // Ensure we didn't lose the key itself
+        assert_eq!(w_reloaded.mss_keys().len(), 1);
+        assert_eq!(w_reloaded.mss_keys()[0].height, 4);
+    }
 }
