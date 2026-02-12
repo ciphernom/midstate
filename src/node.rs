@@ -1025,10 +1025,12 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use crate::core::extension::create_extension;
-
+    use crate::core::mss;
+    use crate::core::types::hash;
+    
     // Helper to create a bare-bones node for testing internal logic
     async fn create_test_node(dir: &std::path::Path) -> Node {
-        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let _keypair = libp2p::identity::Keypair::generate_ed25519();
         // Bind to port 0 to let OS assign a random available port
         let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
         // Initialize node (this will create genesis if needed)
@@ -1136,4 +1138,245 @@ mod tests {
         let fork_h = node.find_fork_point(&[batch1_prime], 1).unwrap();
         assert_eq!(fork_h, 1, "Genesis fork should be detected at height 1");
     }
+    
+    #[test]
+    fn scan_txs_for_mss_index_finds_max() {
+        // Create an MSS keypair and sign a few messages
+        let seed = hash(b"test mss scan seed");
+        let mut keypair = mss::keygen(&seed, 4).unwrap();
+        let master_pk = keypair.public_key();
+
+        // Sign 5 messages (uses leaves 0-4)
+        let mut txs = Vec::new();
+        for i in 0..5u8 {
+            let msg = hash(&[i]);
+            let sig = keypair.sign(&msg).unwrap();
+            let sig_bytes = sig.to_bytes();
+
+            // Build a minimal Reveal tx with this MSS signature
+            let tx = Transaction::Reveal {
+                inputs: vec![InputReveal {
+                    owner_pk: master_pk,
+                    value: 1,
+                    salt: [i; 32],
+                }],
+                signatures: vec![sig_bytes],
+                outputs: vec![OutputData {
+                    address: [0xAA; 32],
+                    value: 1,
+                    salt: [i; 32],
+                }],
+                salt: [0; 32],
+            };
+            txs.push(tx);
+        }
+
+        // scan should find max index = 5 (leaf 4 used, so next = 5)
+        let max_idx = scan_txs_for_mss_index(&txs, &master_pk);
+        assert_eq!(max_idx, 5);
+    }
+
+    #[test]
+    fn scan_txs_for_mss_index_ignores_other_keys() {
+        let seed1 = hash(b"key1");
+        let seed2 = hash(b"key2");
+        let mut kp1 = mss::keygen(&seed1, 4).unwrap();
+        let kp2 = mss::keygen(&seed2, 4).unwrap();
+
+        let msg = hash(b"msg");
+        let sig = kp1.sign(&msg).unwrap();
+
+        let tx = Transaction::Reveal {
+            inputs: vec![InputReveal {
+                owner_pk: kp1.public_key(),
+                value: 1,
+                salt: [0; 32],
+            }],
+            signatures: vec![sig.to_bytes()],
+            outputs: vec![OutputData {
+                address: [0xAA; 32],
+                value: 1,
+                salt: [0; 32],
+            }],
+            salt: [0; 32],
+        };
+
+        // Scanning for kp2's key should find nothing
+        assert_eq!(scan_txs_for_mss_index(&[tx.clone()], &kp2.public_key()), 0);
+        // Scanning for kp1's key should find index 1
+        assert_eq!(scan_txs_for_mss_index(&[tx], &kp1.public_key()), 1);
+    }
+
+    #[test]
+    fn scan_txs_mss_recovery_simulation() {
+        // Simulates: use indices 0-4, then "restore backup" to 0,
+        // scan should report 5 so wallet can jump ahead
+        let seed = hash(b"recovery sim");
+        let mut keypair = mss::keygen(&seed, 4).unwrap();
+        let master_pk = keypair.public_key();
+
+        let mut txs = Vec::new();
+        for i in 0..5u8 {
+            let msg = hash(&[i]);
+            let sig = keypair.sign(&msg).unwrap();
+            txs.push(Transaction::Reveal {
+                inputs: vec![InputReveal {
+                    owner_pk: master_pk,
+                    value: 1,
+                    salt: [i; 32],
+                }],
+                signatures: vec![sig.to_bytes()],
+                outputs: vec![OutputData {
+                    address: [0xBB; 32],
+                    value: 1,
+                    salt: [i; 32],
+                }],
+                salt: [0; 32],
+            });
+        }
+
+        let chain_max = scan_txs_for_mss_index(&txs, &master_pk);
+        assert_eq!(chain_max, 5, "should find highest used index + 1");
+
+        // Simulate backup restore: keypair at index 0
+        let mut restored = mss::keygen(&seed, 4).unwrap();
+        assert_eq!(restored.next_leaf, 0);
+
+        // Apply recovery logic (same as wallet sync)
+        const SAFETY_MARGIN: u64 = 20;
+        if chain_max >= restored.next_leaf {
+            restored.set_next_leaf(chain_max + SAFETY_MARGIN);
+        }
+        assert_eq!(restored.next_leaf, 25, "should be 5 + 20 safety margin");
+    }
+
+    #[test]
+    fn scan_txs_mss_mempool_race() {
+        // Simulate: tx with index 10 in mempool (unmined)
+        let seed = hash(b"mempool race");
+        let mut keypair = mss::keygen(&seed, 5).unwrap(); // height 5 = 32 leaves
+
+        // Advance to leaf 10 by signing 10 messages
+        for i in 0..10u8 {
+            keypair.sign(&hash(&[i])).unwrap();
+        }
+
+        // Sign one more (leaf index 10) — this is the "mempool tx"
+        let msg = hash(b"mempool tx");
+        let sig = keypair.sign(&msg).unwrap();
+        assert_eq!(sig.leaf_index, 10);
+
+        let mempool_tx = Transaction::Reveal {
+            inputs: vec![InputReveal {
+                owner_pk: keypair.public_key(),
+                value: 1,
+                salt: [0; 32],
+            }],
+            signatures: vec![sig.to_bytes()],
+            outputs: vec![OutputData {
+                address: [0xCC; 32],
+                value: 1,
+                salt: [0; 32],
+            }],
+            salt: [0; 32],
+        };
+
+        let mempool_max = scan_txs_for_mss_index(&[mempool_tx], &keypair.public_key());
+        assert_eq!(mempool_max, 11, "should account for leaf 10 → next = 11");
+
+        // Simulate restore from backup at index 0
+        let mut restored = mss::keygen(&seed, 5).unwrap();
+
+        const SAFETY_MARGIN: u64 = 20;
+        let remote_idx = mempool_max; // in real code: max(chain_max, mempool_max)
+        if remote_idx >= restored.next_leaf {
+            restored.set_next_leaf(remote_idx + SAFETY_MARGIN);
+        }
+        assert_eq!(restored.next_leaf, 31, "should be 11 + 20 safety margin");
+    }
+    
+    #[test]
+    fn scan_txs_skips_wots_signatures() {
+        // WOTS sigs are exactly 576 bytes — scanner should ignore them
+        let seed = hash(b"wots not mss");
+        let pk = wots::keygen(&seed);
+        let msg = hash(b"test");
+        let sig = wots::sign(&seed, &msg);
+        let sig_bytes = wots::sig_to_bytes(&sig);
+        assert_eq!(sig_bytes.len(), wots::SIG_SIZE);
+
+        let tx = Transaction::Reveal {
+            inputs: vec![InputReveal {
+                owner_pk: pk,
+                value: 1,
+                salt: [0; 32],
+            }],
+            signatures: vec![sig_bytes],
+            outputs: vec![OutputData {
+                address: [0xAA; 32],
+                value: 1,
+                salt: [0; 32],
+            }],
+            salt: [0; 32],
+        };
+
+        // Should return 0 — no MSS signatures found
+        assert_eq!(scan_txs_for_mss_index(&[tx], &pk), 0);
+    }
+
+    #[test]
+    fn scan_txs_empty_returns_zero() {
+        let pk = hash(b"any key");
+        assert_eq!(scan_txs_for_mss_index(&[], &pk), 0);
+    }
+
+    #[test]
+    fn mss_recovery_does_not_roll_back() {
+        // If local index is ahead of remote, should NOT decrease
+        let seed = hash(b"no rollback");
+        let mut keypair = mss::keygen(&seed, 4).unwrap();
+
+        // Advance local to leaf 10
+        for i in 0..10u8 {
+            keypair.sign(&hash(&[i])).unwrap();
+        }
+        assert_eq!(keypair.next_leaf, 10);
+
+        // Remote only knows about 3 usages
+        let remote_idx: u64 = 3;
+
+        // Recovery logic should NOT roll back
+        const SAFETY_MARGIN: u64 = 20;
+        if remote_idx >= keypair.next_leaf {
+            keypair.set_next_leaf(remote_idx + SAFETY_MARGIN);
+        }
+        // Should still be 10, not 23
+        assert_eq!(keypair.next_leaf, 10);
+    }
+
+    #[test]
+    fn scan_txs_corrupt_mss_sig_no_panic() {
+        // Garbage bytes longer than WOTS SIG_SIZE should not crash
+        let pk = hash(b"corrupt test");
+        let garbage = vec![0xFFu8; wots::SIG_SIZE + 100]; // longer than WOTS → tries MSS parse
+
+        let tx = Transaction::Reveal {
+            inputs: vec![InputReveal {
+                owner_pk: pk,
+                value: 1,
+                salt: [0; 32],
+            }],
+            signatures: vec![garbage],
+            outputs: vec![OutputData {
+                address: [0xAA; 32],
+                value: 1,
+                salt: [0; 32],
+            }],
+            salt: [0; 32],
+        };
+
+        // Should not panic, just return 0
+        assert_eq!(scan_txs_for_mss_index(&[tx], &pk), 0);
+    }
+    
 }

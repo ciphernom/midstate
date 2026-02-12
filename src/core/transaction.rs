@@ -214,3 +214,97 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
         }
     }
 }
+
+#[cfg(test)] 
+mod tests {
+    use super::*;
+    use crate::core::mmr::UtxoAccumulator;
+
+    fn empty_state() -> State {
+        State {
+            midstate: [0u8; 32],
+            coins: UtxoAccumulator::new(),
+            commitments: UtxoAccumulator::new(),
+            depth: 0,
+            target: [0xff; 32],
+            height: 1,
+            timestamp: 1000,
+            commitment_heights: std::collections::HashMap::new(),
+        }
+    }
+
+    fn mine_commit_nonce(commitment: &[u8; 32]) -> u64 {
+        let mut n = 0u64;
+        loop {
+            let h = hash_concat(commitment, &n.to_le_bytes());
+            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 {
+                return n;
+            }
+            n += 1;
+        }
+    }
+
+    #[test]
+    fn commit_pow_valid_nonce_passes() {
+        let commitment = hash(b"test commitment");
+        let nonce = mine_commit_nonce(&commitment);
+        assert!(validate_commit_pow(&commitment, nonce).is_ok());
+    }
+
+    #[test]
+    fn commit_pow_invalid_nonce_fails() {
+        let commitment = hash(b"test commitment");
+        // Nonce 0 is almost certainly invalid (1 in 65536 chance)
+        // Try a few to find one that fails
+        let mut bad_nonce = 0u64;
+        loop {
+            let h = hash_concat(&commitment, &bad_nonce.to_le_bytes());
+            if u16::from_be_bytes([h[0], h[1]]) != 0x0000 {
+                break;
+            }
+            bad_nonce += 1;
+        }
+        assert!(validate_commit_pow(&commitment, bad_nonce).is_err());
+    }
+
+    #[test]
+    fn commit_pow_benchmark() {
+        // Measure time to mine a valid nonce — should be ~10-50ms
+        let commitment = hash(b"benchmark commitment");
+        let start = std::time::Instant::now();
+        let nonce = mine_commit_nonce(&commitment);
+        let elapsed = start.elapsed();
+        // Verify it's actually valid
+        assert!(validate_commit_pow(&commitment, nonce).is_ok());
+        // Log timing (visible with `cargo test -- --nocapture`)
+        eprintln!("Commit PoW mining took {:?} (nonce: {})", elapsed, nonce);
+        // Soft assert: should complete within 5 seconds even on slow hardware
+        assert!(elapsed.as_secs() < 5, "PoW took too long: {:?}", elapsed);
+    }
+
+    #[test]
+    fn validate_transaction_rejects_bad_commit_pow() {
+        let state = empty_state();
+        let commitment = hash(b"reject test");
+        // Find an invalid nonce
+        let mut bad_nonce = 0u64;
+        loop {
+            let h = hash_concat(&commitment, &bad_nonce.to_le_bytes());
+            if u16::from_be_bytes([h[0], h[1]]) != 0x0000 {
+                break;
+            }
+            bad_nonce += 1;
+        }
+        let tx = Transaction::Commit { commitment, spam_nonce: bad_nonce };
+        assert!(validate_transaction(&state, &tx).is_err());
+    }
+
+    #[test]
+    fn validate_transaction_accepts_good_commit_pow() {
+        let state = empty_state();
+        let commitment = hash(b"accept test");
+        let nonce = mine_commit_nonce(&commitment);
+        let tx = Transaction::Commit { commitment, spam_nonce: nonce };
+        assert!(validate_transaction(&state, &tx).is_ok());
+    }
+}
