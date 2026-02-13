@@ -942,3 +942,122 @@ fn save_keypair(data_dir: &PathBuf, keypair: &Keypair) {
         let _ = std::fs::write(&path, ed_kp.to_bytes());
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use crate::core::extension::create_extension;
+
+    // Helper to create a bare-bones node for testing internal logic
+    async fn create_test_node(dir: &std::path::Path) -> Node {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        // Bind to port 0 to let OS assign a random available port
+        let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+        // Initialize node (this will create genesis if needed)
+        Node::new(dir.to_path_buf(), false, listen, vec![]).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_find_fork_point_logic() {
+        // 1. Setup
+        let dir = tempdir().unwrap();
+        let mut node = create_test_node(dir.path()).await;
+
+        // 2. Build a local chain: Genesis (0) -> B1 -> B2
+        // Note: Node::new already created Genesis at height 0.
+        let genesis_batch = node.storage.load_batch(0).unwrap().unwrap();
+        let midstate_0 = genesis_batch.extension.final_hash;
+
+        // Create Batch 1
+        let ext1 = create_extension(midstate_0, 100);
+        let midstate_1 = ext1.final_hash;
+        let batch1 = Batch {
+            prev_midstate: midstate_0,
+            transactions: vec![],
+            extension: ext1,
+            coinbase: vec![],
+            timestamp: 1000,
+            target: node.state.target,
+        };
+        node.storage.save_batch(1, &batch1).unwrap();
+
+        // Create Batch 2
+        let ext2 = create_extension(midstate_1, 200);
+        let midstate_2 = ext2.final_hash;
+        let batch2 = Batch {
+            prev_midstate: midstate_1,
+            transactions: vec![],
+            extension: ext2,
+            coinbase: vec![],
+            timestamp: 1010,
+            target: node.state.target,
+        };
+        node.storage.save_batch(2, &batch2).unwrap();
+
+        // Manually update node state to reflect tip is at height 2
+        node.state.height = 2;
+        node.state.midstate = midstate_2;
+
+        // ---------------------------------------------------------
+        // Case A: Linear Extension (No Fork)
+        // ---------------------------------------------------------
+        // Remote sends Batch 3, which builds on Batch 2.
+        let ext3 = create_extension(midstate_2, 300);
+        let batch3 = Batch {
+            prev_midstate: midstate_2,
+            transactions: vec![],
+            extension: ext3,
+            coinbase: vec![],
+            timestamp: 1020,
+            target: node.state.target,
+        };
+
+        // We ask: "Where does this batch attach?"
+        // Since batch3.prev_midstate == node.midstate (midstate_2),
+        // find_fork_point should identify it attaches at height 3.
+        let fork_h = node.find_fork_point(&[batch3.clone()], 3).unwrap();
+        assert_eq!(fork_h, 3, "Linear extension should attach at height 3");
+
+        // ---------------------------------------------------------
+        // Case B: Deep Fork
+        // ---------------------------------------------------------
+        // Remote sends Batch 2', which builds on Batch 1 (forks off before Batch 2).
+        // prev_midstate = midstate_1.
+        let ext2_prime = create_extension(midstate_1, 999); // Different nonce -> different hash
+        let batch2_prime = Batch {
+            prev_midstate: midstate_1,
+            transactions: vec![],
+            extension: ext2_prime,
+            coinbase: vec![],
+            timestamp: 1011,
+            target: node.state.target,
+        };
+
+        // We ask: "Where does this batch attach?"
+        // It connects to Batch 1 (height 1).
+        // So the fork point (the first new block) is at height 2.
+        let fork_h = node.find_fork_point(&[batch2_prime], 2).unwrap();
+        assert_eq!(fork_h, 2, "Deep fork should be detected at height 2");
+
+        // ---------------------------------------------------------
+        // Case C: Genesis Fork
+        // ---------------------------------------------------------
+        // Remote sends a batch that builds on Genesis (height 0), replacing Batch 1.
+        let ext1_prime = create_extension(midstate_0, 555);
+        let batch1_prime = Batch {
+            prev_midstate: midstate_0,
+            transactions: vec![],
+            extension: ext1_prime,
+            coinbase: vec![],
+            timestamp: 1001,
+            target: node.state.target,
+        };
+
+        // It connects to Genesis (height 0).
+        // Fork point is height 1.
+        let fork_h = node.find_fork_point(&[batch1_prime], 1).unwrap();
+        assert_eq!(fork_h, 1, "Genesis fork should be detected at height 1");
+    }
+}

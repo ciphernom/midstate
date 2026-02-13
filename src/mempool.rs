@@ -3,6 +3,10 @@ use crate::core::transaction::validate_transaction;
 use anyhow::Result;
 use std::collections::HashSet;
 
+const MAX_MEMPOOL_SIZE: usize = 10_000;
+const MAX_PENDING_COMMITS: usize = 1_000;
+const MIN_REVEAL_FEE: u64 = 1;
+
 pub struct Mempool {
     transactions: Vec<Transaction>,
     seen_inputs: HashSet<[u8; 32]>,
@@ -19,6 +23,24 @@ impl Mempool {
     }
 
     pub fn add(&mut self, tx: Transaction, state: &State) -> Result<()> {
+        
+        // DoS protection
+        if self.transactions.len() >= MAX_MEMPOOL_SIZE {
+            anyhow::bail!("Mempool full");
+        }
+        match &tx {
+            Transaction::Commit { .. } => {
+                if self.seen_commitments.len() >= MAX_PENDING_COMMITS {
+                    anyhow::bail!("Too many pending commits");
+                }
+            }
+            Transaction::Reveal { .. } => {
+                if tx.fee() < MIN_REVEAL_FEE {
+                    anyhow::bail!("Fee too low (minimum: {})", MIN_REVEAL_FEE);
+                }
+            }
+        }
+        
         validate_transaction(state, &tx)?;
 
         match &tx {
