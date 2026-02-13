@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use midstate::*;
 use midstate::wallet::{self, Wallet, short_hex};
 use midstate::core::wots;
+use midstate::network::{socket_to_multiaddr, MidstateNetwork, NetworkEvent};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -35,6 +36,8 @@ enum Command {
         peer: Vec<SocketAddr>,
         #[arg(long)]
         mine: bool,
+        #[arg(long)]
+        listen: Option<String>,
     },
 
     /// Wallet operations
@@ -91,6 +94,8 @@ enum Command {
         data_dir: PathBuf,
         #[arg(long)]
         peer: SocketAddr,
+        #[arg(long, default_value = "9333")]
+        port: u16,
     },
 }
 
@@ -222,7 +227,6 @@ fn parse_hex32(s: &str) -> Result<[u8; 32]> {
     Ok(<[u8; 32]>::try_from(bytes).unwrap())
 }
 
-/// Parse a --to argument: <owner_pk_hex>:<value>
 fn parse_output_spec(s: &str) -> Result<([u8; 32], u64)> {
     let parts: Vec<&str> = s.splitn(2, ':').collect();
     if parts.len() != 2 {
@@ -267,8 +271,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Node { data_dir, port, rpc_port, peer, mine } => {
-            run_node(data_dir, port, rpc_port, peer, mine).await
+        Command::Node { data_dir, port, rpc_port, peer, mine, listen } => {
+            run_node(data_dir, port, rpc_port, peer, mine, listen).await
         }
         Command::Wallet { action } => handle_wallet(action).await,
         Command::Commit { rpc_port, coin, dest } => {
@@ -279,7 +283,7 @@ async fn main() -> Result<()> {
         Command::Mempool { rpc_port } => get_mempool(rpc_port).await,
         Command::Peers { rpc_port } => get_peers(rpc_port).await,
         Command::Keygen { rpc_port } => keygen(rpc_port).await,
-        Command::Sync { data_dir, peer } => sync_from_genesis(data_dir, peer).await,
+        Command::Sync { data_dir, peer, port } => sync_from_genesis(data_dir, peer, port).await,
     }
 }
 
@@ -328,7 +332,6 @@ fn wallet_receive(path: &PathBuf, label: Option<String>) -> Result<()> {
     println!("\n  Your receiving address ({}):\n", label);
     println!("  {}\n", hex::encode(owner_pk));
     println!("  Share this with the sender.");
-    println!("  After receiving, import the coin with: wallet import --seed <seed> --value <val> --salt <salt>");
     Ok(())
 }
 
@@ -354,7 +357,6 @@ async fn wallet_list(path: &PathBuf, rpc_port: u16, full: bool) -> Result<()> {
     let wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
 
-    // List coins with values
     if wallet.coin_count() > 0 {
         println!("COINS:");
         if full {
@@ -379,7 +381,6 @@ async fn wallet_list(path: &PathBuf, rpc_port: u16, full: bool) -> Result<()> {
         }
     }
 
-    // List unused receiving keys
     if !wallet.keys().is_empty() {
         println!("\nUNUSED RECEIVING KEYS:");
         for (i, k) in wallet.keys().iter().enumerate() {
@@ -430,15 +431,13 @@ async fn wallet_send(
     let mut wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
 
-    // Parse recipient outputs
     let recipient_specs: Vec<([u8; 32], u64)> = to_args.iter()
         .map(|s| parse_output_spec(s))
         .collect::<Result<Vec<_>>>()?;
 
     let total_send: u64 = recipient_specs.iter().map(|(_, v)| v).sum();
-    let needed = total_send + 1; // +1 minimum fee
+    let needed = total_send + 1;
 
-    // Gather live coins
     let mut live_coins = Vec::new();
     for wc in wallet.coins() {
         if let Ok(true) = check_coin_rpc(&client, rpc_port, &hex::encode(wc.coin_id)).await {
@@ -447,10 +446,7 @@ async fn wallet_send(
     }
 
     if private {
-        // Private mode: one independent tx per recipient output
-        // Group by recipient pk: all outputs to the same pk in one batch
         let denoms: Vec<u64> = recipient_specs.iter().map(|(_, v)| *v).collect();
-        // Assume all going to same recipient pk for simplicity (first pk)
         let recipient_pk = recipient_specs[0].0;
 
         let pairs = wallet.plan_private_send(&live_coins, &recipient_pk, &denoms)?;
@@ -487,7 +483,6 @@ async fn wallet_send(
             let server_commitment = parse_hex32(&commit_resp.commitment)?;
             let server_salt = parse_hex32(&commit_resp.salt)?;
 
-            // Replace our local pending with server's commitment/salt
             wallet.data.pending.retain(|p| p.commitment != commitment);
             wallet.data.pending.push(wallet::PendingCommit {
                 commitment: server_commitment,
@@ -517,7 +512,6 @@ async fn wallet_send(
             do_reveal(&client, &mut wallet, rpc_port, &server_commitment, timeout_secs).await?;
         }
     } else {
-        // Normal mode
         let input_coin_ids: Vec<[u8; 32]> = if !coin_args.is_empty() {
             coin_args.iter()
                 .map(|s| wallet.resolve_coin(s))
@@ -535,10 +529,9 @@ async fn wallet_send(
             anyhow::bail!("input value ({}) must exceed output value ({}) to pay fee", in_sum, total_send);
         }
 
-        let fee = 1u64; // minimum fee
+        let fee = 1u64;
         let change = in_sum - total_send - fee;
 
-        // Build recipient outputs (one per --to spec, all already power of 2)
         let mut all_outputs = Vec::new();
         let mut change_seeds = Vec::new();
 
@@ -547,7 +540,6 @@ async fn wallet_send(
             all_outputs.push(OutputData { owner_pk: *pk, value: *value, salt });
         }
 
-        // Add change outputs
         if change > 0 {
             let change_denoms = decompose_value(change);
             for denom in change_denoms {
@@ -677,7 +669,6 @@ async fn do_reveal(
     }
     let _result: rpc::SendTransactionResponse = response.json().await?;
 
-    // Wait for reveal to be mined (first input coin disappears)
     let check_coin_hex = hex::encode(pending.input_coin_ids[0]);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut revealed = false;
@@ -952,18 +943,20 @@ async fn check_coin_rpc(client: &reqwest::Client, rpc_port: u16, coin_hex: &str)
 // ── Original commands ───────────────────────────────────────────────────────
 
 async fn run_node(
-    data_dir: PathBuf, port: u16, rpc_port: u16, peers: Vec<SocketAddr>, mine: bool,
+    data_dir: PathBuf, port: u16, rpc_port: u16, peers: Vec<SocketAddr>, mine: bool, listen: Option<String>,
 ) -> Result<()> {
-    let bind_addr: SocketAddr = ([0, 0, 0, 0], port).into();
+    let listen_addr: libp2p::Multiaddr = match listen {
+        Some(addr) => addr.parse()?,
+        None => format!("/ip4/0.0.0.0/tcp/{}", port).parse()?,
+    };
 
-    let mut node = node::Node::new(data_dir, mine, bind_addr)?;
-    node.listen(bind_addr).await?;
-    for peer_addr in peers {
-        if let Err(e) = node.connect_to_peer(peer_addr).await {
-            tracing::warn!("Failed to connect to {}: {}", peer_addr, e);
-        }
-    }
+    let bootstrap: Vec<libp2p::Multiaddr> = peers.iter()
+        .map(|a| socket_to_multiaddr(*a))
+        .collect();
+
+    let node = node::Node::new(data_dir, mine, listen_addr, bootstrap).await?;
     let (handle, cmd_rx) = node.create_handle();
+
     let rpc_server = rpc::RpcServer::new(rpc_port);
     let handle_clone = handle.clone();
     tokio::spawn(async move {
@@ -989,7 +982,6 @@ async fn commit_transaction(rpc_port: u16, coins: Vec<String>, destinations: Vec
         println!("Commitment submitted!");
         println!("  Commitment: {}", result.commitment);
         println!("  Salt:       {}", result.salt);
-        println!("\n⚠️  Save the salt! You need it for the reveal (send) phase.");
     } else {
         let error: rpc::ErrorResponse = response.json().await?;
         println!("Error: {}", error.error);
@@ -1077,11 +1069,25 @@ async fn keygen(rpc_port: Option<u16>) -> Result<()> {
     Ok(())
 }
 
-async fn sync_from_genesis(data_dir: PathBuf, peer_addr: SocketAddr) -> Result<()> {
+async fn sync_from_genesis(data_dir: PathBuf, peer_addr: SocketAddr, port: u16) -> Result<()> {
     let storage = storage::Storage::open(data_dir.join("db"))?;
     let syncer = sync::Syncer::new(storage);
-    let mut peer = network::PeerConnection::connect(peer_addr, ([127, 0, 0, 1], 0).into()).await?;
-    let state = syncer.sync_from_genesis(&mut peer).await?;
+
+    let listen_addr: libp2p::Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", port).parse()?;
+    let peer_multiaddr = socket_to_multiaddr(peer_addr);
+
+    let keypair = libp2p::identity::Keypair::generate_ed25519();
+    let mut network = MidstateNetwork::new(keypair, listen_addr, vec![peer_multiaddr]).await?;
+
+    // Wait for connection
+    let peer_id = loop {
+        match network.next_event().await {
+            NetworkEvent::PeerConnected(id) => break id,
+            _ => continue,
+        }
+    };
+
+    let state = syncer.sync_via_network(&mut network, peer_id).await?;
     println!("Sync complete!");
     println!("  Height:      {}", state.height);
     println!("  Depth:       {}", state.depth);
