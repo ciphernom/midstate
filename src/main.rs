@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, Context};
 use clap::{Parser, Subcommand};
 use midstate::*;
 use midstate::compute_address;
@@ -516,6 +516,50 @@ async fn wallet_send(
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
+
+    // MSS Index Verification
+    if !wallet.data.mss_keys.is_empty() {
+        println!("Connecting to node to verify MSS safety indices...");
+        let mss_url = format!("http://127.0.0.1:{}/mss_state", rpc_port);
+
+        for i in 0..wallet.data.mss_keys.len() {
+            let master_pk = wallet.data.mss_keys[i].master_pk;
+            let current_leaf = wallet.data.mss_keys[i].next_leaf;
+
+            let req = rpc::GetMssStateRequest {
+                master_pk: hex::encode(master_pk),
+            };
+
+            // STRICT SAFETY: We use context() to ensure that if the node is offline,
+            // the program crashes here rather than risking a reuse of the private key.
+            let response = client.post(&mss_url).json(&req).send().await
+                .context("CRITICAL: Could not connect to node. Aborting to prevent MSS key reuse.")?;
+
+            if !response.status().is_success() {
+                anyhow::bail!("Safety Check Failed: Node returned error checking MSS state.");
+            }
+
+            let mss_resp: rpc::GetMssStateResponse = response.json().await
+                .context("Safety Check Failed: Invalid response from node.")?;
+
+            // If the node has seen more signatures than we have locally, FAST FORWARD.
+            if mss_resp.next_index > current_leaf {
+                const SAFETY_MARGIN: u64 = 20;
+                let new_leaf = mss_resp.next_index + SAFETY_MARGIN;
+                
+                println!("  ⚠️  MSS Key {}: Old state detected (Node: {}, Local: {})", 
+                    short_hex(&master_pk), mss_resp.next_index, current_leaf);
+                println!("      Fast-forwarding index to {} to ensure safety.", new_leaf);
+                
+                wallet.data.mss_keys[i].set_next_leaf(new_leaf);
+                
+                // Save immediately. If save fails, we crash before signing.
+                wallet.save().context("Failed to save updated wallet state")?;
+            }
+        }
+        println!("  ✓ MSS indices verified safe.");
+    }
+
 
     let recipient_specs: Vec<([u8; 32], u64)> = to_args.iter()
         .map(|s| parse_output_spec(s))
