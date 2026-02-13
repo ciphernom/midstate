@@ -399,11 +399,12 @@ impl Node {
 
                 if midstate == self.state.midstate && height == self.state.height {
                     self.sync_in_progress = false;
-                } else if !self.sync_in_progress && (depth > self.state.depth || height > self.state.height) {
-                    self.sync_in_progress = true;
+                } else if depth > self.state.depth || height > self.state.height {
                     let start = self.state.height.saturating_sub(self.max_reorg_depth.min(self.state.height));
                     let count = (height.saturating_sub(start) + 1).min(MAX_GETBATCHES_COUNT);
                     tracing::info!("Syncing from peer {} (requesting {} batches from {})", from, count, start);
+                    self.sync_in_progress = true;
+                    self.sync_requested_up_to = height;
                     self.network.send(from, Message::GetBatches { start_height: start, count });
                 }
             }
@@ -698,6 +699,7 @@ impl Node {
                     }
 
                     self.network.broadcast_except(from, Message::Batch(batch));
+                    tracing::info!("Applied new batch from peer, height now {}", self.state.height);
                     self.try_apply_orphans().await;
                 }
                 Ok(())
@@ -810,10 +812,17 @@ impl Node {
             tracing::info!("Synced {} batch(es), now at height {}", applied, self.state.height);
             self.mempool.prune_invalid(&self.state);
             self.try_apply_orphans().await;
-            self.network.send(from, Message::GetState);
-        }
 
-        if self.sync_requested_up_to <= self.state.height {
+            if self.state.height >= self.sync_requested_up_to {
+                self.sync_in_progress = false;
+            } else {
+                // Still behind — request more batches from same peer
+                let start = self.state.height;
+                let count = (self.sync_requested_up_to.saturating_sub(start) + 1).min(MAX_GETBATCHES_COUNT);
+                tracing::info!("Continuing sync from peer {} (requesting {} batches from {})", from, count, start);
+                self.network.send(from, Message::GetBatches { start_height: start, count });
+            }
+        } else {
             self.sync_in_progress = false;
         }
 
