@@ -565,4 +565,45 @@ mod tests {
         for c in &coins { acc2.insert(*c); }
         assert_eq!(acc.root(), acc2.root());
     }
+    #[test]
+    fn utxo_accumulator_large_set() {
+        let mut acc = UtxoAccumulator::new();
+        let coins: Vec<[u8; 32]> = (0..200u32).map(|i| {
+            let mut h = blake3::Hasher::new();
+            h.update(&i.to_le_bytes());
+            *h.finalize().as_bytes()
+        }).collect();
+        for c in &coins { acc.insert(*c); }
+        assert_eq!(acc.len(), 200);
+        let root_with_all = acc.root();
+        for c in &coins { assert!(acc.contains(c)); }
+        for c in &coins[..100] { acc.remove(c); }
+        assert_eq!(acc.len(), 100);
+        assert_ne!(root_with_all, acc.root());
+    }
+
+    #[test]
+    fn utxo_remove_all_returns_to_empty_root() {
+        let mut acc = UtxoAccumulator::new();
+        let empty_root = acc.root();
+        let coins: Vec<[u8; 32]> = (0..5u8).map(|i| hash(&[i])).collect();
+        for c in &coins { acc.insert(*c); }
+        for c in &coins { acc.remove(c); }
+        assert_eq!(acc.root(), empty_root);
+        assert!(acc.is_empty());
+    }
+
+    #[test]
+    fn utxo_proof_non_member_fails() {
+        let acc = UtxoAccumulator::new();
+        let coin = hash(b"not in set");
+        assert!(acc.prove(&coin).is_err());
+    }
+
+    #[test]
+    fn mmr_proof_invalid_position() {
+        let mut mmr = MerkleMountainRange::new();
+        mmr.append(&hash(b"a"));
+        assert!(mmr.prove(999).is_err());
+    }
 }
