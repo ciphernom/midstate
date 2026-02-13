@@ -9,7 +9,8 @@ use crate::metrics::Metrics;
 use crate::network::{Message, MidstateNetwork, NetworkEvent, MAX_GETBATCHES_COUNT};
 use crate::storage::Storage;
 use crate::wallet::{coinbase_seed, coinbase_salt};
-
+use crate::core::mss;
+use crate::core::wots;
 use anyhow::Result;
 use libp2p::{request_response::ResponseChannel, PeerId, Multiaddr, identity::Keypair};
 use std::collections::HashMap;
@@ -124,7 +125,34 @@ impl NodeHandle {
         }
         Ok(found)
     }
+    pub fn scan_mss_index(&self, master_pk: &[u8; 32], height: u64) -> Result<u64> {
+        let store = crate::storage::BatchStore::new(&self.batches_path)?;
+        let mut max_idx: u64 = 0;
+        for h in 0..height {
+            if let Some(batch) = store.load(h)? {
+                max_idx = max_idx.max(scan_txs_for_mss_index(&batch.transactions, master_pk));
+            }
+        }
+        Ok(max_idx)
+    }
     
+}
+
+pub fn scan_txs_for_mss_index(txs: &[Transaction], master_pk: &[u8; 32]) -> u64 {
+    let mut max_idx: u64 = 0;
+    for tx in txs {
+        if let Transaction::Reveal { inputs, signatures, .. } = tx {
+            for (input, sig_bytes) in inputs.iter().zip(signatures.iter()) {
+                if input.owner_pk == *master_pk && sig_bytes.len() > wots::SIG_SIZE {
+                    if let Ok(mss_sig) = mss::MssSignature::from_bytes(sig_bytes) {
+                        // leaf_index is 0-based, so next usable = leaf_index + 1
+                        max_idx = max_idx.max(mss_sig.leaf_index + 1);
+                    }
+                }
+            }
+        }
+    }
+    max_idx
 }
 
 impl Node {
