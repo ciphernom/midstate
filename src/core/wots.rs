@@ -258,4 +258,35 @@ mod tests {
         assert_eq!(cd[0], 0);
         assert_eq!(cd[1], 0);
     }
+
+    #[test]
+    fn sig_from_bytes_wrong_length() {
+        assert!(sig_from_bytes(&[0u8; 100]).is_none());
+        assert!(sig_from_bytes(&[0u8; SIG_SIZE + 1]).is_none());
+        assert!(sig_from_bytes(&[]).is_none());
+    }
+
+    #[test]
+    fn keygen_deterministic() {
+        let seed = [0x42u8; 32];
+        assert_eq!(keygen(&seed), keygen(&seed));
+    }
+
+    #[test]
+    fn different_seeds_different_keys() {
+        assert_ne!(keygen(&[1u8; 32]), keygen(&[2u8; 32]));
+    }
+
+    #[test]
+    fn verify_wrong_length_sig_fails() {
+        let seed = [0x42u8; 32];
+        let coin = keygen(&seed);
+        let msg = hash(b"test");
+        // Too few chunks
+        let short_sig: Vec<[u8; 32]> = vec![[0u8; 32]; CHAINS - 1];
+        assert!(!verify(&short_sig, &msg, &coin));
+    }
+
+
+
 }
