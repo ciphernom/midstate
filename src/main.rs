@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use rayon::prelude::*; 
+use rayon::prelude::*;
 
 fn default_wallet_path() -> PathBuf {
     wallet::default_path()
@@ -51,24 +51,6 @@ enum Command {
         coin: Vec<String>,
         #[arg(long)]
         dest: Vec<String>,
-    },
-
-    /// Phase 2: Reveal with WOTS signatures
-    Send {
-        #[arg(long, default_value = "8545")]
-        rpc_port: u16,
-        /// Input coin IDs (hex)
-        #[arg(long)]
-        input_coin: Vec<String>,
-        /// WOTS seeds for signing (hex, one per input)
-        #[arg(long)]
-        seed: Vec<String>,
-        /// Destination coins (hex)
-        #[arg(long)]
-        dest: Vec<String>,
-        /// Salt from the commit phase (hex)
-        #[arg(long)]
-        salt: String,
     },
 
     /// Check if a coin exists
@@ -118,12 +100,14 @@ enum WalletAction {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
     },
+    /// Generate a receiving address (WOTS key)
     Receive {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
         #[arg(long)]
         label: Option<String>,
     },
+    /// Generate multiple receiving keys
     Generate {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
@@ -136,7 +120,6 @@ enum WalletAction {
     GenerateMss {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
-        /// Tree height (e.g. 10 = 1024 sigs). Warning: >14 is slow.
         #[arg(long, default_value = "10")]
         height: u32,
         #[arg(long)]
@@ -156,27 +139,34 @@ enum WalletAction {
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
     },
+    /// Send value. --to format: <owner_pk_hex>:<value> (value must be power of 2)
     Send {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// Explicit input coin IDs (optional, auto-selects if omitted)
         #[arg(long)]
         coin: Vec<String>,
+        /// Recipient outputs: <owner_pk_hex>:<value>
         #[arg(long)]
         to: Vec<String>,
         #[arg(long, default_value = "120")]
         timeout: u64,
-        /// Private mode: split into independent 2-in-1-out pairs with random reveal delays
         #[arg(long)]
         private: bool,
     },
+    /// Import a coin with known seed, value, and salt
     Import {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
         /// WOTS seed (hex)
         #[arg(long)]
         seed: String,
+        #[arg(long)]
+        value: u64,
+        #[arg(long)]
+        salt: String,
         #[arg(long)]
         label: Option<String>,
     },
@@ -208,7 +198,6 @@ enum WalletAction {
     ImportRewards {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
-        /// Path to coinbase_seeds.jsonl
         #[arg(long)]
         coinbase_file: PathBuf,
     },
@@ -231,6 +220,24 @@ fn parse_hex32(s: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(s)?;
     if bytes.len() != 32 { anyhow::bail!("expected 32 bytes, got {}", bytes.len()); }
     Ok(<[u8; 32]>::try_from(bytes).unwrap())
+}
+
+/// Parse a --to argument: <owner_pk_hex>:<value>
+fn parse_output_spec(s: &str) -> Result<([u8; 32], u64)> {
+    let parts: Vec<&str> = s.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        anyhow::bail!("expected format <owner_pk_hex>:<value>, got: {}", s);
+    }
+    let pk = parse_hex32(parts[0])?;
+    let value: u64 = parts[1].parse()
+        .map_err(|_| anyhow::anyhow!("invalid value: {}", parts[1]))?;
+    if value == 0 {
+        anyhow::bail!("value must be > 0");
+    }
+    if !value.is_power_of_two() {
+        anyhow::bail!("value {} is not a power of 2", value);
+    }
+    Ok((pk, value))
 }
 
 fn format_age(secs: u64) -> String {
@@ -267,9 +274,6 @@ async fn main() -> Result<()> {
         Command::Commit { rpc_port, coin, dest } => {
             commit_transaction(rpc_port, coin, dest).await
         }
-        Command::Send { rpc_port, input_coin, seed, dest, salt } => {
-            send_transaction(rpc_port, input_coin, seed, dest, salt).await
-        }
         Command::Balance { rpc_port, coin } => check_balance(rpc_port, coin).await,
         Command::State { rpc_port } => get_state(rpc_port).await,
         Command::Mempool { rpc_port } => get_mempool(rpc_port).await,
@@ -291,7 +295,9 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         WalletAction::Send { path, rpc_port, coin, to, timeout, private } => {
             wallet_send(&path, rpc_port, coin, to, timeout, private).await
         }
-        WalletAction::Import { path, seed, label } => wallet_import(&path, &seed, label),
+        WalletAction::Import { path, seed, value, salt, label } => {
+            wallet_import(&path, &seed, value, &salt, label)
+        }
         WalletAction::Export { path, coin } => wallet_export(&path, &coin),
         WalletAction::Pending { path } => wallet_pending(&path),
         WalletAction::Reveal { path, rpc_port, commitment } => {
@@ -317,11 +323,12 @@ fn wallet_create(path: &PathBuf) -> Result<()> {
 fn wallet_receive(path: &PathBuf, label: Option<String>) -> Result<()> {
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
-    let label = label.unwrap_or_else(|| format!("receive #{}", wallet.coin_count() + 1));
-    let wc = wallet.generate(Some(label.clone()))?;
+    let label = label.unwrap_or_else(|| format!("receive #{}", wallet.keys().len() + 1));
+    let owner_pk = wallet.generate_key(Some(label.clone()))?;
     println!("\n  Your receiving address ({}):\n", label);
-    println!("  {}\n", hex::encode(wc.coin));
+    println!("  {}\n", hex::encode(owner_pk));
     println!("  Share this with the sender.");
+    println!("  After receiving, import the coin with: wallet import --seed <seed> --value <val> --salt <salt>");
     Ok(())
 }
 
@@ -334,43 +341,55 @@ fn wallet_generate(path: &PathBuf, count: usize, label: Option<String>) -> Resul
         } else {
             label.as_ref().map(|l| format!("{} #{}", l, i + 1))
         };
-        let wc = wallet.generate(lbl)?;
-        let coin = wc.coin;
-        let idx = wallet.coin_count() - 1;
-        println!("  [{}] {}", idx, hex::encode(coin));
+        let pk = wallet.generate_key(lbl)?;
+        println!("  [{}] {}", wallet.keys().len() - 1, hex::encode(pk));
     }
-    println!("\nGenerated {} coin(s). Total: {}", count, wallet.coin_count());
+    println!("\nGenerated {} key(s). Total keys: {}, Total coins: {}",
+        count, wallet.keys().len(), wallet.coin_count());
     Ok(())
 }
 
 async fn wallet_list(path: &PathBuf, rpc_port: u16, full: bool) -> Result<()> {
     let password = read_password("Password: ")?;
     let wallet = Wallet::open(path, &password)?;
-    if wallet.coin_count() == 0 {
-        println!("Wallet is empty. Use `wallet receive` to create an address.");
-        return Ok(());
-    }
     let client = reqwest::Client::new();
-    if full {
-        println!("{:<5} {:<66} {:<10} {}", "#", "COIN", "STATUS", "LABEL");
-        println!("{}", "-".repeat(95));
-    } else {
-        println!("{:<5} {:<15} {:<10} {}", "#", "COIN", "STATUS", "LABEL");
-        println!("{}", "-".repeat(50));
+
+    // List coins with values
+    if wallet.coin_count() > 0 {
+        println!("COINS:");
+        if full {
+            println!("{:<5} {:<66} {:<8} {:<10} {}", "#", "COIN_ID", "VALUE", "STATUS", "LABEL");
+            println!("{}", "-".repeat(100));
+        } else {
+            println!("{:<5} {:<15} {:<8} {:<10} {}", "#", "COIN_ID", "VALUE", "STATUS", "LABEL");
+            println!("{}", "-".repeat(55));
+        }
+
+        for (i, wc) in wallet.coins().iter().enumerate() {
+            let coin_hex = hex::encode(wc.coin_id);
+            let status = check_coin_rpc(&client, rpc_port, &coin_hex).await;
+            let label = wc.label.as_deref().unwrap_or("");
+            let status_str = match status {
+                Ok(true) => "✓ live",
+                Ok(false) => "✗ unset",
+                Err(_) => "? error",
+            };
+            let display = if full { coin_hex } else { short_hex(&wc.coin_id) };
+            println!("{:<5} {:<15} {:<8} {:<10} {}", i, display, wc.value, status_str, label);
+        }
     }
-    for (i, wc) in wallet.coins().iter().enumerate() {
-        let coin_hex = hex::encode(wc.coin);
-        let status = check_coin_rpc(&client, rpc_port, &coin_hex).await;
-        let label = wc.label.as_deref().unwrap_or("");
-        let status_str = match status {
-            Ok(true) => "✓ live",
-            Ok(false) => "✗ unset",
-            Err(_) => "? error",
-        };
-        let display = if full { coin_hex } else { short_hex(&wc.coin) };
-        println!("{:<5} {:<15} {:<10} {}", i, display, status_str, label);
+
+    // List unused receiving keys
+    if !wallet.keys().is_empty() {
+        println!("\nUNUSED RECEIVING KEYS:");
+        for (i, k) in wallet.keys().iter().enumerate() {
+            let display = if full { hex::encode(k.owner_pk) } else { short_hex(&k.owner_pk) };
+            let label = k.label.as_deref().unwrap_or("");
+            println!("  [K{}] {} {}", i, display, label);
+        }
     }
-    if !full { println!("\nUse --full to show complete coin IDs."); }
+
+    if !full { println!("\nUse --full to show complete IDs."); }
     Ok(())
 }
 
@@ -378,15 +397,20 @@ async fn wallet_balance(path: &PathBuf, rpc_port: u16) -> Result<()> {
     let password = read_password("Password: ")?;
     let wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
-    let mut live = 0usize;
+
+    let mut live_count = 0usize;
+    let mut live_value = 0u64;
     for wc in wallet.coins() {
-        if let Ok(true) = check_coin_rpc(&client, rpc_port, &hex::encode(wc.coin)).await {
-            live += 1;
+        if let Ok(true) = check_coin_rpc(&client, rpc_port, &hex::encode(wc.coin_id)).await {
+            live_count += 1;
+            live_value += wc.value;
         }
     }
-    println!("Coins in wallet: {}", wallet.coin_count());
-    println!("Live on-chain:   {}", live);
-    println!("Pending commits: {}", wallet.pending().len());
+
+    println!("Coins in wallet:  {}", wallet.coin_count());
+    println!("Live on-chain:    {} (value: {})", live_count, live_value);
+    println!("Unused keys:      {}", wallet.keys().len());
+    println!("Pending commits:  {}", wallet.pending().len());
     Ok(())
 }
 
@@ -399,39 +423,57 @@ async fn wallet_send(
     private: bool,
 ) -> Result<()> {
     if to_args.is_empty() {
-        anyhow::bail!("must specify at least one --to destination");
+        anyhow::bail!("must specify at least one --to <owner_pk>:<value>");
     }
 
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
-
-    let destinations: Vec<[u8; 32]> = to_args.iter()
-        .map(|s| parse_hex32(s))
-        .collect::<Result<Vec<_>>>()?;
-
     let client = reqwest::Client::new();
 
-    if private {
-        // Private mode: gather live coins, plan independent pairs
-        let mut live_coins = Vec::new();
-        for wc in wallet.coins() {
-            if let Ok(true) = check_coin_rpc(&client, rpc_port, &hex::encode(wc.coin)).await {
-                live_coins.push(wc.coin);
-            }
-        }
+    // Parse recipient outputs
+    let recipient_specs: Vec<([u8; 32], u64)> = to_args.iter()
+        .map(|s| parse_output_spec(s))
+        .collect::<Result<Vec<_>>>()?;
 
-        let pairs = wallet.plan_private_send(&live_coins, &destinations)?;
+    let total_send: u64 = recipient_specs.iter().map(|(_, v)| v).sum();
+    let needed = total_send + 1; // +1 minimum fee
+
+    // Gather live coins
+    let mut live_coins = Vec::new();
+    for wc in wallet.coins() {
+        if let Ok(true) = check_coin_rpc(&client, rpc_port, &hex::encode(wc.coin_id)).await {
+            live_coins.push(wc.coin_id);
+        }
+    }
+
+    if private {
+        // Private mode: one independent tx per recipient output
+        // Group by recipient pk: all outputs to the same pk in one batch
+        let denoms: Vec<u64> = recipient_specs.iter().map(|(_, v)| *v).collect();
+        // Assume all going to same recipient pk for simplicity (first pk)
+        let recipient_pk = recipient_specs[0].0;
+
+        let pairs = wallet.plan_private_send(&live_coins, &recipient_pk, &denoms)?;
         println!("Private send: {} independent transaction(s)\n", pairs.len());
 
-        for (pair_idx, (inputs, outputs)) in pairs.iter().enumerate() {
-            println!("  Pair {}: {} in → {} out", pair_idx, inputs.len(), outputs.len());
+        for (pair_idx, (inputs, outputs, change_seeds)) in pairs.iter().enumerate() {
+            let in_val: u64 = inputs.iter()
+                .filter_map(|id| wallet.find_coin(id))
+                .map(|c| c.value)
+                .sum();
+            let out_val: u64 = outputs.iter().map(|o| o.value).sum();
+            println!("  Pair {}: {} in (value {}) → {} out (value {}, fee {})",
+                pair_idx, inputs.len(), in_val, outputs.len(), out_val, in_val - out_val);
 
-            // Commit
-            let (commitment, _salt) = wallet.prepare_commit(inputs, outputs, true)?;
+            let output_coin_ids: Vec<[u8; 32]> = outputs.iter().map(|o| o.coin_id()).collect();
+
+            let (commitment, _salt) = wallet.prepare_commit(
+                inputs, outputs, change_seeds.clone(), true
+            )?;
 
             let commit_req = rpc::CommitRequest {
                 coins: inputs.iter().map(|c| hex::encode(c)).collect(),
-                destinations: outputs.iter().map(|d| hex::encode(d)).collect(),
+                destinations: output_coin_ids.iter().map(|d| hex::encode(d)).collect(),
             };
 
             let url = format!("http://127.0.0.1:{}/commit", rpc_port);
@@ -445,15 +487,14 @@ async fn wallet_send(
             let server_commitment = parse_hex32(&commit_resp.commitment)?;
             let server_salt = parse_hex32(&commit_resp.salt)?;
 
-            // Replace pending with server's commitment
+            // Replace our local pending with server's commitment/salt
             wallet.data.pending.retain(|p| p.commitment != commitment);
-
-
             wallet.data.pending.push(wallet::PendingCommit {
                 commitment: server_commitment,
                 salt: server_salt,
                 input_coin_ids: inputs.clone(),
-                destinations: outputs.clone(),
+                outputs: outputs.clone(),
+                change_seeds: change_seeds.clone(),
                 created_at: now_secs(),
                 reveal_not_before: now_secs() + 10 + (rand::random::<u64>() % 41),
             });
@@ -461,13 +502,11 @@ async fn wallet_send(
 
             println!("  ✓ Commit submitted ({})", short_hex(&server_commitment));
 
-            // Wait for commit to be mined
             if !wait_for_commit_mined(&client, rpc_port, &commit_resp.commitment, timeout_secs).await {
                 println!("  ⏳ Not mined yet. Run `wallet reveal` later.");
                 continue;
             }
 
-            // Wait for privacy delay
             let pending = wallet.find_pending(&server_commitment).unwrap().clone();
             let delay = pending.reveal_not_before.saturating_sub(now_secs());
             if delay > 0 {
@@ -475,53 +514,68 @@ async fn wallet_send(
                 tokio::time::sleep(Duration::from_secs(delay)).await;
             }
 
-            // Reveal
             do_reveal(&client, &mut wallet, rpc_port, &server_commitment, timeout_secs).await?;
         }
     } else {
-        // Normal mode: all inputs → all outputs in one tx
-        // Need inputs > outputs for fee
-        let needed_inputs = destinations.len() + 1; // +1 for fee
-
-        let input_coins: Vec<[u8; 32]> = if !coin_args.is_empty() {
+        // Normal mode
+        let input_coin_ids: Vec<[u8; 32]> = if !coin_args.is_empty() {
             coin_args.iter()
                 .map(|s| wallet.resolve_coin(s))
                 .collect::<Result<Vec<_>>>()?
         } else {
-            let mut picked = Vec::new();
-            for wc in wallet.coins() {
-                if picked.len() >= needed_inputs { break; }
-                if let Ok(true) = check_coin_rpc(&client, rpc_port, &hex::encode(wc.coin)).await {
-                    picked.push(wc.coin);
-                }
-            }
-            if picked.len() < needed_inputs {
-                anyhow::bail!(
-                    "not enough live coins: need {} (outputs + fee), found {}",
-                    needed_inputs, picked.len()
-                );
-            }
-            picked
+            wallet.select_coins(needed, &live_coins)?
         };
 
-        if input_coins.len() <= destinations.len() {
-            anyhow::bail!(
-                "need more inputs ({}) than outputs ({}) to pay fee",
-                input_coins.len(), destinations.len()
-            );
+        let in_sum: u64 = input_coin_ids.iter()
+            .filter_map(|id| wallet.find_coin(id))
+            .map(|c| c.value)
+            .sum();
+
+        if in_sum <= total_send {
+            anyhow::bail!("input value ({}) must exceed output value ({}) to pay fee", in_sum, total_send);
         }
 
+        let fee = 1u64; // minimum fee
+        let change = in_sum - total_send - fee;
+
+        // Build recipient outputs (one per --to spec, all already power of 2)
+        let mut all_outputs = Vec::new();
+        let mut change_seeds = Vec::new();
+
+        for (pk, value) in &recipient_specs {
+            let salt: [u8; 32] = rand::random();
+            all_outputs.push(OutputData { owner_pk: *pk, value: *value, salt });
+        }
+
+        // Add change outputs
+        if change > 0 {
+            let change_denoms = decompose_value(change);
+            for denom in change_denoms {
+                let seed: [u8; 32] = rand::random();
+                let pk = wots::keygen(&seed);
+                let salt: [u8; 32] = rand::random();
+                let idx = all_outputs.len();
+                all_outputs.push(OutputData { owner_pk: pk, value: denom, salt });
+                change_seeds.push((idx, seed));
+            }
+        }
+
+        let output_coin_ids: Vec<[u8; 32]> = all_outputs.iter().map(|o| o.coin_id()).collect();
+
         println!(
-            "Spending {} coin(s) → {} destination(s) (fee: {})",
-            input_coins.len(), destinations.len(), input_coins.len() - destinations.len()
+            "Spending {} coin(s) (value {}) → {} output(s) (value {}, fee: {})",
+            input_coin_ids.len(), in_sum,
+            all_outputs.len(), total_send + change,
+            fee
         );
 
-        // Commit
-        let (commitment, _salt) = wallet.prepare_commit(&input_coins, &destinations, false)?;
+        let (commitment, _salt) = wallet.prepare_commit(
+            &input_coin_ids, &all_outputs, change_seeds.clone(), false
+        )?;
 
         let commit_req = rpc::CommitRequest {
-            coins: input_coins.iter().map(|c| hex::encode(c)).collect(),
-            destinations: destinations.iter().map(|d| hex::encode(d)).collect(),
+            coins: input_coin_ids.iter().map(|c| hex::encode(c)).collect(),
+            destinations: output_coin_ids.iter().map(|d| hex::encode(d)).collect(),
         };
 
         let url = format!("http://127.0.0.1:{}/commit", rpc_port);
@@ -535,13 +589,12 @@ async fn wallet_send(
         let server_salt = parse_hex32(&commit_resp.salt)?;
 
         wallet.data.pending.retain(|p| p.commitment != commitment);
-
-
         wallet.data.pending.push(wallet::PendingCommit {
             commitment: server_commitment,
             salt: server_salt,
-            input_coin_ids: input_coins.clone(),
-            destinations: destinations.clone(),
+            input_coin_ids: input_coin_ids.clone(),
+            outputs: all_outputs,
+            change_seeds,
             created_at: now_secs(),
             reveal_not_before: 0,
         });
@@ -562,7 +615,6 @@ async fn wallet_send(
     Ok(())
 }
 
-/// Wait for a commitment to leave the mempool (i.e. be mined).
 async fn wait_for_commit_mined(
     client: &reqwest::Client,
     rpc_port: u16,
@@ -589,7 +641,6 @@ async fn wait_for_commit_mined(
     false
 }
 
-/// Submit a reveal transaction for a pending commit.
 async fn do_reveal(
     client: &reqwest::Client,
     wallet: &mut Wallet,
@@ -601,14 +652,21 @@ async fn do_reveal(
         .ok_or_else(|| anyhow::anyhow!("pending commit not found"))?
         .clone();
 
-    // Build WOTS signatures
-    let signatures = wallet.sign_reveal(&pending)?;
+    let (input_reveals, signatures) = wallet.sign_reveal(&pending)?;
 
     let reveal_url = format!("http://127.0.0.1:{}/send", rpc_port);
     let reveal_req = rpc::SendTransactionRequest {
-        input_coins: pending.input_coin_ids.iter().map(|c| hex::encode(c)).collect(),
+        inputs: input_reveals.iter().map(|ir| rpc::InputRevealJson {
+            owner_pk: hex::encode(ir.owner_pk),
+            value: ir.value,
+            salt: hex::encode(ir.salt),
+        }).collect(),
         signatures: signatures.iter().map(|s| hex::encode(s)).collect(),
-        destinations: pending.destinations.iter().map(|d| hex::encode(d)).collect(),
+        outputs: pending.outputs.iter().map(|o| rpc::OutputDataJson {
+            owner_pk: hex::encode(o.owner_pk),
+            value: o.value,
+            salt: hex::encode(o.salt),
+        }).collect(),
         salt: hex::encode(pending.salt),
     };
 
@@ -619,7 +677,7 @@ async fn do_reveal(
     }
     let _result: rpc::SendTransactionResponse = response.json().await?;
 
-    // Wait for reveal to be mined (input coin disappears)
+    // Wait for reveal to be mined (first input coin disappears)
     let check_coin_hex = hex::encode(pending.input_coin_ids[0]);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut revealed = false;
@@ -645,33 +703,38 @@ async fn do_reveal(
 
     wallet.complete_reveal(commitment)?;
     println!("✓ Transfer complete!");
-    for c in &pending.input_coin_ids {
-        println!("  spent:   {}", short_hex(c));
+    for id in &pending.input_coin_ids {
+        let val = input_reveals.iter().find(|ir| ir.coin_id() == *id).map(|ir| ir.value).unwrap_or(0);
+        println!("  spent:   {} (value {})", short_hex(id), val);
     }
-    for d in &pending.destinations {
-        println!("  created: {}", short_hex(d));
+    for out in &pending.outputs {
+        println!("  created: {} (value {})", short_hex(&out.coin_id()), out.value);
     }
     Ok(())
 }
 
-fn wallet_import(path: &PathBuf, seed_hex: &str, label: Option<String>) -> Result<()> {
+fn wallet_import(path: &PathBuf, seed_hex: &str, value: u64, salt_hex: &str, label: Option<String>) -> Result<()> {
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
     let seed = parse_hex32(seed_hex)?;
-    let coin = wallet.import_seed(seed, label)?;
-    println!("Imported: [{}] {}", wallet.coin_count() - 1, short_hex(&coin));
+    let salt = parse_hex32(salt_hex)?;
+    let coin_id = wallet.import_coin(seed, value, salt, label)?;
+    println!("Imported: {} (value {})", short_hex(&coin_id), value);
     Ok(())
 }
 
 fn wallet_export(path: &PathBuf, coin_ref: &str) -> Result<()> {
     let password = read_password("Password: ")?;
     let wallet = Wallet::open(path, &password)?;
-    let coin = wallet.resolve_coin(coin_ref)?;
-    let wc = wallet.find_coin(&coin)
+    let coin_id = wallet.resolve_coin(coin_ref)?;
+    let wc = wallet.find_coin(&coin_id)
         .ok_or_else(|| anyhow::anyhow!("coin not found in wallet"))?;
-    println!("Seed: {}", hex::encode(wc.seed));
-    println!("Coin: {}", hex::encode(wc.coin));
-    println!("\n⚠️  Anyone with the seed can spend this coin.");
+    println!("Seed:    {}", hex::encode(wc.seed));
+    println!("Value:   {}", wc.value);
+    println!("Salt:    {}", hex::encode(wc.salt));
+    println!("CoinID:  {}", hex::encode(wc.coin_id));
+    println!("OwnerPK: {}", hex::encode(wc.owner_pk));
+    println!("\n⚠️  Anyone with the seed + value + salt can spend this coin.");
     Ok(())
 }
 
@@ -686,11 +749,13 @@ fn wallet_pending(path: &PathBuf) -> Result<()> {
     println!("{} pending commit(s):\n", pending.len());
     for (i, p) in pending.iter().enumerate() {
         let age = now_secs().saturating_sub(p.created_at);
+        let out_val: u64 = p.outputs.iter().map(|o| o.value).sum();
         println!(
-            "  [{}] {} — {} in, {} out, {}",
+            "  [{}] {} — {} in, {} out (value {}), {}",
             i, short_hex(&p.commitment),
-            p.input_coin_ids.len(), 
-            p.destinations.len(), 
+            p.input_coin_ids.len(),
+            p.outputs.len(),
+            out_val,
             format_age(age),
         );
     }
@@ -710,7 +775,7 @@ fn wallet_history(path: &PathBuf, count: usize) -> Result<()> {
     println!("Transaction history ({} of {}):\n", entries.len(), history.len());
     for (i, entry) in entries.iter().enumerate() {
         let age = now_secs().saturating_sub(entry.timestamp);
-        println!("  [{}] {}", start + i, format_age(age));
+        println!("  [{}] {} (fee: {})", start + i, format_age(age), entry.fee);
         for c in &entry.inputs { println!("    spent:   {}", short_hex(c)); }
         for c in &entry.outputs { println!("    created: {}", short_hex(c)); }
         println!();
@@ -748,20 +813,27 @@ async fn wallet_reveal(
             }
         };
 
-        // Check privacy delay
         if pending.reveal_not_before > now_secs() {
             let wait = pending.reveal_not_before - now_secs();
             println!("  {} — waiting {}s (privacy delay)", short_hex(&commitment), wait);
             tokio::time::sleep(Duration::from_secs(wait)).await;
         }
 
-        let signatures = wallet.sign_reveal(&pending)?;
+        let (input_reveals, signatures) = wallet.sign_reveal(&pending)?;
 
         let url = format!("http://127.0.0.1:{}/send", rpc_port);
         let req = rpc::SendTransactionRequest {
-            input_coins: pending.input_coin_ids.iter().map(|c| hex::encode(c)).collect(),
+            inputs: input_reveals.iter().map(|ir| rpc::InputRevealJson {
+                owner_pk: hex::encode(ir.owner_pk),
+                value: ir.value,
+                salt: hex::encode(ir.salt),
+            }).collect(),
             signatures: signatures.iter().map(|s| hex::encode(s)).collect(),
-            destinations: pending.destinations.iter().map(|d| hex::encode(d)).collect(),
+            outputs: pending.outputs.iter().map(|o| rpc::OutputDataJson {
+                owner_pk: hex::encode(o.owner_pk),
+                value: o.value,
+                salt: hex::encode(o.salt),
+            }).collect(),
             salt: hex::encode(pending.salt),
         };
 
@@ -784,60 +856,64 @@ fn wallet_import_rewards(path: &PathBuf, coinbase_file: &PathBuf) -> Result<()> 
 
     println!("Reading coinbase log...");
     let contents = std::fs::read_to_string(coinbase_file)?;
-    
-    // Define the struct locally for deserialization
+
     #[derive(serde::Deserialize)]
     struct CoinbaseEntry {
+        #[allow(dead_code)]
         height: u64,
+        #[allow(dead_code)]
         index: u64,
         seed: String,
         #[serde(rename = "coin")]
         _coin: String,
+        value: u64,
+        salt: String,
     }
 
-    // 1. Parse all lines first
     let entries: Vec<CoinbaseEntry> = contents
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
 
-    println!("Found {} rewards. Calculating keys in parallel...", entries.len());
+    println!("Found {} rewards. Importing...", entries.len());
 
-    // 2. Generate keys in PARALLEL (Uses all cores)
-    // This crunches the 300 million hashes instantly
-    let new_coins: Vec<midstate::wallet::WalletCoin> = entries
-        .into_par_iter() 
+    let new_coins: Vec<wallet::WalletCoin> = entries
+        .into_par_iter()
         .map(|entry| {
-            let seed = parse_hex32(&entry.seed).unwrap(); // We assume log is valid
-            let coin = wots::keygen(&seed); // Heavy lifting happens here
-            midstate::wallet::WalletCoin {
+            let seed = parse_hex32(&entry.seed).unwrap();
+            let salt = parse_hex32(&entry.salt).unwrap();
+            let owner_pk = wots::keygen(&seed);
+            let coin_id = compute_coin_id(&owner_pk, entry.value, &salt);
+            wallet::WalletCoin {
                 seed,
-                coin,
-                label: Some(format!("coinbase h={} i={}", entry.height, entry.index)),
+                owner_pk,
+                value: entry.value,
+                salt,
+                coin_id,
+                label: Some(format!("coinbase (value {})", entry.value)),
             }
         })
         .collect();
 
-    // 3. Batch Insert (Sequential, but fast memory operation)
-    let mut imported = 0usize;
     let existing_coins: std::collections::HashSet<_> = wallet.data.coins
         .iter()
-        .map(|c| c.coin)
+        .map(|c| c.coin_id)
         .collect();
 
+    let mut imported = 0usize;
     for wc in new_coins {
-        if !existing_coins.contains(&wc.coin) {
+        if !existing_coins.contains(&wc.coin_id) {
             wallet.data.coins.push(wc);
             imported += 1;
         }
     }
 
-    // 4. Save ONCE at the end
     println!("Saving wallet...");
     wallet.save()?;
 
-    println!("Imported {} coinbase reward(s). Total coins: {}", imported, wallet.coin_count());
+    println!("Imported {} coinbase reward(s). Total coins: {}, total value: {}",
+        imported, wallet.coin_count(), wallet.total_value());
     Ok(())
 }
 
@@ -860,7 +936,7 @@ fn wallet_generate_mss(path: &PathBuf, height: u32, label: Option<String>) -> Re
     println!("  Capacity: {} signatures", capacity);
     println!("  Address:  {}", hex::encode(root));
     println!("\nThis address is reusable until the capacity is exhausted.");
-    
+
     Ok(())
 }
 
@@ -878,7 +954,8 @@ async fn check_coin_rpc(client: &reqwest::Client, rpc_port: u16, coin_hex: &str)
 async fn run_node(
     data_dir: PathBuf, port: u16, rpc_port: u16, peers: Vec<SocketAddr>, mine: bool,
 ) -> Result<()> {
-    let bind_addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let bind_addr: SocketAddr = ([0, 0, 0, 0], port).into();
+
     let mut node = node::Node::new(data_dir, mine, bind_addr)?;
     node.listen(bind_addr).await?;
     for peer_addr in peers {
@@ -913,60 +990,6 @@ async fn commit_transaction(rpc_port: u16, coins: Vec<String>, destinations: Vec
         println!("  Commitment: {}", result.commitment);
         println!("  Salt:       {}", result.salt);
         println!("\n⚠️  Save the salt! You need it for the reveal (send) phase.");
-    } else {
-        let error: rpc::ErrorResponse = response.json().await?;
-        println!("Error: {}", error.error);
-    }
-    Ok(())
-}
-
-async fn send_transaction(
-    rpc_port: u16,
-    input_coins: Vec<String>,
-    seeds: Vec<String>,
-    destinations: Vec<String>,
-    salt: String,
-) -> Result<()> {
-    if input_coins.is_empty() { anyhow::bail!("Must provide at least one input coin"); }
-    if seeds.len() != input_coins.len() { anyhow::bail!("Must provide one seed per input coin"); }
-
-    // Parse inputs and compute WOTS signatures
-    let parsed_coins: Vec<[u8; 32]> = input_coins.iter()
-        .map(|s| parse_hex32(s))
-        .collect::<Result<_>>()?;
-    let parsed_dests: Vec<[u8; 32]> = destinations.iter()
-        .map(|s| parse_hex32(s))
-        .collect::<Result<_>>()?;
-    let parsed_salt = parse_hex32(&salt)?;
-
-    let commitment = compute_commitment(&parsed_coins, &parsed_dests, &parsed_salt);
-
-    let mut sigs_hex = Vec::new();
-    for seed_hex in &seeds {
-        let seed = parse_hex32(seed_hex)?;
-        let sig = wots::sign(&seed, &commitment);
-        sigs_hex.push(hex::encode(wots::sig_to_bytes(&sig)));
-    }
-
-    let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/send", rpc_port);
-    let req = rpc::SendTransactionRequest {
-        input_coins,
-        signatures: sigs_hex,
-        destinations,
-        salt,
-    };
-
-    let response = client.post(&url).json(&req).send().await?;
-    if response.status().is_success() {
-        let result: rpc::SendTransactionResponse = response.json().await?;
-        println!("Transaction submitted!");
-        for (i, input) in result.input_coins.iter().enumerate() {
-            println!("  Input {}: {}", i, input);
-        }
-        for (i, output) in result.output_coins.iter().enumerate() {
-            println!("  Output {}: {}", i, output);
-        }
     } else {
         let error: rpc::ErrorResponse = response.json().await?;
         println!("Error: {}", error.error);
@@ -1019,6 +1042,9 @@ async fn get_mempool(rpc_port: u16) -> Result<()> {
         if let Some(ref outputs) = tx.output_coins {
             for (j, output) in outputs.iter().enumerate() { println!("    Output {}: {}", j, output); }
         }
+        if let Some(fee) = tx.fee {
+            println!("    Fee: {}", fee);
+        }
     }
     Ok(())
 }
@@ -1038,16 +1064,16 @@ async fn keygen(rpc_port: Option<u16>) -> Result<()> {
         let url = format!("http://127.0.0.1:{}/keygen", port);
         let response: rpc::GenerateKeyResponse = client.get(&url).send().await?.json().await?;
         println!("Generated WOTS keypair:");
-        println!("  Seed: {}", response.seed);
-        println!("  Coin: {}", response.coin);
+        println!("  Seed:     {}", response.seed);
+        println!("  OwnerPK:  {}", response.coin);
     } else {
         let seed: [u8; 32] = rand::random();
         let coin = wots::keygen(&seed);
         println!("Generated WOTS keypair:");
-        println!("  Seed: {}", hex::encode(seed));
-        println!("  Coin: {}", hex::encode(coin));
+        println!("  Seed:     {}", hex::encode(seed));
+        println!("  OwnerPK:  {}", hex::encode(coin));
     }
-    println!("\n⚠️  Keep the seed safe! Anyone with it can spend the coin.");
+    println!("\n⚠️  Keep the seed safe! Anyone with it can spend coins sent to this address.");
     Ok(())
 }
 
