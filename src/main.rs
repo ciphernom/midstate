@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use midstate::*;
+use midstate::compute_address;
 use midstate::wallet::{self, Wallet, short_hex};
 use midstate::core::wots;
 use midstate::network::{socket_to_multiaddr, MidstateNetwork, NetworkEvent};
@@ -153,7 +154,7 @@ enum WalletAction {
         /// Explicit input coin IDs (optional, auto-selects if omitted)
         #[arg(long)]
         coin: Vec<String>,
-        /// Recipient outputs: <owner_pk_hex>:<value>
+        /// Recipient outputs: <address_hex>:<value>
         #[arg(long)]
         to: Vec<String>,
         #[arg(long, default_value = "120")]
@@ -328,9 +329,9 @@ fn wallet_receive(path: &PathBuf, label: Option<String>) -> Result<()> {
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
     let label = label.unwrap_or_else(|| format!("receive #{}", wallet.keys().len() + 1));
-    let owner_pk = wallet.generate_key(Some(label.clone()))?;
+    let address = wallet.generate_key(Some(label.clone()))?;
     println!("\n  Your receiving address ({}):\n", label);
-    println!("  {}\n", hex::encode(owner_pk));
+    println!("  {}\n", hex::encode(address));
     println!("  Share this with the sender.");
     Ok(())
 }
@@ -384,7 +385,7 @@ async fn wallet_list(path: &PathBuf, rpc_port: u16, full: bool) -> Result<()> {
     if !wallet.keys().is_empty() {
         println!("\nUNUSED RECEIVING KEYS:");
         for (i, k) in wallet.keys().iter().enumerate() {
-            let display = if full { hex::encode(k.owner_pk) } else { short_hex(&k.owner_pk) };
+            let display = if full { hex::encode(k.address) } else { short_hex(&k.address) };
             let label = k.label.as_deref().unwrap_or("");
             println!("  [K{}] {} {}", i, display, label);
         }
@@ -447,9 +448,8 @@ async fn wallet_send(
 
     if private {
         let denoms: Vec<u64> = recipient_specs.iter().map(|(_, v)| *v).collect();
-        let recipient_pk = recipient_specs[0].0;
-
-        let pairs = wallet.plan_private_send(&live_coins, &recipient_pk, &denoms)?;
+        let recipient_address = recipient_specs[0].0;
+        let pairs = wallet.plan_private_send(&live_coins, &recipient_address, &denoms)?;
         println!("Private send: {} independent transaction(s)\n", pairs.len());
 
         for (pair_idx, (inputs, outputs, change_seeds)) in pairs.iter().enumerate() {
@@ -535,9 +535,9 @@ async fn wallet_send(
         let mut all_outputs = Vec::new();
         let mut change_seeds = Vec::new();
 
-        for (pk, value) in &recipient_specs {
+        for (address, value) in &recipient_specs {
             let salt: [u8; 32] = rand::random();
-            all_outputs.push(OutputData { owner_pk: *pk, value: *value, salt });
+            all_outputs.push(OutputData { address: *address, value: *value, salt });
         }
 
         if change > 0 {
@@ -545,9 +545,10 @@ async fn wallet_send(
             for denom in change_denoms {
                 let seed: [u8; 32] = rand::random();
                 let pk = wots::keygen(&seed);
+                let addr = compute_address(&pk);
                 let salt: [u8; 32] = rand::random();
                 let idx = all_outputs.len();
-                all_outputs.push(OutputData { owner_pk: pk, value: denom, salt });
+                all_outputs.push(OutputData { address: addr, value: denom, salt });
                 change_seeds.push((idx, seed));
             }
         }
@@ -655,7 +656,7 @@ async fn do_reveal(
         }).collect(),
         signatures: signatures.iter().map(|s| hex::encode(s)).collect(),
         outputs: pending.outputs.iter().map(|o| rpc::OutputDataJson {
-            owner_pk: hex::encode(o.owner_pk),
+            address: hex::encode(o.address),
             value: o.value,
             salt: hex::encode(o.salt),
         }).collect(),
@@ -724,7 +725,7 @@ fn wallet_export(path: &PathBuf, coin_ref: &str) -> Result<()> {
     println!("Value:   {}", wc.value);
     println!("Salt:    {}", hex::encode(wc.salt));
     println!("CoinID:  {}", hex::encode(wc.coin_id));
-    println!("OwnerPK: {}", hex::encode(wc.owner_pk));
+    println!("Address: {}", hex::encode(wc.address));
     println!("\n⚠️  Anyone with the seed + value + salt can spend this coin.");
     Ok(())
 }
@@ -821,7 +822,7 @@ async fn wallet_reveal(
             }).collect(),
             signatures: signatures.iter().map(|s| hex::encode(s)).collect(),
             outputs: pending.outputs.iter().map(|o| rpc::OutputDataJson {
-                owner_pk: hex::encode(o.owner_pk),
+                address: hex::encode(o.address),
                 value: o.value,
                 salt: hex::encode(o.salt),
             }).collect(),
@@ -875,10 +876,13 @@ fn wallet_import_rewards(path: &PathBuf, coinbase_file: &PathBuf) -> Result<()> 
             let seed = parse_hex32(&entry.seed).unwrap();
             let salt = parse_hex32(&entry.salt).unwrap();
             let owner_pk = wots::keygen(&seed);
-            let coin_id = compute_coin_id(&owner_pk, entry.value, &salt);
+            let address = compute_address(&owner_pk);
+            let coin_id = compute_coin_id(&address, entry.value, &salt);
+
             wallet::WalletCoin {
                 seed,
                 owner_pk,
+                address,
                 value: entry.value,
                 salt,
                 coin_id,
@@ -1057,13 +1061,14 @@ async fn keygen(rpc_port: Option<u16>) -> Result<()> {
         let response: rpc::GenerateKeyResponse = client.get(&url).send().await?.json().await?;
         println!("Generated WOTS keypair:");
         println!("  Seed:     {}", response.seed);
-        println!("  OwnerPK:  {}", response.coin);
+        println!("  Address:  {}", response.address);
     } else {
         let seed: [u8; 32] = rand::random();
-        let coin = wots::keygen(&seed);
+        let owner_pk = wots::keygen(&seed);
+        let address = compute_address(&owner_pk);
         println!("Generated WOTS keypair:");
         println!("  Seed:     {}", hex::encode(seed));
-        println!("  OwnerPK:  {}", hex::encode(coin));
+        println!("  Address:  {}", hex::encode(address));
     }
     println!("\n⚠️  Keep the seed safe! Anyone with it can spend coins sent to this address.");
     Ok(())
