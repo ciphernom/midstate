@@ -29,10 +29,10 @@ impl Syncer {
         
         // 2. Download all batches
         let batch_size = 100u64;
-        let mut current = 0u64;
+        let mut current = 1u64;
         
-        while current < peer_height {
-            let count = batch_size.min(peer_height - current);
+        while current <= peer_height {
+            let count = batch_size.min(peer_height - current+1);
             
             tracing::info!("Requesting batches {}-{}", current, current + count - 1);
             
@@ -67,9 +67,9 @@ impl Syncer {
     
     /// Verify entire chain from genesis
     fn verify_chain(&self, target_height: u64) -> Result<State> {
-        let mut state = State::genesis();
+        let mut state = State::genesis().0;
         
-        for height in 0..target_height {
+        for height in 1..target_height {
             if height % 100 == 0 {
                 tracing::info!("Verified {}/{} batches", height, target_height);
             }
@@ -110,7 +110,7 @@ impl Syncer {
         
         // Download and apply
         peer.send_message(&Message::GetBatches {
-            start_height: current_height,
+            start_height: current_height+1,
             count: needed,
         }).await?;
         
@@ -118,7 +118,7 @@ impl Syncer {
             Message::Batches(batches) => {
                 for batch in batches {
                     apply_batch(&mut state, &batch)?;
-                    self.storage.save_batch(state.height - 1, &batch)?;
+                    self.storage.save_batch(state.height, &batch)?;
                 }
             }
             _ => anyhow::bail!("Expected batches"),
