@@ -193,6 +193,7 @@ pub enum Transaction {
     /// Phase 1: Register a commitment binding inputs to outputs.
     Commit {
         commitment: [u8; 32],
+        spam_nonce: u64,
     },
 
     /// Phase 2: Reveal and execute the spend with signatures.
