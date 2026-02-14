@@ -75,4 +75,23 @@ mod tests {
         let encrypted = encrypt(b"secret", b"correct").unwrap();
         assert!(decrypt(&encrypted, b"wrong").is_err());
     }
+    #[test]
+    fn truncated_data_fails() {
+        let encrypted = encrypt(b"hello", b"pass").unwrap();
+        assert!(decrypt(&encrypted[..5], b"pass").is_err());
+    }
+
+    #[test]
+    fn empty_data_fails() {
+        assert!(decrypt(&[], b"pass").is_err());
+    }
+
+    #[test]
+    fn large_payload_round_trip() {
+        let data = vec![0xABu8; 100_000];
+        let password = b"strong_password_123";
+        let encrypted = encrypt(&data, password).unwrap();
+        let decrypted = decrypt(&encrypted, password).unwrap();
+        assert_eq!(data, decrypted);
+    }
 }
