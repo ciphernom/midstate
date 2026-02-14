@@ -28,6 +28,7 @@ impl RpcServer {
             .route("/mempool", get(get_mempool))
             .route("/keygen", get(generate_key))
             .route("/peers", get(get_peers))
+            .route("/scan", post(scan_addresses))
             .layer(TraceLayer::new_for_http())
             .with_state(node_handle);
 
