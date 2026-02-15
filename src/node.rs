@@ -1,7 +1,6 @@
 use crate::core::*;
 use crate::core::types::compute_address;
-use crate::core::types::CoinbaseOutput;
-use crate::core::types::BatchHeader;
+use crate::core::types::{CoinbaseOutput, BatchHeader};
 use crate::core::state::{apply_batch, choose_best_state};
 use crate::core::extension::{mine_extension, create_extension};
 use crate::core::transaction::{apply_transaction, validate_transaction};
@@ -12,6 +11,7 @@ use crate::storage::Storage;
 use crate::wallet::{coinbase_seed, coinbase_salt};
 use crate::core::mss;
 use crate::core::wots;
+use crate::sync::Syncer;
 use anyhow::Result;
 use libp2p::{request_response::ResponseChannel, PeerId, Multiaddr, identity::Keypair};
 use std::collections::HashMap;
@@ -29,6 +29,7 @@ pub struct Node {
     mempool: Mempool,
     storage: Storage,
     network: MidstateNetwork,
+    syncer: Syncer,
     metrics: Metrics,
     is_mining: bool,
     recent_headers: Vec<BatchHeader>,
@@ -254,10 +255,12 @@ impl Node {
         for h in start_height..state.height {
             if let Some(batch) = storage.load_batch(h)? {
                 recent_headers.push(BatchHeader {
-                    midstate: batch.extension.final_hash,
+                    height: h + 1,
+                    prev_midstate: batch.prev_midstate,
+                    post_tx_midstate: batch.extension.final_hash,
+                    extension: batch.extension.clone(),
                     timestamp: batch.timestamp,
                     target: batch.target,
-                    height: h + 1,
                 });
             }
         }
@@ -265,7 +268,8 @@ impl Node {
         Ok(Self {
             state,
             mempool: Mempool::new(),
-            storage,
+            storage: storage.clone(),
+            syncer: Syncer::new(storage),
             network,
             metrics: Metrics::new(),
             is_mining,
@@ -408,7 +412,7 @@ impl Node {
                 };
                 self.send_response(channel, response);
             }
-            // ── Fix C (Fix 1): Replaced StateInfo handler ────────────────
+
             Message::StateInfo { height, depth, midstate } => {
                 self.ack(channel);
                 tracing::debug!("Peer {} state: height={} depth={}", from, height, depth);
@@ -416,14 +420,25 @@ impl Node {
                 if midstate == self.state.midstate && height == self.state.height {
                     self.sync_in_progress = false;
                 } else if depth > self.state.depth || height > self.state.height {
-                    let start = self.state.height.saturating_sub(self.max_reorg_depth.min(self.state.height));
-                    let count = (height.saturating_sub(start) + 1).min(MAX_GETBATCHES_COUNT);
-                    tracing::info!("Syncing from peer {} (requesting {} batches from {})", from, count, start);
-                    self.sync_in_progress = true;
-                    self.sync_requested_up_to = height;
-                    self.network.send(from, Message::GetBatches { start_height: start, count });
+                    // Use headers-first sync via Syncer
+                   tracing::info!("Peer ahead (height={}, depth={}). Starting headers-first sync", height, depth);
+                   self.sync_in_progress = true;
+                    
+                    match self.syncer.sync_via_network(&mut self.network, from).await {
+                        Ok(new_state) => {
+                            self.state = new_state;
+                            self.storage.save_state(&self.state)?;
+                            self.sync_in_progress = false;
+                            tracing::info!("✓ Headers-first sync complete! Height: {}", self.state.height);
+                        }
+                        Err(e) => {
+                            tracing::error!("✗ Headers-first sync failed: {}", e);
+                            self.sync_in_progress = false;
+                        }
+                    }
                 }
             }
+            
             Message::Ping { nonce } => {
                 self.send_response(channel, Message::Pong { nonce });
             }
@@ -468,6 +483,26 @@ impl Node {
                 if !batches.is_empty() {
                     self.handle_batches_response(batch_start, batches, from).await?;
                 }
+            }
+            Message::GetHeaders { start_height, count } => {
+                let count = count.min(MAX_GETBATCHES_COUNT);
+                let end = (start_height + count).min(self.state.height + 1);
+                
+                match self.storage.batches.load_headers(start_height, end) {
+                    Ok(headers) => {
+                        self.send_response(channel, Message::Headers { 
+                            start_height, 
+                            headers 
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load headers: {}", e);
+                    }
+                }
+            }
+            Message::Headers { .. } => {
+                // Handled by Syncer, just ack
+                self.ack(channel);
             }
         }
         Ok(())
@@ -544,10 +579,12 @@ impl Node {
         for h in start_height..fork_height {
             if let Some(batch) = self.storage.load_batch(h)? {
                 recent_headers.push(BatchHeader {
-                    midstate: batch.extension.final_hash,
+                    height: h + 1,
+                    prev_midstate: batch.prev_midstate,
+                    post_tx_midstate: batch.extension.final_hash,
+                    extension: batch.extension.clone(),
                     timestamp: batch.timestamp,
                     target: batch.target,
-                    height: h + 1,
                 });
             }
         }
@@ -635,14 +672,16 @@ impl Node {
         let start = self.state.height.saturating_sub(window);
         
         for h in start..self.state.height {
-             if let Some(batch) = self.storage.load_batch(h)? {
-                 self.recent_headers.push(BatchHeader {
-                     midstate: batch.extension.final_hash,
-                     timestamp: batch.timestamp,
-                     target: batch.target,
-                     height: h + 1,
-                 });
-             }
+            if let Some(batch) = self.storage.load_batch(h)? {
+                self.recent_headers.push(BatchHeader {
+                    height: h + 1,
+                    prev_midstate: batch.prev_midstate,
+                    post_tx_midstate: batch.extension.final_hash,
+                    extension: batch.extension.clone(),
+                    timestamp: batch.timestamp,
+                    target: batch.target,
+                });
+            }
         }
 
         self.state.target = adjust_difficulty(&self.state, &self.recent_headers);
