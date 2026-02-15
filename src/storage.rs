@@ -5,13 +5,15 @@ use crate::core::State;
 use anyhow::Result;
 use redb::{Database, TableDefinition};
 use std::path::Path;
+use std::sync::Arc;
 
 const STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
 const MINING_SEED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("mining_seed");
 
+#[derive(Debug, Clone)]
 pub struct Storage {
-    db: Database,
-    batches: BatchStore,
+    db: Arc<Database>,
+    pub batches: BatchStore,
 }
 
 impl Storage {
@@ -31,7 +33,10 @@ impl Storage {
 
         let batches = BatchStore::new(path.join("batches"))?;
 
-        Ok(Self { db, batches })
+        Ok(Self { 
+            db: Arc::new(db), 
+            batches 
+        })
     }
 
     pub fn save_state(&self, state: &State) -> Result<()> {
