@@ -135,6 +135,14 @@ impl State {
 
         (state, genesis_coinbase)
     }
+    pub fn header(&self) -> BatchHeader {
+        BatchHeader {
+            midstate: self.midstate,
+            timestamp: self.timestamp,
+            target: self.target,
+            height: self.height,
+        }
+    }
 }
 
 // ── Value-bearing data structures ───────────────────────────────────────────
@@ -262,6 +270,17 @@ pub struct Batch {
     /// Target this batch was mined against
     pub target: [u8; 32],
 }
+
+// Add this struct
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BatchHeader {
+    pub midstate: [u8; 32], // The resulting midstate (hash ID)
+    pub timestamp: u64,
+    pub target: [u8; 32],
+    pub height: u64,
+}
+
+
 
 // ── Protocol constants ──────────────────────────────────────────────────────
 
