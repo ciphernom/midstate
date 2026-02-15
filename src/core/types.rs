@@ -137,15 +137,63 @@ impl State {
     }
     pub fn header(&self) -> BatchHeader {
         BatchHeader {
-            midstate: self.midstate,
+            height: self.height,
+            prev_midstate: [0u8; 32],
+            post_tx_midstate: self.midstate,
+            extension: Extension {
+                nonce: 0,
+                final_hash: self.midstate,
+                checkpoints: vec![],
+            },
             timestamp: self.timestamp,
             target: self.target,
-            height: self.height,
+        }
+    }
+}
+impl Batch {
+    /// Compute header from full batch by replaying transaction commitments
+    pub fn header(&self) -> BatchHeader {
+        let mut midstate = self.prev_midstate;
+
+        // 1. Replay transaction commitments
+        for tx in &self.transactions {
+            match tx {
+                Transaction::Commit { commitment, .. } => {
+                    midstate = hash_concat(&midstate, commitment);
+                }
+                Transaction::Reveal { inputs, outputs, salt, .. } => {
+                    let mut hasher = blake3::Hasher::new();
+                    for i in inputs {
+                        hasher.update(&i.coin_id());
+                    }
+                    for o in outputs {
+                        hasher.update(&o.coin_id());
+                    }
+                    hasher.update(salt);
+                    let tx_hash = *hasher.finalize().as_bytes();
+                    midstate = hash_concat(&midstate, &tx_hash);
+                }
+            }
+        }
+
+        // 2. Replay coinbase
+        for cb in &self.coinbase {
+            midstate = hash_concat(&midstate, &cb.coin_id());
+        }
+ 
+        BatchHeader {
+            height: 0, // Caller assigns this
+            prev_midstate: self.prev_midstate,
+            post_tx_midstate: midstate,
+            extension: self.extension.clone(),
+            timestamp: self.timestamp,
+            target: self.target,
         }
     }
 }
 
 // ── Value-bearing data structures ───────────────────────────────────────────
+
 
 /// Cleartext output data carried in a transaction.
 /// Transmitted in the block, validated (value is power of 2), then discarded from state.
@@ -271,13 +319,14 @@ pub struct Batch {
     pub target: [u8; 32],
 }
 
-// Add this struct
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BatchHeader {
-    pub midstate: [u8; 32], // The resulting midstate (hash ID)
+    pub height: u64,
+    pub prev_midstate: [u8; 32],
+    pub post_tx_midstate: [u8; 32],
+    pub extension: Extension,
     pub timestamp: u64,
     pub target: [u8; 32],
-    pub height: u64,
 }
 
 
