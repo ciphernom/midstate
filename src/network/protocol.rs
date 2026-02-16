@@ -1,4 +1,4 @@
-use crate::core::{Batch, Transaction};
+use crate::core::{Batch, BatchHeader, Transaction};
 use futures::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use libp2p::StreamProtocol;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,16 @@ pub enum Message {
     Batches {
         start_height: u64,
         batches: Vec<Batch>,
+    },
+    /// Request headers-only to verify PoW quickly
+    GetHeaders {
+        start_height: u64,
+        count: u64,
+    },
+    /// Response with headers
+    Headers {
+        start_height: u64,
+        headers: Vec<BatchHeader>,
     },
 }
 
