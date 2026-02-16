@@ -5,18 +5,19 @@ use anyhow::{bail, Result};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Calculate new difficulty target based on recent block times
-pub fn adjust_difficulty(state: &State, previous_states: &[State]) -> [u8; 32] {
+pub fn adjust_difficulty(state: &State, previous_headers: &[BatchHeader]) -> [u8; 32] {
     if state.height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0 || state.height == 0 {
         return state.target;
     }
 
-    if previous_states.len() < DIFFICULTY_ADJUSTMENT_INTERVAL as usize {
+if previous_headers.len() < DIFFICULTY_ADJUSTMENT_INTERVAL as usize {
         return state.target;
     }
 
-    let interval_start_time = previous_states
-        [previous_states.len() - DIFFICULTY_ADJUSTMENT_INTERVAL as usize]
+    let interval_start_time = previous_headers
+        [previous_headers.len() - DIFFICULTY_ADJUSTMENT_INTERVAL as usize]
         .timestamp;
+        
     let interval_end_time = state.timestamp;
     let actual_time = interval_end_time.saturating_sub(interval_start_time);
     let expected_time = TARGET_BLOCK_TIME * DIFFICULTY_ADJUSTMENT_INTERVAL;
@@ -71,7 +72,7 @@ pub fn current_timestamp() -> u64 {
 /// Validate a block's timestamp against the chain.
 pub fn validate_timestamp(
     new_timestamp: u64,
-    previous_states: &[State],
+    previous_headers: &[BatchHeader],
     current_time: u64,
 ) -> Result<()> {
     const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
@@ -85,8 +86,8 @@ pub fn validate_timestamp(
         );
     }
 
-    if previous_states.len() >= 11 {
-        let mut recent_timestamps: Vec<u64> = previous_states
+    if previous_headers.len() >= 11 {
+        let mut recent_timestamps: Vec<u64> = previous_headers
             .iter()
             .rev()
             .take(11)
@@ -103,12 +104,12 @@ pub fn validate_timestamp(
                 median
             );
         }
-    } else if let Some(last_state) = previous_states.last() {
-        if new_timestamp <= last_state.timestamp {
+    } else if let Some(last_header) = previous_headers.last() {
+        if new_timestamp <= last_header.timestamp {
             bail!(
                 "Block timestamp {} must be greater than previous block timestamp {}",
                 new_timestamp,
-                last_state.timestamp
+                last_header.timestamp
             );
         }
     }
@@ -423,8 +424,11 @@ mod tests {
     fn adjust_difficulty_not_enough_history() {
         let mut state = genesis_state();
         state.height = DIFFICULTY_ADJUSTMENT_INTERVAL;
-        let few_states = vec![genesis_state()]; // not enough
-        let result = adjust_difficulty(&state, &few_states);
+        
+        // FIX: Convert to header
+        let few_headers = vec![genesis_state().header()]; 
+        
+        let result = adjust_difficulty(&state, &few_headers);
         assert_eq!(result, state.target);
     }
 
@@ -457,7 +461,11 @@ mod tests {
             timestamp: 1000,
             commitment_heights: std::collections::HashMap::new(),
         };
-        let result = validate_timestamp(999, &[prev], 2000);
+        
+        // FIX: Pass header, not state
+        let headers = vec![prev.header()];
+        
+        let result = validate_timestamp(999, &headers, 2000);
         assert!(result.is_err());
     }
 }
