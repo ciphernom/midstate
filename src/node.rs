@@ -1,6 +1,7 @@
 use crate::core::*;
 use crate::core::types::compute_address;
 use crate::core::types::CoinbaseOutput;
+use crate::core::types::BatchHeader;
 use crate::core::state::{apply_batch, choose_best_state};
 use crate::core::extension::{mine_extension, create_extension};
 use crate::core::transaction::{apply_transaction, validate_transaction};
@@ -30,7 +31,7 @@ pub struct Node {
     network: MidstateNetwork,
     metrics: Metrics,
     is_mining: bool,
-    recent_states: Vec<State>,
+    recent_headers: Vec<BatchHeader>,
     orphan_batches: HashMap<u64, Batch>,
     sync_in_progress: bool,
     sync_requested_up_to: u64,
@@ -246,6 +247,21 @@ impl Node {
 
         let network = MidstateNetwork::new(keypair, listen_addr, bootstrap_peers).await?;
 
+        let mut recent_headers = Vec::new();
+        let window = DIFFICULTY_ADJUSTMENT_INTERVAL as u64 * 2;
+        let start_height = state.height.saturating_sub(window);
+
+        for h in start_height..state.height {
+            if let Some(batch) = storage.load_batch(h)? {
+                recent_headers.push(BatchHeader {
+                    midstate: batch.extension.final_hash,
+                    timestamp: batch.timestamp,
+                    target: batch.target,
+                    height: h + 1,
+                });
+            }
+        }
+
         Ok(Self {
             state,
             mempool: Mempool::new(),
@@ -253,7 +269,7 @@ impl Node {
             network,
             metrics: Metrics::new(),
             is_mining,
-            recent_states: Vec::new(),
+            recent_headers, // Updated field
             orphan_batches: HashMap::new(),
             sync_in_progress: false,
             sync_requested_up_to: 0,
@@ -518,32 +534,29 @@ impl Node {
 
         let mut candidate_state = fork_state;
         let mut new_history = Vec::new();
-        let mut recent_states = Vec::new();
+        
+        // CHANGED: Use headers instead of states
+        let mut recent_headers = Vec::new();
 
         let window_size = (DIFFICULTY_ADJUSTMENT_INTERVAL as usize) * 2;
         let start_height = fork_height.saturating_sub(window_size as u64);
 
         for h in start_height..fork_height {
             if let Some(batch) = self.storage.load_batch(h)? {
-                let mut temp_state = if h == start_height {
-                    if start_height == 0 {
-                        State::genesis().0
-                    } else {
-                        self.rebuild_state_at_height(start_height)?
-                    }
-                } else {
-                    recent_states.last().cloned().unwrap()
-                };
-                apply_batch(&mut temp_state, &batch)?;
-                temp_state.target = adjust_difficulty(&temp_state, &recent_states);
-                recent_states.push(temp_state);
+                recent_headers.push(BatchHeader {
+                    midstate: batch.extension.final_hash,
+                    timestamp: batch.timestamp,
+                    target: batch.target,
+                    height: h + 1,
+                });
             }
         }
 
         for (i, batch) in alternative_batches.iter().enumerate() {
-            recent_states.push(candidate_state.clone());
-            if recent_states.len() > window_size {
-                recent_states.remove(0);
+            // Push the *current* state's header before applying the new batch
+            recent_headers.push(candidate_state.header());
+            if recent_headers.len() > window_size {
+                recent_headers.remove(0);
             }
 
             if batch.prev_midstate != candidate_state.midstate {
@@ -556,7 +569,8 @@ impl Node {
 
             match apply_batch(&mut candidate_state, batch) {
                 Ok(_) => {
-                    candidate_state.target = adjust_difficulty(&candidate_state, &recent_states);
+                    // Pass headers to adjust_difficulty
+                    candidate_state.target = adjust_difficulty(&candidate_state, &recent_headers);
                     new_history.push((
                         fork_height + i as u64,
                         candidate_state.midstate,
@@ -615,22 +629,23 @@ impl Node {
         self.chain_history.retain(|(h, _, _)| *h < fork_height);
         self.chain_history.extend(new_history);
 
-        self.recent_states.clear();
-        let window_start = self.state.height.saturating_sub((DIFFICULTY_ADJUSTMENT_INTERVAL * 2) as u64);
-        let mut current_state = self.rebuild_state_at_height(window_start)?;
-        self.recent_states.push(current_state.clone());
-
-        for pre_height in window_start..self.state.height {
-            if let Some(batch) = self.storage.load_batch(pre_height)? {
-                if apply_batch(&mut current_state, &batch).is_err() {
-                    tracing::error!("Invalid batch {} during recent_states rebuild", pre_height);
-                    break;
-                }
-                self.recent_states.push(current_state.clone());
-            }
+        // Rebuild headers cache from disk
+        self.recent_headers.clear();
+        let window = (DIFFICULTY_ADJUSTMENT_INTERVAL * 2) as u64;
+        let start = self.state.height.saturating_sub(window);
+        
+        for h in start..self.state.height {
+             if let Some(batch) = self.storage.load_batch(h)? {
+                 self.recent_headers.push(BatchHeader {
+                     midstate: batch.extension.final_hash,
+                     timestamp: batch.timestamp,
+                     target: batch.target,
+                     height: h + 1,
+                 });
+             }
         }
 
-        self.state.target = adjust_difficulty(&self.state, &self.recent_states);
+        self.state.target = adjust_difficulty(&self.state, &self.recent_headers);
 
         for (_, _, batch) in abandoned_history {
             self.mempool.re_add(batch.transactions, &self.state);
@@ -646,16 +661,16 @@ impl Node {
 
     fn rebuild_state_at_height(&self, target_height: u64) -> Result<State> {
         let mut state = State::genesis().0;
-        let mut recent_states = Vec::new();
+        let mut recent_headers = Vec::new();
 
         for h in 0..target_height {
             if let Some(batch) = self.storage.load_batch(h)? {
-                recent_states.push(state.clone());
-                if recent_states.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
-                    recent_states.remove(0);
+                recent_headers.push(state.header());
+                if recent_headers.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
+                    recent_headers.remove(0);
                 }
                 apply_batch(&mut state, &batch)?;
-                state.target = adjust_difficulty(&state, &recent_states);
+                state.target = adjust_difficulty(&state, &recent_headers);
             } else {
                 anyhow::bail!("Missing batch at height {} needed for reorg", h);
             }
@@ -678,14 +693,18 @@ impl Node {
                         self.metrics.inc_reorgs();
                     }
 
-                    self.recent_states.push(self.state.clone());
-                    if self.recent_states.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
-                        self.recent_states.remove(0);
+                    // Use recent_headers and header()
+                    self.recent_headers.push(self.state.header());
+                    if self.recent_headers.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
+                        self.recent_headers.remove(0);
                     }
                     let pre_height = self.state.height;
                     self.state = candidate_state;
                     self.storage.save_batch(pre_height, &batch)?;
-                    self.state.target = adjust_difficulty(&self.state, &self.recent_states);
+                    
+                    // Pass recent_headers
+                    self.state.target = adjust_difficulty(&self.state, &self.recent_headers);
+                    
                     self.metrics.inc_batches_processed();
                     self.mempool.prune_invalid(&self.state);
 
@@ -788,13 +807,17 @@ impl Node {
         for batch in batches {
             let mut candidate = self.state.clone();
             if apply_batch(&mut candidate, &batch).is_ok() {
-                self.recent_states.push(self.state.clone());
-                if self.recent_states.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
-                    self.recent_states.remove(0);
+                // CHANGED: recent_headers
+                self.recent_headers.push(self.state.header());
+                if self.recent_headers.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
+                    self.recent_headers.remove(0);
                 }
                 self.storage.save_batch(candidate.height - 1, &batch)?;
                 self.state = candidate;
-                self.state.target = adjust_difficulty(&self.state, &self.recent_states);
+                
+                // CHANGED: recent_headers
+                self.state.target = adjust_difficulty(&self.state, &self.recent_headers);
+                
                 self.metrics.inc_batches_processed();
 
                 self.chain_history.push((self.state.height, self.state.midstate, batch.clone()));
@@ -841,13 +864,17 @@ impl Node {
             let mut candidate = self.state.clone();
             match apply_batch(&mut candidate, &batch) {
                 Ok(_) => {
-                    self.recent_states.push(self.state.clone());
-                    if self.recent_states.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
-                        self.recent_states.remove(0);
+                    // recent_headers
+                    self.recent_headers.push(self.state.header());
+                    if self.recent_headers.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
+                        self.recent_headers.remove(0);
                     }
                     self.storage.save_batch(candidate.height - 1, &batch).ok();
                     self.state = candidate;
-                    self.state.target = adjust_difficulty(&self.state, &self.recent_states);
+                    
+                    // recent_headers
+                    self.state.target = adjust_difficulty(&self.state, &self.recent_headers);
+                    
                     self.metrics.inc_batches_processed();
                     self.mempool.prune_invalid(&self.state);
                     applied += 1;
@@ -979,16 +1006,16 @@ impl Node {
             target: self.state.target,
         };
 
-        self.recent_states.push(self.state.clone());
-        if self.recent_states.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
-            self.recent_states.remove(0);
+        self.recent_headers.push(self.state.header());
+        if self.recent_headers.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
+            self.recent_headers.remove(0);
         }
 
         match apply_batch(&mut self.state, &batch) {
             Ok(_) => {
                 self.storage.save_batch(pre_mine_height, &batch)?;
                 self.storage.save_state(&self.state)?;
-                self.state.target = adjust_difficulty(&self.state, &self.recent_states);
+                self.state.target = adjust_difficulty(&self.state, &self.recent_headers);
                 self.metrics.inc_batches_mined();
                 self.network.broadcast(Message::Batch(batch));
                 self.log_coinbase(pre_mine_height, total_fees);
@@ -1038,7 +1065,7 @@ mod tests {
     use crate::core::types::hash;
     
     // Helper to create a bare-bones node for testing internal logic
-    async fn create_test_node(dir: &std::path::Path) -> Node {
+    pub(crate) async fn create_test_node(dir: &std::path::Path) -> Node {
         let _keypair = libp2p::identity::Keypair::generate_ed25519();
         // Bind to port 0 to let OS assign a random available port
         let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
@@ -1387,5 +1414,254 @@ mod tests {
         // Should not panic, just return 0
         assert_eq!(scan_txs_for_mss_index(&[tx], &pk), 0);
     }
-    
+}
+
+// ── Complex Integration Tests ───────────────────────────────────────────────
+#[cfg(test)]
+mod complex_tests {
+    use super::*;
+    use tempfile::tempdir;
+    use crate::core::types::hash;
+
+    // --- Test Helpers ---
+
+    /// Creates a node instance isolated in a temp directory.
+    /// 
+    /// Note: Node::new() automatically creates and applies the genesis block (Height 0).
+    /// Therefore, any node returned by this function is sitting at Height 1, ready 
+    /// to mine or receive Block 1.
+    async fn create_test_node(dir: &std::path::Path) -> Node {
+        let _keypair = libp2p::identity::Keypair::generate_ed25519();
+        let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+        
+        // Initialize node (creates Genesis internally)
+        Node::new(dir.to_path_buf(), false, listen, vec![]).await.unwrap()
+    }
+
+    /// specific helper to manually construct a valid batch structure.
+    /// 
+    /// This bypasses the main mining loop but performs all necessary cryptographic 
+    /// operations to create a valid block:
+    /// 1. Simulates transaction application to calculate the correct `midstate`.
+    /// 2. Generates the correct deterministic Coinbase outputs.
+    /// 3. Finds a valid Proof-of-Work nonce for the *real* target of the previous state.
+    fn make_valid_batch(prev_state: &State, timestamp_offset: u64, transactions: Vec<Transaction>) -> Batch {
+        let timestamp = prev_state.timestamp + timestamp_offset;
+        let mut midstate_after_txs = prev_state.midstate;
+        let mut tx_fees = 0;
+
+        // 1. Simulate applying transactions to get the post-tx midstate
+        for tx in &transactions {
+            tx_fees += tx.fee();
+            if let Transaction::Commit { commitment, .. } = tx {
+                midstate_after_txs = hash_concat(&midstate_after_txs, commitment);
+            } else if let Transaction::Reveal { inputs, outputs, salt, .. } = tx {
+                let mut hasher = blake3::Hasher::new();
+                for i in inputs { hasher.update(&i.coin_id()); }
+                for o in outputs { hasher.update(&o.coin_id()); }
+                hasher.update(salt);
+                let tx_hash = *hasher.finalize().as_bytes();
+                midstate_after_txs = hash_concat(&midstate_after_txs, &tx_hash);
+            }
+        }
+
+        // 2. Generate Coinbase outputs (deterministic based on previous midstate/height)
+        let reward = crate::core::block_reward(prev_state.height);
+        let total_value = reward + tx_fees;
+        let mining_seed = prev_state.midstate; 
+        
+        let denominations = crate::core::types::decompose_value(total_value);
+        let coinbase: Vec<CoinbaseOutput> = denominations.iter().enumerate().map(|(i, &val)| {
+             let seed = coinbase_seed(&mining_seed, prev_state.height, i as u64);
+             let pk = wots::keygen(&seed);
+             let addr = compute_address(&pk);
+             let salt = coinbase_salt(&mining_seed, prev_state.height, i as u64);
+             CoinbaseOutput { address: addr, value: val, salt }
+        }).collect();
+
+        // 3. Update midstate with coinbase
+        for cb in &coinbase {
+            midstate_after_txs = hash_concat(&midstate_after_txs, &cb.coin_id());
+        }
+
+        // 4. Mine a valid nonce.
+        let target = prev_state.target;
+        let mut nonce = 0u64;
+        let extension = loop {
+            let ext = create_extension(midstate_after_txs, nonce);
+            if ext.final_hash < target {
+                break ext;
+            }
+            nonce += 1;
+        };
+
+        Batch {
+            prev_midstate: prev_state.midstate,
+            transactions,
+            extension,
+            coinbase,
+            timestamp,
+            target,
+        }
+    }
+
+    // --- Tests ---
+
+    /// Verifies that the node stops mining activities when a sync is triggered.
+    /// This prevents wasting resources extending a chain that might be obsolete.
+    #[tokio::test]
+    async fn mining_pauses_during_sync() {
+        let dir = tempdir().unwrap();
+        let mut node = create_test_node(dir.path()).await;
+        
+        // Node starts at Height 1 (Genesis applied)
+        assert_eq!(node.state.height, 1);
+
+        // 1. Verify mining works normally
+        // The node is in "mining mode" but we call try_mine() manually to step through it.
+        node.try_mine().await.expect("Mining should succeed");
+        assert_eq!(node.state.height, 2);
+
+        // 2. Set sync flag manually (simulating a "GetBatches" request sent to a peer)
+        node.sync_in_progress = true;
+
+        // 3. Try mine again. It should return Ok() immediately without doing work.
+        node.try_mine().await.expect("Should return Ok implicitly");
+        
+        // 4. Assert height did NOT increase
+        assert_eq!(node.state.height, 2, "Mining should be paused during sync");
+
+        // 5. Unset flag (simulating sync completion) and verify mining resumes
+        node.sync_in_progress = false;
+        node.try_mine().await.expect("Mining should succeed");
+        assert_eq!(node.state.height, 3, "Mining should resume after sync");
+    }
+
+    /// Verifies the critical safety mechanism of Reorgs:
+    /// When switching to a longer chain, transactions in the abandoned blocks 
+    /// must be returned to the mempool so they are not lost.
+    #[tokio::test]
+    async fn reorg_restores_mempool_transactions() {
+        let dir = tempdir().unwrap();
+        let mut node = create_test_node(dir.path()).await;
+        // Start at H=1
+
+        // --- Chain A: H=1 -> B1(H=2) -> B2(H=3) ---
+        // This is the "local" chain the node initially follows.
+        
+        // Block 1 (Height 1->2)
+        let b1 = make_valid_batch(&node.state, 10, vec![]);
+        node.handle_new_batch(b1.clone(), None).await.unwrap();
+        assert_eq!(node.state.height, 2);
+        
+        // Create a unique transaction that will be mined into Block 2 of Chain A.
+        let commit_hash = hash(b"tx_on_chain_a");
+        let mut nonce = 0u64;
+        loop {
+            let h = hash_concat(&commit_hash, &nonce.to_le_bytes());
+            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 { break; }
+            nonce += 1;
+        }
+        let valid_tx = Transaction::Commit { commitment: commit_hash, spam_nonce: nonce };
+
+        // Block 2 (Height 2->3) contains the transaction
+        let b2 = make_valid_batch(&node.state, 10, vec![valid_tx.clone()]);
+        node.handle_new_batch(b2.clone(), None).await.unwrap();
+
+        assert_eq!(node.state.height, 3);
+        assert!(node.state.commitments.contains(&commit_hash), "Tx confirmed in Chain A");
+        assert_eq!(node.mempool.len(), 0, "Mempool empty after mining");
+
+        // --- Chain B: Fork at H=2 ---
+        // Chain B: H=1 -> B1(H=2) -> B2'(H=3) -> B3'(H=4)
+        // This is the "competitor" chain. It is longer, so it should trigger a reorg.
+        // It forks *after* B1.
+        
+        // We need to reconstruct the state at H=1 (Genesis) to build the fork.
+        let mut state_at_2 = State::genesis().0; 
+        
+        // REASONING: We cannot simply use State::genesis() because we need to load 
+        // the *exact* genesis batch saved by the node to ensure midstates align.
+        let genesis_batch = node.storage.load_batch(0).unwrap().unwrap();
+        apply_batch(&mut state_at_2, &genesis_batch).unwrap(); // H=1
+        
+        // Apply B1 (shared history)
+        apply_batch(&mut state_at_2, &b1).unwrap(); // H=2
+
+        // B2' (Alternative block at H=3). Empty, does NOT have the transaction.
+        let b2_prime = make_valid_batch(&state_at_2, 20, vec![]); 
+        let mut state_at_3_prime = state_at_2.clone();
+        apply_batch(&mut state_at_3_prime, &b2_prime).unwrap();
+
+        // B3' (extends B2', making Chain B longer)
+        let b3_prime = make_valid_batch(&state_at_3_prime, 10, vec![]);
+
+        // --- Submit Chain B ---
+        let peer = PeerId::random();
+        
+        // We simulate receiving the fork batches.
+        // The node detects the fork at H=2, evaluates Chain B, sees it is longer (Len 4 vs 3),
+        // and performs the reorg.
+        node.handle_batches_response(2, vec![b2_prime, b3_prime], peer).await.unwrap();
+
+        // --- Assertions ---
+        assert_eq!(node.state.height, 4, "Node should have switched to longer chain (H=4)");
+        
+        // The transaction `commit_hash` was in Block 2 (Chain A), but NOT in Block 2' (Chain B).
+        // Therefore, it is no longer in the confirmed state.
+        assert!(!node.state.commitments.contains(&commit_hash), "Tx from abandoned chain should be gone from state");
+        
+        // However, the reorg logic should have rescued it from the abandoned block 
+        // and placed it back into the mempool.
+        assert_eq!(node.mempool.len(), 1, "Mempool should have 1 restored tx");
+        let mempool_txs = node.mempool.transactions();
+        if let Transaction::Commit { commitment, .. } = mempool_txs[0] {
+            assert_eq!(commitment, commit_hash);
+        } else {
+            panic!("Restored transaction mismatch");
+        }
+    }
+
+    /// Verifies that the node can ingest a linear sequence of blocks during sync.
+    #[tokio::test]
+    async fn sync_ingests_batches_and_completes() {
+        let dir = tempdir().unwrap();
+        let mut node = create_test_node(dir.path()).await;
+        
+        // Snapshot the start state (H=1) so we can reset the node later to simulate being behind.
+        let start_state = node.state.clone();
+
+        // Generate 50 blocks extending H=1.
+        // We use the node's internal state to generate them validly, then revert.
+        let mut batches = Vec::new();
+        for _ in 0..50 {
+            let b = make_valid_batch(&node.state, 10, vec![]);
+            apply_batch(&mut node.state, &b).unwrap();
+            
+            // Note: Storage keys are usually (height-1) for batches? 
+            // Actually storage saves batch X at index X. 
+            // If Genesis is batch_0 (H=0), apply_batch makes H=1.
+            // Next block is batch_1.
+            // We save mainly to ensure `make_valid_batch` has consistent history if it looked at storage.
+            node.storage.save_batch(node.state.height - 1, &b).unwrap();
+            batches.push(b);
+        }
+        
+        assert_eq!(node.state.height, 51);
+
+        // Reset node to H=1 (the "behind" node).
+        node.state = start_state;
+        
+        // Simulate sync state
+        node.sync_in_progress = true;
+        node.sync_requested_up_to = 51;
+        
+        // Feed the 50 batches we generated.
+        let peer = PeerId::random();
+        node.handle_batches_response(1, batches, peer).await.unwrap();
+
+        // Verify the node caught up.
+        assert_eq!(node.state.height, 51);
+        assert_eq!(node.sync_in_progress, false, "Sync should complete automatically");
+    }
 }
