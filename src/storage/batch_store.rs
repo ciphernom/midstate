@@ -1,8 +1,9 @@
-use crate::core::Batch;
+use crate::core::{Batch, BatchHeader};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::fs;
 
+#[derive(Debug, Clone)]
 pub struct BatchStore {
     base_path: PathBuf,
 }
@@ -42,7 +43,20 @@ impl BatchStore {
         let batch = bincode::deserialize(&bytes)?;
         Ok(Some(batch))
     }
-    
+
+    /// Load headers for a range (efficient - lightweight)
+    pub fn load_headers(&self, start: u64, end: u64) -> Result<Vec<BatchHeader>> {
+        let mut headers = Vec::new();
+        for h in start..end {
+            if let Some(batch) = self.load(h)? {
+                let mut header = batch.header();
+                header.height = h;
+                headers.push(header);
+            }
+        }
+        Ok(headers)
+    }
+
     /// Get all batches from height range
     pub fn load_range(&self, start: u64, end: u64) -> Result<Vec<(u64, Batch)>> {
 
@@ -93,9 +107,6 @@ impl BatchStore {
     }
     
 }
-// ============================================================
-// ADD THIS ENTIRE BLOCK at the bottom of src/storage/batch_store.rs
-// ============================================================
 
 #[cfg(test)]
 mod tests {
