@@ -41,7 +41,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             Ok(())
         }
 
-        Transaction::Reveal { inputs, signatures, outputs, salt } => {
+        Transaction::Reveal { inputs, signatures, outputs, salt, .. } => {
             if inputs.is_empty() {
                 bail!("Transaction must spend at least one coin");
             }
@@ -152,7 +152,7 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
             Ok(())
         }
 
-        Transaction::Reveal { inputs, signatures, outputs, salt } => {
+        Transaction::Reveal { inputs, signatures, outputs, salt, .. } => {
             if inputs.is_empty() {
                 bail!("Must spend at least one coin");
             }
@@ -357,6 +357,7 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&sig)],
             outputs: vec![output],
             salt: commit_salt,
+            stealth_nonces: vec![],
         };
         apply_transaction(&mut state, &tx).unwrap();
 
@@ -379,6 +380,7 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&sig)],
             outputs: vec![output],
             salt: [0; 32],
+            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -400,6 +402,7 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&bad_sig)],
             outputs: vec![output],
             salt: commit_salt,
+            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -426,6 +429,7 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&sig)],
             outputs: vec![output],
             salt: commit_salt,
+            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -447,6 +451,7 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&sig)],
             outputs: vec![output],
             salt: commit_salt,
+            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -474,6 +479,7 @@ mod tests {
             signatures: vec![vec![0; wots::SIG_SIZE]],
             outputs: vec![],
             salt: [0; 32],
+            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -505,6 +511,7 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&sig)],
             outputs: vec![output],
             salt: commit_salt,
+            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -537,6 +544,7 @@ mod tests {
             signatures: vec![vec![0; wots::SIG_SIZE], vec![0; wots::SIG_SIZE]],
             outputs: vec![OutputData { address: [0; 32], value: 16, salt: [0; 32] }],
             salt: [0; 32],
+            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -569,6 +577,7 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&sig2)],
             outputs: vec![out2],
             salt: salt2,
+            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx2).is_err());
     }
@@ -604,6 +613,7 @@ mod tests {
             signatures: vec![sig_bytes],
             outputs: vec![output],
             salt: commit_salt,
+            stealth_nonces: vec![],
         };
         apply_transaction(&mut state, &tx).unwrap();
         assert!(!state.coins.contains(&coin_id));

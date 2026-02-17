@@ -1,5 +1,5 @@
 pub mod crypto;
-use crate::core::{hash_concat, compute_commitment, compute_coin_id, compute_address, decompose_value, wots, OutputData, InputReveal};
+use crate::core::{hash, hash_concat, compute_commitment, compute_coin_id, compute_address, decompose_value, wots, OutputData, InputReveal};
 use crate::core::mss::{self, MssKeypair};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,17 @@ pub struct WalletKey {
     pub seed: [u8; 32],
     pub owner_pk: [u8; 32],
     pub address: [u8; 32],
+    pub label: Option<String>,
+}
+
+/// A stable identity key that the wallet owner publishes so others can send
+/// stealth payments. It never appears on-chain and never signs anything.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScanKey {
+    /// Private half — never shared.
+    pub seed: [u8; 32],
+    /// Public half — share this with anyone who wants to send you stealth coins.
+    pub public_key: [u8; 32],
     pub label: Option<String>,
 }
 
@@ -72,6 +83,8 @@ pub struct WalletData {
     pub coins: Vec<WalletCoin>,
     #[serde(default)]
     pub mss_keys: Vec<MssKeypair>,
+    #[serde(default)]
+    pub scan_keys: Vec<ScanKey>,
     pub pending: Vec<PendingCommit>,
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
@@ -85,6 +98,7 @@ impl WalletData {
             keys: Vec::new(),
             coins: Vec::new(),
             mss_keys: Vec::new(),
+            scan_keys: Vec::new(),
             pending: Vec::new(),
             history: Vec::new(),
             last_scan_height: 0,
@@ -96,6 +110,46 @@ pub struct Wallet {
     path: PathBuf,
     password: Vec<u8>,
     pub data: WalletData,
+}
+
+// ---------------------------------------------------------------------------
+// Stealth address helpers
+// ---------------------------------------------------------------------------
+
+/// Derive a stealth WOTS keypair from a recipient's scan key and a fresh nonce.
+///
+/// Protocol:
+///   shared_secret = BLAKE3(scan_public_key || nonce)
+///   stealth_seed  = BLAKE3(shared_secret  || b"wots")   // domain separation
+///   stealth_pk    = wots::keygen(&stealth_seed)
+///   stealth_addr  = compute_address(&stealth_pk)         // = BLAKE3(stealth_pk)
+///
+/// Returns (stealth_seed, stealth_pk, stealth_addr).
+/// The sender only needs stealth_addr to build the output.
+/// The recipient needs stealth_seed to spend the coin later.
+pub fn stealth_derive(
+    scan_public_key: &[u8; 32],
+    nonce: &[u8; 32],
+) -> ([u8; 32], [u8; 32], [u8; 32]) {
+    let shared_secret = hash_concat(scan_public_key, nonce);
+    let stealth_seed  = hash_concat(&shared_secret, b"wots");
+    let stealth_pk    = wots::keygen(&stealth_seed);
+    let stealth_addr  = compute_address(&stealth_pk);
+    (stealth_seed, stealth_pk, stealth_addr)
+}
+
+/// Build a stealth OutputData for a recipient identified by their scan key.
+/// Returns the output and the nonce; the caller must include the nonce in the
+/// reveal transaction's `stealth_nonces` field at the matching index.
+pub fn build_stealth_output(
+    recipient_scan_key: &[u8; 32],
+    value: u64,
+) -> (OutputData, [u8; 32]) {
+    let nonce: [u8; 32] = rand::random();
+    let (_seed, _pk, stealth_addr) = stealth_derive(recipient_scan_key, &nonce);
+    let salt: [u8; 32] = rand::random();
+    let output = OutputData { address: stealth_addr, value, salt };
+    (output, nonce)
 }
 
 impl Wallet {
@@ -121,7 +175,7 @@ pub fn watched_addresses(&self) -> Vec<[u8; 32]> {
 }
 
 /// Import a scanned coin, matching it to a wallet key. Returns true if new.
-pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) -> Result<Option<[u8; 32]>> {
+pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32], stealth_seed: Option<[u8; 32]>) -> Result<Option<[u8; 32]>> {
     let coin_id = compute_coin_id(&address, value, &salt);
 
     if self.data.coins.iter().any(|c| c.coin_id == coin_id) {
@@ -154,6 +208,22 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             coin_id,
             label: Some(format!("received ({})", value)),
         });
+        return Ok(Some(coin_id));
+    }
+
+    // Stealth coin — the caller derived the spending seed during scanning.
+    if let Some(seed) = stealth_seed {
+        let owner_pk = wots::keygen(&seed);
+        self.data.coins.push(WalletCoin {
+            seed,
+            owner_pk,
+            address,
+            value,
+            salt,
+            coin_id,
+            label: Some(format!("stealth ({})", value)),
+        });
+        self.save()?;
         return Ok(Some(coin_id));
     }
 
@@ -193,6 +263,17 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         self.data.keys.push(WalletKey { seed, owner_pk, address, label });
         self.save()?;
         Ok(address)
+    }
+
+    /// Generate a fresh scan key and persist it. Share the returned public key
+    /// with anyone who wants to send you stealth payments.
+    pub fn generate_scan_key(&mut self, label: Option<String>) -> anyhow::Result<[u8; 32]> {
+        let seed: [u8; 32] = rand::random();
+        // The scan key is just a random value — it never signs anything.
+        let public_key = hash(&seed);
+        self.data.scan_keys.push(ScanKey { seed, public_key, label });
+        self.save()?;
+        Ok(public_key)
     }
 
     /// Generate a new MSS tree (reusable address).
@@ -825,7 +906,7 @@ mod tests {
 
         let salt = [0x55; 32];
         let value = 8u64;
-        let result = w.import_scanned(addr, value, salt).unwrap();
+        let result = w.import_scanned(addr, value, salt, None).unwrap();
         assert!(result.is_some());
         assert_eq!(w.coin_count(), 1);
         assert_eq!(w.keys().len(), 0); // key consumed
@@ -838,7 +919,7 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         let mut w = Wallet::create(&path, b"pass").unwrap();
-        let result = w.import_scanned([0xFF; 32], 8, [0; 32]).unwrap();
+        let result = w.import_scanned([0xFF; 32], 8, [0; 32], None).unwrap();
         assert!(result.is_none());
     }
 
@@ -852,9 +933,9 @@ mod tests {
         let addr = w.generate_key(None).unwrap();
         let salt = [0x55; 32];
 
-        w.import_scanned(addr, 8, salt).unwrap();
+        w.import_scanned(addr, 8, salt, None).unwrap();
         // Second import same coin → None
-        let result = w.import_scanned(addr, 8, salt).unwrap();
+        let result = w.import_scanned(addr, 8, salt, None).unwrap();
         assert!(result.is_none());
         assert_eq!(w.coin_count(), 1);
     }
