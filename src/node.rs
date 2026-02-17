@@ -199,7 +199,7 @@ pub fn scan_txs_for_mss_index(txs: &[Transaction], master_pk: &[u8; 32]) -> u64 
                         max_idx = max_idx.max(mss_sig.leaf_index + 1);
                     }
                 }
-            }           
+            }
         }
     }
     max_idx
@@ -1756,5 +1756,472 @@ mod complex_tests {
         // Verify the node caught up.
         assert_eq!(node.state.height, 51);
         assert_eq!(node.sync_in_progress, false, "Sync should complete automatically");
+    }
+
+    // ── Crash Recovery ──────────────────────────────────────────────────
+
+    /// Verify that a node can be killed and restarted from the same data dir
+    /// and resume at the correct height with the correct state.
+    #[tokio::test]
+    async fn crash_recovery_preserves_state() {
+        let dir = tempdir().unwrap();
+
+        // 1. Create a node, mine 5 blocks, save state
+        let height_before;
+        let midstate_before;
+        let coins_before;
+        {
+            let mut node = create_test_node(dir.path()).await;
+            assert_eq!(node.state.height, 1);
+
+            for _ in 0..5 {
+                node.try_mine().await.unwrap();
+            }
+            assert_eq!(node.state.height, 6);
+
+            // Save state (normally happens on interval)
+            node.storage.save_state(&node.state).unwrap();
+
+            height_before = node.state.height;
+            midstate_before = node.state.midstate;
+            coins_before = node.state.coins.len();
+            // node is dropped here — simulates crash
+        }
+
+        // 2. Recreate node from same data dir
+        let node2 = create_test_node(dir.path()).await;
+
+        // 3. Verify state matches
+        assert_eq!(node2.state.height, height_before, "height must survive restart");
+        assert_eq!(node2.state.midstate, midstate_before, "midstate must survive restart");
+        assert_eq!(node2.state.coins.len(), coins_before, "coin set must survive restart");
+    }
+
+    /// Verify that after crash recovery, mining can resume and produce valid blocks.
+    #[tokio::test]
+    async fn crash_recovery_can_resume_mining() {
+        let dir = tempdir().unwrap();
+
+        {
+            let mut node = create_test_node(dir.path()).await;
+            for _ in 0..3 {
+                node.try_mine().await.unwrap();
+            }
+            node.storage.save_state(&node.state).unwrap();
+        }
+
+        let mut node2 = create_test_node(dir.path()).await;
+        assert_eq!(node2.state.height, 4);
+
+        // Mining should work after restart
+        node2.is_mining = true;
+        node2.try_mine().await.unwrap();
+        assert_eq!(node2.state.height, 5, "mining must resume after crash recovery");
+    }
+
+    // ── Sync From Scratch ───────────────────────────────────────────────
+
+    /// A fresh node with no history receives the full chain and catches up.
+    #[tokio::test]
+    async fn fresh_node_syncs_full_chain() {
+        let dir_miner = tempdir().unwrap();
+        let dir_fresh = tempdir().unwrap();
+
+        // 1. Build a chain of 20 blocks on the "miner" node
+        let mut miner = create_test_node(dir_miner.path()).await;
+        for _ in 0..20 {
+            miner.try_mine().await.unwrap();
+        }
+        assert_eq!(miner.state.height, 21);
+
+        // 2. Collect all batches from storage
+        let mut batches = Vec::new();
+        for h in 1..21 {
+            let batch = miner.storage.load_batch(h).unwrap().unwrap();
+            batches.push(batch);
+        }
+
+        // 3. Create a fresh node
+        let mut fresh = create_test_node(dir_fresh.path()).await;
+        assert_eq!(fresh.state.height, 1);
+
+        // 4. Feed batches as if received from a peer
+        fresh.sync_in_progress = true;
+        fresh.sync_requested_up_to = 21;
+        let peer = PeerId::random();
+        fresh.handle_batches_response(1, batches, peer).await.unwrap();
+
+        // 5. Verify state matches
+        assert_eq!(fresh.state.height, miner.state.height);
+        assert_eq!(fresh.state.midstate, miner.state.midstate);
+        assert_eq!(fresh.state.coins.len(), miner.state.coins.len());
+        assert!(!fresh.sync_in_progress);
+    }
+
+    /// A node that is partially synced receives remaining blocks.
+    #[tokio::test]
+    async fn partial_sync_completes() {
+        let dir_miner = tempdir().unwrap();
+        let dir_behind = tempdir().unwrap();
+
+        let mut miner = create_test_node(dir_miner.path()).await;
+        for _ in 0..15 {
+            miner.try_mine().await.unwrap();
+        }
+
+        // Collect batches 1..15
+        let mut all_batches = Vec::new();
+        for h in 1..16 {
+            all_batches.push(miner.storage.load_batch(h).unwrap().unwrap());
+        }
+
+        // Fresh node syncs first 5 blocks
+        let mut behind = create_test_node(dir_behind.path()).await;
+        behind.sync_in_progress = true;
+        behind.sync_requested_up_to = 16;
+        let peer = PeerId::random();
+        behind.handle_batches_response(1, all_batches[..5].to_vec(), peer).await.unwrap();
+        assert_eq!(behind.state.height, 6);
+
+        // Now feed remaining blocks
+        behind.handle_batches_response(6, all_batches[5..].to_vec(), peer).await.unwrap();
+        assert_eq!(behind.state.height, 16);
+        assert_eq!(behind.state.midstate, miner.state.midstate);
+    }
+
+    // ── Full Commit-Reveal Transaction Cycle ────────────────────────────
+
+    /// Exercises the complete transaction lifecycle through the node:
+    /// mine → get coins → commit → mine commit → reveal → mine reveal → verify
+    #[tokio::test]
+    async fn full_commit_reveal_cycle() {
+        let dir = tempdir().unwrap();
+        let mut node = create_test_node(dir.path()).await;
+        let mining_seed = node.mining_seed;
+
+        // 1. Mine a block to get coinbase coins
+        let pre_mine_height = node.state.height; // = 1
+        node.try_mine().await.unwrap();
+        assert_eq!(node.state.height, 2);
+
+        // 2. Derive the coinbase coin we just mined (index 0 of that block)
+        let cb_seed = coinbase_seed(&mining_seed, pre_mine_height, 0);
+        let cb_owner_pk = wots::keygen(&cb_seed);
+        let cb_address = compute_address(&cb_owner_pk);
+        let cb_salt = coinbase_salt(&mining_seed, pre_mine_height, 0);
+        let cb_value = block_reward(pre_mine_height); // first denomination
+        // Actual coinbase uses decompose_value, so first output is the largest power of 2
+        let denominations = decompose_value(cb_value);
+        let first_denom = denominations[0];
+        let cb_coin_id = compute_coin_id(&cb_address, first_denom, &cb_salt);
+        assert!(node.state.coins.contains(&cb_coin_id), "coinbase coin must be in UTXO set");
+
+        // 3. Build a transaction spending the coinbase coin
+        let recipient_seed: [u8; 32] = hash(b"recipient seed");
+        let recipient_pk = wots::keygen(&recipient_seed);
+        let recipient_addr = compute_address(&recipient_pk);
+        let output_salt: [u8; 32] = hash(b"output salt");
+
+        // Output must be power-of-2 and less than input (fee > 0)
+        let send_value = first_denom / 2;
+        assert!(send_value > 0 && send_value.is_power_of_two());
+
+        // Change output
+        let change_seed: [u8; 32] = hash(b"change seed");
+        let change_pk = wots::keygen(&change_seed);
+        let change_addr = compute_address(&change_pk);
+        let change_salt: [u8; 32] = hash(b"change salt");
+        let change_value = first_denom / 4; // fee = first_denom - send - change
+        assert!(send_value + change_value < first_denom, "must leave fee");
+
+        let outputs = vec![
+            OutputData { address: recipient_addr, value: send_value, salt: output_salt },
+            OutputData { address: change_addr, value: change_value, salt: change_salt },
+        ];
+
+        let input_coin_ids = vec![cb_coin_id];
+        let output_coin_ids: Vec<[u8; 32]> = outputs.iter().map(|o| o.coin_id()).collect();
+        let tx_salt: [u8; 32] = hash(b"tx salt");
+        let commitment = compute_commitment(&input_coin_ids, &output_coin_ids, &tx_salt);
+
+        // 4. Find a valid spam nonce for commit PoW
+        let mut spam_nonce = 0u64;
+        loop {
+            let h = hash_concat(&commitment, &spam_nonce.to_le_bytes());
+            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 { break; }
+            spam_nonce += 1;
+        }
+
+        let commit_tx = Transaction::Commit { commitment, spam_nonce };
+
+        // 5. Mine the commit into a block
+        let commit_batch = make_valid_batch(&node.state, 10, vec![commit_tx]);
+        node.handle_new_batch(commit_batch, None).await.unwrap();
+        assert!(node.state.commitments.contains(&commitment), "commitment must be in state");
+
+        // 6. Build the reveal
+        let sig = wots::sign(&cb_seed, &commitment);
+        let reveal_tx = Transaction::Reveal {
+            inputs: vec![InputReveal {
+                owner_pk: cb_owner_pk,
+                value: first_denom,
+                salt: cb_salt,
+            }],
+            signatures: vec![wots::sig_to_bytes(&sig)],
+            outputs,
+            salt: tx_salt,
+            stealth_nonces: vec![],
+        };
+
+        // 7. Mine the reveal into a block
+        let reveal_batch = make_valid_batch(&node.state, 10, vec![reveal_tx]);
+        node.handle_new_batch(reveal_batch, None).await.unwrap();
+
+        // 8. Verify: old coin gone, new coins exist
+        assert!(!node.state.coins.contains(&cb_coin_id), "spent coin must be removed");
+        let recipient_coin_id = compute_coin_id(&recipient_addr, send_value, &output_salt);
+        let change_coin_id = compute_coin_id(&change_addr, change_value, &change_salt);
+        assert!(node.state.coins.contains(&recipient_coin_id), "recipient coin must exist");
+        assert!(node.state.coins.contains(&change_coin_id), "change coin must exist");
+    }
+
+    // ── Wallet Send Flow End-to-End ─────────────────────────────────────
+
+    /// Full wallet lifecycle: create → mine → scan → send → verify
+    #[tokio::test]
+    async fn wallet_send_flow_end_to_end() {
+        use crate::wallet::{Wallet, coinbase_seed, coinbase_salt};
+
+        let dir = tempdir().unwrap();
+        let mut node = create_test_node(dir.path()).await;
+        let mining_seed = node.mining_seed;
+
+        // 1. Mine a block
+        let mine_height = node.state.height;
+        node.try_mine().await.unwrap();
+
+        // 2. Create a wallet and import the coinbase coin
+        let wallet_path = dir.path().join("test_wallet.dat");
+        let mut wallet = Wallet::create(&wallet_path, b"pass").unwrap();
+
+        let denominations = decompose_value(block_reward(mine_height));
+        let cb_seed = coinbase_seed(&mining_seed, mine_height, 0);
+        let cb_salt = coinbase_salt(&mining_seed, mine_height, 0);
+        let coin_id = wallet.import_coin(cb_seed, denominations[0], cb_salt, Some("coinbase".into())).unwrap();
+        assert!(node.state.coins.contains(&coin_id));
+
+        // 3. Generate a recipient address in the same wallet (self-send)
+        let recv_addr = wallet.generate_key(Some("recv".into())).unwrap();
+        let send_value = denominations[0] / 2;
+        let send_denoms = decompose_value(send_value);
+
+        // 4. Build outputs via wallet
+        let live_coins: Vec<[u8; 32]> = wallet.coins().iter().map(|c| c.coin_id).collect();
+        let selected = wallet.select_coins(send_value + 1, &live_coins).unwrap(); // +1 for fee room
+        assert_eq!(selected.len(), 1);
+
+        let in_value: u64 = selected.iter()
+            .filter_map(|id| wallet.find_coin(id))
+            .map(|c| c.value)
+            .sum();
+        let change_value = in_value - send_value - 1; // 1 unit fee (must be > 0)
+        // change_value may not work if it's not representable, let's adjust
+        // Actually fee = in_value - out_value, we need out_value < in_value and all outputs power-of-2
+        // Let's keep it simple: send half, no change, the rest is fee
+        let (outputs, change_seeds) = wallet.build_outputs(&recv_addr, &send_denoms, 0).unwrap();
+        let out_sum: u64 = outputs.iter().map(|o| o.value).sum();
+        assert!(in_value > out_sum, "fee must be positive");
+
+        // 5. Build commit
+        let (commitment, _salt) = wallet.prepare_commit(&selected, &outputs, change_seeds, false).unwrap();
+
+        // Find spam nonce
+        let mut spam_nonce = 0u64;
+        loop {
+            let h = hash_concat(&commitment, &spam_nonce.to_le_bytes());
+            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 { break; }
+            spam_nonce += 1;
+        }
+
+        let commit_tx = Transaction::Commit { commitment, spam_nonce };
+        let commit_batch = make_valid_batch(&node.state, 10, vec![commit_tx]);
+        node.handle_new_batch(commit_batch, None).await.unwrap();
+        assert!(node.state.commitments.contains(&commitment));
+
+        // 6. Build reveal
+        let pending = wallet.find_pending(&commitment).unwrap().clone();
+        let (input_reveals, signatures) = wallet.sign_reveal(&pending).unwrap();
+        let reveal_tx = Transaction::Reveal {
+            inputs: input_reveals,
+            signatures,
+            outputs: pending.outputs.clone(),
+            salt: pending.salt,
+            stealth_nonces: vec![],
+        };
+
+        let reveal_batch = make_valid_batch(&node.state, 10, vec![reveal_tx]);
+        node.handle_new_batch(reveal_batch, None).await.unwrap();
+
+        // 7. Verify old coin spent, new coin(s) exist
+        assert!(!node.state.coins.contains(&coin_id), "spent coin removed");
+        for out in &pending.outputs {
+            assert!(node.state.coins.contains(&out.coin_id()), "output coin must exist in UTXO set");
+        }
+
+        // 8. Complete reveal in wallet
+        wallet.complete_reveal(&commitment).unwrap();
+    }
+
+    // ── Stealth Transaction Through Node ────────────────────────────────
+
+    /// Exercises stealth output creation → mining → scanning via node handle.
+    #[tokio::test]
+    async fn stealth_tx_end_to_end_through_node() {
+        use crate::wallet::{Wallet, coinbase_seed, coinbase_salt, stealth_derive, build_stealth_output};
+
+        let dir = tempdir().unwrap();
+        let mut node = create_test_node(dir.path()).await;
+        let mining_seed = node.mining_seed;
+
+        // 1. Mine a block to get a spendable coin
+        let mine_height = node.state.height;
+        node.try_mine().await.unwrap();
+
+        let denominations = decompose_value(block_reward(mine_height));
+        let cb_seed = coinbase_seed(&mining_seed, mine_height, 0);
+        let cb_owner_pk = wots::keygen(&cb_seed);
+        let cb_salt = coinbase_salt(&mining_seed, mine_height, 0);
+        let first_denom = denominations[0];
+        let cb_coin_id = compute_coin_id(&compute_address(&cb_owner_pk), first_denom, &cb_salt);
+
+        // 2. Recipient creates a wallet with a scan key
+        let wallet_path = dir.path().join("recipient.dat");
+        let mut recipient_wallet = Wallet::create(&wallet_path, b"pass").unwrap();
+        let scan_pub = recipient_wallet.generate_scan_key(Some("stealth".into())).unwrap();
+
+        // 3. Sender builds a stealth output
+        let stealth_value = first_denom / 2;
+        assert!(stealth_value.is_power_of_two());
+        let nonce: [u8; 32] = hash(b"deterministic nonce for test");
+        let (_stealth_seed, _stealth_pk, stealth_addr) = stealth_derive(&scan_pub, &nonce);
+        let stealth_salt: [u8; 32] = hash(b"stealth salt");
+        let stealth_output = OutputData { address: stealth_addr, value: stealth_value, salt: stealth_salt };
+
+        // Build the transaction
+        let input_coin_ids = vec![cb_coin_id];
+        let output_coin_ids = vec![stealth_output.coin_id()];
+        let tx_salt: [u8; 32] = hash(b"stealth tx salt");
+        let commitment = compute_commitment(&input_coin_ids, &output_coin_ids, &tx_salt);
+
+        // Commit PoW
+        let mut spam_nonce = 0u64;
+        loop {
+            let h = hash_concat(&commitment, &spam_nonce.to_le_bytes());
+            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 { break; }
+            spam_nonce += 1;
+        }
+
+        // 4. Mine the commit
+        let commit_tx = Transaction::Commit { commitment, spam_nonce };
+        let commit_batch = make_valid_batch(&node.state, 10, vec![commit_tx]);
+        node.handle_new_batch(commit_batch, None).await.unwrap();
+
+        // 5. Mine the reveal (with stealth nonce)
+        let sig = wots::sign(&cb_seed, &commitment);
+        let reveal_tx = Transaction::Reveal {
+            inputs: vec![InputReveal {
+                owner_pk: cb_owner_pk,
+                value: first_denom,
+                salt: cb_salt,
+            }],
+            signatures: vec![wots::sig_to_bytes(&sig)],
+            outputs: vec![stealth_output.clone()],
+            salt: tx_salt,
+            stealth_nonces: vec![nonce],
+        };
+
+        let reveal_height = node.state.height;
+        let reveal_batch = make_valid_batch(&node.state, 10, vec![reveal_tx]);
+        node.handle_new_batch(reveal_batch, None).await.unwrap();
+
+        // Save batches so NodeHandle can read them
+        node.storage.save_state(&node.state).unwrap();
+
+        // 6. Scan via NodeHandle
+        let (handle, _rx) = node.create_handle();
+        let stealth_nonces = handle.scan_stealth_nonces(0, node.state.height).unwrap();
+
+        assert_eq!(stealth_nonces.len(), 1, "should find exactly one stealth nonce");
+        assert_eq!(stealth_nonces[0].nonce, nonce);
+        assert_eq!(stealth_nonces[0].value, stealth_value);
+        assert_eq!(stealth_nonces[0].salt, stealth_salt);
+
+        // 7. Recipient tries each scan key against the nonce
+        let mut found_seed = None;
+        for sk in &recipient_wallet.data.scan_keys {
+            let (stealth_seed, _pk, derived_addr) = stealth_derive(&sk.public_key, &stealth_nonces[0].nonce);
+            let derived_coin_id = compute_coin_id(
+                &derived_addr,
+                stealth_nonces[0].value,
+                &stealth_nonces[0].salt,
+            );
+            if node.state.coins.contains(&derived_coin_id) {
+                found_seed = Some(stealth_seed);
+                break;
+            }
+        }
+        assert!(found_seed.is_some(), "recipient must detect their stealth payment");
+
+        // 8. Import into wallet and verify spendable
+        let coin_result = recipient_wallet.import_scanned(
+            stealth_addr,
+            stealth_value,
+            stealth_salt,
+            found_seed,
+        ).unwrap();
+        assert!(coin_result.is_some());
+        assert_eq!(recipient_wallet.coin_count(), 1);
+
+        let coin = &recipient_wallet.data.coins[0];
+        let pk = wots::keygen(&coin.seed);
+        assert_eq!(compute_address(&pk), stealth_addr, "wallet must be able to derive spending key");
+    }
+
+    // ── Reorg Under Concurrent Mining ───────────────────────────────────
+
+    /// Two miners find blocks at the same height. The node initially follows one,
+    /// then switches when the other chain becomes longer.
+    #[tokio::test]
+    async fn concurrent_miners_reorg() {
+        let dir = tempdir().unwrap();
+        let mut node = create_test_node(dir.path()).await;
+
+        // Mine 3 blocks for common history
+        for _ in 0..3 {
+            node.try_mine().await.unwrap();
+        }
+        assert_eq!(node.state.height, 4);
+        let fork_state = node.state.clone();
+
+        // Chain A: node mines 1 more block (height 5)
+        node.try_mine().await.unwrap();
+        assert_eq!(node.state.height, 5);
+
+        // Chain B: built offline from fork_state, 3 blocks (heights 5, 6, 7)
+        let mut chain_b_state = fork_state.clone();
+        let mut chain_b_batches = Vec::new();
+        for i in 0..3 {
+            let b = make_valid_batch(&chain_b_state, 10 + i, vec![]);
+            apply_batch(&mut chain_b_state, &b).unwrap();
+            chain_b_batches.push(b);
+        }
+        assert_eq!(chain_b_state.height, 7);
+
+        // Feed Chain B to the node — should trigger reorg
+        let peer = PeerId::random();
+        node.handle_batches_response(4, chain_b_batches, peer).await.unwrap();
+
+        assert_eq!(node.state.height, 7, "should switch to longer chain");
+        assert_eq!(node.state.midstate, chain_b_state.midstate, "must adopt chain B's midstate");
     }
 }
