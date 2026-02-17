@@ -624,6 +624,7 @@ mod tests {
             signatures: vec![vec![]],
             outputs: vec![output.clone()],
             salt: [0u8; 32],
+            stealth_nonces: vec![],
         };
         assert_eq!(tx.input_coin_ids(), vec![input.coin_id()]);
         assert_eq!(tx.output_coin_ids(), vec![output.coin_id()]);
