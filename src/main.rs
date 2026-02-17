@@ -2,7 +2,7 @@ use anyhow::{Result, Context};
 use clap::{Parser, Subcommand};
 use midstate::*;
 use midstate::compute_address;
-use midstate::wallet::{self, Wallet, short_hex};
+use midstate::wallet::{self, Wallet, stealth_derive, build_stealth_output, short_hex};
 use midstate::core::wots;
 use midstate::network::{socket_to_multiaddr, MidstateNetwork, NetworkEvent};
 use std::net::SocketAddr;
@@ -131,6 +131,13 @@ enum WalletAction {
         #[arg(long)]
         label: Option<String>,
     },
+    /// Generate a scan key for receiving stealth payments
+    GenerateScanKey {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+        #[arg(long)]
+        label: Option<String>,
+    },
     List {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
@@ -145,7 +152,7 @@ enum WalletAction {
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
     },
-    /// Send value. --to format: <owner_pk_hex>:<value> (value must be power of 2)
+    /// Send value. --to format: <address_hex>:<value>
     Send {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
@@ -161,6 +168,10 @@ enum WalletAction {
         timeout: u64,
         #[arg(long)]
         private: bool,
+        /// Recipient's stealth scan key (hex). When set, outputs go to an
+        /// unlinkable stealth address derived from this key.
+        #[arg(long)]
+        stealth_scan_key: Option<String>,
     },
     /// Import a coin with known seed, value, and salt
     Import {
@@ -245,9 +256,6 @@ fn parse_output_spec(s: &str) -> Result<([u8; 32], u64)> {
     if value == 0 {
         anyhow::bail!("value must be > 0");
     }
-    if !value.is_power_of_two() {
-        anyhow::bail!("value {} is not a power of 2", value);
-    }
     Ok((pk, value))
 }
 
@@ -330,9 +338,43 @@ async fn wallet_scan(path: &PathBuf, rpc_port: u16) -> Result<()> {
     for sc in &resp.coins {
         let address = parse_hex32(&sc.address)?;
         let salt = parse_hex32(&sc.salt)?;
-        if let Some(coin_id) = wallet.import_scanned(address, sc.value, salt)? {
+        if let Some(coin_id) = wallet.import_scanned(address, sc.value, salt, None)? {
             println!("  found: {} (value {}, height {})", short_hex(&coin_id), sc.value, sc.height);
             imported += 1;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Stealth scan — fetch all nonces, test each against our scan keys.
+    // -----------------------------------------------------------------------
+    if !wallet.data.scan_keys.is_empty() {
+        let stealth_url = format!("http://127.0.0.1:{}/scan_stealth", rpc_port);
+        let stealth_req = rpc::ScanStealthRequest { start_height: start, end_height: chain_height };
+        let stealth_resp: rpc::ScanStealthResponse = client
+            .post(&stealth_url)
+            .json(&stealth_req)
+            .send().await?
+            .json().await?;
+
+        for entry in &stealth_resp.nonces {
+            let nonce = parse_hex32(&entry.nonce)?;
+            let salt  = parse_hex32(&entry.salt)?;
+
+            // Try every scan key we hold against this nonce.
+            for scan_key in &wallet.data.scan_keys.clone() {
+                let (stealth_seed, _, stealth_addr) =
+                    stealth_derive(&scan_key.public_key, &nonce);
+
+                if let Some(coin_id) = wallet.import_scanned(
+                    stealth_addr, entry.value, salt, Some(stealth_seed),
+                )? {
+                    println!(
+                        "  found stealth: {} (value {}, height {})",
+                        short_hex(&coin_id), entry.value, entry.height,
+                    );
+                    imported += 1;
+                }
+            }
         }
     }
 
@@ -381,8 +423,8 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         WalletAction::List { path, rpc_port, full } => wallet_list(&path, rpc_port, full).await,
         WalletAction::Balance { path, rpc_port } => wallet_balance(&path, rpc_port).await,
         WalletAction::Scan { path, rpc_port } => wallet_scan(&path, rpc_port).await,
-        WalletAction::Send { path, rpc_port, coin, to, timeout, private } => {
-            wallet_send(&path, rpc_port, coin, to, timeout, private).await
+        WalletAction::Send { path, rpc_port, coin, to, timeout, private, stealth_scan_key } => {
+            wallet_send(&path, rpc_port, coin, to, timeout, private, stealth_scan_key.as_deref()).await
         }
         WalletAction::Import { path, seed, value, salt, label } => {
             wallet_import(&path, &seed, value, &salt, label)
@@ -398,6 +440,9 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         }
         WalletAction::GenerateMss { path, height, label } => {
             wallet_generate_mss(&path, height, label)
+        }
+        WalletAction::GenerateScanKey { path, label } => {
+            wallet_generate_scan_key(&path, label)
         }
         
     }
@@ -508,6 +553,7 @@ async fn wallet_send(
     to_args: Vec<String>,
     timeout_secs: u64,
     private: bool,
+    stealth_scan_key: Option<&str>,
 ) -> Result<()> {
     if to_args.is_empty() {
         anyhow::bail!("must specify at least one --to <owner_pk>:<value>");
@@ -663,10 +709,30 @@ async fn wallet_send(
 
         let mut all_outputs = Vec::new();
         let mut change_seeds = Vec::new();
+        let mut stealth_nonces: Vec<[u8; 32]> = Vec::new();
+
+        // Parse stealth scan key once if provided.
+        let parsed_scan_key: Option<[u8; 32]> = stealth_scan_key
+            .map(|h| parse_hex32(h))
+            .transpose()?;
 
         for (address, value) in &recipient_specs {
-            let salt: [u8; 32] = rand::random();
-            all_outputs.push(OutputData { address: *address, value: *value, salt });
+            if let Some(scan_key) = &parsed_scan_key {
+                // Stealth path: build one output per denomination, each with its
+                // own independently derived nonce and stealth address.
+                for denom in decompose_value(*value) {
+                    let (output, nonce) = build_stealth_output(scan_key, denom);
+                    all_outputs.push(output);
+                    stealth_nonces.push(nonce);
+                }
+            } else {
+                // Normal path: decompose value, pad nonces with zeros.
+                for denom in decompose_value(*value) {
+                    let salt: [u8; 32] = rand::random();
+                    all_outputs.push(OutputData { address: *address, value: denom, salt });
+                    stealth_nonces.push([0u8; 32]);
+                }
+            }
         }
 
         if change > 0 {
@@ -679,6 +745,7 @@ async fn wallet_send(
                 let idx = all_outputs.len();
                 all_outputs.push(OutputData { address: addr, value: denom, salt });
                 change_seeds.push((idx, seed));
+                stealth_nonces.push([0u8; 32]); // change is never stealth
             }
         }
 
@@ -790,6 +857,7 @@ async fn do_reveal(
             salt: hex::encode(o.salt),
         }).collect(),
         salt: hex::encode(pending.salt),
+        stealth_nonces: vec![],
     };
 
     let response = client.post(&reveal_url).json(&reveal_req).send().await?;
@@ -956,7 +1024,8 @@ async fn wallet_reveal(
                 salt: hex::encode(o.salt),
             }).collect(),
             salt: hex::encode(pending.salt),
-        };
+        stealth_nonces: vec![],
+    };
 
         let response = client.post(&url).json(&req).send().await?;
         if response.status().is_success() {
@@ -1061,6 +1130,16 @@ fn wallet_generate_mss(path: &PathBuf, height: u32, label: Option<String>) -> Re
     println!("  Address:  {}", hex::encode(root));
     println!("\nThis address is reusable until the capacity is exhausted.");
 
+    Ok(())
+}
+
+fn wallet_generate_scan_key(path: &PathBuf, label: Option<String>) -> Result<()> {
+    let password = read_password("Password: ")?;
+    let mut wallet = Wallet::open(path, &password)?;
+    let public_key = wallet.generate_scan_key(label)?;
+    println!("\n  Scan key (share this to receive stealth payments):\n");
+    println!("  {}\n", hex::encode(public_key));
+    println!("  Senders pass this to --stealth-scan-key when sending.");
     Ok(())
 }
 
