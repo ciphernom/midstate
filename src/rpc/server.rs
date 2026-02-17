@@ -29,6 +29,7 @@ impl RpcServer {
             .route("/keygen", get(generate_key))
             .route("/peers", get(get_peers))
             .route("/scan", post(scan_addresses))
+            .route("/scan_stealth", post(scan_stealth))
             .route("/mss_state", post(get_mss_state))
             .layer(TraceLayer::new_for_http())
             .with_state(node_handle);
