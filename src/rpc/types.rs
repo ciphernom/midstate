@@ -36,6 +36,10 @@ pub struct SendTransactionRequest {
     pub outputs: Vec<OutputDataJson>,
     /// Commitment salt (hex)
     pub salt: String,
+    /// Hex-encoded stealth nonces, one per output. Omit or leave empty for
+    /// non-stealth transactions.
+    #[serde(default)]
+    pub stealth_nonces: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,6 +69,32 @@ pub struct ScanCoin {
     pub coin_id: String,
     pub height: u64,
 }
+
+/// Ask the node for every stealth nonce in a block range.
+/// The wallet derives candidate addresses locally; the node never learns
+/// which outputs belong to which wallet.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScanStealthRequest {
+    pub start_height: u64,
+    pub end_height: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScanStealthResponse {
+    pub nonces: Vec<StealthNonceEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StealthNonceEntry {
+    /// Nonce embedded in the reveal transaction (hex-encoded).
+    pub nonce: String,
+    /// Output value — needed to reconstruct coin_id after address derivation.
+    pub value: u64,
+    /// Output salt (hex-encoded) — needed to reconstruct coin_id.
+    pub salt: String,
+    pub height: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetStateResponse {
     pub height: u64,
