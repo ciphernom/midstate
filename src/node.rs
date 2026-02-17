@@ -65,6 +65,17 @@ pub struct ScannedCoin {
     pub height: u64,
 }
 
+/// A stealth nonce entry returned by scan_stealth_nonces.
+pub struct StealthNonce {
+    /// The nonce embedded in the reveal transaction.
+    pub nonce: [u8; 32],
+    /// The output's value — needed by the wallet to reconstruct coin_id.
+    pub value: u64,
+    /// The output's salt — needed by the wallet to reconstruct coin_id.
+    pub salt: [u8; 32],
+    pub height: u64,
+}
+
 impl NodeHandle {
     pub async fn get_state(&self) -> State {
         self.state.read().await.clone()
@@ -137,6 +148,43 @@ impl NodeHandle {
         }
         Ok(max_idx)
     }
+
+    /// Iterate every Reveal transaction in [start_height, end_height) and
+    /// collect outputs that carry a non-zero stealth nonce.
+    /// The wallet calls this during scanning and tries each nonce against its
+    /// own scan keys locally — the node never learns which matched.
+    pub fn scan_stealth_nonces(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> anyhow::Result<Vec<StealthNonce>> {
+        let store = crate::storage::BatchStore::new(&self.batches_path)?;
+        let mut found = Vec::new();
+
+        for height in start..end {
+            let Some(batch) = store.load(height)? else { continue };
+
+            for tx in &batch.transactions {
+                let Transaction::Reveal { outputs, stealth_nonces, .. } = tx else {
+                    continue
+                };
+                for (i, output) in outputs.iter().enumerate() {
+                    let nonce = stealth_nonces.get(i).copied().unwrap_or([0u8; 32]);
+                    if nonce == [0u8; 32] {
+                        continue; // not a stealth output
+                    }
+                    found.push(StealthNonce {
+                        nonce,
+                        value: output.value,
+                        salt: output.salt,
+                        height,
+                    });
+                }
+            }
+        }
+
+        Ok(found)
+    }
     
 }
 
@@ -151,7 +199,7 @@ pub fn scan_txs_for_mss_index(txs: &[Transaction], master_pk: &[u8; 32]) -> u64 
                         max_idx = max_idx.max(mss_sig.leaf_index + 1);
                     }
                 }
-            }
+            }           
         }
     }
     max_idx
@@ -1242,6 +1290,7 @@ mod tests {
                     salt: [i; 32],
                 }],
                 salt: [0; 32],
+                stealth_nonces: vec![],
             };
             txs.push(tx);
         }
@@ -1274,6 +1323,7 @@ mod tests {
                 salt: [0; 32],
             }],
             salt: [0; 32],
+            stealth_nonces: vec![],
         };
 
         // Scanning for kp2's key should find nothing
@@ -1307,6 +1357,7 @@ mod tests {
                     salt: [i; 32],
                 }],
                 salt: [0; 32],
+                stealth_nonces: vec![],
             });
         }
 
@@ -1354,6 +1405,7 @@ mod tests {
                 salt: [0; 32],
             }],
             salt: [0; 32],
+            stealth_nonces: vec![],
         };
 
         let mempool_max = scan_txs_for_mss_index(&[mempool_tx], &keypair.public_key());
@@ -1393,6 +1445,7 @@ mod tests {
                 salt: [0; 32],
             }],
             salt: [0; 32],
+            stealth_nonces: vec![],
         };
 
         // Should return 0 — no MSS signatures found
@@ -1448,6 +1501,7 @@ mod tests {
                 salt: [0; 32],
             }],
             salt: [0; 32],
+            stealth_nonces: vec![],
         };
 
         // Should not panic, just return 0
