@@ -1,5 +1,5 @@
 pub mod crypto;
-use crate::core::{hash, hash_concat, compute_commitment, compute_coin_id, compute_address, decompose_value, wots, OutputData, InputReveal};
+use crate::core::{hash_concat, compute_commitment, compute_coin_id, compute_address, decompose_value, wots, OutputData, InputReveal};
 use crate::core::mss::{self, MssKeypair};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -25,17 +25,6 @@ pub struct WalletKey {
     pub seed: [u8; 32],
     pub owner_pk: [u8; 32],
     pub address: [u8; 32],
-    pub label: Option<String>,
-}
-
-/// A stable identity key that the wallet owner publishes so others can send
-/// stealth payments. It never appears on-chain and never signs anything.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ScanKey {
-    /// Private half — never shared.
-    pub seed: [u8; 32],
-    /// Public half — share this with anyone who wants to send you stealth coins.
-    pub public_key: [u8; 32],
     pub label: Option<String>,
 }
 
@@ -83,8 +72,6 @@ pub struct WalletData {
     pub coins: Vec<WalletCoin>,
     #[serde(default)]
     pub mss_keys: Vec<MssKeypair>,
-    #[serde(default)]
-    pub scan_keys: Vec<ScanKey>,
     pub pending: Vec<PendingCommit>,
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
@@ -98,7 +85,6 @@ impl WalletData {
             keys: Vec::new(),
             coins: Vec::new(),
             mss_keys: Vec::new(),
-            scan_keys: Vec::new(),
             pending: Vec::new(),
             history: Vec::new(),
             last_scan_height: 0,
@@ -110,46 +96,6 @@ pub struct Wallet {
     path: PathBuf,
     password: Vec<u8>,
     pub data: WalletData,
-}
-
-// ---------------------------------------------------------------------------
-// Stealth address helpers
-// ---------------------------------------------------------------------------
-
-/// Derive a stealth WOTS keypair from a recipient's scan key and a fresh nonce.
-///
-/// Protocol:
-///   shared_secret = BLAKE3(scan_public_key || nonce)
-///   stealth_seed  = BLAKE3(shared_secret  || b"wots")   // domain separation
-///   stealth_pk    = wots::keygen(&stealth_seed)
-///   stealth_addr  = compute_address(&stealth_pk)         // = BLAKE3(stealth_pk)
-///
-/// Returns (stealth_seed, stealth_pk, stealth_addr).
-/// The sender only needs stealth_addr to build the output.
-/// The recipient needs stealth_seed to spend the coin later.
-pub fn stealth_derive(
-    scan_public_key: &[u8; 32],
-    nonce: &[u8; 32],
-) -> ([u8; 32], [u8; 32], [u8; 32]) {
-    let shared_secret = hash_concat(scan_public_key, nonce);
-    let stealth_seed  = hash_concat(&shared_secret, b"wots");
-    let stealth_pk    = wots::keygen(&stealth_seed);
-    let stealth_addr  = compute_address(&stealth_pk);
-    (stealth_seed, stealth_pk, stealth_addr)
-}
-
-/// Build a stealth OutputData for a recipient identified by their scan key.
-/// Returns the output and the nonce; the caller must include the nonce in the
-/// reveal transaction's `stealth_nonces` field at the matching index.
-pub fn build_stealth_output(
-    recipient_scan_key: &[u8; 32],
-    value: u64,
-) -> (OutputData, [u8; 32]) {
-    let nonce: [u8; 32] = rand::random();
-    let (_seed, _pk, stealth_addr) = stealth_derive(recipient_scan_key, &nonce);
-    let salt: [u8; 32] = rand::random();
-    let output = OutputData { address: stealth_addr, value, salt };
-    (output, nonce)
 }
 
 impl Wallet {
@@ -175,7 +121,7 @@ pub fn watched_addresses(&self) -> Vec<[u8; 32]> {
 }
 
 /// Import a scanned coin, matching it to a wallet key. Returns true if new.
-pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32], stealth_seed: Option<[u8; 32]>) -> Result<Option<[u8; 32]>> {
+pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) -> Result<Option<[u8; 32]>> {
     let coin_id = compute_coin_id(&address, value, &salt);
 
     if self.data.coins.iter().any(|c| c.coin_id == coin_id) {
@@ -208,22 +154,6 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32], 
             coin_id,
             label: Some(format!("received ({})", value)),
         });
-        return Ok(Some(coin_id));
-    }
-
-    // Stealth coin — the caller derived the spending seed during scanning.
-    if let Some(seed) = stealth_seed {
-        let owner_pk = wots::keygen(&seed);
-        self.data.coins.push(WalletCoin {
-            seed,
-            owner_pk,
-            address,
-            value,
-            salt,
-            coin_id,
-            label: Some(format!("stealth ({})", value)),
-        });
-        self.save()?;
         return Ok(Some(coin_id));
     }
 
@@ -263,17 +193,6 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32], 
         self.data.keys.push(WalletKey { seed, owner_pk, address, label });
         self.save()?;
         Ok(address)
-    }
-
-    /// Generate a fresh scan key and persist it. Share the returned public key
-    /// with anyone who wants to send you stealth payments.
-    pub fn generate_scan_key(&mut self, label: Option<String>) -> anyhow::Result<[u8; 32]> {
-        let seed: [u8; 32] = rand::random();
-        // The scan key is just a random value — it never signs anything.
-        let public_key = hash(&seed);
-        self.data.scan_keys.push(ScanKey { seed, public_key, label });
-        self.save()?;
-        Ok(public_key)
     }
 
     /// Generate a new MSS tree (reusable address).
@@ -906,7 +825,7 @@ mod tests {
 
         let salt = [0x55; 32];
         let value = 8u64;
-        let result = w.import_scanned(addr, value, salt, None).unwrap();
+        let result = w.import_scanned(addr, value, salt).unwrap();
         assert!(result.is_some());
         assert_eq!(w.coin_count(), 1);
         assert_eq!(w.keys().len(), 0); // key consumed
@@ -919,7 +838,7 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         let mut w = Wallet::create(&path, b"pass").unwrap();
-        let result = w.import_scanned([0xFF; 32], 8, [0; 32], None).unwrap();
+        let result = w.import_scanned([0xFF; 32], 8, [0; 32]).unwrap();
         assert!(result.is_none());
     }
 
@@ -933,9 +852,9 @@ mod tests {
         let addr = w.generate_key(None).unwrap();
         let salt = [0x55; 32];
 
-        w.import_scanned(addr, 8, salt, None).unwrap();
+        w.import_scanned(addr, 8, salt).unwrap();
         // Second import same coin → None
-        let result = w.import_scanned(addr, 8, salt, None).unwrap();
+        let result = w.import_scanned(addr, 8, salt).unwrap();
         assert!(result.is_none());
         assert_eq!(w.coin_count(), 1);
     }
@@ -1016,160 +935,6 @@ mod tests {
         assert!(Wallet::create(&path, b"pass").is_err());
     }
     
-    // ── stealth addresses ──────────────────────────────────────────────
-
-    #[test]
-    fn stealth_derive_deterministic() {
-        let scan_pk = hash(b"scan public key");
-        let nonce = hash(b"nonce");
-        let (seed1, pk1, addr1) = stealth_derive(&scan_pk, &nonce);
-        let (seed2, pk2, addr2) = stealth_derive(&scan_pk, &nonce);
-        assert_eq!(seed1, seed2);
-        assert_eq!(pk1, pk2);
-        assert_eq!(addr1, addr2);
-    }
-
-    #[test]
-    fn stealth_derive_different_nonce_different_address() {
-        let scan_pk = hash(b"scan public key");
-        let nonce_a = hash(b"nonce a");
-        let nonce_b = hash(b"nonce b");
-        let (_, _, addr_a) = stealth_derive(&scan_pk, &nonce_a);
-        let (_, _, addr_b) = stealth_derive(&scan_pk, &nonce_b);
-        assert_ne!(addr_a, addr_b);
-    }
-
-    #[test]
-    fn stealth_derive_different_scan_key_different_address() {
-        let scan_pk_a = hash(b"scan key a");
-        let scan_pk_b = hash(b"scan key b");
-        let nonce = hash(b"same nonce");
-        let (_, _, addr_a) = stealth_derive(&scan_pk_a, &nonce);
-        let (_, _, addr_b) = stealth_derive(&scan_pk_b, &nonce);
-        assert_ne!(addr_a, addr_b);
-    }
-
-    #[test]
-    fn stealth_derive_address_matches_wots_keygen() {
-        // Verify the derived address is actually compute_address(wots::keygen(stealth_seed))
-        let scan_pk = hash(b"scan pk");
-        let nonce = hash(b"nonce");
-        let (stealth_seed, _pk, addr) = stealth_derive(&scan_pk, &nonce);
-        let expected_pk = wots::keygen(&stealth_seed);
-        let expected_addr = compute_address(&expected_pk);
-        assert_eq!(addr, expected_addr);
-    }
-
-    #[test]
-    fn build_stealth_output_produces_valid_output() {
-        let scan_pk = hash(b"recipient scan key");
-        let (output, nonce) = build_stealth_output(&scan_pk, 64);
-        assert_eq!(output.value, 64);
-        assert_ne!(nonce, [0u8; 32]);
-        // Verify the output address matches what stealth_derive would produce
-        let (_, _, expected_addr) = stealth_derive(&scan_pk, &nonce);
-        assert_eq!(output.address, expected_addr);
-    }
-
-    #[test]
-    fn stealth_round_trip_sender_to_recipient() {
-        // Full flow: recipient generates scan key, sender builds output,
-        // recipient scans nonce and recovers spending seed.
-        let file = NamedTempFile::new().unwrap();
-        let path = file.path().to_path_buf();
-        std::fs::remove_file(&path).unwrap();
-
-        let mut wallet = Wallet::create(&path, b"pass").unwrap();
-
-        // 1. Recipient generates a scan key
-        let scan_pub = wallet.generate_scan_key(Some("stealth".into())).unwrap();
-        assert_eq!(wallet.data.scan_keys.len(), 1);
-        let scan_seed = wallet.data.scan_keys[0].seed;
-
-        // 2. Sender builds a stealth output using the public scan key
-        let (output, nonce) = build_stealth_output(&scan_pub, 16);
-
-        // 3. Recipient sees the nonce on-chain and tries each scan key
-        //    (simulating what wallet_scan does)
-        let mut found_seed = None;
-        for sk in &wallet.data.scan_keys {
-            let (stealth_seed, _pk, stealth_addr) = stealth_derive(&sk.public_key, &nonce);
-            if stealth_addr == output.address {
-                found_seed = Some(stealth_seed);
-                break;
-            }
-        }
-        assert!(found_seed.is_some(), "recipient should detect stealth payment");
-
-        // 4. Import the stealth coin
-        let coin_id = wallet.import_scanned(
-            output.address,
-            output.value,
-            output.salt,
-            found_seed,
-        ).unwrap();
-        assert!(coin_id.is_some());
-        assert_eq!(wallet.coin_count(), 1);
-
-        // 5. Verify the coin is spendable (seed produces correct pk/address)
-        let coin = &wallet.data.coins[0];
-        let pk = wots::keygen(&coin.seed);
-        assert_eq!(pk, coin.owner_pk);
-        assert_eq!(compute_address(&pk), coin.address);
-        assert_eq!(coin.address, output.address);
-        assert_eq!(coin.label, Some("stealth (16)".into()));
-    }
-
-    #[test]
-    fn stealth_wrong_scan_key_does_not_match() {
-        let real_scan_pk = hash(b"real scan key");
-        let wrong_scan_pk = hash(b"wrong scan key");
-
-        let (output, nonce) = build_stealth_output(&real_scan_pk, 8);
-
-        // Try to recover with the wrong key
-        let (_, _, wrong_addr) = stealth_derive(&wrong_scan_pk, &nonce);
-        assert_ne!(wrong_addr, output.address, "wrong scan key must not match");
-    }
-
-    #[test]
-    fn stealth_import_without_seed_rejected() {
-        // If no scan key matches, import_scanned with None stealth_seed
-        // should return None for an unknown address.
-        let file = NamedTempFile::new().unwrap();
-        let path = file.path().to_path_buf();
-        std::fs::remove_file(&path).unwrap();
-
-        let mut wallet = Wallet::create(&path, b"pass").unwrap();
-        let scan_pk = hash(b"some scan key");
-        let (output, _nonce) = build_stealth_output(&scan_pk, 4);
-
-        // Try importing without stealth_seed — wallet has no matching key
-        let result = wallet.import_scanned(output.address, output.value, output.salt, None).unwrap();
-        assert!(result.is_none(), "should reject unknown stealth address without seed");
-    }
-
-    #[test]
-    fn generate_scan_key_persists() {
-        let file = NamedTempFile::new().unwrap();
-        let path = file.path().to_path_buf();
-        std::fs::remove_file(&path).unwrap();
-
-        let mut w = Wallet::create(&path, b"pass").unwrap();
-        let pub1 = w.generate_scan_key(Some("key1".into())).unwrap();
-        let pub2 = w.generate_scan_key(None).unwrap();
-        assert_ne!(pub1, pub2);
-        w.save().unwrap();
-
-        // Reopen and verify
-        let w2 = Wallet::open(&path, b"pass").unwrap();
-        assert_eq!(w2.data.scan_keys.len(), 2);
-        assert_eq!(w2.data.scan_keys[0].public_key, pub1);
-        assert_eq!(w2.data.scan_keys[1].public_key, pub2);
-        assert_eq!(w2.data.scan_keys[0].label, Some("key1".into()));
-        assert_eq!(w2.data.scan_keys[1].label, None);
-    }
-
     #[test]
     fn test_mss_safety_recovery_persistence() {
         // 1. Setup: Create a wallet with an MSS key
