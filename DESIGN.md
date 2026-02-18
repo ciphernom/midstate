@@ -40,7 +40,10 @@ Where `address = BLAKE3(owner_pk)`.
 
 ### Sequential Proof of Work
 
-Mining is not parallelizable. It requires sequential iteration to prove time has passed.
+Mining requires sequential iteration to prove time has passed. Each mining attempt performs a full sequential hash chain that cannot be shortcut. 
+However, miners can try multiple nonces in parallel across cores — the sequential property applies per-attempt, not across attempts. 
+At low difficulty (loose target), most attempts succeed, making parallelism nearly useless. 
+As difficulty increases, the advantage of parallel nonce search grows.
 
 1. **Input**: `midstate` (after applying transactions and coinbase).
 2. **Start**: `x₀ = BLAKE3(midstate || nonce)`.
