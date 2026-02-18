@@ -2,9 +2,7 @@ use crate::core::{State, BatchHeader};
 use crate::core::state::apply_batch;
 use crate::core::extension::verify_extension;
 use crate::storage::Storage;
-use crate::network::{Message, MidstateNetwork, NetworkEvent};
 use anyhow::{bail, Result};
-use libp2p::PeerId;
 
 pub struct Syncer {
     storage: Storage,
@@ -15,144 +13,72 @@ impl Syncer {
         Self { storage }
     }
 
-    pub async fn sync_via_network(&self, network: &mut MidstateNetwork, peer: PeerId) -> Result<State> {
-        tracing::info!("Starting headers-first sync...");
+    /// Verify PoW and internal header-to-header linkage on a contiguous
+    /// slice of headers. The first header's prev_midstate is NOT checked
+    /// here — that is handled by the fork-point logic.
+    pub fn verify_header_chain(headers: &[BatchHeader]) -> Result<()> {
+        for (i, header) in headers.iter().enumerate() {
+            verify_extension(
+                header.post_tx_midstate,
+                &header.extension,
+                &header.target,
+            )
+            .map_err(|e| anyhow::anyhow!("Invalid PoW at header index {}: {}", i, e))?;
 
-        // Load current state to know where we are
-        let mut state = self.storage.load_state()?.unwrap_or_else(|| State::genesis().0);
-        let start_height = state.height;
-
-        // Ask peer for their height
-        network.send(peer, Message::GetState);
-
-        let (peer_height, _) = loop {
-            match network.next_event().await {
-                NetworkEvent::MessageReceived { message: Message::StateInfo { height, depth, .. }, .. } => {
-                    break (height, depth);
+            if i > 0 {
+                let prev = &headers[i - 1];
+                if header.prev_midstate != prev.extension.final_hash {
+                    bail!(
+                        "Header linkage broken at index {}: prev_midstate mismatch",
+                        i
+                    );
                 }
-                _ => continue,
             }
-        };
-
-        // Already caught up?
-        if peer_height <= start_height {
-            tracing::info!("Already at peer height {}, no sync needed", start_height);
-            return Ok(state);
         }
+        Ok(())
+    }
 
-        tracing::info!(
-            "Peer at height {}. Syncing headers from {} to {}...",
-            peer_height,
-            start_height,
-            peer_height
-        );
+    /// Find the first height where our locally stored chain and the peer's
+    /// header chain diverge.  Everything below this height is shared history.
+    ///
+    /// `peer_headers` covers [0, peer_height).  We compare against our local
+    /// batches stored on disk.
+    pub fn find_fork_point(
+        &self,
+        peer_headers: &[BatchHeader],
+        our_height: u64,
+    ) -> Result<u64> {
+        let compare_end = our_height.min(peer_headers.len() as u64);
 
-        // 2. Download and verify headers
-        let mut headers_buffer: Vec<BatchHeader> = Vec::new();
-        let mut current_h = start_height;  // ← Start where we left off, not 0!
-
-        while current_h < peer_height {
-            let count = 100.min(peer_height - current_h);
-            network.send(peer, Message::GetHeaders { start_height: current_h, count });
-
-            let received_headers = loop {
-                match network.next_event().await {
-                    NetworkEvent::MessageReceived { message: Message::Headers { headers, .. }, .. } => break headers,
-                    _ => continue,
-                }
-            };
-
-            if received_headers.is_empty() {
-                bail!("Peer sent empty headers");
-            }
-            
-            // VERIFY HEADERS
-            for (i, header) in received_headers.iter().enumerate() {
-                let height = current_h + i as u64;
-                
-                // A. Check Linkage
-                if height > start_height {
-                    // For first batch, check against our current state
-                    if headers_buffer.is_empty() && height == start_height {
-                        if header.prev_midstate != state.midstate {
-                            bail!("Header linkage broken at height {}: expected prev={}, got prev={}",
-                                height, hex::encode(state.midstate), hex::encode(header.prev_midstate));
-                        }
-                    } else if !headers_buffer.is_empty() {
-                        // Check against previous header in buffer
-                        let prev_idx = headers_buffer.len() - 1;
-                        let prev = &headers_buffer[prev_idx];
-                        
-                        if header.prev_midstate != prev.extension.final_hash {
-                            bail!("Header linkage broken at height {}", height);
-                        }
+        for h in 0..compare_end {
+            match self.storage.load_batch(h)? {
+                Some(our_batch) => {
+                    let peer_hdr = &peer_headers[h as usize];
+                    if our_batch.extension.final_hash != peer_hdr.extension.final_hash {
+                        tracing::info!("Fork detected at height {}", h);
+                        return Ok(h);
                     }
                 }
-
-                // B. Verify PoW
-                verify_extension(header.post_tx_midstate, &header.extension, &header.target)
-                    .map_err(|e| anyhow::anyhow!("Invalid PoW at height {}: {}", height, e))?;
-
-                headers_buffer.push(header.clone());
+                None => {
+                    return Ok(h);
+                }
             }
-
-            current_h += received_headers.len() as u64;
-            tracing::info!("Verified {} headers (PoW valid)", current_h - start_height);
         }
 
-        tracing::info!("All {} headers verified. Downloading blocks...", headers_buffer.len());
+        Ok(compare_end)
+    }
 
-        // 3. Download Blocks and Full Verify
-        let mut current_dl = 0;
-        while current_dl < headers_buffer.len() as u64 {
-            let count = 10.min(headers_buffer.len() as u64 - current_dl);
-            
-            network.send(peer, Message::GetBatches { 
-                start_height: start_height + current_dl,  // ← Offset by start_height
-                count 
-            });
-            
-            let batches = loop {
-                match network.next_event().await {
-                    NetworkEvent::MessageReceived { message: Message::Batches { batches, .. }, .. } => break batches,
-                    _ => continue,
-                }
-            };
-
-            if batches.is_empty() {
-                bail!("Peer sent empty batches at height {}", start_height + current_dl);
-            }
-
-            for (i, batch) in batches.iter().enumerate() {
-                let height = start_height + current_dl + i as u64;
-                let header_idx = (current_dl + i as u64) as usize;
-                
-                if header_idx >= headers_buffer.len() {
-                    bail!("Batch index {} exceeds header buffer length {}", header_idx, headers_buffer.len());
-                }
-                
-                let header = &headers_buffer[header_idx];
-
-                // A. Integrity Check
-                let batch_header_calc = batch.header();
-                
-                if batch.extension.final_hash != header.extension.final_hash {
-                    bail!("Batch at {} does not match verified header PoW", height);
-                }
-                if batch_header_calc.post_tx_midstate != header.post_tx_midstate {
-                    bail!("Batch at {} transactions do not match header commitment", height);
-                }
-
-                // B. Full Application
-                apply_batch(&mut state, batch)?;
-                self.storage.save_batch(height, batch)?;
-            }
-            
-            current_dl += batches.len() as u64;
-            tracing::info!("Applied {}/{} blocks", current_dl, headers_buffer.len());
+    /// Rebuild local state from genesis up to (but not including) `target`,
+    /// using batches already on disk.
+    pub fn rebuild_state_to(&self, target: u64) -> Result<State> {
+        let mut state = State::genesis().0;
+        for h in 0..target {
+            let batch = self
+                .storage
+                .load_batch(h)?
+                .ok_or_else(|| anyhow::anyhow!("Missing batch at height {} during rebuild", h))?;
+            apply_batch(&mut state, &batch)?;
         }
- 
-        tracing::info!("Sync complete! Height: {}, Depth: {}", state.height, state.depth);
         Ok(state)
     }
 }
