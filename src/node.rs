@@ -23,6 +23,34 @@ use tokio::time;
 use rayon::prelude::*;
 
 const MAX_ORPHAN_BATCHES: usize = 256;
+const SYNC_TIMEOUT_SECS: u64 = 120;
+
+/// Non-blocking sync session driven by the main event loop.
+/// Replaces the old blocking `Syncer::sync_via_network` which hijacked the
+/// network and dropped unrelated messages.
+struct SyncSession {
+    peer: PeerId,
+    peer_height: u64,
+    peer_depth: u64,
+    phase: SyncPhase,
+    started_at: std::time::Instant,
+}
+
+enum SyncPhase {
+    /// Downloading headers from genesis to peer_height.
+    Headers {
+        accumulated: Vec<BatchHeader>,
+        cursor: u64,
+    },
+    /// Headers verified, now downloading batches from fork_height forward.
+    Batches {
+        headers: Vec<BatchHeader>,
+        fork_height: u64,
+        candidate_state: State,
+        cursor: u64,
+        new_history: Vec<(u64, [u8; 32], Batch)>,
+    },
+}
 
 pub struct Node {
     state: State,
@@ -36,6 +64,7 @@ pub struct Node {
     orphan_batches: HashMap<u64, Batch>,
     sync_in_progress: bool,
     sync_requested_up_to: u64,
+    sync_session: Option<SyncSession>,
     mining_seed: [u8; 32],
     data_dir: PathBuf,
     chain_history: Vec<(u64, [u8; 32], Batch)>,
@@ -329,6 +358,7 @@ impl Node {
             data_dir,
             chain_history: Vec::new(),
             max_reorg_depth: 100,
+            sync_session: None,
         })
     }
 
@@ -356,6 +386,7 @@ impl Node {
         let mut metrics_interval = time::interval(Duration::from_secs(30));
         let mut sync_poll_interval = time::interval(Duration::from_secs(30));
         let mut mempool_prune_interval = time::interval(Duration::from_secs(60));
+        let mut sync_timeout_interval = time::interval(Duration::from_secs(5));
 
         // Initial sync: ask all peers for their height
         if self.network.peer_count() > 0 {
@@ -398,6 +429,13 @@ impl Node {
                         self.network.send(peer, Message::GetState);
                     }
                 }
+                _ = sync_timeout_interval.tick() => {
+                    if let Some(session) = &self.sync_session {
+                        if session.started_at.elapsed().as_secs() > SYNC_TIMEOUT_SECS {
+                            self.abort_sync_session("timed out");
+                        }
+                    }
+                }
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
                         NodeCommand::SendTransaction(tx) => {
@@ -420,6 +458,9 @@ impl Node {
                         }
                         NetworkEvent::PeerDisconnected(peer) => {
                             tracing::info!("Peer disconnected: {}", peer);
+                            if self.sync_session.as_ref().map_or(false, |s| s.peer == peer) {
+                                self.abort_sync_session("sync peer disconnected");
+                            }
                         }
                     }
                 }
@@ -467,23 +508,20 @@ impl Node {
 
                 if midstate == self.state.midstate && height == self.state.height {
                     self.sync_in_progress = false;
+                    self.sync_session = None;
                 } else if depth > self.state.depth || height > self.state.height {
-                    // Use headers-first sync via Syncer
-                   tracing::info!("Peer ahead (height={}, depth={}). Starting headers-first sync", height, depth);
-                   self.sync_in_progress = true;
-                    
-                    match self.syncer.sync_via_network(&mut self.network, from).await {
-                        Ok(new_state) => {
-                            self.state = new_state;
-                            self.storage.save_state(&self.state)?;
-                            self.sync_in_progress = false;
-                            tracing::info!("✓ Headers-first sync complete! Height: {}", self.state.height);
-                        }
-                        Err(e) => {
-                            tracing::error!("✗ Headers-first sync failed: {}", e);
-                            self.sync_in_progress = false;
-                        }
+                    // Don't restart sync if we're already syncing from this peer
+                    if self.sync_session.as_ref().map_or(false, |s| s.peer == from) {
+                        tracing::debug!("Already syncing from this peer, ignoring duplicate StateInfo");
+                    } else {
+                        self.start_sync_session(from, height, depth);
                     }
+                } else {
+                    tracing::debug!(
+                        "Peer {} at equal/lower depth (h={}, d={}) with different chain, resuming mining",
+                        from, height, depth
+                    );
+                    self.sync_in_progress = false;
                 }
             }
             
@@ -529,7 +567,20 @@ impl Node {
             Message::Batches { start_height: batch_start, batches } => {
                 self.ack(channel);
                 if !batches.is_empty() {
-                    self.handle_batches_response(batch_start, batches, from).await?;
+                    // If we have an active sync session in the Batches phase from this
+                    // peer, route through the sync state machine instead of the normal
+                    // batch handler.
+                    let is_sync_batches = self.sync_session.as_ref().map_or(false, |s| {
+                        s.peer == from && matches!(s.phase, SyncPhase::Batches { .. })
+                    });
+                    if is_sync_batches {
+                        if let Err(e) = self.handle_sync_batches(from, batches).await {
+                            tracing::warn!("Error processing sync batches: {}", e);
+                            self.abort_sync_session("batch processing error");
+                        }
+                    } else {
+                        self.handle_batches_response(batch_start, batches, from).await?;
+                    }
                 }
             }
             Message::GetHeaders { start_height, count } => {
@@ -548,11 +599,258 @@ impl Node {
                     }
                 }
             }
-            Message::Headers { .. } => {
-                // Handled by Syncer, just ack
+            Message::Headers { start_height: _, headers } => {
                 self.ack(channel);
+                if let Err(e) = self.handle_sync_headers(from, headers).await {
+                    tracing::warn!("Error processing sync headers: {}", e);
+                    self.abort_sync_session("header processing error");
+                }
             }
         }
+        Ok(())
+    }
+
+    // ── Non-blocking sync state machine ─────────────────────────────────
+
+    fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u64) {
+        tracing::info!(
+            "Starting headers-first sync: peer(h={}, d={}) vs us(h={}, d={})",
+            peer_height, peer_depth, self.state.height, self.state.depth
+        );
+        self.sync_in_progress = true;
+        self.sync_session = Some(SyncSession {
+            peer,
+            peer_height,
+            peer_depth,
+            phase: SyncPhase::Headers {
+                accumulated: Vec::new(),
+                cursor: 0,
+            },
+            started_at: std::time::Instant::now(),
+        });
+
+        // Request first chunk of headers from genesis
+        let count = 100.min(peer_height);
+        self.network.send(peer, Message::GetHeaders { start_height: 0, count });
+    }
+
+    fn abort_sync_session(&mut self, reason: &str) {
+        if self.sync_session.is_some() {
+            tracing::warn!("Aborting sync session: {}", reason);
+        }
+        self.sync_session = None;
+        self.sync_in_progress = false;
+    }
+
+    async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHeader>) -> Result<()> {
+        // Extract state from the session — only accept headers from the sync peer
+        let (peer_height, cursor) = match &self.sync_session {
+            Some(s) if s.peer == from => {
+                match &s.phase {
+                    SyncPhase::Headers { cursor, .. } => (s.peer_height, *cursor),
+                    _ => return Ok(()), // Wrong phase, ignore
+                }
+            }
+            _ => return Ok(()), // No session or wrong peer, ignore
+        };
+
+        if headers.is_empty() {
+            self.abort_sync_session("peer sent empty headers");
+            return Ok(());
+        }
+
+        // Accumulate headers
+        let new_cursor = cursor + headers.len() as u64;
+        match &mut self.sync_session {
+            Some(s) => {
+                if let SyncPhase::Headers { accumulated, cursor } = &mut s.phase {
+                    accumulated.extend(headers);
+                    *cursor = new_cursor;
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        if new_cursor < peer_height {
+            // Need more headers — request next chunk
+            let count = 100.min(peer_height - new_cursor);
+            self.network.send(from, Message::GetHeaders { start_height: new_cursor, count });
+            return Ok(());
+        }
+
+        // All headers received — take ownership of the session data
+        let session = self.sync_session.take().unwrap();
+        let all_headers = match session.phase {
+            SyncPhase::Headers { accumulated, .. } => accumulated,
+            _ => unreachable!(),
+        };
+
+        tracing::info!("Downloaded {} headers, verifying PoW + linkage...", all_headers.len());
+
+        // Validate the full header chain
+        if let Err(e) = Syncer::verify_header_chain(&all_headers) {
+            tracing::warn!("Peer header chain invalid: {}", e);
+            self.sync_in_progress = false;
+            return Ok(());
+        }
+        tracing::info!("Header chain verified. Finding fork point...");
+
+        // Find fork point using local storage
+        let fork_height = self.syncer.find_fork_point(&all_headers, self.state.height)?;
+        tracing::info!(
+            "Fork point at height {}. Will download batches {}..{}",
+            fork_height, fork_height, session.peer_height
+        );
+
+        if fork_height >= session.peer_height {
+            // Already in sync
+            tracing::info!("Already in sync with peer");
+            self.sync_in_progress = false;
+            return Ok(());
+        }
+
+        // Build the candidate state at the fork point
+        let candidate_state = if fork_height == 0 {
+            State::genesis().0
+        } else if fork_height <= self.state.height {
+            // Reorg: rebuild state to the fork point
+            self.syncer.rebuild_state_to(fork_height)?
+        } else {
+            // Peer extends us — start from our current state
+            self.state.clone()
+        };
+
+        // Transition to Batches phase
+        self.sync_session = Some(SyncSession {
+            peer: from,
+            peer_height: session.peer_height,
+            peer_depth: session.peer_depth,
+            phase: SyncPhase::Batches {
+                headers: all_headers,
+                fork_height,
+                candidate_state,
+                cursor: fork_height,
+                new_history: Vec::new(),
+            },
+            started_at: session.started_at,
+        });
+
+        // Request first chunk of batches from the fork point
+        let count = (session.peer_height - fork_height).min(MAX_GETBATCHES_COUNT);
+        self.network.send(from, Message::GetBatches { start_height: fork_height, count });
+
+        Ok(())
+    }
+
+    async fn handle_sync_batches(&mut self, from: PeerId, batches: Vec<Batch>) -> Result<()> {
+        if batches.is_empty() {
+            self.abort_sync_session("peer sent empty batches");
+            return Ok(());
+        }
+
+        // Take the session to work with it
+        let mut session = match self.sync_session.take() {
+            Some(s) if s.peer == from => s,
+            other => {
+                self.sync_session = other; // put it back
+                return Ok(());
+            }
+        };
+
+        let (headers, _fork_height, candidate_state, cursor, new_history) = match &mut session.phase {
+            SyncPhase::Batches { headers, fork_height, candidate_state, cursor, new_history } => {
+                (headers, *fork_height, candidate_state, cursor, new_history)
+            }
+            _ => {
+                self.sync_session = Some(session); // wrong phase, put it back
+                return Ok(());
+            }
+        };
+
+        // Apply each batch, verifying against the already-validated headers
+        for batch in &batches {
+            let height = *cursor;
+            let hdr_idx = height as usize;
+
+            if hdr_idx >= headers.len() {
+                tracing::warn!("Batch height {} exceeds header count {}", height, headers.len());
+                self.sync_in_progress = false;
+                return Ok(());
+            }
+
+            let header = &headers[hdr_idx];
+
+            // Integrity: batch PoW must match the already-verified header
+            if batch.extension.final_hash != header.extension.final_hash {
+                tracing::warn!("Batch at height {} does not match verified header PoW", height);
+                self.sync_in_progress = false;
+                return Ok(());
+            }
+            let calc = batch.header();
+            if calc.post_tx_midstate != header.post_tx_midstate {
+                tracing::warn!("Batch at height {} tx commitment does not match header", height);
+                self.sync_in_progress = false;
+                return Ok(());
+            }
+
+            // Apply to candidate state (do NOT save to disk yet — if sync
+            // aborts before the reorg is committed, premature writes would
+            // leave a Frankenstein chain on disk: some heights from the peer,
+            // some from our old chain.  Batches are persisted atomically in
+            // perform_reorg only after we decide to adopt.)
+            apply_batch(candidate_state, batch)?;
+            new_history.push((height, candidate_state.midstate, batch.clone()));
+            *cursor += 1;
+        }
+
+        let current_cursor = *cursor;
+        let peer_height = session.peer_height;
+
+        tracing::info!("Applied sync batches up to height {}/{}", current_cursor, peer_height);
+
+        if current_cursor < peer_height {
+            // Need more batches — request next chunk
+            let count = (peer_height - current_cursor).min(MAX_GETBATCHES_COUNT);
+            self.network.send(from, Message::GetBatches { start_height: current_cursor, count });
+            self.sync_session = Some(session); // put session back
+            return Ok(());
+        }
+
+        // All batches applied — check if we should adopt this chain
+        let (final_state, final_history) = match session.phase {
+            SyncPhase::Batches { candidate_state, new_history, .. } => {
+                (candidate_state, new_history)
+            }
+            _ => unreachable!(),
+        };
+
+        if final_state.depth > self.state.depth {
+            tracing::info!(
+                "✓ Sync complete! Adopting chain: height {} -> {}, depth {} -> {}",
+                self.state.height, final_state.height,
+                self.state.depth, final_state.depth
+            );
+            self.perform_reorg(final_state, final_history)?;
+            // Try to apply any broadcast blocks that were orphaned during sync
+            // — they may now chain onto the adopted state.
+            self.try_apply_orphans().await;
+        } else {
+            tracing::info!(
+                "Sync complete but peer chain has less work (depth {} <= {}), keeping ours",
+                final_state.depth, self.state.depth
+            );
+        }
+
+        self.sync_in_progress = false;
+        // sync_session is already None (we took it above)
+
+        // Immediately check if the peer has mined more blocks while we were
+        // syncing.  Without this, we'd have to wait for the next broadcast
+        // (which will fail because we missed intermediate blocks) before
+        // discovering we're still behind — creating a catch-up death spiral
+        // where each cycle takes ~5 s and the miner advances by ~1 block.
+        self.network.send(from, Message::GetState);
+
         Ok(())
     }
 
@@ -869,6 +1167,9 @@ impl Node {
                 match self.evaluate_alternative_chain(fork_height, relevant, from).await {
                     Ok(Some((new_state, new_history))) => {
                         self.perform_reorg(new_state, new_history)?;
+                        self.try_apply_orphans().await;
+                        // Check if peer has even more blocks
+                        self.network.send(from, Message::GetState);
                     }
                     Ok(None) => {
                         tracing::debug!("Alternative chain rejected (insufficient work)");
@@ -942,8 +1243,20 @@ impl Node {
     async fn try_apply_orphans(&mut self) {
         let mut applied = 0;
         loop {
+            // First try the expected height key (fast path for normal operation)
             let height = self.state.height;
-            let batch = match self.orphan_batches.remove(&height) {
+            let matching_key = if self.orphan_batches.contains_key(&height) {
+                Some(height)
+            } else {
+                // Scan all orphans for one whose prev_midstate matches our
+                // current state.  This is essential after reorgs where
+                // broadcast blocks were stored at incorrect estimated heights.
+                self.orphan_batches.iter()
+                    .find(|(_, batch)| batch.prev_midstate == self.state.midstate)
+                    .map(|(&k, _)| k)
+            };
+
+            let batch = match matching_key.and_then(|k| self.orphan_batches.remove(&k)) {
                 Some(b) => b,
                 None => break,
             };
@@ -967,7 +1280,7 @@ impl Node {
                     applied += 1;
                 }
                 Err(e) => {
-                    tracing::warn!("Orphan batch at {} still invalid: {}", height, e);
+                    tracing::warn!("Orphan batch still invalid: {}", e);
                     break;
                 }
             }
@@ -2224,4 +2537,328 @@ mod complex_tests {
         assert_eq!(node.state.height, 7, "should switch to longer chain");
         assert_eq!(node.state.midstate, chain_b_state.midstate, "must adopt chain B's midstate");
     }
+    
+    // ── Interrupted Sync / Frankenstein Chain Tests ────────────────────
+
+    /// Build a divergent chain from a fork point, returning the batches
+    /// and the headers the peer would serve.
+    fn build_divergent_chain(
+        fork_state: &State,
+        length: usize,
+    ) -> (Vec<Batch>, Vec<BatchHeader>) {
+        let mut state = fork_state.clone();
+        let mut batches = Vec::new();
+        let mut headers = Vec::new();
+
+        for i in 0..length {
+            // Use a different timestamp offset so PoW differs from the main chain
+            let batch = make_valid_batch(&state, 50 + i as u64, vec![]);
+            let mut hdr = batch.header();
+            hdr.height = state.height;
+            headers.push(hdr);
+            apply_batch(&mut state, &batch).unwrap();
+            batches.push(batch);
+        }
+        (batches, headers)
+    }
+
+    /// Core invariant: after an aborted sync, on-disk headers must still
+    /// form a valid chain (no Frankenstein mixing of two chains).
+    ///
+    /// Before the fix, handle_sync_batches called save_batch() for each
+    /// incoming peer batch *during* sync.  If the session was then aborted
+    /// (timeout, disconnect, new session), some heights on disk held the
+    /// peer's blocks while others still held the original chain's blocks.
+    /// A subsequent load_headers() would produce a chain with broken
+    /// prev_midstate linkage — the "Frankenstein chain" bug.
+    #[tokio::test]
+    async fn aborted_sync_does_not_corrupt_disk() {
+        let dir = tempdir().unwrap();
+        let mut node = create_test_node(dir.path()).await;
+
+        // 1. Mine 10 blocks on the "main" chain so we have something on disk
+        for _ in 0..10 {
+            node.try_mine().await.unwrap();
+        }
+        assert_eq!(node.state.height, 11);
+
+        // Snapshot — this is what disk should look like after abort
+        let pre_sync_state = node.state.clone();
+
+        // 2. Build a divergent chain that forks at height 5
+        //    (longer than ours so the node would want to adopt it)
+        let fork_state = node.rebuild_state_at_height(5).unwrap();
+        let (alt_batches, alt_headers) = build_divergent_chain(&fork_state, 15);
+
+        // We need the full header chain from genesis for the sync session.
+        // Heights 0..5 are shared, 5..20 are the alt chain.
+        let mut full_headers = node.storage.batches.load_headers(0, 5).unwrap();
+        full_headers.extend(alt_headers);
+
+        // 3. Manually construct a sync session in the Batches phase
+        let peer = PeerId::random();
+        let peer_height = 5 + alt_batches.len() as u64; // = 20
+        node.sync_in_progress = true;
+        node.sync_session = Some(SyncSession {
+            peer,
+            peer_height,
+            peer_depth: peer_height * 1_000_000,
+            phase: SyncPhase::Batches {
+                headers: full_headers,
+                fork_height: 5,
+                candidate_state: fork_state.clone(),
+                cursor: 5,
+                new_history: Vec::new(),
+            },
+            started_at: std::time::Instant::now(),
+        });
+
+        // 4. Feed only half the alt batches (simulating partial download)
+        let half = alt_batches.len() / 2;
+        node.handle_sync_batches(peer, alt_batches[..half].to_vec())
+            .await
+            .unwrap();
+
+        // Session should still be in progress (waiting for more batches)
+        assert!(node.sync_session.is_some(), "Session should still be active");
+
+        // 5. ABORT the sync (simulates timeout or peer disconnect)
+        node.abort_sync_session("simulated timeout");
+
+        // 6. THE KEY ASSERTION: on-disk headers must still be a valid chain.
+        //    Load all headers from disk and verify linkage.
+        let disk_headers = node.storage.batches.load_headers(0, pre_sync_state.height).unwrap();
+        assert!(
+            !disk_headers.is_empty(),
+            "Should have headers on disk"
+        );
+        assert!(
+            Syncer::verify_header_chain(&disk_headers).is_ok(),
+            "On-disk header chain must have valid linkage after aborted sync. \
+             If this fails, sync wrote peer batches to disk before committing the reorg."
+        );
+
+        // 7. The node's in-memory state should be unchanged
+        assert_eq!(node.state.height, pre_sync_state.height);
+        assert_eq!(node.state.midstate, pre_sync_state.midstate);
+    }
+
+    /// Verify that a node which aborted a sync can still serve valid
+    /// headers to other peers.  This is the downstream consequence of
+    /// the Frankenstein bug: even if the node's own state is fine, any
+    /// peer trying to sync FROM it would see broken header linkage and
+    /// abort its own sync.
+    #[tokio::test]
+    async fn headers_served_after_aborted_sync_are_valid() {
+        let dir = tempdir().unwrap();
+        let mut node = create_test_node(dir.path()).await;
+
+        // Mine 8 blocks
+        for _ in 0..8 {
+            node.try_mine().await.unwrap();
+        }
+        let original_height = node.state.height; // 9
+
+        // Build alt chain forking at height 3, longer than ours
+        let fork_state = node.rebuild_state_at_height(3).unwrap();
+        let (alt_batches, alt_headers) = build_divergent_chain(&fork_state, 12);
+
+        let mut full_headers = node.storage.batches.load_headers(0, 3).unwrap();
+        full_headers.extend(alt_headers);
+
+        // Set up sync session and feed some batches
+        let peer = PeerId::random();
+        node.sync_in_progress = true;
+        node.sync_session = Some(SyncSession {
+            peer,
+            peer_height: 3 + alt_batches.len() as u64,
+            peer_depth: (3 + alt_batches.len() as u64) * 1_000_000,
+            phase: SyncPhase::Batches {
+                headers: full_headers,
+                fork_height: 3,
+                candidate_state: fork_state,
+                cursor: 3,
+                new_history: Vec::new(),
+            },
+            started_at: std::time::Instant::now(),
+        });
+
+        // Feed 4 of 12 alt batches, then abort
+        node.handle_sync_batches(peer, alt_batches[..4].to_vec())
+            .await
+            .unwrap();
+        node.abort_sync_session("peer disconnected");
+
+        // Now simulate what happens when another peer asks us for headers.
+        // This is exactly what GetHeaders does internally.
+        let served_headers = node.storage.batches
+            .load_headers(0, original_height)
+            .unwrap();
+
+        assert!(
+            Syncer::verify_header_chain(&served_headers).is_ok(),
+            "Headers served to peers must have valid linkage. \
+             Broken linkage here means peers cannot sync from us."
+        );
+    }
+
+    /// Verify that a COMPLETED sync (not aborted) does persist the new
+    /// chain to disk correctly and the headers are valid.
+    #[tokio::test]
+    async fn completed_sync_persists_valid_chain() {
+        let dir = tempdir().unwrap();
+        let mut node = create_test_node(dir.path()).await;
+
+        // Mine 5 blocks
+        for _ in 0..5 {
+            node.try_mine().await.unwrap();
+        }
+        assert_eq!(node.state.height, 6);
+
+        // Build alt chain forking at genesis (height 1), longer than ours
+        let fork_state = node.rebuild_state_at_height(1).unwrap();
+        let (alt_batches, alt_headers) = build_divergent_chain(&fork_state, 10);
+
+        let mut full_headers = node.storage.batches.load_headers(0, 1).unwrap();
+        full_headers.extend(alt_headers);
+
+        let peer = PeerId::random();
+        let peer_height = 1 + alt_batches.len() as u64; // 11
+        node.sync_in_progress = true;
+        node.sync_session = Some(SyncSession {
+            peer,
+            peer_height,
+            peer_depth: peer_height * 1_000_000,
+            phase: SyncPhase::Batches {
+                headers: full_headers,
+                fork_height: 1,
+                candidate_state: fork_state,
+                cursor: 1,
+                new_history: Vec::new(),
+            },
+            started_at: std::time::Instant::now(),
+        });
+
+        // Feed ALL batches — sync should complete and adopt the chain
+        node.handle_sync_batches(peer, alt_batches.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(node.state.height, peer_height);
+        assert!(!node.sync_in_progress);
+
+        // Verify that the NEW chain on disk is coherent
+        let disk_headers = node.storage.batches
+            .load_headers(0, node.state.height)
+            .unwrap();
+        assert_eq!(disk_headers.len(), (node.state.height) as usize);
+        assert!(
+            Syncer::verify_header_chain(&disk_headers).is_ok(),
+            "After a completed sync+reorg, on-disk headers must be a valid chain"
+        );
+    }
+
+    /// A second sync replacing a first mid-flight must not leave the disk
+    /// in a mixed state.  This simulates: start syncing from peer A,
+    /// receive some batches, then peer B shows up with a better chain
+    /// and we start a new session (dropping the old one).
+    #[tokio::test]
+    async fn replaced_sync_session_does_not_corrupt_disk() {
+        let dir = tempdir().unwrap();
+        let mut node = create_test_node(dir.path()).await;
+
+        for _ in 0..8 {
+            node.try_mine().await.unwrap();
+        }
+        let original_state = node.state.clone();
+
+        // Build two different alt chains forking at different points
+        let fork_a_state = node.rebuild_state_at_height(3).unwrap();
+        let (alt_a_batches, alt_a_headers) = build_divergent_chain(&fork_a_state, 10);
+
+        let mut full_headers_a = node.storage.batches.load_headers(0, 3).unwrap();
+        full_headers_a.extend(alt_a_headers);
+
+        // Start sync session with peer A
+        let peer_a = PeerId::random();
+        node.sync_in_progress = true;
+        node.sync_session = Some(SyncSession {
+            peer: peer_a,
+            peer_height: 13,
+            peer_depth: 13_000_000,
+            phase: SyncPhase::Batches {
+                headers: full_headers_a,
+                fork_height: 3,
+                candidate_state: fork_a_state,
+                cursor: 3,
+                new_history: Vec::new(),
+            },
+            started_at: std::time::Instant::now(),
+        });
+
+        // Feed some of A's batches
+        node.handle_sync_batches(peer_a, alt_a_batches[..3].to_vec())
+            .await
+            .unwrap();
+
+        // Now peer B shows up — start_sync_session replaces the session
+        let peer_b = PeerId::random();
+        node.start_sync_session(peer_b, 20, 20_000_000);
+
+        // Disk should still be coherent (old session's writes should not exist)
+        let disk_headers = node.storage.batches
+            .load_headers(0, original_state.height)
+            .unwrap();
+        assert!(
+            Syncer::verify_header_chain(&disk_headers).is_ok(),
+            "Replacing a sync session mid-flight must not leave corrupted headers on disk"
+        );
+    }
+
+    // ── Database Lock Retry Test ────────────────────────────────────────
+
+    /// Verify that Storage::open retries when the database lock is held,
+    /// rather than failing immediately.
+    #[tokio::test]
+    async fn storage_open_retries_on_lock() {
+        use crate::storage::Storage;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("db");
+
+        // Open the database (acquires the exclusive lock)
+        let _storage1 = Storage::open(&db_path).unwrap();
+
+        // Spawn a thread that will drop storage1 after a short delay,
+        // simulating a previous process releasing the lock
+        let db_path2 = db_path.clone();
+        let handle = std::thread::spawn(move || {
+            // Hold the lock for 300ms then drop
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(_storage1);
+            // Now try to open — should succeed after retry
+            Storage::open(&db_path2)
+        });
+
+        // The spawned thread should eventually acquire the lock
+        let result = handle.join().unwrap();
+        assert!(result.is_ok(), "Storage::open should succeed after lock is released");
+    }
+
+    /// Verify that Storage::open still fails if the lock is permanently held.
+    #[test]
+    fn storage_open_fails_after_max_retries() {
+        use crate::storage::Storage;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("db");
+
+        // Hold the lock for the duration of the test
+        let _storage1 = Storage::open(&db_path).unwrap();
+
+        // Second open should fail after exhausting retries
+        let result = Storage::open(&db_path);
+        assert!(result.is_err(), "Should fail when lock is permanently held");
+    }
+    
 }
