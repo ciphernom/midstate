@@ -357,7 +357,6 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&sig)],
             outputs: vec![output],
             salt: commit_salt,
-            stealth_nonces: vec![],
         };
         apply_transaction(&mut state, &tx).unwrap();
 
@@ -380,7 +379,6 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&sig)],
             outputs: vec![output],
             salt: [0; 32],
-            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -402,7 +400,6 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&bad_sig)],
             outputs: vec![output],
             salt: commit_salt,
-            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -429,7 +426,6 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&sig)],
             outputs: vec![output],
             salt: commit_salt,
-            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -451,7 +447,6 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&sig)],
             outputs: vec![output],
             salt: commit_salt,
-            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -466,7 +461,6 @@ mod tests {
             signatures: vec![],
             outputs: vec![OutputData { address: [0; 32], value: 1, salt: [0; 32] }],
             salt: [0; 32],
-            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -480,7 +474,6 @@ mod tests {
             signatures: vec![vec![0; wots::SIG_SIZE]],
             outputs: vec![],
             salt: [0; 32],
-            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -494,7 +487,6 @@ mod tests {
             signatures: vec![], // 0 sigs for 1 input
             outputs: vec![OutputData { address: [0; 32], value: 4, salt: [0; 32] }],
             salt: [0; 32],
-            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -513,7 +505,6 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&sig)],
             outputs: vec![output],
             salt: commit_salt,
-            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -532,7 +523,6 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&sig)],
             outputs: vec![output],
             salt: commit_salt,
-            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -547,7 +537,6 @@ mod tests {
             signatures: vec![vec![0; wots::SIG_SIZE], vec![0; wots::SIG_SIZE]],
             outputs: vec![OutputData { address: [0; 32], value: 16, salt: [0; 32] }],
             salt: [0; 32],
-            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
     }
@@ -567,7 +556,6 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&sig1)],
             outputs: vec![out1],
             salt: salt1,
-            stealth_nonces: vec![],
         };
         apply_transaction(&mut state, &tx1).unwrap();
 
@@ -581,7 +569,6 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&sig2)],
             outputs: vec![out2],
             salt: salt2,
-            stealth_nonces: vec![],
         };
         assert!(apply_transaction(&mut state, &tx2).is_err());
     }
@@ -617,7 +604,6 @@ mod tests {
             signatures: vec![sig_bytes],
             outputs: vec![output],
             salt: commit_salt,
-            stealth_nonces: vec![],
         };
         apply_transaction(&mut state, &tx).unwrap();
         assert!(!state.coins.contains(&coin_id));
