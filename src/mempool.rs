@@ -353,6 +353,7 @@ mod tests {
             signatures: vec![wots::sig_to_bytes(&sig)],
             outputs: vec![output],
             salt: commit_salt,
+            stealth_nonces: vec![],
         }
     }
 
@@ -403,6 +404,7 @@ mod tests {
             signatures: vec![crate::core::wots::sig_to_bytes(&sig)],
             outputs: vec![output],
             salt: commit_salt,
+            stealth_nonces: vec![],
         };
 
         let mut mp = Mempool::new();
