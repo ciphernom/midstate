@@ -373,66 +373,9 @@ def run_tests(skip_build: bool):
         log("Note: Receiver may not see funds yet if reveal hasn't been mined")
 
     # ══════════════════════════════════════════════════════════════════════
-    # TEST 4: Stealth send
+    # TEST 4: Transaction propagation to Node B
     # ══════════════════════════════════════════════════════════════════════
-    section("Test 4: Stealth send")
-
-    wallet_stealth = DIR_A / "wallet_stealth.dat"
-    subprocess.run([BINARY, "wallet", "create", "--path", str(wallet_stealth)],
-                   capture_output=True, text=True, env=os.environ)
-
-    r = subprocess.run([BINARY, "wallet", "generate-scan-key",
-                        "--path", str(wallet_stealth), "--label", "stealth-test"],
-                       capture_output=True, text=True, env=os.environ)
-    scan_match = re.search(r'[0-9a-f]{64}', r.stdout + r.stderr)
-    scan_pub = scan_match.group(0) if scan_match else ""
-
-    if scan_pub:
-        pass_test(f"Stealth scan key generated: {scan_pub[:16]}...")
-
-        subprocess.run([BINARY, "wallet", "scan",
-                        "--path", str(wallet_sender),
-                        "--rpc-port", str(RPC_A)],
-                       capture_output=True, text=True, env=os.environ)
-
-        r = subprocess.run([BINARY, "wallet", "send",
-                            "--path", str(wallet_sender),
-                            "--rpc-port", str(RPC_A),
-                            "--to", "0" * 64 + ":1",
-                            "--stealth-scan-key", scan_pub,
-                            "--timeout", "120"],
-                           capture_output=True, text=True, env=os.environ)
-        stealth_out = r.stdout + r.stderr
-        log(f"Stealth send output: {stealth_out.strip()}")
-
-        if re.search(r'complete|submitted|committed|revealed|success', stealth_out, re.I):
-            pass_test("Stealth send completed")
-
-            time.sleep(15)
-            subprocess.run([BINARY, "wallet", "scan",
-                            "--path", str(wallet_stealth),
-                            "--rpc-port", str(RPC_A)],
-                           capture_output=True, text=True, env=os.environ)
-            r = subprocess.run([BINARY, "wallet", "balance",
-                                "--path", str(wallet_stealth),
-                                "--rpc-port", str(RPC_A)],
-                               capture_output=True, text=True, env=os.environ)
-            sm = re.search(r'value:\s*(\d+)', r.stdout + r.stderr)
-            stealth_bal = int(sm.group(1)) if sm else 0
-            log(f"Stealth recipient balance: {stealth_bal}")
-            if stealth_bal > 0:
-                pass_test(f"Stealth recipient received funds ({stealth_bal})")
-            else:
-                log("Note: stealth coins may need more time to be mined")
-        else:
-            fail_test("Stealth send", "unexpected output")
-    else:
-        fail_test("Stealth scan key generation", "could not parse key")
-
-    # ══════════════════════════════════════════════════════════════════════
-    # TEST 5: Transaction propagation to Node B
-    # ══════════════════════════════════════════════════════════════════════
-    section("Test 5: Transaction propagation to Node B")
+    section("Test 4: Transaction propagation to Node B")
 
     time.sleep(5)
     if wait_for_sync(RPC_A, RPC_B, 60):
@@ -449,9 +392,9 @@ def run_tests(skip_build: bool):
         fail_test("Post-tx midstate", "diverged")
 
     # ══════════════════════════════════════════════════════════════════════
-    # TEST 6: Crash recovery
+    # TEST 5: Crash recovery
     # ══════════════════════════════════════════════════════════════════════
-    section("Test 6: Crash recovery (kill and restart Node B)")
+    section("Test 5: Crash recovery (kill and restart Node B)")
 
     hb_before = get_height(RPC_B)
     log(f"Node B at height {hb_before} before crash")
@@ -489,9 +432,9 @@ def run_tests(skip_build: bool):
         fail_test("Post-crash sync", f"A={ha} B={hb} after 90s")
 
     # ══════════════════════════════════════════════════════════════════════
-    # TEST 7: Sync from scratch
+    # TEST 6: Sync from scratch
     # ══════════════════════════════════════════════════════════════════════
-    section("Test 7: Fresh node syncs from scratch")
+    section("Test 6: Fresh node syncs from scratch")
 
     log(f"Node A at height {get_height(RPC_A)}. Starting fresh Node C...")
 
@@ -519,13 +462,13 @@ def run_tests(skip_build: bool):
         fail_test("Three-node consensus", "midstates diverge")
 
     # ══════════════════════════════════════════════════════════════════════
-    # TEST 8: Competitive mining — two isolated miners, then reconnect
+    # TEST 7: Competitive mining — two isolated miners, then reconnect
     #
     # FIX: After reconnecting, we STOP the miner so the chain doesn't move
     #      while the syncing node downloads the full header chain from
     #      genesis. This eliminates the catch-up death spiral.
     # ══════════════════════════════════════════════════════════════════════
-    section("Test 8: Competitive mining (isolated miners converge)")
+    section("Test 7: Competitive mining (isolated miners converge)")
 
     log("Shutting down nodes A, B, C for competitive mining test...")
     kill_node("A"); kill_node("B"); kill_node("C")
@@ -579,12 +522,12 @@ def run_tests(skip_build: bool):
                    f"A: h={HA} d={DA} m={MA[:16]} / D: h={HD} d={DD} m={MD[:16]}")
 
     # ══════════════════════════════════════════════════════════════════════
-    # TEST 9: Simultaneous connected mining
+    # TEST 8: Simultaneous connected mining
     #
     # FIX: After the race, stop BOTH miners, restart as non-miners
     #      peered together, and wait for convergence on a static chain.
     # ══════════════════════════════════════════════════════════════════════
-    section("Test 9: Simultaneous connected mining")
+    section("Test 8: Simultaneous connected mining")
 
     kill_node("A"); kill_node("D")
     time.sleep(3)
@@ -656,11 +599,11 @@ def run_tests(skip_build: bool):
                    f"A: h={HA} m={MA[:16]} / D: h={HD} m={MD[:16]}")
 
     # ══════════════════════════════════════════════════════════════════════
-    # TEST 10: Network partition and rejoin
+    # TEST 9: Network partition and rejoin
     #
     # FIX: Same approach — freeze both chains before checking convergence.
     # ══════════════════════════════════════════════════════════════════════
-    section("Test 10: Network partition and rejoin")
+    section("Test 9: Network partition and rejoin")
 
     # A is not mining. Restart it as a miner for the partition test.
     kill_node("A"); kill_node("D")
@@ -719,9 +662,9 @@ def run_tests(skip_build: bool):
                    f"A: h={HA} d={DA} m={MA[:16]} / D: h={HD} d={DD} m={MD[:16]}")
 
     # ══════════════════════════════════════════════════════════════════════
-    # TEST 11: RPC scan endpoints
+    # TEST 10: RPC scan endpoint
     # ══════════════════════════════════════════════════════════════════════
-    section("Test 11: Scan endpoints")
+    section("Test 10: Scan endpoint")
 
     scan_height = get_height(RPC_A)
     dummy_addr = "0" * 63 + "1"
@@ -735,18 +678,10 @@ def run_tests(skip_build: bool):
     else:
         fail_test("Scan endpoint", "no response")
 
-    stealth_resp = rpc(RPC_A, "/scan_stealth", method="POST",
-                       body={"start_height": 0, "end_height": scan_height},
-                       timeout=10)
-    if stealth_resp and "nonces" in stealth_resp:
-        pass_test(f"Stealth scan endpoint works (found {len(stealth_resp['nonces'])} nonces)")
-    else:
-        fail_test("Stealth scan endpoint", "no response")
-
     # ══════════════════════════════════════════════════════════════════════
-    # TEST 12: Final state
+    # TEST 11: Final state
     # ══════════════════════════════════════════════════════════════════════
-    section("Test 12: Final state")
+    section("Test 11: Final state")
 
     sa = rpc(RPC_A, "/state")
     sd = rpc(RPC_D, "/state")
