@@ -94,17 +94,6 @@ pub struct ScannedCoin {
     pub height: u64,
 }
 
-/// A stealth nonce entry returned by scan_stealth_nonces.
-pub struct StealthNonce {
-    /// The nonce embedded in the reveal transaction.
-    pub nonce: [u8; 32],
-    /// The output's value — needed by the wallet to reconstruct coin_id.
-    pub value: u64,
-    /// The output's salt — needed by the wallet to reconstruct coin_id.
-    pub salt: [u8; 32],
-    pub height: u64,
-}
-
 impl NodeHandle {
     pub async fn get_state(&self) -> State {
         self.state.read().await.clone()
@@ -176,43 +165,6 @@ impl NodeHandle {
             }
         }
         Ok(max_idx)
-    }
-
-    /// Iterate every Reveal transaction in [start_height, end_height) and
-    /// collect outputs that carry a non-zero stealth nonce.
-    /// The wallet calls this during scanning and tries each nonce against its
-    /// own scan keys locally — the node never learns which matched.
-    pub fn scan_stealth_nonces(
-        &self,
-        start: u64,
-        end: u64,
-    ) -> anyhow::Result<Vec<StealthNonce>> {
-        let store = crate::storage::BatchStore::new(&self.batches_path)?;
-        let mut found = Vec::new();
-
-        for height in start..end {
-            let Some(batch) = store.load(height)? else { continue };
-
-            for tx in &batch.transactions {
-                let Transaction::Reveal { outputs, stealth_nonces, .. } = tx else {
-                    continue
-                };
-                for (i, output) in outputs.iter().enumerate() {
-                    let nonce = stealth_nonces.get(i).copied().unwrap_or([0u8; 32]);
-                    if nonce == [0u8; 32] {
-                        continue; // not a stealth output
-                    }
-                    found.push(StealthNonce {
-                        nonce,
-                        value: output.value,
-                        salt: output.salt,
-                        height,
-                    });
-                }
-            }
-        }
-
-        Ok(found)
     }
     
 }
@@ -509,7 +461,9 @@ impl Node {
                 if midstate == self.state.midstate && height == self.state.height {
                     self.sync_in_progress = false;
                     self.sync_session = None;
-                } else if depth > self.state.depth || height > self.state.height {
+                } else if depth > self.state.depth || height > self.state.height
+                    || (depth == self.state.depth && midstate < self.state.midstate)
+                {
                     // Don't restart sync if we're already syncing from this peer
                     if self.sync_session.as_ref().map_or(false, |s| s.peer == from) {
                         tracing::debug!("Already syncing from this peer, ignoring duplicate StateInfo");
@@ -801,6 +755,7 @@ impl Node {
             apply_batch(candidate_state, batch)?;
             new_history.push((height, candidate_state.midstate, batch.clone()));
             *cursor += 1;
+            tokio::task::yield_now().await;
         }
 
         let current_cursor = *cursor;
@@ -824,7 +779,9 @@ impl Node {
             _ => unreachable!(),
         };
 
-        if final_state.depth > self.state.depth {
+        if final_state.depth > self.state.depth
+            || (final_state.depth == self.state.depth && final_state.midstate < self.state.midstate)
+        {
             tracing::info!(
                 "✓ Sync complete! Adopting chain: height {} -> {}, depth {} -> {}",
                 self.state.height, final_state.height,
@@ -1603,7 +1560,6 @@ mod tests {
                     salt: [i; 32],
                 }],
                 salt: [0; 32],
-                stealth_nonces: vec![],
             };
             txs.push(tx);
         }
@@ -1636,7 +1592,6 @@ mod tests {
                 salt: [0; 32],
             }],
             salt: [0; 32],
-            stealth_nonces: vec![],
         };
 
         // Scanning for kp2's key should find nothing
@@ -1670,7 +1625,6 @@ mod tests {
                     salt: [i; 32],
                 }],
                 salt: [0; 32],
-                stealth_nonces: vec![],
             });
         }
 
@@ -1718,7 +1672,6 @@ mod tests {
                 salt: [0; 32],
             }],
             salt: [0; 32],
-            stealth_nonces: vec![],
         };
 
         let mempool_max = scan_txs_for_mss_index(&[mempool_tx], &keypair.public_key());
@@ -1758,7 +1711,6 @@ mod tests {
                 salt: [0; 32],
             }],
             salt: [0; 32],
-            stealth_nonces: vec![],
         };
 
         // Should return 0 — no MSS signatures found
@@ -1814,7 +1766,6 @@ mod tests {
                 salt: [0; 32],
             }],
             salt: [0; 32],
-            stealth_nonces: vec![],
         };
 
         // Should not panic, just return 0
@@ -2283,7 +2234,6 @@ mod complex_tests {
             signatures: vec![wots::sig_to_bytes(&sig)],
             outputs,
             salt: tx_salt,
-            stealth_nonces: vec![],
         };
 
         // 7. Mine the reveal into a block
@@ -2369,7 +2319,6 @@ mod complex_tests {
             signatures,
             outputs: pending.outputs.clone(),
             salt: pending.salt,
-            stealth_nonces: vec![],
         };
 
         let reveal_batch = make_valid_batch(&node.state, 10, vec![reveal_tx]);
@@ -2383,121 +2332,6 @@ mod complex_tests {
 
         // 8. Complete reveal in wallet
         wallet.complete_reveal(&commitment).unwrap();
-    }
-
-    // ── Stealth Transaction Through Node ────────────────────────────────
-
-    /// Exercises stealth output creation → mining → scanning via node handle.
-    #[tokio::test]
-    async fn stealth_tx_end_to_end_through_node() {
-        use crate::wallet::{Wallet, coinbase_seed, coinbase_salt, stealth_derive, build_stealth_output};
-
-        let dir = tempdir().unwrap();
-        let mut node = create_test_node(dir.path()).await;
-        let mining_seed = node.mining_seed;
-
-        // 1. Mine a block to get a spendable coin
-        let mine_height = node.state.height;
-        node.try_mine().await.unwrap();
-
-        let denominations = decompose_value(block_reward(mine_height));
-        let cb_seed = coinbase_seed(&mining_seed, mine_height, 0);
-        let cb_owner_pk = wots::keygen(&cb_seed);
-        let cb_salt = coinbase_salt(&mining_seed, mine_height, 0);
-        let first_denom = denominations[0];
-        let cb_coin_id = compute_coin_id(&compute_address(&cb_owner_pk), first_denom, &cb_salt);
-
-        // 2. Recipient creates a wallet with a scan key
-        let wallet_path = dir.path().join("recipient.dat");
-        let mut recipient_wallet = Wallet::create(&wallet_path, b"pass").unwrap();
-        let scan_pub = recipient_wallet.generate_scan_key(Some("stealth".into())).unwrap();
-
-        // 3. Sender builds a stealth output
-        let stealth_value = first_denom / 2;
-        assert!(stealth_value.is_power_of_two());
-        let nonce: [u8; 32] = hash(b"deterministic nonce for test");
-        let (_stealth_seed, _stealth_pk, stealth_addr) = stealth_derive(&scan_pub, &nonce);
-        let stealth_salt: [u8; 32] = hash(b"stealth salt");
-        let stealth_output = OutputData { address: stealth_addr, value: stealth_value, salt: stealth_salt };
-
-        // Build the transaction
-        let input_coin_ids = vec![cb_coin_id];
-        let output_coin_ids = vec![stealth_output.coin_id()];
-        let tx_salt: [u8; 32] = hash(b"stealth tx salt");
-        let commitment = compute_commitment(&input_coin_ids, &output_coin_ids, &tx_salt);
-
-        // Commit PoW
-        let mut spam_nonce = 0u64;
-        loop {
-            let h = hash_concat(&commitment, &spam_nonce.to_le_bytes());
-            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 { break; }
-            spam_nonce += 1;
-        }
-
-        // 4. Mine the commit
-        let commit_tx = Transaction::Commit { commitment, spam_nonce };
-        let commit_batch = make_valid_batch(&node.state, 10, vec![commit_tx]);
-        node.handle_new_batch(commit_batch, None).await.unwrap();
-
-        // 5. Mine the reveal (with stealth nonce)
-        let sig = wots::sign(&cb_seed, &commitment);
-        let reveal_tx = Transaction::Reveal {
-            inputs: vec![InputReveal {
-                owner_pk: cb_owner_pk,
-                value: first_denom,
-                salt: cb_salt,
-            }],
-            signatures: vec![wots::sig_to_bytes(&sig)],
-            outputs: vec![stealth_output.clone()],
-            salt: tx_salt,
-            stealth_nonces: vec![nonce],
-        };
-
-        let reveal_height = node.state.height;
-        let reveal_batch = make_valid_batch(&node.state, 10, vec![reveal_tx]);
-        node.handle_new_batch(reveal_batch, None).await.unwrap();
-
-        // Save batches so NodeHandle can read them
-        node.storage.save_state(&node.state).unwrap();
-
-        // 6. Scan via NodeHandle
-        let (handle, _rx) = node.create_handle();
-        let stealth_nonces = handle.scan_stealth_nonces(0, node.state.height).unwrap();
-
-        assert_eq!(stealth_nonces.len(), 1, "should find exactly one stealth nonce");
-        assert_eq!(stealth_nonces[0].nonce, nonce);
-        assert_eq!(stealth_nonces[0].value, stealth_value);
-        assert_eq!(stealth_nonces[0].salt, stealth_salt);
-
-        // 7. Recipient tries each scan key against the nonce
-        let mut found_seed = None;
-        for sk in &recipient_wallet.data.scan_keys {
-            let (stealth_seed, _pk, derived_addr) = stealth_derive(&sk.public_key, &stealth_nonces[0].nonce);
-            let derived_coin_id = compute_coin_id(
-                &derived_addr,
-                stealth_nonces[0].value,
-                &stealth_nonces[0].salt,
-            );
-            if node.state.coins.contains(&derived_coin_id) {
-                found_seed = Some(stealth_seed);
-                break;
-            }
-        }
-        assert!(found_seed.is_some(), "recipient must detect their stealth payment");
-
-        // 8. Import into wallet and verify spendable
-        let coin_result = recipient_wallet.import_scanned(
-            stealth_addr,
-            stealth_value,
-            stealth_salt,
-            found_seed,
-        ).unwrap();
-        assert!(coin_result.is_some());
-        assert_eq!(recipient_wallet.coin_count(), 1);
-
-        let coin = &recipient_wallet.data.coins[0];
-        let pk = wots::keygen(&coin.seed);
-        assert_eq!(compute_address(&pk), stealth_addr, "wallet must be able to derive spending key");
     }
 
     // ── Reorg Under Concurrent Mining ───────────────────────────────────
