@@ -262,11 +262,6 @@ pub enum Transaction {
         outputs: Vec<OutputData>,
         /// Salt used when computing the commitment.
         salt: [u8; 32],
-        /// One nonce per output for stealth address scanning.
-        /// All-zero nonce means the output is not stealth.
-        /// Defaults to empty vec for backwards-compatible deserialisation.
-        #[serde(default)]
-        stealth_nonces: Vec<[u8; 32]>,
     },
 }
 
@@ -610,7 +605,6 @@ mod tests {
             signatures: vec![vec![]],
             outputs: vec![OutputData { address: [0u8; 32], value: 8, salt: [0u8; 32] }],
             salt: [0u8; 32],
-            stealth_nonces: vec![],
         };
         assert_eq!(tx.fee(), 2);
     }
@@ -624,7 +618,6 @@ mod tests {
             signatures: vec![vec![]],
             outputs: vec![output.clone()],
             salt: [0u8; 32],
-            stealth_nonces: vec![],
         };
         assert_eq!(tx.input_coin_ids(), vec![input.coin_id()]);
         assert_eq!(tx.output_coin_ids(), vec![output.coin_id()]);
