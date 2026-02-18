@@ -147,16 +147,6 @@ pub async fn send_transaction(
 
     let salt = parse_hex32(&req.salt, "salt")?;
 
-    // Parse stealth nonces; pad with zeros to match output count so the field
-    // is always well-formed inside the transaction.
-    let stealth_nonces: Vec<[u8; 32]> = {
-        let mut nonces: Vec<[u8; 32]> = req.stealth_nonces.iter()
-            .map(|h| parse_hex32(h, "stealth_nonce"))
-            .collect::<Result<_, _>>()?;
-        nonces.resize(outputs.len(), [0u8; 32]);
-        nonces
-    };
-
     let input_coin_ids: Vec<String> = inputs.iter().map(|i| hex::encode(i.coin_id())).collect();
     let output_coin_ids: Vec<String> = outputs.iter().map(|o| hex::encode(o.coin_id())).collect();
     let fee = {
@@ -165,7 +155,7 @@ pub async fn send_transaction(
         in_sum.saturating_sub(out_sum)
     };
 
-    let tx = Transaction::Reveal { inputs, signatures, outputs, salt, stealth_nonces };
+    let tx = Transaction::Reveal { inputs, signatures, outputs, salt };
 
     node.send_transaction(tx)
         .await
@@ -233,26 +223,6 @@ pub async fn scan_addresses(
             salt: hex::encode(c.salt),
             coin_id: hex::encode(c.coin_id),
             height: c.height,
-        }).collect(),
-    }))
-}
-
-/// Return every stealth nonce found in reveal transactions within
-/// [start_height, end_height). The wallet tests each nonce against its own
-/// scan keys; the node learns nothing about which outputs were matched.
-pub async fn scan_stealth(
-    State(node): State<AppState>,
-    Json(req): Json<ScanStealthRequest>,
-) -> Result<Json<ScanStealthResponse>, ErrorResponse> {
-    let nonces = node.scan_stealth_nonces(req.start_height, req.end_height)
-        .map_err(|e| ErrorResponse { error: e.to_string() })?;
-
-    Ok(Json(ScanStealthResponse {
-        nonces: nonces.into_iter().map(|n| StealthNonceEntry {
-            nonce: hex::encode(n.nonce),
-            value: n.value,
-            salt: hex::encode(n.salt),
-            height: n.height,
         }).collect(),
     }))
 }
