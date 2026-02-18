@@ -157,6 +157,19 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         return Ok(Some(coin_id));
     }
 
+    // Detect coins sent to an already-consumed WOTS address (key was used for a previous coin).
+    // WOTS keys are one-time — spending the first coin would expose the key if a second coin
+    // were also spent, so the wallet intentionally consumed the key on first import.
+    if self.data.coins.iter().any(|c| c.address == address) {
+        tracing::warn!(
+            "Coin {} (value {}) sent to already-used WOTS address {}. \
+             This coin is UNRECOVERABLE — the one-time key was consumed by an earlier coin. \
+             The sender should be asked to resend to a fresh address.",
+            hex::encode(coin_id), value, hex::encode(address)
+        );
+        return Ok(None);
+    }
+
     Ok(None) // address not ours
 }
     pub fn open(path: &Path, password: &[u8]) -> Result<Self> {
