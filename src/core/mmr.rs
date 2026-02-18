@@ -242,6 +242,7 @@ fn get_empty_hash(height: usize) -> [u8; 32] {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UtxoAccumulator {
     coins: Vec<[u8; 32]>,
+    #[serde(skip)]
     nodes: std::collections::HashMap<(u16, [u8; 32]), [u8; 32]>,
 }
 
@@ -256,6 +257,14 @@ impl Eq for UtxoAccumulator {}
 impl UtxoAccumulator {
     pub fn new() -> Self {
         Self { coins: Vec::new(), nodes: std::collections::HashMap::new() }
+    }
+
+    /// Rebuild the SMT node cache from the coin list (after deserialization).
+    pub fn rebuild_tree(&mut self) {
+        self.nodes.clear();
+        for &coin in &self.coins { 
+            self.update_path(coin, true);
+        }
     }
 
     pub fn from_set(coins: impl IntoIterator<Item = [u8; 32]>) -> Self {

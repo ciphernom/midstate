@@ -77,7 +77,9 @@ impl Storage {
         let table = read_txn.open_table(STATE_TABLE)?;
         match table.get("current")? {
             Some(bytes) => {
-                let state = bincode::deserialize(bytes.value())?;
+                let mut state: State = bincode::deserialize(bytes.value())?;
+                state.coins.rebuild_tree();
+                state.commitments.rebuild_tree();
                 Ok(Some(state))
             }
             None => Ok(None),
