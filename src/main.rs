@@ -1152,6 +1152,7 @@ async fn get_state(rpc_port: u16) -> Result<()> {
     println!("State:");
     println!("  Height:       {}", response.height);
     println!("  Depth:        {}", response.depth);
+    println!("  Safe Depth:   {} blocks (1e-6 risk)", response.safe_depth);
     println!("  Coins:        {}", response.num_coins);
     println!("  Commitments:  {}", response.num_commitments);
     println!("  Midstate:     {}", response.midstate);
