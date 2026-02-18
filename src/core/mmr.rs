@@ -262,7 +262,7 @@ impl UtxoAccumulator {
     /// Rebuild the SMT node cache from the coin list (after deserialization).
     pub fn rebuild_tree(&mut self) {
         self.nodes.clear();
-        for &coin in &self.coins { 
+        for coin in self.coins.clone() {
             self.update_path(coin, true);
         }
     }
