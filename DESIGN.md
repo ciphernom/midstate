@@ -36,6 +36,17 @@ Where `address = BLAKE3(owner_pk)`.
 - **Max Height**: 20 (~1M signatures).
 - **Signature Size**: ~950 bytes at height 10.
 
+### Stealth Addresses
+
+- **Purpose**: Provides unlinkable, one-time addresses for private payments, preventing on-chain observers from linking a transaction to a recipient's known public identity.
+- **Scan Key**: A stable public key (`BLAKE3(seed)`) shared by the recipient. It never signs anything and never appears on-chain.
+- **Derivation**: 
+  1. The sender generates a fresh 32-byte `nonce`.
+  2. A shared secret is computed: `shared_secret = BLAKE3(scan_public_key || nonce)`.
+  3. A unique stealth seed is derived: `stealth_seed = BLAKE3(shared_secret || "wots")`.
+  4. The WOTS keypair and resulting address are generated from this seed.
+- **Scanning**: Senders embed the `nonce` in the transaction payload. Recipients use their scan keys to query the network's `/scan_stealth` endpoint, locally checking nonces to detect payments without revealing their identity to the node.
+
 ## 3. Consensus & Mining
 
 ### Sequential Proof of Work
@@ -83,17 +94,18 @@ Transactions use a two-phase Commit-Reveal scheme to separate intent from execut
 ### Phase 2: Reveal
 
 - **Payload**:
-    - **Inputs**: Preimages (Owner PK, Value, Salt) for spent coins.
-    - **Signatures**: WOTS or MSS signatures over the commitment hash, verifying ownership.
-    - **Outputs**: New coin definitions (Address, Value, Salt).
-    - **Salt**: The blinding factor used in Phase 1.
+    - **Inputs**: Preimages (Owner PK, Value, Salt) for spent coins.
+    - **Signatures**: WOTS or MSS signatures over the commitment hash, verifying ownership.
+    - **Outputs**: New coin definitions (Address, Value, Salt).
+    - **Salt**: The blinding factor used in Phase 1.
+    - **Stealth Nonces**: An array of 32-byte nonces (one per output) used by recipients to scan for stealth payments. Non-stealth outputs use a zeroed nonce array.
 - **Validation**:
-    - Commitment must exist in state.
-    - All inputs must exist in UTXO set.
-    - No duplicate inputs.
-    - Signatures must be valid against each input's `owner_pk`.
-    - All output values must be powers of 2 and nonzero.
-    - `Sum(Input Values) > Sum(Output Values)` (conservation of value + fee).
+    - Commitment must exist in state.
+    - All inputs must exist in UTXO set.
+    - No duplicate inputs.
+    - Signatures must be valid against each input's `owner_pk`.
+    - All output values must be powers of 2 and nonzero.
+    - `Sum(Input Values) > Sum(Output Values)` (conservation of value + fee).
 - **Limits**: Max 256 inputs, max 256 outputs per transaction.
 
 ## 6. Networking
