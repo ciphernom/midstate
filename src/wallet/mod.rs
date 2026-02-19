@@ -1016,6 +1016,160 @@ mod tests {
         assert!(Wallet::create(&path, b"pass").is_err());
     }
     
+    // ── stealth addresses ──────────────────────────────────────────────
+
+    #[test]
+    fn stealth_derive_deterministic() {
+        let scan_pk = hash(b"scan public key");
+        let nonce = hash(b"nonce");
+        let (seed1, pk1, addr1) = stealth_derive(&scan_pk, &nonce);
+        let (seed2, pk2, addr2) = stealth_derive(&scan_pk, &nonce);
+        assert_eq!(seed1, seed2);
+        assert_eq!(pk1, pk2);
+        assert_eq!(addr1, addr2);
+    }
+
+    #[test]
+    fn stealth_derive_different_nonce_different_address() {
+        let scan_pk = hash(b"scan public key");
+        let nonce_a = hash(b"nonce a");
+        let nonce_b = hash(b"nonce b");
+        let (_, _, addr_a) = stealth_derive(&scan_pk, &nonce_a);
+        let (_, _, addr_b) = stealth_derive(&scan_pk, &nonce_b);
+        assert_ne!(addr_a, addr_b);
+    }
+
+    #[test]
+    fn stealth_derive_different_scan_key_different_address() {
+        let scan_pk_a = hash(b"scan key a");
+        let scan_pk_b = hash(b"scan key b");
+        let nonce = hash(b"same nonce");
+        let (_, _, addr_a) = stealth_derive(&scan_pk_a, &nonce);
+        let (_, _, addr_b) = stealth_derive(&scan_pk_b, &nonce);
+        assert_ne!(addr_a, addr_b);
+    }
+
+    #[test]
+    fn stealth_derive_address_matches_wots_keygen() {
+        // Verify the derived address is actually compute_address(wots::keygen(stealth_seed))
+        let scan_pk = hash(b"scan pk");
+        let nonce = hash(b"nonce");
+        let (stealth_seed, _pk, addr) = stealth_derive(&scan_pk, &nonce);
+        let expected_pk = wots::keygen(&stealth_seed);
+        let expected_addr = compute_address(&expected_pk);
+        assert_eq!(addr, expected_addr);
+    }
+
+    #[test]
+    fn build_stealth_output_produces_valid_output() {
+        let scan_pk = hash(b"recipient scan key");
+        let (output, nonce) = build_stealth_output(&scan_pk, 64);
+        assert_eq!(output.value, 64);
+        assert_ne!(nonce, [0u8; 32]);
+        // Verify the output address matches what stealth_derive would produce
+        let (_, _, expected_addr) = stealth_derive(&scan_pk, &nonce);
+        assert_eq!(output.address, expected_addr);
+    }
+
+    #[test]
+    fn stealth_round_trip_sender_to_recipient() {
+        // Full flow: recipient generates scan key, sender builds output,
+        // recipient scans nonce and recovers spending seed.
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut wallet = Wallet::create(&path, b"pass").unwrap();
+
+        // 1. Recipient generates a scan key
+        let scan_pub = wallet.generate_scan_key(Some("stealth".into())).unwrap();
+        assert_eq!(wallet.data.scan_keys.len(), 1);
+        let scan_seed = wallet.data.scan_keys[0].seed;
+
+        // 2. Sender builds a stealth output using the public scan key
+        let (output, nonce) = build_stealth_output(&scan_pub, 16);
+
+        // 3. Recipient sees the nonce on-chain and tries each scan key
+        //    (simulating what wallet_scan does)
+        let mut found_seed = None;
+        for sk in &wallet.data.scan_keys {
+            let (stealth_seed, _pk, stealth_addr) = stealth_derive(&sk.public_key, &nonce);
+            if stealth_addr == output.address {
+                found_seed = Some(stealth_seed);
+                break;
+            }
+        }
+        assert!(found_seed.is_some(), "recipient should detect stealth payment");
+
+        // 4. Import the stealth coin
+        let coin_id = wallet.import_scanned(
+            output.address,
+            output.value,
+            output.salt,
+            found_seed,
+        ).unwrap();
+        assert!(coin_id.is_some());
+        assert_eq!(wallet.coin_count(), 1);
+
+        // 5. Verify the coin is spendable (seed produces correct pk/address)
+        let coin = &wallet.data.coins[0];
+        let pk = wots::keygen(&coin.seed);
+        assert_eq!(pk, coin.owner_pk);
+        assert_eq!(compute_address(&pk), coin.address);
+        assert_eq!(coin.address, output.address);
+        assert_eq!(coin.label, Some("stealth (16)".into()));
+    }
+
+    #[test]
+    fn stealth_wrong_scan_key_does_not_match() {
+        let real_scan_pk = hash(b"real scan key");
+        let wrong_scan_pk = hash(b"wrong scan key");
+
+        let (output, nonce) = build_stealth_output(&real_scan_pk, 8);
+
+        // Try to recover with the wrong key
+        let (_, _, wrong_addr) = stealth_derive(&wrong_scan_pk, &nonce);
+        assert_ne!(wrong_addr, output.address, "wrong scan key must not match");
+    }
+
+    #[test]
+    fn stealth_import_without_seed_rejected() {
+        // If no scan key matches, import_scanned with None stealth_seed
+        // should return None for an unknown address.
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut wallet = Wallet::create(&path, b"pass").unwrap();
+        let scan_pk = hash(b"some scan key");
+        let (output, _nonce) = build_stealth_output(&scan_pk, 4);
+
+        // Try importing without stealth_seed — wallet has no matching key
+        let result = wallet.import_scanned(output.address, output.value, output.salt, None).unwrap();
+        assert!(result.is_none(), "should reject unknown stealth address without seed");
+    }
+
+    #[test]
+    fn generate_scan_key_persists() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let pub1 = w.generate_scan_key(Some("key1".into())).unwrap();
+        let pub2 = w.generate_scan_key(None).unwrap();
+        assert_ne!(pub1, pub2);
+        w.save().unwrap();
+
+        // Reopen and verify
+        let w2 = Wallet::open(&path, b"pass").unwrap();
+        assert_eq!(w2.data.scan_keys.len(), 2);
+        assert_eq!(w2.data.scan_keys[0].public_key, pub1);
+        assert_eq!(w2.data.scan_keys[1].public_key, pub2);
+        assert_eq!(w2.data.scan_keys[0].label, Some("key1".into()));
+        assert_eq!(w2.data.scan_keys[1].label, None);
+    }
+
     #[test]
     fn test_mss_safety_recovery_persistence() {
         // 1. Setup: Create a wallet with an MSS key
