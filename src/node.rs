@@ -60,14 +60,14 @@ pub struct Node {
     syncer: Syncer,
     metrics: Metrics,
     is_mining: bool,
-    recent_headers: Vec<BatchHeader>,
+     recent_headers: Vec<u64>,
     orphan_batches: HashMap<u64, Batch>,
     sync_in_progress: bool,
     sync_requested_up_to: u64,
     sync_session: Option<SyncSession>,
     mining_seed: [u8; 32],
     data_dir: PathBuf,
-    chain_history: Vec<(u64, [u8; 32], Batch)>,
+    chain_history: Vec<(u64, [u8; 32])>,
     finality: crate::core::finality::FinalityEstimator,
 }
 
@@ -251,13 +251,13 @@ impl Node {
                         target: state.target,
                     };
                     storage.save_batch(0, &genesis_batch)?;
-                    apply_batch(&mut state, &genesis_batch)?;
+                    apply_batch(&mut state, &genesis_batch, &[])?;
                     storage.save_state(&state)?;
                     tracing::info!("Genesis batch applied, height now {}", state.height);
                 }
                 Some(batch) => {
                     if state.height == 0 {
-                        apply_batch(&mut state, &batch)?;
+                        apply_batch(&mut state, &batch, &[])?;
                         storage.save_state(&state)?;
                     }
                 }
@@ -299,14 +299,7 @@ impl Node {
 
         for h in start_height..state.height {
             if let Some(batch) = storage.load_batch(h)? {
-                recent_headers.push(BatchHeader {
-                    height: h + 1,
-                    prev_midstate: batch.prev_midstate,
-                    post_tx_midstate: batch.extension.final_hash,
-                    extension: batch.extension.clone(),
-                    timestamp: batch.timestamp,
-                    target: batch.target,
-                });
+                recent_headers.push(batch.timestamp);
             }
         }
 
@@ -325,7 +318,8 @@ impl Node {
             mining_seed,
             data_dir,
             chain_history: Vec::new(),
-            finality: crate::core::finality::FinalityEstimator::new(10, 2),
+            //lets assume a hostile environment where 80% of new connections are malicious. 
+            finality: crate::core::finality::FinalityEstimator::new(2, 8), 
             sync_session: None,
         })
     }
@@ -770,7 +764,8 @@ impl Node {
             // leave a Frankenstein chain on disk: some heights from the peer,
             // some from our old chain.  Batches are persisted atomically in
             // perform_reorg only after we decide to adopt.)
-            apply_batch(candidate_state, batch)?;
+            let ts: Vec<u64> = headers[..hdr_idx].iter().map(|h| h.timestamp).collect();
+            apply_batch(candidate_state, batch, &ts)?;
             new_history.push((height, candidate_state.midstate, batch.clone()));
             *cursor += 1;
             tokio::task::yield_now().await;
@@ -891,28 +886,20 @@ impl Node {
         let mut candidate_state = fork_state;
         let mut new_history = Vec::new();
         
-        // CHANGED: Use headers instead of states
-        let mut recent_headers = Vec::new();
+        // Use headers instead of states
+        let mut recent_headers: Vec<u64> = Vec::new();
 
         let window_size = (DIFFICULTY_ADJUSTMENT_INTERVAL as usize) * 2;
         let start_height = fork_height.saturating_sub(window_size as u64);
 
         for h in start_height..fork_height {
             if let Some(batch) = self.storage.load_batch(h)? {
-                recent_headers.push(BatchHeader {
-                    height: h + 1,
-                    prev_midstate: batch.prev_midstate,
-                    post_tx_midstate: batch.extension.final_hash,
-                    extension: batch.extension.clone(),
-                    timestamp: batch.timestamp,
-                    target: batch.target,
-                });
+                recent_headers.push(batch.timestamp);
             }
         }
 
         for (i, batch) in alternative_batches.iter().enumerate() {
-            // Push the *current* state's header before applying the new batch
-            recent_headers.push(candidate_state.header());
+            recent_headers.push(candidate_state.timestamp);
             if recent_headers.len() > window_size {
                 recent_headers.remove(0);
             }
@@ -925,7 +912,7 @@ impl Node {
                 return Ok(None);
             }
 
-            match apply_batch(&mut candidate_state, batch) {
+            match apply_batch(&mut candidate_state, batch, &recent_headers) {
                 Ok(_) => {
                     // Pass headers to adjust_difficulty
                     candidate_state.target = adjust_difficulty(&candidate_state, &recent_headers);
@@ -971,11 +958,13 @@ impl Node {
 
         let fork_height = new_history.first().map(|(h, _, _)| *h).unwrap_or(0);
 
-        let abandoned_history: Vec<_> = self.chain_history
-            .iter()
-            .skip_while(|(h, _, _)| *h < fork_height)
-            .cloned()
-            .collect();
+        // Load abandoned batches from disk BEFORE overwriting them
+        let mut abandoned_txs = Vec::new();
+        for (h, _) in self.chain_history.iter().filter(|(h, _)| *h >= fork_height) {
+            if let Ok(Some(batch)) = self.storage.load_batch(*h) {
+                abandoned_txs.extend(batch.transactions);
+            }
+        }
 
         for (height, _, batch) in &new_history {
             if let Err(e) = self.storage.save_batch(*height, batch) {
@@ -984,8 +973,8 @@ impl Node {
         }
 
         self.state = new_state;
-        self.chain_history.retain(|(h, _, _)| *h < fork_height);
-        self.chain_history.extend(new_history);
+        self.chain_history.retain(|(h, _)| *h < fork_height);
+        self.chain_history.extend(new_history.iter().map(|(h, ms, _)| (*h, *ms)));
 
         // Rebuild headers cache from disk
         self.recent_headers.clear();
@@ -994,22 +983,14 @@ impl Node {
         
         for h in start..self.state.height {
             if let Some(batch) = self.storage.load_batch(h)? {
-                self.recent_headers.push(BatchHeader {
-                    height: h + 1,
-                    prev_midstate: batch.prev_midstate,
-                    post_tx_midstate: batch.extension.final_hash,
-                    extension: batch.extension.clone(),
-                    timestamp: batch.timestamp,
-                    target: batch.target,
-                });
+                self.recent_headers.push(batch.timestamp);
             }
         }
 
         self.state.target = adjust_difficulty(&self.state, &self.recent_headers);
 
-        for (_, _, batch) in abandoned_history {
-            self.mempool.re_add(batch.transactions, &self.state);
-        }
+        self.mempool.re_add(abandoned_txs, &self.state);
+
         self.mempool.prune_invalid(&self.state);
         self.metrics.inc_reorgs();
         self.storage.save_state(&self.state)?;
@@ -1021,15 +1002,15 @@ impl Node {
 
     fn rebuild_state_at_height(&self, target_height: u64) -> Result<State> {
         let mut state = State::genesis().0;
-        let mut recent_headers = Vec::new();
+        let mut recent_headers: Vec<u64> = Vec::new();
 
         for h in 0..target_height {
             if let Some(batch) = self.storage.load_batch(h)? {
-                recent_headers.push(state.header());
+                recent_headers.push(state.timestamp);
                 if recent_headers.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
                     recent_headers.remove(0);
                 }
-                apply_batch(&mut state, &batch)?;
+                apply_batch(&mut state, &batch, &recent_headers)?;
                 state.target = adjust_difficulty(&state, &recent_headers);
             } else {
                 anyhow::bail!("Missing batch at height {} needed for reorg", h);
@@ -1041,7 +1022,7 @@ impl Node {
 
     async fn handle_new_batch(&mut self, batch: Batch, from: Option<PeerId>) -> Result<()> {
         let mut candidate_state = self.state.clone();
-        match apply_batch(&mut candidate_state, &batch) {
+        match apply_batch(&mut candidate_state, &batch, &self.recent_headers) {
             Ok(_) => {
                 let best = choose_best_state(&self.state, &candidate_state);
                 let is_reorg = best.height == self.state.height &&
@@ -1054,7 +1035,7 @@ impl Node {
                     }
 
                     // Use recent_headers and header()
-                    self.recent_headers.push(self.state.header());
+                    self.recent_headers.push(self.state.timestamp);
                     if self.recent_headers.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
                         self.recent_headers.remove(0);
                     }
@@ -1068,15 +1049,11 @@ impl Node {
                     self.metrics.inc_batches_processed();
                     self.mempool.prune_invalid(&self.state);
 
-                    self.chain_history.push((
-                        pre_height,
-                        self.state.midstate,
-                        batch.clone(),
-                    ));
+                    self.chain_history.push((pre_height, self.state.midstate));
                     self.finality.observe_honest();
                     let safe_depth = self.finality.calculate_safe_depth(1e-6);
                     let cutoff_height = self.state.height.saturating_sub(safe_depth);
-                    self.chain_history.retain(|(h, _, _)| *h >= cutoff_height);
+                    self.chain_history.retain(|(h, _)| *h >= cutoff_height);
 
                     self.network.broadcast_except(from, Message::Batch(batch));
                     tracing::info!("Applied new batch from peer, height now {}", self.state.height);
@@ -1121,14 +1098,14 @@ impl Node {
 
         // Try 1: Do they extend our current chain directly?
         let mut test_state = self.state.clone();
-        if apply_batch(&mut test_state, &batches[0]).is_ok() {
+        if apply_batch(&mut test_state, &batches[0], &self.recent_headers).is_ok() {
             return self.process_linear_extension(batches, from).await;
         }
 
         // Try 2: Do any of them extend our chain? (we might already have some)
         for (i, batch) in batches.iter().enumerate() {
             let mut candidate = self.state.clone();
-            if apply_batch(&mut candidate, batch).is_ok() {
+            if apply_batch(&mut candidate, batch, &self.recent_headers).is_ok() {
                 tracing::info!("Found linear extension at batch index {}", i);
                 return self.process_linear_extension(batches[i..].to_vec(), from).await;
             }
@@ -1171,25 +1148,24 @@ impl Node {
         let mut applied = 0;
         for batch in batches {
             let mut candidate = self.state.clone();
-            if apply_batch(&mut candidate, &batch).is_ok() {
-                // CHANGED: recent_headers
-                self.recent_headers.push(self.state.header());
+            if apply_batch(&mut candidate, &batch, &self.recent_headers).is_ok() {
+                // recent_headers
+                self.recent_headers.push(self.state.timestamp);
                 if self.recent_headers.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
                     self.recent_headers.remove(0);
                 }
                 self.storage.save_batch(candidate.height - 1, &batch)?;
                 self.state = candidate;
                 
-                // CHANGED: recent_headers
-                self.state.target = adjust_difficulty(&self.state, &self.recent_headers);
-                
+                // recent_headers
+                self.state.target = adjust_difficulty(&self.state, &self.recent_headers);                
                 self.metrics.inc_batches_processed();
 
-                self.chain_history.push((self.state.height, self.state.midstate, batch.clone()));
+                self.chain_history.push((self.state.height, self.state.midstate));
                 self.finality.observe_honest();
                 let safe_depth = self.finality.calculate_safe_depth(1e-6);
                 let cutoff = self.state.height.saturating_sub(safe_depth);
-                self.chain_history.retain(|(h, _, _)| *h >= cutoff);
+                self.chain_history.retain(|(h, _)| *h >= cutoff);
 
                 applied += 1;
             } else {
@@ -1240,10 +1216,10 @@ impl Node {
             };
 
             let mut candidate = self.state.clone();
-            match apply_batch(&mut candidate, &batch) {
+            match apply_batch(&mut candidate, &batch, &self.recent_headers) {
                 Ok(_) => {
                     // recent_headers
-                    self.recent_headers.push(self.state.header());
+                    self.recent_headers.push(self.state.timestamp);
                     if self.recent_headers.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
                         self.recent_headers.remove(0);
                     }
@@ -1252,7 +1228,6 @@ impl Node {
                     
                     // recent_headers
                     self.state.target = adjust_difficulty(&self.state, &self.recent_headers);
-                    
                     self.metrics.inc_batches_processed();
                     self.mempool.prune_invalid(&self.state);
                     applied += 1;
@@ -1384,12 +1359,12 @@ impl Node {
             target: self.state.target,
         };
 
-        self.recent_headers.push(self.state.header());
+        self.recent_headers.push(self.state.timestamp);
         if self.recent_headers.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
             self.recent_headers.remove(0);
         }
 
-        match apply_batch(&mut self.state, &batch) {
+        match apply_batch(&mut self.state, &batch, &self.recent_headers) {
             Ok(_) => {
                 self.storage.save_batch(pre_mine_height, &batch)?;
                 self.storage.save_state(&self.state)?;
@@ -1961,16 +1936,18 @@ mod complex_tests {
         // REASONING: We cannot simply use State::genesis() because we need to load 
         // the *exact* genesis batch saved by the node to ensure midstates align.
         let genesis_batch = node.storage.load_batch(0).unwrap().unwrap();
-        apply_batch(&mut state_at_2, &genesis_batch).unwrap(); // H=1
+        apply_batch(&mut state_at_2, &genesis_batch, &[]).unwrap(); // H=1
         
         // Apply B1 (shared history)
-        apply_batch(&mut state_at_2, &b1).unwrap(); // H=2
+       let ts_at_1 = vec![state_at_2.timestamp];
+        apply_batch(&mut state_at_2, &b1, &ts_at_1).unwrap(); // H = 2
 
         // B2' (Alternative block at H=3). Empty, does NOT have the transaction.
         let b2_prime = make_valid_batch(&state_at_2, 20, vec![]); 
         let mut state_at_3_prime = state_at_2.clone();
-        apply_batch(&mut state_at_3_prime, &b2_prime).unwrap();
-
+        let ts_at_2 = vec![state_at_2.timestamp];
+        apply_batch(&mut state_at_3_prime, &b2_prime, &ts_at_2).unwrap();
+        
         // B3' (extends B2', making Chain B longer)
         let b3_prime = make_valid_batch(&state_at_3_prime, 10, vec![]);
 
@@ -2012,10 +1989,12 @@ mod complex_tests {
         // Generate 50 blocks extending H=1.
         // We use the node's internal state to generate them validly, then revert.
         let mut batches = Vec::new();
+        let mut recent_headers: Vec<u64> = vec![node.state.timestamp];
         for _ in 0..50 {
             let b = make_valid_batch(&node.state, 10, vec![]);
-            apply_batch(&mut node.state, &b).unwrap();
-            
+            apply_batch(&mut node.state, &b, &recent_headers).unwrap();
+            recent_headers.push(node.state.timestamp);
+            if recent_headers.len() > 11 { recent_headers.remove(0); }
             // Note: Storage keys are usually (height-1) for batches? 
             // Actually storage saves batch X at index X. 
             // If Genesis is batch_0 (H=0), apply_batch makes H=1.
@@ -2308,7 +2287,7 @@ mod complex_tests {
             .filter_map(|id| wallet.find_coin(id))
             .map(|c| c.value)
             .sum();
-        let change_value = in_value - send_value - 1; // 1 unit fee (must be > 0)
+        let _change_value = in_value - send_value - 1; // 1 unit fee (must be > 0)
         // change_value may not work if it's not representable, let's adjust
         // Actually fee = in_value - out_value, we need out_value < in_value and all outputs power-of-2
         // Let's keep it simple: send half, no change, the rest is fee
@@ -2378,9 +2357,13 @@ mod complex_tests {
         // Chain B: built offline from fork_state, 3 blocks (heights 5, 6, 7)
         let mut chain_b_state = fork_state.clone();
         let mut chain_b_batches = Vec::new();
+        let mut recent_headers: Vec<u64> = vec![chain_b_state.timestamp];
+
         for i in 0..3 {
             let b = make_valid_batch(&chain_b_state, 10 + i, vec![]);
-            apply_batch(&mut chain_b_state, &b).unwrap();
+            apply_batch(&mut chain_b_state, &b, &recent_headers).unwrap();
+            recent_headers.push(chain_b_state.timestamp);
+            if recent_headers.len() > 11 { recent_headers.remove(0); } 
             chain_b_batches.push(b);
         }
         assert_eq!(chain_b_state.height, 7);
@@ -2404,14 +2387,17 @@ mod complex_tests {
         let mut state = fork_state.clone();
         let mut batches = Vec::new();
         let mut headers = Vec::new();
-
+        let mut recent_headers: Vec<u64> = vec![state.timestamp];
+        
         for i in 0..length {
             // Use a different timestamp offset so PoW differs from the main chain
             let batch = make_valid_batch(&state, 50 + i as u64, vec![]);
             let mut hdr = batch.header();
             hdr.height = state.height;
             headers.push(hdr);
-            apply_batch(&mut state, &batch).unwrap();
+            apply_batch(&mut state, &batch, &recent_headers).unwrap();
+            recent_headers.push(state.timestamp);
+            if recent_headers.len() > 11 { recent_headers.remove(0); } 
             batches.push(batch);
         }
         (batches, headers)
