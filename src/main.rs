@@ -1267,6 +1267,7 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: SocketAddr, port: u16) 
 
     // 4. Download and apply batches
     let mut state = syncer.rebuild_state_to(fork_height)?;
+    let mut recent_headers: Vec<u64> = Vec::new();
     let mut dl_cursor = fork_height;
     while dl_cursor < peer_height {
         let chunk = 10.min(peer_height - dl_cursor);
@@ -1281,7 +1282,9 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: SocketAddr, port: u16) 
         };
         if batches.is_empty() { anyhow::bail!("Peer sent empty batches at {}", dl_cursor); }
         for batch in &batches {
-            apply_batch(&mut state, batch)?;
+            recent_headers.push(state.timestamp);
+            if recent_headers.len() > MEDIAN_TIME_PAST_WINDOW { recent_headers.remove(0); }
+            apply_batch(&mut state, batch, &recent_headers)?;
             storage.save_batch(dl_cursor, batch)?;
             dl_cursor += 1;
         }
