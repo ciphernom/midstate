@@ -41,10 +41,12 @@ pub async fn get_mss_state(
 }
 pub async fn get_state(State(node): State<AppState>) -> Json<GetStateResponse> {
     let state = node.get_state().await;
+    let safe_depth = node.get_safe_depth().await;
 
     Json(GetStateResponse {
         height: state.height,
         depth: state.depth,
+        safe_depth,
         midstate: hex::encode(state.midstate),
         num_coins: state.coins.len(),
         num_commitments: state.commitments.len(),
