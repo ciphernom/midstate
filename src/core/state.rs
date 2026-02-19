@@ -5,18 +5,17 @@ use anyhow::{bail, Result};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Calculate new difficulty target based on recent block times
-pub fn adjust_difficulty(state: &State, previous_headers: &[BatchHeader]) -> [u8; 32] {
+pub fn adjust_difficulty(state: &State, previous_timestamps: &[u64]) -> [u8; 32] {
     if state.height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0 || state.height == 0 {
         return state.target;
     }
 
-if previous_headers.len() < DIFFICULTY_ADJUSTMENT_INTERVAL as usize {
-        return state.target;
-    }
+    if previous_timestamps.len() < DIFFICULTY_ADJUSTMENT_INTERVAL as usize {
+            return state.target;
+        }
 
-    let interval_start_time = previous_headers
-        [previous_headers.len() - DIFFICULTY_ADJUSTMENT_INTERVAL as usize]
-        .timestamp;
+        let interval_start_time = previous_timestamps
+            [previous_timestamps.len() - DIFFICULTY_ADJUSTMENT_INTERVAL as usize];
         
     let interval_end_time = state.timestamp;
     let actual_time = interval_end_time.saturating_sub(interval_start_time);
@@ -72,7 +71,7 @@ pub fn current_timestamp() -> u64 {
 /// Validate a block's timestamp against the chain.
 pub fn validate_timestamp(
     new_timestamp: u64,
-    previous_headers: &[BatchHeader],
+    previous_timestamps: &[u64],
     current_time: u64,
 ) -> Result<()> {
     const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
@@ -86,30 +85,31 @@ pub fn validate_timestamp(
         );
     }
 
-    if previous_headers.len() >= 11 {
-        let mut recent_timestamps: Vec<u64> = previous_headers
+    if previous_timestamps.len() >= MEDIAN_TIME_PAST_WINDOW {
+        let mut recent_timestamps: Vec<u64> = previous_timestamps
             .iter()
             .rev()
-            .take(11)
-            .map(|s| s.timestamp)
+            .take(MEDIAN_TIME_PAST_WINDOW)
+            .copied()
             .collect();
 
         recent_timestamps.sort_unstable();
-        let median = recent_timestamps[5];
+        let median = recent_timestamps[MEDIAN_TIME_PAST_WINDOW / 2];
 
         if new_timestamp <= median {
             bail!(
-                "Block timestamp {} must be greater than median of last 11 blocks ({})",
+                "Block timestamp {} must be greater than median of last {} blocks ({})",
                 new_timestamp,
+                MEDIAN_TIME_PAST_WINDOW,
                 median
             );
         }
-    } else if let Some(last_header) = previous_headers.last() {
-        if new_timestamp <= last_header.timestamp {
+    } else if let Some(&last_ts) = previous_timestamps.last() {
+        if new_timestamp <= last_ts {
             bail!(
                 "Block timestamp {} must be greater than previous block timestamp {}",
                 new_timestamp,
-                last_header.timestamp
+                last_ts
             );
         }
     }
@@ -118,7 +118,7 @@ pub fn validate_timestamp(
 }
 
 /// Apply a batch to the state
-pub fn apply_batch(state: &mut State, batch: &Batch) -> Result<()> {
+pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]) -> Result<()> {
     // 1. Check parent linkage
     if batch.prev_midstate != state.midstate {
         bail!("Block parent mismatch: expected {}, got {}",
@@ -134,14 +134,7 @@ pub fn apply_batch(state: &mut State, batch: &Batch) -> Result<()> {
 
     //timewarp prevention: Validate timestamp
     if state.height > 0 {
-        if batch.timestamp <= state.timestamp {
-            bail!("Block timestamp {} must be greater than previous {}", batch.timestamp, state.timestamp);
-        }
-        let current_time = current_timestamp();
-        const MAX_FUTURE: u64 = 2 * 60 * 60;
-        if batch.timestamp > current_time + MAX_FUTURE {
-            bail!("Block timestamp {} too far in future (now: {})", batch.timestamp, current_time);
-        }
+        validate_timestamp(batch.timestamp, previous_timestamps, current_timestamp())?;
     }
 
     // 2. Apply transactions and tally fees
@@ -290,7 +283,8 @@ mod tests {
         let mut state = genesis_state();
         let reward = block_reward(state.height);
         let batch = make_empty_batch(&state, reward, state.timestamp + 1);
-        apply_batch(&mut state, &batch).unwrap();
+        let timestamps = vec![state.timestamp];
+        apply_batch(&mut state, &batch, &timestamps).unwrap();
         assert_eq!(state.height, 1);
     }
 
@@ -300,7 +294,8 @@ mod tests {
         let initial_depth = state.depth;
         let reward = block_reward(state.height);
         let batch = make_empty_batch(&state, reward, state.timestamp + 1);
-        apply_batch(&mut state, &batch).unwrap();
+    let timestamps = vec![state.timestamp];
+        apply_batch(&mut state, &batch, &timestamps).unwrap();
         assert_eq!(state.depth, initial_depth + EXTENSION_ITERATIONS);
     }
 
@@ -310,7 +305,8 @@ mod tests {
         let old_midstate = state.midstate;
         let reward = block_reward(state.height);
         let batch = make_empty_batch(&state, reward, state.timestamp + 1);
-        apply_batch(&mut state, &batch).unwrap();
+        let timestamps = vec![state.timestamp];
+        apply_batch(&mut state, &batch, &timestamps).unwrap();
         assert_ne!(state.midstate, old_midstate);
         assert_eq!(state.midstate, batch.extension.final_hash);
     }
@@ -321,7 +317,8 @@ mod tests {
         let reward = block_reward(state.height);
         let batch = make_empty_batch(&state, reward, state.timestamp + 1);
         let coinbase_ids: Vec<[u8; 32]> = batch.coinbase.iter().map(|c| c.coin_id()).collect();
-        apply_batch(&mut state, &batch).unwrap();
+        let timestamps = vec![state.timestamp];
+        apply_batch(&mut state, &batch, &timestamps).unwrap();
         for id in &coinbase_ids {
             assert!(state.coins.contains(id), "coinbase coin should be in state");
         }
@@ -333,8 +330,9 @@ mod tests {
         let reward = block_reward(state.height);
         let mut batch = make_empty_batch(&state, reward, state.timestamp + 1);
         batch.prev_midstate = [0xFFu8; 32]; // wrong parent
-        let mut state2 = state;
-        assert!(apply_batch(&mut state2, &batch).is_err());
+        let mut state2 = state.clone();
+        let timestamps = vec![state2.timestamp];
+        assert!(apply_batch(&mut state2, &batch, &timestamps).is_err());
     }
 
     #[test]
@@ -343,7 +341,8 @@ mod tests {
         let reward = block_reward(state.height);
         let mut batch = make_empty_batch(&state, reward, state.timestamp + 1);
         batch.target = [0x00; 32]; // wrong target
-        assert!(apply_batch(&mut state, &batch).is_err());
+        let timestamps = vec![state.timestamp];
+        assert!(apply_batch(&mut state, &batch, &timestamps).is_err());
     }
 
     #[test]
@@ -351,7 +350,8 @@ mod tests {
         let mut state = genesis_state();
         // Coinbase with too much value
         let batch = make_empty_batch(&state, block_reward(state.height) + 100, state.timestamp + 1);
-        assert!(apply_batch(&mut state, &batch).is_err());
+        let timestamps = vec![state.timestamp];
+        assert!(apply_batch(&mut state, &batch, &timestamps).is_err());
     }
 
     #[test]
@@ -362,7 +362,8 @@ mod tests {
         if let Some(cb) = batch.coinbase.first_mut() {
             cb.value = 3; // not a power of 2
         }
-        assert!(apply_batch(&mut state, &batch).is_err());
+        let timestamps = vec![state.timestamp];
+        assert!(apply_batch(&mut state, &batch, &timestamps).is_err());
     }
 
     #[test]
@@ -371,12 +372,35 @@ mod tests {
         // Apply genesis batch first to get height > 0
         let reward = block_reward(state.height);
         let batch0 = make_empty_batch(&state, reward, state.timestamp + 1);
-        apply_batch(&mut state, &batch0).unwrap();
+        let timestamps_0 = vec![state.timestamp];
+        apply_batch(&mut state, &batch0, &timestamps_0).unwrap();
 
         // Now try a batch with timestamp <= previous
         let reward = block_reward(state.height);
         let batch1 = make_empty_batch(&state, reward, state.timestamp); // same timestamp
-        assert!(apply_batch(&mut state, &batch1).is_err());
+        let timestamps_1 = vec![state.timestamp];
+        assert!(apply_batch(&mut state, &batch1, &timestamps_1).is_err());
+    }
+
+    #[test]
+    fn apply_batch_validates_timestamp() {
+        let mut state = genesis_state();
+        let reward = block_reward(state.height);
+        
+        // 1. Apply a valid block so height > 0
+        let valid_batch = make_empty_batch(&state, reward, state.timestamp + 1);
+        let timestamps_0 = vec![state.timestamp];
+        apply_batch(&mut state, &valid_batch, &timestamps_0).unwrap();
+
+        // 2. Try to apply an invalid block (timestamp not strictly greater)
+        let reward2 = block_reward(state.height);
+        let invalid_batch = make_empty_batch(&state, reward2, state.timestamp);
+        let timestamps_1 = vec![state.timestamp];
+
+        
+        let result = apply_batch(&mut state, &invalid_batch, &timestamps_1);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("greater than previous"));
     }
 
     // ── choose_best_state ───────────────────────────────────────────────
@@ -425,10 +449,9 @@ mod tests {
         let mut state = genesis_state();
         state.height = DIFFICULTY_ADJUSTMENT_INTERVAL;
         
-        // FIX: Convert to header
-        let few_headers = vec![genesis_state().header()]; 
+        let few_timestamps = vec![genesis_state().timestamp]; 
         
-        let result = adjust_difficulty(&state, &few_headers);
+        let result = adjust_difficulty(&state, &few_timestamps);
         assert_eq!(result, state.target);
     }
 
@@ -462,10 +485,9 @@ mod tests {
             commitment_heights: std::collections::HashMap::new(),
         };
         
-        // FIX: Pass header, not state
-        let headers = vec![prev.header()];
+        let timestamps = vec![prev.timestamp];
         
-        let result = validate_timestamp(999, &headers, 2000);
+        let result = validate_timestamp(999, &timestamps, 2000);
         assert!(result.is_err());
     }
 }
