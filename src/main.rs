@@ -4,7 +4,8 @@ use midstate::*;
 use midstate::compute_address;
 use midstate::wallet::{self, Wallet, stealth_derive, build_stealth_output, short_hex};
 use midstate::core::wots;
-use midstate::network::{socket_to_multiaddr, MidstateNetwork, NetworkEvent};
+use midstate::core::state::apply_batch;
+use midstate::network::{socket_to_multiaddr, MidstateNetwork, NetworkEvent, Message};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -227,12 +228,19 @@ enum WalletAction {
 }
 
 fn read_password(prompt: &str) -> Result<Vec<u8>> {
+    if let Ok(val) = std::env::var("MIDSTATE_PASSWORD") {
+        if val.is_empty() { anyhow::bail!("MIDSTATE_PASSWORD is set but empty"); }
+        return Ok(val.into_bytes());
+    }
     let input = rpassword::prompt_password(prompt)?;
     if input.is_empty() { anyhow::bail!("password cannot be empty"); }
     Ok(input.into_bytes())
 }
 
 fn read_password_confirm() -> Result<Vec<u8>> {
+    if std::env::var("MIDSTATE_PASSWORD").is_ok() {
+        return read_password(""); // env var skips confirmation
+    }
     let p1 = read_password("Password: ")?;
     let p2 = read_password("Confirm:  ")?;
     if p1 != p2 { anyhow::bail!("passwords do not match"); }
@@ -1024,8 +1032,8 @@ async fn wallet_reveal(
                 salt: hex::encode(o.salt),
             }).collect(),
             salt: hex::encode(pending.salt),
-        stealth_nonces: vec![],
-    };
+                    stealth_nonces: vec![],
+        };
 
         let response = client.post(&url).json(&req).send().await?;
         if response.status().is_success() {
@@ -1284,7 +1292,7 @@ async fn keygen(rpc_port: Option<u16>) -> Result<()> {
 
 async fn sync_from_genesis(data_dir: PathBuf, peer_addr: SocketAddr, port: u16) -> Result<()> {
     let storage = storage::Storage::open(data_dir.join("db"))?;
-    let syncer = sync::Syncer::new(storage);
+    let syncer = sync::Syncer::new(storage.clone());
 
     let listen_addr: libp2p::Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", port).parse()?;
     let peer_multiaddr = socket_to_multiaddr(peer_addr);
@@ -1300,7 +1308,65 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: SocketAddr, port: u16) 
         }
     };
 
-    let state = syncer.sync_via_network(&mut network, peer_id).await?;
+    // 1. Ask peer for state
+    network.send(peer_id, Message::GetState);
+    let (peer_height, _peer_depth) = loop {
+        match network.next_event().await {
+            NetworkEvent::MessageReceived {
+                message: Message::StateInfo { height, depth, .. }, ..
+            } => break (height, depth),
+            _ => continue,
+        }
+    };
+    println!("Peer at height {}", peer_height);
+
+    // 2. Download headers
+    let mut headers = Vec::new();
+    let mut cursor = 0u64;
+    while cursor < peer_height {
+        let count = 100.min(peer_height - cursor);
+        network.send(peer_id, Message::GetHeaders { start_height: cursor, count });
+        let received = loop {
+            match network.next_event().await {
+                NetworkEvent::MessageReceived {
+                    message: Message::Headers { headers, .. }, ..
+                } => break headers,
+                _ => continue,
+            }
+        };
+        if received.is_empty() { anyhow::bail!("Peer sent empty headers at {}", cursor); }
+        cursor += received.len() as u64;
+        headers.extend(received);
+    }
+
+    // 3. Verify
+    sync::Syncer::verify_header_chain(&headers)?;
+    let our_state = storage.load_state()?.unwrap_or_else(|| State::genesis().0);
+    let fork_height = syncer.find_fork_point(&headers, our_state.height)?;
+
+    // 4. Download and apply batches
+    let mut state = syncer.rebuild_state_to(fork_height)?;
+    let mut dl_cursor = fork_height;
+    while dl_cursor < peer_height {
+        let chunk = 10.min(peer_height - dl_cursor);
+        network.send(peer_id, Message::GetBatches { start_height: dl_cursor, count: chunk });
+        let batches = loop {
+            match network.next_event().await {
+                NetworkEvent::MessageReceived {
+                    message: Message::Batches { batches, .. }, ..
+                } => break batches,
+                _ => continue,
+            }
+        };
+        if batches.is_empty() { anyhow::bail!("Peer sent empty batches at {}", dl_cursor); }
+        for batch in &batches {
+            apply_batch(&mut state, batch)?;
+            storage.save_batch(dl_cursor, batch)?;
+            dl_cursor += 1;
+        }
+    }
+    storage.save_state(&state)?;
+
     println!("Sync complete!");
     println!("  Height:      {}", state.height);
     println!("  Depth:       {}", state.depth);
