@@ -3,17 +3,22 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use anyhow::{bail, Result};
+use argon2::Argon2;
 
-const KDF_ITERATIONS: u32 = 100_000;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 
-/// Derive a 32-byte key from password + salt via iterated BLAKE3.
+/// Derive a 32-byte key from password + salt via Argon2id.
+///
+/// ```
+/// # use midstate::wallet::crypto::*;
+/// // Internal doc test
+/// ```
 fn derive_key(password: &[u8], salt: &[u8]) -> [u8; 32] {
-    let mut key = *blake3::hash(&[password, salt].concat()).as_bytes();
-    for _ in 1..KDF_ITERATIONS {
-        key = *blake3::hash(&key).as_bytes();
-    }
+    let mut key = [0u8; 32];
+    Argon2::default()
+        .hash_password_into(password, salt, &mut key)
+        .expect("Argon2id KDF failed");
     key
 }
 
@@ -60,6 +65,16 @@ pub fn decrypt(data: &[u8], password: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn argon2_derivation_deterministic() {
+        let pwd = b"my_secure_password";
+        let salt = b"random_salt_1234";
+        let key1 = derive_key(pwd, salt);
+        let key2 = derive_key(pwd, salt);
+        assert_eq!(key1, key2);
+        assert_ne!(key1, [0u8; 32]);
+    }
 
     #[test]
     fn round_trip() {
