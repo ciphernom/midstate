@@ -3,8 +3,7 @@ use futures::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use libp2p::StreamProtocol;
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::net::SocketAddr;
-use async_trait::async_trait; // <--- Import this
+use async_trait::async_trait;
 
 pub const MAX_GETBATCHES_COUNT: u64 = 100;
 
@@ -19,7 +18,8 @@ pub enum Message {
         midstate: [u8; 32],
     },
     GetAddr,
-    Addr(Vec<SocketAddr>),
+    /// Peer exchange: list of multiaddr strings peers can dial
+    Addr(Vec<String>),
     Ping { nonce: u64 },
     Pong { nonce: u64 },
     GetBatches {
@@ -198,21 +198,67 @@ mod tests {
 
     #[test]
     fn message_all_variants_round_trip() {
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
         let messages = vec![
             Message::GetState,
             Message::GetAddr,
             Message::Ping { nonce: 12345 },
             Message::Pong { nonce: 54321 },
-            Message::Addr(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)]),
+            Message::Addr(vec![
+                "/ip4/203.0.113.10/tcp/9333/p2p/12D3KooWTest".to_string(),
+                "/ip4/10.0.0.1/udp/9333/quic-v1/p2p/12D3KooWOther".to_string(),
+            ]),
             Message::GetBatches { start_height: 0, count: 100 },
             Message::Batches { start_height: 0, batches: vec![] },
+            Message::GetHeaders { start_height: 0, count: 50 },
+            Message::Headers { start_height: 0, headers: vec![] },
         ];
 
         for msg in messages {
             let bytes = msg.serialize_bin();
             assert!(Message::deserialize_bin(&bytes).is_ok());
+        }
+    }
+
+    // ── PEX message tests ───────────────────────────────────────────
+
+    #[test]
+    fn addr_message_preserves_multiaddr_strings() {
+        let addrs = vec![
+            "/ip4/1.2.3.4/tcp/9333/p2p/12D3KooWAbCdEf".to_string(),
+            "/ip4/5.6.7.8/udp/9333/quic-v1/p2p/12D3KooWGhIjKl".to_string(),
+            "/ip4/10.0.0.1/tcp/9333/p2p/12D3KooWRelay/p2p-circuit/p2p/12D3KooWNatted".to_string(),
+        ];
+        let msg = Message::Addr(addrs.clone());
+        let bytes = msg.serialize_bin();
+        let msg2 = Message::deserialize_bin(&bytes).unwrap();
+        match msg2 {
+            Message::Addr(got) => assert_eq!(got, addrs),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn addr_message_empty_vec() {
+        let msg = Message::Addr(vec![]);
+        let bytes = msg.serialize_bin();
+        match Message::deserialize_bin(&bytes).unwrap() {
+            Message::Addr(addrs) => assert!(addrs.is_empty()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn addr_message_large_peer_list() {
+        // PEX should handle up to ~1000 addrs without hitting MAX_MSG_SIZE
+        let addrs: Vec<String> = (0..1000)
+            .map(|i| format!("/ip4/10.{}.{}.{}/tcp/9333/p2p/12D3KooWTest{}", i / 65536, (i / 256) % 256, i % 256, i))
+            .collect();
+        let msg = Message::Addr(addrs.clone());
+        let bytes = msg.serialize_bin();
+        assert!(bytes.len() < MAX_MSG_SIZE);
+        match Message::deserialize_bin(&bytes).unwrap() {
+            Message::Addr(got) => assert_eq!(got.len(), 1000),
+            _ => panic!("wrong variant"),
         }
     }
 }
