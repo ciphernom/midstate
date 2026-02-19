@@ -27,9 +27,10 @@ rand_chacha = "0.3"
 blake3 = "1.5"
 argon2 = "0.5"
 rayon = "1.8"
-libp2p = { version = "0.54", features = ["tokio", "noise", "tcp", "yamux", "kad", "identify", "request-response", "macros"] }
+libp2p = { version = "0.54", features = ["tokio", "noise", "tcp", "yamux", "kad", "identify", "request-response", "macros","quic","relay", "dcutr", "autonat"] }
 futures = "0.3"
 async-trait = "0.1"
+toml = "1.0.3"
 
 [features]
 fast-mining = []
