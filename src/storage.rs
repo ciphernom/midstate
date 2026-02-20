@@ -21,22 +21,44 @@ impl Storage {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
 
-        let db = Database::create(path.join("state.redb"))?;
+        // redb acquires an exclusive file lock.  If a previous node process
+        // is still shutting down (race between kill and restart), the lock
+        // may not yet be released.  Retry with back-off before giving up.
+        let db_path = path.join("state.redb");
+        let mut last_err = None;
+        for attempt in 0..10 {
+            match Database::create(&db_path) {
+                Ok(db) => {
+                    if attempt > 0 {
+                        tracing::info!("Database lock acquired after {} retries", attempt);
+                    }
+                    // Initialize tables
+                    let write_txn = db.begin_write()?;
+                    {
+                        let _ = write_txn.open_table(STATE_TABLE)?;
+                        let _ = write_txn.open_table(MINING_SEED_TABLE)?;
+                    }
+                    write_txn.commit()?;
 
-        // Initialize tables
-        let write_txn = db.begin_write()?;
-        {
-            let _ = write_txn.open_table(STATE_TABLE)?;
-            let _ = write_txn.open_table(MINING_SEED_TABLE)?;
+                    let batches = BatchStore::new(path.join("batches"))?;
+
+                    return Ok(Self {
+                        db: Arc::new(db),
+                        batches,
+                    });
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    let delay = std::time::Duration::from_millis(100 * (1 << attempt.min(5)));
+                    tracing::warn!(
+                        "Database lock attempt {} failed, retrying in {:?}...",
+                        attempt + 1, delay
+                    );
+                    std::thread::sleep(delay);
+                }
+            }
         }
-        write_txn.commit()?;
-
-        let batches = BatchStore::new(path.join("batches"))?;
-
-        Ok(Self { 
-            db: Arc::new(db), 
-            batches 
-        })
+        Err(last_err.unwrap().into())
     }
 
     pub fn save_state(&self, state: &State) -> Result<()> {
