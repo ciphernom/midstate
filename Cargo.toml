@@ -31,6 +31,7 @@ libp2p = { version = "0.54", features = ["tokio", "noise", "tcp", "yamux", "kad"
 futures = "0.3"
 async-trait = "0.1"
 toml = "1.0.3"
+primitive-types = "0.14"
 
 [features]
 fast-mining = []

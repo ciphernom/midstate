@@ -105,8 +105,70 @@ pub fn verify_extension(midstate: [u8; 32], ext: &Extension, target: &[u8; 32]) 
 }
 
 /// Mine: try nonces until one produces a final_hash below target.
+/// Spawns one worker per available core, each trying independent nonces.
 /// Uses an AtomicBool to instantly abort if a peer solves the block first.
 pub fn mine_extension(midstate: [u8; 32], target: [u8; 32], cancel: Arc<AtomicBool>) -> Option<Extension> {
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    if num_threads <= 1 {
+        return mine_extension_single(midstate, target, cancel);
+    }
+
+    let found = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel::<(Extension, u64)>();
+
+    let threads: Vec<_> = (0..num_threads)
+        .map(|_| {
+            let cancel = Arc::clone(&cancel);
+            let found = Arc::clone(&found);
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut attempts = 0u64;
+                loop {
+                    if cancel.load(Ordering::Relaxed) || found.load(Ordering::Relaxed) {
+                        return;
+                    }
+
+                    attempts += 1;
+                    let nonce: u64 = rand::random();
+                    let (final_hash, checkpoints) = compute_chain(&midstate, nonce);
+
+                    if final_hash < target {
+                        found.store(true, Ordering::Relaxed);
+                        let _ = tx.send((Extension { nonce, final_hash, checkpoints }, attempts));
+                        return;
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // Drop our copy so rx terminates when all threads finish
+    drop(tx);
+
+    let result = rx.recv().ok();
+
+    // Ensure all threads exit before returning
+    for t in threads {
+        let _ = t.join();
+    }
+
+    if let Some((ext, attempts)) = result {
+        tracing::info!(
+            "Found valid extension! nonce={} attempts={} hash={} threads={}",
+            ext.nonce, attempts, hex::encode(ext.final_hash), num_threads
+        );
+        Some(ext)
+    } else {
+        tracing::debug!("Mining cancelled after all threads exited ({} threads)", num_threads);
+        None
+    }
+}
+
+/// Single-threaded fallback.
+fn mine_extension_single(midstate: [u8; 32], target: [u8; 32], cancel: Arc<AtomicBool>) -> Option<Extension> {
     let mut attempts = 0u64;
 
     loop {
@@ -123,17 +185,12 @@ pub fn mine_extension(midstate: [u8; 32], target: [u8; 32], cancel: Arc<AtomicBo
         if final_hash < target {
             tracing::info!(
                 "Found valid extension! nonce={} attempts={} hash={}",
-                nonce,
-                attempts,
-                hex::encode(final_hash)
+                nonce, attempts, hex::encode(final_hash)
             );
             return Some(Extension { nonce, final_hash, checkpoints });
         }
     }
 }
-// ============================================================
-// ADD THIS ENTIRE BLOCK at the bottom of src/core/extension.rs
-// ============================================================
 
 #[cfg(test)]
 mod tests {
