@@ -10,13 +10,14 @@ Key fixes over the bash version:
   2. Stops mining before convergence checks (no moving-target problem)
   3. Proper process lifecycle (SIGTERM → wait → SIGKILL)
   4. Longer waits between kill/restart for port and DB lock release
+  5. Dynamically extracts libp2p PeerIds to construct valid Multiaddrs.
 
 Usage:
     python3 testnet.py              # build + run all tests
     python3 testnet.py --skip-build # reuse existing binary
 """
 
-import subprocess, signal, sys, os, time, json, shutil, argparse
+import subprocess, signal, sys, os, time, json, shutil, argparse, re
 from pathlib import Path
 from typing import Optional
 
@@ -110,9 +111,27 @@ def kill_all():
         kill_node(name)
 
 
-# ── RPC helpers ──────────────────────────────────────────────────────────────
+# ── P2P & RPC helpers ────────────────────────────────────────────────────────
 
 import urllib.request, urllib.error
+
+def get_local_multiaddr(data_dir: Path, port: int, timeout=15) -> str:
+    """Reads the node.log to extract the dynamic libp2p PeerId and construct the Multiaddr."""
+    deadline = time.time() + timeout
+    log_file = data_dir / "node.log"
+    while time.time() < deadline:
+        if log_file.exists():
+            try:
+                with open(log_file, "r") as f:
+                    for line in f:
+                        m = re.search(r'Local peer id:\s+([1-9A-HJ-NP-Za-km-z]+)', line)
+                        if m:
+                            return f"/ip4/127.0.0.1/tcp/{port}/p2p/{m.group(1)}"
+            except Exception:
+                pass
+        time.sleep(0.5)
+    raise RuntimeError(f"Could not find PeerId in {log_file} within {timeout}s")
+
 
 def rpc(port: int, path: str, *, method="GET", body=None, timeout=5) -> Optional[dict]:
     """Hit an RPC endpoint. Returns parsed JSON or None on failure."""
@@ -239,7 +258,9 @@ def run_tests(skip_build: bool):
     start_node("A", DIR_A, P2P_A, RPC_A, mine=True, fresh=True)
     if not wait_for_health(RPC_A, "Node-A"):
         sys.exit(1)
-    pass_test("Node A starts and responds to /health")
+
+    ma_A = get_local_multiaddr(DIR_A, P2P_A)
+    pass_test(f"Node A starts and responds to /health. Multiaddr: {ma_A}")
 
     if wait_for_height(RPC_A, 3, timeout=60):
         pass_test(f"Node A mining works (height={get_height(RPC_A)})")
@@ -253,7 +274,7 @@ def run_tests(skip_build: bool):
     section("Test 2: Peer sync (Node B joins and catches up)")
 
     start_node("B", DIR_B, P2P_B, RPC_B, mine=False,
-               peers=[f"127.0.0.1:{P2P_A}"], fresh=True)
+               peers=[ma_A], fresh=True)
     if not wait_for_health(RPC_B, "Node-B"):
         sys.exit(1)
     pass_test("Node B starts and responds to /health")
@@ -313,7 +334,6 @@ def run_tests(skip_build: bool):
                        capture_output=True, text=True, env=os.environ)
     bal_output = r.stdout + r.stderr
     log(f"Balance output: {bal_output.strip()}")
-    import re
     bal_match = re.search(r'value:\s*(\d+)', bal_output)
     sender_bal = int(bal_match.group(1)) if bal_match else 0
     log(f"Sender wallet live value: {sender_bal}")
@@ -408,7 +428,7 @@ def run_tests(skip_build: bool):
 
     # Restart from existing data (not fresh!)
     start_node("B", DIR_B, P2P_B, RPC_B, mine=False,
-               peers=[f"127.0.0.1:{P2P_A}"])
+               peers=[ma_A])
     if wait_for_health(RPC_B, "Node-B (restarted)", 30):
         pass_test("Node B restarts after crash")
     else:
@@ -439,7 +459,7 @@ def run_tests(skip_build: bool):
     log(f"Node A at height {get_height(RPC_A)}. Starting fresh Node C...")
 
     start_node("C", DIR_C, P2P_C, RPC_C, mine=False,
-               peers=[f"127.0.0.1:{P2P_A}"], fresh=True)
+               peers=[ma_A], fresh=True)
     if wait_for_health(RPC_C, "Node-C", 30):
         pass_test("Node C starts fresh")
     else:
@@ -463,10 +483,6 @@ def run_tests(skip_build: bool):
 
     # ══════════════════════════════════════════════════════════════════════
     # TEST 7: Competitive mining — two isolated miners, then reconnect
-    #
-    # FIX: After reconnecting, we STOP the miner so the chain doesn't move
-    #      while the syncing node downloads the full header chain from
-    #      genesis. This eliminates the catch-up death spiral.
     # ══════════════════════════════════════════════════════════════════════
     section("Test 7: Competitive mining (isolated miners converge)")
 
@@ -479,6 +495,10 @@ def run_tests(skip_build: bool):
     start_node("D", DIR_D, P2P_D, RPC_D, mine=True, fresh=True)
     wait_for_health(RPC_A, "Miner-A") or sys.exit(1)
     wait_for_health(RPC_D, "Miner-D") or sys.exit(1)
+
+    # We need the PeerId multiaddrs to connect them later
+    ma_A = get_local_multiaddr(DIR_A, P2P_A)
+    ma_D = get_local_multiaddr(DIR_D, P2P_D)
 
     log("Both miners mining independently for 30 seconds...")
     time.sleep(30)
@@ -494,8 +514,7 @@ def run_tests(skip_build: bool):
     else:
         pass_test("Miners at same state (unlikely but not impossible)")
 
-    # KEY FIX: Stop A's mining, restart as non-miner, THEN connect D.
-    # This freezes the chain so D can sync to a static target.
+    # Stop A's mining, restart as non-miner, THEN connect D.
     frozen_height = get_height(RPC_A)
     log(f"Freezing Miner A's chain at height {frozen_height} for convergence...")
 
@@ -505,8 +524,8 @@ def run_tests(skip_build: bool):
     # Now restart D connected to the frozen A
     kill_node("D")
     time.sleep(3)
-    start_node("D", DIR_D, P2P_D, RPC_D, mine=False,
-               peers=[f"127.0.0.1:{P2P_A}"])
+    start_node("D", DIR_D, P2P_D, RPC_D, mine=False, peers=[ma_A])
+    
     wait_for_health(RPC_D, "Miner-D (reconnected)", 30) or sys.exit(1)
     wait_for_peers(RPC_D, "Miner-D", timeout=30)
 
@@ -523,25 +542,21 @@ def run_tests(skip_build: bool):
 
     # ══════════════════════════════════════════════════════════════════════
     # TEST 8: Simultaneous connected mining
-    #
-    # FIX: After the race, stop BOTH miners, restart as non-miners
-    #      peered together, and wait for convergence on a static chain.
     # ══════════════════════════════════════════════════════════════════════
     section("Test 8: Simultaneous connected mining")
 
     kill_node("A"); kill_node("D")
     time.sleep(3)
 
-    # Both mining, connected from the start
+    # Start A first so we can grab its multiaddr
     start_node("A", DIR_A, P2P_A, RPC_A, mine=True, fresh=True)
     wait_for_health(RPC_A, "Racer-A") or sys.exit(1)
+    ma_A = get_local_multiaddr(DIR_A, P2P_A)
     time.sleep(1)
 
-    start_node("D", DIR_D, P2P_D, RPC_D, mine=True,
-               peers=[f"127.0.0.1:{P2P_A}"], fresh=True)
+    start_node("D", DIR_D, P2P_D, RPC_D, mine=True, peers=[ma_A], fresh=True)
     wait_for_health(RPC_D, "Racer-D") or sys.exit(1)
 
-    # Verify P2P connection before starting the race
     if wait_for_peers(RPC_D, "Racer-D", timeout=15):
         log("P2P connection verified between racers")
     else:
@@ -562,33 +577,27 @@ def run_tests(skip_build: bool):
     else:
         fail_test("Mining race height", f"A={HA} D={HD} (diff={height_diff})")
 
-    # KEY FIX: Stop both miners, let them settle to consensus on a frozen chain.
     log("Stopping both miners for convergence settlement...")
-    frozen_a = get_height(RPC_A)
-    frozen_d = get_height(RPC_D)
-
-    # Figure out which has the deeper chain — it becomes the authority.
     da_depth, dd_depth = get_depth(RPC_A), get_depth(RPC_D)
 
     kill_node("A"); kill_node("D")
     time.sleep(3)
 
     # Restart both as non-miners, peered together.
-    # Start the deeper chain node first so the other syncs to it.
     if (da_depth or 0) >= (dd_depth or 0):
         start_node("A", DIR_A, P2P_A, RPC_A, mine=False, peers=[])
         wait_for_health(RPC_A, "Racer-A (settling)") or sys.exit(1)
-        start_node("D", DIR_D, P2P_D, RPC_D, mine=False,
-                   peers=[f"127.0.0.1:{P2P_A}"])
+        ma_A = get_local_multiaddr(DIR_A, P2P_A)
+        start_node("D", DIR_D, P2P_D, RPC_D, mine=False, peers=[ma_A])
         wait_for_health(RPC_D, "Racer-D (settling)") or sys.exit(1)
+        wait_for_peers(RPC_D, "Racer-D settling", timeout=30)
     else:
         start_node("D", DIR_D, P2P_D, RPC_D, mine=False, peers=[])
         wait_for_health(RPC_D, "Racer-D (settling)") or sys.exit(1)
-        start_node("A", DIR_A, P2P_A, RPC_A, mine=False,
-                   peers=[f"127.0.0.1:{P2P_D}"])
+        ma_D = get_local_multiaddr(DIR_D, P2P_D)
+        start_node("A", DIR_A, P2P_A, RPC_A, mine=False, peers=[ma_D])
         wait_for_health(RPC_A, "Racer-A (settling)") or sys.exit(1)
-
-    wait_for_peers(RPC_D, "Racer-D settling", timeout=30)
+        wait_for_peers(RPC_A, "Racer-A settling", timeout=30)
 
     if wait_for_consensus(RPC_A, RPC_D, 120):
         pass_test("Miners settled to identical state after race")
@@ -600,12 +609,9 @@ def run_tests(skip_build: bool):
 
     # ══════════════════════════════════════════════════════════════════════
     # TEST 9: Network partition and rejoin
-    #
-    # FIX: Same approach — freeze both chains before checking convergence.
     # ══════════════════════════════════════════════════════════════════════
     section("Test 9: Network partition and rejoin")
 
-    # A is not mining. Restart it as a miner for the partition test.
     kill_node("A"); kill_node("D")
     time.sleep(3)
 
@@ -628,27 +634,24 @@ def run_tests(skip_build: bool):
     else:
         log("Warning: chains identical despite partition (possible but unlikely)")
 
-    # KEY FIX: Stop both miners, then reconnect as non-miners.
     log("Freezing both chains for convergence...")
     kill_node("A"); kill_node("D")
     time.sleep(3)
 
-    # Start deeper chain first
     if (DA or 0) >= (DD or 0):
         start_node("A", DIR_A, P2P_A, RPC_A, mine=False, peers=[])
         wait_for_health(RPC_A, "Rejoin-A") or sys.exit(1)
-        start_node("D", DIR_D, P2P_D, RPC_D, mine=False,
-                   peers=[f"127.0.0.1:{P2P_A}"])
+        ma_A = get_local_multiaddr(DIR_A, P2P_A)
+        start_node("D", DIR_D, P2P_D, RPC_D, mine=False, peers=[ma_A])
         wait_for_health(RPC_D, "Rejoin-D") or sys.exit(1)
+        wait_for_peers(RPC_D, "Rejoin peer", timeout=30)
     else:
         start_node("D", DIR_D, P2P_D, RPC_D, mine=False, peers=[])
         wait_for_health(RPC_D, "Rejoin-D") or sys.exit(1)
-        start_node("A", DIR_A, P2P_A, RPC_A, mine=False,
-                   peers=[f"127.0.0.1:{P2P_D}"])
+        ma_D = get_local_multiaddr(DIR_D, P2P_D)
+        start_node("A", DIR_A, P2P_A, RPC_A, mine=False, peers=[ma_D])
         wait_for_health(RPC_A, "Rejoin-A") or sys.exit(1)
-
-    wait_for_peers(RPC_D if (DA or 0) >= (DD or 0) else RPC_A,
-                   "Rejoin peer", timeout=30)
+        wait_for_peers(RPC_A, "Rejoin peer", timeout=30)
 
     log("Waiting for post-partition convergence...")
     if wait_for_consensus(RPC_A, RPC_D, 120):

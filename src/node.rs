@@ -14,7 +14,7 @@ use crate::core::wots;
 use crate::sync::Syncer;
 use anyhow::Result;
 use libp2p::{request_response::ResponseChannel, PeerId, Multiaddr, identity::Keypair};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,6 +69,7 @@ pub struct Node {
     data_dir: PathBuf,
     chain_history: Vec<(u64, [u8; 32])>,
     finality: crate::core::finality::FinalityEstimator,
+    known_pex_addrs: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -321,6 +322,7 @@ impl Node {
             //lets assume a hostile environment where 80% of new connections are malicious. 
             finality: crate::core::finality::FinalityEstimator::new(2, 8), 
             sync_session: None,
+            known_pex_addrs: HashSet::new(),
         })
     }
 
@@ -350,6 +352,7 @@ impl Node {
         let mut sync_poll_interval = time::interval(Duration::from_secs(30));
         let mut mempool_prune_interval = time::interval(Duration::from_secs(60));
         let mut sync_timeout_interval = time::interval(Duration::from_secs(5));
+        let mut pex_interval = time::interval(Duration::from_secs(120));
 
         // Initial sync: ask all peers for their height
         if self.network.peer_count() > 0 {
@@ -400,6 +403,12 @@ impl Node {
                         }
                     }
                 }
+                _ = pex_interval.tick() => {
+                    if let Some(peer) = self.network.random_peer() {
+                        tracing::debug!("PEX: requesting addrs from {}", peer);
+                        self.network.send(peer, Message::GetAddr);
+                    }
+                }
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
                         NodeCommand::SendTransaction(tx) => {
@@ -419,6 +428,7 @@ impl Node {
                         NetworkEvent::PeerConnected(peer) => {
                             tracing::info!("Peer connected: {}", peer);
                             self.network.send(peer, Message::GetState);
+                            self.network.send(peer, Message::GetAddr);
                         }
                         NetworkEvent::PeerDisconnected(peer) => {
                             tracing::info!("Peer disconnected: {}", peer);
@@ -498,16 +508,23 @@ impl Node {
                 self.ack(channel);
             }
             Message::GetAddr => {
-                let addrs = self.network.peer_addrs();
-                // Convert to SocketAddr for protocol compat — send empty if can't parse
-                let socket_addrs: Vec<std::net::SocketAddr> = addrs
-                    .iter()
-                    .filter_map(|s| s.parse().ok())
-                    .collect();
-                self.send_response(channel, Message::Addr(socket_addrs));
+                let addrs = self.network.pex_addrs();
+                tracing::debug!("PEX: sending {} addrs to {}", addrs.len(), from);
+                self.send_response(channel, Message::Addr(addrs));
             }
-            Message::Addr(_addrs) => {
+            Message::Addr(addrs) => {
                 self.ack(channel);
+                let mut new_count = 0;
+                for addr_str in &addrs {
+                    if !self.known_pex_addrs.contains(addr_str) {
+                        self.known_pex_addrs.insert(addr_str.clone());
+                       self.network.dial_addr(addr_str);
+                        new_count += 1;
+                    }
+                }
+                if new_count > 0 {
+                    tracing::info!("PEX: received {} addrs from {}, {} new", addrs.len(), from, new_count);
+                }
             }
             Message::GetBatches { start_height, count } => {
                 let count = count.min(MAX_GETBATCHES_COUNT);

@@ -5,12 +5,60 @@ use midstate::compute_address;
 use midstate::wallet::{self, Wallet, short_hex};
 use midstate::core::wots;
 use midstate::core::state::apply_batch;
-use midstate::network::{socket_to_multiaddr, MidstateNetwork, NetworkEvent, Message};
-use std::net::SocketAddr;
+use midstate::network::{MidstateNetwork, NetworkEvent, Message};
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use rayon::prelude::*;
+
+// ── Config file ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+struct Config {
+    /// Bootstrap peer multiaddrs
+    #[serde(default)]
+    bootstrap_peers: Vec<String>,
+}
+
+impl Config {
+    fn load(path: &std::path::Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config: {}", path.display()))?;
+        let config: Config = toml::from_str(&contents)
+            .with_context(|| format!("Failed to parse config: {}", path.display()))?;
+        Ok(config)
+    }
+
+    /// Create a default config file if it doesn't exist.
+    fn create_default(path: &std::path::Path) -> Result<()> {
+        if path.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let default_contents = r#"# Midstate node configuration
+            #
+            # Bootstrap peers — full multiaddr with peer ID.
+            # Get peer ID from the bootstrap node's startup logs.
+            #
+            # Example:
+            # bootstrap_peers = [
+            #     "/ip4/203.0.113.10/tcp/9333/p2p/12D3KooWAbCdEf...",
+            #     "/ip4/198.51.100.5/tcp/9333/p2p/12D3KooWGhIjKl...",
+            # ]
+
+            bootstrap_peers = []
+            "#;
+        std::fs::write(path, default_contents)
+            .with_context(|| format!("Failed to create default config: {}", path.display()))?;
+        tracing::info!("Created default config at {}", path.display());
+        Ok(())
+    }
+}
 
 fn default_wallet_path() -> PathBuf {
     wallet::default_path()
@@ -35,11 +83,14 @@ enum Command {
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
         #[arg(long)]
-        peer: Vec<SocketAddr>,
+        peer: Vec<String>,
         #[arg(long)]
         mine: bool,
         #[arg(long)]
         listen: Option<String>,
+        /// Path to config file (default: <data_dir>/config.toml)
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 
     /// Wallet operations
@@ -95,7 +146,7 @@ enum Command {
         #[arg(long, default_value = "./data")]
         data_dir: PathBuf,
         #[arg(long)]
-        peer: SocketAddr,
+        peer: String,
         #[arg(long, default_value = "9333")]
         port: u16,
     },
@@ -283,8 +334,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Node { data_dir, port, rpc_port, peer, mine, listen } => {
-            run_node(data_dir, port, rpc_port, peer, mine, listen).await
+        Command::Node { data_dir, port, rpc_port, peer, mine, listen, config } => {
+            run_node(data_dir, port, rpc_port, peer, mine, listen, config).await
         }
         Command::Wallet { action } => handle_wallet(action).await,
         Command::Commit { rpc_port, coin, dest } => {
@@ -1083,16 +1134,35 @@ async fn check_coin_rpc(client: &reqwest::Client, rpc_port: u16, coin_hex: &str)
 // ── Original commands ───────────────────────────────────────────────────────
 
 async fn run_node(
-    data_dir: PathBuf, port: u16, rpc_port: u16, peers: Vec<SocketAddr>, mine: bool, listen: Option<String>,
+    data_dir: PathBuf, port: u16, rpc_port: u16, cli_peers: Vec<String>,
+    mine: bool, listen: Option<String>, config_path: Option<PathBuf>,
 ) -> Result<()> {
+    // Load config: explicit --config path, or <data_dir>/config.toml
+    let config_file = config_path.unwrap_or_else(|| data_dir.join("config.toml"));
+    Config::create_default(&config_file)?;
+    let config = Config::load(&config_file)?;
+
+    // Merge: config file peers first, then CLI --peer flags on top, dedup
+    let mut all_peers = config.bootstrap_peers;
+    all_peers.extend(cli_peers);
+    all_peers.sort();
+    all_peers.dedup();
+
+    if all_peers.is_empty() {
+        tracing::warn!("No bootstrap peers configured. Add peers to {} or use --peer", config_file.display());
+    } else {
+        tracing::info!("Bootstrap peers: {} (config: {})", all_peers.len(), config_file.display());
+    }
+
     let listen_addr: libp2p::Multiaddr = match listen {
         Some(addr) => addr.parse()?,
         None => format!("/ip4/0.0.0.0/tcp/{}", port).parse()?,
     };
 
-    let bootstrap: Vec<libp2p::Multiaddr> = peers.iter()
-        .map(|a| socket_to_multiaddr(*a))
-        .collect();
+    let bootstrap: Vec<libp2p::Multiaddr> = all_peers.iter()
+        .map(|a| a.parse())
+        .collect::<Result<Vec<_>, _>>()
+        .context("Invalid peer multiaddr (expected e.g. /ip4/1.2.3.4/tcp/9333/p2p/12D3KooW...)")?;
 
     let node = node::Node::new(data_dir, mine, listen_addr, bootstrap).await?;
     let (handle, cmd_rx) = node.create_handle();
@@ -1211,12 +1281,13 @@ async fn keygen(rpc_port: Option<u16>) -> Result<()> {
     Ok(())
 }
 
-async fn sync_from_genesis(data_dir: PathBuf, peer_addr: SocketAddr, port: u16) -> Result<()> {
+async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> Result<()> {
     let storage = storage::Storage::open(data_dir.join("db"))?;
     let syncer = sync::Syncer::new(storage.clone());
 
     let listen_addr: libp2p::Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", port).parse()?;
-    let peer_multiaddr = socket_to_multiaddr(peer_addr);
+    let peer_multiaddr: libp2p::Multiaddr = peer_addr.parse()
+       .context("Invalid peer multiaddr (expected e.g. /ip4/1.2.3.4/tcp/9333/p2p/12D3KooW...)")?;
 
     let keypair = libp2p::identity::Keypair::generate_ed25519();
     let mut network = MidstateNetwork::new(keypair, listen_addr, vec![peer_multiaddr]).await?;
