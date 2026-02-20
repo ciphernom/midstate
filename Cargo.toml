@@ -25,6 +25,7 @@ rpassword = "7.3"
 dirs = "5.0"
 rand_chacha = "0.3"
 blake3 = "1.5"
+argon2 = "0.5"
 rayon = "1.8"
 libp2p = { version = "0.54", features = ["tokio", "noise", "tcp", "yamux", "kad", "identify", "request-response", "macros"] }
 futures = "0.3"

@@ -354,6 +354,7 @@ pub const MAX_BATCH_SIZE: usize = 100;
 
 pub const TARGET_BLOCK_TIME: u64 = 600;
 pub const DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 2016;
+pub const MEDIAN_TIME_PAST_WINDOW: usize = 11;
 pub const MAX_ADJUSTMENT_FACTOR: u64 = 4;
 pub const COMMITMENT_TTL: u64 = 100; 
 // ── Economics ───────────────────────────────────────────────────────────────
