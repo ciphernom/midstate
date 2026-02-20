@@ -1,5 +1,7 @@
 use super::types::*;
 use anyhow::{bail, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Compute the sequential hash chain, collecting checkpoints along the way.
 /// Used by both create_extension and mine_extension.
@@ -103,11 +105,16 @@ pub fn verify_extension(midstate: [u8; 32], ext: &Extension, target: &[u8; 32]) 
 }
 
 /// Mine: try nonces until one produces a final_hash below target.
-/// Each attempt pays the full sequential work cost.
-pub fn mine_extension(midstate: [u8; 32], target: [u8; 32]) -> Extension {
+/// Uses an AtomicBool to instantly abort if a peer solves the block first.
+pub fn mine_extension(midstate: [u8; 32], target: [u8; 32], cancel: Arc<AtomicBool>) -> Option<Extension> {
     let mut attempts = 0u64;
 
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            tracing::debug!("Mining cancelled by network event after {} attempts", attempts);
+            return None;
+        }
+
         attempts += 1;
         let nonce: u64 = rand::random();
 
@@ -120,7 +127,7 @@ pub fn mine_extension(midstate: [u8; 32], target: [u8; 32]) -> Extension {
                 attempts,
                 hex::encode(final_hash)
             );
-            return Extension { nonce, final_hash, checkpoints };
+            return Some(Extension { nonce, final_hash, checkpoints });
         }
     }
 }
@@ -244,7 +251,8 @@ mod tests {
         let ms = hash(b"mine test");
         // Use easy target so mining finishes quickly
         let target = easy_target();
-        let ext = mine_extension(ms, target);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ext = mine_extension(ms, target, cancel).unwrap();
         assert!(ext.final_hash < target);
         assert!(verify_extension(ms, &ext, &target).is_ok());
     }
