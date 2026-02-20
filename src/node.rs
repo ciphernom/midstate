@@ -16,6 +16,7 @@ use anyhow::Result;
 use libp2p::{request_response::ResponseChannel, PeerId, Multiaddr, identity::Keypair};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -24,6 +25,7 @@ use rayon::prelude::*;
 
 const MAX_ORPHAN_BATCHES: usize = 256;
 const SYNC_TIMEOUT_SECS: u64 = 120;
+const CATCH_UP_THRESHOLD: u64 = 20;
 
 /// Non-blocking sync session driven by the main event loop.
 /// Replaces the old blocking `Syncer::sync_via_network` which hijacked the
@@ -70,6 +72,10 @@ pub struct Node {
     chain_history: Vec<(u64, [u8; 32])>,
     finality: crate::core::finality::FinalityEstimator,
     known_pex_addrs: HashSet<String>,
+    // Background mining concurrency
+    mining_cancel: Option<Arc<AtomicBool>>,
+    mined_batch_rx: tokio::sync::mpsc::UnboundedReceiver<Batch>,
+    mined_batch_tx: tokio::sync::mpsc::UnboundedSender<Batch>,
 }
 
 #[derive(Clone)]
@@ -304,6 +310,8 @@ impl Node {
             }
         }
 
+        let (mined_batch_tx, mined_batch_rx) = tokio::sync::mpsc::unbounded_channel();
+
         Ok(Self {
             state,
             mempool: Mempool::new(),
@@ -323,6 +331,9 @@ impl Node {
             finality: crate::core::finality::FinalityEstimator::new(2, 8), 
             sync_session: None,
             known_pex_addrs: HashSet::new(),
+            mining_cancel: None,
+            mined_batch_rx,
+            mined_batch_tx,
         })
     }
 
@@ -338,6 +349,16 @@ impl Node {
             batches_path: self.data_dir.join("db").join("batches"),
         };
         (handle, rx)
+    }
+
+    /// Abort any active background mining task so the event loop can adopt a new chain.
+    fn cancel_mining(&mut self) {
+        if let Some(cancel) = self.mining_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+            // Drain any batch the thread may have sent before seeing the flag
+            while self.mined_batch_rx.try_recv().is_ok() {}
+            tracing::debug!("Cancelled active mining task for network update.");
+        }
     }
 
     pub async fn run(
@@ -367,10 +388,15 @@ impl Node {
         loop {
             tokio::select! {
                 _ = mine_interval.tick() => {
-                    if self.is_mining && !self.sync_in_progress {
-                        if let Err(e) = self.try_mine().await {
+                    if self.is_mining && !self.sync_in_progress && self.mining_cancel.is_none() {
+                        if let Err(e) = self.spawn_mining_task() {
                             tracing::error!("Mining error: {}", e);
                         }
+                    }
+                }
+                Some(batch) = self.mined_batch_rx.recv() => {
+                    if let Err(e) = self.handle_mined_batch(batch).await {
+                        tracing::error!("Failed to process mined batch: {}", e);
                     }
                 }
                 _ = save_interval.tick() => {
@@ -490,7 +516,27 @@ impl Node {
                     if self.sync_session.as_ref().map_or(false, |s| s.peer == from) {
                         tracing::debug!("Already syncing from this peer, ignoring duplicate StateInfo");
                     } else {
-                        self.start_sync_session(from, height, depth);
+                        let gap = height.saturating_sub(self.state.height);
+                        if gap > 0 && gap <= CATCH_UP_THRESHOLD {
+                            // Small gap — just request the missing batches directly.
+                            // handle_batches_response will apply them as a linear
+                            // extension, or detect a fork and handle it.  This avoids
+                            // the O(chain_height) header download + verify cycle.
+                            tracing::info!(
+                                "Peer {} blocks ahead (h={} vs h={}), requesting batches directly",
+                                gap, height, self.state.height
+                            );
+                            self.cancel_mining();
+                            self.sync_in_progress = true;
+                            self.sync_requested_up_to = height;
+                            let count = gap.min(MAX_GETBATCHES_COUNT);
+                            self.network.send(from, Message::GetBatches {
+                                start_height: self.state.height,
+                                count,
+                            });
+                        } else {
+                            self.start_sync_session(from, height, depth);
+                        }
                     }
                 } else {
                     tracing::debug!(
@@ -596,6 +642,7 @@ impl Node {
     // ── Non-blocking sync state machine ─────────────────────────────────
 
     fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u64) {
+        self.cancel_mining();
         tracing::info!(
             "Starting headers-first sync: peer(h={}, d={}) vs us(h={}, d={})",
             peer_height, peer_depth, self.state.height, self.state.depth
@@ -967,19 +1014,33 @@ impl Node {
         new_state: State,
         new_history: Vec<(u64, [u8; 32], Batch)>,
     ) -> Result<()> {
-        tracing::warn!(
-            "PERFORMING REORG: height {} -> {}, depth {} -> {}",
-            self.state.height, new_state.height,
-            self.state.depth, new_state.depth
-        );
+        self.cancel_mining();
+
 
         let fork_height = new_history.first().map(|(h, _, _)| *h).unwrap_or(0);
 
+        let is_actual_reorg = fork_height < self.state.height;
+
+        if is_actual_reorg {
+            tracing::warn!(
+                "CHAIN REORG at fork height {}: replacing blocks {}..{} with new chain to {}",
+                fork_height, fork_height, self.state.height, new_state.height
+            );
+            self.finality.observe_adversarial();
+        } else {
+            tracing::info!(
+                "Chain extension via sync: height {} -> {}",
+                self.state.height, new_state.height
+            );
+        }
+
         // Load abandoned batches from disk BEFORE overwriting them
         let mut abandoned_txs = Vec::new();
-        for (h, _) in self.chain_history.iter().filter(|(h, _)| *h >= fork_height) {
-            if let Ok(Some(batch)) = self.storage.load_batch(*h) {
-                abandoned_txs.extend(batch.transactions);
+        if is_actual_reorg {
+            for (h, _) in self.chain_history.iter().filter(|(h, _)| *h >= fork_height) {
+                if let Ok(Some(batch)) = self.storage.load_batch(*h) {
+                    abandoned_txs.extend(batch.transactions);
+                }
             }
         }
 
@@ -1009,7 +1070,9 @@ impl Node {
         self.mempool.re_add(abandoned_txs, &self.state);
 
         self.mempool.prune_invalid(&self.state);
-        self.metrics.inc_reorgs();
+        if is_actual_reorg {
+            self.metrics.inc_reorgs();
+        }
         self.storage.save_state(&self.state)?;
 
         self.sync_in_progress = false;
@@ -1046,6 +1109,8 @@ impl Node {
                                best.midstate != self.state.midstate;
 
                 if best.height > self.state.height || is_reorg {
+                    self.cancel_mining();
+
                     if is_reorg {
                         tracing::warn!("REORG at height {}", self.state.height);
                         self.metrics.inc_reorgs();
@@ -1086,8 +1151,7 @@ impl Node {
                    err_str.contains("No matching commitment")
                 {
                     self.finality.observe_adversarial();
-                    tracing::info!("Received orphan/fork block (parent mismatch). Estimator updated.");
-
+                    tracing::debug!("Received orphan block (parent mismatch), queuing for later.");
                     const ORPHAN_LIMIT: usize = 64;
                     if self.orphan_batches.len() >= ORPHAN_LIMIT {
                         self.orphan_batches.clear();
@@ -1162,6 +1226,7 @@ impl Node {
 
     // ── Fix C (Fix 2): Added sync_in_progress clear at end ──────────────
     async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) -> Result<()> {
+        self.cancel_mining();
         let mut applied = 0;
         for batch in batches {
             let mut candidate = self.state.clone();
@@ -1235,6 +1300,7 @@ impl Node {
             let mut candidate = self.state.clone();
             match apply_batch(&mut candidate, &batch, &self.recent_headers) {
                 Ok(_) => {
+                    self.cancel_mining();
                     // recent_headers
                     self.recent_headers.push(self.state.timestamp);
                     if self.recent_headers.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
@@ -1250,7 +1316,7 @@ impl Node {
                     applied += 1;
                 }
                 Err(e) => {
-                    tracing::warn!("Orphan batch still invalid: {}", e);
+                    tracing::debug!("Orphan batch still invalid: {}", e);
                     break;
                 }
             }
@@ -1326,21 +1392,31 @@ impl Node {
         }
     }
 
-    async fn try_mine(&mut self) -> Result<()> {
-        if self.sync_in_progress {
+    /// Prepare a batch template and spawn a non-blocking background mining task.
+    /// Returns immediately — the result arrives via mined_batch_rx.
+    fn spawn_mining_task(&mut self) -> Result<()> {
+        if self.sync_in_progress || self.mining_cancel.is_some() {
             return Ok(());
         }
         tracing::info!("Mining batch with {} transactions...", self.mempool.len());
 
-        let transactions = self.mempool.drain(MAX_BATCH_SIZE);
+        // Clone only valid transactions. If any became stale since entering the
+        // mempool, skip them silently instead of aborting the entire mining attempt.
         let pre_mine_height = self.state.height;
         let pre_mine_midstate = self.state.midstate;
-
         let mut candidate_state = self.state.clone();
         let mut total_fees: u64 = 0;
-        for tx in &transactions {
-            total_fees += tx.fee();
-            apply_transaction(&mut candidate_state, tx)?;
+        let mut transactions = Vec::new();
+        for tx in self.mempool.transactions().iter().take(MAX_BATCH_SIZE) {
+            match apply_transaction(&mut candidate_state, tx) {
+                Ok(_) => {
+                    total_fees += tx.fee();
+                    transactions.push(tx.clone());
+                }
+                Err(e) => {
+                    tracing::debug!("Skipping stale mempool tx during mining: {}", e);
+                }
+            }
         }
 
         let coinbase = self.generate_coinbase(pre_mine_height, total_fees);
@@ -1353,28 +1429,46 @@ impl Node {
         let midstate = candidate_state.midstate;
         let target = self.state.target;
 
-        let extension = tokio::task::spawn_blocking(move || {
-            mine_extension(midstate, target)
-        })
-        .await?;
-
-        if self.state.height != pre_mine_height || self.state.midstate != pre_mine_midstate {
-            tracing::warn!("State advanced during mining. Restoring transactions.");
-            self.mempool.re_add(transactions, &self.state);
-            return Ok(());
-        }
-
         let current_time = state::current_timestamp();
         let block_timestamp = current_time.max(self.state.timestamp + 1);
 
-        let batch = Batch {
+        let mut template = Batch {
             prev_midstate: pre_mine_midstate,
             transactions,
-            extension,
-            coinbase: coinbase.clone(),
+            extension: Extension { nonce: 0, final_hash: [0; 32], checkpoints: vec![] },
+            coinbase,
             timestamp: block_timestamp,
             target: self.state.target,
         };
+
+        // Spawn background mining with cancellation token
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.mining_cancel = Some(cancel.clone());
+        let tx = self.mined_batch_tx.clone();
+
+        tokio::task::spawn_blocking(move || {
+            if let Some(extension) = mine_extension(midstate, target, cancel) {
+                template.extension = extension;
+                let _ = tx.send(template);
+            }
+            // If cancelled or channel closed, silently drop — the main loop already moved on
+        });
+
+        Ok(())
+    }
+
+    /// Process a successfully mined batch received from the background task.
+    async fn handle_mined_batch(&mut self, batch: Batch) -> Result<()> {
+        // If state advanced while we were mining, this batch is stale.
+        // Don't clear mining_cancel — a new task may already be running.
+        if self.state.midstate != batch.prev_midstate {
+            tracing::warn!("State advanced during mining. Discarding stale mined block.");
+            return Ok(());
+        }
+
+        self.mining_cancel = None; // This batch is current — task is done
+
+        let pre_mine_height = self.state.height;
 
         self.recent_headers.push(self.state.timestamp);
         if self.recent_headers.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
@@ -1387,24 +1481,41 @@ impl Node {
                 self.storage.save_state(&self.state)?;
                 self.state.target = adjust_difficulty(&self.state, &self.recent_headers);
                 self.metrics.inc_batches_mined();
-                self.network.broadcast(Message::Batch(batch));
+                self.network.broadcast(Message::Batch(batch.clone()));
+
+                let total_fees: u64 = batch.transactions.iter().map(|tx| tx.fee()).sum();
                 self.log_coinbase(pre_mine_height, total_fees);
 
-                let coinbase_value: u64 = coinbase.iter().map(|cb| cb.value).sum();
+                let coinbase_value: u64 = batch.coinbase.iter().map(|cb| cb.value).sum();
                 tracing::info!(
                     "Mined batch! height={} coinbase_value={} outputs={} target={}",
                     self.state.height,
                     coinbase_value,
-                    coinbase.len(),
+                    batch.coinbase.len(),
                     hex::encode(self.state.target)
                 );
+
+                self.mempool.prune_invalid(&self.state);
             }
             Err(e) => {
                 tracing::error!("Failed to apply our own mined batch: {}", e);
-                self.mempool.re_add(batch.transactions, &self.state);
             }
         }
 
+        Ok(())
+    }
+
+    /// Synchronous test wrapper — spawns mining then blocks until it finishes.
+    /// Preserves identical behavior for all existing tests.
+    #[cfg(test)]
+    pub async fn try_mine(&mut self) -> Result<()> {
+        self.spawn_mining_task()?;
+        if self.mining_cancel.is_none() {
+            return Ok(()); // Not spawned (e.g. sync_in_progress)
+        }
+        if let Some(batch) = self.mined_batch_rx.recv().await {
+            self.handle_mined_batch(batch).await?;
+        }
         Ok(())
     }
 }
