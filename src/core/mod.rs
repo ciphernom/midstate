@@ -1,3 +1,4 @@
+pub mod finality;
 pub mod types;
 pub mod wots;
 pub mod transaction;
@@ -6,5 +7,6 @@ pub mod state;
 pub mod mmr;  
 pub mod mss;   
 
+pub use finality::*;
 pub use types::*;
 pub use state::adjust_difficulty;

@@ -68,12 +68,13 @@ pub struct Node {
     mining_seed: [u8; 32],
     data_dir: PathBuf,
     chain_history: Vec<(u64, [u8; 32], Batch)>,
-    max_reorg_depth: u64,
+    finality: crate::core::finality::FinalityEstimator,
 }
 
 #[derive(Clone)]
 pub struct NodeHandle {
     state: Arc<RwLock<State>>,
+    safe_depth: Arc<RwLock<u64>>,
     mempool_size: Arc<RwLock<usize>>,
     mempool_txs: Arc<RwLock<Vec<Transaction>>>,
     peer_addrs: Arc<RwLock<Vec<String>>>,
@@ -97,6 +98,21 @@ pub struct ScannedCoin {
 impl NodeHandle {
     pub async fn get_state(&self) -> State {
         self.state.read().await.clone()
+    }
+
+    /// Returns the current dynamic safe depth calculated by the Bayesian finality estimator.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use midstate::node::NodeHandle;
+    /// # async fn example(handle: NodeHandle) {
+    /// let depth = handle.get_safe_depth().await;
+    /// println!("Transactions older than {} blocks are final.", depth);
+    /// # }
+    /// ```
+    pub async fn get_safe_depth(&self) -> u64 {
+        *self.safe_depth.read().await
     }
 
     pub async fn check_coin(&self, coin: [u8; 32]) -> bool {
@@ -309,7 +325,7 @@ impl Node {
             mining_seed,
             data_dir,
             chain_history: Vec::new(),
-            max_reorg_depth: 100,
+            finality: crate::core::finality::FinalityEstimator::new(10, 2),
             sync_session: None,
         })
     }
@@ -318,6 +334,7 @@ impl Node {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = NodeHandle {
             state: Arc::new(RwLock::new(self.state.clone())),
+            safe_depth: Arc::new(RwLock::new(self.finality.calculate_safe_depth(1e-6))),
             mempool_size: Arc::new(RwLock::new(self.mempool.len())),
             mempool_txs: Arc::new(RwLock::new(self.mempool.transactions().to_vec())),
             peer_addrs: Arc::new(RwLock::new(Vec::new())),
@@ -366,6 +383,7 @@ impl Node {
                 }
                 _ = ui_interval.tick() => {
                     *handle.state.write().await = self.state.clone();
+                    *handle.safe_depth.write().await = self.finality.calculate_safe_depth(1e-6);
                     *handle.mempool_size.write().await = self.mempool.len();
                     *handle.mempool_txs.write().await = self.mempool.transactions().to_vec();
                     *handle.peer_addrs.write().await = self.network.peer_addrs();
@@ -863,8 +881,8 @@ impl Node {
         // Simplified fork_state derivation
         let fork_state = if fork_height == 0 {
             State::genesis().0
-        } else if fork_height <= self.state.height.saturating_sub(self.max_reorg_depth) {
-            tracing::warn!("Fork at {} exceeds max reorg depth, rejecting", fork_height);
+        } else if fork_height <= self.state.height.saturating_sub(self.finality.calculate_safe_depth(1e-6)) {
+            tracing::warn!("Fork at {} exceeds statistical safe depth, rejecting", fork_height);
             return Ok(None);
         } else {
             self.rebuild_state_at_height(fork_height)?
@@ -1055,9 +1073,10 @@ impl Node {
                         self.state.midstate,
                         batch.clone(),
                     ));
-                    if self.chain_history.len() > self.max_reorg_depth as usize {
-                        self.chain_history.remove(0);
-                    }
+                    self.finality.observe_honest();
+                    let safe_depth = self.finality.calculate_safe_depth(1e-6);
+                    let cutoff_height = self.state.height.saturating_sub(safe_depth);
+                    self.chain_history.retain(|(h, _, _)| *h >= cutoff_height);
 
                     self.network.broadcast_except(from, Message::Batch(batch));
                     tracing::info!("Applied new batch from peer, height now {}", self.state.height);
@@ -1072,7 +1091,8 @@ impl Node {
                    err_str.contains("not found") ||
                    err_str.contains("No matching commitment")
                 {
-                    tracing::info!("Received orphan/fork block (parent mismatch).");
+                    self.finality.observe_adversarial();
+                    tracing::info!("Received orphan/fork block (parent mismatch). Estimator updated.");
 
                     const ORPHAN_LIMIT: usize = 64;
                     if self.orphan_batches.len() >= ORPHAN_LIMIT {
@@ -1166,9 +1186,10 @@ impl Node {
                 self.metrics.inc_batches_processed();
 
                 self.chain_history.push((self.state.height, self.state.midstate, batch.clone()));
-                if self.chain_history.len() > self.max_reorg_depth as usize {
-                    self.chain_history.remove(0);
-                }
+                self.finality.observe_honest();
+                let safe_depth = self.finality.calculate_safe_depth(1e-6);
+                let cutoff = self.state.height.saturating_sub(safe_depth);
+                self.chain_history.retain(|(h, _, _)| *h >= cutoff);
 
                 applied += 1;
             } else {
