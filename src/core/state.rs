@@ -4,60 +4,80 @@ use super::extension::verify_extension;
 use anyhow::{bail, Result};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Calculate new difficulty target based on recent block times
+/// Per-block difficulty adjustment using a Linearly Weighted Moving Average.
+///
+/// Recent blocks matter more than old ones: block i in the window gets weight i.
+/// If miners arrive en masse, difficulty ramps quickly. If they leave, the
+/// asymmetric clamp (can drop 50% per block but only rise 10%) lets the chain
+/// recover in minutes rather than days.
 pub fn adjust_difficulty(state: &State, previous_timestamps: &[u64]) -> [u8; 32] {
-    if state.height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0 || state.height == 0 {
+    if state.height == 0 {
         return state.target;
     }
 
-    if previous_timestamps.len() < DIFFICULTY_ADJUSTMENT_INTERVAL as usize {
-            return state.target;
-        }
+    let n = DIFFICULTY_LOOKBACK as usize;
 
-        let interval_start_time = previous_timestamps
-            [previous_timestamps.len() - DIFFICULTY_ADJUSTMENT_INTERVAL as usize];
-        
-    let interval_end_time = state.timestamp;
-    let actual_time = interval_end_time.saturating_sub(interval_start_time);
-    let expected_time = TARGET_BLOCK_TIME * DIFFICULTY_ADJUSTMENT_INTERVAL;
-
-    if actual_time == 0 {
+    // Need at least N timestamps in the window to compute N solve-time intervals.
+    // previous_timestamps holds timestamps of prior blocks; state.timestamp is
+    // the block we just applied.  Together they give us N+1 time-points → N intervals.
+    if previous_timestamps.len() < n {
         return state.target;
     }
 
-    // Clamp ratio to [1/4, 4] — same as Bitcoin
-    let clamped_actual = actual_time
-        .max(expected_time / MAX_ADJUSTMENT_FACTOR)
-        .min(expected_time * MAX_ADJUSTMENT_FACTOR);
+    // Build the N+1 time-point sequence: last N entries of previous_timestamps
+    // plus the current block's timestamp.
+    let base = previous_timestamps.len() - n;
+    let mut weighted_sum: u128 = 0;
 
-    // Integer math: new_target = old_target * clamped_actual / expected_time
-    // Work in u128 to avoid overflow
-    let old = target_to_u128(&state.target);
-    let new_target = (old as u128)
-        .saturating_mul(clamped_actual as u128)
-        / (expected_time as u128);
-    let new_target = new_target.min(u128::MAX);
+    for i in 0..n {
+        let t_prev = previous_timestamps[base + i];
+        let t_next = if i + 1 < n {
+            previous_timestamps[base + i + 1]
+        } else {
+            state.timestamp
+        };
 
-    let result = u128_to_target(new_target as u128);
+        // Clamp individual solve times to [1, 6*T] to limit timestamp gaming.
+        let raw = t_next.saturating_sub(t_prev).max(1).min(6 * TARGET_BLOCK_TIME);
+        let weight = (i as u128) + 1; // 1, 2, 3, ..., N
+        weighted_sum += (raw as u128) * weight;
+    }
 
-    tracing::info!(
-        "Difficulty adjustment at height {}: actual={}s expected={}s old={} new={}",
-        state.height, actual_time, expected_time,
-        hex::encode(state.target), hex::encode(result)
-    );
+    // Denominator: if every solve time equalled TARGET_BLOCK_TIME the ratio is 1.0
+    let total_weight: u128 = (n as u128) * (n as u128 + 1) / 2;
+    let denominator = (TARGET_BLOCK_TIME as u128) * total_weight;
 
-    result
-}
+    // new_target = old_target * weighted_sum / denominator
+    let old = primitive_types::U256::from_big_endian(&state.target);
+    let num = primitive_types::U256::from(weighted_sum);
+    let den = primitive_types::U256::from(denominator);
 
-fn target_to_u128(target: &[u8; 32]) -> u128 {
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&target[0..16]);
-    u128::from_be_bytes(bytes)
-}
+    if den.is_zero() {
+        return state.target;
+    }
 
-fn u128_to_target(value: u128) -> [u8; 32] {
-    let mut result = [0xffu8; 32];
-    result[0..16].copy_from_slice(&value.to_be_bytes());
+    let q = old / den;
+    let r = old % den;
+    let unclamped = q * num + (r * num) / den;
+
+    // Asymmetric per-block clamp: can rise 10% but drop 50%.
+    let max_target = old * primitive_types::U256::from(MAX_DIFFICULTY_RISE) / primitive_types::U256::from(100u64);
+    let min_target = old * primitive_types::U256::from(MAX_DIFFICULTY_DROP) / primitive_types::U256::from(100u64);
+
+    let clamped = unclamped.max(min_target).min(max_target);
+    let result: [u8; 32] = clamped.to_big_endian();
+
+    if result != state.target {
+        tracing::info!(
+            "Difficulty adjustment at height {}: weighted_avg={:.1}s target={}s old={} new={}",
+            state.height,
+            weighted_sum as f64 / total_weight as f64,
+            TARGET_BLOCK_TIME,
+            hex::encode(state.target),
+            hex::encode(result)
+        );
+    }
+
     result
 }
 
@@ -430,14 +450,6 @@ mod tests {
     // ── adjust_difficulty ───────────────────────────────────────────────
 
     #[test]
-    fn adjust_difficulty_no_change_before_interval() {
-        let mut state = genesis_state();
-        state.height = 1; // not at adjustment interval
-        let result = adjust_difficulty(&state, &[]);
-        assert_eq!(result, state.target);
-    }
-
-    #[test]
     fn adjust_difficulty_no_change_at_height_zero() {
         let state = genesis_state();
         let result = adjust_difficulty(&state, &[]);
@@ -447,12 +459,63 @@ mod tests {
     #[test]
     fn adjust_difficulty_not_enough_history() {
         let mut state = genesis_state();
-        state.height = DIFFICULTY_ADJUSTMENT_INTERVAL;
-        
-        let few_timestamps = vec![genesis_state().timestamp]; 
-        
+        state.height = 5;
+        state.timestamp = state.timestamp + 300;
+
+        let few_timestamps = vec![state.timestamp - 60];
+
         let result = adjust_difficulty(&state, &few_timestamps);
         assert_eq!(result, state.target);
+    }
+
+    #[test]
+    fn adjust_difficulty_stable_when_on_target() {
+        let mut state = genesis_state();
+        state.height = DIFFICULTY_LOOKBACK + 1;
+
+        // Build timestamps exactly on target (60s apart)
+        let base = 1_000_000u64;
+        let timestamps: Vec<u64> = (0..DIFFICULTY_LOOKBACK)
+            .map(|i| base + i * TARGET_BLOCK_TIME)
+            .collect();
+        state.timestamp = base + DIFFICULTY_LOOKBACK * TARGET_BLOCK_TIME;
+
+        let result = adjust_difficulty(&state, &timestamps);
+        assert_eq!(result, state.target, "Target should not change when blocks are exactly on schedule");
+    }
+
+    #[test]
+    fn adjust_difficulty_drops_when_blocks_slow() {
+        let mut state = genesis_state();
+        state.height = DIFFICULTY_LOOKBACK + 1;
+
+        // Blocks taking 3x longer than target
+        let base = 1_000_000u64;
+        let timestamps: Vec<u64> = (0..DIFFICULTY_LOOKBACK)
+            .map(|i| base + i * TARGET_BLOCK_TIME * 3)
+            .collect();
+        state.timestamp = base + DIFFICULTY_LOOKBACK * TARGET_BLOCK_TIME * 3;
+
+        let result = adjust_difficulty(&state, &timestamps);
+        // Target should increase (easier difficulty) — higher target = easier
+        assert!(result > state.target, "Target should increase (get easier) when blocks are slow");
+    }
+
+    #[test]
+    fn adjust_difficulty_rises_when_blocks_fast() {
+        let mut state = genesis_state();
+        state.height = DIFFICULTY_LOOKBACK + 1;
+
+        // Blocks taking 1/3 the target time
+        let base = 1_000_000u64;
+        let timestamps: Vec<u64> = (0..DIFFICULTY_LOOKBACK)
+            .map(|i| base + i * TARGET_BLOCK_TIME / 3)
+            .collect();
+        state.timestamp = base + DIFFICULTY_LOOKBACK * TARGET_BLOCK_TIME / 3;
+
+        let result = adjust_difficulty(&state, &timestamps);
+        // Target should decrease (harder difficulty) — lower target = harder
+        assert!(result < state.target, "Target should decrease (get harder) when blocks are fast");
     }
 
     // ── validate_timestamp ──────────────────────────────────────────────

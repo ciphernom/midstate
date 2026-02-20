@@ -140,14 +140,14 @@ impl Mempool {
     }
 
     pub fn prune_invalid(&mut self, state: &State) {
-        let mut inputs_to_remove = Vec::new();
-        let mut commitments_to_remove = Vec::new();
+        let mut inputs_to_remove: HashSet<[u8; 32]> = HashSet::new();
+        let mut commitments_to_remove: HashSet<[u8; 32]> = HashSet::new();
 
         for tx in &self.transactions {
             if validate_transaction(state, tx).is_err() {
                 match tx {
                     Transaction::Commit { commitment, .. } =>{
-                        commitments_to_remove.push(*commitment);
+                        commitments_to_remove.insert(*commitment);
                     }
                     Transaction::Reveal { .. } => {
                         inputs_to_remove.extend(tx.input_coin_ids());
