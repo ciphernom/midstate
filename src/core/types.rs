@@ -352,10 +352,14 @@ pub const MAX_BATCH_SIZE: usize = 100;
 
 // ── Difficulty adjustment ───────────────────────────────────────────────────
 
-pub const TARGET_BLOCK_TIME: u64 = 600;
-pub const DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 2016;
+pub const TARGET_BLOCK_TIME: u64 = 60;
+/// Number of recent blocks used for difficulty adjustment (LWMA window).
+pub const DIFFICULTY_LOOKBACK: u64 = 60;
 pub const MEDIAN_TIME_PAST_WINDOW: usize = 11;
-pub const MAX_ADJUSTMENT_FACTOR: u64 = 4;
+/// Per-block clamp: difficulty can rise at most 10% or drop at most 50%.
+/// Asymmetric so the chain recovers fast from hash-and-flee attacks.
+pub const MAX_DIFFICULTY_RISE: u64 = 110;   // 110/100 = 1.10x
+pub const MAX_DIFFICULTY_DROP: u64 = 50;    // 50/100  = 0.50x
 pub const COMMITMENT_TTL: u64 = 100; 
 // ── Economics ───────────────────────────────────────────────────────────────
 
