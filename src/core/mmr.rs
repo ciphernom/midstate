@@ -237,11 +237,11 @@ fn get_empty_hash(height: usize) -> [u8; 32] {
 }
 
 /// Sparse Merkle Tree backed UTXO accumulator.
-/// Sorted vec kept in parallel for iteration/contains.
+/// BTreeSet for O(log n) insert/remove/contains (was sorted Vec with O(n) shift).
 /// SMT nodes stored as (height, path_key) -> hash.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UtxoAccumulator {
-    coins: Vec<[u8; 32]>,
+    coins: std::collections::BTreeSet<[u8; 32]>,
     #[serde(skip)]
     nodes: std::collections::HashMap<(u16, [u8; 32]), [u8; 32]>,
 }
@@ -256,14 +256,15 @@ impl Eq for UtxoAccumulator {}
 
 impl UtxoAccumulator {
     pub fn new() -> Self {
-        Self { coins: Vec::new(), nodes: std::collections::HashMap::new() }
+        Self { coins: std::collections::BTreeSet::new(), nodes: std::collections::HashMap::new() }
     }
 
     /// Rebuild the SMT node cache from the coin list (after deserialization).
     pub fn rebuild_tree(&mut self) {
         self.nodes.clear();
-        for i in 0..self.coins.len() {
-            let coin = self.coins[i];
+        // Collect first → immutable borrow ends before we start mutating
+        let coins: Vec<[u8; 32]> = self.coins.iter().copied().collect();
+        for coin in coins {
             self.update_path(coin, true);
         }
     }
@@ -278,25 +279,19 @@ impl UtxoAccumulator {
     pub fn is_empty(&self) -> bool { self.coins.is_empty() }
 
     pub fn contains(&self, coin: &[u8; 32]) -> bool {
-        self.coins.binary_search(coin).is_ok()
+        self.coins.contains(coin)
     }
 
     pub fn insert(&mut self, coin: [u8; 32]) -> bool {
-        if self.contains(&coin) { return false; }
-        let idx = self.coins.binary_search(&coin).unwrap_err();
-        self.coins.insert(idx, coin);
+        if !self.coins.insert(coin) { return false; }
         self.update_path(coin, true);
         true
     }
 
     pub fn remove(&mut self, coin: &[u8; 32]) -> bool {
-        if let Ok(idx) = self.coins.binary_search(coin) {
-            self.coins.remove(idx);
-            self.update_path(*coin, false);
-            true
-        } else {
-            false
-        }
+        if !self.coins.remove(coin) { return false; }
+        self.update_path(*coin, false);
+        true
     }
 
     pub fn root(&mut self) -> [u8; 32] {
@@ -334,7 +329,7 @@ impl UtxoAccumulator {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &[u8; 32]> { self.coins.iter() }
-    pub fn into_vec(self) -> Vec<[u8; 32]> { self.coins }
+    pub fn into_vec(self) -> Vec<[u8; 32]> { self.coins.into_iter().collect() }
 
     fn get_node(&self, height: u16, path: [u8; 32]) -> [u8; 32] {
         self.nodes.get(&(height, path))
