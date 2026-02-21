@@ -15,7 +15,7 @@ impl BatchStore {
         Ok(Self { base_path })
     }
     
-    /// Save a batch
+    /// Save a batch (and its lightweight header for fast sync)
     pub fn save(&self, height: u64, batch: &Batch) -> Result<()> {
         let folder = height / 1000; // 1000 batches per folder
         let folder_path = self.base_path.join(format!("{:06}", folder));
@@ -23,8 +23,16 @@ impl BatchStore {
         
         let file_path = folder_path.join(format!("batch_{}.bin", height));
         let bytes = bincode::serialize(batch)?;
-        fs::write(file_path, bytes)?;
-        
+        fs::write(&file_path, bytes)?;
+
+        // Write header separately — avoids deserializing full batch (with
+        // transactions + WOTS sigs) when peers request header chains.
+        let mut header = batch.header();
+        header.height = height;
+        let hdr_path = folder_path.join(format!("header_{}.bin", height));
+        let hdr_bytes = bincode::serialize(&header)?;
+        fs::write(hdr_path, hdr_bytes)?;
+
         Ok(())
     }
     
@@ -44,13 +52,33 @@ impl BatchStore {
         Ok(Some(batch))
     }
 
-    /// Load headers for a range (efficient - lightweight)
+    /// Load a pre-computed header (falls back to full batch if header file missing)
+    fn load_header(&self, height: u64) -> Result<Option<BatchHeader>> {
+        let folder = height / 1000;
+        let folder_path = self.base_path.join(format!("{:06}", folder));
+        let hdr_path = folder_path.join(format!("header_{}.bin", height));
+
+        if hdr_path.exists() {
+            let bytes = fs::read(hdr_path)?;
+            let header: BatchHeader = bincode::deserialize(&bytes)?;
+            return Ok(Some(header));
+        }
+
+        // Fallback: load full batch (for batches saved before this change)
+        if let Some(batch) = self.load(height)? {
+            let mut header = batch.header();
+            header.height = height;
+            Ok(Some(header))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Load headers for a range — uses lightweight header files when available
     pub fn load_headers(&self, start: u64, end: u64) -> Result<Vec<BatchHeader>> {
-        let mut headers = Vec::new();
+        let mut headers = Vec::with_capacity((end - start) as usize);
         for h in start..end {
-            if let Some(batch) = self.load(h)? {
-                let mut header = batch.header();
-                header.height = h;
+            if let Some(header) = self.load_header(h)? {
                 headers.push(header);
             }
         }
