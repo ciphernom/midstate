@@ -353,14 +353,19 @@ pub const MAX_BATCH_SIZE: usize = 100;
 // ── Difficulty adjustment ───────────────────────────────────────────────────
 
 pub const TARGET_BLOCK_TIME: u64 = 60;
-/// Number of recent blocks used for difficulty adjustment (LWMA window).
+/// ASERT half-life in seconds. Difficulty halves (or doubles) for every
+/// half-life of drift between actual and ideal elapsed time since genesis.
+pub const ASERT_HALF_LIFE: i64 = 4 * 60 * 60; // 4 hours (240 blocks)
+/// Maximum number of recent timestamps kept for median-time-past validation
+/// and timestamp window management in the node layer.
 pub const DIFFICULTY_LOOKBACK: u64 = 60;
 pub const MEDIAN_TIME_PAST_WINDOW: usize = 11;
-/// Per-block clamp: difficulty can rise at most 10% or drop at most 50%.
-/// Asymmetric so the chain recovers fast from hash-and-flee attacks.
-pub const MAX_DIFFICULTY_RISE: u64 = 110;   // 110/100 = 1.10x
-pub const MAX_DIFFICULTY_DROP: u64 = 50;    // 50/100  = 0.50x
 pub const COMMITMENT_TTL: u64 = 100; 
+
+/// Blocks behind tip before checkpoints are pruned from stored batches.
+/// Pruning reclaims ~32 KB per block (~98% of batch storage). Pruned batches
+/// remain fully verifiable via full-chain recomputation in verify_extension.
+pub const PRUNE_DEPTH: u64 = 1000;
 // ── Economics ───────────────────────────────────────────────────────────────
 
 /// Blocks per year at TARGET_BLOCK_TIME seconds per block.
@@ -371,6 +376,13 @@ pub const INITIAL_REWARD: u64 = 16;
 
 pub const MAX_TX_INPUTS: usize = 256;
 pub const MAX_TX_OUTPUTS: usize = 256;
+/// Maximum size of a single signature in bytes.
+/// WOTS = 576, MSS(height=20) = 1280. Pad for safety.
+pub const MAX_SIGNATURE_SIZE: usize = 1_536;
+/// Cap on total signature verifications per batch to prevent CPU exhaustion.
+/// 100 txs × 256 inputs = 25,600 WOTS verifications ≈ 15B hashes — too much.
+/// 1,024 total inputs keeps verification under ~600M hashes (~0.5s).
+pub const MAX_BATCH_INPUTS: usize = 1_024;
 
 /// Block reward value at a given height. Halves every BLOCKS_PER_YEAR, minimum 1.
 pub fn block_reward(height: u64) -> u64 {
