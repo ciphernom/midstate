@@ -18,6 +18,7 @@ use libp2p::{
     tcp, yamux,
     identity::Keypair,
     Multiaddr, PeerId, Swarm,
+    core::ConnectedPoint
 };
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -64,7 +65,7 @@ pub enum NetworkEvent {
 
 pub struct MidstateNetwork {
     swarm: Swarm<MidstateBehaviour>,
-    connected: HashSet<PeerId>,
+    connected: HashMap<PeerId, ConnectedPoint>,
     pending_requests: HashMap<OutboundRequestId, PeerId>,
     nat_status: NatStatus,
     relay_reservations: HashSet<PeerId>,
@@ -80,6 +81,9 @@ impl MidstateNetwork {
     ) -> Result<Self> {
         let peer_id = keypair.public().to_peer_id();
         tracing::info!("Local peer id: {}", peer_id);
+
+        // Removed outdated libp2p::swarm::ConnectionLimits block.
+        // We handle inbound limits manually in the event loop now.
 
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
             .with_tokio()
@@ -142,12 +146,13 @@ impl MidstateNetwork {
             })?
             .with_swarm_config(|c| {
                 c.with_idle_connection_timeout(Duration::from_secs(120))
+                // Removed .with_connection_limits(limits)
             })
             .build();
 
         let mut net = Self {
             swarm,
-            connected: HashSet::new(),
+            connected: HashMap::new(), // Fixed: using HashMap instead of HashSet
             pending_requests: HashMap::new(),
             nat_status: NatStatus::Unknown,
             relay_reservations: HashSet::new(),
@@ -204,7 +209,7 @@ impl MidstateNetwork {
     }
 
     pub fn broadcast(&mut self, msg: Message) {
-        let peers: Vec<PeerId> = self.connected.iter().copied().collect();
+        let peers: Vec<PeerId> = self.connected.keys().copied().collect();
         for peer in peers {
             self.send(peer, msg.clone());
         }
@@ -212,8 +217,8 @@ impl MidstateNetwork {
 
     pub fn broadcast_except(&mut self, exclude: Option<PeerId>, msg: Message) {
         let peers: Vec<PeerId> = self.connected
-            .iter()
-            .filter(|p| Some(**p) != exclude)
+            .keys()
+            .filter(|&&p| Some(p) != exclude)
             .copied()
             .collect();
         for peer in peers {
@@ -232,11 +237,11 @@ impl MidstateNetwork {
     }
 
     pub fn connected_peers(&self) -> Vec<PeerId> {
-        self.connected.iter().copied().collect()
+        self.connected.keys().copied().collect()
     }
 
     pub fn peer_addrs(&self) -> Vec<String> {
-        self.connected.iter().map(|p| p.to_string()).collect()
+        self.connected.keys().map(|p| p.to_string()).collect()
     }
 
     pub fn add_kad_address(&mut self, peer: PeerId, addr: Multiaddr) {
@@ -246,7 +251,7 @@ impl MidstateNetwork {
     pub fn random_peer(&self) -> Option<PeerId> {
         use rand::seq::IteratorRandom;
         self.connected
-            .iter()
+            .keys()
             .copied()
             .choose(&mut rand::thread_rng())
     }
@@ -285,7 +290,7 @@ impl MidstateNetwork {
         for bucket in self.swarm.behaviour_mut().kademlia.kbuckets() {
             for entry in bucket.iter() {
                 let peer = entry.node.key.preimage();
-                if !self.connected.contains(peer) {
+                if !self.connected.contains_key(peer) {
                     continue;
                 }
                 for addr in entry.node.value.iter() {
@@ -318,7 +323,7 @@ impl MidstateNetwork {
             Ok(addr) => {
                 // Feed into Kademlia if it has a peer ID
                 if let Some(peer) = extract_peer_id(&addr) {
-                    if self.connected.contains(&peer) || peer == *self.swarm.local_peer_id() {
+                    if self.connected.contains_key(&peer) || peer == *self.swarm.local_peer_id() {
                         return; // already connected or it's us
                     }
                     self.swarm.behaviour_mut().kademlia.add_address(&peer, addr.clone());
@@ -470,7 +475,17 @@ impl MidstateNetwork {
 
                 // ── Connection lifecycle ─────────────────────────────
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                    self.connected.insert(peer_id);
+                    // Eclipse Protection: Enforce inbound limit manually
+                    if endpoint.is_listener() {
+                        let inbound_count = self.connected.values().filter(|e| e.is_listener()).count();
+                        if inbound_count >= 40 {
+                            tracing::warn!("Max inbound peers (40) reached, dropping {}", peer_id);
+                            let _ = self.swarm.disconnect_peer_id(peer_id);
+                            continue; // Skip further processing, let them disconnect
+                        }
+                    }
+
+                    self.connected.insert(peer_id, endpoint.clone());
                     tracing::info!(
                         "Peer connected: {} via {:?} (total: {})",
                         peer_id,
@@ -507,6 +522,10 @@ impl MidstateNetwork {
                 _ => {}
             }
         }
+    }
+    
+    pub fn outbound_peer_count(&self) -> usize {
+        self.connected.values().filter(|e| e.is_dialer()).count()
     }
 }
 

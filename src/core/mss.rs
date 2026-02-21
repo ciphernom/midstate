@@ -233,6 +233,9 @@ impl MssSignature {
 
         let ao = 40 + wots::SIG_SIZE;
         let auth_len = u32::from_le_bytes(data[ao..ao + 4].try_into().unwrap()) as usize;
+        if auth_len > MAX_HEIGHT as usize {
+            bail!("MSS auth path too long: {} > {}", auth_len, MAX_HEIGHT);
+        }
         let ps = ao + 4;
         if data.len() < ps + auth_len * 33 { bail!("MSS signature truncated"); }
 

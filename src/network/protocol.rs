@@ -40,15 +40,55 @@ pub enum Message {
         start_height: u64,
         headers: Vec<BatchHeader>,
     },
+
+    // ── Dark Pool CoinJoin ──────────────────────────────────────────
+
+    /// Announce intent to mix a specific denomination.
+    MixAnnounce {
+        mix_id: [u8; 32],
+        denomination: u64,
+    },
+    /// Join an announced mix session with input and desired output.
+    MixJoin {
+        mix_id: [u8; 32],
+        input: crate::core::InputReveal,
+        output: crate::core::OutputData,
+    },
+    MixFee {
+        mix_id: [u8; 32],
+        input: crate::core::InputReveal,
+    },
+    /// Broadcast the canonical proposal so all participants can sign.
+    MixProposal {
+        mix_id: [u8; 32],
+        inputs: Vec<crate::core::InputReveal>,
+        outputs: Vec<crate::core::OutputData>,
+        salt: [u8; 32],
+        commitment: [u8; 32],
+    },
+    /// A participant's signature for their input in the mix.
+    MixSign {
+        mix_id: [u8; 32],
+        /// Index into the proposal's canonical input list.
+        input_index: usize,
+        signature: Vec<u8>,
+    },
 }
 
 impl Message {
     pub fn serialize_bin(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("Serialization failed")
+        use bincode::Options;
+        bincode::DefaultOptions::new()
+            .with_limit(MAX_MSG_SIZE as u64)
+            .serialize(self)
+            .expect("Serialization failed")
     }
 
     pub fn deserialize_bin(bytes: &[u8]) -> anyhow::Result<Self> {
-        Ok(bincode::deserialize(bytes)?)
+        use bincode::Options;
+        Ok(bincode::DefaultOptions::new()
+            .with_limit(MAX_MSG_SIZE as u64)
+            .deserialize(bytes)?)
     }
 }
 
@@ -198,6 +238,7 @@ mod tests {
 
     #[test]
     fn message_all_variants_round_trip() {
+        use crate::core::types::{InputReveal, OutputData};
         let messages = vec![
             Message::GetState,
             Message::GetAddr,
@@ -211,6 +252,24 @@ mod tests {
             Message::Batches { start_height: 0, batches: vec![] },
             Message::GetHeaders { start_height: 0, count: 50 },
             Message::Headers { start_height: 0, headers: vec![] },
+            Message::MixAnnounce { mix_id: [0; 32], denomination: 8 },
+            Message::MixJoin {
+                mix_id: [0; 32],
+                input: InputReveal { owner_pk: [1; 32], value: 8, salt: [2; 32] },
+                output: OutputData { address: [3; 32], value: 8, salt: [4; 32] },
+            },
+            Message::MixProposal {
+                mix_id: [0; 32],
+                inputs: vec![],
+                outputs: vec![],
+                salt: [0; 32],
+                commitment: [0; 32],
+            },
+            Message::MixSign {
+                mix_id: [0; 32],
+                input_index: 0,
+                signature: vec![],
+            },
         ];
 
         for msg in messages {
@@ -243,6 +302,89 @@ mod tests {
         let bytes = msg.serialize_bin();
         match Message::deserialize_bin(&bytes).unwrap() {
             Message::Addr(addrs) => assert!(addrs.is_empty()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── CoinJoin dark pool messages ─────────────────────────────────
+
+    #[test]
+    fn mix_announce_round_trip() {
+        let msg = Message::MixAnnounce {
+            mix_id: [0xAA; 32],
+            denomination: 16,
+        };
+        let bytes = msg.serialize_bin();
+        match Message::deserialize_bin(&bytes).unwrap() {
+            Message::MixAnnounce { mix_id, denomination } => {
+                assert_eq!(mix_id, [0xAA; 32]);
+                assert_eq!(denomination, 16);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn mix_join_round_trip() {
+        use crate::core::types::{InputReveal, OutputData};
+        let msg = Message::MixJoin {
+            mix_id: [0xBB; 32],
+            input: InputReveal { owner_pk: [1; 32], value: 8, salt: [2; 32] },
+            output: OutputData { address: [3; 32], value: 8, salt: [4; 32] },
+        };
+        let bytes = msg.serialize_bin();
+        match Message::deserialize_bin(&bytes).unwrap() {
+            Message::MixJoin { mix_id, input, output } => {
+                assert_eq!(mix_id, [0xBB; 32]);
+                assert_eq!(input.value, 8);
+                assert_eq!(output.value, 8);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn mix_proposal_round_trip() {
+        use crate::core::types::{InputReveal, OutputData};
+        let msg = Message::MixProposal {
+            mix_id: [0xCC; 32],
+            inputs: vec![
+                InputReveal { owner_pk: [1; 32], value: 8, salt: [2; 32] },
+                InputReveal { owner_pk: [3; 32], value: 1, salt: [4; 32] },
+            ],
+            outputs: vec![
+                OutputData { address: [5; 32], value: 8, salt: [6; 32] },
+            ],
+            salt: [0xDD; 32],
+            commitment: [0xEE; 32],
+        };
+        let bytes = msg.serialize_bin();
+        match Message::deserialize_bin(&bytes).unwrap() {
+            Message::MixProposal { mix_id, inputs, outputs, salt, commitment } => {
+                assert_eq!(mix_id, [0xCC; 32]);
+                assert_eq!(inputs.len(), 2);
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(salt, [0xDD; 32]);
+                assert_eq!(commitment, [0xEE; 32]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn mix_sign_round_trip() {
+        let msg = Message::MixSign {
+            mix_id: [0xFF; 32],
+            input_index: 2,
+            signature: vec![0xAB; 576],
+        };
+        let bytes = msg.serialize_bin();
+        match Message::deserialize_bin(&bytes).unwrap() {
+            Message::MixSign { mix_id, input_index, signature } => {
+                assert_eq!(mix_id, [0xFF; 32]);
+                assert_eq!(input_index, 2);
+                assert_eq!(signature.len(), 576);
+            }
             _ => panic!("wrong variant"),
         }
     }
