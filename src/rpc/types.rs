@@ -131,3 +131,71 @@ pub struct GetPeersResponse {
 pub struct ErrorResponse {
     pub error: String,
 }
+
+// ── CoinJoin Mix Types ──────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MixCreateRequest {
+    pub denomination: u64,
+    #[serde(default = "default_min_participants")]
+    pub min_participants: usize,
+}
+fn default_min_participants() -> usize { 2 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MixCreateResponse {
+    pub mix_id: String,
+    pub denomination: u64,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MixRegisterRequest {
+    pub mix_id: String,
+    /// Hex coin_id of the input being mixed
+    pub coin_id: String,
+    /// Input reveal data
+    pub input: InputRevealJson,
+    /// Output data for the mixed coin
+    pub output: OutputDataJson,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MixFeeRequest {
+    pub mix_id: String,
+    /// Input reveal for the denomination-1 fee coin
+    pub input: InputRevealJson,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MixSignRequest {
+    pub mix_id: String,
+    /// Hex coin_id the wallet is signing for (used to find input_index)
+    pub coin_id: String,
+    /// Hex-encoded signature
+    pub signature: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MixStatusResponse {
+    pub mix_id: String,
+    pub denomination: u64,
+    pub participants: usize,
+    pub phase: String,
+    /// Set when phase == "signing"
+    pub commitment: Option<String>,
+    /// Input coin IDs in canonical proposal order (for the wallet to find its index)
+    pub input_coin_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MixListResponse {
+    pub sessions: Vec<MixStatusResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MixActionResponse {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_index: Option<usize>,
+}
