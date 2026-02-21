@@ -84,7 +84,7 @@ impl Syncer {
             recent_headers.push(state.timestamp);
             if recent_headers.len() > window_size { recent_headers.remove(0); }
             apply_batch(&mut state, &batch, &recent_headers)?;
-            state.target = adjust_difficulty(&state, &recent_headers);
+            state.target = adjust_difficulty(&state);
         }
         Ok(state)
     }

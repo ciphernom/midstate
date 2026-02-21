@@ -6,13 +6,14 @@ use crate::core::extension::{mine_extension, create_extension};
 use crate::core::transaction::{apply_transaction, validate_transaction};
 use crate::mempool::Mempool;
 use crate::metrics::Metrics;
+use crate::mix::{MixManager, MixPhase, MixStatusSnapshot};
 use crate::network::{Message, MidstateNetwork, NetworkEvent, MAX_GETBATCHES_COUNT};
 use crate::storage::Storage;
 use crate::wallet::{coinbase_seed, coinbase_salt};
 use crate::core::mss;
 use crate::core::wots;
 use crate::sync::Syncer;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use libp2p::{request_response::ResponseChannel, PeerId, Multiaddr, identity::Keypair};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -72,10 +73,16 @@ pub struct Node {
     chain_history: Vec<(u64, [u8; 32])>,
     finality: crate::core::finality::FinalityEstimator,
     known_pex_addrs: HashSet<String>,
+    connected_peers: HashSet<PeerId>,
     // Background mining concurrency
     mining_cancel: Option<Arc<AtomicBool>>,
     mined_batch_rx: tokio::sync::mpsc::UnboundedReceiver<Batch>,
     mined_batch_tx: tokio::sync::mpsc::UnboundedSender<Batch>,
+    // CoinJoin mix coordinator
+    mix_manager: Arc<RwLock<MixManager>>,
+    /// Reveals waiting for their Commit to be mined.
+    /// Key: commitment hash, Value: (mix_id, Reveal transaction)
+    pending_mix_reveals: HashMap<[u8; 32], ([u8; 32], Transaction)>,
 }
 
 #[derive(Clone)]
@@ -87,10 +94,18 @@ pub struct NodeHandle {
     peer_addrs: Arc<RwLock<Vec<String>>>,
     tx_sender: tokio::sync::mpsc::UnboundedSender<NodeCommand>,
     batches_path: PathBuf,
+    pub mix_manager: Arc<RwLock<MixManager>>,
 }
 
 pub enum NodeCommand {
     SendTransaction(Transaction),
+    SubmitMixTransaction { mix_id: [u8; 32], tx: Transaction },
+    // --- NEW: P2P Mix Coordination Commands ---
+    BroadcastMixAnnounce { mix_id: [u8; 32], denomination: u64 },
+    SendMixJoin { coordinator: PeerId, mix_id: [u8; 32], input: InputReveal, output: OutputData },
+    SendMixFee { coordinator: PeerId, mix_id: [u8; 32], input: InputReveal },
+    SendMixSign { coordinator: PeerId, mix_id: [u8; 32], input_index: usize, signature: Vec<u8> },
+    BroadcastMixProposal { mix_id: [u8; 32], proposal: crate::wallet::coinjoin::MixProposal, peers: Vec<PeerId> },
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -189,6 +204,90 @@ impl NodeHandle {
         }
         Ok(max_idx)
     }
+
+    // ── CoinJoin mix helpers ────────────────────────────────────────────
+
+    pub async fn mix_create(&self, denomination: u64, min_participants: usize) -> Result<[u8; 32]> {
+        let mut mgr = self.mix_manager.write().await;
+        let mix_id = mgr.create_session(denomination, min_participants)?;
+        drop(mgr); // Drop lock before sending over channel
+        
+        // Broadcast the announcement to the network
+        self.tx_sender.send(NodeCommand::BroadcastMixAnnounce { mix_id, denomination })?;
+        Ok(mix_id)
+    }
+
+    pub async fn mix_register(
+        &self, mix_id: [u8; 32], input: InputReveal, output: OutputData,
+    ) -> Result<()> {
+        let mut mgr = self.mix_manager.write().await;
+        let (is_coord, coord_peer) = mgr.get_session_info(&mix_id)
+            .ok_or_else(|| anyhow::anyhow!("mix session not found"))?;
+
+        mgr.register(&mix_id, input.clone(), output.clone(), None)?;
+
+        if !is_coord {
+            if let Some(peer) = coord_peer {
+                self.tx_sender.send(NodeCommand::SendMixJoin { coordinator: peer, mix_id, input, output })?;
+            }
+        } else if let Some(proposal) = mgr.try_finalize(&mix_id)? {
+            // We are the coordinator and the mix is full. Broadcast proposal!
+            let peers = mgr.remote_participants(&mix_id);
+            self.tx_sender.send(NodeCommand::BroadcastMixProposal { mix_id, proposal, peers })?;
+        }
+        Ok(())
+    }
+
+    pub async fn mix_set_fee(&self, mix_id: [u8; 32], input: InputReveal) -> Result<()> {
+        let mut mgr = self.mix_manager.write().await;
+        let (is_coord, coord_peer) = mgr.get_session_info(&mix_id)
+            .ok_or_else(|| anyhow::anyhow!("mix session not found"))?;
+
+        mgr.set_fee_input(&mix_id, input.clone(), None)?;
+
+        if !is_coord {
+            if let Some(peer) = coord_peer {
+                self.tx_sender.send(NodeCommand::SendMixFee { coordinator: peer, mix_id, input })?;
+            }
+        } else if let Some(proposal) = mgr.try_finalize(&mix_id)? {
+            let peers = mgr.remote_participants(&mix_id);
+            self.tx_sender.send(NodeCommand::BroadcastMixProposal { mix_id, proposal, peers })?;
+        }
+        Ok(())
+    }
+
+    pub async fn mix_sign(&self, mix_id: [u8; 32], input_index: usize, signature: Vec<u8>) -> Result<()> {
+        let mut mgr = self.mix_manager.write().await;
+        let (is_coord, coord_peer) = mgr.get_session_info(&mix_id)
+            .ok_or_else(|| anyhow::anyhow!("mix session not found"))?;
+
+        mgr.add_signature(&mix_id, input_index, signature.clone())?;
+
+        if !is_coord {
+            if let Some(peer) = coord_peer {
+                self.tx_sender.send(NodeCommand::SendMixSign { coordinator: peer, mix_id, input_index, signature })?;
+            }
+        } else if let Some(tx) = mgr.try_build_transaction(&mix_id)? {
+            mgr.set_phase(&mix_id, MixPhase::CommitSubmitted);
+            self.tx_sender.send(NodeCommand::SubmitMixTransaction { mix_id, tx })?;
+        }
+        Ok(())
+    }
+
+    pub async fn mix_status(&self, mix_id: [u8; 32]) -> Option<MixStatusSnapshot> {
+        let mgr = self.mix_manager.read().await;
+        mgr.status(&mix_id)
+    }
+
+    pub async fn mix_list(&self) -> Vec<MixStatusSnapshot> {
+        let mgr = self.mix_manager.read().await;
+        mgr.list_sessions()
+    }
+
+    pub async fn mix_find_input_index(&self, mix_id: [u8; 32], coin_id: [u8; 32]) -> Option<usize> {
+        let mgr = self.mix_manager.read().await;
+        mgr.find_input_index(&mix_id, &coin_id)
+    }
     
 }
 
@@ -259,12 +358,14 @@ impl Node {
                     };
                     storage.save_batch(0, &genesis_batch)?;
                     apply_batch(&mut state, &genesis_batch, &[])?;
+                    state.target = adjust_difficulty(&state);
                     storage.save_state(&state)?;
                     tracing::info!("Genesis batch applied, height now {}", state.height);
                 }
                 Some(batch) => {
                     if state.height == 0 {
                         apply_batch(&mut state, &batch, &[])?;
+                        state.target = adjust_difficulty(&state);
                         storage.save_state(&state)?;
                     }
                 }
@@ -331,9 +432,12 @@ impl Node {
             finality: crate::core::finality::FinalityEstimator::new(2, 8), 
             sync_session: None,
             known_pex_addrs: HashSet::new(),
+            connected_peers: HashSet::new(),
             mining_cancel: None,
             mined_batch_rx,
             mined_batch_tx,
+            mix_manager: Arc::new(RwLock::new(MixManager::new())),
+            pending_mix_reveals: HashMap::new(),
         })
     }
 
@@ -347,6 +451,7 @@ impl Node {
             peer_addrs: Arc::new(RwLock::new(Vec::new())),
             tx_sender: tx,
             batches_path: self.data_dir.join("db").join("batches"),
+            mix_manager: Arc::clone(&self.mix_manager),
         };
         (handle, rx)
     }
@@ -374,7 +479,9 @@ impl Node {
         let mut mempool_prune_interval = time::interval(Duration::from_secs(60));
         let mut sync_timeout_interval = time::interval(Duration::from_secs(5));
         let mut pex_interval = time::interval(Duration::from_secs(120));
-
+        let mut connection_maintenance = time::interval(Duration::from_secs(15));
+        const TARGET_OUTBOUND_PEERS: usize = 8;
+        
         // Initial sync: ask all peers for their height
         if self.network.peer_count() > 0 {
             tracing::info!("Requesting chain state from {} peer(s)...", self.network.peer_count());
@@ -403,6 +510,7 @@ impl Node {
                     if let Err(e) = self.storage.save_state(&self.state) {
                         tracing::error!("Failed to save state: {}", e);
                     }
+                    self.maybe_prune_checkpoints();
                 }
                 _ = ui_interval.tick() => {
                     *handle.state.write().await = self.state.clone();
@@ -416,6 +524,10 @@ impl Node {
                 }
                 _ = mempool_prune_interval.tick() => {
                     self.mempool.prune_invalid(&self.state);
+                    // CoinJoin: clean up stale mix sessions
+                    self.mix_manager.write().await.cleanup();
+                    // CoinJoin: check if any pending Commits have been mined
+                    self.check_pending_mix_reveals().await;
                 }
                 _ = sync_poll_interval.tick() => {
                     if let Some(peer) = self.network.random_peer() {
@@ -435,11 +547,65 @@ impl Node {
                         self.network.send(peer, Message::GetAddr);
                     }
                 }
+                
+                _ = connection_maintenance.tick() => {
+                    let current_outbound = self.network.outbound_peer_count();
+                    if current_outbound < TARGET_OUTBOUND_PEERS {
+                        let needed = TARGET_OUTBOUND_PEERS - current_outbound;
+                        
+                        // Pick random addresses from our known pool
+                        use rand::seq::IteratorRandom;
+                        let mut rng = rand::thread_rng();
+                        let to_dial: Vec<String> = self.known_pex_addrs
+                            .iter()
+                            .choose_multiple(&mut rng, needed)
+                            .into_iter()
+                            .cloned()
+                            .collect();
+
+                        for addr in to_dial {
+                            tracing::info!("Maintenance: Dialing {} to maintain outbound ratio", addr);
+                            self.network.dial_addr(&addr);
+                        }
+                    }
+                }                
+                
+                
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
                         NodeCommand::SendTransaction(tx) => {
                             if let Err(e) = self.handle_new_transaction(tx, None).await {
                                 tracing::error!("Failed to handle transaction: {}", e);
+                            }
+                        }
+                        NodeCommand::SubmitMixTransaction { mix_id, tx } => {
+                            if let Err(e) = self.handle_mix_transaction(mix_id, tx).await {
+                                tracing::error!("Failed to submit mix transaction: {}", e);
+                                let mut mgr = self.mix_manager.write().await;
+                                mgr.set_phase(&mix_id, MixPhase::Failed(e.to_string()));
+                            }
+                        }
+                        NodeCommand::BroadcastMixAnnounce { mix_id, denomination } => {
+                            self.network.broadcast(Message::MixAnnounce { mix_id, denomination });
+                        }
+                        NodeCommand::SendMixJoin { coordinator, mix_id, input, output } => {
+                            self.network.send(coordinator, Message::MixJoin { mix_id, input, output });
+                        }
+                        NodeCommand::SendMixFee { coordinator, mix_id, input } => {
+                            self.network.send(coordinator, Message::MixFee { mix_id, input });
+                        }
+                        NodeCommand::SendMixSign { coordinator, mix_id, input_index, signature } => {
+                            self.network.send(coordinator, Message::MixSign { mix_id, input_index, signature });
+                        }
+                        NodeCommand::BroadcastMixProposal { mix_id, proposal, peers } => {
+                            for peer in peers {
+                                self.network.send(peer, Message::MixProposal {
+                                    mix_id,
+                                    inputs: proposal.inputs.clone(),
+                                    outputs: proposal.outputs.clone(),
+                                    salt: proposal.salt,
+                                    commitment: proposal.commitment,
+                                });
                             }
                         }
                     }
@@ -452,15 +618,23 @@ impl Node {
                             }
                         }
                         NetworkEvent::PeerConnected(peer) => {
+                            if !self.connected_peers.insert(peer) {
+                                // Already connected via another transport — skip
+                                continue;
+                            }
                             tracing::info!("Peer connected: {}", peer);
                             self.network.send(peer, Message::GetState);
                             self.network.send(peer, Message::GetAddr);
                         }
                         NetworkEvent::PeerDisconnected(peer) => {
+                            self.connected_peers.remove(&peer);
                             tracing::info!("Peer disconnected: {}", peer);
                             if self.sync_session.as_ref().map_or(false, |s| s.peer == peer) {
                                 self.abort_sync_session("sync peer disconnected");
                             }
+                            
+                            // Fail any mixes relying on this peer
+                            self.mix_manager.write().await.handle_peer_disconnect(peer);
                         }
                     }
                 }
@@ -564,7 +738,7 @@ impl Node {
                 for addr_str in &addrs {
                     if !self.known_pex_addrs.contains(addr_str) {
                         self.known_pex_addrs.insert(addr_str.clone());
-                       self.network.dial_addr(addr_str);
+                     //  self.network.dial_addr(addr_str); lets not autodial, could be someone we don't like
                         new_count += 1;
                     }
                 }
@@ -633,6 +807,105 @@ impl Node {
                 if let Err(e) = self.handle_sync_headers(from, headers).await {
                     tracing::warn!("Error processing sync headers: {}", e);
                     self.abort_sync_session("header processing error");
+                }
+            }
+
+            // ── CoinJoin mix messages ───────────────────────────────────
+
+            Message::MixAnnounce { mix_id, denomination } => {
+                self.ack(channel);
+                let mut mgr = self.mix_manager.write().await;
+                if mgr.get_session_info(&mix_id).is_none() {
+                    match mgr.create_joining_session(mix_id, denomination, from) {
+                        Ok(()) => tracing::info!(
+                            "Joined mix session {} (denom={}) from peer {}",
+                            hex::encode(mix_id), denomination, from
+                        ),
+                        Err(e) => tracing::debug!("Ignoring MixAnnounce: {}", e),
+                    }
+                }
+            }
+
+            Message::MixJoin { mix_id, input, output } => {
+                self.ack(channel);
+                let mut mgr = self.mix_manager.write().await;
+                match mgr.register(&mix_id, input, output, Some(from)) {
+                    Ok(()) => {
+                        tracing::info!("Peer {} joined mix {}", from, hex::encode(mix_id));
+                        // Auto-finalize if ready
+                        if let Ok(Some(proposal)) = mgr.try_finalize(&mix_id) {
+                            let peers = mgr.remote_participants(&mix_id);
+                            drop(mgr);
+                            // Broadcast proposal to all participants
+                            for peer in peers {
+                                self.network.send(peer, Message::MixProposal {
+                                    mix_id,
+                                    inputs: proposal.inputs.clone(),
+                                    outputs: proposal.outputs.clone(),
+                                    salt: proposal.salt,
+                                    commitment: proposal.commitment,
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => tracing::debug!("MixJoin rejected: {}", e),
+                }
+            }
+            
+            Message::MixFee { mix_id, input } => {
+                self.ack(channel);
+                let mut mgr = self.mix_manager.write().await;
+                match mgr.set_fee_input(&mix_id, input, Some(from)) {
+                    Ok(()) => {
+                        tracing::info!("Peer {} provided fee for mix {}", from, hex::encode(mix_id));
+                        // Auto-finalize if ready
+                        if let Ok(Some(proposal)) = mgr.try_finalize(&mix_id) {
+                            let peers = mgr.remote_participants(&mix_id);
+                            drop(mgr);
+                            for peer in peers {
+                                self.network.send(peer, Message::MixProposal {
+                                    mix_id,
+                                    inputs: proposal.inputs.clone(),
+                                    outputs: proposal.outputs.clone(),
+                                    salt: proposal.salt,
+                                    commitment: proposal.commitment,
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => tracing::debug!("MixFee rejected: {}", e),
+                }
+            }
+            
+            Message::MixProposal { mix_id, inputs, outputs, salt, commitment } => {
+                self.ack(channel);
+                let mut mgr = self.mix_manager.write().await;
+                match mgr.apply_remote_proposal(&mix_id, inputs, outputs, salt, commitment) {
+                    Ok(()) => tracing::info!(
+                        "Applied remote mix proposal for {}",
+                        hex::encode(mix_id)
+                    ),
+                    Err(e) => tracing::debug!("MixProposal rejected: {}", e),
+                }
+            }
+
+            Message::MixSign { mix_id, input_index, signature } => {
+                self.ack(channel);
+                let mut mgr = self.mix_manager.write().await;
+                if let Err(e) = mgr.add_signature(&mix_id, input_index, signature) {
+                    tracing::debug!("MixSign rejected: {}", e);
+                } else {
+                    // Auto-build if all sigs collected
+                    if let Ok(Some(tx)) = mgr.try_build_transaction(&mix_id) {
+                        tracing::info!("Mix {} complete from p2p signatures", hex::encode(mix_id));
+                        mgr.set_phase(&mix_id, MixPhase::CommitSubmitted);
+                        drop(mgr);
+                        if let Err(e) = self.handle_mix_transaction(mix_id, tx).await {
+                            tracing::error!("Failed to submit p2p mix tx: {}", e);
+                            self.mix_manager.write().await
+                                .set_phase(&mix_id, MixPhase::Failed(e.to_string()));
+                        }
+                    }
                 }
             }
         }
@@ -799,7 +1072,7 @@ impl Node {
 
         // Build a bounded sliding window of recent timestamps (mirrors
         // evaluate_alternative_chain).  Both validate_timestamp and
-        // adjust_difficulty only looks back DIFFICULTY_LOOKBACK blocks,
+        // adjust_difficulty uses ASERT anchored to genesis,
         // entries, so there is no need to collect every timestamp from genesis.
         let window_size = DIFFICULTY_LOOKBACK as usize;
         let initial_cursor = *cursor as usize;
@@ -845,7 +1118,7 @@ impl Node {
                 recent_ts.remove(0);
             }
             apply_batch(candidate_state, batch, &recent_ts)?;
-            candidate_state.target = adjust_difficulty(candidate_state, &recent_ts);
+            candidate_state.target = adjust_difficulty(candidate_state);
             new_history.push((height, candidate_state.midstate, batch.clone()));
             *cursor += 1;
             tokio::task::yield_now().await;
@@ -994,8 +1267,8 @@ impl Node {
 
             match apply_batch(&mut candidate_state, batch, &recent_headers) {
                 Ok(_) => {
-                    // Pass headers to adjust_difficulty
-                    candidate_state.target = adjust_difficulty(&candidate_state, &recent_headers);
+                    // Adjust difficulty via ASERT
+                    candidate_state.target = adjust_difficulty(&candidate_state);
                     new_history.push((
                         fork_height + i as u64,
                         candidate_state.midstate,
@@ -1081,7 +1354,7 @@ impl Node {
             }
         }
 
-        self.state.target = adjust_difficulty(&self.state, self.recent_headers.make_contiguous());
+        self.state.target = adjust_difficulty(&self.state);
 
         self.mempool.re_add(abandoned_txs, &self.state);
 
@@ -1107,13 +1380,102 @@ impl Node {
                     recent_headers.remove(0);
                 }
                 apply_batch(&mut state, &batch, &recent_headers)?;
-                state.target = adjust_difficulty(&state, &recent_headers);
+                state.target = adjust_difficulty(&state);
             } else {
                 anyhow::bail!("Missing batch at height {} needed for reorg", h);
             }
         }
 
         Ok(state)
+    }
+
+    /// Prune checkpoints from deeply finalized batches.
+    ///
+    /// Safe to call after every state advancement — internally tracks what's
+    /// already pruned and skips redundant work.
+    fn maybe_prune_checkpoints(&self) {
+        if self.state.height > PRUNE_DEPTH {
+            let prune_below = self.state.height - PRUNE_DEPTH;
+            if let Err(e) = self.storage.prune_checkpoints(prune_below) {
+                tracing::warn!("Checkpoint pruning failed: {}", e);
+            }
+        }
+    }
+
+    /// Handle a completed CoinJoin mix: submit Commit, queue Reveal.
+    async fn handle_mix_transaction(&mut self, mix_id: [u8; 32], reveal_tx: Transaction) -> Result<()> {
+        // Extract the commitment from the reveal tx
+        let (input_ids, output_ids, salt) = match &reveal_tx {
+            Transaction::Reveal { inputs, outputs, salt, .. } => {
+                let ins: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+                let outs: Vec<[u8; 32]> = outputs.iter().map(|o| o.coin_id()).collect();
+                (ins, outs, *salt)
+            }
+            _ => bail!("expected Reveal transaction"),
+        };
+
+        let commitment = compute_commitment(&input_ids, &output_ids, &salt);
+
+        // Mine spam nonce for the Commit
+        let spam_nonce = {
+            let mut n = 0u64;
+            loop {
+                let h = hash_concat(&commitment, &n.to_le_bytes());
+                if u16::from_be_bytes([h[0], h[1]]) == 0x0000 {
+                    break n;
+                }
+                n += 1;
+            }
+        };
+
+        let commit_tx = Transaction::Commit { commitment, spam_nonce };
+        tracing::info!(
+            "CoinJoin mix {}: submitting Commit ({})",
+            hex::encode(mix_id), hex::encode(commitment)
+        );
+
+        // Submit Commit to mempool
+        self.handle_new_transaction(commit_tx, None).await?;
+
+        // Queue Reveal for when the Commit gets mined
+        self.pending_mix_reveals.insert(commitment, (mix_id, reveal_tx));
+        Ok(())
+    }
+
+    /// Check if any pending CoinJoin Commits have been mined, and if so, submit their Reveals.
+    async fn check_pending_mix_reveals(&mut self) {
+        if self.pending_mix_reveals.is_empty() {
+            return;
+        }
+
+        let mut to_reveal = Vec::new();
+        for (commitment, _) in &self.pending_mix_reveals {
+            // A commitment is "mined" when it's in the state accumulator
+            if self.state.commitments.contains(commitment) {
+                to_reveal.push(*commitment);
+            }
+        }
+
+        for commitment in to_reveal {
+            if let Some((mix_id, reveal_tx)) = self.pending_mix_reveals.remove(&commitment) {
+                tracing::info!(
+                    "CoinJoin mix {}: Commit mined, submitting Reveal",
+                    hex::encode(mix_id)
+                );
+                match self.handle_new_transaction(reveal_tx, None).await {
+                    Ok(()) => {
+                        self.mix_manager.write().await
+                            .set_phase(&mix_id, MixPhase::Complete);
+                        tracing::info!("CoinJoin mix {} complete!", hex::encode(mix_id));
+                    }
+                    Err(e) => {
+                        tracing::error!("CoinJoin Reveal failed for mix {}: {}", hex::encode(mix_id), e);
+                        self.mix_manager.write().await
+                            .set_phase(&mix_id, MixPhase::Failed(format!("reveal failed: {}", e)));
+                    }
+                }
+            }
+        }
     }
 
     async fn handle_new_batch(&mut self, batch: Batch, from: Option<PeerId>) -> Result<()> {
@@ -1167,7 +1529,7 @@ impl Node {
                     self.state = candidate_state;
                     self.storage.save_batch(pre_height, &batch)?;
                     
-                    self.state.target = adjust_difficulty(&self.state, self.recent_headers.make_contiguous());
+                    self.state.target = adjust_difficulty(&self.state);
                     
                     self.metrics.inc_batches_processed();
                     self.mempool.prune_invalid(&self.state);
@@ -1264,7 +1626,7 @@ impl Node {
                 self.storage.save_batch(candidate.height - 1, &batch)?;
                 self.state = candidate;
                 
-                self.state.target = adjust_difficulty(&self.state, self.recent_headers.make_contiguous());
+                self.state.target = adjust_difficulty(&self.state);
                 self.metrics.inc_batches_processed();
 
                 self.chain_history.push((self.state.height, self.state.midstate));
@@ -1332,7 +1694,7 @@ impl Node {
                     self.storage.save_batch(candidate.height - 1, &batch).ok();
                     self.state = candidate;
                     
-                    self.state.target = adjust_difficulty(&self.state, self.recent_headers.make_contiguous());
+                    self.state.target = adjust_difficulty(&self.state);
                     self.metrics.inc_batches_processed();
                     self.mempool.prune_invalid(&self.state);
                     applied += 1;
@@ -1501,7 +1863,7 @@ impl Node {
             Ok(_) => {
                 self.storage.save_batch(pre_mine_height, &batch)?;
                 self.storage.save_state(&self.state)?;
-                self.state.target = adjust_difficulty(&self.state, self.recent_headers.make_contiguous());
+                self.state.target = adjust_difficulty(&self.state);
                 self.metrics.inc_batches_mined();
                 self.network.broadcast(Message::Batch(batch.clone()));
 
@@ -2087,16 +2449,19 @@ mod complex_tests {
         // the *exact* genesis batch saved by the node to ensure midstates align.
         let genesis_batch = node.storage.load_batch(0).unwrap().unwrap();
         apply_batch(&mut state_at_2, &genesis_batch, &[]).unwrap(); // H=1
+        state_at_2.target = adjust_difficulty(&state_at_2);
         
         // Apply B1 (shared history)
        let ts_at_1 = vec![state_at_2.timestamp];
         apply_batch(&mut state_at_2, &b1, &ts_at_1).unwrap(); // H = 2
+        state_at_2.target = adjust_difficulty(&state_at_2);
 
         // B2' (Alternative block at H=3). Empty, does NOT have the transaction.
         let b2_prime = make_valid_batch(&state_at_2, 20, vec![]); 
         let mut state_at_3_prime = state_at_2.clone();
         let ts_at_2 = vec![state_at_2.timestamp];
         apply_batch(&mut state_at_3_prime, &b2_prime, &ts_at_2).unwrap();
+        state_at_3_prime.target = adjust_difficulty(&state_at_3_prime);
         
         // B3' (extends B2', making Chain B longer)
         let b3_prime = make_valid_batch(&state_at_3_prime, 10, vec![]);
@@ -2140,7 +2505,8 @@ mod complex_tests {
         // We use the node's internal state to generate them validly, then revert.
         // IMPORTANT: must call adjust_difficulty after each batch, exactly as
         // process_linear_extension does, so the target carried inside each batch
-        // matches what the replaying node will expect.
+        // matches what the replaying node will expect. recent_headers are still
+        // needed for timestamp validation (MTP) in apply_batch.
         let mut batches = Vec::new();
         let mut recent_headers: Vec<u64> = vec![node.state.timestamp];
         let window_size = DIFFICULTY_LOOKBACK as usize;
@@ -2149,7 +2515,7 @@ mod complex_tests {
             apply_batch(&mut node.state, &b, &recent_headers).unwrap();
             recent_headers.push(node.state.timestamp);
             if recent_headers.len() > window_size { recent_headers.remove(0); }
-            node.state.target = adjust_difficulty(&node.state, &recent_headers);
+            node.state.target = adjust_difficulty(&node.state);
             node.storage.save_batch(node.state.height - 1, &b).unwrap();
             batches.push(b);
         }
@@ -2514,7 +2880,8 @@ mod complex_tests {
             let b = make_valid_batch(&chain_b_state, 10 + i, vec![]);
             apply_batch(&mut chain_b_state, &b, &recent_headers).unwrap();
             recent_headers.push(chain_b_state.timestamp);
-            if recent_headers.len() > 11 { recent_headers.remove(0); } 
+            if recent_headers.len() > 11 { recent_headers.remove(0); }
+            chain_b_state.target = adjust_difficulty(&chain_b_state);
             chain_b_batches.push(b);
         }
         assert_eq!(chain_b_state.height, 7);
@@ -2548,7 +2915,8 @@ mod complex_tests {
             headers.push(hdr);
             apply_batch(&mut state, &batch, &recent_headers).unwrap();
             recent_headers.push(state.timestamp);
-            if recent_headers.len() > 11 { recent_headers.remove(0); } 
+            if recent_headers.len() > 11 { recent_headers.remove(0); }
+            state.target = adjust_difficulty(&state);
             batches.push(batch);
         }
         (batches, headers)
