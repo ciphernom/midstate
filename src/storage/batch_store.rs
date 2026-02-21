@@ -14,6 +14,81 @@ impl BatchStore {
         fs::create_dir_all(&base_path)?;
         Ok(Self { base_path })
     }
+
+    /// Height up to which checkpoints have already been pruned.
+    /// Returns 0 if no pruning has occurred yet.
+    pub fn pruned_up_to(&self) -> u64 {
+        let marker = self.base_path.join("pruned_up_to");
+        fs::read_to_string(marker)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Prune checkpoints from all batch and header files below `below_height`.
+    ///
+    /// Skips heights already pruned (tracked via a marker file). Each pruned
+    /// batch drops ~32 KB of checkpoint data, reducing storage by ~98%.
+    /// Pruned batches remain verifiable via full-chain recomputation.
+    ///
+    /// Returns the number of batches pruned in this call.
+    pub fn prune_checkpoints(&self, below_height: u64) -> Result<u64> {
+        let already_pruned = self.pruned_up_to();
+        if below_height <= already_pruned {
+            return Ok(0);
+        }
+
+        let mut count = 0u64;
+        for height in already_pruned..below_height {
+            let folder = height / 1000;
+            let folder_path = self.base_path.join(format!("{:06}", folder));
+
+            // Prune batch file
+            let batch_path = folder_path.join(format!("batch_{}.bin", height));
+            if batch_path.exists() {
+                if let Ok(bytes) = fs::read(&batch_path) {
+                    if let Ok(mut batch) = bincode::deserialize::<Batch>(&bytes) {
+                        if !batch.extension.checkpoints.is_empty() {
+                            batch.extension.checkpoints = vec![];
+                            if let Ok(pruned_bytes) = bincode::serialize(&batch) {
+                                fs::write(&batch_path, pruned_bytes)?;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Prune header file
+            let hdr_path = folder_path.join(format!("header_{}.bin", height));
+            if hdr_path.exists() {
+                if let Ok(bytes) = fs::read(&hdr_path) {
+                    if let Ok(mut header) = bincode::deserialize::<BatchHeader>(&bytes) {
+                        if !header.extension.checkpoints.is_empty() {
+                            header.extension.checkpoints = vec![];
+                            if let Ok(pruned_bytes) = bincode::serialize(&header) {
+                                fs::write(&hdr_path, pruned_bytes)?;
+                            }
+                        }
+                    }
+                }
+            }
+
+            count += 1;
+        }
+
+        // Update marker
+        let marker = self.base_path.join("pruned_up_to");
+        fs::write(marker, below_height.to_string())?;
+
+        if count > 0 {
+            tracing::info!(
+                "Pruned checkpoints from {} batches (heights {}..{})",
+                count, already_pruned, below_height
+            );
+        }
+
+        Ok(count)
+    }
     
     /// Save a batch (and its lightweight header for fast sync)
     pub fn save(&self, height: u64, batch: &Batch) -> Result<()> {
@@ -242,5 +317,194 @@ mod tests {
         assert!(store.load(999).unwrap().is_some());
         assert!(store.load(1000).unwrap().is_some());
         assert_eq!(store.highest().unwrap(), 1000);
+    }
+
+    // ── Checkpoint pruning ──────────────────────────────────────────────
+
+    #[test]
+    fn prune_removes_checkpoints() {
+        let dir = tempdir().unwrap();
+        let store = BatchStore::new(dir.path().join("batches")).unwrap();
+
+        for h in 0..5 {
+            store.save(h, &dummy_batch(h)).unwrap();
+        }
+
+        // Before pruning: checkpoints present
+        let batch = store.load(0).unwrap().unwrap();
+        assert!(!batch.extension.checkpoints.is_empty());
+
+        // Prune below height 3
+        let count = store.prune_checkpoints(3).unwrap();
+        assert_eq!(count, 3);
+
+        // Heights 0-2: checkpoints gone
+        for h in 0..3 {
+            let batch = store.load(h).unwrap().unwrap();
+            assert!(batch.extension.checkpoints.is_empty(),
+                "height {} should be pruned", h);
+        }
+
+        // Heights 3-4: checkpoints intact
+        for h in 3..5 {
+            let batch = store.load(h).unwrap().unwrap();
+            assert!(!batch.extension.checkpoints.is_empty(),
+                "height {} should NOT be pruned", h);
+        }
+    }
+
+    #[test]
+    fn prune_also_prunes_headers() {
+        let dir = tempdir().unwrap();
+        let store = BatchStore::new(dir.path().join("batches")).unwrap();
+
+        store.save(0, &dummy_batch(0)).unwrap();
+        store.prune_checkpoints(1).unwrap();
+
+        let headers = store.load_headers(0, 1).unwrap();
+        assert_eq!(headers.len(), 1);
+        assert!(headers[0].extension.checkpoints.is_empty());
+    }
+
+    #[test]
+    fn prune_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let store = BatchStore::new(dir.path().join("batches")).unwrap();
+
+        for h in 0..3 {
+            store.save(h, &dummy_batch(h)).unwrap();
+        }
+
+        store.prune_checkpoints(2).unwrap();
+        let count = store.prune_checkpoints(2).unwrap();
+        assert_eq!(count, 0, "second prune to same height should be no-op");
+    }
+
+    #[test]
+    fn prune_incremental() {
+        let dir = tempdir().unwrap();
+        let store = BatchStore::new(dir.path().join("batches")).unwrap();
+
+        for h in 0..10 {
+            store.save(h, &dummy_batch(h)).unwrap();
+        }
+
+        store.prune_checkpoints(3).unwrap();
+        assert_eq!(store.pruned_up_to(), 3);
+
+        store.prune_checkpoints(7).unwrap();
+        assert_eq!(store.pruned_up_to(), 7);
+
+        // Heights 0-6 pruned, 7-9 intact
+        for h in 0..7 {
+            let batch = store.load(h).unwrap().unwrap();
+            assert!(batch.extension.checkpoints.is_empty());
+        }
+        for h in 7..10 {
+            let batch = store.load(h).unwrap().unwrap();
+            assert!(!batch.extension.checkpoints.is_empty());
+        }
+    }
+
+    #[test]
+    fn prune_marker_persists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("batches");
+        let store = BatchStore::new(&path).unwrap();
+
+        store.save(0, &dummy_batch(0)).unwrap();
+        store.prune_checkpoints(1).unwrap();
+        assert_eq!(store.pruned_up_to(), 1);
+
+        // New store instance reads the marker
+        let store2 = BatchStore::new(&path).unwrap();
+        assert_eq!(store2.pruned_up_to(), 1);
+    }
+
+    #[test]
+    fn pruned_batches_still_load_correctly() {
+        let dir = tempdir().unwrap();
+        let store = BatchStore::new(dir.path().join("batches")).unwrap();
+
+        let batch = dummy_batch(42);
+        store.save(0, &batch).unwrap();
+        store.prune_checkpoints(1).unwrap();
+
+        let loaded = store.load(0).unwrap().unwrap();
+        assert_eq!(loaded.prev_midstate, batch.prev_midstate);
+        assert_eq!(loaded.extension.nonce, batch.extension.nonce);
+        assert_eq!(loaded.extension.final_hash, batch.extension.final_hash);
+        assert!(loaded.extension.checkpoints.is_empty());
+    }
+
+    #[test]
+    fn pruned_batch_passes_full_chain_verification() {
+        use crate::core::extension::verify_extension;
+
+        let dir = tempdir().unwrap();
+        let store = BatchStore::new(dir.path().join("batches")).unwrap();
+
+        let nonce = 42u64;
+        let batch = dummy_batch(nonce);
+        let midstate = batch.prev_midstate;
+
+        // Verify before pruning (spot-check path)
+        assert!(verify_extension(
+            midstate, &batch.extension, &[0xff; 32]
+        ).is_ok());
+
+        store.save(0, &batch).unwrap();
+        store.prune_checkpoints(1).unwrap();
+        let pruned = store.load(0).unwrap().unwrap();
+
+        // Verify after pruning (full-chain path)
+        assert!(verify_extension(
+            midstate, &pruned.extension, &[0xff; 32]
+        ).is_ok());
+    }
+
+    #[test]
+    fn prune_skips_missing_heights() {
+        let dir = tempdir().unwrap();
+        let store = BatchStore::new(dir.path().join("batches")).unwrap();
+
+        // Save only height 0 and 2 (gap at 1)
+        store.save(0, &dummy_batch(0)).unwrap();
+        store.save(2, &dummy_batch(2)).unwrap();
+
+        // Should not panic on missing height 1
+        let count = store.prune_checkpoints(3).unwrap();
+        assert_eq!(count, 3); // iterates 0,1,2 — silently skips missing
+
+        let b0 = store.load(0).unwrap().unwrap();
+        assert!(b0.extension.checkpoints.is_empty());
+        let b2 = store.load(2).unwrap().unwrap();
+        assert!(b2.extension.checkpoints.is_empty());
+    }
+
+    #[test]
+    fn prune_storage_savings() {
+        let dir = tempdir().unwrap();
+        let store = BatchStore::new(dir.path().join("batches")).unwrap();
+
+        store.save(0, &dummy_batch(0)).unwrap();
+
+        let folder = dir.path().join("batches/000000");
+        let batch_path = folder.join("batch_0.bin");
+        let header_path = folder.join("header_0.bin");
+
+        let pre_batch = std::fs::metadata(&batch_path).unwrap().len();
+        let pre_header = std::fs::metadata(&header_path).unwrap().len();
+
+        store.prune_checkpoints(1).unwrap();
+
+        let post_batch = std::fs::metadata(&batch_path).unwrap().len();
+        let post_header = std::fs::metadata(&header_path).unwrap().len();
+
+        // Pruned files should be dramatically smaller
+        assert!(post_batch < pre_batch / 2,
+            "batch should shrink: {} -> {}", pre_batch, post_batch);
+        assert!(post_header < pre_header / 2,
+            "header should shrink: {} -> {}", pre_header, post_header);
     }
 }
