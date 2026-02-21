@@ -126,4 +126,10 @@ impl Storage {
     pub fn highest_batch(&self) -> Result<u64> {
         self.batches.highest()
     }
+
+    /// Prune checkpoints from batches below the given height.
+    /// See [`BatchStore::prune_checkpoints`] for details.
+    pub fn prune_checkpoints(&self, below_height: u64) -> Result<u64> {
+        self.batches.prune_checkpoints(below_height)
+    }
 }
