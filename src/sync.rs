@@ -1,5 +1,5 @@
-use crate::core::{State, BatchHeader, MEDIAN_TIME_PAST_WINDOW};
-use crate::core::state::apply_batch;
+use crate::core::{State, BatchHeader, DIFFICULTY_LOOKBACK};
+use crate::core::state::{apply_batch, adjust_difficulty};
 use crate::core::extension::verify_extension;
 use crate::storage::Storage;
 use anyhow::{bail, Result};
@@ -72,7 +72,8 @@ impl Syncer {
     /// using batches already on disk.
     pub fn rebuild_state_to(&self, target: u64) -> Result<State> {
         let mut state = State::genesis().0;
-        let mut recent_headers: Vec<u64> = Vec::new(); 
+        let mut recent_headers: Vec<u64> = Vec::new();
+        let window_size = DIFFICULTY_LOOKBACK as usize;
 
         for h in 0..target {
             let batch = self
@@ -81,8 +82,9 @@ impl Syncer {
                 .ok_or_else(|| anyhow::anyhow!("Missing batch at height {} during rebuild", h))?;
             
             recent_headers.push(state.timestamp);
-            if recent_headers.len() > MEDIAN_TIME_PAST_WINDOW { recent_headers.remove(0); }
-            apply_batch(&mut state, &batch, &recent_headers)?; 
+            if recent_headers.len() > window_size { recent_headers.remove(0); }
+            apply_batch(&mut state, &batch, &recent_headers)?;
+            state.target = adjust_difficulty(&state, &recent_headers);
         }
         Ok(state)
     }
