@@ -61,8 +61,8 @@ While miners can search for nonces in parallel, the computation of a single proo
 - **Extension Iterations**: 1,000,000 (100 in fast-mining mode).
 - **Checkpoint Interval**: 1,000 (10 in fast-mining mode).
 - **Spot Checks**: 16 (3 in fast-mining mode).
-- **Block Time**: 600 seconds (10 minutes).
-- **Difficulty Adjustment**: Every 2,016 blocks (~2 weeks).
+- **Block Time**: 60 seconds (1 minutes).
+- **Difficulty Adjustment**: Every 660 blocks (~11 minutes).
 - **Adjustment Limit**: Max 4x increase or decrease per period.
 - **Max Batch Size**: 100 transactions per block.
 - **Commitment TTL**: 100 blocks.
@@ -73,7 +73,7 @@ While miners can search for nonces in parallel, the computation of a single proo
 - **Unit**: Integer values only.
 - **Denominations**: All output values must be powers of 2 (e.g., 1, 2, 4, 8...). This naturally obfuscates exact transaction amounts.
 - **Block Reward**: Starts at 16.
-- **Halving**: Reward halves every ~52,560 blocks (~1 year at 10-min blocks). Minimum reward: 1.
+- **Halving**: Reward halves every ~52,5600 blocks (~1 year at 1-min blocks). Minimum reward: 1.
 - **Fees**: `Sum(Inputs) - Sum(Outputs)`. Minimum fee for reveals: 1.
 
 ## 5. Transactions

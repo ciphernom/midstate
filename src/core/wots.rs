@@ -1,4 +1,5 @@
 use super::types::hash;
+use rayon::prelude::*;
 
 // ── Winternitz parameter w=16 ───────────────────────────────────────────────
 //
@@ -85,12 +86,16 @@ fn all_digits(msg: &[u8; 32]) -> [u32; CHAINS] {
 /// Cost: CHAINS × MAX_DIGIT = 18 × 65535 ≈ 1.18M hashes.
 /// With BLAKE3: ~1–2 ms on modern hardware.
 pub fn keygen(seed: &[u8; 32]) -> [u8; 32] {
-    let mut endpoints = [[0u8; 32]; CHAINS];
-    for i in 0..CHAINS {
-        let sk_i = chain_sk(seed, i);
-        endpoints[i] = hash_n(&sk_i, MAX_DIGIT);
-    }
-    compress(&endpoints)
+    let endpoints: Vec<[u8; 32]> = (0..CHAINS)
+        .into_par_iter()
+        .map(|i| {
+            let sk_i = chain_sk(seed, i);
+            hash_n(&sk_i, MAX_DIGIT)
+        })
+        .collect();
+    let mut arr = [[0u8; 32]; CHAINS];
+    arr.copy_from_slice(&endpoints);
+    compress(&arr)
 }
 
 /// Sign a 32-byte message with the given seed.
@@ -99,12 +104,13 @@ pub fn keygen(seed: &[u8; 32]) -> [u8; 32] {
 /// The verifier can hash the remaining (MAX_DIGIT - d_i) times to reach the endpoint.
 pub fn sign(seed: &[u8; 32], message: &[u8; 32]) -> Vec<[u8; 32]> {
     let digits = all_digits(message);
-    let mut sig = Vec::with_capacity(CHAINS);
-    for (i, &d) in digits.iter().enumerate() {
-        let sk_i = chain_sk(seed, i);
-        sig.push(hash_n(&sk_i, d));
-    }
-    sig
+    (0..CHAINS)
+        .into_par_iter()
+        .map(|i| {
+            let sk_i = chain_sk(seed, i);
+            hash_n(&sk_i, digits[i])
+        })
+        .collect()
 }
 
 /// Verify a WOTS signature against a message and coin ID.
@@ -120,13 +126,16 @@ pub fn verify(sig: &[[u8; 32]], message: &[u8; 32], coin_id: &[u8; 32]) -> bool 
     }
 
     let digits = all_digits(message);
-    let mut endpoints = [[0u8; 32]; CHAINS];
-    for (i, &d) in digits.iter().enumerate() {
-        let remaining = MAX_DIGIT - d;
-        endpoints[i] = hash_n(&sig[i], remaining);
-    }
-
-    compress(&endpoints) == *coin_id
+    let endpoints: Vec<[u8; 32]> = (0..CHAINS)
+        .into_par_iter()
+        .map(|i| {
+            let remaining = MAX_DIGIT - digits[i];
+            hash_n(&sig[i], remaining)
+        })
+        .collect();
+    let mut arr = [[0u8; 32]; CHAINS];
+    arr.copy_from_slice(&endpoints);
+    compress(&arr) == *coin_id
 }
 
 /// Serialize signature to bytes (18 × 32 = 576 bytes).
