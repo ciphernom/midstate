@@ -265,6 +265,28 @@ enum WalletAction {
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
     },
+    /// CoinJoin mix: create or join a mixing session
+    Mix {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+        /// Denomination to mix (power of 2)
+        #[arg(long)]
+        denomination: u64,
+        /// Explicit coin ID to mix (auto-selects if omitted)
+        #[arg(long)]
+        coin: Option<String>,
+        /// Join an existing mix session (hex mix_id) instead of creating one
+        #[arg(long)]
+        join: Option<String>,
+        /// Also pay the fee (requires a denomination-1 coin)
+        #[arg(long)]
+        pay_fee: bool,
+        /// Timeout in seconds to wait for the mix to complete
+        #[arg(long, default_value = "300")]
+        timeout: u64,
+    },
 }
 
 fn read_password(prompt: &str) -> Result<Vec<u8>> {
@@ -454,6 +476,9 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         }
         WalletAction::GenerateMss { path, height, label } => {
             wallet_generate_mss(&path, height, label)
+        }
+        WalletAction::Mix { path, rpc_port, denomination, coin, join, pay_fee, timeout } => {
+            wallet_mix(&path, rpc_port, denomination, coin, join, pay_fee, timeout).await
         }
         
     }
@@ -889,6 +914,257 @@ async fn do_reveal(
     for out in &pending.outputs {
         println!("  created: {} (value {})", short_hex(&out.coin_id()), out.value);
     }
+    Ok(())
+}
+
+// ── CoinJoin Mix ────────────────────────────────────────────────────────────
+
+async fn wallet_mix(
+    path: &PathBuf,
+    rpc_port: u16,
+    denomination: u64,
+    coin_arg: Option<String>,
+    join_mix_id: Option<String>,
+    pay_fee: bool,
+    timeout_secs: u64,
+) -> Result<()> {
+    if !denomination.is_power_of_two() || denomination == 0 {
+        anyhow::bail!("denomination must be a non-zero power of 2");
+    }
+
+    let password = read_password("Password: ")?;
+    let mut wallet = Wallet::open(path, &password)?;
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{}", rpc_port);
+
+    // Find live coins
+    let mut live_coins = Vec::new();
+    for wc in wallet.coins() {
+        if let Ok(true) = check_coin_rpc(&client, rpc_port, &hex::encode(wc.coin_id)).await {
+            live_coins.push(wc.coin_id);
+        }
+    }
+
+    // Select the coin to mix
+    let mix_coin_id: [u8; 32] = if let Some(ref coin_ref) = coin_arg {
+        let resolved = wallet.resolve_coin(coin_ref)?;
+        if !live_coins.contains(&resolved) {
+            anyhow::bail!("coin {} is not live on-chain", short_hex(&resolved));
+        }
+        let coin = wallet.find_coin(&resolved)
+            .ok_or_else(|| anyhow::anyhow!("coin not in wallet"))?;
+        if coin.value != denomination {
+            anyhow::bail!(
+                "coin {} has value {} but denomination is {}",
+                short_hex(&resolved), coin.value, denomination
+            );
+        }
+        resolved
+    } else {
+        // Auto-select a coin matching the denomination
+        let found = wallet.coins().iter()
+            .find(|c| c.value == denomination && live_coins.contains(&c.coin_id))
+            .ok_or_else(|| anyhow::anyhow!(
+                "no live coin with denomination {} found in wallet", denomination
+            ))?;
+        found.coin_id
+    };
+
+    println!("CoinJoin Mix");
+    println!("  Denomination: {}", denomination);
+    println!("  Input coin:   {}", short_hex(&mix_coin_id));
+
+    // Step 1: Create or join a session
+    let mix_id_hex: String = if let Some(ref join_hex) = join_mix_id {
+        println!("  Joining session: {}", join_hex);
+        join_hex.clone()
+    } else {
+        // Create new session
+        let create_req = rpc::MixCreateRequest {
+            denomination,
+            min_participants: 2,
+        };
+        let resp = client.post(format!("{}/mix/create", base_url))
+            .json(&create_req).send().await?;
+        if !resp.status().is_success() {
+            let error: rpc::ErrorResponse = resp.json().await?;
+            anyhow::bail!("create failed: {}", error.error);
+        }
+        let create_resp: rpc::MixCreateResponse = resp.json().await?;
+        println!("  Created session: {}", &create_resp.mix_id[..16]);
+        println!("\n  Share this mix_id with other participants:");
+        println!("  {}\n", create_resp.mix_id);
+        create_resp.mix_id
+    };
+
+    // Step 2: Register our input/output
+    let (input, output, output_seed) = wallet.prepare_mix_registration(&mix_coin_id)?;
+
+    let register_req = rpc::MixRegisterRequest {
+        mix_id: mix_id_hex.clone(),
+        coin_id: hex::encode(mix_coin_id),
+        input: rpc::InputRevealJson {
+            owner_pk: hex::encode(input.owner_pk),
+            value: input.value,
+            salt: hex::encode(input.salt),
+        },
+        output: rpc::OutputDataJson {
+            address: hex::encode(output.address),
+            value: output.value,
+            salt: hex::encode(output.salt),
+        },
+    };
+
+    let resp = client.post(format!("{}/mix/register", base_url))
+        .json(&register_req).send().await?;
+    if !resp.status().is_success() {
+        let error: rpc::ErrorResponse = resp.json().await?;
+        anyhow::bail!("register failed: {}", error.error);
+    }
+    println!("  ✓ Registered in mix session");
+
+    // Step 3: Optionally pay the fee
+    let mut fee_coin_id: Option<[u8; 32]> = None;
+    if pay_fee {
+        match wallet.prepare_mix_fee(&live_coins) {
+            Ok((fee_input, fee_cid)) => {
+                let fee_req = rpc::MixFeeRequest {
+                    mix_id: mix_id_hex.clone(),
+                    input: rpc::InputRevealJson {
+                        owner_pk: hex::encode(fee_input.owner_pk),
+                        value: fee_input.value,
+                        salt: hex::encode(fee_input.salt),
+                    },
+                };
+                let resp = client.post(format!("{}/mix/fee", base_url))
+                    .json(&fee_req).send().await?;
+                if !resp.status().is_success() {
+                    let error: rpc::ErrorResponse = resp.json().await?;
+                    anyhow::bail!("fee failed: {}", error.error);
+                }
+                println!("  ✓ Fee coin registered ({})", short_hex(&fee_cid));
+                fee_coin_id = Some(fee_cid);
+            }
+            Err(e) => {
+                println!("  ⚠ Cannot pay fee: {}", e);
+                println!("    Another participant must contribute a denomination-1 coin.");
+            }
+        }
+    }
+
+    // Step 4: Wait for signing phase
+    println!("\n  Waiting for all participants to register...");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let mut commitment_hex = String::new();
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for signing phase");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let status_url = format!("{}/mix/status/{}", base_url, mix_id_hex);
+        let resp = client.get(&status_url).send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("mix session not found");
+        }
+        let status: rpc::MixStatusResponse = resp.json().await?;
+
+        match status.phase.as_str() {
+            "collecting" => { eprint!("."); }
+            "signing" => {
+                eprintln!();
+                commitment_hex = status.commitment.unwrap_or_default();
+                println!("  ✓ All participants registered! Signing phase.");
+                break;
+            }
+            "failed" => {
+                anyhow::bail!("mix session failed");
+            }
+            other => {
+                println!("  Unexpected phase: {}", other);
+                break;
+            }
+        }
+    }
+
+    // Step 5: Sign our input(s)
+    let commitment = parse_hex32(&commitment_hex)?;
+
+    // Sign the mix input
+    let sig = wallet.sign_mix_input(&mix_coin_id, &commitment)?;
+    let sign_req = rpc::MixSignRequest {
+        mix_id: mix_id_hex.clone(),
+        coin_id: hex::encode(mix_coin_id),
+        signature: hex::encode(&sig),
+    };
+    let resp = client.post(format!("{}/mix/sign", base_url))
+        .json(&sign_req).send().await?;
+    if !resp.status().is_success() {
+        let error: rpc::ErrorResponse = resp.json().await?;
+        anyhow::bail!("sign failed: {}", error.error);
+    }
+    println!("  ✓ Signed mix input");
+
+    // Sign fee input if we're paying
+    if let Some(fee_cid) = fee_coin_id {
+        let fee_sig = wallet.sign_mix_input(&fee_cid, &commitment)?;
+        let fee_sign_req = rpc::MixSignRequest {
+            mix_id: mix_id_hex.clone(),
+            coin_id: hex::encode(fee_cid),
+            signature: hex::encode(&fee_sig),
+        };
+        let resp = client.post(format!("{}/mix/sign", base_url))
+            .json(&fee_sign_req).send().await?;
+        if !resp.status().is_success() {
+            let error: rpc::ErrorResponse = resp.json().await?;
+            anyhow::bail!("fee sign failed: {}", error.error);
+        }
+        println!("  ✓ Signed fee input");
+    }
+
+    // Step 6: Wait for completion
+    println!("\n  Waiting for all signatures and on-chain confirmation...");
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            println!("  ⏳ Timed out. The mix may still complete — check status later.");
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let status_url = format!("{}/mix/status/{}", base_url, mix_id_hex);
+        let resp = client.get(&status_url).send().await?;
+        if !resp.status().is_success() { break; }
+        let status: rpc::MixStatusResponse = resp.json().await?;
+
+        match status.phase.as_str() {
+            "signing" => { eprint!("."); }
+            "commit_submitted" => { eprint!("c"); }
+            "complete" => {
+                eprintln!();
+                // Update wallet: remove spent coin(s), import mixed output
+                let mut spent = vec![mix_coin_id];
+                if let Some(fee_cid) = fee_coin_id {
+                    spent.push(fee_cid);
+                }
+                wallet.complete_mix(&spent, &output, output_seed)?;
+
+                println!("\n  ✓ CoinJoin mix complete!");
+                println!("  Spent:    {}", short_hex(&mix_coin_id));
+                println!("  Received: {} (value {})", short_hex(&output.coin_id()), output.value);
+                if let Some(fee_cid) = fee_coin_id {
+                    println!("  Fee paid: {} (value 1)", short_hex(&fee_cid));
+                }
+                return Ok(());
+            }
+            "failed" => {
+                eprintln!();
+                anyhow::bail!("mix failed");
+            }
+            _ => { eprint!("?"); }
+        }
+    }
+
     Ok(())
 }
 
