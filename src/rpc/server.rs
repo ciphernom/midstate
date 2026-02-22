@@ -30,6 +30,13 @@ impl RpcServer {
             .route("/peers", get(get_peers))
             .route("/scan", post(scan_addresses))
             .route("/mss_state", post(get_mss_state))
+            // CoinJoin mix endpoints
+            .route("/mix/create", post(mix_create))
+            .route("/mix/register", post(mix_register))
+            .route("/mix/fee", post(mix_fee))
+            .route("/mix/sign", post(mix_sign))
+            .route("/mix/status/:mix_id", get(mix_status))
+            .route("/mix/list", get(mix_list))
             .layer(TraceLayer::new_for_http())
             .with_state(node_handle);
 
