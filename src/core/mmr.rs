@@ -241,9 +241,9 @@ fn get_empty_hash(height: usize) -> [u8; 32] {
 /// SMT nodes stored as (height, path_key) -> hash.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UtxoAccumulator {
-    coins: std::collections::BTreeSet<[u8; 32]>,
+    coins: im::OrdSet<[u8; 32]>,
     #[serde(skip)]
-    nodes: std::collections::HashMap<(u16, [u8; 32]), [u8; 32]>,
+    nodes: im::HashMap<(u16, [u8; 32]), [u8; 32]>,
 }
 
 impl PartialEq for UtxoAccumulator {
@@ -256,7 +256,10 @@ impl Eq for UtxoAccumulator {}
 
 impl UtxoAccumulator {
     pub fn new() -> Self {
-        Self { coins: std::collections::BTreeSet::new(), nodes: std::collections::HashMap::new() }
+        Self { 
+            coins: im::OrdSet::new(), 
+            nodes: im::HashMap::new() 
+        }
     }
 
     /// Rebuild the SMT node cache from the coin list (after deserialization).
@@ -283,16 +286,18 @@ impl UtxoAccumulator {
     }
 
     pub fn insert(&mut self, coin: [u8; 32]) -> bool {
-        if !self.coins.insert(coin) { return false; }
+        // im::OrdSet returns Some(replaced_value) if it already existed
+        if self.coins.insert(coin).is_some() { return false; }
         self.update_path(coin, true);
         true
     }
 
     pub fn remove(&mut self, coin: &[u8; 32]) -> bool {
-        if !self.coins.remove(coin) { return false; }
+        // im::OrdSet returns Some(removed_value) if it existed
+        if self.coins.remove(coin).is_none() { return false; }
         self.update_path(*coin, false);
         true
-    }
+    }   
 
     pub fn root(&mut self) -> [u8; 32] {
         self.get_node(256, [0u8; 32])
