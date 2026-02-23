@@ -244,3 +244,120 @@ pub async fn get_peers(State(node): State<AppState>) -> Json<GetPeersResponse> {
     let peers = node.get_peers().await;
     Json(GetPeersResponse { peers })
 }
+
+// ── CoinJoin Mix Handlers ───────────────────────────────────────────────
+
+pub async fn mix_create(
+    State(node): State<AppState>,
+    Json(req): Json<MixCreateRequest>,
+) -> Result<Json<MixCreateResponse>, ErrorResponse> {
+    let mix_id = node.mix_create(req.denomination, req.min_participants).await
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    Ok(Json(MixCreateResponse {
+        mix_id: hex::encode(mix_id),
+        denomination: req.denomination,
+        status: "collecting".to_string(),
+    }))
+}
+
+pub async fn mix_register(
+    State(node): State<AppState>,
+    Json(req): Json<MixRegisterRequest>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let mix_id = parse_hex32(&req.mix_id, "mix_id")?;
+
+    let input = InputReveal {
+        owner_pk: parse_hex32(&req.input.owner_pk, "owner_pk")?,
+        value: req.input.value,
+        salt: parse_hex32(&req.input.salt, "input_salt")?,
+    };
+    let output = OutputData {
+        address: parse_hex32(&req.output.address, "address")?,
+        value: req.output.value,
+        salt: parse_hex32(&req.output.salt, "output_salt")?,
+    };
+
+    node.mix_register(mix_id, input, output).await
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    Ok(Json(serde_json::json!({ "status": "registered" })))
+}
+
+pub async fn mix_fee(
+    State(node): State<AppState>,
+    Json(req): Json<MixFeeRequest>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let mix_id = parse_hex32(&req.mix_id, "mix_id")?;
+
+    let input = InputReveal {
+        owner_pk: parse_hex32(&req.input.owner_pk, "owner_pk")?,
+        value: req.input.value,
+        salt: parse_hex32(&req.input.salt, "input_salt")?,
+    };
+
+    node.mix_set_fee(mix_id, input).await
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    Ok(Json(serde_json::json!({ "status": "fee_set" })))
+}
+
+pub async fn mix_sign(
+    State(node): State<AppState>,
+    Json(req): Json<MixSignRequest>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let mix_id = parse_hex32(&req.mix_id, "mix_id")?;
+    let coin_id = parse_hex32(&req.coin_id, "coin_id")?;
+
+    let input_index = node.mix_find_input_index(mix_id, coin_id).await
+        .ok_or_else(|| ErrorResponse {
+            error: format!("coin {} not found in mix proposal", req.coin_id),
+        })?;
+
+    let signature = hex::decode(&req.signature)
+        .map_err(|e| ErrorResponse { error: format!("invalid signature hex: {}", e) })?;
+
+    node.mix_sign(mix_id, input_index, signature).await
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    Ok(Json(serde_json::json!({ "status": "signed", "input_index": input_index })))
+}
+
+pub async fn mix_status(
+    State(node): State<AppState>,
+    axum::extract::Path(mix_id_hex): axum::extract::Path<String>,
+) -> Result<Json<MixStatusResponse>, ErrorResponse> {
+    let mix_id = parse_hex32(&mix_id_hex, "mix_id")?;
+
+    let snapshot = node.mix_status(mix_id).await
+        .ok_or_else(|| ErrorResponse { error: "mix session not found".to_string() })?;
+
+    Ok(Json(snapshot_to_response(snapshot)))
+}
+
+pub async fn mix_list(
+    State(node): State<AppState>,
+) -> Json<MixListResponse> {
+    let sessions = node.mix_list().await;
+    Json(MixListResponse {
+        sessions: sessions.into_iter().map(snapshot_to_response).collect(),
+    })
+}
+
+fn snapshot_to_response(s: crate::mix::MixStatusSnapshot) -> MixStatusResponse {
+    let phase_str = match &s.phase {
+        crate::mix::MixPhase::Collecting => "collecting",
+        crate::mix::MixPhase::Signing => "signing",
+        crate::mix::MixPhase::CommitSubmitted => "commit_submitted",
+        crate::mix::MixPhase::Complete => "complete",
+        crate::mix::MixPhase::Failed(_) => "failed",
+    };
+    MixStatusResponse {
+        mix_id: s.mix_id,
+        denomination: s.denomination,
+        participants: s.participants,
+        phase: phase_str.to_string(),
+        commitment: s.commitment,
+        input_coin_ids: s.input_coin_ids,
+    }
+}

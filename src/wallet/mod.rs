@@ -1,3 +1,4 @@
+pub mod coinjoin;
 pub mod crypto;
 use crate::core::{hash_concat, compute_commitment, compute_coin_id, compute_address, decompose_value, wots, OutputData, InputReveal};
 use crate::core::mss::{self, MssKeypair};
@@ -573,6 +574,124 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
 
         Ok(pairs)
     }
+
+    // ── CoinJoin mixing ─────────────────────────────────────────────────────
+
+    /// Prepare a coin for CoinJoin mixing.
+    ///
+    /// Generates a fresh one-time address to receive the mixed output, and returns
+    /// the `(InputReveal, OutputData, output_seed)` triple needed for registration
+    /// with a [`coinjoin::MixSession`].
+    ///
+    /// The caller must hold `output_seed` until the mix completes, then pass it
+    /// to [`complete_mix`] to import the received coin.
+    pub fn prepare_mix_registration(
+        &self,
+        coin_id: &[u8; 32],
+    ) -> Result<(InputReveal, OutputData, [u8; 32])> {
+        let coin = self.find_coin(coin_id)
+            .ok_or_else(|| anyhow::anyhow!("coin {} not in wallet", short_hex(coin_id)))?;
+
+        let input = InputReveal {
+            owner_pk: coin.owner_pk,
+            value: coin.value,
+            salt: coin.salt,
+        };
+
+        // Fresh one-time key for the output
+        let output_seed: [u8; 32] = rand::random();
+        let output_pk = wots::keygen(&output_seed);
+        let output_address = compute_address(&output_pk);
+        let output_salt: [u8; 32] = rand::random();
+
+        let output = OutputData {
+            address: output_address,
+            value: coin.value,
+            salt: output_salt,
+        };
+
+        Ok((input, output, output_seed))
+    }
+
+    /// Find and prepare a denomination-1 coin to pay the CoinJoin fee.
+    ///
+    /// Returns `(InputReveal, coin_id)` for the selected coin.
+    pub fn prepare_mix_fee(
+        &self,
+        live_coins: &[[u8; 32]],
+    ) -> Result<(InputReveal, [u8; 32])> {
+        let coin = self.data.coins.iter()
+            .find(|c| c.value == 1 && live_coins.contains(&c.coin_id))
+            .ok_or_else(|| anyhow::anyhow!("no denomination-1 coin available for fee"))?;
+
+        let input = InputReveal {
+            owner_pk: coin.owner_pk,
+            value: coin.value,
+            salt: coin.salt,
+        };
+        Ok((input, coin.coin_id))
+    }
+
+    /// Sign a CoinJoin commitment for one of our coins.
+    ///
+    /// Returns the serialized signature bytes.
+    pub fn sign_mix_input(
+        &mut self,
+        coin_id: &[u8; 32],
+        commitment: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        // Try WOTS first
+        if let Some(coin) = self.find_coin(coin_id).cloned() {
+            if let Some(pos) = self.data.mss_keys.iter().position(|k| k.master_pk == coin.owner_pk) {
+                let keypair = &mut self.data.mss_keys[pos];
+                let sig = keypair.sign(commitment)?;
+                self.save()?;
+                return Ok(sig.to_bytes());
+            }
+            let sig = wots::sign(&coin.seed, commitment);
+            return Ok(wots::sig_to_bytes(&sig));
+        }
+        bail!("coin {} not in wallet", short_hex(coin_id));
+    }
+
+    /// Complete a CoinJoin mix: remove spent coins and import the received output.
+    pub fn complete_mix(
+        &mut self,
+        spent_coin_ids: &[[u8; 32]],
+        output: &OutputData,
+        output_seed: [u8; 32],
+    ) -> Result<()> {
+        self.data.coins.retain(|c| !spent_coin_ids.contains(&c.coin_id));
+
+        let output_pk = wots::keygen(&output_seed);
+        let coin_id = output.coin_id();
+        if !self.data.coins.iter().any(|c| c.coin_id == coin_id) {
+            self.data.coins.push(WalletCoin {
+                seed: output_seed,
+                owner_pk: output_pk,
+                address: output.address,
+                value: output.value,
+                salt: output.salt,
+                coin_id,
+                label: Some(format!("mixed ({})", output.value)),
+            });
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        self.data.history.push(HistoryEntry {
+            inputs: spent_coin_ids.to_vec(),
+            outputs: vec![coin_id],
+            fee: 0, // fee donor pays, not us (unless we donated)
+            timestamp: now,
+        });
+
+        self.save()?;
+        Ok(())
+    }
 }
 
 /// Deterministic coinbase seed derivation.
@@ -924,6 +1043,149 @@ mod tests {
         let mut w = Wallet::create(&path, b"pass").unwrap();
         let c1 = w.import_coin([1; 32], 2, [10; 32], None).unwrap();
         assert!(w.plan_private_send(&[c1], &[0xAA; 32], &[4, 4]).is_err());
+    }
+
+    // ── CoinJoin helpers ────────────────────────────────────────────────
+
+    #[test]
+    fn prepare_mix_registration_produces_matching_denomination() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let coin_id = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
+
+        let (input, output, _seed) = w.prepare_mix_registration(&coin_id).unwrap();
+        assert_eq!(input.value, 8);
+        assert_eq!(output.value, 8);
+        assert_eq!(input.coin_id(), coin_id);
+    }
+
+    #[test]
+    fn prepare_mix_registration_unknown_coin_fails() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let w = Wallet::create(&path, b"pass").unwrap();
+        assert!(w.prepare_mix_registration(&[0xFF; 32]).is_err());
+    }
+
+    #[test]
+    fn prepare_mix_fee_finds_denomination_1() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
+        let c2 = w.import_coin([2; 32], 1, [20; 32], None).unwrap();
+
+        let (fee_input, fee_id) = w.prepare_mix_fee(&[c1, c2]).unwrap();
+        assert_eq!(fee_input.value, 1);
+        assert_eq!(fee_id, c2);
+    }
+
+    #[test]
+    fn prepare_mix_fee_fails_without_denomination_1() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
+        assert!(w.prepare_mix_fee(&[c1]).is_err());
+    }
+
+    #[test]
+    fn sign_mix_input_produces_valid_signature() {
+        use crate::core::wots;
+
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let seed = [0x42; 32];
+        let coin_id = w.import_coin(seed, 8, [10; 32], None).unwrap();
+
+        let commitment = crate::core::types::hash(b"test commitment");
+        let sig_bytes = w.sign_mix_input(&coin_id, &commitment).unwrap();
+
+        let coin = w.find_coin(&coin_id).unwrap();
+        let sig = wots::sig_from_bytes(&sig_bytes).unwrap();
+        assert!(wots::verify(&sig, &commitment, &coin.owner_pk));
+    }
+
+    #[test]
+    fn sign_mix_input_unknown_coin_fails() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let commitment = [0; 32];
+        assert!(w.sign_mix_input(&[0xFF; 32], &commitment).is_err());
+    }
+
+    #[test]
+    fn complete_mix_removes_spent_adds_output() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let coin_id = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
+        let fee_id = w.import_coin([2; 32], 1, [20; 32], None).unwrap();
+        assert_eq!(w.coin_count(), 2);
+
+        let output_seed: [u8; 32] = [0x99; 32];
+        let output_pk = crate::core::wots::keygen(&output_seed);
+        let output_addr = crate::core::types::compute_address(&output_pk);
+        let output = crate::core::OutputData {
+            address: output_addr,
+            value: 8,
+            salt: [0xAA; 32],
+        };
+
+        w.complete_mix(&[coin_id, fee_id], &output, output_seed).unwrap();
+
+        assert_eq!(w.coin_count(), 1);
+        assert!(w.find_coin(&coin_id).is_none());
+        assert!(w.find_coin(&fee_id).is_none());
+
+        let new_coin = w.find_coin(&output.coin_id()).unwrap();
+        assert_eq!(new_coin.value, 8);
+        assert_eq!(new_coin.seed, output_seed);
+    }
+
+    #[test]
+    fn complete_mix_persists() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let coin_id = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
+
+        let output_seed: [u8; 32] = [0x99; 32];
+        let output_pk = crate::core::wots::keygen(&output_seed);
+        let output_addr = crate::core::types::compute_address(&output_pk);
+        let output = crate::core::OutputData {
+            address: output_addr,
+            value: 8,
+            salt: [0xAA; 32],
+        };
+
+        w.complete_mix(&[coin_id], &output, output_seed).unwrap();
+        let output_coin_id = output.coin_id();
+
+        // Reopen
+        let w2 = Wallet::open(&path, b"pass").unwrap();
+        assert_eq!(w2.coin_count(), 1);
+        assert!(w2.find_coin(&output_coin_id).is_some());
+        assert_eq!(w2.history().len(), 1);
     }
 
     // ── wrong password ──────────────────────────────────────────────────

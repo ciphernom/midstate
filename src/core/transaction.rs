@@ -58,6 +58,11 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             if signatures.len() != inputs.len() {
                 bail!("Signature count must match input count");
             }
+            for (i, sig) in signatures.iter().enumerate() {
+                if sig.len() > MAX_SIGNATURE_SIZE {
+                    bail!("Signature {} too large: {} > {}", i, sig.len(), MAX_SIGNATURE_SIZE);
+                }
+            }
             {
                 let mut seen = std::collections::HashSet::new();
                 for input in inputs {
@@ -169,6 +174,11 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
             if signatures.len() != inputs.len() {
                 bail!("Signature count must match input count");
             }
+            for (i, sig) in signatures.iter().enumerate() {
+                if sig.len() > MAX_SIGNATURE_SIZE {
+                    bail!("Signature {} too large: {} > {}", i, sig.len(), MAX_SIGNATURE_SIZE);
+                }
+            }
             {
                 let mut seen = std::collections::HashSet::new();
                 for input in inputs {
@@ -198,6 +208,13 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
             let expected = compute_commitment(&input_coin_ids, &output_coin_ids, salt);
             if !state.commitments.contains(&expected) {
                 bail!("No matching commitment found");
+            }
+
+            // Check commitment hasn't expired (or is about to expire this block)
+            if let Some(&commit_height) = state.commitment_heights.get(&expected) {
+                if state.height.saturating_sub(commit_height) >= COMMITMENT_TTL {
+                    bail!("Commitment expired (committed at height {}, current {})", commit_height, state.height);
+                }
             }
 
             for (i, (input, sig_bytes)) in inputs.iter().zip(signatures.iter()).enumerate() {
