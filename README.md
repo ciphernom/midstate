@@ -1,213 +1,165 @@
 # Midstate
 
-Midstate is a minimal, post-quantum cryptocurrency. It uses a unique "sequential-time" proof of work and requires exact power-of-2 coin values under the hood (though the wallet handles the math for you). 
+Midstate is a cryptocurrency implementing BLAKE3 sequential-time proof of work, post-quantum cryptography (WOTS and MSS), and strict power-of-2 coin denominations. Transactions operate on a two-phase commit-reveal protocol.
 
-This guide covers everything you need to know to compile the software, run a node, mine, and use the wallet securely.
+## 1. Build
 
----
+Compilation requires the standard Rust toolchain.
 
-## 1. Installation & Building
-
-You will need the [Rust toolchain](https://rustup.rs/) installed.
-
-Clone the repository and build the project:
 ```bash
 cargo build --release
 
 ```
 
-The compiled binary will be located at `./target/release/midstate`.
+The binary is output to `./target/release/midstate`.
+To build with reduced hash iteration requirements for local testing, append `--features fast-mining`.
 
-*(Developer Note: If you want to test the network without waiting for the full 1-million hash iterations per block, build with `cargo build --release --features fast-mining`)*.
+## 2. Node Operations
 
----
+Nodes maintain the state accumulator, manage libp2p networking, and execute mining.
 
-## 2. Running a Node
-
-To interact with the network, you need to run a node. Nodes maintain the blockchain state, relay transactions, and handle mining.
-
-### Starting your first node (Miner / Seed)
+Start a node with mining enabled:
 
 ```bash
-midstate node --data-dir ./node-data --port 9333 --rpc-port 8545 --mine
+midstate node --data-dir ./data --port 9333 --rpc-port 8545 --mine --threads 2
 
 ```
 
-* `--data-dir`: Where the blockchain and node settings are saved.
-* `--port`: The P2P network port (for connecting to other nodes).
-* `--rpc-port`: The local port your wallet uses to talk to your node.
-* `--mine`: Tells the node to continuously mine new blocks.
+* `--threads`: Restricts the number of CPU cores used by the miner. If omitted, all available cores are used.
+* The node's multiaddr (e.g., `/ip4/127.0.0.1/tcp/9333/p2p/12D3...`) is printed to standard output on startup.
 
-**Important:** When the node starts, look at the terminal output for your **Peer ID** (it looks like `/ip4/127.0.0.1/tcp/9333/p2p/12D3KooW...`). You will need this to connect other nodes to your network.
-
-### Connecting a second node to the network
+Connect a subsequent node:
 
 ```bash
-midstate node --data-dir ./node2-data --port 9334 --rpc-port 8546 --peer <PEER_ID_FROM_NODE_1>
+midstate node --data-dir ./data2 --port 9334 --rpc-port 8546 --peer <PEER_MULTIADDR>
 
 ```
 
----
+## 3. Wallet Operations
 
-## 3. Wallet Basics
+The wallet communicates with the node via HTTP RPC. All wallet commands require a password, which is prompted interactively or read from the `MIDSTATE_PASSWORD` environment variable.
 
-Midstate uses post-quantum cryptography. This introduces a very important rule: **standard addresses can only be used to receive funds ONCE.** *(All wallet commands require a password. You will be prompted in the terminal, or you can set the `MIDSTATE_PASSWORD` environment variable).*
-
-### Create a new wallet
+Create a wallet:
 
 ```bash
-midstate wallet create --path my_wallet.dat
+midstate wallet create --path wallet.dat
 
 ```
 
-### Checking your balance
-
-Your wallet needs to ask your local node about the status of your coins. Make sure your node is running!
+Query local state:
 
 ```bash
-# List all individual coins and unused addresses
-midstate wallet list --path my_wallet.dat --rpc-port 8545
-
-# Show total spendable balance
-midstate wallet balance --path my_wallet.dat --rpc-port 8545
+midstate wallet list --path wallet.dat --rpc-port 8545
+midstate wallet balance --path wallet.dat --rpc-port 8545
 
 ```
 
----
+## 4. Addresses & Receiving
 
-## 4. Receiving Coins
+Midstate utilizes post-quantum signatures. Standard addresses are consumed upon spending.
 
-Because standard addresses are strictly one-time use, Midstate offers two ways to receive funds:
-
-### Option A: Standard One-Time Address (WOTS)
-
-Generates a highly secure, single-use address.
+**Generate a WOTS Address (Single-use):**
 
 ```bash
-midstate wallet receive --path my_wallet.dat --label "payment from Alice"
+midstate wallet receive --path wallet.dat --label "payment1"
 
 ```
 
-**Warning:** Never let someone send coins to a standard address twice. If you spend from it twice, the private key becomes mathematically compromised.
+*Note: If multiple payments are sent to the same WOTS address, the wallet will only import the first one to prevent signature reuse. Subsequent coins sent to that address cannot be spent.*
 
-### Option B: Reusable Address (MSS)
-
-If you need an address to post publicly (like on a website or profile), generate a Merkle Signature Scheme (MSS) address.
+**Generate an MSS Address (Multi-use):**
 
 ```bash
-midstate wallet generate-mss --path my_wallet.dat --height 10 --label "donation address"
+midstate wallet generate-mss --path wallet.dat --height 10 --label "donation"
 
 ```
 
-* `--height 10` means this address can safely sign exactly  (1,024) transactions before it is exhausted.
-* Note: Generating high-capacity MSS addresses (height > 14) can take a few minutes.
+The `--height` parameter defines tree depth. A height of 10 allows exactly 1,024 signatures before the address is exhausted.
 
-### Scanning for Incoming Coins
-
-Because Midstate is privacy-focused, your wallet doesn't automatically know when someone sends you money. You must scan the blockchain to find your incoming coins:
+**Scan for Outputs:**
+Incoming transactions are not indexed automatically. You must scan the chain to update local balances:
 
 ```bash
-midstate wallet scan --path my_wallet.dat --rpc-port 8545
+midstate wallet scan --path wallet.dat --rpc-port 8545
 
 ```
 
-*Always run a scan before sending money to ensure your wallet's internal security indices are synced with the network.*
+## 5. Sending
 
----
+Outputs must be powers of 2. The wallet automatically decomposes base-10 integers into power-of-2 denominations, computes change, and executes the required commit and reveal transactions.
 
-## 5. Sending Coins
-
-Midstate natively uses a two-phase "Commit and Reveal" system to prevent network front-running, and it forces all coins to be exact powers of 2. **The wallet completely abstracts this for you.**
-
-Send any integer amount to an address:
+**Standard Send:**
 
 ```bash
-midstate wallet send --path my_wallet.dat --rpc-port 8545 --to <ADDRESS_HEX>:15
+midstate wallet send --path wallet.dat --rpc-port 8545 --to <ADDRESS_HEX>:15
 
 ```
 
-*The wallet will automatically break the `15` down into `8 + 4 + 2 + 1` behind the scenes, calculate change, submit the "Commit" transaction, wait for it to be mined, and then submit the final "Reveal" transaction.*
-
-### Private Send
-
-If you want to hide the link between your inputs and outputs, use the `--private` flag.
+**Private Send:**
 
 ```bash
-midstate wallet send --path my_wallet.dat --rpc-port 8545 --to <ADDRESS_HEX>:15 --private
+midstate wallet send --path wallet.dat --rpc-port 8545 --to <ADDRESS_HEX>:15 --private
 
 ```
 
-This breaks your payment into completely independent, delayed transactions for each denomination. It costs slightly more in fees and takes longer to fully clear, but greatly enhances on-chain privacy.
+The `--private` flag splits the payment into separate, independent transactions for each required denomination. This increases total network fees and processing time.
 
----
+## 6. P2P CoinJoin
 
-## 6. Advanced Privacy: CoinJoin Mixing
+Nodes coordinate uniform-denomination CoinJoin transactions over the p2p network.
 
-Midstate has a built-in "Dark Pool" CoinJoin feature. It allows you to mix your coins with other users seamlessly over the P2P network, with no central coordinator.
-
-Because Midstate coins are strictly powers of 2, these mixes are mathematically perfect—an observer cannot map inputs to outputs.
-
-**Step 1: Announce a mix (User A)**
-Decide on a power-of-2 denomination you want to mix (e.g., `8`).
+**Initiate a mix:**
 
 ```bash
-midstate wallet mix --path my_wallet.dat --rpc-port 8545 --denomination 8
+midstate wallet mix --path wallet.dat --rpc-port 8545 --denomination 8
 
 ```
 
-This will print a `mix_id`. Share this ID securely with the person you want to mix with.
+This outputs a `<MIX_ID>`.
 
-**Step 2: Join a mix (User B)**
+**Join a mix:**
 
 ```bash
-midstate wallet mix --path my_wallet.dat --rpc-port 8545 --denomination 8 --join <MIX_ID>
+midstate wallet mix --path wallet.dat --rpc-port 8545 --denomination 8 --join <MIX_ID>
 
 ```
 
-*Note: One user in the mix must append the `--pay-fee` flag to contribute a `1`-value coin to cover the network mining fee.*
+Exactly one participant in the session must supply the `--pay-fee` flag, which requires an available denomination-1 coin in their wallet to cover the network fee.
 
-The wallets will automatically negotiate, sign, and broadcast the completely anonymized transaction.
+## 7. Mining Rewards
 
----
-
-## 7. Claiming Mining Rewards
-
-If you are running a node with the `--mine` flag, your node is saving your block rewards directly into a log file (`coinbase_seeds.jsonl`).
-
-To make these coins spendable, import them into your wallet:
+A mining node writes its deterministic coinbase seeds to a local log file. These must be imported to the wallet to be spent.
 
 ```bash
-midstate wallet import-rewards --path my_wallet.dat --coinbase-file ./node-data/coinbase_seeds.jsonl
+midstate wallet import-rewards --path wallet.dat --coinbase-file ./data/coinbase_seeds.jsonl
 
 ```
 
----
+## CLI Reference
 
-## CLI Command Cheat Sheet
-
-### Node Commands
+**Node**
 
 * `node` - Start the node daemon.
 
-### Wallet Commands
+**Wallet**
 
-* `wallet create` - Make a new wallet.
-* `wallet receive` - Get a 1-time address.
-* `wallet generate-mss` - Get a reusable address.
-* `wallet list` - View your coins and unused keys.
-* `wallet balance` - View aggregate balance.
-* `wallet scan` - Find incoming payments on the blockchain.
-* `wallet send` - Send funds to someone.
-* `wallet mix` - Anonymize a coin via P2P CoinJoin.
-* `wallet history` - View past transactions.
-* `wallet pending` - View transactions waiting to be mined.
-* `wallet import-rewards` - Claim mined coins.
-* `wallet export` - Export raw coin data (seed, salt, value) for backups.
-* `wallet import` - Manually import raw coin data.
+* `wallet create` - Initialize a new wallet file.
+* `wallet receive` - Generate a WOTS address.
+* `wallet generate-mss` - Generate an MSS address.
+* `wallet list` - Display controlled coins and unused keys.
+* `wallet balance` - Display aggregate balance.
+* `wallet scan` - Scan blockchain for incoming coins.
+* `wallet send` - Construct and broadcast a transaction.
+* `wallet mix` - Participate in a CoinJoin session.
+* `wallet history` - Display past transactions.
+* `wallet pending` - Display transactions awaiting block inclusion.
+* `wallet import-rewards` - Import coinbase seeds from node logs.
+* `wallet export` - Display raw coin data (seed, salt, value).
+* `wallet import` - Import raw coin data.
 
-### Low-Level RPC Commands (For debugging)
+**RPC (Debug)**
 
-* `state` - View current blockchain height, difficulty, and midstate.
-* `mempool` - View transactions waiting in the memory pool.
-* `peers` - List connected network peers.
-* `balance` - Check if a specific raw `Coin_ID` exists in the UTXO set.
+* `state` - Display chain height, depth, and midstate.
+* `mempool` - Display pending transactions.
+* `peers` - List active p2p connections.
+* `balance` - Check if a specific Coin ID exists in the UTXO set.
