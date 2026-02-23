@@ -5,7 +5,8 @@ pub mod transaction;
 pub mod extension;
 pub mod state;
 pub mod mmr;  
-pub mod mss;   
+pub mod mss;
+pub mod script;
 
 pub use finality::*;
 pub use types::*;

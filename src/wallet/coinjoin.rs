@@ -261,15 +261,13 @@ impl MixSession {
     pub fn build_reveal(&self, signatures: Vec<Vec<u8>>) -> Result<Transaction> {
         let proposal = self.proposal()?;
         if signatures.len() != proposal.inputs.len() {
-            bail!(
-                "expected {} signatures, got {}",
-                proposal.inputs.len(),
-                signatures.len()
-            );
+            bail!("expected {} signatures", proposal.inputs.len());
         }
+        let witnesses = signatures.into_iter().map(Witness::sig).collect();
+        
         Ok(Transaction::Reveal {
             inputs: proposal.inputs,
-            signatures,
+            witnesses,
             outputs: proposal.outputs,
             salt: proposal.salt,
         })
@@ -313,12 +311,13 @@ pub fn is_uniform_mix(tx: &Transaction) -> bool {
 mod tests {
     use super::*;
     use crate::core::wots;
+    use crate::core::types::{Predicate, Witness};
 
     fn make_participant(name: &[u8]) -> ([u8; 32], InputReveal, OutputData) {
         let seed = hash(name);
         let pk = wots::keygen(&seed);
         let input = InputReveal {
-            owner_pk: pk,
+            predicate: Predicate::p2pk(&pk),
             value: 8,
             salt: hash_concat(name, b"input-salt"),
         };
@@ -334,7 +333,7 @@ mod tests {
         let seed = hash(name);
         let pk = wots::keygen(&seed);
         let input = InputReveal {
-            owner_pk: pk,
+            predicate: Predicate::p2pk(&pk),
             value: 1,
             salt: hash_concat(name, b"fee-salt"),
         };
@@ -405,7 +404,7 @@ mod tests {
         let mut s = MixSession::new(8, 2).unwrap();
         let seed = hash(b"bad");
         let pk = wots::keygen(&seed);
-        let input = InputReveal { owner_pk: pk, value: 4, salt: [0; 32] };
+        let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 4, salt: [0; 32] };
         let output = OutputData { address: [0; 32], value: 8, salt: [0; 32] };
         assert!(s.register(input, output).is_err());
     }
@@ -415,7 +414,7 @@ mod tests {
         let mut s = MixSession::new(8, 2).unwrap();
         let seed = hash(b"bad");
         let pk = wots::keygen(&seed);
-        let input = InputReveal { owner_pk: pk, value: 8, salt: [0; 32] };
+        let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 8, salt: [0; 32] };
         let output = OutputData { address: [0; 32], value: 4, salt: [0; 32] };
         assert!(s.register(input, output).is_err());
     }
@@ -456,7 +455,7 @@ mod tests {
         let mut s = MixSession::new(8, 2).unwrap();
         let seed = hash(b"bad-fee");
         let pk = wots::keygen(&seed);
-        let input = InputReveal { owner_pk: pk, value: 2, salt: [0; 32] };
+        let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 2, salt: [0; 32] };
         assert!(s.set_fee_input(input).is_err());
     }
 
@@ -475,7 +474,7 @@ mod tests {
         // Register a denomination-1 mix input
         let seed = hash(b"collider");
         let pk = wots::keygen(&seed);
-        let input = InputReveal { owner_pk: pk, value: 1, salt: [0xAA; 32] };
+        let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 1, salt: [0xAA; 32] };
         let output = OutputData { address: hash(b"dest"), value: 1, salt: [0xBB; 32] };
         s.register(input.clone(), output).unwrap();
 
@@ -623,16 +622,16 @@ mod tests {
 
         let sigs: Vec<Vec<u8>> = proposal.inputs.iter().map(|input| {
             let seed = seeds.iter()
-                .find(|(_, i)| i.owner_pk == input.owner_pk)
+                .find(|(_, i)| i.predicate == input.predicate)
                 .unwrap().0;
             wots::sig_to_bytes(&wots::sign(&seed, &proposal.commitment))
         }).collect();
 
         let tx = session.build_reveal(sigs).unwrap();
         match &tx {
-            Transaction::Reveal { inputs, signatures, outputs, salt } => {
+            Transaction::Reveal { inputs, witnesses, outputs, salt } => {
                 assert_eq!(inputs.len(), 3);
-                assert_eq!(signatures.len(), 3);
+                assert_eq!(witnesses.len(), 3);
                 assert_eq!(outputs.len(), 2);
                 assert_eq!(*salt, proposal.salt);
             }
@@ -647,16 +646,20 @@ mod tests {
 
         let sigs: Vec<Vec<u8>> = proposal.inputs.iter().map(|input| {
             let seed = seeds.iter()
-                .find(|(_, i)| i.owner_pk == input.owner_pk)
+                .find(|(_, i)| i.predicate == input.predicate)
                 .unwrap().0;
             wots::sig_to_bytes(&wots::sign(&seed, &proposal.commitment))
         }).collect();
 
         let tx = session.build_reveal(sigs).unwrap();
-        if let Transaction::Reveal { inputs, signatures, .. } = &tx {
-            for (input, sig_bytes) in inputs.iter().zip(signatures.iter()) {
-                let sig = wots::sig_from_bytes(sig_bytes).unwrap();
-                assert!(wots::verify(&sig, &proposal.commitment, &input.owner_pk));
+        if let Transaction::Reveal { inputs, witnesses, .. } = &tx {
+            for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                if let Witness::ScriptInputs(wit_inputs) = witness {
+                    if let (Some(owner_pk), Some(sig_bytes)) = (input.predicate.owner_pk(), wit_inputs.first()) {
+                        let sig = wots::sig_from_bytes(sig_bytes).unwrap();
+                        assert!(wots::verify(&sig, &proposal.commitment, &owner_pk));
+                    }
+                }
             }
         }
     }
@@ -669,7 +672,7 @@ mod tests {
         let proposal = session.proposal().unwrap();
         let sigs: Vec<Vec<u8>> = proposal.inputs.iter().map(|input| {
             let seed = seeds.iter()
-                .find(|(_, i)| i.owner_pk == input.owner_pk)
+                .find(|(_, i)| i.predicate == input.predicate)
                 .unwrap().0;
             wots::sig_to_bytes(&wots::sign(&seed, &proposal.commitment))
         }).collect();
@@ -687,11 +690,11 @@ mod tests {
     fn is_uniform_mix_false_for_non_uniform_outputs() {
         let tx = Transaction::Reveal {
             inputs: vec![
-                InputReveal { owner_pk: [1; 32], value: 8, salt: [0; 32] },
-                InputReveal { owner_pk: [2; 32], value: 8, salt: [0; 32] },
-                InputReveal { owner_pk: [3; 32], value: 1, salt: [0; 32] },
+                InputReveal { predicate: Predicate::p2pk(&[1; 32]), value: 8, salt: [0; 32] },
+                InputReveal { predicate: Predicate::p2pk(&[2; 32]), value: 8, salt: [0; 32] },
+                InputReveal { predicate: Predicate::p2pk(&[3; 32]), value: 1, salt: [0; 32] },
             ],
-            signatures: vec![vec![]; 3],
+            witnesses: vec![Witness::sig(vec![]); 3],
             outputs: vec![
                 OutputData { address: [0; 32], value: 8, salt: [0; 32] },
                 OutputData { address: [0; 32], value: 4, salt: [0; 32] }, // mismatch
@@ -706,10 +709,10 @@ mod tests {
         // 1 mix input + 1 fee = 2 inputs, 1 output → below MIN_MIX_PARTICIPANTS
         let tx = Transaction::Reveal {
             inputs: vec![
-                InputReveal { owner_pk: [1; 32], value: 8, salt: [0; 32] },
-                InputReveal { owner_pk: [2; 32], value: 1, salt: [0; 32] },
+                InputReveal { predicate: Predicate::p2pk(&[1; 32]), value: 8, salt: [0; 32] },
+                InputReveal { predicate: Predicate::p2pk(&[2; 32]), value: 1, salt: [0; 32] },
             ],
-            signatures: vec![vec![]; 2],
+            witnesses: vec![Witness::sig(vec![]); 2],
             outputs: vec![
                 OutputData { address: [0; 32], value: 8, salt: [0; 32] },
             ],
@@ -733,7 +736,7 @@ mod tests {
             target: [0xff; 32],
             height: 1,
             timestamp: 1000,
-            commitment_heights: std::collections::HashMap::new(),
+            commitment_heights: im::HashMap::new(),
         };
 
         // Create 3 coins in the UTXO set
@@ -741,9 +744,9 @@ mod tests {
         let (seed_b, in_b, out_b) = make_participant(b"bob");
         let (seed_f, fee) = make_fee_participant(b"fee-donor");
 
-        let pk_a = in_a.owner_pk;
-        let pk_b = in_b.owner_pk;
-        let pk_f = fee.owner_pk;
+        let pk_a = in_a.predicate.owner_pk().unwrap();
+        let pk_b = in_b.predicate.owner_pk().unwrap();
+        let pk_f = fee.predicate.owner_pk().unwrap();
         let in_a_id = in_a.coin_id();
         let in_b_id = in_b.coin_id();
         let fee_id = fee.coin_id();
@@ -785,7 +788,7 @@ mod tests {
         ];
         let sigs: Vec<Vec<u8>> = proposal.inputs.iter().map(|input| {
             let (seed, _) = seeds.iter()
-                .find(|(_, pk)| *pk == input.owner_pk)
+                .find(|(_, pk)| crate::core::types::Predicate::p2pk(pk) == input.predicate)
                 .unwrap();
             wots::sig_to_bytes(&wots::sign(seed, &proposal.commitment))
         }).collect();
@@ -817,7 +820,7 @@ mod tests {
             let name = [i; 4];
             let seed = hash(&name);
             let pk = wots::keygen(&seed);
-            let input = InputReveal { owner_pk: pk, value: 16, salt: hash(&[i + 100]) };
+            let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 16, salt: hash(&[i + 100]) };
             let output = OutputData {
                 address: hash(&[i + 200]),
                 value: 16,
@@ -826,7 +829,7 @@ mod tests {
             session.register(input, output).unwrap();
         }
 
-        let (seed_f, fee) = make_fee_participant(b"fee3");
+        let (_seed_f, fee) = make_fee_participant(b"fee3");
         session.set_fee_input(fee).unwrap();
 
         let p = session.proposal().unwrap();
@@ -842,8 +845,8 @@ mod tests {
 
     #[test]
     fn proposal_independent_of_registration_order() {
-        let (seed_a, in_a, out_a) = make_participant(b"alice");
-        let (seed_b, in_b, out_b) = make_participant(b"bob");
+        let (_seed_a, in_a, out_a) = make_participant(b"alice");
+        let (_seed_b, in_b, out_b) = make_participant(b"bob");
         let (_, fee) = make_fee_participant(b"fee");
 
         let salt = [0x77; 32];
@@ -886,7 +889,7 @@ mod tests {
         for i in 0..2u8 {
             let seed = hash(&[i]);
             let pk = wots::keygen(&seed);
-            let input = InputReveal { owner_pk: pk, value: 1, salt: [i + 10; 32] };
+            let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 1, salt: [i + 10; 32] };
             let output = OutputData { address: hash(&[i + 20]), value: 1, salt: [i + 30; 32] };
             session.register(input, output).unwrap();
         }
