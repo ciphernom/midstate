@@ -90,6 +90,12 @@ midstate balance --rpc-port 8545 --coin <COIN_ID_HEX>
 
 ## 4. Privacy Mechanics
 
+### Smart Contract Auto-Solving
+
+Because every address is a smart contract, the wallet performs Ahead-Of-Time (AOT) decompilation when you attempt to spend a coin.
+
+If the wallet detects an `OP_CHECKSIGVERIFY` instruction preceded by a public key that matches a seed stored in your `wallet.dat`, it will automatically generate the required WOTS or MSS signature and inject it into the correct position on the VM execution stack.
+
 ### Private Sends
 
 The standard `send` command aggregates inputs and produces a single transaction. The `--private` flag splits the transaction.
