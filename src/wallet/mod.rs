@@ -1,6 +1,6 @@
 pub mod coinjoin;
 pub mod crypto;
-use crate::core::{hash_concat, compute_commitment, compute_coin_id, compute_address, decompose_value, wots, OutputData, InputReveal};
+use crate::core::{hash_concat, compute_commitment, compute_coin_id, compute_address, decompose_value, wots, OutputData, InputReveal, Predicate, Witness};
 use crate::core::mss::{self, MssKeypair};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -397,43 +397,33 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
     }
 
     /// Build InputReveals and signatures for a pending commit.
-    pub fn sign_reveal(&mut self, pending: &PendingCommit) -> Result<(Vec<InputReveal>, Vec<Vec<u8>>)> {
+    pub fn sign_reveal(&mut self, pending: &PendingCommit) -> Result<(Vec<InputReveal>, Vec<Witness>)> {
         let output_coin_ids: Vec<[u8; 32]> = pending.outputs.iter().map(|o| o.coin_id()).collect();
-        let commitment = compute_commitment(
-            &pending.input_coin_ids,
-            &output_coin_ids,
-            &pending.salt,
-        );
+        let commitment = compute_commitment(&pending.input_coin_ids, &output_coin_ids, &pending.salt);
 
         let mut input_reveals = Vec::new();
-        let mut signatures = Vec::new();
+        let mut witnesses = Vec::new();
 
         for coin_id in &pending.input_coin_ids {
-            // Try WOTS coin
             if let Some(wc) = self.find_coin(coin_id).cloned() {
                 input_reveals.push(InputReveal {
-                    owner_pk: wc.owner_pk,
+                    predicate: Predicate::p2pk(&wc.owner_pk),
                     value: wc.value,
                     salt: wc.salt,
                 });
                 let sig = wots::sign(&wc.seed, &commitment);
-                signatures.push(wots::sig_to_bytes(&sig));
-            }
-            // Try MSS key (coin's owner_pk matches an MSS master_pk)
-            else if let Some(wc) = self.data.coins.iter().find(|c| &c.coin_id == coin_id) {
-                // Found the coin data, but the seed might be for an MSS key
+                witnesses.push(Witness::sig(wots::sig_to_bytes(&sig)));
+            } else if let Some(wc) = self.data.coins.iter().find(|c| &c.coin_id == coin_id) {
                 if let Some(pos) = self.data.mss_keys.iter().position(|k| k.master_pk == wc.owner_pk) {
                     input_reveals.push(InputReveal {
-                        owner_pk: wc.owner_pk,
+                        predicate: Predicate::p2pk(&wc.owner_pk),
                         value: wc.value,
                         salt: wc.salt,
                     });
                     let keypair = &mut self.data.mss_keys[pos];
-                    if keypair.remaining() == 0 {
-                        bail!("MSS key {} exhausted", short_hex(&wc.owner_pk));
-                    }
+                    if keypair.remaining() == 0 { bail!("MSS key exhausted"); }
                     let sig = keypair.sign(&commitment)?;
-                    signatures.push(sig.to_bytes());
+                    witnesses.push(Witness::sig(sig.to_bytes()));
                 } else {
                     bail!("key for {} not found", short_hex(coin_id));
                 }
@@ -441,9 +431,8 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                 bail!("coin {} not found in wallet", short_hex(coin_id));
             }
         }
-
         self.save()?;
-        Ok((input_reveals, signatures))
+        Ok((input_reveals, witnesses))
     }
 
     pub fn find_pending(&self, commitment: &[u8; 32]) -> Option<&PendingCommit> {
@@ -593,7 +582,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             .ok_or_else(|| anyhow::anyhow!("coin {} not in wallet", short_hex(coin_id)))?;
 
         let input = InputReveal {
-            owner_pk: coin.owner_pk,
+            predicate: Predicate::p2pk(&coin.owner_pk),
             value: coin.value,
             salt: coin.salt,
         };
@@ -625,7 +614,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             .ok_or_else(|| anyhow::anyhow!("no denomination-1 coin available for fee"))?;
 
         let input = InputReveal {
-            owner_pk: coin.owner_pk,
+            predicate: Predicate::p2pk(&coin.owner_pk),
             value: coin.value,
             salt: coin.salt,
         };
