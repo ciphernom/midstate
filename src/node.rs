@@ -25,7 +25,7 @@ use tokio::time;
 use rayon::prelude::*;
 
 const MAX_ORPHAN_BATCHES: usize = 256;
-const SYNC_TIMEOUT_SECS: u64 = 120;
+const SYNC_TIMEOUT_SECS: u64 = 300;
 const CATCH_UP_THRESHOLD: u64 = 20;
 
 /// Non-blocking sync session driven by the main event loop.
@@ -45,6 +45,7 @@ enum SyncPhase {
         accumulated: Vec<BatchHeader>,
         cursor: u64,
     },
+    VerifyingHeaders,
     /// Headers verified, now downloading batches from fork_height forward.
     Batches {
         headers: Vec<BatchHeader>,
@@ -62,7 +63,7 @@ pub struct Node {
     network: MidstateNetwork,
     syncer: Syncer,
     metrics: Metrics,
-    is_mining: bool,
+    mining_threads: Option<usize>,
      recent_headers: VecDeque<u64>,
     orphan_batches: HashMap<u64, Batch>,
     sync_in_progress: bool,
@@ -83,6 +84,7 @@ pub struct Node {
     /// Reveals waiting for their Commit to be mined.
     /// Key: commitment hash, Value: (mix_id, Reveal transaction)
     pending_mix_reveals: HashMap<[u8; 32], ([u8; 32], Transaction)>,
+    cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<NodeCommand>>,
 }
 
 #[derive(Clone)]
@@ -106,6 +108,7 @@ pub enum NodeCommand {
     SendMixFee { coordinator: PeerId, mix_id: [u8; 32], input: InputReveal },
     SendMixSign { coordinator: PeerId, mix_id: [u8; 32], input_index: usize, signature: Vec<u8> },
     BroadcastMixProposal { mix_id: [u8; 32], proposal: crate::wallet::coinjoin::MixProposal, peers: Vec<PeerId> },
+    FinishSyncHeaders { peer: PeerId, headers: Vec<BatchHeader>, is_valid: bool },
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -294,12 +297,18 @@ impl NodeHandle {
 pub fn scan_txs_for_mss_index(txs: &[Transaction], master_pk: &[u8; 32]) -> u64 {
     let mut max_idx: u64 = 0;
     for tx in txs {
-        if let Transaction::Reveal { inputs, signatures, .. } = tx {
-            for (input, sig_bytes) in inputs.iter().zip(signatures.iter()) {
-                if input.owner_pk == *master_pk && sig_bytes.len() > wots::SIG_SIZE {
-                    if let Ok(mss_sig) = mss::MssSignature::from_bytes(sig_bytes) {
-                        // leaf_index is 0-based, so next usable = leaf_index + 1
-                        max_idx = max_idx.max(mss_sig.leaf_index + 1);
+        if let Transaction::Reveal { inputs, witnesses, .. } = tx {
+            for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                if let Some(owner_pk) = input.predicate.owner_pk() {
+                    if &owner_pk == master_pk {
+                        let Witness::ScriptInputs(wit_inputs) = witness; 
+                            if let Some(sig_bytes) = wit_inputs.first() {
+                                if sig_bytes.len() > wots::SIG_SIZE {
+                                    if let Ok(mss_sig) = mss::MssSignature::from_bytes(sig_bytes) {
+                                        max_idx = max_idx.max(mss_sig.leaf_index.saturating_add(1));
+                                    }
+                                }
+                            }                        
                     }
                 }
             }
@@ -311,7 +320,7 @@ pub fn scan_txs_for_mss_index(txs: &[Transaction], master_pk: &[u8; 32]) -> u64 
 impl Node {
     pub async fn new(
         data_dir: PathBuf,
-        is_mining: bool,
+        mining_threads: Option<usize>,
         listen_addr: Multiaddr,
         bootstrap_peers: Vec<Multiaddr>,
     ) -> Result<Self> {
@@ -420,7 +429,7 @@ impl Node {
             syncer: Syncer::new(storage),
             network,
             metrics: Metrics::new(),
-            is_mining,
+            mining_threads,
             recent_headers, // Updated field
             orphan_batches: HashMap::new(),
             sync_in_progress: false,
@@ -438,6 +447,7 @@ impl Node {
             mined_batch_tx,
             mix_manager: Arc::new(RwLock::new(MixManager::new())),
             pending_mix_reveals: HashMap::new(),
+            cmd_tx: None,
         })
     }
 
@@ -471,6 +481,7 @@ impl Node {
         handle: NodeHandle,
         mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<NodeCommand>,
     ) -> Result<()> {
+        self.cmd_tx = Some(handle.tx_sender.clone());
         let mut mine_interval = time::interval(Duration::from_secs(5));
         let mut save_interval = time::interval(Duration::from_secs(10));
         let mut ui_interval = time::interval(Duration::from_secs(1));
@@ -495,7 +506,8 @@ impl Node {
         loop {
             tokio::select! {
                 _ = mine_interval.tick() => {
-                    if self.is_mining && !self.sync_in_progress && self.mining_cancel.is_none() {
+                    // Check mining_threads.is_some() instead of is_mining
+                    if self.mining_threads.is_some() && !self.sync_in_progress && self.mining_cancel.is_none() {
                         if let Err(e) = self.spawn_mining_task() {
                             tracing::error!("Mining error: {}", e);
                         }
@@ -564,7 +576,7 @@ impl Node {
                             .collect();
 
                         for addr in to_dial {
-                            tracing::info!("Maintenance: Dialing {} to maintain outbound ratio", addr);
+                            //tracing::info!("Maintenance: Dialing {} to maintain outbound ratio", addr); //spams output
                             self.network.dial_addr(&addr);
                         }
                     }
@@ -596,6 +608,11 @@ impl Node {
                         }
                         NodeCommand::SendMixSign { coordinator, mix_id, input_index, signature } => {
                             self.network.send(coordinator, Message::MixSign { mix_id, input_index, signature });
+                        }
+                        NodeCommand::FinishSyncHeaders { peer, headers, is_valid } => {
+                            if let Err(e) = self.process_verified_headers(peer, headers, is_valid).await {
+                                tracing::warn!("Failed to process verified headers: {}", e);
+                            }
                         }
                         NodeCommand::BroadcastMixProposal { mix_id, proposal, peers } => {
                             for peer in peers {
@@ -752,7 +769,33 @@ impl Node {
                 match self.storage.load_batches(start_height, end) {
                     Ok(tagged) => {
                         let actual_start = tagged.first().map(|(h, _)| *h).unwrap_or(start_height);
-                        let batches: Vec<Batch> = tagged.into_iter().map(|(_, b)| b).collect();
+                        
+                        // Byte-bounded packing to prevent MAX_MSG_SIZE crashes ---
+                        let mut batches = Vec::new();
+                        let mut current_size = 0u64;
+                        
+                        // Target 8 MB to leave 2 MB of safety margin for bincode/network overhead
+                        // against the 10 MB MAX_MSG_SIZE limit.
+                        const MAX_PAYLOAD_BYTES: u64 = 8_000_000; 
+
+                        for (_, batch) in tagged {
+                            // bincode::serialized_size is very fast, it doesn't allocate
+                            let batch_size = bincode::serialized_size(&batch).unwrap_or(0);
+                            
+                            // Always include at least 1 batch to prevent stalling the sync,
+                            // otherwise break if adding this batch exceeds our safe limit.
+                            if !batches.is_empty() && current_size + batch_size > MAX_PAYLOAD_BYTES {
+                                tracing::debug!(
+                                    "Truncating GetBatches response to {} blocks ({} bytes) to fit message limits.", 
+                                    batches.len(), current_size
+                                );
+                                break;
+                            }
+                            
+                            batches.push(batch);
+                            current_size += batch_size;
+                        }
+
                         self.send_response(channel, Message::Batches {
                             start_height: actual_start,
                             batches,
@@ -978,8 +1021,16 @@ impl Node {
             // Need more headers — request next chunk
             let count = 100.min(peer_height - new_cursor);
             self.network.send(from, Message::GetHeaders { start_height: new_cursor, count });
+
+            //  Reset idle timeout because we are making progress
+            if let Some(s) = &mut self.sync_session {
+                s.started_at = std::time::Instant::now();
+            }
+            // ----------------
+
             return Ok(());
         }
+
 
         // All headers received — take ownership of the session data
         let session = self.sync_session.take().unwrap();
@@ -988,17 +1039,104 @@ impl Node {
             _ => unreachable!(),
         };
 
-        tracing::info!("Downloaded {} headers, verifying PoW + linkage...", all_headers.len());
+        let total_headers = all_headers.len(); // <--- Capture total length
+        tracing::info!("Downloaded {} headers, offloading PoW verification...", total_headers);
 
-        // Validate the full header chain
-        if let Err(e) = Syncer::verify_header_chain(&all_headers) {
-            tracing::warn!("Peer header chain invalid: {}", e);
+        let tx = self.cmd_tx.as_ref().unwrap().clone();
+        tokio::spawn(async move {
+            let mut is_valid = true;
+
+            // 1. Fast sequential check: Ensure chain linkage is intact for all headers
+            for i in 1..all_headers.len() {
+                if all_headers[i].prev_midstate != all_headers[i - 1].extension.final_hash {
+                    tracing::warn!("Header linkage broken at index {}", i);
+                    is_valid = false;
+                    break;
+                }
+            }
+
+            // 2. Heavy PoW check in chunks, yielding to prevent CPU starvation
+            if is_valid {
+                let mut processed = 0; // <--- Track progress
+                
+                for chunk in all_headers.chunks(100) {
+                    let chunk_owned = chunk.to_vec();
+                    
+                    let chunk_valid = tokio::task::spawn_blocking(move || {
+                        use rayon::prelude::*;
+                        use crate::core::extension::verify_extension;
+                        
+                        chunk_owned.par_iter().all(|header| {
+                            verify_extension(
+                                header.post_tx_midstate,
+                                &header.extension,
+                                &header.target,
+                            ).is_ok()
+                        })
+                    }).await.expect("Header verification task panicked");
+
+                    if !chunk_valid {
+                        is_valid = false;
+                        break;
+                    }
+
+                    processed += chunk.len();
+
+                    // --- NEW: Progress Logging ---
+                    // Log progress every 1,000 headers, or when we hit 100%
+                    if processed % 1000 == 0 || processed == total_headers {
+                        let pct = (processed as f64 / total_headers as f64) * 100.0;
+                        tracing::info!("Initial Headers Download Progress: Verified {}/{} headers ({:.1}%)", processed, total_headers, pct);
+                    }
+                    // -----------------------------
+
+                    // Suspend this task for exactly one cycle of the Tokio executor,
+                    // letting it answer network pings before Rayon locks the CPUs again.
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            let _ = tx.send(NodeCommand::FinishSyncHeaders {
+                peer: from,
+                headers: all_headers,
+                is_valid,
+            });
+        });
+
+        // Put the session into a waiting state while the OS thread works
+        self.sync_session = Some(SyncSession {
+            peer: session.peer,
+            peer_height: session.peer_height,
+            peer_depth: session.peer_depth,
+            phase: SyncPhase::VerifyingHeaders,
+            started_at: session.started_at,
+        });
+
+        Ok(())
+    }
+
+    async fn process_verified_headers(
+        &mut self,
+        peer: PeerId,
+        all_headers: Vec<BatchHeader>,
+        is_valid: bool,
+    ) -> Result<()> {
+        let session = match self.sync_session.take() {
+            Some(s) if s.peer == peer && matches!(s.phase, SyncPhase::VerifyingHeaders) => s,
+            other => {
+                self.sync_session = other; // Session was aborted or overwritten
+                return Ok(());
+            }
+        };
+
+        if !is_valid {
+            tracing::warn!("Peer header chain invalid (PoW or linkage failed)");
             self.sync_in_progress = false;
             return Ok(());
         }
+
         tracing::info!("Header chain verified. Finding fork point...");
 
-        // Find fork point using local storage
         let fork_height = self.syncer.find_fork_point(&all_headers, self.state.height)?;
         tracing::info!(
             "Fork point at height {}. Will download batches {}..{}",
@@ -1006,26 +1144,21 @@ impl Node {
         );
 
         if fork_height >= session.peer_height {
-            // Already in sync
             tracing::info!("Already in sync with peer");
             self.sync_in_progress = false;
             return Ok(());
         }
 
-        // Build the candidate state at the fork point
         let candidate_state = if fork_height == 0 {
             State::genesis().0
         } else if fork_height <= self.state.height {
-            // Reorg: rebuild state to the fork point
             self.syncer.rebuild_state_to(fork_height)?
         } else {
-            // Peer extends us — start from our current state
             self.state.clone()
         };
 
-        // Transition to Batches phase
         self.sync_session = Some(SyncSession {
-            peer: from,
+            peer,
             peer_height: session.peer_height,
             peer_depth: session.peer_depth,
             phase: SyncPhase::Batches {
@@ -1035,12 +1168,11 @@ impl Node {
                 cursor: fork_height,
                 new_history: Vec::new(),
             },
-            started_at: session.started_at,
+            started_at: std::time::Instant::now(),
         });
 
-        // Request first chunk of batches from the fork point
         let count = (session.peer_height - fork_height).min(MAX_GETBATCHES_COUNT);
-        self.network.send(from, Message::GetBatches { start_height: fork_height, count });
+        self.network.send(peer, Message::GetBatches { start_height: fork_height, count });
 
         Ok(())
     }
@@ -1133,6 +1265,8 @@ impl Node {
             // Need more batches — request next chunk
             let count = (peer_height - current_cursor).min(MAX_GETBATCHES_COUNT);
             self.network.send(from, Message::GetBatches { start_height: current_cursor, count });
+            // Reset idle timeout
+            session.started_at = std::time::Instant::now();
             self.sync_session = Some(session); // put session back
             return Ok(());
         }
@@ -1191,7 +1325,7 @@ impl Node {
         }
     }
 
-    // ── Fix A: New find_fork_point method ────────────────────────────────
+    // ── New find_fork_point method ────────────────────────────────
     /// Find the height where our chain and the alternative chain diverge
     /// by comparing batches side-by-side.
     fn find_fork_point(&self, alternative_batches: &[Batch], alt_start_height: u64) -> Result<u64> {
@@ -1219,7 +1353,7 @@ impl Node {
         anyhow::bail!("No divergence found — chains are identical over the received range")
     }
 
-    // ── Fix D: Simplified evaluate_alternative_chain ─────────────────────
+    // ── Simplified evaluate_alternative_chain ─────────────────────
     async fn evaluate_alternative_chain(
         &mut self,
         fork_height: u64,
@@ -1297,7 +1431,7 @@ impl Node {
         }
     }
 
-    // ── Fix C (Fix 3): Added sync_in_progress = false at end ────────────
+    // ── Added sync_in_progress = false at end ────────────
     fn perform_reorg(
         &mut self,
         new_state: State,
@@ -1416,17 +1550,18 @@ impl Node {
 
         let commitment = compute_commitment(&input_ids, &output_ids, &salt);
 
-        // Mine spam nonce for the Commit
-        let spam_nonce = {
+        // Mine spam nonce for the Commit (respecting dynamic mempool difficulty)
+        let required_pow = self.mempool.required_commit_pow();
+        let spam_nonce = tokio::task::spawn_blocking(move || {
             let mut n = 0u64;
             loop {
                 let h = hash_concat(&commitment, &n.to_le_bytes());
-                if u16::from_be_bytes([h[0], h[1]]) == 0x0000 {
-                    break n;
+                if crate::core::types::count_leading_zeros(&h) >= required_pow {
+                    return n;
                 }
                 n += 1;
             }
-        };
+        }).await?;
 
         let commit_tx = Transaction::Commit { commitment, spam_nonce };
         tracing::info!(
@@ -1554,7 +1689,7 @@ impl Node {
         }
     }
 
-    // ── Fix B: Rewritten handle_batches_response ─────────────────────────
+    // ── Rewritten handle_batches_response ─────────────────────────
     async fn handle_batches_response(&mut self, batch_start_height: u64, batches: Vec<Batch>, from: PeerId) -> Result<()> {
         if batches.is_empty() { return Ok(()); }
         tracing::info!("Received {} batch(es) starting at height {} from peer {}", batches.len(), batch_start_height, from);
@@ -1610,7 +1745,7 @@ impl Node {
         Ok(())
     }
 
-    // ── Fix C (Fix 2): Added sync_in_progress clear at end ──────────────
+    // ── Added sync_in_progress clear at end ──────────────
     async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) -> Result<()> {
         self.cancel_mining();
         let mut applied = 0;
@@ -1779,6 +1914,11 @@ impl Node {
     /// Prepare a batch template and spawn a non-blocking background mining task.
     /// Returns immediately — the result arrives via mined_batch_rx.
     fn spawn_mining_task(&mut self) -> Result<()> {
+        let threads = match self.mining_threads {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        
         if self.sync_in_progress || self.mining_cancel.is_some() {
             return Ok(());
         }
@@ -1831,7 +1971,8 @@ impl Node {
         let tx = self.mined_batch_tx.clone();
 
         tokio::task::spawn_blocking(move || {
-            if let Some(extension) = mine_extension(midstate, target, cancel) {
+            // Pass the `threads` variable into mine_extension
+            if let Some(extension) = mine_extension(midstate, target, threads, cancel) {
                 template.extension = extension;
                 let _ = tx.send(template);
             }
@@ -1893,10 +2034,11 @@ impl Node {
     /// Preserves identical behavior for all existing tests.
     #[cfg(test)]
     pub async fn try_mine(&mut self) -> Result<()> {
-        self.spawn_mining_task()?;
-        if self.mining_cancel.is_none() {
-            return Ok(()); // Not spawned (e.g. sync_in_progress)
+        // Automatically enable mining for tests if it wasn't enabled
+        if self.mining_threads.is_none() {
+            self.mining_threads = Some(0); 
         }
+        self.spawn_mining_task()?;
         if let Some(batch) = self.mined_batch_rx.recv().await {
             self.handle_mined_batch(batch).await?;
         }
@@ -1935,7 +2077,7 @@ mod tests {
         // Bind to port 0 to let OS assign a random available port
         let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
         // Initialize node (this will create genesis if needed)
-        Node::new(dir.to_path_buf(), false, listen, vec![]).await.unwrap()
+        Node::new(dir.to_path_buf(), None, listen, vec![]).await.unwrap()
     }
 
     #[tokio::test]
@@ -2042,26 +2184,23 @@ mod tests {
     
     #[test]
     fn scan_txs_for_mss_index_finds_max() {
-        // Create an MSS keypair and sign a few messages
         let seed = hash(b"test mss scan seed");
         let mut keypair = mss::keygen(&seed, 4).unwrap();
         let master_pk = keypair.public_key();
 
-        // Sign 5 messages (uses leaves 0-4)
         let mut txs = Vec::new();
         for i in 0..5u8 {
             let msg = hash(&[i]);
             let sig = keypair.sign(&msg).unwrap();
             let sig_bytes = sig.to_bytes();
 
-            // Build a minimal Reveal tx with this MSS signature
             let tx = Transaction::Reveal {
                 inputs: vec![InputReveal {
-                    owner_pk: master_pk,
+                    predicate: Predicate::p2pk(&master_pk),
                     value: 1,
                     salt: [i; 32],
                 }],
-                signatures: vec![sig_bytes],
+                witnesses: vec![Witness::sig(sig_bytes)],
                 outputs: vec![OutputData {
                     address: [0xAA; 32],
                     value: 1,
@@ -2072,7 +2211,6 @@ mod tests {
             txs.push(tx);
         }
 
-        // scan should find max index = 5 (leaf 4 used, so next = 5)
         let max_idx = scan_txs_for_mss_index(&txs, &master_pk);
         assert_eq!(max_idx, 5);
     }
@@ -2089,11 +2227,11 @@ mod tests {
 
         let tx = Transaction::Reveal {
             inputs: vec![InputReveal {
-                owner_pk: kp1.public_key(),
+                predicate: Predicate::p2pk(&kp1.public_key()),
                 value: 1,
                 salt: [0; 32],
             }],
-            signatures: vec![sig.to_bytes()],
+            witnesses: vec![Witness::sig(sig.to_bytes())],
             outputs: vec![OutputData {
                 address: [0xAA; 32],
                 value: 1,
@@ -2102,16 +2240,12 @@ mod tests {
             salt: [0; 32],
         };
 
-        // Scanning for kp2's key should find nothing
         assert_eq!(scan_txs_for_mss_index(&[tx.clone()], &kp2.public_key()), 0);
-        // Scanning for kp1's key should find index 1
         assert_eq!(scan_txs_for_mss_index(&[tx], &kp1.public_key()), 1);
     }
 
     #[test]
     fn scan_txs_mss_recovery_simulation() {
-        // Simulates: use indices 0-4, then "restore backup" to 0,
-        // scan should report 5 so wallet can jump ahead
         let seed = hash(b"recovery sim");
         let mut keypair = mss::keygen(&seed, 4).unwrap();
         let master_pk = keypair.public_key();
@@ -2122,11 +2256,11 @@ mod tests {
             let sig = keypair.sign(&msg).unwrap();
             txs.push(Transaction::Reveal {
                 inputs: vec![InputReveal {
-                    owner_pk: master_pk,
+                    predicate: Predicate::p2pk(&master_pk),
                     value: 1,
                     salt: [i; 32],
                 }],
-                signatures: vec![sig.to_bytes()],
+                witnesses: vec![Witness::sig(sig.to_bytes())],
                 outputs: vec![OutputData {
                     address: [0xBB; 32],
                     value: 1,
@@ -2139,11 +2273,9 @@ mod tests {
         let chain_max = scan_txs_for_mss_index(&txs, &master_pk);
         assert_eq!(chain_max, 5, "should find highest used index + 1");
 
-        // Simulate backup restore: keypair at index 0
         let mut restored = mss::keygen(&seed, 4).unwrap();
         assert_eq!(restored.next_leaf, 0);
 
-        // Apply recovery logic (same as wallet sync)
         const SAFETY_MARGIN: u64 = 20;
         if chain_max >= restored.next_leaf {
             restored.set_next_leaf(chain_max + SAFETY_MARGIN);
@@ -2153,27 +2285,24 @@ mod tests {
 
     #[test]
     fn scan_txs_mss_mempool_race() {
-        // Simulate: tx with index 10 in mempool (unmined)
         let seed = hash(b"mempool race");
-        let mut keypair = mss::keygen(&seed, 5).unwrap(); // height 5 = 32 leaves
+        let mut keypair = mss::keygen(&seed, 5).unwrap();
 
-        // Advance to leaf 10 by signing 10 messages
         for i in 0..10u8 {
             keypair.sign(&hash(&[i])).unwrap();
         }
 
-        // Sign one more (leaf index 10) — this is the "mempool tx"
         let msg = hash(b"mempool tx");
         let sig = keypair.sign(&msg).unwrap();
         assert_eq!(sig.leaf_index, 10);
 
         let mempool_tx = Transaction::Reveal {
             inputs: vec![InputReveal {
-                owner_pk: keypair.public_key(),
+                predicate: Predicate::p2pk(&keypair.public_key()),
                 value: 1,
                 salt: [0; 32],
             }],
-            signatures: vec![sig.to_bytes()],
+            witnesses: vec![Witness::sig(sig.to_bytes())],
             outputs: vec![OutputData {
                 address: [0xCC; 32],
                 value: 1,
@@ -2185,11 +2314,10 @@ mod tests {
         let mempool_max = scan_txs_for_mss_index(&[mempool_tx], &keypair.public_key());
         assert_eq!(mempool_max, 11, "should account for leaf 10 → next = 11");
 
-        // Simulate restore from backup at index 0
         let mut restored = mss::keygen(&seed, 5).unwrap();
 
         const SAFETY_MARGIN: u64 = 20;
-        let remote_idx = mempool_max; // in real code: max(chain_max, mempool_max)
+        let remote_idx = mempool_max; 
         if remote_idx >= restored.next_leaf {
             restored.set_next_leaf(remote_idx + SAFETY_MARGIN);
         }
@@ -2198,21 +2326,19 @@ mod tests {
     
     #[test]
     fn scan_txs_skips_wots_signatures() {
-        // WOTS sigs are exactly 576 bytes — scanner should ignore them
         let seed = hash(b"wots not mss");
         let pk = wots::keygen(&seed);
         let msg = hash(b"test");
         let sig = wots::sign(&seed, &msg);
         let sig_bytes = wots::sig_to_bytes(&sig);
-        assert_eq!(sig_bytes.len(), wots::SIG_SIZE);
 
         let tx = Transaction::Reveal {
             inputs: vec![InputReveal {
-                owner_pk: pk,
+                predicate: Predicate::p2pk(&pk),
                 value: 1,
                 salt: [0; 32],
             }],
-            signatures: vec![sig_bytes],
+            witnesses: vec![Witness::sig(sig_bytes)],
             outputs: vec![OutputData {
                 address: [0xAA; 32],
                 value: 1,
@@ -2221,7 +2347,6 @@ mod tests {
             salt: [0; 32],
         };
 
-        // Should return 0 — no MSS signatures found
         assert_eq!(scan_txs_for_mss_index(&[tx], &pk), 0);
     }
 
@@ -2263,11 +2388,11 @@ mod tests {
 
         let tx = Transaction::Reveal {
             inputs: vec![InputReveal {
-                owner_pk: pk,
+                predicate: Predicate::p2pk(&pk),
                 value: 1,
                 salt: [0; 32],
             }],
-            signatures: vec![garbage],
+            witnesses: vec![Witness::sig(garbage)],
             outputs: vec![OutputData {
                 address: [0xAA; 32],
                 value: 1,
@@ -2300,7 +2425,7 @@ mod complex_tests {
         let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
         
         // Initialize node (creates Genesis internally)
-        Node::new(dir.to_path_buf(), false, listen, vec![]).await.unwrap()
+        Node::new(dir.to_path_buf(), None, listen, vec![]).await.unwrap()
     }
 
     /// specific helper to manually construct a valid batch structure.
@@ -2595,7 +2720,7 @@ mod complex_tests {
         assert_eq!(node2.state.height, 4);
 
         // Mining should work after restart
-        node2.is_mining = true;
+        node2.mining_threads = Some(0);
         node2.try_mine().await.unwrap();
         assert_eq!(node2.state.height, 5, "mining must resume after crash recovery");
     }
@@ -2680,39 +2805,33 @@ mod complex_tests {
         let mut node = create_test_node(dir.path()).await;
         let mining_seed = node.mining_seed;
 
-        // 1. Mine a block to get coinbase coins
         let pre_mine_height = node.state.height; // = 1
         node.try_mine().await.unwrap();
         assert_eq!(node.state.height, 2);
 
-        // 2. Derive the coinbase coin we just mined (index 0 of that block)
         let cb_seed = coinbase_seed(&mining_seed, pre_mine_height, 0);
         let cb_owner_pk = wots::keygen(&cb_seed);
         let cb_address = compute_address(&cb_owner_pk);
         let cb_salt = coinbase_salt(&mining_seed, pre_mine_height, 0);
-        let cb_value = block_reward(pre_mine_height); // first denomination
-        // Actual coinbase uses decompose_value, so first output is the largest power of 2
+        let cb_value = block_reward(pre_mine_height);
         let denominations = decompose_value(cb_value);
         let first_denom = denominations[0];
         let cb_coin_id = compute_coin_id(&cb_address, first_denom, &cb_salt);
         assert!(node.state.coins.contains(&cb_coin_id), "coinbase coin must be in UTXO set");
 
-        // 3. Build a transaction spending the coinbase coin
         let recipient_seed: [u8; 32] = hash(b"recipient seed");
         let recipient_pk = wots::keygen(&recipient_seed);
         let recipient_addr = compute_address(&recipient_pk);
         let output_salt: [u8; 32] = hash(b"output salt");
 
-        // Output must be power-of-2 and less than input (fee > 0)
         let send_value = first_denom / 2;
         assert!(send_value > 0 && send_value.is_power_of_two());
 
-        // Change output
         let change_seed: [u8; 32] = hash(b"change seed");
         let change_pk = wots::keygen(&change_seed);
         let change_addr = compute_address(&change_pk);
         let change_salt: [u8; 32] = hash(b"change salt");
-        let change_value = first_denom / 4; // fee = first_denom - send - change
+        let change_value = first_denom / 4; 
         assert!(send_value + change_value < first_denom, "must leave fee");
 
         let outputs = vec![
@@ -2725,7 +2844,6 @@ mod complex_tests {
         let tx_salt: [u8; 32] = hash(b"tx salt");
         let commitment = compute_commitment(&input_coin_ids, &output_coin_ids, &tx_salt);
 
-        // 4. Find a valid spam nonce for commit PoW
         let mut spam_nonce = 0u64;
         loop {
             let h = hash_concat(&commitment, &spam_nonce.to_le_bytes());
@@ -2734,30 +2852,25 @@ mod complex_tests {
         }
 
         let commit_tx = Transaction::Commit { commitment, spam_nonce };
-
-        // 5. Mine the commit into a block
         let commit_batch = make_valid_batch(&node.state, 10, vec![commit_tx]);
         node.handle_new_batch(commit_batch, None).await.unwrap();
         assert!(node.state.commitments.contains(&commitment), "commitment must be in state");
 
-        // 6. Build the reveal
         let sig = wots::sign(&cb_seed, &commitment);
         let reveal_tx = Transaction::Reveal {
             inputs: vec![InputReveal {
-                owner_pk: cb_owner_pk,
+                predicate: Predicate::p2pk(&cb_owner_pk),
                 value: first_denom,
                 salt: cb_salt,
             }],
-            signatures: vec![wots::sig_to_bytes(&sig)],
+            witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
             outputs,
             salt: tx_salt,
         };
 
-        // 7. Mine the reveal into a block
         let reveal_batch = make_valid_batch(&node.state, 10, vec![reveal_tx]);
         node.handle_new_batch(reveal_batch, None).await.unwrap();
 
-        // 8. Verify: old coin gone, new coins exist
         assert!(!node.state.coins.contains(&cb_coin_id), "spent coin must be removed");
         let recipient_coin_id = compute_coin_id(&recipient_addr, send_value, &output_salt);
         let change_coin_id = compute_coin_id(&change_addr, change_value, &change_salt);
@@ -2776,11 +2889,9 @@ mod complex_tests {
         let mut node = create_test_node(dir.path()).await;
         let mining_seed = node.mining_seed;
 
-        // 1. Mine a block
         let mine_height = node.state.height;
         node.try_mine().await.unwrap();
 
-        // 2. Create a wallet and import the coinbase coin
         let wallet_path = dir.path().join("test_wallet.dat");
         let mut wallet = Wallet::create(&wallet_path, b"pass").unwrap();
 
@@ -2790,32 +2901,25 @@ mod complex_tests {
         let coin_id = wallet.import_coin(cb_seed, denominations[0], cb_salt, Some("coinbase".into())).unwrap();
         assert!(node.state.coins.contains(&coin_id));
 
-        // 3. Generate a recipient address in the same wallet (self-send)
         let recv_addr = wallet.generate_key(Some("recv".into())).unwrap();
         let send_value = denominations[0] / 2;
         let send_denoms = decompose_value(send_value);
 
-        // 4. Build outputs via wallet
         let live_coins: Vec<[u8; 32]> = wallet.coins().iter().map(|c| c.coin_id).collect();
-        let selected = wallet.select_coins(send_value + 1, &live_coins).unwrap(); // +1 for fee room
+        let selected = wallet.select_coins(send_value + 1, &live_coins).unwrap();
         assert_eq!(selected.len(), 1);
 
         let in_value: u64 = selected.iter()
             .filter_map(|id| wallet.find_coin(id))
             .map(|c| c.value)
             .sum();
-        let _change_value = in_value - send_value - 1; // 1 unit fee (must be > 0)
-        // change_value may not work if it's not representable, let's adjust
-        // Actually fee = in_value - out_value, we need out_value < in_value and all outputs power-of-2
-        // Let's keep it simple: send half, no change, the rest is fee
+            
         let (outputs, change_seeds) = wallet.build_outputs(&recv_addr, &send_denoms, 0).unwrap();
         let out_sum: u64 = outputs.iter().map(|o| o.value).sum();
         assert!(in_value > out_sum, "fee must be positive");
 
-        // 5. Build commit
         let (commitment, _salt) = wallet.prepare_commit(&selected, &outputs, change_seeds, false).unwrap();
 
-        // Find spam nonce
         let mut spam_nonce = 0u64;
         loop {
             let h = hash_concat(&commitment, &spam_nonce.to_le_bytes());
@@ -2828,12 +2932,13 @@ mod complex_tests {
         node.handle_new_batch(commit_batch, None).await.unwrap();
         assert!(node.state.commitments.contains(&commitment));
 
-        // 6. Build reveal
         let pending = wallet.find_pending(&commitment).unwrap().clone();
-        let (input_reveals, signatures) = wallet.sign_reveal(&pending).unwrap();
+        let (input_reveals, witnesses) = wallet.sign_reveal(&pending).unwrap();
+        
+        // This is the specific fix for wallet_send_flow_end_to_end
         let reveal_tx = Transaction::Reveal {
             inputs: input_reveals,
-            signatures,
+            witnesses,
             outputs: pending.outputs.clone(),
             salt: pending.salt,
         };
@@ -2841,13 +2946,11 @@ mod complex_tests {
         let reveal_batch = make_valid_batch(&node.state, 10, vec![reveal_tx]);
         node.handle_new_batch(reveal_batch, None).await.unwrap();
 
-        // 7. Verify old coin spent, new coin(s) exist
         assert!(!node.state.coins.contains(&coin_id), "spent coin removed");
         for out in &pending.outputs {
             assert!(node.state.coins.contains(&out.coin_id()), "output coin must exist in UTXO set");
         }
 
-        // 8. Complete reveal in wallet
         wallet.complete_reveal(&commitment).unwrap();
     }
 

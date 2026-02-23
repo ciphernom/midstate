@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 const MAX_MEMPOOL_SIZE: usize = 10_000;
 const MAX_PENDING_COMMITS: usize = 1_000;
-const MIN_REVEAL_FEE: u64 = 1;
+const MIN_FEE_PER_KB: u64 = 10;
 
 pub struct Mempool {
     transactions: Vec<Transaction>,
@@ -21,24 +21,66 @@ impl Mempool {
             seen_commitments: HashSet::new(),
         }
     }
-
+    
+    /// Calculate required PoW based on mempool congestion.
+    /// Base network minimum is 16. Ramps up as the commit pool fills.
+    pub fn required_commit_pow(&self) -> u32 {
+        let commits = self.seen_commitments.len();
+        if commits < 500 {
+            16
+        } else if commits < 750 {
+            18 // 4x harder
+        } else if commits < 900 {
+            20 // 16x harder
+        } else {
+            22 // 64x harder
+        }
+    }
+    
+    /// Compares two transactions to see if the first has a strictly higher fee rate.
+    /// Uses u128 to safely cross-multiply and avoid overflow or float non-determinism.
+    fn has_higher_rate(tx_a: &Transaction, size_a: u64, tx_b: &Transaction, size_b: u64) -> bool {
+        // (Fee_a / Size_a) > (Fee_b / Size_b)  =>  (Fee_a * Size_b) > (Fee_b * Size_a)
+        let rate_a = (tx_a.fee() as u128) * (size_b as u128);
+        let rate_b = (tx_b.fee() as u128) * (size_a as u128);
+        rate_a > rate_b
+    }
+    
     pub fn add(&mut self, tx: Transaction, state: &State) -> Result<()> {
+        let tx_bytes = bincode::serialized_size(&tx).unwrap_or(0) as u64;
+
         // 1. Initial Validation
         match &tx {
-            Transaction::Commit { .. } => {
+            Transaction::Commit { commitment, spam_nonce } => {
                 if self.seen_commitments.len() >= MAX_PENDING_COMMITS {
                     anyhow::bail!("Too many pending commits");
                 }
+                
+                // Dynamic Mempool PoW Check (Network base is 16)
+                let h = crate::core::types::hash_concat(commitment, &spam_nonce.to_le_bytes());
+                let required = self.required_commit_pow();
+                let actual_zeros = crate::core::types::count_leading_zeros(&h);
+                
+                if actual_zeros < required {
+                    anyhow::bail!(
+                        "Mempool is busy. Commit PoW requires {} leading zero bits (provided: {})", 
+                        required, actual_zeros
+                    );
+                }
             }
             Transaction::Reveal { .. } => {
-                if tx.fee() < MIN_REVEAL_FEE {
-                    anyhow::bail!("Fee too low (minimum: {})", MIN_REVEAL_FEE);
+                // Integer-only density check using u128 for safety
+                if (tx.fee() as u128) * 1024 < (MIN_FEE_PER_KB as u128) * (tx_bytes as u128) {
+                    anyhow::bail!(
+                        "Fee rate too low. Required: {} per KB. Provided: {} for {} bytes", 
+                        MIN_FEE_PER_KB, tx.fee(), tx_bytes
+                    );
                 }
             }
         }
         
         validate_transaction(state, &tx)?;
-
+        
         // 2. Duplicate Checks
         match &tx {
             Transaction::Commit { commitment, .. } => {
@@ -55,42 +97,49 @@ impl Mempool {
             }
         }
 
-        // 3. Fee-Based Eviction if Full
+        // 3. RBF Eviction if Mempool is Full
         if self.transactions.len() >= MAX_MEMPOOL_SIZE {
             if let Transaction::Reveal { .. } = &tx {
-                let tx_fee = tx.fee();
-                
-                // Find the Reveal transaction with the lowest fee
-                let mut lowest_fee = u64::MAX;
-                let mut lowest_fee_idx = None;
+                let mut lowest_rate_idx = None;
 
                 for (i, existing_tx) in self.transactions.iter().enumerate() {
+                    // CRITICAL: Only consider Reveals for eviction. Commits stay until mined.
                     if let Transaction::Reveal { .. } = existing_tx {
-                        let f = existing_tx.fee();
-                        if f < lowest_fee {
-                            lowest_fee = f;
-                            lowest_fee_idx = Some(i);
+                        let existing_bytes = bincode::serialized_size(existing_tx).unwrap_or(1) as u64;
+                        
+                        match lowest_rate_idx {
+                            None => lowest_rate_idx = Some(i),
+                            Some(idx) => {
+                                let current_worst = &self.transactions[idx];
+                                let worst_bytes = bincode::serialized_size(current_worst).unwrap_or(1) as u64;
+                                
+                                // Is this existing_tx even WORSE than our current "worst"?
+                                if Self::has_higher_rate(current_worst, worst_bytes, existing_tx, existing_bytes) {
+                                    lowest_rate_idx = Some(i);
+                                }
+                            }
                         }
                     }
                 }
 
-                if let Some(idx) = lowest_fee_idx {
-                    if tx_fee > lowest_fee {
+                if let Some(idx) = lowest_rate_idx {
+                    let worst_tx = &self.transactions[idx];
+                    let worst_bytes = bincode::serialized_size(worst_tx).unwrap_or(1) as u64;
+
+                    // Final check: Is the NEW tx actually better than the worst one in the pool?
+                    if Self::has_higher_rate(&tx, tx_bytes, worst_tx, worst_bytes) {
                         let evicted = self.transactions.remove(idx);
-                        tracing::info!("Evicted tx with fee {} to make room for tx with fee {}", lowest_fee, tx_fee);
-                        
-                        // Clean up the indexes for the evicted transaction
                         for input in evicted.input_coin_ids() {
                             self.seen_inputs.remove(&input);
                         }
                     } else {
-                        anyhow::bail!("Mempool full: fee {} too low to replace existing tx (lowest: {})", tx_fee, lowest_fee);
+                        anyhow::bail!("Mempool full: incoming fee rate too low to replace any existing Reveal");
                     }
                 } else {
-                    anyhow::bail!("Mempool full of commits, cannot accept new Reveal");
+                    anyhow::bail!("Mempool full of Commits: no Reveals available to evict.");
                 }
             } else {
-                anyhow::bail!("Mempool full: cannot accept more commits");
+                anyhow::bail!("Mempool full: cannot accept more Commits");
             }
         }
 
@@ -245,7 +294,7 @@ mod tests {
             target: [0xff; 32],
             height: 1,
             timestamp: 1000,
-            commitment_heights: std::collections::HashMap::new(),
+            commitment_heights: im::HashMap::new(),
         }
     }
 
@@ -282,7 +331,7 @@ mod tests {
         assert_eq!(mp.len(), 1);
     }
     
-    #[test]
+#[test]
     fn mempool_full_rejects() {
         let state = empty_state();
         let mut mp = Mempool::new();
@@ -290,13 +339,13 @@ mod tests {
         // Fill to capacity with dummy Reveals to avoid hitting MAX_PENDING_COMMITS
         for i in 0..MAX_MEMPOOL_SIZE {
             let dummy_input = InputReveal { 
-                owner_pk: [0; 32], 
+                predicate: Predicate::p2pk(&[0; 32]), 
                 value: 10, 
                 salt: hash(&(i as u64).to_le_bytes()) 
             };
             let dummy_reveal = Transaction::Reveal {
                 inputs: vec![dummy_input.clone()],
-                signatures: vec![],
+                witnesses: vec![],
                 outputs: vec![OutputData { address: [0; 32], value: 8, salt: [0; 32] }],
                 salt: [0; 32],
             };
@@ -388,7 +437,7 @@ mod tests {
         (state, seed, coin_id, input_salt, commit_salt, output)
     }
 
-    fn make_reveal_tx(seed: &[u8; 32], value: u64, input_salt: [u8; 32], commit_salt: [u8; 32], output: OutputData) -> Transaction {
+fn make_reveal_tx(seed: &[u8; 32], value: u64, input_salt: [u8; 32], commit_salt: [u8; 32], output: OutputData) -> Transaction {
         use crate::core::wots;
 
         let owner_pk = wots::keygen(seed);
@@ -399,8 +448,8 @@ mod tests {
         let sig = wots::sign(seed, &commitment);
 
         Transaction::Reveal {
-            inputs: vec![InputReveal { owner_pk, value, salt: input_salt }],
-            signatures: vec![wots::sig_to_bytes(&sig)],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value, salt: input_salt }],
+            witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
             outputs: vec![output],
             salt: commit_salt,
         }
@@ -424,7 +473,7 @@ mod tests {
         assert!(mp.add(tx, &state).is_err());
     }
 
-    #[test]
+#[test]
     fn mempool_rejects_low_fee_reveal() {
         let mut state = empty_state();
         let seed: [u8; 32] = [0x42; 32];
@@ -449,15 +498,15 @@ mod tests {
         let sig = crate::core::wots::sign(&seed, &commitment);
         // in=1, out=1 → fee=0 < MIN_REVEAL_FEE
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { owner_pk, value: 1, salt: input_salt }],
-            signatures: vec![crate::core::wots::sig_to_bytes(&sig)],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 1, salt: input_salt }],
+            witnesses: vec![Witness::sig(crate::core::wots::sig_to_bytes(&sig))],
             outputs: vec![output],
             salt: commit_salt,
         };
 
         let mut mp = Mempool::new();
         let err = mp.add(tx, &state).unwrap_err();
-        assert!(err.to_string().contains("Fee too low"));
+        assert!(err.to_string().contains("Fee rate too low"));
     }
 
     // ── drain ───────────────────────────────────────────────────────────
@@ -529,23 +578,22 @@ mod tests {
         assert_eq!(mp.len(), 1); // still just 1
     }
     
-    #[test]
+#[test]
     fn mempool_rbf_evicts_lowest_fee_reveal() {
         let (state, seed, _coin_id, input_salt, commit_salt, output) = state_with_committed_coin();
         let mut mp = Mempool::new();
 
-        // 1. Fill mempool to capacity with dummy Commits and exactly one Reveal with a low fee (fee = 2)
         for i in 0..(MAX_MEMPOOL_SIZE - 1) {
             let commitment = hash(&(i as u64).to_le_bytes());
             mp.transactions.push(Transaction::Commit { commitment, spam_nonce: 0 });
             mp.seen_commitments.insert(commitment);
         }
 
-        let dummy_input = InputReveal { owner_pk: [0; 32], value: 10, salt: [0; 32] };
+        let dummy_input = InputReveal { predicate: Predicate::p2pk(&[0; 32]), value: 10, salt: [0; 32] };
         let dummy_output = OutputData { address: [0; 32], value: 8, salt: [0; 32] }; // fee = 2
         let dummy_reveal = Transaction::Reveal {
             inputs: vec![dummy_input.clone()],
-            signatures: vec![],
+            witnesses: vec![],
             outputs: vec![dummy_output],
             salt: [0; 32],
         };
@@ -554,15 +602,12 @@ mod tests {
 
         assert_eq!(mp.len(), MAX_MEMPOOL_SIZE);
 
-        // 2. We have a valid incoming transaction with a higher fee (Input 16, Output 8 -> Fee = 8)
         let tx = make_reveal_tx(&seed, 16, input_salt, commit_salt, output);
         assert_eq!(tx.fee(), 8);
 
-        // 3. Attempting to add should succeed and evict the fee=2 dummy reveal.
         assert!(mp.add(tx.clone(), &state).is_ok());
         assert_eq!(mp.len(), MAX_MEMPOOL_SIZE);
         
-        // 4. Verify the dummy input was removed from the index, and the new one was added
         assert!(!mp.seen_inputs.contains(&dummy_input.coin_id()), "Evicted input should be removed from seen index");
         assert!(mp.seen_inputs.contains(&tx.input_coin_ids()[0]), "New input should be added to seen index");
     }
@@ -572,18 +617,17 @@ mod tests {
         let (state, seed, _coin_id, input_salt, commit_salt, output) = state_with_committed_coin();
         let mut mp = Mempool::new();
 
-        // 1. Fill mempool to capacity with dummy Commits and exactly one Reveal with a HIGH fee (fee = 10)
         for i in 0..(MAX_MEMPOOL_SIZE - 1) {
             let commitment = hash(&(i as u64).to_le_bytes());
             mp.transactions.push(Transaction::Commit { commitment, spam_nonce: 0 });
             mp.seen_commitments.insert(commitment);
         }
 
-        let dummy_input = InputReveal { owner_pk: [0; 32], value: 20, salt: [0; 32] };
+        let dummy_input = InputReveal { predicate: Predicate::p2pk(&[0; 32]), value: 20, salt: [0; 32] };
         let dummy_output = OutputData { address: [0; 32], value: 10, salt: [0; 32] }; // fee = 10
         let dummy_reveal = Transaction::Reveal {
             inputs: vec![dummy_input.clone()],
-            signatures: vec![],
+            witnesses: vec![],
             outputs: vec![dummy_output],
             salt: [0; 32],
         };
@@ -592,13 +636,11 @@ mod tests {
 
         assert_eq!(mp.len(), MAX_MEMPOOL_SIZE);
 
-        // 2. Incoming transaction has a lower fee (Input 16, Output 8 -> Fee = 8)
         let tx = make_reveal_tx(&seed, 16, input_salt, commit_salt, output);
         assert_eq!(tx.fee(), 8);
 
-        // 3. Attempting to add should fail because 8 is not > 10.
         let err = mp.add(tx, &state).unwrap_err();
-        assert!(err.to_string().contains("too low to replace existing tx"));
+        assert!(err.to_string().contains("fee rate too low to replace any existing Reveal"));
     }
     
 }

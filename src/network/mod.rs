@@ -82,9 +82,6 @@ impl MidstateNetwork {
         let peer_id = keypair.public().to_peer_id();
         tracing::info!("Local peer id: {}", peer_id);
 
-        // Removed outdated libp2p::swarm::ConnectionLimits block.
-        // We handle inbound limits manually in the event loop now.
-
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
             .with_tokio()
             .with_tcp(
@@ -97,10 +94,15 @@ impl MidstateNetwork {
             .with_behaviour(|key, relay_client| {
                 let local_peer = key.public().to_peer_id();
 
+            // --- Increase timeout from 10s to 60s ---
+                let rr_config = RequestResponseConfig::default()
+                    .with_request_timeout(Duration::from_secs(60));
+
                 let rr = request_response::Behaviour::new(
                     [(MIDSTATE_PROTOCOL, ProtocolSupport::Full)],
-                    RequestResponseConfig::default(),
+                    rr_config,
                 );
+                // -------------------------------------------------
 
                 let kad_store = kad::store::MemoryStore::new(local_peer);
                 let mut kademlia = kad::Behaviour::new(local_peer, kad_store);
@@ -146,13 +148,12 @@ impl MidstateNetwork {
             })?
             .with_swarm_config(|c| {
                 c.with_idle_connection_timeout(Duration::from_secs(120))
-                // Removed .with_connection_limits(limits)
             })
             .build();
 
         let mut net = Self {
             swarm,
-            connected: HashMap::new(), // Fixed: using HashMap instead of HashSet
+            connected: HashMap::new(),
             pending_requests: HashMap::new(),
             nat_status: NatStatus::Unknown,
             relay_reservations: HashSet::new(),
@@ -321,15 +322,19 @@ impl MidstateNetwork {
     pub fn dial_addr(&mut self, addr_str: &str) {
         match addr_str.parse::<Multiaddr>() {
             Ok(addr) => {
-                // Feed into Kademlia if it has a peer ID
                 if let Some(peer) = extract_peer_id(&addr) {
+                    // Don't dial if we're already connected, or if it's our own PeerId
                     if self.connected.contains_key(&peer) || peer == *self.swarm.local_peer_id() {
-                        return; // already connected or it's us
+                        return; 
                     }
+                    // Feed into Kademlia
                     self.swarm.behaviour_mut().kademlia.add_address(&peer, addr.clone());
-                }
-                if let Err(e) = self.swarm.dial(addr.clone()) {
-                    tracing::debug!("PEX dial {} failed: {}", addr_str, e);
+                    
+                    if let Err(e) = self.swarm.dial(addr) {
+                        tracing::debug!("PEX dial {} failed: {}", addr_str, e);
+                    }
+                } else {
+                    tracing::debug!("Ignoring PEX address without PeerId: {}", addr_str);
                 }
             }
             Err(e) => {
@@ -475,6 +480,14 @@ impl MidstateNetwork {
 
                 // ── Connection lifecycle ─────────────────────────────
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                    // --- Prevent self-connections from poisoning the peer list ---
+                    if peer_id == *self.swarm.local_peer_id() {
+                        tracing::debug!("Ignoring self-connection");
+                        let _ = self.swarm.disconnect_peer_id(peer_id);
+                        continue;
+                    }
+                    // ------------------------------------------------------------------
+
                     // Eclipse Protection: Enforce inbound limit manually
                     if endpoint.is_listener() {
                         let inbound_count = self.connected.values().filter(|e| e.is_listener()).count();
@@ -499,6 +512,12 @@ impl MidstateNetwork {
                     num_established,
                     ..
                 } => {
+                    // --- Ignore closures of self-connections ---
+                    if peer_id == *self.swarm.local_peer_id() {
+                        continue;
+                    }
+                    // ------------------------------------------------
+                    
                     if num_established == 0 {
                         self.connected.remove(&peer_id);
                         tracing::info!(
@@ -582,7 +601,6 @@ fn is_localhost(addr: &Multiaddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
 
     // ── Helper function tests ───────────────────────────────────────
 
