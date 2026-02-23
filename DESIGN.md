@@ -10,13 +10,16 @@
 
 ## 2. Cryptography
 
-### Coin IDs
+### Coin IDs & Addresses
 
 A Coin ID is the hash of its properties. It is the only identifier stored in the state.
 
 `CoinID = BLAKE3(address || value_le_bytes || salt)`
 
-Where `address = BLAKE3(owner_pk)`.
+**Pay-to-Script-Hash (P2SH):** Every address in Midstate is the hash of a compiled MidstateScript bytecode payload.
+`address = BLAKE3(script_bytecode)`
+
+For standard wallet transfers, the wallet automatically generates a Pay-to-Public-Key (P2PK) script behind the scenes: `[PUSH_DATA <32-byte-pk>, CHECKSIGVERIFY, PUSH_INT 1]`.
 
 ### WOTS (Winternitz One-Time Signatures)
 
@@ -85,8 +88,8 @@ Transactions use a two-phase Commit-Reveal scheme to separate intent from execut
 - **Cost**: 0 fee.
 
 ### Phase 2: Reveal
-- **Payload**: Preimages (Owner PK, Value, Salt) for spent coins, Signatures, and new Output definitions.
-- **Validation**: Signatures must be valid against `owner_pk`. Output values must be powers of 2. `Sum(Input) > Sum(Output)`.
+- **Payload**: Preimages (Script Bytecode, Value, Salt) for spent coins, Stack Witnesses (e.g., Signatures, Preimages), and new Output definitions.
+- **Validation**: The node pushes the witness items onto the stack and executes the bytecode via the MidstateScript VM. The transaction is valid only if execution succeeds and leaves exactly `[1]` on the stack. Output values must be powers of 2. `Sum(Input) > Sum(Output)`.
 
 ### Native CoinJoin Mixing
 - The strict power-of-2 denominations enable perfect, subset-sum-resistant CoinJoins.
@@ -99,3 +102,12 @@ Transactions use a two-phase Commit-Reveal scheme to separate intent from execut
 - **Discovery**: Kademlia DHT + Identify + custom Peer Exchange.
 - **NAT Traversal**: Built-in AutoNAT, DCUtR (Hole-punching), and Circuit Relays.
 - **Header-First Sync**: Nodes download and verify lightweight `BatchHeader`s from genesis to find deterministic fork points *before* downloading full batches. This prevents "Frankenstein" chain corruptions and catch-up death spirals.
+
+## 7. MidstateScript Virtual Machine
+
+Midstate abandons hardcoded transaction types in favor of a Turing-incomplete stack machine. 
+
+- **Zero Gas**: There are no loops or backward jumps (`JUMP`/`LOOP`). Execution time is strictly bounded to $O(N)$ based on the 1,024-byte script limit.
+- **Implicit Math**: To bridge the gap between boolean logic and financial math, mathematical opcodes (`ADD`, `GREATER_OR_EQUAL`) implicitly zero-pad byte arrays up to 8 bytes (little-endian u64).
+- **Post-Quantum Native**: The VM's memory limits (1,536 bytes per stack item) natively accommodate massive post-quantum WOTS and MSS signatures.
+- **Covenants**: The `SUM_TO_ADDR` introspection opcode scans the transaction's outputs and sums the value being sent to a specific address. This allows users to build on-chain limit orders and atomic swaps while flawlessly handling Midstate's strict power-of-2 output denomination rules.

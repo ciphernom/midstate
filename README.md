@@ -76,6 +76,16 @@ midstate wallet generate-mss --path wallet.dat --height 10 --label "donation"
 
 The `--height` parameter defines tree depth. A height of 10 allows exactly 1,024 signatures before the address is exhausted.
 
+**Smart Contracts & Covenants (MidstateScript):**
+Midstate supports Turing-incomplete smart contracts. You can compile a human-readable `.msc` assembly file into a Pay-to-Script-Hash (P2SH) address.
+
+```bash
+midstate wallet compile --file limit_order.msc
+
+```
+
+*Anyone can send funds to the resulting address, but the UTXO can only be spent if the transaction satisfies the bytecode logic of the script.*
+
 **Scan for Outputs:**
 Incoming transactions are not indexed automatically. You must scan the chain to update local balances:
 
@@ -146,6 +156,7 @@ midstate wallet import-rewards --path wallet.dat --coinbase-file ./data/coinbase
 * `wallet create` - Initialize a new wallet file.
 * `wallet receive` - Generate a WOTS address.
 * `wallet generate-mss` - Generate an MSS address.
+* `wallet compile` - Compile a `.msc` script into bytecode and generate its P2SH address.
 * `wallet list` - Display controlled coins and unused keys.
 * `wallet balance` - Display aggregate balance.
 * `wallet scan` - Scan blockchain for incoming coins.
