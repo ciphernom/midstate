@@ -3,6 +3,7 @@ use crate::core::state::{apply_batch, adjust_difficulty};
 use crate::core::extension::verify_extension;
 use crate::storage::Storage;
 use anyhow::{bail, Result};
+use rayon::prelude::*;
 
 pub struct Syncer {
     storage: Storage,
@@ -17,24 +18,35 @@ impl Syncer {
     /// slice of headers. The first header's prev_midstate is NOT checked
     /// here — that is handled by the fork-point logic.
     pub fn verify_header_chain(headers: &[BatchHeader]) -> Result<()> {
-        for (i, header) in headers.iter().enumerate() {
-            verify_extension(
-                header.post_tx_midstate,
-                &header.extension,
-                &header.target,
-            )
-            .map_err(|e| anyhow::anyhow!("Invalid PoW at header index {}: {}", i, e))?;
-
-            if i > 0 {
-                let prev = &headers[i - 1];
-                if header.prev_midstate != prev.extension.final_hash {
-                    bail!(
-                        "Header linkage broken at index {}: prev_midstate mismatch",
-                        i
-                    );
-                }
+        // 1. Fast sequential check: Ensure chain linkage is intact
+        for i in 1..headers.len() {
+            let header = &headers[i];
+            let prev = &headers[i - 1];
+            if header.prev_midstate != prev.extension.final_hash {
+                bail!("Header linkage broken at index {}: prev_midstate mismatch", i);
             }
         }
+
+        // 2. Heavy parallel check: Verify Proof of Work for all headers across all CPU cores
+        let results: Vec<Result<(), String>> = headers
+            .par_iter()
+            .enumerate()
+            .map(|(i, header)| {
+                verify_extension(
+                    header.post_tx_midstate,
+                    &header.extension,
+                    &header.target,
+                ).map_err(|e| format!("Invalid PoW at header index {}: {}", i, e))
+            })
+            .collect();
+
+        // 3. Report first error if any failed
+        for res in results {
+            if let Err(e) = res {
+                bail!("{}", e);
+            }
+        }
+
         Ok(())
     }
 

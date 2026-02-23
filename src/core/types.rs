@@ -2,6 +2,62 @@ use serde::{Deserialize, Serialize};
 use super::mmr::UtxoAccumulator;
 
 
+/// A stateless spending condition that governs a UTXO.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum Predicate {
+    /// A compiled MidstateScript bytecode payload.
+    Script { bytecode: Vec<u8> },
+}
+
+impl Predicate {
+    /// Address = BLAKE3(bytecode). Every address is Pay-to-Script-Hash.
+    pub fn address(&self) -> [u8; 32] {
+        match self {
+            Predicate::Script { bytecode } => hash(bytecode),
+        }
+    }
+
+    /// Convenience: build a standard P2PK predicate.
+    pub fn p2pk(owner_pk: &[u8; 32]) -> Self {
+        Predicate::Script { bytecode: super::script::compile_p2pk(owner_pk) }
+    }
+
+    /// Extract owner_pk from a standard P2PK script, if it is one.
+    pub fn owner_pk(&self) -> Option<[u8; 32]> {
+        match self {
+            Predicate::Script { bytecode } => {
+                // P2PK: PUSH_DATA(32) + CHECKSIGVERIFY + PUSH_DATA(8) = 47 bytes
+                if bytecode.len() == 47
+                    && bytecode[0] == 0x01
+                    && bytecode[1] == 32
+                    && bytecode[2] == 0
+                    && bytecode[35] == 0x32
+                {
+                    let mut pk = [0u8; 32];
+                    pk.copy_from_slice(&bytecode[3..35]);
+                    Some(pk)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// The proof provided to satisfy a Predicate.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum Witness {
+    /// Raw byte arrays pushed onto the stack before script execution.
+    ScriptInputs(Vec<Vec<u8>>),
+}
+
+impl Witness {
+    /// Convenience: P2PK witness from a single signature.
+    pub fn sig(sig_bytes: Vec<u8>) -> Self {
+        Witness::ScriptInputs(vec![sig_bytes])
+    }
+}
+
 /// Hash a byte slice with BLAKE3 (truncated to 32 bytes — BLAKE3 native output).
 pub fn hash(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
@@ -15,9 +71,23 @@ pub fn hash_concat(a: &[u8], b: &[u8]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// Compute a P2PKH address: address = BLAKE3(owner_pk).
+/// Count the number of leading zero bits in a 32-byte hash
+pub fn count_leading_zeros(hash: &[u8; 32]) -> u32 {
+    let mut zeros = 0;
+    for &byte in hash {
+        if byte == 0 {
+            zeros += 8;
+        } else {
+            zeros += byte.leading_zeros();
+            break;
+        }
+    }
+    zeros
+}
+
+/// Compute a standard P2PK address: BLAKE3(compile_p2pk(owner_pk)).
 pub fn compute_address(owner_pk: &[u8; 32]) -> [u8; 32] {
-    hash(owner_pk)
+    Predicate::p2pk(owner_pk).address()
 }
 
 /// Compute a coin ID that commits to address, value, and salt.
@@ -59,7 +129,9 @@ pub fn decompose_value(mut value: u64) -> Vec<u64> {
             parts.push(bit);
         }
         value >>= 1;
-        bit <<= 1;
+        if value > 0 {
+            bit <<= 1;
+        }
     }
     parts
 }
@@ -75,7 +147,7 @@ pub struct State {
     pub height: u64,
     pub timestamp: u64,
     #[serde(default)]
-    pub commitment_heights: std::collections::HashMap<[u8; 32], u64>,  
+    pub commitment_heights: im::HashMap<[u8; 32], u64>,
 }
 
 impl State {
@@ -130,7 +202,7 @@ impl State {
             target,
             height: 0,
             timestamp: BITCOIN_BLOCK_TIME,
-            commitment_heights: std::collections::HashMap::new(),
+            commitment_heights: im::HashMap::new(),
         };
 
         (state, genesis_coinbase)
@@ -215,15 +287,15 @@ impl OutputData {
 /// Proves what value a coin holds by revealing the preimage of its coin_id.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct InputReveal {
-    pub owner_pk: [u8; 32],
+    pub predicate: Predicate,
     pub value: u64,
     pub salt: [u8; 32],
 }
 
 impl InputReveal {
     pub fn coin_id(&self) -> [u8; 32] {
-        let address = compute_address(&self.owner_pk);
-        compute_coin_id(&address, self.value, &self.salt)
+        // The coin_id now commits to the Predicate's address hash
+        compute_coin_id(&self.predicate.address(), self.value, &self.salt)
     }
 }
 
@@ -256,8 +328,8 @@ pub enum Transaction {
     Reveal {
         /// Preimages proving what each input coin contains.
         inputs: Vec<InputReveal>,
-        /// Signatures proving ownership (one per input, verified against input.owner_pk).
-        signatures: Vec<Vec<u8>>,
+        /// Matches 1:1 with inputs, replacing the old `signatures: Vec<Vec<u8>>`
+        witnesses: Vec<Witness>,
         /// New coins to create. Value + salt revealed for validation, then discarded.
         outputs: Vec<OutputData>,
         /// Salt used when computing the commitment.
@@ -287,8 +359,8 @@ impl Transaction {
         match self {
             Transaction::Commit { .. } => 0,
             Transaction::Reveal { inputs, outputs, .. } => {
-                let in_sum: u64 = inputs.iter().map(|i| i.value).sum();
-                let out_sum: u64 = outputs.iter().map(|o| o.value).sum();
+                let in_sum = inputs.iter().try_fold(0u64, |acc, i| acc.checked_add(i.value)).unwrap_or(u64::MAX);
+                let out_sum = outputs.iter().try_fold(0u64, |acc, o| acc.checked_add(o.value)).unwrap_or(u64::MAX);
                 in_sum.saturating_sub(out_sum)
             }
         }
@@ -406,8 +478,6 @@ const _: () = assert!(
 mod tests {
     use super::*;
 
-    // ── hash / hash_concat ──────────────────────────────────────────────
-
     #[test]
     fn hash_deterministic() {
         assert_eq!(hash(b"hello"), hash(b"hello"));
@@ -454,9 +524,9 @@ mod tests {
     }
 
     #[test]
-    fn compute_address_is_hash_of_pk() {
+    fn compute_address_is_hash_of_script() {
         let pk = [0xBB; 32];
-        assert_eq!(compute_address(&pk), hash(&pk));
+        assert_eq!(compute_address(&pk), hash(&super::script::compile_p2pk(&pk)));
     }
 
     // ── compute_coin_id ─────────────────────────────────────────────────
@@ -594,8 +664,8 @@ mod tests {
     #[test]
     fn input_reveal_coin_id_uses_address() {
         let pk = [0xAA; 32];
-        let ir = InputReveal { owner_pk: pk, value: 4, salt: [0u8; 32] };
-        let expected_addr = compute_address(&pk);
+        let ir = InputReveal { predicate: Predicate::p2pk(&pk), value: 4, salt: [0u8; 32] };
+        let expected_addr = Predicate::p2pk(&pk).address();
         assert_eq!(ir.coin_id(), compute_coin_id(&expected_addr, 4, &[0u8; 32]));
     }
 
@@ -618,8 +688,8 @@ mod tests {
     #[test]
     fn reveal_fee_computed() {
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { owner_pk: [0u8; 32], value: 10, salt: [0u8; 32] }],
-            signatures: vec![vec![]],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&[0u8; 32]), value: 10, salt: [0u8; 32] }],
+            witnesses: vec![Witness::sig(vec![])],
             outputs: vec![OutputData { address: [0u8; 32], value: 8, salt: [0u8; 32] }],
             salt: [0u8; 32],
         };
@@ -628,11 +698,11 @@ mod tests {
 
     #[test]
     fn reveal_input_output_coin_ids() {
-        let input = InputReveal { owner_pk: [1u8; 32], value: 8, salt: [2u8; 32] };
+        let input = InputReveal { predicate: Predicate::p2pk(&[1u8; 32]), value: 8, salt: [2u8; 32] };
         let output = OutputData { address: [3u8; 32], value: 4, salt: [4u8; 32] };
         let tx = Transaction::Reveal {
             inputs: vec![input.clone()],
-            signatures: vec![vec![]],
+            witnesses: vec![Witness::sig(vec![])],
             outputs: vec![output.clone()],
             salt: [0u8; 32],
         };

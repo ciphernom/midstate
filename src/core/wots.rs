@@ -86,31 +86,26 @@ fn all_digits(msg: &[u8; 32]) -> [u32; CHAINS] {
 /// Cost: CHAINS × MAX_DIGIT = 18 × 65535 ≈ 1.18M hashes.
 /// With BLAKE3: ~1–2 ms on modern hardware.
 pub fn keygen(seed: &[u8; 32]) -> [u8; 32] {
-    let endpoints: Vec<[u8; 32]> = (0..CHAINS)
-        .into_par_iter()
-        .map(|i| {
-            let sk_i = chain_sk(seed, i);
-            hash_n(&sk_i, MAX_DIGIT)
-        })
-        .collect();
-    let mut arr = [[0u8; 32]; CHAINS];
-    arr.copy_from_slice(&endpoints);
-    compress(&arr)
+    let mut endpoints = [[0u8; 32]; CHAINS];
+    endpoints.par_iter_mut().enumerate().for_each(|(i, chunk)| {
+        let sk_i = chain_sk(seed, i);
+        *chunk = hash_n(&sk_i, MAX_DIGIT);
+    });
+    compress(&endpoints)
 }
 
 /// Sign a 32-byte message with the given seed.
 ///
 /// For each digit d_i, reveals hash^{d_i}(sk_i).
 /// The verifier can hash the remaining (MAX_DIGIT - d_i) times to reach the endpoint.
-pub fn sign(seed: &[u8; 32], message: &[u8; 32]) -> Vec<[u8; 32]> {
+pub fn sign(seed: &[u8; 32], message: &[u8; 32]) -> [[u8; 32]; CHAINS] {
     let digits = all_digits(message);
-    (0..CHAINS)
-        .into_par_iter()
-        .map(|i| {
-            let sk_i = chain_sk(seed, i);
-            hash_n(&sk_i, digits[i])
-        })
-        .collect()
+    let mut sig = [[0u8; 32]; CHAINS];
+    sig.par_iter_mut().enumerate().for_each(|(i, chunk)| {
+        let sk_i = chain_sk(seed, i);
+        *chunk = hash_n(&sk_i, digits[i]);
+    });
+    sig
 }
 
 /// Verify a WOTS signature against a message and coin ID.
@@ -120,27 +115,19 @@ pub fn sign(seed: &[u8; 32], message: &[u8; 32]) -> Vec<[u8; 32]> {
 ///
 /// Average verification cost: CHAINS × (MAX_DIGIT / 2) ≈ 590K hashes.
 /// With BLAKE3: ~0.5–1 ms on modern hardware.
-pub fn verify(sig: &[[u8; 32]], message: &[u8; 32], coin_id: &[u8; 32]) -> bool {
-    if sig.len() != CHAINS {
-        return false;
-    }
-
+pub fn verify(sig: &[[u8; 32]; CHAINS], message: &[u8; 32], coin_id: &[u8; 32]) -> bool {
     let digits = all_digits(message);
-    let endpoints: Vec<[u8; 32]> = (0..CHAINS)
-        .into_par_iter()
-        .map(|i| {
-            let remaining = MAX_DIGIT - digits[i];
-            hash_n(&sig[i], remaining)
-        })
-        .collect();
-    let mut arr = [[0u8; 32]; CHAINS];
-    arr.copy_from_slice(&endpoints);
-    compress(&arr) == *coin_id
+    let mut endpoints = [[0u8; 32]; CHAINS];
+    endpoints.par_iter_mut().enumerate().for_each(|(i, chunk)| {
+        let remaining = MAX_DIGIT - digits[i];
+        *chunk = hash_n(&sig[i], remaining);
+    });
+    compress(&endpoints) == *coin_id
 }
 
 /// Serialize signature to bytes (18 × 32 = 576 bytes).
-pub fn sig_to_bytes(sig: &[[u8; 32]]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(sig.len() * 32);
+pub fn sig_to_bytes(sig: &[[u8; 32]; CHAINS]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SIG_SIZE);
     for chunk in sig {
         out.extend_from_slice(chunk);
     }
@@ -148,13 +135,13 @@ pub fn sig_to_bytes(sig: &[[u8; 32]]) -> Vec<u8> {
 }
 
 /// Deserialize signature from bytes.
-pub fn sig_from_bytes(bytes: &[u8]) -> Option<Vec<[u8; 32]>> {
+pub fn sig_from_bytes(bytes: &[u8]) -> Option<[[u8; 32]; CHAINS]> {
     if bytes.len() != SIG_SIZE {
         return None;
     }
-    let mut sig = Vec::with_capacity(CHAINS);
-    for chunk in bytes.chunks_exact(32) {
-        sig.push(<[u8; 32]>::try_from(chunk).unwrap());
+    let mut sig = [[0u8; 32]; CHAINS];
+    for (i, chunk) in bytes.chunks_exact(32).enumerate() {
+        sig[i].copy_from_slice(chunk);
     }
     Some(sig)
 }
@@ -212,21 +199,17 @@ mod tests {
 
     #[test]
     fn checksum_prevents_forgery() {
-        // Verify that increasing a message digit forces a checksum digit to decrease,
-        // which requires hashing *forward* on the checksum chain (infeasible).
         let msg1 = [0u8; 32];
         let msg2 = {
             let mut m = [0u8; 32];
-            m[0] = 1; // increase first digit
+            m[0] = 1; 
             m
         };
         let d1 = all_digits(&msg1);
         let d2 = all_digits(&msg2);
 
-        // Message digit increased
         assert!(d2[0] > d1[0]);
 
-        // At least one checksum digit decreased
         let cs_decreased = (MSG_CHAINS..CHAINS).any(|i| d2[i] < d1[i]);
         assert!(cs_decreased, "checksum must decrease when a message digit increases");
     }
@@ -234,7 +217,6 @@ mod tests {
     #[test]
     fn digit_extraction() {
         let mut msg = [0u8; 32];
-        // Set first two bytes to 0x0100 = 256
         msg[0] = 0x01;
         msg[1] = 0x00;
         let digits = message_digits(&msg);
@@ -244,20 +226,17 @@ mod tests {
 
     #[test]
     fn max_checksum_fits() {
-        // All-zero message → max checksum
         let msg = [0u8; 32];
         let md = message_digits(&msg);
         let cd = checksum_digits(&md);
         let sum: u32 = md.iter().map(|&d| MAX_DIGIT - d).sum();
-        assert_eq!(sum, 16 * 65535); // 1,048,560
-        // Must fit in 2 × 16-bit digits
+        assert_eq!(sum, 16 * 65535); 
         assert!(cd[0] <= MAX_DIGIT);
         assert!(cd[1] <= MAX_DIGIT);
     }
 
     #[test]
     fn all_ff_message() {
-        // All-0xFF message → all digits = 65535 → checksum = 0
         let msg = [0xff; 32];
         let md = message_digits(&msg);
         for &d in &md {
@@ -285,17 +264,4 @@ mod tests {
     fn different_seeds_different_keys() {
         assert_ne!(keygen(&[1u8; 32]), keygen(&[2u8; 32]));
     }
-
-    #[test]
-    fn verify_wrong_length_sig_fails() {
-        let seed = [0x42u8; 32];
-        let coin = keygen(&seed);
-        let msg = hash(b"test");
-        // Too few chunks
-        let short_sig: Vec<[u8; 32]> = vec![[0u8; 32]; CHAINS - 1];
-        assert!(!verify(&short_sig, &msg, &coin));
-    }
-
-
-
 }
