@@ -243,6 +243,7 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
 mod tests {
     use super::*;
     use crate::core::mmr::UtxoAccumulator;
+    use crate::core::wots;
 
     fn empty_state() -> State {
         State {
