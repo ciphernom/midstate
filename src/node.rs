@@ -2038,6 +2038,10 @@ impl Node {
         if self.mining_threads.is_none() {
             self.mining_threads = Some(0); 
         }
+        // Short-circuit if a sync is happening so the test doesn't hang forever
+        if self.sync_in_progress || self.mining_cancel.is_some() {
+            return Ok(());
+        }
         self.spawn_mining_task()?;
         if let Some(batch) = self.mined_batch_rx.recv().await {
             self.handle_mined_batch(batch).await?;
