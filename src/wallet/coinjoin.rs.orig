@@ -654,10 +654,11 @@ mod tests {
         let tx = session.build_reveal(sigs).unwrap();
         if let Transaction::Reveal { inputs, witnesses, .. } = &tx {
             for (input, witness) in inputs.iter().zip(witnesses.iter()) {
-                let Witness::ScriptInputs(wit_inputs) = witness;
-                if let (Some(owner_pk), Some(sig_bytes)) = (input.predicate.owner_pk(), wit_inputs.first()) {
-                    let sig = wots::sig_from_bytes(sig_bytes).unwrap();
-                    assert!(wots::verify(&sig, &proposal.commitment, &owner_pk));
+                if let Witness::ScriptInputs(wit_inputs) = witness {
+                    if let (Some(owner_pk), Some(sig_bytes)) = (input.predicate.owner_pk(), wit_inputs.first()) {
+                        let sig = wots::sig_from_bytes(sig_bytes).unwrap();
+                        assert!(wots::verify(&sig, &proposal.commitment, &owner_pk));
+                    }
                 }
             }
         }
