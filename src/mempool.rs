@@ -417,7 +417,7 @@ mod tests {
         let owner_pk = wots::keygen(&seed);
         let address = compute_address(&owner_pk);
         let input_salt = hash(b"test salt");
-        let coin_id = compute_coin_id(&address, 16, &input_salt);
+        let coin_id = compute_coin_id(&address, 20, &input_salt);
         state.coins.insert(coin_id);
 
         let output = OutputData { address: hash(b"recipient"), value: 8, salt: [0x11; 32] };
@@ -459,7 +459,7 @@ fn make_reveal_tx(seed: &[u8; 32], value: u64, input_salt: [u8; 32], commit_salt
     fn mempool_accepts_valid_reveal() {
         let (state, seed, _coin_id, input_salt, commit_salt, output) = state_with_committed_coin();
         let mut mp = Mempool::new();
-        let tx = make_reveal_tx(&seed, 16, input_salt, commit_salt, output);
+        let tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
         assert!(mp.add(tx, &state).is_ok());
         assert_eq!(mp.len(), 1);
     }
@@ -468,7 +468,7 @@ fn make_reveal_tx(seed: &[u8; 32], value: u64, input_salt: [u8; 32], commit_salt
     fn mempool_rejects_duplicate_input() {
         let (state, seed, _coin_id, input_salt, commit_salt, output) = state_with_committed_coin();
         let mut mp = Mempool::new();
-        let tx = make_reveal_tx(&seed, 16, input_salt, commit_salt, output);
+        let tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
         mp.add(tx.clone(), &state).unwrap();
         assert!(mp.add(tx, &state).is_err());
     }
@@ -602,8 +602,8 @@ fn make_reveal_tx(seed: &[u8; 32], value: u64, input_salt: [u8; 32], commit_salt
 
         assert_eq!(mp.len(), MAX_MEMPOOL_SIZE);
 
-        let tx = make_reveal_tx(&seed, 16, input_salt, commit_salt, output);
-        assert_eq!(tx.fee(), 8);
+        let tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
+        assert_eq!(tx.fee(), 12);
 
         assert!(mp.add(tx.clone(), &state).is_ok());
         assert_eq!(mp.len(), MAX_MEMPOOL_SIZE);
@@ -636,8 +636,8 @@ fn make_reveal_tx(seed: &[u8; 32], value: u64, input_salt: [u8; 32], commit_salt
 
         assert_eq!(mp.len(), MAX_MEMPOOL_SIZE);
 
-        let tx = make_reveal_tx(&seed, 16, input_salt, commit_salt, output);
-        assert_eq!(tx.fee(), 8);
+        let tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
+        assert_eq!(tx.fee(), 12);
 
         let err = mp.add(tx, &state).unwrap_err();
         assert!(err.to_string().contains("fee rate too low to replace any existing Reveal"));
