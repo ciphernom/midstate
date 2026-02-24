@@ -220,8 +220,10 @@ mod tests {
     use tempfile::tempdir;
 
     fn dummy_batch(nonce: u64) -> Batch {
-        let ms = hash(&nonce.to_le_bytes());
-        let ext = create_extension(ms, nonce);
+        let ms = crate::core::types::hash(&nonce.to_le_bytes());
+        let state_root = [0u8; 32];
+        let mining_ms = crate::core::types::hash_concat(&ms, &state_root);
+        let ext = crate::core::extension::create_extension(mining_ms, nonce);
         Batch {
             prev_midstate: ms,
             transactions: vec![],
@@ -229,6 +231,7 @@ mod tests {
             coinbase: vec![],
             timestamp: 1000 + nonce,
             target: [0xff; 32],
+            state_root,
         }
     }
 

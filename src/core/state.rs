@@ -187,29 +187,26 @@ pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]
         future_midstate = hash_concat(&future_midstate, coin_id);
     }
 
-    // --- LOGGING START ---
-    if state.height == 0 { // Only log for genesis to reduce noise
-        tracing::debug!("APPLY_BATCH DEBUG:");
-        tracing::debug!("  State Midstate: {}", hex::encode(state.midstate));
-        tracing::debug!("  Future Midstate (calculated): {}", hex::encode(future_midstate));
+    // --- NEW: State Root Validation ---
+    // Simulate adding coinbase coins to calculate the exact state root
+    let mut temp_state_coins = state.coins.clone();
+    for coin_id in &coinbase_ids {
+        temp_state_coins.insert(*coin_id);
     }
-    // --- LOGGING END ---
-
-    {
-        let expired: Vec<[u8; 32]> = state.commitment_heights.iter()
-            .filter(|(_, &h)| state.height.saturating_sub(h) > COMMITMENT_TTL)
-            .map(|(c, _)| *c)
-            .collect();
-        for c in &expired {
-            state.commitments.remove(c);
-            state.commitment_heights.remove(c);
-        }
+    let expected_state_root = hash_concat(&temp_state_coins.root(), &state.chain_mmr.root());
+    
+    if batch.state_root != expected_state_root {
+        bail!("State root mismatch: expected {}, got {}", hex::encode(expected_state_root), hex::encode(batch.state_root));
     }
+    
+    // Hash the state root into the midstate BEFORE verifying the PoW!
+    future_midstate = hash_concat(&future_midstate, &batch.state_root);
+    // -----------------------------------
 
     // 5. Verify extension against future midstate
     verify_extension(future_midstate, &batch.extension, &batch.target)?;
 
-// 6. Add coinbase coins to state
+    // 6. Add coinbase coins to state
     for coin_id in &coinbase_ids {
         if !state.coins.insert(*coin_id) {
             bail!("Duplicate coinbase coin");
@@ -217,7 +214,7 @@ pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]
     }
 
     // 7. Finalize
-    state.midstate = batch.extension.final_hash; 
+    state.midstate = batch.extension.final_hash;
     state.chain_mmr.append(&batch.extension.final_hash);
     state.depth += EXTENSION_ITERATIONS;
     state.height += 1;
@@ -259,9 +256,17 @@ mod tests {
     fn make_empty_batch(state: &State, reward: u64, timestamp: u64) -> Batch {
         let coinbase = make_coinbase(state, reward);
         let mut mining_midstate = state.midstate;
+        
+        let mut temp_coins = state.coins.clone();
         for cb in &coinbase {
-            mining_midstate = hash_concat(&mining_midstate, &cb.coin_id());
+            let coin_id = cb.coin_id();
+            mining_midstate = hash_concat(&mining_midstate, &coin_id);
+            temp_coins.insert(coin_id);
         }
+        
+        let state_root = hash_concat(&temp_coins.root(), &state.chain_mmr.root());
+        mining_midstate = hash_concat(&mining_midstate, &state_root);
+
         // Search for a nonce that meets the target
         let mut nonce = 0u64;
         let extension = loop {
@@ -278,6 +283,7 @@ mod tests {
             coinbase,
             timestamp,
             target: state.target,
+            state_root,
         }
     }
 
