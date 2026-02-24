@@ -156,8 +156,6 @@ pub struct State {
 
 impl State {
     pub fn genesis() -> (Self, Vec<CoinbaseOutput>) {
-        use super::wots;
-
         // Bitcoin block anchor
         // Height: 935897
         // Hash: 00000000000000000000329a84d79877397ec0fa7c5aaa706a88e545daf599a5
@@ -168,25 +166,38 @@ impl State {
 
         let anchor = hash(BITCOIN_BLOCK_HASH.as_bytes());
 
-        const MERKLE_ROOT: &str = "6def077d292edb863bd64d2a8d8803ab12caf1eef9c76823ee01e9e47fce7d0d";
-        let merkle_hash = hash(MERKLE_ROOT.as_bytes());
+        // --- The Genesis Inscription ---
+        // We embed this plaintext directly into the address and salt fields of 
+        // the genesis coinbase outputs. This places the message permanently 
+        // into the blockchain data on disk, while mathematically ensuring the 
+        // initial coins are unspendable (burned).
+        
+        let mut chunk0 = [0u8; 32];
+        chunk0.copy_from_slice(b"Harvest Now, Decrypt Later: The ");
+        
+        let mut chunk1 = [0u8; 32];
+        chunk1.copy_from_slice(b"Quantum Era's Encryption Challen");
+        
+        let mut chunk2 = [0u8; 32];
+        chunk2.copy_from_slice(b"ge (Published Feb 24, 2026, by R");
+        
+        let mut chunk3 = [0u8; 32];
+        let last_part = b"BC Disruptors)";
+        chunk3[..last_part.len()].copy_from_slice(last_part);
 
-        // Genesis coinbase: INITIAL_REWARD decomposed into power-of-2 outputs.
-        // Each output gets a deterministic seed and salt.
-        let base_seed = hash_concat(&anchor, &merkle_hash);
-        let denominations = decompose_value(INITIAL_REWARD);
-
-        let genesis_coinbase: Vec<CoinbaseOutput> = denominations
-            .iter()
-            .enumerate()
-            .map(|(i, &value)| {
-                let seed = hash_concat(&base_seed, &(i as u64).to_le_bytes());
-                let owner_pk = wots::keygen(&seed);
-                let address = compute_address(&owner_pk);
-                let salt = hash_concat(&seed, &[0xCBu8; 32]);
-                CoinbaseOutput { address, value, salt }
-            })
-            .collect();
+        // INITIAL_REWARD is 16. We use two outputs of 8 (both are powers of 2).
+        let genesis_coinbase = vec![
+            CoinbaseOutput {
+                address: chunk0, // Plaintext!
+                value: 8,
+                salt: chunk1,    // Plaintext!
+            },
+            CoinbaseOutput {
+                address: chunk2, // Plaintext!
+                value: 8,
+                salt: chunk3,    // Plaintext!
+            }
+        ];
 
         // Initial difficulty target (very easy for testing)
         let target = [
@@ -211,7 +222,11 @@ impl State {
         };
         (state, genesis_coinbase)
     }
-    pub fn header(&self) -> BatchHeader {
+pub fn header(&self) -> BatchHeader {
+        // Clone coins because root() requires &mut self
+        let mut coins_clone = self.coins.clone();
+        let state_root = hash_concat(&coins_clone.root(), &self.chain_mmr.root());
+
         BatchHeader {
             height: self.height,
             prev_midstate: [0u8; 32],
@@ -223,6 +238,7 @@ impl State {
             },
             timestamp: self.timestamp,
             target: self.target,
+            state_root, 
         }
     }
 }
@@ -239,12 +255,8 @@ impl Batch {
                 }
                 Transaction::Reveal { inputs, outputs, salt, .. } => {
                     let mut hasher = blake3::Hasher::new();
-                    for i in inputs {
-                        hasher.update(&i.coin_id());
-                    }
-                    for o in outputs {
-                        hasher.update(&o.hash_for_commitment());
-                    }
+                    for i in inputs { hasher.update(&i.coin_id()); }
+                    for o in outputs { hasher.update(&o.hash_for_commitment()); }
                     hasher.update(salt);
                     let tx_hash = *hasher.finalize().as_bytes();
                     midstate = hash_concat(&midstate, &tx_hash);
@@ -256,7 +268,10 @@ impl Batch {
         for cb in &self.coinbase {
             midstate = hash_concat(&midstate, &cb.coin_id());
         }
- 
+
+        // 3. Hash in the state root
+        midstate = hash_concat(&midstate, &self.state_root);
+
         BatchHeader {
             height: 0, // Caller assigns this
             prev_midstate: self.prev_midstate,
@@ -264,6 +279,7 @@ impl Batch {
             extension: self.extension.clone(),
             timestamp: self.timestamp,
             target: self.target,
+            state_root: self.state_root, 
         }
     }
 }
@@ -442,6 +458,9 @@ pub struct Batch {
     pub timestamp: u64,
     /// Target this batch was mined against
     pub target: [u8; 32],
+    /// Explicitly commit to the state
+    #[serde(default)]
+    pub state_root: [u8; 32],
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -452,6 +471,8 @@ pub struct BatchHeader {
     pub extension: Extension,
     pub timestamp: u64,
     pub target: [u8; 32],
+    #[serde(default)]
+    pub state_root: [u8; 32],
 }
 
 
