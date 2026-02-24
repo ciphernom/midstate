@@ -14,7 +14,8 @@ impl BatchStore {
         fs::create_dir_all(&base_path)?;
         Ok(Self { base_path })
     }
-
+    pub fn base_path(&self) -> &PathBuf { &self.base_path }
+    
     /// Height up to which checkpoints have already been pruned.
     /// Returns 0 if no pruning has occurred yet.
     pub fn pruned_up_to(&self) -> u64 {

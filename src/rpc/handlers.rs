@@ -153,20 +153,31 @@ let inputs: Vec<InputReveal> = req.inputs.iter().map(|i| {
     }
 
     let outputs: Vec<OutputData> = req.outputs.iter().map(|o| {
-        Ok(OutputData {
-            address: parse_hex32(&o.address, "address")?,
-            value: o.value,
-            salt: parse_hex32(&o.salt, "output_salt")?,
-        })
+        match o {
+            OutputDataJson::Standard { address, value, salt } => {
+                Ok(OutputData::Standard {
+                    address: parse_hex32(address, "address")?,
+                    value: *value,
+                    salt: parse_hex32(salt, "output_salt")?,
+                })
+            }
+            OutputDataJson::DataBurn { payload, value_burned } => {
+                Ok(OutputData::DataBurn {
+                    payload: hex::decode(payload).map_err(|_| ErrorResponse { error: "Invalid payload hex".into() })?,
+                    value_burned: *value_burned,
+                })
+            }
+        }
     }).collect::<Result<_, ErrorResponse>>()?;
 
     let salt = parse_hex32(&req.salt, "salt")?;
 
     let input_coin_ids: Vec<String> = inputs.iter().map(|i| hex::encode(i.coin_id())).collect();
-    let output_coin_ids: Vec<String> = outputs.iter().map(|o| hex::encode(o.coin_id())).collect();
+    let output_commit_hashes: Vec<String> = outputs.iter().map(|o| hex::encode(o.hash_for_commitment())).collect();
+    
     let fee = {
         let in_sum: u64 = inputs.iter().map(|i| i.value).sum();
-        let out_sum: u64 = outputs.iter().map(|o| o.value).sum();
+        let out_sum: u64 = outputs.iter().map(|o| o.value()).sum();
         in_sum.saturating_sub(out_sum)
     };
 
@@ -178,7 +189,7 @@ let inputs: Vec<InputReveal> = req.inputs.iter().map(|i| {
 
     Ok(Json(SendTransactionResponse {
         input_coins: input_coin_ids,
-        output_coins: output_coin_ids,
+        output_coins: output_commit_hashes,
         fee,
         status: "submitted".to_string(),
     }))
@@ -212,7 +223,7 @@ pub async fn get_mempool(State(node): State<AppState>) -> Json<GetMempoolRespons
             Transaction::Reveal { inputs, outputs, .. } => TransactionInfo {
                 commitment: None,
                 input_coins: Some(inputs.iter().map(|i| hex::encode(i.coin_id())).collect()),
-                output_coins: Some(outputs.iter().map(|o| hex::encode(o.coin_id())).collect()),
+                output_coins: Some(outputs.iter().filter_map(|o| o.coin_id().map(hex::encode)).collect()),                
                 fee: Some(tx.fee()),
             },
         })
@@ -287,16 +298,27 @@ let input = InputReveal {
         value: req.input.value,
         salt: parse_hex32(&req.input.salt, "input_salt")?,
     };
-    let output = OutputData {
-        address: parse_hex32(&req.output.address, "address")?,
-        value: req.output.value,
-        salt: parse_hex32(&req.output.salt, "output_salt")?,
+    let output = match req.output {
+        OutputDataJson::Standard { address, value, salt } => OutputData::Standard {
+            address: parse_hex32(&address, "address")?,
+            value,
+            salt: parse_hex32(&salt, "output_salt")?,
+        },
+        OutputDataJson::DataBurn { .. } => {
+            return Err(ErrorResponse { error: "DataBurn payloads are not allowed in CoinJoin mixes".into() })
+        }
     };
 
-    node.mix_register(mix_id, input, output).await
+    // --- Decode the signature from the RPC request ---
+    let signature = hex::decode(&req.signature)
+        .map_err(|e| ErrorResponse { error: format!("Invalid signature hex: {}", e) })?;
+    // ------------------------------------------------------
+
+    // Pass the signature into the node handle
+    node.mix_register(mix_id, input, output, signature).await
         .map_err(|e| ErrorResponse { error: e.to_string() })?;
 
-    Ok(Json(serde_json::json!({ "status": "registered" })))
+        Ok(Json(serde_json::json!({ "status": "registered" })))
 }
 
 pub async fn mix_fee(

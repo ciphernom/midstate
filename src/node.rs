@@ -40,10 +40,15 @@ struct SyncSession {
 }
 
 enum SyncPhase {
-    /// Downloading headers from genesis to peer_height.
+    /// Waiting for a requested state snapshot
+    WaitingForSnapshot {
+        target_height: u64,
+    },
+    /// Downloading headers. If fast-forwarding, it holds the snapshot to verify against.
     Headers {
         accumulated: Vec<BatchHeader>,
         cursor: u64,
+        snapshot: Option<Box<State>>,
     },
     VerifyingHeaders,
     /// Headers verified, now downloading batches from fork_height forward.
@@ -53,6 +58,7 @@ enum SyncPhase {
         candidate_state: State,
         cursor: u64,
         new_history: Vec<(u64, [u8; 32], Batch)>,
+        is_fast_forward: bool,
     },
 }
 
@@ -102,13 +108,13 @@ pub struct NodeHandle {
 pub enum NodeCommand {
     SendTransaction(Transaction),
     SubmitMixTransaction { mix_id: [u8; 32], tx: Transaction },
-    // --- NEW: P2P Mix Coordination Commands ---
+    // --- P2P Mix Coordination Commands ---
     BroadcastMixAnnounce { mix_id: [u8; 32], denomination: u64 },
-    SendMixJoin { coordinator: PeerId, mix_id: [u8; 32], input: InputReveal, output: OutputData },
+    SendMixJoin { coordinator: PeerId, mix_id: [u8; 32], input: InputReveal, output: OutputData, signature: Vec<u8> },
     SendMixFee { coordinator: PeerId, mix_id: [u8; 32], input: InputReveal },
     SendMixSign { coordinator: PeerId, mix_id: [u8; 32], input_index: usize, signature: Vec<u8> },
     BroadcastMixProposal { mix_id: [u8; 32], proposal: crate::wallet::coinjoin::MixProposal, peers: Vec<PeerId> },
-    FinishSyncHeaders { peer: PeerId, headers: Vec<BatchHeader>, is_valid: bool },
+    FinishSyncHeaders { peer: PeerId, headers: Vec<BatchHeader>, is_valid: bool, snapshot: Option<Box<State>> },
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -170,14 +176,16 @@ impl NodeHandle {
                 for tx in &batch.transactions {
                     if let Transaction::Reveal { outputs, .. } = tx {
                         for out in outputs {
-                            if addresses.contains(&out.address) {
-                                found.push(ScannedCoin {
-                                    address: out.address,
-                                    value: out.value,
-                                    salt: out.salt,
-                                    coin_id: out.coin_id(),
-                                    height,
-                                });
+                            if addresses.contains(&out.address()) {
+                                if let Some(c_id) = out.coin_id() {
+                                    found.push(ScannedCoin {
+                                        address: out.address(),
+                                        value: out.value(),
+                                        salt: out.salt(),
+                                        coin_id: c_id,
+                                        height,
+                                    });
+                                }
                             }
                         }
                     }
@@ -221,17 +229,24 @@ impl NodeHandle {
     }
 
     pub async fn mix_register(
-        &self, mix_id: [u8; 32], input: InputReveal, output: OutputData,
+        &self, mix_id: [u8; 32], input: InputReveal, output: OutputData, signature: Vec<u8> // <-- Added signature
     ) -> Result<()> {
         let mut mgr = self.mix_manager.write().await;
         let (is_coord, coord_peer) = mgr.get_session_info(&mix_id)
             .ok_or_else(|| anyhow::anyhow!("mix session not found"))?;
 
-        mgr.register(&mix_id, input.clone(), output.clone(), None)?;
+        // Pass the signature to the MixManager
+        mgr.register(&mix_id, input.clone(), output.clone(), &signature, None)?;
 
         if !is_coord {
             if let Some(peer) = coord_peer {
-                self.tx_sender.send(NodeCommand::SendMixJoin { coordinator: peer, mix_id, input, output })?;
+                self.tx_sender.send(NodeCommand::SendMixJoin { 
+                    coordinator: peer, 
+                    mix_id, 
+                    input, 
+                    output, 
+                    signature // <-- Added signature
+                })?;
             }
         } else if let Some(proposal) = mgr.try_finalize(&mix_id)? {
             // We are the coordinator and the mix is full. Broadcast proposal!
@@ -522,6 +537,14 @@ impl Node {
                     if let Err(e) = self.storage.save_state(&self.state) {
                         tracing::error!("Failed to save state: {}", e);
                     }
+                    
+                    // Periodically save a snapshot for fast-sync peers
+                    if self.state.height > 0 && self.state.height % PRUNE_DEPTH == 0 {
+                        if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
+                            tracing::warn!("Failed to save state snapshot: {}", e);
+                        }
+                    }
+                    
                     self.maybe_prune_checkpoints();
                 }
                 _ = ui_interval.tick() => {
@@ -600,8 +623,8 @@ impl Node {
                         NodeCommand::BroadcastMixAnnounce { mix_id, denomination } => {
                             self.network.broadcast(Message::MixAnnounce { mix_id, denomination });
                         }
-                        NodeCommand::SendMixJoin { coordinator, mix_id, input, output } => {
-                            self.network.send(coordinator, Message::MixJoin { mix_id, input, output });
+                        NodeCommand::SendMixJoin { coordinator, mix_id, input, output, signature } => {
+                            self.network.send(coordinator, Message::MixJoin { mix_id, input, output, signature });
                         }
                         NodeCommand::SendMixFee { coordinator, mix_id, input } => {
                             self.network.send(coordinator, Message::MixFee { mix_id, input });
@@ -609,8 +632,9 @@ impl Node {
                         NodeCommand::SendMixSign { coordinator, mix_id, input_index, signature } => {
                             self.network.send(coordinator, Message::MixSign { mix_id, input_index, signature });
                         }
-                        NodeCommand::FinishSyncHeaders { peer, headers, is_valid } => {
-                            if let Err(e) = self.process_verified_headers(peer, headers, is_valid).await {
+                        
+                        NodeCommand::FinishSyncHeaders { peer, headers, is_valid, snapshot } => {
+                            if let Err(e) = self.process_verified_headers(peer, headers, is_valid, snapshot).await {
                                 tracing::warn!("Failed to process verified headers: {}", e);
                             }
                         }
@@ -652,6 +676,12 @@ impl Node {
                             
                             // Fail any mixes relying on this peer
                             self.mix_manager.write().await.handle_peer_disconnect(peer);
+                        }
+                        // Eclipse Defense Purge 
+                        NetworkEvent::OutgoingConnectionFailed(addr_str) => {
+                            if self.known_pex_addrs.remove(&addr_str) {
+                                tracing::info!("Eclipse Defense: Purged unreachable PEX address: {}", addr_str);
+                            }
                         }
                     }
                 }
@@ -709,10 +739,6 @@ impl Node {
                     } else {
                         let gap = height.saturating_sub(self.state.height);
                         if gap > 0 && gap <= CATCH_UP_THRESHOLD {
-                            // Small gap — just request the missing batches directly.
-                            // handle_batches_response will apply them as a linear
-                            // extension, or detect a fork and handle it.  This avoids
-                            // the O(chain_height) header download + verify cycle.
                             tracing::info!(
                                 "Peer {} blocks ahead (h={} vs h={}), requesting batches directly",
                                 gap, height, self.state.height
@@ -725,7 +751,11 @@ impl Node {
                                 start_height: self.state.height,
                                 count,
                             });
+                        } else if gap > PRUNE_DEPTH {
+                            // The gap is massive -> Trigger Fast-Forward
+                            self.start_fast_forward_sync(from, height, depth);
                         } else {
+                            // Standard sync
                             self.start_sync_session(from, height, depth);
                         }
                     }
@@ -752,15 +782,25 @@ impl Node {
             Message::Addr(addrs) => {
                 self.ack(channel);
                 let mut new_count = 0;
-                for addr_str in &addrs {
-                    if !self.known_pex_addrs.contains(addr_str) {
-                        self.known_pex_addrs.insert(addr_str.clone());
-                     //  self.network.dial_addr(addr_str); lets not autodial, could be someone we don't like
+                
+                // 1. Cap intake: Do not let one peer flood the table in a single message
+                for addr_str in addrs.into_iter().take(20) {
+                    if !self.known_pex_addrs.contains(&addr_str) {
+                        
+                        // 2. Churn: If the table is full, evict an arbitrary older address
+                        // so the set never permanently freezes.
+                        if self.known_pex_addrs.len() >= 1_000 {
+                            let victim = self.known_pex_addrs.iter().next().cloned().unwrap();
+                            self.known_pex_addrs.remove(&victim);
+                        }
+                        
+                        self.known_pex_addrs.insert(addr_str);
                         new_count += 1;
                     }
                 }
+                
                 if new_count > 0 {
-                    tracing::info!("PEX: received {} addrs from {}, {} new", addrs.len(), from, new_count);
+                    tracing::debug!("PEX: saved {} new addrs from {}", new_count, from);
                 }
             }
             Message::GetBatches { start_height, count } => {
@@ -869,10 +909,11 @@ impl Node {
                 }
             }
 
-            Message::MixJoin { mix_id, input, output } => {
+            Message::MixJoin { mix_id, input, output, signature } => { // <-- Added signature
                 self.ack(channel);
                 let mut mgr = self.mix_manager.write().await;
-                match mgr.register(&mix_id, input, output, Some(from)) {
+                // Pass the signature reference to the MixManager
+                match mgr.register(&mix_id, input, output, &signature, Some(from)) {
                     Ok(()) => {
                         tracing::info!("Peer {} joined mix {}", from, hex::encode(mix_id));
                         // Auto-finalize if ready
@@ -951,6 +992,56 @@ impl Node {
                     }
                 }
             }
+            // ── Fast-Forward Sync Messages ──────────────────────────────
+            
+            Message::GetStateSnapshot { height } => {
+                match self.storage.load_state_snapshot(height) {
+                    Ok(Some(state)) => {
+                        self.send_response(channel, Message::StateSnapshot {
+                            height,
+                            state: Box::new(state),
+                        });
+                    }
+                    Ok(None) => {
+                        tracing::debug!("Peer {} requested snapshot for height {}, but we don't have it", from, height);
+                        self.ack(channel);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to load snapshot for height {}: {}", height, e);
+                        self.ack(channel);
+                    }
+                }
+            }
+
+            Message::StateSnapshot { height, state } => {
+                self.ack(channel);
+                if let Some(session) = self.sync_session.take() {
+                    if session.peer == from {
+                        if let SyncPhase::WaitingForSnapshot { target_height } = session.phase {
+                            if height == target_height {
+                                tracing::info!("Received snapshot at height {}. Downloading {} subsequent headers to verify PoW...", height, session.peer_height - height);
+                                
+                                self.sync_session = Some(SyncSession {
+                                    peer: from,
+                                    peer_height: session.peer_height,
+                                    peer_depth: session.peer_depth,
+                                    phase: SyncPhase::Headers {
+                                        accumulated: Vec::new(),
+                                        cursor: height,
+                                        snapshot: Some(state),
+                                    },
+                                    started_at: std::time::Instant::now(),
+                                });
+
+                                let count = 100.min(session.peer_height - height);
+                                self.network.send(from, Message::GetHeaders { start_height: height, count });
+                                return Ok(());
+                            }
+                        }
+                    }
+                    self.sync_session = Some(session); // Put session back if it wasn't a match
+                }
+            }
         }
         Ok(())
     }
@@ -971,13 +1062,30 @@ impl Node {
             phase: SyncPhase::Headers {
                 accumulated: Vec::new(),
                 cursor: 0,
+                snapshot: None, // Added field
             },
             started_at: std::time::Instant::now(),
         });
-
         // Request first chunk of headers from genesis
         let count = 100.min(peer_height);
         self.network.send(peer, Message::GetHeaders { start_height: 0, count });
+    }
+
+    fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth: u64) {
+        self.cancel_mining();
+        // Snapshots are saved every PRUNE_DEPTH blocks, so we round down to the nearest multiple.
+        let snap_height = (peer_height / PRUNE_DEPTH) * PRUNE_DEPTH;
+        
+        tracing::info!("Fast-forward sync: requesting snapshot at height {}", snap_height);
+        self.sync_in_progress = true;
+        self.sync_session = Some(SyncSession {
+            peer,
+            peer_height,
+            peer_depth,
+            phase: SyncPhase::WaitingForSnapshot { target_height: snap_height },
+            started_at: std::time::Instant::now(),
+        });
+        self.network.send(peer, Message::GetStateSnapshot { height: snap_height });
     }
 
     fn abort_sync_session(&mut self, reason: &str) {
@@ -988,16 +1096,16 @@ impl Node {
         self.sync_in_progress = false;
     }
 
-    async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHeader>) -> Result<()> {
+    pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHeader>) -> Result<()> {
         // Extract state from the session — only accept headers from the sync peer
-        let (peer_height, cursor) = match &self.sync_session {
+        let (peer_height, cursor, snapshot) = match &mut self.sync_session {
             Some(s) if s.peer == from => {
-                match &s.phase {
-                    SyncPhase::Headers { cursor, .. } => (s.peer_height, *cursor),
-                    _ => return Ok(()), // Wrong phase, ignore
+                match &mut s.phase {
+                    SyncPhase::Headers { cursor, snapshot, .. } => (s.peer_height, *cursor, snapshot.take()),
+                    _ => return Ok(()), 
                 }
             }
-            _ => return Ok(()), // No session or wrong peer, ignore
+            _ => return Ok(()), 
         };
 
         if headers.is_empty() {
@@ -1009,9 +1117,18 @@ impl Node {
         let new_cursor = cursor + headers.len() as u64;
         match &mut self.sync_session {
             Some(s) => {
-                if let SyncPhase::Headers { accumulated, cursor } = &mut s.phase {
+                if let SyncPhase::Headers { accumulated, cursor: c, snapshot: snap_ref } = &mut s.phase {
+                    
+                    // --- OOM Defense ---
+                    if accumulated.len() + headers.len() > 100_000 {
+                        self.abort_sync_session("Peer attempted OOM DoS with too many headers");
+                        return Ok(());
+                    }
                     accumulated.extend(headers);
-                    *cursor = new_cursor;
+                    *c = new_cursor;
+                    if snapshot.is_some() {
+                        *snap_ref = snapshot; // Put the snapshot back for the next iteration
+                    }
                 }
             }
             _ => unreachable!(),
@@ -1034,12 +1151,12 @@ impl Node {
 
         // All headers received — take ownership of the session data
         let session = self.sync_session.take().unwrap();
-        let all_headers = match session.phase {
-            SyncPhase::Headers { accumulated, .. } => accumulated,
+        let (all_headers, snapshot) = match session.phase {
+            SyncPhase::Headers { accumulated, snapshot, .. } => (accumulated, snapshot),
             _ => unreachable!(),
         };
 
-        let total_headers = all_headers.len(); // <--- Capture total length
+        let total_headers = all_headers.len(); 
         tracing::info!("Downloaded {} headers, offloading PoW verification...", total_headers);
 
         let tx = self.cmd_tx.as_ref().unwrap().clone();
@@ -1096,14 +1213,14 @@ impl Node {
                 }
             }
 
-            let _ = tx.send(NodeCommand::FinishSyncHeaders {
+        let _ = tx.send(NodeCommand::FinishSyncHeaders {
                 peer: from,
                 headers: all_headers,
                 is_valid,
+                snapshot,
             });
         });
 
-        // Put the session into a waiting state while the OS thread works
         self.sync_session = Some(SyncSession {
             peer: session.peer,
             peer_height: session.peer_height,
@@ -1120,11 +1237,12 @@ impl Node {
         peer: PeerId,
         all_headers: Vec<BatchHeader>,
         is_valid: bool,
+        snapshot: Option<Box<State>>,
     ) -> Result<()> {
         let session = match self.sync_session.take() {
             Some(s) if s.peer == peer && matches!(s.phase, SyncPhase::VerifyingHeaders) => s,
             other => {
-                self.sync_session = other; // Session was aborted or overwritten
+                self.sync_session = other; 
                 return Ok(());
             }
         };
@@ -1135,11 +1253,35 @@ impl Node {
             return Ok(());
         }
 
-        tracing::info!("Header chain verified. Finding fork point...");
+        // --- Fast-Forward Validation Logic ---
+        let (fork_height, candidate_state, is_fast_forward) = if let Some(snap) = snapshot {
+            tracing::info!("Headers verified. Cryptographically validating snapshot at height {}...", snap.height);
+            
+            // THE CRITICAL CHECK: The downloaded headers represent thousands of valid blocks of PoW. 
+            // If the first header builds exactly on top of the snapshot's midstate, the snapshot is authentic.
+            if all_headers.is_empty() || all_headers[0].prev_midstate != snap.midstate {
+                tracing::warn!("Snapshot midstate mismatch! Peer sent fraudulent snapshot. Aborting sync.");
+                self.sync_in_progress = false;
+                return Ok(());
+            }
+            
+            // Trust the snapshot!
+            (snap.height, *snap, true)
+        } else {
+            // Standard sync path
+            let fh = self.syncer.find_fork_point(&all_headers, self.state.height)?;
+            let cand = if fh == 0 {
+                State::genesis().0
+            } else if fh <= self.state.height {
+                self.syncer.rebuild_state_to(fh)?
+            } else {
+                self.state.clone()
+            };
+            (fh, cand, false)
+        };
 
-        let fork_height = self.syncer.find_fork_point(&all_headers, self.state.height)?;
         tracing::info!(
-            "Fork point at height {}. Will download batches {}..{}",
+            "Fork point/Snapshot at height {}. Will download batches {}..{}",
             fork_height, fork_height, session.peer_height
         );
 
@@ -1148,14 +1290,6 @@ impl Node {
             self.sync_in_progress = false;
             return Ok(());
         }
-
-        let candidate_state = if fork_height == 0 {
-            State::genesis().0
-        } else if fork_height <= self.state.height {
-            self.syncer.rebuild_state_to(fork_height)?
-        } else {
-            self.state.clone()
-        };
 
         self.sync_session = Some(SyncSession {
             peer,
@@ -1167,6 +1301,7 @@ impl Node {
                 candidate_state,
                 cursor: fork_height,
                 new_history: Vec::new(),
+                is_fast_forward,
             },
             started_at: std::time::Instant::now(),
         });
@@ -1192,9 +1327,9 @@ impl Node {
             }
         };
 
-        let (headers, _fork_height, candidate_state, cursor, new_history) = match &mut session.phase {
-            SyncPhase::Batches { headers, fork_height, candidate_state, cursor, new_history } => {
-                (headers, *fork_height, candidate_state, cursor, new_history)
+        let (headers, _fork_height, candidate_state, cursor, new_history, _is_fast_forward) = match &mut session.phase {
+            SyncPhase::Batches { headers, fork_height, candidate_state, cursor, new_history, is_fast_forward } => {
+                (headers, *fork_height, candidate_state, cursor, new_history, *is_fast_forward)
             }
             _ => {
                 self.sync_session = Some(session); // wrong phase, put it back
@@ -1272,9 +1407,9 @@ impl Node {
         }
 
         // All batches applied — check if we should adopt this chain
-        let (final_state, final_history) = match session.phase {
-            SyncPhase::Batches { candidate_state, new_history, .. } => {
-                (candidate_state, new_history)
+        let (final_state, final_history, is_ff) = match session.phase {
+            SyncPhase::Batches { candidate_state, new_history, is_fast_forward, .. } => {
+                (candidate_state, new_history, is_fast_forward)
             }
             _ => unreachable!(),
         };
@@ -1287,9 +1422,7 @@ impl Node {
                 self.state.height, final_state.height,
                 self.state.depth, final_state.depth
             );
-            self.perform_reorg(final_state, final_history)?;
-            // Try to apply any broadcast blocks that were orphaned during sync
-            // — they may now chain onto the adopted state.
+            self.perform_reorg(final_state, final_history, is_ff)?;
             self.try_apply_orphans().await;
         } else {
             tracing::info!(
@@ -1432,19 +1565,22 @@ impl Node {
     }
 
     // ── Added sync_in_progress = false at end ────────────
-    fn perform_reorg(
+fn perform_reorg(
         &mut self,
         new_state: State,
         new_history: Vec<(u64, [u8; 32], Batch)>,
+        is_fast_forward: bool,
     ) -> Result<()> {
         self.cancel_mining();
 
-
         let fork_height = new_history.first().map(|(h, _, _)| *h).unwrap_or(0);
+        let is_actual_reorg = fork_height < self.state.height && !is_fast_forward;
 
-        let is_actual_reorg = fork_height < self.state.height;
-
-        if is_actual_reorg {
+        if is_fast_forward {
+            tracing::warn!("FAST-FORWARD SYNC COMPLETE: Jumped from {} to {}", self.state.height, new_state.height);
+            self.chain_history.clear();
+            self.recent_headers.clear();
+        } else if is_actual_reorg {
             tracing::warn!(
                 "CHAIN REORG at fork height {}: replacing blocks {}..{} with new chain to {}",
                 fork_height, fork_height, self.state.height, new_state.height
@@ -1542,7 +1678,7 @@ impl Node {
         let (input_ids, output_ids, salt) = match &reveal_tx {
             Transaction::Reveal { inputs, outputs, salt, .. } => {
                 let ins: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
-                let outs: Vec<[u8; 32]> = outputs.iter().map(|o| o.coin_id()).collect();
+                let outs: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
                 (ins, outs, *salt)
             }
             _ => bail!("expected Reveal transaction"),
@@ -1722,7 +1858,7 @@ impl Node {
 
                 match self.evaluate_alternative_chain(fork_height, relevant, from).await {
                     Ok(Some((new_state, new_history))) => {
-                        self.perform_reorg(new_state, new_history)?;
+                        self.perform_reorg(new_state, new_history, false)?;
                         self.try_apply_orphans().await;
                         // Check if peer has even more blocks
                         self.network.send(from, Message::GetState);
@@ -2205,7 +2341,7 @@ mod tests {
                     salt: [i; 32],
                 }],
                 witnesses: vec![Witness::sig(sig_bytes)],
-                outputs: vec![OutputData {
+                outputs: vec![OutputData::Standard {
                     address: [0xAA; 32],
                     value: 1,
                     salt: [i; 32],
@@ -2236,7 +2372,7 @@ mod tests {
                 salt: [0; 32],
             }],
             witnesses: vec![Witness::sig(sig.to_bytes())],
-            outputs: vec![OutputData {
+            outputs: vec![OutputData::Standard {
                 address: [0xAA; 32],
                 value: 1,
                 salt: [0; 32],
@@ -2265,7 +2401,7 @@ mod tests {
                     salt: [i; 32],
                 }],
                 witnesses: vec![Witness::sig(sig.to_bytes())],
-                outputs: vec![OutputData {
+                outputs: vec![OutputData::Standard {
                     address: [0xBB; 32],
                     value: 1,
                     salt: [i; 32],
@@ -2307,7 +2443,7 @@ mod tests {
                 salt: [0; 32],
             }],
             witnesses: vec![Witness::sig(sig.to_bytes())],
-            outputs: vec![OutputData {
+            outputs: vec![OutputData::Standard {
                 address: [0xCC; 32],
                 value: 1,
                 salt: [0; 32],
@@ -2343,7 +2479,7 @@ mod tests {
                 salt: [0; 32],
             }],
             witnesses: vec![Witness::sig(sig_bytes)],
-            outputs: vec![OutputData {
+            outputs: vec![OutputData::Standard {
                 address: [0xAA; 32],
                 value: 1,
                 salt: [0; 32],
@@ -2397,7 +2533,7 @@ mod tests {
                 salt: [0; 32],
             }],
             witnesses: vec![Witness::sig(garbage)],
-            outputs: vec![OutputData {
+            outputs: vec![OutputData::Standard {
                 address: [0xAA; 32],
                 value: 1,
                 salt: [0; 32],
@@ -2444,7 +2580,9 @@ mod complex_tests {
         let mut midstate_after_txs = prev_state.midstate;
         let mut tx_fees = 0;
 
-        // 1. Simulate applying transactions to get the post-tx midstate
+        // 1. Simulate applying transactions
+        // Note: In the actual protocol, transactions update the state, 
+        // and then the block PoW commits to that final state.
         for tx in &transactions {
             tx_fees += tx.fee();
             if let Transaction::Commit { commitment, .. } = tx {
@@ -2452,14 +2590,14 @@ mod complex_tests {
             } else if let Transaction::Reveal { inputs, outputs, salt, .. } = tx {
                 let mut hasher = blake3::Hasher::new();
                 for i in inputs { hasher.update(&i.coin_id()); }
-                for o in outputs { hasher.update(&o.coin_id()); }
+                for o in outputs { hasher.update(&o.hash_for_commitment()); }
                 hasher.update(salt);
                 let tx_hash = *hasher.finalize().as_bytes();
                 midstate_after_txs = hash_concat(&midstate_after_txs, &tx_hash);
             }
         }
 
-        // 2. Generate Coinbase outputs (deterministic based on previous midstate/height)
+        // 2. Generate Coinbase outputs
         let reward = crate::core::block_reward(prev_state.height);
         let total_value = reward + tx_fees;
         let mining_seed = prev_state.midstate; 
@@ -2474,6 +2612,7 @@ mod complex_tests {
         }).collect();
 
         // 3. Update midstate with coinbase
+        // THIS PART IS CRITICAL: It must match the order in apply_batch
         for cb in &coinbase {
             midstate_after_txs = hash_concat(&midstate_after_txs, &cb.coin_id());
         }
@@ -2839,12 +2978,12 @@ mod complex_tests {
         assert!(send_value + change_value < first_denom, "must leave fee");
 
         let outputs = vec![
-            OutputData { address: recipient_addr, value: send_value, salt: output_salt },
-            OutputData { address: change_addr, value: change_value, salt: change_salt },
+            OutputData::Standard { address: recipient_addr, value: send_value, salt: output_salt },
+            OutputData::Standard { address: change_addr, value: change_value, salt: change_salt },
         ];
 
         let input_coin_ids = vec![cb_coin_id];
-        let output_coin_ids: Vec<[u8; 32]> = outputs.iter().map(|o| o.coin_id()).collect();
+        let output_coin_ids: Vec<[u8; 32]> = outputs.iter().filter_map(|o| o.coin_id()).collect();
         let tx_salt: [u8; 32] = hash(b"tx salt");
         let commitment = compute_commitment(&input_coin_ids, &output_coin_ids, &tx_salt);
 
@@ -2919,7 +3058,7 @@ mod complex_tests {
             .sum();
             
         let (outputs, change_seeds) = wallet.build_outputs(&recv_addr, &send_denoms, 0).unwrap();
-        let out_sum: u64 = outputs.iter().map(|o| o.value).sum();
+        let out_sum: u64 = outputs.iter().map(|o| o.value()).sum();
         assert!(in_value > out_sum, "fee must be positive");
 
         let (commitment, _salt) = wallet.prepare_commit(&selected, &outputs, change_seeds, false).unwrap();
@@ -2952,7 +3091,7 @@ mod complex_tests {
 
         assert!(!node.state.coins.contains(&coin_id), "spent coin removed");
         for out in &pending.outputs {
-            assert!(node.state.coins.contains(&out.coin_id()), "output coin must exist in UTXO set");
+            assert!(node.state.coins.contains(&out.coin_id().unwrap()), "output coin must exist in UTXO set");
         }
 
         wallet.complete_reveal(&commitment).unwrap();
@@ -3005,25 +3144,31 @@ mod complex_tests {
 
     /// Build a divergent chain from a fork point, returning the batches
     /// and the headers the peer would serve.
-    fn build_divergent_chain(
+fn build_divergent_chain(
         fork_state: &State,
         length: usize,
     ) -> (Vec<Batch>, Vec<BatchHeader>) {
         let mut state = fork_state.clone();
         let mut batches = Vec::new();
         let mut headers = Vec::new();
-        let mut recent_headers: Vec<u64> = vec![state.timestamp];
+        
+        let mut recent_ts = vec![state.timestamp];
         
         for i in 0..length {
-            // Use a different timestamp offset so PoW differs from the main chain
             let batch = make_valid_batch(&state, 50 + i as u64, vec![]);
+            
             let mut hdr = batch.header();
-            hdr.height = state.height;
+            // FIX 1: The height of the new block is the parent's height 
+            hdr.height = state.height; 
             headers.push(hdr);
-            apply_batch(&mut state, &batch, &recent_headers).unwrap();
-            recent_headers.push(state.timestamp);
-            if recent_headers.len() > 11 { recent_headers.remove(0); }
-            state.target = adjust_difficulty(&state);
+
+            // FIX 2: Push the PARENT state's timestamp into the history window,
+            // NOT the new batch's timestamp!
+            recent_ts.push(state.timestamp);
+            if recent_ts.len() > 11 { recent_ts.remove(0); }
+            
+            crate::core::state::apply_batch(&mut state, &batch, &recent_ts).unwrap();
+            state.target = crate::core::state::adjust_difficulty(&state);
             batches.push(batch);
         }
         (batches, headers)
@@ -3076,6 +3221,7 @@ mod complex_tests {
                 candidate_state: fork_state.clone(),
                 cursor: 5,
                 new_history: Vec::new(),
+                is_fast_forward: false,
             },
             started_at: std::time::Instant::now(),
         });
@@ -3146,6 +3292,7 @@ mod complex_tests {
                 candidate_state: fork_state,
                 cursor: 3,
                 new_history: Vec::new(),
+                is_fast_forward: false,
             },
             started_at: std::time::Instant::now(),
         });
@@ -3202,6 +3349,7 @@ mod complex_tests {
                 candidate_state: fork_state,
                 cursor: 1,
                 new_history: Vec::new(),
+                is_fast_forward: false,
             },
             started_at: std::time::Instant::now(),
         });
@@ -3259,6 +3407,7 @@ mod complex_tests {
                 candidate_state: fork_a_state,
                 cursor: 3,
                 new_history: Vec::new(),
+                is_fast_forward: false,
             },
             started_at: std::time::Instant::now(),
         });

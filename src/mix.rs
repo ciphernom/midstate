@@ -10,7 +10,7 @@ use crate::wallet::coinjoin::{MixSession, MixProposal};
 use anyhow::{bail, Result};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Session timeout in seconds. Stale sessions are garbage collected.
 const MIX_SESSION_TIMEOUT: u64 = 300;
@@ -47,6 +47,7 @@ pub struct NodeMixSession {
     proposal: Option<MixProposal>,
     signatures: HashMap<usize, Vec<u8>>,
     pub phase: MixPhase,
+    pub phase_started_at: u64,
     created_at: u64,
     /// True if this node initiated the session (is the coordinator).
     pub is_coordinator: bool,
@@ -71,12 +72,14 @@ pub struct MixStatusSnapshot {
 /// Manages all active mix sessions for a node.
 pub struct MixManager {
     sessions: HashMap<[u8; 32], NodeMixSession>,
+    banned_coins: HashSet<[u8; 32]>, // <-- Added
 }
 
 impl MixManager {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
+            banned_coins: HashSet::new(), 
         }
     }
 
@@ -110,6 +113,7 @@ impl MixManager {
             proposal: None,
             signatures: HashMap::new(),
             phase: MixPhase::Collecting,
+            phase_started_at: now(),
             created_at: now(),
             is_coordinator: true,
             coordinator_peer: None,
@@ -138,6 +142,7 @@ impl MixManager {
             proposal: None,
             signatures: HashMap::new(),
             phase: MixPhase::Collecting,
+            phase_started_at: now(),
             created_at: now(),
             is_coordinator: false,
             coordinator_peer: Some(coordinator),
@@ -146,13 +151,27 @@ impl MixManager {
     }
 
     /// Register a participant (local or remote).
-    pub fn register(
+pub fn register(
         &mut self,
         mix_id: &[u8; 32],
         input: InputReveal,
         output: OutputData,
+        signature: &[u8], 
         peer: Option<PeerId>,
     ) -> Result<()> {
+        let coin_id = input.coin_id();
+        
+        // ---Authenticate ownership before registering ---
+        let pk = input.predicate.owner_pk().ok_or_else(|| anyhow::anyhow!("Mix input must be P2PK"))?;
+        let sig = crate::core::wots::sig_from_bytes(signature)
+            .ok_or_else(|| anyhow::anyhow!("Invalid signature format"))?;
+        if !crate::core::wots::verify(&sig, mix_id, &pk) {
+            bail!("MixJoin signature verification failed (Framed Ban Defense)");
+        }
+
+        if self.banned_coins.contains(&coin_id) {
+            bail!("Coin is banned from mixing due to a previous signature timeout");
+        }
         let ns = self.sessions.get_mut(mix_id)
             .ok_or_else(|| anyhow::anyhow!("mix session not found"))?;
 
@@ -172,6 +191,10 @@ impl MixManager {
         input: InputReveal,
         peer: Option<PeerId>,
     ) -> Result<()> {
+        let coin_id = input.coin_id();
+        if self.banned_coins.contains(&coin_id) {
+            bail!("Coin is banned from mixing due to a previous signature timeout");
+        }
         let ns = self.sessions.get_mut(mix_id)
             .ok_or_else(|| anyhow::anyhow!("mix session not found"))?;
 
@@ -194,9 +217,10 @@ impl MixManager {
             return Ok(None);
         }
 
-        let proposal = ns.session.proposal()?;
+    let proposal = ns.session.proposal()?;
         ns.proposal = Some(proposal.clone());
         ns.phase = MixPhase::Signing;
+        ns.phase_started_at = now(); 
         Ok(Some(proposal))
     }
 
@@ -272,7 +296,7 @@ impl MixManager {
 
         // Verify the commitment matches
         let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
-        let output_ids: Vec<[u8; 32]> = outputs.iter().map(|o| o.coin_id()).collect();
+        let output_ids: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
         let expected = compute_commitment(&input_ids, &output_ids, &salt);
         if expected != commitment {
             bail!("proposal commitment mismatch");
@@ -340,23 +364,38 @@ impl MixManager {
 
     /// Remove timed-out and completed sessions.
     pub fn cleanup(&mut self) {
-        let now = now();
+        let now_time = now();
+        let mut to_ban = Vec::new();
+
         self.sessions.retain(|id, ns| {
+            // Griefer detection: 60 seconds in Signing phase without finishing
+            if ns.phase == MixPhase::Signing && now_time.saturating_sub(ns.phase_started_at) > 60 {
+                if let Some(proposal) = &ns.proposal {
+                    for (i, input) in proposal.inputs.iter().enumerate() {
+                        if !ns.signatures.contains_key(&i) {
+                            let cid = input.coin_id();
+                            to_ban.push(cid);
+                            tracing::warn!("Coin {} banned for stalling mix {}", hex::encode(cid), hex::encode(id));
+                        }
+                    }
+                }
+                ns.phase = MixPhase::Failed("signing timed out".to_string());
+                ns.phase_started_at = now_time; // Reset so it gets swept cleanly
+            }
+
             match &ns.phase {
                 MixPhase::Complete | MixPhase::Failed(_) => {
-                    // Keep for 30s after completion so wallet can poll final status
-                    now.saturating_sub(ns.created_at) < MIX_SESSION_TIMEOUT + 30
+                    now_time.saturating_sub(ns.phase_started_at) < 30
                 }
                 _ => {
-                    if now.saturating_sub(ns.created_at) > MIX_SESSION_TIMEOUT {
-                        tracing::debug!("Mix session {} timed out", hex::encode(id));
-                        false
-                    } else {
-                        true
-                    }
+                    now_time.saturating_sub(ns.created_at) < MIX_SESSION_TIMEOUT
                 }
             }
         });
+
+        for coin_id in to_ban {
+            self.banned_coins.insert(coin_id);
+        }
     }
 
     pub fn session_count(&self) -> usize {
@@ -382,9 +421,13 @@ mod tests {
         let pk = wots::keygen(&seed);
         InputReveal { predicate: Predicate::p2pk(&pk), value, salt: hash_concat(name, b"salt") }
     }
-
+    // Helper to dynamically generate a valid signature for the test inputs
+    fn test_sig(name: &[u8], mix_id: &[u8; 32]) -> Vec<u8> {
+        let seed = crate::core::types::hash(name);
+        crate::core::wots::sig_to_bytes(&crate::core::wots::sign(&seed, mix_id))
+    }
     fn make_output(name: &[u8], value: u64) -> OutputData {
-        OutputData { address: hash_concat(name, b"dest"), value, salt: hash_concat(name, b"osalt") }
+        OutputData::Standard { address: hash_concat(name, b"dest"), value, salt: hash_concat(name, b"osalt") }
     }
 
     #[test]
@@ -392,8 +435,8 @@ mod tests {
         let mut mgr = MixManager::new();
         let mix_id = mgr.create_session(8, 2).unwrap();
 
-        mgr.register(&mix_id, make_input(b"alice", 8), make_output(b"alice", 8), None).unwrap();
-        mgr.register(&mix_id, make_input(b"bob", 8), make_output(b"bob", 8), None).unwrap();
+        mgr.register(&mix_id, make_input(b"alice", 8), make_output(b"alice", 8), &test_sig(b"alice", &mix_id), None).unwrap();
+        mgr.register(&mix_id, make_input(b"bob", 8), make_output(b"bob", 8), &test_sig(b"bob", &mix_id), None).unwrap();
 
         let status = mgr.status(&mix_id).unwrap();
         assert_eq!(status.participants, 2);
@@ -404,7 +447,7 @@ mod tests {
     fn rejects_wrong_denomination() {
         let mut mgr = MixManager::new();
         let mix_id = mgr.create_session(8, 2).unwrap();
-        assert!(mgr.register(&mix_id, make_input(b"bad", 4), make_output(b"bad", 8), None).is_err());
+        assert!(mgr.register(&mix_id, make_input(b"bad", 4), make_output(b"bad", 8), &test_sig(b"bad", &mix_id), None).is_err());
     }
 
     #[test]
@@ -412,8 +455,8 @@ mod tests {
         let mut mgr = MixManager::new();
         let mix_id = mgr.create_session(8, 2).unwrap();
 
-        mgr.register(&mix_id, make_input(b"alice", 8), make_output(b"alice", 8), None).unwrap();
-        mgr.register(&mix_id, make_input(b"bob", 8), make_output(b"bob", 8), None).unwrap();
+        mgr.register(&mix_id, make_input(b"alice", 8), make_output(b"alice", 8), &test_sig(b"alice", &mix_id), None).unwrap();
+        mgr.register(&mix_id, make_input(b"bob", 8), make_output(b"bob", 8), &test_sig(b"bob", &mix_id), None).unwrap();
         mgr.set_fee_input(&mix_id, make_input(b"fee", 1), None).unwrap();
 
         let proposal = mgr.try_finalize(&mix_id).unwrap();
@@ -428,7 +471,7 @@ mod tests {
     fn finalize_returns_none_when_not_ready() {
         let mut mgr = MixManager::new();
         let mix_id = mgr.create_session(8, 2).unwrap();
-        mgr.register(&mix_id, make_input(b"alice", 8), make_output(b"alice", 8), None).unwrap();
+       mgr.register(&mix_id, make_input(b"alice", 8), make_output(b"alice", 8), &test_sig(b"alice", &mix_id), None).unwrap();
         // Only 1 of 2 participants
         assert!(mgr.try_finalize(&mix_id).unwrap().is_none());
     }
@@ -442,8 +485,8 @@ mod tests {
         let seed_b = hash(b"bob");
         let seed_f = hash(b"fee");
 
-        mgr.register(&mix_id, make_input(b"alice", 8), make_output(b"alice", 8), None).unwrap();
-        mgr.register(&mix_id, make_input(b"bob", 8), make_output(b"bob", 8), None).unwrap();
+        mgr.register(&mix_id, make_input(b"alice", 8), make_output(b"alice", 8), &test_sig(b"alice", &mix_id), None).unwrap();
+        mgr.register(&mix_id, make_input(b"bob", 8), make_output(b"bob", 8), &test_sig(b"bob", &mix_id), None).unwrap();
         mgr.set_fee_input(&mix_id, make_input(b"fee", 1), None).unwrap();
 
         let proposal = mgr.try_finalize(&mix_id).unwrap().unwrap();
@@ -475,8 +518,8 @@ mod tests {
         let mut mgr = MixManager::new();
         let mix_id = mgr.create_session(8, 2).unwrap();
 
-        mgr.register(&mix_id, make_input(b"alice", 8), make_output(b"alice", 8), None).unwrap();
-        mgr.register(&mix_id, make_input(b"bob", 8), make_output(b"bob", 8), None).unwrap();
+        mgr.register(&mix_id, make_input(b"alice", 8), make_output(b"alice", 8), &test_sig(b"alice", &mix_id), None).unwrap();
+        mgr.register(&mix_id, make_input(b"bob", 8), make_output(b"bob", 8), &test_sig(b"bob", &mix_id), None).unwrap();
         mgr.set_fee_input(&mix_id, make_input(b"fee", 1), None).unwrap();
 
         mgr.try_finalize(&mix_id).unwrap();

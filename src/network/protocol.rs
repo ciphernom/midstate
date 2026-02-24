@@ -17,6 +17,13 @@ pub enum Message {
         depth: u64,
         midstate: [u8; 32],
     },
+    GetStateSnapshot { 
+        height: u64 
+    },
+    StateSnapshot { 
+        height: u64, 
+        state: Box<crate::core::State> 
+    },
     GetAddr,
     /// Peer exchange: list of multiaddr strings peers can dial
     Addr(Vec<String>),
@@ -51,6 +58,7 @@ pub enum Message {
         mix_id: [u8; 32],
         input: crate::core::InputReveal,
         output: crate::core::OutputData,
+        signature: Vec<u8>,
     },
     MixFee {
         mix_id: [u8; 32],
@@ -286,11 +294,12 @@ mod tests {
                     value: 8,
                     salt: [2; 32],
                 },
-                output: OutputData {
+                output: OutputData::Standard {
                     address: [3; 32],
                     value: 8,
                     salt: [4; 32],
                 },
+                signature: vec![],
             },
             Message::MixProposal {
                 mix_id: [0; 32],
@@ -368,19 +377,21 @@ mod tests {
                 value: 8,
                 salt: [2; 32],
             },
-            output: OutputData {
+            output: OutputData::Standard {
                 address: [3; 32],
                 value: 8,
                 salt: [4; 32],
             },
+            signature: vec![0xDD; 576],
         };
 
         let bytes = msg.serialize_bin();
         match Message::deserialize_bin(&bytes).unwrap() {
-            Message::MixJoin { mix_id, input, output } => {
+            Message::MixJoin { mix_id, input, output, signature } => {
                 assert_eq!(mix_id, [0xBB; 32]);
                 assert_eq!(input.value, 8);
-                assert_eq!(output.value, 8);
+                assert_eq!(output.value(), 8);
+                assert_eq!(signature.len(), 576);
             }
             _ => panic!("wrong variant"),
         }
@@ -405,7 +416,7 @@ mod tests {
                     salt: [4; 32],
                 },
             ],
-            outputs: vec![OutputData {
+            outputs: vec![OutputData::Standard {
                 address: [5; 32],
                 value: 8,
                 salt: [6; 32],
