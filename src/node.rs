@@ -358,9 +358,17 @@ impl Node {
                     let genesis_coinbase = State::genesis().1;
 
                     let mut mining_midstate = state.midstate;
+                    let mut temp_coins = state.coins.clone();
                     for cb in &genesis_coinbase {
-                        mining_midstate = hash_concat(&mining_midstate, &cb.coin_id());
+                        let coin_id = cb.coin_id();
+                        mining_midstate = hash_concat(&mining_midstate, &coin_id);
+                        temp_coins.insert(coin_id);
                     }
+
+                    // --- NEW: Calculate Genesis State Root ---
+                    let state_root = hash_concat(&temp_coins.root(), &state.chain_mmr.root());
+                    mining_midstate = hash_concat(&mining_midstate, &state_root);
+                    // -----------------------------------------
 
                     let mut nonce = 0u64;
                     let extension = loop {
@@ -379,6 +387,7 @@ impl Node {
                         coinbase: genesis_coinbase,
                         timestamp: state.timestamp,
                         target: state.target,
+                        state_root, // NEW
                     };
                     storage.save_batch(0, &genesis_batch)?;
                     apply_batch(&mut state, &genesis_batch, &[])?;
@@ -2086,10 +2095,15 @@ fn perform_reorg(
             candidate_state.midstate = hash_concat(&candidate_state.midstate, &coin_id);
         }
 
+        // --- NEW: Calculate state root ---
+        let state_root = hash_concat(&candidate_state.coins.root(), &candidate_state.chain_mmr.root());
+        candidate_state.midstate = hash_concat(&candidate_state.midstate, &state_root);
+        // ---------------------------------
+
         let midstate = candidate_state.midstate;
         let target = self.state.target;
 
-        let current_time = state::current_timestamp();
+        let current_time = crate::core::state::current_timestamp();
         let block_timestamp = current_time.max(self.state.timestamp + 1);
 
         let mut template = Batch {
@@ -2099,6 +2113,7 @@ fn perform_reorg(
             coinbase,
             timestamp: block_timestamp,
             target: self.state.target,
+            state_root, // NEW
         };
 
         // Spawn background mining with cancellation token
@@ -2207,7 +2222,6 @@ fn save_keypair(data_dir: &PathBuf, keypair: &Keypair) {
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    use crate::core::extension::create_extension;
     use crate::core::mss;
     use crate::core::types::hash;
     
@@ -2241,6 +2255,7 @@ mod tests {
             coinbase: vec![],
             timestamp: 1000,
             target: node.state.target,
+            state_root: [0u8; 32],
         };
         node.storage.save_batch(1, &batch1).unwrap();
 
@@ -2254,6 +2269,7 @@ mod tests {
             coinbase: vec![],
             timestamp: 1010,
             target: node.state.target,
+            state_root: [0u8; 32],
         };
         node.storage.save_batch(2, &batch2).unwrap();
 
@@ -2273,6 +2289,7 @@ mod tests {
             coinbase: vec![],
             timestamp: 1020,
             target: node.state.target,
+            state_root: [0u8; 32],
         };
 
         // We ask: "Where does this batch attach?"
@@ -2294,6 +2311,7 @@ mod tests {
             coinbase: vec![],
             timestamp: 1011,
             target: node.state.target,
+            state_root: [0u8; 32],
         };
 
         // We ask: "Where does this batch attach?"
@@ -2314,6 +2332,7 @@ mod tests {
             coinbase: vec![],
             timestamp: 1001,
             target: node.state.target,
+            state_root: [0u8; 32],
         };
 
         // It connects to Genesis (height 0).
@@ -2577,51 +2596,43 @@ mod complex_tests {
     /// 3. Finds a valid Proof-of-Work nonce for the *real* target of the previous state.
     fn make_valid_batch(prev_state: &State, timestamp_offset: u64, transactions: Vec<Transaction>) -> Batch {
         let timestamp = prev_state.timestamp + timestamp_offset;
-        let mut midstate_after_txs = prev_state.midstate;
+        let mut candidate_state = prev_state.clone();
+        
+        // 1. Apply txs to candidate state
         let mut tx_fees = 0;
-
-        // 1. Simulate applying transactions
-        // Note: In the actual protocol, transactions update the state, 
-        // and then the block PoW commits to that final state.
         for tx in &transactions {
             tx_fees += tx.fee();
-            if let Transaction::Commit { commitment, .. } = tx {
-                midstate_after_txs = hash_concat(&midstate_after_txs, commitment);
-            } else if let Transaction::Reveal { inputs, outputs, salt, .. } = tx {
-                let mut hasher = blake3::Hasher::new();
-                for i in inputs { hasher.update(&i.coin_id()); }
-                for o in outputs { hasher.update(&o.hash_for_commitment()); }
-                hasher.update(salt);
-                let tx_hash = *hasher.finalize().as_bytes();
-                midstate_after_txs = hash_concat(&midstate_after_txs, &tx_hash);
-            }
+            crate::core::transaction::apply_transaction(&mut candidate_state, tx).unwrap();
         }
 
-        // 2. Generate Coinbase outputs
+        // 2. Generate coinbase
         let reward = crate::core::block_reward(prev_state.height);
         let total_value = reward + tx_fees;
         let mining_seed = prev_state.midstate; 
         
         let denominations = crate::core::types::decompose_value(total_value);
         let coinbase: Vec<CoinbaseOutput> = denominations.iter().enumerate().map(|(i, &val)| {
-             let seed = coinbase_seed(&mining_seed, prev_state.height, i as u64);
-             let pk = wots::keygen(&seed);
-             let addr = compute_address(&pk);
-             let salt = coinbase_salt(&mining_seed, prev_state.height, i as u64);
+             let seed = crate::wallet::coinbase_seed(&mining_seed, prev_state.height, i as u64);
+             let pk = crate::core::wots::keygen(&seed);
+             let addr = crate::core::types::compute_address(&pk);
+             let salt = crate::wallet::coinbase_salt(&mining_seed, prev_state.height, i as u64);
              CoinbaseOutput { address: addr, value: val, salt }
         }).collect();
 
-        // 3. Update midstate with coinbase
-        // THIS PART IS CRITICAL: It must match the order in apply_batch
         for cb in &coinbase {
-            midstate_after_txs = hash_concat(&midstate_after_txs, &cb.coin_id());
+            let coin_id = cb.coin_id();
+            candidate_state.coins.insert(coin_id);
+            candidate_state.midstate = hash_concat(&candidate_state.midstate, &coin_id);
         }
 
-        // 4. Mine a valid nonce.
+        // 3. Compute State Root
+        let state_root = hash_concat(&candidate_state.coins.root(), &candidate_state.chain_mmr.root());
+        candidate_state.midstate = hash_concat(&candidate_state.midstate, &state_root);
+
         let target = prev_state.target;
         let mut nonce = 0u64;
         let extension = loop {
-            let ext = create_extension(midstate_after_txs, nonce);
+            let ext = create_extension(candidate_state.midstate, nonce);
             if ext.final_hash < target {
                 break ext;
             }
@@ -2635,6 +2646,7 @@ mod complex_tests {
             coinbase,
             timestamp,
             target,
+            state_root,
         }
     }
 
