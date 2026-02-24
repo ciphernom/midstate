@@ -319,17 +319,19 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         anyhow::bail!("Cannot auto-solve: Private key for {} not found in wallet.dat", short_hex(owner_pk))
     }
 
-    /// Select coins whose total value >= needed. Returns selected coin_ids.
+    /// Select coins whose total value >= needed, aggressively pulling in extra
+    /// dust coins to merge change into higher powers of 2.
     pub fn select_coins(&self, needed: u64, live_coins: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
         let mut selected = Vec::new();
         let mut total = 0u64;
-        // Sort by value descending to minimize number of inputs
+        
+        // 1. Initial Selection: Sort by value descending to minimize baseline inputs
         let mut available: Vec<&WalletCoin> = self.data.coins.iter()
             .filter(|c| live_coins.contains(&c.coin_id))
             .collect();
         available.sort_by(|a, b| b.value.cmp(&a.value));
 
-        for coin in available {
+        for coin in &available {
             if total >= needed { break; }
             selected.push(coin.coin_id);
             total += coin.value;
@@ -338,6 +340,36 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         if total < needed {
             bail!("insufficient funds: have {}, need {}", total, needed);
         }
+
+        // 2. The Greedy "Snowball" Merge
+        // If our resulting change includes a denomination we already have in our wallet,
+        // pull that wallet coin into the transaction! This effectively adds it to 
+        // the change, merging the two identical denominations into the next power of 2.
+        let mut added_new = true;
+        while added_new {
+            added_new = false;
+            let change = total - needed;
+            let change_denoms = decompose_value(change);
+            
+            for denom in change_denoms {
+                // Try to find an unselected live coin of this exact denomination
+                if let Some(pos) = available.iter().position(|c| c.value == denom && !selected.contains(&c.coin_id)) {
+                    selected.push(available[pos].coin_id);
+                    total += denom;
+                    added_new = true;
+                    
+                    tracing::info!("Greedy Merge: Pulled in an extra coin of value {} to consolidate change", denom);
+                    break; // Break inner loop to re-evaluate the new, larger change
+                }
+            }
+            
+            // Consensus safety valve: MAX_TX_INPUTS is 256. Stop at 250 to be safe.
+            if selected.len() >= 250 {
+                tracing::warn!("Greedy merge stopped early to avoid exceeding MAX_TX_INPUTS");
+                break;
+            }
+        }
+
         Ok(selected)
     }
 
@@ -355,7 +387,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         // Recipient outputs
         for &denom in recipient_denominations {
             let salt: [u8; 32] = rand::random();
-            outputs.push(OutputData {
+            outputs.push(OutputData::Standard {
                 address: *recipient_address,
                 value: denom,
                 salt,
@@ -371,7 +403,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                 let address = compute_address(&owner_pk);
                 let salt: [u8; 32] = rand::random();
                 let idx = outputs.len();
-                outputs.push(OutputData { address, value: denom, salt });
+                outputs.push(OutputData::Standard { address, value: denom, salt });
                 change_seeds.push((idx, seed));
             }
         }
@@ -394,9 +426,9 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             }
         }
 
-        let output_coin_ids: Vec<[u8; 32]> = outputs.iter().map(|o| o.coin_id()).collect();
+        let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
         let salt: [u8; 32] = rand::random();
-        let commitment = compute_commitment(input_coin_ids, &output_coin_ids, &salt);
+        let commitment = compute_commitment(input_coin_ids, &output_commit_hashes, &salt);
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -425,8 +457,8 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
 
     /// Build InputReveals and signatures for a pending commit.
     pub fn sign_reveal(&mut self, pending: &PendingCommit) -> Result<(Vec<InputReveal>, Vec<Witness>)> {
-        let output_coin_ids: Vec<[u8; 32]> = pending.outputs.iter().map(|o| o.coin_id()).collect();
-        let commitment = compute_commitment(&pending.input_coin_ids, &output_coin_ids, &pending.salt);
+        let output_commit_hashes: Vec<[u8; 32]> = pending.outputs.iter().map(|o| o.hash_for_commitment()).collect();
+        let commitment = compute_commitment(&pending.input_coin_ids, &output_commit_hashes, &pending.salt);
 
         let mut input_reveals = Vec::new();
         let mut witnesses = Vec::new();
@@ -483,39 +515,35 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                 .filter_map(|id| self.find_coin(id))
                 .map(|c| c.value)
                 .sum();
-            let out_sum: u64 = pending.outputs.iter().map(|o| o.value).sum();
+            let out_sum: u64 = pending.outputs.iter().map(|o| o.value()).sum();
             in_sum.saturating_sub(out_sum)
         };
 
-        // Remove spent coins
         self.data.coins.retain(|c| !spent_coin_ids.contains(&c.coin_id));
 
-        // Add change coins
         for (idx, seed) in &pending.change_seeds {
             let out = &pending.outputs[*idx];
-            let coin_id = out.coin_id();
-            if !self.data.coins.iter().any(|c| c.coin_id == coin_id) {
-                let owner_pk = wots::keygen(seed);
-                self.data.coins.push(WalletCoin {
-                    seed: *seed,
-                    owner_pk,
-                    address: out.address,
-                    value: out.value,
-                    salt: out.salt,
-                    coin_id,
-                    label: Some(format!("change ({})", out.value)),
-                });
+            if let Some(coin_id) = out.coin_id() {
+                if !self.data.coins.iter().any(|c| c.coin_id == coin_id) {
+                    let owner_pk = wots::keygen(seed);
+                    self.data.coins.push(WalletCoin {
+                        seed: *seed,
+                        owner_pk,
+                        address: out.address(),
+                        value: out.value(),
+                        salt: out.salt(),
+                        coin_id,
+                        label: Some(format!("change ({})", out.value())),
+                    });
+                }
             }
         }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
 
         self.data.history.push(HistoryEntry {
             inputs: spent_coin_ids,
-            outputs: pending.outputs.iter().map(|o| o.coin_id()).collect(),
+            outputs: pending.outputs.iter().filter_map(|o| o.coin_id()).collect(),
             fee,
             timestamp: now,
         });
@@ -566,7 +594,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
 
             let change = total - denom - 1; // fee = 1
             let salt: [u8; 32] = rand::random();
-            let mut outputs = vec![OutputData {
+            let mut outputs = vec![OutputData::Standard {
                 address: *recipient_address,
                 value: denom,
                 salt,
@@ -580,7 +608,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                     let addr = compute_address(&pk);
                     let cs: [u8; 32] = rand::random();
                     let idx = outputs.len();
-                    outputs.push(OutputData { address: addr, value: cd, salt: cs });
+                    outputs.push(OutputData::Standard { address: addr, value: cd, salt: cs });
                     change_seeds.push((idx, seed));
                 }
             }
@@ -620,7 +648,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         let output_address = compute_address(&output_pk);
         let output_salt: [u8; 32] = rand::random();
 
-        let output = OutputData {
+        let output = OutputData::Standard {
             address: output_address,
             value: coin.value,
             salt: output_salt,
@@ -680,16 +708,16 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         self.data.coins.retain(|c| !spent_coin_ids.contains(&c.coin_id));
 
         let output_pk = wots::keygen(&output_seed);
-        let coin_id = output.coin_id();
+        let coin_id = output.coin_id().expect("Mix outputs are guaranteed to be standard UTXOs");
         if !self.data.coins.iter().any(|c| c.coin_id == coin_id) {
             self.data.coins.push(WalletCoin {
                 seed: output_seed,
                 owner_pk: output_pk,
-                address: output.address,
-                value: output.value,
-                salt: output.salt,
+                address: output.address(),
+                value: output.value(),
+                salt: output.salt(),
                 coin_id,
-                label: Some(format!("mixed ({})", output.value)),
+                label: Some(format!("mixed ({})", output.value())),
             });
         }
 
@@ -817,7 +845,7 @@ mod tests {
 
     // ── select_coins ────────────────────────────────────────────────────
 
-    #[test]
+#[test]
     fn select_coins_minimal() {
         let file = NamedTempFile::new().unwrap();
         let path = file.path().to_path_buf();
@@ -829,8 +857,11 @@ mod tests {
         let c3 = w.import_coin([3; 32], 16, [30; 32], None).unwrap();
 
         let live = vec![c1, c2, c3];
-        // Need 9 → should select the 16-coin (largest first)
-        let selected = w.select_coins(9, &live).unwrap();
+        
+        // Need 15 -> should select the 16-coin. 
+        // Change is 1. The wallet has no `1` coin, so the greedy snowball 
+        // safely stops without merging anything else.
+        let selected = w.select_coins(15, &live).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0], c3);
     }
@@ -879,13 +910,13 @@ mod tests {
         assert_eq!(change_seeds.len(), change_count);
 
         // First two are to recipient
-        assert_eq!(outputs[0].address, dest);
-        assert_eq!(outputs[0].value, 4);
-        assert_eq!(outputs[1].address, dest);
-        assert_eq!(outputs[1].value, 2);
+        assert_eq!(outputs[0].address(), dest);
+        assert_eq!(outputs[0].value(), 4);
+        assert_eq!(outputs[1].address(), dest);
+        assert_eq!(outputs[1].value(), 2);
 
         // Change values sum correctly
-        let change_total: u64 = change_seeds.iter().map(|(idx, _)| outputs[*idx].value).sum();
+        let change_total: u64 = change_seeds.iter().map(|(idx, _)| outputs[*idx].value()).sum();
         assert_eq!(change_total, 3);
     }
 
@@ -1074,7 +1105,7 @@ mod tests {
 
         let (input, output, _seed) = w.prepare_mix_registration(&coin_id).unwrap();
         assert_eq!(input.value, 8);
-        assert_eq!(output.value, 8);
+        assert_eq!(output.value(), 8);
         assert_eq!(input.coin_id(), coin_id);
     }
 
@@ -1159,7 +1190,7 @@ mod tests {
         let output_seed: [u8; 32] = [0x99; 32];
         let output_pk = crate::core::wots::keygen(&output_seed);
         let output_addr = crate::core::types::compute_address(&output_pk);
-        let output = crate::core::OutputData {
+        let output = crate::core::OutputData::Standard {
             address: output_addr,
             value: 8,
             salt: [0xAA; 32],
@@ -1171,7 +1202,7 @@ mod tests {
         assert!(w.find_coin(&coin_id).is_none());
         assert!(w.find_coin(&fee_id).is_none());
 
-        let new_coin = w.find_coin(&output.coin_id()).unwrap();
+        let new_coin = w.find_coin(&output.coin_id().unwrap()).unwrap();
         assert_eq!(new_coin.value, 8);
         assert_eq!(new_coin.seed, output_seed);
     }
@@ -1188,7 +1219,7 @@ mod tests {
         let output_seed: [u8; 32] = [0x99; 32];
         let output_pk = crate::core::wots::keygen(&output_seed);
         let output_addr = crate::core::types::compute_address(&output_pk);
-        let output = crate::core::OutputData {
+        let output = crate::core::OutputData::Standard {
             address: output_addr,
             value: 8,
             salt: [0xAA; 32],
@@ -1200,7 +1231,7 @@ mod tests {
         // Reopen
         let w2 = Wallet::open(&path, b"pass").unwrap();
         assert_eq!(w2.coin_count(), 1);
-        assert!(w2.find_coin(&output_coin_id).is_some());
+        assert!(w2.find_coin(&output_coin_id.unwrap()).is_some());
         assert_eq!(w2.history().len(), 1);
     }
 
@@ -1260,5 +1291,64 @@ mod tests {
         // Ensure we didn't lose the key itself
         assert_eq!(w_reloaded.mss_keys().len(), 1);
         assert_eq!(w_reloaded.mss_keys()[0].height, 4);
+    }
+    // ── Snowball Merge (Greedy UTXO Defragmentation) ────────────────────
+
+    #[test]
+    fn select_coins_greedy_snowball_basic() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        
+        let c8 = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
+        let c2_a = w.import_coin([2; 32], 2, [20; 32], None).unwrap();
+        let c2_b = w.import_coin([3; 32], 2, [30; 32], None).unwrap();
+
+        let live = vec![c8, c2_a, c2_b];
+        
+        // Scenario: We need 6.
+        // Normal selection: picks `8`. Change = 2. Wallet becomes [2, 2, 2] (worse fragmentation).
+        // Greedy selection: picks `8`. Change = 2. 
+        //   - Sees an unselected `2`. Pulls it in. Total = 10. Change = 4.
+        //   - Doesn't have a `4`. Stops.
+        // New Wallet state after tx: [4, 2] (Defragmented!)
+        let selected = w.select_coins(6, &live).unwrap();
+        
+        assert_eq!(selected.len(), 2, "Should pick the 8 and one of the 2s");
+        assert!(selected.contains(&c8));
+        assert!(selected.contains(&c2_a) || selected.contains(&c2_b));
+    }
+
+    #[test]
+    fn select_coins_greedy_snowball_cascade() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        
+        let c16 = w.import_coin([1; 32], 16, [10; 32], None).unwrap();
+        let c4 = w.import_coin([2; 32], 4, [20; 32], None).unwrap();
+        let c2_a = w.import_coin([3; 32], 2, [30; 32], None).unwrap();
+        let c2_b = w.import_coin([4; 32], 2, [40; 32], None).unwrap();
+
+        let live = vec![c16, c4, c2_a, c2_b];
+        
+        // Scenario: We need 14.
+        // Normal selection: picks `16`. Change = 2. Wallet becomes [4, 2, 2, 2].
+        // Greedy selection:
+        //   1. Base: picks `16`. Total = 16. Change = 2.
+        //   2. Iteration 1: sees a `2`. Picks `c2_a`. Total = 18. Change = 4.
+        //   3. Iteration 2: sees a `4`. Picks `c4`. Total = 22. Change = 8.
+        //   4. Iteration 3: sees an `8`. None available. Stops.
+        // Resulting wallet state after tx: [8, 2] (Massively defragmented!)
+        let selected = w.select_coins(14, &live).unwrap();
+        
+        assert_eq!(selected.len(), 3, "Should cascade and pick 16, 4, and 2");
+        assert!(selected.contains(&c16));
+        assert!(selected.contains(&c4));
+        assert!(selected.contains(&c2_a) || selected.contains(&c2_b));
     }
 }

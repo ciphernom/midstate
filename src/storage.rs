@@ -61,6 +61,33 @@ impl Storage {
         Err(last_err.unwrap().into())
     }
 
+    /// Saves a historical snapshot of the state so it can be served to fast-syncing peers.
+    pub fn save_state_snapshot(&self, height: u64, state: &State) -> Result<()> {
+        let snapshot_dir = self.batches.base_path().parent().unwrap().join("snapshots");
+        std::fs::create_dir_all(&snapshot_dir)?;
+        
+        let path = snapshot_dir.join(format!("state_{}.bin", height));
+        let bytes = bincode::serialize(state)?;
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    /// Loads a historical snapshot to serve to a peer.
+    pub fn load_state_snapshot(&self, height: u64) -> Result<Option<State>> {
+        let snapshot_dir = self.batches.base_path().parent().unwrap().join("snapshots");
+        let path = snapshot_dir.join(format!("state_{}.bin", height));
+        
+        if path.exists() {
+            let bytes = std::fs::read(path)?;
+            let mut state: State = bincode::deserialize(&bytes)?;
+            state.coins.rebuild_tree();
+            state.commitments.rebuild_tree();
+            Ok(Some(state))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn save_state(&self, state: &State) -> Result<()> {
         let bytes = bincode::serialize(state)?;
         let write_txn = self.db.begin_write()?;
