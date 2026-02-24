@@ -17,7 +17,7 @@ pub struct CommitResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InputRevealJson {
-    pub owner_pk: String,  
+    pub bytecode: String,
     pub value: u64,
     pub salt: String,
 }
