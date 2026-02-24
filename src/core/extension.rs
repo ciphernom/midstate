@@ -132,10 +132,14 @@ fn verify_extension_full(midstate: [u8; 32], ext: &Extension) -> Result<()> {
 /// Mine: try nonces until one produces a final_hash below target.
 /// Spawns one worker per available core, each trying independent nonces.
 /// Uses an AtomicBool to instantly abort if a peer solves the block first.
-pub fn mine_extension(midstate: [u8; 32], target: [u8; 32], cancel: Arc<AtomicBool>) -> Option<Extension> {
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+pub fn mine_extension(midstate: [u8; 32], target: [u8; 32], threads: usize, cancel: Arc<AtomicBool>) -> Option<Extension> {
+    let num_threads = if threads == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    } else {
+        threads
+    };
 
     if num_threads <= 1 {
         return mine_extension_single(midstate, target, cancel);
@@ -414,7 +418,8 @@ mod tests {
         // Use easy target so mining finishes quickly
         let target = easy_target();
         let cancel = Arc::new(AtomicBool::new(false));
-        let ext = mine_extension(ms, target, cancel).unwrap();
+        // Add the '0' for the threads argument
+        let ext = mine_extension(ms, target, 0, cancel).unwrap();
         assert!(ext.final_hash < target);
         assert!(verify_extension(ms, &ext, &target).is_ok());
     }
