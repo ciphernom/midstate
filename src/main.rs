@@ -310,6 +310,27 @@ enum WalletAction {
         #[arg(long, default_value = "300")]
         timeout: u64,
     },
+    /// Spend a custom MidstateScript contract
+    SpendScript {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+        /// The Coin ID of the UTXO to spend
+        #[arg(long)]
+        coin: String,
+        /// Hex-encoded bytecode of the UTXO's locking script
+        #[arg(long)]
+        bytecode: String,
+        /// Comma-separated hex inputs to push to the stack. Use AUTO:<pk_hex> to trigger the auto-solver.
+        #[arg(long)]
+        inputs: String,
+        /// Recipient outputs: <address_hex>:<value>
+        #[arg(long)]
+        to: Vec<String>,
+        #[arg(long, default_value = "120")]
+        timeout: u64,
+    },
 }
 
 fn read_password(prompt: &str) -> Result<Vec<u8>> {
@@ -473,6 +494,116 @@ async fn wallet_scan(path: &PathBuf, rpc_port: u16) -> Result<()> {
     Ok(())
 }
 
+async fn wallet_spend_script(
+    path: &PathBuf,
+    rpc_port: u16,
+    coin_ref: String,
+    bytecode_hex: String,
+    inputs_arg: String,
+    to_args: Vec<String>,
+    timeout_secs: u64,
+) -> Result<()> {
+    let password = read_password("Password: ")?;
+    let mut wallet = Wallet::open(path, &password)?;
+    let client = reqwest::Client::new();
+
+    let coin_id = wallet.resolve_coin(&coin_ref)?;
+    let coin = wallet.find_coin(&coin_id).cloned()
+        .ok_or_else(|| anyhow::anyhow!("Coin not found in local wallet"))?;
+
+    // 1. Verify the bytecode matches the coin's P2SH address
+    let bytecode = hex::decode(&bytecode_hex).context("Invalid bytecode hex")?;
+    let script_address = midstate::core::types::hash(&bytecode);
+    if script_address != coin.address {
+        anyhow::bail!("Bytecode hash ({}) does not match coin address ({})", hex::encode(script_address), hex::encode(coin.address));
+    }
+
+    // 2. Parse outputs
+    if to_args.is_empty() { anyhow::bail!("Must specify at least one output via --to"); }
+    let mut outputs = Vec::new();
+    let mut out_sum = 0u64;
+    for arg in &to_args {
+        let (addr, val) = parse_output_spec(arg)?;
+        let salt: [u8; 32] = rand::random();
+        outputs.push(OutputData { address: addr, value: val, salt });
+        out_sum += val;
+    }
+
+    if coin.value <= out_sum {
+        anyhow::bail!("Input value ({}) must exceed output value ({}) to pay network fee", coin.value, out_sum);
+    }
+
+    // 3. Phase 1: Prepare and submit Commit
+    let output_coin_ids: Vec<[u8; 32]> = outputs.iter().map(|o| o.coin_id()).collect();
+
+    let commit_req = rpc::CommitRequest {
+        coins: vec![hex::encode(coin_id)],
+        destinations: output_coin_ids.iter().map(hex::encode).collect(),
+    };
+
+    println!("Submitting Phase 1 Commit...");
+    let url = format!("http://127.0.0.1:{}/commit", rpc_port);
+    let resp = client.post(&url).json(&commit_req).send().await?;
+    if !resp.status().is_success() {
+        let err: rpc::ErrorResponse = resp.json().await?;
+        anyhow::bail!("Commit failed: {}", err.error);
+    }
+    let commit_resp: rpc::CommitResponse = resp.json().await?;
+    let server_commitment = parse_hex32(&commit_resp.commitment)?;
+
+    if !wait_for_commit_mined(&client, rpc_port, &commit_resp.commitment, timeout_secs).await {
+        anyhow::bail!("Timed out waiting for Commit to be mined.");
+    }
+    println!("✓ Commit mined!");
+
+    // 4. Phase 2: The Auto-Solver
+    let mut stack_items = Vec::new();
+    let input_tokens = inputs_arg.split(',').filter(|s| !s.is_empty());
+    
+    for token in input_tokens {
+        if token.starts_with("AUTO:") {
+            let pk_hex = token.strip_prefix("AUTO:").unwrap();
+            let pk = parse_hex32(pk_hex)?;
+            println!("Auto-solving signature for {}...", short_hex(&pk));
+            let sig = wallet.auto_sign(&pk, &server_commitment)?;
+            stack_items.push(sig);
+        } else {
+            let raw_bytes = hex::decode(token).context("Invalid hex in --inputs")?;
+            stack_items.push(raw_bytes);
+        }
+    }
+
+    // 5. Build and submit the Reveal
+    let reveal_req = rpc::SendTransactionRequest {
+        inputs: vec![rpc::InputRevealJson {
+            bytecode: bytecode_hex,
+            value: coin.value,
+            salt: hex::encode(coin.salt),
+        }],
+        signatures: vec![stack_items.iter().map(hex::encode).collect::<Vec<_>>().join(",")],
+        outputs: outputs.iter().map(|o| rpc::OutputDataJson {
+            address: hex::encode(o.address),
+            value: o.value,
+            salt: hex::encode(o.salt),
+        }).collect(),
+        salt: commit_resp.salt,
+    };
+    
+    println!("Submitting Phase 2 Reveal...");
+    let reveal_url = format!("http://127.0.0.1:{}/send", rpc_port);
+    let resp = client.post(&reveal_url).json(&reveal_req).send().await?;
+    if !resp.status().is_success() {
+        let err: rpc::ErrorResponse = resp.json().await?;
+        anyhow::bail!("Reveal failed: {}", err.error);
+    }
+
+    // Remove the coin from the local wallet now that it's spent
+    wallet.data.coins.retain(|c| c.coin_id != coin_id);
+    wallet.save()?;
+
+    println!("✓ Custom script spent successfully!");
+    Ok(())
+}
 
 async fn handle_wallet(action: WalletAction) -> Result<()> {
     match action {
@@ -485,6 +616,9 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         WalletAction::Scan { path, rpc_port } => wallet_scan(&path, rpc_port).await,
         WalletAction::Send { path, rpc_port, coin, to, timeout, private } => {
             wallet_send(&path, rpc_port, coin, to, timeout, private).await
+        }
+        WalletAction::SpendScript { path, rpc_port, coin, bytecode, inputs, to, timeout } => {
+            wallet_spend_script(&path, rpc_port, coin, bytecode, inputs, to, timeout).await
         }
         WalletAction::Import { path, seed, value, salt, label } => {
             wallet_import(&path, &seed, value, &salt, label)
@@ -903,7 +1037,7 @@ async fn do_reveal(
     let reveal_url = format!("http://127.0.0.1:{}/send", rpc_port);
     let reveal_req = rpc::SendTransactionRequest {
         inputs: input_reveals.iter().map(|ir| rpc::InputRevealJson {
-            owner_pk: hex::encode(ir.predicate.owner_pk().unwrap_or(ir.predicate.address())),
+            bytecode: match &ir.predicate { midstate::core::types::Predicate::Script { bytecode } => hex::encode(bytecode) },
             value: ir.value,
             salt: hex::encode(ir.salt),
         }).collect(),
@@ -1049,7 +1183,7 @@ async fn wallet_mix(
         mix_id: mix_id_hex.clone(),
         coin_id: hex::encode(mix_coin_id),
         input: rpc::InputRevealJson {
-            owner_pk: hex::encode(input.predicate.owner_pk().unwrap_or(input.predicate.address())),
+            bytecode: match &input.predicate { midstate::core::types::Predicate::Script { bytecode } => hex::encode(bytecode) },
             value: input.value,
             salt: hex::encode(input.salt),
         },
@@ -1076,7 +1210,7 @@ async fn wallet_mix(
                 let fee_req = rpc::MixFeeRequest {
                     mix_id: mix_id_hex.clone(),
                     input: rpc::InputRevealJson {
-                        owner_pk: hex::encode(fee_input.predicate.owner_pk().unwrap_or(fee_input.predicate.address())),
+                        bytecode: match &fee_input.predicate { midstate::core::types::Predicate::Script { bytecode } => hex::encode(bytecode) },
                         value: fee_input.value,
                         salt: hex::encode(fee_input.salt),
                     },
@@ -1324,7 +1458,7 @@ async fn wallet_reveal(
         let url = format!("http://127.0.0.1:{}/send", rpc_port);
         let req = rpc::SendTransactionRequest {
             inputs: input_reveals.iter().map(|ir| rpc::InputRevealJson {
-                owner_pk: hex::encode(ir.predicate.owner_pk().unwrap_or(ir.predicate.address())),
+                bytecode: match &ir.predicate { midstate::core::types::Predicate::Script { bytecode } => hex::encode(bytecode) },
                 value: ir.value,
                 salt: hex::encode(ir.salt),
             }).collect(),
