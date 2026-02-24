@@ -14,17 +14,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// inherent to relative algorithms like LWMA.
 ///
 /// All arithmetic is deterministic integer math (16.16 fixed-point Taylor
-/// polynomial for 2^x) — no floating-point is used.
-pub fn adjust_difficulty(state: &State) -> [u8; 32] {
-    if state.height == 0 {
-        return state.target;
-    }
-
+/// polynomial for 2^x) — no floating-point is used. 
+/// difficulty adjustment logic: 
+pub fn calculate_target(height: u64, timestamp: u64) -> [u8; 32] {
     let (genesis, _) = State::genesis();
+    if height == 0 { return genesis.target; }
 
     // 1. Drift = how far actual time is from ideal time
-    let ideal_time = (state.height - genesis.height) as i64 * (TARGET_BLOCK_TIME as i64);
-    let actual_time = (state.timestamp as i64).saturating_sub(genesis.timestamp as i64);
+    let ideal_time = (height - genesis.height) as i64 * (TARGET_BLOCK_TIME as i64);
+    let actual_time = (timestamp as i64).saturating_sub(genesis.timestamp as i64);
     let drift = actual_time - ideal_time;
 
     // 2. Fixed-point exponent: drift / half_life in 16.16
@@ -63,6 +61,11 @@ pub fn adjust_difficulty(state: &State) -> [u8; 32] {
     }
 
     target.to_big_endian()
+}
+
+/// Convenience wrapper around `calculate_target` for a full `State` object.
+pub fn adjust_difficulty(state: &State) -> [u8; 32] {
+    calculate_target(state.height, state.timestamp)
 }
 
 pub fn current_timestamp() -> u64 {
@@ -206,16 +209,16 @@ pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]
     // 5. Verify extension against future midstate
     verify_extension(future_midstate, &batch.extension, &batch.target)?;
 
-    // 6. Add coinbase coins to state
+// 6. Add coinbase coins to state
     for coin_id in &coinbase_ids {
         if !state.coins.insert(*coin_id) {
             bail!("Duplicate coinbase coin");
         }
-        state.midstate = hash_concat(&state.midstate, coin_id);
     }
 
     // 7. Finalize
-    state.midstate = batch.extension.final_hash;
+    state.midstate = batch.extension.final_hash; 
+    state.chain_mmr.append(&batch.extension.final_hash);
     state.depth += EXTENSION_ITERATIONS;
     state.height += 1;
     state.timestamp = batch.timestamp;
@@ -543,6 +546,7 @@ mod tests {
             height: 1,
             timestamp: 1000,
             commitment_heights: im::HashMap::new(),
+            chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
         };
         
         let timestamps = vec![prev.timestamp];
