@@ -11,6 +11,19 @@ use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use rayon::prelude::*;
 
+// Use jemalloc on Linux/macOS (excellent for anti-fragmentation on the Pi)
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+// Use mimalloc on Windows (since jemalloc does not support MSVC)
+#[cfg(target_env = "msvc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // ── Config file ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
@@ -86,6 +99,11 @@ enum Command {
         peer: Vec<String>,
         #[arg(long)]
         mine: bool,
+        #[arg(long)] 
+        threads: Option<usize>,
+        /// Limit the number of threads used for signature and block verification
+        #[arg(long)]
+        verify_threads: Option<usize>,
         #[arg(long)]
         listen: Option<String>,
         /// Path to config file (default: <data_dir>/config.toml)
@@ -190,6 +208,11 @@ enum WalletAction {
         rpc_port: u16,
         #[arg(long)]
         full: bool,
+    },
+    /// Compile a MidstateScript assembly file (.msc) into bytecode
+    Compile {
+        #[arg(long)]
+        file: PathBuf,
     },
     Balance {
         #[arg(long, default_value_os_t = default_wallet_path())]
@@ -356,8 +379,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Node { data_dir, port, rpc_port, peer, mine, listen, config } => {
-            run_node(data_dir, port, rpc_port, peer, mine, listen, config).await
+        Command::Node { data_dir, port, rpc_port, peer, mine, threads, verify_threads, listen, config } => {
+            run_node(data_dir, port, rpc_port, peer, mine, threads, verify_threads, listen, config).await
         }
         Command::Wallet { action } => handle_wallet(action).await,
         Command::Commit { rpc_port, coin, dest } => {
@@ -455,6 +478,7 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
     match action {
         WalletAction::Create { path } => wallet_create(&path),
         WalletAction::Receive { path, label } => wallet_receive(&path, label),
+        WalletAction::Compile { file } => wallet_compile(&file),
         WalletAction::Generate { path, count, label } => wallet_generate(&path, count, label),
         WalletAction::List { path, rpc_port, full } => wallet_list(&path, rpc_port, full).await,
         WalletAction::Balance { path, rpc_port } => wallet_balance(&path, rpc_port).await,
@@ -490,7 +514,24 @@ fn wallet_create(path: &PathBuf) -> Result<()> {
     println!("Wallet created: {}", path.display());
     Ok(())
 }
-
+fn wallet_compile(path: &std::path::Path) -> Result<()> {
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read script file: {}", path.display()))?;
+    
+    match midstate::core::script::assemble(&source) {
+        Ok(bytecode) => {
+            let address = midstate::core::types::hash(&bytecode);
+            println!("Compilation Successful!\n");
+            println!("Bytecode (hex): {}", hex::encode(&bytecode));
+            println!("Size:           {} bytes", bytecode.len());
+            println!("Address:        {}", hex::encode(address));
+        }
+        Err(e) => {
+            anyhow::bail!("Compilation failed: {}", e);
+        }
+    }
+    Ok(())
+}
 fn wallet_receive(path: &PathBuf, label: Option<String>) -> Result<()> {
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
@@ -862,11 +903,15 @@ async fn do_reveal(
     let reveal_url = format!("http://127.0.0.1:{}/send", rpc_port);
     let reveal_req = rpc::SendTransactionRequest {
         inputs: input_reveals.iter().map(|ir| rpc::InputRevealJson {
-            owner_pk: hex::encode(ir.owner_pk),
+            owner_pk: hex::encode(ir.predicate.owner_pk().unwrap_or(ir.predicate.address())),
             value: ir.value,
             salt: hex::encode(ir.salt),
         }).collect(),
-        signatures: signatures.iter().map(|s| hex::encode(s)).collect(),
+        signatures: signatures.iter().map(|s| match s {
+            midstate::core::types::Witness::ScriptInputs(inputs) => {
+                inputs.iter().map(hex::encode).collect::<Vec<_>>().join(",")
+            }
+        }).collect(),
         outputs: pending.outputs.iter().map(|o| rpc::OutputDataJson {
             address: hex::encode(o.address),
             value: o.value,
@@ -1004,7 +1049,7 @@ async fn wallet_mix(
         mix_id: mix_id_hex.clone(),
         coin_id: hex::encode(mix_coin_id),
         input: rpc::InputRevealJson {
-            owner_pk: hex::encode(input.owner_pk),
+            owner_pk: hex::encode(input.predicate.owner_pk().unwrap_or(input.predicate.address())),
             value: input.value,
             salt: hex::encode(input.salt),
         },
@@ -1031,7 +1076,7 @@ async fn wallet_mix(
                 let fee_req = rpc::MixFeeRequest {
                     mix_id: mix_id_hex.clone(),
                     input: rpc::InputRevealJson {
-                        owner_pk: hex::encode(fee_input.owner_pk),
+                        owner_pk: hex::encode(fee_input.predicate.owner_pk().unwrap_or(fee_input.predicate.address())),
                         value: fee_input.value,
                         salt: hex::encode(fee_input.salt),
                     },
@@ -1279,11 +1324,15 @@ async fn wallet_reveal(
         let url = format!("http://127.0.0.1:{}/send", rpc_port);
         let req = rpc::SendTransactionRequest {
             inputs: input_reveals.iter().map(|ir| rpc::InputRevealJson {
-                owner_pk: hex::encode(ir.owner_pk),
+                owner_pk: hex::encode(ir.predicate.owner_pk().unwrap_or(ir.predicate.address())),
                 value: ir.value,
                 salt: hex::encode(ir.salt),
             }).collect(),
-            signatures: signatures.iter().map(|s| hex::encode(s)).collect(),
+            signatures: signatures.iter().map(|s| match s {
+                midstate::core::types::Witness::ScriptInputs(inputs) => {
+                    inputs.iter().map(hex::encode).collect::<Vec<_>>().join(",")
+                }
+            }).collect(),
             outputs: pending.outputs.iter().map(|o| rpc::OutputDataJson {
                 address: hex::encode(o.address),
                 value: o.value,
@@ -1410,9 +1459,30 @@ async fn check_coin_rpc(client: &reqwest::Client, rpc_port: u16, coin_hex: &str)
 // ── Original commands ───────────────────────────────────────────────────────
 
 async fn run_node(
-    data_dir: PathBuf, port: u16, rpc_port: u16, cli_peers: Vec<String>,
-    mine: bool, listen: Option<String>, config_path: Option<PathBuf>,
+    data_dir: PathBuf, 
+    port: u16, 
+    rpc_port: u16, 
+    cli_peers: Vec<String>,
+    mine: bool, 
+    threads: Option<usize>, 
+    verify_threads: Option<usize>,
+    listen: Option<String>, 
+    config_path: Option<PathBuf>,
 ) -> Result<()> {
+
+    // --- Configure Rayon Global Thread Pool for Verification ---
+    if let Some(vt) = verify_threads {
+        // If vt is 0, Rayon defaults to the number of logical cores.
+        // If vt is 1, verification becomes strictly sequential.
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(vt)
+            .build_global()
+            .unwrap_or_else(|e| tracing::warn!("Failed to configure verification threads: {}", e));
+            
+        tracing::info!("Verification restricted to {} thread(s)", vt);
+    }
+    // -----------------------------------------------------------
+
     // Load config: explicit --config path, or <data_dir>/config.toml
     let config_file = config_path.unwrap_or_else(|| data_dir.join("config.toml"));
     Config::create_default(&config_file)?;
@@ -1435,12 +1505,19 @@ async fn run_node(
         None => format!("/ip4/0.0.0.0/tcp/{}", port).parse()?,
     };
 
-    let bootstrap: Vec<libp2p::Multiaddr> = all_peers.iter()
+let bootstrap: Vec<libp2p::Multiaddr> = all_peers.iter()
         .map(|a| a.parse())
         .collect::<Result<Vec<_>, _>>()
-        .context("Invalid peer multiaddr (expected e.g. /ip4/1.2.3.4/tcp/9333/p2p/12D3KooW...)")?;
+        .context("Invalid peer multiaddr")?;
 
-    let node = node::Node::new(data_dir, mine, listen_addr, bootstrap).await?;
+    // Combine the `mine` bool and `threads` argument into an Option
+    let mining_threads = if mine {
+        Some(threads.unwrap_or(0)) // 0 acts as the "use all cores" default
+    } else {
+        None
+    };
+
+    let node = node::Node::new(data_dir, mining_threads, listen_addr, bootstrap).await?;
     let (handle, cmd_rx) = node.create_handle();
 
     let rpc_server = rpc::RpcServer::new(rpc_port);
@@ -1450,7 +1527,11 @@ async fn run_node(
             tracing::error!("RPC server error: {}", e);
         }
     });
-    tracing::info!("Node started (mining: {}, rpc: {})", mine, rpc_port);
+    
+    // Update the logging print
+    tracing::info!("Node started (mining: {}, threads: {}, rpc: {})", 
+        mine, threads.unwrap_or(0), rpc_port);
+        
     node.run(handle, cmd_rx).await
 }
 

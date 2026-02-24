@@ -70,8 +70,8 @@ pub struct MssSignature {
     pub leaf_index: u64,
     /// WOTS public key for this leaf (Merkle-verified against master PK).
     pub wots_pk: [u8; 32],
-    /// The WOTS signature (18 × 32-byte chunks).
-    pub wots_sig: Vec<[u8; 32]>,
+    /// The WOTS signature 
+    pub wots_sig: [[u8; 32]; wots::CHAINS],
     /// Auth path: H sibling hashes from leaf to root.
     pub auth_path: Vec<AuthNode>,
 }
