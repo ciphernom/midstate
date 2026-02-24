@@ -23,10 +23,17 @@ pub struct InputRevealJson {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct OutputDataJson {
-    pub address: String, 
-    pub value: u64,
-    pub salt: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OutputDataJson {
+    Standard {
+        address: String, 
+        value: u64,
+        salt: String,
+    },
+    DataBurn {
+        payload: String,
+        value_burned: u64,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -158,6 +165,7 @@ pub struct MixRegisterRequest {
     pub input: InputRevealJson,
     /// Output data for the mixed coin
     pub output: OutputDataJson,
+    pub signature: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
