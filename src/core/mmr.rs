@@ -77,16 +77,16 @@ pub fn peaks(size: u64) -> Vec<u64> {
     result
 }
 
-/// A Merkle Mountain Range backed by a flat vec of hashes.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// A Merkle Mountain Range backed by an immutable vector for O(1) cloning.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct MerkleMountainRange {
-    nodes: Vec<[u8; 32]>,
+    nodes: im::Vector<[u8; 32]>,
     leaf_count: u64,
 }
 
 impl MerkleMountainRange {
     pub fn new() -> Self {
-        Self { nodes: Vec::new(), leaf_count: 0 }
+        Self { nodes: im::Vector::new(), leaf_count: 0 }
     }
 
     pub fn leaf_count(&self) -> u64 { self.leaf_count }
@@ -95,7 +95,7 @@ impl MerkleMountainRange {
     /// Append a leaf, auto-merging complete pairs. Returns its MMR position.
     pub fn append(&mut self, leaf_hash: &[u8; 32]) -> u64 {
         let pos = self.nodes.len() as u64;
-        self.nodes.push(*leaf_hash);
+        self.nodes.push_back(*leaf_hash);
         self.leaf_count += 1;
 
         let mut current_pos = pos;
@@ -112,7 +112,7 @@ impl MerkleMountainRange {
                 &self.nodes[current_pos as usize],
             );
             let parent_pos = self.nodes.len() as u64;
-            self.nodes.push(parent_hash);
+            self.nodes.push_back(parent_hash);
             current_pos = parent_pos;
             current_height += 1;
         }

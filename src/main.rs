@@ -325,6 +325,9 @@ enum WalletAction {
         /// Comma-separated hex inputs to push to the stack. Use AUTO:<pk_hex> to trigger the auto-solver.
         #[arg(long)]
         inputs: String,
+        /// Data to be burned
+        #[arg(long)]
+        burn_data: Option<String>,
         /// Recipient outputs: <address_hex>:<value>
         #[arg(long)]
         to: Vec<String>,
@@ -500,6 +503,7 @@ async fn wallet_spend_script(
     coin_ref: String,
     bytecode_hex: String,
     inputs_arg: String,
+    burn_data: Option<String>,
     to_args: Vec<String>,
     timeout_secs: u64,
 ) -> Result<()> {
@@ -511,34 +515,43 @@ async fn wallet_spend_script(
     let coin = wallet.find_coin(&coin_id).cloned()
         .ok_or_else(|| anyhow::anyhow!("Coin not found in local wallet"))?;
 
-    // 1. Verify the bytecode matches the coin's P2SH address
     let bytecode = hex::decode(&bytecode_hex).context("Invalid bytecode hex")?;
     let script_address = midstate::core::types::hash(&bytecode);
     if script_address != coin.address {
-        anyhow::bail!("Bytecode hash ({}) does not match coin address ({})", hex::encode(script_address), hex::encode(coin.address));
+        anyhow::bail!("Bytecode hash does not match coin address");
     }
 
-    // 2. Parse outputs
-    if to_args.is_empty() { anyhow::bail!("Must specify at least one output via --to"); }
+    if to_args.is_empty() && burn_data.is_none() { 
+        anyhow::bail!("Must specify at least one output via --to or --burn-data"); 
+    }
+
     let mut outputs = Vec::new();
     let mut out_sum = 0u64;
+    
     for arg in &to_args {
         let (addr, val) = parse_output_spec(arg)?;
         let salt: [u8; 32] = rand::random();
-        outputs.push(OutputData { address: addr, value: val, salt });
+        outputs.push(OutputData::Standard { address: addr, value: val, salt });
+        out_sum += val;
+    }
+
+    if let Some(burn_str) = burn_data {
+        let parts: Vec<&str> = burn_str.splitn(2, ':').collect();
+        if parts.len() != 2 { anyhow::bail!("Format: <hex_payload>:<value>"); }
+        let payload = hex::decode(parts[0]).context("Invalid burn payload hex")?;
+        let val: u64 = parts[1].parse().context("Invalid burn value")?;
+        outputs.push(OutputData::DataBurn { payload, value_burned: val });
         out_sum += val;
     }
 
     if coin.value <= out_sum {
-        anyhow::bail!("Input value ({}) must exceed output value ({}) to pay network fee", coin.value, out_sum);
+        anyhow::bail!("Input value ({}) must exceed output value ({})", coin.value, out_sum);
     }
 
-    // 3. Phase 1: Prepare and submit Commit
-    let output_coin_ids: Vec<[u8; 32]> = outputs.iter().map(|o| o.coin_id()).collect();
-
+    let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
     let commit_req = rpc::CommitRequest {
         coins: vec![hex::encode(coin_id)],
-        destinations: output_coin_ids.iter().map(hex::encode).collect(),
+        destinations: output_commit_hashes.iter().map(hex::encode).collect(),
     };
 
     println!("Submitting Phase 1 Commit...");
@@ -556,24 +569,18 @@ async fn wallet_spend_script(
     }
     println!("✓ Commit mined!");
 
-    // 4. Phase 2: The Auto-Solver
     let mut stack_items = Vec::new();
-    let input_tokens = inputs_arg.split(',').filter(|s| !s.is_empty());
-    
-    for token in input_tokens {
+    for token in inputs_arg.split(',').filter(|s| !s.is_empty()) {
         if token.starts_with("AUTO:") {
             let pk_hex = token.strip_prefix("AUTO:").unwrap();
             let pk = parse_hex32(pk_hex)?;
             println!("Auto-solving signature for {}...", short_hex(&pk));
-            let sig = wallet.auto_sign(&pk, &server_commitment)?;
-            stack_items.push(sig);
+            stack_items.push(wallet.auto_sign(&pk, &server_commitment)?);
         } else {
-            let raw_bytes = hex::decode(token).context("Invalid hex in --inputs")?;
-            stack_items.push(raw_bytes);
+            stack_items.push(hex::decode(token).context("Invalid hex in --inputs")?);
         }
     }
 
-    // 5. Build and submit the Reveal
     let reveal_req = rpc::SendTransactionRequest {
         inputs: vec![rpc::InputRevealJson {
             bytecode: bytecode_hex,
@@ -581,10 +588,16 @@ async fn wallet_spend_script(
             salt: hex::encode(coin.salt),
         }],
         signatures: vec![stack_items.iter().map(hex::encode).collect::<Vec<_>>().join(",")],
-        outputs: outputs.iter().map(|o| rpc::OutputDataJson {
-            address: hex::encode(o.address),
-            value: o.value,
-            salt: hex::encode(o.salt),
+        outputs: outputs.iter().map(|o| match o {
+            OutputData::Standard { address, value, salt } => rpc::OutputDataJson::Standard {
+                address: hex::encode(address),
+                value: *value,
+                salt: hex::encode(salt),
+            },
+            OutputData::DataBurn { payload, value_burned } => rpc::OutputDataJson::DataBurn {
+                payload: hex::encode(payload),
+                value_burned: *value_burned,
+            },
         }).collect(),
         salt: commit_resp.salt,
     };
@@ -597,7 +610,6 @@ async fn wallet_spend_script(
         anyhow::bail!("Reveal failed: {}", err.error);
     }
 
-    // Remove the coin from the local wallet now that it's spent
     wallet.data.coins.retain(|c| c.coin_id != coin_id);
     wallet.save()?;
 
@@ -617,8 +629,8 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         WalletAction::Send { path, rpc_port, coin, to, timeout, private } => {
             wallet_send(&path, rpc_port, coin, to, timeout, private).await
         }
-        WalletAction::SpendScript { path, rpc_port, coin, bytecode, inputs, to, timeout } => {
-            wallet_spend_script(&path, rpc_port, coin, bytecode, inputs, to, timeout).await
+        WalletAction::SpendScript { path, rpc_port, coin, bytecode, inputs, burn_data, to, timeout } => {
+            wallet_spend_script(&path, rpc_port, coin, bytecode, inputs, burn_data, to, timeout).await
         }
         WalletAction::Import { path, seed, value, salt, label } => {
             wallet_import(&path, &seed, value, &salt, label)
@@ -842,11 +854,11 @@ async fn wallet_send(
                 .filter_map(|id| wallet.find_coin(id))
                 .map(|c| c.value)
                 .sum();
-            let out_val: u64 = outputs.iter().map(|o| o.value).sum();
+            let out_val: u64 = outputs.iter().map(|o| o.value()).sum();
             println!("  Pair {}: {} in (value {}) → {} out (value {}, fee {})",
                 pair_idx, inputs.len(), in_val, outputs.len(), out_val, in_val - out_val);
 
-            let output_coin_ids: Vec<[u8; 32]> = outputs.iter().map(|o| o.coin_id()).collect();
+            let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
 
             let (commitment, _salt) = wallet.prepare_commit(
                 inputs, outputs, change_seeds.clone(), true
@@ -854,7 +866,7 @@ async fn wallet_send(
 
             let commit_req = rpc::CommitRequest {
                 coins: inputs.iter().map(|c| hex::encode(c)).collect(),
-                destinations: output_coin_ids.iter().map(|d| hex::encode(d)).collect(),
+                destinations: output_commit_hashes.iter().map(|d| hex::encode(d)).collect(),
             };
 
             let url = format!("http://127.0.0.1:{}/commit", rpc_port);
@@ -923,7 +935,7 @@ async fn wallet_send(
         for (address, value) in &recipient_specs {
             for denom in decompose_value(*value) {
                 let salt: [u8; 32] = rand::random();
-                all_outputs.push(OutputData { address: *address, value: denom, salt });
+                all_outputs.push(OutputData::Standard { address: *address, value: denom, salt });
             }
         }
 
@@ -935,12 +947,12 @@ async fn wallet_send(
                 let addr = compute_address(&pk);
                 let salt: [u8; 32] = rand::random();
                 let idx = all_outputs.len();
-                all_outputs.push(OutputData { address: addr, value: denom, salt });
+                all_outputs.push(OutputData::Standard { address: addr, value: denom, salt });
                 change_seeds.push((idx, seed));
             }
         }
 
-        let output_coin_ids: Vec<[u8; 32]> = all_outputs.iter().map(|o| o.coin_id()).collect();
+        let output_commit_hashes: Vec<[u8; 32]> = all_outputs.iter().map(|o| o.hash_for_commitment()).collect();
 
         println!(
             "Spending {} coin(s) (value {}) → {} output(s) (value {}, fee: {})",
@@ -955,7 +967,7 @@ async fn wallet_send(
 
         let commit_req = rpc::CommitRequest {
             coins: input_coin_ids.iter().map(|c| hex::encode(c)).collect(),
-            destinations: output_coin_ids.iter().map(|d| hex::encode(d)).collect(),
+            destinations: output_commit_hashes.iter().map(|d| hex::encode(d)).collect(),
         };
 
         let url = format!("http://127.0.0.1:{}/commit", rpc_port);
@@ -1046,10 +1058,16 @@ async fn do_reveal(
                 inputs.iter().map(hex::encode).collect::<Vec<_>>().join(",")
             }
         }).collect(),
-        outputs: pending.outputs.iter().map(|o| rpc::OutputDataJson {
-            address: hex::encode(o.address),
-            value: o.value,
-            salt: hex::encode(o.salt),
+        outputs: pending.outputs.iter().map(|o| match o {
+            OutputData::Standard { address, value, salt } => rpc::OutputDataJson::Standard {
+                address: hex::encode(address),
+                value: *value,
+                salt: hex::encode(salt),
+            },
+            OutputData::DataBurn { payload, value_burned } => rpc::OutputDataJson::DataBurn {
+                payload: hex::encode(payload),
+                value_burned: *value_burned,
+            },
         }).collect(),
         salt: hex::encode(pending.salt),
     };
@@ -1091,7 +1109,11 @@ async fn do_reveal(
         println!("  spent:   {} (value {})", short_hex(id), val);
     }
     for out in &pending.outputs {
-        println!("  created: {} (value {})", short_hex(&out.coin_id()), out.value);
+        if let Some(c_id) = out.coin_id() {
+            println!("  created: {} (value {})", short_hex(&c_id), out.value());
+        } else {
+            println!("  burned: (value {})", out.value());
+        }
     }
     Ok(())
 }
@@ -1178,6 +1200,11 @@ async fn wallet_mix(
 
     // Step 2: Register our input/output
     let (input, output, output_seed) = wallet.prepare_mix_registration(&mix_coin_id)?;
+    
+    // --- Sign the mix_id to prove ownership ---
+    let parsed_mix_id = parse_hex32(&mix_id_hex)?;
+    let join_sig = wallet.sign_mix_input(&mix_coin_id, &parsed_mix_id)?;
+    // -----------------------------------------------
 
     let register_req = rpc::MixRegisterRequest {
         mix_id: mix_id_hex.clone(),
@@ -1187,11 +1214,12 @@ async fn wallet_mix(
             value: input.value,
             salt: hex::encode(input.salt),
         },
-        output: rpc::OutputDataJson {
-            address: hex::encode(output.address),
-            value: output.value,
-            salt: hex::encode(output.salt),
+        output: rpc::OutputDataJson::Standard {
+            address: hex::encode(output.address()),
+            value: output.value(),
+            salt: hex::encode(output.salt()),
         },
+        signature: hex::encode(join_sig),
     };
 
     let resp = client.post(format!("{}/mix/register", base_url))
@@ -1330,7 +1358,7 @@ async fn wallet_mix(
 
                 println!("\n  ✓ CoinJoin mix complete!");
                 println!("  Spent:    {}", short_hex(&mix_coin_id));
-                println!("  Received: {} (value {})", short_hex(&output.coin_id()), output.value);
+                println!("  Received: {} (value {})", short_hex(&output.coin_id().unwrap()), output.value());
                 if let Some(fee_cid) = fee_coin_id {
                     println!("  Fee paid: {} (value 1)", short_hex(&fee_cid));
                 }
@@ -1383,7 +1411,7 @@ fn wallet_pending(path: &PathBuf) -> Result<()> {
     println!("{} pending commit(s):\n", pending.len());
     for (i, p) in pending.iter().enumerate() {
         let age = now_secs().saturating_sub(p.created_at);
-        let out_val: u64 = p.outputs.iter().map(|o| o.value).sum();
+        let out_val: u64 = p.outputs.iter().map(|o| o.value()).sum();
         println!(
             "  [{}] {} — {} in, {} out (value {}), {}",
             i, short_hex(&p.commitment),
@@ -1467,11 +1495,17 @@ async fn wallet_reveal(
                     inputs.iter().map(hex::encode).collect::<Vec<_>>().join(",")
                 }
             }).collect(),
-            outputs: pending.outputs.iter().map(|o| rpc::OutputDataJson {
-                address: hex::encode(o.address),
-                value: o.value,
-                salt: hex::encode(o.salt),
-            }).collect(),
+            outputs: pending.outputs.iter().map(|o| match o {
+            midstate::core::OutputData::Standard { address, value, salt } => rpc::OutputDataJson::Standard {
+                address: hex::encode(address),
+                value: *value,
+                salt: hex::encode(salt),
+            },
+            midstate::core::OutputData::DataBurn { payload, value_burned } => rpc::OutputDataJson::DataBurn {
+                payload: hex::encode(payload),
+                value_burned: *value_burned,
+            },
+        }).collect(),
             salt: hex::encode(pending.salt),
         };
 

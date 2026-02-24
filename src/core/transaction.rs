@@ -58,17 +58,22 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             }
             // 1. Validate all output values are power of 2 and nonzero
             for (i, out) in outputs.iter().enumerate() {
-                if out.value == 0 {
+                if out.value() == 0 {
                     bail!("Zero-value output {}", i);
                 }
-                if !out.value.is_power_of_two() {
-                    bail!("Invalid denomination: output {} value {} is not a power of 2", i, out.value);
+                if !out.value().is_power_of_two() {
+                    bail!("Invalid denomination: output {} value {} is not a power of 2", i, out.value());
+                }
+                if let OutputData::DataBurn { payload, .. } = out {
+                    if payload.len() > crate::core::types::MAX_BURN_DATA_SIZE {
+                        bail!("DataBurn payload exceeds max size of {} bytes", crate::core::types::MAX_BURN_DATA_SIZE);
+                    }
                 }
             }
 
             // 2. Value conservation: sum(inputs) > sum(outputs)
             let in_sum = inputs.iter().try_fold(0u64, |acc, i| acc.checked_add(i.value)).ok_or_else(|| anyhow::anyhow!("Input value overflow"))?;
-            let out_sum = outputs.iter().try_fold(0u64, |acc, o| acc.checked_add(o.value)).ok_or_else(|| anyhow::anyhow!("Output value overflow"))?;
+            let out_sum = outputs.iter().try_fold(0u64, |acc, o| acc.checked_add(o.value())).ok_or_else(|| anyhow::anyhow!("Output value overflow"))?;
             if in_sum <= out_sum {
                 bail!(
                     "Input value ({}) must exceed output value ({}) to pay fee",
@@ -76,12 +81,12 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 );
             }
 
-            // 3. Compute coin IDs from preimages
+            // 3. Compute commitment hashes
             let input_coin_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
-            let output_coin_ids: Vec<[u8; 32]> = outputs.iter().map(|o| o.coin_id()).collect();
+            let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
 
             // 4. Verify commitment exists and matches
-            let expected = compute_commitment(&input_coin_ids, &output_coin_ids, salt);
+            let expected = compute_commitment(&input_coin_ids, &output_commit_hashes, salt);
             if !state.commitments.remove(&expected) {
                 bail!(
                     "No matching commitment found (expected {})",
@@ -107,10 +112,12 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 state.coins.remove(coin_id);
             }
 
-            // 7. Add new coins (store only the coin_id hash)
-            for coin_id in &output_coin_ids {
-                if !state.coins.insert(*coin_id) {
-                    bail!("Duplicate coin created");
+            // 7. Add new coins (Ignore DataBurns, protecting the SMT!)
+            for out in outputs {
+                if let Some(coin_id) = out.coin_id() {
+                    if !state.coins.insert(coin_id) {
+                        bail!("Duplicate coin created");
+                    }
                 }
             }
 
@@ -120,8 +127,8 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 for coin_id in &input_coin_ids {
                     hasher.update(coin_id);
                 }
-                for coin_id in &output_coin_ids {
-                    hasher.update(coin_id);
+                for hash in &output_commit_hashes {
+                    hasher.update(hash);
                 }
                 hasher.update(salt);
                 let tx_hash = *hasher.finalize().as_bytes();
@@ -194,25 +201,30 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                     }
                 }
             }
-            for (i, out) in outputs.iter().enumerate() {
-                if out.value == 0 {
+                for (i, out) in outputs.iter().enumerate() {
+                if out.value() == 0 {
                     bail!("Zero-value output {}", i);
                 }
-                if !out.value.is_power_of_two() {
-                    bail!("Invalid denomination: output {} value {} is not a power of 2", i, out.value);
+                if !out.value().is_power_of_two() {
+                    bail!("Invalid denomination: output {} value {} is not a power of 2", i, out.value());
+                }
+                if let OutputData::DataBurn { payload, .. } = out {
+                    if payload.len() > crate::core::types::MAX_BURN_DATA_SIZE {
+                        bail!("DataBurn payload exceeds max size of {} bytes", crate::core::types::MAX_BURN_DATA_SIZE);
+                    }
                 }
             }
 
-            let in_sum: u64 = inputs.iter().map(|i| i.value).sum();
-            let out_sum: u64 = outputs.iter().map(|o| o.value).sum();
+            let in_sum = inputs.iter().try_fold(0u64, |acc, i| acc.checked_add(i.value)).ok_or_else(|| anyhow::anyhow!("Input value overflow"))?;
+            let out_sum = outputs.iter().try_fold(0u64, |acc, o| acc.checked_add(o.value())).ok_or_else(|| anyhow::anyhow!("Output value overflow"))?;
             if in_sum <= out_sum {
                 bail!("Input value must exceed output value");
             }
 
             let input_coin_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
-            let output_coin_ids: Vec<[u8; 32]> = outputs.iter().map(|o| o.coin_id()).collect();
+            let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
 
-            let expected = compute_commitment(&input_coin_ids, &output_coin_ids, salt);
+            let expected = compute_commitment(&input_coin_ids, &output_commit_hashes, salt);
             if !state.commitments.contains(&expected) {
                 bail!("No matching commitment found");
             }
@@ -255,6 +267,7 @@ mod tests {
             height: 1,
             timestamp: 1000,
             commitment_heights: im::HashMap::new(),
+            chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
         }
     }
 
@@ -362,7 +375,7 @@ mod tests {
         // Build output
         let out_addr = hash(b"recipient");
         let out_salt: [u8; 32] = [0x11; 32];
-        let output = OutputData { address: out_addr, value: 8, salt: out_salt };
+        let output = OutputData::Standard { address: out_addr, value: 8, salt: out_salt };
         let output_coin_id = output.coin_id();
 
         // Commit
@@ -370,7 +383,7 @@ mod tests {
         let commitment = do_commit(
             &mut state,
             &[coin_id],
-            &[output_coin_id],
+            &[output_coin_id.unwrap()],
             &commit_salt,
         );
 
@@ -392,14 +405,14 @@ mod tests {
         // Input coin spent
         assert!(!state.coins.contains(&coin_id));
         // Output coin created
-        assert!(state.coins.contains(&output_coin_id));
+        assert!(state.coins.contains(&output_coin_id.unwrap()));
     }
 
 #[test]
     fn reveal_rejects_without_commit() {
         let (mut state, seed, _coin_id, input_salt) = state_with_coin(16);
         let owner_pk = wots::keygen(&seed);
-        let output = OutputData { address: hash(b"r"), value: 8, salt: [0; 32] };
+        let output = OutputData::Standard { address: hash(b"r"), value: 8, salt: [0; 32] };
         let fake_commitment = hash(b"not committed");
         let sig = wots::sign(&seed, &fake_commitment);
 
@@ -416,10 +429,10 @@ mod tests {
     fn reveal_rejects_wrong_signature() {
         let (mut state, seed, coin_id, input_salt) = state_with_coin(16);
         let owner_pk = wots::keygen(&seed);
-        let output = OutputData { address: hash(b"r"), value: 8, salt: [0; 32] };
+        let output = OutputData::Standard { address: hash(b"r"), value: 8, salt: [0; 32] };
         let commit_salt: [u8; 32] = [0x33; 32];
-        let commitment = do_commit(&mut state, &[coin_id], &[output.coin_id()], &commit_salt);
-
+        let commitment = do_commit(&mut state, &[coin_id], &[output.coin_id().unwrap()], &commit_salt);
+        
         // Sign with wrong key
         let wrong_seed: [u8; 32] = [0xFF; 32];
         let bad_sig = wots::sign(&wrong_seed, &commitment);
@@ -443,11 +456,11 @@ mod tests {
         let coin_id = compute_coin_id(&address, 16, &input_salt);
         // Do NOT insert coin into state
 
-        let output = OutputData { address: hash(b"r"), value: 8, salt: [0; 32] };
+        let output = OutputData::Standard { address: hash(b"r"), value: 8, salt: [0; 32] };
         let commit_salt = [1u8; 32];
 
         // Commit is allowed (doesn't check coins)
-        let commitment = do_commit(&mut state, &[coin_id], &[output.coin_id()], &commit_salt);
+        let commitment = do_commit(&mut state, &[coin_id], &[output.coin_id().unwrap()], &commit_salt);
         let sig = wots::sign(&seed, &commitment);
 
         let tx = Transaction::Reveal {
@@ -465,9 +478,9 @@ mod tests {
     fn reveal_rejects_output_exceeding_input() {
         let (mut state, seed, coin_id, input_salt) = state_with_coin(8);
         let owner_pk = wots::keygen(&seed);
-        let output = OutputData { address: hash(b"r"), value: 8, salt: [0; 32] };
+        let output = OutputData::Standard { address: hash(b"r"), value: 8, salt: [0; 32] };
         let commit_salt = [0u8; 32];
-        let commitment = do_commit(&mut state, &[coin_id], &[output.coin_id()], &commit_salt);
+        let commitment = do_commit(&mut state, &[coin_id], &[output.coin_id().unwrap()], &commit_salt);
         let sig = wots::sign(&seed, &commitment);
 
         // output value == input value, no fee → rejected
@@ -488,7 +501,7 @@ mod tests {
         let tx = Transaction::Reveal {
             inputs: vec![],
             witnesses: vec![],
-            outputs: vec![OutputData { address: [0; 32], value: 1, salt: [0; 32] }],
+            outputs: vec![OutputData::Standard { address: [0; 32], value: 1, salt: [0; 32] }],
             salt: [0; 32],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
@@ -514,7 +527,7 @@ mod tests {
         let tx = Transaction::Reveal {
             inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 8, salt: input_salt }],
             witnesses: vec![], // 0 sigs for 1 input
-            outputs: vec![OutputData { address: [0; 32], value: 4, salt: [0; 32] }],
+            outputs: vec![OutputData::Standard { address: [0; 32], value: 4, salt: [0; 32] }],
             salt: [0; 32],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
@@ -524,9 +537,9 @@ mod tests {
     fn reveal_rejects_zero_value_output() {
         let (mut state, seed, coin_id, input_salt) = state_with_coin(8);
         let owner_pk = wots::keygen(&seed);
-        let output = OutputData { address: hash(b"r"), value: 0, salt: [0; 32] };
+        let output = OutputData::Standard { address: hash(b"r"), value: 0, salt: [0; 32] };
         let commit_salt = [0u8; 32];
-        let commitment = do_commit(&mut state, &[coin_id], &[output.coin_id()], &commit_salt);
+        let commitment = do_commit(&mut state, &[coin_id], &[output.coin_id().unwrap()], &commit_salt);
         let sig = wots::sign(&seed, &commitment);
 
         let tx = Transaction::Reveal {
@@ -542,9 +555,9 @@ mod tests {
     fn reveal_rejects_non_power_of_two_output() {
         let (mut state, seed, coin_id, input_salt) = state_with_coin(16);
         let owner_pk = wots::keygen(&seed);
-        let output = OutputData { address: hash(b"r"), value: 3, salt: [0; 32] };
+        let output = OutputData::Standard { address: hash(b"r"), value: 3, salt: [0; 32] };
         let commit_salt = [0u8; 32];
-        let commitment = do_commit(&mut state, &[coin_id], &[output.coin_id()], &commit_salt);
+        let commitment = do_commit(&mut state, &[coin_id], &[output.coin_id().unwrap()], &commit_salt);
         let sig = wots::sign(&seed, &commitment);
 
         let tx = Transaction::Reveal {
@@ -564,7 +577,7 @@ mod tests {
         let tx = Transaction::Reveal {
             inputs: vec![same_input.clone(), same_input],
             witnesses: vec![Witness::sig(vec![0; wots::SIG_SIZE]), Witness::sig(vec![0; wots::SIG_SIZE])],
-            outputs: vec![OutputData { address: [0; 32], value: 16, salt: [0; 32] }],
+            outputs: vec![OutputData::Standard { address: [0; 32], value: 16, salt: [0; 32] }],
             salt: [0; 32],
         };
         assert!(apply_transaction(&mut state, &tx).is_err());
@@ -576,9 +589,9 @@ mod tests {
         let owner_pk = wots::keygen(&seed);
 
         // First spend
-        let out1 = OutputData { address: hash(b"r1"), value: 8, salt: [1; 32] };
+        let out1 = OutputData::Standard { address: hash(b"r1"), value: 8, salt: [1; 32] };
         let salt1 = [0xA0; 32];
-        let commitment1 = do_commit(&mut state, &[coin_id], &[out1.coin_id()], &salt1);
+        let commitment1 = do_commit(&mut state, &[coin_id], &[out1.coin_id().unwrap()], &salt1);
         let sig1 = wots::sign(&seed, &commitment1);
         let tx1 = Transaction::Reveal {
             inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt }],
@@ -589,9 +602,9 @@ mod tests {
         apply_transaction(&mut state, &tx1).unwrap();
 
         // Second spend of same coin should fail
-        let out2 = OutputData { address: hash(b"r2"), value: 4, salt: [2; 32] };
+        let out2 = OutputData::Standard { address: hash(b"r2"), value: 4, salt: [2; 32] };
         let salt2 = [0xB0; 32];
-        let commitment2 = do_commit(&mut state, &[coin_id], &[out2.coin_id()], &salt2);
+        let commitment2 = do_commit(&mut state, &[coin_id], &[out2.coin_id().unwrap()], &salt2);
         let sig2 = wots::sign(&seed, &commitment2);
         let tx2 = Transaction::Reveal {
             inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt }],
@@ -620,9 +633,9 @@ mod tests {
         let coin_id = compute_coin_id(&address, value, &input_salt);
         state.coins.insert(coin_id);
 
-        let output = OutputData { address: hash(b"dest"), value: 8, salt: [0; 32] };
+        let output = OutputData::Standard { address: hash(b"dest"), value: 8, salt: [0; 32] };
         let commit_salt = [0xCC; 32];
-        let commitment = do_commit(&mut state, &[coin_id], &[output.coin_id()], &commit_salt);
+        let commitment = do_commit(&mut state, &[coin_id], &[output.coin_id().unwrap()], &commit_salt);
 
         // Sign with MSS
         let mss_sig = keypair.sign(&commitment).unwrap();
