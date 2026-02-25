@@ -21,6 +21,7 @@ impl RpcServer {
     pub async fn run(self, node_handle: NodeHandle) -> Result<()> {
         let app = Router::new()
             .route("/health", get(health))
+            .route("/filters", post(get_filters))
             .route("/state", get(get_state))
             .route("/commit", post(commit_transaction))
             .route("/send", post(send_transaction))
@@ -30,7 +31,6 @@ impl RpcServer {
             .route("/peers", get(get_peers))
             .route("/scan", post(scan_addresses))
             .route("/mss_state", post(get_mss_state))
-            // CoinJoin mix endpoints
             .route("/mix/create", post(mix_create))
             .route("/mix/register", post(mix_register))
             .route("/mix/fee", post(mix_fee))
