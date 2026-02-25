@@ -40,9 +40,7 @@ pub enum Message {
         start_height: u64,
         headers: Vec<BatchHeader>,
     },
-
     // ── Dark Pool CoinJoin ──────────────────────────────────────────
-
     /// Announce intent to mix a specific denomination.
     MixAnnounce {
         mix_id: [u8; 32],
@@ -93,14 +91,13 @@ impl Message {
 }
 
 // ── libp2p request-response codec ───────────────────────────────────────────
-
 pub const MIDSTATE_PROTOCOL: StreamProtocol = StreamProtocol::new("/midstate/1.0.0");
 const MAX_MSG_SIZE: usize = 10_000_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct MidstateCodec;
 
-#[async_trait] // <--- Add this attribute
+#[async_trait]
 impl libp2p::request_response::Codec for MidstateCodec {
     type Protocol = StreamProtocol;
     type Request = Message;
@@ -174,22 +171,24 @@ async fn write_message<T: AsyncWrite + Unpin + Send>(io: &mut T, msg: &Message) 
     Ok(())
 }
 
-// ============================================================
-// ADD THIS ENTIRE BLOCK at the bottom of src/network/protocol.rs
-// ============================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn message_serialize_deserialize_transaction() {
-        let tx = Transaction::Commit { commitment: [0xAA; 32], spam_nonce: 42 };
+        let tx = Transaction::Commit {
+            commitment: [0xAA; 32],
+            spam_nonce: 42,
+        };
         let msg = Message::Transaction(tx);
         let bytes = msg.serialize_bin();
         let msg2 = Message::deserialize_bin(&bytes).unwrap();
         match msg2 {
-            Message::Transaction(Transaction::Commit { commitment, spam_nonce }) => {
+            Message::Transaction(Transaction::Commit {
+                commitment,
+                spam_nonce,
+            }) => {
                 assert_eq!(commitment, [0xAA; 32]);
                 assert_eq!(spam_nonce, 42);
             }
@@ -207,7 +206,11 @@ mod tests {
         let bytes = msg.serialize_bin();
         let msg2 = Message::deserialize_bin(&bytes).unwrap();
         match msg2 {
-            Message::StateInfo { height, depth, midstate } => {
+            Message::StateInfo {
+                height,
+                depth,
+                midstate,
+            } => {
                 assert_eq!(height, 100);
                 assert_eq!(depth, 5000);
                 assert_eq!(midstate, [0xBB; 32]);
@@ -218,11 +221,17 @@ mod tests {
 
     #[test]
     fn message_serialize_deserialize_get_batches() {
-        let msg = Message::GetBatches { start_height: 50, count: 20 };
+        let msg = Message::GetBatches {
+            start_height: 50,
+            count: 20,
+        };
         let bytes = msg.serialize_bin();
         let msg2 = Message::deserialize_bin(&bytes).unwrap();
         match msg2 {
-            Message::GetBatches { start_height, count } => {
+            Message::GetBatches {
+                start_height,
+                count,
+            } => {
                 assert_eq!(start_height, 50);
                 assert_eq!(count, 20);
             }
@@ -239,6 +248,8 @@ mod tests {
     #[test]
     fn message_all_variants_round_trip() {
         use crate::core::types::{InputReveal, OutputData};
+        use crate::core::types::Predicate;
+
         let messages = vec![
             Message::GetState,
             Message::GetAddr,
@@ -248,15 +259,38 @@ mod tests {
                 "/ip4/203.0.113.10/tcp/9333/p2p/12D3KooWTest".to_string(),
                 "/ip4/10.0.0.1/udp/9333/quic-v1/p2p/12D3KooWOther".to_string(),
             ]),
-            Message::GetBatches { start_height: 0, count: 100 },
-            Message::Batches { start_height: 0, batches: vec![] },
-            Message::GetHeaders { start_height: 0, count: 50 },
-            Message::Headers { start_height: 0, headers: vec![] },
-            Message::MixAnnounce { mix_id: [0; 32], denomination: 8 },
+            Message::GetBatches {
+                start_height: 0,
+                count: 100,
+            },
+            Message::Batches {
+                start_height: 0,
+                batches: vec![],
+            },
+            Message::GetHeaders {
+                start_height: 0,
+                count: 50,
+            },
+            Message::Headers {
+                start_height: 0,
+                headers: vec![],
+            },
+            Message::MixAnnounce {
+                mix_id: [0; 32],
+                denomination: 8,
+            },
             Message::MixJoin {
                 mix_id: [0; 32],
-                input: InputReveal { owner_pk: [1; 32], value: 8, salt: [2; 32] },
-                output: OutputData { address: [3; 32], value: 8, salt: [4; 32] },
+                input: InputReveal {
+                    predicate: Predicate::p2pk(&[1; 32]),
+                    value: 8,
+                    salt: [2; 32],
+                },
+                output: OutputData {
+                    address: [3; 32],
+                    value: 8,
+                    salt: [4; 32],
+                },
             },
             Message::MixProposal {
                 mix_id: [0; 32],
@@ -279,7 +313,6 @@ mod tests {
     }
 
     // ── PEX message tests ───────────────────────────────────────────
-
     #[test]
     fn addr_message_preserves_multiaddr_strings() {
         let addrs = vec![
@@ -307,7 +340,6 @@ mod tests {
     }
 
     // ── CoinJoin dark pool messages ─────────────────────────────────
-
     #[test]
     fn mix_announce_round_trip() {
         let msg = Message::MixAnnounce {
@@ -327,11 +359,22 @@ mod tests {
     #[test]
     fn mix_join_round_trip() {
         use crate::core::types::{InputReveal, OutputData};
+        use crate::core::types::Predicate;
+
         let msg = Message::MixJoin {
             mix_id: [0xBB; 32],
-            input: InputReveal { owner_pk: [1; 32], value: 8, salt: [2; 32] },
-            output: OutputData { address: [3; 32], value: 8, salt: [4; 32] },
+            input: InputReveal {
+                predicate: Predicate::p2pk(&[1; 32]),
+                value: 8,
+                salt: [2; 32],
+            },
+            output: OutputData {
+                address: [3; 32],
+                value: 8,
+                salt: [4; 32],
+            },
         };
+
         let bytes = msg.serialize_bin();
         match Message::deserialize_bin(&bytes).unwrap() {
             Message::MixJoin { mix_id, input, output } => {
@@ -346,21 +389,40 @@ mod tests {
     #[test]
     fn mix_proposal_round_trip() {
         use crate::core::types::{InputReveal, OutputData};
+        use crate::core::types::Predicate;
+
         let msg = Message::MixProposal {
             mix_id: [0xCC; 32],
             inputs: vec![
-                InputReveal { owner_pk: [1; 32], value: 8, salt: [2; 32] },
-                InputReveal { owner_pk: [3; 32], value: 1, salt: [4; 32] },
+                InputReveal {
+                    predicate: Predicate::p2pk(&[1; 32]),
+                    value: 8,
+                    salt: [2; 32],
+                },
+                InputReveal {
+                    predicate: Predicate::p2pk(&[3; 32]),
+                    value: 1,
+                    salt: [4; 32],
+                },
             ],
-            outputs: vec![
-                OutputData { address: [5; 32], value: 8, salt: [6; 32] },
-            ],
+            outputs: vec![OutputData {
+                address: [5; 32],
+                value: 8,
+                salt: [6; 32],
+            }],
             salt: [0xDD; 32],
             commitment: [0xEE; 32],
         };
+
         let bytes = msg.serialize_bin();
         match Message::deserialize_bin(&bytes).unwrap() {
-            Message::MixProposal { mix_id, inputs, outputs, salt, commitment } => {
+            Message::MixProposal {
+                mix_id,
+                inputs,
+                outputs,
+                salt,
+                commitment,
+            } => {
                 assert_eq!(mix_id, [0xCC; 32]);
                 assert_eq!(inputs.len(), 2);
                 assert_eq!(outputs.len(), 1);
@@ -380,7 +442,11 @@ mod tests {
         };
         let bytes = msg.serialize_bin();
         match Message::deserialize_bin(&bytes).unwrap() {
-            Message::MixSign { mix_id, input_index, signature } => {
+            Message::MixSign {
+                mix_id,
+                input_index,
+                signature,
+            } => {
                 assert_eq!(mix_id, [0xFF; 32]);
                 assert_eq!(input_index, 2);
                 assert_eq!(signature.len(), 576);
@@ -393,7 +459,15 @@ mod tests {
     fn addr_message_large_peer_list() {
         // PEX should handle up to ~1000 addrs without hitting MAX_MSG_SIZE
         let addrs: Vec<String> = (0..1000)
-            .map(|i| format!("/ip4/10.{}.{}.{}/tcp/9333/p2p/12D3KooWTest{}", i / 65536, (i / 256) % 256, i % 256, i))
+            .map(|i| {
+                format!(
+                    "/ip4/10.{}.{}.{}/tcp/9333/p2p/12D3KooWTest{}",
+                    i / 65536,
+                    (i / 256) % 256,
+                    i % 256,
+                    i
+                )
+            })
             .collect();
         let msg = Message::Addr(addrs.clone());
         let bytes = msg.serialize_bin();

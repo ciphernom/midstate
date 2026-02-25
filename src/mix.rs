@@ -375,11 +375,12 @@ fn now() -> u64 {
 mod tests {
     use super::*;
     use crate::core::wots;
+    use crate::core::types::Predicate;
 
     fn make_input(name: &[u8], value: u64) -> InputReveal {
         let seed = hash(name);
         let pk = wots::keygen(&seed);
-        InputReveal { owner_pk: pk, value, salt: hash_concat(name, b"salt") }
+        InputReveal { predicate: Predicate::p2pk(&pk), value, salt: hash_concat(name, b"salt") }
     }
 
     fn make_output(name: &[u8], value: u64) -> OutputData {
@@ -449,7 +450,7 @@ mod tests {
 
         // Sign each input
         for (i, input) in proposal.inputs.iter().enumerate() {
-            let pk = input.owner_pk;
+            let pk = input.predicate.owner_pk().unwrap();
             let seed = if pk == wots::keygen(&seed_a) { seed_a }
                 else if pk == wots::keygen(&seed_b) { seed_b }
                 else { seed_f };
@@ -460,9 +461,9 @@ mod tests {
         let tx = mgr.try_build_transaction(&mix_id).unwrap();
         assert!(tx.is_some());
         match tx.unwrap() {
-            Transaction::Reveal { inputs, signatures, outputs, .. } => {
+            Transaction::Reveal { inputs, witnesses, outputs, .. } => {
                 assert_eq!(inputs.len(), 3);
-                assert_eq!(signatures.len(), 3);
+                assert_eq!(witnesses.len(), 3);
                 assert_eq!(outputs.len(), 2);
             }
             _ => panic!("expected Reveal"),

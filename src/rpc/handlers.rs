@@ -1,6 +1,6 @@
 use super::types::*;
 use crate::core::{compute_commitment, compute_address, hash_concat, wots,
-                  block_reward, Transaction, InputReveal, OutputData};
+                  block_reward, Transaction, InputReveal, OutputData, Predicate, Witness};
 use crate::node::NodeHandle;
 use axum::{
     extract::State,
@@ -86,17 +86,25 @@ pub async fn commit_transaction(
     let salt: [u8; 32] = rand::random();
     let commitment = compute_commitment(&input_coins, &destinations, &salt);
 
+    // Determine dynamic PoW requirement based on mempool congestion
+    let (_, txs) = node.get_mempool_info().await;
+    let pending_commits = txs.iter().filter(|t| matches!(t, Transaction::Commit { .. })).count();
+    let required_pow = if pending_commits < 500 { 16 } 
+        else if pending_commits < 750 { 18 } 
+        else if pending_commits < 900 { 20 } 
+        else { 22 };
+
     // Mine PoW nonce for anti-spam
-    let spam_nonce = {
+    let spam_nonce = tokio::task::spawn_blocking(move || {
         let mut n = 0u64;
         loop {
             let h = hash_concat(&commitment, &n.to_le_bytes());
-            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 {
-                break n;
+            if crate::core::types::count_leading_zeros(&h) >= required_pow {
+                return n;
             }
             n += 1;
         }
-    };
+    }).await.map_err(|_| ErrorResponse { error: "PoW task failed".into() })?;
 
     let tx = Transaction::Commit { commitment, spam_nonce };
     
@@ -126,17 +134,20 @@ pub async fn send_transaction(
 
     let inputs: Vec<InputReveal> = req.inputs.iter().map(|i| {
         Ok(InputReveal {
-            owner_pk: parse_hex32(&i.owner_pk, "owner_pk")?,
+            predicate: Predicate::p2pk(&parse_hex32(&i.owner_pk, "owner_pk")?),
             value: i.value,
             salt: parse_hex32(&i.salt, "input_salt")?,
         })
     }).collect::<Result<_, ErrorResponse>>()?;
 
-    let mut signatures = Vec::new();
-    for sig_hex in &req.signatures {
-        let sig_bytes = hex::decode(sig_hex)
-            .map_err(|e| ErrorResponse { error: format!("Invalid signature hex: {}", e) })?;
-        signatures.push(sig_bytes);
+    let mut witnesses = Vec::new();
+    for sig_string in &req.signatures {
+        let stack_items = sig_string.split(',')
+            .filter(|s| !s.is_empty())
+            .map(hex::decode)
+            .collect::<Result<Vec<Vec<u8>>, _>>()
+            .map_err(|e| ErrorResponse { error: format!("Invalid hex in witness stack: {}", e) })?;
+        witnesses.push(Witness::ScriptInputs(stack_items));
     }
 
     let outputs: Vec<OutputData> = req.outputs.iter().map(|o| {
@@ -157,7 +168,7 @@ pub async fn send_transaction(
         in_sum.saturating_sub(out_sum)
     };
 
-    let tx = Transaction::Reveal { inputs, signatures, outputs, salt };
+    let tx = Transaction::Reveal { inputs, witnesses, outputs, salt };
 
     node.send_transaction(tx)
         .await
@@ -268,7 +279,7 @@ pub async fn mix_register(
     let mix_id = parse_hex32(&req.mix_id, "mix_id")?;
 
     let input = InputReveal {
-        owner_pk: parse_hex32(&req.input.owner_pk, "owner_pk")?,
+        predicate: Predicate::p2pk(&parse_hex32(&req.input.owner_pk, "owner_pk")?),
         value: req.input.value,
         salt: parse_hex32(&req.input.salt, "input_salt")?,
     };
@@ -291,11 +302,10 @@ pub async fn mix_fee(
     let mix_id = parse_hex32(&req.mix_id, "mix_id")?;
 
     let input = InputReveal {
-        owner_pk: parse_hex32(&req.input.owner_pk, "owner_pk")?,
+        predicate: Predicate::p2pk(&parse_hex32(&req.input.owner_pk, "owner_pk")?),
         value: req.input.value,
         salt: parse_hex32(&req.input.salt, "input_salt")?,
     };
-
     node.mix_set_fee(mix_id, input).await
         .map_err(|e| ErrorResponse { error: e.to_string() })?;
 

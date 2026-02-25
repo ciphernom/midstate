@@ -1,6 +1,5 @@
 use super::types::*;
-use super::wots;
-use super::mss;
+use super::script;
 use anyhow::{bail, Result};
 
 const COMMIT_POW_TARGET: u16 = 0x0000;
@@ -13,20 +12,6 @@ fn validate_commit_pow(commitment: &[u8; 32], nonce: u64) -> Result<()> {
     Ok(())
 }
 
-/// Verify a signature that may be either raw WOTS (576 bytes) or MSS (longer).
-fn verify_signature(sig_bytes: &[u8], message: &[u8; 32], owner_pk: &[u8; 32]) -> bool {
-    if sig_bytes.len() == wots::SIG_SIZE {
-        match wots::sig_from_bytes(sig_bytes) {
-            Some(sig) => wots::verify(&sig, message, owner_pk),
-            None => false,
-        }
-    } else {
-        match mss::MssSignature::from_bytes(sig_bytes) {
-            Ok(mss_sig) => mss::verify(&mss_sig, message, owner_pk),
-            Err(_) => false,
-        }
-    }
-}
 
 /// Apply a transaction to the state
 pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
@@ -41,7 +26,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             Ok(())
         }
 
-        Transaction::Reveal { inputs, signatures, outputs, salt, .. } => {
+        Transaction::Reveal { inputs, witnesses, outputs, salt, .. } => {
             if inputs.is_empty() {
                 bail!("Transaction must spend at least one coin");
             }
@@ -55,13 +40,13 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 bail!("Too many outputs (max {})", MAX_TX_OUTPUTS); 
             }
             
-            if signatures.len() != inputs.len() {
-                bail!("Signature count must match input count");
+            if witnesses.len() != inputs.len() {
+                bail!("Witness count must match input count");
             }
-            for (i, sig) in signatures.iter().enumerate() {
-                if sig.len() > MAX_SIGNATURE_SIZE {
-                    bail!("Signature {} too large: {} > {}", i, sig.len(), MAX_SIGNATURE_SIZE);
-                }
+            // Arbitrary payload size protection
+            let max_witness_size = MAX_SIGNATURE_SIZE * 16; 
+            if bincode::serialized_size(&witnesses).unwrap_or(u64::MAX) > max_witness_size as u64 {
+                bail!("Witnesses payload exceeds maximum allowed size");
             }
             {
                 let mut seen = std::collections::HashSet::new();
@@ -82,8 +67,8 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             }
 
             // 2. Value conservation: sum(inputs) > sum(outputs)
-            let in_sum: u64 = inputs.iter().map(|i| i.value).sum();
-            let out_sum: u64 = outputs.iter().map(|o| o.value).sum();
+            let in_sum = inputs.iter().try_fold(0u64, |acc, i| acc.checked_add(i.value)).ok_or_else(|| anyhow::anyhow!("Input value overflow"))?;
+            let out_sum = outputs.iter().try_fold(0u64, |acc, o| acc.checked_add(o.value)).ok_or_else(|| anyhow::anyhow!("Output value overflow"))?;
             if in_sum <= out_sum {
                 bail!(
                     "Input value ({}) must exceed output value ({}) to pay fee",
@@ -104,14 +89,16 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 );
             }
 
-            // 5. Verify each input coin exists and signature is valid against owner_pk
-            for (i, (input, sig_bytes)) in inputs.iter().zip(signatures.iter()).enumerate() {
+            // 5. Verify each input coin exists and executes cleanly against its Predicate
+            for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
                 let coin_id = input.coin_id();
                 if !state.coins.contains(&coin_id) {
                     bail!("Coin {} not found or already spent", hex::encode(coin_id));
                 }
-                if !verify_signature(sig_bytes, &expected, &input.owner_pk) {
-                    bail!("Invalid signature for input {}", i);
+                
+                // Script Execution Engine
+                if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs) {
+                    bail!("Predicate execution failed for input {}", i);
                 }
             }
 
@@ -146,6 +133,26 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
     }
 }
 
+/// Execute a Witness against a Predicate via the MidstateScript VM.
+fn verify_predicate(
+    predicate: &Predicate,
+    witness: &Witness,
+    commitment: &[u8; 32],
+    current_height: u64,
+    outputs: &[OutputData],
+) -> bool {
+    match (predicate, witness) {
+        (Predicate::Script { bytecode }, Witness::ScriptInputs(inputs)) => {
+            let ctx = script::ExecContext {
+                commitment,
+                height: current_height,
+                outputs,
+            };
+            script::execute_script(bytecode, inputs, &ctx).is_ok()
+        }
+    }
+}
+
 /// Validate a transaction without applying it
 pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
     match tx {
@@ -157,7 +164,7 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
             Ok(())
         }
 
-        Transaction::Reveal { inputs, signatures, outputs, salt, .. } => {
+        Transaction::Reveal { inputs, witnesses, outputs, salt, .. } => {
             if inputs.is_empty() {
                 bail!("Must spend at least one coin");
             }
@@ -171,13 +178,13 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                 bail!("Too many outputs (max {})", MAX_TX_OUTPUTS); 
             }
             
-            if signatures.len() != inputs.len() {
-                bail!("Signature count must match input count");
+            if witnesses.len() != inputs.len() {
+                bail!("Witness count must match input count");
             }
-            for (i, sig) in signatures.iter().enumerate() {
-                if sig.len() > MAX_SIGNATURE_SIZE {
-                    bail!("Signature {} too large: {} > {}", i, sig.len(), MAX_SIGNATURE_SIZE);
-                }
+            // Arbitrary payload size protection
+            let max_witness_size = MAX_SIGNATURE_SIZE * 16; 
+            if bincode::serialized_size(&witnesses).unwrap_or(u64::MAX) > max_witness_size as u64 {
+                bail!("Witnesses payload exceeds maximum allowed size");
             }
             {
                 let mut seen = std::collections::HashSet::new();
@@ -216,14 +223,14 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                     bail!("Commitment expired (committed at height {}, current {})", commit_height, state.height);
                 }
             }
-
-            for (i, (input, sig_bytes)) in inputs.iter().zip(signatures.iter()).enumerate() {
+            // 5. Verify each Witness executes cleanly against its Predicate
+            for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
                 let coin_id = input.coin_id();
                 if !state.coins.contains(&coin_id) {
                     bail!("Coin {} not found", hex::encode(coin_id));
                 }
-                if !verify_signature(sig_bytes, &expected, &input.owner_pk) {
-                    bail!("Invalid signature for input {}", i);
+                if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs) {
+                    bail!("Predicate execution failed for input {}", i);
                 }
             }
 
@@ -246,7 +253,7 @@ mod tests {
             target: [0xff; 32],
             height: 1,
             timestamp: 1000,
-            commitment_heights: std::collections::HashMap::new(),
+            commitment_heights: im::HashMap::new(),
         }
     }
 
@@ -370,8 +377,12 @@ mod tests {
         let owner_pk = wots::keygen(&seed);
         let sig = wots::sign(&seed, &commitment);
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { owner_pk, value: 16, salt: input_salt }],
-            signatures: vec![wots::sig_to_bytes(&sig)],
+            inputs: vec![InputReveal { 
+                predicate: Predicate::p2pk(&owner_pk), 
+                value: 16, 
+                salt: input_salt 
+            }],
+            witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
             outputs: vec![output],
             salt: commit_salt,
         };
@@ -383,7 +394,7 @@ mod tests {
         assert!(state.coins.contains(&output_coin_id));
     }
 
-    #[test]
+#[test]
     fn reveal_rejects_without_commit() {
         let (mut state, seed, _coin_id, input_salt) = state_with_coin(16);
         let owner_pk = wots::keygen(&seed);
@@ -392,8 +403,8 @@ mod tests {
         let sig = wots::sign(&seed, &fake_commitment);
 
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { owner_pk, value: 16, salt: input_salt }],
-            signatures: vec![wots::sig_to_bytes(&sig)],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt }],
+            witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
             outputs: vec![output],
             salt: [0; 32],
         };
@@ -413,8 +424,8 @@ mod tests {
         let bad_sig = wots::sign(&wrong_seed, &commitment);
 
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { owner_pk, value: 16, salt: input_salt }],
-            signatures: vec![wots::sig_to_bytes(&bad_sig)],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt }],
+            witnesses: vec![Witness::sig(wots::sig_to_bytes(&bad_sig))],
             outputs: vec![output],
             salt: commit_salt,
         };
@@ -439,8 +450,8 @@ mod tests {
         let sig = wots::sign(&seed, &commitment);
 
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { owner_pk, value: 16, salt: input_salt }],
-            signatures: vec![wots::sig_to_bytes(&sig)],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt }],
+            witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
             outputs: vec![output],
             salt: commit_salt,
         };
@@ -460,8 +471,8 @@ mod tests {
 
         // output value == input value, no fee → rejected
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { owner_pk, value: 8, salt: input_salt }],
-            signatures: vec![wots::sig_to_bytes(&sig)],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 8, salt: input_salt }],
+            witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
             outputs: vec![output],
             salt: commit_salt,
         };
@@ -475,7 +486,7 @@ mod tests {
         let mut state = empty_state();
         let tx = Transaction::Reveal {
             inputs: vec![],
-            signatures: vec![],
+            witnesses: vec![],
             outputs: vec![OutputData { address: [0; 32], value: 1, salt: [0; 32] }],
             salt: [0; 32],
         };
@@ -487,8 +498,8 @@ mod tests {
         let (mut state, seed, _coin_id, input_salt) = state_with_coin(8);
         let owner_pk = wots::keygen(&seed);
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { owner_pk, value: 8, salt: input_salt }],
-            signatures: vec![vec![0; wots::SIG_SIZE]],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 8, salt: input_salt }],
+            witnesses: vec![Witness::sig(vec![0; wots::SIG_SIZE])],
             outputs: vec![],
             salt: [0; 32],
         };
@@ -500,8 +511,8 @@ mod tests {
         let (mut state, seed, _coin_id, input_salt) = state_with_coin(8);
         let owner_pk = wots::keygen(&seed);
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { owner_pk, value: 8, salt: input_salt }],
-            signatures: vec![], // 0 sigs for 1 input
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 8, salt: input_salt }],
+            witnesses: vec![], // 0 sigs for 1 input
             outputs: vec![OutputData { address: [0; 32], value: 4, salt: [0; 32] }],
             salt: [0; 32],
         };
@@ -518,8 +529,8 @@ mod tests {
         let sig = wots::sign(&seed, &commitment);
 
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { owner_pk, value: 8, salt: input_salt }],
-            signatures: vec![wots::sig_to_bytes(&sig)],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 8, salt: input_salt }],
+            witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
             outputs: vec![output],
             salt: commit_salt,
         };
@@ -536,8 +547,8 @@ mod tests {
         let sig = wots::sign(&seed, &commitment);
 
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { owner_pk, value: 16, salt: input_salt }],
-            signatures: vec![wots::sig_to_bytes(&sig)],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt }],
+            witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
             outputs: vec![output],
             salt: commit_salt,
         };
@@ -548,10 +559,10 @@ mod tests {
     fn reveal_rejects_duplicate_inputs() {
         let (mut state, seed, _coin_id, input_salt) = state_with_coin(16);
         let owner_pk = wots::keygen(&seed);
-        let same_input = InputReveal { owner_pk, value: 16, salt: input_salt };
+        let same_input = InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt };
         let tx = Transaction::Reveal {
             inputs: vec![same_input.clone(), same_input],
-            signatures: vec![vec![0; wots::SIG_SIZE], vec![0; wots::SIG_SIZE]],
+            witnesses: vec![Witness::sig(vec![0; wots::SIG_SIZE]), Witness::sig(vec![0; wots::SIG_SIZE])],
             outputs: vec![OutputData { address: [0; 32], value: 16, salt: [0; 32] }],
             salt: [0; 32],
         };
@@ -569,8 +580,8 @@ mod tests {
         let commitment1 = do_commit(&mut state, &[coin_id], &[out1.coin_id()], &salt1);
         let sig1 = wots::sign(&seed, &commitment1);
         let tx1 = Transaction::Reveal {
-            inputs: vec![InputReveal { owner_pk, value: 16, salt: input_salt }],
-            signatures: vec![wots::sig_to_bytes(&sig1)],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt }],
+            witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig1))],
             outputs: vec![out1],
             salt: salt1,
         };
@@ -582,8 +593,8 @@ mod tests {
         let commitment2 = do_commit(&mut state, &[coin_id], &[out2.coin_id()], &salt2);
         let sig2 = wots::sign(&seed, &commitment2);
         let tx2 = Transaction::Reveal {
-            inputs: vec![InputReveal { owner_pk, value: 16, salt: input_salt }],
-            signatures: vec![wots::sig_to_bytes(&sig2)],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt }],
+            witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig2))],
             outputs: vec![out2],
             salt: salt2,
         };
@@ -617,8 +628,8 @@ mod tests {
         let sig_bytes = mss_sig.to_bytes();
 
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { owner_pk: master_pk, value, salt: input_salt }],
-            signatures: vec![sig_bytes],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&master_pk), value, salt: input_salt }],
+            witnesses: vec![Witness::sig(sig_bytes)],
             outputs: vec![output],
             salt: commit_salt,
         };

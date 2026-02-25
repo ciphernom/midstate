@@ -153,13 +153,13 @@ pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]
     // 3. Apply transactions and tally fees
     let mut total_fees: u64 = 0;
     for tx in &batch.transactions {
-        total_fees += tx.fee();
+        total_fees = total_fees.checked_add(tx.fee()).ok_or_else(|| anyhow::anyhow!("Fee overflow"))?;
         apply_transaction(state, tx)?;
     }
 
     // 3. Validate coinbase outputs
     let reward = block_reward(state.height);
-    let allowed_value = reward + total_fees;
+    let allowed_value = reward.checked_add(total_fees).ok_or_else(|| anyhow::anyhow!("Reward overflow"))?;
 
     let mut coinbase_total: u64 = 0;
     for (i, cb) in batch.coinbase.iter().enumerate() {
@@ -186,9 +186,9 @@ pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]
 
     // --- LOGGING START ---
     if state.height == 0 { // Only log for genesis to reduce noise
-        tracing::error!("APPLY_BATCH DEBUG:");
-        tracing::error!("  State Midstate: {}", hex::encode(state.midstate));
-        tracing::error!("  Future Midstate (calculated): {}", hex::encode(future_midstate));
+        tracing::debug!("APPLY_BATCH DEBUG:");
+        tracing::debug!("  State Midstate: {}", hex::encode(state.midstate));
+        tracing::debug!("  Future Midstate (calculated): {}", hex::encode(future_midstate));
     }
     // --- LOGGING END ---
 
@@ -542,7 +542,7 @@ mod tests {
             target: easy_target(),
             height: 1,
             timestamp: 1000,
-            commitment_heights: std::collections::HashMap::new(),
+            commitment_heights: im::HashMap::new(),
         };
         
         let timestamps = vec![prev.timestamp];
