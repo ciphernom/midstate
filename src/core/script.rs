@@ -38,6 +38,7 @@ pub const OP_SUM_TO_ADDR: u8      = 0x50;
 pub const MAX_SCRIPT_SIZE: usize  = 1_024;
 pub const MAX_STACK_DEPTH: usize  = 64;
 pub const MAX_ITEM_SIZE: usize    = 1_536;
+pub const MAX_SIGOPS_PER_SCRIPT: usize = 3;
 
 // ── Errors ─────────────────────────────────────────────────────────────────
 
@@ -165,11 +166,14 @@ fn stack_pop(stack: &mut Vec<Vec<u8>>) -> Result<Vec<u8>, ScriptError> {
     stack.pop().ok_or(ScriptError::StackUnderflow)
 }
 
-fn to_u64(item: &[u8]) -> u64 {
+fn to_u64(item: &[u8]) -> Result<u64, ScriptError> {
+    if item.len() > 8 {
+        // Reject oversized integers to prevent malleability
+        return Err(ScriptError::InvalidOpcode(0)); 
+    }
     let mut buf = [0u8; 8];
-    let len = item.len().min(8);
-    buf[..len].copy_from_slice(&item[..len]);
-    u64::from_le_bytes(buf)
+    buf[..item.len()].copy_from_slice(item);
+    Ok(u64::from_le_bytes(buf))
 }
 
 fn from_u64(v: u64) -> Vec<u8> {
@@ -220,7 +224,7 @@ pub fn execute_script(
     for item in witness {
         stack_push(&mut stack, item.clone())?;
     }
-
+    let mut sigop_count = 0;
     let mut pc = 0usize;
     let mut exec_stack: Vec<bool> = Vec::new();
 
@@ -258,6 +262,12 @@ pub fn execute_script(
                 }
                 exec_stack.pop();
                 continue;
+            }
+            OP_CHECKSIG | OP_CHECKSIGVERIFY => {
+                sigop_count += 1;
+                if sigop_count > MAX_SIGOPS_PER_SCRIPT {
+                    return Err(ScriptError::VerifyFailed); 
+                }
             }
             _ => {}
         }
@@ -312,13 +322,13 @@ pub fn execute_script(
             OP_ADD => {
                 let b = stack_pop(&mut stack)?;
                 let a = stack_pop(&mut stack)?;
-                let sum = to_u64(&a).checked_add(to_u64(&b)).ok_or(ScriptError::MathOverflow)?;
+                let sum = to_u64(&a)?.checked_add(to_u64(&b)?).ok_or(ScriptError::MathOverflow)?;
                 stack_push(&mut stack, from_u64(sum))?;
             }
             OP_GREATER_OR_EQUAL => {
                 let b = stack_pop(&mut stack)?;
                 let a = stack_pop(&mut stack)?;
-                let result = if to_u64(&a) >= to_u64(&b) { vec![1u8] } else { vec![0u8] };
+                let result = if to_u64(&a)? >= to_u64(&b)? { vec![1u8] } else { vec![0u8] };
                 stack_push(&mut stack, result)?;
             }
 
@@ -342,7 +352,7 @@ pub fn execute_script(
             }
             OP_CHECKTIMEVERIFY => {
                 let height_item = stack_pop(&mut stack)?;
-                let required_height = to_u64(&height_item);
+                let required_height = to_u64(&height_item)?;
                 if ctx.height < required_height {
                     return Err(ScriptError::VerifyFailed);
                 }
