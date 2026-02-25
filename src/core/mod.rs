@@ -7,6 +7,7 @@ pub mod state;
 pub mod mmr;  
 pub mod mss;
 pub mod script;
+pub mod filter;
 
 pub use finality::*;
 pub use types::*;
