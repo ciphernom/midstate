@@ -323,17 +323,21 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
     /// dust coins to merge change into higher powers of 2.
     pub fn select_coins(&self, needed: u64, live_coins: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
         let mut selected = Vec::new();
+        let mut selected_set = std::collections::HashSet::new();
         let mut total = 0u64;
         
+        let live_set: std::collections::HashSet<[u8; 32]> = live_coins.iter().copied().collect();
+
         // 1. Initial Selection: Sort by value descending to minimize baseline inputs
         let mut available: Vec<&WalletCoin> = self.data.coins.iter()
-            .filter(|c| live_coins.contains(&c.coin_id))
+            .filter(|c| live_set.contains(&c.coin_id))
             .collect();
         available.sort_by(|a, b| b.value.cmp(&a.value));
 
         for coin in &available {
             if total >= needed { break; }
             selected.push(coin.coin_id);
+            selected_set.insert(coin.coin_id);
             total += coin.value;
         }
 
@@ -353,8 +357,9 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             
             for denom in change_denoms {
                 // Try to find an unselected live coin of this exact denomination
-                if let Some(pos) = available.iter().position(|c| c.value == denom && !selected.contains(&c.coin_id)) {
+                if let Some(pos) = available.iter().position(|c| c.value == denom && !selected_set.contains(&c.coin_id)) {
                     selected.push(available[pos].coin_id);
+                    selected_set.insert(available[pos].coin_id);
                     total += denom;
                     added_new = true;
                     

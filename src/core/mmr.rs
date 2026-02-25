@@ -356,7 +356,6 @@ impl UtxoAccumulator {
 
             let mut sibling_path = current_path;
             flip_bit(&mut sibling_path, h);
-            mask_lower_bits(&mut sibling_path, h);
 
             let current_hash = self.get_node(h as u16, current_path);
             let sibling_hash = self.get_node(h as u16, sibling_path);
@@ -367,7 +366,10 @@ impl UtxoAccumulator {
                 hash_concat(&sibling_hash, &current_hash)
             };
 
-            mask_lower_bits(&mut current_path, h + 1);
+            // Clear bit h incrementally (bits 0..h-1 already clear from prior iterations)
+            let byte_idx = 31 - (h / 8);
+            let bit_offset = h % 8;
+            current_path[byte_idx] &= !(1 << bit_offset);
 
             let empty = get_empty_hash(h + 1);
             if parent_hash == empty {

@@ -1180,10 +1180,19 @@ impl Node {
         tokio::spawn(async move {
             let mut is_valid = true;
 
-            // 1. Fast sequential check: Ensure chain linkage is intact for all headers
+            // 1. Fast sequential check: linkage + difficulty target validation
             for i in 1..all_headers.len() {
                 if all_headers[i].prev_midstate != all_headers[i - 1].extension.final_hash {
                     tracing::warn!("Header linkage broken at index {}", i);
+                    is_valid = false;
+                    break;
+                }
+                let expected_target = crate::core::state::calculate_target(
+                    all_headers[i - 1].height + 1,
+                    all_headers[i - 1].timestamp,
+                );
+                if all_headers[i].target != expected_target {
+                    tracing::warn!("Invalid difficulty target at header index {}", i);
                     is_valid = false;
                     break;
                 }
@@ -1290,7 +1299,7 @@ impl Node {
             let cand = if fh == 0 {
                 State::genesis().0
             } else if fh <= self.state.height {
-                self.syncer.rebuild_state_to(fh)?
+                self.rebuild_state_at_height(fh)?
             } else {
                 self.state.clone()
             };
