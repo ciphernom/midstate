@@ -171,7 +171,14 @@ fn to_u64(item: &[u8]) -> u64 {
 }
 
 fn from_u64(v: u64) -> Vec<u8> {
-    v.to_le_bytes().to_vec()
+    if v == 0 {
+        return vec![0];
+    }
+    let mut bytes = v.to_le_bytes().to_vec();
+    while bytes.len() > 1 && bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    bytes
 }
 
 fn is_true(item: &[u8]) -> bool {
@@ -428,8 +435,9 @@ pub fn push_data(bc: &mut Vec<u8>, data: &[u8]) {
     bc.extend_from_slice(data);
 }
 
+/// Append a PUSH_DATA instruction encoding a u64 as a minimal LE byte array.
 pub fn push_int(bc: &mut Vec<u8>, value: u64) {
-    push_data(bc, &value.to_le_bytes());
+    push_data(bc, &from_u64(value));
 }
 
 // ── Assembler ──────────────────────────────────────────────────────────────

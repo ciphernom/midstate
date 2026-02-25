@@ -26,8 +26,8 @@ impl Predicate {
     pub fn owner_pk(&self) -> Option<[u8; 32]> {
         match self {
             Predicate::Script { bytecode } => {
-                // P2PK: PUSH_DATA(32) + CHECKSIGVERIFY + PUSH_DATA(8) = 47 bytes
-                if bytecode.len() == 47
+                // P2PK: PUSH_DATA(32) + CHECKSIGVERIFY + PUSH_DATA(1) = 40 bytes
+                if bytecode.len() == 40
                     && bytecode[0] == 0x01
                     && bytecode[1] == 32
                     && bytecode[2] == 0
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn compute_address_is_hash_of_script() {
         let pk = [0xBB; 32];
-        assert_eq!(compute_address(&pk), hash(&super::script::compile_p2pk(&pk)));
+        assert_eq!(compute_address(&pk), hash(&crate::core::script::compile_p2pk(&pk)));
     }
 
     // ── compute_coin_id ─────────────────────────────────────────────────
