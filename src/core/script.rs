@@ -264,9 +264,15 @@ pub fn execute_script(
                 continue;
             }
             OP_CHECKSIG | OP_CHECKSIGVERIFY => {
-                sigop_count += 1;
-                if sigop_count > MAX_SIGOPS_PER_SCRIPT {
-                    return Err(ScriptError::VerifyFailed); 
+                // Count sigops only in executing branches. Dead-branch
+                // checksigs don't consume verifier resources, so counting
+                // them penalizes legitimate scripts like HTLCs where both
+                // branches have their own checksig.
+                if executing {
+                    sigop_count += 1;
+                    if sigop_count > MAX_SIGOPS_PER_SCRIPT {
+                        return Err(ScriptError::VerifyFailed); 
+                    }
                 }
             }
             _ => {}
