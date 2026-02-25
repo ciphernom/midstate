@@ -169,6 +169,18 @@ pub struct MixRegisterRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct GetFiltersRequest {
+    pub start_height: u64,
+    pub end_height: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetFiltersResponse {
+    pub start_height: u64,
+    pub filters: Vec<String>, // Hex-encoded filter data
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MixFeeRequest {
     pub mix_id: String,
     /// Input reveal for the denomination-1 fee coin

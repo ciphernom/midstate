@@ -382,6 +382,32 @@ pub async fn mix_list(
     })
 }
 
+pub async fn get_filters(
+    State(node): State<AppState>,
+    Json(req): Json<GetFiltersRequest>,
+) -> Result<Json<GetFiltersResponse>, ErrorResponse> {
+    // Limit to 1000 filters per request to prevent abuse
+    let count = (req.end_height.saturating_sub(req.start_height)).min(1000);
+    let end = req.start_height + count;
+
+    let store = crate::storage::BatchStore::new(&node.batches_path)
+        .map_err(|e| ErrorResponse { error: format!("Storage error: {}", e) })?;
+
+    let mut filters = Vec::new();
+    for h in req.start_height..end {
+        if let Ok(Some(filter_data)) = store.load_filter(h) {
+            filters.push(hex::encode(filter_data));
+        } else {
+            break; // Stop at the first missing filter (chain tip)
+        }
+    }
+
+    Ok(Json(GetFiltersResponse {
+        start_height: req.start_height,
+        filters,
+    }))
+}
+
 fn snapshot_to_response(s: crate::mix::MixStatusSnapshot) -> MixStatusResponse {
     let phase_str = match &s.phase {
         crate::mix::MixPhase::Collecting => "collecting",
