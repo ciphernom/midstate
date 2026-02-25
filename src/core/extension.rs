@@ -77,17 +77,6 @@ pub fn verify_extension(midstate: [u8; 32], ext: &Extension, target: &[u8; 32]) 
 
     // 4. First checkpoint must match midstate + nonce
     let expected_start = hash_concat(&midstate, &ext.nonce.to_le_bytes());
-    
-    // --- LOGGING START ---
-    if ext.checkpoints[0] != expected_start {
-        tracing::error!("VERIFY ERROR DEBUG:");
-        tracing::error!("  Input Midstate: {}", hex::encode(midstate));
-        tracing::error!("  Nonce: {}", ext.nonce);
-        tracing::error!("  Expected Checkpoint[0] (hash(midstate+nonce)): {}", hex::encode(expected_start));
-        tracing::error!("  Actual Extension Checkpoint[0]: {}", hex::encode(ext.checkpoints[0]));
-    }
-    // --- LOGGING END ---
-
     if ext.checkpoints[0] != expected_start {
         bail!("First checkpoint doesn't match midstate+nonce");
     }
