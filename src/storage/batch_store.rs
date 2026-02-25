@@ -1,4 +1,5 @@
 use crate::core::{Batch, BatchHeader};
+use crate::core::filter::CompactFilter;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::fs;
@@ -109,7 +110,38 @@ impl BatchStore {
         let hdr_bytes = bincode::serialize(&header)?;
         fs::write(hdr_path, hdr_bytes)?;
 
+        // --- Save Compact Filter ---
+        let filter = CompactFilter::build(batch);
+        let filter_path = folder_path.join(format!("filter_{}.bin", height));
+        fs::write(filter_path, filter.data)?;
+
+        // Update the highest-height marker so `highest()` is O(1) instead of
+        // scanning every file in every subdirectory.  Written last so that a
+        // crash mid-save cannot advance the marker past a fully-written block.
+        let marker = self.base_path.join("highest_height");
+        let current_highest = fs::read_to_string(&marker)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if height >= current_highest {
+            fs::write(&marker, height.to_string())?;
+        }
+
         Ok(())
+    }
+ 
+    /// Load a filter
+    pub fn load_filter(&self, height: u64) -> Result<Option<Vec<u8>>> {
+        let folder = height / 1000;
+        let filter_path = self.base_path
+            .join(format!("{:06}", folder))
+            .join(format!("filter_{}.bin", height));
+
+        if filter_path.exists() {
+            Ok(Some(fs::read(filter_path)?))
+        } else {
+            Ok(None)
+        }
     }
     
     /// Load a batch
@@ -184,21 +216,38 @@ impl BatchStore {
         Ok(batches)
     }
     
-    /// Get highest batch we have
+    /// Get highest batch we have.
+    ///
+    /// Fast path: reads the `highest_height` marker file written by `save()`,
+    /// giving O(1) startup cost regardless of chain length.
+    ///
+    /// Fallback: if the marker doesn't exist (fresh node or pre-marker data
+    /// directory), performs the original O(N) directory scan so that existing
+    /// nodes work correctly without any migration step.
     pub fn highest(&self) -> Result<u64> {
+        let marker = self.base_path.join("highest_height");
+        if marker.exists() {
+            let val = fs::read_to_string(&marker)?
+                .trim()
+                .parse::<u64>()
+                .unwrap_or(0);
+            return Ok(val);
+        }
+
+        // Fallback: full directory scan for nodes that predate the marker.
         let mut max = 0u64;
-        
         for entry in fs::read_dir(&self.base_path)? {
             let entry = entry?;
             let path = entry.path();
-            
             if path.is_dir() {
                 for file in fs::read_dir(path)? {
                     let file = file?;
                     let name = file.file_name();
                     let name_str = name.to_string_lossy();
-                    
-                    if let Some(height_str) = name_str.strip_prefix("batch_").and_then(|s| s.strip_suffix(".bin")) {
+                    if let Some(height_str) = name_str
+                        .strip_prefix("batch_")
+                        .and_then(|s| s.strip_suffix(".bin"))
+                    {
                         if let Ok(height) = height_str.parse::<u64>() {
                             max = max.max(height);
                         }
@@ -206,7 +255,6 @@ impl BatchStore {
                 }
             }
         }
-        
         Ok(max)
     }
     
@@ -216,7 +264,6 @@ impl BatchStore {
 mod tests {
     use super::*;
     use crate::core::types::*;
-    use crate::core::extension::create_extension;
     use tempfile::tempdir;
 
     fn dummy_batch(nonce: u64) -> Batch {
@@ -307,6 +354,70 @@ mod tests {
         store.save(50, &dummy_batch(50)).unwrap();
 
         assert_eq!(store.highest().unwrap(), 100);
+    }
+
+    // ── highest_height marker ───────────────────────────────────────────
+
+    #[test]
+    fn highest_uses_marker_after_save() {
+        let dir = tempdir().unwrap();
+        let store = BatchStore::new(dir.path().join("batches")).unwrap();
+
+        store.save(0, &dummy_batch(0)).unwrap();
+        store.save(7, &dummy_batch(7)).unwrap();
+        store.save(3, &dummy_batch(3)).unwrap();
+
+        // Marker should reflect the highest height saved, not insertion order.
+        let marker_path = dir.path().join("batches").join("highest_height");
+        assert!(marker_path.exists(), "marker file must be written by save()");
+
+        assert_eq!(store.highest().unwrap(), 7);
+    }
+
+    #[test]
+    fn highest_marker_not_regressed_by_lower_save() {
+        let dir = tempdir().unwrap();
+        let store = BatchStore::new(dir.path().join("batches")).unwrap();
+
+        store.save(10, &dummy_batch(10)).unwrap();
+        assert_eq!(store.highest().unwrap(), 10);
+
+        // Saving a lower height (e.g. reorg fill-in) must not move the marker back.
+        store.save(5, &dummy_batch(5)).unwrap();
+        assert_eq!(store.highest().unwrap(), 10);
+    }
+
+    #[test]
+    fn highest_falls_back_to_scan_without_marker() {
+        let dir = tempdir().unwrap();
+        let store = BatchStore::new(dir.path().join("batches")).unwrap();
+
+        // Manually write a batch file without going through save(),
+        // simulating a pre-marker data directory.
+        let folder = dir.path().join("batches/000000");
+        std::fs::create_dir_all(&folder).unwrap();
+        let batch = dummy_batch(42);
+        let bytes = bincode::serialize(&batch).unwrap();
+        std::fs::write(folder.join("batch_42.bin"), bytes).unwrap();
+
+        // No marker file exists — must fall back to directory scan.
+        let marker = dir.path().join("batches/highest_height");
+        assert!(!marker.exists());
+        assert_eq!(store.highest().unwrap(), 42);
+    }
+
+    #[test]
+    fn highest_marker_persists_across_instances() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("batches");
+        let store = BatchStore::new(&path).unwrap();
+
+        store.save(99, &dummy_batch(99)).unwrap();
+        drop(store);
+
+        // New instance should read marker, not scan.
+        let store2 = BatchStore::new(&path).unwrap();
+        assert_eq!(store2.highest().unwrap(), 99);
     }
 
     #[test]
@@ -450,7 +561,7 @@ mod tests {
 
         let nonce = 42u64;
         let batch = dummy_batch(nonce);
-        let midstate = batch.prev_midstate;
+        let midstate = batch.header().post_tx_midstate;
 
         // Verify before pruning (spot-check path)
         assert!(verify_extension(

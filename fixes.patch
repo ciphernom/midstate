@@ -1,0 +1,173 @@
+diff -ruN orig/src/core/extension.rs src/core/extension.rs
+--- orig/src/core/extension.rs	2026-02-25 20:40:36.000000000 +0000
++++ src/core/extension.rs	2026-02-27 00:45:42.183232028 +0000
+@@ -77,17 +77,6 @@
+ 
+     // 4. First checkpoint must match midstate + nonce
+     let expected_start = hash_concat(&midstate, &ext.nonce.to_le_bytes());
+-    
+-    // --- LOGGING START ---
+-    if ext.checkpoints[0] != expected_start {
+-        tracing::error!("VERIFY ERROR DEBUG:");
+-        tracing::error!("  Input Midstate: {}", hex::encode(midstate));
+-        tracing::error!("  Nonce: {}", ext.nonce);
+-        tracing::error!("  Expected Checkpoint[0] (hash(midstate+nonce)): {}", hex::encode(expected_start));
+-        tracing::error!("  Actual Extension Checkpoint[0]: {}", hex::encode(ext.checkpoints[0]));
+-    }
+-    // --- LOGGING END ---
+-
+     if ext.checkpoints[0] != expected_start {
+         bail!("First checkpoint doesn't match midstate+nonce");
+     }
+diff -ruN orig/src/core/mmr.rs src/core/mmr.rs
+--- orig/src/core/mmr.rs	2026-02-26 01:37:16.000000000 +0000
++++ src/core/mmr.rs	2026-02-27 00:45:06.110238307 +0000
+@@ -356,7 +356,6 @@
+ 
+             let mut sibling_path = current_path;
+             flip_bit(&mut sibling_path, h);
+-            mask_lower_bits(&mut sibling_path, h);
+ 
+             let current_hash = self.get_node(h as u16, current_path);
+             let sibling_hash = self.get_node(h as u16, sibling_path);
+@@ -367,7 +366,10 @@
+                 hash_concat(&sibling_hash, &current_hash)
+             };
+ 
+-            mask_lower_bits(&mut current_path, h + 1);
++            // Clear bit h incrementally (bits 0..h-1 already clear from prior iterations)
++            let byte_idx = 31 - (h / 8);
++            let bit_offset = h % 8;
++            current_path[byte_idx] &= !(1 << bit_offset);
+ 
+             let empty = get_empty_hash(h + 1);
+             if parent_hash == empty {
+diff -ruN orig/src/core/script.rs src/core/script.rs
+--- orig/src/core/script.rs	2026-02-26 11:25:07.000000000 +0000
++++ src/core/script.rs	2026-02-27 00:44:46.929241645 +0000
+@@ -312,7 +312,7 @@
+             }
+             OP_VERIFY => {
+                 let top = stack_pop(&mut stack)?;
+-                if top != vec![1u8] { return Err(ScriptError::VerifyFailed); }
++                if !is_true(&top) { return Err(ScriptError::VerifyFailed); }
+             }
+             OP_EQUALVERIFY => {
+                 let b = stack_pop(&mut stack)?;
+diff -ruN orig/src/core/transaction.rs src/core/transaction.rs
+--- orig/src/core/transaction.rs	2026-02-26 23:20:09.000000000 +0000
++++ src/core/transaction.rs	2026-02-27 00:44:30.572244493 +0000
+@@ -91,6 +91,7 @@
+             if !state.commitments.remove(&expected) {
+                 bail!("No matching commitment found (expected {})", hex::encode(expected));
+             }
++            state.commitment_heights.remove(&expected);
+ 
+             // Coin existence check still needed — sig verification doesn't touch state
+             for input in inputs.iter() {
+@@ -212,6 +213,7 @@
+                     hex::encode(expected)
+                 );
+             }
++            state.commitment_heights.remove(&expected);
+ 
+             // 5. Verify each input coin exists and executes cleanly against its Predicate
+             for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
+diff -ruN orig/src/node.rs src/node.rs
+--- orig/src/node.rs	2026-02-27 00:30:35.000000000 +0000
++++ src/node.rs	2026-02-27 00:44:52.623240654 +0000
+@@ -1180,13 +1180,22 @@
+         tokio::spawn(async move {
+             let mut is_valid = true;
+ 
+-            // 1. Fast sequential check: Ensure chain linkage is intact for all headers
++            // 1. Fast sequential check: linkage + difficulty target validation
+             for i in 1..all_headers.len() {
+                 if all_headers[i].prev_midstate != all_headers[i - 1].extension.final_hash {
+                     tracing::warn!("Header linkage broken at index {}", i);
+                     is_valid = false;
+                     break;
+                 }
++                let expected_target = crate::core::state::calculate_target(
++                    all_headers[i - 1].height + 1,
++                    all_headers[i - 1].timestamp,
++                );
++                if all_headers[i].target != expected_target {
++                    tracing::warn!("Invalid difficulty target at header index {}", i);
++                    is_valid = false;
++                    break;
++                }
+             }
+ 
+             // 2. Heavy PoW check in chunks, yielding to prevent CPU starvation
+@@ -1290,7 +1299,7 @@
+             let cand = if fh == 0 {
+                 State::genesis().0
+             } else if fh <= self.state.height {
+-                self.syncer.rebuild_state_to(fh)?
++                self.rebuild_state_at_height(fh)?
+             } else {
+                 self.state.clone()
+             };
+diff -ruN orig/src/sync.rs src/sync.rs
+--- orig/src/sync.rs	2026-02-26 10:21:06.000000000 +0000
++++ src/sync.rs	2026-02-27 00:45:33.347233566 +0000
+@@ -92,7 +92,7 @@
+     /// using batches already on disk.
+     pub fn rebuild_state_to(&self, target: u64) -> Result<State> {
+         let mut state = State::genesis().0;
+-        let mut recent_headers: Vec<u64> = Vec::new();
++        let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+         let window_size = DIFFICULTY_LOOKBACK as usize;
+ 
+         for h in 0..target {
+@@ -101,9 +101,9 @@
+                 .load_batch(h)?
+                 .ok_or_else(|| anyhow::anyhow!("Missing batch at height {} during rebuild", h))?;
+             
+-            recent_headers.push(state.timestamp);
+-            if recent_headers.len() > window_size { recent_headers.remove(0); }
+-            apply_batch(&mut state, &batch, &recent_headers)?;
++            recent_headers.push_back(state.timestamp);
++            if recent_headers.len() > window_size { recent_headers.pop_front(); }
++            apply_batch(&mut state, &batch, recent_headers.make_contiguous())?;
+             state.target = adjust_difficulty(&state);
+         }
+         Ok(state)
+diff -ruN orig/src/wallet/mod.rs src/wallet/mod.rs
+--- orig/src/wallet/mod.rs	2026-02-26 02:59:04.000000000 +0000
++++ src/wallet/mod.rs	2026-02-27 00:45:24.775235058 +0000
+@@ -323,17 +323,21 @@
+     /// dust coins to merge change into higher powers of 2.
+     pub fn select_coins(&self, needed: u64, live_coins: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
+         let mut selected = Vec::new();
++        let mut selected_set = std::collections::HashSet::new();
+         let mut total = 0u64;
+         
++        let live_set: std::collections::HashSet<[u8; 32]> = live_coins.iter().copied().collect();
++
+         // 1. Initial Selection: Sort by value descending to minimize baseline inputs
+         let mut available: Vec<&WalletCoin> = self.data.coins.iter()
+-            .filter(|c| live_coins.contains(&c.coin_id))
++            .filter(|c| live_set.contains(&c.coin_id))
+             .collect();
+         available.sort_by(|a, b| b.value.cmp(&a.value));
+ 
+         for coin in &available {
+             if total >= needed { break; }
+             selected.push(coin.coin_id);
++            selected_set.insert(coin.coin_id);
+             total += coin.value;
+         }
+ 
+@@ -353,8 +357,9 @@
+             
+             for denom in change_denoms {
+                 // Try to find an unselected live coin of this exact denomination
+-                if let Some(pos) = available.iter().position(|c| c.value == denom && !selected.contains(&c.coin_id)) {
++                if let Some(pos) = available.iter().position(|c| c.value == denom && !selected_set.contains(&c.coin_id)) {
+                     selected.push(available[pos].coin_id);
++                    selected_set.insert(available[pos].coin_id);
+                     total += denom;
+                     added_new = true;
+                     

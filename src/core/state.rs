@@ -1,9 +1,11 @@
 use super::types::*;
-use super::transaction::apply_transaction;
+use super::transaction::{apply_transaction_no_sig_check, verify_transaction_sigs};
+
 use super::extension::verify_extension;
 use anyhow::{bail, Result};
 use primitive_types::U256;
 use std::time::{SystemTime, UNIX_EPOCH};
+use rayon::prelude::*;
 
 /// Adjusts the mining difficulty using the ASERT algorithm.
 ///
@@ -154,10 +156,16 @@ pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]
     }
 
     // 3. Apply transactions and tally fees
+    // Phase 1: verify all signatures in parallel (pure, no state mutation)
+    batch.transactions.par_iter().try_for_each(|tx| {
+        verify_transaction_sigs(tx, state.height)
+    })?;
+
+    // Phase 2: apply sequentially (state mutation, sigs already verified)
     let mut total_fees: u64 = 0;
     for tx in &batch.transactions {
         total_fees = total_fees.checked_add(tx.fee()).ok_or_else(|| anyhow::anyhow!("Fee overflow"))?;
-        apply_transaction(state, tx)?;
+        apply_transaction_no_sig_check(state, tx)?;
     }
 
     // 3. Validate coinbase outputs
