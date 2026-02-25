@@ -32,14 +32,14 @@
 //! let pk_a = wots::keygen(&seed_a);
 //! // Update: Use Predicate::p2pk
 //! let input_a = InputReveal { predicate: Predicate::p2pk(&pk_a), value: 8, salt: [0xAA; 32] };
-//! let output_a = OutputData { address: hash(b"alice-dest"), value: 8, salt: [0xBB; 32] };
+//! let output_a = OutputData::Standard { address: hash(b"alice-dest"), value: 8, salt: [0xBB; 32] };
 //! session.register(input_a, output_a).unwrap();
 //!
 //! // Bob: input 8, output 8 to fresh address
 //! let seed_b = hash(b"bob");
 //! let pk_b = wots::keygen(&seed_b);
 //! let input_b = InputReveal { predicate: Predicate::p2pk(&pk_b), value: 8, salt: [0xCC; 32] };
-//! let output_b = OutputData { address: hash(b"bob-dest"), value: 8, salt: [0xDD; 32] };
+//! let output_b = OutputData::Standard { address: hash(b"bob-dest"), value: 8, salt: [0xDD; 32] };
 //! session.register(input_b, output_b).unwrap();
 //!
 //! // Fee coin (denomination 1)
@@ -174,10 +174,10 @@ impl MixSession {
                 input.value, self.denomination
             );
         }
-        if output.value != self.denomination {
+        if output.value() != self.denomination {
             bail!(
                 "output value {} != session denomination {}",
-                output.value, self.denomination
+                output.value(), self.denomination
             );
         }
         let coin_id = input.coin_id();
@@ -245,8 +245,8 @@ impl MixSession {
         outputs.sort_by_key(|o| o.coin_id());
 
         let input_coin_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
-        let output_coin_ids: Vec<[u8; 32]> = outputs.iter().map(|o| o.coin_id()).collect();
-        let commitment = compute_commitment(&input_coin_ids, &output_coin_ids, &self.salt);
+        let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+        let commitment = compute_commitment(&input_coin_ids, &output_commit_hashes, &self.salt);
 
         Ok(MixProposal {
             inputs,
@@ -294,11 +294,11 @@ pub fn is_uniform_mix(tx: &Transaction) -> bool {
     }
 
     // All outputs must share the same power-of-2 denomination.
-    let denom = outputs[0].value;
+    let denom = outputs[0].value();
     if denom == 0 || !denom.is_power_of_two() {
         return false;
     }
-    if !outputs.iter().all(|o| o.value == denom) {
+    if !outputs.iter().all(|o| o.value() == denom) {
         return false;
     }
 
@@ -324,7 +324,7 @@ mod tests {
             value: 8,
             salt: hash_concat(name, b"input-salt"),
         };
-        let output = OutputData {
+        let output = OutputData::Standard {
             address: hash_concat(name, b"dest"),
             value: 8,
             salt: hash_concat(name, b"output-salt"),
@@ -408,7 +408,7 @@ mod tests {
         let seed = hash(b"bad");
         let pk = wots::keygen(&seed);
         let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 4, salt: [0; 32] };
-        let output = OutputData { address: [0; 32], value: 8, salt: [0; 32] };
+        let output = OutputData::Standard { address: [0; 32], value: 8, salt: [0; 32] };
         assert!(s.register(input, output).is_err());
     }
 
@@ -418,7 +418,7 @@ mod tests {
         let seed = hash(b"bad");
         let pk = wots::keygen(&seed);
         let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 8, salt: [0; 32] };
-        let output = OutputData { address: [0; 32], value: 4, salt: [0; 32] };
+        let output = OutputData::Standard { address: [0; 32], value: 4, salt: [0; 32] };
         assert!(s.register(input, output).is_err());
     }
 
@@ -428,7 +428,7 @@ mod tests {
         let (_, input, output) = make_participant(b"alice");
         s.register(input.clone(), output.clone()).unwrap();
 
-        let output2 = OutputData { address: hash(b"other"), value: 8, salt: [0xFF; 32] };
+        let output2 = OutputData::Standard { address: hash(b"other"), value: 8, salt: [0xFF; 32] };
         assert!(s.register(input, output2).is_err());
     }
 
@@ -478,7 +478,7 @@ mod tests {
         let seed = hash(b"collider");
         let pk = wots::keygen(&seed);
         let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 1, salt: [0xAA; 32] };
-        let output = OutputData { address: hash(b"dest"), value: 1, salt: [0xBB; 32] };
+        let output = OutputData::Standard { address: hash(b"dest"), value: 1, salt: [0xBB; 32] };
         s.register(input.clone(), output).unwrap();
 
         // Same coin as fee should fail
@@ -573,7 +573,7 @@ mod tests {
     fn proposal_outputs_sorted_by_coin_id() {
         let (session, _) = ready_session();
         let p = session.proposal().unwrap();
-        let out_ids: Vec<[u8; 32]> = p.outputs.iter().map(|o| o.coin_id()).collect();
+        let out_ids: Vec<[u8; 32]> = p.outputs.iter().map(|o| o.coin_id().unwrap()).collect();
         let mut sorted = out_ids.clone();
         sorted.sort();
         assert_eq!(out_ids, sorted);
@@ -584,7 +584,7 @@ mod tests {
         let (session, _) = ready_session();
         let p = session.proposal().unwrap();
         let in_sum: u64 = p.inputs.iter().map(|i| i.value).sum();
-        let out_sum: u64 = p.outputs.iter().map(|o| o.value).sum();
+        let out_sum: u64 = p.outputs.iter().map(|o| o.value()).sum();
         assert!(in_sum > out_sum);
         assert_eq!(in_sum - out_sum, 1); // fee = 1
     }
@@ -604,7 +604,7 @@ mod tests {
         let p = session.proposal().unwrap();
 
         let input_ids: Vec<[u8; 32]> = p.inputs.iter().map(|i| i.coin_id()).collect();
-        let output_ids: Vec<[u8; 32]> = p.outputs.iter().map(|o| o.coin_id()).collect();
+        let output_ids: Vec<[u8; 32]> = p.outputs.iter().map(|o| o.coin_id().unwrap()).collect();
         let expected = compute_commitment(&input_ids, &output_ids, &p.salt);
         assert_eq!(p.commitment, expected);
     }
@@ -698,8 +698,8 @@ mod tests {
             ],
             witnesses: vec![Witness::sig(vec![]); 3],
             outputs: vec![
-                OutputData { address: [0; 32], value: 8, salt: [0; 32] },
-                OutputData { address: [0; 32], value: 4, salt: [0; 32] }, // mismatch
+                OutputData::Standard { address: [0; 32], value: 8, salt: [0; 32] },
+                OutputData::Standard { address: [0; 32], value: 4, salt: [0; 32] }, // mismatch
             ],
             salt: [0; 32],
         };
@@ -716,7 +716,7 @@ mod tests {
             ],
             witnesses: vec![Witness::sig(vec![]); 2],
             outputs: vec![
-                OutputData { address: [0; 32], value: 8, salt: [0; 32] },
+                OutputData::Standard { address: [0; 32], value: 8, salt: [0; 32] },
             ],
             salt: [0; 32],
         };
@@ -739,6 +739,7 @@ mod tests {
             height: 1,
             timestamp: 1000,
             commitment_heights: im::HashMap::new(),
+            chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
         };
 
         // Create 3 coins in the UTXO set
@@ -807,7 +808,7 @@ mod tests {
         // Output coins created
         if let Transaction::Reveal { outputs, .. } = &reveal_tx {
             for o in outputs {
-                assert!(state.coins.contains(&o.coin_id()));
+                assert!(state.coins.contains(&o.coin_id().unwrap()));
             }
         }
     }
@@ -823,7 +824,7 @@ mod tests {
             let seed = hash(&name);
             let pk = wots::keygen(&seed);
             let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 16, salt: hash(&[i + 100]) };
-            let output = OutputData {
+            let output = OutputData::Standard {
                 address: hash(&[i + 200]),
                 value: 16,
                 salt: hash(&[i + 150]),
@@ -839,7 +840,7 @@ mod tests {
         assert_eq!(p.outputs.len(), 3);
 
         let in_sum: u64 = p.inputs.iter().map(|i| i.value).sum();
-        let out_sum: u64 = p.outputs.iter().map(|o| o.value).sum();
+        let out_sum: u64 = p.outputs.iter().map(|o| o.value()).sum();
         assert_eq!(in_sum - out_sum, 1);
     }
 
@@ -892,7 +893,7 @@ mod tests {
             let seed = hash(&[i]);
             let pk = wots::keygen(&seed);
             let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 1, salt: [i + 10; 32] };
-            let output = OutputData { address: hash(&[i + 20]), value: 1, salt: [i + 30; 32] };
+            let output = OutputData::Standard { address: hash(&[i + 20]), value: 1, salt: [i + 30; 32] };
             session.register(input, output).unwrap();
         }
 
@@ -905,7 +906,7 @@ mod tests {
         assert_eq!(p.outputs.len(), 2);
 
         let in_sum: u64 = p.inputs.iter().map(|i| i.value).sum();
-        let out_sum: u64 = p.outputs.iter().map(|o| o.value).sum();
+        let out_sum: u64 = p.outputs.iter().map(|o| o.value()).sum();
         assert_eq!(in_sum - out_sum, 1);
     }
 
