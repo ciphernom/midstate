@@ -446,6 +446,20 @@ impl Mempool {
         all
     }
 
+    /// Returns commits and reveals as separate priority-sorted vectors.
+    ///
+    /// Used by block assembly to reserve capacity for each type, preventing
+    /// fee-paying reveals from starving zero-fee commits out of blocks.
+    pub fn transactions_split(&self) -> (Vec<Arc<Transaction>>, Vec<Arc<Transaction>>) {
+        let commits: Vec<Arc<Transaction>> = self.commits_by_pow.iter().rev()
+            .filter_map(|&(_, comm)| self.commits.get(&comm).map(Arc::clone))
+            .collect();
+        let reveals: Vec<Arc<Transaction>> = self.reveals_by_fee.iter().rev()
+            .filter_map(|&(_, id)| self.reveals.get(&id).map(Arc::clone))
+            .collect();
+        (commits, reveals)
+    }
+
     /// Returns a priority-sorted snapshot as owned `Transaction` values.
     ///
     /// This is a convenience wrapper around [`transactions`](Self::transactions)
