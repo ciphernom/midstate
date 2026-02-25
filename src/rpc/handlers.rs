@@ -132,9 +132,11 @@ pub async fn send_transaction(
         });
     }
 
-    let inputs: Vec<InputReveal> = req.inputs.iter().map(|i| {
+let inputs: Vec<InputReveal> = req.inputs.iter().map(|i| {
         Ok(InputReveal {
-            predicate: Predicate::p2pk(&parse_hex32(&i.owner_pk, "owner_pk")?),
+            predicate: Predicate::Script { 
+                bytecode: hex::decode(&i.bytecode).map_err(|e| ErrorResponse { error: format!("Invalid bytecode hex: {}", e) })? 
+            },
             value: i.value,
             salt: parse_hex32(&i.salt, "input_salt")?,
         })
@@ -278,8 +280,10 @@ pub async fn mix_register(
 ) -> Result<Json<serde_json::Value>, ErrorResponse> {
     let mix_id = parse_hex32(&req.mix_id, "mix_id")?;
 
-    let input = InputReveal {
-        predicate: Predicate::p2pk(&parse_hex32(&req.input.owner_pk, "owner_pk")?),
+let input = InputReveal {
+        predicate: Predicate::Script { 
+            bytecode: hex::decode(&req.input.bytecode).map_err(|e| ErrorResponse { error: format!("Invalid bytecode hex: {}", e) })? 
+        },
         value: req.input.value,
         salt: parse_hex32(&req.input.salt, "input_salt")?,
     };
@@ -301,8 +305,10 @@ pub async fn mix_fee(
 ) -> Result<Json<serde_json::Value>, ErrorResponse> {
     let mix_id = parse_hex32(&req.mix_id, "mix_id")?;
 
-    let input = InputReveal {
-        predicate: Predicate::p2pk(&parse_hex32(&req.input.owner_pk, "owner_pk")?),
+let input = InputReveal {
+        predicate: Predicate::Script { 
+            bytecode: hex::decode(&req.input.bytecode).map_err(|e| ErrorResponse { error: format!("Invalid bytecode hex: {}", e) })? 
+        },
         value: req.input.value,
         salt: parse_hex32(&req.input.salt, "input_salt")?,
     };
