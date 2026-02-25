@@ -312,7 +312,7 @@ pub fn execute_script(
             }
             OP_VERIFY => {
                 let top = stack_pop(&mut stack)?;
-                if top != vec![1u8] { return Err(ScriptError::VerifyFailed); }
+                if !is_true(&top) { return Err(ScriptError::VerifyFailed); }
             }
             OP_EQUALVERIFY => {
                 let b = stack_pop(&mut stack)?;
