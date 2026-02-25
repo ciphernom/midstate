@@ -228,6 +228,20 @@ pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]
     state.height += 1;
     state.timestamp = batch.timestamp;
 
+    // 8. Deterministic GC: remove expired commitments from state.
+    // This MUST happen at a deterministic point (after height increment)
+    // so all nodes expire the same commitments at the same height.
+    // Uses strict '>' so a commitment at height H expires at H + TTL + 1,
+    // giving the full TTL window for reveals.
+    let expired: Vec<[u8; 32]> = state.commitment_heights.iter()
+        .filter(|(_, &h)| state.height.saturating_sub(h) > COMMITMENT_TTL)
+        .map(|(k, _)| *k)
+        .collect();
+    for k in &expired {
+        state.commitments.remove(k);
+        state.commitment_heights.remove(k);
+    }
+
     Ok(())
 }
 
