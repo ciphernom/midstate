@@ -91,6 +91,7 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
             if !state.commitments.remove(&expected) {
                 bail!("No matching commitment found (expected {})", hex::encode(expected));
             }
+            state.commitment_heights.remove(&expected);
 
             // Coin existence check still needed — sig verification doesn't touch state
             for input in inputs.iter() {
@@ -212,6 +213,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                     hex::encode(expected)
                 );
             }
+            state.commitment_heights.remove(&expected);
 
             // 5. Verify each input coin exists and executes cleanly against its Predicate
             for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
