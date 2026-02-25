@@ -20,13 +20,17 @@ fn compute_chain(midstate: &[u8; 32], nonce: u64) -> ([u8; 32], Vec<[u8; 32]>) {
     (x, checkpoints)
 }
 
-/// Derive which segments to spot-check from the final hash.
-/// Deterministic: all nodes check the same segments for the same block.
-/// Unpredictable: attacker must complete the full chain to learn which are checked.
-fn spot_check_indices(final_hash: &[u8; 32], num_segments: usize, count: usize) -> Vec<usize> {
+/// Derive which segments to spot-check from a checkpoint commitment.
+///
+/// The commitment binds ALL checkpoints before revealing which segments are
+/// verified. This is a Fiat-Shamir transform: the attacker must commit to
+/// every checkpoint before learning which ones get checked. Changing any
+/// checkpoint changes the commitment, which changes the checked set —
+/// creating a fixed-point problem with no efficient solution.
+fn spot_check_indices(commitment: &[u8; 32], num_segments: usize, count: usize) -> Vec<usize> {
     let count = count.min(num_segments);
     let mut indices = Vec::with_capacity(count);
-    let mut seed = *final_hash;
+    let mut seed = *commitment;
 
     while indices.len() < count {
         seed = hash(&seed);
@@ -46,12 +50,32 @@ pub fn create_extension(midstate: [u8; 32], nonce: u64) -> Extension {
     Extension { nonce, final_hash, checkpoints }
 }
 
+/// Hash all checkpoints into a single binding commitment.
+///
+/// This is the value from which spot-check indices are derived. Because it
+/// covers every checkpoint, an attacker cannot learn which segments will be
+/// checked without first fixing all checkpoint values — which requires
+/// computing the full sequential chain.
+fn checkpoint_commitment(checkpoints: &[[u8; 32]]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for cp in checkpoints {
+        hasher.update(cp);
+    }
+    *hasher.finalize().as_bytes()
+}
+
 /// Verify an extension by spot-checking random checkpoint segments.
-/// Cost: O(SPOT_CHECK_COUNT * CHECKPOINT_INTERVAL) instead of O(EXTENSION_ITERATIONS).
+///
+/// Check indices are derived from a hash of ALL checkpoints (Fiat-Shamir
+/// commitment), not from `final_hash` alone. This prevents the attack where
+/// a miner fabricates interior checkpoints and only computes the segments
+/// they know will be checked.
+///
+/// Cost: O(SPOT_CHECK_COUNT * CHECKPOINT_INTERVAL) + one hash over ~32 KB
+/// of checkpoints. Typically ~16,000 BLAKE3 hashes ≈ 16µs.
 ///
 /// When checkpoints have been pruned (empty vec), falls back to full-chain
-/// recomputation: O(EXTENSION_ITERATIONS). This is ~1ms per block with BLAKE3
-/// and happens only for deeply finalized historical blocks during sync.
+/// recomputation: O(EXTENSION_ITERATIONS) ≈ 1ms.
 pub fn verify_extension(midstate: [u8; 32], ext: &Extension, target: &[u8; 32]) -> Result<()> {
     // 1. Difficulty check (instant)
     if ext.final_hash >= *target {
@@ -86,8 +110,10 @@ pub fn verify_extension(midstate: [u8; 32], ext: &Extension, target: &[u8; 32]) 
         bail!("Last checkpoint doesn't match final_hash");
     }
 
-    // 6. Spot-check segments
-    let indices = spot_check_indices(&ext.final_hash, num_segments, SPOT_CHECK_COUNT);
+    // 6. Fiat-Shamir: derive check indices from a commitment over ALL checkpoints.
+    //    This binds the attacker to every checkpoint before revealing the challenge.
+    let commitment = checkpoint_commitment(&ext.checkpoints);
+    let indices = spot_check_indices(&commitment, num_segments, SPOT_CHECK_COUNT);
 
     for seg in indices {
         let mut x = ext.checkpoints[seg];
