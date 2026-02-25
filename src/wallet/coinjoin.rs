@@ -30,21 +30,22 @@
 //! // Alice: input 8, output 8 to fresh address
 //! let seed_a = hash(b"alice");
 //! let pk_a = wots::keygen(&seed_a);
-//! let input_a = InputReveal { owner_pk: pk_a, value: 8, salt: [0xAA; 32] };
+//! // Update: Use Predicate::p2pk
+//! let input_a = InputReveal { predicate: Predicate::p2pk(&pk_a), value: 8, salt: [0xAA; 32] };
 //! let output_a = OutputData { address: hash(b"alice-dest"), value: 8, salt: [0xBB; 32] };
 //! session.register(input_a, output_a).unwrap();
 //!
 //! // Bob: input 8, output 8 to fresh address
 //! let seed_b = hash(b"bob");
 //! let pk_b = wots::keygen(&seed_b);
-//! let input_b = InputReveal { owner_pk: pk_b, value: 8, salt: [0xCC; 32] };
+//! let input_b = InputReveal { predicate: Predicate::p2pk(&pk_b), value: 8, salt: [0xCC; 32] };
 //! let output_b = OutputData { address: hash(b"bob-dest"), value: 8, salt: [0xDD; 32] };
 //! session.register(input_b, output_b).unwrap();
 //!
 //! // Fee coin (denomination 1)
 //! let seed_f = hash(b"fee");
 //! let pk_f = wots::keygen(&seed_f);
-//! let fee_input = InputReveal { owner_pk: pk_f, value: 1, salt: [0xEE; 32] };
+//! let fee_input = InputReveal { predicate: Predicate::p2pk(&pk_f), value: 1, salt: [0xEE; 32] };
 //! session.set_fee_input(fee_input).unwrap();
 //!
 //! let proposal = session.proposal().unwrap();
@@ -54,8 +55,10 @@
 //! // Each participant signs the commitment for their input(s)
 //! let mut sigs = vec![Vec::new(); proposal.inputs.len()];
 //! for (i, input) in proposal.inputs.iter().enumerate() {
-//!     let seed = if input.owner_pk == pk_a { &seed_a }
-//!         else if input.owner_pk == pk_b { &seed_b }
+//!     // Update: Extract PK from script
+//!     let pk = input.predicate.owner_pk().unwrap();
+//!     let seed = if pk == pk_a { &seed_a }
+//!         else if pk == pk_b { &seed_b }
 //!         else { &seed_f };
 //!     sigs[i] = wots::sig_to_bytes(&wots::sign(seed, &proposal.commitment));
 //! }
