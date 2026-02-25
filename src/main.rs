@@ -1567,6 +1567,7 @@ fn wallet_import_rewards(path: &PathBuf, coinbase_file: &PathBuf) -> Result<()> 
                 salt,
                 coin_id,
                 label: Some(format!("coinbase (value {})", entry.value)),
+                wots_signed: false,
             }
         })
         .collect();
