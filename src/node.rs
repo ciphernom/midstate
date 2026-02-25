@@ -28,6 +28,10 @@ use rayon::prelude::*;
 const MAX_ORPHAN_BATCHES: usize = 256;
 const SYNC_TIMEOUT_SECS: u64 = 300;
 const CATCH_UP_THRESHOLD: u64 = 20;
+/// Max transactions accepted from a single peer per rate-limit window.
+const MAX_TX_PER_PEER_PER_WINDOW: u32 = 50;
+/// Rate-limit window duration in seconds.
+const TX_RATE_WINDOW_SECS: u64 = 10;
 
 /// Non-blocking sync session driven by the main event loop.
 /// Replaces the old blocking `Syncer::sync_via_network` which hijacked the
@@ -92,6 +96,9 @@ pub struct Node {
     /// Reveals waiting for their Commit to be mined.
     /// Key: commitment hash, Value: (mix_id, Reveal transaction)
     pending_mix_reveals: HashMap<[u8; 32], ([u8; 32], Transaction)>,
+    /// Per-peer transaction rate limiter: maps peer -> (count, window_start).
+    /// Resets every TX_RATE_WINDOW_SECS seconds.
+    peer_tx_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<NodeCommand>>,
 }
 
@@ -474,6 +481,7 @@ impl Node {
             mined_batch_tx,
             mix_manager: Arc::new(RwLock::new(MixManager::new())),
             pending_mix_reveals: HashMap::new(),
+            peer_tx_counts: HashMap::new(),
             cmd_tx: None,
         })
     }
@@ -1510,6 +1518,21 @@ impl Node {
     }
 
     async fn handle_new_transaction(&mut self, tx: Transaction, from: Option<PeerId>) -> Result<()> {
+        // Per-peer rate limiting: prevent CPU exhaustion from tx validation spam.
+        // Local submissions (from = None, i.e. RPC) bypass the limit.
+        if let Some(peer) = from {
+            let now = std::time::Instant::now();
+            let entry = self.peer_tx_counts.entry(peer).or_insert((0, now));
+            if now.duration_since(entry.1).as_secs() >= TX_RATE_WINDOW_SECS {
+                *entry = (0, now); // reset window
+            }
+            entry.0 += 1;
+            if entry.0 > MAX_TX_PER_PEER_PER_WINDOW {
+                tracing::debug!("Rate-limiting peer {}: {} txs in window", peer, entry.0);
+                return Ok(()); // silently drop, don't validate
+            }
+        }
+
         match self.mempool.add(tx.clone(), &self.state) {
             Ok(_) => {
                 self.metrics.inc_transactions_processed();
