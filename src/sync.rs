@@ -17,13 +17,21 @@ impl Syncer {
     /// Verify PoW and internal header-to-header linkage on a contiguous
     /// slice of headers. The first header's prev_midstate is NOT checked
     /// here — that is handled by the fork-point logic.
-    pub fn verify_header_chain(headers: &[BatchHeader]) -> Result<()> {
-        // 1. Fast sequential check: Ensure chain linkage is intact
+pub fn verify_header_chain(headers: &[BatchHeader]) -> Result<()> {
+        // 1. Fast sequential check: Ensure chain linkage is intact AND validate targets
         for i in 1..headers.len() {
             let header = &headers[i];
             let prev = &headers[i - 1];
             if header.prev_midstate != prev.extension.final_hash {
                 bail!("Header linkage broken at index {}: prev_midstate mismatch", i);
+            }
+            
+            // FIX: The target for the current block is determined by the height 
+            // and timestamp of the PREVIOUS block.
+            let expected_target = crate::core::state::calculate_target(prev.height + 1, prev.timestamp);
+            if header.target != expected_target {
+                bail!("Invalid difficulty target at height {} (expected {}, got {})", 
+                    header.height, hex::encode(expected_target), hex::encode(header.target));
             }
         }
 
