@@ -292,6 +292,33 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
 
     // ── Transaction building ────────────────────────────────────────────────
 
+    /// Auto-Solver: Automatically generates a WOTS or MSS signature for a given 
+    /// public key if the wallet holds the corresponding private seed.
+    pub fn auto_sign(&mut self, owner_pk: &[u8; 32], commitment: &[u8; 32]) -> Result<Vec<u8>> {
+        // 1. Check MSS (Reusable) Keys
+        if let Some(pos) = self.data.mss_keys.iter().position(|k| k.master_pk == *owner_pk) {
+            let keypair = &mut self.data.mss_keys[pos];
+            if keypair.remaining() == 0 { anyhow::bail!("MSS key exhausted"); }
+            let sig = keypair.sign(commitment)?;
+            self.save()?;
+            return Ok(sig.to_bytes());
+        }
+        
+        // 2. Check unused WOTS Keys
+        if let Some(key) = self.data.keys.iter().find(|k| k.owner_pk == *owner_pk) {
+            let sig = crate::core::wots::sign(&key.seed, commitment);
+            return Ok(crate::core::wots::sig_to_bytes(&sig));
+        }
+
+        // 3. Check already-known WOTS Coins
+        if let Some(coin) = self.data.coins.iter().find(|c| c.owner_pk == *owner_pk) {
+            let sig = crate::core::wots::sign(&coin.seed, commitment);
+            return Ok(crate::core::wots::sig_to_bytes(&sig));
+        }
+
+        anyhow::bail!("Cannot auto-solve: Private key for {} not found in wallet.dat", short_hex(owner_pk))
+    }
+
     /// Select coins whose total value >= needed. Returns selected coin_ids.
     pub fn select_coins(&self, needed: u64, live_coins: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
         let mut selected = Vec::new();
