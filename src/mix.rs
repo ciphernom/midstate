@@ -156,18 +156,20 @@ pub fn register(
         mix_id: &[u8; 32],
         input: InputReveal,
         output: OutputData,
-        signature: &[u8], 
+        _signature: &[u8],  // DEPRECATED: kept for wire compat, not verified
         peer: Option<PeerId>,
     ) -> Result<()> {
         let coin_id = input.coin_id();
         
-        // ---Authenticate ownership before registering ---
-        let pk = input.predicate.owner_pk().ok_or_else(|| anyhow::anyhow!("Mix input must be P2PK"))?;
-        let sig = crate::core::wots::sig_from_bytes(signature)
-            .ok_or_else(|| anyhow::anyhow!("Invalid signature format"))?;
-        if !crate::core::wots::verify(&sig, mix_id, &pk) {
-            bail!("MixJoin signature verification failed (Framed Ban Defense)");
-        }
+        // SECURITY NOTE: We intentionally do NOT verify a WOTS signature here.
+        // WOTS keys are strictly one-time-use. Signing the mix_id during
+        // registration AND signing the proposal commitment during the Signing
+        // phase would constitute two uses of the same key, enabling forgery.
+        //
+        // Ownership is authenticated by knowledge of the InputReveal preimage
+        // (predicate + value + salt). The salt is secret, making coin_id
+        // unpredictable — only the coin owner can provide a valid InputReveal.
+        // The actual spending signature happens exactly once in the Signing phase.
 
         if self.banned_coins.contains(&coin_id) {
             bail!("Coin is banned from mixing due to a previous signature timeout");
