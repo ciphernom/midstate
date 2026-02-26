@@ -16,6 +16,7 @@ use crate::sync::Syncer;
 use anyhow::{bail, Result};
 use libp2p::{request_response::ResponseChannel, PeerId, Multiaddr, identity::Keypair};
 use std::collections::{HashMap, HashSet, VecDeque};
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -70,14 +71,15 @@ pub struct Node {
     syncer: Syncer,
     metrics: Metrics,
     mining_threads: Option<usize>,
-     recent_headers: VecDeque<u64>,
-    orphan_batches: HashMap<u64, Batch>,
+    recent_headers: VecDeque<u64>,
+    orphan_batches: HashMap<[u8; 32], Vec<Batch>>,
+    orphan_order: VecDeque<[u8; 32]>,
     sync_in_progress: bool,
     sync_requested_up_to: u64,
     sync_session: Option<SyncSession>,
     mining_seed: [u8; 32],
     data_dir: PathBuf,
-    chain_history: Vec<(u64, [u8; 32])>,
+    chain_history: VecDeque<(u64, [u8; 32])>,
     finality: crate::core::finality::FinalityEstimator,
     known_pex_addrs: HashSet<String>,
     connected_peers: HashSet<PeerId>,
@@ -101,7 +103,7 @@ pub struct NodeHandle {
     mempool_txs: Arc<RwLock<Vec<Transaction>>>,
     peer_addrs: Arc<RwLock<Vec<String>>>,
     tx_sender: tokio::sync::mpsc::UnboundedSender<NodeCommand>,
-    batches_path: PathBuf,
+    pub batches_path: PathBuf,
     pub mix_manager: Arc<RwLock<MixManager>>,
 }
 
@@ -454,13 +456,14 @@ impl Node {
             network,
             metrics: Metrics::new(),
             mining_threads,
-            recent_headers, // Updated field
+            recent_headers,
             orphan_batches: HashMap::new(),
+            orphan_order: VecDeque::new(),
             sync_in_progress: false,
             sync_requested_up_to: 0,
             mining_seed,
             data_dir,
-            chain_history: Vec::new(),
+            chain_history: VecDeque::new(),
             //lets assume a hostile environment where 80% of new connections are malicious. 
             finality: crate::core::finality::FinalityEstimator::new(2, 8), 
             sync_session: None,
@@ -481,7 +484,7 @@ impl Node {
             state: Arc::new(RwLock::new(self.state.clone())),
             safe_depth: Arc::new(RwLock::new(self.finality.calculate_safe_depth(1e-6))),
             mempool_size: Arc::new(RwLock::new(self.mempool.len())),
-            mempool_txs: Arc::new(RwLock::new(self.mempool.transactions().to_vec())),
+            mempool_txs: Arc::new(RwLock::new(self.mempool.transactions_cloned())),
             peer_addrs: Arc::new(RwLock::new(Vec::new())),
             tx_sender: tx,
             batches_path: self.data_dir.join("db").join("batches"),
@@ -560,18 +563,15 @@ impl Node {
                     *handle.state.write().await = self.state.clone();
                     *handle.safe_depth.write().await = self.finality.calculate_safe_depth(1e-6);
                     *handle.mempool_size.write().await = self.mempool.len();
-                    *handle.mempool_txs.write().await = self.mempool.transactions().to_vec();
+                    *handle.mempool_txs.write().await = self.mempool.transactions_cloned();
                     *handle.peer_addrs.write().await = self.network.peer_addrs();
                 }
                 _ = metrics_interval.tick() => {
                     self.metrics.report();
                 }
                 _ = mempool_prune_interval.tick() => {
-                    self.mempool.prune_invalid(&self.state);
                     // CoinJoin: clean up stale mix sessions
                     self.mix_manager.write().await.cleanup();
-                    // CoinJoin: check if any pending Commits have been mined
-                    self.check_pending_mix_reveals().await;
                 }
                 _ = sync_poll_interval.tick() => {
                     if let Some(peer) = self.network.random_peer() {
@@ -1022,8 +1022,16 @@ impl Node {
                 }
             }
 
-            Message::StateSnapshot { height, state } => {
+            Message::StateSnapshot { height, mut state } => {
                 self.ack(channel);
+
+                // --- Rebuild the SMT caches after network deserialization! ---
+                // Without this, the node cache is empty due to #[serde(skip)],
+                // and the state root validation will fail on the very next block.
+                state.coins.rebuild_tree();
+                state.commitments.rebuild_tree();
+                // -----------------------------------------------------------------
+
                 if let Some(session) = self.sync_session.take() {
                     if session.peer == from {
                         if let SyncPhase::WaitingForSnapshot { target_height } = session.phase {
@@ -1037,7 +1045,7 @@ impl Node {
                                     phase: SyncPhase::Headers {
                                         accumulated: Vec::new(),
                                         cursor: height,
-                                        snapshot: Some(state),
+                                        snapshot: Some(state), // This now holds the rebuilt tree!
                                     },
                                     started_at: std::time::Instant::now(),
                                 });
@@ -1336,7 +1344,7 @@ impl Node {
             }
         };
 
-        let (headers, _fork_height, candidate_state, cursor, new_history, _is_fast_forward) = match &mut session.phase {
+        let (headers, fork_height, candidate_state, cursor, new_history, is_fast_forward) = match &mut session.phase {
             SyncPhase::Batches { headers, fork_height, candidate_state, cursor, new_history, is_fast_forward } => {
                 (headers, *fork_height, candidate_state, cursor, new_history, *is_fast_forward)
             }
@@ -1351,17 +1359,38 @@ impl Node {
         // adjust_difficulty uses ASERT anchored to genesis,
         // entries, so there is no need to collect every timestamp from genesis.
         let window_size = DIFFICULTY_LOOKBACK as usize;
-        let initial_cursor = *cursor as usize;
-        let window_start = initial_cursor.saturating_sub(window_size);
-        let mut recent_ts: Vec<u64> = headers[window_start..initial_cursor]
-            .iter()
-            .map(|h| h.timestamp)
-            .collect();
+        let mut recent_ts: VecDeque<u64> = VecDeque::new();
+
+
+        let header_start_height = if is_fast_forward { fork_height } else { 0 };
+        let start_height = cursor.saturating_sub(window_size as u64);
+
+        for h in start_height..*cursor {
+            // 1. If we have the header in our downloaded array, use it
+            if h >= header_start_height {
+                let idx = (h - header_start_height) as usize;
+                if let Some(hdr) = headers.get(idx) {
+                    recent_ts.push_back(hdr.timestamp);
+                    continue;
+                }
+            }
+            
+            // 2. Try local storage (for standard sync resolving a local fork)
+            if let Ok(Some(batch)) = self.storage.load_batch(h) {
+                recent_ts.push_back(batch.timestamp);
+                continue;
+            }
+
+            // 3. Fallback for fast-forward gaps: use the snapshot's timestamp
+            recent_ts.push_back(candidate_state.timestamp);
+        }
 
         // Apply each batch, verifying against the already-validated headers
         for batch in &batches {
             let height = *cursor;
-            let hdr_idx = height as usize;
+            
+            // Map absolute height to relative array index
+            let hdr_idx = (height - header_start_height) as usize;
 
             if hdr_idx >= headers.len() {
                 tracing::warn!("Batch height {} exceeds header count {}", height, headers.len());
@@ -1389,11 +1418,11 @@ impl Node {
             // leave a Frankenstein chain on disk: some heights from the peer,
             // some from our old chain.  Batches are persisted atomically in
             // perform_reorg only after we decide to adopt.)
-            recent_ts.push(candidate_state.timestamp);
+            recent_ts.push_back(candidate_state.timestamp);
             if recent_ts.len() > window_size {
-                recent_ts.remove(0);
+                recent_ts.pop_front();
             }
-            apply_batch(candidate_state, batch, &recent_ts)?;
+            apply_batch(candidate_state, batch, recent_ts.make_contiguous())?;
             candidate_state.target = adjust_difficulty(candidate_state);
             new_history.push((height, candidate_state.midstate, batch.clone()));
             *cursor += 1;
@@ -1516,22 +1545,24 @@ impl Node {
         let mut new_history = Vec::new();
         
         // Use headers instead of states
-        let mut recent_headers: Vec<u64> = Vec::new();
+        let mut recent_headers: VecDeque<u64> = VecDeque::new();
+
 
         let window_size = DIFFICULTY_LOOKBACK as usize;
         let start_height = fork_height.saturating_sub(window_size as u64);
 
         for h in start_height..fork_height {
             if let Some(batch) = self.storage.load_batch(h)? {
-                recent_headers.push(batch.timestamp);
+                recent_headers.push_back(batch.timestamp);
             }
         }
 
         for (i, batch) in alternative_batches.iter().enumerate() {
-            recent_headers.push(candidate_state.timestamp);
+            recent_headers.push_back(candidate_state.timestamp);
             if recent_headers.len() > window_size {
-                recent_headers.remove(0);
+                recent_headers.pop_front();
             }
+
 
             if batch.prev_midstate != candidate_state.midstate {
                 tracing::warn!(
@@ -1541,7 +1572,8 @@ impl Node {
                 return Ok(None);
             }
 
-            match apply_batch(&mut candidate_state, batch, &recent_headers) {
+            match apply_batch(&mut candidate_state, batch, recent_headers.make_contiguous()) {
+
                 Ok(_) => {
                     // Adjust difficulty via ASERT
                     candidate_state.target = adjust_difficulty(&candidate_state);
@@ -1619,7 +1651,9 @@ fn perform_reorg(
         }
 
         self.state = new_state;
-        self.chain_history.retain(|(h, _)| *h < fork_height);
+        while self.chain_history.back().map_or(false, |&(h, _)| h >= fork_height) {
+            self.chain_history.pop_back();
+        }
         self.chain_history.extend(new_history.iter().map(|(h, ms, _)| (*h, *ms)));
 
         // Rebuild headers cache from disk
@@ -1649,19 +1683,42 @@ fn perform_reorg(
     }
 
     fn rebuild_state_at_height(&self, target_height: u64) -> Result<State> {
-        let mut state = State::genesis().0;
-        let mut recent_headers: Vec<u64> = Vec::new();
-
-        for h in 0..target_height {
-            if let Some(batch) = self.storage.load_batch(h)? {
-                recent_headers.push(state.timestamp);
-                if recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
-                    recent_headers.remove(0);
+        // Find the nearest snapshot at or below target_height so we only
+        // replay blocks from that point instead of from genesis.
+        // Snapshots are written every PRUNE_DEPTH blocks, so round down.
+        let snap_height = (target_height / PRUNE_DEPTH) * PRUNE_DEPTH;
+        let (mut state, replay_from) = if snap_height > 0 {
+            match self.storage.load_state_snapshot(snap_height) {
+                Ok(Some(snap)) => {
+                    tracing::debug!(
+                        "rebuild_state_at_height: using snapshot at {} (target {})",
+                        snap_height, target_height
+                    );
+                    (snap, snap_height)
                 }
-                apply_batch(&mut state, &batch, &recent_headers)?;
+                _ => {
+                    tracing::debug!(
+                        "rebuild_state_at_height: no snapshot at {}, replaying from genesis",
+                        snap_height
+                    );
+                    (State::genesis().0, 0)
+                }
+            }
+        } else {
+            (State::genesis().0, 0)
+        };
+
+        let mut recent_headers: VecDeque<u64> = VecDeque::new();
+        for h in replay_from..target_height {
+            if let Some(batch) = self.storage.load_batch(h)? {
+                recent_headers.push_back(state.timestamp);
+                if recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
+                    recent_headers.pop_front();
+                }
+                apply_batch(&mut state, &batch, recent_headers.make_contiguous())?;
                 state.target = adjust_difficulty(&state);
             } else {
-                anyhow::bail!("Missing batch at height {} needed for reorg", h);
+                anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
             }
         }
 
@@ -1764,12 +1821,19 @@ fn perform_reorg(
             tracing::debug!("Received orphan block (parent mismatch), queuing for later.");
 
             const ORPHAN_LIMIT: usize = 64;
-            if self.orphan_batches.len() >= ORPHAN_LIMIT {
-                self.orphan_batches.clear();
+            
+            if self.orphan_order.len() >= ORPHAN_LIMIT {
+                // Evict oldest half via FIFO order
+                let to_evict = ORPHAN_LIMIT / 2;
+                for _ in 0..to_evict {
+                    if let Some(key) = self.orphan_order.pop_front() {
+                        self.orphan_batches.remove(&key);
+                    }
+                }
             }
 
-            let estimated_height = self.state.height + 1;
-            self.orphan_batches.insert(estimated_height, batch);
+            self.orphan_order.push_back(batch.prev_midstate);
+            self.orphan_batches.entry(batch.prev_midstate).or_default().push(batch);
 
             if !self.sync_in_progress {
                 if let Some(peer) = from {
@@ -1812,17 +1876,31 @@ fn perform_reorg(
                     self.state.target = adjust_difficulty(&self.state);
                     
                     self.metrics.inc_batches_processed();
-                    self.mempool.prune_invalid(&self.state);
 
-                    self.chain_history.push((pre_height, self.state.midstate));
+                    let mut spent_inputs = Vec::new();
+                    let mut mined_commits = Vec::new();
+                    for tx in &batch.transactions {
+                        match tx {
+                            Transaction::Commit { commitment, .. } => mined_commits.push(*commitment),
+                            Transaction::Reveal { inputs, .. } => {
+                                for input in inputs { spent_inputs.push(input.coin_id()); }
+                            }
+                        }
+                    }
+                    self.mempool.prune_on_new_block(&self.state, &spent_inputs, &mined_commits);
+
+                    self.chain_history.push_back((pre_height, self.state.midstate));
                     self.finality.observe_honest();
                     let safe_depth = self.finality.calculate_safe_depth(1e-6);
                     let cutoff_height = self.state.height.saturating_sub(safe_depth);
-                    self.chain_history.retain(|(h, _)| *h >= cutoff_height);
+                    while self.chain_history.front().map_or(false, |&(h, _)| h < cutoff_height) {
+                        self.chain_history.pop_front();
+                    }
 
                     self.network.broadcast_except(from, Message::Batch(batch));
                     tracing::info!("Applied new batch from peer, height now {}", self.state.height);
                     self.try_apply_orphans().await;
+                    self.check_pending_mix_reveals().await;
                 }
                 Ok(())
             }
@@ -1909,11 +1987,13 @@ fn perform_reorg(
                 self.state.target = adjust_difficulty(&self.state);
                 self.metrics.inc_batches_processed();
 
-                self.chain_history.push((self.state.height, self.state.midstate));
+                self.chain_history.push_back((self.state.height, self.state.midstate));
                 self.finality.observe_honest();
                 let safe_depth = self.finality.calculate_safe_depth(1e-6);
                 let cutoff = self.state.height.saturating_sub(safe_depth);
-                self.chain_history.retain(|(h, _)| *h >= cutoff);
+                while self.chain_history.front().map_or(false, |&(h, _)| h < cutoff) {
+                    self.chain_history.pop_front();
+                }
 
                 applied += 1;
             } else {
@@ -1923,8 +2003,10 @@ fn perform_reorg(
 
         if applied > 0 {
             tracing::info!("Synced {} batch(es), now at height {}", applied, self.state.height);
+            // During bulk sync, a single O(N) sweep at the end is fine
             self.mempool.prune_invalid(&self.state);
             self.try_apply_orphans().await;
+            self.check_pending_mix_reveals().await;
 
             if self.state.height >= self.sync_requested_up_to {
                 self.sync_in_progress = false;
@@ -1944,28 +2026,15 @@ fn perform_reorg(
 
     async fn try_apply_orphans(&mut self) {
         let mut applied = 0;
-        loop {
-            // First try the expected height key (fast path for normal operation)
-            let height = self.state.height;
-            let matching_key = if self.orphan_batches.contains_key(&height) {
-                Some(height)
-            } else {
-                // Scan all orphans for one whose prev_midstate matches our
-                // current state.  This is essential after reorgs where
-                // broadcast blocks were stored at incorrect estimated heights.
-                self.orphan_batches.iter()
-                    .find(|(_, batch)| batch.prev_midstate == self.state.midstate)
-                    .map(|(&k, _)| k)
-            };
 
-            let batch = match matching_key.and_then(|k| self.orphan_batches.remove(&k)) {
-                Some(b) => b,
-                None => break,
-            };
+        while let Some(mut batches) = self.orphan_batches.remove(&self.state.midstate) {
+            // Also remove all entries for this key from the order tracker
+            self.orphan_order.retain(|k| k != &self.state.midstate);
 
-            let mut candidate = self.state.clone();
-            match apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous()) {
-                Ok(_) => {
+            let mut matched = false;
+            for batch in batches.drain(..) {
+                let mut candidate = self.state.clone();
+                if apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous()).is_ok() {
                     self.cancel_mining();
                     self.recent_headers.push_back(self.state.timestamp);
                     if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
@@ -1973,16 +2042,30 @@ fn perform_reorg(
                     }
                     self.storage.save_batch(candidate.height - 1, &batch).ok();
                     self.state = candidate;
-                    
+
                     self.state.target = adjust_difficulty(&self.state);
                     self.metrics.inc_batches_processed();
-                    self.mempool.prune_invalid(&self.state);
+
+                    let mut spent_inputs = Vec::new();
+                    let mut mined_commits = Vec::new();
+                    for tx in &batch.transactions {
+                        match tx {
+                            Transaction::Commit { commitment, .. } => mined_commits.push(*commitment),
+                            Transaction::Reveal { inputs, .. } => {
+                                for input in inputs { spent_inputs.push(input.coin_id()); }
+                            }
+                        }
+                    }
+                    self.mempool.prune_on_new_block(&self.state, &spent_inputs, &mined_commits);
+
                     applied += 1;
+                    matched = true;
+                    break; // State advanced — re-enter while loop for next height
                 }
-                Err(e) => {
-                    tracing::debug!("Orphan batch still invalid: {}", e);
-                    break;
-                }
+            }
+
+            if !matched {
+                break; // All candidates for this midstate failed validation
             }
         }
 
@@ -1990,12 +2073,10 @@ fn perform_reorg(
             tracing::info!("Applied {} orphan batch(es)", applied);
         }
 
-        let cutoff = self.state.height.saturating_sub(10);
-        self.orphan_batches.retain(|&h, _| h > cutoff);
-
-        while self.orphan_batches.len() > MAX_ORPHAN_BATCHES {
-            if let Some(&oldest) = self.orphan_batches.keys().min() {
-                self.orphan_batches.remove(&oldest);
+        // Evict if over limit (FIFO: oldest first)
+        while self.orphan_order.len() > MAX_ORPHAN_BATCHES {
+            if let Some(key) = self.orphan_order.pop_front() {
+                self.orphan_batches.remove(&key);
             }
         }
     }
@@ -2076,11 +2157,17 @@ fn perform_reorg(
         let mut candidate_state = self.state.clone();
         let mut total_fees: u64 = 0;
         let mut transactions = Vec::new();
-        for tx in self.mempool.transactions().iter().take(MAX_BATCH_SIZE) {
-            match apply_transaction(&mut candidate_state, tx) {
+        
+        // Use .transactions() to get cheap Arcs, take MAX_BATCH_SIZE, 
+        // and only deep clone the ones we actually put in the block.
+        let pending_arcs = self.mempool.transactions();
+        for arc_tx in pending_arcs.into_iter().take(MAX_BATCH_SIZE) {
+            // Unpack the Arc into a real Transaction for the batch
+            let tx = Arc::unwrap_or_clone(arc_tx); 
+            match apply_transaction(&mut candidate_state, &tx) {
                 Ok(_) => {
                     total_fees += tx.fee();
-                    transactions.push(tx.clone());
+                    transactions.push(tx);
                 }
                 Err(e) => {
                     tracing::debug!("Skipping stale mempool tx during mining: {}", e);
@@ -2171,7 +2258,18 @@ fn perform_reorg(
                     hex::encode(self.state.target)
                 );
 
-                self.mempool.prune_invalid(&self.state);
+                let mut spent_inputs = Vec::new();
+                let mut mined_commits = Vec::new();
+                for tx in &batch.transactions {
+                    match tx {
+                        Transaction::Commit { commitment, .. } => mined_commits.push(*commitment),
+                        Transaction::Reveal { inputs, .. } => {
+                            for input in inputs { spent_inputs.push(input.coin_id()); }
+                        }
+                    }
+                }
+                self.mempool.prune_on_new_block(&self.state, &spent_inputs, &mined_commits);
+                self.check_pending_mix_reveals().await;
             }
             Err(e) => {
                 tracing::error!("Failed to apply our own mined batch: {}", e);
@@ -2764,7 +2862,7 @@ mod complex_tests {
         // However, the reorg logic should have rescued it from the abandoned block 
         // and placed it back into the mempool.
         assert_eq!(node.mempool.len(), 1, "Mempool should have 1 restored tx");
-        let mempool_txs = node.mempool.transactions();
+        let mempool_txs = node.mempool.transactions_cloned();
         if let Transaction::Commit { commitment, .. } = mempool_txs[0] {
             assert_eq!(commitment, commit_hash);
         } else {
