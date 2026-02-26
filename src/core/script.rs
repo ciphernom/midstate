@@ -55,6 +55,7 @@ pub enum ScriptError {
     InvalidBooleanOnStack,
     ScriptMustFinishTrue,
     EmptyStack,
+    CleanStackRuleFailed,
 }
 
 impl std::fmt::Display for ScriptError {
@@ -72,6 +73,7 @@ impl std::fmt::Display for ScriptError {
             Self::InvalidBooleanOnStack => write!(f, "expected boolean on stack"),
             Self::ScriptMustFinishTrue => write!(f, "script did not finish with [1] on top"),
             Self::EmptyStack => write!(f, "stack empty at end of execution"),
+            Self::CleanStackRuleFailed => write!(f, "script execution finished with extra items on the stack (Clean Stack Rule)"), // <-- NEW
         }
     }
 }
@@ -354,8 +356,8 @@ pub fn execute_script(
                 let addr: [u8; 32] = addr_item.try_into().unwrap();
                 let mut sum: u64 = 0;
                 for out in ctx.outputs {
-                    if out.address == addr {
-                        sum = sum.checked_add(out.value).ok_or(ScriptError::MathOverflow)?;
+                    if out.address() == addr {
+                        sum = sum.checked_add(out.value()).ok_or(ScriptError::MathOverflow)?;
                     }
                 }
                 stack_push(&mut stack, from_u64(sum))?;
@@ -366,6 +368,9 @@ pub fn execute_script(
     }
 
     if stack.is_empty() { return Err(ScriptError::EmptyStack); }
+    // Clean Stack Rule: Exactly 1 item must remain
+    if stack.len() > 1 { return Err(ScriptError::CleanStackRuleFailed); }
+    
     let top = stack.last().unwrap();
     if top == &vec![1u8] { Ok(()) } else { Err(ScriptError::ScriptMustFinishTrue) }
 }
@@ -743,10 +748,10 @@ mod tests {
     fn sum_to_addr_covenant() {
         let alice_addr = [0xAA; 32];
         let outputs = vec![
-            OutputData { address: alice_addr, value: 32, salt: [0; 32] },
-            OutputData { address: alice_addr, value: 16, salt: [1; 32] },
-            OutputData { address: [0xBB; 32], value: 4, salt: [2; 32] },
-            OutputData { address: alice_addr, value: 2, salt: [3; 32] },
+            OutputData::Standard { address: alice_addr, value: 32, salt: [0; 32] },
+            OutputData::Standard { address: alice_addr, value: 16, salt: [1; 32] },
+            OutputData::Standard { address: [0xBB; 32], value: 4, salt: [2; 32] },
+            OutputData::Standard { address: alice_addr, value: 2, salt: [3; 32] },
         ];
         let mut bc = Vec::new();
         push_data(&mut bc, &alice_addr);
@@ -762,7 +767,7 @@ mod tests {
     #[test]
     fn sum_to_addr_insufficient_fails() {
         let alice_addr = [0xAA; 32];
-        let outputs = vec![OutputData { address: alice_addr, value: 16, salt: [0; 32] }];
+        let outputs = vec![OutputData::Standard { address: alice_addr, value: 16, salt: [0; 32] }];
         let mut bc = Vec::new();
         push_data(&mut bc, &alice_addr);
         bc.push(OP_SUM_TO_ADDR);

@@ -52,20 +52,45 @@ impl Mempool {
         // 1. Initial Validation
         match &tx {
             Transaction::Commit { commitment, spam_nonce } => {
-                if self.seen_commitments.len() >= MAX_PENDING_COMMITS {
-                    anyhow::bail!("Too many pending commits");
-                }
-                
-                // Dynamic Mempool PoW Check (Network base is 16)
                 let h = crate::core::types::hash_concat(commitment, &spam_nonce.to_le_bytes());
-                let required = self.required_commit_pow();
                 let actual_zeros = crate::core::types::count_leading_zeros(&h);
+                let required = self.required_commit_pow();
                 
                 if actual_zeros < required {
                     anyhow::bail!(
                         "Mempool is busy. Commit PoW requires {} leading zero bits (provided: {})", 
                         required, actual_zeros
                     );
+                }
+
+                if self.seen_commitments.len() >= MAX_PENDING_COMMITS {
+                    // Find the lowest PoW commit in the mempool
+                    let mut lowest_pow = u32::MAX;
+                    let mut lowest_idx = None;
+                    
+                    for (i, existing_tx) in self.transactions.iter().enumerate() {
+                        if let Transaction::Commit { commitment: e_comm, spam_nonce: e_nonce } = existing_tx {
+                            let e_h = crate::core::types::hash_concat(e_comm, &e_nonce.to_le_bytes());
+                            let e_pow = crate::core::types::count_leading_zeros(&e_h);
+                            if e_pow < lowest_pow {
+                                lowest_pow = e_pow;
+                                lowest_idx = Some(i);
+                            }
+                        }
+                    }
+                    
+                    if let Some(idx) = lowest_idx {
+                        if actual_zeros > lowest_pow {
+                            // Evict the spammer
+                            let evicted = self.transactions.remove(idx);
+                            if let Transaction::Commit { commitment: e_comm, .. } = evicted {
+                                self.seen_commitments.remove(&e_comm);
+                            }
+                            tracing::info!("Evicted low-PoW commit ({} bits) for higher-PoW commit ({} bits)", lowest_pow, actual_zeros);
+                        } else {
+                            anyhow::bail!("Mempool full of Commits: incoming PoW ({} bits) must exceed lowest existing PoW ({} bits) to evict", actual_zeros, lowest_pow);
+                        }
+                    }
                 }
             }
             Transaction::Reveal { .. } => {
@@ -295,6 +320,7 @@ mod tests {
             height: 1,
             timestamp: 1000,
             commitment_heights: im::HashMap::new(),
+            chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
         }
     }
 
@@ -346,7 +372,7 @@ mod tests {
             let dummy_reveal = Transaction::Reveal {
                 inputs: vec![dummy_input.clone()],
                 witnesses: vec![],
-                outputs: vec![OutputData { address: [0; 32], value: 8, salt: [0; 32] }],
+                outputs: vec![OutputData::Standard { address: [0; 32], value: 8, salt: [0; 32] }],
                 salt: [0; 32],
             };
             mp.transactions.push(dummy_reveal);
@@ -372,22 +398,38 @@ mod tests {
     fn max_pending_commits_enforced() {
         let state = empty_state();
         let mut mp = Mempool::new();
+        
+        // Fill mempool to MAX_PENDING_COMMITS with dummy commits.
+        // We push them directly to bypass the slow PoW generation in tests.
+        // Their spam_nonce is 0, so their actual PoW is basically 0.
         for i in 0..MAX_PENDING_COMMITS {
             let commitment = hash(&(i as u64).to_le_bytes());
             mp.transactions.push(Transaction::Commit { commitment, spam_nonce: 0 });
             mp.seen_commitments.insert(commitment);
         }
 
+        // The Mempool is now at capacity (1,000 commits).
+        // Dynamic PoW logic requires 22 leading zeros to enter.
         let extra = hash(b"commit overflow");
         let mut n = 0u64;
         loop {
             let h = hash_concat(&extra, &n.to_le_bytes());
-            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 { break; }
+            if crate::core::types::count_leading_zeros(&h) >= 22 { break; }
             n += 1;
         }
+        
         let tx = Transaction::Commit { commitment: extra, spam_nonce: n };
-        let err = mp.add(tx, &state).unwrap_err();
-        assert!(err.to_string().contains("Too many pending commits"));
+        
+        // This new commit has >= 22 zeros. The dummy commits have ~0 zeros.
+        // It should successfully evict one of the low-PoW dummies.
+        assert!(mp.add(tx, &state).is_ok());
+        assert_eq!(mp.len(), MAX_PENDING_COMMITS, "Mempool should not exceed max capacity");
+        assert!(mp.seen_commitments.contains(&extra), "New high-PoW commit should be accepted");
+        
+        // Conversely, a commit with insufficient PoW (< 22) should be rejected immediately.
+        let bad_tx = Transaction::Commit { commitment: hash(b"bad"), spam_nonce: 0 };
+        let err = mp.add(bad_tx, &state).unwrap_err();
+        assert!(err.to_string().contains("Mempool is busy"));
     }
 
     #[test]
@@ -420,9 +462,9 @@ mod tests {
         let coin_id = compute_coin_id(&address, 20, &input_salt);
         state.coins.insert(coin_id);
 
-        let output = OutputData { address: hash(b"recipient"), value: 8, salt: [0x11; 32] };
+        let output = OutputData::Standard { address: hash(b"recipient"), value: 8, salt: [0x11; 32] };
         let commit_salt: [u8; 32] = [0x22; 32];
-        let commitment = compute_commitment(&[coin_id], &[output.coin_id()], &commit_salt);
+        let commitment = compute_commitment(&[coin_id], &[output.coin_id().unwrap()], &commit_salt);
 
         // Mine PoW and add commitment
         let mut n = 0u64;
@@ -444,7 +486,8 @@ fn make_reveal_tx(seed: &[u8; 32], value: u64, input_salt: [u8; 32], commit_salt
         let address = compute_address(&owner_pk);
         let coin_id = compute_coin_id(&address, value, &input_salt);
 
-        let commitment = compute_commitment(&[coin_id], &[output.coin_id()], &commit_salt);
+        let commitment = compute_commitment(&[coin_id], &[output.coin_id().unwrap()], &commit_salt);
+        
         let sig = wots::sign(seed, &commitment);
 
         Transaction::Reveal {
@@ -483,9 +526,9 @@ fn make_reveal_tx(seed: &[u8; 32], value: u64, input_salt: [u8; 32], commit_salt
         let coin_id = compute_coin_id(&address, 1, &input_salt);
         state.coins.insert(coin_id);
 
-        let output = OutputData { address: hash(b"r"), value: 1, salt: [0; 32] };
+        let output = OutputData::Standard { address: hash(b"r"), value: 1, salt: [0; 32] };
         let commit_salt = [1u8; 32];
-        let commitment = compute_commitment(&[coin_id], &[output.coin_id()], &commit_salt);
+        let commitment = compute_commitment(&[coin_id], &[output.coin_id().unwrap()], &commit_salt);
 
         let mut n = 0u64;
         loop {
@@ -590,7 +633,7 @@ fn make_reveal_tx(seed: &[u8; 32], value: u64, input_salt: [u8; 32], commit_salt
         }
 
         let dummy_input = InputReveal { predicate: Predicate::p2pk(&[0; 32]), value: 10, salt: [0; 32] };
-        let dummy_output = OutputData { address: [0; 32], value: 8, salt: [0; 32] }; // fee = 2
+        let dummy_output = OutputData::Standard { address: [0; 32], value: 8, salt: [0; 32] }; // fee = 2
         let dummy_reveal = Transaction::Reveal {
             inputs: vec![dummy_input.clone()],
             witnesses: vec![],
@@ -624,7 +667,7 @@ fn make_reveal_tx(seed: &[u8; 32], value: u64, input_salt: [u8; 32], commit_salt
         }
 
         let dummy_input = InputReveal { predicate: Predicate::p2pk(&[0; 32]), value: 20, salt: [0; 32] };
-        let dummy_output = OutputData { address: [0; 32], value: 10, salt: [0; 32] }; // fee = 10
+        let dummy_output = OutputData::Standard { address: [0; 32], value: 10, salt: [0; 32] }; // fee = 10
         let dummy_reveal = Transaction::Reveal {
             inputs: vec![dummy_input.clone()],
             witnesses: vec![],

@@ -59,6 +59,7 @@ pub enum NetworkEvent {
     },
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
+    OutgoingConnectionFailed(String),
 }
 
 // ── Network API ─────────────────────────────────────────────────────────────
@@ -531,6 +532,18 @@ impl MidstateNetwork {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     tracing::info!("Listening on {}", address);
                     self.listen_addrs.push(address);
+                }
+                SwarmEvent::OutgoingConnectionError { error, .. } => {
+                    // Extract the failed multiaddr based on the type of dial error
+                    if let libp2p::swarm::DialError::Transport(failed_addrs) = error {
+                        // Just grab the first failed address from the transport error
+                        if let Some((multiaddr, _)) = failed_addrs.first() {
+                            return NetworkEvent::OutgoingConnectionFailed(multiaddr.to_string());
+                        }
+                    } else if let libp2p::swarm::DialError::WrongPeerId { endpoint, .. } = error {
+                        // The peer answered, but lied about its PeerId (malicious/misconfigured)
+                        return NetworkEvent::OutgoingConnectionFailed(endpoint.get_remote_address().to_string());
+                    }
                 }
                 SwarmEvent::ExternalAddrConfirmed { address } => {
                     tracing::info!("External address confirmed: {}", address);

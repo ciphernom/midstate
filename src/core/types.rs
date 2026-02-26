@@ -103,13 +103,14 @@ pub fn compute_coin_id(address: &[u8; 32], value: u64, salt: &[u8; 32]) -> [u8; 
 
 /// Compute a commitment hash that binds inputs to outputs.
 ///
-/// commitment = BLAKE3(coin_id_1 || ... || new_coin_id_1 || ... || salt)
+/// commitment = BLAKE3(NETWORK_MAGIC || coin_id_1 || ... || new_coin_id_1 || ... || salt)
 pub fn compute_commitment(
     input_coins: &[[u8; 32]],
     new_coins: &[[u8; 32]],
     salt: &[u8; 32],
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
+    hasher.update(NETWORK_MAGIC); 
     for coin in input_coins {
         hasher.update(coin);
     }
@@ -148,6 +149,9 @@ pub struct State {
     pub timestamp: u64,
     #[serde(default)]
     pub commitment_heights: im::HashMap<[u8; 32], u64>,
+    /// Append-only log of historical block hashes for light client proofs
+    #[serde(default)]
+    pub chain_mmr: crate::core::mmr::MerkleMountainRange,
 }
 
 impl State {
@@ -203,8 +207,8 @@ impl State {
             height: 0,
             timestamp: BITCOIN_BLOCK_TIME,
             commitment_heights: im::HashMap::new(),
+            chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
         };
-
         (state, genesis_coinbase)
     }
     pub fn header(&self) -> BatchHeader {
@@ -239,7 +243,7 @@ impl Batch {
                         hasher.update(&i.coin_id());
                     }
                     for o in outputs {
-                        hasher.update(&o.coin_id());
+                        hasher.update(&o.hash_for_commitment());
                     }
                     hasher.update(salt);
                     let tx_hash = *hasher.finalize().as_bytes();
@@ -268,18 +272,67 @@ impl Batch {
 
 
 /// Cleartext output data carried in a transaction.
-/// Transmitted in the block, validated (value is power of 2), then discarded from state.
-/// Only the resulting coin_id is stored in the UTXO set.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct OutputData {
-    pub address: [u8; 32],
-    pub value: u64,
-    pub salt: [u8; 32],
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+pub enum OutputData {
+    Standard {
+        address: [u8; 32],
+        value: u64,
+        salt: [u8; 32],
+    },
+    /// A provably unspendable data payload that is ignored by the UTXO SMT
+    DataBurn {
+        payload: Vec<u8>,
+        value_burned: u64,
+    }
 }
 
 impl OutputData {
-    pub fn coin_id(&self) -> [u8; 32] {
-        compute_coin_id(&self.address, self.value, &self.salt)
+    /// Returns the Coin ID if this is a standard spendable UTXO.
+    pub fn coin_id(&self) -> Option<[u8; 32]> {
+        match self {
+            OutputData::Standard { address, value, salt } => {
+                Some(compute_coin_id(address, *value, salt))
+            }
+            OutputData::DataBurn { .. } => None,
+        }
+    }
+
+    /// The hash used when computing the transaction commitment. 
+    /// Burns must be committed to so they cannot be tampered with in the mempool.
+    pub fn hash_for_commitment(&self) -> [u8; 32] {
+        match self {
+            OutputData::Standard { address, value, salt } => {
+                compute_coin_id(address, *value, salt)
+            }
+            OutputData::DataBurn { payload, value_burned } => {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"DATABURN");
+                hasher.update(&value_burned.to_le_bytes());
+                hasher.update(payload);
+                *hasher.finalize().as_bytes()
+            }
+        }
+    }
+
+    pub fn value(&self) -> u64 {
+        match self {
+            OutputData::Standard { value, .. } => *value,
+            OutputData::DataBurn { value_burned, .. } => *value_burned,
+        }
+    }
+
+    pub fn address(&self) -> [u8; 32] {
+        match self {
+            OutputData::Standard { address, .. } => *address,
+            OutputData::DataBurn { .. } => [0u8; 32],
+        }
+    }
+
+    pub fn salt(&self) -> [u8; 32] {
+        match self {
+            OutputData::Standard { salt, .. } => *salt,
+            OutputData::DataBurn { .. } => [0u8; 32],
+        }
     }
 }
 
@@ -350,7 +403,7 @@ impl Transaction {
     pub fn output_coin_ids(&self) -> Vec<[u8; 32]> {
         match self {
             Transaction::Commit { .. } => vec![],
-            Transaction::Reveal { outputs, .. } => outputs.iter().map(|o| o.coin_id()).collect(),
+            Transaction::Reveal { outputs, .. } => outputs.iter().filter_map(|o| o.coin_id()).collect(),
         }
     }
 
@@ -360,7 +413,7 @@ impl Transaction {
             Transaction::Commit { .. } => 0,
             Transaction::Reveal { inputs, outputs, .. } => {
                 let in_sum = inputs.iter().try_fold(0u64, |acc, i| acc.checked_add(i.value)).unwrap_or(u64::MAX);
-                let out_sum = outputs.iter().try_fold(0u64, |acc, o| acc.checked_add(o.value)).unwrap_or(u64::MAX);
+                let out_sum = outputs.iter().try_fold(0u64, |acc, o| acc.checked_add(o.value())).unwrap_or(u64::MAX);
                 in_sum.saturating_sub(out_sum)
             }
         }
@@ -404,7 +457,8 @@ pub struct BatchHeader {
 
 
 // ── Protocol constants ──────────────────────────────────────────────────────
-
+pub const MAX_BURN_DATA_SIZE: usize = 80; //OP_RETURN analog
+pub const NETWORK_MAGIC: &[u8] = b"MIDSTATE_MAINNET_V1";
 #[cfg(not(feature = "fast-mining"))]
 pub const EXTENSION_ITERATIONS: u64 = 1_000_000;
 #[cfg(feature = "fast-mining")]
@@ -657,8 +711,8 @@ mod tests {
 
     #[test]
     fn output_data_coin_id() {
-        let o = OutputData { address: [1u8; 32], value: 8, salt: [2u8; 32] };
-        assert_eq!(o.coin_id(), compute_coin_id(&[1u8; 32], 8, &[2u8; 32]));
+        let o = OutputData::Standard { address: [1u8; 32], value: 8, salt: [2u8; 32] };
+        assert_eq!(o.coin_id(), Some(compute_coin_id(&[1u8; 32], 8, &[2u8; 32])));
     }
 
     #[test]
@@ -690,7 +744,7 @@ mod tests {
         let tx = Transaction::Reveal {
             inputs: vec![InputReveal { predicate: Predicate::p2pk(&[0u8; 32]), value: 10, salt: [0u8; 32] }],
             witnesses: vec![Witness::sig(vec![])],
-            outputs: vec![OutputData { address: [0u8; 32], value: 8, salt: [0u8; 32] }],
+            outputs: vec![OutputData::Standard { address: [0u8; 32], value: 8, salt: [0u8; 32] }],
             salt: [0u8; 32],
         };
         assert_eq!(tx.fee(), 2);
@@ -699,7 +753,7 @@ mod tests {
     #[test]
     fn reveal_input_output_coin_ids() {
         let input = InputReveal { predicate: Predicate::p2pk(&[1u8; 32]), value: 8, salt: [2u8; 32] };
-        let output = OutputData { address: [3u8; 32], value: 4, salt: [4u8; 32] };
+        let output = OutputData::Standard { address: [3u8; 32], value: 4, salt: [4u8; 32] };
         let tx = Transaction::Reveal {
             inputs: vec![input.clone()],
             witnesses: vec![Witness::sig(vec![])],
@@ -707,7 +761,7 @@ mod tests {
             salt: [0u8; 32],
         };
         assert_eq!(tx.input_coin_ids(), vec![input.coin_id()]);
-        assert_eq!(tx.output_coin_ids(), vec![output.coin_id()]);
+        assert_eq!(tx.output_coin_ids(), vec![output.coin_id().unwrap()]);
     }
 
     // ── State::genesis ──────────────────────────────────────────────────
