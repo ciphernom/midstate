@@ -796,10 +796,11 @@ impl Node {
                 for addr_str in addrs.into_iter().take(20) {
                     if !self.known_pex_addrs.contains(&addr_str) {
                         
-                        // 2. Churn: If the table is full, evict an arbitrary older address
-                        // so the set never permanently freezes.
+                        // 2. Churn: If the table is full, evict a random address
+                        // to prevent deterministic eclipse attacks.
                         if self.known_pex_addrs.len() >= 1_000 {
-                            let victim = self.known_pex_addrs.iter().next().cloned().unwrap();
+                            let skip = rand::random::<usize>() % self.known_pex_addrs.len();
+                            let victim = self.known_pex_addrs.iter().nth(skip).cloned().unwrap();
                             self.known_pex_addrs.remove(&victim);
                         }
                         
@@ -1287,6 +1288,23 @@ impl Node {
             // If the first header builds exactly on top of the snapshot's midstate, the snapshot is authentic.
             if all_headers.is_empty() || all_headers[0].prev_midstate != snap.midstate {
                 tracing::warn!("Snapshot midstate mismatch! Peer sent fraudulent snapshot. Aborting sync.");
+                self.sync_in_progress = false;
+                return Ok(());
+            }
+
+            // SECURITY: Require a minimum number of post-snapshot headers before
+            // trusting a snapshot. Without this, an attacker with modest hash power
+            // could forge a snapshot for a fresh node by mining only a handful of
+            // valid blocks on top of a fabricated state. PRUNE_DEPTH headers
+            // (1,000 blocks × 1M iterations each = 1 billion sequential hashes)
+            // makes this prohibitively expensive.
+            let min_headers = PRUNE_DEPTH as usize;
+            if all_headers.len() < min_headers {
+                tracing::warn!(
+                    "Fast-forward rejected: only {} headers on top of snapshot (need >= {}). \
+                     Peer may be attempting state injection.",
+                    all_headers.len(), min_headers
+                );
                 self.sync_in_progress = false;
                 return Ok(());
             }
@@ -1915,7 +1933,11 @@ fn perform_reorg(
             }
             Err(e) => {
                 tracing::debug!("Batch rejected after full validation: {}", e);
-                self.finality.observe_adversarial();
+                // NOTE: We intentionally do NOT call observe_adversarial() here.
+                // A rejected batch could be simple spam (garbage sigs, no PoW).
+                // The finality estimator models adversarial *hashpower* — only
+                // actual chain reorgs (which require real PoW) should shift the
+                // estimate. See perform_reorg() for the legitimate call site.
                 Ok(())
             }
         }
@@ -2167,12 +2189,32 @@ fn perform_reorg(
         let mut total_fees: u64 = 0;
         let mut transactions = Vec::new();
         
-        // Use .transactions() to get cheap Arcs, take MAX_BATCH_SIZE, 
-        // and only deep clone the ones we actually put in the block.
-        let pending_arcs = self.mempool.transactions();
-        for arc_tx in pending_arcs.into_iter().take(MAX_BATCH_SIZE) {
-            // Unpack the Arc into a real Transaction for the batch
-            let tx = Arc::unwrap_or_clone(arc_tx); 
+        // Pull commits and reveals separately so commits can't be starved.
+        // Reserve up to 20% of block space for commits; fills the rest with
+        // fee-paying reveals. This is a local mining policy — not consensus —
+        // but rational miners should follow it: including commits enables future
+        // reveals (which pay fees), and a miner who starves commits starves
+        // their own future revenue.
+        let max_commits = MAX_BATCH_SIZE / 5;  // 20 slots reserved
+        let max_reveals = MAX_BATCH_SIZE - max_commits;
+
+        let (pending_commits, pending_reveals) = self.mempool.transactions_split();
+
+        for arc_tx in pending_commits.into_iter().take(max_commits) {
+            let tx = Arc::unwrap_or_clone(arc_tx);
+            match apply_transaction(&mut candidate_state, &tx) {
+                Ok(_) => {
+                    total_fees += tx.fee();
+                    transactions.push(tx);
+                }
+                Err(e) => {
+                    tracing::debug!("Skipping stale mempool tx during mining: {}", e);
+                }
+            }
+        }
+
+        for arc_tx in pending_reveals.into_iter().take(max_reveals) {
+            let tx = Arc::unwrap_or_clone(arc_tx);
             match apply_transaction(&mut candidate_state, &tx) {
                 Ok(_) => {
                     total_fees += tx.fee();
