@@ -39,6 +39,11 @@ pub struct WalletCoin {
     pub salt: [u8; 32],
     pub coin_id: [u8; 32],
     pub label: Option<String>,
+    /// Set to true after this coin's WOTS key has signed a message.
+    /// A second signature with the same key would be catastrophic.
+    /// MSS-backed coins don't use this flag (MSS handles its own leaf counter).
+    #[serde(default)]
+    pub wots_signed: bool,
 }
 
 /// A commit that has been submitted but not yet revealed.
@@ -140,6 +145,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             salt,
             coin_id,
             label: key.label,
+            wots_signed: false,
         });
         return Ok(Some(coin_id));
     }
@@ -154,6 +160,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             salt,
             coin_id,
             label: Some(format!("received ({})", value)),
+            wots_signed: false,
         });
         return Ok(Some(coin_id));
     }
@@ -237,6 +244,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         }
         self.data.coins.push(WalletCoin {
             seed, owner_pk, address, value, salt, coin_id, label,
+            wots_signed: false,
         });
         // Remove matching key from unused keys if present
         self.data.keys.retain(|k| k.address != address);
@@ -311,8 +319,17 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         }
 
         // 3. Check already-known WOTS Coins
-        if let Some(coin) = self.data.coins.iter().find(|c| c.owner_pk == *owner_pk) {
-            let sig = crate::core::wots::sign(&coin.seed, commitment);
+        if let Some(pos) = self.data.coins.iter().position(|c| c.owner_pk == *owner_pk) {
+            if self.data.coins[pos].wots_signed {
+                anyhow::bail!(
+                    "WOTS key {} has already signed — refusing to sign again. \
+                     Use an MSS key for multiple signatures.",
+                    short_hex(owner_pk)
+                );
+            }
+            let sig = crate::core::wots::sign(&self.data.coins[pos].seed, commitment);
+            self.data.coins[pos].wots_signed = true;
+            self.save()?;
             return Ok(crate::core::wots::sig_to_bytes(&sig));
         }
 
@@ -475,6 +492,17 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                     value: wc.value,
                     salt: wc.salt,
                 });
+                // Check if this is a bare WOTS key (not MSS-backed)
+                let is_mss = self.data.mss_keys.iter().any(|k| k.master_pk == wc.owner_pk);
+                if !is_mss {
+                    if wc.wots_signed {
+                        bail!("WOTS key {} already signed — cannot sign again", short_hex(&wc.owner_pk));
+                    }
+                    // Mark as signed
+                    if let Some(c) = self.data.coins.iter_mut().find(|c| &c.coin_id == coin_id) {
+                        c.wots_signed = true;
+                    }
+                }
                 let sig = wots::sign(&wc.seed, &commitment);
                 witnesses.push(Witness::sig(wots::sig_to_bytes(&sig)));
             } else if let Some(wc) = self.data.coins.iter().find(|c| &c.coin_id == coin_id) {
@@ -539,6 +567,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                         salt: out.salt(),
                         coin_id,
                         label: Some(format!("change ({})", out.value())),
+                        wots_signed: false,
                     });
                 }
             }
@@ -697,7 +726,15 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                 self.save()?;
                 return Ok(sig.to_bytes());
             }
+            if coin.wots_signed {
+                bail!("WOTS key {} already signed — cannot sign again for mix", short_hex(&coin.owner_pk));
+            }
             let sig = wots::sign(&coin.seed, commitment);
+            // Mark as signed
+            if let Some(c) = self.data.coins.iter_mut().find(|c| c.coin_id == coin.coin_id) {
+                c.wots_signed = true;
+            }
+            self.save()?;
             return Ok(wots::sig_to_bytes(&sig));
         }
         bail!("coin {} not in wallet", short_hex(coin_id));
@@ -723,6 +760,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                 salt: output.salt(),
                 coin_id,
                 label: Some(format!("mixed ({})", output.value())),
+                wots_signed: false,
             });
         }
 
