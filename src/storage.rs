@@ -42,10 +42,18 @@ impl Storage {
 
                     let batches = BatchStore::new(path.join("batches"))?;
 
-                    return Ok(Self {
+                    let storage = Self {
                         db: Arc::new(db),
                         batches,
-                    });
+                    };
+
+                    // State-aware WAL recovery: load the committed height from
+                    // redb BEFORE recovering .tmp files so we know which belong
+                    // to a committed reorg (promote) vs an aborted one (delete).
+                    let committed_height = storage.load_committed_height()?;
+                    storage.batches.recover_wal(committed_height)?;
+
+                    return Ok(storage);
                 }
                 Err(e) => {
                     last_err = Some(e);
@@ -110,6 +118,20 @@ impl Storage {
                 Ok(Some(state))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Load only the committed state height from redb (no tree rebuilds).
+    /// Used by WAL recovery to determine which .tmp files to promote vs delete.
+    fn load_committed_height(&self) -> Result<u64> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(STATE_TABLE)?;
+        match table.get("current")? {
+            Some(bytes) => {
+                let state: State = bincode::deserialize(bytes.value())?;
+                Ok(state.height)
+            }
+            None => Ok(0),
         }
     }
 
