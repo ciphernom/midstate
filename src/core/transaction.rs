@@ -88,9 +88,18 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
                 .collect();
             let expected = compute_commitment(&input_coin_ids, &output_commit_hashes, salt);
 
-            if !state.commitments.remove(&expected) {
+            if !state.commitments.contains(&expected) {
                 bail!("No matching commitment found (expected {})", hex::encode(expected));
             }
+            if let Some(&commit_height) = state.commitment_heights.get(&expected) {
+                if state.height.saturating_sub(commit_height) > COMMITMENT_TTL {
+                    bail!(
+                        "Commitment expired at consensus (committed at height {}, current {}, TTL {})",
+                        commit_height, state.height, COMMITMENT_TTL
+                    );
+                }
+            }
+            state.commitments.remove(&expected);
             state.commitment_heights.remove(&expected);
 
             // Coin existence check still needed — sig verification doesn't touch state
@@ -205,14 +214,23 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             let input_coin_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
             let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
 
-            // 4. Verify commitment exists and matches
+            // 4. Verify commitment exists, is not expired, and matches
             let expected = compute_commitment(&input_coin_ids, &output_commit_hashes, salt);
-            if !state.commitments.remove(&expected) {
+            if !state.commitments.contains(&expected) {
                 bail!(
                     "No matching commitment found (expected {})",
                     hex::encode(expected)
                 );
             }
+            if let Some(&commit_height) = state.commitment_heights.get(&expected) {
+                if state.height.saturating_sub(commit_height) > COMMITMENT_TTL {
+                    bail!(
+                        "Commitment expired at consensus (committed at height {}, current {}, TTL {})",
+                        commit_height, state.height, COMMITMENT_TTL
+                    );
+                }
+            }
+            state.commitments.remove(&expected);
             state.commitment_heights.remove(&expected);
 
             // 5. Verify each input coin exists and executes cleanly against its Predicate
