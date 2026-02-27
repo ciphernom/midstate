@@ -27,11 +27,18 @@ use rayon::prelude::*;
 
 const MAX_ORPHAN_BATCHES: usize = 256;
 const SYNC_TIMEOUT_SECS: u64 = 300;
-const CATCH_UP_THRESHOLD: u64 = 20;
+
 /// Max transactions accepted from a single peer per rate-limit window.
 const MAX_TX_PER_PEER_PER_WINDOW: u32 = 50;
 /// Rate-limit window duration in seconds.
 const TX_RATE_WINDOW_SECS: u64 = 10;
+
+/// Dandelion++: probability (out of 100) that a stem-phase tx gets "fluffed"
+/// (broadcast to all peers) at each hop. ~10% means ~10 hops on average.
+const STEM_FLUFF_PERCENT: u32 = 10;
+/// Dandelion++: if a stem tx hasn't been fluffed within this many seconds,
+/// we fluff it ourselves as a safety net.
+const STEM_TIMEOUT_SECS: u64 = 30;
 
 /// Non-blocking sync session driven by the main event loop.
 /// Replaces the old blocking `Syncer::sync_via_network` which hijacked the
@@ -100,6 +107,10 @@ pub struct Node {
     /// Resets every TX_RATE_WINDOW_SECS seconds.
     peer_tx_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<NodeCommand>>,
+    /// Dandelion++ stem pool: txs in stem phase waiting to be fluffed.
+    /// Key: commitment or tx hash, Value: (transaction, received_at).
+    /// After STEM_TIMEOUT_SECS without being fluffed, we fluff them ourselves.
+    stem_pool: HashMap<[u8; 32], (Transaction, std::time::Instant)>,
 }
 
 #[derive(Clone)]
@@ -112,6 +123,7 @@ pub struct NodeHandle {
     tx_sender: tokio::sync::mpsc::UnboundedSender<NodeCommand>,
     pub batches_path: PathBuf,
     pub mix_manager: Arc<RwLock<MixManager>>,
+    pub commit_limiter: Arc<tokio::sync::Semaphore>, 
 }
 
 pub enum NodeCommand {
@@ -119,8 +131,8 @@ pub enum NodeCommand {
     SubmitMixTransaction { mix_id: [u8; 32], tx: Transaction },
     // --- P2P Mix Coordination Commands ---
     BroadcastMixAnnounce { mix_id: [u8; 32], denomination: u64 },
-    SendMixJoin { coordinator: PeerId, mix_id: [u8; 32], input: InputReveal, output: OutputData, signature: Vec<u8> },
-    SendMixFee { coordinator: PeerId, mix_id: [u8; 32], input: InputReveal },
+    SendMixJoin { coordinator: PeerId, mix_id: [u8; 32], input: InputReveal, output: OutputData, signature: Vec<u8>, join_nonce: u64 },
+    SendMixFee { coordinator: PeerId, mix_id: [u8; 32], input: InputReveal, join_nonce: u64 },
     SendMixSign { coordinator: PeerId, mix_id: [u8; 32], input_index: usize, signature: Vec<u8> },
     BroadcastMixProposal { mix_id: [u8; 32], proposal: crate::wallet::coinjoin::MixProposal, peers: Vec<PeerId> },
     FinishSyncHeaders { peer: PeerId, headers: Vec<BatchHeader>, is_valid: bool, snapshot: Option<Box<State>> },
@@ -249,12 +261,19 @@ impl NodeHandle {
 
         if !is_coord {
             if let Some(peer) = coord_peer {
+                // Mine anti-Sybil PoW on a blocking thread to avoid starving Tokio
+                let coin_id = input.coin_id();
+                let join_nonce = tokio::task::spawn_blocking(move || {
+                    crate::mix::mine_mix_join_pow(&mix_id, &coin_id)
+                }).await.map_err(|e| anyhow::anyhow!("PoW task failed: {}", e))?;
+
                 self.tx_sender.send(NodeCommand::SendMixJoin { 
                     coordinator: peer, 
                     mix_id, 
                     input, 
                     output, 
-                    signature // <-- Added signature
+                    signature,
+                    join_nonce,
                 })?;
             }
         } else if let Some(proposal) = mgr.try_finalize(&mix_id)? {
@@ -274,7 +293,13 @@ impl NodeHandle {
 
         if !is_coord {
             if let Some(peer) = coord_peer {
-                self.tx_sender.send(NodeCommand::SendMixFee { coordinator: peer, mix_id, input })?;
+                // Mine anti-Sybil PoW on a blocking thread to avoid starving Tokio
+                let coin_id = input.coin_id();
+                let join_nonce = tokio::task::spawn_blocking(move || {
+                    crate::mix::mine_mix_join_pow(&mix_id, &coin_id)
+                }).await.map_err(|e| anyhow::anyhow!("PoW task failed: {}", e))?;
+
+                self.tx_sender.send(NodeCommand::SendMixFee { coordinator: peer, mix_id, input, join_nonce })?;
             }
         } else if let Some(proposal) = mgr.try_finalize(&mix_id)? {
             let peers = mgr.remote_participants(&mix_id);
@@ -283,12 +308,12 @@ impl NodeHandle {
         Ok(())
     }
 
-    pub async fn mix_sign(&self, mix_id: [u8; 32], input_index: usize, signature: Vec<u8>) -> Result<()> {
+    pub async fn mix_sign(&self, mix_id: [u8; 32], input_index: usize, signature: Vec<u8>, current_height: u64) -> Result<()> {
         let mut mgr = self.mix_manager.write().await;
         let (is_coord, coord_peer) = mgr.get_session_info(&mix_id)
             .ok_or_else(|| anyhow::anyhow!("mix session not found"))?;
 
-        mgr.add_signature(&mix_id, input_index, signature.clone())?;
+        mgr.add_signature(&mix_id, input_index, signature.clone(), current_height, None)?;
 
         if !is_coord {
             if let Some(peer) = coord_peer {
@@ -375,19 +400,24 @@ impl Node {
                     }
 
                     // --- NEW: Calculate Genesis State Root ---
-                    let state_root = hash_concat(&temp_coins.root(), &state.chain_mmr.root());
+                    let smt_root = hash_concat(&temp_coins.root(), &state.commitments.root());
+                    let state_root = hash_concat(&smt_root, &state.chain_mmr.root());
                     mining_midstate = hash_concat(&mining_midstate, &state_root);
                     // -----------------------------------------
 
-                    let mut nonce = 0u64;
-                    let extension = loop {
-                        let ext = create_extension(mining_midstate, nonce);
-                        if ext.final_hash < state.target {
-                            tracing::info!("Found deterministic genesis nonce: {}", nonce);
-                            break ext;
-                        }
-                        nonce += 1;
-                    };
+                    // Hardcoded genesis nonce to avoid PoW on node initialization.
+                    let nonce = 166;
+                    let extension = create_extension(mining_midstate, nonce);
+                    
+                    // Safety check: Ensure the hardcoded nonce is still valid in case 
+                    // genesis parameters (e.g., the inscription or target) are modified later.
+                    assert!(
+                        extension.final_hash < state.target,
+                        "Hardcoded genesis nonce {} is invalid! Did the genesis parameters change?",
+                        nonce
+                    );
+                    
+                    tracing::info!("Using hardcoded deterministic genesis nonce: {}", nonce);
 
                     let genesis_batch = Batch {
                         prev_midstate: state.midstate,
@@ -483,10 +513,21 @@ impl Node {
             pending_mix_reveals: HashMap::new(),
             peer_tx_counts: HashMap::new(),
             cmd_tx: None,
+            stem_pool: HashMap::new(),
         })
     }
 
-    pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver<NodeCommand>) {
+
+    /// Evaluates if the node is ready to mine, and spawns the task if so.
+    fn trigger_mining(&mut self) {
+        if self.mining_threads.is_some() && !self.sync_in_progress && self.mining_cancel.is_none() {
+            if let Err(e) = self.spawn_mining_task() {
+                tracing::error!("Failed to trigger mining task: {}", e);
+            }
+        }
+    }
+
+pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver<NodeCommand>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = NodeHandle {
             state: Arc::new(RwLock::new(self.state.clone())),
@@ -497,6 +538,7 @@ impl Node {
             tx_sender: tx,
             batches_path: self.data_dir.join("db").join("batches"),
             mix_manager: Arc::clone(&self.mix_manager),
+            commit_limiter: Arc::new(tokio::sync::Semaphore::new(4)), // <-- ADD THIS (Max 4 concurrent PoW tasks)
         };
         (handle, rx)
     }
@@ -517,7 +559,6 @@ impl Node {
         mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<NodeCommand>,
     ) -> Result<()> {
         self.cmd_tx = Some(handle.tx_sender.clone());
-        let mut mine_interval = time::interval(Duration::from_secs(5));
         let mut save_interval = time::interval(Duration::from_secs(10));
         let mut ui_interval = time::interval(Duration::from_secs(1));
         let mut metrics_interval = time::interval(Duration::from_secs(30));
@@ -526,6 +567,7 @@ impl Node {
         let mut sync_timeout_interval = time::interval(Duration::from_secs(5));
         let mut pex_interval = time::interval(Duration::from_secs(120));
         let mut connection_maintenance = time::interval(Duration::from_secs(15));
+        let mut stem_flush_interval = time::interval(Duration::from_secs(5));
         const TARGET_OUTBOUND_PEERS: usize = 8;
         
         // Initial sync: ask all peers for their height
@@ -537,17 +579,11 @@ impl Node {
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-
+        // FIX: Start mining immediately if we aren't waiting on a sync!
+        self.trigger_mining();
         loop {
             tokio::select! {
-                _ = mine_interval.tick() => {
-                    // Check mining_threads.is_some() instead of is_mining
-                    if self.mining_threads.is_some() && !self.sync_in_progress && self.mining_cancel.is_none() {
-                        if let Err(e) = self.spawn_mining_task() {
-                            tracing::error!("Mining error: {}", e);
-                        }
-                    }
-                }
+                
                 Some(batch) = self.mined_batch_rx.recv() => {
                     if let Err(e) = self.handle_mined_batch(batch).await {
                         tracing::error!("Failed to process mined batch: {}", e);
@@ -557,15 +593,6 @@ impl Node {
                     if let Err(e) = self.storage.save_state(&self.state) {
                         tracing::error!("Failed to save state: {}", e);
                     }
-                    
-                    // Periodically save a snapshot for fast-sync peers
-                    if self.state.height > 0 && self.state.height % PRUNE_DEPTH == 0 {
-                        if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
-                            tracing::warn!("Failed to save state snapshot: {}", e);
-                        }
-                    }
-                    
-                    self.maybe_prune_checkpoints();
                 }
                 _ = ui_interval.tick() => {
                     *handle.state.write().await = self.state.clone();
@@ -581,6 +608,9 @@ impl Node {
                     // CoinJoin: clean up stale mix sessions
                     self.mix_manager.write().await.cleanup();
                 }
+                _ = stem_flush_interval.tick() => {
+                    self.flush_stem_pool();
+                }
                 _ = sync_poll_interval.tick() => {
                     if let Some(peer) = self.network.random_peer() {
                         self.network.send(peer, Message::GetState);
@@ -588,8 +618,11 @@ impl Node {
                 }
                 _ = sync_timeout_interval.tick() => {
                     if let Some(session) = &self.sync_session {
-                        if session.started_at.elapsed().as_secs() > SYNC_TIMEOUT_SECS {
-                            self.abort_sync_session("timed out");
+                        // FIX: Do not timeout if the delay is caused by our own CPU verifying headers.
+                        if !matches!(session.phase, SyncPhase::VerifyingHeaders) {
+                            if session.started_at.elapsed().as_secs() > SYNC_TIMEOUT_SECS {
+                                self.abort_sync_session("timed out");
+                            }
                         }
                     }
                 }
@@ -640,11 +673,11 @@ impl Node {
                         NodeCommand::BroadcastMixAnnounce { mix_id, denomination } => {
                             self.network.broadcast(Message::MixAnnounce { mix_id, denomination });
                         }
-                        NodeCommand::SendMixJoin { coordinator, mix_id, input, output, signature } => {
-                            self.network.send(coordinator, Message::MixJoin { mix_id, input, output, signature });
+                        NodeCommand::SendMixJoin { coordinator, mix_id, input, output, signature, join_nonce } => {
+                            self.network.send(coordinator, Message::MixJoin { mix_id, input, output, signature, join_nonce });
                         }
-                        NodeCommand::SendMixFee { coordinator, mix_id, input } => {
-                            self.network.send(coordinator, Message::MixFee { mix_id, input });
+                        NodeCommand::SendMixFee { coordinator, mix_id, input, join_nonce } => {
+                            self.network.send(coordinator, Message::MixFee { mix_id, input, join_nonce });
                         }
                         NodeCommand::SendMixSign { coordinator, mix_id, input_index, signature } => {
                             self.network.send(coordinator, Message::MixSign { mix_id, input_index, signature });
@@ -681,6 +714,13 @@ impl Node {
                                 continue;
                             }
                             tracing::info!("Peer connected: {}", peer);
+                            // Ask the peer for their chain state. If they are ahead,
+                            // the StateInfo handler will call start_sync_session()
+                            // which sets sync_in_progress and cancels mining.
+                            // We must NOT set sync_in_progress here — doing so causes
+                            // the StateInfo handler to ignore the reply (it thinks a
+                            // real sync is already running), leaving the flag stuck
+                            // true and mining permanently dead.
                             self.network.send(peer, Message::GetState);
                             self.network.send(peer, Message::GetAddr);
                         }
@@ -727,6 +767,10 @@ impl Node {
                 self.ack(channel);
                 self.handle_new_transaction(tx, Some(from)).await?;
             }
+            Message::StemTransaction(tx) => {
+                self.ack(channel);
+                self.handle_stem_transaction(tx, from).await?;
+            }
             Message::Batch(batch) => {
                 self.ack(channel);
                 self.handle_new_batch(batch, Some(from)).await?;
@@ -747,33 +791,26 @@ impl Node {
                 if midstate == self.state.midstate && height == self.state.height {
                     self.sync_in_progress = false;
                     self.sync_session = None;
+                    self.trigger_mining();
                 } else if depth > self.state.depth || height > self.state.height
                     || (depth == self.state.depth && midstate < self.state.midstate)
                 {
-                    // Don't restart sync if we're already syncing from this peer
-                    if self.sync_session.as_ref().map_or(false, |s| s.peer == from) {
-                        tracing::debug!("Already syncing from this peer, ignoring duplicate StateInfo");
+                    // FIX: Don't get distracted if we are already busy syncing!
+                    // Only ignore if there is an actual sync session in flight.
+                    // Checking sync_in_progress alone is insufficient because the
+                    // flag can be stale (e.g. set by a peer connection handshake
+                    // that hasn't resolved yet).
+                    if self.sync_session.is_some() {
+                        tracing::debug!("Sync session already active. Ignoring StateInfo from {} to prevent thrashing.", from);
                     } else {
                         let gap = height.saturating_sub(self.state.height);
-                        if gap > 0 && gap <= CATCH_UP_THRESHOLD {
-                            tracing::info!(
-                                "Peer {} blocks ahead (h={} vs h={}), requesting batches directly",
-                                gap, height, self.state.height
-                            );
-                            self.cancel_mining();
-                            self.sync_in_progress = true;
-                            self.sync_requested_up_to = height;
-                            let count = gap.min(MAX_GETBATCHES_COUNT);
-                            self.network.send(from, Message::GetBatches {
-                                start_height: self.state.height,
-                                count,
-                            });
-                        } else if gap > PRUNE_DEPTH {
-                            // The gap is massive -> Trigger Fast-Forward
+                        
+                        // FIX: The GetBatches shortcut has been completely removed.
+                        // We ALWAYS use Headers to safely find micro-forks and prove the chain.
+                        if gap > PRUNE_DEPTH {
                             self.start_fast_forward_sync(from, height, depth);
                         } else {
-                            // Standard sync
-                            self.start_sync_session(from, height, depth);
+                            self.start_sync_session(from, height, depth, None);
                         }
                     }
                 } else {
@@ -782,6 +819,7 @@ impl Node {
                         from, height, depth
                     );
                     self.sync_in_progress = false;
+                    self.trigger_mining();
                 }
             }
             
@@ -927,8 +965,22 @@ impl Node {
                 }
             }
 
-            Message::MixJoin { mix_id, input, output, signature } => { // <-- Added signature
+            Message::MixJoin { mix_id, input, output, signature, join_nonce } => {
                 self.ack(channel);
+
+                // Validate coin exists in UTXO set before touching MixManager
+                let coin_id = input.coin_id();
+                if !self.state.coins.contains(&coin_id) {
+                    tracing::debug!("MixJoin rejected from peer {}: coin does not exist", from);
+                    return Ok(());
+                }
+
+                // Anti-Sybil: verify join PoW to prevent costless session flooding
+                if !crate::mix::verify_mix_join_pow(&mix_id, &coin_id, join_nonce) {
+                    tracing::debug!("MixJoin rejected from peer {}: insufficient join PoW", from);
+                    return Ok(());
+                }
+
                 let mut mgr = self.mix_manager.write().await;
                 // Pass the signature reference to the MixManager
                 match mgr.register(&mix_id, input, output, &signature, Some(from)) {
@@ -954,8 +1006,22 @@ impl Node {
                 }
             }
             
-            Message::MixFee { mix_id, input } => {
+            Message::MixFee { mix_id, input, join_nonce } => {
                 self.ack(channel);
+
+                // Validate fee coin exists in UTXO set before touching MixManager
+                let coin_id = input.coin_id();
+                if !self.state.coins.contains(&coin_id) {
+                    tracing::debug!("MixFee rejected from peer {}: fee coin does not exist", from);
+                    return Ok(());
+                }
+
+                // Anti-Sybil: verify join PoW
+                if !crate::mix::verify_mix_join_pow(&mix_id, &coin_id, join_nonce) {
+                    tracing::debug!("MixFee rejected from peer {}: insufficient join PoW", from);
+                    return Ok(());
+                }
+
                 let mut mgr = self.mix_manager.write().await;
                 match mgr.set_fee_input(&mix_id, input, Some(from)) {
                     Ok(()) => {
@@ -994,7 +1060,7 @@ impl Node {
             Message::MixSign { mix_id, input_index, signature } => {
                 self.ack(channel);
                 let mut mgr = self.mix_manager.write().await;
-                if let Err(e) = mgr.add_signature(&mix_id, input_index, signature) {
+                if let Err(e) = mgr.add_signature(&mix_id, input_index, signature, self.state.height, Some(from)) {
                     tracing::debug!("MixSign rejected: {}", e);
                 } else {
                     // Auto-build if all sigs collected
@@ -1074,11 +1140,16 @@ impl Node {
 
     // ── Non-blocking sync state machine ─────────────────────────────────
 
-    fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u64) {
+fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u64, force_start: Option<u64>) {
         self.cancel_mining();
+        
+        // Use a fixed 360-block lookback instead of the un-warmed finality estimator.
+        // If the caller provided a specific start_height (e.g., a fallback), use that instead.
+        let start_height = force_start.unwrap_or_else(|| self.state.height.saturating_sub(360));
+        
         tracing::info!(
-            "Starting headers-first sync: peer(h={}, d={}) vs us(h={}, d={})",
-            peer_height, peer_depth, self.state.height, self.state.depth
+            "Starting headers-first sync from height {}: peer(h={}, d={}) vs us(h={}, d={})",
+            start_height, peer_height, peer_depth, self.state.height, self.state.depth
         );
         self.sync_in_progress = true;
         self.sync_session = Some(SyncSession {
@@ -1087,20 +1158,30 @@ impl Node {
             peer_depth,
             phase: SyncPhase::Headers {
                 accumulated: Vec::new(),
-                cursor: 0,
-                snapshot: None, // Added field
+                cursor: start_height,
+                snapshot: None, 
             },
             started_at: std::time::Instant::now(),
         });
-        // Request first chunk of headers from genesis
-        let count = 100.min(peer_height);
-        self.network.send(peer, Message::GetHeaders { start_height: 0, count });
+        
+        let count = 100.min(peer_height.saturating_sub(start_height));
+        self.network.send(peer, Message::GetHeaders { start_height, count });
     }
 
-    fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth: u64) {
+fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth: u64) {
         self.cancel_mining();
-        // Snapshots are saved every PRUNE_DEPTH blocks, so we round down to the nearest multiple.
-        let snap_height = (peer_height / PRUNE_DEPTH) * PRUNE_DEPTH;
+        
+        // FIX 1: Subtract PRUNE_DEPTH before rounding down to guarantee at least 1,000 blocks 
+        // exist between the snapshot and the peer's tip.
+        let snap_height = (peer_height.saturating_sub(PRUNE_DEPTH) / PRUNE_DEPTH) * PRUNE_DEPTH;
+        
+        // FIX 2: Snapshot 0 is never saved. If the chain is so young that the safe 
+        // snapshot is genesis, just do a normal sync.
+        if snap_height == 0 {
+            tracing::info!("Fast-forward threshold not met (safe snap_height=0), falling back to standard sync");
+            self.start_sync_session(peer, peer_height, peer_depth, None); 
+            return;
+        }
         
         tracing::info!("Fast-forward sync: requesting snapshot at height {}", snap_height);
         self.sync_in_progress = true;
@@ -1238,7 +1319,7 @@ impl Node {
                     // Log progress every 1,000 headers, or when we hit 100%
                     if processed % 1000 == 0 || processed == total_headers {
                         let pct = (processed as f64 / total_headers as f64) * 100.0;
-                        tracing::info!("Initial Headers Download Progress: Verified {}/{} headers ({:.1}%)", processed, total_headers, pct);
+                        tracing::info!("Initial Headers Verification Progress: Verified {}/{} headers ({:.1}%)", processed, total_headers, pct);
                     }
                     // -----------------------------
 
@@ -1317,11 +1398,28 @@ impl Node {
                 return Ok(());
             }
             
+            // Save the trusted snapshot to disk so we can use it for rebuilds later!
+            if let Err(e) = self.storage.save_state_snapshot(snap.height, &snap) {
+                tracing::warn!("Failed to save fast-forward snapshot to disk: {}", e);
+            }
+
             // Trust the snapshot!
             (snap.height, *snap, true)
-        } else {
+            } else {
             // Standard sync path
-            let fh = self.syncer.find_fork_point(&all_headers, self.state.height)?;
+            let headers_start_height = all_headers.first().map(|h| h.height).unwrap_or(0);
+            let fh = self.syncer.find_fork_point(&all_headers, headers_start_height, self.state.height)?;
+            
+            // NEW: Deep Fork Guard. 
+            // If the fork point equals the start of our 100-block window, it means the 
+            // chains actually diverged even further back in time.
+            if fh == headers_start_height && headers_start_height > 0 {
+                tracing::warn!("Fork is deeper than the 100-block lookback window. Restarting sync from genesis.");
+                // Fall back to a full sync from 0
+                self.start_sync_session(peer, session.peer_height, session.peer_depth, Some(0));
+                return Ok(());
+            }
+
             let cand = if fh == 0 {
                 State::genesis().0
             } else if fh <= self.state.height {
@@ -1379,7 +1477,7 @@ impl Node {
             }
         };
 
-        let (headers, fork_height, candidate_state, cursor, new_history, is_fast_forward) = match &mut session.phase {
+        let (headers, _fork_height, candidate_state, cursor, new_history, _is_fast_forward) = match &mut session.phase {
             SyncPhase::Batches { headers, fork_height, candidate_state, cursor, new_history, is_fast_forward } => {
                 (headers, *fork_height, candidate_state, cursor, new_history, *is_fast_forward)
             }
@@ -1396,8 +1494,8 @@ impl Node {
         let window_size = DIFFICULTY_LOOKBACK as usize;
         let mut recent_ts: VecDeque<u64> = VecDeque::new();
 
-
-        let header_start_height = if is_fast_forward { fork_height } else { 0 };
+        // FIX: Unify start height mapping
+        let header_start_height = headers.first().map(|h| h.height).unwrap_or(0);
         let start_height = cursor.saturating_sub(window_size as u64);
 
         for h in start_height..*cursor {
@@ -1536,12 +1634,110 @@ impl Node {
         match self.mempool.add(tx.clone(), &self.state) {
             Ok(_) => {
                 self.metrics.inc_transactions_processed();
-                self.network.broadcast_except(from, Message::Transaction(tx));
+
+                if from.is_none() {
+                    // Dandelion++ stem phase: we originated this tx locally.
+                    // Send to ONE random peer as StemTransaction instead of broadcasting.
+                    if let Some(stem_peer) = self.network.random_peer() {
+                        let tx_id = tx.input_coin_ids().first().copied()
+                            .unwrap_or_else(|| match &tx { Transaction::Commit { commitment, .. } => *commitment, _ => [0; 32] });
+                        self.stem_pool.insert(tx_id, (tx.clone(), std::time::Instant::now()));
+                        self.network.send(stem_peer, Message::StemTransaction(tx));
+                        tracing::debug!("Dandelion++ stem: sent tx to {}", stem_peer);
+                    } else {
+                        // No peers — broadcast directly
+                        self.network.broadcast(Message::Transaction(tx));
+                    }
+                } else {
+                    // Received from a peer (already fluffed) — relay normally
+                    self.network.broadcast_except(from, Message::Transaction(tx.clone()));
+
+                    // If this tx was in our stem pool (we were stemming it),
+                    // remove it now that it's been fluffed by someone else.
+                    // Prevents redundant re-broadcast when flush_stem_pool fires.
+                    let tx_id = tx.input_coin_ids().first().copied()
+                        .unwrap_or_else(|| match &tx { Transaction::Commit { commitment, .. } => *commitment, _ => [0; 32] });
+                    self.stem_pool.remove(&tx_id);
+                }
+
+                self.cancel_mining();
+                self.trigger_mining();
                 Ok(())
             }
             Err(e) => {
                 self.metrics.inc_invalid_transactions();
                 Err(e)
+            }
+        }
+    }
+
+    /// Dandelion++ stem phase handler: received a StemTransaction from a peer.
+    /// With STEM_FLUFF_PERCENT probability, "fluff" it (broadcast normally).
+    /// Otherwise, forward to one random peer (excluding sender).
+    async fn handle_stem_transaction(&mut self, tx: Transaction, from: PeerId) -> Result<()> {
+        // Compute a tx identifier for dedup
+        let tx_id = tx.input_coin_ids().first().copied()
+            .unwrap_or_else(|| match &tx { Transaction::Commit { commitment, .. } => *commitment, _ => [0; 32] });
+
+        // Already in stem pool — ignore duplicate
+        if self.stem_pool.contains_key(&tx_id) {
+            return Ok(());
+        }
+
+        // Dandelion++ Privacy: Do NOT add to mempool during stem phase!
+        // Adding to mempool exposes the tx via RPC and mining, defeating anonymity.
+        // Validate only — mempool insertion happens when we fluff.
+        if let Err(e) = validate_transaction(&self.state, &tx) {
+            self.metrics.inc_invalid_transactions();
+            return Err(e);
+        }
+        self.metrics.inc_transactions_processed();
+
+        // Flip the coin: fluff or continue stemming?
+        let roll = rand::random::<u32>() % 100;
+        if roll < STEM_FLUFF_PERCENT {
+            // Fluff: add to public mempool and broadcast
+            tracing::debug!("Dandelion++ fluff: broadcasting tx after stem");
+            let _ = self.mempool.add(tx.clone(), &self.state);
+            self.network.broadcast(Message::Transaction(tx));
+            self.cancel_mining();
+            self.trigger_mining();
+        } else {
+            // Continue stem: forward to ONE random peer (not the sender)
+            let peers: Vec<PeerId> = self.network.connected_peers()
+                .into_iter()
+                .filter(|p| *p != from)
+                .collect();
+            if let Some(next) = peers.first() {
+                self.stem_pool.insert(tx_id, (tx.clone(), std::time::Instant::now()));
+                self.network.send(*next, Message::StemTransaction(tx));
+                tracing::debug!("Dandelion++ stem: forwarded to {}", next);
+            } else {
+                // No other peers — fluff immediately
+                let _ = self.mempool.add(tx.clone(), &self.state);
+                self.network.broadcast(Message::Transaction(tx));
+                self.cancel_mining();
+                self.trigger_mining();
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush timed-out stem pool entries: if a tx has been in stem phase
+    /// for longer than STEM_TIMEOUT_SECS, broadcast it ourselves.
+    fn flush_stem_pool(&mut self) {
+        let now = std::time::Instant::now();
+        let expired: Vec<[u8; 32]> = self.stem_pool.iter()
+            .filter(|(_, (_, t))| now.duration_since(*t).as_secs() >= STEM_TIMEOUT_SECS)
+            .map(|(k, _)| *k)
+            .collect();
+
+        for tx_id in expired {
+            if let Some((tx, _)) = self.stem_pool.remove(&tx_id) {
+                tracing::debug!("Dandelion++ timeout: fluffing stem tx");
+                // ADD TO LOCAL MEMPOOL
+                let _ = self.mempool.add(tx.clone(), &self.state); 
+                self.network.broadcast(Message::Transaction(tx));
             }
         }
     }
@@ -1581,13 +1777,19 @@ impl Node {
         alternative_batches: &[Batch],
         _from: PeerId,
     ) -> Result<Option<(State, Vec<(u64, [u8; 32], Batch)>)>> {
-        // Simplified fork_state derivation
-        let fork_state = if fork_height == 0 {
+        
+        // FIX: Optimize state derivation to prevent unnecessary and impossible rebuilds.
+        let fork_state = if fork_height == self.state.height {
+            // It's a direct linear extension. We already have the exact state in memory!
+            // No need to touch the disk or search for snapshots.
+            self.state.clone()
+        } else if fork_height == 0 {
             State::genesis().0
         } else if fork_height <= self.state.height.saturating_sub(self.finality.calculate_safe_depth(1e-6)) {
             tracing::warn!("Fork at {} exceeds statistical safe depth, rejecting", fork_height);
             return Ok(None);
         } else {
+            // It's a genuine reorg (fork_height < self.state.height). We MUST rebuild the state.
             self.rebuild_state_at_height(fork_height)?
         };
 
@@ -1694,30 +1896,56 @@ fn perform_reorg(
             }
         }
 
-        for (height, _, batch) in &new_history {
-            if let Err(e) = self.storage.save_batch(*height, batch) {
-                tracing::error!("Failed to save reorg batch at height {}: {}", height, e);
-            }
-        }
-
+        // Update in-memory state FIRST
         self.state = new_state;
         while self.chain_history.back().map_or(false, |&(h, _)| h >= fork_height) {
             self.chain_history.pop_back();
         }
         self.chain_history.extend(new_history.iter().map(|(h, ms, _)| (*h, *ms)));
 
-        // Rebuild headers cache from disk
+        // Rebuild headers cache. For heights below the fork, read from disk
+        // (those batches are shared between old and new fork). For heights at
+        // or above the fork, use the in-memory new_history (batch files may
+        // not be written yet).
         self.recent_headers.clear();
         let window = DIFFICULTY_LOOKBACK as u64;
         let start = self.state.height.saturating_sub(window);
-        
+
+        // Build a lookup table from new_history for fast access
+        let new_batch_timestamps: HashMap<u64, u64> = new_history.iter()
+            .map(|(h, _, b)| (*h, b.timestamp))
+            .collect();
+
         for h in start..self.state.height {
-            if let Some(batch) = self.storage.load_batch(h)? {
+            if let Some(&ts) = new_batch_timestamps.get(&h) {
+                self.recent_headers.push_back(ts);
+            } else if let Some(batch) = self.storage.load_batch(h)? {
                 self.recent_headers.push_back(batch.timestamp);
             }
         }
 
         self.state.target = adjust_difficulty(&self.state);
+
+        // 1. PREPARE: Write the batch files to .tmp FIRST.
+        // If we crash here, the DB hasn't advanced, and recover_wal() will
+        // delete these .tmp files on next boot (height > committed_height).
+        for (height, _, batch) in &new_history {
+            if let Err(e) = self.storage.batches.save_tmp(*height, batch) {
+                tracing::error!("Failed to save temp reorg batch at {}: {}", height, e);
+                return Err(e.into());
+            }
+        }
+
+        // 2. COMMIT: Atomically update the state pointer in the database.
+        // This is the point of no return. 
+        self.storage.save_state(&self.state)?;
+
+        // 3. APPLY: Rename .tmp files to .bin.
+        // If we crash during this loop, recover_wal() will finish the renames
+        // on the next boot (height <= committed_height).
+        for (height, _, _) in &new_history {
+            let _ = self.storage.batches.commit_tmp(*height);
+        }
 
         self.mempool.re_add(abandoned_txs, &self.state);
 
@@ -1725,10 +1953,9 @@ fn perform_reorg(
         if is_actual_reorg {
             self.metrics.inc_reorgs();
         }
-        self.storage.save_state(&self.state)?;
 
         self.sync_in_progress = false;
-
+        self.trigger_mining();
         Ok(())
     }
 
@@ -1736,29 +1963,33 @@ fn perform_reorg(
         // Find the nearest snapshot at or below target_height so we only
         // replay blocks from that point instead of from genesis.
         // Snapshots are written every PRUNE_DEPTH blocks, so round down.
-        let snap_height = (target_height / PRUNE_DEPTH) * PRUNE_DEPTH;
-        let (mut state, replay_from) = if snap_height > 0 {
+        let mut snap_height = (target_height / PRUNE_DEPTH) * PRUNE_DEPTH;
+        let mut best_snap = None;
+
+        // Step backwards until we find a snapshot, instead of just checking once and giving up.
+        while snap_height > 0 {
             match self.storage.load_state_snapshot(snap_height) {
                 Ok(Some(snap)) => {
                     tracing::debug!(
                         "rebuild_state_at_height: using snapshot at {} (target {})",
                         snap_height, target_height
                     );
-                    (snap, snap_height)
+                    best_snap = Some((snap, snap_height));
+                    break;
                 }
                 _ => {
-                    tracing::debug!(
-                        "rebuild_state_at_height: no snapshot at {}, replaying from genesis",
-                        snap_height
-                    );
-                    (State::genesis().0, 0)
+                    // Missed this one, step back and try the previous tier
+                    snap_height = snap_height.saturating_sub(PRUNE_DEPTH);
                 }
             }
-        } else {
-            (State::genesis().0, 0)
-        };
+        }
 
-        let mut recent_headers: VecDeque<u64> = VecDeque::new();
+        let (mut state, replay_from) = best_snap.unwrap_or_else(|| {
+            tracing::debug!("rebuild_state_at_height: no snapshots found, replaying from genesis");
+            (State::genesis().0, 0)
+        });
+
+        let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
         for h in replay_from..target_height {
             if let Some(batch) = self.storage.load_batch(h)? {
                 recent_headers.push_back(state.timestamp);
@@ -1866,7 +2097,7 @@ fn perform_reorg(
     }
 
     async fn handle_new_batch(&mut self, batch: Batch, from: Option<PeerId>) -> Result<()> {
-        // Fast pre-checks BEFORE cloning state (which copies the entire SMT).
+        // Fast pre-checks BEFORE cloning state (O(1) shallow clone via structural sharing).
         if batch.prev_midstate != self.state.midstate {
             tracing::debug!("Received orphan block (parent mismatch), queuing for later.");
 
@@ -1924,6 +2155,16 @@ fn perform_reorg(
                     self.storage.save_batch(pre_height, &batch)?;
                     
                     self.state.target = adjust_difficulty(&self.state);
+
+                    // Periodic snapshot + checkpoint pruning (matches handle_mined_batch)
+                    if self.state.height > 0 && self.state.height % PRUNE_DEPTH == 0 {
+                        if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
+                            tracing::warn!("Failed to save state snapshot: {}", e);
+                        } else {
+                            tracing::info!("Saved state snapshot at height {}", self.state.height);
+                        }
+                    }
+                    self.maybe_prune_checkpoints();
                     
                     self.metrics.inc_batches_processed();
 
@@ -1951,6 +2192,7 @@ fn perform_reorg(
                     tracing::info!("Applied new batch from peer, height now {}", self.state.height);
                     self.try_apply_orphans().await;
                     self.check_pending_mix_reveals().await;
+                    self.trigger_mining();
                 }
                 Ok(())
             }
@@ -2038,6 +2280,17 @@ fn perform_reorg(
                 self.storage.save_batch(candidate.height - 1, &batch)?;
                 self.state = candidate;
                 
+                // NEW: Event-driven snapshot saving!
+                if self.state.height > 0 && self.state.height % PRUNE_DEPTH == 0 {
+                    if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
+                        tracing::warn!("Failed to save state snapshot: {}", e);
+                    } else {
+                        tracing::info!("Saved state snapshot at height {}", self.state.height);
+                    }
+                }
+                
+                self.maybe_prune_checkpoints();
+                
                 self.state.target = adjust_difficulty(&self.state);
                 self.metrics.inc_batches_processed();
 
@@ -2071,6 +2324,7 @@ fn perform_reorg(
                 tracing::info!("Continuing sync from peer {} (requesting {} batches from {})", from, count, start);
                 self.network.send(from, Message::GetBatches { start_height: start, count });
             }
+            self.trigger_mining();
         } else {
             self.sync_in_progress = false;
         }
@@ -2257,22 +2511,24 @@ fn perform_reorg(
         }
 
         // --- NEW: Calculate state root ---
-        let state_root = hash_concat(&candidate_state.coins.root(), &candidate_state.chain_mmr.root());
+        let smt_root = hash_concat(&candidate_state.coins.root(), &candidate_state.commitments.root());
+        let state_root = hash_concat(&smt_root, &candidate_state.chain_mmr.root());
         candidate_state.midstate = hash_concat(&candidate_state.midstate, &state_root);
         // ---------------------------------
 
         let midstate = candidate_state.midstate;
         let target = self.state.target;
 
-        let current_time = crate::core::state::current_timestamp();
-        let block_timestamp = current_time.max(self.state.timestamp + 1);
+        // Minimum timestamp the block must have (consensus: must exceed previous).
+        // The actual timestamp is set AFTER mining completes to avoid staleness.
+        let min_timestamp = self.state.timestamp + 1;
 
         let mut template = Batch {
             prev_midstate: pre_mine_midstate,
             transactions,
             extension: Extension { nonce: 0, final_hash: [0; 32], checkpoints: vec![] },
             coinbase,
-            timestamp: block_timestamp,
+            timestamp: 0, // placeholder — set after mining
             target: self.state.target,
             state_root, // NEW
         };
@@ -2286,6 +2542,10 @@ fn perform_reorg(
             // Pass the `threads` variable into mine_extension
             if let Some(extension) = mine_extension(midstate, target, threads, cancel) {
                 template.extension = extension;
+                // Set timestamp NOW (after mining) so it reflects actual wall-clock time.
+                // This prevents difficulty drift from stale pre-mining timestamps.
+                let fresh_time = crate::core::state::current_timestamp();
+                template.timestamp = fresh_time.max(min_timestamp);
                 let _ = tx.send(template);
             }
             // If cancelled or channel closed, silently drop — the main loop already moved on
@@ -2316,6 +2576,18 @@ fn perform_reorg(
             Ok(_) => {
                 self.storage.save_batch(pre_mine_height, &batch)?;
                 self.storage.save_state(&self.state)?;
+                
+                // NEW: Event-driven snapshot saving!
+                if self.state.height > 0 && self.state.height % PRUNE_DEPTH == 0 {
+                    if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
+                        tracing::warn!("Failed to save state snapshot: {}", e);
+                    } else {
+                        tracing::info!("Saved state snapshot at height {}", self.state.height);
+                    }
+                }
+                
+                self.maybe_prune_checkpoints();
+
                 self.state.target = adjust_difficulty(&self.state);
                 self.metrics.inc_batches_mined();
                 self.network.broadcast(Message::Batch(batch.clone()));
@@ -2349,7 +2621,7 @@ fn perform_reorg(
                 tracing::error!("Failed to apply our own mined batch: {}", e);
             }
         }
-
+        self.trigger_mining();
         Ok(())
     }
 
@@ -2735,6 +3007,33 @@ mod tests {
         // Should not panic, just return 0
         assert_eq!(scan_txs_for_mss_index(&[tx], &pk), 0);
     }
+    
+    #[test]
+fn find_genesis_nonce() {
+    use crate::core::types::*;
+    use crate::core::extension::create_extension;
+
+    let (mut state, genesis_coinbase) = State::genesis();
+    let mut mining_midstate = state.midstate;
+    let mut temp_coins = state.coins.clone();
+    for cb in &genesis_coinbase {
+        let coin_id = cb.coin_id();
+        mining_midstate = hash_concat(&mining_midstate, &coin_id);
+        temp_coins.insert(coin_id);
+    }
+    let smt_root = hash_concat(&temp_coins.root(), &state.commitments.root());
+    let state_root = hash_concat(&smt_root, &state.chain_mmr.root());
+    mining_midstate = hash_concat(&mining_midstate, &state_root);
+
+    for nonce in 0u64.. {
+        let ext = create_extension(mining_midstate, nonce);
+        if ext.final_hash < state.target {
+            println!("\n\n  *** VALID GENESIS NONCE: {} ***\n", nonce);
+            return;
+        }
+    }
+}
+    
 }
 
 // ── Complex Integration Tests ───────────────────────────────────────────────
@@ -2798,7 +3097,8 @@ mod complex_tests {
         }
 
         // 3. Compute State Root
-        let state_root = hash_concat(&candidate_state.coins.root(), &candidate_state.chain_mmr.root());
+        let smt_root = hash_concat(&candidate_state.coins.root(), &candidate_state.commitments.root());
+        let state_root = hash_concat(&smt_root, &candidate_state.chain_mmr.root());
         candidate_state.midstate = hash_concat(&candidate_state.midstate, &state_root);
 
         let target = prev_state.target;
@@ -2876,7 +3176,7 @@ mod complex_tests {
         let mut nonce = 0u64;
         loop {
             let h = hash_concat(&commit_hash, &nonce.to_le_bytes());
-            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 { break; }
+            if crate::core::types::count_leading_zeros(&h) >= crate::core::transaction::MIN_COMMIT_POW_BITS { break; }
             nonce += 1;
         }
         let valid_tx = Transaction::Commit { commitment: commit_hash, spam_nonce: nonce };
@@ -3174,7 +3474,7 @@ mod complex_tests {
         let mut spam_nonce = 0u64;
         loop {
             let h = hash_concat(&commitment, &spam_nonce.to_le_bytes());
-            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 { break; }
+            if crate::core::types::count_leading_zeros(&h) >= crate::core::transaction::MIN_COMMIT_POW_BITS { break; }
             spam_nonce += 1;
         }
 
@@ -3250,7 +3550,7 @@ mod complex_tests {
         let mut spam_nonce = 0u64;
         loop {
             let h = hash_concat(&commitment, &spam_nonce.to_le_bytes());
-            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 { break; }
+            if crate::core::types::count_leading_zeros(&h) >= crate::core::transaction::MIN_COMMIT_POW_BITS { break; }
             spam_nonce += 1;
         }
 
@@ -3603,7 +3903,7 @@ fn build_divergent_chain(
 
         // Now peer B shows up — start_sync_session replaces the session
         let peer_b = PeerId::random();
-        node.start_sync_session(peer_b, 20, 20_000_000);
+        node.start_sync_session(peer_b, 20, 20_000_000, None);
 
         // Disk should still be coherent (old session's writes should not exist)
         let disk_headers = node.storage.batches
