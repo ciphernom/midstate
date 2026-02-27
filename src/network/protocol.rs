@@ -10,6 +10,11 @@ pub const MAX_GETBATCHES_COUNT: u64 = 100;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Message {
     Transaction(Transaction),
+    /// Dandelion++ stem phase: forward to one random peer before broadcast.
+    /// When a node originates a tx, it sends it as StemTransaction to ONE peer.
+    /// Each hop has a 10% chance to "fluff" (broadcast normally). After ~10 hops
+    /// on average, or a 30-second timeout, the tx enters the public mempool.
+    StemTransaction(Transaction),
     Batch(Batch),
     GetState,
     StateInfo {
@@ -59,10 +64,12 @@ pub enum Message {
         input: crate::core::InputReveal,
         output: crate::core::OutputData,
         signature: Vec<u8>,
+        join_nonce: u64,
     },
     MixFee {
         mix_id: [u8; 32],
         input: crate::core::InputReveal,
+        join_nonce: u64,
     },
     /// Broadcast the canonical proposal so all participants can sign.
     MixProposal {
@@ -300,6 +307,7 @@ mod tests {
                     salt: [4; 32],
                 },
                 signature: vec![],
+                join_nonce: 0,
             },
             Message::MixProposal {
                 mix_id: [0; 32],
@@ -383,15 +391,17 @@ mod tests {
                 salt: [4; 32],
             },
             signature: vec![0xDD; 576],
+            join_nonce: 42,
         };
 
         let bytes = msg.serialize_bin();
         match Message::deserialize_bin(&bytes).unwrap() {
-            Message::MixJoin { mix_id, input, output, signature } => {
+            Message::MixJoin { mix_id, input, output, signature, join_nonce } => {
                 assert_eq!(mix_id, [0xBB; 32]);
                 assert_eq!(input.value, 8);
                 assert_eq!(output.value(), 8);
                 assert_eq!(signature.len(), 576);
+                assert_eq!(join_nonce, 42);
             }
             _ => panic!("wrong variant"),
         }
