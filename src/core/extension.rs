@@ -184,6 +184,12 @@ pub fn mine_extension(midstate: [u8; 32], target: [u8; 32], threads: usize, canc
                         let _ = tx.send((Extension { nonce, final_hash, checkpoints }, attempts));
                         return;
                     }
+                    
+                    // Prevent CPU starvation by yielding the thread periodically.
+                    // This allows the Tokio network executor to process incoming blocks.
+                    if attempts % 10_000 == 0 {
+                        std::thread::yield_now();
+                    }
                 }
             })
         })

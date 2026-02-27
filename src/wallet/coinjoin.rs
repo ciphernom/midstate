@@ -770,7 +770,7 @@ mod tests {
         let mut nonce = 0u64;
         loop {
             let h = hash_concat(&proposal.commitment, &nonce.to_le_bytes());
-            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 {
+            if crate::core::types::count_leading_zeros(&h) >= crate::core::transaction::MIN_COMMIT_POW_BITS {
                 break;
             }
             nonce += 1;
