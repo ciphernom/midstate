@@ -92,7 +92,7 @@ pub fn verify_header_chain(headers: &[BatchHeader]) -> Result<()> {
     /// using batches already on disk.
     pub fn rebuild_state_to(&self, target: u64) -> Result<State> {
         let mut state = State::genesis().0;
-        let mut recent_headers: Vec<u64> = Vec::new();
+        let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
         let window_size = DIFFICULTY_LOOKBACK as usize;
 
         for h in 0..target {
@@ -101,9 +101,9 @@ pub fn verify_header_chain(headers: &[BatchHeader]) -> Result<()> {
                 .load_batch(h)?
                 .ok_or_else(|| anyhow::anyhow!("Missing batch at height {} during rebuild", h))?;
             
-            recent_headers.push(state.timestamp);
-            if recent_headers.len() > window_size { recent_headers.remove(0); }
-            apply_batch(&mut state, &batch, &recent_headers)?;
+            recent_headers.push_back(state.timestamp);
+            if recent_headers.len() > window_size { recent_headers.pop_front(); }
+            apply_batch(&mut state, &batch, recent_headers.make_contiguous())?;
             state.target = adjust_difficulty(&state);
         }
         Ok(state)
