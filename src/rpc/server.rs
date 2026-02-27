@@ -20,6 +20,11 @@ impl RpcServer {
 
     pub async fn run(self, node_handle: NodeHandle) -> Result<()> {
         let app = Router::new()
+            .route("/", get(explorer_ui))
+            .route("/batch/:height", get(get_batch))
+            .route("/search", post(search))
+            .route("/coin/:coin_id", get(check_coin_get))
+            .route("/block/:height", get(get_block_raw))
             .route("/health", get(health))
             .route("/filters", post(get_filters))
             .route("/state", get(get_state))
