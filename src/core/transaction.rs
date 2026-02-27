@@ -12,6 +12,125 @@ fn validate_commit_pow(commitment: &[u8; 32], nonce: u64) -> Result<()> {
     Ok(())
 }
 
+/// Pure signature verification only — no state reads or mutations.
+/// Called in parallel across all transactions in a batch before sequential apply.
+pub fn verify_transaction_sigs(tx: &Transaction, height: u64) -> Result<()> {
+    if let Transaction::Reveal { inputs, witnesses, outputs, salt, .. } = tx {
+        let input_coin_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+        let output_commit_hashes: Vec<[u8; 32]> = outputs.iter()
+            .map(|o| o.hash_for_commitment())
+            .collect();
+        let commitment = compute_commitment(&input_coin_ids, &output_commit_hashes, salt);
+
+        for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
+            if !verify_predicate(&input.predicate, witness, &commitment, height, outputs) {
+                bail!("Predicate execution failed for input {}", i);
+            }
+        }
+    }
+    // Commits have no signature to verify
+    Ok(())
+}
+
+/// Apply a transaction that has already passed signature verification.
+/// Skips the verify_predicate call — all other validation still runs.
+pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Result<()> {
+    match tx {
+        Transaction::Commit { .. } => {
+            // Commits are cheap — just delegate to the normal path
+            apply_transaction(state, tx)
+        }
+
+        Transaction::Reveal { inputs, witnesses, outputs, salt, .. } => {
+            if inputs.is_empty() { bail!("Transaction must spend at least one coin"); }
+            if outputs.is_empty() { bail!("Transaction must create at least one new coin"); }
+            if inputs.len() > MAX_TX_INPUTS { bail!("Too many inputs (max {})", MAX_TX_INPUTS); }
+            if outputs.len() > MAX_TX_OUTPUTS { bail!("Too many outputs (max {})", MAX_TX_OUTPUTS); }
+            if witnesses.len() != inputs.len() { bail!("Witness count must match input count"); }
+
+            let max_witness_size = MAX_SIGNATURE_SIZE * 16;
+            if bincode::serialized_size(&witnesses).unwrap_or(u64::MAX) > max_witness_size as u64 {
+                bail!("Witnesses payload exceeds maximum allowed size");
+            }
+
+            {
+                let mut seen = std::collections::HashSet::new();
+                for input in inputs {
+                    if !seen.insert(input.coin_id()) {
+                        bail!("Duplicate input coin");
+                    }
+                }
+            }
+
+            for (i, out) in outputs.iter().enumerate() {
+                if out.value() == 0 { bail!("Zero-value output {}", i); }
+                if !out.value().is_power_of_two() {
+                    bail!("Invalid denomination: output {} value {} is not a power of 2", i, out.value());
+                }
+                if let OutputData::DataBurn { payload, .. } = out {
+                    if payload.len() > crate::core::types::MAX_BURN_DATA_SIZE {
+                        bail!("DataBurn payload exceeds max size of {} bytes", crate::core::types::MAX_BURN_DATA_SIZE);
+                    }
+                }
+            }
+
+            let in_sum = inputs.iter().try_fold(0u64, |acc, i| acc.checked_add(i.value))
+                .ok_or_else(|| anyhow::anyhow!("Input value overflow"))?;
+            let out_sum = outputs.iter().try_fold(0u64, |acc, o| acc.checked_add(o.value()))
+                .ok_or_else(|| anyhow::anyhow!("Output value overflow"))?;
+            if in_sum <= out_sum {
+                bail!("Input value ({}) must exceed output value ({}) to pay fee", in_sum, out_sum);
+            }
+
+            let input_coin_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+            let output_commit_hashes: Vec<[u8; 32]> = outputs.iter()
+                .map(|o| o.hash_for_commitment())
+                .collect();
+            let expected = compute_commitment(&input_coin_ids, &output_commit_hashes, salt);
+
+            if !state.commitments.remove(&expected) {
+                bail!("No matching commitment found (expected {})", hex::encode(expected));
+            }
+
+            // Coin existence check still needed — sig verification doesn't touch state
+            for input in inputs.iter() {
+                let coin_id = input.coin_id();
+                if !state.coins.contains(&coin_id) {
+                    bail!("Coin {} not found or already spent", hex::encode(coin_id));
+                }
+            }
+
+            // NOTE: verify_predicate intentionally skipped here — already done in parallel
+
+            for coin_id in &input_coin_ids {
+                state.coins.remove(coin_id);
+            }
+
+            for out in outputs {
+                if let Some(coin_id) = out.coin_id() {
+                    if !state.coins.insert(coin_id) {
+                        bail!("Duplicate coin created");
+                    }
+                }
+            }
+
+            {
+                let mut hasher = blake3::Hasher::new();
+                for coin_id in &input_coin_ids {
+                    hasher.update(coin_id);
+                }
+                for hash in &output_commit_hashes {
+                    hasher.update(hash);
+                }
+                hasher.update(salt);
+                let tx_hash = *hasher.finalize().as_bytes();
+                state.midstate = hash_concat(&state.midstate, &tx_hash);
+            }
+
+            Ok(())
+        }
+    }
+}
 
 /// Apply a transaction to the state
 pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
