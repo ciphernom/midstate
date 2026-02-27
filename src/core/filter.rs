@@ -127,6 +127,120 @@ fn encode_golomb(writer: &mut BitWriter, value: u64) {
     writer.write_bits(remainder, P);
 }
 
+// ── Client-side filter matching ─────────────────────────────────────────────
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    byte_index: usize,
+    bit_index: u8,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, byte_index: 0, bit_index: 0 }
+    }
+
+    fn read_bit(&mut self) -> Option<bool> {
+        if self.byte_index >= self.data.len() {
+            return None;
+        }
+        let bit = (self.data[self.byte_index] >> (7 - self.bit_index)) & 1 == 1;
+        self.bit_index += 1;
+        if self.bit_index == 8 {
+            self.bit_index = 0;
+            self.byte_index += 1;
+        }
+        Some(bit)
+    }
+
+    fn read_bits(&mut self, count: u8) -> Option<u64> {
+        let mut value = 0u64;
+        for _ in 0..count {
+            value = (value << 1) | (self.read_bit()? as u64);
+        }
+        Some(value)
+    }
+}
+
+/// Decode a single Golomb-Rice coded value.
+fn decode_golomb(reader: &mut BitReader) -> Option<u64> {
+    // Unary: count '1' bits until '0'
+    let mut quotient = 0u64;
+    loop {
+        match reader.read_bit() {
+            Some(true) => quotient += 1,
+            Some(false) => break,
+            None => return None,
+        }
+    }
+    // Binary: read P-bit remainder
+    let remainder = reader.read_bits(P)?;
+    Some((quotient << P) | remainder)
+}
+
+/// Decode an entire filter into the sorted list of hash values.
+fn decode_filter(data: &[u8], n: u64) -> Vec<u64> {
+    if data.is_empty() || n == 0 {
+        return vec![];
+    }
+    let mut reader = BitReader::new(data);
+    let mut values = Vec::with_capacity(n as usize);
+    let mut cumulative = 0u64;
+    for _ in 0..n {
+        match decode_golomb(&mut reader) {
+            Some(delta) => {
+                cumulative += delta;
+                values.push(cumulative);
+            }
+            None => break,
+        }
+    }
+    values
+}
+
+/// Check if ANY of the given items might be present in a compact filter.
+///
+/// `filter_data`: raw Golomb-coded bytes from `CompactFilter::build()` or
+///                from the `/filters` RPC endpoint.
+/// `block_hash`:  the `extension.final_hash` of the block this filter covers.
+///                Required because the filter uses it as a hash key.
+/// `n`:           the number of elements encoded in the filter.
+/// `items`:       set of 32-byte items to test (addresses, coin_ids, etc).
+///
+/// Returns `true` if there's a potential match (may be a false positive at
+/// rate 1/FPR_INVERSE). Returns `false` only if NO item is in the filter.
+pub fn match_any(filter_data: &[u8], block_hash: &[u8; 32], n: u64, items: &[[u8; 32]]) -> bool {
+    if filter_data.is_empty() || n == 0 || items.is_empty() {
+        return false;
+    }
+
+    let modulus = n * FPR_INVERSE;
+
+    // Hash the query items the same way build() does
+    let mut query_hashes: Vec<u64> = items.iter().map(|item| {
+        let h = hash_concat(block_hash, item);
+        let raw = u64::from_le_bytes(h[..8].try_into().unwrap());
+        raw % modulus
+    }).collect();
+    query_hashes.sort();
+    query_hashes.dedup();
+
+    // Decode the filter
+    let filter_values = decode_filter(filter_data, n);
+
+    // Sorted set intersection (both lists are sorted)
+    let mut fi = 0;
+    let mut qi = 0;
+    while fi < filter_values.len() && qi < query_hashes.len() {
+        match filter_values[fi].cmp(&query_hashes[qi]) {
+            std::cmp::Ordering::Equal => return true,
+            std::cmp::Ordering::Less => fi += 1,
+            std::cmp::Ordering::Greater => qi += 1,
+        }
+    }
+    false
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -267,5 +381,103 @@ mod tests {
         // We have 1 commit + (1 input coin_id + 1 input addr) + (1 output coin_id + 1 output addr) = 5 items.
         // 5 items * 2.5 bytes = ~12.5 bytes minimum.
         assert!(filter.data.len() >= 12, "Filter size should reflect the number of elements");
+    }
+
+    // ── Filter Matching Tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_match_any_finds_included_address() {
+        let mut batch = dummy_batch();
+        let address = [0x42; 32];
+        batch.coinbase.push(CoinbaseOutput {
+            address,
+            value: 50,
+            salt: [3; 32],
+        });
+
+        let filter = CompactFilter::build(&batch);
+        // n = number of unique items. Coinbase adds: coin_id + address = 2 items
+        let n = 2;
+        assert!(
+            match_any(&filter.data, &batch.extension.final_hash, n, &[address]),
+            "Filter should match an address that was included in the batch"
+        );
+    }
+
+    #[test]
+    fn test_match_any_rejects_absent_address() {
+        let mut batch = dummy_batch();
+        batch.coinbase.push(CoinbaseOutput {
+            address: [0x42; 32],
+            value: 50,
+            salt: [3; 32],
+        });
+
+        let filter = CompactFilter::build(&batch);
+        let n = 2;
+        let absent = [0xFF; 32];
+        assert!(
+            !match_any(&filter.data, &batch.extension.final_hash, n, &[absent]),
+            "Filter should not match an address absent from the batch"
+        );
+    }
+
+    #[test]
+    fn test_match_any_empty_filter() {
+        let batch = dummy_batch();
+        let filter = CompactFilter::build(&batch);
+        assert!(!match_any(&filter.data, &batch.extension.final_hash, 0, &[[1; 32]]));
+    }
+
+    #[test]
+    fn test_match_any_empty_query() {
+        let mut batch = dummy_batch();
+        batch.coinbase.push(CoinbaseOutput {
+            address: [1; 32], value: 50, salt: [2; 32],
+        });
+        let filter = CompactFilter::build(&batch);
+        assert!(!match_any(&filter.data, &batch.extension.final_hash, 2, &[]));
+    }
+
+    #[test]
+    fn test_encode_decode_round_trip() {
+        // Encode a known sequence and verify decode matches
+        let values = vec![5u64, 12, 100, 1000, 50000];
+        let mut writer = BitWriter::new();
+        let mut prev = 0u64;
+        for &v in &values {
+            encode_golomb(&mut writer, v - prev);
+            prev = v;
+        }
+        let data = writer.into_bytes();
+
+        let decoded = decode_filter(&data, values.len() as u64);
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn test_match_any_with_reveal_outputs() {
+        let mut batch = dummy_batch();
+        let recipient_addr = [0xAA; 32];
+        batch.transactions.push(Transaction::Reveal {
+            inputs: vec![InputReveal {
+                predicate: Predicate::p2pk(&[8; 32]),
+                value: 10,
+                salt: [9; 32],
+            }],
+            witnesses: vec![],
+            outputs: vec![OutputData::Standard {
+                address: recipient_addr,
+                value: 9,
+                salt: [11; 32],
+            }],
+            salt: [12; 32],
+        });
+
+        let filter = CompactFilter::build(&batch);
+        // Items: input coin_id, input address, output coin_id, output address = 4 unique
+        let n = 4;
+        assert!(match_any(&filter.data, &batch.extension.final_hash, n, &[recipient_addr]));
+        assert!(!match_any(&filter.data, &batch.extension.final_hash, n, &[[0xBB; 32]]));
     }
 }

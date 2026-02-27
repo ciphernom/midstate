@@ -126,6 +126,12 @@ pub fn validate_timestamp(
     Ok(())
 }
 
+fn calculate_work(target: &[u8; 32]) -> u64 {
+    let t = U256::from_big_endian(target);
+    if t.is_zero() { return 0; }
+    (U256::MAX / t).low_u64()
+}
+
 /// Apply a batch to the state
 pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]) -> Result<()> {
     // 1. Check parent linkage
@@ -139,6 +145,11 @@ pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]
         bail!("Batch target mismatch: expected {}, got {}",
               hex::encode(state.target),
               hex::encode(batch.target));
+    }
+
+    // Reject oversized batches at consensus level (not just local mining policy)
+    if batch.transactions.len() > MAX_BATCH_SIZE {
+        bail!("Batch exceeds max transaction count: {} > {}", batch.transactions.len(), MAX_BATCH_SIZE);
     }
 
     //timewarp prevention: Validate timestamp
@@ -201,7 +212,8 @@ pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]
     for coin_id in &coinbase_ids {
         temp_state_coins.insert(*coin_id);
     }
-    let expected_state_root = hash_concat(&temp_state_coins.root(), &state.chain_mmr.root());
+    let smt_root = hash_concat(&temp_state_coins.root(), &state.commitments.root());
+    let expected_state_root = hash_concat(&smt_root, &state.chain_mmr.root());
     
     if batch.state_root != expected_state_root {
         bail!("State root mismatch: expected {}, got {}", hex::encode(expected_state_root), hex::encode(batch.state_root));
@@ -224,13 +236,18 @@ pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]
     // 7. Finalize
     state.midstate = batch.extension.final_hash;
     state.chain_mmr.append(&batch.extension.final_hash);
-    state.depth += EXTENSION_ITERATIONS;
+    state.depth += calculate_work(&batch.target);
     state.height += 1;
     state.timestamp = batch.timestamp;
 
     // 8. Deterministic GC: remove expired commitments from state.
     // This MUST happen at a deterministic point (after height increment)
     // so all nodes expire the same commitments at the same height.
+    //
+    // NOTE ON FUND SAFETY: Commits do not lock or modify UTXOs. If a 
+    // commitment expires here, the user's funds are NOT lost or burned. 
+    // The user simply loses their PoW effort and must submit a new Commit.
+    //
     // Uses strict '>' so a commitment at height H expires at H + TTL + 1,
     // giving the full TTL window for reveals.
     let expired: Vec<[u8; 32]> = state.commitment_heights.iter()
