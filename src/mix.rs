@@ -18,6 +18,33 @@ const MIX_SESSION_TIMEOUT: u64 = 300;
 /// Maximum concurrent mix sessions per node.
 const MAX_MIX_SESSIONS: usize = 16;
 
+/// Proof-of-Work bits required for MixJoin/MixFee messages.
+/// 20 bits ≈ 1M BLAKE3 hashes ≈ ~100ms on modern hardware.
+/// Prevents costless Sybil flooding of CoinJoin sessions with rotating PeerIds.
+pub const MIX_JOIN_POW_BITS: u32 = 20;
+
+/// Verify the PoW accompanying a MixJoin or MixFee message.
+/// The challenge is: hash(mix_id || coin_id || nonce_le) must have
+/// at least MIX_JOIN_POW_BITS leading zero bits.
+pub fn verify_mix_join_pow(mix_id: &[u8; 32], coin_id: &[u8; 32], nonce: u64) -> bool {
+    let mut data = Vec::with_capacity(72);
+    data.extend_from_slice(mix_id);
+    data.extend_from_slice(coin_id);
+    data.extend_from_slice(&nonce.to_le_bytes());
+    let h = hash(&data);
+    count_leading_zeros(&h) >= MIX_JOIN_POW_BITS
+}
+
+/// Mine a MixJoin PoW nonce for the given mix_id and coin_id.
+pub fn mine_mix_join_pow(mix_id: &[u8; 32], coin_id: &[u8; 32]) -> u64 {
+    for nonce in 0u64.. {
+        if verify_mix_join_pow(mix_id, coin_id, nonce) {
+            return nonce;
+        }
+    }
+    unreachable!()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MixPhase {
     /// Collecting registrations from participants.
@@ -37,6 +64,8 @@ pub enum MixPhase {
 struct Participant {
     /// None if this participant registered via local RPC.
     peer: Option<PeerId>,
+    /// The coin_id this participant registered, for griefer identification.
+    coin_id: [u8; 32],
 }
 
 /// Node-side state for a single CoinJoin session.
@@ -53,6 +82,9 @@ pub struct NodeMixSession {
     pub is_coordinator: bool,
     /// The coordinator peer (if we're a joiner).
     pub coordinator_peer: Option<PeerId>,
+    /// Outputs registered by the LOCAL wallet (peer = None).
+    /// Used to verify that a coordinator's proposal actually includes our outputs.
+    local_outputs: Vec<[u8; 32]>,
 }
 
 /// Snapshot of a mix session exposed to the RPC layer.
@@ -72,14 +104,18 @@ pub struct MixStatusSnapshot {
 /// Manages all active mix sessions for a node.
 pub struct MixManager {
     sessions: HashMap<[u8; 32], NodeMixSession>,
-    banned_coins: HashSet<[u8; 32]>, // <-- Added
+    /// Peers that failed to sign during a mix session, suggesting griefing.
+    /// We ban the PEER (not the coin) because coin salts are public on-chain,
+    /// meaning anyone can construct valid InputReveals for others' coins.
+    /// Banning coins would let an attacker lock victims out of CoinJoin.
+    banned_peers: HashSet<PeerId>,
 }
 
 impl MixManager {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
-            banned_coins: HashSet::new(), 
+            banned_peers: HashSet::new(), 
         }
     }
 
@@ -117,6 +153,7 @@ impl MixManager {
             created_at: now(),
             is_coordinator: true,
             coordinator_peer: None,
+            local_outputs: Vec::new(),
         });
         Ok(mix_id)
     }
@@ -146,6 +183,7 @@ impl MixManager {
             created_at: now(),
             is_coordinator: false,
             coordinator_peer: Some(coordinator),
+            local_outputs: Vec::new(),
         });
         Ok(())
     }
@@ -166,13 +204,16 @@ pub fn register(
         // registration AND signing the proposal commitment during the Signing
         // phase would constitute two uses of the same key, enabling forgery.
         //
-        // Ownership is authenticated by knowledge of the InputReveal preimage
-        // (predicate + value + salt). The salt is secret, making coin_id
-        // unpredictable — only the coin owner can provide a valid InputReveal.
+        // NOTE: The InputReveal (predicate + value + salt) is NOT a secret —
+        // all three fields are broadcast in cleartext when a coin is spent.
+        // This means a third party can register someone else's coins in a mix.
+        // To mitigate griefing, we ban the PEER on signing timeout, not the coin.
         // The actual spending signature happens exactly once in the Signing phase.
 
-        if self.banned_coins.contains(&coin_id) {
-            bail!("Coin is banned from mixing due to a previous signature timeout");
+        if let Some(p) = peer {
+            if self.banned_peers.contains(&p) {
+                bail!("Peer is banned from mixing due to a previous signature timeout");
+            }
         }
         let ns = self.sessions.get_mut(mix_id)
             .ok_or_else(|| anyhow::anyhow!("mix session not found"))?;
@@ -182,7 +223,12 @@ pub fn register(
         }
 
         ns.session.register(input.clone(), output.clone())?;
-        ns.participants.push(Participant { peer });
+        // Track outputs from LOCAL wallet so we can verify the coordinator's
+        // proposal includes them (prevents proposal-stealing attack).
+        if peer.is_none() {
+            ns.local_outputs.push(output.hash_for_commitment());
+        }
+        ns.participants.push(Participant { peer, coin_id });
         Ok(())
     }
 
@@ -193,9 +239,10 @@ pub fn register(
         input: InputReveal,
         peer: Option<PeerId>,
     ) -> Result<()> {
-        let coin_id = input.coin_id();
-        if self.banned_coins.contains(&coin_id) {
-            bail!("Coin is banned from mixing due to a previous signature timeout");
+        if let Some(p) = peer {
+            if self.banned_peers.contains(&p) {
+                bail!("Peer is banned from mixing due to a previous signature timeout");
+            }
         }
         let ns = self.sessions.get_mut(mix_id)
             .ok_or_else(|| anyhow::anyhow!("mix session not found"))?;
@@ -205,7 +252,8 @@ pub fn register(
         }
 
         ns.session.set_fee_input(input.clone())?;
-        ns.fee_participant = Some(Participant { peer });
+        let coin_id = input.coin_id();
+        ns.fee_participant = Some(Participant { peer, coin_id });
         Ok(())
     }
 
@@ -232,6 +280,8 @@ pub fn register(
         mix_id: &[u8; 32],
         input_index: usize,
         signature: Vec<u8>,
+        current_height: u64,
+        peer: Option<PeerId>,
     ) -> Result<()> {
         let ns = self.sessions.get_mut(mix_id)
             .ok_or_else(|| anyhow::anyhow!("mix session not found"))?;
@@ -245,6 +295,29 @@ pub fn register(
 
         if input_index >= proposal.inputs.len() {
             bail!("input_index {} out of range ({})", input_index, proposal.inputs.len());
+        }
+
+        // Cryptographic verification: execute the predicate script against the
+        // provided signature BEFORE accepting it. Without this, an attacker can
+        // submit garbage bytes, forcing the coordinator to waste CPU mining the
+        // Commit PoW only for the Reveal to fail mempool validation.
+        let input = &proposal.inputs[input_index];
+        let is_valid = match &input.predicate {
+            crate::core::types::Predicate::Script { bytecode } => {
+                let ctx = crate::core::script::ExecContext {
+                    commitment: &proposal.commitment,
+                    height: current_height,
+                    outputs: &proposal.outputs,
+                };
+                crate::core::script::execute_script(bytecode, &[signature.clone()], &ctx).is_ok()
+            }
+        };
+
+        if !is_valid {
+            if let Some(p) = peer {
+                self.banned_peers.insert(p);
+            }
+            bail!("Invalid signature for input {}", input_index);
         }
 
         ns.signatures.insert(input_index, signature);
@@ -302,6 +375,18 @@ pub fn register(
         let expected = compute_commitment(&input_ids, &output_ids, &salt);
         if expected != commitment {
             bail!("proposal commitment mismatch");
+        }
+
+        // SECURITY: Verify that ALL outputs we registered locally are present
+        // in the proposal. Without this check, a malicious coordinator could
+        // replace our destination address with their own.
+        for local_hash in &ns.local_outputs {
+            if !output_ids.contains(local_hash) {
+                bail!(
+                    "Proposal is missing our registered output {} — possible proposal-stealing attack",
+                    hex::encode(local_hash)
+                );
+            }
         }
 
         ns.proposal = Some(MixProposal {
@@ -367,7 +452,7 @@ pub fn register(
     /// Remove timed-out and completed sessions.
     pub fn cleanup(&mut self) {
         let now_time = now();
-        let mut to_ban = Vec::new();
+        let mut peers_to_ban = Vec::new();
 
         self.sessions.retain(|id, ns| {
             // Griefer detection: 60 seconds in Signing phase without finishing
@@ -376,8 +461,22 @@ pub fn register(
                     for (i, input) in proposal.inputs.iter().enumerate() {
                         if !ns.signatures.contains_key(&i) {
                             let cid = input.coin_id();
-                            to_ban.push(cid);
-                            tracing::warn!("Coin {} banned for stalling mix {}", hex::encode(cid), hex::encode(id));
+                            // Find the PEER that registered this coin_id.
+                            // Only ban remote peers — local wallet can't grief itself.
+                            let peer = ns.participants.iter()
+                                .find(|p| p.coin_id == cid)
+                                .and_then(|p| p.peer)
+                                .or_else(|| ns.fee_participant.as_ref()
+                                    .filter(|fp| fp.coin_id == cid)
+                                    .and_then(|fp| fp.peer));
+
+                            if let Some(p) = peer {
+                                peers_to_ban.push(p);
+                                tracing::warn!(
+                                    "Peer {} banned for stalling mix {} (unsigned input {})",
+                                    p, hex::encode(id), hex::encode(cid)
+                                );
+                            }
                         }
                     }
                 }
@@ -395,8 +494,8 @@ pub fn register(
             }
         });
 
-        for coin_id in to_ban {
-            self.banned_coins.insert(coin_id);
+        for peer in peers_to_ban {
+            self.banned_peers.insert(peer);
         }
     }
 
@@ -500,7 +599,7 @@ mod tests {
                 else if pk == wots::keygen(&seed_b) { seed_b }
                 else { seed_f };
             let sig = wots::sig_to_bytes(&wots::sign(&seed, &proposal.commitment));
-            mgr.add_signature(&mix_id, i, sig).unwrap();
+            mgr.add_signature(&mix_id, i, sig, 0, None).unwrap();
         }
 
         let tx = mgr.try_build_transaction(&mix_id).unwrap();
@@ -520,12 +619,23 @@ mod tests {
         let mut mgr = MixManager::new();
         let mix_id = mgr.create_session(8, 2).unwrap();
 
+        let seed_a = hash(b"alice");
+        let seed_b = hash(b"bob");
+        let seed_f = hash(b"fee");
+
         mgr.register(&mix_id, make_input(b"alice", 8), make_output(b"alice", 8), &test_sig(b"alice", &mix_id), None).unwrap();
         mgr.register(&mix_id, make_input(b"bob", 8), make_output(b"bob", 8), &test_sig(b"bob", &mix_id), None).unwrap();
         mgr.set_fee_input(&mix_id, make_input(b"fee", 1), None).unwrap();
 
-        mgr.try_finalize(&mix_id).unwrap();
-        mgr.add_signature(&mix_id, 0, vec![0u8; 576]).unwrap();
+        let proposal = mgr.try_finalize(&mix_id).unwrap().unwrap();
+
+        // Sign only input 0 with a real signature
+        let pk = proposal.inputs[0].predicate.owner_pk().unwrap();
+        let seed = if pk == wots::keygen(&seed_a) { seed_a }
+            else if pk == wots::keygen(&seed_b) { seed_b }
+            else { seed_f };
+        let sig = wots::sig_to_bytes(&wots::sign(&seed, &proposal.commitment));
+        mgr.add_signature(&mix_id, 0, sig, 0, None).unwrap();
 
         // Still missing sigs for inputs 1 and 2
         assert!(mgr.try_build_transaction(&mix_id).unwrap().is_none());

@@ -6,10 +6,10 @@
 //!    O(1) amortised append, O(log n) inclusion proofs, O(log n) root via peaks.
 //!
 //! 2. **UtxoAccumulator** — Merkle-committed mutable UTXO set.
-//!    Sorted-vec backed today (O(n) insert/remove, trivially correct).
-//!    Drop-in replacement: swap `State.coins: HashSet` → `UtxoAccumulator`,
-//!    keep the same `.contains()` / `.insert()` / `.remove()` API.
-//!    For millions of coins, swap internals for a Sparse Merkle Tree or Utreexo.
+//!    Implemented as a Sparse Merkle Tree (SMT) backed by `im::OrdSet` to yield 
+//!    O(log n) insert/remove/contains operations. It serves as a drop-in replacement 
+//!    for `HashSet`, maintaining the same `.contains()` / `.insert()` / `.remove()` API 
+//!    while providing a verifiable cryptographic state root.
 
 use super::types::hash_concat;
 use anyhow::{bail, Result};
