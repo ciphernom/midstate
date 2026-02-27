@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use super::mmr::UtxoAccumulator;
 
 
@@ -157,12 +157,11 @@ pub struct State {
 impl State {
     pub fn genesis() -> (Self, Vec<CoinbaseOutput>) {
         // Bitcoin block anchor
-        // Height: 935897
-        // Hash: 00000000000000000000329a84d79877397ec0fa7c5aaa706a88e545daf599a5
-        // Time: 2026-02-10 10:37:27 UTC
-        const BITCOIN_BLOCK_HASH: &str = "00000000000000000000329a84d79877397ec0fa7c5aaa706a88e545daf599a5";
-        const BITCOIN_BLOCK_HEIGHT: u64 = 935897;
-        const BITCOIN_BLOCK_TIME: u64 = 1770719847;
+        // Height: 938708
+        // Hash: 000000000000000000018f5ad5625d43356136c2e50c6dc18967a90a18f0af2e
+        const BITCOIN_BLOCK_HASH: &str = "000000000000000000018f5ad5625d43356136c2e50c6dc18967a90a18f0af2e";
+        const BITCOIN_BLOCK_HEIGHT: u64 = 938708;
+        const BITCOIN_BLOCK_TIME: u64 = 1772274770;
 
         let anchor = hash(BITCOIN_BLOCK_HASH.as_bytes());
 
@@ -199,14 +198,13 @@ impl State {
             }
         ];
 
-        // Initial difficulty target (very easy for testing)
+        // Initial difficulty target (calibrated for ~60s blocks on baseline hardware)
         let target = [
-            0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0x00, 0x11, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
         ];
-
         let initial_midstate = hash_concat(&anchor, &BITCOIN_BLOCK_HEIGHT.to_le_bytes());
 
         let state = Self {
@@ -225,7 +223,9 @@ impl State {
 pub fn header(&self) -> BatchHeader {
         // Clone coins because root() requires &mut self
         let mut coins_clone = self.coins.clone();
-        let state_root = hash_concat(&coins_clone.root(), &self.chain_mmr.root());
+        let mut commitments_clone = self.commitments.clone();
+        let smt_root = hash_concat(&coins_clone.root(), &commitments_clone.root());
+        let state_root = hash_concat(&smt_root, &self.chain_mmr.root());
 
         BatchHeader {
             height: self.height,
@@ -287,8 +287,10 @@ impl Batch {
 // ── Value-bearing data structures ───────────────────────────────────────────
 
 
+
+
 /// Cleartext output data carried in a transaction.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq, Hash)] // <-- Removed serde::Deserialize here
 pub enum OutputData {
     Standard {
         address: [u8; 32],
@@ -299,6 +301,36 @@ pub enum OutputData {
     DataBurn {
         payload: Vec<u8>,
         value_burned: u64,
+    }
+}
+
+// Manually implement Deserialize to enforce the payload size limit
+impl<'de> Deserialize<'de> for OutputData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        enum OutputDataHelper {
+            Standard { address: [u8; 32], value: u64, salt: [u8; 32] },
+            DataBurn { payload: Vec<u8>, value_burned: u64 },
+        }
+
+        let helper = OutputDataHelper::deserialize(deserializer)?;
+        match helper {
+            OutputDataHelper::Standard { address, value, salt } => {
+                Ok(OutputData::Standard { address, value, salt })
+            }
+            OutputDataHelper::DataBurn { payload, value_burned } => {
+                if payload.len() > crate::core::MAX_BURN_DATA_SIZE {
+                    return Err(serde::de::Error::custom(format!(
+                        "DataBurn payload exceeds max size of {}", 
+                        crate::core::MAX_BURN_DATA_SIZE
+                    )));
+                }
+                Ok(OutputData::DataBurn { payload, value_burned })
+            }
+        }
     }
 }
 
@@ -507,7 +539,13 @@ pub const ASERT_HALF_LIFE: i64 = 4 * 60 * 60; // 4 hours (240 blocks)
 /// and timestamp window management in the node layer.
 pub const DIFFICULTY_LOOKBACK: u64 = 60;
 pub const MEDIAN_TIME_PAST_WINDOW: usize = 11;
-pub const COMMITMENT_TTL: u64 = 100; 
+/// Commitment time-to-live in blocks. A commitment must be revealed within
+/// this window or it expires and is garbage-collected from state.
+///
+/// 1000 blocks ≈ 16.7 hours at 60s target. Long enough to survive transient
+/// censorship or network partitions; short enough to bound state bloat
+/// (max ~20K live commitments at 20 commits/block).
+pub const COMMITMENT_TTL: u64 = 1000; 
 
 /// Blocks behind tip before checkpoints are pruned from stored batches.
 /// Pruning reclaims ~32 KB per block (~98% of batch storage). Pruned batches

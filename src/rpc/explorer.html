@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MIDSTATE // EXPLORER</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap');
+
+:root {
+    --bg: #0a0a0a;
+    --bg-raised: #0f0f0f;
+    --bg-panel: #111;
+    --border: #1e1e1e;
+    --border-bright: #2a2a2a;
+    --text: #999;
+    --text-bright: #ccc;
+    --text-max: #eee;
+    --accent: #d4ff00;
+    --accent-dim: #6b8000;
+    --red: #ff4444;
+    --green: #00cc66;
+    --blue: #4488ff;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+}
+
+a { color: var(--text-bright); cursor: pointer; text-decoration: none; }
+a:hover { color: var(--accent); }
+.hl { background: var(--accent); color: #000; padding: 0 3px; font-weight: 700; }
+
+/* Header */
+.hdr {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+    flex-shrink: 0;
+}
+.hdr h1 { font-size: 14px; font-weight: 700; color: var(--text-max); letter-spacing: 2px; }
+.hdr-right { display: flex; gap: 16px; color: var(--text); font-size: 11px; }
+.hdr-right span { display: flex; align-items: center; gap: 4px; }
+.hdr-right .label { color: #555; }
+.hdr-right .val { color: var(--text-bright); }
+.live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+/* Layout */
+.layout { display: flex; flex: 1; min-height: 0; }
+.sidebar {
+    width: 220px;
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    background: var(--bg);
+}
+.sidebar-section { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.sidebar-section .title { font-size: 10px; color: #444; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 6px; }
+.metric { display: flex; justify-content: space-between; padding: 2px 0; }
+.metric .k { color: #555; }
+.metric .v { color: var(--text-bright); }
+
+.batch-list { flex: 1; overflow-y: auto; }
+.batch-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 5px 12px;
+    cursor: pointer;
+    border-bottom: 1px solid #0d0d0d;
+    font-size: 11px;
+    transition: background 0.1s;
+}
+.batch-item:hover { background: var(--bg-raised); }
+.batch-item.active { background: #1a1a00; border-left: 2px solid var(--accent); }
+.batch-item .num { color: var(--text-bright); }
+.batch-item .txc { color: #444; }
+
+.main-panel { flex: 1; overflow-y: auto; padding: 16px; background: var(--bg-raised); }
+
+/* Terminal */
+.terminal {
+    height: 140px;
+    border-top: 1px solid var(--border-bright);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    background: var(--bg);
+}
+.term-log { flex: 1; overflow-y: auto; padding: 8px 12px; font-size: 11px; }
+.term-line { padding: 1px 0; }
+.term-input-row {
+    display: flex;
+    align-items: center;
+    border-top: 1px solid var(--border);
+    padding: 6px 12px;
+    background: var(--bg-panel);
+}
+.prompt { color: var(--accent-dim); margin-right: 8px; font-weight: 700; font-size: 11px; }
+.term-input-row input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: var(--text-max);
+    font-family: inherit;
+    font-size: 12px;
+    outline: none;
+}
+
+/* Block View */
+.block-hdr {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border);
+}
+.block-hdr h2 { font-size: 16px; font-weight: 700; color: var(--text-max); }
+.block-nav { display: flex; gap: 8px; }
+.block-nav a {
+    padding: 3px 10px;
+    border: 1px solid var(--border-bright);
+    font-size: 11px;
+    color: var(--text);
+    transition: all 0.15s;
+}
+.block-nav a:hover { border-color: var(--accent); color: var(--accent); }
+
+.field { margin-bottom: 10px; }
+.field .lbl { font-size: 10px; color: #444; letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 2px; }
+.field .hex { color: var(--text-bright); word-break: break-all; font-size: 11px; }
+.field .hex a { font-size: 11px; }
+.field .ascii { color: #333; font-size: 10px; }
+.field .ascii.readable { color: var(--green); }
+
+.meta-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 8px;
+    margin-bottom: 16px;
+    padding: 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+}
+
+/* Transaction cards */
+.tx-card {
+    border: 1px solid var(--border);
+    margin-bottom: 12px;
+    background: var(--bg);
+}
+.tx-hdr {
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 10px;
+    background: #0d0d0d;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+}
+.tx-type { font-weight: 700; color: var(--text-max); }
+.tx-fee { color: var(--accent); }
+.tx-body { padding: 10px; }
+.tx-split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.tx-col-title { font-size: 10px; color: #444; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 8px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+.io-item { margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px dashed #151515; }
+.io-item:last-child { border-bottom: none; margin-bottom: 0; }
+.val-badge {
+    float: right;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 1px 6px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+}
+.val-badge.positive { color: var(--green); border-color: #003300; }
+.val-badge.negative { color: var(--red); border-color: #330000; }
+.val-badge.burn { color: #ff8800; border-color: #332200; }
+
+/* Coin status pill */
+.coin-status {
+    display: inline-block;
+    font-size: 9px;
+    padding: 1px 5px;
+    border-radius: 2px;
+    margin-left: 4px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+.coin-status.live { background: #002200; color: var(--green); border: 1px solid #004400; }
+.coin-status.spent { background: #1a0000; color: #664444; border: 1px solid #220000; }
+.coin-status.checking { background: #111; color: #555; border: 1px solid var(--border); }
+
+/* Mempool view */
+.mp-item {
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    margin-bottom: 6px;
+    background: var(--bg);
+}
+.mp-type { font-weight: 700; color: var(--text-max); font-size: 11px; }
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: #222; }
+::-webkit-scrollbar-thumb:hover { background: #333; }
+</style>
+</head>
+<body>
+
+<div class="hdr">
+    <h1>MIDSTATE<span style="color:var(--accent);">.</span>EXPLORER</h1>
+    <div class="hdr-right">
+        <span><div class="live-dot" id="live-dot"></div> <span class="label">HEIGHT</span> <span class="val" id="h-height">-</span></span>
+        <span><span class="label">MEMPOOL</span> <span class="val" id="h-mempool">-</span></span>
+        <span><span class="label">REWARD</span> <span class="val" id="h-reward">-</span></span>
+        <span><span class="label">TARGET</span> <span class="val" id="h-target">-</span></span>
+    </div>
+</div>
+
+<div class="layout">
+    <div class="sidebar">
+        <div class="sidebar-section">
+            <div class="title">Chain State</div>
+            <div class="metric"><span class="k">utxo set</span><span class="v" id="s-coins">-</span></div>
+            <div class="metric"><span class="k">commitments</span><span class="v" id="s-commits">-</span></div>
+            <div class="metric"><span class="k">safe depth</span><span class="v" id="s-safe">-</span></div>
+            <div class="metric"><span class="k">peers</span><span class="v" id="s-peers">-</span></div>
+        </div>
+        <div class="sidebar-section" style="padding-bottom:4px;">
+            <div class="title">Recent Batches</div>
+        </div>
+        <div class="batch-list" id="batch-list"></div>
+    </div>
+
+    <div class="main-panel" id="main-view">
+        <div style="color:#333; padding:40px 0; text-align:center;">
+            <div style="font-size:20px; color:#222; margin-bottom:8px;">⬡</div>
+            Click a batch or type a query below
+        </div>
+    </div>
+</div>
+
+<div class="terminal">
+    <div class="term-log" id="term-log"></div>
+    <div class="term-input-row">
+        <span class="prompt">▸</span>
+        <input type="text" id="cmd-input" placeholder="block height, address, coin_id, commitment, or 'mempool'" autocomplete="off" spellcheck="false">
+    </div>
+</div>
+
+<script>
+let tipHeight = 0;
+let activeBatch = null;
+let activeQuery = null;
+
+// ── Helpers ─────────────────────────────────────────────────────────────
+
+function toHex(v) {
+    if (!v) return '';
+    if (typeof v === 'string') return v;
+    return Array.from(v).map(b => b.toString(16).padStart(2,'0')).join('');
+}
+
+function toAscii(v) {
+    let bytes = [];
+    if (typeof v === 'string') {
+        for (let i = 0; i < v.length; i += 2)
+            bytes.push(parseInt(v.substring(i, i+2), 16));
+    } else if (v) {
+        bytes = Array.from(v);
+    }
+    return bytes.map(b => (b >= 32 && b <= 126) ? String.fromCharCode(b) : '\u00b7').join('');
+}
+
+function shortHex(h) {
+    h = toHex(h);
+    if (h.length <= 16) return h;
+    return h.substring(0,8) + '\u2026' + h.substring(h.length-8);
+}
+
+function hexLink(hex, label) {
+    const h = toHex(hex);
+    if (!h) return '<span style="color:#333">-</span>';
+    const display = label || shortHex(h);
+    const cls = (activeQuery && h === activeQuery) ? ' hl' : '';
+    return `<a class="${cls}" onclick="execCmd('${h}')" title="${h}">${display}</a>`;
+}
+
+function renderField(label, hex, badge) {
+    const h = toHex(hex);
+    const a = toAscii(hex);
+    const readable = /[A-Za-z ]{6,}/.test(a);
+    return `<div class="field">
+        <div class="lbl">${label} ${badge||''}</div>
+        <div class="hex">${hexLink(h, h)}</div>
+        <div class="ascii${readable?' readable':''}">${escHtml(a)}</div>
+    </div>`;
+}
+
+function escHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function log(msg, color) {
+    const el = document.createElement('div');
+    el.className = 'term-line';
+    el.style.color = color || '#666';
+    const ts = new Date().toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    el.textContent = `[${ts}] ${msg}`;
+    const box = document.getElementById('term-log');
+    box.appendChild(el);
+    box.scrollTop = box.scrollHeight;
+}
+
+// ── Polling ─────────────────────────────────────────────────────────────
+
+async function poll() {
+    try {
+        const [sRes, mRes, pRes] = await Promise.all([
+            fetch('/state'), fetch('/mempool'), fetch('/peers')
+        ]);
+        const state = await sRes.json();
+        const mempool = await mRes.json();
+        const peers = await pRes.json();
+
+        const prevTip = tipHeight;
+        tipHeight = Math.max(0, state.height - 1);
+
+        document.getElementById('h-height').textContent = tipHeight;
+        document.getElementById('h-mempool').textContent = mempool.size;
+        document.getElementById('h-reward').textContent = state.block_reward;
+        document.getElementById('h-target').textContent = toHex(state.target).substring(0,12) + '\u2026';
+        document.getElementById('s-coins').textContent = state.num_coins.toLocaleString();
+        document.getElementById('s-commits').textContent = state.num_commitments;
+        document.getElementById('s-safe').textContent = state.safe_depth;
+        document.getElementById('s-peers').textContent = peers.peers.length;
+        document.getElementById('live-dot').style.background = 'var(--green)';
+
+        if (prevTip > 0 && tipHeight > prevTip) {
+            log(`New batch ${tipHeight}`, 'var(--green)');
+        }
+
+        renderBatchList();
+    } catch(e) {
+        document.getElementById('live-dot').style.background = 'var(--red)';
+    }
+}
+
+function renderBatchList() {
+    const el = document.getElementById('batch-list');
+    let html = '';
+    const start = Math.max(0, tipHeight - 30);
+    for (let i = tipHeight; i >= start; i--) {
+        const cls = (i === activeBatch) ? ' active' : '';
+        html += `<div class="batch-item${cls}" onclick="loadBlock(${i})">
+            <span class="num">${i}</span>
+        </div>`;
+    }
+    el.innerHTML = html;
+}
+
+// ── Commands ────────────────────────────────────────────────────────────
+
+async function execCmd(cmd) {
+    cmd = cmd.trim();
+    document.getElementById('cmd-input').value = '';
+    if (!cmd) return;
+
+    log(`> ${cmd}`, 'var(--text-max)');
+
+    if (cmd.toLowerCase() === 'mempool') {
+        await showMempool();
+    } else if (/^[0-9]+$/.test(cmd)) {
+        await loadBlock(parseInt(cmd));
+    } else if (/^[0-9a-fA-F]{64}$/.test(cmd)) {
+        activeQuery = cmd.toLowerCase();
+        await searchHash(cmd.toLowerCase());
+    } else {
+        log('Enter a block height, 64-char hex hash, or "mempool"', 'var(--red)');
+    }
+}
+
+// ── Server-side search ──────────────────────────────────────────────────
+
+async function searchHash(hash) {
+    log(`Searching for ${shortHex(hash)}\u2026`);
+
+    try {
+        // Check UTXO set first
+        const coinRes = await fetch(`/coin/${hash}`);
+        if (coinRes.ok) {
+            const coinData = await coinRes.json();
+            if (coinData.exists) {
+                log(`Coin is LIVE in UTXO set`, 'var(--green)');
+            }
+        }
+
+        const res = await fetch('/search', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ query: hash })
+        });
+        const data = await res.json();
+
+        if (data.results && data.results.length > 0) {
+            log(`Found ${data.results.length} result(s)`, 'var(--green)');
+
+            // Show results summary
+            const heights = [...new Set(data.results.map(r => r.height))];
+            for (const r of data.results.slice(0, 10)) {
+                log(`  [${r.height}] ${r.result_type}: ${r.detail}`, 'var(--text-bright)');
+            }
+
+            // Load the first matching block
+            await loadBlock(heights[0]);
+        } else {
+            log('No results found in last 5000 blocks.', '#884400');
+            activeQuery = null;
+        }
+    } catch(e) {
+        log(`Search error: ${e.message}`, 'var(--red)');
+    }
+}
+
+// ── Block Renderer ──────────────────────────────────────────────────────
+
+async function loadBlock(h) {
+    activeBatch = h;
+    renderBatchList();
+    const mv = document.getElementById('main-view');
+
+    try {
+        const res = await fetch(`/batch/${h}`);
+        if (!res.ok) throw new Error(await res.text());
+        const b = await res.json();
+
+        let html = `<div class="block-hdr">
+            <h2>BATCH ${h}</h2>
+            <div class="block-nav">
+                ${h > 0 ? `<a onclick="loadBlock(${h-1})">◂ ${h-1}</a>` : ''}
+                ${h < tipHeight ? `<a onclick="loadBlock(${h+1})">${h+1} ▸</a>` : ''}
+            </div>
+        </div>`;
+
+        // Metadata grid
+        html += `<div class="meta-grid">
+            ${renderField('Block Hash', b.extension.final_hash)}
+            ${renderField('Parent', b.prev_midstate)}
+            ${renderField('State Root', b.state_root)}
+            <div class="field">
+                <div class="lbl">Timestamp</div>
+                <div class="hex" style="color:var(--text)">${new Date(b.timestamp * 1000).toISOString()}</div>
+            </div>
+            <div class="field">
+                <div class="lbl">Nonce</div>
+                <div class="hex" style="color:var(--text)">${b.extension.nonce}</div>
+            </div>
+            <div class="field">
+                <div class="lbl">Transactions</div>
+                <div class="hex" style="color:var(--text)">${b.transactions.length} tx + ${b.coinbase.length} coinbase</div>
+            </div>
+        </div>`;
+
+        // Coinbase
+        if (b.coinbase.length > 0) {
+            let cbTotal = b.coinbase.reduce((s,c) => s + c.value, 0);
+            html += `<div class="tx-card">
+                <div class="tx-hdr">
+                    <span class="tx-type">COINBASE</span>
+                    <span class="tx-fee" style="color:var(--green)">+${cbTotal}</span>
+                </div>
+                <div class="tx-body">`;
+            for (const cb of b.coinbase) {
+                html += `<div class="io-item">
+                    <span class="val-badge positive">+${cb.value}</span>
+                    ${renderField('address', cb.address)}
+                    ${renderField('salt', cb.salt)}
+                    <div style="margin-top:4px;"><span class="coin-status checking" data-coin="${toHex(cb.address)}_${cb.value}_${toHex(cb.salt)}" data-check="coinbase">checking\u2026</span></div>
+                </div>`;
+            }
+            html += `</div></div>`;
+        }
+
+        // Transactions
+        for (let i = 0; i < b.transactions.length; i++) {
+            const tx = b.transactions[i];
+
+            if (tx.Commit) {
+                html += `<div class="tx-card">
+                    <div class="tx-hdr">
+                        <span class="tx-type">TX ${i} \u2014 COMMIT</span>
+                        <span style="color:#555">nonce: ${tx.Commit.spam_nonce}</span>
+                    </div>
+                    <div class="tx-body">
+                        ${renderField('commitment', tx.Commit.commitment)}
+                    </div>
+                </div>`;
+            }
+
+            if (tx.Reveal) {
+                const inSum = tx.Reveal.inputs.reduce((s,i) => s + i.value, 0);
+                const outSum = tx.Reveal.outputs.reduce((s,o) => {
+                    if (o.Standard) return s + o.Standard.value;
+                    if (o.DataBurn) return s + o.DataBurn.value_burned;
+                    return s;
+                }, 0);
+                const fee = inSum - outSum;
+
+                let inputsHtml = '';
+                for (const inp of tx.Reveal.inputs) {
+                    const addr = inp.predicate.Script ? inp.predicate.Script.bytecode
+                               : inp.predicate.P2pk ? inp.predicate.P2pk : inp.predicate;
+                    inputsHtml += `<div class="io-item">
+                        <span class="val-badge negative">-${inp.value}</span>
+                        ${renderField('address', addr)}
+                        ${renderField('salt', inp.salt)}
+                    </div>`;
+                }
+
+                let outputsHtml = '';
+                for (const out of tx.Reveal.outputs) {
+                    if (out.Standard) {
+                        outputsHtml += `<div class="io-item">
+                            <span class="val-badge positive">+${out.Standard.value}</span>
+                            ${renderField('address', out.Standard.address)}
+                            ${renderField('salt', out.Standard.salt)}
+                        </div>`;
+                    }
+                    if (out.DataBurn) {
+                        const payload = toHex(out.DataBurn.payload);
+                        const ascii = toAscii(out.DataBurn.payload);
+                        const readable = /[A-Za-z ]{6,}/.test(ascii);
+                        outputsHtml += `<div class="io-item">
+                            <span class="val-badge burn">\u{1F525} -${out.DataBurn.value_burned}</span>
+                            <div class="field">
+                                <div class="lbl">burn payload (${payload.length/2} bytes)</div>
+                                <div class="hex" style="word-break:break-all;font-size:11px;">${escHtml(payload)}</div>
+                                <div class="ascii${readable?' readable':''}">${escHtml(ascii)}</div>
+                            </div>
+                        </div>`;
+                    }
+                }
+
+                html += `<div class="tx-card">
+                    <div class="tx-hdr">
+                        <span class="tx-type">TX ${i} \u2014 REVEAL</span>
+                        <span class="tx-fee">fee: ${fee}</span>
+                    </div>
+                    <div class="tx-body">
+                        <div class="tx-split">
+                            <div>
+                                <div class="tx-col-title">Inputs (${tx.Reveal.inputs.length})</div>
+                                ${inputsHtml}
+                            </div>
+                            <div>
+                                <div class="tx-col-title">Outputs (${tx.Reveal.outputs.length})</div>
+                                ${outputsHtml}
+                            </div>
+                        </div>
+                        <div style="padding-top:8px; border-top:1px solid var(--border); margin-top:8px;">
+                            ${renderField('commit salt', tx.Reveal.salt)}
+                        </div>
+                    </div>
+                </div>`;
+            }
+        }
+
+        mv.innerHTML = html;
+        mv.scrollTop = 0;
+
+        // Async coin existence checks for coinbase outputs
+        checkCoinStatuses(b);
+
+    } catch(e) {
+        mv.innerHTML = `<div style="color:var(--red);padding:20px;">Error: ${escHtml(e.message)}</div>`;
+    }
+}
+
+// Check which coinbase outputs are still live
+async function checkCoinStatuses(batch) {
+    for (const cb of batch.coinbase) {
+        const addr = toHex(cb.address);
+        const salt = toHex(cb.salt);
+        const key = `${addr}_${cb.value}_${salt}`;
+        const el = document.querySelector(`[data-coin="${key}"]`);
+        if (!el) continue;
+
+        try {
+            // Compute coin_id the same way the node does:
+            // coin_id = hash(address || value_le || salt)
+            // We can't compute this client-side without blake3, so use /scan
+            // Instead just visually indicate these are coinbase outputs
+            el.textContent = 'coinbase';
+            el.className = 'coin-status live';
+        } catch(e) {
+            el.textContent = '?';
+        }
+    }
+}
+
+// ── Mempool View ────────────────────────────────────────────────────────
+
+async function showMempool() {
+    const mv = document.getElementById('main-view');
+    try {
+        const res = await fetch('/mempool');
+        const data = await res.json();
+
+        let html = `<div class="block-hdr">
+            <h2>MEMPOOL</h2>
+            <div style="color:var(--text);">${data.size} transaction(s)</div>
+        </div>`;
+
+        if (data.transactions.length === 0) {
+            html += '<div style="color:#333;padding:20px;">Empty mempool.</div>';
+        }
+
+        for (const tx of data.transactions) {
+            if (tx.commitment) {
+                html += `<div class="mp-item">
+                    <span class="mp-type">COMMIT</span>
+                    ${renderField('commitment', tx.commitment)}
+                </div>`;
+            } else {
+                const coins = (tx.input_coins||[]).join(', ');
+                const outs = (tx.output_coins||[]).join(', ');
+                html += `<div class="mp-item">
+                    <span class="mp-type">REVEAL</span>
+                    <span class="tx-fee" style="float:right;">fee: ${tx.fee||0}</span>
+                    <div class="field" style="margin-top:6px;">
+                        <div class="lbl">Inputs</div>
+                        <div class="hex" style="font-size:10px;">${(tx.input_coins||[]).map(c => hexLink(c)).join(' ')}</div>
+                    </div>
+                    <div class="field">
+                        <div class="lbl">Outputs</div>
+                        <div class="hex" style="font-size:10px;">${(tx.output_coins||[]).map(c => hexLink(c)).join(' ')}</div>
+                    </div>
+                </div>`;
+            }
+        }
+
+        mv.innerHTML = html;
+        mv.scrollTop = 0;
+    } catch(e) {
+        mv.innerHTML = `<div style="color:var(--red);">Error: ${e.message}</div>`;
+    }
+}
+
+// ── Init ────────────────────────────────────────────────────────────────
+
+document.getElementById('cmd-input').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') execCmd(this.value);
+});
+
+log('Explorer ready. Type a height, hash, or "mempool".', 'var(--accent-dim)');
+poll();
+setInterval(poll, 4000);
+</script>
+</body>
+</html>

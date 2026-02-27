@@ -178,6 +178,12 @@ pub struct GetFiltersRequest {
 pub struct GetFiltersResponse {
     pub start_height: u64,
     pub filters: Vec<String>, // Hex-encoded filter data
+    /// Block hashes (final_hash) keying each filter — needed for client-side matching
+    #[serde(default)]
+    pub block_hashes: Vec<String>,
+    /// Number of elements in each filter — needed for Golomb-Rice decoding
+    #[serde(default)]
+    pub element_counts: Vec<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -218,4 +224,25 @@ pub struct MixActionResponse {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_index: Option<usize>,
+}
+
+// ── Explorer Search Types ───────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchRequest {
+    /// Hex-encoded 32-byte hash to search for
+    pub query: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub result_type: String, // "block_hash", "commitment", "address", "coin_id", "salt"
+    pub height: u64,
+    pub tx_index: Option<usize>,
+    pub detail: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchResponse {
+    pub results: Vec<SearchResult>,
 }
