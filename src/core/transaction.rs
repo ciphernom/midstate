@@ -2,12 +2,19 @@ use super::types::*;
 use super::script;
 use anyhow::{bail, Result};
 
-const COMMIT_POW_TARGET: u16 = 0x0000;
+/// Minimum number of leading zero bits required for a Commit transaction's PoW.
+/// 24 bits ≈ 16M BLAKE3 hashes ≈ 15ms on modern hardware. High enough to
+/// deter spam (~65 commits/second per core) while remaining instant for
+/// legitimate users who submit one commit at a time.
+#[cfg(not(feature = "fast-mining"))]
+pub const MIN_COMMIT_POW_BITS: u32 = 24;
+#[cfg(feature = "fast-mining")]
+pub const MIN_COMMIT_POW_BITS: u32 = 16;
 
 fn validate_commit_pow(commitment: &[u8; 32], nonce: u64) -> Result<()> {
     let h = super::types::hash_concat(commitment, &nonce.to_le_bytes());
-    if u16::from_be_bytes([h[0], h[1]]) != COMMIT_POW_TARGET {
-        bail!("Insufficient Commit PoW");
+    if count_leading_zeros(&h) < MIN_COMMIT_POW_BITS {
+        bail!("Insufficient Commit PoW: need {} leading zero bits", MIN_COMMIT_POW_BITS);
     }
     Ok(())
 }
@@ -48,7 +55,7 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
             if outputs.len() > MAX_TX_OUTPUTS { bail!("Too many outputs (max {})", MAX_TX_OUTPUTS); }
             if witnesses.len() != inputs.len() { bail!("Witness count must match input count"); }
 
-            let max_witness_size = MAX_SIGNATURE_SIZE * 16;
+            let max_witness_size = MAX_SIGNATURE_SIZE * MAX_TX_INPUTS;
             if bincode::serialized_size(&witnesses).unwrap_or(u64::MAX) > max_witness_size as u64 {
                 bail!("Witnesses payload exceeds maximum allowed size");
             }
@@ -173,7 +180,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 bail!("Witness count must match input count");
             }
             // Arbitrary payload size protection
-            let max_witness_size = MAX_SIGNATURE_SIZE * 16; 
+            let max_witness_size = MAX_SIGNATURE_SIZE * MAX_TX_INPUTS; 
             if bincode::serialized_size(&witnesses).unwrap_or(u64::MAX) > max_witness_size as u64 {
                 bail!("Witnesses payload exceeds maximum allowed size");
             }
@@ -260,15 +267,15 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 }
             }
 
-            // 8. Update midstate
+            // 8. Update midstate (SegWit: witnesses are explicitly excluded.
+            //    The Commit phase already binds inputs, outputs, and salt via
+            //    compute_commitment, so the transaction cannot be malleated.
+            //    Excluding witnesses keeps apply_transaction in sync with
+            //    apply_transaction_no_sig_check and Batch::header().)
             {
                 let mut hasher = blake3::Hasher::new();
-                for coin_id in &input_coin_ids {
-                    hasher.update(coin_id);
-                }
-                for hash in &output_commit_hashes {
-                    hasher.update(hash);
-                }
+                for coin_id in &input_coin_ids { hasher.update(coin_id); }
+                for hash in &output_commit_hashes { hasher.update(hash); }
                 hasher.update(salt);
                 let tx_hash = *hasher.finalize().as_bytes();
                 state.midstate = hash_concat(&state.midstate, &tx_hash);
@@ -328,7 +335,7 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                 bail!("Witness count must match input count");
             }
             // Arbitrary payload size protection
-            let max_witness_size = MAX_SIGNATURE_SIZE * 16; 
+            let max_witness_size = MAX_SIGNATURE_SIZE * MAX_TX_INPUTS; 
             if bincode::serialized_size(&witnesses).unwrap_or(u64::MAX) > max_witness_size as u64 {
                 bail!("Witnesses payload exceeds maximum allowed size");
             }
@@ -368,9 +375,9 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                 bail!("No matching commitment found");
             }
 
-            // Check commitment hasn't expired (or is about to expire this block)
+            // Check commitment hasn't expired
             if let Some(&commit_height) = state.commitment_heights.get(&expected) {
-                if state.height.saturating_sub(commit_height) >= COMMITMENT_TTL {
+                if state.height.saturating_sub(commit_height) > COMMITMENT_TTL {
                     bail!("Commitment expired (committed at height {}, current {})", commit_height, state.height);
                 }
             }
@@ -414,7 +421,7 @@ mod tests {
         let mut n = 0u64;
         loop {
             let h = hash_concat(commitment, &n.to_le_bytes());
-            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 {
+            if count_leading_zeros(&h) >= MIN_COMMIT_POW_BITS {
                 return n;
             }
             n += 1;
@@ -431,12 +438,11 @@ mod tests {
     #[test]
     fn commit_pow_invalid_nonce_fails() {
         let commitment = hash(b"test commitment");
-        // Nonce 0 is almost certainly invalid (1 in 65536 chance)
-        // Try a few to find one that fails
+        // Find a nonce that does NOT meet the PoW threshold
         let mut bad_nonce = 0u64;
         loop {
             let h = hash_concat(&commitment, &bad_nonce.to_le_bytes());
-            if u16::from_be_bytes([h[0], h[1]]) != 0x0000 {
+            if count_leading_zeros(&h) < MIN_COMMIT_POW_BITS {
                 break;
             }
             bad_nonce += 1;
@@ -467,7 +473,7 @@ mod tests {
         let mut bad_nonce = 0u64;
         loop {
             let h = hash_concat(&commitment, &bad_nonce.to_le_bytes());
-            if u16::from_be_bytes([h[0], h[1]]) != 0x0000 {
+            if count_leading_zeros(&h) < MIN_COMMIT_POW_BITS {
                 break;
             }
             bad_nonce += 1;
