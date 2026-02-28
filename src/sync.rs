@@ -66,14 +66,16 @@ pub fn verify_header_chain(headers: &[BatchHeader]) -> Result<()> {
     pub fn find_fork_point(
         &self,
         peer_headers: &[BatchHeader],
+        headers_start_height: u64, 
         our_height: u64,
     ) -> Result<u64> {
-        let compare_end = our_height.min(peer_headers.len() as u64);
+        let compare_end = our_height.min(headers_start_height + peer_headers.len() as u64);
 
-        for h in 0..compare_end {
+        for h in headers_start_height..compare_end {
+            let idx = (h - headers_start_height) as usize;
             match self.storage.load_batch(h)? {
                 Some(our_batch) => {
-                    let peer_hdr = &peer_headers[h as usize];
+                    let peer_hdr = &peer_headers[idx];
                     if our_batch.extension.final_hash != peer_hdr.extension.final_hash {
                         tracing::info!("Fork detected at height {}", h);
                         return Ok(h);
