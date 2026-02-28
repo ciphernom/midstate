@@ -35,6 +35,7 @@ primitive-types = "0.14"
 im = { version = "15.1", features = ["serde"] }
 tikv-jemallocator = "0.5"
 mimalloc = "0.1.34"
+bip39 = "2.0"
 
 [features]
 fast-mining = []
