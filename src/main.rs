@@ -1060,7 +1060,6 @@ async fn wallet_send(
         .collect::<Result<Vec<_>>>()?;
 
     let total_send: u64 = recipient_specs.iter().map(|(_, v)| v).sum();
-    let needed = total_send + 1;
 
     let mut live_coins = Vec::new();
     for wc in wallet.coins() {
@@ -1135,72 +1134,107 @@ async fn wallet_send(
             do_reveal(&client, &mut wallet, rpc_port, &server_commitment, timeout_secs).await?;
         }
     } else {
-        let input_coin_ids: Vec<[u8; 32]> = if !coin_args.is_empty() {
-            coin_args.iter()
-                .map(|s| wallet.resolve_coin(s))
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            wallet.select_coins(needed, &live_coins)?
-        };
+        let mut target_fee = 100u64; // Start with a conservative minimum guess
+        let  input_coin_ids;
+        let mut all_outputs;
+        let mut change_seeds;
+        let  in_sum;
+        let final_fee;
 
-        let in_sum: u64 = input_coin_ids.iter()
-            .filter_map(|id| wallet.find_coin(id))
-            .map(|c| c.value)
-            .sum();
+        loop {
+            // Dynamically calculate what we need based on the current fee guess
+            let needed = total_send + target_fee;
+            
+            let selected = if !coin_args.is_empty() {
+                coin_args.iter()
+                    .map(|s| wallet.resolve_coin(s))
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                wallet.select_coins(needed, &live_coins)?
+            };
 
-        if in_sum <= total_send {
-            anyhow::bail!("input value ({}) must exceed output value ({}) to pay fee", in_sum, total_send);
-        }
+            let current_in_sum: u64 = selected.iter()
+                .filter_map(|id| wallet.find_coin(id))
+                .map(|c| c.value)
+                .sum();
 
-        let fee = 1u64;
-        let change = in_sum - total_send - fee;
-
-        let mut all_outputs = Vec::new();
-        let mut change_seeds = Vec::new();
-
-        for (address, value) in &recipient_specs {
-            for denom in decompose_value(*value) {
-                let salt: [u8; 32] = rand::random();
-                all_outputs.push(OutputData::Standard { address: *address, value: denom, salt });
+            if current_in_sum <= total_send {
+                anyhow::bail!("input value ({}) must exceed output value ({}) to pay fee", current_in_sum, total_send);
             }
-        }
 
-        if change > 0 {
-            let change_denoms = decompose_value(change);
-            for denom in change_denoms {
-                let seed = wallet.next_wots_seed();
-                let pk = wots::keygen(&seed);
-                let addr = compute_address(&pk);
-                let salt: [u8; 32] = rand::random();
-                let idx = all_outputs.len();
-                all_outputs.push(OutputData::Standard { address: addr, value: denom, salt });
-                change_seeds.push((idx, seed));
+            // Estimate the number of outputs that will be created
+            let change = current_in_sum.saturating_sub(total_send + target_fee);
+            let mut num_outputs = 0;
+            for (_, value) in &recipient_specs {
+                num_outputs += decompose_value(*value).len();
             }
-        }
+            num_outputs += decompose_value(change).len();
+            
+            // Calculate a strict upper bound for serialized byte size
+            // 1536 (WOTS sig) + 100 (input struct) = 1636 bytes per input
+            // 100 bytes per output + 100 bytes transaction base overhead
+            let estimated_bytes = 100 + (selected.len() as u64 * 1636) + (num_outputs as u64 * 100);
+            
+            // Calculate required fee based on Mempool limit (10 units per 1024 bytes)
+            let required_fee = (estimated_bytes * 10) / 1024 + 10; // +10 unit safety padding
+            
+            if current_in_sum >= total_send + required_fee {
+                // The selected coins cover the send AND the exact calculated fee! Lock it in.
+                final_fee = required_fee;
+                in_sum = current_in_sum;
+                input_coin_ids = selected;
+                
+                let final_change = current_in_sum - total_send - final_fee;
+                all_outputs = Vec::new();
+                change_seeds = Vec::new();
 
-        // Decoy padding: pad to at least 4 outputs with denomination-1 self-sends.
-        // These are real UTXOs recoverable from the HD seed, usable for fee payment.
-        while all_outputs.len() < 4 {
-            let seed = wallet.next_wots_seed();
-            let pk = wots::keygen(&seed);
-            let addr = compute_address(&pk);
-            let salt: [u8; 32] = rand::random();
-            let idx = all_outputs.len();
-            all_outputs.push(OutputData::Standard { address: addr, value: 1, salt });
-            change_seeds.push((idx, seed));
-        }
+                // 1. Build recipient outputs
+                for (address, value) in &recipient_specs {
+                    for denom in decompose_value(*value) {
+                        let salt: [u8; 32] = rand::random();
+                        all_outputs.push(OutputData::Standard { address: *address, value: denom, salt });
+                    }
+                }
 
-        // Shuffle outputs so the recipient position is random
-        {
-            use rand::seq::SliceRandom;
-            let mut indices: Vec<usize> = (0..all_outputs.len()).collect();
-            indices.shuffle(&mut rand::thread_rng());
-            let shuffled: Vec<OutputData> = indices.iter().map(|&i| all_outputs[i].clone()).collect();
-            let mut rev = vec![0usize; indices.len()];
-            for (new_i, &old_i) in indices.iter().enumerate() { rev[old_i] = new_i; }
-            change_seeds = change_seeds.into_iter()
-                .map(|(old_idx, s)| (rev[old_idx], s)).collect();
-            all_outputs = shuffled;
+                // 2. Build exact change outputs
+                if final_change > 0 {
+                    for denom in decompose_value(final_change) {
+                        let seed = wallet.next_wots_seed();
+                        let pk = wots::keygen(&seed);
+                        let addr = compute_address(&pk);
+                        let salt: [u8; 32] = rand::random();
+                        let idx = all_outputs.len();
+                        all_outputs.push(OutputData::Standard { address: addr, value: denom, salt });
+                        change_seeds.push((idx, seed));
+                    }
+                }
+
+                // 3. Shuffle outputs to obfuscate which is the recipient vs change
+                {
+                    use rand::seq::SliceRandom;
+                    let mut indices: Vec<usize> = (0..all_outputs.len()).collect();
+                    indices.shuffle(&mut rand::thread_rng());
+                    let shuffled: Vec<OutputData> = indices.iter().map(|&i| all_outputs[i].clone()).collect();
+                    let mut rev = vec![0usize; indices.len()];
+                    for (new_i, &old_i) in indices.iter().enumerate() { rev[old_i] = new_i; }
+                    change_seeds = change_seeds.into_iter()
+                        .map(|(old_idx, s)| (rev[old_idx], s)).collect();
+                    all_outputs = shuffled;
+                }
+                
+                break;
+            } else {
+                // We need more inputs to cover the real fee. Let's loop again with the new target!
+                target_fee = required_fee;
+                
+                // If the user manually provided specific coins via CLI args, we can't auto-select more.
+                if !coin_args.is_empty() {
+                    anyhow::bail!(
+                        "The manually selected coins do not cover the transaction amount plus the dynamically calculated fee of {}", 
+                        required_fee
+                    );
+                }
+            }
         }
 
         let output_commit_hashes: Vec<[u8; 32]> = all_outputs.iter().map(|o| o.hash_for_commitment()).collect();
@@ -1208,8 +1242,8 @@ async fn wallet_send(
         println!(
             "Spending {} coin(s) (value {}) → {} output(s) (value {}, fee: {})",
             input_coin_ids.len(), in_sum,
-            all_outputs.len(), total_send + change,
-            fee
+            all_outputs.len(), in_sum - final_fee,
+            final_fee
         );
 
         let (commitment, _salt) = wallet.prepare_commit(
