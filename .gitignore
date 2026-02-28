@@ -5,3 +5,5 @@ ccfiles.sh
 old.txt
 cc.sh
 all_rust_code.txt
+alice_wallet.dat
+bob_wallet.dat
