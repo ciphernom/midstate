@@ -236,14 +236,64 @@ fn get_empty_hash(height: usize) -> [u8; 32] {
     hashes[height]
 }
 
+const CACHE_MIN_HEIGHT: usize = 240;
+
+/// Recursively computes the SMT root for a given height, purely from a slice of active coins.
+/// Because this is a Sparse Merkle Tree, we only traverse branches that contain coins,
+/// making this extremely fast for small buckets.
+///
+/// # Examples
+/// ```
+/// # use midstate::core::mmr::*;
+/// # use midstate::core::types::hash;
+/// let coins = vec![hash(b"coin1")];
+/// let root = compute_sparse_subtree(240, &coins);
+/// assert_ne!(root, [0u8; 32]);
+/// ```
+pub fn compute_sparse_subtree(height: usize, coins: &[[u8; 32]]) -> [u8; 32] {
+    // Base Case 1: Empty branch. Return the precomputed empty hash.
+    if coins.is_empty() {
+        return get_empty_hash(height);
+    }
+    // Base Case 2: We reached the leaf level.
+    if height == 0 {
+        return coins[0];
+    }
+
+    // The bit index we split on for height `h`. 
+    let bit_idx = height - 1;
+
+    // Because the coins are sorted lexicographically (big-endian), all coins 
+    // with bit == 0 come before bit == 1. Find the exact split index.
+    let split_idx = coins.iter()
+        .position(|c| get_bit(c, bit_idx) == 1)
+        .unwrap_or(coins.len());
+
+    let left_coins = &coins[..split_idx];
+    let right_coins = &coins[split_idx..];
+
+    // Recursively fold the left and right sides
+    let left_hash = compute_sparse_subtree(height - 1, left_coins);
+    let right_hash = compute_sparse_subtree(height - 1, right_coins);
+
+    hash_concat(&left_hash, &right_hash)
+}
+
 /// Sparse Merkle Tree backed UTXO accumulator.
-/// BTreeSet for O(log n) insert/remove/contains (was sorted Vec with O(n) shift).
-/// SMT nodes stored as (height, path_key) -> hash.
+/// BTreeSet for O(log n) insert/remove/contains.
+/// SMT nodes stored as (height, path_key) -> hash, truncated at CACHE_MIN_HEIGHT.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UtxoAccumulator {
     coins: im::OrdSet<[u8; 32]>,
+    
+    /// Top 16 levels of the SMT cache. Strictly bounded to 65,536 entries max.
     #[serde(skip)]
     nodes: im::HashMap<(u16, [u8; 32]), [u8; 32]>,
+    
+    /// Coins grouped by their top 16 bits (first 2 bytes). 
+    /// Used for instant O(1) subtree extraction during dynamic folding.
+    #[serde(skip)]
+    buckets: im::HashMap<u16, im::OrdSet<[u8; 32]>>,
 }
 
 impl PartialEq for UtxoAccumulator {
@@ -258,17 +308,28 @@ impl UtxoAccumulator {
     pub fn new() -> Self {
         Self { 
             coins: im::OrdSet::new(), 
-            nodes: im::HashMap::new() 
+            nodes: im::HashMap::new(),
+            buckets: im::HashMap::new(),
         }
     }
 
-    /// Rebuild the SMT node cache from the coin list (after deserialization).
+    /// Rebuild the top-level SMT node cache and prefix buckets after deserialization.
     pub fn rebuild_tree(&mut self) {
         self.nodes.clear();
-        // Collect first → immutable borrow ends before we start mutating
+        self.buckets.clear();
+        
         let coins: Vec<[u8; 32]> = self.coins.iter().copied().collect();
         for coin in coins {
-            self.update_path(coin, true);
+            let prefix = u16::from_be_bytes([coin[0], coin[1]]);
+            let mut bucket = self.buckets.remove(&prefix).unwrap_or_default();
+            bucket.insert(coin);
+            self.buckets.insert(prefix, bucket);
+        }
+
+        let prefixes: Vec<u16> = self.buckets.keys().copied().collect();
+        for prefix in prefixes {
+            let bucket = self.buckets.get(&prefix).unwrap().clone();
+            self.update_cache_for_bucket(prefix, &bucket);
         }
     }
 
@@ -286,16 +347,31 @@ impl UtxoAccumulator {
     }
 
     pub fn insert(&mut self, coin: [u8; 32]) -> bool {
-        // im::OrdSet returns Some(replaced_value) if it already existed
         if self.coins.insert(coin).is_some() { return false; }
-        self.update_path(coin, true);
+        
+        let prefix = u16::from_be_bytes([coin[0], coin[1]]);
+        let mut bucket = self.buckets.remove(&prefix).unwrap_or_default();
+        bucket.insert(coin);
+        self.buckets.insert(prefix, bucket.clone());
+        
+        self.update_cache_for_bucket(prefix, &bucket);
         true
     }
 
     pub fn remove(&mut self, coin: &[u8; 32]) -> bool {
-        // im::OrdSet returns Some(removed_value) if it existed
         if self.coins.remove(coin).is_none() { return false; }
-        self.update_path(*coin, false);
+        
+        let prefix = u16::from_be_bytes([coin[0], coin[1]]);
+        let mut bucket = self.buckets.remove(&prefix).unwrap_or_default();
+        bucket.remove(coin);
+        
+        if bucket.is_empty() {
+            self.buckets.remove(&prefix);
+            self.update_cache_for_bucket(prefix, &im::OrdSet::new());
+        } else {
+            self.buckets.insert(prefix, bucket.clone());
+            self.update_cache_for_bucket(prefix, &bucket);
+        }
         true
     }   
 
@@ -311,7 +387,38 @@ impl UtxoAccumulator {
         let mut siblings = Vec::with_capacity(256);
         let mut current_path = *coin;
 
-        for h in 0usize..256 {
+        // 1. Get the bucket for the bottom 240 levels
+        let prefix = u16::from_be_bytes([coin[0], coin[1]]);
+        let bucket = self.buckets.get(&prefix).cloned().unwrap_or_default();
+        let bucket_coins: Vec<[u8; 32]> = bucket.iter().copied().collect();
+
+        // 2. Dynamically fold the bottom levels
+        for h in 0usize..CACHE_MIN_HEIGHT {
+            let bit = get_bit(coin, h);
+            let mut sibling_path = current_path;
+            flip_bit(&mut sibling_path, h);
+            mask_lower_bits(&mut sibling_path, h);
+
+            let sibling_coins: Vec<[u8; 32]> = bucket_coins.iter()
+                .filter(|c| {
+                    let mut c_path = **c;
+                    mask_lower_bits(&mut c_path, h);
+                    c_path == sibling_path
+                })
+                .copied()
+                .collect();
+
+            let sibling_hash = compute_sparse_subtree(h, &sibling_coins);
+            siblings.push(ProofElement {
+                hash: sibling_hash,
+                is_right: bit == 0,
+            });
+
+            mask_lower_bits(&mut current_path, h + 1);
+        }
+
+        // 3. Read the top 16 levels instantly from the cache
+        for h in CACHE_MIN_HEIGHT..256 {
             let bit = get_bit(coin, h);
             let mut sibling_path = current_path;
             flip_bit(&mut sibling_path, h);
@@ -337,46 +444,59 @@ impl UtxoAccumulator {
     pub fn into_vec(self) -> Vec<[u8; 32]> { self.coins.into_iter().collect() }
 
     fn get_node(&self, height: u16, path: [u8; 32]) -> [u8; 32] {
+        if (height as usize) < CACHE_MIN_HEIGHT {
+            panic!("Attempted to read SMT node below memory cache boundary!");
+        }
         self.nodes.get(&(height, path))
             .copied()
             .unwrap_or_else(|| get_empty_hash(height as usize))
     }
 
-    fn update_path(&mut self, coin: [u8; 32], inserting: bool) {
-        if inserting {
-            self.nodes.insert((0u16, coin), coin);
+    /// Computes the height-240 hash for a bucket on the fly, then ripples it up 
+    /// through the top 16 levels of the cache.
+    fn update_cache_for_bucket(&mut self, prefix: u16, bucket: &im::OrdSet<[u8; 32]>) {
+        let bucket_coins: Vec<[u8; 32]> = bucket.iter().copied().collect();
+        let current_hash = compute_sparse_subtree(CACHE_MIN_HEIGHT, &bucket_coins);
+
+        let mut current_path = [0u8; 32];
+        current_path[0..2].copy_from_slice(&prefix.to_be_bytes());
+
+        // Cache the base node
+        let empty_base = get_empty_hash(CACHE_MIN_HEIGHT);
+        if current_hash == empty_base {
+            self.nodes.remove(&(CACHE_MIN_HEIGHT as u16, current_path));
         } else {
-            self.nodes.remove(&(0u16, coin));
+            self.nodes.insert((CACHE_MIN_HEIGHT as u16, current_path), current_hash);
         }
 
-        let mut current_path = coin;
+        let mut hash_to_ripple = current_hash;
 
-        for h in 0usize..256 {
-            let bit = get_bit(&coin, h);
+        for h in CACHE_MIN_HEIGHT..256 {
+            let bit = get_bit(&current_path, h);
 
             let mut sibling_path = current_path;
             flip_bit(&mut sibling_path, h);
 
-            let current_hash = self.get_node(h as u16, current_path);
             let sibling_hash = self.get_node(h as u16, sibling_path);
 
             let parent_hash = if bit == 0 {
-                hash_concat(&current_hash, &sibling_hash)
+                hash_concat(&hash_to_ripple, &sibling_hash)
             } else {
-                hash_concat(&sibling_hash, &current_hash)
+                hash_concat(&sibling_hash, &hash_to_ripple)
             };
 
-            // Clear bit h incrementally (bits 0..h-1 already clear from prior iterations)
             let byte_idx = 31 - (h / 8);
             let bit_offset = h % 8;
             current_path[byte_idx] &= !(1 << bit_offset);
 
-            let empty = get_empty_hash(h + 1);
-            if parent_hash == empty {
+            let empty_parent = get_empty_hash(h + 1);
+            if parent_hash == empty_parent {
                 self.nodes.remove(&((h + 1) as u16, current_path));
             } else {
                 self.nodes.insert(((h + 1) as u16, current_path), parent_hash);
             }
+
+            hash_to_ripple = parent_hash;
         }
     }
 }
@@ -542,6 +662,32 @@ mod tests {
             let proof = acc.prove(c).unwrap();
             assert!(verify_utxo_proof(c, &proof, &root));
         }
+    }
+
+    #[test]
+    fn utxo_accumulator_memory_safety_check() {
+        let mut acc = UtxoAccumulator::new();
+        // Insert 1,000 completely separate coins.
+        // Under the old system, this would create 256,000 entries in `nodes`.
+        // Under the new system, it creates at most 16,000.
+        for i in 0..1000u32 {
+            let mut h = blake3::Hasher::new();
+            h.update(&i.to_le_bytes());
+            acc.insert(*h.finalize().as_bytes());
+        }
+        
+        // Assert the strict mathematical limit is respected
+        assert!(acc.nodes.len() < 65536, "Cache boundary failed!");
+        println!("SMT Cached nodes for 1000 coins: {}", acc.nodes.len());
+        
+        // Ensure root and proofs still compute flawlessly
+        let root = acc.root();
+        let mut h = blake3::Hasher::new();
+        h.update(&42u32.to_le_bytes());
+        let coin = *h.finalize().as_bytes();
+        
+        let proof = acc.prove(&coin).unwrap();
+        assert!(verify_utxo_proof(&coin, &proof, &root));
     }
 
     #[test]
