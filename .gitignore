@@ -7,3 +7,10 @@ cc.sh
 all_rust_code.txt
 alice_wallet.dat
 bob_wallet.dat
+*.dat
+
+# WASM Wallet Build Artifacts
+wasm-wallet/target/
+
+# (Optional) If you ever add npm/webpack later, ignore this too:
+wasm-wallet/node_modules/
