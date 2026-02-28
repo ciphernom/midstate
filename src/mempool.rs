@@ -9,7 +9,7 @@ const MAX_PENDING_COMMITS: usize = 1_000;
 /// Total mempool capacity is the sum of both pools.
 pub const MAX_MEMPOOL_SIZE: usize = MAX_MEMPOOL_REVEALS + MAX_PENDING_COMMITS;
 const MIN_FEE_PER_KB: u64 = 10;
-/// Scaling factor used when computing fee rates to preserve sub-satoshi precision
+/// Scaling factor used when computing fee rates to preserve precision
 /// while staying in integer arithmetic. fee_rate = fee * FEE_RATE_SCALE / bytes.
 const FEE_RATE_SCALE: u128 = 1_024;
 
