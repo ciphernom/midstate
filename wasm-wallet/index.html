@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Midstate Web Wallet</title>
+    <style>
+        body { font-family: monospace; background: #111; color: #0f0; padding: 20px; max-width: 600px; margin: 0 auto; }
+        input, button { background: #222; color: #0f0; border: 1px solid #0f0; padding: 10px; margin: 5px 0; width: 100%; box-sizing: border-box;}
+        button { cursor: pointer; font-weight: bold; }
+        button:hover { background: #0f0; color: #111; }
+        .panel { border: 1px dashed #0f0; padding: 15px; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <h1>Midstate Web Wallet</h1>
+
+    <div class="panel">
+        <h3>1. Network Config</h3>
+        <label>RPC Node URL:</label>
+        <input type="text" id="rpcUrl" value="http://127.0.0.1:8001">
+        <button onclick="checkNode()">Ping Node</button>
+        <div id="nodeStatus"></div>
+    </div>
+
+    <div class="panel">
+        <h3>2. Wallet Setup</h3>
+        <label>Seed Phrase (or Hex for MVP):</label>
+        <input type="text" id="seedPhrase" placeholder="Enter 24 words...">
+        <button onclick="loadWallet()">Load Wallet</button>
+        <div id="walletInfo"></div>
+    </div>
+<div class="panel">
+        <h3>3. Balance Scanner</h3>
+        <button onclick="scanChain()">Scan Blockchain for Funds</button>
+        <br><br>
+        <progress id="scanProgress" value="0" max="100" style="width: 100%; display: none;"></progress>
+        <div id="scanStatus">Ready to scan...</div>
+    </div>
+    <div class="panel">
+        <h3>4. Send Funds</h3>
+        <label>To Address (Hex):</label>
+        <input type="text" id="sendAddress" placeholder="Enter recipient address...">
+        <label>Amount (Units):</label>
+        <input type="number" id="sendAmount" value="1000">
+        <button onclick="sendTransaction()">Send Transaction</button>
+        <div id="sendStatus"></div>
+    </div>
+    <script type="module">
+        // Import the generated Wasm Javascript wrapper
+        import init, { WebWallet } from './pkg/wasm_wallet.js';
+
+        let wallet = null;
+
+        // Initialize WebAssembly when the page loads
+        async function run() {
+            await init();
+            console.log("Wasm Cryptography Loaded!");
+        }
+        run();
+
+
+window.scanChain = async () => {
+            if (!wallet) {
+                alert("Please load your wallet first!");
+                return;
+            }
+
+            const url = document.getElementById('rpcUrl').value;
+            const statusDiv = document.getElementById('scanStatus');
+            const progressBar = document.getElementById('scanProgress');
+            const myAddress = wallet.get_primary_address();
+            let totalBalance = 0;
+
+            try {
+                statusDiv.innerText = "Fetching current chain height...";
+                progressBar.style.display = "block";
+                progressBar.value = 0;
+
+                const stateResp = await fetch(`${url}/state`);
+                const state = await stateResp.json();
+                const height = state.height;
+                
+                if (height === 0) {
+                    statusDiv.innerText = "Chain is empty.";
+                    progressBar.style.display = "none";
+                    return;
+                }
+
+                progressBar.max = height;
+                statusDiv.innerText = `Downloading filters for ${height} blocks...`;
+                
+                const filterReq = await fetch(`${url}/filters`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    body: JSON.stringify({ start_height: 0, end_height: height })
+                });
+                const filterData = await filterReq.json();
+
+                let matchCount = 0;
+
+                statusDiv.innerText = `Scanning blocks...`;
+
+                for (let i = 0; i < filterData.filters.length; i++) {
+                    // Update progress bar
+                    progressBar.value = i;
+                    
+                    // THE MAGIC YIELD: Give the browser a microsecond to redraw the UI every 10 blocks
+                    if (i % 10 === 0) {
+                        statusDiv.innerText = `Scanning block ${i} of ${height}...`;
+                        await new Promise(r => setTimeout(r, 0)); 
+                    }
+
+                    const filterHex = filterData.filters[i];
+                    const blockHash = filterData.block_hashes[i];
+                    const n = filterData.element_counts[i];
+
+                    if (n === 0) continue; 
+
+                    const isMatch = wallet.check_filter(filterHex, blockHash, n);
+                    
+                    if (isMatch) {
+                        statusDiv.innerText = `Match found in block ${i}! Fetching details...`;
+                        await new Promise(r => setTimeout(r, 0)); // Yield before network request
+                        
+                        const blockResp = await fetch(`${url}/block/${i}`);
+                        const block = await blockResp.json();
+                        
+                        for (const cb of block.coinbase) {
+                            if (cb.address === myAddress) {
+                                totalBalance += cb.value;
+                                matchCount++;
+                            }
+                        }
+                        
+                        for (const tx of block.transactions) {
+                            if (tx.Reveal && tx.Reveal.outputs) {
+                                for (const out of tx.Reveal.outputs) {
+                                    if (out.Standard && out.Standard.address === myAddress) {
+                                        totalBalance += out.Standard.value;
+                                        matchCount++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                progressBar.value = height;
+                statusDiv.innerHTML = `
+                    <p>Scan Complete!</p>
+                    <p>Found <strong>${matchCount}</strong> UTXOs.</p>
+                    <p>Total Balance: <strong>${totalBalance}</strong> units</p>
+                `;
+
+            } catch (e) {
+                statusDiv.innerText = `Scan failed: ${e}`;
+                progressBar.style.display = "none";
+            }
+        };
+
+
+        // Global functions for the HTML buttons
+        window.checkNode = async () => {
+            const url = document.getElementById('rpcUrl').value;
+            const statusDiv = document.getElementById('nodeStatus');
+            statusDiv.innerText = "Pinging...";
+            try {
+                const response = await fetch(`${url}/state`);
+                const data = await response.json();
+                statusDiv.innerText = `Connected! Chain Height: ${data.height}, Reward: ${data.block_reward}`;
+            } catch (e) {
+                statusDiv.innerText = `Connection failed. Is the node running and CORS enabled?`;
+            }
+        };
+
+        window.loadWallet = () => {
+            const phrase = document.getElementById('seedPhrase').value;
+            const infoDiv = document.getElementById('walletInfo');
+            try {
+                // This calls your Rust code!
+                wallet = new WebWallet(phrase);
+                const address = wallet.get_primary_address();
+                infoDiv.innerHTML = `
+                    <p>Wallet Loaded Successfully!</p>
+                    <p><strong>Your Primary Address:</strong><br>${address}</p>
+                `;
+            } catch (e) {
+                infoDiv.innerText = `Error loading wallet: ${e}`;
+            }
+        };
+        
+        // Add a global array at the top of your script to store found UTXOs
+        let availableUtxos = []; 
+
+
+        window.sendTransaction = async () => {
+            const url = document.getElementById('rpcUrl').value;
+            const statusDiv = document.getElementById('sendStatus');
+            const toAddress = document.getElementById('sendAddress').value;
+            const amount = parseInt(document.getElementById('sendAmount').value);
+            const fee = 1000; // Hardcoded safe fee for MVP
+
+            if (availableUtxos.length === 0) {
+                statusDiv.innerText = "Please run the scanner first to find UTXOs to spend!";
+                return;
+            }
+
+            try {
+                // For MVP, just grab the first available UTXO
+                const utxo = availableUtxos[0]; 
+                const inputsJson = JSON.stringify([utxo]);
+
+                // PHASE 1: Build & Submit Commit
+                statusDiv.innerText = "Building Commit Payload...";
+                const commitPayloadStr = wallet.build_commit(inputsJson, toAddress, amount, fee);
+                const commitPayload = JSON.parse(commitPayloadStr);
+
+                statusDiv.innerText = "Submitting Commit to Node...";
+                const commitReq = await fetch(`${url}/commit`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    body: JSON.stringify(commitPayload)
+                });
+                const commitResp = await commitReq.json();
+                
+                if (commitResp.error) throw new Error(commitResp.error);
+
+                statusDiv.innerText = `Commit mined! (Salt: ${commitResp.salt.substring(0,8)}...). Generating Signatures...`;
+
+                // PHASE 2: Build & Submit Reveal
+                // Yield thread to let UI update
+                await new Promise(r => setTimeout(r, 50)); 
+
+                const revealPayloadStr = wallet.build_reveal(commitResp.commitment, commitResp.salt);
+                const revealPayload = JSON.parse(revealPayloadStr);
+
+                statusDiv.innerText = "Submitting Signatures...";
+                const revealReq = await fetch(`${url}/send`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    body: JSON.stringify(revealPayload)
+                });
+                const revealResp = await revealReq.json();
+
+                if (revealResp.error) throw new Error(revealResp.error);
+
+                statusDiv.innerHTML = `<p style="color: #0f0;"><strong>Success!</strong> Transaction broadcasted.</p>`;
+                
+                // Remove the spent UTXO from our local array
+                availableUtxos.shift(); 
+
+            } catch (e) {
+                statusDiv.innerText = `Transaction failed: ${e}`;
+            }
+        };
+    </script>
+</body>
+</html>
