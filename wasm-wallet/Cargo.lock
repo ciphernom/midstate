@@ -4323,6 +4323,7 @@ dependencies = [
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "hex",
+ "js-sys",
  "midstate",
  "rand 0.8.5",
  "serde",
