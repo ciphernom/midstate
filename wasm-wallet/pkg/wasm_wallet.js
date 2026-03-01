@@ -12,86 +12,86 @@ export class WebWallet {
         wasm.__wbg_webwallet_free(ptr, 0);
     }
     /**
-     * Phase 1: Build the Commit payload
-     * @param {string} inputs_json
-     * @param {string} to_address
-     * @param {bigint} send_amount
-     * @param {bigint} fee
-     * @returns {string}
-     */
-    build_commit(inputs_json, to_address, send_amount, fee) {
-        let deferred4_0;
-        let deferred4_1;
-        try {
-            const ptr0 = passStringToWasm0(inputs_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-            const len0 = WASM_VECTOR_LEN;
-            const ptr1 = passStringToWasm0(to_address, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-            const len1 = WASM_VECTOR_LEN;
-            const ret = wasm.webwallet_build_commit(this.__wbg_ptr, ptr0, len0, ptr1, len1, send_amount, fee);
-            var ptr3 = ret[0];
-            var len3 = ret[1];
-            if (ret[3]) {
-                ptr3 = 0; len3 = 0;
-                throw takeFromExternrefTable0(ret[2]);
-            }
-            deferred4_0 = ptr3;
-            deferred4_1 = len3;
-            return getStringFromWasm0(ptr3, len3);
-        } finally {
-            wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
-        }
-    }
-    /**
-     * Phase 2: Sign the transaction and build the Reveal payload
-     * @param {string} commitment_hex
+     * @param {string} spend_context_json
+     * @param {string} server_commitment_hex
      * @param {string} server_salt_hex
      * @returns {string}
      */
-    build_reveal(commitment_hex, server_salt_hex) {
-        let deferred4_0;
-        let deferred4_1;
+    build_reveal(spend_context_json, server_commitment_hex, server_salt_hex) {
+        let deferred5_0;
+        let deferred5_1;
         try {
-            const ptr0 = passStringToWasm0(commitment_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const ptr0 = passStringToWasm0(spend_context_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             const len0 = WASM_VECTOR_LEN;
-            const ptr1 = passStringToWasm0(server_salt_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const ptr1 = passStringToWasm0(server_commitment_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             const len1 = WASM_VECTOR_LEN;
-            const ret = wasm.webwallet_build_reveal(this.__wbg_ptr, ptr0, len0, ptr1, len1);
-            var ptr3 = ret[0];
-            var len3 = ret[1];
+            const ptr2 = passStringToWasm0(server_salt_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len2 = WASM_VECTOR_LEN;
+            const ret = wasm.webwallet_build_reveal(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+            var ptr4 = ret[0];
+            var len4 = ret[1];
             if (ret[3]) {
-                ptr3 = 0; len3 = 0;
+                ptr4 = 0; len4 = 0;
                 throw takeFromExternrefTable0(ret[2]);
             }
-            deferred4_0 = ptr3;
-            deferred4_1 = len3;
-            return getStringFromWasm0(ptr3, len3);
+            deferred5_0 = ptr4;
+            deferred5_1 = len4;
+            return getStringFromWasm0(ptr4, len4);
         } finally {
-            wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+            wasm.__wbindgen_free(deferred5_0, deferred5_1, 1);
         }
     }
     /**
-     * Checks a block's compact filter to see if it contains our address
      * @param {string} filter_hex
      * @param {string} block_hash_hex
      * @param {number} n
+     * @param {string} addrs_json
      * @returns {boolean}
      */
-    check_filter(filter_hex, block_hash_hex, n) {
+    check_filter(filter_hex, block_hash_hex, n, addrs_json) {
         const ptr0 = passStringToWasm0(filter_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passStringToWasm0(block_hash_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.webwallet_check_filter(this.__wbg_ptr, ptr0, len0, ptr1, len1, n);
+        const ptr2 = passStringToWasm0(addrs_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.webwallet_check_filter(this.__wbg_ptr, ptr0, len0, ptr1, len1, n, ptr2, len2);
         return ret !== 0;
     }
     /**
+     * Derives a reusable MSS address for receiving funds (Height 5 recommended)
+     * @param {number} index
+     * @param {number} height
      * @returns {string}
      */
-    get_primary_address() {
+    get_mss_address(index, height) {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.webwallet_get_mss_address(this.__wbg_ptr, index, height);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * Derives a single-use WOTS address (used internally for change outputs)
+     * @param {number} index
+     * @returns {string}
+     */
+    get_wots_address(index) {
         let deferred1_0;
         let deferred1_1;
         try {
-            const ret = wasm.webwallet_get_primary_address(this.__wbg_ptr);
+            const ret = wasm.webwallet_get_wots_address(this.__wbg_ptr, index);
             deferred1_0 = ret[0];
             deferred1_1 = ret[1];
             return getStringFromWasm0(ret[0], ret[1]);
@@ -113,18 +113,78 @@ export class WebWallet {
         WebWalletFinalization.register(this, this.__wbg_ptr, this);
         return this;
     }
+    /**
+     * @param {string} available_utxos_json
+     * @param {string} to_address_hex
+     * @param {bigint} send_amount
+     * @param {number} next_wots_index
+     * @returns {string}
+     */
+    prepare_spend(available_utxos_json, to_address_hex, send_amount, next_wots_index) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const ptr0 = passStringToWasm0(available_utxos_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(to_address_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            const ret = wasm.webwallet_prepare_spend(this.__wbg_ptr, ptr0, len0, ptr1, len1, send_amount, next_wots_index);
+            var ptr3 = ret[0];
+            var len3 = ret[1];
+            if (ret[3]) {
+                ptr3 = 0; len3 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+        }
+    }
 }
 if (Symbol.dispose) WebWallet.prototype[Symbol.dispose] = WebWallet.prototype.free;
 
 /**
- * Helper to generate a brand new seed phrase in the browser
+ * @param {string} address_hex
+ * @param {bigint} value
+ * @param {string} salt_hex
  * @returns {string}
  */
-export function generate_new_phrase() {
+export function compute_coin_id_hex(address_hex, value, salt_hex) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const ptr0 = passStringToWasm0(address_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(salt_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.compute_coin_id_hex(ptr0, len0, value, ptr1, len1);
+        deferred3_0 = ret[0];
+        deferred3_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * @param {bigint} amount
+ * @returns {BigUint64Array}
+ */
+export function decompose_amount(amount) {
+    const ret = wasm.decompose_amount(amount);
+    return ret;
+}
+
+/**
+ * @returns {string}
+ */
+export function generate_phrase() {
     let deferred1_0;
     let deferred1_1;
     try {
-        const ret = wasm.generate_new_phrase();
+        const ret = wasm.generate_phrase();
         deferred1_0 = ret[0];
         deferred1_1 = ret[1];
         return getStringFromWasm0(ret[0], ret[1]);
@@ -173,6 +233,10 @@ function __wbg_get_imports() {
         },
         __wbg_msCrypto_bd5a034af96bcba6: function(arg0) {
             const ret = arg0.msCrypto;
+            return ret;
+        },
+        __wbg_new_from_slice_14158c9615ed2369: function(arg0, arg1) {
+            const ret = new BigUint64Array(getArrayU64FromWasm0(arg0, arg1));
             return ret;
         },
         __wbg_new_with_length_825018a1616e9e55: function(arg0) {
@@ -257,9 +321,22 @@ function addToExternrefTable0(obj) {
     return idx;
 }
 
+function getArrayU64FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getBigUint64ArrayMemory0().subarray(ptr / 8, ptr / 8 + len);
+}
+
 function getArrayU8FromWasm0(ptr, len) {
     ptr = ptr >>> 0;
     return getUint8ArrayMemory0().subarray(ptr / 1, ptr / 1 + len);
+}
+
+let cachedBigUint64ArrayMemory0 = null;
+function getBigUint64ArrayMemory0() {
+    if (cachedBigUint64ArrayMemory0 === null || cachedBigUint64ArrayMemory0.byteLength === 0) {
+        cachedBigUint64ArrayMemory0 = new BigUint64Array(wasm.memory.buffer);
+    }
+    return cachedBigUint64ArrayMemory0;
 }
 
 function getStringFromWasm0(ptr, len) {
@@ -364,6 +441,7 @@ let wasmModule, wasm;
 function __wbg_finalize_init(instance, module) {
     wasm = instance.exports;
     wasmModule = module;
+    cachedBigUint64ArrayMemory0 = null;
     cachedUint8ArrayMemory0 = null;
     wasm.__wbindgen_start();
     return wasm;
