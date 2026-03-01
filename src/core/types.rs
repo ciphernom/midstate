@@ -188,12 +188,12 @@ impl State {
         let genesis_coinbase = vec![
             CoinbaseOutput {
                 address: chunk0, // Plaintext!
-                value: 8,
+                value: 536_870_912,
                 salt: chunk1,    // Plaintext!
             },
             CoinbaseOutput {
                 address: chunk2, // Plaintext!
-                value: 8,
+                value: 536_870_912,
                 salt: chunk3,    // Plaintext!
             }
         ];
@@ -556,8 +556,8 @@ pub const PRUNE_DEPTH: u64 = 1000;
 /// Blocks per year at TARGET_BLOCK_TIME seconds per block.
 pub const BLOCKS_PER_YEAR: u64 = 365 * 24 * 3600 / TARGET_BLOCK_TIME; // 3_153_600
 
-/// Initial block reward in value units.
-pub const INITIAL_REWARD: u64 = 16;
+/// Initial block reward in value units (2^30).
+pub const INITIAL_REWARD: u64 = 1_073_741_824;
 
 pub const MAX_TX_INPUTS: usize = 256;
 pub const MAX_TX_OUTPUTS: usize = 256;

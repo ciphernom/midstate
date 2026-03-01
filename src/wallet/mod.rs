@@ -848,8 +848,8 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         let mut pairs = Vec::new();
 
         for &denom in denominations {
-            // Find inputs covering denom + 1 (minimum fee)
-            let needed = denom + 1;
+            // Find inputs covering denom + 10_000 (minimum fee)
+            let needed = denom + 10_000u64;
             let mut selected = Vec::new();
             let mut total = 0u64;
 

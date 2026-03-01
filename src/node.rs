@@ -399,14 +399,14 @@ impl Node {
                         temp_coins.insert(coin_id);
                     }
 
-                    // --- NEW: Calculate Genesis State Root ---
+                    // --- Calculate Genesis State Root ---
                     let smt_root = hash_concat(&temp_coins.root(), &state.commitments.root());
                     let state_root = hash_concat(&smt_root, &state.chain_mmr.root());
                     mining_midstate = hash_concat(&mining_midstate, &state_root);
                     // -----------------------------------------
 
                     // Hardcoded genesis nonce to avoid PoW on node initialization.
-                    let nonce = 166;
+                    let nonce = 438;
                     let extension = create_extension(mining_midstate, nonce);
                     
                     // Safety check: Ensure the hardcoded nonce is still valid in case 
@@ -3009,30 +3009,30 @@ mod tests {
     }
     
     #[test]
-fn find_genesis_nonce() {
-    use crate::core::types::*;
-    use crate::core::extension::create_extension;
+    fn find_genesis_nonce() {
+        use crate::core::types::*;
+        use crate::core::extension::create_extension;
 
-    let (mut state, genesis_coinbase) = State::genesis();
-    let mut mining_midstate = state.midstate;
-    let mut temp_coins = state.coins.clone();
-    for cb in &genesis_coinbase {
-        let coin_id = cb.coin_id();
-        mining_midstate = hash_concat(&mining_midstate, &coin_id);
-        temp_coins.insert(coin_id);
-    }
-    let smt_root = hash_concat(&temp_coins.root(), &state.commitments.root());
-    let state_root = hash_concat(&smt_root, &state.chain_mmr.root());
-    mining_midstate = hash_concat(&mining_midstate, &state_root);
+        let (mut state, genesis_coinbase) = State::genesis();
+        let mut mining_midstate = state.midstate;
+        let mut temp_coins = state.coins.clone();
+        for cb in &genesis_coinbase {
+            let coin_id = cb.coin_id();
+            mining_midstate = hash_concat(&mining_midstate, &coin_id);
+            temp_coins.insert(coin_id);
+        }
+        let smt_root = hash_concat(&temp_coins.root(), &state.commitments.root());
+        let state_root = hash_concat(&smt_root, &state.chain_mmr.root());
+        mining_midstate = hash_concat(&mining_midstate, &state_root);
 
-    for nonce in 0u64.. {
-        let ext = create_extension(mining_midstate, nonce);
-        if ext.final_hash < state.target {
-            println!("\n\n  *** VALID GENESIS NONCE: {} ***\n", nonce);
-            return;
+        for nonce in 0u64.. {
+            let ext = create_extension(mining_midstate, nonce);
+            if ext.final_hash < state.target {
+                println!("\n\n  *** VALID GENESIS NONCE: {} ***\n", nonce);
+                return;
+            }
         }
     }
-}
     
 }
 
