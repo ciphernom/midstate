@@ -37,6 +37,7 @@ use super::types::hash_concat;
 use super::wots;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+use rayon::prelude::*;
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -105,11 +106,21 @@ pub fn keygen(master_seed: &[u8; 32], height: u32) -> Result<MssKeypair> {
     let mut tree = vec![[0u8; 32]; tree_size];
 
     // Leaves: tree[num_leaves .. 2*num_leaves)
+    // OLD:
+    // let leaf_start = num_leaves as usize;
+    // for i in 0..num_leaves {
+    //     let seed = derive_wots_seed(master_seed, i);
+    //     tree[leaf_start + i as usize] = wots::keygen(&seed);
+    // }
+
+    // NEW: Parallelize the 1,024 leaves, sequentialize the 18 inner chains
     let leaf_start = num_leaves as usize;
-    for i in 0..num_leaves {
-        let seed = derive_wots_seed(master_seed, i);
-        tree[leaf_start + i as usize] = wots::keygen(&seed);
-    }
+    let (_internal, leaves) = tree.split_at_mut(leaf_start);
+    
+    leaves.par_iter_mut().enumerate().for_each(|(i, leaf)| {
+        let seed = derive_wots_seed(master_seed, i as u64);
+        *leaf = wots::keygen_seq(&seed); 
+    });
 
     // Internal nodes bottom-up
     for i in (1..leaf_start).rev() {
