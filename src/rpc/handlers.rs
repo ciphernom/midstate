@@ -68,6 +68,12 @@ pub async fn commit_transaction(
     State(node): State<AppState>,
     Json(req): Json<CommitRequest>,
 ) -> Result<Json<CommitResponse>, ErrorResponse> {
+    
+    // --- Rate Limit Check using Semaphore on NodeHandle ---
+    let _permit = node.commit_limiter.try_acquire().map_err(|_| ErrorResponse {
+        error: "Server is under heavy load computing PoW. Try again later.".into()
+    })?;
+
     if req.coins.is_empty() {
         return Err(ErrorResponse { error: "Must provide at least one coin".into() });
     }
@@ -89,10 +95,9 @@ pub async fn commit_transaction(
     // Determine dynamic PoW requirement based on mempool congestion
     let (_, txs) = node.get_mempool_info().await;
     let pending_commits = txs.iter().filter(|t| matches!(t, Transaction::Commit { .. })).count();
-    let required_pow = if pending_commits < 500 { 16 } 
-        else if pending_commits < 750 { 18 } 
-        else if pending_commits < 900 { 20 } 
-        else { 22 };
+    
+    // Use the dynamic threshold from Mempool
+    let required_pow = crate::mempool::Mempool::calculate_required_pow(pending_commits);
 
     // Mine PoW nonce for anti-spam
     let spam_nonce = tokio::task::spawn_blocking(move || {
@@ -309,6 +314,18 @@ let input = InputReveal {
         }
     };
 
+    // --- Validate coin exists in UTXO set before touching MixManager ---
+    let coin_id = input.coin_id();
+    {
+        let state = node.get_state().await;
+        if !state.coins.contains(&coin_id) {
+            return Err(ErrorResponse {
+                error: "Input coin does not exist or is already spent".into(),
+            });
+        }
+    }
+    // -------------------------------------------------------------------
+
     // --- Decode the signature from the RPC request ---
     let signature = hex::decode(&req.signature)
         .map_err(|e| ErrorResponse { error: format!("Invalid signature hex: {}", e) })?;
@@ -334,6 +351,18 @@ let input = InputReveal {
         value: req.input.value,
         salt: parse_hex32(&req.input.salt, "input_salt")?,
     };
+    // --- Validate fee coin exists in UTXO set before touching MixManager ---
+    {
+        let coin_id = input.coin_id();
+        let state = node.get_state().await;
+        if !state.coins.contains(&coin_id) {
+            return Err(ErrorResponse {
+                error: "Fee input coin does not exist or is already spent".into(),
+            });
+        }
+    }
+    // ---------------------------------------------------------------------
+
     node.mix_set_fee(mix_id, input).await
         .map_err(|e| ErrorResponse { error: e.to_string() })?;
 
@@ -355,7 +384,8 @@ pub async fn mix_sign(
     let signature = hex::decode(&req.signature)
         .map_err(|e| ErrorResponse { error: format!("invalid signature hex: {}", e) })?;
 
-    node.mix_sign(mix_id, input_index, signature).await
+    let height = node.get_state().await.height;
+    node.mix_sign(mix_id, input_index, signature, height).await
         .map_err(|e| ErrorResponse { error: e.to_string() })?;
 
     Ok(Json(serde_json::json!({ "status": "signed", "input_index": input_index })))
@@ -394,17 +424,56 @@ pub async fn get_filters(
         .map_err(|e| ErrorResponse { error: format!("Storage error: {}", e) })?;
 
     let mut filters = Vec::new();
+    let mut block_hashes = Vec::new();
+    let mut element_counts = Vec::new();
+
     for h in req.start_height..end {
-        if let Ok(Some(filter_data)) = store.load_filter(h) {
-            filters.push(hex::encode(filter_data));
-        } else {
-            break; // Stop at the first missing filter (chain tip)
+        let filter_data = match store.load_filter(h) {
+            Ok(Some(data)) => data,
+            _ => break,
+        };
+
+        // Load batch to get the block hash (final_hash) and element count.
+        // Needed for client-side Golomb-Rice filter matching.
+        let batch = match store.load(h) {
+            Ok(Some(b)) => b,
+            _ => break,
+        };
+
+        // Count unique identifiable elements the same way CompactFilter::build does
+        let mut items = std::collections::HashSet::new();
+        for tx in &batch.transactions {
+            match tx {
+                crate::core::Transaction::Commit { commitment, .. } => {
+                    items.insert(*commitment);
+                }
+                crate::core::Transaction::Reveal { inputs, outputs, .. } => {
+                    for input in inputs {
+                        items.insert(input.coin_id());
+                        items.insert(input.predicate.address());
+                    }
+                    for output in outputs {
+                        if let Some(cid) = output.coin_id() { items.insert(cid); }
+                        items.insert(output.address());
+                    }
+                }
+            }
         }
+        for cb in &batch.coinbase {
+            items.insert(cb.coin_id());
+            items.insert(cb.address);
+        }
+
+        filters.push(hex::encode(filter_data));
+        block_hashes.push(hex::encode(batch.extension.final_hash));
+        element_counts.push(items.len() as u64);
     }
 
     Ok(Json(GetFiltersResponse {
         start_height: req.start_height,
         filters,
+        block_hashes,
+        element_counts,
     }))
 }
 
@@ -424,4 +493,229 @@ fn snapshot_to_response(s: crate::mix::MixStatusSnapshot) -> MixStatusResponse {
         commitment: s.commitment,
         input_coin_ids: s.input_coin_ids,
     }
+}
+
+// ── Explorer Endpoints ──────────────────────────────────────────────────
+
+/// Return a batch with witnesses stripped (they're ~40KB each and useless
+/// for display). Keeps the explorer snappy.
+pub async fn get_batch(
+    State(node): State<AppState>,
+    axum::extract::Path(height): axum::extract::Path<u64>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let store = crate::storage::BatchStore::new(&node.batches_path)
+        .map_err(|e| ErrorResponse { error: format!("Storage error: {}", e) })?;
+
+    let batch = store.load(height)
+        .map_err(|e| ErrorResponse { error: e.to_string() })?
+        .ok_or_else(|| ErrorResponse { error: format!("Batch at height {} not found", height) })?;
+
+    // Serialize to JSON, then strip the witness arrays to save bandwidth
+    let mut val = serde_json::to_value(&batch)
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    // Strip witnesses from each Reveal transaction
+    if let Some(txs) = val.get_mut("transactions").and_then(|v| v.as_array_mut()) {
+        for tx in txs {
+            if let Some(reveal) = tx.get_mut("Reveal") {
+                if let Some(witnesses) = reveal.get_mut("witnesses") {
+                    // Replace with just the count so the UI knows how many inputs
+                    let count = witnesses.as_array().map(|a| a.len()).unwrap_or(0);
+                    *witnesses = serde_json::json!(format!("{} witness(es) stripped", count));
+                }
+            }
+        }
+    }
+
+    // Inject height into the response
+    val.as_object_mut().map(|o| o.insert("height".to_string(), serde_json::json!(height)));
+
+    Ok(Json(val))
+}
+
+/// Universal search: find any 32-byte hash across blocks, txs, addresses.
+/// Searches the last `limit` blocks (default 1000) server-side.
+pub async fn search(
+    State(node): State<AppState>,
+    Json(req): Json<SearchRequest>,
+) -> Result<Json<SearchResponse>, ErrorResponse> {
+    let query = parse_hex32(&req.query, "query")?;
+
+    let store = crate::storage::BatchStore::new(&node.batches_path)
+        .map_err(|e| ErrorResponse { error: format!("Storage error: {}", e) })?;
+
+    let tip = store.highest()
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    let search_start = tip.saturating_sub(5000);
+    let mut results = Vec::new();
+
+    for height in (search_start..=tip).rev() {
+        let batch = match store.load(height) {
+            Ok(Some(b)) => b,
+            _ => continue,
+        };
+
+        // Check block-level hashes
+        if batch.extension.final_hash == query {
+            results.push(SearchResult {
+                result_type: "block_hash".into(),
+                height,
+                tx_index: None,
+                detail: "Block hash match".into(),
+            });
+        }
+        if batch.prev_midstate == query {
+            results.push(SearchResult {
+                result_type: "prev_midstate".into(),
+                height,
+                tx_index: None,
+                detail: "Parent midstate match".into(),
+            });
+        }
+        if batch.state_root == query {
+            results.push(SearchResult {
+                result_type: "state_root".into(),
+                height,
+                tx_index: None,
+                detail: "State root match".into(),
+            });
+        }
+
+        // Check coinbase
+        for cb in &batch.coinbase {
+            if cb.address == query {
+                results.push(SearchResult {
+                    result_type: "coinbase_address".into(),
+                    height,
+                    tx_index: None,
+                    detail: format!("Coinbase output, value {}", cb.value),
+                });
+            }
+            if cb.coin_id() == query {
+                results.push(SearchResult {
+                    result_type: "coinbase_coin_id".into(),
+                    height,
+                    tx_index: None,
+                    detail: format!("Coinbase coin, value {}", cb.value),
+                });
+            }
+        }
+
+        // Check transactions
+        for (i, tx) in batch.transactions.iter().enumerate() {
+            match tx {
+                Transaction::Commit { commitment, .. } => {
+                    if *commitment == query {
+                        results.push(SearchResult {
+                            result_type: "commitment".into(),
+                            height,
+                            tx_index: Some(i),
+                            detail: "Commitment hash match".into(),
+                        });
+                    }
+                }
+                Transaction::Reveal { inputs, outputs, salt, .. } => {
+                    if *salt == query {
+                        results.push(SearchResult {
+                            result_type: "reveal_salt".into(),
+                            height,
+                            tx_index: Some(i),
+                            detail: "Reveal commitment salt".into(),
+                        });
+                    }
+                    for (j, inp) in inputs.iter().enumerate() {
+                        if inp.predicate.address() == query {
+                            results.push(SearchResult {
+                                result_type: "input_address".into(),
+                                height,
+                                tx_index: Some(i),
+                                detail: format!("Input {} spent, value {}", j, inp.value),
+                            });
+                        }
+                        if inp.coin_id() == query {
+                            results.push(SearchResult {
+                                result_type: "input_coin_id".into(),
+                                height,
+                                tx_index: Some(i),
+                                detail: format!("Input {} coin spent, value {}", j, inp.value),
+                            });
+                        }
+                    }
+                    for (j, out) in outputs.iter().enumerate() {
+                        if out.address() == query {
+                            results.push(SearchResult {
+                                result_type: "output_address".into(),
+                                height,
+                                tx_index: Some(i),
+                                detail: format!("Output {} created, value {}", j, out.value()),
+                            });
+                        }
+                        if let Some(cid) = out.coin_id() {
+                            if cid == query {
+                                results.push(SearchResult {
+                                    result_type: "output_coin_id".into(),
+                                    height,
+                                    tx_index: Some(i),
+                                    detail: format!("Output {} coin created, value {}", j, out.value()),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Stop after finding results (return all matches at first matching height,
+        // then keep scanning for more)
+        if results.len() >= 50 {
+            break;
+        }
+    }
+
+    Ok(Json(SearchResponse { results }))
+}
+
+/// Check whether a coin exists in the current UTXO set (GET version for explorer)
+pub async fn check_coin_get(
+    State(node): State<AppState>,
+    axum::extract::Path(coin_hex): axum::extract::Path<String>,
+) -> Result<Json<CheckCoinResponse>, ErrorResponse> {
+    let coin = parse_hex32(&coin_hex, "coin")?;
+    let exists = node.check_coin(coin).await;
+    Ok(Json(CheckCoinResponse {
+        exists,
+        coin: hex::encode(coin),
+    }))
+}
+
+/// Return a raw block for private wallet scanning.
+/// Unlike /batch/:height, this returns the full Batch struct including
+/// output addresses and salts but with witnesses stripped for bandwidth.
+/// The wallet parses this client-side so it never has to send addresses
+/// to the node — preserving Neutrino-level scan privacy.
+pub async fn get_block_raw(
+    State(node): State<AppState>,
+    axum::extract::Path(height): axum::extract::Path<u64>,
+) -> Result<Json<crate::core::Batch>, ErrorResponse> {
+    let store = crate::storage::BatchStore::new(&node.batches_path)
+        .map_err(|e| ErrorResponse { error: format!("Storage error: {}", e) })?;
+
+    let mut batch = store.load(height)
+        .map_err(|e| ErrorResponse { error: e.to_string() })?
+        .ok_or_else(|| ErrorResponse { error: format!("Block at height {} not found", height) })?;
+
+    // Strip witness data to save bandwidth (~40KB per input).
+    // The wallet only needs inputs (for address) and outputs (for address, value, salt).
+    for tx in &mut batch.transactions {
+        if let Transaction::Reveal { witnesses, .. } = tx {
+            *witnesses = vec![];
+        }
+    }
+
+    Ok(Json(batch))
+}
+
+pub async fn explorer_ui() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("explorer.html"))
 }

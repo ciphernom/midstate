@@ -175,6 +175,19 @@ enum WalletAction {
     Create {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// Create a legacy (non-HD) wallet instead of a seed-phrase wallet
+        #[arg(long)]
+        legacy: bool,
+    },
+    /// Restore an HD wallet from a 24-word seed phrase
+    Restore {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+        /// The 24-word mnemonic phrase (will be prompted if not provided)
+        #[arg(long)]
+        phrase: Option<String>,
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
     },
     /// Generate a receiving address (WOTS key)
     Receive {
@@ -431,8 +444,9 @@ async fn wallet_scan(path: &PathBuf, rpc_port: u16) -> Result<()> {
         return Ok(());
     }
 
-    let state_url = format!("http://127.0.0.1:{}/state", rpc_port);
-    let state: rpc::GetStateResponse = client.get(&state_url).send().await?.json().await?;
+    let base_url = format!("http://127.0.0.1:{}", rpc_port);
+    let state: rpc::GetStateResponse = client.get(format!("{}/state", base_url))
+        .send().await?.json().await?;
     let chain_height = state.height;
     let start = wallet.data.last_scan_height;
 
@@ -441,32 +455,26 @@ async fn wallet_scan(path: &PathBuf, rpc_port: u16) -> Result<()> {
         return Ok(());
     }
 
-    println!("Scanning blocks {}..{} for {} address(es)...", start, chain_height, addresses.len());
+    println!("Scanning blocks {}..{} for {} address(es) using compact filters...", start, chain_height, addresses.len());
 
-    let scan_url = format!("http://127.0.0.1:{}/scan", rpc_port);
-    let req = rpc::ScanRequest {
-        addresses: addresses.iter().map(|a| hex::encode(a)).collect(),
-        start_height: start,
-        end_height: chain_height,
-    };
-    let resp: rpc::ScanResponse = client.post(&scan_url).json(&req).send().await?.json().await?;
+    // Phase 1: Filter scan — find which blocks might contain our addresses
+    let matching_heights = filter_scan(&client, &base_url, &addresses, start, chain_height).await?;
 
-    let mut imported = 0usize;
-    for sc in &resp.coins {
-        let address = parse_hex32(&sc.address)?;
-        let salt = parse_hex32(&sc.salt)?;
-        if let Some(coin_id) = wallet.import_scanned(address, sc.value, salt)? {
-            println!("  found: {} (value {}, height {})", short_hex(&coin_id), sc.value, sc.height);
-            imported += 1;
-        }
+    if matching_heights.is_empty() {
+        println!("  No filter matches found.");
+    } else {
+        println!("  {} block(s) matched filters, fetching details...", matching_heights.len());
     }
+
+    // Phase 2: Targeted scan — only fetch full data for matching blocks
+    let imported = targeted_scan(&client, &base_url, &mut wallet, &addresses, &matching_heights).await?;
 
     wallet.data.last_scan_height = chain_height;
     
     // Sync MSS key indices (stateful recovery)
     if !wallet.data.mss_keys.is_empty() {
         println!("Syncing MSS key indices...");
-        let mss_url = format!("http://127.0.0.1:{}/mss_state", rpc_port);
+        let mss_url = format!("{}/mss_state", base_url);
         for mss_key in &mut wallet.data.mss_keys {
             let req = rpc::GetMssStateRequest {
                 master_pk: hex::encode(mss_key.master_pk),
@@ -490,11 +498,126 @@ async fn wallet_scan(path: &PathBuf, rpc_port: u16) -> Result<()> {
         }
     }
     
-    
     wallet.save()?;
 
     println!("Scan complete. {} new coin(s) found. Scanned to height {}.", imported, chain_height);
     Ok(())
+}
+
+/// Download compact filters in batches and test which blocks might contain
+/// any of the given addresses. Returns the list of block heights with
+/// potential matches (may include false positives at rate ~1/1M per block).
+async fn filter_scan(
+    client: &reqwest::Client,
+    base_url: &str,
+    addresses: &[[u8; 32]],
+    start: u64,
+    end: u64,
+) -> Result<Vec<u64>> {
+    use midstate::core::filter::match_any;
+
+    let mut matching = Vec::new();
+    let filter_url = format!("{}/filters", base_url);
+    const FILTER_BATCH: u64 = 500;
+
+    let mut cursor = start;
+    while cursor < end {
+        let batch_end = (cursor + FILTER_BATCH).min(end);
+        let req = rpc::GetFiltersRequest {
+            start_height: cursor,
+            end_height: batch_end,
+        };
+        let resp: rpc::GetFiltersResponse = client.post(&filter_url)
+            .json(&req).send().await?.json().await?;
+
+        for (i, filter_hex) in resp.filters.iter().enumerate() {
+            let height = resp.start_height + i as u64;
+
+            // Decode the metadata needed for client-side matching
+            let block_hash = if i < resp.block_hashes.len() {
+                parse_hex32(&resp.block_hashes[i])?
+            } else {
+                // Fallback: server didn't send hashes (old node), do full scan
+                matching.push(height);
+                continue;
+            };
+            let n = if i < resp.element_counts.len() {
+                resp.element_counts[i]
+            } else {
+                matching.push(height);
+                continue;
+            };
+
+            if n == 0 {
+                continue;
+            }
+
+            let filter_data = hex::decode(filter_hex)?;
+            if match_any(&filter_data, &block_hash, n, addresses) {
+                matching.push(height);
+            }
+        }
+
+        cursor = batch_end;
+    }
+    Ok(matching)
+}
+
+/// Fetch full blocks for specific heights and scan for our addresses client-side.
+/// PRIVACY: This function never sends any addresses to the node. It downloads
+/// raw blocks and matches outputs locally, preserving Neutrino-level privacy.
+/// Returns count of newly imported coins.
+async fn targeted_scan(
+    client: &reqwest::Client,
+    base_url: &str,
+    wallet: &mut Wallet,
+    addresses: &[[u8; 32]],
+    heights: &[u64],
+) -> Result<usize> {
+    if heights.is_empty() {
+        return Ok(0);
+    }
+
+    let addr_set: std::collections::HashSet<[u8; 32]> = addresses.iter().copied().collect();
+    let mut imported = 0usize;
+
+    for &height in heights {
+        // Fetch the full block (witnesses stripped for bandwidth)
+        let url = format!("{}/block/{}", base_url, height);
+        let resp = client.get(&url).send().await?;
+        if !resp.status().is_success() {
+            continue;
+        }
+        let batch: midstate::core::Batch = resp.json().await?;
+
+        // Scan coinbase outputs
+        for cb in &batch.coinbase {
+            if addr_set.contains(&cb.address) {
+                if let Some(coin_id) = wallet.import_scanned(cb.address, cb.value, cb.salt)? {
+                    println!("  found: {} (value {}, height {})", short_hex(&coin_id), cb.value, height);
+                    imported += 1;
+                }
+            }
+        }
+
+        // Scan transaction outputs
+        for tx in &batch.transactions {
+            if let midstate::core::Transaction::Reveal { outputs, .. } = tx {
+                for out in outputs {
+                    if addr_set.contains(&out.address()) {
+                        if let Some(_cid) = out.coin_id() {
+                            if let Some(coin_id) = wallet.import_scanned(out.address(), out.value(), out.salt())? {
+                                println!("  found: {} (value {}, height {})", short_hex(&coin_id), out.value(), height);
+                                imported += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(imported)
 }
 
 async fn wallet_spend_script(
@@ -619,7 +742,8 @@ async fn wallet_spend_script(
 
 async fn handle_wallet(action: WalletAction) -> Result<()> {
     match action {
-        WalletAction::Create { path } => wallet_create(&path),
+        WalletAction::Create { path, legacy } => wallet_create(&path, legacy),
+        WalletAction::Restore { path, phrase, rpc_port } => wallet_restore(&path, phrase, rpc_port).await,
         WalletAction::Receive { path, label } => wallet_receive(&path, label),
         WalletAction::Compile { file } => wallet_compile(&file),
         WalletAction::Generate { path, count, label } => wallet_generate(&path, count, label),
@@ -654,10 +778,112 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
     }
 }
 
-fn wallet_create(path: &PathBuf) -> Result<()> {
+fn wallet_create(path: &PathBuf, legacy: bool) -> Result<()> {
     let password = read_password_confirm()?;
-    Wallet::create(path, &password)?;
-    println!("Wallet created: {}", path.display());
+
+    if legacy {
+        Wallet::create(path, &password)?;
+        println!("Legacy wallet created: {}", path.display());
+    } else {
+        let (_wallet, phrase) = Wallet::create_hd(path, &password)?;
+        println!();
+        println!("=================================================================");
+        println!("  WALLET CREATED SUCCESSFULLY");
+        println!("  WRITE DOWN THESE 24 WORDS. THIS IS YOUR ONLY BACKUP.");
+        println!("  If you lose this phrase, your funds are UNRECOVERABLE.");
+        println!("-----------------------------------------------------------------");
+        println!("  {}", phrase);
+        println!("=================================================================");
+        println!();
+        println!("Wallet saved to: {}", path.display());
+    }
+    Ok(())
+}
+
+async fn wallet_restore(path: &PathBuf, phrase_arg: Option<String>, rpc_port: u16) -> Result<()> {
+    let phrase = match phrase_arg {
+        Some(p) => p,
+        None => {
+            print!("Enter your 24-word seed phrase: ");
+            std::io::Write::flush(&mut std::io::stdout())?;
+            let mut input = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut input)?;
+            input.trim().to_string()
+        }
+    };
+
+    // Validate the phrase before asking for a password
+    midstate::wallet::hd::master_seed_from_mnemonic(&phrase)?;
+
+    let password = read_password_confirm()?;
+    let mut wallet = Wallet::restore_from_mnemonic(path, &password, &phrase)?;
+
+    println!("Wallet restored from seed phrase.");
+    println!("Saved to: {}", path.display());
+    println!("\nCRITICAL WARNING: Run `midstate wallet scan` before sending any transactions.");
+    println!("Spending from an unscanned wallet may result in the permanent loss of sibling UTXOs.");
+    println!();
+
+    // Gap-limit scan: generate keys in batches, scan the chain, repeat until
+    // a full window of GAP_LIMIT consecutive unused keys is found.
+    println!("Starting chain scan to rediscover coins...");
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{}", rpc_port);
+
+    let state: rpc::GetStateResponse = client.get(format!("{}/state", base_url))
+        .send().await?.json().await?;
+    let chain_height = state.height;
+
+    if chain_height == 0 {
+        println!("Chain is empty — nothing to scan. Generate keys as you go.");
+        return Ok(());
+    }
+
+    const GAP_LIMIT: u64 = 20;
+    const BATCH_SIZE: u64 = 50;
+    let mut total_found = 0usize;
+    let mut consecutive_empty = 0u64;
+
+    loop {
+        // Generate a batch of keys
+        let idx_before = wallet.wots_index();
+        wallet.restore_generate_keys(BATCH_SIZE)?;
+        let addresses = wallet.watched_addresses();
+
+        println!(
+            "  Scanning with {} addresses (WOTS index {}..{})...",
+            addresses.len(), idx_before, wallet.wots_index()
+        );
+
+        // Use compact filters to find which blocks might contain our addresses
+        let matching_heights = filter_scan(&client, &base_url, &addresses, 0, chain_height).await?;
+
+        if matching_heights.is_empty() {
+            consecutive_empty += BATCH_SIZE;
+        } else {
+            // Do targeted full scans only on matching blocks
+            let found = targeted_scan(&client, &base_url, &mut wallet, &addresses, &matching_heights).await?;
+            if found > 0 {
+                total_found += found;
+                consecutive_empty = 0;
+            } else {
+                consecutive_empty += BATCH_SIZE;
+            }
+        }
+
+        if consecutive_empty >= GAP_LIMIT {
+            break;
+        }
+    }
+
+    wallet.data.last_scan_height = chain_height;
+    wallet.save()?;
+
+    println!();
+    println!("Restore complete. {} coin(s) recovered. Scanned to height {}.", total_found, chain_height);
+    if wallet.total_value() > 0 {
+        println!("Total balance: {}", wallet.total_value());
+    }
     Ok(())
 }
 fn wallet_compile(path: &std::path::Path) -> Result<()> {
@@ -942,7 +1168,7 @@ async fn wallet_send(
         if change > 0 {
             let change_denoms = decompose_value(change);
             for denom in change_denoms {
-                let seed: [u8; 32] = rand::random();
+                let seed = wallet.next_wots_seed();
                 let pk = wots::keygen(&seed);
                 let addr = compute_address(&pk);
                 let salt: [u8; 32] = rand::random();
@@ -950,6 +1176,31 @@ async fn wallet_send(
                 all_outputs.push(OutputData::Standard { address: addr, value: denom, salt });
                 change_seeds.push((idx, seed));
             }
+        }
+
+        // Decoy padding: pad to at least 4 outputs with denomination-1 self-sends.
+        // These are real UTXOs recoverable from the HD seed, usable for fee payment.
+        while all_outputs.len() < 4 {
+            let seed = wallet.next_wots_seed();
+            let pk = wots::keygen(&seed);
+            let addr = compute_address(&pk);
+            let salt: [u8; 32] = rand::random();
+            let idx = all_outputs.len();
+            all_outputs.push(OutputData::Standard { address: addr, value: 1, salt });
+            change_seeds.push((idx, seed));
+        }
+
+        // Shuffle outputs so the recipient position is random
+        {
+            use rand::seq::SliceRandom;
+            let mut indices: Vec<usize> = (0..all_outputs.len()).collect();
+            indices.shuffle(&mut rand::thread_rng());
+            let shuffled: Vec<OutputData> = indices.iter().map(|&i| all_outputs[i].clone()).collect();
+            let mut rev = vec![0usize; indices.len()];
+            for (new_i, &old_i) in indices.iter().enumerate() { rev[old_i] = new_i; }
+            change_seeds = change_seeds.into_iter()
+                .map(|(old_idx, s)| (rev[old_idx], s)).collect();
+            all_outputs = shuffled;
         }
 
         let output_commit_hashes: Vec<[u8; 32]> = all_outputs.iter().map(|o| o.hash_for_commitment()).collect();
@@ -1860,7 +2111,8 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
     // 3. Verify
     sync::Syncer::verify_header_chain(&headers)?;
     let our_state = storage.load_state()?.unwrap_or_else(|| State::genesis().0);
-    let fork_height = syncer.find_fork_point(&headers, our_state.height)?;
+    // from genesis here...
+    let fork_height = syncer.find_fork_point(&headers, 0, our_state.height)?;
 
     // 4. Download and apply batches
     let mut state = syncer.rebuild_state_to(fork_height)?;

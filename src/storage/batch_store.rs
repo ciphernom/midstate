@@ -13,8 +13,95 @@ impl BatchStore {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let base_path = path.as_ref().to_path_buf();
         fs::create_dir_all(&base_path)?;
+        
+        // NOTE: WAL recovery is deferred to recover_wal() which must be called
+        // AFTER loading the committed state height from redb. Calling it here
+        // would blindly promote .tmp files from an aborted reorg, corrupting
+        // the block data on disk.
+        
         Ok(Self { base_path })
     }
+
+    /// State-aware WAL recovery. Must be called after loading state from redb.
+    ///
+    /// - If a `.tmp` file's height <= committed_height, the DB committed but
+    ///   the rename was interrupted (crash at Step 3) → promote to `.bin`.
+    /// - If a `.tmp` file's height > committed_height, the DB never committed
+    ///   (crash at Step 1) → delete the orphaned `.tmp` file.
+    pub fn recover_wal(&self, committed_height: u64) -> Result<()> {
+        if !self.base_path.exists() { return Ok(()); }
+        for entry in fs::read_dir(&self.base_path)? {
+            let entry = entry?;
+            if entry.path().is_dir() {
+                for file in fs::read_dir(entry.path())? {
+                    let file = file?;
+                    let path = file.path();
+                    if path.extension().and_then(|s| s.to_str()) == Some("tmp") {
+                        // Extract height from filename (e.g. "batch_105.tmp" -> 105)
+                        let height = path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .and_then(|s| s.split('_').last())
+                            .and_then(|s| s.parse::<u64>().ok());
+
+                        match height {
+                            Some(h) if h <= committed_height => {
+                                // DB committed this height — finish the rename
+                                let mut bin_path = path.clone();
+                                bin_path.set_extension("bin");
+                                fs::rename(&path, &bin_path)?;
+                                tracing::info!("WAL recovery: promoted {:?} (height {} <= committed {})",
+                                    path.file_name().unwrap(), h, committed_height);
+                            }
+                            Some(h) => {
+                                // DB never committed this height — discard
+                                fs::remove_file(&path)?;
+                                tracing::info!("WAL recovery: deleted orphan {:?} (height {} > committed {})",
+                                    path.file_name().unwrap(), h, committed_height);
+                            }
+                            None => {
+                                // Can't parse height — leave it alone
+                                tracing::warn!("WAL recovery: skipping {:?} (could not parse height)", path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // PHASE 1: Write to disk safely without overriding live data
+    pub fn save_tmp(&self, height: u64, batch: &Batch) -> Result<()> {
+        let folder = height / 1000;
+        let folder_path = self.base_path.join(format!("{:06}", folder));
+        std::fs::create_dir_all(&folder_path)?;
+        
+        let batch_tmp = folder_path.join(format!("batch_{}.tmp", height));
+        let hdr_tmp = folder_path.join(format!("header_{}.tmp", height));
+        
+        std::fs::write(&batch_tmp, bincode::serialize(batch)?)?;
+        let mut header = batch.header();
+        header.height = height;
+        std::fs::write(&hdr_tmp, bincode::serialize(&header)?)?;
+        
+        Ok(())
+    }
+
+    // PHASE 2: Promote temporary files to live files
+    pub fn commit_tmp(&self, height: u64) -> Result<()> {
+        let folder = height / 1000;
+        let folder_path = self.base_path.join(format!("{:06}", folder));
+        
+        let batch_tmp = folder_path.join(format!("batch_{}.tmp", height));
+        let batch_bin = folder_path.join(format!("batch_{}.bin", height));
+        let hdr_tmp = folder_path.join(format!("header_{}.tmp", height));
+        let hdr_bin = folder_path.join(format!("header_{}.bin", height));
+        
+        if batch_tmp.exists() { fs::rename(batch_tmp, batch_bin)?; }
+        if hdr_tmp.exists() { fs::rename(hdr_tmp, hdr_bin)?; }
+        Ok(())
+    }
+    
     pub fn base_path(&self) -> &PathBuf { &self.base_path }
     
     /// Height up to which checkpoints have already been pruned.

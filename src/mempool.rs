@@ -98,28 +98,52 @@ impl Mempool {
     }
 
     /// Calculates the required Proof-of-Work (number of leading zero bits)
-    /// based on the current number of pending commits. Scales dynamically
+    /// based on the provided number of pending commits. Scales dynamically
     /// to deter spam when the commit pool is congested.
     ///
-    /// | Pending commits | Required leading zeros | Relative difficulty |
-    /// |-----------------|------------------------|---------------------|
-    /// | < 500           | 16                     | 1×                  |
-    /// | 500 – 749       | 18                     | 4×                  |
-    /// | 750 – 899       | 20                     | 16×                 |
-    /// | ≥ 900           | 22                     | 64×                 |
+    /// | Pending commits | Required zeros (normal) | Required zeros (fast-mining) |
+    /// |-----------------|-------------------------|------------------------------|
+    /// | < 500           | 24                      | 16                           |
+    /// | 500 – 749       | 26                      | 18                           |
+    /// | 750 – 899       | 28                      | 20                           |
+    /// | >= 900          | 30                      | 22                           |
+    ///
+    /// # Examples
+    /// ```
+    /// use midstate::mempool::Mempool;
+    /// // Base threshold varies by build profile
+    /// let pow = Mempool::calculate_required_pow(100);
+    /// assert!(pow >= 16);
+    /// ```
+    pub fn calculate_required_pow(commits: usize) -> u32 {
+        #[cfg(not(feature = "fast-mining"))]
+        {
+            if commits < 500      { 24 }
+            else if commits < 750 { 26 }
+            else if commits < 900 { 28 }
+            else                  { 30 }
+        }
+        #[cfg(feature = "fast-mining")]
+        {
+            if commits < 500      { 16 }
+            else if commits < 750 { 18 }
+            else if commits < 900 { 20 }
+            else                  { 22 }
+        }
+    }
+
+    /// Convenience method to get the required Proof-of-Work based on the
+    /// *current* size of the mempool's commit pool.
     ///
     /// # Examples
     /// ```
     /// use midstate::mempool::Mempool;
     /// let mempool = Mempool::new();
-    /// assert_eq!(mempool.required_commit_pow(), 16);
+    /// let pow = mempool.required_commit_pow();
+    /// assert!(pow >= 16);
     /// ```
     pub fn required_commit_pow(&self) -> u32 {
-        let commits = self.commits.len();
-        if commits < 500      { 16 }
-        else if commits < 750 { 18 }
-        else if commits < 900 { 20 }
-        else                  { 22 }
+        Self::calculate_required_pow(self.commits.len())
     }
 
     /// Adds a transaction to the mempool after validating it against the
@@ -227,9 +251,15 @@ impl Mempool {
                         MIN_FEE_PER_KB, reveal_tx.fee(), tx_bytes
                     );
                 }
+                // Input-level Replace-By-Fee: if any input conflicts with an
+                // existing mempool transaction, the new tx must pay a strictly
+                // higher fee rate than ALL conflicting txs to evict them.
+                let mut conflicting_txs: Vec<[u8; 32]> = Vec::new();
                 for input in reveal_tx.input_coin_ids() {
-                    if self.seen_inputs.contains(&input) {
-                        anyhow::bail!("Transaction input already in mempool");
+                    if let Some(&existing_id) = self.txs_by_input.get(&input) {
+                        if !conflicting_txs.contains(&existing_id) {
+                            conflicting_txs.push(existing_id);
+                        }
                     }
                 }
 
@@ -237,6 +267,39 @@ impl Mempool {
 
                 let fee_rate = compute_fee_rate(reveal_tx.fee(), tx_bytes);
                 let tx_id = get_tx_id(&reveal_tx);
+
+                if !conflicting_txs.is_empty() {
+                    let mut total_evicted_fee = 0u64;
+
+                    // Must outbid every conflicting transaction's fee RATE
+                    for &cid in &conflicting_txs {
+                        if let Some(existing_tx) = self.reveals.get(&cid) {
+                            let existing_bytes = bincode::serialized_size(&**existing_tx).unwrap_or(1) as u64;
+                            let existing_rate = compute_fee_rate(existing_tx.fee(), existing_bytes);
+                            
+                            if fee_rate <= existing_rate {
+                                anyhow::bail!(
+                                    "RBF rejected: new fee rate {} must exceed conflicting tx rate {}",
+                                    fee_rate, existing_rate
+                                );
+                            }
+                            total_evicted_fee = total_evicted_fee.saturating_add(existing_tx.fee());
+                        }
+                    }
+
+                    // BIP-125 Rule 3: Must pay a higher ABSOLUTE fee than the sum of all evicted txs
+                    if reveal_tx.fee() <= total_evicted_fee {
+                        anyhow::bail!(
+                            "RBF rejected: new absolute fee {} must exceed total evicted fee {}",
+                            reveal_tx.fee(), total_evicted_fee
+                        );
+                    }
+
+                    // Evict all conflicting txs safely
+                    for cid in &conflicting_txs {
+                        self.remove_reveal(cid);
+                    }
+                }
 
                 if self.reveals.len() >= MAX_MEMPOOL_REVEALS {
                     if let Some(&(lowest_rate, lowest_id)) = self.reveals_by_fee.iter().next() {
@@ -509,10 +572,16 @@ impl Mempool {
 
         // 3. O(R) TTL Prune (Instant, no signatures verified)
         let expired: Vec<_> = self.reveals.iter().filter(|(_, tx)| {
-            if let Transaction::Reveal { salt, .. } = &***tx {
-                let commit_hash = crate::core::compute_commitment(&tx.input_coin_ids(), &tx.output_coin_ids(), salt);
+            if let Transaction::Reveal { inputs, outputs, salt, .. } = &***tx {
+                let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+                let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+                let commit_hash = crate::core::compute_commitment(&input_ids, &output_hashes, salt);
                 if let Some(&height) = state.commitment_heights.get(&commit_hash) {
-                    return state.height.saturating_sub(height) >= crate::core::COMMITMENT_TTL;
+                    return state.height.saturating_sub(height) > crate::core::COMMITMENT_TTL;
+                } else {
+                    // If the commit is missing from the state entirely (expired or reorged out),
+                    // the reveal is definitively dead. Evict it.
+                    return true;
                 }
             }
             false
@@ -566,15 +635,7 @@ impl Mempool {
             .collect();
 
         for id in reveals_to_remove {
-            if let Some(arc_tx) = self.reveals.remove(&id) {
-                let tx_bytes = bincode::serialized_size(&*arc_tx).unwrap_or(0) as u64;
-                let fee_rate = compute_fee_rate(arc_tx.fee(), tx_bytes);
-                self.reveals_by_fee.remove(&(fee_rate, id));
-                for input in arc_tx.input_coin_ids() {
-                    self.seen_inputs.remove(&input);
-                    self.txs_by_input.remove(&input);
-                }
-            }
+            self.remove_reveal(&id); // CLEANUP: Reuse helper instead of duplicating logic
         }
     }
 }
@@ -647,14 +708,13 @@ mod tests {
         }
     }
 
-    /// Mines a commit PoW nonce that achieves exactly 16 leading zero bits
-    /// (the base network minimum) by checking that the first two bytes of the
-    /// hash are 0x0000.
+    /// Mines a commit PoW nonce that achieves at least 24 leading zero bits
+    /// (the base network minimum).
     fn mine_commit_nonce(commitment: &[u8; 32]) -> u64 {
         let mut n = 0u64;
         loop {
             let h = hash_concat(commitment, &n.to_le_bytes());
-            if u16::from_be_bytes([h[0], h[1]]) == 0x0000 {
+            if crate::core::types::count_leading_zeros(&h) >= 24 {
                 return n;
             }
             n += 1;
@@ -728,11 +788,11 @@ mod tests {
         let mut mp = Mempool::new();
         let state = empty_state();
         let commitment = hash(b"mempool test");
-        // Find a nonce that does NOT produce 16 leading zero bits.
+        // Find a nonce that does NOT produce 24 leading zero bits.
         let mut bad = 0u64;
         loop {
             let h = hash_concat(&commitment, &bad.to_le_bytes());
-            if u16::from_be_bytes([h[0], h[1]]) != 0x0000 {
+            if crate::core::types::count_leading_zeros(&h) < 24 {
                 break;
             }
             bad += 1;
@@ -778,12 +838,12 @@ mod tests {
         }
         assert_eq!(mp.commits.len(), MAX_PENDING_COMMITS);
 
-        // Pool is full; required PoW is now 22 bits.
+        // Pool is full; required PoW is now 30 bits.
         let extra = hash(b"commit overflow");
         let mut n = 0u64;
         loop {
             let h = hash_concat(&extra, &n.to_le_bytes());
-            if crate::core::types::count_leading_zeros(&h) >= 22 {
+            if crate::core::types::count_leading_zeros(&h) >= 30 {
                 break;
             }
             n += 1;
@@ -795,7 +855,7 @@ mod tests {
         assert_eq!(mp.len(), MAX_PENDING_COMMITS, "Pool must not exceed capacity");
         assert!(mp.commits.contains_key(&extra), "New commit must be present");
 
-        // A low-PoW commit should now be rejected outright (pool still full, 22 bits required).
+        // A low-PoW commit should now be rejected outright (pool still full, 30 bits required).
         let bad_tx = Transaction::Commit { commitment: hash(b"bad"), spam_nonce: 0 };
         let err = mp.add(bad_tx, &state).unwrap_err();
         assert!(err.to_string().contains("Mempool is busy"));
@@ -809,22 +869,17 @@ mod tests {
         let state = empty_state();
         let mut mp = Mempool::new();
 
-        // Fill with commits that all have exactly 16 leading zero bits.
+        // Fill with dummy zero-PoW commits via force_add.
         for i in 0..MAX_PENDING_COMMITS {
             let commitment = hash(&(i as u64).to_le_bytes());
-            // Force-add with a fake nonce; the BTreeSet key uses the recomputed zeros.
-            // We need the stored PoW to be a known value — use force_add with nonce 0 and
-            // then fix up the BTreeSet key to be 16 so the test is deterministic.
-            // Simpler: just force-add with the real nonce.
-            let real_nonce = mine_commit_nonce(&commitment);
-            let tx = Transaction::Commit { commitment, spam_nonce: real_nonce };
-            mp.force_add_commit(commitment, real_nonce, tx);
+            let tx = Transaction::Commit { commitment, spam_nonce: 0 };
+            mp.force_add_commit(commitment, 0, tx);
         }
 
-        // The pool is full. Dynamic threshold is now 22 bits.
-        // A commit with exactly 16 bits should fail the dynamic threshold check first.
+        // The pool is full. Dynamic threshold is now 30 bits.
+        // A commit with only 24 bits should fail the dynamic threshold check.
         let commitment = hash(b"equal pow");
-        let nonce = mine_commit_nonce(&commitment); // exactly 16 bits
+        let nonce = mine_commit_nonce(&commitment); // ~24 bits
         let tx = Transaction::Commit { commitment, spam_nonce: nonce };
         let err = mp.add(tx, &state).unwrap_err();
         assert!(err.to_string().contains("Mempool is busy") || err.to_string().contains("Mempool full of Commits"));
@@ -849,8 +904,9 @@ mod tests {
         let mut mp = Mempool::new();
         let tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
         mp.add(tx.clone(), &state).unwrap();
+        // Same tx has same fee rate — RBF requires strictly higher fee rate
         let err = mp.add(tx, &state).unwrap_err();
-        assert!(err.to_string().contains("already in mempool"));
+        assert!(err.to_string().contains("RBF rejected"));
     }
 
     #[test]
@@ -981,10 +1037,10 @@ mod tests {
         }
         assert_eq!(mp.commits.len(), MAX_PENDING_COMMITS);
 
-        // A commit with just 16 bits of PoW cannot displace any entry
-        // because the dynamic threshold is now 22 bits.
+        // A commit with just 24 bits of PoW cannot displace any entry
+        // because the dynamic threshold is now 30 bits.
         let extra = hash(b"one more");
-        let n = mine_commit_nonce(&extra); // 16 bits
+        let n = mine_commit_nonce(&extra); // ~24 bits
         let tx = Transaction::Commit { commitment: extra, spam_nonce: n };
         let err = mp.add(tx, &state).unwrap_err();
         assert!(
@@ -1119,7 +1175,7 @@ mod tests {
         let state = empty_state();
         let mut mp = Mempool::new();
 
-        // Fill the commit pool so the dynamic threshold is 22 bits.
+        // Fill the commit pool so the dynamic threshold is 30 bits.
         for i in 0..MAX_PENDING_COMMITS {
             let commitment = hash(&(i as u64).to_le_bytes());
             let tx = Transaction::Commit { commitment, spam_nonce: 0 };
@@ -1127,15 +1183,15 @@ mod tests {
         }
         assert_eq!(mp.commits.len(), MAX_PENDING_COMMITS);
 
-        // A commit that only has 16 bits of PoW would be rejected by `add`
-        // because the threshold is now 22. But if it came from an orphaned
+        // A commit that only has 24 bits of PoW would be rejected by `add`
+        // because the threshold is now 30. But if it came from an orphaned
         // block it was previously valid and re_add must restore it.
         //
         // NOTE: validate_transaction must accept it for this to work.
-        // If your implementation rejects 16-bit commits at the state-validation
-        // layer rather than just at the mempool layer, adjust accordingly.
+        // The consensus layer checks MIN_COMMIT_POW_BITS (24), not the
+        // mempool's dynamic threshold.
         let reorg_commitment = hash(b"reorg commit");
-        let reorg_nonce = mine_commit_nonce(&reorg_commitment); // 16 bits
+        let reorg_nonce = mine_commit_nonce(&reorg_commitment); // ~24 bits
         let reorg_tx = Transaction::Commit { commitment: reorg_commitment, spam_nonce: reorg_nonce };
 
         // validate_transaction must pass for this tx against the state.
