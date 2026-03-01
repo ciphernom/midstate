@@ -7,6 +7,8 @@ use axum::{
 };
 use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
+use tower_http::cors::CorsLayer;
+use axum::http::{Method, HeaderValue, header};
 
 pub struct RpcServer {
     addr: SocketAddr,
@@ -19,6 +21,18 @@ impl RpcServer {
     }
 
     pub async fn run(self, node_handle: NodeHandle) -> Result<()> {
+        
+        // Create a strict list of allowed origins
+        let allowed_origins = [
+            "http://localhost:8080".parse::<HeaderValue>().unwrap(),
+            "https://ciphernom.github.io".parse::<HeaderValue>().unwrap(), 
+        ];
+        
+        let cors = CorsLayer::new()
+            .allow_origin(allowed_origins)
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([header::CONTENT_TYPE, header::ACCEPT]);
+            
         let app = Router::new()
             .route("/", get(explorer_ui))
             .route("/batch/:height", get(get_batch))
@@ -43,6 +57,7 @@ impl RpcServer {
             .route("/mix/status/:mix_id", get(mix_status))
             .route("/mix/list", get(mix_list))
             .layer(TraceLayer::new_for_http())
+            .layer(cors)
             .with_state(node_handle);
 
         tracing::info!("RPC server listening on {}", self.addr);
