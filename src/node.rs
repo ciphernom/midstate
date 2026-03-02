@@ -1539,7 +1539,7 @@ fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth
             recent_ts.push_back(candidate_state.timestamp);
         }
 
-        // Apply each batch, verifying against the already-validated headers
+// Apply each batch, verifying against the already-validated headers
         for batch in &batches {
             let height = *cursor;
             
@@ -1572,11 +1572,13 @@ fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth
             // leave a Frankenstein chain on disk: some heights from the peer,
             // some from our old chain.  Batches are persisted atomically in
             // perform_reorg only after we decide to adopt.)
-            recent_ts.push_back(candidate_state.timestamp);
+            apply_batch(candidate_state, batch, recent_ts.make_contiguous())?;
+            
+            recent_ts.push_back(batch.timestamp);
             if recent_ts.len() > window_size {
                 recent_ts.pop_front();
             }
-            apply_batch(candidate_state, batch, recent_ts.make_contiguous())?;
+            
             candidate_state.target = adjust_difficulty(candidate_state);
             new_history.push((height, candidate_state.midstate, batch.clone()));
             *cursor += 1;
@@ -1830,12 +1832,7 @@ fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth
             }
         }
 
-        for (i, batch) in alternative_batches.iter().enumerate() {
-            recent_headers.push_back(candidate_state.timestamp);
-            if recent_headers.len() > window_size {
-                recent_headers.pop_front();
-            }
-
+for (i, batch) in alternative_batches.iter().enumerate() {
 
             if batch.prev_midstate != candidate_state.midstate {
                 tracing::warn!(
@@ -1848,6 +1845,10 @@ fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth
             match apply_batch(&mut candidate_state, batch, recent_headers.make_contiguous()) {
 
                 Ok(_) => {
+                    recent_headers.push_back(batch.timestamp);
+                    if recent_headers.len() > window_size {
+                        recent_headers.pop_front();
+                    }
                     // Adjust difficulty via ASERT
                     candidate_state.target = adjust_difficulty(&candidate_state);
                     new_history.push((
@@ -2151,7 +2152,7 @@ fn perform_reorg(
             return Ok(());
         }
 
-        // Checks passed — now clone state and apply fully.
+// Checks passed — now clone state and apply fully.
         let mut candidate_state = self.state.clone();
         match apply_batch(&mut candidate_state, &batch, self.recent_headers.make_contiguous()) {
             Ok(_) => {
@@ -2167,15 +2168,17 @@ fn perform_reorg(
                         self.metrics.inc_reorgs();
                     }
 
-                    self.recent_headers.push_back(self.state.timestamp);
+                    self.recent_headers.push_back(batch.timestamp);
                     if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
                         self.recent_headers.pop_front();
                     }
                     let pre_height = self.state.height;
                     self.state = candidate_state;
-                    self.storage.save_batch(pre_height, &batch)?;
                     
+                    // ADJUST TARGET FIRST
                     self.state.target = adjust_difficulty(&self.state);
+
+                    self.storage.save_batch(pre_height, &batch)?;
 
                     // Periodic snapshot + checkpoint pruning (matches handle_mined_batch)
                     if self.state.height > 0 && self.state.height % PRUNE_DEPTH == 0 {
@@ -2286,20 +2289,24 @@ fn perform_reorg(
     }
 
     // ── Added sync_in_progress clear at end ──────────────
-    async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) -> Result<()> {
-        self.cancel_mining();
+async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) -> Result<()> {
+            self.cancel_mining();
         let mut applied = 0;
         for batch in batches {
             // Cheap check before expensive clone
             if batch.prev_midstate != self.state.midstate { break; }
             let mut candidate = self.state.clone();
             if apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous()).is_ok() {
-                self.recent_headers.push_back(self.state.timestamp);
+                self.recent_headers.push_back(batch.timestamp);
                 if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
                     self.recent_headers.pop_front();
                 }
-                self.storage.save_batch(candidate.height - 1, &batch)?;
                 self.state = candidate;
+                
+                // ADJUST TARGET FIRST
+                self.state.target = adjust_difficulty(&self.state);
+
+                self.storage.save_batch(self.state.height - 1, &batch)?;
                 
                 // NEW: Event-driven snapshot saving!
                 if self.state.height > 0 && self.state.height % PRUNE_DEPTH == 0 {
@@ -2311,8 +2318,6 @@ fn perform_reorg(
                 }
                 
                 self.maybe_prune_checkpoints();
-                
-                self.state.target = adjust_difficulty(&self.state);
                 self.metrics.inc_batches_processed();
 
                 self.chain_history.push_back((self.state.height, self.state.midstate));
@@ -2353,7 +2358,7 @@ fn perform_reorg(
         Ok(())
     }
 
-    async fn try_apply_orphans(&mut self) {
+async fn try_apply_orphans(&mut self) {
         let mut applied = 0;
 
         while let Some(mut batches) = self.orphan_batches.remove(&self.state.midstate) {
@@ -2365,14 +2370,17 @@ fn perform_reorg(
                 let mut candidate = self.state.clone();
                 if apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous()).is_ok() {
                     self.cancel_mining();
-                    self.recent_headers.push_back(self.state.timestamp);
+                    self.recent_headers.push_back(batch.timestamp);
                     if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
                         self.recent_headers.pop_front();
                     }
-                    self.storage.save_batch(candidate.height - 1, &batch).ok();
+                    
                     self.state = candidate;
-
+                    
+                    // ADJUST TARGET FIRST
                     self.state.target = adjust_difficulty(&self.state);
+
+                    self.storage.save_batch(self.state.height - 1, &batch).ok();
                     self.metrics.inc_batches_processed();
 
                     let mut spent_inputs = Vec::new();
@@ -2588,17 +2596,22 @@ fn perform_reorg(
 
         let pre_mine_height = self.state.height;
 
-        self.recent_headers.push_back(self.state.timestamp);
-        if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
-            self.recent_headers.pop_front();
-        }
-
         match apply_batch(&mut self.state, &batch, self.recent_headers.make_contiguous()) {
             Ok(_) => {
+                self.recent_headers.push_back(batch.timestamp);
+                if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
+                    self.recent_headers.pop_front();
+                }
+
                 self.storage.save_batch(pre_mine_height, &batch)?;
+                
+                // 1. ADJUST TARGET BEFORE SAVING ANYTHING
+                self.state.target = adjust_difficulty(&self.state);
+                
+                // 2. NOW SAVE STATE
                 self.storage.save_state(&self.state)?;
                 
-                // NEW: Event-driven snapshot saving!
+                // 3. NOW SAVE SNAPSHOT
                 if self.state.height > 0 && self.state.height % PRUNE_DEPTH == 0 {
                     if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
                         tracing::warn!("Failed to save state snapshot: {}", e);
@@ -2609,7 +2622,6 @@ fn perform_reorg(
                 
                 self.maybe_prune_checkpoints();
 
-                self.state.target = adjust_difficulty(&self.state);
                 self.metrics.inc_batches_mined();
                 self.network.broadcast(Message::Batch(batch.clone()));
 
@@ -3667,12 +3679,13 @@ fn build_divergent_chain(
             hdr.height = state.height; 
             headers.push(hdr);
 
-            // FIX 2: Push the PARENT state's timestamp into the history window,
-            // NOT the new batch's timestamp!
-            recent_ts.push(state.timestamp);
+            crate::core::state::apply_batch(&mut state, &batch, &recent_ts).unwrap();
+            
+            // FIX 2: Push the CURRENT block's timestamp into the history window 
+            // after validating it
+            recent_ts.push(batch.timestamp);
             if recent_ts.len() > 11 { recent_ts.remove(0); }
             
-            crate::core::state::apply_batch(&mut state, &batch, &recent_ts).unwrap();
             state.target = crate::core::state::adjust_difficulty(&state);
             batches.push(batch);
         }
