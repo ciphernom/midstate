@@ -30,6 +30,17 @@ fn hash_n(data: &[u8; 32], n: u32) -> [u8; 32] {
     x
 }
 
+/// Generate a coin ID sequentially. 
+/// Use this inside outer parallel loops (like MSS tree generation) to avoid thread thrashing.
+pub fn keygen_seq(seed: &[u8; 32]) -> [u8; 32] {
+    let mut endpoints = [[0u8; 32]; CHAINS];
+    endpoints.iter_mut().enumerate().for_each(|(i, chunk)| {
+        let sk_i = chain_sk(seed, i);
+        *chunk = hash_n(&sk_i, MAX_DIGIT);
+    });
+    compress(&endpoints)
+}
+
 /// Derive chain secret key element: sk[i] = BLAKE3(seed || i)
 fn chain_sk(seed: &[u8; 32], i: usize) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();

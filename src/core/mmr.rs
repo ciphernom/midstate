@@ -265,9 +265,13 @@ pub fn compute_sparse_subtree(height: usize, coins: &[[u8; 32]]) -> [u8; 32] {
 
     // Because the coins are sorted lexicographically (big-endian), all coins 
     // with bit == 0 come before bit == 1. Find the exact split index.
-    let split_idx = coins.iter()
-        .position(|c| get_bit(c, bit_idx) == 1)
-        .unwrap_or(coins.len());
+    // OLD: Linear scan O(N)
+    // let split_idx = coins.iter()
+    //     .position(|c| get_bit(c, bit_idx) == 1)
+    //     .unwrap_or(coins.len());
+
+    // NEW: Binary search O(log N)
+    let split_idx = coins.partition_point(|c| get_bit(c, bit_idx) == 0);
 
     let left_coins = &coins[..split_idx];
     let right_coins = &coins[split_idx..];
