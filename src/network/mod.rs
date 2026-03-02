@@ -75,7 +75,7 @@ pub struct MidstateNetwork {
     relay_reservations: HashSet<PeerId>,
     listen_addrs: Vec<Multiaddr>,
     external_addrs: Vec<Multiaddr>,
-    subnet_counts: HashMap<IpAddr, usize>,
+    subnet_peers: HashMap<IpAddr, HashSet<PeerId>>,
 }
 
 impl MidstateNetwork {
@@ -164,7 +164,7 @@ impl MidstateNetwork {
             relay_reservations: HashSet::new(),
             listen_addrs: Vec::new(),
             external_addrs: Vec::new(),
-            subnet_counts: HashMap::new(),
+            subnet_peers: HashMap::new(),
         };
 
         net.swarm.listen_on(listen_addr.clone())?;
@@ -335,9 +335,12 @@ impl MidstateNetwork {
 
                     // --- NEW: Prevent dialing saturated subnets ---
                     if let Some(subnet) = extract_subnet(&addr) {
-                        if self.subnet_counts.get(&subnet).copied().unwrap_or(0) >= 2 {
-                            tracing::debug!("PEX ignoring {}: subnet limit reached", addr_str);
-                            return;
+                        if let Some(peers) = self.subnet_peers.get(&subnet) {
+                            // Only reject if there are 4+ peers AND this specific peer isn't one of them
+                            if peers.len() >= 4 && !peers.contains(&peer) {
+                                tracing::debug!("PEX ignoring {}: subnet limit reached", addr_str);
+                                return;
+                            }
                         }
                     }
                     // ----------------------------------------------
@@ -505,16 +508,17 @@ impl MidstateNetwork {
                     // --- NEW: Subnet Limit Defense ---
                     let remote_addr = endpoint.get_remote_address();
                     if let Some(subnet) = extract_subnet(remote_addr) {
-                        let count = self.subnet_counts.get(&subnet).copied().unwrap_or(0);
-                        // Restrict to max 2 connections per subnet
-                        if count >= 2 {
-                            tracing::warn!("Eclipse Defense: Rejecting {}, subnet {} limit reached", peer_id, subnet);
-                            let _ = self.swarm.disconnect_peer_id(peer_id);
-                            continue;
+                        let peers = self.subnet_peers.entry(subnet).or_default();
+                        // If this peer is already connected on this subnet, allow the multiplex/upgrade
+                        if !peers.contains(&peer_id) {
+                            if peers.len() >= 4 { // Max 4 distinct peers per subnet
+                                tracing::warn!("Eclipse Defense: Rejecting {}, subnet {} limit reached", peer_id, subnet);
+                                let _ = self.swarm.disconnect_peer_id(peer_id);
+                                continue;
+                            }
+                            peers.insert(peer_id);
                         }
-                        *self.subnet_counts.entry(subnet).or_insert(0) += 1;
                     }
-                    // ---------------------------------
 
                     // Eclipse Protection: Enforce inbound limit manually
                     if endpoint.is_listener() {
@@ -552,9 +556,9 @@ impl MidstateNetwork {
                         
                         // --- NEW: Subnet Limit Defense Cleanup ---
                         if let Some(subnet) = extract_subnet(endpoint.get_remote_address()) {
-                            if let std::collections::hash_map::Entry::Occupied(mut entry) = self.subnet_counts.entry(subnet) {
-                                *entry.get_mut() -= 1;
-                                if *entry.get() == 0 {
+                            if let std::collections::hash_map::Entry::Occupied(mut entry) = self.subnet_peers.entry(subnet) {
+                                entry.get_mut().remove(&peer_id);
+                                if entry.get().is_empty() {
                                     entry.remove();
                                 }
                             }
@@ -644,6 +648,10 @@ fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
 /// Returns None for localhost addresses so local testing isn't restricted.
 fn extract_subnet(addr: &Multiaddr) -> Option<IpAddr> {
     if is_localhost(addr) {
+        return None;
+    }
+    // Relayed connections share the relay's IP. Do not rate-limit the relay itself.
+    if addr.iter().any(|p| p == libp2p::multiaddr::Protocol::P2pCircuit) {
         return None;
     }
     addr.iter().find_map(|p| match p {
