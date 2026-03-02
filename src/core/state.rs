@@ -169,7 +169,7 @@ pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]
     // 3. Apply transactions and tally fees
     // Phase 1: verify all signatures in parallel (pure, no state mutation)
     batch.transactions.par_iter().try_for_each(|tx| {
-        verify_transaction_sigs(tx, state.height)
+        verify_transaction_sigs(tx, state.height, &state.commitments)
     })?;
 
     // Phase 2: apply sequentially (state mutation, sigs already verified)
@@ -199,7 +199,7 @@ pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]
               coinbase_total, allowed_value, reward, total_fees);
     }
 
-// 4. Compute future midstate with coinbase coin IDs
+    // 4. Compute future midstate with coinbase coin IDs
     let mut future_midstate = state.midstate;
     let coinbase_ids: Vec<[u8; 32]> = batch.coinbase.iter().map(|cb| cb.coin_id()).collect();
     for coin_id in &coinbase_ids {
