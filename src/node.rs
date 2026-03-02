@@ -367,11 +367,12 @@ pub fn scan_txs_for_mss_index(txs: &[Transaction], master_pk: &[u8; 32]) -> u64 
 }
 
 impl Node {
-    pub async fn new(
+pub async fn new(
         data_dir: PathBuf,
         mining_threads: Option<usize>,
         listen_addr: Multiaddr,
         bootstrap_peers: Vec<Multiaddr>,
+        is_bootstrap: bool,
     ) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
         let storage = Storage::open(data_dir.join("db"))?;
@@ -458,17 +459,23 @@ impl Node {
         };
 
         // Load or generate libp2p keypair
-        let keypair = match load_keypair(&data_dir) {
-            Some(kp) => {
-                tracing::info!("Loaded peer keypair");
-                kp
+        let keypair = if is_bootstrap {
+            match load_keypair(&data_dir) {
+                Some(kp) => {
+                    tracing::info!("Loaded peer keypair");
+                    kp
+                }
+                None => {
+                    let kp = Keypair::generate_ed25519();
+                    save_keypair(&data_dir, &kp);
+                    tracing::info!("Generated new peer keypair");
+                    kp
+                }
             }
-            None => {
-                let kp = Keypair::generate_ed25519();
-                save_keypair(&data_dir, &kp);
-                tracing::info!("Generated new peer keypair");
-                kp
-            }
+        } else {
+            let kp = Keypair::generate_ed25519();
+            tracing::info!("Generated ephemeral peer keypair");
+            kp
         };
 
         let network = MidstateNetwork::new(keypair, listen_addr, bootstrap_peers).await?;
@@ -517,6 +524,10 @@ impl Node {
         })
     }
 
+
+    pub fn local_peer_id(&self) -> PeerId {
+        self.network.local_peer_id()
+    }
 
     /// Evaluates if the node is ready to mine, and spawns the task if so.
     fn trigger_mining(&mut self) {
@@ -1269,6 +1280,16 @@ fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth
         let tx = self.cmd_tx.as_ref().unwrap().clone();
         tokio::spawn(async move {
             let mut is_valid = true;
+
+            // --- NEW: Time Warp Defense ---
+            let current_time = crate::core::state::current_timestamp();
+            const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
+
+            if !all_headers.is_empty() && all_headers[0].timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
+                tracing::warn!("Root header timestamp too far in future");
+                is_valid = false;
+            }
+            // ------------------------------
 
             // 1. Fast sequential check: linkage + difficulty target validation
             for i in 1..all_headers.len() {
@@ -2675,7 +2696,7 @@ mod tests {
         // Bind to port 0 to let OS assign a random available port
         let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
         // Initialize node (this will create genesis if needed)
-        Node::new(dir.to_path_buf(), None, listen, vec![]).await.unwrap()
+        Node::new(dir.to_path_buf(), None, listen, vec![], false).await.unwrap()
     }
 
     #[tokio::test]

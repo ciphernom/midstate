@@ -26,11 +26,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // ── Config file ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize, Clone)]
 struct Config {
     /// Bootstrap peer multiaddrs
     #[serde(default)]
     bootstrap_peers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    peer_id: Option<String>,
 }
 
 impl Config {
@@ -106,10 +108,12 @@ enum Command {
         verify_threads: Option<usize>,
         #[arg(long)]
         listen: Option<String>,
-        /// Path to config file (default: <data_dir>/config.toml)
-        #[arg(long)]
-        config: Option<PathBuf>,
-    },
+/// Path to config file (default: <data_dir>/config.toml)
+            #[arg(long)]
+            config: Option<PathBuf>,
+            #[arg(long)]
+            isbootstrap: bool,
+        },
 
     /// Wallet operations
     Wallet {
@@ -416,8 +420,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Node { data_dir, port, rpc_port, peer, mine, threads, verify_threads, listen, config } => {
-            run_node(data_dir, port, rpc_port, peer, mine, threads, verify_threads, listen, config).await
+        Command::Node { data_dir, port, rpc_port, peer, mine, threads, verify_threads, listen, config, isbootstrap } => {
+            run_node(data_dir, port, rpc_port, peer, mine, threads, verify_threads, listen, config, isbootstrap).await
         }
         Command::Wallet { action } => handle_wallet(action).await,
         Command::Commit { rpc_port, coin, dest } => {
@@ -1922,6 +1926,7 @@ async fn run_node(
     verify_threads: Option<usize>,
     listen: Option<String>, 
     config_path: Option<PathBuf>,
+    is_bootstrap: bool,
 ) -> Result<()> {
 
     // --- Configure Rayon Global Thread Pool for Verification ---
@@ -1943,7 +1948,7 @@ async fn run_node(
     let config = Config::load(&config_file)?;
 
     // Merge: config file peers first, then CLI --peer flags on top, dedup
-    let mut all_peers = config.bootstrap_peers;
+    let mut all_peers = config.bootstrap_peers.clone();
     all_peers.extend(cli_peers);
     all_peers.sort();
     all_peers.dedup();
@@ -1971,7 +1976,25 @@ let bootstrap: Vec<libp2p::Multiaddr> = all_peers.iter()
         None
     };
 
-    let node = node::Node::new(data_dir, mining_threads, listen_addr, bootstrap).await?;
+    let node = node::Node::new(data_dir.clone(), mining_threads, listen_addr, bootstrap, is_bootstrap).await?;
+    
+    if is_bootstrap {
+        let peer_id_str = node.local_peer_id().to_string();
+        if config.peer_id.as_deref() != Some(&peer_id_str) {
+            let contents = std::fs::read_to_string(&config_file).unwrap_or_default();
+            if contents.contains("peer_id") {
+                let mut new_config = config.clone();
+                new_config.peer_id = Some(peer_id_str.clone());
+                std::fs::write(&config_file, toml::to_string(&new_config)?)?;
+            } else {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new().append(true).open(&config_file)?;
+                writeln!(file, "\npeer_id = \"{}\"", peer_id_str)?;
+            }
+            tracing::info!("Saved bootstrap peer ID to config file: {}", peer_id_str);
+        }
+    }
+
     let (handle, cmd_rx) = node.create_handle();
 
     let rpc_server = rpc::RpcServer::new(rpc_port);
