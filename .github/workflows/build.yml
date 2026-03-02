@@ -1,0 +1,98 @@
+name: Build Release Binaries
+
+on:
+  push:
+    branches: [ "main" ]
+    # Also trigger on version tags (e.g., v1.0.0)
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches: [ "main" ]
+  # Allow manual triggering from the GitHub Actions tab
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }} (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # Don't cancel all builds if one OS fails
+      matrix:
+        include:
+          # Linux (x86_64)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: midstate-linux-amd64
+            bin_name: midstate
+          # Windows (x86_64)
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: midstate-windows-amd64.exe
+            bin_name: midstate.exe
+          # macOS (Intel)
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: midstate-macos-amd64
+            bin_name: midstate
+          # macOS (Apple Silicon / M1 / M2)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: midstate-macos-arm64
+            bin_name: midstate
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Linux Dependencies
+      if: matrix.os == 'ubuntu-latest'
+      run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev build-essential cmake
+
+    - name: Install Rust Toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ matrix.target }}
+
+    - name: Build Release
+      run: cargo build --release --target ${{ matrix.target }}
+
+    - name: Rename Binary for Artifacts (Linux/macOS)
+      if: matrix.os != 'windows-latest'
+      run: mv target/${{ matrix.target }}/release/${{ matrix.bin_name }} target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+
+    - name: Rename Binary for Artifacts (Windows)
+      if: matrix.os == 'windows-latest'
+      run: Rename-Item -Path "target\${{ matrix.target }}\release\${{ matrix.bin_name }}" -NewName "${{ matrix.artifact_name }}"
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact_name }}
+        path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+        if-no-files-found: error
+
+  # Optional: Automatically create a GitHub Release when a tag is pushed
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
