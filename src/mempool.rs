@@ -6,6 +6,11 @@ use std::sync::Arc;
 
 const MAX_MEMPOOL_REVEALS: usize = 9_000;
 const MAX_PENDING_COMMITS: usize = 1_000;
+
+/// Maximum total byte size of all Reveal transactions in the mempool (100 MB).
+/// Protects low-memory nodes (e.g. Raspberry Pi, cheap VPS) from OOM crashes.
+const MAX_MEMPOOL_BYTES: u64 = 100_000_000;
+
 /// Total mempool capacity is the sum of both pools.
 pub const MAX_MEMPOOL_SIZE: usize = MAX_MEMPOOL_REVEALS + MAX_PENDING_COMMITS;
 const MIN_FEE_PER_KB: u64 = 10;
@@ -90,6 +95,9 @@ pub struct Mempool {
     /// Maps an Input Coin ID to the Mempool Transaction ID that is trying to spend it.
     /// Used for O(1) mempool eviction when a block is mined.
     txs_by_input: HashMap<[u8; 32], [u8; 32]>,
+    
+    /// Tracks the total byte size of all active Reveals
+    current_reveal_bytes: u64,
 }
 
 impl Mempool {
@@ -109,6 +117,7 @@ impl Mempool {
             reveals_by_fee: BTreeSet::new(),
             seen_inputs: HashSet::new(),
             txs_by_input: HashMap::new(),
+            current_reveal_bytes: 0,
         }
     }
 
@@ -255,9 +264,6 @@ impl Mempool {
             reveal_tx @ Transaction::Reveal { .. } => {
                 // Admission fee check and stored ordering key use the same
                 // FEE_RATE_SCALE so they are numerically consistent.
-                //
-                // Minimum check:  fee * 1024 >= MIN_FEE_PER_KB * bytes
-                // Stored key:     fee * 1024 / bytes   (== compute_fee_rate)
                 if (reveal_tx.fee() as u128) * FEE_RATE_SCALE
                     < (MIN_FEE_PER_KB as u128) * (tx_bytes as u128)
                 {
@@ -266,9 +272,7 @@ impl Mempool {
                         MIN_FEE_PER_KB, reveal_tx.fee(), tx_bytes
                     );
                 }
-                // Input-level Replace-By-Fee: if any input conflicts with an
-                // existing mempool transaction, the new tx must pay a strictly
-                // higher fee rate than ALL conflicting txs to evict them.
+                
                 let mut conflicting_txs: Vec<[u8; 32]> = Vec::new();
                 for input in reveal_tx.input_coin_ids() {
                     if let Some(&existing_id) = self.txs_by_input.get(&input) {
@@ -282,6 +286,11 @@ impl Mempool {
 
                 let fee_rate = compute_fee_rate(reveal_tx.fee(), tx_bytes);
                 let tx_id = get_tx_id(&reveal_tx);
+
+                // --- FIX: Setup simulation tracking BEFORE mutating the mempool ---
+                let mut to_evict = conflicting_txs.clone();
+                let mut simulated_bytes = self.current_reveal_bytes;
+                let mut simulated_len = self.reveals.len();
 
                 if !conflicting_txs.is_empty() {
                     let mut total_evicted_fee = 0u64;
@@ -299,6 +308,10 @@ impl Mempool {
                                 );
                             }
                             total_evicted_fee = total_evicted_fee.saturating_add(existing_tx.fee());
+                            
+                            // Track simulated removal
+                            simulated_bytes = simulated_bytes.saturating_sub(existing_bytes);
+                            simulated_len = simulated_len.saturating_sub(1);
                         }
                     }
 
@@ -309,28 +322,41 @@ impl Mempool {
                             reveal_tx.fee(), total_evicted_fee
                         );
                     }
-
-                    // Evict all conflicting txs safely
-                    for cid in &conflicting_txs {
-                        self.remove_reveal(cid);
-                    }
                 }
 
-                if self.reveals.len() >= MAX_MEMPOOL_REVEALS {
-                    if let Some(&(lowest_rate, lowest_id)) = self.reveals_by_fee.iter().next() {
+                // --- Byte-Bounded & Count-Bounded Eviction Loop ---
+                // We use our simulated metrics so we don't accidentally drop valid transactions
+                // if this loop ultimately fails to free up enough space.
+                let mut fee_iter = self.reveals_by_fee.iter();
+                while simulated_len + 1 > MAX_MEMPOOL_REVEALS || simulated_bytes + tx_bytes > MAX_MEMPOOL_BYTES {
+                    if let Some(&(lowest_rate, lowest_id)) = fee_iter.next() {
+                        
+                        // Skip if we already marked this for RBF eviction
+                        if to_evict.contains(&lowest_id) {
+                            continue; 
+                        }
+
                         if fee_rate > lowest_rate {
-                            let evicted_arc = self.reveals.remove(&lowest_id).unwrap();
-                            self.reveals_by_fee.remove(&(lowest_rate, lowest_id));
-                            for input in evicted_arc.input_coin_ids() {
-                                self.seen_inputs.remove(&input);
-                                self.txs_by_input.remove(&input);
+                            if let Some(existing_tx) = self.reveals.get(&lowest_id) {
+                                let existing_bytes = bincode::serialized_size(&**existing_tx).unwrap_or(0) as u64;
+                                simulated_bytes = simulated_bytes.saturating_sub(existing_bytes);
+                                simulated_len = simulated_len.saturating_sub(1);
+                                to_evict.push(lowest_id);
                             }
                         } else {
                             anyhow::bail!(
-                                "Mempool full: incoming fee rate too low to replace any existing Reveal"
+                                "Mempool full ({} bytes, {} txs): incoming fee rate too low to evict cheaper transactions",
+                                self.current_reveal_bytes, self.reveals.len()
                             );
                         }
+                    } else {
+                        anyhow::bail!("Mempool full and no evictable transactions found");
                     }
+                }
+
+                // --- ALL CHECKS PASSED, BEGIN REAL MUTATION ---
+                for cid in to_evict {
+                    self.remove_reveal(&cid);
                 }
 
                 for input in reveal_tx.input_coin_ids() {
@@ -341,6 +367,7 @@ impl Mempool {
                 let arc_tx = Arc::new(reveal_tx);
                 self.reveals.insert(tx_id, arc_tx);
                 self.reveals_by_fee.insert((fee_rate, tx_id));
+                self.current_reveal_bytes += tx_bytes;
             }
         }
 
@@ -423,6 +450,7 @@ impl Mempool {
                     let arc_tx = Arc::new(reveal_tx);
                     self.reveals.insert(tx_id, arc_tx);
                     self.reveals_by_fee.insert((fee_rate, tx_id));
+                    self.current_reveal_bytes += tx_bytes;
                 }
             }
 
@@ -459,6 +487,10 @@ impl Mempool {
             if let Some(&(rate, id)) = self.reveals_by_fee.iter().next_back() {
                 self.reveals_by_fee.remove(&(rate, id));
                 let arc_tx = self.reveals.remove(&id).unwrap();
+                
+                let tx_bytes = bincode::serialized_size(&*arc_tx).unwrap_or(0) as u64;
+                self.current_reveal_bytes = self.current_reveal_bytes.saturating_sub(tx_bytes);
+                
                 for input in arc_tx.input_coin_ids() {
                     self.seen_inputs.remove(&input);
                     self.txs_by_input.remove(&input);
@@ -555,6 +587,7 @@ impl Mempool {
     fn remove_reveal(&mut self, id: &[u8; 32]) {
         if let Some(arc_tx) = self.reveals.remove(id) {
             let tx_bytes = bincode::serialized_size(&*arc_tx).unwrap_or(0) as u64;
+            self.current_reveal_bytes = self.current_reveal_bytes.saturating_sub(tx_bytes);
             let fee_rate = compute_fee_rate(arc_tx.fee(), tx_bytes);
             self.reveals_by_fee.remove(&(fee_rate, *id));
             for input in arc_tx.input_coin_ids() {
@@ -679,6 +712,7 @@ impl Mempool {
         let arc_tx = Arc::new(tx);
         self.reveals.insert(tx_id, arc_tx);
         self.reveals_by_fee.insert((fee_rate, tx_id));
+        self.current_reveal_bytes += tx_bytes;
     }
 
     /// Directly inserts a Commit transaction, bypassing all admission checks.
