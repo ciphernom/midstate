@@ -3,151 +3,61 @@ use anyhow::{bail, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// Compute the sequential hash chain, collecting checkpoints along the way.
-/// Used by both create_extension and mine_extension.
-fn compute_chain(midstate: &[u8; 32], nonce: u64) -> ([u8; 32], Vec<[u8; 32]>) {
-    let mut x = hash_concat(midstate, &nonce.to_le_bytes());
-    let mut checkpoints = Vec::with_capacity((EXTENSION_ITERATIONS / CHECKPOINT_INTERVAL) as usize + 1);
-    checkpoints.push(x);
 
-    for i in 1..=EXTENSION_ITERATIONS {
-        x = hash(&x);
-        if i % CHECKPOINT_INTERVAL == 0 {
-            checkpoints.push(x);
-        }
-    }
-
-    (x, checkpoints)
-}
-
-/// Derive which segments to spot-check from a checkpoint commitment.
-///
-/// The commitment binds ALL checkpoints before revealing which segments are
-/// verified. This is a Fiat-Shamir transform: the attacker must commit to
-/// every checkpoint before learning which ones get checked. Changing any
-/// checkpoint changes the commitment, which changes the checked set —
-/// creating a fixed-point problem with no efficient solution.
-fn spot_check_indices(commitment: &[u8; 32], num_segments: usize, count: usize) -> Vec<usize> {
-    let count = count.min(num_segments);
-    let mut indices = Vec::with_capacity(count);
-    let mut seed = *commitment;
-
-    while indices.len() < count {
-        seed = hash(&seed);
-        let raw = u64::from_le_bytes(seed[..8].try_into().unwrap());
-        let idx = (raw as usize) % num_segments;
-        if !indices.contains(&idx) {
-            indices.push(idx);
-        }
-    }
-
-    indices
-}
 
 /// Create an extension by doing sequential work
 pub fn create_extension(midstate: [u8; 32], nonce: u64) -> Extension {
-    let (final_hash, checkpoints) = compute_chain(&midstate, nonce);
-    Extension { nonce, final_hash, checkpoints }
-}
-
-/// Hash all checkpoints into a single binding commitment.
-///
-/// This is the value from which spot-check indices are derived. Because it
-/// covers every checkpoint, an attacker cannot learn which segments will be
-/// checked without first fixing all checkpoint values — which requires
-/// computing the full sequential chain.
-fn checkpoint_commitment(checkpoints: &[[u8; 32]]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    for cp in checkpoints {
-        hasher.update(cp);
-    }
-    *hasher.finalize().as_bytes()
-}
-
-/// Verify an extension by spot-checking random checkpoint segments.
-///
-/// Check indices are derived from a hash of ALL checkpoints (Fiat-Shamir
-/// commitment), not from `final_hash` alone. This prevents the attack where
-/// a miner fabricates interior checkpoints and only computes the segments
-/// they know will be checked.
-///
-/// Cost: O(SPOT_CHECK_COUNT * CHECKPOINT_INTERVAL) + one hash over ~32 KB
-/// of checkpoints. Typically ~16,000 BLAKE3 hashes ≈ 16µs.
-///
-/// When checkpoints have been pruned (empty vec), falls back to full-chain
-/// recomputation: O(EXTENSION_ITERATIONS) ≈ 1ms.
-pub fn verify_extension(midstate: [u8; 32], ext: &Extension, target: &[u8; 32]) -> Result<()> {
-    // 1. Difficulty check (instant)
-    if ext.final_hash >= *target {
-        bail!("Extension doesn't meet difficulty target");
-    }
-
-    // 2. Pruned checkpoints — full-chain recomputation
-    if ext.checkpoints.is_empty() {
-        return verify_extension_full(midstate, ext);
-    }
-
-    let num_segments = (EXTENSION_ITERATIONS / CHECKPOINT_INTERVAL) as usize;
-    let expected_checkpoints = num_segments + 1;
-
-    // 3. Structural check
-    if ext.checkpoints.len() != expected_checkpoints {
-        bail!(
-            "Wrong checkpoint count: got {}, expected {}",
-            ext.checkpoints.len(),
-            expected_checkpoints
-        );
-    }
-
-    // 4. First checkpoint must match midstate + nonce
-    let expected_start = hash_concat(&midstate, &ext.nonce.to_le_bytes());
-    if ext.checkpoints[0] != expected_start {
-        bail!("First checkpoint doesn't match midstate+nonce");
-    }
-
-    // 5. Last checkpoint must equal final_hash
-    if ext.checkpoints[num_segments] != ext.final_hash {
-        bail!("Last checkpoint doesn't match final_hash");
-    }
-
-    // 6. Fiat-Shamir: derive check indices from a commitment over ALL checkpoints.
-    //    This binds the attacker to every checkpoint before revealing the challenge.
-    let commitment = checkpoint_commitment(&ext.checkpoints);
-    let indices = spot_check_indices(&commitment, num_segments, SPOT_CHECK_COUNT);
-
-    for seg in indices {
-        let mut x = ext.checkpoints[seg];
-        for _ in 0..CHECKPOINT_INTERVAL {
-            x = hash(&x);
-        }
-        if x != ext.checkpoints[seg + 1] {
-            bail!("Checkpoint verification failed at segment {}", seg);
-        }
-    }
-
-    Ok(())
-}
-
-/// Full-chain recomputation for pruned extensions.
-///
-/// Recomputes the entire sequential hash chain from `hash(midstate || nonce)`
-/// through EXTENSION_ITERATIONS steps and verifies the result matches `final_hash`.
-/// Cost: O(EXTENSION_ITERATIONS) ≈ 1M BLAKE3 hashes ≈ 1ms.
-fn verify_extension_full(midstate: [u8; 32], ext: &Extension) -> Result<()> {
-    let mut x = hash_concat(&midstate, &ext.nonce.to_le_bytes());
+    let mut x = hash_concat(&midstate, &nonce.to_le_bytes());
     for _ in 0..EXTENSION_ITERATIONS {
         x = hash(&x);
     }
-    if x != ext.final_hash {
-        bail!("Full-chain verification failed: recomputed hash != final_hash");
+    Extension { nonce, final_hash: x }
+}
+
+
+/// Verify an extension by recomputing the full sequential hash chain.
+///
+/// Recomputes all EXTENSION_ITERATIONS hashes from `hash(midstate || nonce)`
+/// and confirms the result matches `final_hash`. This is the only
+/// cryptographically sound verification method for a linear hash chain —
+/// probabilistic spot-checking is insecure because interior checkpoints
+/// have no algebraic binding to their neighbours, enabling subset-grinding
+/// attacks regardless of the commitment scheme used.
+///
+/// Cost: O(EXTENSION_ITERATIONS) — exactly 1,000,000 BLAKE3 hashes ≈ 1ms.
+/// This is strictly faster than mining at any non-trivial difficulty, since
+/// verification requires one deterministic pass while mining requires an
+/// expected (1 / difficulty_fraction) passes to find a valid nonce.
+pub fn verify_extension(midstate: [u8; 32], ext: &Extension, target: &[u8; 32]) -> Result<()> {
+    if ext.final_hash >= *target {
+        bail!("Extension doesn't meet difficulty target");
+    }
+    if create_extension(midstate, ext.nonce).final_hash != ext.final_hash {
+        bail!("Sequential work verification failed");
     }
     Ok(())
 }
+
 
 /// Mine: try nonces until one produces a final_hash below target.
 /// Spawns one worker per available core, each trying independent nonces.
 /// Uses an AtomicBool to instantly abort if a peer solves the block first.
-pub fn mine_extension(midstate: [u8; 32], target: [u8; 32], threads: usize, cancel: Arc<AtomicBool>) -> Option<Extension> {
+pub enum MiningResult {
+    Block(Extension),
+    Share(Extension),
+}
+
+/// Mine: try nonces until one produces a final_hash below target (or pool_target).
+/// Spawns one worker per available core, each trying independent nonces.
+/// Uses an AtomicBool to instantly abort if a peer solves the block first.
+pub fn mine_extension(
+    midstate: [u8; 32], 
+    target: [u8; 32], 
+    pool_target: Option<[u8; 32]>, 
+    threads: usize, 
+    cancel: Arc<AtomicBool>,
+    hash_counter: Arc<std::sync::atomic::AtomicU64>
+) -> Option<MiningResult> {
     let num_threads = if threads == 0 {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -157,17 +67,18 @@ pub fn mine_extension(midstate: [u8; 32], target: [u8; 32], threads: usize, canc
     };
 
     if num_threads <= 1 {
-        return mine_extension_single(midstate, target, cancel);
+        return mine_extension_single(midstate, target, pool_target, cancel, hash_counter); 
     }
 
     let found = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = std::sync::mpsc::channel::<(Extension, u64)>();
+    let (tx, rx) = std::sync::mpsc::channel::<(MiningResult, u64)>();
 
     let threads: Vec<_> = (0..num_threads)
         .map(|_| {
             let cancel = Arc::clone(&cancel);
             let found = Arc::clone(&found);
             let tx = tx.clone();
+            let hash_counter = Arc::clone(&hash_counter);
             std::thread::spawn(move || {
                 let mut attempts = 0u64;
                 loop {
@@ -176,13 +87,20 @@ pub fn mine_extension(midstate: [u8; 32], target: [u8; 32], threads: usize, canc
                     }
 
                     attempts += 1;
+                    hash_counter.fetch_add(1, Ordering::Relaxed);
                     let nonce: u64 = rand::random();
-                    let (final_hash, checkpoints) = compute_chain(&midstate, nonce);
-
-                    if final_hash < target {
+                    let ext = create_extension(midstate, nonce);
+                    
+                    if ext.final_hash < target {
                         found.store(true, Ordering::Relaxed);
-                        let _ = tx.send((Extension { nonce, final_hash, checkpoints }, attempts));
+                        let _ = tx.send((MiningResult::Block(ext), attempts));
                         return;
+                    } else if let Some(pt) = pool_target {
+                        if ext.final_hash < pt {
+                            found.store(true, Ordering::Relaxed);
+                            let _ = tx.send((MiningResult::Share(ext), attempts));
+                            return;
+                        }
                     }
                     
                     // Prevent CPU starvation by yielding the thread periodically.
@@ -205,12 +123,22 @@ pub fn mine_extension(midstate: [u8; 32], target: [u8; 32], threads: usize, canc
         let _ = t.join();
     }
 
-    if let Some((ext, attempts)) = result {
-        tracing::info!(
-            "Found valid extension! nonce={} attempts={} hash={} threads={}",
-            ext.nonce, attempts, hex::encode(ext.final_hash), num_threads
-        );
-        Some(ext)
+    if let Some((res, attempts)) = result {
+        match &res {
+            MiningResult::Block(ext) => {
+                tracing::info!(
+                    "Found valid block extension! nonce={} attempts={} hash={} threads={}",
+                    ext.nonce, attempts, hex::encode(ext.final_hash), num_threads
+                );
+            }
+            MiningResult::Share(ext) => {
+                tracing::info!(
+                    "Found valid pool share! nonce={} attempts={} hash={} threads={}",
+                    ext.nonce, attempts, hex::encode(ext.final_hash), num_threads
+                );
+            }
+        }
+        Some(res)
     } else {
         tracing::debug!("Mining cancelled after all threads exited ({} threads)", num_threads);
         None
@@ -218,7 +146,13 @@ pub fn mine_extension(midstate: [u8; 32], target: [u8; 32], threads: usize, canc
 }
 
 /// Single-threaded fallback.
-fn mine_extension_single(midstate: [u8; 32], target: [u8; 32], cancel: Arc<AtomicBool>) -> Option<Extension> {
+fn mine_extension_single(
+    midstate: [u8; 32], 
+    target: [u8; 32], 
+    pool_target: Option<[u8; 32]>, 
+    cancel: Arc<AtomicBool>,
+    hash_counter: Arc<std::sync::atomic::AtomicU64>
+) -> Option<MiningResult> {
     let mut attempts = 0u64;
 
     loop {
@@ -228,19 +162,28 @@ fn mine_extension_single(midstate: [u8; 32], target: [u8; 32], cancel: Arc<Atomi
         }
 
         attempts += 1;
+        hash_counter.fetch_add(1, Ordering::Relaxed);
         let nonce: u64 = rand::random();
 
-        let (final_hash, checkpoints) = compute_chain(&midstate, nonce);
-
-        if final_hash < target {
+        let ext = create_extension(midstate, nonce);
+        if ext.final_hash < target {
             tracing::info!(
-                "Found valid extension! nonce={} attempts={} hash={}",
-                nonce, attempts, hex::encode(final_hash)
+                "Found valid block extension! nonce={} attempts={} hash={}",
+                nonce, attempts, hex::encode(ext.final_hash)
             );
-            return Some(Extension { nonce, final_hash, checkpoints });
+            return Some(MiningResult::Block(ext));
+        } else if let Some(pt) = pool_target {
+            if ext.final_hash < pt {
+                tracing::info!(
+                    "Found valid pool share! nonce={} attempts={} hash={}",
+                    nonce, attempts, hex::encode(ext.final_hash)
+                );
+                return Some(MiningResult::Share(ext));
+            }
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -258,7 +201,6 @@ mod tests {
         let e1 = create_extension(ms, 42);
         let e2 = create_extension(ms, 42);
         assert_eq!(e1.final_hash, e2.final_hash);
-        assert_eq!(e1.checkpoints, e2.checkpoints);
     }
 
     #[test]
@@ -269,29 +211,7 @@ mod tests {
         assert_ne!(e1.final_hash, e2.final_hash);
     }
 
-    #[test]
-    fn create_extension_checkpoint_count() {
-        let ms = hash(b"test midstate");
-        let ext = create_extension(ms, 0);
-        let expected = (EXTENSION_ITERATIONS / CHECKPOINT_INTERVAL) as usize + 1;
-        assert_eq!(ext.checkpoints.len(), expected);
-    }
 
-    #[test]
-    fn create_extension_first_checkpoint_is_hash_of_midstate_nonce() {
-        let ms = hash(b"test midstate");
-        let nonce = 99u64;
-        let ext = create_extension(ms, nonce);
-        let expected = hash_concat(&ms, &nonce.to_le_bytes());
-        assert_eq!(ext.checkpoints[0], expected);
-    }
-
-    #[test]
-    fn create_extension_last_checkpoint_equals_final_hash() {
-        let ms = hash(b"test midstate");
-        let ext = create_extension(ms, 0);
-        assert_eq!(*ext.checkpoints.last().unwrap(), ext.final_hash);
-    }
 
     // ── verify_extension ────────────────────────────────────────────────
 
@@ -319,31 +239,6 @@ mod tests {
     }
 
     #[test]
-    fn verify_rejects_wrong_checkpoint_count() {
-        let ms = hash(b"bad checkpoint");
-        let mut ext = create_extension(ms, 0);
-        ext.checkpoints.push([0u8; 32]); // extra checkpoint
-        assert!(verify_extension(ms, &ext, &easy_target()).is_err());
-    }
-
-    #[test]
-    fn verify_rejects_tampered_checkpoint() {
-        let ms = hash(b"tamper test");
-        let mut ext = create_extension(ms, 0);
-        // Flip a byte in a middle checkpoint
-        let mid = ext.checkpoints.len() / 2;
-        ext.checkpoints[mid][0] ^= 0xFF;
-        // This may or may not be caught depending on spot-check sampling,
-        // but the last checkpoint won't match final_hash anymore
-        // OR a spot-checked segment will fail.
-        // At minimum, if the last checkpoint is tampered it's caught:
-        let last = ext.checkpoints.len() - 1;
-        let mut ext2 = create_extension(ms, 0);
-        ext2.checkpoints[last][0] ^= 0xFF;
-        assert!(verify_extension(ms, &ext2, &easy_target()).is_err());
-    }
-
-    #[test]
     fn verify_rejects_tampered_final_hash() {
         let ms = hash(b"final hash tamper");
         let mut ext = create_extension(ms, 0);
@@ -360,7 +255,6 @@ mod tests {
         let pruned = Extension {
             nonce: ext.nonce,
             final_hash: ext.final_hash,
-            checkpoints: vec![],
         };
         assert!(verify_extension(ms, &pruned, &easy_target()).is_ok());
     }
@@ -372,7 +266,6 @@ mod tests {
         let pruned = Extension {
             nonce: ext.nonce,
             final_hash: ext.final_hash,
-            checkpoints: vec![],
         };
         let wrong = hash(b"prune wrong");
         assert!(verify_extension(wrong, &pruned, &easy_target()).is_err());
@@ -385,7 +278,6 @@ mod tests {
         let pruned = Extension {
             nonce: 43, // wrong nonce
             final_hash: ext.final_hash,
-            checkpoints: vec![],
         };
         assert!(verify_extension(ms, &pruned, &easy_target()).is_err());
     }
@@ -397,7 +289,6 @@ mod tests {
         let mut pruned = Extension {
             nonce: ext.nonce,
             final_hash: ext.final_hash,
-            checkpoints: vec![],
         };
         pruned.final_hash[0] ^= 0xFF;
         assert!(verify_extension(ms, &pruned, &easy_target()).is_err());
@@ -410,7 +301,6 @@ mod tests {
         let pruned = Extension {
             nonce: ext.nonce,
             final_hash: ext.final_hash,
-            checkpoints: vec![],
         };
         let impossible_target = [0u8; 32];
         assert!(verify_extension(ms, &pruned, &impossible_target).is_err());
@@ -424,7 +314,6 @@ mod tests {
         let pruned = Extension {
             nonce: ext.nonce,
             final_hash: ext.final_hash,
-            checkpoints: vec![],
         };
         let full_ok = verify_extension(ms, &ext, &easy_target()).is_ok();
         let pruned_ok = verify_extension(ms, &pruned, &easy_target()).is_ok();
@@ -436,49 +325,18 @@ mod tests {
     #[test]
     fn mine_extension_meets_target() {
         let ms = hash(b"mine test");
-        // Use easy target so mining finishes quickly
         let target = easy_target();
         let cancel = Arc::new(AtomicBool::new(false));
-        // Add the '0' for the threads argument
-        let ext = mine_extension(ms, target, 0, cancel).unwrap();
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0)); // <-- Dummy counter for test
+        
+        let res = mine_extension(ms, target, None, 0, cancel, counter).unwrap();
+        let ext = match res {
+            MiningResult::Block(e) => e,
+            MiningResult::Share(_) => panic!("Should not return share"),
+        };
         assert!(ext.final_hash < target);
         assert!(verify_extension(ms, &ext, &target).is_ok());
     }
 
-    // ── spot_check_indices ──────────────────────────────────────────────
 
-    #[test]
-    fn spot_check_indices_deterministic() {
-        let fh = hash(b"deterministic");
-        let a = spot_check_indices(&fh, 100, 10);
-        let b = spot_check_indices(&fh, 100, 10);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn spot_check_indices_unique() {
-        let fh = hash(b"unique check");
-        let indices = spot_check_indices(&fh, 1000, 50);
-        let mut deduped = indices.clone();
-        deduped.sort();
-        deduped.dedup();
-        assert_eq!(indices.len(), deduped.len());
-    }
-
-    #[test]
-    fn spot_check_indices_within_bounds() {
-        let fh = hash(b"bounds");
-        let num_segments = 100;
-        let indices = spot_check_indices(&fh, num_segments, 20);
-        for &idx in &indices {
-            assert!(idx < num_segments);
-        }
-    }
-
-    #[test]
-    fn spot_check_count_capped_at_segments() {
-        let fh = hash(b"cap");
-        let indices = spot_check_indices(&fh, 5, 100);
-        assert_eq!(indices.len(), 5);
-    }
 }
