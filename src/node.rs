@@ -13,12 +13,13 @@ use crate::wallet::{coinbase_seed, coinbase_salt};
 use crate::core::mss;
 use crate::core::wots;
 use crate::sync::Syncer;
+
 use anyhow::{bail, Result};
 use libp2p::{request_response::ResponseChannel, PeerId, Multiaddr, identity::Keypair};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -52,10 +53,6 @@ struct SyncSession {
 }
 
 enum SyncPhase {
-    /// Waiting for a requested state snapshot
-    WaitingForSnapshot {
-        target_height: u64,
-    },
     /// Downloading headers. If fast-forwarding, it holds the snapshot to verify against.
     Headers {
         accumulated: Vec<BatchHeader>,
@@ -71,6 +68,28 @@ enum SyncPhase {
         cursor: u64,
         new_history: Vec<(u64, [u8; 32], Batch)>,
         is_fast_forward: bool,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MinerToml {
+    pub mining: MiningConfig,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MiningConfig {
+    pub mode: String,
+    pub pool_url: Option<String>,
+    pub payout_address: Option<String>,
+    pub pool_address: Option<String>,
+}
+
+pub enum MinedResult {
+    Block(Batch),
+    Share {
+        batch: Batch,
+        pool_url: String,
+        payout_address: String,
     },
 }
 
@@ -96,8 +115,8 @@ pub struct Node {
     connected_peers: HashSet<PeerId>,
     // Background mining concurrency
     mining_cancel: Option<Arc<AtomicBool>>,
-    mined_batch_rx: tokio::sync::mpsc::UnboundedReceiver<Batch>,
-    mined_batch_tx: tokio::sync::mpsc::UnboundedSender<Batch>,
+    mined_batch_rx: tokio::sync::mpsc::UnboundedReceiver<MinedResult>,
+    mined_batch_tx: tokio::sync::mpsc::UnboundedSender<MinedResult>,
     // CoinJoin mix coordinator
     mix_manager: Arc<RwLock<MixManager>>,
     /// Reveals waiting for their Commit to be mined.
@@ -111,6 +130,7 @@ pub struct Node {
     /// Key: commitment or tx hash, Value: (transaction, received_at).
     /// After STEM_TIMEOUT_SECS without being fluffed, we fluff them ourselves.
     stem_pool: HashMap<[u8; 32], (Transaction, std::time::Instant)>,
+    hash_counter: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -124,6 +144,7 @@ pub struct NodeHandle {
     pub batches_path: PathBuf,
     pub mix_manager: Arc<RwLock<MixManager>>,
     pub commit_limiter: Arc<tokio::sync::Semaphore>, 
+    pub hash_counter: Arc<AtomicU64>,
 }
 
 pub enum NodeCommand {
@@ -250,14 +271,16 @@ impl NodeHandle {
     }
 
     pub async fn mix_register(
-        &self, mix_id: [u8; 32], input: InputReveal, output: OutputData, signature: Vec<u8> // <-- Added signature
+        &self, mix_id: [u8; 32], input: InputReveal, output: OutputData, signature: Vec<u8> 
     ) -> Result<()> {
         let mut mgr = self.mix_manager.write().await;
         let (is_coord, coord_peer) = mgr.get_session_info(&mix_id)
             .ok_or_else(|| anyhow::anyhow!("mix session not found"))?;
 
-        // Pass the signature to the MixManager
         mgr.register(&mix_id, input.clone(), output.clone(), &signature, None)?;
+        
+        //  Drop the lock BEFORE doing heavy PoW
+        drop(mgr);
 
         if !is_coord {
             if let Some(peer) = coord_peer {
@@ -268,18 +291,16 @@ impl NodeHandle {
                 }).await.map_err(|e| anyhow::anyhow!("PoW task failed: {}", e))?;
 
                 self.tx_sender.send(NodeCommand::SendMixJoin { 
-                    coordinator: peer, 
-                    mix_id, 
-                    input, 
-                    output, 
-                    signature,
-                    join_nonce,
+                    coordinator: peer, mix_id, input, output, signature, join_nonce 
                 })?;
             }
-        } else if let Some(proposal) = mgr.try_finalize(&mix_id)? {
-            // We are the coordinator and the mix is full. Broadcast proposal!
-            let peers = mgr.remote_participants(&mix_id);
-            self.tx_sender.send(NodeCommand::BroadcastMixProposal { mix_id, proposal, peers })?;
+        } else {
+            // We are the coordinator. Re-acquire lock to check if ready.
+            let mut mgr_coord = self.mix_manager.write().await;
+            if let Ok(Some(proposal)) = mgr_coord.try_finalize(&mix_id) {
+                let peers = mgr_coord.remote_participants(&mix_id);
+                self.tx_sender.send(NodeCommand::BroadcastMixProposal { mix_id, proposal, peers })?;
+            }
         }
         Ok(())
     }
@@ -290,6 +311,9 @@ impl NodeHandle {
             .ok_or_else(|| anyhow::anyhow!("mix session not found"))?;
 
         mgr.set_fee_input(&mix_id, input.clone(), None)?;
+        
+        //  Drop the lock BEFORE doing heavy PoW
+        drop(mgr);
 
         if !is_coord {
             if let Some(peer) = coord_peer {
@@ -301,9 +325,13 @@ impl NodeHandle {
 
                 self.tx_sender.send(NodeCommand::SendMixFee { coordinator: peer, mix_id, input, join_nonce })?;
             }
-        } else if let Some(proposal) = mgr.try_finalize(&mix_id)? {
-            let peers = mgr.remote_participants(&mix_id);
-            self.tx_sender.send(NodeCommand::BroadcastMixProposal { mix_id, proposal, peers })?;
+        } else {
+            // We are the coordinator. Re-acquire lock to check if ready.
+            let mut mgr_coord = self.mix_manager.write().await;
+            if let Ok(Some(proposal)) = mgr_coord.try_finalize(&mix_id) {
+                let peers = mgr_coord.remote_participants(&mix_id);
+                self.tx_sender.send(NodeCommand::BroadcastMixProposal { mix_id, proposal, peers })?;
+            }
         }
         Ok(())
     }
@@ -521,6 +549,7 @@ pub async fn new(
             peer_tx_counts: HashMap::new(),
             cmd_tx: None,
             stem_pool: HashMap::new(),
+            hash_counter: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -549,7 +578,8 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
             tx_sender: tx,
             batches_path: self.data_dir.join("db").join("batches"),
             mix_manager: Arc::clone(&self.mix_manager),
-            commit_limiter: Arc::new(tokio::sync::Semaphore::new(4)), // <-- ADD THIS (Max 4 concurrent PoW tasks)
+            commit_limiter: Arc::new(tokio::sync::Semaphore::new(4)), // <--  (Max 4 concurrent PoW tasks)
+            hash_counter: Arc::clone(&self.hash_counter),
         };
         (handle, rx)
     }
@@ -595,9 +625,37 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
         loop {
             tokio::select! {
                 
-                Some(batch) = self.mined_batch_rx.recv() => {
-                    if let Err(e) = self.handle_mined_batch(batch).await {
-                        tracing::error!("Failed to process mined batch: {}", e);
+                Some(result) = self.mined_batch_rx.recv() => {
+                    match result {
+                        MinedResult::Block(batch) => {
+                            if let Err(e) = self.handle_mined_batch(batch).await {
+                                tracing::error!("Failed to process mined batch: {}", e);
+                            }
+                        }
+                        MinedResult::Share { batch, pool_url, payout_address } => {
+                            tracing::info!("Found pool share! Submitting to {}", pool_url);
+                            let client = reqwest::Client::new();
+                            tokio::spawn(async move {
+                                let payload = serde_json::json!({
+                                    "batch": batch,
+                                    "payout_address": payout_address
+                                });
+                                match client.post(&pool_url).json(&payload).send().await {
+                                    Ok(res) if res.status().is_success() => {
+                                        tracing::info!("Share accepted by pool!");
+                                    }
+                                    Ok(res) => {
+                                        tracing::warn!("Pool rejected share. Status: {}", res.status());
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Failed to submit share to pool: {}", e);
+                                    }
+                                }
+                            });
+                            // Resume mining the same template immediately
+                            self.mining_cancel = None;
+                            self.trigger_mining();
+                        }
                     }
                 }
                 _ = save_interval.tick() => {
@@ -737,6 +795,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                         }
                         NetworkEvent::PeerDisconnected(peer) => {
                             self.connected_peers.remove(&peer);
+                            self.peer_tx_counts.remove(&peer); 
                             tracing::info!("Peer disconnected: {}", peer);
                             if self.sync_session.as_ref().map_or(false, |s| s.peer == peer) {
                                 self.abort_sync_session("sync peer disconnected");
@@ -806,23 +865,13 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                 } else if depth > self.state.depth || height > self.state.height
                     || (depth == self.state.depth && midstate < self.state.midstate)
                 {
-                    // FIX: Don't get distracted if we are already busy syncing!
-                    // Only ignore if there is an actual sync session in flight.
-                    // Checking sync_in_progress alone is insufficient because the
-                    // flag can be stale (e.g. set by a peer connection handshake
-                    // that hasn't resolved yet).
                     if self.sync_session.is_some() {
                         tracing::debug!("Sync session already active. Ignoring StateInfo from {} to prevent thrashing.", from);
                     } else {
-                        let gap = height.saturating_sub(self.state.height);
-                        
-                        // FIX: The GetBatches shortcut has been completely removed.
-                        // We ALWAYS use Headers to safely find micro-forks and prove the chain.
-                        if gap > PRUNE_DEPTH {
-                            self.start_fast_forward_sync(from, height, depth);
-                        } else {
-                            self.start_sync_session(from, height, depth, None);
-                        }
+                        // --- FIX: Disable insecure Fast-Forward Sync ---
+                        // We must always anchor syncs to our locally verified chain history.
+                        self.start_sync_session(from, height, depth, None);
+                        // -----------------------------------------------
                     }
                 } else {
                     tracing::debug!(
@@ -1087,64 +1136,6 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                     }
                 }
             }
-            // ── Fast-Forward Sync Messages ──────────────────────────────
-            
-            Message::GetStateSnapshot { height } => {
-                match self.storage.load_state_snapshot(height) {
-                    Ok(Some(state)) => {
-                        self.send_response(channel, Message::StateSnapshot {
-                            height,
-                            state: Box::new(state),
-                        });
-                    }
-                    Ok(None) => {
-                        tracing::debug!("Peer {} requested snapshot for height {}, but we don't have it", from, height);
-                        self.ack(channel);
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to load snapshot for height {}: {}", height, e);
-                        self.ack(channel);
-                    }
-                }
-            }
-
-            Message::StateSnapshot { height, mut state } => {
-                self.ack(channel);
-
-                // --- Rebuild the SMT caches after network deserialization! ---
-                // Without this, the node cache is empty due to #[serde(skip)],
-                // and the state root validation will fail on the very next block.
-                state.coins.rebuild_tree();
-                state.commitments.rebuild_tree();
-                // -----------------------------------------------------------------
-
-                if let Some(session) = self.sync_session.take() {
-                    if session.peer == from {
-                        if let SyncPhase::WaitingForSnapshot { target_height } = session.phase {
-                            if height == target_height {
-                                tracing::info!("Received snapshot at height {}. Downloading {} subsequent headers to verify PoW...", height, session.peer_height - height);
-                                
-                                self.sync_session = Some(SyncSession {
-                                    peer: from,
-                                    peer_height: session.peer_height,
-                                    peer_depth: session.peer_depth,
-                                    phase: SyncPhase::Headers {
-                                        accumulated: Vec::new(),
-                                        cursor: height,
-                                        snapshot: Some(state), // This now holds the rebuilt tree!
-                                    },
-                                    started_at: std::time::Instant::now(),
-                                });
-
-                                let count = 100.min(session.peer_height - height);
-                                self.network.send(from, Message::GetHeaders { start_height: height, count });
-                                return Ok(());
-                            }
-                        }
-                    }
-                    self.sync_session = Some(session); // Put session back if it wasn't a match
-                }
-            }
         }
         Ok(())
     }
@@ -1179,32 +1170,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u64
         self.network.send(peer, Message::GetHeaders { start_height, count });
     }
 
-fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth: u64) {
-        self.cancel_mining();
-        
-        // FIX 1: Subtract PRUNE_DEPTH before rounding down to guarantee at least 1,000 blocks 
-        // exist between the snapshot and the peer's tip.
-        let snap_height = (peer_height.saturating_sub(PRUNE_DEPTH) / PRUNE_DEPTH) * PRUNE_DEPTH;
-        
-        // FIX 2: Snapshot 0 is never saved. If the chain is so young that the safe 
-        // snapshot is genesis, just do a normal sync.
-        if snap_height == 0 {
-            tracing::info!("Fast-forward threshold not met (safe snap_height=0), falling back to standard sync");
-            self.start_sync_session(peer, peer_height, peer_depth, None); 
-            return;
-        }
-        
-        tracing::info!("Fast-forward sync: requesting snapshot at height {}", snap_height);
-        self.sync_in_progress = true;
-        self.sync_session = Some(SyncSession {
-            peer,
-            peer_height,
-            peer_depth,
-            phase: SyncPhase::WaitingForSnapshot { target_height: snap_height },
-            started_at: std::time::Instant::now(),
-        });
-        self.network.send(peer, Message::GetStateSnapshot { height: snap_height });
-    }
+
 
     fn abort_sync_session(&mut self, reason: &str) {
         if self.sync_session.is_some() {
@@ -1214,7 +1180,7 @@ fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth
         self.sync_in_progress = false;
     }
 
-    pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHeader>) -> Result<()> {
+ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHeader>) -> Result<()> {
         // Extract state from the session — only accept headers from the sync peer
         let (peer_height, cursor, snapshot) = match &mut self.sync_session {
             Some(s) if s.peer == from => {
@@ -1281,7 +1247,7 @@ fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth
         tokio::spawn(async move {
             let mut is_valid = true;
 
-            // --- NEW: Time Warp Defense ---
+            // --- Time Warp Defense (Constants) ---
             let current_time = crate::core::state::current_timestamp();
             const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
 
@@ -1292,20 +1258,34 @@ fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth
             // ------------------------------
 
             // 1. Fast sequential check: linkage + difficulty target validation
-            for i in 1..all_headers.len() {
-                if all_headers[i].prev_midstate != all_headers[i - 1].extension.final_hash {
-                    tracing::warn!("Header linkage broken at index {}", i);
-                    is_valid = false;
-                    break;
-                }
-                let expected_target = crate::core::state::calculate_target(
-                    all_headers[i - 1].height + 1,
-                    all_headers[i - 1].timestamp,
-                );
-                if all_headers[i].target != expected_target {
-                    tracing::warn!("Invalid difficulty target at header index {}", i);
-                    is_valid = false;
-                    break;
+            if is_valid {
+                for i in 1..all_headers.len() {
+                    
+                    // --- CORRECTED: Time Warp & CPU Exhaustion Defense ---
+                    // We ONLY check the future time limit. Nakamoto consensus 
+                    // allows slight backward drift, so we do NOT enforce 
+                    // header.timestamp > prev.timestamp.
+                    if all_headers[i].timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
+                        tracing::warn!("Header timestamp too far in future at index {}", i);
+                        is_valid = false;
+                        break;
+                    }
+                    // -----------------------------------------------------
+
+                    if all_headers[i].prev_midstate != all_headers[i - 1].extension.final_hash {
+                        tracing::warn!("Header linkage broken at index {}", i);
+                        is_valid = false;
+                        break;
+                    }
+                    let expected_target = crate::core::state::calculate_target(
+                        all_headers[i - 1].height + 1,
+                        all_headers[i - 1].timestamp,
+                    );
+                    if all_headers[i].target != expected_target {
+                        tracing::warn!("Invalid difficulty target at header index {}", i);
+                        is_valid = false;
+                        break;
+                    }
                 }
             }
 
@@ -1336,7 +1316,7 @@ fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth
 
                     processed += chunk.len();
 
-                    // --- NEW: Progress Logging ---
+                    // --- Progress Logging ---
                     // Log progress every 1,000 headers, or when we hit 100%
                     if processed % 1000 == 0 || processed == total_headers {
                         let pct = (processed as f64 / total_headers as f64) * 100.0;
@@ -1350,7 +1330,7 @@ fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth
                 }
             }
 
-        let _ = tx.send(NodeCommand::FinishSyncHeaders {
+            let _ = tx.send(NodeCommand::FinishSyncHeaders {
                 peer: from,
                 headers: all_headers,
                 is_valid,
@@ -1430,6 +1410,14 @@ fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth
             // Standard sync path
             let headers_start_height = all_headers.first().map(|h| h.height).unwrap_or(0);
             let fh = self.syncer.find_fork_point(&all_headers, headers_start_height, self.state.height)?;
+            
+            // --- NEW: Enforce Safe Depth During Sync ---
+            let safe_depth = self.finality.calculate_safe_depth(1e-6);
+            let max_reorg_depth = self.state.height.saturating_sub(safe_depth);
+            if fh < max_reorg_depth {
+                tracing::warn!("Sync fork at {} exceeds safe depth {}, aborting", fh, max_reorg_depth);
+                self.abort_sync_session("Fork point exceeds safe finality depth");
+            }
             
             // NEW: Deep Fork Guard. 
             // If the fork point equals the start of our 100-block window, it means the 
@@ -1698,6 +1686,19 @@ fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth
     /// With STEM_FLUFF_PERCENT probability, "fluff" it (broadcast normally).
     /// Otherwise, forward to one random peer (excluding sender).
     async fn handle_stem_transaction(&mut self, tx: Transaction, from: PeerId) -> Result<()> {
+        // --- FIX: Dandelion++ Rate Limiting ---
+        let now = std::time::Instant::now();
+        let entry = self.peer_tx_counts.entry(from).or_insert((0, now));
+        if now.duration_since(entry.1).as_secs() >= TX_RATE_WINDOW_SECS {
+            *entry = (0, now); // reset window
+        }
+        entry.0 += 1;
+        if entry.0 > MAX_TX_PER_PEER_PER_WINDOW {
+            tracing::debug!("Stem rate-limiting peer {}: {} txs in window", from, entry.0);
+            return Ok(()); // silently drop, don't execute heavy validation
+        }
+        // --------------------------------------
+
         // Compute a tx identifier for dedup
         let tx_id = tx.input_coin_ids().first().copied()
             .unwrap_or_else(|| match &tx { Transaction::Commit { commitment, .. } => *commitment, _ => [0; 32] });
@@ -1757,10 +1758,20 @@ fn start_fast_forward_sync(&mut self, peer: PeerId, peer_height: u64, peer_depth
 
         for tx_id in expired {
             if let Some((tx, _)) = self.stem_pool.remove(&tx_id) {
-                tracing::debug!("Dandelion++ timeout: fluffing stem tx");
-                // ADD TO LOCAL MEMPOOL
-                let _ = self.mempool.add(tx.clone(), &self.state); 
-                self.network.broadcast(Message::Transaction(tx));
+                // 1. Check if the tx is still fundamentally valid against the chain state
+                if validate_transaction(&self.state, &tx).is_ok() {
+                    tracing::debug!("Dandelion++ timeout: fluffing valid stem tx");
+                    
+                    // 2. Try to add to local mempool (might fail if our mempool is full/fee too low)
+                    let _ = self.mempool.add(tx.clone(), &self.state);
+                    
+                    // 3. Broadcast to the network regardless of local mempool admission, 
+                    // so the rest of the network gets a chance to mine it.
+                    self.network.broadcast(Message::Transaction(tx));
+                } else {
+                    // It became invalid while waiting in the stem pool (e.g., double spent)
+                    tracing::debug!("Dandelion++ timeout: dropping stem tx (became invalid)");
+                }
             }
         }
     }
@@ -2028,18 +2039,7 @@ fn perform_reorg(
         Ok(state)
     }
 
-    /// Prune checkpoints from deeply finalized batches.
-    ///
-    /// Safe to call after every state advancement — internally tracks what's
-    /// already pruned and skips redundant work.
-    fn maybe_prune_checkpoints(&self) {
-        if self.state.height > PRUNE_DEPTH {
-            let prune_below = self.state.height - PRUNE_DEPTH;
-            if let Err(e) = self.storage.prune_checkpoints(prune_below) {
-                tracing::warn!("Checkpoint pruning failed: {}", e);
-            }
-        }
-    }
+
 
     /// Handle a completed CoinJoin mix: submit Commit, queue Reveal.
     async fn handle_mix_transaction(&mut self, mix_id: [u8; 32], reveal_tx: Transaction) -> Result<()> {
@@ -2119,9 +2119,43 @@ fn perform_reorg(
     }
 
     async fn handle_new_batch(&mut self, batch: Batch, from: Option<PeerId>) -> Result<()> {
+        // Extract the midstate before we potentially move the batch
+        let prev_midstate = batch.prev_midstate;
+
         // Fast pre-checks BEFORE cloning state (O(1) shallow clone via structural sharing).
-        if batch.prev_midstate != self.state.midstate {
-            tracing::debug!("Received orphan block (parent mismatch), queuing for later.");
+        if prev_midstate != self.state.midstate {
+            // --- FIX: Prevent Orphan OOM Attack ---
+            // 1. Verify the sequential PoW is valid (forces attacker to compute 1M hashes)
+            let header = batch.header();
+            if crate::core::extension::verify_extension(header.post_tx_midstate, &batch.extension, &batch.target).is_err() {
+                tracing::debug!("Rejected invalid orphan block (PoW failed)");
+                return Ok(());
+            }
+
+            // 2. Asymmetry check: ensure the target isn't artificially easy.
+            // Since ASERT smooths difficulty, a valid orphan shouldn't be significantly 
+            // easier than our current tip. We reject if it's >4x easier (shifted by 2 bits).
+            let current_target = primitive_types::U256::from_big_endian(&self.state.target);
+            let batch_target = primitive_types::U256::from_big_endian(&batch.target);
+            if batch_target > (current_target << 2) {
+                tracing::debug!("Rejected invalid orphan block (Target too easy, possible spam)");
+                return Ok(());
+            }
+            // --------------------------------------
+
+            tracing::debug!("Received valid orphan block (parent mismatch), queuing for later.");
+
+            let list = self.orphan_batches.entry(prev_midstate).or_default();
+            
+            // CRITICAL FIX: Prevent infinite vector growth on a single midstate
+            if list.len() < 16 {
+                list.push(batch); // batch is moved here
+                if list.len() == 1 { // Only push to order queue on first entry
+                    self.orphan_order.push_back(prev_midstate); // Use the extracted variable here!
+                }
+            } else {
+                tracing::warn!("Too many orphans for midstate, dropping to prevent RAM exhaustion.");
+            }
 
             const ORPHAN_LIMIT: usize = 64;
             
@@ -2134,9 +2168,6 @@ fn perform_reorg(
                     }
                 }
             }
-
-            self.orphan_order.push_back(batch.prev_midstate);
-            self.orphan_batches.entry(batch.prev_midstate).or_default().push(batch);
 
             if !self.sync_in_progress {
                 if let Some(peer) = from {
@@ -2152,7 +2183,7 @@ fn perform_reorg(
             return Ok(());
         }
 
-// Checks passed — now clone state and apply fully.
+        // Checks passed — now clone state and apply fully.
         let mut candidate_state = self.state.clone();
         match apply_batch(&mut candidate_state, &batch, self.recent_headers.make_contiguous()) {
             Ok(_) => {
@@ -2180,7 +2211,7 @@ fn perform_reorg(
 
                     self.storage.save_batch(pre_height, &batch)?;
 
-                    // Periodic snapshot + checkpoint pruning (matches handle_mined_batch)
+                    // Periodic snapshot 
                     if self.state.height > 0 && self.state.height % PRUNE_DEPTH == 0 {
                         if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
                             tracing::warn!("Failed to save state snapshot: {}", e);
@@ -2188,7 +2219,6 @@ fn perform_reorg(
                             tracing::info!("Saved state snapshot at height {}", self.state.height);
                         }
                     }
-                    self.maybe_prune_checkpoints();
                     
                     self.metrics.inc_batches_processed();
 
@@ -2317,7 +2347,6 @@ async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) 
                     }
                 }
                 
-                self.maybe_prune_checkpoints();
                 self.metrics.inc_batches_processed();
 
                 self.chain_history.push_back((self.state.height, self.state.midstate));
@@ -2418,21 +2447,46 @@ async fn try_apply_orphans(&mut self) {
         }
     }
 
-    fn generate_coinbase(&self, height: u64, total_fees: u64) -> Vec<CoinbaseOutput> {
+    fn generate_coinbase(
+        &self, 
+        height: u64, 
+        total_fees: u64,
+        pool_target: Option<([u8; 32], [u8; 32])>, // (Pool MSS Address, Miner Payout Address)
+    ) -> Vec<CoinbaseOutput> {
         let reward = block_reward(height);
         let total_value = reward + total_fees;
         let denominations = decompose_value(total_value);
 
-        let mining_seed = self.mining_seed; // Extract seed here
+        let mining_seed = self.mining_seed;
 
         denominations.into_par_iter()
             .enumerate()
-            .map(move |(i, value)| { // Add move
-                let seed = coinbase_seed(&mining_seed, height, i as u64); // Use local variable
-                let owner_pk = wots::keygen(&seed);
-                let address = compute_address(&owner_pk);
-                let salt = coinbase_salt(&mining_seed, height, i as u64); // Use local variable
-                CoinbaseOutput { address, value, salt }
+            .map(move |(i, value)| {
+                match pool_target {
+                    Some((pool_addr, miner_addr)) => {
+                        // POOL MINING MODE
+                        // Pay the pool's address, but embed the miner's address in the salt
+                        // so the pool can cryptographically verify who did the work.
+                        let mut salt = [0u8; 32];
+                        let mut hasher = blake3::Hasher::new();
+                        hasher.update(b"pool_share");
+                        hasher.update(&miner_addr);
+                        hasher.update(&height.to_le_bytes());
+                        hasher.update(&(i as u64).to_le_bytes());
+                        salt.copy_from_slice(hasher.finalize().as_bytes());
+
+                        CoinbaseOutput { address: pool_addr, value, salt }
+                    }
+                    None => {
+                        // SOLO MINING MODE (Original Logic)
+                        let seed = coinbase_seed(&mining_seed, height, i as u64);
+                        let owner_pk = wots::keygen(&seed);
+                        let address = compute_address(&owner_pk);
+                        let salt = coinbase_salt(&mining_seed, height, i as u64);
+                        
+                        CoinbaseOutput { address, value, salt }
+                    }
+                }
             })
             .collect()
     }
@@ -2487,24 +2541,54 @@ async fn try_apply_orphans(&mut self) {
         }
         tracing::info!("Mining batch with {} transactions...", self.mempool.len());
 
+        let mut pool_target = None;
+        let mut pool_url = None;
+        let mut payout_address = None;
+        let mut pool_address_bytes = None;
+        
+        if let Ok(toml_str) = std::fs::read_to_string("miner.toml") {
+            if let Ok(config) = toml::from_str::<MinerToml>(&toml_str) {
+                if config.mining.mode == "pool" {
+                    pool_url = config.mining.pool_url;
+                    payout_address = config.mining.payout_address.clone();
+                    
+                    // Parse the addresses from the config
+                    if let (Some(pool_hex), Some(payout_hex)) = (&config.mining.pool_address, &config.mining.payout_address) {
+                        if let (Ok(pool_bytes), Ok(payout_bytes)) = (hex::decode(pool_hex), hex::decode(payout_hex)) {
+                            if pool_bytes.len() == 32 && payout_bytes.len() == 32 {
+                                let mut pb = [0u8; 32];
+                                pb.copy_from_slice(&pool_bytes);
+                                let mut mb = [0u8; 32];
+                                mb.copy_from_slice(&payout_bytes);
+                                pool_address_bytes = Some((pb, mb));
+                            }
+                        }
+                    }
+
+                    // Lower share difficulty: 16 leading zero bits for demonstration
+                    let mut pt = [0xff; 32];
+                    pt[0] = 0x00; pt[1] = 0x00;
+                    pool_target = Some(pt);
+                }
+            }
+        }
+
         // Clone only valid transactions. If any became stale since entering the
         // mempool, skip them silently instead of aborting the entire mining attempt.
         let pre_mine_height = self.state.height;
         let pre_mine_midstate = self.state.midstate;
         let mut candidate_state = self.state.clone();
+        
         let mut total_fees: u64 = 0;
         let mut transactions = Vec::new();
         
-        // Pull commits and reveals separately so commits can't be starved.
-        // Reserve up to 20% of block space for commits; fills the rest with
-        // fee-paying reveals. This is a local mining policy — not consensus —
-        // but rational miners should follow it: including commits enables future
-        // reveals (which pay fees), and a miner who starves commits starves
-        // their own future revenue.
-        let max_commits = MAX_BATCH_SIZE / 5;  // 20 slots reserved
-        let max_reveals = MAX_BATCH_SIZE - max_commits;
+        let max_commits = crate::core::MAX_BATCH_COMMITS;
+        let max_reveals = crate::core::MAX_BATCH_REVEALS;
 
         let (pending_commits, pending_reveals) = self.mempool.transactions_split();
+
+        let mut current_inputs = 0;
+        let mut current_outputs = 0;
 
         for arc_tx in pending_commits.into_iter().take(max_commits) {
             let tx = Arc::unwrap_or_clone(arc_tx);
@@ -2513,33 +2597,44 @@ async fn try_apply_orphans(&mut self) {
                     total_fees += tx.fee();
                     transactions.push(tx);
                 }
-                Err(e) => {
-                    tracing::debug!("Skipping stale mempool tx during mining: {}", e);
-                }
+                Err(e) => tracing::debug!("Skipping stale commit during mining: {}", e),
             }
         }
 
         for arc_tx in pending_reveals.into_iter().take(max_reveals) {
             let tx = Arc::unwrap_or_clone(arc_tx);
+
+            // Pre-check: Will adding this transaction exceed our global batch limits?
+            if let Transaction::Reveal { inputs, outputs, .. } = &tx {
+                if current_inputs + inputs.len() > crate::core::MAX_BATCH_INPUTS {
+                    continue; // Skip this tx, try the next one
+                }
+                if current_outputs + outputs.len() > crate::core::MAX_BATCH_OUTPUTS {
+                    continue; // Skip this tx, try the next one
+                }
+            }
+
             match apply_transaction(&mut candidate_state, &tx) {
                 Ok(_) => {
+                    if let Transaction::Reveal { inputs, outputs, .. } = &tx {
+                        current_inputs += inputs.len();
+                        current_outputs += outputs.len();
+                    }
                     total_fees += tx.fee();
                     transactions.push(tx);
                 }
-                Err(e) => {
-                    tracing::debug!("Skipping stale mempool tx during mining: {}", e);
-                }
+                Err(e) => tracing::debug!("Skipping stale reveal during mining: {}", e),
             }
         }
 
-        let coinbase = self.generate_coinbase(pre_mine_height, total_fees);
+        let coinbase = self.generate_coinbase(pre_mine_height, total_fees, pool_address_bytes);
         for cb in &coinbase {
             let coin_id = cb.coin_id();
             candidate_state.coins.insert(coin_id);
             candidate_state.midstate = hash_concat(&candidate_state.midstate, &coin_id);
         }
 
-        // --- NEW: Calculate state root ---
+        // --- Calculate state root ---
         let smt_root = hash_concat(&candidate_state.coins.root(), &candidate_state.commitments.root());
         let state_root = hash_concat(&smt_root, &candidate_state.chain_mmr.root());
         candidate_state.midstate = hash_concat(&candidate_state.midstate, &state_root);
@@ -2555,7 +2650,7 @@ async fn try_apply_orphans(&mut self) {
         let mut template = Batch {
             prev_midstate: pre_mine_midstate,
             transactions,
-            extension: Extension { nonce: 0, final_hash: [0; 32], checkpoints: vec![] },
+            extension: Extension { nonce: 0, final_hash: [0; 32]},
             coinbase,
             timestamp: 0, // placeholder — set after mining
             target: self.state.target,
@@ -2566,18 +2661,30 @@ async fn try_apply_orphans(&mut self) {
         let cancel = Arc::new(AtomicBool::new(false));
         self.mining_cancel = Some(cancel.clone());
         let tx = self.mined_batch_tx.clone();
-
+        let hash_counter = Arc::clone(&self.hash_counter);
         tokio::task::spawn_blocking(move || {
-            // Pass the `threads` variable into mine_extension
-            if let Some(extension) = mine_extension(midstate, target, threads, cancel) {
-                template.extension = extension;
-                // Set timestamp NOW (after mining) so it reflects actual wall-clock time.
-                // This prevents difficulty drift from stale pre-mining timestamps.
+            use crate::core::extension::MiningResult;
+            if let Some(mining_result) = mine_extension(midstate, target, pool_target, threads, cancel, hash_counter) {
                 let fresh_time = crate::core::state::current_timestamp();
                 template.timestamp = fresh_time.max(min_timestamp);
-                let _ = tx.send(template);
+
+                match mining_result {
+                    MiningResult::Block(extension) => {
+                        template.extension = extension;
+                        let _ = tx.send(MinedResult::Block(template));
+                    }
+                    MiningResult::Share(extension) => {
+                        template.extension = extension;
+                        if let (Some(url), Some(addr)) = (pool_url, payout_address) {
+                            let _ = tx.send(MinedResult::Share {
+                                batch: template,
+                                pool_url: url,
+                                payout_address: addr,
+                            });
+                        }
+                    }
+                }
             }
-            // If cancelled or channel closed, silently drop — the main loop already moved on
         });
 
         Ok(())
@@ -2620,7 +2727,6 @@ async fn try_apply_orphans(&mut self) {
                     }
                 }
                 
-                self.maybe_prune_checkpoints();
 
                 self.metrics.inc_batches_mined();
                 self.network.broadcast(Message::Batch(batch.clone()));
@@ -2671,8 +2777,16 @@ async fn try_apply_orphans(&mut self) {
             return Ok(());
         }
         self.spawn_mining_task()?;
-        if let Some(batch) = self.mined_batch_rx.recv().await {
-            self.handle_mined_batch(batch).await?;
+        if let Some(res) = self.mined_batch_rx.recv().await {
+            match res {
+                MinedResult::Block(batch) => {
+                    self.handle_mined_batch(batch).await?;
+                }
+                MinedResult::Share { .. } => {
+                    // For tests, clear the flag to avoid deadlocking
+                    self.mining_cancel = None;
+                }
+            }
         }
         Ok(())
     }
@@ -3088,7 +3202,7 @@ mod complex_tests {
         let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
         
         // Initialize node (creates Genesis internally)
-        Node::new(dir.to_path_buf(), None, listen, vec![]).await.unwrap()
+        Node::new(dir.to_path_buf(), None, listen, vec![], false).await.unwrap()
     }
 
     /// specific helper to manually construct a valid batch structure.
