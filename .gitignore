@@ -14,3 +14,5 @@ wasm-wallet/target/
 
 # (Optional) If you ever add npm/webpack later, ignore this too:
 wasm-wallet/node_modules/
+target/
+Cargo.lock
