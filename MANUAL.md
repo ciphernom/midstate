@@ -9,106 +9,92 @@ Midstate separates node data from wallet data.
 ### Node Directory (`./data` by default)
 
 * `db/`: The Redb database containing the state accumulator (`state.redb`) and the `batches/` directory for historical block storage.
-* `config.toml`: Node configuration file.
+* `config.toml`: Node P2P configuration file.
+* `miner.toml`: Mining configuration file (Solo/Pool mode, pool URLs, payout addresses).
 * `peer_key`: The libp2p identity key. This determines the node's `PeerId`.
-* `coinbase_seeds.jsonl`: Append-only log of mined block rewards.
-* `mining_seed`: The persistent seed used to generate deterministic coinbase outputs.
+* `coinbase_seeds.jsonl`: Append-only log of mined solo block rewards.
+* `mining_seed`: The persistent seed used to generate deterministic solo coinbase outputs.
 
 ### Wallet Directory (`~/.midstate/` by default)
 
-* `wallet.dat`: Encrypted JSON payload containing WOTS keys, MSS trees, unspent coin data, and transaction history.
-
-### Static Peering (`config.toml`)
-
-To persist connections across restarts, add peer multiaddrs to `config.toml`. The node will dial these addresses on boot.
-
-```toml
-bootstrap_peers = [
-    "/ip4/203.0.113.10/tcp/9333/p2p/12D3KooW...",
-    "/ip4/198.51.100.5/udp/9333/quic-v1/p2p/12D3KooW..."
-]
-
-```
+* `wallet.dat`: Encrypted JSON payload containing HD seeds, WOTS keys, MSS trees, unspent coin data, and transaction history.
 
 ## 2. Backup and Disaster Recovery
 
 The `wallet.dat` file is encrypted using AES-256-GCM. The encryption key is derived from the password via Argon2id. Passwords cannot be recovered.
 
-### Raw Data Extraction
+### Primary Backup: BIP39 Seed Phrase
 
-If the wallet file is corrupted, or for offline paper backups, extract the raw coin data.
+By default, wallets are Hierarchical Deterministic (HD). The 24-word phrase generated at creation is your primary backup. **Do not lose it.**
+
+To restore an HD wallet to a new machine:
+```bash
+midstate wallet restore --path wallet.dat
+
+```
+
+*Note: Because MSS keys are stateful, restoring a wallet requires scanning the blockchain. The node will automatically query the chain to fast-forward your MSS `leaf_index` to prevent cryptographic key reuse.*
+
+### Legacy/Advanced: Raw Data Extraction
+
+If dealing with a legacy (non-HD) wallet or for specific offline backups, extract the raw coin data:
 
 ```bash
 midstate wallet export --path wallet.dat --coin <COIN_ID_HEX>
 
 ```
 
-Record the `Seed`, `Value`, and `Salt`. A coin can be reconstructed entirely from these three variables.
-
-### Raw Data Restoration
-
-To rebuild a coin from raw data:
+To rebuild a single coin from raw data:
 
 ```bash
 midstate wallet import --path wallet.dat --seed <SEED_HEX> --value <INTEGER> --salt <SALT_HEX>
 
 ```
 
-### MSS State Recovery
-
-Merkle Signature Scheme (MSS) keys are stateful. Reusing a leaf index destroys the cryptographic security of the key. If you restore an old `wallet.dat` backup, the local leaf index will be outdated.
-
-When you run `midstate wallet scan`, the wallet queries the node's `/mss_state` RPC endpoint. The node scans the chain and mempool for the highest used index for your MSS key. The wallet then fast-forwards its internal index plus a safety margin to prevent reuse.
-
 ## 3. Node Maintenance and Troubleshooting
-
-### Sync States and Mining
-
-A node cannot mine and sync simultaneously. If a peer broadcasts a longer chain, the node will abort the current mining task, download the headers, verify the PoW, calculate the fork point, and apply the new batches. Mining resumes automatically once the node reaches the chain tip.
 
 ### Thread Management
 
-By default, the miner utilizes 100% of available CPU cores. This can starve the asynchronous network executor (Tokio), causing the node to drop peer connections.
-
-Use the `--threads` flag to restrict the miner and reserve CPU time for network keep-alives.
+By default, the solo miner utilizes all available CPU cores. This can starve the asynchronous network executor (Tokio) on low-power devices.
+Use the `--threads` flag to restrict the miner and reserve CPU time for network keep-alives (e.g., on a 4-core Raspberry Pi, use 3 threads).
 
 ```bash
-midstate node --mine --threads 2
+midstate node --mine --threads 3
 
 ```
 
 ### Unrecoverable Coins (Address Reuse)
 
-WOTS addresses are strictly single-use. If a sender transmits funds to a WOTS address that has already been spent from, the wallet will ignore the incoming transaction. Spending the second coin would reveal additional parts of the private key, compromising the funds. The second coin becomes "burnt" effectively being lost.
-
-To verify if a specific coin exists in the state accumulator regardless of wallet recognition:
-
-```bash
-midstate balance --rpc-port 8545 --coin <COIN_ID_HEX>
-
-```
+WOTS addresses are strictly single-use. If a sender transmits funds to a WOTS address that has already been spent from, the wallet will ignore the incoming transaction to protect the key. The second coin becomes "burnt".
 
 ## 4. Privacy Mechanics
 
 ### Smart Contract Auto-Solving
 
-Because every address is a smart contract, the wallet performs Ahead-Of-Time (AOT) decompilation when you attempt to spend a coin.
-
-If the wallet detects an `OP_CHECKSIGVERIFY` instruction preceded by a public key that matches a seed stored in your `wallet.dat`, it will automatically generate the required WOTS or MSS signature and inject it into the correct position on the VM execution stack.
+Because every address is a smart contract, the wallet performs Ahead-Of-Time (AOT) decompilation when you attempt to spend a coin. If the wallet detects a matching public key, it automatically generates the required WOTS or MSS signature and injects it into the execution stack.
 
 ### Private Sends
 
-The standard `send` command aggregates inputs and produces a single transaction. The `--private` flag splits the transaction.
+The standard `send` command aggregates inputs. The `--private` flag splits the transaction into independent, denomination-specific transactions with decoy change outputs, thwarting chain-analysis linking.
 
 ```bash
-midstate wallet send --path wallet.dat --rpc-port 8545 --to <ADDRESS>:15 --private
+midstate wallet send --to <ADDRESS>:15 --private
 
 ```
 
-If the wallet selects a 16-value coin to fund this, it must decompose the 15-value output into 8, 4, 2, and 1. The `--private` flag forces the wallet to execute four separate, independent Commit/Reveal cycles. This prevents chain observers from linking the exact outputs together, at the cost of higher network fees and extended execution time.
-
 ### CoinJoin P2P Timeouts
 
-CoinJoin (`wallet mix`) operates in phases: `Collecting`, `Signing`, and `CommitSubmitted`.
+CoinJoin (`wallet mix`) operates in phases: `Collecting`, `Signing`, and `CommitSubmitted`. If a peer disconnects or fails to provide a signature, they are banned from the pool, and the session halts. Because the final `Reveal` transaction is never broadcast, your inputs remain unspent and safe.
 
-If a peer disconnects or fails to provide a signature during the `Signing` phase, the session halts. The session will timeout after 300 seconds. Because the final `Reveal` transaction is never broadcast, the inputs remain unspent and can be used in a new transaction immediately.
+## 5. Midstate Axe & Hardware Operations
+
+Midstate is engineered to run on bare-metal ARM hardware (e.g., Raspberry Pi Zero 2 W).
+
+When the node is running, you can access the local hardware dashboard by navigating a browser to:
+`http://127.0.0.1:8545/axe` (or the IP of the device on your local network).
+
+From the dashboard, you can:
+
+1. Reconfigure network Wi-Fi settings (Captive Portal).
+2. Toggle between Solo Mining and Decentralized Pool Mining.
+3. Apply hardware-level overclocks. **Warning: Do not apply the 'Force Turbo' overclock without a physical copper/aluminum heatsink attached to the SoC, or thermal throttling will severely degrade node performance.**
