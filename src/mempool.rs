@@ -16,9 +16,24 @@ const FEE_RATE_SCALE: u128 = 1_024;
 /// Computes a stable, content-derived transaction ID by hashing the bincode
 /// serialization of the transaction. Used as the key in the reveals map and
 /// the secondary sort key in `reveals_by_fee`.
+// OLD: Allocates ~1.3KB on the heap per call
+// fn get_tx_id(tx: &Transaction) -> [u8; 32] {
+//     let bytes = bincode::serialize(tx).unwrap_or_default();
+//     crate::core::types::hash(&bytes)
+// }
+
+// NEW: 100% stack-allocated, ignores massive witness payloads
 fn get_tx_id(tx: &Transaction) -> [u8; 32] {
-    let bytes = bincode::serialize(tx).unwrap_or_default();
-    crate::core::types::hash(&bytes)
+    match tx {
+        Transaction::Commit { commitment, .. } => *commitment,
+        Transaction::Reveal { inputs, outputs, salt, .. } => {
+            let mut hasher = blake3::Hasher::new();
+            for i in inputs { hasher.update(&i.coin_id()); }
+            for o in outputs { hasher.update(&o.hash_for_commitment()); }
+            hasher.update(salt);
+            *hasher.finalize().as_bytes()
+        }
+    }
 }
 
 /// Computes the fee rate of a transaction as `fee * FEE_RATE_SCALE / size_bytes`.
