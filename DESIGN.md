@@ -3,7 +3,7 @@
 ## 1. Fundamentals
 
 - **Hash Function**: BLAKE3 (32-byte output).
-- **Architecture**: Sequential-time blockchain.
+- **Architecture**: Sequential-time blockchain. Optimized for edge hardware (e.g., Raspberry Pi Zero 2 W).
 - **State Model**: UTXO Accumulator via Sparse Merkle Tree (SMT).
 - **Time**: Unix timestamp (seconds).
 - **Storage**: Hybrid. `redb` (Key-Value) for hot chain state and mempool; flat `.bin` files chunked in directories for immutable batch history. Checkpoints are automatically pruned for deep history to save ~98% of disk space.
@@ -19,7 +19,8 @@ A Coin ID is the hash of its properties. It is the only identifier stored in the
 **Pay-to-Script-Hash (P2SH):** Every address in Midstate is the hash of a compiled MidstateScript bytecode payload.
 `address = BLAKE3(script_bytecode)`
 
-For standard wallet transfers, the wallet automatically generates a Pay-to-Public-Key (P2PK) script behind the scenes: `[PUSH_DATA <32-byte-pk>, CHECKSIGVERIFY, PUSH_INT 1]`.
+### HD Wallets (BIP39)
+Midstate wallets are Hierarchical Deterministic (HD). A 24-word BIP39 mnemonic derives a master seed. From this master seed, infinite WOTS and MSS child seeds are derived using domain-separated BLAKE3 hashes (e.g., `BLAKE3("midstate/wots/v1" || master_seed || index)`). No elliptic curve math (BIP32) is required.
 
 ### WOTS (Winternitz One-Time Signatures)
 
@@ -34,7 +35,7 @@ For standard wallet transfers, the wallet automatically generates a Pay-to-Publi
 - **Structure**: Binary Merkle tree of WOTS keys.
 - **Root**: Master Public Key (32 bytes).
 - **Usage**: Allows `2^Height` signatures per public key.
-- **Safety**: Wallet statefully tracks the `next_leaf` index and actively syncs with the node mempool/chain before signing to prevent catastrophic key reuse.
+- **Safety**: The signature strictly binds the `leaf_index` to the cryptographic authentication path. The wallet statefully tracks the `next_leaf` index and actively syncs with the node to prevent catastrophic key reuse.
 
 ## 3. Consensus & Mining
 
@@ -42,45 +43,35 @@ For standard wallet transfers, the wallet automatically generates a Pay-to-Publi
 
 Mining requires sequential iteration to prove time has passed. While miners can search for nonces in parallel, the computation of a single proof is strictly single-threaded, neutralizing ASIC advantages and enforcing "one CPU, one vote".
 
-1. **Input**: `midstate` (after applying transactions and coinbase).
-2. **Start**: `x₀ = BLAKE3(midstate || nonce)`.
-3. **Work**: Iteratively hash `xᵢ = BLAKE3(xᵢ₋₁)` for `N` iterations, recording checkpoints every `C` steps.
-4. **Result**: `final_hash = xₙ`.
-5. **Target**: `final_hash` must be `< target`.
-6. **Verification**: `O(1)`. Verifiers spot-check random segments of the hash chain.
+### Decentralized Pool Mining
+Midstate reverses traditional Stratum-style pools to eliminate censorship. 
+1. The local node autonomously selects transactions from its own mempool and builds the block template. 
+2. The node hardcodes the block reward to pay the **Pool's MSS Address**. 
+3. The miner's personal payout address is cryptographically watermarked into the coinbase `salt`. 
+4. The pool operator receives the share, verifies the watermark, and distributes rewards, but has zero power to censor network transactions.
 
 ### Difficulty Adjustment (ASERT)
 
 Midstate uses the Absolutely Scheduled Exponentially Decaying (ASERT) algorithm.
 - Adjusts continuously on every block based on absolute elapsed time since genesis.
 - Completely eliminates sliding-window exploits (time-warp, hash-and-flee, echo effects).
-- Uses integer-based Taylor polynomial approximations for determinism.
-- **Half-life**: 4 hours.
 
 ### Fork Resolution & Bayesian Finality
 
 - **Longest Chain Rule**: The chain with the highest cumulative sequential `depth` wins.
 - **Finality Estimator**: Nodes track network health using a Beta-Binomial probabilistic model. By observing honest extensions vs. adversarial orphans, nodes dynamically calculate the required block depth (`safe_depth`) to achieve a 1-in-a-million (`1e-6`) mathematical risk of a successful reorg.
 
-### Constants
-
-- **Extension Iterations**: 1,000,000 (100 in fast-mining mode).
-- **Checkpoint Interval**: 1,000 (10 in fast-mining mode).
-- **Block Time**: 60 seconds (1 minute).
-- **Max Batch Size**: 100 transactions per block.
-- **Commitment TTL**: 100 blocks.
-
 ## 4. Economics
 
 - **Unit**: Integer values only.
-- **Denominations**: All on-chain output values must be strictly powers of 2 (e.g., 1, 2, 4, 8...). The wallet abstracts this away, allowing users to send arbitrary amounts which are automatically decomposed into multiple power-of-2 outputs. This naturally obfuscates exact transaction amounts.
-- **Block Reward**: Starts at 16.
+- **Denominations**: All on-chain output values must be strictly powers of 2 (e.g., 1, 2, 4, 8...). 
+- **Block Reward**: Starts at 1,073,741,824 (2^30).
 - **Halving**: Reward halves every 525,600 blocks (~1 year at 1-min blocks). Minimum reward: 1.
 - **Fees**: `Sum(Inputs) - Sum(Outputs)`. Minimum fee for reveals: 1.
 
 ## 5. Transactions & Mempool
 
-Transactions use a two-phase Commit-Reveal scheme to separate intent from execution, enhancing privacy and thwarting front-running. The mempool enforces Replace-By-Fee (RBF) for eviction when full.
+Transactions use a two-phase Commit-Reveal scheme to separate intent from execution. The mempool enforces Replace-By-Fee (RBF) for eviction when full, and strictly bounds memory capacity to allow node hosting on 512MB RAM devices.
 
 ### Phase 1: Commit
 - **Payload**: `commitment = BLAKE3(input_coin_ids... || output_coin_ids... || salt)`.
@@ -89,7 +80,6 @@ Transactions use a two-phase Commit-Reveal scheme to separate intent from execut
 
 ### Phase 2: Reveal
 - **Payload**: Preimages (Script Bytecode, Value, Salt) for spent coins, Stack Witnesses (e.g., Signatures, Preimages), and new Output definitions.
-- **Validation**: The node pushes the witness items onto the stack and executes the bytecode via the MidstateScript VM. The transaction is valid only if execution succeeds and leaves exactly `[1]` on the stack. Output values must be powers of 2. `Sum(Input) > Sum(Output)`.
 
 ### Native CoinJoin Mixing
 - The strict power-of-2 denominations enable perfect, subset-sum-resistant CoinJoins.
@@ -100,14 +90,10 @@ Transactions use a two-phase Commit-Reveal scheme to separate intent from execut
 - **Transport**: TCP and QUIC via `libp2p`.
 - **Encryption & Muxing**: Noise protocol + Yamux.
 - **Discovery**: Kademlia DHT + Identify + custom Peer Exchange.
-- **NAT Traversal**: Built-in AutoNAT, DCUtR (Hole-punching), and Circuit Relays.
-- **Header-First Sync**: Nodes download and verify lightweight `BatchHeader`s from genesis to find deterministic fork points *before* downloading full batches. This prevents "Frankenstein" chain corruptions and catch-up death spirals.
+- **Header-First Sync**: Nodes download and verify lightweight `BatchHeader`s from genesis to find deterministic fork points *before* downloading full batches.
 
 ## 7. MidstateScript Virtual Machine
 
 Midstate abandons hardcoded transaction types in favor of a Turing-incomplete stack machine. 
-
-- **Zero Gas**: There are no loops or backward jumps (`JUMP`/`LOOP`). Execution time is strictly bounded to $O(N)$ based on the 1,024-byte script limit.
-- **Implicit Math**: To bridge the gap between boolean logic and financial math, mathematical opcodes (`ADD`, `GREATER_OR_EQUAL`) implicitly zero-pad byte arrays up to 8 bytes (little-endian u64).
-- **Post-Quantum Native**: The VM's memory limits (1,536 bytes per stack item) natively accommodate massive post-quantum WOTS and MSS signatures.
-- **Covenants**: The `SUM_TO_ADDR` introspection opcode scans the transaction's outputs and sums the value being sent to a specific address. This allows users to build on-chain limit orders and atomic swaps while flawlessly handling Midstate's strict power-of-2 output denomination rules.
+- **Zero Gas**: No loops or backward jumps. 
+- **Post-Quantum Native**: The VM's memory limits accommodate massive post-quantum signatures.

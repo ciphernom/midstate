@@ -18,10 +18,33 @@ impl Syncer {
     /// slice of headers. The first header's prev_midstate is NOT checked
     /// here — that is handled by the fork-point logic.
 pub fn verify_header_chain(headers: &[BatchHeader]) -> Result<()> {
+        if headers.is_empty() {
+            return Ok(());
+        }
+
+        // --- NEW: Grab current time for future check ---
+        let current_time = crate::core::state::current_timestamp();
+        const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
+
+        // Check the first header (since the loop below starts at index 1)
+        if headers[0].timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
+            bail!("Header timestamp too far in future at index 0");
+        }
+
         // 1. Fast sequential check: Ensure chain linkage is intact AND validate targets
         for i in 1..headers.len() {
             let header = &headers[i];
             let prev = &headers[i - 1];
+
+            // --- CORRECTED: Time Warp & CPU Exhaustion Defense ---
+            // We ONLY check the future time limit. Nakamoto consensus 
+            // allows slight backward drift, so we do NOT enforce 
+            // header.timestamp > prev.timestamp.
+            if header.timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
+                bail!("Header timestamp too far in future at index {}", i);
+            }
+            // -----------------------------------------------------
+
             if header.prev_midstate != prev.extension.final_hash {
                 bail!("Header linkage broken at index {}: prev_midstate mismatch", i);
             }

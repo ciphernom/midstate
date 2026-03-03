@@ -246,3 +246,29 @@ pub struct SearchResult {
 pub struct SearchResponse {
     pub results: Vec<SearchResult>,
 }
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AxeStatsResponse {
+    pub temp_c: f32,
+    pub uptime_s: u64,
+    pub total_nonces: u64,
+    pub is_axe_hardware: bool,
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AxeWifiRequest {
+    pub ssid: String,
+    pub password: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AxeConfigRequest {
+    pub mode: String, // "solo" or "pool"
+    pub pool_url: Option<String>,
+    pub payout_address: Option<String>,
+    pub pool_address: Option<String>, // <-- NEW: The pool's MSS address
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AxeOverclockRequest {
+    pub freq: u32,
+    pub overvoltage: u32,
+}

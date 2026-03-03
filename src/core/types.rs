@@ -234,7 +234,6 @@ pub fn header(&self) -> BatchHeader {
             extension: Extension {
                 nonce: 0,
                 final_hash: self.midstate,
-                checkpoints: vec![],
             },
             timestamp: self.timestamp,
             target: self.target,
@@ -473,7 +472,6 @@ impl Transaction {
 pub struct Extension {
     pub nonce: u64,
     pub final_hash: [u8; 32],
-    pub checkpoints: Vec<[u8; 32]>,
 }
 
 /// A batch of transactions plus proof of work
@@ -517,17 +515,10 @@ pub const EXTENSION_ITERATIONS: u64 = 1_000_000;
 #[cfg(feature = "fast-mining")]
 pub const EXTENSION_ITERATIONS: u64 = 100;
 
-#[cfg(not(feature = "fast-mining"))]
-pub const CHECKPOINT_INTERVAL: u64 = 1_000;
-#[cfg(feature = "fast-mining")]
-pub const CHECKPOINT_INTERVAL: u64 = 10;
-
-#[cfg(not(feature = "fast-mining"))]
-pub const SPOT_CHECK_COUNT: usize = 16;
-#[cfg(feature = "fast-mining")]
-pub const SPOT_CHECK_COUNT: usize = 3;
-
-pub const MAX_BATCH_SIZE: usize = 100;
+/// Maximum number of Reveals (actual value transfers) per batch
+pub const MAX_BATCH_REVEALS: usize = 500;
+/// Maximum number of Commits per batch. High limit to prevent bottlenecks.
+pub const MAX_BATCH_COMMITS: usize = 2_000;
 
 // ── Difficulty adjustment ───────────────────────────────────────────────────
 
@@ -554,7 +545,7 @@ pub const PRUNE_DEPTH: u64 = 1000;
 // ── Economics ───────────────────────────────────────────────────────────────
 
 /// Blocks per year at TARGET_BLOCK_TIME seconds per block.
-pub const BLOCKS_PER_YEAR: u64 = 365 * 24 * 3600 / TARGET_BLOCK_TIME; // 3_153_600
+pub const BLOCKS_PER_YEAR: u64 = 365 * 24 * 3600 / TARGET_BLOCK_TIME; 
 
 /// Initial block reward in value units (2^30).
 pub const INITIAL_REWARD: u64 = 1_073_741_824;
@@ -569,23 +560,16 @@ pub const MAX_SIGNATURE_SIZE: usize = 1_536;
 /// 1,024 total inputs keeps verification under ~600M hashes (~0.5s).
 pub const MAX_BATCH_INPUTS: usize = 1_024;
 
+/// Cap on total outputs per batch to strictly bound worst-case block size 
+/// and prevent exceeding the 10MB P2P message limit.
+pub const MAX_BATCH_OUTPUTS: usize = 10_000;
+
 /// Block reward value at a given height. Halves every BLOCKS_PER_YEAR, minimum 1.
 pub fn block_reward(height: u64) -> u64 {
     let halvings = height / BLOCKS_PER_YEAR;
-    if halvings >= 8 {
-        1
-    } else {
-        (INITIAL_REWARD >> halvings).max(1)
-    }
+    INITIAL_REWARD >> halvings.min(30)
 }
 
-const _: () = assert!(
-    EXTENSION_ITERATIONS % CHECKPOINT_INTERVAL == 0,
-    "EXTENSION_ITERATIONS must be divisible by CHECKPOINT_INTERVAL"
-);
-// ============================================================
-// ADD THIS ENTIRE BLOCK at the bottom of src/core/types.rs
-// ============================================================
 
 #[cfg(test)]
 mod tests {

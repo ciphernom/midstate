@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MIDSTATE // AXE</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap');
+
+:root {
+    --bg: #0a0a0a;
+    --bg-raised: #0f0f0f;
+    --bg-panel: #111;
+    --border: #1e1e1e;
+    --border-bright: #2a2a2a;
+    --text: #999;
+    --text-bright: #ccc;
+    --text-max: #eee;
+    --accent: #d4ff00;
+    --accent-dim: #6b8000;
+    --red: #ff4444;
+    --green: #00cc66;
+    --blue: #4488ff;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+}
+
+a { color: var(--text-bright); cursor: pointer; text-decoration: none; }
+a:hover { color: var(--accent); }
+
+/* Header */
+.hdr {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+    flex-shrink: 0;
+}
+.hdr h1 { font-size: 14px; font-weight: 700; color: var(--text-max); letter-spacing: 2px; }
+.hdr-right { display: flex; gap: 16px; color: var(--text); font-size: 11px; }
+.hdr-right span { display: flex; align-items: center; gap: 4px; }
+.hdr-right .label { color: #555; }
+.hdr-right .val { color: var(--text-bright); }
+.live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+/* Layout */
+.layout { display: flex; flex: 1; min-height: 0; }
+.sidebar {
+    width: 260px;
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    background: var(--bg);
+    overflow-y: auto;
+}
+.sidebar-section { padding: 16px 12px; border-bottom: 1px solid var(--border); }
+.sidebar-section .title { font-size: 10px; color: #444; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 12px; font-weight: 700; }
+
+/* Metrics & Forms */
+.metric { display: flex; justify-content: space-between; padding: 3px 0; }
+.metric .k { color: #555; }
+.metric .v { color: var(--text-bright); }
+
+.field-group { margin-bottom: 12px; }
+.field-group label { display: block; font-size: 10px; color: #555; text-transform: uppercase; margin-bottom: 4px; }
+.field-group input, .field-group select {
+    width: 100%;
+    background: var(--bg-raised);
+    border: 1px solid var(--border-bright);
+    color: var(--text-max);
+    font-family: inherit;
+    font-size: 11px;
+    padding: 6px 8px;
+    outline: none;
+    border-radius: 2px;
+}
+.field-group input:focus, .field-group select:focus { border-color: var(--accent); }
+
+button {
+    width: 100%;
+    background: transparent;
+    border: 1px solid var(--accent-dim);
+    color: var(--accent);
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 6px;
+    cursor: pointer;
+    text-transform: uppercase;
+    transition: all 0.2s;
+}
+button:hover { background: var(--accent); color: #000; }
+button.danger { border-color: #880000; color: var(--red); }
+button.danger:hover { background: var(--red); color: #fff; }
+
+/* Main Panel */
+.main-panel { flex: 1; overflow-y: auto; padding: 20px; background: var(--bg-raised); }
+
+.meta-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin-bottom: 16px;
+}
+.panel-card {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    padding: 16px;
+    border-left: 2px solid var(--accent);
+}
+.panel-card.solo { border-left-color: var(--blue); }
+.panel-card h3 {
+    margin-top: 0;
+    font-size: 10px;
+    color: #555;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+}
+.data-value { font-size: 24px; font-weight: 700; color: var(--text-max); margin-bottom: 4px; }
+.data-sub { font-size: 10px; color: var(--text); }
+.data-sub span { color: var(--text-bright); }
+
+/* Terminal */
+.terminal {
+    height: 180px;
+    border-top: 1px solid var(--border-bright);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    background: var(--bg);
+}
+.term-hdr {
+    padding: 4px 12px;
+    background: #0d0d0d;
+    border-bottom: 1px solid var(--border);
+    font-size: 10px;
+    color: #555;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+.term-log { flex: 1; overflow-y: auto; padding: 8px 12px; font-size: 11px; }
+.term-line { padding: 2px 0; }
+.log-time { color: #555; margin-right: 8px; }
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: #222; }
+::-webkit-scrollbar-thumb:hover { background: #333; }
+</style>
+</head>
+<body>
+
+<div class="hdr">
+    <h1>MIDSTATE<span style="color:var(--accent);">.</span>AXE</h1>
+    <div class="hdr-right">
+        <span><div class="live-dot" id="live-dot"></div> <span class="label">STATUS</span> <span class="val" style="color:var(--accent)" id="h-status">MINING</span></span>
+        <span><span class="label">UPTIME</span> <span class="val" id="h-uptime">0h 0m</span></span>
+    </div>
+</div>
+
+<div class="layout">
+    <div class="sidebar">
+
+        <div class="sidebar-section" id="hw-wifi-panel">
+            <div class="title">Network Setup (Captive Portal)</div>
+            <div class="field-group">
+                <label>Wi-Fi SSID</label>
+                <input type="text" id="wifi-ssid" placeholder="Network Name">
+            </div>
+            <div class="field-group">
+                <label>Password</label>
+                <input type="password" id="wifi-pass" placeholder="Network Password">
+            </div>
+            <button onclick="connectWifi()">Connect Wi-Fi</button>
+        </div>
+        
+        <div class="sidebar-section">
+            <div class="title">Mining Configuration</div>
+            <div class="field-group">
+                <label>Mode</label>
+                <select id="mining-mode" onchange="togglePoolFields()">
+                    <option value="solo">Solo Mining (Full Node)</option>
+                    <option value="pool">Pool Mining</option>
+                </select>
+            </div>
+            
+            <div id="pool-fields" style="display:none;">
+                <div class="field-group">
+                    <label>Pool URL</label>
+                    <input type="text" id="pool-url" placeholder="http://127.0.0.1:8080">
+                </div>
+                <div class="field-group">
+                    <label>Pool MSS Address</label>
+                    <input type="text" id="pool-mss-addr" placeholder="Pool's 32-byte hex address">
+                </div>
+            </div>
+
+            <div class="field-group">
+                <label>Miner Payout Address</label>
+                <input type="text" id="payout-addr" placeholder="Your 32-byte hex address">
+            </div>
+            <button onclick="saveConfig()">Apply Config</button>
+        </div>
+
+        <div class="sidebar-section" id="hw-oc-panel">
+            <div class="title">Hardware & Overclock</div>
+            <div class="metric"><span class="k">Board</span><span class="v">Pi Zero 2 W</span></div>
+            <div class="metric"><span class="k">Arch</span><span class="v">ARMv8 NEON</span></div>
+            <div class="metric"><span class="k">Base Clock</span><span class="v">1000 MHz</span></div>
+            <div style="margin-top: 12px;"></div>
+            
+            <div class="field-group">
+                <label>Target Frequency</label>
+                <select id="cpu-freq">
+                    <option value="1000">1000 MHz (Stock)</option>
+                    <option value="1100">1100 MHz (Light)</option>
+                    <option value="1200" selected>1200 MHz (Turbo)</option>
+                </select>
+            </div>
+            <div class="field-group">
+                <label>Overvoltage (0-6)</label>
+                <input type="number" id="overvoltage" value="4" min="0" max="6">
+            </div>
+            <button class="danger" onclick="applyOverclock()">Force Turbo</button>
+        </div>
+
+    </div>
+
+    <div class="main-panel" id="main-view">
+        <h2 style="font-size:16px; font-weight:700; color:var(--text-max); margin-bottom:16px;">LIVE TELEMETRY</h2>
+        
+        <div class="meta-grid">
+            <div class="panel-card">
+                <h3>Hashrate</h3>
+                <div class="data-value" id="hashrate">--- N/s</div>
+                <div class="data-sub">Algorithm: <span>Seq BLAKE3 (1M)</span></div>
+            </div>
+            <div class="panel-card">
+                <h3>Hardware Temp</h3>
+                <div class="data-value" id="temp">--.-°C</div>
+                <div class="data-sub">Freq: <span id="current-freq">1200 MHz</span></div>
+            </div>
+            <div class="panel-card solo" id="mode-card">
+                <h3>Network Tip</h3>
+                <div class="data-value" id="height">---</div>
+                <div class="data-sub">Target: <span id="target">---</span></div>
+            </div>
+            <div class="panel-card">
+                <h3>Mempool</h3>
+                <div class="data-value" id="mempool">-- txs</div>
+                <div class="data-sub">Assembling next block</div>
+            </div>
+        </div>
+
+        <div style="color:#555; font-size:11px; margin-top:20px; padding-top:20px; border-top:1px solid var(--border);">
+            <strong>MidstateAxe OS v0.1.0</strong><br>
+            Running bare-metal Buildroot environment. ZRAM enabled (128MB).
+        </div>
+    </div>
+</div>
+
+<div class="terminal">
+    <div class="term-hdr">System Console</div>
+    <div class="term-log" id="term-log"></div>
+</div>
+
+<script>
+let lastHeight = 0;
+let lastNonces = 0;
+let lastPollTime = Date.now();
+
+function log(msg, color = 'var(--text-bright)') {
+    const el = document.createElement('div');
+    el.className = 'term-line';
+    el.style.color = color;
+    const ts = new Date().toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    el.innerHTML = `<span class="log-time">[${ts}]</span> ${msg}`;
+    const box = document.getElementById('term-log');
+    box.appendChild(el);
+    box.scrollTop = box.scrollHeight;
+}
+
+function formatUptime(seconds) {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    return `${h}h ${m}m`;
+}
+
+function togglePoolFields() {
+    const mode = document.getElementById('mining-mode').value;
+    document.getElementById('pool-fields').style.display = mode === 'pool' ? 'block' : 'none';
+    
+    const modeCard = document.getElementById('mode-card');
+    if (mode === 'pool') {
+        modeCard.style.borderLeftColor = 'var(--accent)';
+        modeCard.querySelector('h3').innerText = 'Pool Shares';
+        modeCard.querySelector('.data-value').innerText = '0 / 0';
+        modeCard.querySelector('.data-sub').innerHTML = 'Status: <span style="color:var(--accent)">Connected</span>';
+        document.getElementById('h-status').innerText = 'POOL MINING';
+    } else {
+        modeCard.style.borderLeftColor = 'var(--blue)';
+        modeCard.querySelector('h3').innerText = 'Network Tip';
+        modeCard.querySelector('.data-value').innerText = lastHeight || '---';
+        modeCard.querySelector('.data-sub').innerHTML = 'Target: <span>0x0011ff...</span>';
+        document.getElementById('h-status').innerText = 'SOLO MINING';
+    }
+}
+
+
+
+async function connectWifi() {
+    const ssid = document.getElementById('wifi-ssid').value;
+    const pass = document.getElementById('wifi-pass').value;
+    
+    if (!ssid) {
+        log(`Error: SSID is required`, 'var(--red)');
+        return;
+    }
+    
+    log(`Applying Wi-Fi credentials for SSID: ${ssid}...`, 'var(--accent)');
+    
+    try {
+        const res = await fetch('/axe/wifi', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ssid: ssid, password: pass })
+        });
+        
+        const data = await res.json();
+        if (data.status === 'error') {
+            log(`Error: ${data.message}`, 'var(--red)');
+        } else {
+            log(`Success: ${data.message}`, 'var(--green)');
+            log(`Please reconnect your client device to your local Wi-Fi.`, 'var(--blue)');
+        }
+    } catch (e) {
+        log(`Network error while configuring Wi-Fi: ${e.message}`, 'var(--red)');
+    }
+}
+
+async function saveConfig() {
+    const mode = document.getElementById('mining-mode').value;
+    const payout = document.getElementById('payout-addr').value;
+    const poolUrl = document.getElementById('pool-url').value;
+    const poolAddress = document.getElementById('pool-mss-addr').value;
+
+    log(`Saving configuration...`, 'var(--accent)');
+    
+    try {
+        const res = await fetch('/axe/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                mode: mode,
+                pool_url: poolUrl || null,
+                payout_address: payout || null,
+                pool_address: poolAddress || null
+            })
+        });
+        
+        const data = await res.json();
+        
+        if (data.status === 'error') {
+            log(`Error: ${data.message}`, 'var(--red)');
+        } else {
+            log(`Config saved! ${data.message}`, 'var(--green)');
+            if (mode === 'pool') {
+                log(`Mode: Pool Mining -> ${poolUrl || 'default'}`);
+                log(`Pool Address set to: ${poolAddress ? poolAddress.substring(0,8) + '...' : 'None'}`);
+            } else {
+                log(`Mode: Solo Mining (Full Node)`);
+            }
+            log(`Miner Payout set to: ${payout ? payout.substring(0,8) + '...' : 'None'}`);
+            log(`The node will adopt the new configuration on the next block template.`, 'var(--accent)');
+        }
+    } catch (e) {
+        log(`Network error while saving config: ${e.message}`, 'var(--red)');
+    }
+}
+
+async function applyOverclock() {
+    const freq = document.getElementById('cpu-freq').value;
+    const ov = document.getElementById('overvoltage').value;
+    
+    log(`⚠️ DANGER: Applying hardware overclock...`, 'var(--red)');
+    log(`Writing to /boot/config.txt: arm_freq=${freq}, over_voltage=${ov}, force_turbo=1`);
+    
+    try {
+        const res = await fetch('/axe/overclock', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                freq: parseInt(freq, 10), 
+                overvoltage: parseInt(ov, 10) 
+            })
+        });
+        
+        const data = await res.json();
+        
+        if (data.status === 'error') {
+            log(`Error: ${data.message}`, 'var(--red)');
+        } else {
+            document.getElementById('current-freq').innerText = `${freq} MHz`;
+            log(`Overclock applied. Ensure armor heatsink is firmly attached!`, 'var(--accent)');
+            log(`Rebooting device in 3 seconds to apply firmware changes...`, 'var(--red)');
+            
+            // Disable UI while rebooting
+            document.getElementById('main-view').style.opacity = '0.5';
+            
+            // Reload page after 20 seconds to give the Pi time to boot back up
+            setTimeout(() => {
+                window.location.reload();
+            }, 20000);
+        }
+    } catch (e) {
+        log(`Network error: ${e.message}`, 'var(--red)');
+    }
+}
+
+async function pollStats() {
+    try {
+        const [stateRes, mpRes, axeRes] = await Promise.all([
+            fetch('/state'), fetch('/mempool'), fetch('/axe/stats')
+        ]);
+        
+        const state = await stateRes.json();
+        const mempool = await mpRes.json();
+        const axe = await axeRes.json();
+
+        // Hide hardware UI if running on desktop ---
+        if (!axe.is_axe_hardware) {
+            document.getElementById('hw-wifi-panel').style.display = 'none';
+            document.getElementById('hw-oc-panel').style.display = 'none';
+        }
+
+        // Update DOM if in Solo Mode
+        const mode = document.getElementById('mining-mode').value;
+        if (mode === 'solo') {
+            document.getElementById('height').textContent = state.height;
+            document.getElementById('target').textContent = state.target.substring(0, 12) + '...';
+        }
+        
+        document.getElementById('mempool').textContent = mempool.size + ' txs';
+        
+        if (axe.temp_c > 0) {
+            const tempEl = document.getElementById('temp');
+            tempEl.textContent = axe.temp_c.toFixed(1) + '°C';
+            tempEl.style.color = axe.temp_c > 75 ? 'var(--red)' : 'var(--text-max)';
+            
+            if (axe.temp_c > 80) {
+                log(`THERMAL WARNING: SoC Temperature ${axe.temp_c.toFixed(1)}°C exceeds safe limits!`, 'var(--red)');
+            }
+        } else {
+            document.getElementById('temp').textContent = 'N/A';
+        }
+        
+        document.getElementById('h-uptime').textContent = formatUptime(axe.uptime_s);
+
+        // --- REAL HARDWARE HASHRATE CALCULATION ---
+        const now = Date.now();
+        if (lastNonces > 0 && axe.total_nonces >= lastNonces) {
+            const deltaNonces = axe.total_nonces - lastNonces;
+            const deltaSeconds = (now - lastPollTime) / 1000.0;
+            
+            if (deltaSeconds > 0) {
+                const hashrate = deltaNonces / deltaSeconds;
+                document.getElementById('hashrate').textContent = hashrate.toFixed(1) + ' N/s';
+            }
+        } else if (axe.total_nonces === 0 || document.getElementById('h-status').innerText !== 'MINING') {
+            document.getElementById('hashrate').textContent = '0.0 N/s';
+        }
+        
+        lastNonces = axe.total_nonces;
+        lastPollTime = now;
+        // ------------------------------------------
+
+        // Block Logging
+        if (lastHeight > 0 && state.height > lastHeight) {
+            log(`[NETWORK] New block verified at height ${state.height}`, 'var(--green)');
+        }
+        lastHeight = state.height;
+
+        document.getElementById('live-dot').style.background = 'var(--green)';
+    } catch (e) {
+        document.getElementById('live-dot').style.background = 'var(--red)';
+    }
+}
+
+// Init
+log('MidstateAxe OS v0.1.0 Booted.', 'var(--accent)');
+log('Initializing API link...');
+log('Initialized BLAKE3 NEON SIMD backend...');
+log('Syncing UTXO SMT to network tip...');
+pollStats();
+setInterval(pollStats, 3000);
+</script>
+</body>
+</html>

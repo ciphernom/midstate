@@ -609,17 +609,6 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             }
         }
 
-        // Decoy padding
-        const MIN_OUTPUTS: usize = 4;
-        while outputs.len() < MIN_OUTPUTS {
-            let seed = self.next_wots_seed();
-            let owner_pk = wots::keygen(&seed);
-            let address = compute_address(&owner_pk);
-            let salt: [u8; 32] = rand::random();
-            let idx = outputs.len();
-            outputs.push(OutputData::Standard { address, value: 1, salt });
-            change_seeds.push((idx, seed));
-        }
 
         // Output shuffling
         use rand::seq::SliceRandom;

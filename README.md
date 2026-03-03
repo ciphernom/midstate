@@ -12,7 +12,6 @@ cargo build --release
 ```
 
 The binary is output to `./target/release/midstate`.
-To build with reduced hash iteration requirements for local testing, append `--features fast-mining`.
 
 ## 2. Node Operations
 
@@ -21,36 +20,31 @@ Nodes maintain the state accumulator, manage libp2p networking, and execute mini
 Start a node with mining enabled:
 
 ```bash
-midstate node --data-dir ./data --port 9333 --rpc-port 8545 --mine --threads 2
+midstate node --data-dir ./data --port 9333 --rpc-port 8545 --mine --threads 3
 
 ```
 
-* `--threads`: Restricts the number of CPU cores used by the miner. If omitted, all available cores are used.
-* The node's multiaddr (e.g., `/ip4/127.0.0.1/tcp/9333/p2p/12D3...`) is printed to standard output on startup.
+**Native Batch Explorer**
+Access the native explorer at `http://localhost:8545` to view detailed info - mempool, batches, height etc.
 
-Connect a subsequent node:
-
-```bash
-midstate node --data-dir ./data2 --port 9334 --rpc-port 8546 --peer <PEER_MULTIADDR>
-
-```
+**Midstate Axe Dashboard:**
+For hardware nodes (or local testing), access the web dashboard at `http://127.0.0.1:8545/axe` to configure Wi-Fi, view live telemetry, and set up pool mining.
 
 ## 3. Wallet Operations
 
 The wallet communicates with the node via HTTP RPC. All wallet commands require a password, which is prompted interactively or read from the `MIDSTATE_PASSWORD` environment variable.
 
-Create a wallet:
+Create a new HD (BIP39) wallet:
 
 ```bash
 midstate wallet create --path wallet.dat
 
 ```
 
-Query local state:
+Restore a wallet from a 24-word seed phrase:
 
 ```bash
-midstate wallet list --path wallet.dat --rpc-port 8545
-midstate wallet balance --path wallet.dat --rpc-port 8545
+midstate wallet restore --path wallet.dat
 
 ```
 
@@ -65,8 +59,6 @@ midstate wallet receive --path wallet.dat --label "payment1"
 
 ```
 
-*Note: If multiple payments are sent to the same WOTS address, the wallet will only import the first one to prevent signature reuse. Subsequent coins sent to that address cannot be spent.*
-
 **Generate an MSS Address (Multi-use):**
 
 ```bash
@@ -74,20 +66,16 @@ midstate wallet generate-mss --path wallet.dat --height 10 --label "donation"
 
 ```
 
-The `--height` parameter defines tree depth. A height of 10 allows exactly 1,024 signatures before the address is exhausted.
-
-**Smart Contracts & Covenants (MidstateScript):**
-Midstate supports Turing-incomplete smart contracts. You can compile a human-readable `.msc` assembly file into a Pay-to-Script-Hash (P2SH) address.
+**Smart Contracts & Covenants:**
+Compile a human-readable `.msc` assembly file into a Pay-to-Script-Hash (P2SH) address.
 
 ```bash
 midstate wallet compile --file limit_order.msc
 
 ```
 
-*Anyone can send funds to the resulting address, but the UTXO can only be spent if the transaction satisfies the bytecode logic of the script.*
-
 **Scan for Outputs:**
-Incoming transactions are not indexed automatically. You must scan the chain to update local balances:
+Incoming transactions must be scanned to update local balances:
 
 ```bash
 midstate wallet scan --path wallet.dat --rpc-port 8545
@@ -112,11 +100,11 @@ midstate wallet send --path wallet.dat --rpc-port 8545 --to <ADDRESS_HEX>:15 --p
 
 ```
 
-The `--private` flag splits the payment into separate, independent transactions for each required denomination. This increases total network fees and processing time.
+The `--private` flag splits the payment into separate, independent transactions for each required denomination, preventing output linking.
 
 ## 6. P2P CoinJoin
 
-Nodes coordinate uniform-denomination CoinJoin transactions over the p2p network.
+Nodes coordinate uniform-denomination CoinJoin transactions over the p2p network to obfuscate UTXO lineage.
 
 **Initiate a mix:**
 
@@ -134,11 +122,9 @@ midstate wallet mix --path wallet.dat --rpc-port 8545 --denomination 8 --join <M
 
 ```
 
-Exactly one participant in the session must supply the `--pay-fee` flag, which requires an available denomination-1 coin in their wallet to cover the network fee.
-
 ## 7. Mining Rewards
 
-A mining node writes its deterministic coinbase seeds to a local log file. These must be imported to the wallet to be spent.
+A solo mining node writes its deterministic coinbase seeds to a local log file. These must be imported to the wallet to be spent.
 
 ```bash
 midstate wallet import-rewards --path wallet.dat --coinbase-file ./data/coinbase_seeds.jsonl
@@ -153,10 +139,11 @@ midstate wallet import-rewards --path wallet.dat --coinbase-file ./data/coinbase
 
 **Wallet**
 
-* `wallet create` - Initialize a new wallet file.
+* `wallet create` - Initialize a new HD wallet.
+* `wallet restore` - Restore an HD wallet from a 24-word seed phrase.
 * `wallet receive` - Generate a WOTS address.
 * `wallet generate-mss` - Generate an MSS address.
-* `wallet compile` - Compile a `.msc` script into bytecode and generate its P2SH address.
+* `wallet compile` - Compile a `.msc` script.
 * `wallet list` - Display controlled coins and unused keys.
 * `wallet balance` - Display aggregate balance.
 * `wallet scan` - Scan blockchain for incoming coins.
@@ -165,12 +152,9 @@ midstate wallet import-rewards --path wallet.dat --coinbase-file ./data/coinbase
 * `wallet history` - Display past transactions.
 * `wallet pending` - Display transactions awaiting block inclusion.
 * `wallet import-rewards` - Import coinbase seeds from node logs.
-* `wallet export` - Display raw coin data (seed, salt, value).
-* `wallet import` - Import raw coin data.
 
 **RPC (Debug)**
 
 * `state` - Display chain height, depth, and midstate.
 * `mempool` - Display pending transactions.
 * `peers` - List active p2p connections.
-* `balance` - Check if a specific Coin ID exists in the UTXO set.
