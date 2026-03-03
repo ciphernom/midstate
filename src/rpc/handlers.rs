@@ -719,3 +719,224 @@ pub async fn get_block_raw(
 pub async fn explorer_ui() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("explorer.html"))
 }
+
+// --- NEW: MidstateAxe Handlers ---
+
+pub async fn axe_ui() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("miner_dashboard.html"))
+}
+
+pub async fn axe_stats(State(node): State<AppState>) -> Json<AxeStatsResponse> {
+    // Read Pi CPU Temperature
+    let temp_c = std::fs::read_to_string("/sys/class/thermal/thermal_zone0/temp")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .map(|milli_celsius| milli_celsius / 1000.0)
+        .unwrap_or(0.0);
+
+    // Read System Uptime
+    let uptime_s = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().map(|u| u.to_string()))
+        .and_then(|s| s.parse::<f32>().ok())
+        .map(|secs| secs as u64)
+        .unwrap_or(0);
+
+    // Read REAL hardware hashrate counter
+    let total_nonces = node.hash_counter.load(std::sync::atomic::Ordering::Relaxed);
+
+    Json(AxeStatsResponse { 
+        temp_c, 
+        uptime_s, 
+        total_nonces,
+        is_axe_hardware: is_axe_device(), 
+    })
+}
+
+pub fn is_axe_device() -> bool {
+    // Look for the standard Raspberry Pi device tree string, 
+    // or allow a manual override file for custom Buildroot images.
+    std::fs::read_to_string("/sys/firmware/devicetree/base/model")
+        .map(|s| s.to_lowercase().contains("raspberry pi"))
+        .unwrap_or(false) || std::path::Path::new("/etc/midstate_axe").exists()
+}
+
+pub async fn axe_wifi_setup(
+    Json(req): Json<AxeWifiRequest>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    // --- HARDWARE SECURITY GATE ---
+    if !is_axe_device() {
+        tracing::warn!("Wi-Fi setup blocked: Not running on MidstateAxe hardware.");
+        return Ok(Json(serde_json::json!({ 
+            "status": "error", 
+            "message": "Hardware configuration is only permitted on MidstateAxe devices." 
+        })));
+    }
+    // ------------------------------
+
+    // PREVENT INJECTION: Reject quotes and newlines
+    if req.ssid.contains('"') || req.ssid.contains('\n') || req.ssid.contains('\r') ||
+       req.password.contains('"') || req.password.contains('\n') || req.password.contains('\r') {
+        return Ok(Json(serde_json::json!({ 
+            "status": "error", 
+            "message": "Invalid characters in SSID or Password" 
+        })));
+    }
+
+    tracing::info!("Received WiFi setup request for SSID: {}", req.ssid);
+    
+    let conf = format!(
+        "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\nupdate_config=1\ncountry=AU\n\nnetwork={{\n    ssid=\"{}\"\n    psk=\"{}\"\n}}\n", 
+        req.ssid, req.password
+    );
+    
+    // 2. Write directly to the Linux filesystem
+    let config_path = "/etc/wpa_supplicant/wpa_supplicant.conf";
+    if let Err(e) = std::fs::write(config_path, &conf) {
+        tracing::error!("CRITICAL: Failed to write wpa_supplicant.conf: {}", e);
+        return Ok(Json(serde_json::json!({ 
+            "status": "error", 
+            "message": format!("Filesystem write error: {}", e) 
+        })));
+    }
+    tracing::debug!("Successfully wrote new WiFi credentials to {}", config_path);
+
+    // 3. Execute the shell command to reconfigure the wlan0 interface live
+    tracing::info!("Reloading wlan0 interface via wpa_cli...");
+    let output = std::process::Command::new("wpa_cli")
+        .args(&["-i", "wlan0", "reconfigure"])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            tracing::info!("WiFi reconfigured successfully. Device should connect momentarily.");
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            tracing::warn!("wpa_cli returned non-zero status. Stderr: {}", stderr);
+        }
+        Err(e) => {
+            tracing::error!("Failed to execute wpa_cli: {}. (Are you running on the Pi?)", e);
+        }
+    }
+
+    Ok(Json(serde_json::json!({ 
+        "status": "wifi_configured", 
+        "message": "Configuration saved. Networking service is reloading..." 
+    })))
+}
+
+pub async fn axe_save_config(
+    Json(req): Json<AxeConfigRequest>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    tracing::info!("Received Axe Config Update: Mode={}", req.mode);
+    
+    // Create struct to safely serialize via the toml crate to prevent injection
+    let config = crate::node::MinerToml {
+        mining: crate::node::MiningConfig {
+            mode: req.mode.clone(),
+            pool_url: req.pool_url.clone(),
+            payout_address: req.payout_address.clone(),
+            pool_address: req.pool_address.clone(), // <-- NEW
+        }
+    };
+
+    let toml_content = toml::to_string(&config).map_err(|e| ErrorResponse {
+        error: format!("Failed to serialize config: {}", e)
+    })?;
+
+    // Write the securely formatted configuration to disk
+    let config_path = "miner.toml";
+    if let Err(e) = std::fs::write(config_path, &toml_content) {
+        tracing::error!("CRITICAL: Failed to write miner.toml: {}", e);
+        return Ok(Json(serde_json::json!({ 
+            "status": "error", 
+            "message": format!("Failed to save mining configuration: {}", e) 
+        })));
+    }
+
+    tracing::info!("Successfully wrote mining config to disk:\n{}", toml_content);
+
+    Ok(Json(serde_json::json!({ 
+        "status": "config_saved", 
+        "message": "Mining configuration written to miner.toml successfully." 
+    })))
+}
+
+pub async fn axe_apply_overclock(
+    Json(req): Json<AxeOverclockRequest>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    // --- HARDWARE SECURITY GATE ---
+    if !is_axe_device() {
+        tracing::warn!("Overclock blocked: Not running on MidstateAxe hardware.");
+        return Ok(Json(serde_json::json!({ 
+            "status": "error", 
+            "message": "Hardware configuration is only permitted on MidstateAxe devices." 
+        })));
+    }
+
+    // --- STRICT BOUNDS CHECKING ---
+    // Prevent the user from entering values that will prevent the Pi from booting
+    if req.freq < 800 || req.freq > 1400 {
+        return Err(ErrorResponse { error: "Frequency out of safe bounds (800-1400 MHz)".into() });
+    }
+    if req.overvoltage > 8 {
+        return Err(ErrorResponse { error: "Overvoltage out of safe bounds (0-8)".into() });
+    }
+
+    tracing::info!("Applying hardware overclock: {} MHz, OV: {}", req.freq, req.overvoltage);
+
+    // Buildroot uses /boot/config.txt, newer RaspiOS uses /boot/firmware/config.txt
+    let config_paths = ["/boot/firmware/config.txt", "/boot/config.txt"];
+    let mut target_path = "";
+    
+    for path in &config_paths {
+        if std::path::Path::new(path).exists() {
+            target_path = path;
+            break;
+        }
+    }
+
+    if target_path.is_empty() {
+        return Err(ErrorResponse { error: "Could not locate Raspberry Pi boot config".into() });
+    }
+
+    // Read current config
+    let current_config = std::fs::read_to_string(target_path)
+        .map_err(|e| ErrorResponse { error: format!("Failed to read config: {}", e) })?;
+
+    // Filter out old overclock settings
+    let mut new_config: Vec<String> = current_config.lines()
+        .filter(|line| {
+            !line.starts_with("arm_freq=") &&
+            !line.starts_with("over_voltage=") &&
+            !line.starts_with("force_turbo=")
+        })
+        .map(|s| s.to_string())
+        .collect();
+
+    // Append new requested settings
+    new_config.push(format!("arm_freq={}", req.freq));
+    new_config.push(format!("over_voltage={}", req.overvoltage));
+    new_config.push("force_turbo=1".to_string());
+
+    let config_content = new_config.join("\n") + "\n";
+
+    // Write back to disk
+    if let Err(e) = std::fs::write(target_path, config_content) {
+        tracing::error!("CRITICAL: Failed to write to {}: {}", target_path, e);
+        return Err(ErrorResponse { error: format!("File write error (requires root): {}", e) });
+    }
+
+    // Spawn a delayed reboot so we can return the HTTP response first
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tracing::warn!("Rebooting system to apply hardware overclock...");
+        let _ = std::process::Command::new("reboot").output();
+    });
+
+    Ok(Json(serde_json::json!({ 
+        "status": "success", 
+        "message": "Overclock applied to boot config. System rebooting..." 
+    })))
+}

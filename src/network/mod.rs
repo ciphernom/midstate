@@ -345,7 +345,6 @@ impl MidstateNetwork {
                     }
                     // ----------------------------------------------
 
-                    self.swarm.behaviour_mut().kademlia.add_address(&peer, addr.clone());
                     
                     if let Err(e) = self.swarm.dial(addr) {
                         tracing::debug!("PEX dial {} failed: {}", addr_str, e);
@@ -497,7 +496,7 @@ impl MidstateNetwork {
 
                 // ── Connection lifecycle ─────────────────────────────
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                    // --- Prevent self-connections from poisoning the peer list ---
+                    // --- Ignore closures of self-connections ---
                     if peer_id == *self.swarm.local_peer_id() {
                         tracing::debug!("Ignoring self-connection");
                         let _ = self.swarm.disconnect_peer_id(peer_id);
@@ -505,11 +504,10 @@ impl MidstateNetwork {
                     }
                     // ------------------------------------------------------------------
 
-                    // --- NEW: Subnet Limit Defense ---
+                    // --- Subnet Limit Defense ---
                     let remote_addr = endpoint.get_remote_address();
                     if let Some(subnet) = extract_subnet(remote_addr) {
                         let peers = self.subnet_peers.entry(subnet).or_default();
-                        // If this peer is already connected on this subnet, allow the multiplex/upgrade
                         if !peers.contains(&peer_id) {
                             if peers.len() >= 4 { // Max 4 distinct peers per subnet
                                 tracing::warn!("Eclipse Defense: Rejecting {}, subnet {} limit reached", peer_id, subnet);
@@ -526,15 +524,18 @@ impl MidstateNetwork {
                         if inbound_count >= 40 {
                             tracing::warn!("Max inbound peers (40) reached, dropping {}", peer_id);
                             let _ = self.swarm.disconnect_peer_id(peer_id);
-                            continue; // Skip further processing, let them disconnect
+                            continue; 
                         }
                     }
+
+                    // NEW: Only add to Kademlia AFTER a successful cryptographic handshake
+                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, remote_addr.clone());
 
                     self.connected.insert(peer_id, endpoint.clone());
                     tracing::info!(
                         "Peer connected: {} via {:?} (total: {})",
                         peer_id,
-                        endpoint.get_remote_address(),
+                        remote_addr,
                         self.connected.len()
                     );
                     return NetworkEvent::PeerConnected(peer_id);

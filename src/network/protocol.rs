@@ -22,13 +22,6 @@ pub enum Message {
         depth: u64,
         midstate: [u8; 32],
     },
-    GetStateSnapshot { 
-        height: u64 
-    },
-    StateSnapshot { 
-        height: u64, 
-        state: Box<crate::core::State> 
-    },
     GetAddr,
     /// Peer exchange: list of multiaddr strings peers can dial
     Addr(Vec<String>),
@@ -172,8 +165,20 @@ async fn read_message<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<Mes
     if len > MAX_MSG_SIZE {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
     }
-    let mut buf = vec![0u8; len];
-    io.read_exact(&mut buf).await?;
+    
+    // FIX: Prevent Slowloris OOM by starting with a small capacity (max 64KB)
+    // and only growing the vector as bytes actually arrive.
+    let initial_alloc = std::cmp::min(len, 65_536);
+    let mut buf = Vec::with_capacity(initial_alloc);
+    
+    // Take exactly `len` bytes from the stream to prevent over-reading
+    let mut handle = io.take(len as u64);
+    handle.read_to_end(&mut buf).await?;
+    
+    if buf.len() != len {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete message"));
+    }
+    
     Message::deserialize_bin(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 

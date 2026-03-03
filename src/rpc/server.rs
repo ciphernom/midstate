@@ -56,6 +56,11 @@ impl RpcServer {
             .route("/mix/sign", post(mix_sign))
             .route("/mix/status/:mix_id", get(mix_status))
             .route("/mix/list", get(mix_list))
+            .route("/axe", get(axe_ui))
+            .route("/axe/stats", get(axe_stats))
+            .route("/axe/wifi", post(axe_wifi_setup)) // Captive portal endpoint
+            .route("/axe/config", post(axe_save_config)) // Pool/Miner config endpoint
+            .route("/axe/overclock", post(axe_apply_overclock))
             .layer(TraceLayer::new_for_http())
             .layer(cors)
             .with_state(node_handle);

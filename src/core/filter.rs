@@ -183,9 +183,17 @@ fn decode_filter(data: &[u8], n: u64) -> Vec<u64> {
     if data.is_empty() || n == 0 {
         return vec![];
     }
+    
+    // Cap the pre-allocation to prevent OOM panics from malicious RPC nodes.
+    // A Golomb-Rice encoded element takes at least 1 bit, so data.len() * 8
+    // is the absolute theoretical maximum number of elements.
+    let max_possible = (data.len() * 8) as usize;
+    let safe_capacity = std::cmp::min(n as usize, max_possible);
+    
     let mut reader = BitReader::new(data);
-    let mut values = Vec::with_capacity(n as usize);
+    let mut values = Vec::with_capacity(safe_capacity);
     let mut cumulative = 0u64;
+    
     for _ in 0..n {
         match decode_golomb(&mut reader) {
             Some(delta) => {
@@ -252,7 +260,7 @@ mod tests {
         Batch {
             prev_midstate: [0; 32],
             transactions: vec![],
-            extension: Extension { nonce: 0, final_hash: [1; 32], checkpoints: vec![] },
+            extension: Extension { nonce: 0, final_hash: [1; 32]},
             coinbase: vec![],
             timestamp: 0,
             target: [0xff; 32],
