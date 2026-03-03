@@ -200,14 +200,26 @@ pub fn verify(sig: &MssSignature, message: &[u8; 32], master_pk: &MasterPublicKe
         return false;
     }
 
-    // 2. Merkle auth path
+    // 2. Merkle auth path - STRICTLY ENFORCED BY LEAF INDEX
     let mut current = sig.wots_pk;
+    let mut current_idx = sig.leaf_index;
+
     for node in &sig.auth_path {
+        // If current_idx is even, we are the left child, so sibling is on the right.
+        let expected_is_right = current_idx % 2 == 0;
+        
+        // Prevent forged paths and leaf_index poisoning
+        if node.is_right != expected_is_right {
+            return false;
+        }
+
         current = if node.is_right {
             hash_concat(&current, &node.hash)
         } else {
             hash_concat(&node.hash, &current)
         };
+        
+        current_idx /= 2;
     }
     current == *master_pk
 }

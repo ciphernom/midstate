@@ -147,10 +147,22 @@ pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]
               hex::encode(batch.target));
     }
 
-    // Reject oversized batches at consensus level (not just local mining policy)
-    if batch.transactions.len() > MAX_BATCH_SIZE {
-        bail!("Batch exceeds max transaction count: {} > {}", batch.transactions.len(), MAX_BATCH_SIZE);
+    // Reject oversized batches at consensus level using decoupled limits
+    let mut commit_count = 0;
+    let mut reveal_count = 0;
+    for tx in &batch.transactions {
+        match tx {
+            Transaction::Commit { .. } => commit_count += 1,
+            Transaction::Reveal { .. } => reveal_count += 1,
+        }
     }
+
+    if reveal_count > MAX_BATCH_REVEALS {
+        bail!("Batch exceeds max reveal count: {} > {}", reveal_count, MAX_BATCH_REVEALS);
+    }
+    if commit_count > MAX_BATCH_COMMITS {
+        bail!("Batch exceeds max commit count: {} > {}", commit_count, MAX_BATCH_COMMITS);
+    }   
 
     //timewarp prevention: Validate timestamp
     if state.height > 0 {
@@ -158,13 +170,25 @@ pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]
     }
 
     // 2. Reject batches that would require excessive signature verification
-    let total_inputs: usize = batch.transactions.iter().map(|tx| match tx {
-        Transaction::Reveal { inputs, .. } => inputs.len(),
-        _ => 0,
-    }).sum();
+    //    OR exceed network bandwidth limits.
+    let mut total_inputs = 0;
+    let mut total_outputs = 0;
+
+    for tx in &batch.transactions {
+        if let Transaction::Reveal { inputs, outputs, .. } = tx {
+            total_inputs += inputs.len();
+            total_outputs += outputs.len();
+        }
+    }
+
     if total_inputs > MAX_BATCH_INPUTS {
         bail!("Batch exceeds max total inputs: {} > {}", total_inputs, MAX_BATCH_INPUTS);
     }
+    
+    if total_outputs > MAX_BATCH_OUTPUTS {
+        bail!("Batch exceeds max total outputs: {} > {}", total_outputs, MAX_BATCH_OUTPUTS);
+    }
+
 
     // 3. Apply transactions and tally fees
     // Phase 1: verify all signatures in parallel (pure, no state mutation)
