@@ -36,10 +36,15 @@ pub fn verify_header_chain(headers: &[BatchHeader]) -> Result<()> {
             let header = &headers[i];
             let prev = &headers[i - 1];
 
-            // --- CORRECTED: Time Warp & CPU Exhaustion Defense ---
-            // We ONLY check the future time limit. Nakamoto consensus 
-            // allows slight backward drift, so we do NOT enforce 
-            // header.timestamp > prev.timestamp.
+            // --- Time Warp & CPU Exhaustion Defense ---
+            // Enforce strict monotonicity during header sync to prevent
+            // attackers from pegging every timestamp to the future limit,
+            // which causes ASERT to drop difficulty to minimum.
+            // Full MTP validation happens in apply_batch; this is a cheap
+            // pre-filter that makes difficulty-gaming infeasible.
+            if header.timestamp <= prev.timestamp {
+                bail!("Header timestamp not monotonically increasing at index {}", i);
+            }
             if header.timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
                 bail!("Header timestamp too far in future at index {}", i);
             }

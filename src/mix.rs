@@ -18,27 +18,29 @@ const MIX_SESSION_TIMEOUT: u64 = 300;
 /// Maximum concurrent mix sessions per node.
 const MAX_MIX_SESSIONS: usize = 16;
 
-/// Proof-of-Work bits required for MixJoin/MixFee messages.
-/// 20 bits ≈ 1M BLAKE3 hashes ≈ ~100ms on modern hardware.
-/// Prevents costless Sybil flooding of CoinJoin sessions with rotating PeerIds.
-pub const MIX_JOIN_POW_BITS: u32 = 20;
+/// 24 bits ≈ 16M BLAKE3 hashes ≈ 5-10s on modern hardware.
+/// Combined with PeerId binding, prevents costless Sybil flooding
+/// of CoinJoin sessions with rotating PeerIds.
+pub const MIX_JOIN_POW_BITS: u32 = 24;
 
 /// Verify the PoW accompanying a MixJoin or MixFee message.
-/// The challenge is: hash(mix_id || coin_id || nonce_le) must have
-/// at least MIX_JOIN_POW_BITS leading zero bits.
-pub fn verify_mix_join_pow(mix_id: &[u8; 32], coin_id: &[u8; 32], nonce: u64) -> bool {
-    let mut data = Vec::with_capacity(72);
+/// The challenge is: hash(mix_id || coin_id || peer_id || nonce_le)
+/// must have at least MIX_JOIN_POW_BITS leading zero bits.
+/// Binding the peer_id prevents pre-computing nonces across identity rotations.
+pub fn verify_mix_join_pow(mix_id: &[u8; 32], coin_id: &[u8; 32], peer_id: &[u8], nonce: u64) -> bool {
+    let mut data = Vec::with_capacity(72 + peer_id.len());
     data.extend_from_slice(mix_id);
     data.extend_from_slice(coin_id);
+    data.extend_from_slice(peer_id);
     data.extend_from_slice(&nonce.to_le_bytes());
     let h = hash(&data);
     count_leading_zeros(&h) >= MIX_JOIN_POW_BITS
 }
 
-/// Mine a MixJoin PoW nonce for the given mix_id and coin_id.
-pub fn mine_mix_join_pow(mix_id: &[u8; 32], coin_id: &[u8; 32]) -> u64 {
+/// Mine a MixJoin PoW nonce for the given mix_id, coin_id, and our peer_id.
+pub fn mine_mix_join_pow(mix_id: &[u8; 32], coin_id: &[u8; 32], peer_id: &[u8]) -> u64 {
     for nonce in 0u64.. {
-        if verify_mix_join_pow(mix_id, coin_id, nonce) {
+        if verify_mix_join_pow(mix_id, coin_id, peer_id, nonce) {
             return nonce;
         }
     }
