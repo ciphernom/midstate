@@ -1,6 +1,7 @@
 use super::types::*;
 use super::script;
 use anyhow::{bail, Result};
+use super::mmr::UtxoAccumulator;
 
 /// Minimum number of leading zero bits required for a Commit transaction's PoW.
 /// 24 bits ≈ 16M BLAKE3 hashes ≈ 15ms on modern hardware. High enough to
@@ -21,13 +22,21 @@ fn validate_commit_pow(commitment: &[u8; 32], nonce: u64) -> Result<()> {
 
 /// Pure signature verification only — no state reads or mutations.
 /// Called in parallel across all transactions in a batch before sequential apply.
-pub fn verify_transaction_sigs(tx: &Transaction, height: u64) -> Result<()> {
+/// Performs an O(1) read-only check against the commitment set to prevent 
+/// CPU exhaustion from stateless signature spam.
+pub fn verify_transaction_sigs(tx: &Transaction, height: u64, commitments: &UtxoAccumulator) -> Result<()> {
     if let Transaction::Reveal { inputs, witnesses, outputs, salt, .. } = tx {
         let input_coin_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
         let output_commit_hashes: Vec<[u8; 32]> = outputs.iter()
             .map(|o| o.hash_for_commitment())
             .collect();
         let commitment = compute_commitment(&input_coin_ids, &output_commit_hashes, salt);
+        
+        // Reject immediately if the commitment isn't in the state.
+        // This drops fake/un-mined Reveal spam before doing any heavy math.
+        if !commitments.contains(&commitment) {
+            bail!("Phase 1 validation failed: Reveal transaction references an unknown or expired commitment");
+        }
 
         for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
             if !verify_predicate(&input.predicate, witness, &commitment, height, outputs) {
