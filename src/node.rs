@@ -1432,7 +1432,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u64
             let cand = if fh == 0 {
                 State::genesis().0
             } else if fh <= self.state.height {
-                self.rebuild_state_at_height(fh)?
+                self.rebuild_state_at_height(fh).await?
             } else {
                 self.state.clone()
             };
@@ -1824,7 +1824,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u64
             return Ok(None);
         } else {
             // It's a genuine reorg (fork_height < self.state.height). We MUST rebuild the state.
-            self.rebuild_state_at_height(fork_height)?
+            self.rebuild_state_at_height(fork_height).await?
         };
 
         let mut candidate_state = fork_state;
@@ -1867,6 +1867,9 @@ for (i, batch) in alternative_batches.iter().enumerate() {
                         candidate_state.midstate,
                         batch.clone(),
                     ));
+                    
+                    // Yield to prevent event loop starvation on large forks
+                    tokio::task::yield_now().await;
                 }
                 Err(e) => {
                     tracing::warn!("Alternative chain invalid at height {}: {}", fork_height + i as u64, e);
@@ -1992,51 +1995,57 @@ fn perform_reorg(
         Ok(())
     }
 
-    fn rebuild_state_at_height(&self, target_height: u64) -> Result<State> {
-        // Find the nearest snapshot at or below target_height so we only
-        // replay blocks from that point instead of from genesis.
-        // Snapshots are written every PRUNE_DEPTH blocks, so round down.
-        let mut snap_height = (target_height / PRUNE_DEPTH) * PRUNE_DEPTH;
-        let mut best_snap = None;
+    async fn rebuild_state_at_height(&self, target_height: u64) -> Result<State> {
+        let storage = self.storage.clone();
 
-        // Step backwards until we find a snapshot, instead of just checking once and giving up.
-        while snap_height > 0 {
-            match self.storage.load_state_snapshot(snap_height) {
-                Ok(Some(snap)) => {
-                    tracing::debug!(
-                        "rebuild_state_at_height: using snapshot at {} (target {})",
-                        snap_height, target_height
-                    );
-                    best_snap = Some((snap, snap_height));
-                    break;
-                }
-                _ => {
-                    // Missed this one, step back and try the previous tier
-                    snap_height = snap_height.saturating_sub(PRUNE_DEPTH);
+        tokio::task::spawn_blocking(move || -> Result<State> {
+            // Find the nearest snapshot at or below target_height so we only
+            // replay blocks from that point instead of from genesis.
+            // Snapshots are written every PRUNE_DEPTH blocks, so round down.
+            let mut snap_height = (target_height / PRUNE_DEPTH) * PRUNE_DEPTH;
+            let mut best_snap = None;
+
+            // Step backwards until we find a snapshot, instead of just checking once and giving up.
+            while snap_height > 0 {
+                match storage.load_state_snapshot(snap_height) {
+                    Ok(Some(snap)) => {
+                        tracing::debug!(
+                            "rebuild_state_at_height: using snapshot at {} (target {})",
+                            snap_height, target_height
+                        );
+                        best_snap = Some((snap, snap_height));
+                        break;
+                    }
+                    _ => {
+                        // Missed this one, step back and try the previous tier
+                        snap_height = snap_height.saturating_sub(PRUNE_DEPTH);
+                    }
                 }
             }
-        }
 
-        let (mut state, replay_from) = best_snap.unwrap_or_else(|| {
-            tracing::debug!("rebuild_state_at_height: no snapshots found, replaying from genesis");
-            (State::genesis().0, 0)
-        });
+            let (mut state, replay_from) = best_snap.unwrap_or_else(|| {
+                tracing::debug!("rebuild_state_at_height: no snapshots found, replaying from genesis");
+                (State::genesis().0, 0)
+            });
 
-        let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
-        for h in replay_from..target_height {
-            if let Some(batch) = self.storage.load_batch(h)? {
-                recent_headers.push_back(state.timestamp);
-                if recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
-                    recent_headers.pop_front();
+            let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+            for h in replay_from..target_height {
+                if let Some(batch) = storage.load_batch(h)? {
+                    recent_headers.push_back(state.timestamp);
+                    if recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
+                        recent_headers.pop_front();
+                    }
+                    apply_batch(&mut state, &batch, recent_headers.make_contiguous())?;
+                    state.target = adjust_difficulty(&state);
+                } else {
+                    anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
                 }
-                apply_batch(&mut state, &batch, recent_headers.make_contiguous())?;
-                state.target = adjust_difficulty(&state);
-            } else {
-                anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
             }
-        }
 
-        Ok(state)
+            Ok(state)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("State rebuild task panicked: {}", e))?
     }
 
 
@@ -3831,7 +3840,7 @@ fn build_divergent_chain(
 
         // 2. Build a divergent chain that forks at height 5
         //    (longer than ours so the node would want to adopt it)
-        let fork_state = node.rebuild_state_at_height(5).unwrap();
+        let fork_state = node.rebuild_state_at_height(5).await.unwrap();
         let (alt_batches, alt_headers) = build_divergent_chain(&fork_state, 15);
 
         // We need the full header chain from genesis for the sync session.
@@ -3905,7 +3914,7 @@ fn build_divergent_chain(
         let original_height = node.state.height; // 9
 
         // Build alt chain forking at height 3, longer than ours
-        let fork_state = node.rebuild_state_at_height(3).unwrap();
+        let fork_state = node.rebuild_state_at_height(3).await.unwrap();
         let (alt_batches, alt_headers) = build_divergent_chain(&fork_state, 12);
 
         let mut full_headers = node.storage.batches.load_headers(0, 3).unwrap();
@@ -3962,7 +3971,7 @@ fn build_divergent_chain(
         assert_eq!(node.state.height, 6);
 
         // Build alt chain forking at genesis (height 1), longer than ours
-        let fork_state = node.rebuild_state_at_height(1).unwrap();
+        let fork_state = node.rebuild_state_at_height(1).await.unwrap();
         let (alt_batches, alt_headers) = build_divergent_chain(&fork_state, 10);
 
         let mut full_headers = node.storage.batches.load_headers(0, 1).unwrap();
