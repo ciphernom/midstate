@@ -111,9 +111,13 @@ pub fn compute_commitment(
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(NETWORK_MAGIC); 
+    // Length-prefix both arrays to prevent boundary ambiguity:
+    // without this, [A,B]+[C] and [A]+[B,C] hash identically.
+    hasher.update(&(input_coins.len() as u32).to_le_bytes());
     for coin in input_coins {
         hasher.update(coin);
     }
+    hasher.update(&(new_coins.len() as u32).to_le_bytes());
     for coin in new_coins {
         hasher.update(coin);
     }
