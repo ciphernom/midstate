@@ -70,6 +70,7 @@ impl Storage {
     }
 
     /// Saves a historical snapshot of the state so it can be served to fast-syncing peers.
+    /// Implements a rolling window: keeps only the 3 most recent snapshots.
     pub fn save_state_snapshot(&self, height: u64, state: &State) -> Result<()> {
         let snapshot_dir = self.batches.base_path().parent().unwrap().join("snapshots");
         std::fs::create_dir_all(&snapshot_dir)?;
@@ -77,6 +78,26 @@ impl Storage {
         let path = snapshot_dir.join(format!("state_{}.bin", height));
         let bytes = bincode::serialize(state)?;
         std::fs::write(path, bytes)?;
+
+        // Garbage-collect old snapshots: keep only the 3 most recent.
+        let mut snapshots: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&snapshot_dir)?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with("state_") && name.ends_with(".bin") {
+                    let h: u64 = name.strip_prefix("state_")?.strip_suffix(".bin")?.parse().ok()?;
+                    Some((h, e.path()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        snapshots.sort_by_key(|(h, _)| std::cmp::Reverse(*h));
+        for (_, old_path) in snapshots.into_iter().skip(3) {
+            let _ = std::fs::remove_file(&old_path);
+            tracing::debug!("Pruned old snapshot: {}", old_path.display());
+        }
+
         Ok(())
     }
 
@@ -86,8 +107,13 @@ impl Storage {
         let path = snapshot_dir.join(format!("state_{}.bin", height));
         
         if path.exists() {
-            let bytes = std::fs::read(path)?;
-            let mut state: State = bincode::deserialize(&bytes)?;
+            let bytes = std::fs::read(&path)?;
+            // Limit deserialization to 500MB to prevent crafted snapshots
+            // from causing unbounded memory allocation.
+            use bincode::Options;
+            let mut state: State = bincode::DefaultOptions::new()
+                .with_limit(500_000_000)
+                .deserialize(&bytes)?;
             state.coins.rebuild_tree();
             state.commitments.rebuild_tree();
             Ok(Some(state))
