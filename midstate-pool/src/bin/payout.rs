@@ -18,6 +18,33 @@ async fn main() -> Result<()> {
     tracing::info!("Starting Midstate Pool Payout Engine...");
 
     let db = Database::create("data/pool.redb").context("Failed to open database")?;
+    
+    // Guard: if a previous run completed the send but crashed before wiping
+    // shares, finish the cleanup now rather than paying miners twice.
+    {
+        let read_txn = db.begin_read()?;
+        let meta = read_txn.open_table(METADATA_TABLE)?;
+        let already_sent = meta.get("payout_send_complete")?
+            .map(|v| v.value() == b"1".as_slice())
+            .unwrap_or(false);
+        drop(meta);
+        drop(read_txn);
+
+        if already_sent {
+            tracing::warn!("Prior payout send was completed but shares were not wiped. Finishing cleanup.");
+            let write_txn = db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(SHARES_TABLE)?;
+                while table.pop_last()?.is_some() {}
+                let mut meta_w = write_txn.open_table(METADATA_TABLE)?;
+                meta_w.remove("payout_send_complete")?;
+            }
+            write_txn.commit()?;
+            tracing::info!("Cleanup complete. Exiting.");
+            return Ok(());
+        }
+    }
+    
     let client = reqwest::Client::new();
 
     // 1. Load the Pool's MSS Keypair
@@ -26,37 +53,49 @@ async fn main() -> Result<()> {
     tracing::info!("Pool Address: {}", hex::encode(pool_address));
 
     // 2. Scan the local node for the pool's available UTXOs
-    tracing::info!("Scanning node for pool UTXOs...");
-    let scan_req = serde_json::json!({
-        "addresses": [hex::encode(pool_address)],
-        "start_height": 0,
-        "end_height": 999_999_999 // Scan to tip
-    });
-    
-    let res = client.post(&format!("{}/scan", NODE_RPC_URL))
+    // Load the last successfully paid-out scan height from DB.
+    let last_scan_height: u64 = {
+        let read_txn = db.begin_read()?;
+        let meta = read_txn.open_table(METADATA_TABLE)?;
+        meta.get("last_scan_height")?
+            .and_then(|v| v.value().try_into().ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0)
+    };
+
+    tracing::info!("Scanning node for pool UTXOs from height {}...", last_scan_height);
+    let scan_req = midstate::rpc::ScanRequest {
+        addresses: vec![hex::encode(pool_address)],
+        start_height: last_scan_height,
+        end_height: 999_999_999,
+    };
+
+    let res: midstate::rpc::ScanResponse = client
+        .post(&format!("{}/scan", NODE_RPC_URL))
         .json(&scan_req)
-        .send().await?.json::<serde_json::Value>().await?;
-        
-    let coins = res["coins"].as_array().context("No coins returned")?;
-    if coins.is_empty() {
-        tracing::info!("Pool has no balance. Exiting.");
+        .send().await?.json().await?;
+
+    if res.coins.is_empty() {
+        tracing::info!("Pool has no balance since height {}. Exiting.", last_scan_height);
         return Ok(());
     }
 
-    let mut total_balance = 0u64;
+let mut total_balance = 0u64;
     let mut inputs_to_spend = Vec::new();
-    
-    for c in coins {
-        let val = c["value"].as_u64().unwrap();
-        total_balance += val;
+
+    for c in &res.coins {
+        let salt_bytes: [u8; 32] = hex::decode(&c.salt)?.try_into()
+            .map_err(|_| anyhow::anyhow!("invalid salt length"))?;
         inputs_to_spend.push(InputReveal {
             predicate: Predicate::p2pk(&pool_address),
-            value: val,
-            salt: hex::decode(c["salt"].as_str().unwrap())?.try_into().unwrap(),
+            value: c.value,
+            salt: salt_bytes,
         });
+        total_balance += c.value;
     }
 
     tracing::info!("Pool Balance: {} units across {} UTXOs", total_balance, inputs_to_spend.len());
+
 
     // 3. Tally Shares from the Database
     let read_txn = db.begin_read()?;
@@ -149,20 +188,49 @@ async fn main() -> Result<()> {
     }
 
     // 6. Phase 2: Sign and REVEAL
-    tracing::info!("Commit mined! Generating MSS signatures...");
-    
+    tracing::info!("Commit mined! Syncing MSS state from node before signing...");
+
+    // SAFETY: Query the node for the highest leaf index it has seen, including
+    // mempool. If it's ahead of our local state (prior crash mid-payout), we
+    // fast-forward before signing, preventing any leaf from being reused.
+    let mss_resp: midstate::rpc::GetMssStateResponse = client
+        .post(&format!("{}/mss_state", NODE_RPC_URL))
+        .json(&midstate::rpc::GetMssStateRequest {
+            master_pk: hex::encode(pool_address),
+        })
+        .send()
+        .await
+        .context("CRITICAL: Cannot reach node to verify MSS state. Aborting to prevent key reuse.")?
+        .json()
+        .await
+        .context("CRITICAL: Invalid response from /mss_state.")?;
+
+    const SAFETY_MARGIN: u64 = 20;
+    if mss_resp.next_index > mss_keypair.next_leaf {
+        let safe_index = mss_resp.next_index + SAFETY_MARGIN;
+        tracing::warn!(
+            "MSS state mismatch: node={}, local={}. Fast-forwarding to {}.",
+            mss_resp.next_index, mss_keypair.next_leaf, safe_index
+        );
+        mss_keypair.set_next_leaf(safe_index);
+        save_mss_key(&db, &mss_keypair)?;
+    }
+
+    tracing::info!("MSS state verified. Generating {} signature(s)...", inputs_to_spend.len());
     let mut signatures = Vec::new();
     for _ in &inputs_to_spend {
         if mss_keypair.remaining() == 0 {
-            anyhow::bail!("CRITICAL: MSS Key capacity exhausted during payout!");
+            anyhow::bail!("CRITICAL: MSS key capacity exhausted during payout!");
         }
-        // Generate the post-quantum signature using the pool's tree
+        // Save the incremented leaf index to disk BEFORE signing.
+        // If the process crashes between save and sign, the next run's
+        // /mss_state check will see the gap and fast-forward past it.
+        // This is strictly safer than saving after: crash-after-sign = reuse.
+        mss_keypair.set_next_leaf(mss_keypair.next_leaf + 1);
+        save_mss_key(&db, &mss_keypair)?;
         let sig = mss_keypair.sign(&commitment)?;
         signatures.push(hex::encode(sig.to_bytes()));
     }
-
-    // Save the updated MSS key state (next_leaf index) to the DB immediately
-    save_mss_key(&db, &mss_keypair)?;
 
     let reveal_req = SendTransactionRequest {
         inputs: inputs_to_spend.iter().map(|i| InputRevealJson {
@@ -189,15 +257,42 @@ async fn main() -> Result<()> {
         anyhow::bail!("Failed to submit Reveal: {}", err);
     }
 
-    // 7. Success! Wipe the shares table for the next round.
-    tracing::info!("Payout successful! Wiping shares table.");
-    let write_txn = db.begin_write()?;
+    // 7. Atomically mark the send as complete BEFORE wiping shares.
+    // If we crash between this write and the wipe below, the startup
+    // guard above will finish the cleanup on the next invocation.
     {
-        let mut table = write_txn.open_table(SHARES_TABLE)?;
-        // redb doesn't have a truncate(), so we pop everything
-        while table.pop_last()?.is_some() {}
+        let write_txn = db.begin_write()?;
+        {
+            let mut meta = write_txn.open_table(METADATA_TABLE)?;
+            meta.insert("payout_send_complete", b"1".as_slice())?;
+        }
+        write_txn.commit()?;
     }
-    write_txn.commit()?;
+
+    tracing::info!("Payout successful! Wiping shares table.");
+    {
+        let write_txn = db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(SHARES_TABLE)?;
+            while table.pop_last()?.is_some() {}
+            let mut meta = write_txn.open_table(METADATA_TABLE)?;
+            meta.remove("payout_send_complete")?;
+        }
+        write_txn.commit()?;
+    }
+    
+    // Persist the scan tip so the next payout only scans new blocks.
+    let state_resp: midstate::rpc::GetStateResponse = client
+        .get(&format!("{}/state", NODE_RPC_URL))
+        .send().await?.json().await?;
+    {
+        let write_txn = db.begin_write()?;
+        {
+            let mut meta = write_txn.open_table(METADATA_TABLE)?;
+            meta.insert("last_scan_height", state_resp.height.to_le_bytes().as_slice())?;
+        }
+        write_txn.commit()?;
+    }
 
     tracing::info!("Payout complete.");
     Ok(())

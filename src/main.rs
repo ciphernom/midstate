@@ -89,7 +89,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a node
     Node {
         #[arg(long, default_value = "./data")]
         data_dir: PathBuf,
@@ -97,73 +96,69 @@ enum Command {
         port: u16,
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_bind: String,
         #[arg(long)]
         peer: Vec<String>,
         #[arg(long)]
         mine: bool,
         #[arg(long)] 
         threads: Option<usize>,
-        /// Limit the number of threads used for signature and block verification
         #[arg(long)]
         verify_threads: Option<usize>,
         #[arg(long)]
         listen: Option<String>,
-/// Path to config file (default: <data_dir>/config.toml)
-            #[arg(long)]
-            config: Option<PathBuf>,
-            #[arg(long)]
-            isbootstrap: bool,
-        },
-
-    /// Wallet operations
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        isbootstrap: bool,
+    },
     Wallet {
         #[command(subcommand)]
         action: WalletAction,
     },
-
-    /// Phase 1: Commit to a spend
     Commit {
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
         #[arg(long)]
         coin: Vec<String>,
         #[arg(long)]
         dest: Vec<String>,
     },
-
-    /// Check if a coin exists
     Balance {
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
         #[arg(long)]
         coin: String,
     },
-
-    /// Get current state
     State {
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
     },
-
-    /// Get mempool info
     Mempool {
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
     },
-
-    /// Get peer list
     Peers {
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
     },
-
-    /// Generate a WOTS keypair
     Keygen {
         #[arg(long)]
         rpc_port: Option<u16>,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
     },
-
-    /// Sync from genesis
     Sync {
         #[arg(long, default_value = "./data")]
         data_dir: PathBuf,
@@ -179,28 +174,25 @@ enum WalletAction {
     Create {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
-        /// Create a legacy (non-HD) wallet instead of a seed-phrase wallet
         #[arg(long)]
         legacy: bool,
     },
-    /// Restore an HD wallet from a 24-word seed phrase
     Restore {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
-        /// The 24-word mnemonic phrase (will be prompted if not provided)
         #[arg(long)]
         phrase: Option<String>,
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
     },
-    /// Generate a receiving address (WOTS key)
     Receive {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
         #[arg(long)]
         label: Option<String>,
     },
-    /// Generate multiple receiving keys
     Generate {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
@@ -209,7 +201,6 @@ enum WalletAction {
         #[arg(long)]
         label: Option<String>,
     },
-    /// Generate a reusable MSS address (Merkle Tree)
     GenerateMss {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
@@ -223,10 +214,11 @@ enum WalletAction {
         path: PathBuf,
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
         #[arg(long)]
         full: bool,
     },
-    /// Compile a MidstateScript assembly file (.msc) into bytecode
     Compile {
         #[arg(long)]
         file: PathBuf,
@@ -236,17 +228,18 @@ enum WalletAction {
         path: PathBuf,
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
     },
-    /// Send value. --to format: <address_hex>:<value>
     Send {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
-        /// Explicit input coin IDs (optional, auto-selects if omitted)
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
         #[arg(long)]
         coin: Vec<String>,
-        /// Recipient outputs: <address_hex>:<value>
         #[arg(long)]
         to: Vec<String>,
         #[arg(long, default_value = "120")]
@@ -254,11 +247,29 @@ enum WalletAction {
         #[arg(long)]
         private: bool,
     },
-    /// Import a coin with known seed, value, and salt
+    SpendScript {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
+        #[arg(long)]
+        coin: String,
+        #[arg(long)]
+        bytecode: String,
+        #[arg(long)]
+        inputs: String,
+        #[arg(long)]
+        burn_data: Option<String>,
+        #[arg(long)]
+        to: Vec<String>,
+        #[arg(long, default_value = "120")]
+        timeout: u64,
+    },
     Import {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
-        /// WOTS seed (hex)
         #[arg(long)]
         seed: String,
         #[arg(long)]
@@ -283,6 +294,8 @@ enum WalletAction {
         path: PathBuf,
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
         #[arg(long)]
         commitment: Option<String>,
     },
@@ -298,57 +311,34 @@ enum WalletAction {
         path: PathBuf,
         #[arg(long)]
         coinbase_file: PathBuf,
+        /// Path to the node's data directory to read the mining seed
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
     },
     Scan {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
     },
-    /// CoinJoin mix: create or join a mixing session
     Mix {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
-        /// Denomination to mix (power of 2)
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
         #[arg(long)]
         denomination: u64,
-        /// Explicit coin ID to mix (auto-selects if omitted)
         #[arg(long)]
         coin: Option<String>,
-        /// Join an existing mix session (hex mix_id) instead of creating one
         #[arg(long)]
         join: Option<String>,
-        /// Also pay the fee (requires a denomination-1 coin)
         #[arg(long)]
         pay_fee: bool,
-        /// Timeout in seconds to wait for the mix to complete
         #[arg(long, default_value = "300")]
-        timeout: u64,
-    },
-    /// Spend a custom MidstateScript contract
-    SpendScript {
-        #[arg(long, default_value_os_t = default_wallet_path())]
-        path: PathBuf,
-        #[arg(long, default_value = "8545")]
-        rpc_port: u16,
-        /// The Coin ID of the UTXO to spend
-        #[arg(long)]
-        coin: String,
-        /// Hex-encoded bytecode of the UTXO's locking script
-        #[arg(long)]
-        bytecode: String,
-        /// Comma-separated hex inputs to push to the stack. Use AUTO:<pk_hex> to trigger the auto-solver.
-        #[arg(long)]
-        inputs: String,
-        /// Data to be burned
-        #[arg(long)]
-        burn_data: Option<String>,
-        /// Recipient outputs: <address_hex>:<value>
-        #[arg(long)]
-        to: Vec<String>,
-        #[arg(long, default_value = "120")]
         timeout: u64,
     },
 }
@@ -420,24 +410,24 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Node { data_dir, port, rpc_port, peer, mine, threads, verify_threads, listen, config, isbootstrap } => {
-            run_node(data_dir, port, rpc_port, peer, mine, threads, verify_threads, listen, config, isbootstrap).await
+        Command::Node { data_dir, port, rpc_port, rpc_bind, peer, mine, threads, verify_threads, listen, config, isbootstrap } => {
+            run_node(data_dir, port, rpc_port, rpc_bind, peer, mine, threads, verify_threads, listen, config, isbootstrap).await
         }
         Command::Wallet { action } => handle_wallet(action).await,
-        Command::Commit { rpc_port, coin, dest } => {
-            commit_transaction(rpc_port, coin, dest).await
+        Command::Commit { rpc_port, rpc_host, coin, dest } => {
+            commit_transaction(rpc_port, rpc_host, coin, dest).await
         }
-        Command::Balance { rpc_port, coin } => check_balance(rpc_port, coin).await,
-        Command::State { rpc_port } => get_state(rpc_port).await,
-        Command::Mempool { rpc_port } => get_mempool(rpc_port).await,
-        Command::Peers { rpc_port } => get_peers(rpc_port).await,
-        Command::Keygen { rpc_port } => keygen(rpc_port).await,
+        Command::Balance { rpc_port, rpc_host, coin } => check_balance(rpc_port, rpc_host, coin).await,
+        Command::State { rpc_port, rpc_host } => get_state(rpc_port, rpc_host).await,
+        Command::Mempool { rpc_port, rpc_host } => get_mempool(rpc_port, rpc_host).await,
+        Command::Peers { rpc_port, rpc_host } => get_peers(rpc_port, rpc_host).await,
+        Command::Keygen { rpc_port, rpc_host } => keygen(rpc_port, rpc_host).await,
         Command::Sync { data_dir, peer, port } => sync_from_genesis(data_dir, peer, port).await,
     }
 }
 
 // ── Wallet commands ─────────────────────────────────────────────────────────
-async fn wallet_scan(path: &PathBuf, rpc_port: u16) -> Result<()> {
+async fn wallet_scan(path: &PathBuf, rpc_port: u16, rpc_host: String) -> Result<()> {
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
@@ -448,7 +438,7 @@ async fn wallet_scan(path: &PathBuf, rpc_port: u16) -> Result<()> {
         return Ok(());
     }
 
-    let base_url = format!("http://127.0.0.1:{}", rpc_port);
+    let base_url = format!("http://{}:{}", rpc_host, rpc_port);
     let state: rpc::GetStateResponse = client.get(format!("{}/state", base_url))
         .send().await?.json().await?;
     let chain_height = state.height;
@@ -627,6 +617,7 @@ async fn targeted_scan(
 async fn wallet_spend_script(
     path: &PathBuf,
     rpc_port: u16,
+    rpc_host: String,
     coin_ref: String,
     bytecode_hex: String,
     inputs_arg: String,
@@ -682,7 +673,7 @@ async fn wallet_spend_script(
     };
 
     println!("Submitting Phase 1 Commit...");
-    let url = format!("http://127.0.0.1:{}/commit", rpc_port);
+    let url = format!("http://{}:{}/commit", rpc_host, rpc_port);
     let resp = client.post(&url).json(&commit_req).send().await?;
     if !resp.status().is_success() {
         let err: rpc::ErrorResponse = resp.json().await?;
@@ -691,7 +682,7 @@ async fn wallet_spend_script(
     let commit_resp: rpc::CommitResponse = resp.json().await?;
     let server_commitment = parse_hex32(&commit_resp.commitment)?;
 
-    if !wait_for_commit_mined(&client, rpc_port, &commit_resp.commitment, timeout_secs).await {
+    if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &commit_resp.commitment, timeout_secs).await {
         anyhow::bail!("Timed out waiting for Commit to be mined.");
     }
     println!("✓ Commit mined!");
@@ -730,7 +721,7 @@ async fn wallet_spend_script(
     };
     
     println!("Submitting Phase 2 Reveal...");
-    let reveal_url = format!("http://127.0.0.1:{}/send", rpc_port);
+    let reveal_url = format!("http://{}:{}/send", rpc_host, rpc_port);
     let resp = client.post(&reveal_url).json(&reveal_req).send().await?;
     if !resp.status().is_success() {
         let err: rpc::ErrorResponse = resp.json().await?;
@@ -747,38 +738,37 @@ async fn wallet_spend_script(
 async fn handle_wallet(action: WalletAction) -> Result<()> {
     match action {
         WalletAction::Create { path, legacy } => wallet_create(&path, legacy),
-        WalletAction::Restore { path, phrase, rpc_port } => wallet_restore(&path, phrase, rpc_port).await,
+        WalletAction::Restore { path, phrase, rpc_port, rpc_host } => wallet_restore(&path, phrase, rpc_port, rpc_host).await,
         WalletAction::Receive { path, label } => wallet_receive(&path, label),
         WalletAction::Compile { file } => wallet_compile(&file),
         WalletAction::Generate { path, count, label } => wallet_generate(&path, count, label),
-        WalletAction::List { path, rpc_port, full } => wallet_list(&path, rpc_port, full).await,
-        WalletAction::Balance { path, rpc_port } => wallet_balance(&path, rpc_port).await,
-        WalletAction::Scan { path, rpc_port } => wallet_scan(&path, rpc_port).await,
-        WalletAction::Send { path, rpc_port, coin, to, timeout, private } => {
-            wallet_send(&path, rpc_port, coin, to, timeout, private).await
+        WalletAction::List { path, rpc_port, rpc_host, full } => wallet_list(&path, rpc_port, rpc_host, full).await,
+        WalletAction::Balance { path, rpc_port, rpc_host } => wallet_balance(&path, rpc_port, rpc_host).await,
+        WalletAction::Scan { path, rpc_port, rpc_host } => wallet_scan(&path, rpc_port, rpc_host).await,
+        WalletAction::Send { path, rpc_port, rpc_host, coin, to, timeout, private } => {
+            wallet_send(&path, rpc_port, rpc_host, coin, to, timeout, private).await
         }
-        WalletAction::SpendScript { path, rpc_port, coin, bytecode, inputs, burn_data, to, timeout } => {
-            wallet_spend_script(&path, rpc_port, coin, bytecode, inputs, burn_data, to, timeout).await
+        WalletAction::SpendScript { path, rpc_port, rpc_host, coin, bytecode, inputs, burn_data, to, timeout } => {
+            wallet_spend_script(&path, rpc_port, rpc_host, coin, bytecode, inputs, burn_data, to, timeout).await
         }
         WalletAction::Import { path, seed, value, salt, label } => {
             wallet_import(&path, &seed, value, &salt, label)
         }
         WalletAction::Export { path, coin } => wallet_export(&path, &coin),
         WalletAction::Pending { path } => wallet_pending(&path),
-        WalletAction::Reveal { path, rpc_port, commitment } => {
-            wallet_reveal(&path, rpc_port, commitment).await
+        WalletAction::Reveal { path, rpc_port, rpc_host, commitment } => {
+            wallet_reveal(&path, rpc_port, rpc_host, commitment).await
         }
         WalletAction::History { path, count } => wallet_history(&path, count),
-        WalletAction::ImportRewards { path, coinbase_file } => {
-            wallet_import_rewards(&path, &coinbase_file)
+        WalletAction::ImportRewards { path, coinbase_file, data_dir } => {
+            wallet_import_rewards(&path, &coinbase_file, &data_dir)
         }
         WalletAction::GenerateMss { path, height, label } => {
             wallet_generate_mss(&path, height, label)
         }
-        WalletAction::Mix { path, rpc_port, denomination, coin, join, pay_fee, timeout } => {
-            wallet_mix(&path, rpc_port, denomination, coin, join, pay_fee, timeout).await
+        WalletAction::Mix { path, rpc_port, rpc_host, denomination, coin, join, pay_fee, timeout } => {
+            wallet_mix(&path, rpc_port, rpc_host, denomination, coin, join, pay_fee, timeout).await
         }
-        
     }
 }
 
@@ -804,7 +794,7 @@ fn wallet_create(path: &PathBuf, legacy: bool) -> Result<()> {
     Ok(())
 }
 
-async fn wallet_restore(path: &PathBuf, phrase_arg: Option<String>, rpc_port: u16) -> Result<()> {
+async fn wallet_restore(path: &PathBuf, phrase_arg: Option<String>, rpc_port: u16, rpc_host: String) -> Result<()> {
     let phrase = match phrase_arg {
         Some(p) => p,
         None => {
@@ -832,8 +822,8 @@ async fn wallet_restore(path: &PathBuf, phrase_arg: Option<String>, rpc_port: u1
     // a full window of GAP_LIMIT consecutive unused keys is found.
     println!("Starting chain scan to rediscover coins...");
     let client = reqwest::Client::new();
-    let base_url = format!("http://127.0.0.1:{}", rpc_port);
-
+    let base_url = format!("http://{}:{}", rpc_host, rpc_port);
+    
     let state: rpc::GetStateResponse = client.get(format!("{}/state", base_url))
         .send().await?.json().await?;
     let chain_height = state.height;
@@ -936,7 +926,7 @@ fn wallet_generate(path: &PathBuf, count: usize, label: Option<String>) -> Resul
     Ok(())
 }
 
-async fn wallet_list(path: &PathBuf, rpc_port: u16, full: bool) -> Result<()> {
+async fn wallet_list(path: &PathBuf, rpc_port: u16, rpc_host: String, full: bool) -> Result<()> {
     let password = read_password("Password: ")?;
     let wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
@@ -953,7 +943,7 @@ async fn wallet_list(path: &PathBuf, rpc_port: u16, full: bool) -> Result<()> {
 
         for (i, wc) in wallet.coins().iter().enumerate() {
             let coin_hex = hex::encode(wc.coin_id);
-            let status = check_coin_rpc(&client, rpc_port, &coin_hex).await;
+            let status = check_coin_rpc(&client, rpc_port, &rpc_host, &coin_hex).await;
             let label = wc.label.as_deref().unwrap_or("");
             let status_str = match status {
                 Ok(true) => "✓ live",
@@ -978,7 +968,7 @@ async fn wallet_list(path: &PathBuf, rpc_port: u16, full: bool) -> Result<()> {
     Ok(())
 }
 
-async fn wallet_balance(path: &PathBuf, rpc_port: u16) -> Result<()> {
+async fn wallet_balance(path: &PathBuf, rpc_port: u16, rpc_host: String) -> Result<()> {
     let password = read_password("Password: ")?;
     let wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
@@ -986,7 +976,7 @@ async fn wallet_balance(path: &PathBuf, rpc_port: u16) -> Result<()> {
     let mut live_count = 0usize;
     let mut live_value = 0u64;
     for wc in wallet.coins() {
-        if let Ok(true) = check_coin_rpc(&client, rpc_port, &hex::encode(wc.coin_id)).await {
+        if let Ok(true) = check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
             live_count += 1;
             live_value += wc.value;
         }
@@ -1002,6 +992,7 @@ async fn wallet_balance(path: &PathBuf, rpc_port: u16) -> Result<()> {
 async fn wallet_send(
     path: &PathBuf,
     rpc_port: u16,
+    rpc_host: String,
     coin_args: Vec<String>,
     to_args: Vec<String>,
     timeout_secs: u64,
@@ -1018,7 +1009,7 @@ async fn wallet_send(
     // MSS Index Verification
     if !wallet.data.mss_keys.is_empty() {
         println!("Connecting to node to verify MSS safety indices...");
-        let mss_url = format!("http://127.0.0.1:{}/mss_state", rpc_port);
+        let mss_url = format!("http://{}:{}/mss_state", rpc_host, rpc_port);
 
         for i in 0..wallet.data.mss_keys.len() {
             let master_pk = wallet.data.mss_keys[i].master_pk;
@@ -1067,7 +1058,7 @@ async fn wallet_send(
 
     let mut live_coins = Vec::new();
     for wc in wallet.coins() {
-        if let Ok(true) = check_coin_rpc(&client, rpc_port, &hex::encode(wc.coin_id)).await {
+        if let Ok(true) = check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
             live_coins.push(wc.coin_id);
         }
     }
@@ -1098,7 +1089,7 @@ async fn wallet_send(
                 destinations: output_commit_hashes.iter().map(|d| hex::encode(d)).collect(),
             };
 
-            let url = format!("http://127.0.0.1:{}/commit", rpc_port);
+            let url = format!("http://{}:{}/commit",rpc_host, rpc_port);
             let response = client.post(&url).json(&commit_req).send().await?;
             if !response.status().is_success() {
                 let error: rpc::ErrorResponse = response.json().await?;
@@ -1123,7 +1114,7 @@ async fn wallet_send(
 
             println!("  ✓ Commit submitted ({})", short_hex(&server_commitment));
 
-            if !wait_for_commit_mined(&client, rpc_port, &commit_resp.commitment, timeout_secs).await {
+            if !wait_for_commit_mined(&client, rpc_port,&rpc_host, &commit_resp.commitment, timeout_secs).await {
                 println!("  ⏳ Not mined yet. Run `wallet reveal` later.");
                 continue;
             }
@@ -1135,7 +1126,7 @@ async fn wallet_send(
                 tokio::time::sleep(Duration::from_secs(delay)).await;
             }
 
-            do_reveal(&client, &mut wallet, rpc_port, &server_commitment, timeout_secs).await?;
+            do_reveal(&client, &mut wallet, rpc_port, &rpc_host, &server_commitment, timeout_secs).await?;
         }
     } else {
         let mut target_fee = 100u64; // Start with a conservative minimum guess
@@ -1259,7 +1250,7 @@ async fn wallet_send(
             destinations: output_commit_hashes.iter().map(|d| hex::encode(d)).collect(),
         };
 
-        let url = format!("http://127.0.0.1:{}/commit", rpc_port);
+        let url = format!("http://{}:{}/commit", rpc_host, rpc_port);
         let response = client.post(&url).json(&commit_req).send().await?;
         if !response.status().is_success() {
             let error: rpc::ErrorResponse = response.json().await?;
@@ -1284,13 +1275,13 @@ async fn wallet_send(
         println!("\n✓ Commit submitted ({})", short_hex(&server_commitment));
         println!("  Waiting for commit to be mined...");
 
-        if !wait_for_commit_mined(&client, rpc_port, &commit_resp.commitment, timeout_secs).await {
+        if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &commit_resp.commitment, timeout_secs).await {
             println!("⏳ Not mined after {}s. Run `wallet reveal` later.", timeout_secs);
             return Ok(());
         }
         println!("✓ Commit mined!");
 
-        do_reveal(&client, &mut wallet, rpc_port, &server_commitment, timeout_secs).await?;
+        do_reveal(&client, &mut wallet, rpc_port, &rpc_host, &server_commitment, timeout_secs).await?;
     }
 
     Ok(())
@@ -1299,13 +1290,14 @@ async fn wallet_send(
 async fn wait_for_commit_mined(
     client: &reqwest::Client,
     rpc_port: u16,
+    rpc_host: &str, 
     commitment_hex: &str,
     timeout_secs: u64,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let mp_url = format!("http://127.0.0.1:{}/mempool", rpc_port);
+        let mp_url = format!("http://{}:{}/mempool", rpc_host, rpc_port);
         if let Ok(resp) = client.get(&mp_url).send().await {
             if let Ok(mp) = resp.json::<rpc::GetMempoolResponse>().await {
                 let still_pending = mp.transactions.iter().any(|tx| {
@@ -1326,6 +1318,7 @@ async fn do_reveal(
     client: &reqwest::Client,
     wallet: &mut Wallet,
     rpc_port: u16,
+    rpc_host: &str,
     commitment: &[u8; 32],
     timeout_secs: u64,
 ) -> Result<()> {
@@ -1335,7 +1328,7 @@ async fn do_reveal(
 
     let (input_reveals, signatures) = wallet.sign_reveal(&pending)?;
 
-    let reveal_url = format!("http://127.0.0.1:{}/send", rpc_port);
+    let reveal_url = format!("http://{}:{}/send", rpc_host, rpc_port);
     let reveal_req = rpc::SendTransactionRequest {
         inputs: input_reveals.iter().map(|ir| rpc::InputRevealJson {
             bytecode: match &ir.predicate { midstate::core::types::Predicate::Script { bytecode } => hex::encode(bytecode) },
@@ -1374,7 +1367,7 @@ async fn do_reveal(
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_secs(2)).await;
         if let Ok(resp) = client
-            .post(&format!("http://127.0.0.1:{}/check", rpc_port))
+            .post(&format!("http://{}:{}/check",rpc_host, rpc_port))
             .json(&rpc::CheckCoinRequest { coin: check_coin_hex.clone() })
             .send().await
         {
@@ -1412,6 +1405,7 @@ async fn do_reveal(
 async fn wallet_mix(
     path: &PathBuf,
     rpc_port: u16,
+    rpc_host: String,
     denomination: u64,
     coin_arg: Option<String>,
     join_mix_id: Option<String>,
@@ -1425,12 +1419,12 @@ async fn wallet_mix(
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
-    let base_url = format!("http://127.0.0.1:{}", rpc_port);
+    let base_url = format!("http://{}:{}", rpc_host, rpc_port);
 
     // Find live coins
     let mut live_coins = Vec::new();
     for wc in wallet.coins() {
-        if let Ok(true) = check_coin_rpc(&client, rpc_port, &hex::encode(wc.coin_id)).await {
+        if let Ok(true) = check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
             live_coins.push(wc.coin_id);
         }
     }
@@ -1737,6 +1731,7 @@ fn wallet_history(path: &PathBuf, count: usize) -> Result<()> {
 async fn wallet_reveal(
     path: &PathBuf,
     rpc_port: u16,
+    rpc_host: String, 
     commitment_hex: Option<String>,
 ) -> Result<()> {
     let password = read_password("Password: ")?;
@@ -1772,7 +1767,7 @@ async fn wallet_reveal(
 
         let (input_reveals, signatures) = wallet.sign_reveal(&pending)?;
 
-        let url = format!("http://127.0.0.1:{}/send", rpc_port);
+        let url = format!("http://{}:{}/send", rpc_host, rpc_port);
         let req = rpc::SendTransactionRequest {
             inputs: input_reveals.iter().map(|ir| rpc::InputRevealJson {
                 bytecode: match &ir.predicate { midstate::core::types::Predicate::Script { bytecode } => hex::encode(bytecode) },
@@ -1811,20 +1806,26 @@ async fn wallet_reveal(
     Ok(())
 }
 
-fn wallet_import_rewards(path: &PathBuf, coinbase_file: &PathBuf) -> Result<()> {
+fn wallet_import_rewards(path: &PathBuf, coinbase_file: &PathBuf, data_dir: &PathBuf) -> Result<()> {
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
+
+    println!("Opening node database to retrieve mining seed...");
+    let storage = midstate::storage::Storage::open(data_dir.join("db"))
+        .context("Failed to open node database. Is the node running? Stop the node first to safely import rewards.")?;
+    
+    let mining_seed = storage.load_mining_seed()?
+        .context("No mining seed found in the database. Has the node started mining yet?")?;
+    drop(storage); // Release the database lock immediately
 
     println!("Reading coinbase log...");
     let contents = std::fs::read_to_string(coinbase_file)?;
 
     #[derive(serde::Deserialize)]
     struct CoinbaseEntry {
-        #[allow(dead_code)]
         height: u64,
-        #[allow(dead_code)]
         index: u64,
-        seed: String,
+        address: String,
         #[serde(rename = "coin")]
         _coin: String,
         value: u64,
@@ -1837,18 +1838,19 @@ fn wallet_import_rewards(path: &PathBuf, coinbase_file: &PathBuf) -> Result<()> 
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
 
-    println!("Found {} rewards. Importing...", entries.len());
+    println!("Found {} rewards. Calculating private keys and importing...", entries.len());
 
     let new_coins: Vec<wallet::WalletCoin> = entries
         .into_par_iter()
         .map(|entry| {
-            let seed = parse_hex32(&entry.seed).unwrap();
+            // Dynamically recreate the private seed using the master mining_seed!
+            let seed = midstate::wallet::coinbase_seed(&mining_seed, entry.height, entry.index);
             let salt = parse_hex32(&entry.salt).unwrap();
-            let owner_pk = wots::keygen(&seed);
-            let address = compute_address(&owner_pk);
-            let coin_id = compute_coin_id(&address, entry.value, &salt);
+            let address = parse_hex32(&entry.address).unwrap();
+            let owner_pk = midstate::core::wots::keygen(&seed);
+            let coin_id = midstate::core::compute_coin_id(&address, entry.value, &salt);
 
-            wallet::WalletCoin {
+            midstate::wallet::WalletCoin {
                 seed,
                 owner_pk,
                 address,
@@ -1907,8 +1909,8 @@ fn wallet_generate_mss(path: &PathBuf, height: u32, label: Option<String>) -> Re
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-async fn check_coin_rpc(client: &reqwest::Client, rpc_port: u16, coin_hex: &str) -> Result<bool> {
-    let url = format!("http://127.0.0.1:{}/check", rpc_port);
+async fn check_coin_rpc(client: &reqwest::Client, rpc_port: u16, rpc_host: &str, coin_hex: &str) -> Result<bool> {
+    let url = format!("http://{}:{}/check", rpc_host, rpc_port);
     let req = rpc::CheckCoinRequest { coin: coin_hex.to_string() };
     let resp: rpc::CheckCoinResponse = client.post(&url).json(&req).send().await?.json().await?;
     Ok(resp.exists)
@@ -1920,6 +1922,7 @@ async fn run_node(
     data_dir: PathBuf, 
     port: u16, 
     rpc_port: u16, 
+    rpc_bind: String,
     cli_peers: Vec<String>,
     mine: bool, 
     threads: Option<usize>, 
@@ -1997,7 +2000,7 @@ let bootstrap: Vec<libp2p::Multiaddr> = all_peers.iter()
 
     let (handle, cmd_rx) = node.create_handle();
 
-    let rpc_server = rpc::RpcServer::new(rpc_port);
+    let rpc_server = rpc::RpcServer::new(&rpc_bind, rpc_port)?;
     let handle_clone = handle.clone();
     tokio::spawn(async move {
         if let Err(e) = rpc_server.run(handle_clone).await {
@@ -2012,12 +2015,12 @@ let bootstrap: Vec<libp2p::Multiaddr> = all_peers.iter()
     node.run(handle, cmd_rx).await
 }
 
-async fn commit_transaction(rpc_port: u16, coins: Vec<String>, destinations: Vec<String>) -> Result<()> {
+async fn commit_transaction(rpc_port: u16, rpc_host: String, coins: Vec<String>, destinations: Vec<String>) -> Result<()> {
     if coins.is_empty() { anyhow::bail!("Must provide at least one coin"); }
     if destinations.is_empty() { anyhow::bail!("Must provide at least one destination"); }
 
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/commit", rpc_port);
+    let url = format!("http://{}:{}/commit", rpc_host, rpc_port);
     let req = rpc::CommitRequest { coins, destinations };
     let response = client.post(&url).json(&req).send().await?;
 
@@ -2033,9 +2036,9 @@ async fn commit_transaction(rpc_port: u16, coins: Vec<String>, destinations: Vec
     Ok(())
 }
 
-async fn check_balance(rpc_port: u16, coin: String) -> Result<()> {
+async fn check_balance(rpc_port: u16, rpc_host: String, coin: String) -> Result<()> {
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/check", rpc_port);
+    let url = format!("http://{}:{}/check", rpc_host, rpc_port);
     let req = rpc::CheckCoinRequest { coin };
     let response = client.post(&url).json(&req).send().await?;
     if response.status().is_success() {
@@ -2049,9 +2052,9 @@ async fn check_balance(rpc_port: u16, coin: String) -> Result<()> {
     Ok(())
 }
 
-async fn get_state(rpc_port: u16) -> Result<()> {
+async fn get_state(rpc_port: u16, rpc_host: String) -> Result<()> {
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/state", rpc_port);
+    let url = format!("http://{}:{}/state", rpc_host, rpc_port);
     let response: rpc::GetStateResponse = client.get(&url).send().await?.json().await?;
     println!("State:");
     println!("  Height:       {}", response.height);
@@ -2065,9 +2068,9 @@ async fn get_state(rpc_port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn get_mempool(rpc_port: u16) -> Result<()> {
+async fn get_mempool(rpc_port: u16, rpc_host: String) -> Result<()> {
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/mempool", rpc_port);
+    let url = format!("http://{}:{}/mempool", rpc_host, rpc_port);
     let response: rpc::GetMempoolResponse = client.get(&url).send().await?.json().await?;
     println!("Mempool: {} transaction(s)", response.size);
     for (i, tx) in response.transactions.iter().enumerate() {
@@ -2086,19 +2089,19 @@ async fn get_mempool(rpc_port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn get_peers(rpc_port: u16) -> Result<()> {
+async fn get_peers(rpc_port: u16, rpc_host: String) -> Result<()> {
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/peers", rpc_port);
+    let url = format!("http://{}:{}/peers", rpc_host, rpc_port);
     let response: rpc::GetPeersResponse = client.get(&url).send().await?.json().await?;
     println!("Peers: {}", response.peers.len());
     for peer in response.peers { println!("  {}", peer); }
     Ok(())
 }
 
-async fn keygen(rpc_port: Option<u16>) -> Result<()> {
+async fn keygen(rpc_port: Option<u16>, rpc_host: String) -> Result<()> {
     if let Some(port) = rpc_port {
         let client = reqwest::Client::new();
-        let url = format!("http://127.0.0.1:{}/keygen", port);
+        let url = format!("http://{}:{}/keygen",rpc_host, port);
         let response: rpc::GenerateKeyResponse = client.get(&url).send().await?.json().await?;
         println!("Generated WOTS keypair:");
         println!("  Seed:     {}", response.seed);
