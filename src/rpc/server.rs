@@ -5,19 +5,23 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use std::net::SocketAddr;
+
 use tower_http::trace::TraceLayer;
 use tower_http::cors::CorsLayer;
 use axum::http::{Method, HeaderValue, header};
+use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 
 pub struct RpcServer {
     addr: SocketAddr,
 }
 
 impl RpcServer {
-    pub fn new(port: u16) -> Self {
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        Self { addr }
+    pub fn new(bind_ip: &str, port: u16) -> anyhow::Result<Self> {
+        let ip = IpAddr::from_str(bind_ip)
+            .map_err(|e| anyhow::anyhow!("Invalid RPC bind IP: {}", e))?;
+        let addr = SocketAddr::new(ip, port);
+        Ok(Self { addr })
     }
 
     pub async fn run(self, node_handle: NodeHandle) -> Result<()> {
@@ -61,6 +65,7 @@ impl RpcServer {
             .route("/axe/wifi", post(axe_wifi_setup)) // Captive portal endpoint
             .route("/axe/config", post(axe_save_config)) // Pool/Miner config endpoint
             .route("/axe/overclock", post(axe_apply_overclock))
+            .route("/axe/rewards", get(axe_download_rewards))
             .layer(TraceLayer::new_for_http())
             .layer(cors)
             .with_state(node_handle);
