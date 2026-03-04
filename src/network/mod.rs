@@ -663,8 +663,9 @@ fn extract_subnet(addr: &Multiaddr) -> Option<IpAddr> {
         }
         libp2p::multiaddr::Protocol::Ip6(ip) => {
             let segs = ip.segments();
-            // Mask to /64
-            Some(IpAddr::V6(std::net::Ipv6Addr::new(segs[0], segs[1], segs[2], segs[3], 0, 0, 0, 0)))
+            // Mask to /48: datacenter VPSes routinely get /48 blocks,
+            // so /64 grouping lets a single server appear as 65536 subnets.
+            Some(IpAddr::V6(std::net::Ipv6Addr::new(segs[0], segs[1], segs[2], 0, 0, 0, 0, 0)))
         }
         _ => None,
     })
