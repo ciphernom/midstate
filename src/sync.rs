@@ -103,9 +103,11 @@ pub fn verify_header_chain(headers: &[BatchHeader]) -> Result<()> {
                 .load_batch(h)?
                 .ok_or_else(|| anyhow::anyhow!("Missing batch at height {} during rebuild", h))?;
             
-            recent_headers.push_back(state.timestamp);
-            if recent_headers.len() > window_size { recent_headers.pop_front(); }
             apply_batch(&mut state, &batch, recent_headers.make_contiguous())?;
+            
+            recent_headers.push_back(batch.timestamp);
+            if recent_headers.len() > window_size { recent_headers.pop_front(); }
+            
             state.target = adjust_difficulty(&state);
         }
         Ok(state)
