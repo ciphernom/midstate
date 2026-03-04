@@ -26,7 +26,7 @@ use tokio::sync::RwLock;
 use tokio::time;
 use rayon::prelude::*;
 
-const MAX_ORPHAN_BATCHES: usize = 32;
+const MAX_ORPHAN_BATCHES: usize = 256;
 const SYNC_TIMEOUT_SECS: u64 = 300;
 
 /// Max transactions accepted from a single peer per rate-limit window.
@@ -44,11 +44,6 @@ const STEM_TIMEOUT_SECS: u64 = 30;
 /// the privacy phase and go directly to the public mempool. This prevents
 /// unbounded memory growth under PoW spam from multiple Sybil peers.
 const MAX_STEM_POOL_SIZE: usize = 1000;
-
-/// Max GetBatches/GetHeaders requests per peer per rate-limit window.
-const MAX_BLOCK_REQS_PER_PEER: u32 = 10;
-/// Rate-limit window for block/header requests in seconds.
-const BLOCK_REQ_WINDOW_SECS: u64 = 10;
 
 /// Non-blocking sync session driven by the main event loop.
 /// Replaces the old blocking `Syncer::sync_via_network` which hijacked the
@@ -139,8 +134,6 @@ pub struct Node {
     /// Key: commitment or tx hash, Value: (transaction, received_at).
     /// After STEM_TIMEOUT_SECS without being fluffed, we fluff them ourselves.
     stem_pool: HashMap<[u8; 32], (Transaction, std::time::Instant)>,
-    /// Per-peer rate limiter for GetBatches/GetHeaders requests.
-    peer_block_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     hash_counter: Arc<AtomicU64>,
 }
 
@@ -564,7 +557,6 @@ pub async fn new(
             peer_tx_counts: HashMap::new(),
             cmd_tx: None,
             stem_pool: HashMap::new(),
-            peer_block_req_counts: HashMap::new(),
             hash_counter: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -937,19 +929,6 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                 }
             }
             Message::GetBatches { start_height, count } => {
-                // Per-peer rate limiting on block requests
-                let now = std::time::Instant::now();
-                let entry = self.peer_block_req_counts.entry(from).or_insert((0, now));
-                if now.duration_since(entry.1).as_secs() >= BLOCK_REQ_WINDOW_SECS {
-                    *entry = (0, now);
-                }
-                entry.0 += 1;
-                if entry.0 > MAX_BLOCK_REQS_PER_PEER {
-                    tracing::debug!("Rate-limiting block requests from peer {}", from);
-                    self.ack(channel);
-                    return Ok(());
-                }
-
                 let count = count.min(MAX_GETBATCHES_COUNT);
                 let end = (start_height + count).min(self.state.height);
                 match self.storage.load_batches(start_height, end) {
@@ -1016,19 +995,6 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                 }
             }
             Message::GetHeaders { start_height, count } => {
-                // Per-peer rate limiting on header requests
-                let now = std::time::Instant::now();
-                let entry = self.peer_block_req_counts.entry(from).or_insert((0, now));
-                if now.duration_since(entry.1).as_secs() >= BLOCK_REQ_WINDOW_SECS {
-                    *entry = (0, now);
-                }
-                entry.0 += 1;
-                if entry.0 > MAX_BLOCK_REQS_PER_PEER {
-                    tracing::debug!("Rate-limiting header requests from peer {}", from);
-                    self.ack(channel);
-                    return Ok(());
-                }
-
                 let count = count.min(MAX_GETBATCHES_COUNT);
                 let end = (start_height + count).min(self.state.height + 1);
                 
@@ -2230,7 +2196,7 @@ fn perform_reorg(
             let list = self.orphan_batches.entry(prev_midstate).or_default();
             
             // CRITICAL FIX: Prevent infinite vector growth on a single midstate
-            if list.len() < 4 {
+            if list.len() < 16 {
                 list.push(batch); // batch is moved here
                 if list.len() == 1 { // Only push to order queue on first entry
                     self.orphan_order.push_back(prev_midstate); // Use the extracted variable here!
@@ -2239,7 +2205,7 @@ fn perform_reorg(
                 tracing::warn!("Too many orphans for midstate, dropping to prevent RAM exhaustion.");
             }
 
-            const ORPHAN_LIMIT: usize = 8;
+            const ORPHAN_LIMIT: usize = 64;
             
             if self.orphan_order.len() >= ORPHAN_LIMIT {
                 // Evict oldest half via FIFO order
@@ -2589,14 +2555,10 @@ async fn try_apply_orphans(&mut self) {
                 let address = compute_address(&owner_pk);
                 let salt = coinbase_salt(&mining_seed, height, i as u64);
                 let coin_id = compute_coin_id(&address, value, &salt);
-                // NOTE: We intentionally do NOT log the seed (private key).
-                // It is derivable from (mining_seed, height, index) when
-                // the wallet needs to spend. Logging it in cleartext would
-                // allow anyone with filesystem or RPC access to steal funds.
                 format!(
-                    r#"{{"height":{},"index":{},"address":"{}","coin":"{}","value":{},"salt":"{}"}}"#,
+                    r#"{{"height":{},"index":{},"seed":"{}","coin":"{}","value":{},"salt":"{}"}}"#,
                     height, i,
-                    hex::encode(address),
+                    hex::encode(seed),
                     hex::encode(coin_id),
                     value,
                     hex::encode(salt)

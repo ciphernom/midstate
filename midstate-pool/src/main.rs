@@ -34,8 +34,11 @@ struct PoolInfoResponse {
 struct SubmitShareRequest {
     batch: Batch,
     payout_address: String,
-    /// The height the miner believes they are mining at (needed for salt validation)
-    height: u64, 
+    /// Optional: height the miner believes they're mining at.
+    /// If absent (current node clients don't send this), falls back
+    /// to the server's known current height.
+    #[serde(default)]
+    height: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -64,6 +67,10 @@ struct AppState {
     db_tx: mpsc::Sender<VerifiedShare>,
     /// Shared atomic tracker for the current network height
     network_height: Arc<AtomicU64>,
+    /// The real network mining target, fetched from the local node every 5s.
+    /// Initialized to all-zeros (impossible target) so shares are rejected
+    /// until the node has been contacted at least once.
+    network_target: Arc<std::sync::RwLock<[u8; 32]>>,
 }
 
 // ── Boot & Main Loop ───────────────────────────────────────────────────────
@@ -105,9 +112,11 @@ async fn main() {
     });
 
     let network_height = Arc::new(AtomicU64::new(0));
-
+    let network_target = Arc::new(std::sync::RwLock::new([0u8; 32])); // all-zeros = reject all until synced
+    
     // 5. Setup Chain Syncer (polls local full node)
     let height_clone = Arc::clone(&network_height);
+    let target_clone = Arc::clone(&network_target);
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         loop {
@@ -115,6 +124,15 @@ async fn main() {
                 if let Ok(json) = res.json::<serde_json::Value>().await {
                     if let Some(h) = json["height"].as_u64() {
                         height_clone.store(h, Ordering::Relaxed);
+                    }
+                    if let Some(t_hex) = json["target"].as_str() {
+                        if let Ok(t_bytes) = hex::decode(t_hex) {
+                            if t_bytes.len() == 32 {
+                                let mut arr = [0u8; 32];
+                                arr.copy_from_slice(&t_bytes);
+                                *target_clone.write().unwrap() = arr;
+                            }
+                        }
                     }
                 }
             }
@@ -126,13 +144,13 @@ async fn main() {
     let state = Arc::new(AppState {
         mss_keypair: std::sync::RwLock::new(mss_keypair),
         share_target,
-        // Keep 1 million recent shares in memory for instant replay rejection
         seen_shares: Cache::builder()
             .max_capacity(1_000_000)
-            .time_to_live(Duration::from_secs(3600)) // Clear after an hour
+            .time_to_live(Duration::from_secs(3600))
             .build(),
         db_tx,
         network_height,
+        network_target,  // <-- add this
     });
 
     // 7. Start HTTP Server
@@ -209,9 +227,9 @@ async fn handle_submit(
     miner_addr.copy_from_slice(&miner_addr_bytes);
 
     // 3. Stale Share Check
-    // If the miner is submitting a block height that is way off, reject it.
     let current_net_height = state.network_height.load(Ordering::Relaxed);
-    if req.height < current_net_height.saturating_sub(2) || req.height > current_net_height + 2 {
+    let claimed_height = req.height.unwrap_or(current_net_height);
+    if claimed_height < current_net_height.saturating_sub(2) || claimed_height > current_net_height + 2 {
         return Err((StatusCode::BAD_REQUEST, "Stale share (Chain moved on)".into()));
     }
 
@@ -230,7 +248,7 @@ async fn handle_submit(
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"pool_share");
             hasher.update(&miner_addr);
-            hasher.update(&req.height.to_le_bytes());
+            hasher.update(&claimed_height.to_le_bytes());
             hasher.update(&(i as u64).to_le_bytes());
             
             if cb.salt == *hasher.finalize().as_bytes() {
@@ -244,24 +262,33 @@ async fn handle_submit(
         return Err((StatusCode::BAD_REQUEST, "Invalid Coinbase watermark or Pool Address".into()));
     }
 
-    // 6. Check if it's a global block winner
-    let is_full_block = verify_extension(header.post_tx_midstate, &batch.extension, &batch.target).is_ok();
+    // 6. Check if it's a global block winner using the REAL network target.
+    let actual_target = *state.network_target.read().unwrap();
+    if actual_target == [0u8; 32] {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "Pool not yet synced with node".into()));
+    }
+    let is_full_block = verify_extension(
+        header.post_tx_midstate,
+        &batch.extension,
+        &actual_target,
+    ).is_ok();
 
-    // 7. Accept Share (Lock-free queuing to the DB worker)
-    // Insert to anti-replay cache
-    state.seen_shares.insert(share_id, ()).await;
-
+    // 7. Accept Share — queue to DB worker first, then mark as seen.
+    // Order matters: if try_send fails, we must NOT insert to seen_shares,
+    // otherwise the share is permanently replay-blocked but never credited.
     let msg = VerifiedShare {
         miner_address: miner_addr,
         is_full_block,
         batch: if is_full_block { Some(batch) } else { None },
     };
 
-    // Send to DB worker (fails only if the channel is completely full, mitigating DoS)
     if state.db_tx.try_send(msg).is_err() {
         tracing::error!("Pool is overloaded! Dropping share.");
         return Err((StatusCode::SERVICE_UNAVAILABLE, "Pool overloaded".into()));
     }
+
+    // Insert AFTER successful queue — share is now guaranteed to be credited.
+    state.seen_shares.insert(share_id, ()).await;
 
     Ok(Json(SubmitShareResponse {
         status: "success".into(),
