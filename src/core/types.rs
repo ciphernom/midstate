@@ -147,7 +147,7 @@ pub struct State {
     pub midstate: [u8; 32],
     pub coins: UtxoAccumulator,
     pub commitments: UtxoAccumulator,
-    pub depth: u64,
+    pub depth: u128,
     pub target: [u8; 32],
     pub height: u64,
     pub timestamp: u64,
