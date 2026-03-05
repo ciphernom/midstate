@@ -26,7 +26,7 @@ use tokio::sync::RwLock;
 use tokio::time;
 use rayon::prelude::*;
 
-const MAX_ORPHAN_BATCHES: usize = 256;
+const MAX_ORPHAN_BATCHES: usize = 32;
 const SYNC_TIMEOUT_SECS: u64 = 300;
 
 /// Max transactions accepted from a single peer per rate-limit window.
@@ -40,6 +40,15 @@ const STEM_FLUFF_PERCENT: u32 = 10;
 /// Dandelion++: if a stem tx hasn't been fluffed within this many seconds,
 /// we fluff it ourselves as a safety net.
 const STEM_TIMEOUT_SECS: u64 = 30;
+/// Dandelion++: hard cap on stem pool entries. If full, new stem txs skip
+/// the privacy phase and go directly to the public mempool. This prevents
+/// unbounded memory growth under PoW spam from multiple Sybil peers.
+const MAX_STEM_POOL_SIZE: usize = 1000;
+
+/// Max GetBatches/GetHeaders requests per peer per rate-limit window.
+const MAX_BLOCK_REQS_PER_PEER: u32 = 10;
+/// Rate-limit window for block/header requests in seconds.
+const BLOCK_REQ_WINDOW_SECS: u64 = 10;
 
 /// Non-blocking sync session driven by the main event loop.
 /// Replaces the old blocking `Syncer::sync_via_network` which hijacked the
@@ -130,6 +139,8 @@ pub struct Node {
     /// Key: commitment or tx hash, Value: (transaction, received_at).
     /// After STEM_TIMEOUT_SECS without being fluffed, we fluff them ourselves.
     stem_pool: HashMap<[u8; 32], (Transaction, std::time::Instant)>,
+    /// Per-peer rate limiter for GetBatches/GetHeaders requests.
+    peer_block_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     hash_counter: Arc<AtomicU64>,
 }
 
@@ -145,6 +156,8 @@ pub struct NodeHandle {
     pub mix_manager: Arc<RwLock<MixManager>>,
     pub commit_limiter: Arc<tokio::sync::Semaphore>, 
     pub hash_counter: Arc<AtomicU64>,
+    /// Our local PeerId, needed for PeerId-bound CoinJoin PoW.
+    local_peer_id: PeerId,
 }
 
 pub enum NodeCommand {
@@ -286,8 +299,9 @@ impl NodeHandle {
             if let Some(peer) = coord_peer {
                 // Mine anti-Sybil PoW on a blocking thread to avoid starving Tokio
                 let coin_id = input.coin_id();
+                let peer_id_bytes = self.local_peer_id.to_bytes();
                 let join_nonce = tokio::task::spawn_blocking(move || {
-                    crate::mix::mine_mix_join_pow(&mix_id, &coin_id)
+                    crate::mix::mine_mix_join_pow(&mix_id, &coin_id, &peer_id_bytes)
                 }).await.map_err(|e| anyhow::anyhow!("PoW task failed: {}", e))?;
 
                 self.tx_sender.send(NodeCommand::SendMixJoin { 
@@ -319,8 +333,9 @@ impl NodeHandle {
             if let Some(peer) = coord_peer {
                 // Mine anti-Sybil PoW on a blocking thread to avoid starving Tokio
                 let coin_id = input.coin_id();
+                let peer_id_bytes = self.local_peer_id.to_bytes();
                 let join_nonce = tokio::task::spawn_blocking(move || {
-                    crate::mix::mine_mix_join_pow(&mix_id, &coin_id)
+                    crate::mix::mine_mix_join_pow(&mix_id, &coin_id, &peer_id_bytes)
                 }).await.map_err(|e| anyhow::anyhow!("PoW task failed: {}", e))?;
 
                 self.tx_sender.send(NodeCommand::SendMixFee { coordinator: peer, mix_id, input, join_nonce })?;
@@ -549,6 +564,7 @@ pub async fn new(
             peer_tx_counts: HashMap::new(),
             cmd_tx: None,
             stem_pool: HashMap::new(),
+            peer_block_req_counts: HashMap::new(),
             hash_counter: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -580,6 +596,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
             mix_manager: Arc::clone(&self.mix_manager),
             commit_limiter: Arc::new(tokio::sync::Semaphore::new(4)), // <--  (Max 4 concurrent PoW tasks)
             hash_counter: Arc::clone(&self.hash_counter),
+            local_peer_id: self.network.local_peer_id(),
         };
         (handle, rx)
     }
@@ -920,6 +937,19 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                 }
             }
             Message::GetBatches { start_height, count } => {
+                // Per-peer rate limiting on block requests
+                let now = std::time::Instant::now();
+                let entry = self.peer_block_req_counts.entry(from).or_insert((0, now));
+                if now.duration_since(entry.1).as_secs() >= BLOCK_REQ_WINDOW_SECS {
+                    *entry = (0, now);
+                }
+                entry.0 += 1;
+                if entry.0 > MAX_BLOCK_REQS_PER_PEER {
+                    tracing::debug!("Rate-limiting block requests from peer {}", from);
+                    self.ack(channel);
+                    return Ok(());
+                }
+
                 let count = count.min(MAX_GETBATCHES_COUNT);
                 let end = (start_height + count).min(self.state.height);
                 match self.storage.load_batches(start_height, end) {
@@ -986,6 +1016,19 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                 }
             }
             Message::GetHeaders { start_height, count } => {
+                // Per-peer rate limiting on header requests
+                let now = std::time::Instant::now();
+                let entry = self.peer_block_req_counts.entry(from).or_insert((0, now));
+                if now.duration_since(entry.1).as_secs() >= BLOCK_REQ_WINDOW_SECS {
+                    *entry = (0, now);
+                }
+                entry.0 += 1;
+                if entry.0 > MAX_BLOCK_REQS_PER_PEER {
+                    tracing::debug!("Rate-limiting header requests from peer {}", from);
+                    self.ack(channel);
+                    return Ok(());
+                }
+
                 let count = count.min(MAX_GETBATCHES_COUNT);
                 let end = (start_height + count).min(self.state.height + 1);
                 
@@ -1035,8 +1078,8 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                     return Ok(());
                 }
 
-                // Anti-Sybil: verify join PoW to prevent costless session flooding
-                if !crate::mix::verify_mix_join_pow(&mix_id, &coin_id, join_nonce) {
+                // Anti-Sybil: verify join PoW bound to sender's PeerId
+                if !crate::mix::verify_mix_join_pow(&mix_id, &coin_id, &from.to_bytes(), join_nonce) {
                     tracing::debug!("MixJoin rejected from peer {}: insufficient join PoW", from);
                     return Ok(());
                 }
@@ -1076,8 +1119,8 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                     return Ok(());
                 }
 
-                // Anti-Sybil: verify join PoW
-                if !crate::mix::verify_mix_join_pow(&mix_id, &coin_id, join_nonce) {
+                // Anti-Sybil: verify join PoW bound to sender's PeerId
+                if !crate::mix::verify_mix_join_pow(&mix_id, &coin_id, &from.to_bytes(), join_nonce) {
                     tracing::debug!("MixFee rejected from peer {}: insufficient join PoW", from);
                     return Ok(());
                 }
@@ -1717,31 +1760,42 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u64
         }
         self.metrics.inc_transactions_processed();
 
-        // Flip the coin: fluff or continue stemming?
-        let roll = rand::random::<u32>() % 100;
-        if roll < STEM_FLUFF_PERCENT {
-            // Fluff: add to public mempool and broadcast
-            tracing::debug!("Dandelion++ fluff: broadcasting tx after stem");
+        // If the stem pool is at capacity, skip the privacy phase entirely
+        // and insert directly into the public mempool. Node survival takes
+        // priority over Dandelion++ anonymity under active spam.
+        if self.stem_pool.len() >= MAX_STEM_POOL_SIZE {
+            tracing::warn!("Stem pool full ({} entries), bypassing Dandelion++ for tx", MAX_STEM_POOL_SIZE);
             let _ = self.mempool.add(tx.clone(), &self.state);
             self.network.broadcast(Message::Transaction(tx));
             self.cancel_mining();
             self.trigger_mining();
         } else {
-            // Continue stem: forward to ONE random peer (not the sender)
-            let peers: Vec<PeerId> = self.network.connected_peers()
-                .into_iter()
-                .filter(|p| *p != from)
-                .collect();
-            if let Some(next) = peers.first() {
-                self.stem_pool.insert(tx_id, (tx.clone(), std::time::Instant::now()));
-                self.network.send(*next, Message::StemTransaction(tx));
-                tracing::debug!("Dandelion++ stem: forwarded to {}", next);
-            } else {
-                // No other peers — fluff immediately
+            // Flip the coin: fluff or continue stemming?
+            let roll = rand::random::<u32>() % 100;
+            if roll < STEM_FLUFF_PERCENT {
+                // Fluff: add to public mempool and broadcast
+                tracing::debug!("Dandelion++ fluff: broadcasting tx after stem");
                 let _ = self.mempool.add(tx.clone(), &self.state);
                 self.network.broadcast(Message::Transaction(tx));
                 self.cancel_mining();
                 self.trigger_mining();
+            } else {
+                // Continue stem: forward to ONE random peer (not the sender)
+                let peers: Vec<PeerId> = self.network.connected_peers()
+                    .into_iter()
+                    .filter(|p| *p != from)
+                    .collect();
+                if let Some(next) = peers.first() {
+                    self.stem_pool.insert(tx_id, (tx.clone(), std::time::Instant::now()));
+                    self.network.send(*next, Message::StemTransaction(tx));
+                    tracing::debug!("Dandelion++ stem: forwarded to {}", next);
+                } else {
+                    // No other peers — fluff immediately
+                    let _ = self.mempool.add(tx.clone(), &self.state);
+                    self.network.broadcast(Message::Transaction(tx));
+                    self.cancel_mining();
+                    self.trigger_mining();
+                }
             }
         }
         Ok(())
@@ -1823,6 +1877,25 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u64
             tracing::warn!("Fork at {} exceeds statistical safe depth, rejecting", fork_height);
             return Ok(None);
         } else {
+            // Pre-check: can the alternative chain's work possibly beat ours?
+            // Compare the work in our chain from fork_height..tip against the
+            // alternative's theoretical maximum. This is O(N) integer math on
+            // small headers — avoids the expensive state rebuild + disk I/O.
+            let our_headers = self.storage.batches.load_headers(fork_height, self.state.height)?;
+            let our_work_since_fork: u64 = our_headers.iter()
+                .map(|h| crate::core::state::calculate_work(&h.target))
+                .fold(0u64, |a, b| a.saturating_add(b));
+            let alt_work: u64 = alternative_batches.iter()
+                .map(|b| crate::core::state::calculate_work(&b.target))
+                .fold(0u64, |a, b| a.saturating_add(b));
+            if alt_work <= our_work_since_fork {
+                tracing::debug!(
+                    "Rejecting fork at {}: alt work {} <= our work since fork {}",
+                    fork_height, alt_work, our_work_since_fork
+                );
+                return Ok(None);
+            }
+
             // It's a genuine reorg (fork_height < self.state.height). We MUST rebuild the state.
             self.rebuild_state_at_height(fork_height).await?
         };
@@ -2157,7 +2230,7 @@ fn perform_reorg(
             let list = self.orphan_batches.entry(prev_midstate).or_default();
             
             // CRITICAL FIX: Prevent infinite vector growth on a single midstate
-            if list.len() < 16 {
+            if list.len() < 4 {
                 list.push(batch); // batch is moved here
                 if list.len() == 1 { // Only push to order queue on first entry
                     self.orphan_order.push_back(prev_midstate); // Use the extracted variable here!
@@ -2166,7 +2239,7 @@ fn perform_reorg(
                 tracing::warn!("Too many orphans for midstate, dropping to prevent RAM exhaustion.");
             }
 
-            const ORPHAN_LIMIT: usize = 64;
+            const ORPHAN_LIMIT: usize = 8;
             
             if self.orphan_order.len() >= ORPHAN_LIMIT {
                 // Evict oldest half via FIFO order
@@ -2516,10 +2589,14 @@ async fn try_apply_orphans(&mut self) {
                 let address = compute_address(&owner_pk);
                 let salt = coinbase_salt(&mining_seed, height, i as u64);
                 let coin_id = compute_coin_id(&address, value, &salt);
+                // NOTE: We intentionally do NOT log the seed (private key).
+                // It is derivable from (mining_seed, height, index) when
+                // the wallet needs to spend. Logging it in cleartext would
+                // allow anyone with filesystem or RPC access to steal funds.
                 format!(
-                    r#"{{"height":{},"index":{},"seed":"{}","coin":"{}","value":{},"salt":"{}"}}"#,
+                    r#"{{"height":{},"index":{},"address":"{}","coin":"{}","value":{},"salt":"{}"}}"#,
                     height, i,
-                    hex::encode(seed),
+                    hex::encode(address),
                     hex::encode(coin_id),
                     value,
                     hex::encode(salt)

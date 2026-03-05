@@ -126,7 +126,7 @@ pub fn validate_timestamp(
     Ok(())
 }
 
-fn calculate_work(target: &[u8; 32]) -> u64 {
+pub(crate) fn calculate_work(target: &[u8; 32]) -> u64 {
     let t = U256::from_big_endian(target);
     if t.is_zero() { return 0; }
     (U256::MAX / t).low_u64()
