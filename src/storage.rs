@@ -2,6 +2,7 @@ mod batch_store;
 pub use batch_store::BatchStore;
 
 use crate::core::State;
+use crate::core::mmr::{MerkleMountainRange, UtxoAccumulator};
 use anyhow::Result;
 use redb::{Database, TableDefinition};
 use std::path::Path;
@@ -9,6 +10,86 @@ use std::sync::Arc;
 
 const STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
 const MINING_SEED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("mining_seed");
+
+/// V1 state layout (depth: u64). Used only for one-time migration from
+/// pre-u128 databases. Identical field order to the old `State` so that
+/// bincode positional decoding works.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct LegacyState {
+    pub midstate: [u8; 32],
+    pub coins: UtxoAccumulator,
+    pub commitments: UtxoAccumulator,
+    pub depth: u64,
+    pub target: [u8; 32],
+    pub height: u64,
+    pub timestamp: u64,
+    #[serde(default)]
+    pub commitment_heights: im::HashMap<[u8; 32], u64>,
+    #[serde(default)]
+    pub chain_mmr: MerkleMountainRange,
+}
+
+impl LegacyState {
+    fn into_current(self) -> State {
+        State {
+            midstate: self.midstate,
+            coins: self.coins,
+            commitments: self.commitments,
+            depth: self.depth as u128,
+            target: self.target,
+            height: self.height,
+            timestamp: self.timestamp,
+            commitment_heights: self.commitment_heights,
+            chain_mmr: self.chain_mmr,
+        }
+    }
+}
+
+/// Try deserializing as current State, fall back to LegacyState (u64 depth)
+/// and convert. Returns the deserialized state and whether migration occurred.
+fn deserialize_state_with_migration(bytes: &[u8]) -> Result<(State, bool)> {
+    // Try current format first
+    match bincode::deserialize::<State>(bytes) {
+        Ok(state) => Ok((state, false)),
+        Err(_) => {
+            // Fall back to legacy format
+            let legacy: LegacyState = bincode::deserialize(bytes)
+                .map_err(|e| anyhow::anyhow!(
+                    "State deserialization failed for both current and legacy formats: {}", e
+                ))?;
+            tracing::info!(
+                "Migrating state from v1 (depth u64={}) to v2 (depth u128={})",
+                legacy.depth, legacy.depth as u128
+            );
+            Ok((legacy.into_current(), true))
+        }
+    }
+}
+
+/// Same as above but with size-limited deserialization (for untrusted snapshots)
+fn deserialize_state_with_migration_limited(bytes: &[u8]) -> Result<(State, bool)> {
+    use bincode::Options;
+    let opts = bincode::DefaultOptions::new().with_limit(500_000_000);
+    // Try current format: first with DefaultOptions (matching old load path),
+    // then standard bincode (matching save path)
+    if let Ok(state) = opts.deserialize::<State>(bytes) {
+        return Ok((state, false));
+    }
+    if let Ok(state) = bincode::deserialize::<State>(bytes) {
+        return Ok((state, false));
+    }
+    // Fall back to legacy formats
+    if let Ok(legacy) = opts.deserialize::<LegacyState>(bytes) {
+        tracing::info!("Migrating snapshot from v1 to v2 (depth {})", legacy.depth);
+        return Ok((legacy.into_current(), true));
+    }
+    let legacy: LegacyState = bincode::deserialize(bytes)
+        .map_err(|e| anyhow::anyhow!(
+            "Snapshot deserialization failed for all format combinations: {}", e
+        ))?;
+    tracing::info!("Migrating snapshot from v1 to v2 (depth {})", legacy.depth);
+    Ok((legacy.into_current(), true))
+}
 
 #[derive(Debug, Clone)]
 pub struct Storage {
@@ -70,7 +151,7 @@ impl Storage {
     }
 
     /// Saves a historical snapshot of the state so it can be served to fast-syncing peers.
-    /// Implements a rolling window: keeps only the 3 most recent snapshots.
+    /// Implements a rolling window: keeps only the 10 most recent snapshots.
     pub fn save_state_snapshot(&self, height: u64, state: &State) -> Result<()> {
         let snapshot_dir = self.batches.base_path().parent().unwrap().join("snapshots");
         std::fs::create_dir_all(&snapshot_dir)?;
@@ -93,7 +174,7 @@ impl Storage {
             })
             .collect();
         snapshots.sort_by_key(|(h, _)| std::cmp::Reverse(*h));
-        for (_, old_path) in snapshots.into_iter().skip(3) {
+        for (_, old_path) in snapshots.into_iter().skip(10) {
             let _ = std::fs::remove_file(&old_path);
             tracing::debug!("Pruned old snapshot: {}", old_path.display());
         }
@@ -108,14 +189,15 @@ impl Storage {
         
         if path.exists() {
             let bytes = std::fs::read(&path)?;
-            // Limit deserialization to 500MB to prevent crafted snapshots
-            // from causing unbounded memory allocation.
-            use bincode::Options;
-            let mut state: State = bincode::DefaultOptions::new()
-                .with_limit(500_000_000)
-                .deserialize(&bytes)?;
+            let (mut state, migrated) = deserialize_state_with_migration_limited(&bytes)?;
             state.coins.rebuild_tree();
             state.commitments.rebuild_tree();
+            // Re-save migrated snapshots so they load faster next time
+            if migrated {
+                let new_bytes = bincode::serialize(&state)?;
+                std::fs::write(&path, new_bytes)?;
+                tracing::info!("Re-saved snapshot at height {} in v2 format", height);
+            }
             Ok(Some(state))
         } else {
             Ok(None)
@@ -138,9 +220,17 @@ impl Storage {
         let table = read_txn.open_table(STATE_TABLE)?;
         match table.get("current")? {
             Some(bytes) => {
-                let mut state: State = bincode::deserialize(bytes.value())?;
+                let (mut state, migrated) = deserialize_state_with_migration(bytes.value())?;
                 state.coins.rebuild_tree();
                 state.commitments.rebuild_tree();
+                // If we migrated from legacy format, write back in new format
+                // so subsequent loads don't need migration.
+                drop(table);
+                drop(read_txn);
+                if migrated {
+                    tracing::info!("Re-saving state in v2 format after migration");
+                    self.save_state(&state)?;
+                }
                 Ok(Some(state))
             }
             None => Ok(None),
@@ -154,7 +244,7 @@ impl Storage {
         let table = read_txn.open_table(STATE_TABLE)?;
         match table.get("current")? {
             Some(bytes) => {
-                let state: State = bincode::deserialize(bytes.value())?;
+                let (state, _) = deserialize_state_with_migration(bytes.value())?;
                 Ok(state.height)
             }
             None => Ok(0),

@@ -18,6 +18,15 @@ use anyhow::{bail, Result};
 use libp2p::{request_response::ResponseChannel, PeerId, Multiaddr, identity::Keypair};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Number of recent states to keep in memory for instant reorg rollback.
+/// Each state uses O(1) memory to clone thanks to `im::` persistent data structures.
+const STATE_CACHE_SIZE: usize = 200;
+
+/// Disk snapshot interval (blocks). Smaller than PRUNE_DEPTH so that
+/// post-restart reorgs deeper than the in-memory cache still have a
+/// nearby snapshot to replay from instead of rewinding to genesis.
+const SNAPSHOT_INTERVAL: u64 = 100;
+
 use std::path::PathBuf;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -57,7 +66,7 @@ const BLOCK_REQ_WINDOW_SECS: u64 = 10;
 struct SyncSession {
     peer: PeerId,
     peer_height: u64,
-    peer_depth: u64,
+    peer_depth: u128,
     phase: SyncPhase,
     started_at: std::time::Instant,
 }
@@ -144,6 +153,10 @@ pub struct Node {
     peer_block_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     hash_counter: Arc<AtomicU64>,
     banned_subnets: HashMap<IpAddr, std::time::Instant>,
+    /// Ring buffer of recent states for instant reorg rollback.
+    /// Keyed by height: state_cache[i] = (height, State) where the State
+    /// is the result of applying all blocks through height-1.
+    state_cache: VecDeque<(u64, State)>,
 }
 
 #[derive(Clone)]
@@ -569,6 +582,7 @@ pub async fn new(
             peer_block_req_counts: HashMap::new(),
             hash_counter: Arc::new(AtomicU64::new(0)),
             banned_subnets: HashMap::new(),
+            state_cache: VecDeque::with_capacity(STATE_CACHE_SIZE + 1),
         })
     }
 
@@ -620,6 +634,12 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
         mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<NodeCommand>,
     ) -> Result<()> {
         self.cmd_tx = Some(handle.tx_sender.clone());
+
+        // Seed the state cache with our loaded tip so that shallow
+        // reorgs immediately after startup can be resolved without
+        // touching disk at all.
+        self.cache_current_state();
+
         let mut save_interval = time::interval(Duration::from_secs(10));
         let mut ui_interval = time::interval(Duration::from_secs(1));
         let mut metrics_interval = time::interval(Duration::from_secs(30));
@@ -1196,7 +1216,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
 
     // ── Non-blocking sync state machine ─────────────────────────────────
 
-fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u64, force_start: Option<u64>) {
+fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u128, force_start: Option<u64>) {
         self.cancel_mining();
         
         // Use a fixed 360-block lookback instead of the un-warmed finality estimator.
@@ -1893,12 +1913,12 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u64
             // alternative's theoretical maximum. This is O(N) integer math on
             // small headers — avoids the expensive state rebuild + disk I/O.
             let our_headers = self.storage.batches.load_headers(fork_height, self.state.height)?;
-            let our_work_since_fork: u64 = our_headers.iter()
+            let our_work_since_fork: u128 = our_headers.iter()
                 .map(|h| crate::core::state::calculate_work(&h.target))
-                .fold(0u64, |a, b| a.saturating_add(b));
-            let alt_work: u64 = alternative_batches.iter()
+                .fold(0u128, |a, b| a.saturating_add(b));
+            let alt_work: u128 = alternative_batches.iter()
                 .map(|b| crate::core::state::calculate_work(&b.target))
-                .fold(0u64, |a, b| a.saturating_add(b));
+                .fold(0u128, |a, b| a.saturating_add(b));
             if alt_work <= our_work_since_fork {
                 tracing::debug!(
                     "Rejecting fork at {}: alt work {} <= our work since fork {}",
@@ -2017,6 +2037,8 @@ fn perform_reorg(
         }
 
         // Update in-memory state FIRST
+        // Trim state cache: discard all entries at or above the fork
+        self.trim_cache_above(fork_height);
         self.state = new_state;
         while self.chain_history.back().map_or(false, |&(h, _)| h >= fork_height) {
             self.chain_history.pop_back();
@@ -2045,6 +2067,9 @@ fn perform_reorg(
         }
 
         self.state.target = adjust_difficulty(&self.state);
+
+        // Cache the new tip for future reorgs
+        self.cache_current_state();
 
         // 1. PREPARE: Write the batch files to .tmp FIRST.
         // If we crash here, the DB hasn't advanced, and recover_wal() will
@@ -2080,56 +2105,122 @@ fn perform_reorg(
     }
 
     async fn rebuild_state_at_height(&self, target_height: u64) -> Result<State> {
+        // Fast path: check in-memory cache (covers recent reorgs instantly)
+        if let Some(state) = self.cached_state_at(target_height) {
+            tracing::info!("rebuild_state_at_height: cache hit at height {}", target_height);
+            return Ok(state);
+        }
+
+        tracing::info!(
+            "rebuild_state_at_height: cache miss at height {} (cache covers {}..{}), falling back to disk",
+            target_height,
+            self.state_cache.front().map(|(h, _)| *h).unwrap_or(0),
+            self.state_cache.back().map(|(h, _)| *h).unwrap_or(0),
+        );
+
+        // Slow path: load nearest snapshot from disk and replay forward.
+        // Check if the cache has ANY state we can use as a closer starting point.
+        let cache_start = self.state_cache.iter()
+            .filter(|(h, _)| *h <= target_height)
+            .max_by_key(|(h, _)| *h)
+            .map(|(h, s)| (*h, s.clone()));
+
         let storage = self.storage.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<State> {
-            // Find the nearest snapshot at or below target_height so we only
-            // replay blocks from that point instead of from genesis.
-            // Snapshots are written every PRUNE_DEPTH blocks, so round down.
-            let mut snap_height = (target_height / PRUNE_DEPTH) * PRUNE_DEPTH;
-            let mut best_snap = None;
-
-            // Step backwards until we find a snapshot, instead of just checking once and giving up.
-            while snap_height > 0 {
-                match storage.load_state_snapshot(snap_height) {
-                    Ok(Some(snap)) => {
-                        tracing::debug!(
-                            "rebuild_state_at_height: using snapshot at {} (target {})",
-                            snap_height, target_height
-                        );
-                        best_snap = Some((snap, snap_height));
-                        break;
-                    }
-                    _ => {
-                        // Missed this one, step back and try the previous tier
-                        snap_height = snap_height.saturating_sub(PRUNE_DEPTH);
+        if let Some((start_h, start_state)) = cache_start {
+            // We have a cached state below the target — replay from there
+            tokio::task::spawn_blocking(move || -> Result<State> {
+                let mut state = start_state;
+                let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+                for h in start_h..target_height {
+                    if let Some(batch) = storage.load_batch(h)? {
+                        recent_headers.push_back(state.timestamp);
+                        if recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
+                            recent_headers.pop_front();
+                        }
+                        apply_batch(&mut state, &batch, recent_headers.make_contiguous())?;
+                        state.target = adjust_difficulty(&state);
+                    } else {
+                        anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
                     }
                 }
-            }
+                Ok(state)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("State rebuild task panicked: {}", e))?
+        } else {
+            // No cache — full disk path
+            tokio::task::spawn_blocking(move || -> Result<State> {
+                let mut snap_height = (target_height / SNAPSHOT_INTERVAL) * SNAPSHOT_INTERVAL;
+                let mut best_snap = None;
 
-            let (mut state, replay_from) = best_snap.unwrap_or_else(|| {
-                tracing::debug!("rebuild_state_at_height: no snapshots found, replaying from genesis");
-                (State::genesis().0, 0)
-            });
-
-            let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
-            for h in replay_from..target_height {
-                if let Some(batch) = storage.load_batch(h)? {
-                    recent_headers.push_back(state.timestamp);
-                    if recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
-                        recent_headers.pop_front();
+                while snap_height > 0 {
+                    match storage.load_state_snapshot(snap_height) {
+                        Ok(Some(snap)) => {
+                            tracing::debug!(
+                                "rebuild_state_at_height: using snapshot at {} (target {})",
+                                snap_height, target_height
+                            );
+                            best_snap = Some((snap, snap_height));
+                            break;
+                        }
+                        _ => {
+                            snap_height = snap_height.saturating_sub(SNAPSHOT_INTERVAL);
+                        }
                     }
-                    apply_batch(&mut state, &batch, recent_headers.make_contiguous())?;
-                    state.target = adjust_difficulty(&state);
-                } else {
-                    anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
                 }
-            }
 
-            Ok(state)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("State rebuild task panicked: {}", e))?
+                let (mut state, replay_from) = best_snap.unwrap_or_else(|| {
+                    tracing::debug!("rebuild_state_at_height: no snapshots found, replaying from genesis");
+                    (State::genesis().0, 0)
+                });
+
+                let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+                for h in replay_from..target_height {
+                    if let Some(batch) = storage.load_batch(h)? {
+                        recent_headers.push_back(state.timestamp);
+                        if recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
+                            recent_headers.pop_front();
+                        }
+                        apply_batch(&mut state, &batch, recent_headers.make_contiguous())?;
+                        state.target = adjust_difficulty(&state);
+                    } else {
+                        anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
+                    }
+                }
+
+                Ok(state)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("State rebuild task panicked: {}", e))?
+        }
+    }
+
+    /// Push the current state into the ring buffer cache.
+    /// Called after every successful state advancement.
+    fn cache_current_state(&mut self) {
+        // Avoid duplicate entries at the same height
+        if self.state_cache.back().map(|(h, _)| *h) == Some(self.state.height) {
+            self.state_cache.pop_back();
+        }
+        self.state_cache.push_back((self.state.height, self.state.clone()));
+        if self.state_cache.len() > STATE_CACHE_SIZE {
+            self.state_cache.pop_front();
+        }
+    }
+
+    /// Look up a cached state at exactly the given height.
+    fn cached_state_at(&self, height: u64) -> Option<State> {
+        self.state_cache.iter()
+            .find(|(h, _)| *h == height)
+            .map(|(_, s)| s.clone())
+    }
+
+    /// Trim the cache: discard all entries at or above `fork_height`.
+    fn trim_cache_above(&mut self, fork_height: u64) {
+        while self.state_cache.back().map_or(false, |(h, _)| *h >= fork_height) {
+            self.state_cache.pop_back();
+        }
     }
 
 
@@ -2302,10 +2393,13 @@ fn perform_reorg(
                     // ADJUST TARGET FIRST
                     self.state.target = adjust_difficulty(&self.state);
 
+                    // Cache for instant reorg rollback
+                    self.cache_current_state();
+
                     self.storage.save_batch(pre_height, &batch)?;
 
                     // Periodic snapshot 
-                    if self.state.height > 0 && self.state.height % PRUNE_DEPTH == 0 {
+                    if self.state.height > 0 && self.state.height % SNAPSHOT_INTERVAL == 0 {
                         if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
                             tracing::warn!("Failed to save state snapshot: {}", e);
                         } else {
@@ -2429,10 +2523,13 @@ async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) 
                 // ADJUST TARGET FIRST
                 self.state.target = adjust_difficulty(&self.state);
 
+                // Cache for instant reorg rollback
+                self.cache_current_state();
+
                 self.storage.save_batch(self.state.height - 1, &batch)?;
                 
-                // NEW: Event-driven snapshot saving!
-                if self.state.height > 0 && self.state.height % PRUNE_DEPTH == 0 {
+                // Periodic snapshot saving
+                if self.state.height > 0 && self.state.height % SNAPSHOT_INTERVAL == 0 {
                     if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
                         tracing::warn!("Failed to save state snapshot: {}", e);
                     } else {
@@ -2501,6 +2598,9 @@ async fn try_apply_orphans(&mut self) {
                     
                     // ADJUST TARGET FIRST
                     self.state.target = adjust_difficulty(&self.state);
+
+                    // Cache for instant reorg rollback
+                    self.cache_current_state();
 
                     self.storage.save_batch(self.state.height - 1, &batch).ok();
                     self.metrics.inc_batches_processed();
@@ -2812,11 +2912,14 @@ async fn try_apply_orphans(&mut self) {
                 // 1. ADJUST TARGET BEFORE SAVING ANYTHING
                 self.state.target = adjust_difficulty(&self.state);
                 
-                // 2. NOW SAVE STATE
+                // 2. Cache for instant reorg rollback
+                self.cache_current_state();
+                
+                // 3. NOW SAVE STATE
                 self.storage.save_state(&self.state)?;
                 
-                // 3. NOW SAVE SNAPSHOT
-                if self.state.height > 0 && self.state.height % PRUNE_DEPTH == 0 {
+                // 4. NOW SAVE SNAPSHOT (every SNAPSHOT_INTERVAL blocks)
+                if self.state.height > 0 && self.state.height % SNAPSHOT_INTERVAL == 0 {
                     if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
                         tracing::warn!("Failed to save state snapshot: {}", e);
                     } else {
@@ -3943,7 +4046,7 @@ fn build_divergent_chain(
         node.sync_session = Some(SyncSession {
             peer,
             peer_height,
-            peer_depth: peer_height * 1_000_000,
+            peer_depth: peer_height as u128 * 1_000_000,
             phase: SyncPhase::Batches {
                 headers: full_headers,
                 fork_height: 5,
@@ -4014,7 +4117,7 @@ fn build_divergent_chain(
         node.sync_session = Some(SyncSession {
             peer,
             peer_height: 3 + alt_batches.len() as u64,
-            peer_depth: (3 + alt_batches.len() as u64) * 1_000_000,
+            peer_depth: (3 + alt_batches.len() as u128) * 1_000_000,
             phase: SyncPhase::Batches {
                 headers: full_headers,
                 fork_height: 3,
@@ -4071,7 +4174,7 @@ fn build_divergent_chain(
         node.sync_session = Some(SyncSession {
             peer,
             peer_height,
-            peer_depth: peer_height * 1_000_000,
+            peer_depth: peer_height as u128 * 1_000_000,
             phase: SyncPhase::Batches {
                 headers: full_headers,
                 fork_height: 1,
@@ -4117,7 +4220,7 @@ fn build_divergent_chain(
         let original_state = node.state.clone();
 
         // Build two different alt chains forking at different points
-        let fork_a_state = node.rebuild_state_at_height(3).unwrap();
+        let fork_a_state = node.rebuild_state_at_height(3).await.unwrap();
         let (alt_a_batches, alt_a_headers) = build_divergent_chain(&fork_a_state, 10);
 
         let mut full_headers_a = node.storage.batches.load_headers(0, 3).unwrap();
