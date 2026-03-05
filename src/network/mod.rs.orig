@@ -251,18 +251,6 @@ impl MidstateNetwork {
         self.connected.keys().map(|p| p.to_string()).collect()
     }
 
-    pub fn disconnect_peer(&mut self, peer: PeerId) {
-        let _ = self.swarm.disconnect_peer_id(peer);
-    }
-
-    /// Extract the subnet of a connected peer to facilitate network-level bans
-    pub fn peer_subnet(&self, peer: &PeerId) -> Option<IpAddr> {
-        self.connected.get(peer).and_then(|endpoint| {
-            let addr = endpoint.get_remote_address();
-            extract_subnet(addr)
-        })
-    }
-
     pub fn add_kad_address(&mut self, peer: PeerId, addr: Multiaddr) {
         self.swarm.behaviour_mut().kademlia.add_address(&peer, addr);
     }
