@@ -165,6 +165,12 @@ impl MixSession {
     /// Both must have value equal to the session denomination.
     /// Rejects duplicate inputs (same coin_id).
     pub fn register(&mut self, input: InputReveal, output: OutputData) -> Result<()> {
+        // --- FIX: Prevent P2P DataBurn Injection ---
+        if matches!(output, OutputData::DataBurn { .. }) {
+            bail!("DataBurn outputs are strictly forbidden in CoinJoin mixes");
+        }
+        // -------------------------------------------
+
         if self.registrations.len() >= MAX_MIX_PARTICIPANTS {
             bail!("session full ({} participants)", MAX_MIX_PARTICIPANTS);
         }
