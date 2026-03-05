@@ -19,7 +19,7 @@ pub enum Message {
     GetState,
     StateInfo {
         height: u64,
-        depth: u64,
+        depth: u128,
         midstate: [u8; 32],
     },
     GetAddr,
