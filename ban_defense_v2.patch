@@ -1,0 +1,111 @@
+diff -ruN a/src/network/mod.rs b/src/network/mod.rs
+--- a/src/network/mod.rs	2026-03-06 13:00:00.000000000 +0000
++++ b/src/network/mod.rs	2026-03-06 13:10:00.000000000 +0000
+@@ -204,6 +204,18 @@
+         self.connected.keys().map(|p| p.to_string()).collect()
+     }
+ 
++    pub fn disconnect_peer(&mut self, peer: PeerId) {
++        let _ = self.swarm.disconnect_peer_id(peer);
++    }
++
++    /// Extract the subnet of a connected peer to facilitate network-level bans
++    pub fn peer_subnet(&self, peer: &PeerId) -> Option<IpAddr> {
++        self.connected.get(peer).and_then(|endpoint| {
++            let addr = endpoint.get_remote_address();
++            extract_subnet(addr)
++        })
++    }
++
+     pub fn add_kad_address(&mut self, peer: PeerId, addr: Multiaddr) {
+         self.swarm.behaviour_mut().kademlia.add_address(&peer, addr);
+     }
+diff -ruN a/src/node.rs b/src/node.rs
+--- a/src/node.rs	2026-03-06 13:00:00.000000000 +0000
++++ b/src/node.rs	2026-03-06 13:10:00.000000000 +0000
+@@ -21,6 +21,7 @@
+ use std::collections::{HashMap, HashSet, VecDeque};
+ 
+ use std::path::PathBuf;
++use std::net::IpAddr;
+ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+ use std::sync::Arc;
+ use std::time::Duration;
+@@ -137,6 +138,9 @@
+     stem_pool: HashMap<[u8; 32], (Transaction, std::time::Instant)>,
+     peer_block_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
+     hash_counter: Arc<AtomicU64>,
++    /// Subnets banned for sending invalid PoW. 
++    /// Keyed by subnet IP, value is the Instant the ban was applied.
++    banned_subnets: HashMap<IpAddr, std::time::Instant>,
+ }
+ 
+ #[derive(Clone)]
+@@ -558,6 +562,7 @@
+             stem_pool: HashMap::new(),
+             peer_block_req_counts: HashMap::new(),
+             hash_counter: Arc::new(AtomicU64::new(0)),
++            banned_subnets: HashMap::new(),
+         })
+     }
+ 
+@@ -805,6 +810,11 @@
+                 }
+                 
+                 _ = connection_maintenance.tick() => {
++                    // Evict bans older than 24 hours (86400 seconds)
++                    let now = std::time::Instant::now();
++                    self.banned_subnets.retain(|_, banned_at| now.duration_since(*banned_at).as_secs() < 86400);
++
+                     let current_outbound = self.network.outbound_peer_count();
+                     if current_outbound < TARGET_OUTBOUND_PEERS {
+                         let needed = TARGET_OUTBOUND_PEERS - current_outbound;
+@@ -825,6 +835,14 @@
+                         }
+                         NetworkEvent::PeerConnected(peer) => {
++                            // --- BANNED SUBNET DEFENSE ---
++                            if let Some(subnet) = self.network.peer_subnet(&peer) {
++                                if self.banned_subnets.contains_key(&subnet) {
++                                    tracing::debug!("Rejected connection from banned subnet: {}", subnet);
++                                    self.network.disconnect_peer(peer);
++                                    continue;
++                                }
++                            }
++
+                             if !self.connected_peers.insert(peer) {
+                                 // Already connected via another transport — skip
+@@ -1341,7 +1359,16 @@
+             });
+         };
+ 
+         if !is_valid {
+-            tracing::warn!("Peer header chain invalid (PoW or linkage failed)");
++            // ONE STRIKE AND YOU'RE OUT: Ban the /24 (IPv4) or /48 (IPv6) subnet for 24h.
++            tracing::warn!("Peer {} sent an invalid header chain (PoW/Linkage failed). Banning subnet.", peer);
++            if let Some(subnet) = self.network.peer_subnet(&peer) {
++                if self.banned_subnets.len() < 10_000 {
++                    self.banned_subnets.insert(subnet, std::time::Instant::now());
++                } else {
++                    tracing::warn!("Banned subnets cap reached, skipping ban for {}", subnet);
++                }
++            }
++            self.network.disconnect_peer(peer);
+             self.sync_in_progress = false;
+             return Ok(());
+         }
+@@ -2160,7 +2187,16 @@
+             // 1. Verify the sequential PoW is valid (forces attacker to compute 1M hashes)
+             let header = batch.header();
+             if crate::core::extension::verify_extension(header.post_tx_midstate, &batch.extension, &batch.target).is_err() {
+-                tracing::debug!("Rejected invalid orphan block (PoW failed)");
++                tracing::warn!("Rejected invalid orphan block from peer (PoW failed). Banning subnet.");
++                if let Some(peer) = from {
++                    if let Some(subnet) = self.network.peer_subnet(&peer) {
++                        if self.banned_subnets.len() < 10_000 {
++                            self.banned_subnets.insert(subnet, std::time::Instant::now());
++                        }
++                    }
++                    self.network.disconnect_peer(peer);
++                }
+                 return Ok(());
+             }

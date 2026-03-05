@@ -19,6 +19,7 @@ use libp2p::{request_response::ResponseChannel, PeerId, Multiaddr, identity::Key
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use std::path::PathBuf;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -142,6 +143,7 @@ pub struct Node {
     /// Per-peer rate limiter for GetBatches/GetHeaders requests.
     peer_block_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     hash_counter: Arc<AtomicU64>,
+    banned_subnets: HashMap<IpAddr, std::time::Instant>,
 }
 
 #[derive(Clone)]
@@ -566,6 +568,7 @@ pub async fn new(
             stem_pool: HashMap::new(),
             peer_block_req_counts: HashMap::new(),
             hash_counter: Arc::new(AtomicU64::new(0)),
+            banned_subnets: HashMap::new(),
         })
     }
 
@@ -795,6 +798,14 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                             }
                         }
                         NetworkEvent::PeerConnected(peer) => {
+                            // --- BANNED SUBNET DEFENSE ---
+                            if let Some(subnet) = self.network.peer_subnet(&peer) {
+                                if self.banned_subnets.contains_key(&subnet) {
+                                    tracing::debug!("Rejected connection from banned subnet: {}", subnet);
+                                    self.network.disconnect_peer(peer);
+                                    continue;
+                                }
+                            }
                             if !self.connected_peers.insert(peer) {
                                 // Already connected via another transport — skip
                                 continue;
