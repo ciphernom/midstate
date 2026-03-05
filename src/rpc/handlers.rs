@@ -4,7 +4,7 @@ use crate::core::{compute_commitment, compute_address, hash_concat, wots,
 use crate::node::NodeHandle;
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{StatusCode,header},
     response::{IntoResponse, Response},
     Json,
 };
@@ -240,11 +240,15 @@ pub async fn scan_addresses(
     State(node): State<AppState>,
     Json(req): Json<ScanRequest>,
 ) -> Result<Json<ScanResponse>, ErrorResponse> {
+    // Cap scan window to prevent disk I/O exhaustion on constrained hardware
+    const MAX_SCAN_RANGE: u64 = 10_000;
+    let capped_end = req.start_height.saturating_add(MAX_SCAN_RANGE).min(req.end_height);
+
     let addresses: Vec<[u8; 32]> = req.addresses.iter()
         .map(|h| parse_hex32(h, "address"))
         .collect::<Result<_, _>>()?;
 
-    let coins = node.scan_addresses(&addresses, req.start_height, req.end_height)
+    let coins = node.scan_addresses(&addresses, req.start_height, capped_end)
         .map_err(|e| ErrorResponse { error: e.to_string() })?;
 
     Ok(Json(ScanResponse {
@@ -547,7 +551,7 @@ pub async fn search(
     let tip = store.highest()
         .map_err(|e| ErrorResponse { error: e.to_string() })?;
 
-    let search_start = tip.saturating_sub(5000);
+    let search_start = tip.saturating_sub(1000);
     let mut results = Vec::new();
 
     for height in (search_start..=tip).rev() {
@@ -774,9 +778,15 @@ pub async fn axe_wifi_setup(
     }
     // ------------------------------
 
-    // PREVENT INJECTION: Reject quotes and newlines
-    if req.ssid.contains('"') || req.ssid.contains('\n') || req.ssid.contains('\r') ||
-       req.password.contains('"') || req.password.contains('\n') || req.password.contains('\r') {
+    // PREVENT INJECTION: Reject quotes, newlines, backslashes, and enforce WPA2 spec limits
+    if req.ssid.len() > 32 || req.password.len() > 63 {
+        return Ok(Json(serde_json::json!({ 
+            "status": "error", 
+            "message": "SSID must be ≤32 bytes, password ≤63 characters" 
+        })));
+    }
+    if req.ssid.contains('"') || req.ssid.contains('\n') || req.ssid.contains('\r') || req.ssid.contains('\\') ||
+       req.password.contains('"') || req.password.contains('\n') || req.password.contains('\r') || req.password.contains('\\') {
         return Ok(Json(serde_json::json!({ 
             "status": "error", 
             "message": "Invalid characters in SSID or Password" 
@@ -939,4 +949,37 @@ pub async fn axe_apply_overclock(
         "status": "success", 
         "message": "Overclock applied to boot config. System rebooting..." 
     })))
+}
+
+pub async fn axe_download_rewards(
+    State(node): State<AppState>,
+) -> Result<Response, ErrorResponse> {
+    // --- HARDWARE + AUTH GATE ---
+    if !is_axe_device() {
+        return Err(ErrorResponse {
+            error: "Rewards download is only available on MidstateAxe hardware.".into(),
+        });
+    }
+
+    // Navigate from data_dir/db/batches back up to data_dir
+    let data_dir = node.batches_path.parent().unwrap().parent().unwrap();
+    let log_path = data_dir.join("coinbase_seeds.jsonl");
+
+    let contents = std::fs::read_to_string(&log_path).unwrap_or_else(|_| {
+        tracing::warn!("No coinbase_seeds.jsonl found (no blocks mined yet?)");
+        String::new()
+    });
+
+    let response = Response::builder()
+        .header(header::CONTENT_TYPE, "application/jsonl")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"coinbase_seeds.jsonl\"",
+        )
+        .body(axum::body::Body::from(contents))
+        .map_err(|e| ErrorResponse {
+            error: format!("Failed to build response: {}", e),
+        })?;
+
+    Ok(response)
 }
