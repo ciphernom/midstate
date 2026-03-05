@@ -1721,16 +1721,21 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
                 self.metrics.inc_transactions_processed();
 
                 if from.is_none() {
-                    // Dandelion++ stem phase: we originated this tx locally.
-                    // Send to ONE random peer as StemTransaction instead of broadcasting.
-                    if let Some(stem_peer) = self.network.random_peer() {
-                        let tx_id = tx.input_coin_ids().first().copied()
-                            .unwrap_or_else(|| match &tx { Transaction::Commit { commitment, .. } => *commitment, _ => [0; 32] });
-                        self.stem_pool.insert(tx_id, (tx.clone(), std::time::Instant::now()));
-                        self.network.send(stem_peer, Message::StemTransaction(tx));
-                        tracing::debug!("Dandelion++ stem: sent tx to {}", stem_peer);
+                    // Dandelion++ stem phase for COMMITS only.
+                    // Reveals are broadcast immediately because:
+                    // 1. They're already linkable to a public commitment
+                    // 2. The 30s stem delay starves other miners' templates
+                    if matches!(&tx, Transaction::Commit { .. }) {
+                        if let Some(stem_peer) = self.network.random_peer() {
+                            let tx_id = match &tx { Transaction::Commit { commitment, .. } => *commitment, _ => [0; 32] };
+                            self.stem_pool.insert(tx_id, (tx.clone(), std::time::Instant::now()));
+                            self.network.send(stem_peer, Message::StemTransaction(tx));
+                            tracing::debug!("Dandelion++ stem: sent commit to {}", stem_peer);
+                        } else {
+                            self.network.broadcast(Message::Transaction(tx));
+                        }
                     } else {
-                        // No peers — broadcast directly
+                        // Reveals: broadcast immediately to all peers
                         self.network.broadcast(Message::Transaction(tx));
                     }
                 } else {
@@ -2820,7 +2825,7 @@ async fn try_apply_orphans(&mut self) {
                     total_fees += tx.fee();
                     transactions.push(tx);
                 }
-                Err(e) => tracing::debug!("Skipping stale reveal during mining: {}", e),
+                Err(e) => tracing::warn!("Skipping stale reveal during mining: {}", e),
             }
         }
 
