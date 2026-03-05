@@ -126,10 +126,19 @@ pub fn validate_timestamp(
     Ok(())
 }
 
-pub(crate) fn calculate_work(target: &[u8; 32]) -> u64 {
+pub(crate) fn calculate_work(target: &[u8; 32]) -> u128 {
     let t = U256::from_big_endian(target);
     if t.is_zero() { return 0; }
-    (U256::MAX / t).low_u64()
+    let w = U256::MAX / t;
+    // Extract low 128 bits; saturate if work exceeds u128
+    // (requires target < 2^128, i.e. mass-of-sun-into-BLAKE3 difficulty)
+    if w > U256::from(u128::MAX) {
+        u128::MAX
+    } else {
+        let lo = w.low_u64() as u128;
+        let hi = (w >> 64).low_u64() as u128;
+        (hi << 64) | lo
+    }
 }
 
 /// Apply a batch to the state
@@ -377,11 +386,13 @@ mod tests {
     fn apply_batch_advances_depth() {
         let mut state = genesis_state();
         let initial_depth = state.depth;
+        let expected_work = calculate_work(&state.target);
         let reward = block_reward(state.height);
         let batch = make_empty_batch(&state, reward, state.timestamp + 1);
-    let timestamps = vec![state.timestamp];
+        let timestamps = vec![state.timestamp];
         apply_batch(&mut state, &batch, &timestamps).unwrap();
-        assert_eq!(state.depth, initial_depth + EXTENSION_ITERATIONS);
+        assert_eq!(state.depth, initial_depth + expected_work);
+        assert!(expected_work > 0, "work per block must be nonzero");
     }
 
     #[test]

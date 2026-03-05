@@ -76,7 +76,7 @@ pub struct ScanCoin {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetStateResponse {
     pub height: u64,
-    pub depth: u64,
+    pub depth: u128,
     /// Number of blocks required for 1e-6 finality risk.
     pub safe_depth: u64,
     pub midstate: String,
