@@ -265,6 +265,11 @@ impl MssKeypair {
 
 /// Verify MSS signature: check WOTS sig, then Merkle path to master PK.
 pub fn verify(sig: &MssSignature, message: &[u8; 32], master_pk: &MasterPublicKey) -> bool {
+    // SECURITY FIX: Prevent high-bit malleability
+    let capacity = 1u64.checked_shl(sig.auth_path.len() as u32).unwrap_or(u64::MAX);
+    if sig.leaf_index >= capacity {
+        return false; 
+    }
     // 1. WOTS
     if !wots::verify(&sig.wots_sig, message, &sig.wots_pk) {
         return false;
