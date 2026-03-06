@@ -1810,22 +1810,13 @@ fn wallet_import_rewards(path: &PathBuf, coinbase_file: &PathBuf, data_dir: &Pat
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
 
-    println!("Retrieving mining seed...");
-    let seed_path = data_dir.join("mining_seed.key");
+    println!("Opening node database to retrieve mining seed...");
+    let storage = midstate::storage::Storage::open(data_dir.join("db"))
+        .context("Failed to open node database. Is the node running? Stop the node first to safely import rewards.")?;
     
-    let mining_seed = if seed_path.exists() {
-        // Fast path: Read flat file without locking the running node's database!
-        let bytes = std::fs::read(&seed_path)?;
-        <[u8; 32]>::try_from(bytes.as_slice()).context("Invalid mining seed file format")?
-    } else {
-        // Migration path: Flat file doesn't exist yet. We must lock redb to extract it.
-        let storage = midstate::storage::Storage::open(data_dir.join("db"))
-            .context("Database locked by running node. \n\n[ACTION REQUIRED] Stop the node ONE TIME and rerun this command. The node will extract the seed to 'mining_seed.key'. After this, you can import rewards without stopping the node ever again.")?;
-        
-        let seed = storage.load_mining_seed()?.context("No mining seed found.")?;
-        drop(storage);
-        seed
-    };
+    let mining_seed = storage.load_mining_seed()?
+        .context("No mining seed found in the database. Has the node started mining yet?")?;
+    drop(storage); // Release the database lock immediately
 
     println!("Reading coinbase log...");
     let contents = std::fs::read_to_string(coinbase_file)?;
@@ -2020,6 +2011,11 @@ let bootstrap: Vec<libp2p::Multiaddr> = all_peers.iter()
     // Update the logging print
     tracing::info!("Node started (mining: {}, threads: {}, rpc: {})", 
         mine, threads.unwrap_or(0), rpc_port);
+
+    if mine {
+        let simd = midstate::core::simd_mining::detected_level();
+        tracing::info!("Mining SIMD: {} ({} nonces/batch)", simd.name(), simd.lanes());
+    }
         
     node.run(handle, cmd_rx).await
 }
