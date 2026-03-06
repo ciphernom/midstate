@@ -160,7 +160,7 @@ impl Storage {
         let bytes = bincode::serialize(state)?;
         std::fs::write(path, bytes)?;
 
-        // Garbage-collect old snapshots: keep only the 3 most recent.
+        // Garbage-collect old snapshots: keep only the 10 most recent.
         let mut snapshots: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&snapshot_dir)?
             .filter_map(|e| e.ok())
             .filter_map(|e| {
@@ -252,16 +252,40 @@ impl Storage {
     }
 
     pub fn save_mining_seed(&self, seed: &[u8; 32]) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
+        // Save to flat file for concurrent CLI access
+        let seed_path = self.batches.base_path().parent().unwrap().join("mining_seed.key");
+        std::fs::write(&seed_path, seed)?;
+        
+        // Restrict permissions to owner-only on Unix systems
+        #[cfg(unix)]
         {
-            let mut table = write_txn.open_table(MINING_SEED_TABLE)?;
-            table.insert("seed", seed.as_slice())?;
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(mut perms) = std::fs::metadata(&seed_path).map(|m| m.permissions()) {
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(&seed_path, perms);
+            }
         }
-        write_txn.commit()?;
+        // Also save to redb for backwards compatibility
+        if let Ok(write_txn) = self.db.begin_write() {
+            if let Ok(mut table) = write_txn.open_table(MINING_SEED_TABLE) {
+                let _ = table.insert("seed", seed.as_slice());
+            }
+            let _ = write_txn.commit();
+        }
         Ok(())
     }
 
     pub fn load_mining_seed(&self) -> Result<Option<[u8; 32]>> {
+        // 1. Try reading from the concurrent-safe flat file first
+        let seed_path = self.batches.base_path().parent().unwrap().join("mining_seed.key");
+        if seed_path.exists() {
+            let bytes = std::fs::read(&seed_path)?;
+            if bytes.len() == 32 {
+                return Ok(Some(<[u8; 32]>::try_from(bytes.as_slice()).unwrap()));
+            }
+        }
+
+        // 2. Fallback: load from redb (for existing nodes) and migrate to flat file
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(MINING_SEED_TABLE)?;
         match table.get("seed")? {
@@ -270,6 +294,9 @@ impl Storage {
                 if val.len() != 32 {
                     anyhow::bail!("corrupt mining seed");
                 }
+                let seed = <[u8; 32]>::try_from(val).unwrap();
+                // Auto-migrate to flat file so CLI doesn't need redb lock next time
+                let _ = self.save_mining_seed(&seed);
                 Ok(Some(<[u8; 32]>::try_from(val).unwrap()))
             }
             None => Ok(None),
