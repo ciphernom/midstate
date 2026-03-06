@@ -17,72 +17,74 @@ impl Syncer {
     /// Verify PoW and internal header-to-header linkage on a contiguous
     /// slice of headers. The first header's prev_midstate is NOT checked
     /// here — that is handled by the fork-point logic.
-    pub fn verify_header_chain(headers: &[BatchHeader]) -> Result<()> {
-    if headers.is_empty() {
-        return Ok(());
-    }
-
-    let current_time = crate::core::state::current_timestamp();
-    const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
-
-    if headers[0].timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
-        bail!("Header timestamp too far in future at index 0");
-    }
-
-    // 1. Fast sequential check: Ensure chain linkage is intact AND validate targets
-    for i in 1..headers.len() {
-        let header = &headers[i];
-        let prev = &headers[i - 1];
-
-        // --- THE FIX: Replace Strict Monotonicity with Median Time Past (MTP) ---
-        if header.timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
-            bail!("Header timestamp too far in future at index {}", i);
+    ///
+    /// `prior_timestamps` must contain the timestamps of the blocks immediately
+    /// preceding `headers` in chain order (oldest first). Pass `&[]` when
+    /// `headers` starts at genesis. This is required so that timestamp
+    /// validation for the first headers in the slice uses the same
+    /// `previous_timestamps` window that `apply_batch` / `validate_timestamp`
+    /// would see, keeping the two code paths in exact consensus.
+    pub fn verify_header_chain(headers: &[BatchHeader], prior_timestamps: &[u64]) -> Result<()> {
+        if headers.is_empty() {
+            return Ok(());
         }
 
-        // Calculate Median Time Past for the fast-syncing headers
-        let window_start = i.saturating_sub(crate::core::MEDIAN_TIME_PAST_WINDOW);
-        let mut recent_timestamps: Vec<u64> = headers[window_start..i]
-            .iter()
-            .map(|h| h.timestamp)
-            .collect();
-        
-        recent_timestamps.sort_unstable();
-        let median = recent_timestamps[recent_timestamps.len() / 2];
+        let current_time = crate::core::state::current_timestamp();
+        let window_size = crate::core::MEDIAN_TIME_PAST_WINDOW;
 
-        if header.timestamp <= median {
-            bail!("Header timestamp {} not greater than MTP {} at index {}", header.timestamp, median, i);
-        }
-        // -------------------------------------------------------------------------
+        // Validate header[0] against prior chain history only (no in-batch predecessors yet).
+        crate::core::state::validate_timestamp(headers[0].timestamp, prior_timestamps, current_time)
+            .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index 0: {}", e))?;
 
-        if header.prev_midstate != prev.extension.final_hash {
-            bail!("Header linkage broken at index {}: prev_midstate mismatch", i);
+        // 1. Fast sequential check: Ensure chain linkage is intact AND validate targets
+        for i in 1..headers.len() {
+            let header = &headers[i];
+            let prev = &headers[i - 1];
+
+            // Build the exact previous_timestamps window that apply_batch would pass to
+            // validate_timestamp: prior chain history followed by in-batch predecessors,
+            // trimmed to the MTP window size. This guarantees verify_header_chain and
+            // apply_batch accept and reject identical chains, including the early-chain
+            // fallback where validate_timestamp uses strict monotonicity instead of MTP.
+            let combined: Vec<u64> = prior_timestamps.iter()
+                .chain(headers[..i].iter().map(|h| &h.timestamp))
+                .copied()
+                .collect();
+            let window_start = combined.len().saturating_sub(window_size);
+            let previous_timestamps = &combined[window_start..];
+
+            crate::core::state::validate_timestamp(header.timestamp, previous_timestamps, current_time)
+                .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index {}: {}", i, e))?;
+
+            if header.prev_midstate != prev.extension.final_hash {
+                bail!("Header linkage broken at index {}: prev_midstate mismatch", i);
+            }
+            
+            let expected_target = crate::core::state::calculate_target(prev.height + 1, prev.timestamp);
+            if header.target != expected_target {
+                bail!("Invalid difficulty target at height {} (expected {}, got {})", 
+                    header.height, hex::encode(expected_target), hex::encode(header.target));
+            }
         }
-        
-        let expected_target = crate::core::state::calculate_target(prev.height + 1, prev.timestamp);
-        if header.target != expected_target {
-            bail!("Invalid difficulty target at height {} (expected {}, got {})", 
-                header.height, hex::encode(expected_target), hex::encode(header.target));
-        }
-    }
 
         // 2. Heavy parallel check: Verify Proof of Work for all headers across all CPU cores
         let results: Vec<Result<(), String>> = headers
-            .par_iter()
-            .enumerate()
-            .map(|(i, header)| {
-                verify_extension(
-                    header.post_tx_midstate,
-                    &header.extension,
-                    &header.target,
-                ).map_err(|e| format!("Invalid PoW at header index {}: {}", i, e))
-            })
-            .collect();
+                .par_iter()
+                .enumerate()
+                .map(|(i, header)| {
+                    verify_extension(
+                        header.post_tx_midstate,
+                        &header.extension,
+                        &header.target,
+                    ).map_err(|e| format!("Invalid PoW at header index {}: {}", i, e))
+                })
+                .collect();
 
         // 3. Report first error if any failed
         for res in results {
-            if let Err(e) = res {
-                bail!("{}", e);
-            }
+                if let Err(e) = res {
+                    bail!("{}", e);
+                }
         }
 
         Ok(())
