@@ -657,7 +657,7 @@ fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
     })
 }
 
-/// Extracts the /24 (IPv4) or /64 (IPv6) subnet prefix from a multiaddr.
+/// Extracts the /24 (IPv4) or /32 (IPv6) subnet prefix from a multiaddr.
 /// Returns None for localhost addresses so local testing isn't restricted.
 fn extract_subnet(addr: &Multiaddr) -> Option<IpAddr> {
     if is_localhost(addr) {
