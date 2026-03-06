@@ -8,6 +8,7 @@ all_rust_code.txt
 alice_wallet.dat
 bob_wallet.dat
 *.dat
+tarsrc.sh
 
 # WASM Wallet Build Artifacts
 wasm-wallet/target/
