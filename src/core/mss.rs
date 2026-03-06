@@ -37,8 +37,12 @@ use super::types::hash_concat;
 use super::wots;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use rayon::prelude::*;
-
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Write}; 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::path::PathBuf;
+use rayon::prelude::*; 
 // ── Config ──────────────────────────────────────────────────────────────────
 
 /// Default tree height. 2^10 = 1024 signatures per master key.
@@ -95,37 +99,96 @@ fn derive_wots_seed(master_seed: &[u8; 32], index: u64) -> [u8; 32] {
 ///
 /// Cost: 2^height WOTS key generations (~1-2 ms each at w=16).
 /// Height 10 ≈ 1-2 s, height 16 ≈ 1-2 min.
+/// Generate an MSS keypair with progress tracking and chunked checkpointing.
 pub fn keygen(master_seed: &[u8; 32], height: u32) -> Result<MssKeypair> {
     if height == 0 || height > MAX_HEIGHT {
         bail!("height must be in 1..={}", MAX_HEIGHT);
     }
 
     let num_leaves = 1u64 << height;
-    let tree_size = (num_leaves * 2) as usize; // 1-indexed, [0] unused
-
+    let tree_size = (num_leaves * 2) as usize;
     let mut tree = vec![[0u8; 32]; tree_size];
 
-    // Leaves: tree[num_leaves .. 2*num_leaves)
-    // OLD:
-    // let leaf_start = num_leaves as usize;
-    // for i in 0..num_leaves {
-    //     let seed = derive_wots_seed(master_seed, i);
-    //     tree[leaf_start + i as usize] = wots::keygen(&seed);
-    // }
-
-    // NEW: Parallelize the 1,024 leaves, sequentialize the 18 inner chains
+    let checkpoint_path = PathBuf::from(format!("mss_h{}.checkpoint", height));
     let leaf_start = num_leaves as usize;
-    let (_internal, leaves) = tree.split_at_mut(leaf_start);
     
-    leaves.par_iter_mut().enumerate().for_each(|(i, leaf)| {
-        let seed = derive_wots_seed(master_seed, i as u64);
-        *leaf = wots::keygen_seq(&seed); 
-    });
+    // THIS IS THE MISSING VARIABLE!
+    let mut leaves_completed = 0usize;
 
-    // Internal nodes bottom-up
+    // 1. Load Checkpoint if it exists
+    if checkpoint_path.exists() {
+        if let Ok(file) = File::open(&checkpoint_path) {
+            let reader = BufReader::new(file);
+            if let Ok(saved_leaves) = bincode::deserialize_from::<_, Vec<[u8; 32]>>(reader) {
+                if saved_leaves.len() == num_leaves as usize {
+                    tree[leaf_start..].copy_from_slice(&saved_leaves);
+                    
+                    // Count how many leaves were actually finished
+                    leaves_completed = saved_leaves.iter().filter(|&&l| l != [0u8; 32]).count();
+                    tracing::info!("Loaded checkpoint for height {}. Resuming from {} leaves.", height, leaves_completed);
+                }
+            }
+        }
+    }
+
+    let start_time = std::time::Instant::now();
+    let total_finished = Arc::new(AtomicUsize::new(leaves_completed));
+    let chunk_size = 4096;
+
+    tracing::info!("Starting MSS Leaf Generation (Height {})...", height);
+
+    // 2. Iterate ONLY over the remaining leaves
+    for chunk_start_idx in (leaves_completed..num_leaves as usize).step_by(chunk_size) {
+        let chunk_end_idx = (chunk_start_idx + chunk_size).min(num_leaves as usize);
+        
+        // Scope the mutable borrow strictly to this block
+        {
+            let chunk = &mut tree[leaf_start + chunk_start_idx .. leaf_start + chunk_end_idx];
+            
+            chunk.par_iter_mut().enumerate().for_each(|(i, leaf)| {
+                let global_idx = (chunk_start_idx + i) as u64;
+                let seed = derive_wots_seed(master_seed, global_idx);
+                *leaf = wots::keygen_seq(&seed);
+                
+                total_finished.fetch_add(1, Ordering::Relaxed);
+            });
+        } // Mutable borrow of 'tree' ends here
+
+        // --- Progress Reporting ---
+        let count = total_finished.load(Ordering::Relaxed);
+        let pct = (count as f64 / num_leaves as f64) * 100.0;
+        
+        // Rate math: Only measure the leaves generated THIS session
+        let leaves_this_session = count - leaves_completed;
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.0 { leaves_this_session as f64 / elapsed } else { 0.0 };
+        let eta = if rate > 0.0 { (num_leaves as usize - count) as f64 / rate } else { 0.0 };
+        
+        print!(
+            "\r[MSS] Progress: {:.2}% ({}/{}) | Rate: {:.1} leaf/s | ETA: {:.1}m    ",
+            pct, count, num_leaves, rate, eta / 60.0
+        );
+        let _ = std::io::stdout().flush();
+
+        // Safe Checkpointing
+        if (chunk_start_idx / chunk_size) % 10 == 0 || count == num_leaves as usize {
+            save_checkpoint(&checkpoint_path, &tree[leaf_start..]);
+        }
+    }
+    println!();
+
+    // 3. Build Internal Nodes
+    tracing::info!("Building Merkle Tree internal nodes...");
     for i in (1..leaf_start).rev() {
         tree[i] = hash_concat(&tree[2 * i], &tree[2 * i + 1]);
     }
+
+    // 4. Cleanup
+    if checkpoint_path.exists() {
+        let _ = std::fs::remove_file(&checkpoint_path);
+    }
+
+    tracing::info!("MSS Keypair generated in {:?}", start_time.elapsed());
 
     Ok(MssKeypair {
         height,
@@ -134,6 +197,13 @@ pub fn keygen(master_seed: &[u8; 32], height: u32) -> Result<MssKeypair> {
         tree,
         next_leaf: 0,
     })
+}
+
+fn save_checkpoint(path: &std::path::Path, leaves: &[[u8; 32]]) {
+    if let Ok(file) = File::create(path) {
+        let writer = BufWriter::new(file);
+        let _ = bincode::serialize_into(writer, leaves);
+    }
 }
 
 /// Generate a random MSS keypair with default height.
