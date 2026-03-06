@@ -4083,7 +4083,7 @@ fn build_divergent_chain(
             "Should have headers on disk"
         );
         assert!(
-            Syncer::verify_header_chain(&disk_headers).is_ok(),
+            Syncer::verify_header_chain(&disk_headers, &[]).is_ok(),
             "On-disk header chain must have valid linkage after aborted sync. \
              If this fails, sync wrote peer batches to disk before committing the reorg."
         );
@@ -4147,7 +4147,7 @@ fn build_divergent_chain(
             .unwrap();
 
         assert!(
-            Syncer::verify_header_chain(&served_headers).is_ok(),
+            Syncer::verify_header_chain(&served_headers, &[]).is_ok(),
             "Headers served to peers must have valid linkage. \
              Broken linkage here means peers cannot sync from us."
         );
@@ -4205,7 +4205,7 @@ fn build_divergent_chain(
             .unwrap();
         assert_eq!(disk_headers.len(), (node.state.height) as usize);
         assert!(
-            Syncer::verify_header_chain(&disk_headers).is_ok(),
+            Syncer::verify_header_chain(&disk_headers, &[]).is_ok(),
             "After a completed sync+reorg, on-disk headers must be a valid chain"
         );
     }
@@ -4263,7 +4263,7 @@ fn build_divergent_chain(
             .load_headers(0, original_state.height)
             .unwrap();
         assert!(
-            Syncer::verify_header_chain(&disk_headers).is_ok(),
+            Syncer::verify_header_chain(&disk_headers, &[]).is_ok(),
             "Replacing a sync session mid-flight must not leave corrupted headers on disk"
         );
     }

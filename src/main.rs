@@ -2174,7 +2174,7 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
     }
 
     // 3. Verify
-    sync::Syncer::verify_header_chain(&headers)?;
+    sync::Syncer::verify_header_chain(&headers, &[])?;
     let our_state = storage.load_state()?.unwrap_or_else(|| State::genesis().0);
     // from genesis here...
     let fork_height = syncer.find_fork_point(&headers, 0, our_state.height)?;
