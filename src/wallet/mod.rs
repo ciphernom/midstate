@@ -571,7 +571,8 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
     /// Returns (all_outputs, change_seeds).
     /// Change seeds are derived from the HD counter (or random for legacy wallets)
     /// so they are recoverable from the mnemonic.
- pub fn build_outputs(
+    /// If an MSS key is near exhaustion, change is routed to a new MSS tree automatically.
+    pub fn build_outputs(
         &mut self,
         recipient_address: &[u8; 32],
         recipient_denominations: &[u64],
@@ -590,25 +591,53 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             });
         }
 
+        // --- NEW: Automatic MSS Rotation Check ---
+        // Find if we have any active MSS keys that are getting dangerously low
+        let mut rotation_target_pk: Option<[u8; 32]> = None;
+        for keypair in &self.data.mss_keys {
+            if keypair.remaining() > 0 && keypair.remaining() < 50 {
+                tracing::warn!(
+                    "MSS Key {} is near exhaustion ({} remaining). Triggering automatic background rotation.",
+                    short_hex(&keypair.master_pk),
+                    keypair.remaining()
+                );
+                rotation_target_pk = Some(keypair.master_pk);
+                break;
+            }
+        }
+
+        // If a rotation is needed, generate the new tree now.
+        // We use height 10 for user wallets (instant generation).
+        let mut new_mss_pk: Option<[u8; 32]> = None;
+        if rotation_target_pk.is_some() {
+            let pk = self.generate_mss(crate::core::mss::DEFAULT_HEIGHT, Some("Auto-Rotated Key".to_string()))?;
+            new_mss_pk = Some(pk);
+        }
+
         // Change outputs
         if change_value > 0 {
             let mut change_denoms = decompose_value(change_value);
-            
-            // Shuffle the change denominations so the order isn't deterministic
             use rand::seq::SliceRandom;
             change_denoms.shuffle(&mut rand::thread_rng());
 
             for denom in change_denoms {
-                let seed = self.next_wots_seed();
-                let owner_pk = wots::keygen(&seed);
-                let address = compute_address(&owner_pk);
+                let address = if let Some(new_pk) = new_mss_pk {
+                    // Route change to the newly rotated MSS address
+                    new_pk 
+                } else {
+                    // Standard routing: derive a fresh one-time WOTS address
+                    let seed = self.next_wots_seed();
+                    let owner_pk = wots::keygen(&seed);
+                    let addr = compute_address(&owner_pk);
+                    let idx = outputs.len();
+                    change_seeds.push((idx, seed));
+                    addr
+                };
+
                 let salt: [u8; 32] = rand::random();
-                let idx = outputs.len();
                 outputs.push(OutputData::Standard { address, value: denom, salt });
-                change_seeds.push((idx, seed));
             }
         }
-
 
         // Output shuffling
         use rand::seq::SliceRandom;
