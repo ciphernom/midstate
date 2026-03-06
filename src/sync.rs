@@ -17,51 +17,53 @@ impl Syncer {
     /// Verify PoW and internal header-to-header linkage on a contiguous
     /// slice of headers. The first header's prev_midstate is NOT checked
     /// here — that is handled by the fork-point logic.
-pub fn verify_header_chain(headers: &[BatchHeader]) -> Result<()> {
-        if headers.is_empty() {
-            return Ok(());
+    pub fn verify_header_chain(headers: &[BatchHeader]) -> Result<()> {
+    if headers.is_empty() {
+        return Ok(());
+    }
+
+    let current_time = crate::core::state::current_timestamp();
+    const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
+
+    if headers[0].timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
+        bail!("Header timestamp too far in future at index 0");
+    }
+
+    // 1. Fast sequential check: Ensure chain linkage is intact AND validate targets
+    for i in 1..headers.len() {
+        let header = &headers[i];
+        let prev = &headers[i - 1];
+
+        // --- THE FIX: Replace Strict Monotonicity with Median Time Past (MTP) ---
+        if header.timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
+            bail!("Header timestamp too far in future at index {}", i);
         }
 
-        // --- NEW: Grab current time for future check ---
-        let current_time = crate::core::state::current_timestamp();
-        const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
+        // Calculate Median Time Past for the fast-syncing headers
+        let window_start = i.saturating_sub(crate::core::MEDIAN_TIME_PAST_WINDOW);
+        let mut recent_timestamps: Vec<u64> = headers[window_start..i]
+            .iter()
+            .map(|h| h.timestamp)
+            .collect();
+        
+        recent_timestamps.sort_unstable();
+        let median = recent_timestamps[recent_timestamps.len() / 2];
 
-        // Check the first header (since the loop below starts at index 1)
-        if headers[0].timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
-            bail!("Header timestamp too far in future at index 0");
+        if header.timestamp <= median {
+            bail!("Header timestamp {} not greater than MTP {} at index {}", header.timestamp, median, i);
         }
+        // -------------------------------------------------------------------------
 
-        // 1. Fast sequential check: Ensure chain linkage is intact AND validate targets
-        for i in 1..headers.len() {
-            let header = &headers[i];
-            let prev = &headers[i - 1];
-
-            // --- Time Warp & CPU Exhaustion Defense ---
-            // Enforce strict monotonicity during header sync to prevent
-            // attackers from pegging every timestamp to the future limit,
-            // which causes ASERT to drop difficulty to minimum.
-            // Full MTP validation happens in apply_batch; this is a cheap
-            // pre-filter that makes difficulty-gaming infeasible.
-            if header.timestamp <= prev.timestamp {
-                bail!("Header timestamp not monotonically increasing at index {}", i);
-            }
-            if header.timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
-                bail!("Header timestamp too far in future at index {}", i);
-            }
-            // -----------------------------------------------------
-
-            if header.prev_midstate != prev.extension.final_hash {
-                bail!("Header linkage broken at index {}: prev_midstate mismatch", i);
-            }
-            
-            // FIX: The target for the current block is determined by the height 
-            // and timestamp of the PREVIOUS block.
-            let expected_target = crate::core::state::calculate_target(prev.height + 1, prev.timestamp);
-            if header.target != expected_target {
-                bail!("Invalid difficulty target at height {} (expected {}, got {})", 
-                    header.height, hex::encode(expected_target), hex::encode(header.target));
-            }
+        if header.prev_midstate != prev.extension.final_hash {
+            bail!("Header linkage broken at index {}: prev_midstate mismatch", i);
         }
+        
+        let expected_target = crate::core::state::calculate_target(prev.height + 1, prev.timestamp);
+        if header.target != expected_target {
+            bail!("Invalid difficulty target at height {} (expected {}, got {})", 
+                header.height, hex::encode(expected_target), hex::encode(header.target));
+        }
+    }
 
         // 2. Heavy parallel check: Verify Proof of Work for all headers across all CPU cores
         let results: Vec<Result<(), String>> = headers
