@@ -476,7 +476,7 @@ async fn wallet_scan(path: &PathBuf, rpc_port: u16, rpc_host: String) -> Result<
             match client.post(&mss_url).json(&req).send().await {
                 Ok(resp) => {
                     if let Ok(mss_resp) = resp.json::<rpc::GetMssStateResponse>().await {
-                        if mss_resp.next_index >= mss_key.next_leaf {
+                        if mss_resp.next_index > mss_key.next_leaf {
                             const SAFETY_MARGIN: u64 = 20;
                             let new_leaf = mss_resp.next_index + SAFETY_MARGIN;
                             println!("  MSS {}: advancing leaf {} -> {}",
@@ -1295,15 +1295,16 @@ async fn wait_for_commit_mined(
     timeout_secs: u64,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let check_url = format!("http://{}:{}/check_commitment", rpc_host, rpc_port);
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let mp_url = format!("http://{}:{}/mempool", rpc_host, rpc_port);
-        if let Ok(resp) = client.get(&mp_url).send().await {
-            if let Ok(mp) = resp.json::<rpc::GetMempoolResponse>().await {
-                let still_pending = mp.transactions.iter().any(|tx| {
-                    tx.commitment.as_deref() == Some(commitment_hex)
-                });
-                if !still_pending {
+        // Confirm the commitment is in chain state, not just absent from mempool.
+        // A commit can leave the mempool by being evicted or reorg'd out, not just mined.
+        // Checking state directly ensures we only reveal when the commitment is spendable.
+        let req = rpc::CheckCommitmentRequest { commitment: commitment_hex.to_string() };
+        if let Ok(resp) = client.post(&check_url).json(&req).send().await {
+            if let Ok(result) = resp.json::<rpc::CheckCommitmentResponse>().await {
+                if result.exists {
                     return true;
                 }
             }
@@ -1816,6 +1817,12 @@ fn wallet_import_rewards(path: &PathBuf, coinbase_file: &PathBuf, data_dir: &Pat
     
     let mining_seed = storage.load_mining_seed()?
         .context("No mining seed found in the database. Has the node started mining yet?")?;
+
+    println!("Loading chain state to check for spent rewards...");
+    let live_coins = storage.load_state()?
+        .map(|s| s.coins)
+        .context("No chain state found in the database. Has the node synced at all?")?;
+
     drop(storage); // Release the database lock immediately
 
     println!("Reading coinbase log...");
@@ -1869,8 +1876,14 @@ fn wallet_import_rewards(path: &PathBuf, coinbase_file: &PathBuf, data_dir: &Pat
         .collect();
 
     let mut imported = 0usize;
+    let mut already_have = 0usize;
+    let mut spent = 0usize;
     for wc in new_coins {
-        if !existing_coins.contains(&wc.coin_id) {
+        if existing_coins.contains(&wc.coin_id) {
+            already_have += 1;
+        } else if !live_coins.contains(&wc.coin_id) {
+            spent += 1;
+        } else {
             wallet.data.coins.push(wc);
             imported += 1;
         }
@@ -1879,8 +1892,8 @@ fn wallet_import_rewards(path: &PathBuf, coinbase_file: &PathBuf, data_dir: &Pat
     println!("Saving wallet...");
     wallet.save()?;
 
-    println!("Imported {} coinbase reward(s). Total coins: {}, total value: {}",
-        imported, wallet.coin_count(), wallet.total_value());
+    println!("Imported {} coinbase reward(s). Skipped {} already in wallet, {} spent on-chain. Total coins: {}, total value: {}",
+        imported, already_have, spent, wallet.coin_count(), wallet.total_value());
     Ok(())
 }
 
