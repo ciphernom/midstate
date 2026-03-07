@@ -67,6 +67,7 @@ impl RpcServer {
             .route("/axe/config", post(axe_save_config)) // Pool/Miner config endpoint
             .route("/axe/overclock", post(axe_apply_overclock))
             .route("/axe/rewards", get(axe_download_rewards))
+            .route("/api/internal/submit_batch", post(submit_batch))
             .layer(TraceLayer::new_for_http())
             .layer(cors)
             .with_state(node_handle);

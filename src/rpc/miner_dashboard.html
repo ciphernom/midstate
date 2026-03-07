@@ -276,6 +276,15 @@ button.danger:hover { background: var(--red); color: #fff; }
                 <div class="data-value" id="mempool">-- txs</div>
                 <div class="data-sub">Assembling next block</div>
             </div>
+            
+            <div class="panel-card" style="grid-column: 1 / -1;">
+                <div style="display:flex; justify-content:space-between;">
+                    <h3>Telemetry Timeline</h3>
+                    <span style="font-size:10px; color:var(--text)"><span style="color:var(--accent)">■ Hashrate</span> | <span style="color:var(--red)">■ Temp</span></span>
+                </div>
+            <canvas id="telemetryChart" width="800" height="120" style="width:100%; height:120px; display:block; margin-top:8px;"></canvas>
+        </div>
+            
         </div>
 
         <div style="color:#555; font-size:11px; margin-top:20px; padding-top:20px; border-top:1px solid var(--border);">
@@ -448,6 +457,55 @@ async function applyOverclock() {
     }
 }
 
+// --- Zero-Dependency Canvas Chart ---
+const historyMax = 60; // 60 ticks @ 3s = 3 mins of history
+let chartData = []; 
+
+function drawChart(hashrate, temp) {
+    const canvas = document.getElementById('telemetryChart');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width;
+    const h = canvas.height;
+
+    chartData.push({ hashrate, temp });
+    if (chartData.length > historyMax) chartData.shift();
+
+    // Clear background
+    ctx.clearRect(0, 0, w, h);
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+
+    if (chartData.length < 2) return;
+
+    // Dynamic scaling
+    const maxH = Math.max(...chartData.map(d => d.hashrate), 10);
+    const maxT = 85.0; // Fixed max temp for Raspberry Pi throttling limits
+    const stepX = w / (historyMax - 1);
+
+    // Draw Hashrate (Accent/Green)
+    ctx.beginPath();
+    ctx.strokeStyle = '#d4ff00';
+    for (let i = 0; i < chartData.length; i++) {
+        let x = i * stepX;
+        let y = h - ((chartData[i].hashrate / maxH) * h * 0.9);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Draw Temp (Red)
+    ctx.beginPath();
+    ctx.strokeStyle = '#ff4444';
+    for (let i = 0; i < chartData.length; i++) {
+        let x = i * stepX;
+        let y = h - ((Math.min(chartData[i].temp, maxT) / maxT) * h * 0.9);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+}
+
 async function pollStats() {
     try {
         const [stateRes, mpRes, axeRes] = await Promise.all([
@@ -496,6 +554,7 @@ async function pollStats() {
             if (deltaSeconds > 0) {
                 const hashrate = deltaNonces / deltaSeconds;
                 document.getElementById('hashrate').textContent = hashrate.toFixed(1) + ' N/s';
+                drawChart(hashrate, axe.temp_c);
             }
         } else if (axe.total_nonces === 0 || document.getElementById('h-status').innerText !== 'MINING') {
             document.getElementById('hashrate').textContent = '0.0 N/s';
