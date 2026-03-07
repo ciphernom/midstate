@@ -106,6 +106,17 @@ pub struct CheckCoinResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct CheckCommitmentRequest {
+    pub commitment: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckCommitmentResponse {
+    pub exists: bool,
+    pub commitment: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GetMempoolResponse {
     pub size: usize,
     pub transactions: Vec<TransactionInfo>,
