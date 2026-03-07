@@ -55,6 +55,14 @@ const STEM_TIMEOUT_SECS: u64 = 30;
 /// unbounded memory growth under PoW spam from multiple Sybil peers.
 const MAX_STEM_POOL_SIZE: usize = 1000;
 
+/// GetHeaders responses are cheap when header files exist (~18 KB for 100 headers).
+/// But the fallback path loads full batches (~8 MB each) for pre-migration blocks.
+/// Allow enough requests for a full sync in one window while still bounding abuse.
+/// 2700 headers needed worst case (12085 - 9425) / 100 = 27 requests minimum.
+/// 200 per 60 seconds gives comfortable headroom without enabling disk-exhaustion.
+const MAX_HEADER_REQS_PER_PEER: u32 = 200;
+const HEADER_REQ_WINDOW_SECS: u64 = 60;
+
 /// GetBatches requests are expensive (up to 8 MB each). Limit them separately.
 /// 500 per 60 seconds allows fast sync while still bounding worst-case CPU/disk load.
 const MAX_BATCH_REQS_PER_PEER: u32 = 500;
@@ -156,6 +164,8 @@ pub struct Node {
     /// Per-peer rate limiter for GetBatches/GetHeaders requests.
     /// Separate rate-limit counter for GetBatches (expensive disk reads).
     peer_batch_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
+    /// Rate-limit counter for GetHeaders (cheap normally, expensive on fallback path).
+    peer_header_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     hash_counter: Arc<AtomicU64>,
     banned_subnets: HashMap<IpAddr, std::time::Instant>,
     /// Ring buffer of recent states for instant reorg rollback.
@@ -591,6 +601,7 @@ pub async fn new(
             cmd_tx: None,
             stem_pool: HashMap::new(),
             peer_batch_req_counts: HashMap::new(),
+            peer_header_req_counts: HashMap::new(),
             hash_counter: Arc::new(AtomicU64::new(0)),
             banned_subnets: HashMap::new(),
             state_cache: VecDeque::with_capacity(STATE_CACHE_SIZE + 1),
@@ -1063,9 +1074,20 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                 }
             }
             Message::GetHeaders { start_height, count } => {
-                // No rate limit on GetHeaders — each response is at most ~20 KB
-                // (100 headers × ~200 bytes). Rate-limiting this was the cause of
-                // sync sessions stalling silently and timing out repeatedly.
+                // Light rate limit: header files are ~18 KB each but the fallback
+                // path loads full batches (~8 MB) for pre-migration blocks.
+                // 200/60s allows a full sync (27+ sequential requests) with headroom.
+                let now = std::time::Instant::now();
+                let entry = self.peer_header_req_counts.entry(from).or_insert((0, now));
+                if now.duration_since(entry.1).as_secs() >= HEADER_REQ_WINDOW_SECS {
+                    *entry = (0, now);
+                }
+                entry.0 += 1;
+                if entry.0 > MAX_HEADER_REQS_PER_PEER {
+                    tracing::debug!("Rate-limiting header requests from peer {}", from);
+                    self.ack(channel);
+                    return Ok(());
+                }
 
                 let count = count.min(MAX_GETBATCHES_COUNT);
                 let end = (start_height + count).min(self.state.height + 1);
