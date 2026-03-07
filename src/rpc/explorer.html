@@ -273,6 +273,8 @@ a:hover { color: var(--accent); }
 let tipHeight = 0;
 let activeBatch = null;
 let activeQuery = null;
+// blockCache stores {txCount, cbCount} keyed by height, populated when blocks are loaded
+const blockCache = {};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -345,6 +347,7 @@ async function poll() {
         const peers = await pRes.json();
 
         const prevTip = tipHeight;
+        // state.height is the next block to be mined; the highest confirmed batch is height-1
         tipHeight = Math.max(0, state.height - 1);
 
         document.getElementById('h-height').textContent = tipHeight;
@@ -373,8 +376,10 @@ function renderBatchList() {
     const start = Math.max(0, tipHeight - 30);
     for (let i = tipHeight; i >= start; i--) {
         const cls = (i === activeBatch) ? ' active' : '';
+        const cached = blockCache[i];
+        const txLabel = cached ? `<span class="txc">${cached.txCount}tx</span>` : '';
         html += `<div class="batch-item${cls}" onclick="loadBlock(${i})">
-            <span class="num">${i}</span>
+            <span class="num">${i}</span>${txLabel}
         </div>`;
     }
     el.innerHTML = html;
@@ -492,6 +497,10 @@ async function loadBlock(h) {
         const b = await res.json();
         const chainState = stateRes.ok ? await stateRes.json() : null;
 
+        // Cache tx/cb counts for the batch list
+        blockCache[h] = { txCount: b.transactions.length, cbCount: b.coinbase.length };
+        renderBatchList();
+
         // Calculate Bayesian Finality
         let finalityBadge = '';
         if (chainState) {
@@ -511,6 +520,7 @@ async function loadBlock(h) {
         </div>`;
 
         // Metadata grid
+        const cbTotal = b.coinbase.reduce((s,c) => s + c.value, 0);
         html += `<div class="meta-grid">
             ${renderField('Block Hash', b.extension.final_hash)}
             ${renderField('Parent', b.prev_midstate)}
@@ -518,6 +528,10 @@ async function loadBlock(h) {
             <div class="field">
                 <div class="lbl">Timestamp</div>
                 <div class="hex" style="color:var(--text)">${new Date(b.timestamp * 1000).toISOString()}</div>
+            </div>
+            <div class="field">
+                <div class="lbl">Block Reward</div>
+                <div class="hex" style="color:var(--green)">${cbTotal.toLocaleString()} units (${b.coinbase.length} output${b.coinbase.length !== 1 ? 's' : ''})</div>
             </div>
             <div class="field">
                 <div class="lbl">Nonce</div>
@@ -543,7 +557,10 @@ async function loadBlock(h) {
                     <span class="val-badge positive">+${cb.value}</span>
                     ${renderField('address', cb.address)}
                     ${renderField('salt', cb.salt)}
-                    <div style="margin-top:4px;"><span class="coin-status checking" data-coin="${toHex(cb.address)}_${cb.value}_${toHex(cb.salt)}" data-check="coinbase">checking\u2026</span></div>
+                    <div style="margin-top:4px;"><span class="coin-status checking" 
+                        data-addr="${toHex(cb.address)}" 
+                        data-value="${cb.value}" 
+                        data-salt="${toHex(cb.salt)}">checking…</span></div>
                 </div>`;
             }
             html += `</div></div>`;
@@ -594,6 +611,10 @@ async function loadBlock(h) {
                             <span class="val-badge positive">+${out.Standard.value}</span>
                             ${renderField('address', out.Standard.address)}
                             ${renderField('salt', out.Standard.salt)}
+                            <div style="margin-top:4px;"><span class="coin-status checking"
+                                data-addr="${toHex(out.Standard.address)}"
+                                data-value="${out.Standard.value}"
+                                data-salt="${toHex(out.Standard.salt)}">checking…</span></div>
                         </div>`;
                     }
                     if (out.DataBurn) {
@@ -640,32 +661,45 @@ async function loadBlock(h) {
         mv.innerHTML = html;
         mv.scrollTop = 0;
 
-        checkCoinStatuses(b);
+        checkCoinStatuses();
 
     } catch(e) {
         mv.innerHTML = `<div style="color:var(--red);padding:20px;">Error: ${escHtml(e.message)}</div>`;
     }
 }
 
-// Check which coinbase outputs are still live
-async function checkCoinStatuses(batch) {
-    for (const cb of batch.coinbase) {
-        const addr = toHex(cb.address);
-        const salt = toHex(cb.salt);
-        const key = `${addr}_${cb.value}_${salt}`;
-        const el = document.querySelector(`[data-coin="${key}"]`);
-        if (!el) continue;
-
-        try {
-            // Compute coin_id the same way the node does:
-            // coin_id = hash(address || value_le || salt)
-            // We can't compute this client-side without blake3, so use /scan
-            // Instead just visually indicate these are coinbase outputs
-            el.textContent = 'coinbase';
-            el.className = 'coin-status live';
-        } catch(e) {
-            el.textContent = '?';
-        }
+// Check live/spent status for all tagged coin outputs in the current view
+async function checkCoinStatuses() {
+    const els = document.querySelectorAll('.coin-status[data-addr]');
+    // Fire requests concurrently, up to 8 at a time to avoid flooding
+    const chunk = 8;
+    const arr = Array.from(els);
+    for (let i = 0; i < arr.length; i += chunk) {
+        await Promise.all(arr.slice(i, i + chunk).map(async el => {
+            try {
+                const res = await fetch('/check_output', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        address: el.dataset.addr,
+                        value:   parseInt(el.dataset.value, 10),
+                        salt:    el.dataset.salt,
+                    })
+                });
+                const data = await res.json();
+                el.textContent  = data.exists ? 'live' : 'spent';
+                el.className    = 'coin-status ' + (data.exists ? 'live' : 'spent');
+                // Attach coin_id as a clickable search link now that we have it
+                if (data.coin_id) {
+                    el.style.cursor = 'pointer';
+                    el.title = data.coin_id;
+                    el.onclick = () => execCmd(data.coin_id);
+                }
+            } catch {
+                el.textContent = '?';
+                el.className   = 'coin-status checking';
+            }
+        }));
     }
 }
 
