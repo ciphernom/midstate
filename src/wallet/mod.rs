@@ -205,7 +205,7 @@ impl Wallet {
 /// All addresses the wallet watches for (keys + coin addresses).
 pub fn watched_addresses(&self) -> Vec<[u8; 32]> {
     let mut addrs: Vec<[u8; 32]> = self.data.keys.iter().map(|k| k.address).collect();
-    addrs.extend(self.data.mss_keys.iter().map(|k| k.master_pk));
+    addrs.extend(self.data.mss_keys.iter().map(|k| compute_address(&k.master_pk)));
     addrs.sort();
     addrs.dedup();
     addrs
@@ -236,7 +236,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
     }
 
     // MSS key match — keep key, just add coin (MSS supports multiple signatures)
-    if let Some(mss) = self.data.mss_keys.iter().find(|k| k.master_pk == address) {
+    if let Some(mss) = self.data.mss_keys.iter().find(|k| compute_address(&k.master_pk) == address) {
         self.data.coins.push(WalletCoin {
             seed: mss.master_seed,
             owner_pk: mss.master_pk,
@@ -255,7 +255,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
     // rule will force all siblings to be spent in the same transaction,
     // producing an identical commitment hash and thus identical WOTS signatures.
     if let Some(existing) = self.data.coins.iter().find(|c| c.address == address).cloned() {
-        let is_mss = self.data.mss_keys.iter().any(|k| k.master_pk == address);
+        let is_mss = self.data.mss_keys.iter().any(|k| compute_address(&k.master_pk) == address);
 
         if !is_mss && existing.wots_signed {
             // Key already signed a transaction. Importing a new coin here
@@ -329,10 +329,10 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
     pub fn generate_mss(&mut self, height: u32, _label: Option<String>) -> Result<[u8; 32]> {
         let seed = self.next_mss_seed();
         let keypair = mss::keygen(&seed, height)?;
-        let root = keypair.master_pk;
+        let address = compute_address(&keypair.master_pk);
         self.data.mss_keys.push(keypair);
         self.save()?;
-        Ok(root)
+        Ok(address)
     }
 
     // ── Coin management ─────────────────────────────────────────────────────
@@ -379,7 +379,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             None => return vec![],
         };
         // MSS keys are reusable — no co-spend rule needed
-        if self.data.mss_keys.iter().any(|k| k.master_pk == coin.address) {
+        if self.data.mss_keys.iter().any(|k| compute_address(&k.master_pk) == coin.address) {
             return vec![];
         }
         let addr = coin.address;
@@ -501,7 +501,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         }
         for coin in &available {
             if grouped_addresses.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
-                let is_mss = self.data.mss_keys.iter().any(|k| k.master_pk == coin.address);
+                let is_mss = self.data.mss_keys.iter().any(|k| compute_address(&k.master_pk) == coin.address);
                 if !is_mss {
                     selected.push(coin.coin_id);
                     selected_set.insert(coin.coin_id);
@@ -551,7 +551,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         let mut final_addresses = std::collections::HashSet::new();
         for id in &selected {
             if let Some(c) = self.find_coin(id) {
-                if !self.data.mss_keys.iter().any(|k| k.master_pk == c.address) {
+                if !self.data.mss_keys.iter().any(|k| compute_address(&k.master_pk) == c.address) {
                     final_addresses.insert(c.address);
                 }
             }
@@ -891,7 +891,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             // Co-spend grouping: pull in WOTS siblings
             let selected_addrs: std::collections::HashSet<[u8; 32]> = selected.iter()
                 .filter_map(|id| self.find_coin(id))
-                .filter(|c| !self.data.mss_keys.iter().any(|k| k.master_pk == c.address))
+                .filter(|c| !self.data.mss_keys.iter().any(|k| compute_address(&k.master_pk) == c.address))
                 .map(|c| c.address)
                 .collect();
             for coin in self.data.coins.iter() {

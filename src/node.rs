@@ -60,6 +60,11 @@ const MAX_BLOCK_REQS_PER_PEER: u32 = 10;
 /// Rate-limit window for block/header requests in seconds.
 const BLOCK_REQ_WINDOW_SECS: u64 = 10;
 
+/// GetBatches requests are expensive (up to 8 MB each). Limit them separately.
+/// 500 per 60 seconds allows fast sync while still bounding worst-case CPU/disk load.
+const MAX_BATCH_REQS_PER_PEER: u32 = 500;
+const BATCH_REQ_WINDOW_SECS: u64 = 60;
+
 /// Non-blocking sync session driven by the main event loop.
 /// Replaces the old blocking `Syncer::sync_via_network` which hijacked the
 /// network and dropped unrelated messages.
@@ -130,6 +135,10 @@ pub struct Node {
     data_dir: PathBuf,
     chain_history: VecDeque<(u64, [u8; 32])>,
     finality: crate::core::finality::FinalityEstimator,
+    cached_safe_depth: u64,
+    /// Last header cursor reached during sync. Used to resume after timeout
+    /// instead of restarting from height - 360 every time.
+    last_sync_cursor: Option<u64>,
     known_pex_addrs: HashSet<String>,
     connected_peers: HashSet<PeerId>,
     // Background mining concurrency
@@ -151,6 +160,8 @@ pub struct Node {
     stem_pool: HashMap<[u8; 32], (Transaction, std::time::Instant)>,
     /// Per-peer rate limiter for GetBatches/GetHeaders requests.
     peer_block_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
+    /// Separate rate-limit counter for GetBatches (expensive disk reads).
+    peer_batch_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     hash_counter: Arc<AtomicU64>,
     banned_subnets: HashMap<IpAddr, std::time::Instant>,
     /// Ring buffer of recent states for instant reorg rollback.
@@ -218,6 +229,10 @@ impl NodeHandle {
 
     pub async fn check_coin(&self, coin: [u8; 32]) -> bool {
         self.state.read().await.coins.contains(&coin)
+    }
+
+    pub async fn check_commitment(&self, commitment: [u8; 32]) -> bool {
+        self.state.read().await.commitments.contains(&commitment)
     }
 
     pub async fn get_mempool_info(&self) -> (usize, Vec<Transaction>) {
@@ -567,7 +582,9 @@ pub async fn new(
             data_dir,
             chain_history: VecDeque::new(),
             //lets assume a hostile environment where 80% of new connections are malicious. 
-            finality: crate::core::finality::FinalityEstimator::new(2, 8), 
+            finality: crate::core::finality::FinalityEstimator::new(2, 8),
+            cached_safe_depth: crate::core::finality::FinalityEstimator::new(2, 8).calculate_safe_depth(1e-6),
+            last_sync_cursor: None,
             sync_session: None,
             known_pex_addrs: HashSet::new(),
             connected_peers: HashSet::new(),
@@ -580,6 +597,7 @@ pub async fn new(
             cmd_tx: None,
             stem_pool: HashMap::new(),
             peer_block_req_counts: HashMap::new(),
+            peer_batch_req_counts: HashMap::new(),
             hash_counter: Arc::new(AtomicU64::new(0)),
             banned_subnets: HashMap::new(),
             state_cache: VecDeque::with_capacity(STATE_CACHE_SIZE + 1),
@@ -642,6 +660,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
 
         let mut save_interval = time::interval(Duration::from_secs(10));
         let mut ui_interval = time::interval(Duration::from_secs(1));
+        ui_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut metrics_interval = time::interval(Duration::from_secs(30));
         let mut sync_poll_interval = time::interval(Duration::from_secs(30));
         let mut mempool_prune_interval = time::interval(Duration::from_secs(60));
@@ -704,8 +723,12 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                     }
                 }
                 _ = ui_interval.tick() => {
+                    // safe_depth is already computed inline after each observe_honest()
+                    // call and stored in self.cached_safe_depth. We just push it to the
+                    // handle here so both state and safe_depth are always coherent.
+                    let current_safe_depth = self.cached_safe_depth;
                     *handle.state.write().await = self.state.clone();
-                    *handle.safe_depth.write().await = self.finality.calculate_safe_depth(1e-6);
+                    *handle.safe_depth.write().await = current_safe_depth;
                     *handle.mempool_size.write().await = self.mempool.len();
                     *handle.mempool_txs.write().await = self.mempool.transactions_cloned();
                     *handle.peer_addrs.write().await = self.network.peer_addrs();
@@ -968,15 +991,15 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                 }
             }
             Message::GetBatches { start_height, count } => {
-                // Per-peer rate limiting on block requests
+                // Per-peer rate limiting on batch requests (each can be up to 8 MB)
                 let now = std::time::Instant::now();
-                let entry = self.peer_block_req_counts.entry(from).or_insert((0, now));
-                if now.duration_since(entry.1).as_secs() >= BLOCK_REQ_WINDOW_SECS {
+                let entry = self.peer_batch_req_counts.entry(from).or_insert((0, now));
+                if now.duration_since(entry.1).as_secs() >= BATCH_REQ_WINDOW_SECS {
                     *entry = (0, now);
                 }
                 entry.0 += 1;
-                if entry.0 > MAX_BLOCK_REQS_PER_PEER {
-                    tracing::debug!("Rate-limiting block requests from peer {}", from);
+                if entry.0 > MAX_BATCH_REQS_PER_PEER {
+                    tracing::debug!("Rate-limiting batch requests from peer {}", from);
                     self.ack(channel);
                     return Ok(());
                 }
@@ -1047,18 +1070,9 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                 }
             }
             Message::GetHeaders { start_height, count } => {
-                // Per-peer rate limiting on header requests
-                let now = std::time::Instant::now();
-                let entry = self.peer_block_req_counts.entry(from).or_insert((0, now));
-                if now.duration_since(entry.1).as_secs() >= BLOCK_REQ_WINDOW_SECS {
-                    *entry = (0, now);
-                }
-                entry.0 += 1;
-                if entry.0 > MAX_BLOCK_REQS_PER_PEER {
-                    tracing::debug!("Rate-limiting header requests from peer {}", from);
-                    self.ack(channel);
-                    return Ok(());
-                }
+                // No rate limit on GetHeaders — each response is at most ~20 KB
+                // (100 headers × ~200 bytes). Rate-limiting this was the cause of
+                // sync sessions stalling silently and timing out repeatedly.
 
                 let count = count.min(MAX_GETBATCHES_COUNT);
                 let end = (start_height + count).min(self.state.height + 1);
@@ -1219,9 +1233,14 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
 fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u128, force_start: Option<u64>) {
         self.cancel_mining();
         
-        // Use a fixed 360-block lookback instead of the un-warmed finality estimator.
-        // If the caller provided a specific start_height (e.g., a fallback), use that instead.
-        let start_height = force_start.unwrap_or_else(|| self.state.height.saturating_sub(360));
+        // Prefer: explicit override > last known cursor > 360-block lookback.
+        // The last_sync_cursor lets us resume a timed-out header download from
+        // where we left off rather than restarting from scratch every time.
+        let start_height = force_start.unwrap_or_else(|| {
+            self.last_sync_cursor
+                .filter(|&c| c > self.state.height.saturating_sub(360))
+                .unwrap_or_else(|| self.state.height.saturating_sub(360))
+        });
         
         tracing::info!(
             "Starting headers-first sync from height {}: peer(h={}, d={}) vs us(h={}, d={})",
@@ -1252,6 +1271,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
         }
         self.sync_session = None;
         self.sync_in_progress = false;
+        // Don't clear last_sync_cursor here — keep it so the next attempt resumes
     }
 
  pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHeader>) -> Result<()> {
@@ -1301,7 +1321,8 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
             if let Some(s) = &mut self.sync_session {
                 s.started_at = std::time::Instant::now();
             }
-            // ----------------
+            // Save cursor so a timeout can resume from here rather than height-360
+            self.last_sync_cursor = Some(new_cursor);
 
             return Ok(());
         }
@@ -1688,7 +1709,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
         }
 
         self.sync_in_progress = false;
-        // sync_session is already None (we took it above)
+        self.last_sync_cursor = None; // Sync complete — next attempt starts fresh
 
         // Immediately check if the peer has mined more blocks while we were
         // syncing.  Without this, we'd have to wait for the next broadcast
@@ -2024,6 +2045,7 @@ fn perform_reorg(
                 fork_height, fork_height, self.state.height, new_state.height
             );
             self.finality.observe_adversarial();
+            self.cached_safe_depth = self.finality.calculate_safe_depth(1e-6);
         } else {
             tracing::info!(
                 "Chain extension via sync: height {} -> {}",
@@ -2428,8 +2450,8 @@ fn perform_reorg(
 
                     self.chain_history.push_back((pre_height, self.state.midstate));
                     self.finality.observe_honest();
-                    let safe_depth = self.finality.calculate_safe_depth(1e-6);
-                    let cutoff_height = self.state.height.saturating_sub(safe_depth);
+                    self.cached_safe_depth = self.finality.calculate_safe_depth(1e-6);
+                    let cutoff_height = self.state.height.saturating_sub(self.cached_safe_depth);
                     while self.chain_history.front().map_or(false, |&(h, _)| h < cutoff_height) {
                         self.chain_history.pop_front();
                     }
@@ -2546,8 +2568,8 @@ async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) 
 
                 self.chain_history.push_back((self.state.height, self.state.midstate));
                 self.finality.observe_honest();
-                let safe_depth = self.finality.calculate_safe_depth(1e-6);
-                let cutoff = self.state.height.saturating_sub(safe_depth);
+                self.cached_safe_depth = self.finality.calculate_safe_depth(1e-6);
+                let cutoff = self.state.height.saturating_sub(self.cached_safe_depth);
                 while self.chain_history.front().map_or(false, |&(h, _)| h < cutoff) {
                     self.chain_history.pop_front();
                 }
