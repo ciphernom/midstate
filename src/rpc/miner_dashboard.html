@@ -21,6 +21,7 @@
     --red: #ff4444;
     --green: #00cc66;
     --blue: #4488ff;
+    --orange: #ff9900;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -39,25 +40,26 @@ body {
 a { color: var(--text-bright); cursor: pointer; text-decoration: none; }
 a:hover { color: var(--accent); }
 
-/* Header */
+/* ── Header ─────────────────────────────────────────────────────── */
 .hdr {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 10px 16px;
+    padding: 8px 16px;
     border-bottom: 1px solid var(--border);
     background: var(--bg);
     flex-shrink: 0;
 }
 .hdr h1 { font-size: 14px; font-weight: 700; color: var(--text-max); letter-spacing: 2px; }
-.hdr-right { display: flex; gap: 16px; color: var(--text); font-size: 11px; }
+.hdr-right { display: flex; gap: 20px; color: var(--text); font-size: 11px; align-items: center; }
 .hdr-right span { display: flex; align-items: center; gap: 4px; }
 .hdr-right .label { color: #555; }
 .hdr-right .val { color: var(--text-bright); }
-.live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+.live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; flex-shrink: 0; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+.hdr-sep { width: 1px; height: 16px; background: var(--border-bright); }
 
-/* Layout */
+/* ── Layout ─────────────────────────────────────────────────────── */
 .layout { display: flex; flex: 1; min-height: 0; }
 .sidebar {
     width: 260px;
@@ -68,10 +70,10 @@ a:hover { color: var(--accent); }
     background: var(--bg);
     overflow-y: auto;
 }
-.sidebar-section { padding: 16px 12px; border-bottom: 1px solid var(--border); }
-.sidebar-section .title { font-size: 10px; color: #444; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 12px; font-weight: 700; }
+.sidebar-section { padding: 14px 12px; border-bottom: 1px solid var(--border); }
+.sidebar-section .title { font-size: 10px; color: #444; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 10px; font-weight: 700; }
 
-/* Metrics & Forms */
+/* ── Metrics & Forms ─────────────────────────────────────────────── */
 .metric { display: flex; justify-content: space-between; padding: 3px 0; }
 .metric .k { color: #555; }
 .metric .v { color: var(--text-bright); }
@@ -102,43 +104,107 @@ button {
     padding: 6px;
     cursor: pointer;
     text-transform: uppercase;
-    transition: all 0.2s;
+    transition: all 0.15s;
 }
 button:hover { background: var(--accent); color: #000; }
 button.danger { border-color: #880000; color: var(--red); }
 button.danger:hover { background: var(--red); color: #fff; }
 
-/* Main Panel */
-.main-panel { flex: 1; overflow-y: auto; padding: 20px; background: var(--bg-raised); }
+/* ── Main Panel ─────────────────────────────────────────────────── */
+.main-panel { flex: 1; overflow-y: auto; padding: 16px 20px; background: var(--bg-raised); }
 
-.meta-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 16px;
-    margin-bottom: 16px;
+.section-label {
+    font-size: 10px;
+    color: #444;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    font-weight: 700;
+    margin-bottom: 10px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
 }
-.panel-card {
+
+/* ── Stat Cards ─────────────────────────────────────────────────── */
+.cards-row {
+    display: grid;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+.cards-row.cols-4 { grid-template-columns: repeat(4, 1fr); }
+.cards-row.cols-3 { grid-template-columns: repeat(3, 1fr); }
+
+.card {
     background: var(--bg-panel);
     border: 1px solid var(--border);
-    padding: 16px;
-    border-left: 2px solid var(--accent);
+    border-left: 2px solid #333;
+    padding: 12px 14px;
+    position: relative;
+    overflow: hidden;
 }
-.panel-card.solo { border-left-color: var(--blue); }
-.panel-card h3 {
-    margin-top: 0;
+.card::after {
+    content: '';
+    position: absolute;
+    top: 0; right: 0;
+    width: 40px; height: 40px;
+    background: radial-gradient(circle at top right, rgba(255,255,255,0.02) 0%, transparent 70%);
+    pointer-events: none;
+}
+.card.accent  { border-left-color: var(--accent); }
+.card.blue    { border-left-color: var(--blue); }
+.card.green   { border-left-color: var(--green); }
+.card.red     { border-left-color: var(--red); }
+.card.orange  { border-left-color: var(--orange); }
+.card.dim     { border-left-color: #333; }
+
+.card-label {
     font-size: 10px;
     color: #555;
     letter-spacing: 1px;
     text-transform: uppercase;
+    margin-bottom: 6px;
+}
+.card-value {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text-max);
+    line-height: 1.1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.card-value.smaller { font-size: 16px; }
+.card-value.tiny    { font-size: 13px; letter-spacing: 0.5px; }
+.card-sub {
+    font-size: 10px;
+    color: var(--text);
+    margin-top: 4px;
+}
+.card-sub .hl { color: var(--text-bright); }
+.card-sub .good { color: var(--green); }
+.card-sub .warn { color: var(--orange); }
+.card-sub .bad  { color: var(--red); }
+
+/* ── Chart ──────────────────────────────────────────────────────── */
+.chart-card {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    padding: 12px 14px;
+    margin-bottom: 10px;
+}
+.chart-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
     margin-bottom: 8px;
 }
-.data-value { font-size: 24px; font-weight: 700; color: var(--text-max); margin-bottom: 4px; }
-.data-sub { font-size: 10px; color: var(--text); }
-.data-sub span { color: var(--text-bright); }
+.chart-legend { display: flex; gap: 14px; font-size: 10px; color: var(--text); }
+.chart-legend span { display: flex; align-items: center; gap: 4px; }
+.chart-legend .dot { width: 8px; height: 2px; border-radius: 1px; }
+canvas#telemetryChart { display: block; width: 100%; height: 110px; }
 
-/* Terminal */
+/* ── Terminal ───────────────────────────────────────────────────── */
 .terminal {
-    height: 180px;
+    height: 160px;
     border-top: 1px solid var(--border-bright);
     display: flex;
     flex-direction: column;
@@ -153,15 +219,19 @@ button.danger:hover { background: var(--red); color: #fff; }
     color: #555;
     text-transform: uppercase;
     letter-spacing: 1px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
 }
-.term-log { flex: 1; overflow-y: auto; padding: 8px 12px; font-size: 11px; }
-.term-line { padding: 2px 0; }
-.log-time { color: #555; margin-right: 8px; }
+.term-hdr-right { color: #333; font-size: 10px; }
+.term-log { flex: 1; overflow-y: auto; padding: 6px 12px; font-size: 11px; }
+.term-line { padding: 1px 0; }
+.log-time { color: #444; margin-right: 8px; }
 
-::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar { width: 4px; }
 ::-webkit-scrollbar-track { background: var(--bg); }
-::-webkit-scrollbar-thumb { background: #222; }
-::-webkit-scrollbar-thumb:hover { background: #333; }
+::-webkit-scrollbar-thumb { background: #1e1e1e; }
+::-webkit-scrollbar-thumb:hover { background: #2a2a2a; }
 </style>
 </head>
 <body>
@@ -169,8 +239,13 @@ button.danger:hover { background: var(--red); color: #fff; }
 <div class="hdr">
     <h1>MIDSTATE<span style="color:var(--accent);">.</span>AXE</h1>
     <div class="hdr-right">
-        <span><div class="live-dot" id="live-dot"></div> <span class="label">STATUS</span> <span class="val" style="color:var(--accent)" id="h-status">MINING</span></span>
-        <span><span class="label">UPTIME</span> <span class="val" id="h-uptime">0h 0m</span></span>
+        <span><div class="live-dot" id="live-dot"></div>&nbsp;<span class="label">STATUS</span>&nbsp;<span class="val" style="color:var(--accent)" id="h-status">MINING</span></span>
+        <div class="hdr-sep"></div>
+        <span><span class="label">HEIGHT</span>&nbsp;<span class="val" id="h-height">—</span></span>
+        <span><span class="label">PEERS</span>&nbsp;<span class="val" id="h-peers">—</span></span>
+        <span><span class="label">SAFE DEPTH</span>&nbsp;<span class="val" id="h-safedepth">—</span></span>
+        <div class="hdr-sep"></div>
+        <span><span class="label">UPTIME</span>&nbsp;<span class="val" id="h-uptime">0h 0m</span></span>
     </div>
 </div>
 
@@ -189,7 +264,7 @@ button.danger:hover { background: var(--red); color: #fff; }
             </div>
             <button onclick="connectWifi()">Connect Wi-Fi</button>
         </div>
-        
+
         <div class="sidebar-section">
             <div class="title">Mining Configuration</div>
             <div class="field-group">
@@ -204,12 +279,11 @@ button.danger:hover { background: var(--red); color: #fff; }
                 <p style="color: var(--accent);">Rewards are deterministically generated by the node.</p>
                 <p style="margin-top: 4px;">Download your rewards log to your main computer, then use the CLI to claim them:</p>
                 <p style="margin-top: 4px;"><code style="color:var(--text-bright)">midstate wallet import-rewards --coinbase-file ./coinbase_seeds.jsonl</code></p>
-                
                 <button type="button" onclick="window.location.href='/axe/rewards'" style="margin-top: 12px; border-color: var(--green); color: var(--green);">
                     ↓ Download Rewards Log
                 </button>
             </div>
-            
+
             <div id="pool-fields" style="display:none;">
                 <div class="field-group">
                     <label>Pool URL</label>
@@ -229,12 +303,11 @@ button.danger:hover { background: var(--red); color: #fff; }
         </div>
 
         <div class="sidebar-section" id="hw-oc-panel">
-            <div class="title">Hardware & Overclock</div>
+            <div class="title">Hardware &amp; Overclock</div>
             <div class="metric"><span class="k">Board</span><span class="v">Pi Zero 2 W</span></div>
             <div class="metric"><span class="k">Arch</span><span class="v">ARMv8 NEON</span></div>
             <div class="metric"><span class="k">Base Clock</span><span class="v">1000 MHz</span></div>
-            <div style="margin-top: 12px;"></div>
-            
+            <div style="margin-top: 10px;"></div>
             <div class="field-group">
                 <label>Target Frequency</label>
                 <select id="cpu-freq">
@@ -244,7 +317,7 @@ button.danger:hover { background: var(--red); color: #fff; }
                 </select>
             </div>
             <div class="field-group">
-                <label>Overvoltage (0-6)</label>
+                <label>Overvoltage (0–6)</label>
                 <input type="number" id="overvoltage" value="4" min="0" max="6">
             </div>
             <button class="danger" onclick="applyOverclock()">Force Turbo</button>
@@ -253,57 +326,126 @@ button.danger:hover { background: var(--red); color: #fff; }
     </div>
 
     <div class="main-panel" id="main-view">
-        <h2 style="font-size:16px; font-weight:700; color:var(--text-max); margin-bottom:16px;">LIVE TELEMETRY</h2>
-        
-        <div class="meta-grid">
-            <div class="panel-card">
-                <h3>Hashrate</h3>
-                <div class="data-value" id="hashrate">--- N/s</div>
-                <div class="data-sub">Algorithm: <span>Seq BLAKE3 (1M)</span></div>
+
+        <!-- Row 1: Hash performance -->
+        <div class="section-label">Mining Performance</div>
+        <div class="cards-row cols-4">
+            <div class="card accent">
+                <div class="card-label">Hashrate</div>
+                <div class="card-value" id="hashrate">— H/s</div>
+                <div class="card-sub">BLAKE3 · 1M iter/hash · <span class="hl" id="simd-label">NEON</span></div>
             </div>
-            <div class="panel-card">
-                <h3>Hardware Temp</h3>
-                <div class="data-value" id="temp">--.-°C</div>
-                <div class="data-sub">Freq: <span id="current-freq">1200 MHz</span></div>
+            <div class="card green">
+                <div class="card-label">Blocks Mined</div>
+                <div class="card-value" id="blocks-mined">—</div>
+                <div class="card-sub">Win rate: <span class="hl" id="win-rate">—</span></div>
             </div>
-            <div class="panel-card solo" id="mode-card">
-                <h3>Network Tip</h3>
-                <div class="data-value" id="height">---</div>
-                <div class="data-sub">Target: <span id="target">---</span></div>
+            <div class="card blue">
+                <div class="card-label">Avg Block Time</div>
+                <div class="card-value" id="avg-block-time">—</div>
+                <div class="card-sub">Last: <span class="hl" id="last-block-age">—</span> ago</div>
             </div>
-            <div class="panel-card">
-                <h3>Mempool</h3>
-                <div class="data-value" id="mempool">-- txs</div>
-                <div class="data-sub">Assembling next block</div>
+            <div class="card orange">
+                <div class="card-label">Hardware Temp</div>
+                <div class="card-value" id="temp">—</div>
+                <div class="card-sub">Freq: <span class="hl" id="current-freq">1200 MHz</span></div>
             </div>
-            
-            <div class="panel-card" style="grid-column: 1 / -1;">
-                <div style="display:flex; justify-content:space-between;">
-                    <h3>Telemetry Timeline</h3>
-                    <span style="font-size:10px; color:var(--text)"><span style="color:var(--accent)">■ Hashrate</span> | <span style="color:var(--red)">■ Temp</span></span>
-                </div>
-            <canvas id="telemetryChart" width="800" height="120" style="width:100%; height:120px; display:block; margin-top:8px;"></canvas>
-        </div>
-            
         </div>
 
-        <div style="color:#555; font-size:11px; margin-top:20px; padding-top:20px; border-top:1px solid var(--border);">
-            <strong>MidstateAxe OS v0.1.0</strong><br>
-            Running bare-metal Buildroot environment. ZRAM enabled (128MB).
+        <!-- Row 2: Chain state -->
+        <div class="section-label" style="margin-top:14px;">Chain State</div>
+        <div class="cards-row cols-4">
+            <div class="card blue" id="mode-card">
+                <div class="card-label">Network Tip</div>
+                <div class="card-value" id="height">—</div>
+                <div class="card-sub">Target: <span class="hl" id="target">—</span></div>
+            </div>
+            <div class="card accent">
+                <div class="card-label">Chain Depth (PoW)</div>
+                <div class="card-value smaller" id="chain-depth">—</div>
+                <div class="card-sub">Accumulated proof-of-work</div>
+            </div>
+            <div class="card green">
+                <div class="card-label">Safe Depth</div>
+                <div class="card-value" id="safe-depth-val">—</div>
+                <div class="card-sub">Blocks for 10⁻⁶ finality risk</div>
+            </div>
+            <div class="card dim">
+                <div class="card-label">Mempool</div>
+                <div class="card-value" id="mempool">—</div>
+                <div class="card-sub">Transactions pending</div>
+            </div>
+        </div>
+
+        <!-- Row 3: Node health -->
+        <div class="section-label" style="margin-top:14px;">Node Health</div>
+        <div class="cards-row cols-4">
+            <div class="card dim">
+                <div class="card-label">Txs Processed</div>
+                <div class="card-value" id="txs-processed">—</div>
+                <div class="card-sub">Since node start</div>
+            </div>
+            <div class="card dim">
+                <div class="card-label">Batches Verified</div>
+                <div class="card-value" id="batches-processed">—</div>
+                <div class="card-sub">Full PoW checks</div>
+            </div>
+            <div class="card red">
+                <div class="card-label">Invalid Rejected</div>
+                <div class="card-value" id="invalid-total">—</div>
+                <div class="card-sub">Batches: <span class="hl" id="invalid-batches">—</span> · Txs: <span class="hl" id="invalid-txs">—</span></div>
+            </div>
+            <div class="card orange">
+                <div class="card-label">Reorgs</div>
+                <div class="card-value" id="reorgs">—</div>
+                <div class="card-sub">Chain reorganisations</div>
+            </div>
+        </div>
+
+        <!-- Chart -->
+        <div class="section-label" style="margin-top:14px;">Telemetry Timeline <span style="color:#333; font-weight:400;">· 3 min rolling</span></div>
+        <div class="chart-card">
+            <div class="chart-header">
+                <div class="chart-legend">
+                    <span><div class="dot" style="background:var(--accent)"></div> Hashrate</span>
+                    <span><div class="dot" style="background:var(--red)"></div> Temp</span>
+                    <span id="chart-block-legend" style="display:none;"><div class="dot" style="background:var(--green); width:2px; height:8px;"></div> Block mined</span>
+                </div>
+                <span style="font-size:10px; color:#444;" id="chart-scale-label">— kH/s max</span>
+            </div>
+            <canvas id="telemetryChart" width="900" height="110"></canvas>
+        </div>
+
+        <div style="color:#333; font-size:10px; padding-top: 6px;">
+            MidstateAxe OS v0.1.0 · BLAKE3 NEON SIMD backend · ZRAM 128 MB
         </div>
     </div>
 </div>
 
 <div class="terminal">
-    <div class="term-hdr">System Console</div>
+    <div class="term-hdr">
+        <span>System Console</span>
+        <span class="term-hdr-right" id="term-count">0 entries</span>
+    </div>
     <div class="term-log" id="term-log"></div>
 </div>
 
 <script>
+// ── State ─────────────────────────────────────────────────────────
 let lastHeight = 0;
 let lastNonces = 0;
 let lastPollTime = Date.now();
+let lastBlockTime = Date.now();  // wall-clock time we last saw height increment
+let blockTimes = [];             // rolling window of block intervals (ms)
+let lastMined = 0;               // last metrics.batches_mined value
+let termCount = 0;
 
+// ── Chart ─────────────────────────────────────────────────────────
+const CHART_TICKS = 60;
+let chartData = [];    // { hashrate, temp }
+let chartEvents = [];  // { tick: index of tick when block was mined }
+
+// ── Helpers ───────────────────────────────────────────────────────
 function log(msg, color = 'var(--text-bright)') {
     const el = document.createElement('div');
     el.className = 'term-line';
@@ -313,273 +455,355 @@ function log(msg, color = 'var(--text-bright)') {
     const box = document.getElementById('term-log');
     box.appendChild(el);
     box.scrollTop = box.scrollHeight;
+    termCount++;
+    document.getElementById('term-count').textContent = termCount + ' entries';
 }
 
-function formatUptime(seconds) {
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
+function fmtUptime(s) {
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
     return `${h}h ${m}m`;
 }
 
-function togglePoolFields() {
-    const mode = document.getElementById('mining-mode').value;
-    
-    // Toggle visibility of the relevant sections
-    document.getElementById('pool-fields').style.display = mode === 'pool' ? 'block' : 'none';
-    document.getElementById('solo-fields').style.display = mode === 'solo' ? 'block' : 'none';
-    
-    const modeCard = document.getElementById('mode-card');
-    if (mode === 'pool') {
-        modeCard.style.borderLeftColor = 'var(--accent)';
-        modeCard.querySelector('h3').innerText = 'Pool Shares';
-        modeCard.querySelector('.data-value').innerText = '0 / 0';
-        modeCard.querySelector('.data-sub').innerHTML = 'Status: <span style="color:var(--accent)">Connected</span>';
-        document.getElementById('h-status').innerText = 'POOL MINING';
-    } else {
-        modeCard.style.borderLeftColor = 'var(--blue)';
-        modeCard.querySelector('h3').innerText = 'Network Tip';
-        modeCard.querySelector('.data-value').innerText = lastHeight || '---';
-        modeCard.querySelector('.data-sub').innerHTML = 'Target: <span>0x0011ff...</span>';
-        document.getElementById('h-status').innerText = 'SOLO MINING';
-    }
+function fmtHashrate(nps) {
+    if (nps >= 1e9) return (nps/1e9).toFixed(2) + ' GH/s';
+    if (nps >= 1e6) return (nps/1e6).toFixed(2) + ' MH/s';
+    if (nps >= 1e3) return (nps/1e3).toFixed(1) + ' kH/s';
+    return nps.toFixed(1) + ' H/s';
 }
 
-
-
-async function connectWifi() {
-    const ssid = document.getElementById('wifi-ssid').value;
-    const pass = document.getElementById('wifi-pass').value;
-    
-    if (!ssid) {
-        log(`Error: SSID is required`, 'var(--red)');
-        return;
-    }
-    
-    log(`Applying Wi-Fi credentials for SSID: ${ssid}...`, 'var(--accent)');
-    
-    try {
-        const res = await fetch('/axe/wifi', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ssid: ssid, password: pass })
-        });
-        
-        const data = await res.json();
-        if (data.status === 'error') {
-            log(`Error: ${data.message}`, 'var(--red)');
-        } else {
-            log(`Success: ${data.message}`, 'var(--green)');
-            log(`Please reconnect your client device to your local Wi-Fi.`, 'var(--blue)');
-        }
-    } catch (e) {
-        log(`Network error while configuring Wi-Fi: ${e.message}`, 'var(--red)');
-    }
+function fmtDepth(d) {
+    // depth is u128 as a number — format in scientific-ish notation
+    if (d >= 1e18) return (d / 1e18).toFixed(2) + 'e18';
+    if (d >= 1e15) return (d / 1e15).toFixed(2) + 'P';
+    if (d >= 1e12) return (d / 1e12).toFixed(2) + 'T';
+    if (d >= 1e9)  return (d / 1e9).toFixed(2) + 'G';
+    if (d >= 1e6)  return (d / 1e6).toFixed(2) + 'M';
+    return d.toString();
 }
 
-async function saveConfig() {
-    const mode = document.getElementById('mining-mode').value;
-    const payout = document.getElementById('payout-addr').value;
-    const poolUrl = document.getElementById('pool-url').value;
-    const poolAddress = document.getElementById('pool-mss-addr').value;
-
-    log(`Saving configuration...`, 'var(--accent)');
-    
-    try {
-        const res = await fetch('/axe/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                mode: mode,
-                // Only send pool data if we are actually in pool mode
-                pool_url: mode === 'pool' ? (poolUrl || null) : null,
-                payout_address: mode === 'pool' ? (payout || null) : null,
-                pool_address: mode === 'pool' ? (poolAddress || null) : null
-            })
-        });
-        
-        const data = await res.json();
-        
-        if (data.status === 'error') {
-            log(`Error: ${data.message}`, 'var(--red)');
-        } else {
-            log(`Config saved! ${data.message}`, 'var(--green)');
-            if (mode === 'pool') {
-                log(`Mode: Pool Mining -> ${poolUrl || 'default'}`);
-                log(`Pool Address set to: ${poolAddress ? poolAddress.substring(0,8) + '...' : 'None'}`);
-                log(`Miner Payout set to: ${payout ? payout.substring(0,8) + '...' : 'None'}`);
-            } else {
-                log(`Mode: Solo Mining (Full Node)`);
-                log(`Rewards logging locally to coinbase_seeds.jsonl`);
-            }
-            log(`The node will adopt the new configuration on the next block template.`, 'var(--accent)');
-        }
-    } catch (e) {
-        log(`Network error while saving config: ${e.message}`, 'var(--red)');
-    }
+function fmtDuration(ms) {
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return s + 's';
+    const m = Math.floor(s / 60), rem = s % 60;
+    return `${m}m ${rem}s`;
 }
 
-async function applyOverclock() {
-    const freq = document.getElementById('cpu-freq').value;
-    const ov = document.getElementById('overvoltage').value;
-    
-    log(`⚠️ DANGER: Applying hardware overclock...`, 'var(--red)');
-    log(`Writing to /boot/config.txt: arm_freq=${freq}, over_voltage=${ov}, force_turbo=1`);
-    
-    try {
-        const res = await fetch('/axe/overclock', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-                freq: parseInt(freq, 10), 
-                overvoltage: parseInt(ov, 10) 
-            })
-        });
-        
-        const data = await res.json();
-        
-        if (data.status === 'error') {
-            log(`Error: ${data.message}`, 'var(--red)');
-        } else {
-            document.getElementById('current-freq').innerText = `${freq} MHz`;
-            log(`Overclock applied. Ensure armor heatsink is firmly attached!`, 'var(--accent)');
-            log(`Rebooting device in 3 seconds to apply firmware changes...`, 'var(--red)');
-            
-            // Disable UI while rebooting
-            document.getElementById('main-view').style.opacity = '0.5';
-            
-            // Reload page after 20 seconds to give the Pi time to boot back up
-            setTimeout(() => {
-                window.location.reload();
-            }, 20000);
-        }
-    } catch (e) {
-        log(`Network error: ${e.message}`, 'var(--red)');
-    }
+function fmtCount(n) {
+    if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n/1e3).toFixed(1) + 'k';
+    return n.toString();
 }
 
-// --- Zero-Dependency Canvas Chart ---
-const historyMax = 60; // 60 ticks @ 3s = 3 mins of history
-let chartData = []; 
-
+// ── Chart Drawing ─────────────────────────────────────────────────
 function drawChart(hashrate, temp) {
     const canvas = document.getElementById('telemetryChart');
     if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const displayW = canvas.clientWidth;
+    const displayH = canvas.clientHeight;
+    if (canvas.width !== displayW * dpr || canvas.height !== displayH * dpr) {
+        canvas.width  = displayW * dpr;
+        canvas.height = displayH * dpr;
+    }
     const ctx = canvas.getContext('2d');
-    const w = canvas.width;
-    const h = canvas.height;
+    ctx.scale(dpr, dpr);
+    const w = displayW, h = displayH;
 
     chartData.push({ hashrate, temp });
-    if (chartData.length > historyMax) chartData.shift();
+    if (chartData.length > CHART_TICKS) {
+        chartData.shift();
+        chartEvents = chartEvents
+            .map(e => ({ tick: e.tick - 1 }))
+            .filter(e => e.tick >= 0);
+    }
 
-    // Clear background
     ctx.clearRect(0, 0, w, h);
-    ctx.lineWidth = 2;
-    ctx.lineJoin = 'round';
 
-    if (chartData.length < 2) return;
+    if (chartData.length < 2) { ctx.setTransform(1,0,0,1,0,0); return; }
 
-    // Dynamic scaling
-    const maxH = Math.max(...chartData.map(d => d.hashrate), 10);
-    const maxT = 85.0; // Fixed max temp for Raspberry Pi throttling limits
-    const stepX = w / (historyMax - 1);
+    const maxH = Math.max(...chartData.map(d => d.hashrate), 1);
+    const maxT = 85.0;
+    const stepX = w / (CHART_TICKS - 1);
+    const padY = 8;
 
-    // Draw Hashrate (Accent/Green)
+    // Grid lines
+    ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 4; i++) {
+        const y = padY + (h - padY * 2) * (i / 4);
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+    }
+
+    // Hashrate fill
+    const gradH = ctx.createLinearGradient(0, 0, 0, h);
+    gradH.addColorStop(0, 'rgba(212,255,0,0.18)');
+    gradH.addColorStop(1, 'rgba(212,255,0,0)');
+    ctx.fillStyle = gradH;
+    ctx.beginPath();
+    for (let i = 0; i < chartData.length; i++) {
+        const x = i * stepX;
+        const y = h - padY - ((chartData[i].hashrate / maxH) * (h - padY * 2));
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.lineTo((chartData.length - 1) * stepX, h);
+    ctx.lineTo(0, h);
+    ctx.closePath();
+    ctx.fill();
+
+    // Hashrate line
     ctx.beginPath();
     ctx.strokeStyle = '#d4ff00';
+    ctx.lineWidth = 1.5;
+    ctx.lineJoin = 'round';
     for (let i = 0; i < chartData.length; i++) {
-        let x = i * stepX;
-        let y = h - ((chartData[i].hashrate / maxH) * h * 0.9);
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
+        const x = i * stepX;
+        const y = h - padY - ((chartData[i].hashrate / maxH) * (h - padY * 2));
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     }
     ctx.stroke();
 
-    // Draw Temp (Red)
+    // Temp line
     ctx.beginPath();
-    ctx.strokeStyle = '#ff4444';
+    ctx.strokeStyle = 'rgba(255,68,68,0.7)';
+    ctx.lineWidth = 1;
+    ctx.lineJoin = 'round';
     for (let i = 0; i < chartData.length; i++) {
-        let x = i * stepX;
-        let y = h - ((Math.min(chartData[i].temp, maxT) / maxT) * h * 0.9);
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
+        const x = i * stepX;
+        const tVal = Math.min(chartData[i].temp, maxT);
+        const y = h - padY - ((tVal / maxT) * (h - padY * 2));
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     }
     ctx.stroke();
+
+    // Block mined markers
+    if (chartEvents.length > 0) {
+        document.getElementById('chart-block-legend').style.display = '';
+        for (const ev of chartEvents) {
+            const x = ev.tick * stepX;
+            ctx.strokeStyle = 'rgba(0,204,102,0.6)';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([2, 3]);
+            ctx.beginPath(); ctx.moveTo(x, padY); ctx.lineTo(x, h - padY); ctx.stroke();
+            ctx.setLineDash([]);
+        }
+    }
+
+    // Scale label
+    document.getElementById('chart-scale-label').textContent = fmtHashrate(maxH) + ' max';
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
 }
 
+// ── Poll ──────────────────────────────────────────────────────────
 async function pollStats() {
     try {
-        const [stateRes, mpRes, axeRes] = await Promise.all([
-            fetch('/state'), fetch('/mempool'), fetch('/axe/stats')
+        const [stateRes, mpRes, axeRes, peersRes, metricsRes] = await Promise.all([
+            fetch('/state'),
+            fetch('/mempool'),
+            fetch('/axe/stats'),
+            fetch('/peers'),
+            fetch('/metrics'),
         ]);
-        
-        const state = await stateRes.json();
-        const mempool = await mpRes.json();
-        const axe = await axeRes.json();
 
-        // Hide hardware UI if running on desktop ---
+        const state   = await stateRes.json();
+        const mempool = await mpRes.json();
+        const axe     = await axeRes.json();
+        const peers   = await peersRes.json();
+        const metrics = await metricsRes.json();
+
+        // ── Hardware visibility ──────────────────────────────────
         if (!axe.is_axe_hardware) {
             document.getElementById('hw-wifi-panel').style.display = 'none';
             document.getElementById('hw-oc-panel').style.display = 'none';
         }
 
-        // Update DOM if in Solo Mode
-        const mode = document.getElementById('mining-mode').value;
-        if (mode === 'solo') {
-            document.getElementById('height').textContent = state.height;
-            document.getElementById('target').textContent = state.target.substring(0, 12) + '...';
-        }
-        
-        document.getElementById('mempool').textContent = mempool.size + ' txs';
-        
-        if (axe.temp_c > 0) {
-            const tempEl = document.getElementById('temp');
-            tempEl.textContent = axe.temp_c.toFixed(1) + '°C';
-            tempEl.style.color = axe.temp_c > 75 ? 'var(--red)' : 'var(--text-max)';
-            
-            if (axe.temp_c > 80) {
-                log(`THERMAL WARNING: SoC Temperature ${axe.temp_c.toFixed(1)}°C exceeds safe limits!`, 'var(--red)');
-            }
-        } else {
-            document.getElementById('temp').textContent = 'N/A';
-        }
-        
-        document.getElementById('h-uptime').textContent = formatUptime(axe.uptime_s);
+        // ── Header ───────────────────────────────────────────────
+        document.getElementById('h-height').textContent = state.height.toLocaleString();
+        document.getElementById('h-peers').textContent  = peers.peers.length;
+        document.getElementById('h-safedepth').textContent = state.safe_depth.toLocaleString();
+        document.getElementById('h-uptime').textContent = fmtUptime(axe.uptime_s);
 
-        // --- REAL HARDWARE HASHRATE CALCULATION ---
+        // ── Mining Performance ───────────────────────────────────
         const now = Date.now();
+        let hashrate = 0;
         if (lastNonces > 0 && axe.total_nonces >= lastNonces) {
-            const deltaNonces = axe.total_nonces - lastNonces;
+            const deltaNonces  = axe.total_nonces - lastNonces;
             const deltaSeconds = (now - lastPollTime) / 1000.0;
-            
-            if (deltaSeconds > 0) {
-                const hashrate = deltaNonces / deltaSeconds;
-                document.getElementById('hashrate').textContent = hashrate.toFixed(1) + ' N/s';
-                drawChart(hashrate, axe.temp_c);
-            }
-        } else if (axe.total_nonces === 0 || document.getElementById('h-status').innerText !== 'MINING') {
-            document.getElementById('hashrate').textContent = '0.0 N/s';
+            if (deltaSeconds > 0) hashrate = deltaNonces / deltaSeconds;
         }
-        
-        lastNonces = axe.total_nonces;
+        if (axe.total_nonces > 0 || hashrate > 0) {
+            document.getElementById('hashrate').textContent = fmtHashrate(hashrate);
+        }
+        lastNonces   = axe.total_nonces;
         lastPollTime = now;
-        // ------------------------------------------
 
-        // Block Logging
+        const mined = metrics.batches_mined;
+        document.getElementById('blocks-mined').textContent = mined.toLocaleString();
+        const winRate = state.height > 0 ? ((mined / state.height) * 100).toFixed(2) + '%' : '—';
+        document.getElementById('win-rate').textContent = winRate;
+
+        // Block mined event
+        if (lastMined > 0 && mined > lastMined) {
+            const diff = mined - lastMined;
+            log(`⛏ Block${diff > 1 ? 's' : ''} mined! (total: ${mined}, height: ${state.height})`, 'var(--accent)');
+            for (let i = 0; i < diff; i++) {
+                chartEvents.push({ tick: chartData.length });
+            }
+        }
+        lastMined = mined;
+
+        // Avg block time (rolling window of last 20 block intervals)
         if (lastHeight > 0 && state.height > lastHeight) {
-            log(`[NETWORK] New block verified at height ${state.height}`, 'var(--green)');
+            const elapsed = now - lastBlockTime;
+            for (let i = 0; i < state.height - lastHeight; i++) {
+                blockTimes.push(elapsed / (state.height - lastHeight));
+            }
+            if (blockTimes.length > 20) blockTimes = blockTimes.slice(-20);
+            lastBlockTime = now;
+            log(`[NET] New block at height ${state.height.toLocaleString()}`, 'var(--green)');
         }
         lastHeight = state.height;
 
+        const avgBlockMs = blockTimes.length > 0
+            ? blockTimes.reduce((a,b) => a+b, 0) / blockTimes.length
+            : 0;
+        document.getElementById('avg-block-time').textContent = avgBlockMs > 0 ? fmtDuration(avgBlockMs) : '—';
+        const sinceLastBlock = now - lastBlockTime;
+        document.getElementById('last-block-age').textContent = lastBlockTime > 0 ? fmtDuration(sinceLastBlock) : '—';
+
+        // ── Temp ─────────────────────────────────────────────────
+        if (axe.temp_c > 0) {
+            const tempEl = document.getElementById('temp');
+            tempEl.textContent = axe.temp_c.toFixed(1) + '°C';
+            tempEl.style.color = axe.temp_c > 75 ? 'var(--red)' : axe.temp_c > 65 ? 'var(--orange)' : 'var(--text-max)';
+            if (axe.temp_c > 80) log(`⚠ THERMAL WARNING: ${axe.temp_c.toFixed(1)}°C — check heatsink!`, 'var(--red)');
+        } else {
+            document.getElementById('temp').textContent = 'N/A';
+        }
+
+        // ── Chain State ──────────────────────────────────────────
+        document.getElementById('height').textContent     = state.height.toLocaleString();
+        document.getElementById('target').textContent     = state.target.substring(0,10) + '…';
+        document.getElementById('chain-depth').textContent = fmtDepth(state.depth);
+        document.getElementById('safe-depth-val').textContent = state.safe_depth.toLocaleString();
+        document.getElementById('mempool').textContent    = mempool.size.toLocaleString();
+
+        // ── Node Health ──────────────────────────────────────────
+        document.getElementById('txs-processed').textContent    = fmtCount(metrics.transactions_processed);
+        document.getElementById('batches-processed').textContent = fmtCount(metrics.batches_processed);
+        const invalidTotal = metrics.invalid_batches + metrics.invalid_transactions;
+        document.getElementById('invalid-total').textContent  = invalidTotal.toLocaleString();
+        document.getElementById('invalid-batches').textContent = metrics.invalid_batches;
+        document.getElementById('invalid-txs').textContent     = metrics.invalid_transactions;
+        document.getElementById('reorgs').textContent          = metrics.reorgs;
+
+        // Reorg warning
+        if (metrics.reorgs > 0) {
+            document.getElementById('reorgs').style.color = 'var(--orange)';
+        }
+
+        // ── Chart ────────────────────────────────────────────────
+        drawChart(hashrate, axe.temp_c > 0 ? axe.temp_c : 0);
+
+        // ── Live dot ─────────────────────────────────────────────
         document.getElementById('live-dot').style.background = 'var(--green)';
+        const mode = document.getElementById('mining-mode').value;
+        document.getElementById('h-status').textContent = mode === 'pool' ? 'POOL MINING' : 'MINING';
+
     } catch (e) {
         document.getElementById('live-dot').style.background = 'var(--red)';
+        document.getElementById('h-status').textContent = 'OFFLINE';
+        document.getElementById('h-status').style.color = 'var(--red)';
     }
 }
 
-// Init
-log('MidstateAxe OS v0.1.0 Booted.', 'var(--accent)');
+// ── Config actions (unchanged from original) ──────────────────────
+function togglePoolFields() {
+    const mode = document.getElementById('mining-mode').value;
+    document.getElementById('pool-fields').style.display = mode === 'pool' ? 'block' : 'none';
+    document.getElementById('solo-fields').style.display = mode === 'solo' ? 'block' : 'none';
+    const modeCard = document.getElementById('mode-card');
+    if (mode === 'pool') {
+        modeCard.style.borderLeftColor = 'var(--accent)';
+        modeCard.querySelector('.card-label').innerText = 'Pool Shares';
+        document.getElementById('h-status').innerText = 'POOL MINING';
+    } else {
+        modeCard.style.borderLeftColor = 'var(--blue)';
+        modeCard.querySelector('.card-label').innerText = 'Network Tip';
+        document.getElementById('h-status').innerText = 'MINING';
+    }
+}
+
+async function connectWifi() {
+    const ssid = document.getElementById('wifi-ssid').value;
+    const pass = document.getElementById('wifi-pass').value;
+    if (!ssid) { log('Error: SSID is required', 'var(--red)'); return; }
+    log(`Applying Wi-Fi credentials for SSID: ${ssid}...`, 'var(--accent)');
+    try {
+        const res = await fetch('/axe/wifi', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ssid, password: pass })
+        });
+        const data = await res.json();
+        if (data.status === 'error') log(`Error: ${data.message}`, 'var(--red)');
+        else { log(`Success: ${data.message}`, 'var(--green)'); log('Please reconnect to your local Wi-Fi.', 'var(--blue)'); }
+    } catch (e) { log(`Network error: ${e.message}`, 'var(--red)'); }
+}
+
+async function saveConfig() {
+    const mode = document.getElementById('mining-mode').value;
+    const payout   = document.getElementById('payout-addr').value;
+    const poolUrl  = document.getElementById('pool-url').value;
+    const poolAddr = document.getElementById('pool-mss-addr').value;
+    log('Saving configuration...', 'var(--accent)');
+    try {
+        const res = await fetch('/axe/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                mode,
+                pool_url:        mode === 'pool' ? (poolUrl  || null) : null,
+                payout_address:  mode === 'pool' ? (payout   || null) : null,
+                pool_address:    mode === 'pool' ? (poolAddr || null) : null,
+            })
+        });
+        const data = await res.json();
+        if (data.status === 'error') log(`Error: ${data.message}`, 'var(--red)');
+        else {
+            log(`Config saved! ${data.message}`, 'var(--green)');
+            log(mode === 'pool' ? `Mode: Pool → ${poolUrl || 'default'}` : 'Mode: Solo Mining', 'var(--text-bright)');
+            log('New config takes effect on the next block template.', 'var(--accent)');
+        }
+    } catch (e) { log(`Network error: ${e.message}`, 'var(--red)'); }
+}
+
+async function applyOverclock() {
+    const freq = document.getElementById('cpu-freq').value;
+    const ov   = document.getElementById('overvoltage').value;
+    log(`⚠ DANGER: Applying overclock arm_freq=${freq} over_voltage=${ov}`, 'var(--red)');
+    try {
+        const res = await fetch('/axe/overclock', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ freq: parseInt(freq), overvoltage: parseInt(ov) })
+        });
+        const data = await res.json();
+        if (data.status === 'error') log(`Error: ${data.message}`, 'var(--red)');
+        else {
+            document.getElementById('current-freq').innerText = freq + ' MHz';
+            log('Overclock applied. Ensure armour heatsink is seated.', 'var(--accent)');
+            log('Rebooting in 3s to apply firmware changes...', 'var(--red)');
+            document.getElementById('main-view').style.opacity = '0.4';
+            setTimeout(() => window.location.reload(), 20000);
+        }
+    } catch (e) { log(`Network error: ${e.message}`, 'var(--red)'); }
+}
+
+// ── Init ──────────────────────────────────────────────────────────
+log('MidstateAxe OS v0.1.0 booted.', 'var(--accent)');
 log('Initializing API link...');
-log('Initialized BLAKE3 NEON SIMD backend...');
+log('BLAKE3 NEON SIMD backend ready.');
 log('Syncing UTXO SMT to network tip...');
 pollStats();
 setInterval(pollStats, 3000);
