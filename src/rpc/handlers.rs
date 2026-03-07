@@ -213,6 +213,19 @@ pub async fn check_coin(
     }))
 }
 
+pub async fn check_commitment(
+    State(node): State<AppState>,
+    Json(req): Json<CheckCommitmentRequest>,
+) -> Result<Json<CheckCommitmentResponse>, ErrorResponse> {
+    let commitment = parse_hex32(&req.commitment, "commitment")?;
+    let exists = node.check_commitment(commitment).await;
+
+    Ok(Json(CheckCommitmentResponse {
+        exists,
+        commitment: hex::encode(commitment),
+    }))
+}
+
 pub async fn get_mempool(State(node): State<AppState>) -> Json<GetMempoolResponse> {
     let (size, transactions) = node.get_mempool_info().await;
 
