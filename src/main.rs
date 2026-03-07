@@ -583,12 +583,15 @@ async fn targeted_scan(
             continue;
         }
         let batch: midstate::core::Batch = resp.json().await?;
+        let block_timestamp = batch.timestamp;
+        let mut block_coins: Vec<[u8; 32]> = Vec::new();
 
         // Scan coinbase outputs
         for cb in &batch.coinbase {
             if addr_set.contains(&cb.address) {
                 if let Some(coin_id) = wallet.import_scanned(cb.address, cb.value, cb.salt)? {
                     println!("  found: {} (value {}, height {})", short_hex(&coin_id), cb.value, height);
+                    block_coins.push(coin_id);
                     imported += 1;
                 }
             }
@@ -602,6 +605,7 @@ async fn targeted_scan(
                         if let Some(_cid) = out.coin_id() {
                             if let Some(coin_id) = wallet.import_scanned(out.address(), out.value(), out.salt())? {
                                 println!("  found: {} (value {}, height {})", short_hex(&coin_id), out.value(), height);
+                                block_coins.push(coin_id);
                                 imported += 1;
                             }
                         }
@@ -609,6 +613,9 @@ async fn targeted_scan(
                 }
             }
         }
+
+        // Record all coins received in this block as a single history entry
+        wallet.record_received(block_coins, block_timestamp);
     }
 
     Ok(imported)
@@ -1721,9 +1728,14 @@ fn wallet_history(path: &PathBuf, count: usize) -> Result<()> {
     println!("Transaction history ({} of {}):\n", entries.len(), history.len());
     for (i, entry) in entries.iter().enumerate() {
         let age = now_secs().saturating_sub(entry.timestamp);
-        println!("  [{}] {} (fee: {})", start + i, format_age(age), entry.fee);
-        for c in &entry.inputs { println!("    spent:   {}", short_hex(c)); }
-        for c in &entry.outputs { println!("    created: {}", short_hex(c)); }
+        let label = match entry.kind.as_str() {
+            "received" => "received",
+            "mixed"    => "mixed",
+            _          => "sent",
+        };
+        println!("  [{}] {} {} (fee: {})", start + i, label, format_age(age), entry.fee);
+        for c in &entry.inputs  { println!("    spent:    {}", short_hex(c)); }
+        for c in &entry.outputs { println!("    created:  {}", short_hex(c)); }
         println!();
     }
     Ok(())
@@ -1811,8 +1823,18 @@ fn wallet_import_rewards(path: &PathBuf, coinbase_file: &PathBuf, data_dir: &Pat
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
 
+    // Infer the data dir from the coinbase file location if not explicitly overridden.
+    // coinbase_seeds.jsonl always lives at <data-dir>/coinbase_seeds.jsonl, so
+    // the natural data-dir is the file's parent. Only fall back to the CLI --data-dir
+    // if the file isn't named coinbase_seeds.jsonl (i.e. user explicitly placed it elsewhere).
+    let inferred_data_dir = if coinbase_file.file_name().and_then(|n| n.to_str()) == Some("coinbase_seeds.jsonl") {
+        coinbase_file.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| data_dir.clone())
+    } else {
+        data_dir.clone()
+    };
+
     println!("Opening node database to retrieve mining seed...");
-    let storage = midstate::storage::Storage::open(data_dir.join("db"))
+    let storage = midstate::storage::Storage::open(inferred_data_dir.join("db"))
         .context("Failed to open node database. Is the node running? Stop the node first to safely import rewards.")?;
     
     let mining_seed = storage.load_mining_seed()?

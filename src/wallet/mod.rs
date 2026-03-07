@@ -69,6 +69,13 @@ pub struct HistoryEntry {
     pub outputs: Vec<[u8; 32]>,
     pub fee: u64,
     pub timestamp: u64,
+    /// "sent", "received", "mixed", or "coinbase"
+    #[serde(default = "HistoryEntry::default_kind")]
+    pub kind: String,
+}
+
+impl HistoryEntry {
+    fn default_kind() -> String { "sent".into() }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -748,9 +755,17 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                     value: wc.value,
                     salt: wc.salt,
                 });
-                // Check if this is a bare WOTS key (not MSS-backed)
+
                 let is_mss = self.data.mss_keys.iter().any(|k| k.master_pk == wc.owner_pk);
-                if !is_mss {
+                if is_mss {
+                    // MSS coin: sign with the Merkle auth path, not bare WOTS.
+                    let pos = self.data.mss_keys.iter().position(|k| k.master_pk == wc.owner_pk)
+                        .ok_or_else(|| anyhow::anyhow!("MSS key for coin {} not found", short_hex(coin_id)))?;
+                    let keypair = &mut self.data.mss_keys[pos];
+                    if keypair.remaining() == 0 { bail!("MSS key exhausted"); }
+                    let sig = keypair.sign(&commitment)?;
+                    witnesses.push(Witness::sig(sig.to_bytes()));
+                } else {
                     if wc.wots_signed {
                         bail!("WOTS key {} already signed — cannot sign again", short_hex(&wc.owner_pk));
                     }
@@ -763,22 +778,8 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                             c.wots_signed = true;
                         }
                     }
-                }
-                let sig = wots::sign(&wc.seed, &commitment);
-                witnesses.push(Witness::sig(wots::sig_to_bytes(&sig)));
-            } else if let Some(wc) = self.data.coins.iter().find(|c| &c.coin_id == coin_id) {
-                if let Some(pos) = self.data.mss_keys.iter().position(|k| k.master_pk == wc.owner_pk) {
-                    input_reveals.push(InputReveal {
-                        predicate: Predicate::p2pk(&wc.owner_pk),
-                        value: wc.value,
-                        salt: wc.salt,
-                    });
-                    let keypair = &mut self.data.mss_keys[pos];
-                    if keypair.remaining() == 0 { bail!("MSS key exhausted"); }
-                    let sig = keypair.sign(&commitment)?;
-                    witnesses.push(Witness::sig(sig.to_bytes()));
-                } else {
-                    bail!("key for {} not found", short_hex(coin_id));
+                    let sig = wots::sign(&wc.seed, &commitment);
+                    witnesses.push(Witness::sig(wots::sig_to_bytes(&sig)));
                 }
             } else {
                 bail!("coin {} not found in wallet", short_hex(coin_id));
@@ -841,6 +842,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             outputs: pending.outputs.iter().filter_map(|o| o.coin_id()).collect(),
             fee,
             timestamp: now,
+            kind: "sent".into(),
         });
 
         self.data.pending.retain(|p| &p.commitment != commitment);
@@ -850,6 +852,19 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
 
     pub fn history(&self) -> &[HistoryEntry] {
         &self.data.history
+    }
+
+    /// Record a batch of coins received in a single block during scan.
+    /// `block_timestamp` should be the block's timestamp (seconds since epoch).
+    pub fn record_received(&mut self, coin_ids: Vec<[u8; 32]>, block_timestamp: u64) {
+        if coin_ids.is_empty() { return; }
+        self.data.history.push(HistoryEntry {
+            inputs: vec![],
+            outputs: coin_ids,
+            fee: 0,
+            timestamp: block_timestamp,
+            kind: "received".into(),
+        });
     }
 
     /// Plan a private send: splits the transaction into independent, 
@@ -1082,8 +1097,9 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         self.data.history.push(HistoryEntry {
             inputs: spent_coin_ids.to_vec(),
             outputs: vec![coin_id],
-            fee: 0, // fee donor pays, not us (unless we donated)
+            fee: 0,
             timestamp: now,
+            kind: "mixed".into(),
         });
 
         self.save()?;

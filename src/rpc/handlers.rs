@@ -996,3 +996,12 @@ pub async fn axe_download_rewards(
 
     Ok(response)
 }
+
+pub async fn submit_batch(
+    State(node): axum::extract::State<AppState>,
+    axum::Json(batch): axum::Json<crate::core::Batch>,
+) -> Result<axum::Json<serde_json::Value>, ErrorResponse> {
+    node.submit_mined_block(batch) 
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+    Ok(axum::Json(serde_json::json!({ "status": "accepted" })))
+}
