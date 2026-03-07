@@ -338,7 +338,7 @@ async fn database_writer_task(db: Arc<Database>, mut rx: mpsc::Receiver<Verified
                     if share.is_full_block {
                         tracing::info!("🥇 Committing FULL BLOCK win by miner {}!", hex::encode(&share.miner_address[..8]));
                         
-                        // In a real setup, we would immediately forward this to the node
+                        //we immediately forward this to the node
                         if let Some(ref b) = share.batch {
                             let _ = client.post("http://127.0.0.1:8545/api/internal/submit_batch")
                                 .json(b)
