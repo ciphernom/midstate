@@ -1,6 +1,3 @@
-use super::types::hash;
-use rayon::prelude::*;
-
 // ── Winternitz parameter w=16 ───────────────────────────────────────────────
 //
 // The message (32 bytes = 256 bits) is parsed as 16-bit digits:
@@ -21,26 +18,22 @@ pub const CHAINS: usize = MSG_CHAINS + CHECKSUM_CHAINS; // 18
 pub const MAX_DIGIT: u32 = (1 << W) - 1; // 65_535
 pub const SIG_SIZE: usize = CHAINS * 32; // 576 bytes
 
-/// Iteratively hash `data` exactly `n` times using BLAKE3.
-fn hash_n(data: &[u8; 32], n: u32) -> [u8; 32] {
-    let mut x = *data;
-    for _ in 0..n {
-        x = hash(&x);
-    }
-    x
-}
-
 /// Generate a coin ID sequentially. 
 /// Use this inside outer parallel loops (like MSS tree generation) to avoid thread thrashing.
 pub fn keygen_seq(seed: &[u8; 32]) -> [u8; 32] {
+    let mut inputs = [[0u8; 32]; CHAINS];
+    for i in 0..CHAINS {
+        inputs[i] = chain_sk(seed, i);
+    }
+    let targets = [MAX_DIGIT as usize; CHAINS];
+    
+    // Process all 18 chains simultaneously using SIMD
+    let results = crate::core::wots_simd::process_wots_batch(&inputs, &targets);
+    
     let mut endpoints = [[0u8; 32]; CHAINS];
-    endpoints.iter_mut().enumerate().for_each(|(i, chunk)| {
-        let sk_i = chain_sk(seed, i);
-        *chunk = hash_n(&sk_i, MAX_DIGIT);
-    });
+    endpoints.copy_from_slice(&results);
     compress(&endpoints)
 }
-
 /// Derive chain secret key element: sk[i] = BLAKE3(seed || i)
 fn chain_sk(seed: &[u8; 32], i: usize) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
@@ -76,7 +69,7 @@ fn message_digits(msg: &[u8; 32]) -> [u32; MSG_CHAINS] {
 fn checksum_digits(msg_digits: &[u32; MSG_CHAINS]) -> [u32; CHECKSUM_CHAINS] {
     let sum: u32 = msg_digits.iter().map(|&d| MAX_DIGIT - d).sum();
     [
-        (sum >> 16) & 0xFFFF, // high 16 bits (at most 0x000F = 15)
+        (sum >> 16) & 0xFFFF, // high 16 bits
         sum & 0xFFFF,         // low 16 bits
     ]
 }
@@ -92,17 +85,10 @@ fn all_digits(msg: &[u8; 32]) -> [u32; CHAINS] {
 }
 
 /// Generate a coin ID (public key) from a seed (private key).
-///
-/// Each chain element is hashed MAX_DIGIT (65535) times to reach the endpoint.
-/// Cost: CHAINS × MAX_DIGIT = 18 × 65535 ≈ 1.18M hashes.
-/// With BLAKE3: ~1–2 ms on modern hardware.
+/// Because SIMD processing is so fast, spawning Rayon threads for 
+/// only 18 items adds latency. We route directly to the SIMD sequence.
 pub fn keygen(seed: &[u8; 32]) -> [u8; 32] {
-    let mut endpoints = [[0u8; 32]; CHAINS];
-    endpoints.par_iter_mut().enumerate().for_each(|(i, chunk)| {
-        let sk_i = chain_sk(seed, i);
-        *chunk = hash_n(&sk_i, MAX_DIGIT);
-    });
-    compress(&endpoints)
+    keygen_seq(seed)
 }
 
 /// Sign a 32-byte message with the given seed.
@@ -111,11 +97,20 @@ pub fn keygen(seed: &[u8; 32]) -> [u8; 32] {
 /// The verifier can hash the remaining (MAX_DIGIT - d_i) times to reach the endpoint.
 pub fn sign(seed: &[u8; 32], message: &[u8; 32]) -> [[u8; 32]; CHAINS] {
     let digits = all_digits(message);
+    
+    let mut inputs = [[0u8; 32]; CHAINS];
+    let mut targets = [0usize; CHAINS];
+    
+    for i in 0..CHAINS {
+        inputs[i] = chain_sk(seed, i);
+        targets[i] = digits[i] as usize;
+    }
+    
+    // Compute the signature via the variable-masking SIMD processor
+    let results = crate::core::wots_simd::process_wots_batch(&inputs, &targets);
+    
     let mut sig = [[0u8; 32]; CHAINS];
-    sig.par_iter_mut().enumerate().for_each(|(i, chunk)| {
-        let sk_i = chain_sk(seed, i);
-        *chunk = hash_n(&sk_i, digits[i]);
-    });
+    sig.copy_from_slice(&results);
     sig
 }
 
@@ -128,11 +123,17 @@ pub fn sign(seed: &[u8; 32], message: &[u8; 32]) -> [[u8; 32]; CHAINS] {
 /// With BLAKE3: ~0.5–1 ms on modern hardware.
 pub fn verify(sig: &[[u8; 32]; CHAINS], message: &[u8; 32], coin_id: &[u8; 32]) -> bool {
     let digits = all_digits(message);
+    let mut targets = [0usize; CHAINS];
+    
+    for i in 0..CHAINS {
+        targets[i] = (MAX_DIGIT - digits[i]) as usize;
+    }
+    
+    // Finish the hash chains simultaneously using SIMD
+    let results = crate::core::wots_simd::process_wots_batch(sig, &targets);
+    
     let mut endpoints = [[0u8; 32]; CHAINS];
-    endpoints.par_iter_mut().enumerate().for_each(|(i, chunk)| {
-        let remaining = MAX_DIGIT - digits[i];
-        *chunk = hash_n(&sig[i], remaining);
-    });
+    endpoints.copy_from_slice(&results);
     compress(&endpoints) == *coin_id
 }
 
