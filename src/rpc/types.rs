@@ -292,3 +292,15 @@ pub struct GetMetricsResponse {
     pub invalid_transactions: u64,
     pub reorgs: u64,
 }
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckOutputRequest {
+    pub address: String,
+    pub value: u64,
+    pub salt: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckOutputResponse {
+    pub coin_id: String,
+    pub exists: bool,
+}
