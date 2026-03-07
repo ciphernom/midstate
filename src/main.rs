@@ -636,19 +636,37 @@ async fn wallet_spend_script(
     let mut wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
 
-    let coin_id = wallet.resolve_coin(&coin_ref)?;
-    let coin = wallet.find_coin(&coin_id).cloned()
+    let target_coin_id = wallet.resolve_coin(&coin_ref)?;
+    let target_coin = wallet.find_coin(&target_coin_id).cloned()
         .ok_or_else(|| anyhow::anyhow!("Coin not found in local wallet"))?;
 
     let bytecode = hex::decode(&bytecode_hex).context("Invalid bytecode hex")?;
     let script_address = midstate::core::types::hash(&bytecode);
-    if script_address != coin.address {
+    if script_address != target_coin.address {
         anyhow::bail!("Bytecode hash does not match coin address");
     }
 
     if to_args.is_empty() && burn_data.is_none() { 
         anyhow::bail!("Must specify at least one output via --to or --burn-data"); 
     }
+
+    // --- 1. SMART CO-SPEND: Gather all sibling coins ---
+    let is_mss = wallet.data.mss_keys.iter().any(|k| midstate::core::compute_address(&k.master_pk) == target_coin.address);
+    let mut spending_coins = vec![target_coin.clone()];
+    
+    if !is_mss {
+        for c in wallet.data.coins.iter() {
+            if c.address == target_coin.address && c.coin_id != target_coin_id {
+                spending_coins.push(c.clone());
+            }
+        }
+        if spending_coins.len() > 1 {
+            println!("Auto-merging {} sibling coin(s) to protect WOTS key...", spending_coins.len() - 1);
+        }
+    }
+
+    let in_sum: u64 = spending_coins.iter().map(|c| c.value).sum();
+    // ----------------------------------------------------
 
     let mut outputs = Vec::new();
     let mut out_sum = 0u64;
@@ -669,13 +687,37 @@ async fn wallet_spend_script(
         out_sum += val;
     }
 
-    if coin.value <= out_sum {
-        anyhow::bail!("Input value ({}) must exceed output value ({})", coin.value, out_sum);
+    if in_sum <= out_sum {
+        anyhow::bail!("Total input value ({}) must exceed output value ({}) to pay fee", in_sum, out_sum);
     }
 
+    // --- 2. AUTO-CHANGE GENERATION ---
+    // If the inputs (including siblings) vastly exceed the requested outputs,
+    // we generate change to prevent paying a massive fee. We assume a base 100-unit fee.
+    let base_fee = 100;
+    let mut change_seeds = Vec::new();
+    
+    if in_sum > out_sum + base_fee {
+        let change_val = in_sum - out_sum - base_fee;
+        let change_denoms = midstate::core::decompose_value(change_val);
+        for denom in change_denoms {
+            let seed = wallet.next_wots_seed();
+            let pk = midstate::core::wots::keygen(&seed);
+            let addr = midstate::core::compute_address(&pk);
+            let salt: [u8; 32] = rand::random();
+            let idx = outputs.len();
+            outputs.push(OutputData::Standard { address: addr, value: denom, salt });
+            change_seeds.push((idx, seed));
+        }
+        println!("Auto-generated {} change output(s) totaling {}", change_seeds.len(), change_val);
+    }
+    // ---------------------------------
+
+    let input_coin_ids: Vec<[u8; 32]> = spending_coins.iter().map(|c| c.coin_id).collect();
     let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+    
     let commit_req = rpc::CommitRequest {
-        coins: vec![hex::encode(coin_id)],
+        coins: input_coin_ids.iter().map(|c| hex::encode(c)).collect(),
         destinations: output_commit_hashes.iter().map(hex::encode).collect(),
     };
 
@@ -694,6 +736,7 @@ async fn wallet_spend_script(
     }
     println!("✓ Commit mined!");
 
+    // Generate the witness stack (only needs to be solved once!)
     let mut stack_items = Vec::new();
     for token in inputs_arg.split(',').filter(|s| !s.is_empty()) {
         if token.starts_with("AUTO:") {
@@ -705,14 +748,26 @@ async fn wallet_spend_script(
             stack_items.push(hex::decode(token).context("Invalid hex in --inputs")?);
         }
     }
+    let witness_string = stack_items.iter().map(hex::encode).collect::<Vec<_>>().join(",");
 
-    let reveal_req = rpc::SendTransactionRequest {
-        inputs: vec![rpc::InputRevealJson {
-            bytecode: bytecode_hex,
+    // --- 3. DUPLICATE WITNESS FOR SIBLINGS ---
+    let mut rpc_inputs = Vec::new();
+    let mut rpc_signatures = Vec::new();
+
+    for coin in &spending_coins {
+        rpc_inputs.push(rpc::InputRevealJson {
+            bytecode: bytecode_hex.clone(),
             value: coin.value,
             salt: hex::encode(coin.salt),
-        }],
-        signatures: vec![stack_items.iter().map(hex::encode).collect::<Vec<_>>().join(",")],
+        });
+        // The exact same witness string satisfies all sibling coins
+        rpc_signatures.push(witness_string.clone());
+    }
+    // -----------------------------------------
+
+    let reveal_req = rpc::SendTransactionRequest {
+        inputs: rpc_inputs,
+        signatures: rpc_signatures,
         outputs: outputs.iter().map(|o| match o {
             OutputData::Standard { address, value, salt } => rpc::OutputDataJson::Standard {
                 address: hex::encode(address),
@@ -735,8 +790,29 @@ async fn wallet_spend_script(
         anyhow::bail!("Reveal failed: {}", err.error);
     }
 
-    wallet.data.coins.retain(|c| c.coin_id != coin_id);
+    // --- 4. CLEANUP WALLET STATE ---
+    // Remove all spent coins
+    wallet.data.coins.retain(|c| !input_coin_ids.contains(&c.coin_id));
+    
+    // Save new change coins
+    for (idx, seed) in change_seeds {
+        let out = &outputs[idx];
+        if let OutputData::Standard { address, value, salt } = out {
+            let owner_pk = midstate::core::wots::keygen(&seed);
+            wallet.data.coins.push(midstate::wallet::WalletCoin {
+                seed,
+                owner_pk,
+                address: *address,
+                value: *value,
+                salt: *salt,
+                coin_id: out.coin_id().unwrap(),
+                label: Some(format!("change ({})", value)),
+                wots_signed: false,
+            });
+        }
+    }
     wallet.save()?;
+    // -------------------------------
 
     println!("✓ Custom script spent successfully!");
     Ok(())
