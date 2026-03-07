@@ -332,7 +332,7 @@ canvas#telemetryChart { display: block; width: 100%; height: 110px; }
         <div class="cards-row cols-4">
             <div class="card accent">
                 <div class="card-label">Hashrate</div>
-                <div class="card-value" id="hashrate">— H/s</div>
+                <div class="card-value" id="hashrate">— N/s</div>
                 <div class="card-sub">BLAKE3 · 1M iter/hash · <span class="hl" id="simd-label">NEON</span></div>
             </div>
             <div class="card green">
@@ -411,7 +411,7 @@ canvas#telemetryChart { display: block; width: 100%; height: 110px; }
                     <span><div class="dot" style="background:var(--red)"></div> Temp</span>
                     <span id="chart-block-legend" style="display:none;"><div class="dot" style="background:var(--green); width:2px; height:8px;"></div> Block mined</span>
                 </div>
-                <span style="font-size:10px; color:#444;" id="chart-scale-label">— kH/s max</span>
+                <span style="font-size:10px; color:#444;" id="chart-scale-label">— kN/s max</span>
             </div>
             <canvas id="telemetryChart" width="900" height="110"></canvas>
         </div>
@@ -465,10 +465,10 @@ function fmtUptime(s) {
 }
 
 function fmtHashrate(nps) {
-    if (nps >= 1e9) return (nps/1e9).toFixed(2) + ' GH/s';
-    if (nps >= 1e6) return (nps/1e6).toFixed(2) + ' MH/s';
-    if (nps >= 1e3) return (nps/1e3).toFixed(1) + ' kH/s';
-    return nps.toFixed(1) + ' H/s';
+    if (nps >= 1e9) return (nps/1e9).toFixed(2) + ' GN/s';
+    if (nps >= 1e6) return (nps/1e6).toFixed(2) + ' MN/s';
+    if (nps >= 1e3) return (nps/1e3).toFixed(1) + ' kN/s';
+    return nps.toFixed(1) + ' N/s';
 }
 
 function fmtDepth(d) {
