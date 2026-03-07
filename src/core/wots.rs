@@ -161,6 +161,7 @@ pub fn sig_from_bytes(bytes: &[u8]) -> Option<[[u8; 32]; CHAINS]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash;
 
     #[test]
     fn sign_verify_round_trip() {
