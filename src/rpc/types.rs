@@ -283,3 +283,12 @@ pub struct AxeOverclockRequest {
     pub freq: u32,
     pub overvoltage: u32,
 }
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetMetricsResponse {
+    pub transactions_processed: u64,
+    pub batches_processed: u64,
+    pub batches_mined: u64,
+    pub invalid_batches: u64,
+    pub invalid_transactions: u64,
+    pub reorgs: u64,
+}
