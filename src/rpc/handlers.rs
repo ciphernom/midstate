@@ -1,5 +1,5 @@
 use super::types::*;
-use crate::core::{compute_commitment, compute_address, hash_concat, wots,
+use crate::core::{compute_commitment, compute_coin_id, compute_address, hash_concat, wots,
                   block_reward, Transaction, InputReveal, OutputData, Predicate, Witness};
 use crate::node::NodeHandle;
 use axum::{
@@ -714,6 +714,20 @@ pub async fn check_coin_get(
     Ok(Json(CheckCoinResponse {
         exists,
         coin: hex::encode(coin),
+    }))
+}
+
+pub async fn check_output(
+    State(node): State<AppState>,
+    Json(req): Json<CheckOutputRequest>,
+) -> Result<Json<CheckOutputResponse>, ErrorResponse> {
+    let address = parse_hex32(&req.address, "address")?;
+    let salt    = parse_hex32(&req.salt,    "salt")?;
+    let coin_id = compute_coin_id(&address, req.value, &salt);
+    let exists  = node.check_coin(coin_id).await;
+    Ok(Json(CheckOutputResponse {
+        coin_id: hex::encode(coin_id),
+        exists,
     }))
 }
 
