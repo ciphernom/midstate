@@ -80,31 +80,40 @@ pub fn mine_extension(
             let tx = tx.clone();
             let hash_counter = Arc::clone(&hash_counter);
             std::thread::spawn(move || {
+                let lanes = crate::core::simd_mining::detected_level().lanes();
                 let mut attempts = 0u64;
                 loop {
                     if cancel.load(Ordering::Relaxed) || found.load(Ordering::Relaxed) {
                         return;
                     }
 
-                    attempts += 1;
-                    hash_counter.fetch_add(1, Ordering::Relaxed);
-                    let nonce: u64 = rand::random();
-                    let ext = create_extension(midstate, nonce);
+                    // Generate N random nonces where N = SIMD width (4 NEON, 8 AVX2)                   
+                    let mut nonces = [0u64; 8]; // Max width for AVX2. Stack allocated.
+                    for i in 0..lanes {
+                        nonces[i] = rand::random();
+                    }
                     
-                    if ext.final_hash < target {
-                        found.store(true, Ordering::Relaxed);
-                        let _ = tx.send((MiningResult::Block(ext), attempts));
-                        return;
-                    } else if let Some(pt) = pool_target {
-                        if ext.final_hash < pt {
+                    attempts += lanes as u64;
+                    hash_counter.fetch_add(lanes as u64, Ordering::Relaxed);
+
+                    //let results = crate::core::simd_mining::mine_batch(midstate, &nonces);
+                    let results = crate::core::simd_mining::mine_batch(midstate, &nonces[..lanes]);
+                    for &(nonce, final_hash) in &results {
+                        if final_hash < target {
                             found.store(true, Ordering::Relaxed);
-                            let _ = tx.send((MiningResult::Share(ext), attempts));
+                            let ext = Extension { nonce, final_hash };
+                            let _ = tx.send((MiningResult::Block(ext), attempts));
                             return;
+                        } else if let Some(pt) = pool_target {
+                            if final_hash < pt {
+                                found.store(true, Ordering::Relaxed);
+                                let ext = Extension { nonce, final_hash };
+                                let _ = tx.send((MiningResult::Share(ext), attempts));
+                                return;
+                            }
                         }
                     }
                     
-                    // Prevent CPU starvation by yielding the thread periodically.
-                    // This allows the Tokio network executor to process incoming blocks.
                     if attempts % 10_000 == 0 {
                         std::thread::yield_now();
                     }
@@ -153,6 +162,7 @@ fn mine_extension_single(
     cancel: Arc<AtomicBool>,
     hash_counter: Arc<std::sync::atomic::AtomicU64>
 ) -> Option<MiningResult> {
+    let lanes = crate::core::simd_mining::detected_level().lanes();
     let mut attempts = 0u64;
 
     loop {
@@ -161,24 +171,32 @@ fn mine_extension_single(
             return None;
         }
 
-        attempts += 1;
-        hash_counter.fetch_add(1, Ordering::Relaxed);
-        let nonce: u64 = rand::random();
+        let mut nonces = [0u64; 8];
+        for i in 0..lanes {
+            nonces[i] = rand::random();
+        }
 
-        let ext = create_extension(midstate, nonce);
-        if ext.final_hash < target {
-            tracing::info!(
-                "Found valid block extension! nonce={} attempts={} hash={}",
-                nonce, attempts, hex::encode(ext.final_hash)
-            );
-            return Some(MiningResult::Block(ext));
-        } else if let Some(pt) = pool_target {
-            if ext.final_hash < pt {
+        attempts += lanes as u64;
+        hash_counter.fetch_add(lanes as u64, Ordering::Relaxed);
+
+        // Pass the slice just like you did in the multi-threaded version
+        let results = crate::core::simd_mining::mine_batch(midstate, &nonces[..lanes]);
+
+        for &(nonce, final_hash) in &results {
+            if final_hash < target {
                 tracing::info!(
-                    "Found valid pool share! nonce={} attempts={} hash={}",
-                    nonce, attempts, hex::encode(ext.final_hash)
+                    "Found valid block extension! nonce={} attempts={} hash={}",
+                    nonce, attempts, hex::encode(final_hash)
                 );
-                return Some(MiningResult::Share(ext));
+                return Some(MiningResult::Block(Extension { nonce, final_hash }));
+            } else if let Some(pt) = pool_target {
+                if final_hash < pt {
+                    tracing::info!(
+                        "Found valid pool share! nonce={} attempts={} hash={}",
+                        nonce, attempts, hex::encode(final_hash)
+                    );
+                    return Some(MiningResult::Share(Extension { nonce, final_hash }));
+                }
             }
         }
     }
