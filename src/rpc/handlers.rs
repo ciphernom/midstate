@@ -291,6 +291,17 @@ pub async fn get_peers(State(node): State<AppState>) -> Json<GetPeersResponse> {
     Json(GetPeersResponse { peers })
 }
 
+pub async fn get_metrics(State(node): State<AppState>) -> Json<GetMetricsResponse> {
+    Json(GetMetricsResponse {
+        transactions_processed: node.metrics.transactions_processed(),
+        batches_processed:      node.metrics.batches_processed(),
+        batches_mined:          node.metrics.batches_mined(),
+        invalid_batches:        node.metrics.invalid_batches(),
+        invalid_transactions:   node.metrics.invalid_transactions(),
+        reorgs:                 node.metrics.reorgs(),
+    })
+}
+
 // ── CoinJoin Mix Handlers ───────────────────────────────────────────────
 
 pub async fn mix_create(
