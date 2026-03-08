@@ -424,7 +424,7 @@ mod neon {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    
     #[test]
     fn test_process_wots_batch_correctness() {
         // Create 10 dummy hash chains with highly varied targets to test the masking trick
