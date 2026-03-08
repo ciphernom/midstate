@@ -55,11 +55,6 @@ const STEM_TIMEOUT_SECS: u64 = 30;
 /// unbounded memory growth under PoW spam from multiple Sybil peers.
 const MAX_STEM_POOL_SIZE: usize = 1000;
 
-/// Max GetBatches/GetHeaders requests per peer per rate-limit window.
-const MAX_BLOCK_REQS_PER_PEER: u32 = 10;
-/// Rate-limit window for block/header requests in seconds.
-const BLOCK_REQ_WINDOW_SECS: u64 = 10;
-
 /// GetBatches requests are expensive (up to 8 MB each). Limit them separately.
 /// 500 per 60 seconds allows fast sync while still bounding worst-case CPU/disk load.
 const MAX_BATCH_REQS_PER_PEER: u32 = 500;
@@ -159,7 +154,6 @@ pub struct Node {
     /// After STEM_TIMEOUT_SECS without being fluffed, we fluff them ourselves.
     stem_pool: HashMap<[u8; 32], (Transaction, std::time::Instant)>,
     /// Per-peer rate limiter for GetBatches/GetHeaders requests.
-    peer_block_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     /// Separate rate-limit counter for GetBatches (expensive disk reads).
     peer_batch_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     hash_counter: Arc<AtomicU64>,
@@ -596,7 +590,6 @@ pub async fn new(
             peer_tx_counts: HashMap::new(),
             cmd_tx: None,
             stem_pool: HashMap::new(),
-            peer_block_req_counts: HashMap::new(),
             peer_batch_req_counts: HashMap::new(),
             hash_counter: Arc::new(AtomicU64::new(0)),
             banned_subnets: HashMap::new(),
