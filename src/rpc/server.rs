@@ -49,6 +49,7 @@ impl RpcServer {
             .route("/commit", post(commit_transaction))
             .route("/send", post(send_transaction))
             .route("/check", post(check_coin))
+            .route("/check_commitment", post(check_commitment))
             .route("/mempool", get(get_mempool))
             .route("/keygen", get(generate_key))
             .route("/peers", get(get_peers))
