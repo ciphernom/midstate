@@ -191,6 +191,7 @@ pub struct NodeHandle {
 }
 
 pub enum NodeCommand {
+    SubmitMinedBlock(Batch),
     SendTransaction(Transaction),
     SubmitMixTransaction { mix_id: [u8; 32], tx: Transaction },
     // --- P2P Mix Coordination Commands ---
@@ -256,7 +257,10 @@ impl NodeHandle {
         self.tx_sender.send(NodeCommand::SendTransaction(tx))?;
         Ok(())
     }
-
+    pub fn submit_mined_block(&self, batch: crate::core::Batch) -> anyhow::Result<()> {
+        self.tx_sender.send(NodeCommand::SubmitMinedBlock(batch))?;
+        Ok(())
+    }
     pub fn scan_addresses(&self, addresses: &[[u8; 32]], start: u64, end: u64) -> Result<Vec<ScannedCoin>> {
         let store = crate::storage::BatchStore::new(&self.batches_path)?;
         let mut found = Vec::new();
@@ -818,7 +822,11 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                         NodeCommand::SendMixSign { coordinator, mix_id, input_index, signature } => {
                             self.network.send(coordinator, Message::MixSign { mix_id, input_index, signature });
                         }
-                        
+                        NodeCommand::SubmitMinedBlock(batch) => {
+                            if let Err(e) = self.handle_new_batch(batch, None).await {
+                                tracing::error!("Failed to process pool-submitted block: {}", e);
+                            }
+                        }
                         NodeCommand::FinishSyncHeaders { peer, headers, is_valid, snapshot } => {
                             if let Err(e) = self.process_verified_headers(peer, headers, is_valid, snapshot).await {
                                 tracing::warn!("Failed to process verified headers: {}", e);
