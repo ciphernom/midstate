@@ -23,29 +23,37 @@ impl Metrics {
         }
     }
     
+    // --- Mutators ---
+    
     pub fn inc_transactions_processed(&self) {
         self.transactions_processed.fetch_add(1, Ordering::Relaxed);
     }
-    
     pub fn inc_batches_processed(&self) {
         self.batches_processed.fetch_add(1, Ordering::Relaxed);
     }
-    
     pub fn inc_batches_mined(&self) {
         self.batches_mined.fetch_add(1, Ordering::Relaxed);
     }
-    
     pub fn inc_invalid_batches(&self) {
         self.invalid_batches.fetch_add(1, Ordering::Relaxed);
     }
-    
     pub fn inc_invalid_transactions(&self) {
         self.invalid_transactions.fetch_add(1, Ordering::Relaxed);
     }
-    
     pub fn inc_reorgs(&self) {
         self.reorgs.fetch_add(1, Ordering::Relaxed);
     }
+    
+    // --- Getters ---
+    
+    pub fn batches_mined(&self) -> u64 { self.batches_mined.load(Ordering::Relaxed) }
+    pub fn transactions_processed(&self) -> u64 { self.transactions_processed.load(Ordering::Relaxed) }
+    pub fn batches_processed(&self) -> u64 { self.batches_processed.load(Ordering::Relaxed) }
+    pub fn invalid_batches(&self) -> u64 { self.invalid_batches.load(Ordering::Relaxed) }
+    pub fn invalid_transactions(&self) -> u64 { self.invalid_transactions.load(Ordering::Relaxed) }
+    pub fn reorgs(&self) -> u64 { self.reorgs.load(Ordering::Relaxed) }
+
+    // --- Reporting ---
     
     pub fn report(&self) {
         tracing::info!(
