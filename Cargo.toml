@@ -34,16 +34,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 redb = "2.0"
 axum = "0.7"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
-reqwest = { version = "0.11", features = ["json"] }
 rpassword = "7.3"
 dirs = "5.0"
 libp2p = { version = "0.54", features = ["tokio", "noise", "tcp", "yamux", "kad", "identify", "request-response", "macros","quic","relay", "dcutr", "autonat"] }
 
+# reqwest: use rustls instead of native openssl — pure Rust, cross-compiles cleanly
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.5.4" # Use the version you currently have
+tikv-jemallocator = "0.5.4"
 
 [target.'cfg(target_env = "msvc")'.dependencies]
-mimalloc = "0.1.43" # Use the version you currently have
+mimalloc = "0.1.43"
 
 [features]
 fast-mining = []
@@ -53,7 +55,7 @@ tempfile = "3.8"
 
 [profile.release]
 opt-level = 3
-lto = "fat"            # Link Time Optimization across all crates
-codegen-units = 1      # Slower to compile, but produces faster code
-panic = "abort"        # Removes panic unwinding infrastructure, saves memory/CPU
-strip = true           # Strips debug symbols, makes the binary tiny
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

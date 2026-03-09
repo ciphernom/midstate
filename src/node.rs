@@ -512,14 +512,14 @@ pub async fn new(
                         state_root, // NEW
                     };
                     storage.save_batch(0, &genesis_batch)?;
-                    apply_batch(&mut state, &genesis_batch, &[])?;
+                    apply_batch(&mut state, &genesis_batch, &[], &std::collections::HashMap::new())?;
                     state.target = adjust_difficulty(&state);
                     storage.save_state(&state)?;
                     tracing::info!("Genesis batch applied, height now {}", state.height);
                 }
                 Some(batch) => {
                     if state.height == 0 {
-                        apply_batch(&mut state, &batch, &[])?;
+                        apply_batch(&mut state, &batch, &[], &std::collections::HashMap::new())?;
                         state.target = adjust_difficulty(&state);
                         storage.save_state(&state)?;
                     }
@@ -1680,7 +1680,12 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
             // leave a Frankenstein chain on disk: some heights from the peer,
             // some from our old chain.  Batches are persisted atomically in
             // perform_reorg only after we decide to adopt.)
-            apply_batch(candidate_state, batch, recent_ts.make_contiguous())?;
+            let wots_oracle = if candidate_state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                self.storage.query_spent_addresses(batch).unwrap_or_default()
+            } else {
+                std::collections::HashMap::new()
+            };
+            apply_batch(candidate_state, batch, recent_ts.make_contiguous(), &wots_oracle)?;
             
             recent_ts.push_back(batch.timestamp);
             if recent_ts.len() > window_size {
@@ -1762,7 +1767,12 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
             }
         }
 
-        match self.mempool.add(tx.clone(), &self.state) {
+        let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+            self.storage.query_spent_addresses_for_tx(&tx).unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
+        match self.mempool.add(tx.clone(), &self.state, &wots_oracle) {
             Ok(_) => {
                 self.metrics.inc_transactions_processed();
 
@@ -1847,7 +1857,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
         // priority over Dandelion++ anonymity under active spam.
         if self.stem_pool.len() >= MAX_STEM_POOL_SIZE {
             tracing::warn!("Stem pool full ({} entries), bypassing Dandelion++ for tx", MAX_STEM_POOL_SIZE);
-            let _ = self.mempool.add(tx.clone(), &self.state);
+            let _ = self.mempool.add(tx.clone(), &self.state, &std::collections::HashMap::new());
             self.network.broadcast(Message::Transaction(tx));
             self.cancel_mining();
             self.trigger_mining();
@@ -1857,7 +1867,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
             if roll < STEM_FLUFF_PERCENT {
                 // Fluff: add to public mempool and broadcast
                 tracing::debug!("Dandelion++ fluff: broadcasting tx after stem");
-                let _ = self.mempool.add(tx.clone(), &self.state);
+                let _ = self.mempool.add(tx.clone(), &self.state, &std::collections::HashMap::new());
                 self.network.broadcast(Message::Transaction(tx));
                 self.cancel_mining();
                 self.trigger_mining();
@@ -1873,7 +1883,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
                     tracing::debug!("Dandelion++ stem: forwarded to {}", next);
                 } else {
                     // No other peers — fluff immediately
-                    let _ = self.mempool.add(tx.clone(), &self.state);
+                    let _ = self.mempool.add(tx.clone(), &self.state, &std::collections::HashMap::new());
                     self.network.broadcast(Message::Transaction(tx));
                     self.cancel_mining();
                     self.trigger_mining();
@@ -1899,7 +1909,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
                     tracing::debug!("Dandelion++ timeout: fluffing valid stem tx");
                     
                     // 2. Try to add to local mempool (might fail if our mempool is full/fee too low)
-                    let _ = self.mempool.add(tx.clone(), &self.state);
+                    let _ = self.mempool.add(tx.clone(), &self.state, &std::collections::HashMap::new());
                     
                     // 3. Broadcast to the network regardless of local mempool admission, 
                     // so the rest of the network gets a chance to mine it.
@@ -2008,7 +2018,14 @@ for (i, batch) in alternative_batches.iter().enumerate() {
                 return Ok(None);
             }
 
-            match apply_batch(&mut candidate_state, batch, recent_headers.make_contiguous()) {
+            match {
+                let wots_oracle = if candidate_state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                    self.storage.query_spent_addresses(batch).unwrap_or_default()
+                } else {
+                    std::collections::HashMap::new()
+                };
+                apply_batch(&mut candidate_state, batch, recent_headers.make_contiguous(), &wots_oracle)
+            } {
 
                 Ok(_) => {
                     recent_headers.push_back(batch.timestamp);
@@ -2137,6 +2154,14 @@ fn perform_reorg(
         // This is the point of no return. 
         self.storage.save_state(&self.state)?;
 
+        // Burn WOTS addresses for all newly adopted blocks.
+        // Idempotent: reorg replays of the same batch write the same commitment value.
+        for (height, _, batch) in &new_history {
+            if let Err(e) = self.storage.burn_batch_addresses(batch, *height) {
+                tracing::warn!("burn_batch_addresses failed at height {}: {}", height, e);
+            }
+        }
+
         // 3. APPLY: Rename .tmp files to .bin.
         // If we crash during this loop, recover_wal() will finish the renames
         // on the next boot (height <= committed_height).
@@ -2190,7 +2215,7 @@ fn perform_reorg(
                         if recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
                             recent_headers.pop_front();
                         }
-                        apply_batch(&mut state, &batch, recent_headers.make_contiguous())?;
+                        apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &std::collections::HashMap::new())?;
                         state.target = adjust_difficulty(&state);
                     } else {
                         anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
@@ -2234,7 +2259,7 @@ fn perform_reorg(
                         if recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
                             recent_headers.pop_front();
                         }
-                        apply_batch(&mut state, &batch, recent_headers.make_contiguous())?;
+                        apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &std::collections::HashMap::new())?;
                         state.target = adjust_difficulty(&state);
                     } else {
                         anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
@@ -2421,7 +2446,12 @@ fn perform_reorg(
 
         // Checks passed — now clone state and apply fully.
         let mut candidate_state = self.state.clone();
-        match apply_batch(&mut candidate_state, &batch, self.recent_headers.make_contiguous()) {
+        let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+            self.storage.query_spent_addresses(&batch).unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
+        match apply_batch(&mut candidate_state, &batch, self.recent_headers.make_contiguous(), &wots_oracle) {
             Ok(_) => {
                 let best = choose_best_state(&self.state, &candidate_state);
                 let is_reorg = best.height == self.state.height &&
@@ -2510,7 +2540,12 @@ fn perform_reorg(
         // Cheap midstate check before expensive state clone.
         if batches[0].prev_midstate == self.state.midstate {
             let mut test_state = self.state.clone();
-            if apply_batch(&mut test_state, &batches[0], self.recent_headers.make_contiguous()).is_ok() {
+            let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                self.storage.query_spent_addresses(&batches[0]).unwrap_or_default()
+            } else {
+                std::collections::HashMap::new()
+            };
+            if apply_batch(&mut test_state, &batches[0], self.recent_headers.make_contiguous(), &wots_oracle).is_ok() {
                 return self.process_linear_extension(batches, from).await;
             }
         }
@@ -2519,7 +2554,12 @@ fn perform_reorg(
         for (i, batch) in batches.iter().enumerate() {
             if batch.prev_midstate != self.state.midstate { continue; }
             let mut candidate = self.state.clone();
-            if apply_batch(&mut candidate, batch, self.recent_headers.make_contiguous()).is_ok() {
+            let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                self.storage.query_spent_addresses(batch).unwrap_or_default()
+            } else {
+                std::collections::HashMap::new()
+            };
+            if apply_batch(&mut candidate, batch, self.recent_headers.make_contiguous(), &wots_oracle).is_ok() {
                 tracing::info!("Found linear extension at batch index {}", i);
                 return self.process_linear_extension(batches[i..].to_vec(), from).await;
             }
@@ -2565,7 +2605,12 @@ async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) 
             // Cheap check before expensive clone
             if batch.prev_midstate != self.state.midstate { break; }
             let mut candidate = self.state.clone();
-            if apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous()).is_ok() {
+            let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                self.storage.query_spent_addresses(&batch).unwrap_or_default()
+            } else {
+                std::collections::HashMap::new()
+            };
+            if apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous(), &wots_oracle).is_ok() {
                 self.recent_headers.push_back(batch.timestamp);
                 if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
                     self.recent_headers.pop_front();
@@ -2639,7 +2684,12 @@ async fn try_apply_orphans(&mut self) {
             let mut matched = false;
             for batch in batches.drain(..) {
                 let mut candidate = self.state.clone();
-                if apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous()).is_ok() {
+                let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                    self.storage.query_spent_addresses(&batch).unwrap_or_default()
+                } else {
+                    std::collections::HashMap::new()
+                };
+                if apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous(), &wots_oracle).is_ok() {
                     self.cancel_mining();
                     self.recent_headers.push_back(batch.timestamp);
                     if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
@@ -2952,7 +3002,12 @@ async fn try_apply_orphans(&mut self) {
 
         let pre_mine_height = self.state.height;
 
-        match apply_batch(&mut self.state, &batch, self.recent_headers.make_contiguous()) {
+        let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+            self.storage.query_spent_addresses(&batch).unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
+        match apply_batch(&mut self.state, &batch, self.recent_headers.make_contiguous(), &wots_oracle) {
             Ok(_) => {
                 self.recent_headers.push_back(batch.timestamp);
                 if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
@@ -2969,8 +3024,13 @@ async fn try_apply_orphans(&mut self) {
                 
                 // 3. NOW SAVE STATE
                 self.storage.save_state(&self.state)?;
+
+                // 4. BURN WOTS ADDRESSES (immediate, post-activation only)
+                if let Err(e) = self.storage.burn_batch_addresses(&batch, pre_mine_height) {
+                    tracing::warn!("burn_batch_addresses failed at height {}: {}", pre_mine_height, e);
+                }
                 
-                // 4. NOW SAVE SNAPSHOT (every SNAPSHOT_INTERVAL blocks)
+                // 5. NOW SAVE SNAPSHOT (every SNAPSHOT_INTERVAL blocks)
                 if self.state.height > 0 && self.state.height % SNAPSHOT_INTERVAL == 0 {
                     if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
                         tracing::warn!("Failed to save state snapshot: {}", e);
@@ -3611,7 +3671,7 @@ mod complex_tests {
         let b2_prime = make_valid_batch(&state_at_2, 20, vec![]); 
         let mut state_at_3_prime = state_at_2.clone();
         let ts_at_2 = vec![state_at_2.timestamp];
-        apply_batch(&mut state_at_3_prime, &b2_prime, &ts_at_2).unwrap();
+        apply_batch(&mut state_at_3_prime, &b2_prime, &ts_at_2, &std::collections::HashMap::new()).unwrap();
         state_at_3_prime.target = adjust_difficulty(&state_at_3_prime);
         
         // B3' (extends B2', making Chain B longer)
@@ -3663,7 +3723,7 @@ mod complex_tests {
         let window_size = DIFFICULTY_LOOKBACK as usize;
         for _ in 0..50 {
             let b = make_valid_batch(&node.state, 10, vec![]);
-            apply_batch(&mut node.state, &b, &recent_headers).unwrap();
+            apply_batch(&mut node.state, &b, &recent_headers, &std::collections::HashMap::new()).unwrap();
             recent_headers.push(node.state.timestamp);
             if recent_headers.len() > window_size { recent_headers.remove(0); }
             node.state.target = adjust_difficulty(&node.state);
@@ -4007,7 +4067,7 @@ mod complex_tests {
 
         for i in 0..3 {
             let b = make_valid_batch(&chain_b_state, 10 + i, vec![]);
-            apply_batch(&mut chain_b_state, &b, &recent_headers).unwrap();
+            apply_batch(&mut chain_b_state, &b, &recent_headers, &std::collections::HashMap::new()).unwrap();
             recent_headers.push(chain_b_state.timestamp);
             if recent_headers.len() > 11 { recent_headers.remove(0); }
             chain_b_state.target = adjust_difficulty(&chain_b_state);
@@ -4045,7 +4105,7 @@ fn build_divergent_chain(
             hdr.height = state.height; 
             headers.push(hdr);
 
-            crate::core::state::apply_batch(&mut state, &batch, &recent_ts).unwrap();
+            crate::core::state::apply_batch(&mut state, &batch, &recent_ts, &std::collections::HashMap::new()).unwrap();
             
             // FIX 2: Push the CURRENT block's timestamp into the history window 
             // after validating it

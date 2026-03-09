@@ -546,6 +546,9 @@ pub const COMMITMENT_TTL: u64 = 1000;
 /// Pruning reclaims ~32 KB per block (~98% of batch storage). Pruned batches
 /// remain fully verifiable via full-chain recomputation in verify_extension.
 pub const PRUNE_DEPTH: u64 = 1000;
+/// Block height at which WOTS address-reuse is enforced at consensus level.
+/// Blocks below this height are grandfathered (network was live before this rule).
+pub const WOTS_REUSE_ACTIVATION_HEIGHT: u64 = 18_000;
 // ── Economics ───────────────────────────────────────────────────────────────
 
 /// Blocks per year at TARGET_BLOCK_TIME seconds per block.
