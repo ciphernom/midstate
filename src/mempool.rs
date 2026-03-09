@@ -57,6 +57,21 @@ fn compute_fee_rate(fee: u64, tx_bytes: u64) -> u64 {
     ((fee as u128 * FEE_RATE_SCALE) / tx_bytes as u128) as u64
 }
 
+/// A stored Reveal transaction with its byte size pre-computed at admission time.
+/// Eliminates repeated `bincode::serialized_size` traversals of 40 KB witness
+/// vectors during RBF checks, eviction loops, drain, and remove_reveal.
+struct MempoolTx {
+    tx: Arc<Transaction>,
+    /// Byte size of `tx` as computed by `bincode::serialized_size` at insertion.
+    size: u64,
+}
+
+impl MempoolTx {
+    fn new(tx: Arc<Transaction>, size: u64) -> Self {
+        Self { tx, size }
+    }
+}
+
 /// A highly efficient, priority-sorted memory pool for pending transactions.
 ///
 /// The mempool is split into two independent, capacity-bounded pools:
@@ -83,7 +98,7 @@ pub struct Mempool {
     commits_by_pow: BTreeSet<(u32, [u8; 32])>,
 
     /// Reveal transactions keyed by their content-hash transaction ID.
-    reveals: HashMap<[u8; 32], Arc<Transaction>>,
+    reveals: HashMap<[u8; 32], MempoolTx>,
     /// Priority index for reveals: `(fee_rate, tx_id)`.
     /// The entry with the *lowest* fee rate is at the front (eviction candidate).
     reveals_by_fee: BTreeSet<(u64, [u8; 32])>,
@@ -338,9 +353,8 @@ impl Mempool {
 
                     // Must outbid every conflicting transaction's fee RATE
                     for &cid in &conflicting_txs {
-                        if let Some(existing_tx) = self.reveals.get(&cid) {
-                            let existing_bytes = bincode::serialized_size(&**existing_tx).unwrap_or(1) as u64;
-                            let existing_rate = compute_fee_rate(existing_tx.fee(), existing_bytes);
+                        if let Some(existing) = self.reveals.get(&cid) {
+                            let existing_rate = compute_fee_rate(existing.tx.fee(), existing.size);
                             
                             if fee_rate <= existing_rate {
                                 anyhow::bail!(
@@ -348,10 +362,10 @@ impl Mempool {
                                     fee_rate, existing_rate
                                 );
                             }
-                            total_evicted_fee = total_evicted_fee.saturating_add(existing_tx.fee());
+                            total_evicted_fee = total_evicted_fee.saturating_add(existing.tx.fee());
                             
                             // Track simulated removal
-                            simulated_bytes = simulated_bytes.saturating_sub(existing_bytes);
+                            simulated_bytes = simulated_bytes.saturating_sub(existing.size);
                             simulated_len = simulated_len.saturating_sub(1);
                         }
                     }
@@ -378,9 +392,8 @@ impl Mempool {
                         }
 
                         if fee_rate > lowest_rate {
-                            if let Some(existing_tx) = self.reveals.get(&lowest_id) {
-                                let existing_bytes = bincode::serialized_size(&**existing_tx).unwrap_or(0) as u64;
-                                simulated_bytes = simulated_bytes.saturating_sub(existing_bytes);
+                            if let Some(existing) = self.reveals.get(&lowest_id) {
+                                simulated_bytes = simulated_bytes.saturating_sub(existing.size);
                                 simulated_len = simulated_len.saturating_sub(1);
                                 to_evict.push(lowest_id);
                             }
@@ -406,7 +419,7 @@ impl Mempool {
                 }
 
                 let arc_tx = Arc::new(reveal_tx);
-                self.reveals.insert(tx_id, arc_tx);
+                self.reveals.insert(tx_id, MempoolTx::new(arc_tx, tx_bytes));
                 self.reveals_by_fee.insert((fee_rate, tx_id));
                 self.current_reveal_bytes += tx_bytes;
             }
@@ -489,7 +502,7 @@ impl Mempool {
                         self.txs_by_input.insert(input, tx_id);
                     }
                     let arc_tx = Arc::new(reveal_tx);
-                    self.reveals.insert(tx_id, arc_tx);
+                    self.reveals.insert(tx_id, MempoolTx::new(arc_tx, tx_bytes));
                     self.reveals_by_fee.insert((fee_rate, tx_id));
                     self.current_reveal_bytes += tx_bytes;
                 }
@@ -527,16 +540,15 @@ impl Mempool {
         while drained.len() < max {
             if let Some(&(rate, id)) = self.reveals_by_fee.iter().next_back() {
                 self.reveals_by_fee.remove(&(rate, id));
-                let arc_tx = self.reveals.remove(&id).unwrap();
+                let mempool_tx = self.reveals.remove(&id).unwrap();
                 
-                let tx_bytes = bincode::serialized_size(&*arc_tx).unwrap_or(0) as u64;
-                self.current_reveal_bytes = self.current_reveal_bytes.saturating_sub(tx_bytes);
+                self.current_reveal_bytes = self.current_reveal_bytes.saturating_sub(mempool_tx.size);
                 
-                for input in arc_tx.input_coin_ids() {
+                for input in mempool_tx.tx.input_coin_ids() {
                     self.seen_inputs.remove(&input);
                     self.txs_by_input.remove(&input);
                 }
-                drained.push(Arc::unwrap_or_clone(arc_tx));
+                drained.push(Arc::unwrap_or_clone(mempool_tx.tx));
             } else {
                 break;
             }
@@ -585,8 +597,8 @@ impl Mempool {
     pub fn transactions(&self) -> Vec<Arc<Transaction>> {
         let mut all = Vec::with_capacity(self.len());
         for &(_, id) in self.reveals_by_fee.iter().rev() {
-            if let Some(arc_tx) = self.reveals.get(&id) {
-                all.push(Arc::clone(arc_tx));
+            if let Some(mempool_tx) = self.reveals.get(&id) {
+                all.push(Arc::clone(&mempool_tx.tx));
             }
         }
         for &(_, comm) in self.commits_by_pow.iter().rev() {
@@ -606,7 +618,7 @@ impl Mempool {
             .filter_map(|&(_, comm)| self.commits.get(&comm).map(Arc::clone))
             .collect();
         let reveals: Vec<Arc<Transaction>> = self.reveals_by_fee.iter().rev()
-            .filter_map(|&(_, id)| self.reveals.get(&id).map(Arc::clone))
+            .filter_map(|&(_, id)| self.reveals.get(&id).map(|m| Arc::clone(&m.tx)))
             .collect();
         (commits, reveals)
     }
@@ -626,12 +638,11 @@ impl Mempool {
 
     /// Helper to cleanly remove a Reveal and its secondary indexes
     fn remove_reveal(&mut self, id: &[u8; 32]) {
-        if let Some(arc_tx) = self.reveals.remove(id) {
-            let tx_bytes = bincode::serialized_size(&*arc_tx).unwrap_or(0) as u64;
-            self.current_reveal_bytes = self.current_reveal_bytes.saturating_sub(tx_bytes);
-            let fee_rate = compute_fee_rate(arc_tx.fee(), tx_bytes);
+        if let Some(mempool_tx) = self.reveals.remove(id) {
+            self.current_reveal_bytes = self.current_reveal_bytes.saturating_sub(mempool_tx.size);
+            let fee_rate = compute_fee_rate(mempool_tx.tx.fee(), mempool_tx.size);
             self.reveals_by_fee.remove(&(fee_rate, *id));
-            for input in arc_tx.input_coin_ids() {
+            for input in mempool_tx.tx.input_coin_ids() {
                 self.seen_inputs.remove(&input);
                 self.txs_by_input.remove(&input);
             }
@@ -660,11 +671,11 @@ impl Mempool {
         }
 
         // 3. O(R) TTL Prune (Instant, no signatures verified)
-        let expired: Vec<_> = self.reveals.iter().filter(|(_, tx)| {
-            if let Transaction::Reveal { inputs, outputs, salt, .. } = &***tx {
+        let expired: Vec<_> = self.reveals.iter().filter(|(_, mempool_tx)| {
+            if let Transaction::Reveal { inputs, outputs, salt, .. } = &*mempool_tx.tx { 
                 let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
                 let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
-                let commit_hash = crate::core::compute_commitment(&input_ids, &output_hashes, salt);
+                let commit_hash = crate::core::compute_commitment(&input_ids, &output_hashes, &salt); 
                 if let Some(&height) = state.commitment_heights.get(&commit_hash) {
                     return state.height.saturating_sub(height) > crate::core::COMMITMENT_TTL;
                 } else {
@@ -719,7 +730,7 @@ impl Mempool {
         let reveals_to_remove: Vec<[u8; 32]> = self
             .reveals
             .iter()
-            .filter(|(_, arc_tx)| validate_transaction(state, arc_tx).is_err())
+            .filter(|(_, mempool_tx)| validate_transaction(state, &mempool_tx.tx).is_err())
             .map(|(id, _)| *id)
             .collect();
 
@@ -751,7 +762,7 @@ impl Mempool {
             self.seen_inputs.insert(input);
         }
         let arc_tx = Arc::new(tx);
-        self.reveals.insert(tx_id, arc_tx);
+        self.reveals.insert(tx_id, MempoolTx::new(arc_tx, tx_bytes));
         self.reveals_by_fee.insert((fee_rate, tx_id));
         self.current_reveal_bytes += tx_bytes;
     }
