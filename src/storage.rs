@@ -10,6 +10,11 @@ use std::sync::Arc;
 
 const STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
 const MINING_SEED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("mining_seed");
+/// Maps spent WOTS address -> the commitment hash that legitimately spent it.
+/// Allows safe replay of the exact same transaction during chain reorgs while
+/// permanently blocking any *different* transaction from reusing the key.
+const SPENT_ADDRESSES_TABLE: TableDefinition<&[u8; 32], &[u8; 32]> =
+    TableDefinition::new("spent_addresses");
 
 /// V1 state layout (depth: u64). Used only for one-time migration from
 /// pre-u128 databases. Identical field order to the old `State` so that
@@ -118,6 +123,7 @@ impl Storage {
                     {
                         let _ = write_txn.open_table(STATE_TABLE)?;
                         let _ = write_txn.open_table(MINING_SEED_TABLE)?;
+                        let _ = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
                     }
                     write_txn.commit()?;
 
@@ -317,6 +323,114 @@ impl Storage {
 
     pub fn highest_batch(&self) -> Result<u64> {
         self.batches.highest()
+    }
+
+    /// Burn every WOTS input address from a committed batch, mapping each to the
+    /// commitment hash that authorised the spend.
+    ///
+    /// - Ignores non-WOTS inputs (MSS etc.) by checking witness size == SIG_SIZE.
+    /// - No-op for blocks below WOTS_REUSE_ACTIVATION_HEIGHT.
+    /// - Idempotent: reorg replays of the same batch write the same value.
+    pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, block_height: u64) -> Result<()> {
+        use crate::core::types::{WOTS_REUSE_ACTIVATION_HEIGHT, Witness, compute_commitment};
+        use crate::core::wots::SIG_SIZE;
+
+        if block_height < WOTS_REUSE_ACTIVATION_HEIGHT {
+            return Ok(());
+        }
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
+            for tx in &batch.transactions {
+                if let crate::core::Transaction::Reveal { inputs, witnesses, outputs, salt } = tx {
+                    let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+                    let output_hashes: Vec<[u8; 32]> = outputs.iter()
+                        .map(|o| o.hash_for_commitment())
+                        .collect();
+                    let commitment = compute_commitment(&input_ids, &output_hashes, salt);
+
+                for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                        let Witness::ScriptInputs(wit_inputs) = witness;
+                        if let Some(sig) = wit_inputs.first() {
+                            // Only burn WOTS keys. MSS and other script types
+                            // have different witness sizes and must not be burned.
+                            if sig.len() == SIG_SIZE {
+                                let addr = input.predicate.address();
+                                table.insert(&addr, &commitment)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Build a pre-flight oracle for a batch: returns a map of
+    /// `address -> prior_commitment` for every WOTS address in the batch
+    /// that already exists in the spent-address table.
+    ///
+    /// The caller uses this to detect reuse: an address is being reused if it
+    /// is present in the map AND the prior commitment differs from the current one.
+    pub fn query_spent_addresses(
+        &self,
+        batch: &crate::core::Batch,
+    ) -> Result<std::collections::HashMap<[u8; 32], [u8; 32]>> {
+        use crate::core::types::Witness;
+        use crate::core::wots::SIG_SIZE;
+
+        let mut result = std::collections::HashMap::new();
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SPENT_ADDRESSES_TABLE)?;
+
+        for tx in &batch.transactions {
+            if let crate::core::Transaction::Reveal { inputs, witnesses, .. } = tx {
+                for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                    let Witness::ScriptInputs(wit_inputs) = witness;
+                        if let Some(sig) = wit_inputs.first() {
+                            if sig.len() == SIG_SIZE {
+                                let addr = input.predicate.address();
+                                if let Some(existing) = table.get(&addr)? {
+                                    result.insert(addr, *existing.value());
+                                }
+                            }
+                        }
+                }
+            }
+        }    
+        Ok(result)
+    }
+
+    /// Single-transaction variant of `query_spent_addresses`.
+    /// Used at mempool admission time when only one tx is being checked.
+    pub fn query_spent_addresses_for_tx(
+        &self,
+        tx: &crate::core::Transaction,
+    ) -> Result<std::collections::HashMap<[u8; 32], [u8; 32]>> {
+        use crate::core::types::Witness;
+        use crate::core::wots::SIG_SIZE;
+
+        let mut result = std::collections::HashMap::new();
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SPENT_ADDRESSES_TABLE)?;
+
+        if let crate::core::Transaction::Reveal { inputs, witnesses, .. } = tx {
+            for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                let Witness::ScriptInputs(wit_inputs) = witness;
+                    if let Some(sig) = wit_inputs.first() {
+                        if sig.len() == SIG_SIZE {
+                            let addr = input.predicate.address();
+                            if let Some(existing) = table.get(&addr)? {
+                                result.insert(addr, *existing.value());
+                            }
+                        }
+                    }
+                }
+            }
+        
+        Ok(result)
     }
 
 }

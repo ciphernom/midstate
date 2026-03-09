@@ -142,7 +142,15 @@ pub(crate) fn calculate_work(target: &[u8; 32]) -> u128 {
 }
 
 /// Apply a batch to the state
-pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]) -> Result<()> {
+pub fn apply_batch(
+    state: &mut State,
+    batch: &Batch,
+    previous_timestamps: &[u64],
+    // Pre-flight oracle: WOTS address -> commitment that previously spent it.
+    // Built by the caller from storage. Pass an empty map pre-activation or
+    // in tests — the check is skipped entirely when the map is empty.
+    spent_oracle: &std::collections::HashMap<[u8; 32], [u8; 32]>,
+) -> Result<()> {
     // 1. Check parent linkage
     if batch.prev_midstate != state.midstate {
         bail!("Block parent mismatch: expected {}, got {}",
@@ -176,6 +184,44 @@ pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]
     //timewarp prevention: Validate timestamp
     if state.height > 0 {
         validate_timestamp(batch.timestamp, previous_timestamps, current_timestamp())?;
+    }
+
+    // WOTS address-reuse consensus check (post-activation).
+    // Uses the pre-built oracle so state.rs stays pure (no storage I/O here).
+    // An address is being reused if it is in the oracle AND the commitment
+    // for this transaction differs from the one that originally spent it.
+    // Same commitment = safe reorg replay of the identical transaction.
+    if state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT && !spent_oracle.is_empty() {
+        for tx in &batch.transactions {
+            if let Transaction::Reveal { inputs, witnesses, outputs, salt } = tx {
+                let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+                let output_hashes: Vec<[u8; 32]> = outputs.iter()
+                    .map(|o| o.hash_for_commitment())
+                    .collect();
+                let this_commitment = crate::core::types::compute_commitment(
+                    &input_ids, &output_hashes, salt,
+                );
+                for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                    let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                    if let Some(sig) = wit_inputs.first() {
+                        if sig.len() == crate::core::wots::SIG_SIZE {
+                            let addr = input.predicate.address();
+                            if let Some(&prior_commitment) = spent_oracle.get(&addr) {
+                                if prior_commitment != this_commitment {
+                                    bail!(
+                                        "Consensus violation: WOTS address {} reused \
+                                         with different commitment (prior: {}, this: {})",
+                                        hex::encode(addr),
+                                        hex::encode(prior_commitment),
+                                        hex::encode(this_commitment),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // 2. Reject batches that would require excessive signature verification
@@ -378,7 +424,7 @@ mod tests {
         let reward = block_reward(state.height);
         let batch = make_empty_batch(&state, reward, state.timestamp + 1);
         let timestamps = vec![state.timestamp];
-        apply_batch(&mut state, &batch, &timestamps).unwrap();
+        apply_batch(&mut state, &batch, &timestamps, &std::collections::HashMap::new()).unwrap();
         assert_eq!(state.height, 1);
     }
 
@@ -390,7 +436,7 @@ mod tests {
         let reward = block_reward(state.height);
         let batch = make_empty_batch(&state, reward, state.timestamp + 1);
         let timestamps = vec![state.timestamp];
-        apply_batch(&mut state, &batch, &timestamps).unwrap();
+        apply_batch(&mut state, &batch, &timestamps, &std::collections::HashMap::new()).unwrap();
         assert_eq!(state.depth, initial_depth + expected_work);
         assert!(expected_work > 0, "work per block must be nonzero");
     }
@@ -402,7 +448,7 @@ mod tests {
         let reward = block_reward(state.height);
         let batch = make_empty_batch(&state, reward, state.timestamp + 1);
         let timestamps = vec![state.timestamp];
-        apply_batch(&mut state, &batch, &timestamps).unwrap();
+        apply_batch(&mut state, &batch, &timestamps, &std::collections::HashMap::new()).unwrap();
         assert_ne!(state.midstate, old_midstate);
         assert_eq!(state.midstate, batch.extension.final_hash);
     }
@@ -414,7 +460,7 @@ mod tests {
         let batch = make_empty_batch(&state, reward, state.timestamp + 1);
         let coinbase_ids: Vec<[u8; 32]> = batch.coinbase.iter().map(|c| c.coin_id()).collect();
         let timestamps = vec![state.timestamp];
-        apply_batch(&mut state, &batch, &timestamps).unwrap();
+        apply_batch(&mut state, &batch, &timestamps, &std::collections::HashMap::new()).unwrap();
         for id in &coinbase_ids {
             assert!(state.coins.contains(id), "coinbase coin should be in state");
         }
@@ -428,7 +474,7 @@ mod tests {
         batch.prev_midstate = [0xFFu8; 32]; // wrong parent
         let mut state2 = state.clone();
         let timestamps = vec![state2.timestamp];
-        assert!(apply_batch(&mut state2, &batch, &timestamps).is_err());
+        assert!(apply_batch(&mut state2, &batch, &timestamps, &std::collections::HashMap::new()).is_err());
     }
 
     #[test]
@@ -438,7 +484,7 @@ mod tests {
         let mut batch = make_empty_batch(&state, reward, state.timestamp + 1);
         batch.target = [0x00; 32]; // wrong target
         let timestamps = vec![state.timestamp];
-        assert!(apply_batch(&mut state, &batch, &timestamps).is_err());
+        assert!(apply_batch(&mut state, &batch, &timestamps, &std::collections::HashMap::new()).is_err());
     }
 
     #[test]
@@ -447,7 +493,7 @@ mod tests {
         // Coinbase with too much value
         let batch = make_empty_batch(&state, block_reward(state.height) + 100, state.timestamp + 1);
         let timestamps = vec![state.timestamp];
-        assert!(apply_batch(&mut state, &batch, &timestamps).is_err());
+        assert!(apply_batch(&mut state, &batch, &timestamps, &std::collections::HashMap::new()).is_err());
     }
 
     #[test]
@@ -459,7 +505,7 @@ mod tests {
             cb.value = 3; // not a power of 2
         }
         let timestamps = vec![state.timestamp];
-        assert!(apply_batch(&mut state, &batch, &timestamps).is_err());
+        assert!(apply_batch(&mut state, &batch, &timestamps, &std::collections::HashMap::new()).is_err());
     }
 
     #[test]
@@ -469,13 +515,13 @@ mod tests {
         let reward = block_reward(state.height);
         let batch0 = make_empty_batch(&state, reward, state.timestamp + 1);
         let timestamps_0 = vec![state.timestamp];
-        apply_batch(&mut state, &batch0, &timestamps_0).unwrap();
+        apply_batch(&mut state, &batch0, &timestamps_0, &std::collections::HashMap::new()).unwrap();
 
         // Now try a batch with timestamp <= previous
         let reward = block_reward(state.height);
         let batch1 = make_empty_batch(&state, reward, state.timestamp); // same timestamp
         let timestamps_1 = vec![state.timestamp];
-        assert!(apply_batch(&mut state, &batch1, &timestamps_1).is_err());
+        assert!(apply_batch(&mut state, &batch1, &timestamps_1, &std::collections::HashMap::new()).is_err());
     }
 
     #[test]
@@ -486,7 +532,7 @@ mod tests {
         // 1. Apply a valid block so height > 0
         let valid_batch = make_empty_batch(&state, reward, state.timestamp + 1);
         let timestamps_0 = vec![state.timestamp];
-        apply_batch(&mut state, &valid_batch, &timestamps_0).unwrap();
+        apply_batch(&mut state, &valid_batch, &timestamps_0, &std::collections::HashMap::new()).unwrap();
 
         // 2. Try to apply an invalid block (timestamp not strictly greater)
         let reward2 = block_reward(state.height);
@@ -494,7 +540,7 @@ mod tests {
         let timestamps_1 = vec![state.timestamp];
 
         
-        let result = apply_batch(&mut state, &invalid_batch, &timestamps_1);
+        let result = apply_batch(&mut state, &invalid_batch, &timestamps_1, &std::collections::HashMap::new());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("greater than previous"));
     }
