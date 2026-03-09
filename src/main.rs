@@ -2309,7 +2309,7 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
         for batch in &batches {
             recent_headers.push(state.timestamp);
             if recent_headers.len() > MEDIAN_TIME_PAST_WINDOW { recent_headers.remove(0); }
-            apply_batch(&mut state, batch, &recent_headers)?;
+            apply_batch(&mut state, batch, &recent_headers, &std::collections::HashMap::new())?;
             storage.save_batch(dl_cursor, batch)?;
             dl_cursor += 1;
         }
