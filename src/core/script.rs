@@ -7,6 +7,13 @@
 use super::types::{hash, OutputData};
 use super::wots;
 use super::mss;
+use smallvec::SmallVec;
+
+// Stack element type alias. 32 bytes covers hashes and public keys inline;
+// larger items (e.g. WOTS signatures at 576 bytes) spill to the heap exactly
+// as a Vec would, so there is no correctness change — only fewer allocations
+// for the 99% case.
+type StackItem = SmallVec<[u8; 32]>;
 
 // ── Opcodes ────────────────────────────────────────────────────────────────
 
@@ -151,7 +158,7 @@ pub fn validate_structure(bytecode: &[u8]) -> Result<(), ScriptError> {
 
 // ── Stack helpers ──────────────────────────────────────────────────────────
 
-fn stack_push(stack: &mut Vec<Vec<u8>>, item: Vec<u8>) -> Result<(), ScriptError> {
+fn stack_push(stack: &mut Vec<StackItem>, item: StackItem) -> Result<(), ScriptError> {
     if item.len() > MAX_ITEM_SIZE {
         return Err(ScriptError::ItemTooLarge);
     }
@@ -162,7 +169,7 @@ fn stack_push(stack: &mut Vec<Vec<u8>>, item: Vec<u8>) -> Result<(), ScriptError
     Ok(())
 }
 
-fn stack_pop(stack: &mut Vec<Vec<u8>>) -> Result<Vec<u8>, ScriptError> {
+fn stack_pop(stack: &mut Vec<StackItem>) -> Result<StackItem, ScriptError> {
     stack.pop().ok_or(ScriptError::StackUnderflow)
 }
 
@@ -176,15 +183,15 @@ fn to_u64(item: &[u8]) -> Result<u64, ScriptError> {
     Ok(u64::from_le_bytes(buf))
 }
 
-fn from_u64(v: u64) -> Vec<u8> {
+fn from_u64(v: u64) -> StackItem {
     if v == 0 {
-        return vec![0];
+        return SmallVec::from_slice(&[0]);
     }
     let mut bytes = v.to_le_bytes().to_vec();
     while bytes.len() > 1 && bytes.last() == Some(&0) {
         bytes.pop();
     }
-    bytes
+    SmallVec::from_vec(bytes)
 }
 
 fn is_true(item: &[u8]) -> bool {
@@ -220,9 +227,9 @@ pub fn execute_script(
 ) -> Result<(), ScriptError> {
     validate_structure(bytecode)?;
 
-    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut stack: Vec<StackItem> = Vec::new();
     for item in witness {
-        stack_push(&mut stack, item.clone())?;
+        stack_push(&mut stack, SmallVec::from_slice(item))?;
     }
     let mut sigop_count = 0;
     let mut pc = 0usize;
@@ -294,7 +301,7 @@ pub fn execute_script(
             OP_PUSH_DATA => {
                 let len = u16::from_le_bytes([bytecode[pc], bytecode[pc + 1]]) as usize;
                 pc += 2;
-                let data = bytecode[pc..pc + len].to_vec();
+                let data = SmallVec::from_slice(&bytecode[pc..pc + len]);
                 pc += len;
                 stack_push(&mut stack, data)?;
             }
@@ -313,7 +320,7 @@ pub fn execute_script(
             OP_EQUAL => {
                 let b = stack_pop(&mut stack)?;
                 let a = stack_pop(&mut stack)?;
-                let result = if a == b { vec![1u8] } else { vec![0u8] };
+                let result: StackItem = if a == b { SmallVec::from_slice(&[1u8]) } else { SmallVec::from_slice(&[0u8]) };
                 stack_push(&mut stack, result)?;
             }
             OP_VERIFY => {
@@ -334,20 +341,20 @@ pub fn execute_script(
             OP_GREATER_OR_EQUAL => {
                 let b = stack_pop(&mut stack)?;
                 let a = stack_pop(&mut stack)?;
-                let result = if to_u64(&a)? >= to_u64(&b)? { vec![1u8] } else { vec![0u8] };
+                let result: StackItem = if to_u64(&a)? >= to_u64(&b)? { SmallVec::from_slice(&[1u8]) } else { SmallVec::from_slice(&[0u8]) };
                 stack_push(&mut stack, result)?;
             }
 
             OP_HASH => {
                 let data = stack_pop(&mut stack)?;
                 let h = hash(&data);
-                stack_push(&mut stack, h.to_vec())?;
+                stack_push(&mut stack, SmallVec::from_slice(&h))?;
             }
             OP_CHECKSIG => {
                 let pk = stack_pop(&mut stack)?;
                 let sig = stack_pop(&mut stack)?;
                 let valid = verify_signature(&sig, ctx.commitment, &pk);
-                stack_push(&mut stack, if valid { vec![1u8] } else { vec![0u8] })?;
+                stack_push(&mut stack, if valid { SmallVec::from_slice(&[1u8]) } else { SmallVec::from_slice(&[0u8]) })?;
             }
             OP_CHECKSIGVERIFY => {
                 let pk = stack_pop(&mut stack)?;
@@ -369,7 +376,7 @@ pub fn execute_script(
                 if addr_item.len() != 32 {
                     return Err(ScriptError::VerifyFailed);
                 }
-                let addr: [u8; 32] = addr_item.try_into().unwrap();
+                let addr: [u8; 32] = addr_item.as_slice().try_into().unwrap();
                 let mut sum: u64 = 0;
                 for out in ctx.outputs {
                     if out.address() == addr {
@@ -388,7 +395,7 @@ pub fn execute_script(
     if stack.len() > 1 { return Err(ScriptError::CleanStackRuleFailed); }
     
     let top = stack.last().unwrap();
-    if top == &vec![1u8] { Ok(()) } else { Err(ScriptError::ScriptMustFinishTrue) }
+    if top.as_slice() == &[1u8] { Ok(()) } else { Err(ScriptError::ScriptMustFinishTrue) }
 }
 
 // ── Script builders ────────────────────────────────────────────────────────
