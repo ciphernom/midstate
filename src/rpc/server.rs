@@ -53,6 +53,7 @@ impl RpcServer {
             .route("/mempool", get(get_mempool))
             .route("/keygen", get(generate_key))
             .route("/peers", get(get_peers))
+            .route("/metrics", get(get_metrics))
             .route("/scan", post(scan_addresses))
             .route("/mss_state", post(get_mss_state))
             .route("/mix/create", post(mix_create))

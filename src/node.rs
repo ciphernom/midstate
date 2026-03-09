@@ -186,6 +186,7 @@ pub struct NodeHandle {
     pub mix_manager: Arc<RwLock<MixManager>>,
     pub commit_limiter: Arc<tokio::sync::Semaphore>, 
     pub hash_counter: Arc<AtomicU64>,
+    pub metrics: Metrics,
     /// Our local PeerId, needed for PeerId-bound CoinJoin PoW.
     local_peer_id: PeerId,
 }
@@ -639,6 +640,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
             mix_manager: Arc::clone(&self.mix_manager),
             commit_limiter: Arc::new(tokio::sync::Semaphore::new(4)), // <--  (Max 4 concurrent PoW tasks)
             hash_counter: Arc::clone(&self.hash_counter),
+            metrics: self.metrics.clone(),
             local_peer_id: self.network.local_peer_id(),
         };
         (handle, rx)
