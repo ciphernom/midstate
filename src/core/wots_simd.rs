@@ -90,46 +90,71 @@ pub fn scalar_wots_chain(mut val: [u8; 32], iters: usize) -> [u8; 32] {
 }
 
 /// Process an arbitrary number of WOTS chains dynamically.
-/// Automatically chunks the workload into optimal SIMD batches and uses 
+///
+/// Before chunking into SIMD batches, chains are sorted by their required
+/// iteration count (descending) so that chains with similar depths land in
+/// the same batch. This minimises the `max_iters` drag caused by one long
+/// chain pulling shorter chains through thousands of ghost-hash iterations.
+/// Results are unshuffled back to the original index order before returning.
+///
+/// Automatically chunks the workload into optimal SIMD batches and uses
 /// the scalar fallback for any remainder.
 pub fn process_wots_batch(inputs: &[[u8; 32]], iters: &[usize]) -> Vec<[u8; 32]> {
     assert_eq!(inputs.len(), iters.len(), "Inputs and iterations must match");
-    let mut results = Vec::with_capacity(inputs.len());
+    let n = inputs.len();
 
+    // Build a sorted index: highest iteration count first.
+    // For the typical WOTS case (18 chains) this is a tiny sort — no heap
+    // allocation needed given the small, fixed input size.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_unstable_by(|&a, &b| iters[b].cmp(&iters[a]));
+
+    // Reorder inputs and iters according to the sorted index.
+    let sorted_inputs: Vec<[u8; 32]> = order.iter().map(|&i| inputs[i]).collect();
+    let sorted_iters: Vec<usize>     = order.iter().map(|&i| iters[i]).collect();
+
+    // Process in SIMD batches over the sorted arrays.
+    let mut sorted_results = Vec::with_capacity(n);
     let lanes = detected_level().lanes();
     let mut i = 0;
 
-    while i < inputs.len() {
-        let remain = inputs.len() - i;
+    while i < n {
+        let remain = n - i;
         if remain >= lanes && lanes > 1 {
             match detected_level() {
                 #[cfg(target_arch = "x86_64")]
                 SimdLevel::Avx2_8 => {
                     let mut starts = [[0u8; 32]; 8];
-                    starts.copy_from_slice(&inputs[i..i+8]);
+                    starts.copy_from_slice(&sorted_inputs[i..i+8]);
                     let mut it_arr = [0usize; 8];
-                    it_arr.copy_from_slice(&iters[i..i+8]);
+                    it_arr.copy_from_slice(&sorted_iters[i..i+8]);
                     let res = unsafe { avx2::compute_8way_avx2(&starts, &it_arr) };
-                    results.extend_from_slice(&res);
+                    sorted_results.extend_from_slice(&res);
                     i += 8;
                 }
                 #[cfg(target_arch = "aarch64")]
                 SimdLevel::Neon4 => {
                     let mut starts = [[0u8; 32]; 4];
-                    starts.copy_from_slice(&inputs[i..i+4]);
+                    starts.copy_from_slice(&sorted_inputs[i..i+4]);
                     let mut it_arr = [0usize; 4];
-                    it_arr.copy_from_slice(&iters[i..i+4]);
+                    it_arr.copy_from_slice(&sorted_iters[i..i+4]);
                     let res = unsafe { neon::compute_4way_neon(&starts, &it_arr) };
-                    results.extend_from_slice(&res);
+                    sorted_results.extend_from_slice(&res);
                     i += 4;
                 }
                 SimdLevel::Scalar => unreachable!(),
             }
         } else {
-            // Remainder (or strict scalar CPU) processed one by one
-            results.push(scalar_wots_chain(inputs[i], iters[i]));
+            // Remainder (or strict scalar CPU) processed one by one.
+            sorted_results.push(scalar_wots_chain(sorted_inputs[i], sorted_iters[i]));
             i += 1;
         }
+    }
+
+    // Unshuffle: place each result back at its original caller index.
+    let mut results = vec![[0u8; 32]; n];
+    for (sorted_pos, &original_idx) in order.iter().enumerate() {
+        results[original_idx] = sorted_results[sorted_pos];
     }
     results
 }
