@@ -9,6 +9,7 @@ alice_wallet.dat
 bob_wallet.dat
 *.dat
 tarsrc.sh
+buildroot
 
 # WASM Wallet Build Artifacts
 wasm-wallet/target/
