@@ -112,7 +112,7 @@
             
             <div style="display: flex; flex-direction: column;">
                 <h3 style="border-bottom: 1px solid var(--border); padding-bottom: 8px;">Available UTXOs</h3>
-                <div style="flex: 1; overflow-y: auto; border: 1px solid var(--border); background: var(--bg-panel);">
+                <div style="flex: 1; overflow-y: auto; max-height: 250px; border: 1px solid var(--border); background: var(--bg-panel);">
                     <table style="margin-top: 0; border: none;">
                         <thead><tr><th>Type</th><th>Value</th><th>ID</th></tr></thead>
                         <tbody id="utxoTable"><tr><td colspan="3" style="text-align:center;">No UTXOs. Run sync.</td></tr></tbody>
@@ -120,6 +120,17 @@
                 </div>
             </div>
         </div>
+
+        <div class="panel" style="margin-top: 1.5rem;">
+            <h3 style="border-bottom: 1px solid var(--border); padding-bottom: 8px;">Transaction History</h3>
+            <div style="max-height: 250px; overflow-y: auto; border: 1px solid var(--border); background: var(--bg-panel);">
+                <table style="margin-top: 0; border: none;">
+                    <thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Fee</th></tr></thead>
+                    <tbody id="historyTable"><tr><td colspan="4" style="text-align:center;">No history.</td></tr></tbody>
+                </table>
+            </div>
+        </div>
+
         <div class="panel" style="margin-top: 1.5rem;">
             <h3 style="border-bottom: 1px solid var(--border); padding-bottom: 8px;">Security & Backup</h3>
             <p style="margin-bottom: 15px; color: #666;">Download your encrypted wallet state or view your raw recovery phrase.</p>
@@ -154,22 +165,23 @@
             logs.scrollTop = logs.scrollHeight;
         }
 
+        // Sanitizes inputs to prevent Safari SyntaxError crashes
+        function getCleanRpcUrl() {
+            const raw = document.getElementById('rpcUrl').value;
+            return raw ? raw.trim().replace(/\s+/g, '') : "";
+        }
+
         function updateDashboard(payload) {
             try {
                 if (!payload) {
                     log("UI Error: Payload is undefined", "var(--red)");
                     return;
                 }
-                
-                // EXTREME DEBUGGING: Dump the exact array size the UI received
-                log(`UI received payload.utxos array with length: ${payload.utxos ? payload.utxos.length : 'undefined'}`, "var(--accent-dim)");
-                if (payload.utxos && payload.utxos.length > 0) {
-                    log(`First UTXO data: ${JSON.stringify(payload.utxos[0])}`, "#666");
-                }
 
                 document.getElementById('lblBalance').innerText = payload.balance !== undefined ? payload.balance : "0";
                 document.getElementById('lblAddress').innerText = payload.primaryAddress || "None";
                 
+                // Update UTXO Table
                 const tbody = document.getElementById('utxoTable');
                 if (!payload.utxos || payload.utxos.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="3" style="text-align:center; color: #555;">No UTXOs synced.</td></tr>';
@@ -181,6 +193,27 @@
                             <td style="font-size: 9px; color: #555;">${u.coin_id ? u.coin_id.substring(0,12) : 'unknown'}...</td>
                         </tr>
                     `).join('');
+                }
+
+                // Update Transaction History Table
+                const hTable = document.getElementById('historyTable');
+                if (!payload.history || payload.history.length === 0) {
+                    hTable.innerHTML = '<tr><td colspan="4" style="text-align:center; color: #555;">No transaction history.</td></tr>';
+                } else {
+                    hTable.innerHTML = payload.history.map(h => {
+                        const date = new Date(h.timestamp * 1000).toLocaleString();
+                        const isSent = h.kind === 'sent';
+                        const color = isSent ? 'var(--red)' : 'var(--accent)';
+                        const sign = isSent ? '-' : '+';
+                        return `
+                            <tr>
+                                <td style="color: #888; font-size: 10px;">${date}</td>
+                                <td style="text-transform: uppercase; color: ${color};">${h.kind}</td>
+                                <td style="color: var(--text-max);">${sign}${h.value}</td>
+                                <td style="color: #555;">${h.fee || 0}</td>
+                            </tr>
+                        `;
+                    }).join('');
                 }
             } catch (err) {
                 log(`UI Render Error: ${err.message}`, 'var(--red)');
@@ -256,7 +289,7 @@
             const password = document.getElementById('newPwd').value;
             if(!phrase || !password) return alert("Phrase and password required.");
             document.getElementById('btnCreate').disabled = true;
-            worker.postMessage({ type: 'CREATE', payload: { phrase, password, rpcUrl: document.getElementById('rpcUrl').value } });
+            worker.postMessage({ type: 'CREATE', payload: { phrase, password, rpcUrl: getCleanRpcUrl() } });
         };
 
         document.getElementById('btnLogin').onclick = () => {
@@ -265,7 +298,7 @@
             document.getElementById('btnLogin').disabled = true;
             
             const bundleStr = localStorage.getItem('midstate_wallet');
-            worker.postMessage({ type: 'LOGIN', payload: { password, rpcUrl: document.getElementById('rpcUrl').value, bundleStr } });
+            worker.postMessage({ type: 'LOGIN', payload: { password, rpcUrl: getCleanRpcUrl(), bundleStr } });
         };
 
         document.getElementById('btnScan').onclick = (e) => {
@@ -287,6 +320,7 @@
             navigator.clipboard.writeText(document.getElementById('lblAddress').innerText);
             log("Address copied to clipboard.");
         };
+        
         // --- BACKUP FEATURES ---
         
         document.getElementById('btnReveal').onclick = () => {
@@ -299,13 +333,11 @@
             const bundleStr = localStorage.getItem('midstate_wallet');
             if (!bundleStr) return alert("No wallet data found to export.");
             
-            // Create a downloadable Blob from the encrypted JSON string
             const blob = new Blob([bundleStr], { type: "application/json" });
             const url = URL.createObjectURL(blob);
             
             const a = document.createElement('a');
             a.href = url;
-            // Name the file with a timestamp
             a.download = `midstate-backup-${new Date().toISOString().split('T')[0]}.json`;
             
             document.body.appendChild(a);
@@ -315,9 +347,9 @@
             
             log("Encrypted wallet backup downloaded.", "var(--accent)");
         };
+        
         // --- IMPORT BACKUP FEATURE ---
         
-        // 1. When the button is clicked, trigger the hidden file input
         document.getElementById('btnImportTrigger').onclick = () => {
             if (walletExists) {
                 if (!confirm("Warning: Importing a backup will overwrite the wallet currently saved in your browser. Continue?")) return;
@@ -325,7 +357,6 @@
             document.getElementById('importFile').click();
         };
 
-        // 2. When the user selects a file, read it and inject it into localStorage
         document.getElementById('importFile').addEventListener('change', function(e) {
             const file = e.target.files[0];
             if (!file) return;
@@ -334,17 +365,14 @@
             reader.onload = function(event) {
                 const contents = event.target.result;
                 try {
-                    // Sanity check to make sure it's actually our encrypted wallet format
                     const parsed = JSON.parse(contents);
                     if (!parsed.salt || !parsed.iv || !parsed.data) {
                         throw new Error("Invalid Midstate backup file format.");
                     }
                     
-                    // Inject the imported data directly into the browser's storage
                     localStorage.setItem('midstate_wallet', contents);
                     walletExists = true;
                     
-                    // Seamlessly flip the UI over to the Login screen
                     createSec.classList.add('hidden');
                     loginSec.classList.remove('hidden');
                     document.getElementById('btnLogin').disabled = false;
@@ -357,7 +385,6 @@
                     log(`Import Error: ${err.message}`, "var(--red)");
                 }
                 
-                // Reset the input so the user can import the same file again if they want
                 e.target.value = ''; 
             };
             
