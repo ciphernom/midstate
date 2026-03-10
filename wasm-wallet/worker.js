@@ -66,7 +66,6 @@ async function loadState(pwd, bundleStr) {
         const loadedState = JSON.parse(dec.decode(decrypted));
         
         wState = loadedState;
-        // Migration: If an older version saved UTXOs as an array, convert it to the new strict Map
         if (Array.isArray(wState.utxos)) {
             const utxoMap = {};
             for (const u of wState.utxos) utxoMap[u.coin_id] = u;
@@ -99,17 +98,16 @@ self.onmessage = async (e) => {
             
             self.postMessage({ type: 'LOG', payload: "Deriving 20 WOTS lookahead addresses..." });
             
-            // FIX: Yield to the event loop so the UI doesn't freeze
             for (let i = 0; i < GAP_LIMIT; i++) {
                 deriveNextWots();
                 if (i % 5 === 0) {
                     self.postMessage({ type: 'LOG', payload: `Derived ${i}/${GAP_LIMIT} addresses...` });
-                    await new Promise(r => setTimeout(r, 0)); // Let the UI update
+                    await new Promise(r => setTimeout(r, 0));
                 }
             }
             
             self.postMessage({ type: 'LOG', payload: "Generating Reusable MSS Address..." });
-            await new Promise(r => setTimeout(r, 10)); // Breathe before heavy MSS computation
+            await new Promise(r => setTimeout(r, 10));
             
             deriveNextMss(5); 
 
@@ -200,7 +198,7 @@ async function performScan() {
         const filterData = await filterReq.json();
         const numFilters = filterData.filters ? filterData.filters.length : 0;
 
-    for (let i = 0; i < numFilters; i++) {
+        for (let i = 0; i < numFilters; i++) {
             const height = filterData.start_height + i;
             if (height % 100 === 0) self.postMessage({ type: 'SCAN_PROGRESS', payload: { height, max: chainHeight } });
 
@@ -213,7 +211,6 @@ async function performScan() {
                 continue;
             }
 
-            // CRITICAL FIX: Include active UTXO coin IDs in the watchlist
             const watchList = [
                 ...Object.keys(wState.wotsAddrs), 
                 ...Object.keys(wState.mssAddrs),
@@ -261,7 +258,6 @@ async function processFullBlock(height) {
     
     let matchFound = false;
 
-// 1. Process new inputs (Spent UTXOs)
     if (block.transactions) {
         for (const tx of block.transactions) {
             const reveal = tx.Reveal || tx.reveal;
@@ -269,20 +265,15 @@ async function processFullBlock(height) {
                 let spentOurCoin = false;
                 for (const inp of reveal.inputs) {
                     const saltHex = normalizeHex(inp.salt);
-                    
-                    // Explicit Map deletion by checking salts
                     for (const [cid, u] of Object.entries(wState.utxos)) {
                         if (u.salt === saltHex) {
                             delete wState.utxos[cid];
                             self.postMessage({ type: 'LOG', payload: `Spent UTXO removed: ${cid.substring(0,8)}` });
                             spentOurCoin = true;
-                            matchFound = true; // FIX: Ensure we log that we matched this block
+                            matchFound = true;
                         }
                     }
                 }
-                
-                // CRITICAL FIX: If we spent a coin, we generated change outputs.
-                // Advance the HD derivation window immediately so we don't miss them!
                 if (spentOurCoin) {
                     self.postMessage({ type: 'LOG', payload: `Spend detected! Advancing derivation window...` });
                     for (let i = 0; i < GAP_LIMIT; i++) deriveNextWots();
@@ -291,7 +282,6 @@ async function processFullBlock(height) {
         }
     }
 
-    // 2. Process new outputs (Coinbase)
     if (block.coinbase) {
         for (const cb of block.coinbase) {
             const addrHex = normalizeHex(cb.address);
@@ -304,7 +294,6 @@ async function processFullBlock(height) {
         }
     }
     
-    // 3. Process new outputs (Transactions)
     if (block.transactions) {
         for (const tx of block.transactions) {
             const reveal = tx.Reveal || tx.reveal;
@@ -358,7 +347,7 @@ async function performSend(toAddress, amount) {
         wallet.set_mss_leaf_index(addr, mss.next_leaf);
     }
     
-    // NEW: Inject the absolute latest leaf index into the UTXOs before sending to Wasm.
+    // Inject the absolute latest leaf index into the UTXOs before sending to Wasm.
     // This ensures all sibling coins get the exact same, current leaf index.
     const utxoArray = Object.values(wState.utxos).map(u => {
         if (u.is_mss && wState.mssAddrs[u.address]) {
@@ -374,7 +363,7 @@ async function performSend(toAddress, amount) {
         deriveNextWots();
     }
     
-    // NEW: Only increment the leaf counter ONCE per unique MSS address used in this transaction!
+    // Only increment the leaf counter ONCE per unique MSS address used in this transaction!
     const usedMssAddrs = new Set();
     for (const inp of ctx.selected_inputs) {
         if (inp.is_mss) usedMssAddrs.add(inp.address);
@@ -437,7 +426,6 @@ async function performSend(toAddress, amount) {
         delete wState.utxos[inp.coin_id];
     }
 
-    // FIX: Eagerly add change outputs so the UI updates immediately without needing another scan
     for (const out of ctx.outputs) {
         const addrHex = normalizeHex(out.address);
         if (wState.wotsAddrs[addrHex] !== undefined || wState.mssAddrs[addrHex] !== undefined) {
