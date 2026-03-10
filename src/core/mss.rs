@@ -354,6 +354,48 @@ impl MssSignature {
     }
 }
 
+
+// --- special web wallet function
+#[cfg(target_arch = "wasm32")]
+pub fn keygen_with_progress<F>(master_seed: &[u8; 32], height: u32, mut progress_cb: F) -> Result<MssKeypair>
+where
+    F: FnMut(u32, u32),
+{
+    use anyhow::bail;
+    if height == 0 || height > MAX_HEIGHT {
+        bail!("height must be in 1..={}", MAX_HEIGHT);
+    }
+
+    let num_leaves = 1u64 << height;
+    let tree_size = (num_leaves * 2) as usize;
+    let mut tree = vec![[0u8; 32]; tree_size];
+    let leaf_start = num_leaves as usize;
+
+    for i in 0..num_leaves as usize {
+        let global_idx = i as u64;
+        let seed = derive_wots_seed(master_seed, global_idx);
+        tree[leaf_start + i] = wots::keygen_seq(&seed);
+        
+        // Fire the callback every 2 leaves, and on the final leaf
+        if i % 2 == 0 || i == (num_leaves as usize - 1) {
+            progress_cb((i + 1) as u32, num_leaves as u32);
+        }
+    }
+
+    // Build Internal Nodes
+    for i in (1..leaf_start).rev() {
+        tree[i] = hash_concat(&tree[2 * i], &tree[2 * i + 1]);
+    }
+
+    Ok(MssKeypair {
+        height,
+        master_seed: *master_seed,
+        master_pk: tree[1],
+        tree,
+        next_leaf: 0,
+    })
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

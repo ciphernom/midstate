@@ -65,17 +65,18 @@ export class WebWallet {
         return ret !== 0;
     }
     /**
-     * Derives a reusable MSS address for receiving funds (Height 5 recommended)
+     * Derives a reusable MSS address for receiving funds
      * @param {number} index
      * @param {number} height
+     * @param {Function | null} [progress_cb]
      * @returns {string}
      */
-    get_mss_address(index, height) {
+    get_mss_address(index, height, progress_cb) {
         let deferred2_0;
         let deferred2_1;
         try {
             const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            wasm.webwallet_get_mss_address(retptr, this.__wbg_ptr, index, height);
+            wasm.webwallet_get_mss_address(retptr, this.__wbg_ptr, index, height, isLikeNone(progress_cb) ? 0 : addHeapObject(progress_cb));
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
             var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
             var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -267,6 +268,10 @@ function __wbg_get_imports() {
             const ret = getObject(arg0).call(getObject(arg1), getObject(arg2));
             return addHeapObject(ret);
         }, arguments); },
+        __wbg_call_dcc2662fa17a72cf: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+            const ret = getObject(arg0).call(getObject(arg1), getObject(arg2), getObject(arg3));
+            return addHeapObject(ret);
+        }, arguments); },
         __wbg_crypto_38df2bab126b63dc: function(arg0) {
             const ret = getObject(arg0).crypto;
             return addHeapObject(ret);
@@ -332,12 +337,17 @@ function __wbg_get_imports() {
             const ret = getObject(arg0).versions;
             return addHeapObject(ret);
         },
-        __wbindgen_cast_0000000000000001: function(arg0, arg1) {
+        __wbindgen_cast_0000000000000001: function(arg0) {
+            // Cast intrinsic for `F64 -> Externref`.
+            const ret = arg0;
+            return addHeapObject(ret);
+        },
+        __wbindgen_cast_0000000000000002: function(arg0, arg1) {
             // Cast intrinsic for `Ref(Slice(U8)) -> NamedExternref("Uint8Array")`.
             const ret = getArrayU8FromWasm0(arg0, arg1);
             return addHeapObject(ret);
         },
-        __wbindgen_cast_0000000000000002: function(arg0, arg1) {
+        __wbindgen_cast_0000000000000003: function(arg0, arg1) {
             // Cast intrinsic for `Ref(String) -> Externref`.
             const ret = getStringFromWasm0(arg0, arg1);
             return addHeapObject(ret);
