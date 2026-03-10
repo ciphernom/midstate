@@ -109,7 +109,6 @@ self.onmessage = async (e) => {
             wallet = new WebWallet(payload.phrase);
             wState.phrase = payload.phrase;
             
-            // Phase 1: WOTS derivation
             for (let i = 0; i < GAP_LIMIT; i++) {
                 deriveNextWots();
                 if (i % 2 === 0) {
@@ -121,7 +120,6 @@ self.onmessage = async (e) => {
                 }
             }
             
-            // Phase 2: MSS derivation
             self.postMessage({ type: 'MSS_PROGRESS', payload: { current: 0, total: 100, label: "Generating Post-Quantum MSS Address..." } });
             await new Promise(r => setTimeout(r, 10));
             
@@ -155,7 +153,10 @@ self.onmessage = async (e) => {
             }
         }
     } catch (err) {
-        self.postMessage({ type: 'ERROR', payload: err.toString() });
+        // Strip the "Error: " prefix if present to keep UI clean
+        let errMsg = err.toString();
+        if (errMsg.startsWith("Error: ")) errMsg = errMsg.substring(7);
+        self.postMessage({ type: 'ERROR', payload: errMsg });
     }
 };
 
@@ -374,7 +375,6 @@ async function processFullBlock(height) {
                 if (!alreadyRecorded) {
                     const createdValue = createdOutputs.reduce((sum, c) => sum + c.val, 0);
                     
-                    // --- NEW: Calculate exact transaction fee ---
                     let totalTxIn = 0;
                     let totalTxOut = 0;
                     if (reveal.inputs) reveal.inputs.forEach(i => totalTxIn += Number(i.value));
@@ -384,9 +384,8 @@ async function processFullBlock(height) {
                     });
                     let actualFee = totalTxIn - totalTxOut;
                     
-                    // Amount actually sent away = Total spent - Our change - The network fee
                     let netSent = spentValue - createdValue - actualFee;
-                    if (netSent < 0) netSent = 0; // Handle self-sends gracefully
+                    if (netSent < 0) netSent = 0; 
                     
                     wState.history.push({
                         kind: 'sent',
@@ -445,7 +444,7 @@ function addUtxo(address, value, salt, coinId) {
 }
 
 async function performSend(toAddress, amount) {
-    self.postMessage({ type: 'LOG', payload: "Syncing Wallet State & Selecting Coins..." });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { pct: 10, msg: "Syncing Wallet State & Selecting Coins..." } });
     
     for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
         wallet.set_mss_leaf_index(addr, mss.next_leaf);
@@ -458,7 +457,13 @@ async function performSend(toAddress, amount) {
         return u;
     });
     
-    const spendContextStr = wallet.prepare_spend(JSON.stringify(utxoArray), toAddress, BigInt(amount), wState.nextWotsIndex);
+    let spendContextStr;
+    try {
+        spendContextStr = wallet.prepare_spend(JSON.stringify(utxoArray), toAddress, BigInt(amount), wState.nextWotsIndex);
+    } catch (e) {
+        throw new Error(`Failed to prepare transaction: ${e.toString()}.\n\nWhat to do: Ensure you have enough funds to cover the amount plus the network fee. Try running a Network Sync first.`);
+    }
+
     const ctx = JSON.parse(spendContextStr);
     
     while (wState.nextWotsIndex < ctx.next_wots_index) {
@@ -475,7 +480,7 @@ async function performSend(toAddress, amount) {
     
     await saveState();
 
-    self.postMessage({ type: 'LOG', payload: `Selected ${ctx.selected_inputs.length} inputs. Submitting Commit to mempool...` });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { pct: 30, msg: `Selected ${ctx.selected_inputs.length} input(s). Submitting Commitment...` } });
 
     const commitReq = await fetch(`${rpcUrl}/commit`, {
         method: 'POST',
@@ -486,18 +491,24 @@ async function performSend(toAddress, amount) {
     if (!commitReq.ok) {
         let errText = await commitReq.text();
         try { errText = JSON.parse(errText).error || errText; } catch(e) {}
-        throw new Error(errText);
+        throw new Error(`Commitment rejected by network:\n${errText}\n\nWhat to do: The network might be congested, or your UTXOs might be out of sync. Your funds have not moved. Run a Network Sync and try again.`);
     }
     const commitResp = await JSON.parse(await commitReq.text());
 
-    self.postMessage({ type: 'LOG', payload: `Commit submitted. Generating Signatures...` });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { pct: 50, msg: "Generating Post-Quantum Signatures (this requires heavy computation)..." } });
+    
+    // Give the UI a chance to render the progress update before blocking the thread with crypto
+    await new Promise(r => setTimeout(r, 50));
     
     const revealPayloadStr = wallet.build_reveal(spendContextStr, commitResp.commitment, commitResp.salt);
 
-    self.postMessage({ type: 'LOG', payload: "Waiting for Commit to hit the blockchain state..." });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { pct: 70, msg: "Waiting for Commit to be mined into a block (this may take a minute)..." } });
     
     let revealed = false;
     for (let attempts = 0; attempts < 150; attempts++) {
+        if (attempts === 30) self.postMessage({ type: 'SEND_PROGRESS', payload: { pct: 80, msg: "Still waiting... the network might be busy right now." } });
+        if (attempts === 60) self.postMessage({ type: 'SEND_PROGRESS', payload: { pct: 85, msg: "This is taking longer than usual. Please keep the app open." } });
+
         const revealReq = await fetch(`${rpcUrl}/send`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -514,12 +525,14 @@ async function performSend(toAddress, amount) {
             if (errText.includes("No matching commitment found")) {
                 await new Promise(r => setTimeout(r, 2000));
             } else {
-                throw new Error(errText); 
+                throw new Error(`Transaction rejected by network:\n${errText}\n\nWhat to do: A cryptographic error or double-spend occurred. Your funds are safe. Run a Network Sync and try again.`); 
             }
         }
     }
 
-    if (!revealed) throw new Error("Timed out waiting for Commit to be mined.");
+    if (!revealed) throw new Error("Timed out waiting for Commit to be mined.\n\nWhat to do: Your funds are perfectly safe. The network dropped the transaction due to high traffic. Please try sending again in a few minutes.");
+
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { pct: 95, msg: "Finalizing internal records..." } });
 
     for (const inp of ctx.selected_inputs) {
         delete wState.utxos[inp.coin_id];
@@ -547,5 +560,7 @@ async function performSend(toAddress, amount) {
     });
 
     await saveState();
+    
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { pct: 100, msg: "Complete!" } });
     self.postMessage({ type: 'SEND_COMPLETE', payload: buildDashboardPayload() });
 }
