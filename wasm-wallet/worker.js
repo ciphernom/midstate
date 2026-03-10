@@ -132,6 +132,13 @@ self.onmessage = async (e) => {
             await saveState();
             self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
             self.postMessage({ type: 'LOG', payload: "New address generated successfully." });
+        } 
+        else if (type === 'REVEAL_SEED') {
+            if (wState.phrase) {
+                self.postMessage({ type: 'SEED_REVEALED', payload: wState.phrase });
+            } else {
+                self.postMessage({ type: 'ERROR', payload: "Seed phrase not found in memory." });
+            }
         }
     } catch (err) {
         self.postMessage({ type: 'ERROR', payload: err.toString() });
@@ -145,7 +152,10 @@ function deriveNextWots() {
 }
 
 function deriveNextMss(height) {
-    const addr = wallet.get_mss_address(wState.nextMssIndex, height);
+    const progressCallback = (current, total) => {
+        self.postMessage({ type: 'LOG', payload: `Generating Reusable Address: Hashed ${current}/${total} leaves...` });
+    };
+    const addr = wallet.get_mss_address(wState.nextMssIndex, height, progressCallback);
     wState.mssAddrs[addr] = { index: wState.nextMssIndex, height, next_leaf: 0 };
     wState.nextMssIndex++;
 }
