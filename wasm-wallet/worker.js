@@ -208,6 +208,13 @@ async function performScan() {
         const filterData = await filterReq.json();
         const numFilters = filterData.filters ? filterData.filters.length : 0;
 
+        // PERFORMANCE FIX: Generate the JSON string ONCE outside the tight block loop
+        let watchListStr = JSON.stringify([
+            ...Object.keys(wState.wotsAddrs), 
+            ...Object.keys(wState.mssAddrs),
+            ...Object.keys(wState.utxos) 
+        ]);
+
         for (let i = 0; i < numFilters; i++) {
             const height = filterData.start_height + i;
             if (height % 100 === 0) self.postMessage({ type: 'SCAN_PROGRESS', payload: { height, max: chainHeight } });
@@ -218,17 +225,23 @@ async function performScan() {
 
             if (!blockHash) {
                 await processFullBlock(height);
+                // Rebuild watchlist if the block mutated our addresses/UTXOs
+                watchListStr = JSON.stringify([
+                    ...Object.keys(wState.wotsAddrs), 
+                    ...Object.keys(wState.mssAddrs),
+                    ...Object.keys(wState.utxos) 
+                ]);
                 continue;
             }
-
-            const watchList = [
-                ...Object.keys(wState.wotsAddrs), 
-                ...Object.keys(wState.mssAddrs),
-                ...Object.keys(wState.utxos) 
-            ];
             
-            if (wallet.check_filter(filterData.filters[i], blockHash, n, JSON.stringify(watchList))) {
+            if (wallet.check_filter(filterData.filters[i], blockHash, n, watchListStr)) {
                 await processFullBlock(height);
+                // Rebuild watchlist if the block mutated our addresses/UTXOs
+                watchListStr = JSON.stringify([
+                    ...Object.keys(wState.wotsAddrs), 
+                    ...Object.keys(wState.mssAddrs),
+                    ...Object.keys(wState.utxos) 
+                ]);
             }
         }
 
@@ -269,6 +282,13 @@ async function processFullBlock(height) {
     let matchFound = false;
     let receivedInBlock = [];
 
+    // PERFORMANCE FIX: Pre-map our UTXOs by Salt for O(1) lookup 
+    // instead of nested O(N) looping through the dictionary
+    const ourSalts = new Map();
+    for (const [cid, u] of Object.entries(wState.utxos)) {
+        ourSalts.set(u.salt, cid);
+    }
+
     if (block.transactions) {
         for (const tx of block.transactions) {
             const reveal = tx.Reveal || tx.reveal;
@@ -276,13 +296,15 @@ async function processFullBlock(height) {
                 let spentOurCoin = false;
                 for (const inp of reveal.inputs) {
                     const saltHex = normalizeHex(inp.salt);
-                    for (const [cid, u] of Object.entries(wState.utxos)) {
-                        if (u.salt === saltHex) {
-                            delete wState.utxos[cid];
-                            self.postMessage({ type: 'LOG', payload: `Spent UTXO removed: ${cid.substring(0,8)}` });
-                            spentOurCoin = true;
-                            matchFound = true;
-                        }
+                    const cid = ourSalts.get(saltHex);
+                    
+                    // O(1) instant lookup
+                    if (cid) {
+                        delete wState.utxos[cid];
+                        ourSalts.delete(saltHex); // Remove from temp map too
+                        self.postMessage({ type: 'LOG', payload: `Spent UTXO removed: ${cid.substring(0,8)}` });
+                        spentOurCoin = true;
+                        matchFound = true;
                     }
                 }
                 if (spentOurCoin) {
