@@ -92,14 +92,14 @@ pub fn compute_address(owner_pk: &[u8; 32]) -> [u8; 32] {
 
 /// Compute a coin ID that commits to address, value, and salt.
 /// CoinID = BLAKE3(address || value_le_bytes || salt)
- /// The UTXO set stores ONLY this 32-byte hash.
+/// The UTXO set stores ONLY this 32-byte hash.
 pub fn compute_coin_id(address: &[u8; 32], value: u64, salt: &[u8; 32]) -> [u8; 32] {
      let mut hasher = blake3::Hasher::new();
      hasher.update(address);
      hasher.update(&value.to_le_bytes());
      hasher.update(salt);
      *hasher.finalize().as_bytes()
- }
+}
 
 /// Compute a commitment hash that binds inputs to outputs.
 ///
@@ -288,8 +288,6 @@ impl Batch {
 }
 
 // ── Value-bearing data structures ───────────────────────────────────────────
-
-
 
 
 /// Cleartext output data carried in a transaction.
@@ -546,9 +544,15 @@ pub const COMMITMENT_TTL: u64 = 1000;
 /// Pruning reclaims ~32 KB per block (~98% of batch storage). Pruned batches
 /// remain fully verifiable via full-chain recomputation in verify_extension.
 pub const PRUNE_DEPTH: u64 = 1000;
+
 /// Block height at which WOTS address-reuse is enforced at consensus level.
 /// Blocks below this height are grandfathered (network was live before this rule).
 pub const WOTS_REUSE_ACTIVATION_HEIGHT: u64 = 18_000;
+
+/// Block height at which MSS leaf reuse is enforced at consensus level.
+/// Uses the leaf's WOTS public key as a nullifier in the spent oracle.
+pub const MSS_REUSE_ACTIVATION_HEIGHT: u64 = 25_000; 
+
 // ── Economics ───────────────────────────────────────────────────────────────
 
 /// Blocks per year at TARGET_BLOCK_TIME seconds per block.

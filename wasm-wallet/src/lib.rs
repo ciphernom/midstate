@@ -67,8 +67,9 @@ struct SpendContext {
 #[wasm_bindgen]
 pub struct WebWallet {
     master_seed: [u8; 32],
-    // CACHE: Stores generated MSS trees to eliminate the hang during spending
     mss_cache: HashMap<String, mss::MssKeypair>, 
+    // PERFORMANCE FIX: Cache watchlist in memory to avoid parsing JSON thousands of times
+    watchlist: Vec<[u8; 32]>, 
 }
 
 #[wasm_bindgen]
@@ -79,7 +80,8 @@ impl WebWallet {
             .map_err(|e| JsValue::from_str(&format!("Invalid mnemonic: {}", e)))?;
         Ok(WebWallet { 
             master_seed,
-            mss_cache: HashMap::new()
+            mss_cache: HashMap::new(),
+            watchlist: Vec::new(),
         })
     }
 
@@ -89,14 +91,22 @@ impl WebWallet {
         }
     }
 
-    /// Derives a single-use WOTS address (used internally for change outputs)
+    pub fn set_watchlist(&mut self, addrs_json: &str) {
+        let addrs_str: Vec<String> = serde_json::from_str(addrs_json).unwrap_or_default();
+        let mut byte_addrs = Vec::with_capacity(addrs_str.len());
+        for a in addrs_str {
+            let mut buf = [0u8; 32];
+            if hex::decode_to_slice(&a, &mut buf).is_ok() { byte_addrs.push(buf); }
+        }
+        self.watchlist = byte_addrs;
+    }
+
     pub fn get_wots_address(&self, index: u32) -> String {
         let seed = derive_wots_seed(&self.master_seed, index as u64);
         let pk = wots::keygen(&seed);
         hex::encode(compute_address(&pk))
     }
 
-    /// Derives a reusable MSS address for receiving funds
     pub fn get_mss_address(&mut self, index: u32, height: u32, progress_cb: Option<js_sys::Function>) -> Result<String, JsValue> {
         let seed = derive_mss_seed(&self.master_seed, index as u64);
         
@@ -114,7 +124,7 @@ impl WebWallet {
         Ok(addr)
     }
 
-    pub fn check_filter(&self, filter_hex: &str, block_hash_hex: &str, n: u32, addrs_json: &str) -> bool {
+    pub fn check_filter(&self, filter_hex: &str, block_hash_hex: &str, n: u32) -> bool {
         let filter_data = match hex::decode(filter_hex) {
             Ok(d) => d,
             Err(_) => return false,
@@ -122,25 +132,16 @@ impl WebWallet {
         let mut block_hash = [0u8; 32];
         if hex::decode_to_slice(block_hash_hex, &mut block_hash).is_err() { return false; }
 
-        let addrs_str: Vec<String> = serde_json::from_str(addrs_json).unwrap_or_default();
-        let mut byte_addrs = Vec::with_capacity(addrs_str.len());
-        for a in addrs_str {
-            let mut buf = [0u8; 32];
-            if hex::decode_to_slice(&a, &mut buf).is_ok() { byte_addrs.push(buf); }
-        }
-
-        if byte_addrs.is_empty() { return false; }
-        midstate::core::filter::match_any(&filter_data, &block_hash, n as u64, &byte_addrs)
+        if self.watchlist.is_empty() { return false; }
+        midstate::core::filter::match_any(&filter_data, &block_hash, n as u64, &self.watchlist)
     }
 
     pub fn prepare_spend(&mut self, available_utxos_json: &str, to_address_hex: &str, send_amount: u64, mut next_wots_index: u32) -> Result<String, JsValue> {
         let mut available: Vec<WasmUtxo> = serde_json::from_str(available_utxos_json)
             .map_err(|e| JsValue::from_str(&format!("Failed to parse UTXOs: {}", e)))?;
 
-        // PRE-CACHE: Ensure all needed MSS trees are in memory before starting the heavy math
         for utxo in &available {
             if utxo.is_mss && !self.mss_cache.contains_key(&utxo.address) {
-                // Pass `None` because we don't need UI feedback during background caching
                 self.get_mss_address(utxo.index, utxo.mss_height, None)?; 
             }
         }
@@ -158,10 +159,8 @@ impl WebWallet {
             let mut selected_set = HashSet::new();
             let mut total = 0u64;
 
-            // 1. Initial Selection
             for coin in &available {
                 if total >= needed { break; }
-                
                 selected_set.insert(coin.coin_id.clone());
                 selected.push(coin.clone());
                 total += coin.value;
@@ -169,7 +168,6 @@ impl WebWallet {
 
             if total < needed { return Err(JsValue::from_str("Insufficient funds.")); }
 
-            // 2. Co-Spend Privacy Grouping (WOTS Only)
             let mut grouped_addresses = HashSet::new();
             for c in &selected { 
                 if !c.is_mss { grouped_addresses.insert(c.address.clone()); }
@@ -183,7 +181,6 @@ impl WebWallet {
                 }
             }
 
-            // 3. Snowball Defragmentation
             let mut added_new = true;
             while added_new {
                 added_new = false;
@@ -203,7 +200,6 @@ impl WebWallet {
                 if selected.len() >= 250 { break; }
             }
 
-            // 4. Final Grouping Catch (WOTS Only)
             let mut final_addresses = HashSet::new();
             for c in &selected { 
                 if !c.is_mss { final_addresses.insert(c.address.clone()); }
@@ -233,7 +229,6 @@ impl WebWallet {
                     final_outputs.push(JsOutput { address: to_address_hex.to_string(), value: denom, salt: hex::encode(salt) });
                 }
 
-                // Change outputs always use WOTS to save space/fees
                 for denom in decompose_value(actual_change) {
                     let seed = derive_wots_seed(&self.master_seed, next_wots_index as u64);
                     let pk = wots::keygen(&seed);
@@ -307,7 +302,6 @@ impl WebWallet {
         let mut signatures = Vec::new();
         let mut safety_input_hashes = Vec::new();
 
-        // CACHE: Ensure we only sign once per MSS address per transaction
         let mut mss_sig_cache: HashMap<String, Vec<u8>> = HashMap::new();
 
         for inp in ctx.selected_inputs {
@@ -316,10 +310,8 @@ impl WebWallet {
                     .ok_or_else(|| JsValue::from_str("MSS tree missing from cache."))?;
                 
                 if let Some(cached_sig) = mss_sig_cache.get(&inp.address) {
-                    // Re-use the exact same signature bytes for siblings in this tx
                     (kp.master_pk, cached_sig.clone())
                 } else {
-                    // First time seeing this MSS key in this tx, generate and cache
                     kp.set_next_leaf(inp.mss_leaf as u64);
                     let sig = kp.sign(&commitment).map_err(|e| JsValue::from_str(&e.to_string()))?;
                     let sig_bytes = sig.to_bytes();

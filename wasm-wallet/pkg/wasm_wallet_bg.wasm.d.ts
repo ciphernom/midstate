@@ -6,12 +6,13 @@ export const compute_coin_id_hex: (a: number, b: number, c: number, d: bigint, e
 export const decompose_amount: (a: bigint) => number;
 export const generate_phrase: (a: number) => void;
 export const webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
-export const webwallet_check_filter: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => number;
+export const webwallet_check_filter: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
 export const webwallet_get_mss_address: (a: number, b: number, c: number, d: number, e: number) => void;
 export const webwallet_get_wots_address: (a: number, b: number, c: number) => void;
 export const webwallet_new: (a: number, b: number, c: number) => void;
 export const webwallet_prepare_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number) => void;
 export const webwallet_set_mss_leaf_index: (a: number, b: number, c: number, d: number) => void;
+export const webwallet_set_watchlist: (a: number, b: number, c: number) => void;
 export const __wbindgen_export: (a: number) => void;
 export const __wbindgen_add_to_stack_pointer: (a: number) => number;
 export const __wbindgen_export2: (a: number, b: number) => number;
