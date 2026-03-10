@@ -71,6 +71,10 @@
                 <input type="password" id="loginPwd" placeholder="Enter password to decrypt" style="margin-bottom: 15px;">
                 <button id="btnLogin" disabled>Unlock Wallet</button>
             </div>
+            <div style="margin-top: 20px; border-top: 1px solid var(--border); padding-top: 15px; text-align: center;">
+                <input type="file" id="importFile" accept=".json" style="display: none;">
+                <button id="btnImportTrigger" style="width: auto; padding: 6px 16px; background: transparent; border: 1px dashed var(--border-bright);">📂 Import Backup File (.json)</button>
+            </div>
         </div>
     </div>
 
@@ -116,6 +120,14 @@
                 </div>
             </div>
         </div>
+        <div class="panel" style="margin-top: 1.5rem;">
+            <h3 style="border-bottom: 1px solid var(--border); padding-bottom: 8px;">Security & Backup</h3>
+            <p style="margin-bottom: 15px; color: #666;">Download your encrypted wallet state or view your raw recovery phrase.</p>
+            <div class="grid" style="margin-bottom: 0;">
+                <button id="btnExport">⬇️ Download Encrypted Backup</button>
+                <button id="btnReveal">👁️ Reveal Seed Phrase</button>
+            </div>
+        </div>
     </div>
 
     <div class="terminal">
@@ -124,8 +136,7 @@
     </div>
 
     <script>
-        const worker = new Worker('worker.js', { type: 'module' });
-        
+        const worker = new Worker('./worker.js', { type: 'module' });
         const authView = document.getElementById('authView');
         const mainView = document.getElementById('mainView');
         const createSec = document.getElementById('createSection');
@@ -191,6 +202,10 @@
                     break;
                 case 'SAVE_WALLET':
                     localStorage.setItem('midstate_wallet', payload);
+                    break;
+                case 'SEED_REVEALED':
+                    alert(`🚨 SECURE YOUR SEED PHRASE 🚨\n\nMake sure no one is looking at your screen.\n\n${payload}`);
+                    log("Seed phrase viewed by user.");
                     break;
                 case 'PHRASE_GENERATED':
                     document.getElementById('seedPhrase').value = payload;
@@ -272,6 +287,82 @@
             navigator.clipboard.writeText(document.getElementById('lblAddress').innerText);
             log("Address copied to clipboard.");
         };
+        // --- BACKUP FEATURES ---
+        
+        document.getElementById('btnReveal').onclick = () => {
+            if (confirm("Warning: Anyone with this phrase can steal your funds. Make sure your screen is private. Continue?")) {
+                worker.postMessage({ type: 'REVEAL_SEED' });
+            }
+        };
+
+        document.getElementById('btnExport').onclick = () => {
+            const bundleStr = localStorage.getItem('midstate_wallet');
+            if (!bundleStr) return alert("No wallet data found to export.");
+            
+            // Create a downloadable Blob from the encrypted JSON string
+            const blob = new Blob([bundleStr], { type: "application/json" });
+            const url = URL.createObjectURL(blob);
+            
+            const a = document.createElement('a');
+            a.href = url;
+            // Name the file with a timestamp
+            a.download = `midstate-backup-${new Date().toISOString().split('T')[0]}.json`;
+            
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            log("Encrypted wallet backup downloaded.", "var(--accent)");
+        };
+        // --- IMPORT BACKUP FEATURE ---
+        
+        // 1. When the button is clicked, trigger the hidden file input
+        document.getElementById('btnImportTrigger').onclick = () => {
+            if (walletExists) {
+                if (!confirm("Warning: Importing a backup will overwrite the wallet currently saved in your browser. Continue?")) return;
+            }
+            document.getElementById('importFile').click();
+        };
+
+        // 2. When the user selects a file, read it and inject it into localStorage
+        document.getElementById('importFile').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            const reader = new FileReader();
+            reader.onload = function(event) {
+                const contents = event.target.result;
+                try {
+                    // Sanity check to make sure it's actually our encrypted wallet format
+                    const parsed = JSON.parse(contents);
+                    if (!parsed.salt || !parsed.iv || !parsed.data) {
+                        throw new Error("Invalid Midstate backup file format.");
+                    }
+                    
+                    // Inject the imported data directly into the browser's storage
+                    localStorage.setItem('midstate_wallet', contents);
+                    walletExists = true;
+                    
+                    // Seamlessly flip the UI over to the Login screen
+                    createSec.classList.add('hidden');
+                    loginSec.classList.remove('hidden');
+                    document.getElementById('btnLogin').disabled = false;
+                    
+                    log("Backup file loaded into memory. Ready for decryption.", "var(--accent)");
+                    alert("Backup imported successfully! Enter your password to unlock.");
+                    
+                } catch (err) {
+                    alert(`Import Failed: ${err.message}`);
+                    log(`Import Error: ${err.message}`, "var(--red)");
+                }
+                
+                // Reset the input so the user can import the same file again if they want
+                e.target.value = ''; 
+            };
+            
+            reader.readAsText(file);
+        });
     </script>
 </body>
 </html>
