@@ -29,23 +29,20 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_webwallet_free: (a: number, b: number) => void;
-    readonly compute_coin_id_hex: (a: number, b: number, c: bigint, d: number, e: number) => [number, number];
-    readonly decompose_amount: (a: bigint) => any;
-    readonly generate_phrase: () => [number, number];
-    readonly webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
+    readonly compute_coin_id_hex: (a: number, b: number, c: number, d: bigint, e: number, f: number) => void;
+    readonly decompose_amount: (a: bigint) => number;
+    readonly generate_phrase: (a: number) => void;
+    readonly webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly webwallet_check_filter: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => number;
-    readonly webwallet_get_mss_address: (a: number, b: number, c: number) => [number, number, number, number];
-    readonly webwallet_get_wots_address: (a: number, b: number) => [number, number];
-    readonly webwallet_new: (a: number, b: number) => [number, number, number];
-    readonly webwallet_prepare_spend: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => [number, number, number, number];
-    readonly __wbindgen_exn_store: (a: number) => void;
-    readonly __externref_table_alloc: () => number;
-    readonly __wbindgen_externrefs: WebAssembly.Table;
-    readonly __wbindgen_malloc: (a: number, b: number) => number;
-    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
-    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
-    readonly __externref_table_dealloc: (a: number) => void;
-    readonly __wbindgen_start: () => void;
+    readonly webwallet_get_mss_address: (a: number, b: number, c: number, d: number) => void;
+    readonly webwallet_get_wots_address: (a: number, b: number, c: number) => void;
+    readonly webwallet_new: (a: number, b: number, c: number) => void;
+    readonly webwallet_prepare_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number) => void;
+    readonly __wbindgen_export: (a: number) => void;
+    readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
+    readonly __wbindgen_export2: (a: number, b: number) => number;
+    readonly __wbindgen_export3: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_export4: (a: number, b: number, c: number) => void;
 }
 
 export type SyncInitInput = BufferSource | WebAssembly.Module;

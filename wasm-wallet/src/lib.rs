@@ -3,6 +3,7 @@ use midstate::core::{wots, mss};
 use midstate::core::types::{compute_address, compute_commitment, compute_coin_id, decompose_value};
 use midstate::wallet::hd::{generate_mnemonic, master_seed_from_mnemonic, derive_wots_seed, derive_mss_seed};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 // ─── Global Wasm Helpers ────────────────────────────────────────────────────
 
@@ -66,6 +67,8 @@ struct SpendContext {
 #[wasm_bindgen]
 pub struct WebWallet {
     master_seed: [u8; 32],
+    // CACHE: Stores generated MSS trees to eliminate the 8-minute hang during spending
+    mss_cache: HashMap<String, mss::MssKeypair>, 
 }
 
 #[wasm_bindgen]
@@ -74,7 +77,10 @@ impl WebWallet {
     pub fn new(phrase: &str) -> Result<WebWallet, JsValue> {
         let master_seed = master_seed_from_mnemonic(phrase)
             .map_err(|e| JsValue::from_str(&format!("Invalid mnemonic: {}", e)))?;
-        Ok(WebWallet { master_seed })
+        Ok(WebWallet { 
+            master_seed,
+            mss_cache: HashMap::new()
+        })
     }
 
     /// Derives a single-use WOTS address (used internally for change outputs)
@@ -85,10 +91,16 @@ impl WebWallet {
     }
 
     /// Derives a reusable MSS address for receiving funds (Height 5 recommended)
-    pub fn get_mss_address(&self, index: u32, height: u32) -> Result<String, JsValue> {
+    pub fn get_mss_address(&mut self, index: u32, height: u32) -> Result<String, JsValue> {
         let seed = derive_mss_seed(&self.master_seed, index as u64);
         let kp = mss::keygen(&seed, height).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(hex::encode(kp.master_pk))
+        
+        // FIX: The address must be the hashed P2PK script, not the raw Master PK
+        let addr = hex::encode(compute_address(&kp.master_pk));
+        
+        // Store in cache using the finalized address as the key
+        self.mss_cache.insert(addr.clone(), kp);
+        Ok(addr)
     }
 
     pub fn check_filter(&self, filter_hex: &str, block_hash_hex: &str, n: u32, addrs_json: &str) -> bool {
@@ -110,9 +122,16 @@ impl WebWallet {
         midstate::core::filter::match_any(&filter_data, &block_hash, n as u64, &byte_addrs)
     }
 
-    pub fn prepare_spend(&self, available_utxos_json: &str, to_address_hex: &str, send_amount: u64, mut next_wots_index: u32) -> Result<String, JsValue> {
+    pub fn prepare_spend(&mut self, available_utxos_json: &str, to_address_hex: &str, send_amount: u64, mut next_wots_index: u32) -> Result<String, JsValue> {
         let mut available: Vec<WasmUtxo> = serde_json::from_str(available_utxos_json)
             .map_err(|e| JsValue::from_str(&format!("Failed to parse UTXOs: {}", e)))?;
+
+        // PRE-CACHE: Ensure all needed MSS trees are in memory before starting the heavy math
+        for utxo in &available {
+            if utxo.is_mss && !self.mss_cache.contains_key(&utxo.address) {
+                self.get_mss_address(utxo.index, utxo.mss_height)?;
+            }
+        }
 
         available.sort_by(|a, b| b.value.cmp(&a.value));
 
@@ -124,31 +143,52 @@ impl WebWallet {
         loop {
             let needed = send_amount + target_fee;
             let mut selected = Vec::new();
-            let mut selected_set = std::collections::HashSet::new();
+            let mut selected_set = HashSet::new();
             let mut total = 0u64;
+            
+            // TRACKER: Auto-increments MSS leaves if multiple coins are selected from the same address
+            let mut leaf_tracker: HashMap<String, u32> = HashMap::new();
 
+            // 1. Initial Selection
             for coin in &available {
                 if total >= needed { break; }
-                selected.push(coin.clone());
+                
+                let mut coin_to_add = coin.clone();
+                if coin_to_add.is_mss {
+                    let current_leaf = leaf_tracker.entry(coin_to_add.address.clone()).or_insert(coin_to_add.mss_leaf);
+                    coin_to_add.mss_leaf = *current_leaf;
+                    *current_leaf += 1; 
+                }
+                
                 selected_set.insert(coin.coin_id.clone());
+                selected.push(coin_to_add);
                 total += coin.value;
             }
 
             if total < needed { return Err(JsValue::from_str("Insufficient funds.")); }
 
-            let mut grouped_addresses = std::collections::HashSet::new();
+            // 2. Co-Spend Privacy Grouping
+            let mut grouped_addresses = HashSet::new();
             for c in &selected { 
                 if !c.is_mss { grouped_addresses.insert(c.address.clone()); }
             }
             
             for coin in &available {
                 if grouped_addresses.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
-                    selected.push(coin.clone());
-                    selected_set.insert(coin.coin_id.clone());
+                    let mut coin_to_add = coin.clone();
+                    if coin_to_add.is_mss {
+                        let current_leaf = leaf_tracker.entry(coin_to_add.address.clone()).or_insert(coin_to_add.mss_leaf);
+                        coin_to_add.mss_leaf = *current_leaf;
+                        *current_leaf += 1;
+                    }
+                    
+                    selected_set.insert(coin.coin_id.clone());                    
+                    selected.push(coin_to_add);
                     total += coin.value;
                 }
             }
 
+            // 3. Snowball Defragmentation
             let mut added_new = true;
             while added_new {
                 added_new = false;
@@ -157,9 +197,14 @@ impl WebWallet {
                 
                 for denom in change_denoms {
                     if let Some(pos) = available.iter().position(|c| c.value == denom && !selected_set.contains(&c.coin_id)) {
-                        let coin = available[pos].clone();
-                        selected.push(coin.clone());
-                        selected_set.insert(coin.coin_id.clone());
+                        let mut coin_to_add = available[pos].clone();
+                        if coin_to_add.is_mss {
+                            let current_leaf = leaf_tracker.entry(coin_to_add.address.clone()).or_insert(coin_to_add.mss_leaf);
+                            coin_to_add.mss_leaf = *current_leaf;
+                            *current_leaf += 1;
+                        }
+                        selected_set.insert(coin_to_add.coin_id.clone());
+                        selected.push(coin_to_add);
                         total += denom;
                         added_new = true;
                         break; 
@@ -168,14 +213,22 @@ impl WebWallet {
                 if selected.len() >= 250 { break; }
             }
 
-            let mut final_addresses = std::collections::HashSet::new();
+            // 4. Final Grouping Catch
+            let mut final_addresses = HashSet::new();
             for c in &selected { 
                 if !c.is_mss { final_addresses.insert(c.address.clone()); }
             }
             for coin in &available {
                 if final_addresses.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
-                    selected.push(coin.clone());
-                    selected_set.insert(coin.coin_id.clone());
+                    let mut coin_to_add = coin.clone();
+                    if coin_to_add.is_mss {
+                        let current_leaf = leaf_tracker.entry(coin_to_add.address.clone()).or_insert(coin_to_add.mss_leaf);
+                        coin_to_add.mss_leaf = *current_leaf;
+                        *current_leaf += 1;
+                    }
+                    
+                    selected_set.insert(coin.coin_id.clone());                    
+                    selected.push(coin_to_add);
                     total += coin.value;
                 }
             }
@@ -247,7 +300,7 @@ impl WebWallet {
         });
 
         let ctx = SpendContext {
-            selected_inputs: final_selected,
+            selected_inputs: final_selected, // Now correctly contains sequential leaf indexes
             outputs: final_outputs,
             commit_payload,
             tx_salt: hex::encode(tx_salt),
@@ -259,7 +312,7 @@ impl WebWallet {
         Ok(serde_json::to_string(&ctx).unwrap())
     }
 
-    pub fn build_reveal(&self, spend_context_json: &str, server_commitment_hex: &str, server_salt_hex: &str) -> Result<String, JsValue> {
+    pub fn build_reveal(&mut self, spend_context_json: &str, server_commitment_hex: &str, server_salt_hex: &str) -> Result<String, JsValue> {
         let ctx: SpendContext = serde_json::from_str(spend_context_json)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
@@ -273,8 +326,10 @@ impl WebWallet {
 
         for inp in ctx.selected_inputs {
             let (pk, sig_bytes) = if inp.is_mss {
-                let seed = derive_mss_seed(&self.master_seed, inp.index as u64);
-                let mut kp = mss::keygen(&seed, inp.mss_height).unwrap();
+                // INSTANT LOOKUP: O(1) time instead of 96 seconds!
+                let kp = self.mss_cache.get_mut(&inp.address)
+                    .ok_or_else(|| JsValue::from_str("MSS tree missing from cache."))?;
+                
                 kp.set_next_leaf(inp.mss_leaf as u64);
                 let sig = kp.sign(&commitment).map_err(|e| JsValue::from_str(&e.to_string()))?;
                 (kp.master_pk, sig.to_bytes())
@@ -297,7 +352,6 @@ impl WebWallet {
                 "salt": inp.salt
             }));
 
-            // The node expects a single continuous hex string for the 576-byte signature
             signatures.push(hex::encode(&sig_bytes));
         }
 
