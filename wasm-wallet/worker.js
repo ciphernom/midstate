@@ -4,7 +4,9 @@ let wallet = null;
 let rpcUrl = "https://rpc.cypherpunk.gold";
 let password = null;
 
-const GAP_LIMIT = 20;
+// Increased from 20 to 100. Change outputs consume multiple WOTS indices. 
+// A higher gap limit ensures we find all coins when restoring from a seed phrase.
+const GAP_LIMIT = 100;
 let wState = {
     phrase: null,
     nextWotsIndex: 0,
@@ -111,7 +113,7 @@ self.onmessage = async (e) => {
             
             for (let i = 0; i < GAP_LIMIT; i++) {
                 deriveNextWots();
-                if (i % 2 === 0) {
+                if (i % 10 === 0) {
                     self.postMessage({ 
                         type: 'MSS_PROGRESS', 
                         payload: { current: i, total: GAP_LIMIT, label: `Deriving base keys (${i}/${GAP_LIMIT})...` } 
@@ -133,6 +135,14 @@ self.onmessage = async (e) => {
             await loadState(payload.password, payload.bundleStr);
         }
         else if (type === 'SCAN') {
+            await performScan();
+        }
+        else if (type === 'RESCAN') {
+            // Clears local volatile state and forces a blockchain rebuild
+            wState.lastScannedHeight = 0;
+            wState.utxos = {};
+            wState.history = [];
+            await saveState();
             await performScan();
         }
         else if (type === 'SEND') {
@@ -444,7 +454,7 @@ function addUtxo(address, value, salt, coinId) {
 }
 
 async function performSend(toAddress, amount) {
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { pct: 10, msg: "Syncing Wallet State & Selecting Coins..." } });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { phase: 1, msg: "Syncing Wallet State & Selecting Coins..." } });
     
     for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
         wallet.set_mss_leaf_index(addr, mss.next_leaf);
@@ -480,7 +490,7 @@ async function performSend(toAddress, amount) {
     
     await saveState();
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { pct: 30, msg: `Selected ${ctx.selected_inputs.length} input(s). Submitting Commitment...` } });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { phase: 1, msg: `Submitting Commit to mempool (${ctx.selected_inputs.length} inputs)...` } });
 
     const commitReq = await fetch(`${rpcUrl}/commit`, {
         method: 'POST',
@@ -491,23 +501,23 @@ async function performSend(toAddress, amount) {
     if (!commitReq.ok) {
         let errText = await commitReq.text();
         try { errText = JSON.parse(errText).error || errText; } catch(e) {}
-        throw new Error(`Commitment rejected by network:\n${errText}\n\nWhat to do: The network might be congested, or your UTXOs might be out of sync. Your funds have not moved. Run a Network Sync and try again.`);
+        throw new Error(`Commit rejected by network:\n${errText}\n\nWhat to do: The network might be congested, or your UTXOs might be out of sync. Your funds have not moved. Run a Network Sync and try again.`);
     }
     const commitResp = await JSON.parse(await commitReq.text());
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { pct: 50, msg: "Generating Post-Quantum Signatures (this requires heavy computation)..." } });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { phase: 1, msg: "Generating Post-Quantum Signatures (this requires heavy computation)..." } });
     
-    // Give the UI a chance to render the progress update before blocking the thread with crypto
+    // Yield to let the UI update before locking the thread with crypto
     await new Promise(r => setTimeout(r, 50));
     
     const revealPayloadStr = wallet.build_reveal(spendContextStr, commitResp.commitment, commitResp.salt);
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { pct: 70, msg: "Waiting for Commit to be mined into a block (this may take a minute)..." } });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { phase: 1, msg: "Waiting for Commit to be mined into a block..." } });
     
-    let revealed = false;
+    // --- WAIT FOR COMMIT TO BE MINED ---
+    let mempoolAccepted = false;
     for (let attempts = 0; attempts < 150; attempts++) {
-        if (attempts === 30) self.postMessage({ type: 'SEND_PROGRESS', payload: { pct: 80, msg: "Still waiting... the network might be busy right now." } });
-        if (attempts === 60) self.postMessage({ type: 'SEND_PROGRESS', payload: { pct: 85, msg: "This is taking longer than usual. Please keep the app open." } });
+        if (attempts === 30) self.postMessage({ type: 'SEND_PROGRESS', payload: { phase: 1, msg: "Still waiting for Commit block..." } });
 
         const revealReq = await fetch(`${rpcUrl}/send`, {
             method: 'POST',
@@ -516,24 +526,53 @@ async function performSend(toAddress, amount) {
         });
 
         if (revealReq.ok) {
-            revealed = true;
+            mempoolAccepted = true;
             break;
         } else {
             let errText = await revealReq.text();
             try { errText = JSON.parse(errText).error || errText; } catch(e) {}
             
+            // "No matching commitment" means the Commit block isn't mined yet
             if (errText.includes("No matching commitment found")) {
                 await new Promise(r => setTimeout(r, 2000));
             } else {
-                throw new Error(`Transaction rejected by network:\n${errText}\n\nWhat to do: A cryptographic error or double-spend occurred. Your funds are safe. Run a Network Sync and try again.`); 
+                throw new Error(`Reveal rejected by network:\n${errText}\n\nWhat to do: A cryptographic error or double-spend occurred. Your funds are safe. Run a Network Sync and try again.`); 
             }
         }
     }
 
-    if (!revealed) throw new Error("Timed out waiting for Commit to be mined.\n\nWhat to do: Your funds are perfectly safe. The network dropped the transaction due to high traffic. Please try sending again in a few minutes.");
+    if (!mempoolAccepted) throw new Error("Timed out waiting for Commit to be mined.\n\nWhat to do: Your funds are perfectly safe. The network dropped the transaction due to high traffic. Please try sending again in a few minutes.");
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { pct: 95, msg: "Finalizing internal records..." } });
+    // --- TRANSITION TO PHASE 2 ---
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { phase: 2, msg: "Commit mined! Reveal submitted to mempool. Waiting for next block..." } });
 
+    // --- WAIT FOR REVEAL TO BE MINED ---
+    // We verify the Reveal is mined by checking if our input coin has been successfully spent (removed from the UTXO set).
+    const inputCoinToCheck = ctx.selected_inputs[0].coin_id;
+    let revealMined = false;
+    for (let attempts = 0; attempts < 150; attempts++) {
+        const checkReq = await fetch(`${rpcUrl}/check`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ coin: inputCoinToCheck })
+        });
+        
+        if (checkReq.ok) {
+            const checkResp = await checkReq.json();
+            if (!checkResp.exists) {
+                revealMined = true; // The coin is gone from the state. Reveal is mined!
+                break;
+            }
+        }
+        await new Promise(r => setTimeout(r, 2000));
+    }
+
+    if (!revealMined) throw new Error("Timed out waiting for Reveal to be mined. Your transaction is likely stuck in the mempool.");
+
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { phase: 2, msg: "Reveal mined! Transaction complete." } });
+    await new Promise(r => setTimeout(r, 500)); // Small delay for UI polish
+
+    // --- FINALIZE LOCAL STATE ---
     for (const inp of ctx.selected_inputs) {
         delete wState.utxos[inp.coin_id];
     }
@@ -561,6 +600,5 @@ async function performSend(toAddress, amount) {
 
     await saveState();
     
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { pct: 100, msg: "Complete!" } });
     self.postMessage({ type: 'SEND_COMPLETE', payload: buildDashboardPayload() });
 }
