@@ -7,9 +7,9 @@ export class WebWallet {
     build_reveal(spend_context_json: string, server_commitment_hex: string, server_salt_hex: string): string;
     check_filter(filter_hex: string, block_hash_hex: string, n: number, addrs_json: string): boolean;
     /**
-     * Derives a reusable MSS address for receiving funds (Height 5 recommended)
+     * Derives a reusable MSS address for receiving funds
      */
-    get_mss_address(index: number, height: number): string;
+    get_mss_address(index: number, height: number, progress_cb?: Function | null): string;
     /**
      * Derives a single-use WOTS address (used internally for change outputs)
      */
@@ -35,7 +35,7 @@ export interface InitOutput {
     readonly generate_phrase: (a: number) => void;
     readonly webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly webwallet_check_filter: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => number;
-    readonly webwallet_get_mss_address: (a: number, b: number, c: number, d: number) => void;
+    readonly webwallet_get_mss_address: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly webwallet_get_wots_address: (a: number, b: number, c: number) => void;
     readonly webwallet_new: (a: number, b: number, c: number) => void;
     readonly webwallet_prepare_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number) => void;
