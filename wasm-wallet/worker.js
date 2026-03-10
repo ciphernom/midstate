@@ -12,6 +12,7 @@ let wState = {
     wotsAddrs: {}, // hex -> index
     mssAddrs: {},  // hex -> { index, height, next_leaf }
     utxos: {},     // RIGID MAP: coinIdHex -> UTXO Object
+    history: [],   // Transaction history array
     lastScannedHeight: 0
 };
 
@@ -55,9 +56,12 @@ async function loadState(pwd, bundleStr) {
     if (!bundleStr) throw new Error("No wallet found");
     const bundle = JSON.parse(bundleStr);
     
-    const salt = new Uint8Array(bundle.salt.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-    const iv = new Uint8Array(bundle.iv.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-    const data = new Uint8Array(bundle.data.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+    // Bulletproof parsing to prevent TypeError / SyntaxError crashes
+    const parseHexArray = (hexStr) => new Uint8Array((hexStr || "").match(/.{1,2}/g)?.map(b => parseInt(b, 16)) || []);
+    
+    const salt = parseHexArray(bundle.salt);
+    const iv = parseHexArray(bundle.iv);
+    const data = parseHexArray(bundle.data);
     
     const key = await deriveCryptoKey(pwd, salt);
     try {
@@ -66,17 +70,22 @@ async function loadState(pwd, bundleStr) {
         const loadedState = JSON.parse(dec.decode(decrypted));
         
         wState = loadedState;
+        
+        // Backwards compatibility migrations
         if (Array.isArray(wState.utxos)) {
             const utxoMap = {};
             for (const u of wState.utxos) utxoMap[u.coin_id] = u;
             wState.utxos = utxoMap;
+        }
+        if (!wState.history) {
+            wState.history = [];
         }
 
         password = pwd;
         wallet = new WebWallet(wState.phrase);
         self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
     } catch(e) {
-        throw new Error("Incorrect password");
+        throw new Error("Incorrect password or corrupted wallet file");
     }
 }
 
@@ -166,7 +175,8 @@ function buildDashboardPayload() {
     return {
         primaryAddress: mssList.length > 0 ? mssList[mssList.length - 1] : "None",
         balance: safeBalance,
-        utxos: utxoArray
+        utxos: utxoArray,
+        history: wState.history.slice().reverse() // Newest first
     };
 }
 
@@ -257,6 +267,7 @@ async function processFullBlock(height) {
     const block = await blockResp.json();
     
     let matchFound = false;
+    let receivedInBlock = [];
 
     if (block.transactions) {
         for (const tx of block.transactions) {
@@ -288,7 +299,9 @@ async function processFullBlock(height) {
             const saltHex = normalizeHex(cb.salt);
             if (wState.wotsAddrs[addrHex] !== undefined || wState.mssAddrs[addrHex] !== undefined) {
                 const coinId = compute_coin_id_hex(addrHex, BigInt(cb.value), saltHex);
-                addUtxo(addrHex, Number(cb.value), saltHex, coinId);
+                if (addUtxo(addrHex, Number(cb.value), saltHex, coinId)) {
+                    receivedInBlock.push({ id: coinId, val: Number(cb.value) });
+                }
                 matchFound = true;
             }
         }
@@ -305,7 +318,9 @@ async function processFullBlock(height) {
                         const saltHex = normalizeHex(outData.salt);
                         if (wState.wotsAddrs[addrHex] !== undefined || wState.mssAddrs[addrHex] !== undefined) {
                             const coinId = compute_coin_id_hex(addrHex, BigInt(outData.value), saltHex);
-                            addUtxo(addrHex, Number(outData.value), saltHex, coinId);
+                            if (addUtxo(addrHex, Number(outData.value), saltHex, coinId)) {
+                                receivedInBlock.push({ id: coinId, val: Number(outData.value) });
+                            }
                             matchFound = true;
                         }
                     }
@@ -314,9 +329,22 @@ async function processFullBlock(height) {
         }
     }
 
+    // Write to transaction history
+    if (receivedInBlock.length > 0) {
+        wState.history.push({
+            kind: 'received',
+            timestamp: block.timestamp || Math.floor(Date.now() / 1000),
+            fee: 0,
+            inputs: [],
+            outputs: receivedInBlock.map(c => c.id),
+            value: receivedInBlock.reduce((sum, c) => sum + c.val, 0)
+        });
+    }
+
     if (matchFound) self.postMessage({ type: 'LOG', payload: `Processed match at block ${height}.` });
 }
 
+// Helper returns true if the UTXO was newly added
 function addUtxo(address, value, salt, coinId) {
     let index = 0;
     let is_mss = false;
@@ -337,7 +365,9 @@ function addUtxo(address, value, salt, coinId) {
     if (!wState.utxos[coinId]) {
         wState.utxos[coinId] = { index, is_mss, mss_height, mss_leaf, address, value, salt, coin_id: coinId };
         self.postMessage({ type: 'LOG', payload: `>>> UTXO FOUND! Value: ${value}, ID: ${coinId.substring(0,8)}` });
+        return true;
     }
+    return false;
 }
 
 async function performSend(toAddress, amount) {
@@ -347,8 +377,6 @@ async function performSend(toAddress, amount) {
         wallet.set_mss_leaf_index(addr, mss.next_leaf);
     }
     
-    // Inject the absolute latest leaf index into the UTXOs before sending to Wasm.
-    // This ensures all sibling coins get the exact same, current leaf index.
     const utxoArray = Object.values(wState.utxos).map(u => {
         if (u.is_mss && wState.mssAddrs[u.address]) {
             return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
@@ -363,7 +391,6 @@ async function performSend(toAddress, amount) {
         deriveNextWots();
     }
     
-    // Only increment the leaf counter ONCE per unique MSS address used in this transaction!
     const usedMssAddrs = new Set();
     for (const inp of ctx.selected_inputs) {
         if (inp.is_mss) usedMssAddrs.add(inp.address);
@@ -426,14 +453,27 @@ async function performSend(toAddress, amount) {
         delete wState.utxos[inp.coin_id];
     }
 
+    let outIds = [];
     for (const out of ctx.outputs) {
         const addrHex = normalizeHex(out.address);
         if (wState.wotsAddrs[addrHex] !== undefined || wState.mssAddrs[addrHex] !== undefined) {
             const saltHex = normalizeHex(out.salt);
             const coinId = compute_coin_id_hex(addrHex, BigInt(out.value), saltHex);
-            addUtxo(addrHex, Number(out.value), saltHex, coinId);
+            if (addUtxo(addrHex, Number(out.value), saltHex, coinId)) {
+                outIds.push(coinId);
+            }
         }
     }
+
+    // Write to transaction history
+    wState.history.push({
+        kind: 'sent',
+        timestamp: Math.floor(Date.now() / 1000),
+        fee: ctx.fee,
+        inputs: ctx.selected_inputs.map(i => i.coin_id),
+        outputs: outIds,
+        value: Number(amount)
+    });
 
     await saveState();
     self.postMessage({ type: 'SEND_COMPLETE', payload: buildDashboardPayload() });
