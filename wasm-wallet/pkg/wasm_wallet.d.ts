@@ -5,18 +5,13 @@ export class WebWallet {
     free(): void;
     [Symbol.dispose](): void;
     build_reveal(spend_context_json: string, server_commitment_hex: string, server_salt_hex: string): string;
-    check_filter(filter_hex: string, block_hash_hex: string, n: number, addrs_json: string): boolean;
-    /**
-     * Derives a reusable MSS address for receiving funds
-     */
+    check_filter(filter_hex: string, block_hash_hex: string, n: number): boolean;
     get_mss_address(index: number, height: number, progress_cb?: Function | null): string;
-    /**
-     * Derives a single-use WOTS address (used internally for change outputs)
-     */
     get_wots_address(index: number): string;
     constructor(phrase: string);
     prepare_spend(available_utxos_json: string, to_address_hex: string, send_amount: bigint, next_wots_index: number): string;
     set_mss_leaf_index(address_hex: string, leaf_index: number): void;
+    set_watchlist(addrs_json: string): void;
 }
 
 export function compute_coin_id_hex(address_hex: string, value: bigint, salt_hex: string): string;
@@ -34,12 +29,13 @@ export interface InitOutput {
     readonly decompose_amount: (a: bigint) => number;
     readonly generate_phrase: (a: number) => void;
     readonly webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
-    readonly webwallet_check_filter: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => number;
+    readonly webwallet_check_filter: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
     readonly webwallet_get_mss_address: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly webwallet_get_wots_address: (a: number, b: number, c: number) => void;
     readonly webwallet_new: (a: number, b: number, c: number) => void;
     readonly webwallet_prepare_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number) => void;
     readonly webwallet_set_mss_leaf_index: (a: number, b: number, c: number, d: number) => void;
+    readonly webwallet_set_watchlist: (a: number, b: number, c: number) => void;
     readonly __wbindgen_export: (a: number) => void;
     readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
     readonly __wbindgen_export2: (a: number, b: number) => number;
