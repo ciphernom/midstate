@@ -204,7 +204,14 @@ impl Mempool {
     /// // 'tx' must carry valid PoW for this to succeed.
     /// mempool.add(tx, &state).unwrap();
     /// ```
-    pub fn add(&mut self, tx: Transaction, state: &State) -> Result<()> {
+    pub fn add(
+        &mut self,
+        tx: Transaction,
+        state: &State,
+        // Pre-flight oracle: WOTS address -> commitment that previously spent it.
+        // Built by the caller from storage. Pass an empty map pre-activation.
+        spent_oracle: &std::collections::HashMap<[u8; 32], [u8; 32]>,
+    ) -> Result<()> {
         let tx_bytes = bincode::serialized_size(&tx).unwrap_or(0) as u64;
 
         // Extract the values we need from borrowed fields *before* any
@@ -262,6 +269,40 @@ impl Mempool {
             }
 
             reveal_tx @ Transaction::Reveal { .. } => {
+                // WOTS address-reuse pre-flight check.
+                // Gives immediate RPC feedback instead of silent miner rejection.
+                if state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT
+                    && !spent_oracle.is_empty()
+                {
+                    if let Transaction::Reveal { inputs, witnesses, outputs, salt } = &reveal_tx {
+                        let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+                        let output_hashes: Vec<[u8; 32]> = outputs.iter()
+                            .map(|o| o.hash_for_commitment())
+                            .collect();
+                        let this_commitment = crate::core::types::compute_commitment(
+                            &input_ids, &output_hashes, salt,
+                        );
+                        for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                            let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                                if let Some(sig) = wit_inputs.first() {
+                                    if sig.len() == crate::core::wots::SIG_SIZE {
+                                        let addr = input.predicate.address();
+                                        if let Some(&prior_commitment) = spent_oracle.get(&addr) {
+                                            if prior_commitment != this_commitment {
+                                                anyhow::bail!(
+                                                    "Mempool rejected: WOTS address {} already \
+                                                     spent with a different commitment",
+                                                    hex::encode(addr)
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    
+                }
+
                 // Admission fee check and stored ordering key use the same
                 // FEE_RATE_SCALE so they are numerically consistent.
                 if (reveal_tx.fee() as u128) * FEE_RATE_SCALE
@@ -847,7 +888,7 @@ mod tests {
             bad += 1;
         }
         let tx = Transaction::Commit { commitment, spam_nonce: bad };
-        assert!(mp.add(tx, &state).is_err());
+        assert!(mp.add(tx, &state, &std::collections::HashMap::new()).is_err());
         assert_eq!(mp.len(), 0);
     }
 
@@ -858,7 +899,7 @@ mod tests {
         let commitment = hash(b"mempool test good");
         let n = mine_commit_nonce(&commitment);
         let tx = Transaction::Commit { commitment, spam_nonce: n };
-        assert!(mp.add(tx, &state).is_ok());
+        assert!(mp.add(tx, &state, &std::collections::HashMap::new()).is_ok());
         assert_eq!(mp.len(), 1);
     }
 
@@ -869,8 +910,8 @@ mod tests {
         let commitment = hash(b"dup test");
         let n = mine_commit_nonce(&commitment);
         let tx = Transaction::Commit { commitment, spam_nonce: n };
-        assert!(mp.add(tx.clone(), &state).is_ok());
-        let err = mp.add(tx, &state).unwrap_err();
+        assert!(mp.add(tx.clone(), &state, &std::collections::HashMap::new()).is_ok());
+        let err = mp.add(tx, &state, &std::collections::HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("already in mempool"));
     }
 
@@ -900,7 +941,7 @@ mod tests {
 
         let tx = Transaction::Commit { commitment: extra, spam_nonce: n };
         // High-PoW commit should evict one of the zero-PoW dummies.
-        assert!(mp.add(tx, &state).is_ok());
+        assert!(mp.add(tx, &state, &std::collections::HashMap::new()).is_ok());
         assert_eq!(mp.len(), MAX_PENDING_COMMITS, "Pool must not exceed capacity");
         assert!(mp.commits.contains_key(&extra), "New commit must be present");
 
@@ -930,7 +971,7 @@ mod tests {
         let commitment = hash(b"equal pow");
         let nonce = mine_commit_nonce(&commitment); // ~24 bits
         let tx = Transaction::Commit { commitment, spam_nonce: nonce };
-        let err = mp.add(tx, &state).unwrap_err();
+        let err = mp.add(tx, &state, &std::collections::HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("Mempool is busy") || err.to_string().contains("Mempool full of Commits"));
     }
 
@@ -942,7 +983,7 @@ mod tests {
             state_with_committed_coin();
         let mut mp = Mempool::new();
         let tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
-        assert!(mp.add(tx, &state).is_ok());
+        assert!(mp.add(tx, &state, &std::collections::HashMap::new()).is_ok());
         assert_eq!(mp.len(), 1);
     }
 
@@ -952,9 +993,9 @@ mod tests {
             state_with_committed_coin();
         let mut mp = Mempool::new();
         let tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
-        mp.add(tx.clone(), &state).unwrap();
+        mp.add(tx.clone(), &state, &std::collections::HashMap::new()).unwrap();
         // Same tx has same fee rate — RBF requires strictly higher fee rate
-        let err = mp.add(tx, &state).unwrap_err();
+        let err = mp.add(tx, &state, &std::collections::HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("RBF rejected"));
     }
 
@@ -993,7 +1034,7 @@ mod tests {
         };
 
         let mut mp = Mempool::new();
-        let err = mp.add(tx, &state).unwrap_err();
+        let err = mp.add(tx, &state, &std::collections::HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("Fee rate too low"));
     }
 
@@ -1028,7 +1069,7 @@ mod tests {
         let tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
         assert_eq!(tx.fee(), 12);
 
-        assert!(mp.add(tx.clone(), &state).is_ok());
+        assert!(mp.add(tx.clone(), &state, &std::collections::HashMap::new()).is_ok());
         assert_eq!(mp.reveals.len(), MAX_MEMPOOL_REVEALS, "Pool size must remain constant");
 
         // The new input must now be tracked.
@@ -1067,7 +1108,7 @@ mod tests {
         // Our tx has fee = 12, but the pool is full of fee-10 txs that are the
         // same size, so the rate is comparable and the incoming tx must not evict.
         let tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
-        let err = mp.add(tx, &state).unwrap_err();
+        let err = mp.add(tx, &state, &std::collections::HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("fee rate too low to replace any existing Reveal"));
     }
 
@@ -1091,7 +1132,7 @@ mod tests {
         let extra = hash(b"one more");
         let n = mine_commit_nonce(&extra); // ~24 bits
         let tx = Transaction::Commit { commitment: extra, spam_nonce: n };
-        let err = mp.add(tx, &state).unwrap_err();
+        let err = mp.add(tx, &state, &std::collections::HashMap::new()).unwrap_err();
         assert!(
             err.to_string().contains("Mempool is busy")
                 || err.to_string().contains("Mempool full of Commits"),
@@ -1144,7 +1185,7 @@ mod tests {
 
         // Add a reveal — it should come out first.
         let reveal_tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
-        mp.add(reveal_tx, &state).unwrap();
+        mp.add(reveal_tx, &state, &std::collections::HashMap::new()).unwrap();
 
         let drained = mp.drain(2);
         assert_eq!(drained.len(), 2);
@@ -1182,7 +1223,7 @@ mod tests {
             state_with_committed_coin();
         let mut mp = Mempool::new();
         let tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
-        mp.add(tx, &state).unwrap();
+        mp.add(tx, &state, &std::collections::HashMap::new()).unwrap();
         assert_eq!(mp.len(), 1);
 
         // Pruning against a fresh state (no committed coin) should remove the reveal.

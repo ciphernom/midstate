@@ -1,0 +1,785 @@
+diff -ruN '--exclude=*.bak' src_orig/core/state.rs src_new/core/state.rs
+--- a/src/core/state.rs	2026-03-11 09:12:19.069210546 +0000
++++ b/src/core/state.rs	2026-03-11 09:19:42.392081773 +0000
+@@ -142,7 +142,15 @@
+ }
+ 
+ /// Apply a batch to the state
+-pub fn apply_batch(state: &mut State, batch: &Batch, previous_timestamps: &[u64]) -> Result<()> {
++pub fn apply_batch(
++    state: &mut State,
++    batch: &Batch,
++    previous_timestamps: &[u64],
++    // Pre-flight oracle: WOTS address -> commitment that previously spent it.
++    // Built by the caller from storage. Pass an empty map pre-activation or
++    // in tests — the check is skipped entirely when the map is empty.
++    spent_oracle: &std::collections::HashMap<[u8; 32], [u8; 32]>,
++) -> Result<()> {
+     // 1. Check parent linkage
+     if batch.prev_midstate != state.midstate {
+         bail!("Block parent mismatch: expected {}, got {}",
+@@ -178,6 +186,45 @@
+         validate_timestamp(batch.timestamp, previous_timestamps, current_timestamp())?;
+     }
+ 
++    // WOTS address-reuse consensus check (post-activation).
++    // Uses the pre-built oracle so state.rs stays pure (no storage I/O here).
++    // An address is being reused if it is in the oracle AND the commitment
++    // for this transaction differs from the one that originally spent it.
++    // Same commitment = safe reorg replay of the identical transaction.
++    if state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT && !spent_oracle.is_empty() {
++        for tx in &batch.transactions {
++            if let Transaction::Reveal { inputs, witnesses, outputs, salt } = tx {
++                let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
++                let output_hashes: Vec<[u8; 32]> = outputs.iter()
++                    .map(|o| o.hash_for_commitment())
++                    .collect();
++                let this_commitment = crate::core::types::compute_commitment(
++                    &input_ids, &output_hashes, salt,
++                );
++                for (input, witness) in inputs.iter().zip(witnesses.iter()) {
++                    if let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness {
++                        if let Some(sig) = wit_inputs.first() {
++                            if sig.len() == crate::core::wots::SIG_SIZE {
++                                let addr = input.predicate.address();
++                                if let Some(&prior_commitment) = spent_oracle.get(&addr) {
++                                    if prior_commitment != this_commitment {
++                                        bail!(
++                                            "Consensus violation: WOTS address {} reused \
++                                             with different commitment (prior: {}, this: {})",
++                                            hex::encode(addr),
++                                            hex::encode(prior_commitment),
++                                            hex::encode(this_commitment),
++                                        );
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
+     // 2. Reject batches that would require excessive signature verification
+     //    OR exceed network bandwidth limits.
+     let mut total_inputs = 0;
+@@ -378,7 +425,7 @@
+         let reward = block_reward(state.height);
+         let batch = make_empty_batch(&state, reward, state.timestamp + 1);
+         let timestamps = vec![state.timestamp];
+-        apply_batch(&mut state, &batch, &timestamps).unwrap();
++        apply_batch(&mut state, &batch, &timestamps, &std::collections::HashMap::new()).unwrap();
+         assert_eq!(state.height, 1);
+     }
+ 
+@@ -390,7 +437,7 @@
+         let reward = block_reward(state.height);
+         let batch = make_empty_batch(&state, reward, state.timestamp + 1);
+         let timestamps = vec![state.timestamp];
+-        apply_batch(&mut state, &batch, &timestamps).unwrap();
++        apply_batch(&mut state, &batch, &timestamps, &std::collections::HashMap::new()).unwrap();
+         assert_eq!(state.depth, initial_depth + expected_work);
+         assert!(expected_work > 0, "work per block must be nonzero");
+     }
+@@ -402,7 +449,7 @@
+         let reward = block_reward(state.height);
+         let batch = make_empty_batch(&state, reward, state.timestamp + 1);
+         let timestamps = vec![state.timestamp];
+-        apply_batch(&mut state, &batch, &timestamps).unwrap();
++        apply_batch(&mut state, &batch, &timestamps, &std::collections::HashMap::new()).unwrap();
+         assert_ne!(state.midstate, old_midstate);
+         assert_eq!(state.midstate, batch.extension.final_hash);
+     }
+@@ -414,7 +461,7 @@
+         let batch = make_empty_batch(&state, reward, state.timestamp + 1);
+         let coinbase_ids: Vec<[u8; 32]> = batch.coinbase.iter().map(|c| c.coin_id()).collect();
+         let timestamps = vec![state.timestamp];
+-        apply_batch(&mut state, &batch, &timestamps).unwrap();
++        apply_batch(&mut state, &batch, &timestamps, &std::collections::HashMap::new()).unwrap();
+         for id in &coinbase_ids {
+             assert!(state.coins.contains(id), "coinbase coin should be in state");
+         }
+@@ -428,7 +475,7 @@
+         batch.prev_midstate = [0xFFu8; 32]; // wrong parent
+         let mut state2 = state.clone();
+         let timestamps = vec![state2.timestamp];
+-        assert!(apply_batch(&mut state2, &batch, &timestamps).is_err());
++        assert!(apply_batch(&mut state2, &batch, &timestamps, &std::collections::HashMap::new()).is_err());
+     }
+ 
+     #[test]
+@@ -438,7 +485,7 @@
+         let mut batch = make_empty_batch(&state, reward, state.timestamp + 1);
+         batch.target = [0x00; 32]; // wrong target
+         let timestamps = vec![state.timestamp];
+-        assert!(apply_batch(&mut state, &batch, &timestamps).is_err());
++        assert!(apply_batch(&mut state, &batch, &timestamps, &std::collections::HashMap::new()).is_err());
+     }
+ 
+     #[test]
+@@ -447,7 +494,7 @@
+         // Coinbase with too much value
+         let batch = make_empty_batch(&state, block_reward(state.height) + 100, state.timestamp + 1);
+         let timestamps = vec![state.timestamp];
+-        assert!(apply_batch(&mut state, &batch, &timestamps).is_err());
++        assert!(apply_batch(&mut state, &batch, &timestamps, &std::collections::HashMap::new()).is_err());
+     }
+ 
+     #[test]
+@@ -459,7 +506,7 @@
+             cb.value = 3; // not a power of 2
+         }
+         let timestamps = vec![state.timestamp];
+-        assert!(apply_batch(&mut state, &batch, &timestamps).is_err());
++        assert!(apply_batch(&mut state, &batch, &timestamps, &std::collections::HashMap::new()).is_err());
+     }
+ 
+     #[test]
+@@ -469,13 +516,13 @@
+         let reward = block_reward(state.height);
+         let batch0 = make_empty_batch(&state, reward, state.timestamp + 1);
+         let timestamps_0 = vec![state.timestamp];
+-        apply_batch(&mut state, &batch0, &timestamps_0).unwrap();
++        apply_batch(&mut state, &batch0, &timestamps_0, &std::collections::HashMap::new()).unwrap();
+ 
+         // Now try a batch with timestamp <= previous
+         let reward = block_reward(state.height);
+         let batch1 = make_empty_batch(&state, reward, state.timestamp); // same timestamp
+         let timestamps_1 = vec![state.timestamp];
+-        assert!(apply_batch(&mut state, &batch1, &timestamps_1).is_err());
++        assert!(apply_batch(&mut state, &batch1, &timestamps_1, &std::collections::HashMap::new()).is_err());
+     }
+ 
+     #[test]
+@@ -486,7 +533,7 @@
+         // 1. Apply a valid block so height > 0
+         let valid_batch = make_empty_batch(&state, reward, state.timestamp + 1);
+         let timestamps_0 = vec![state.timestamp];
+-        apply_batch(&mut state, &valid_batch, &timestamps_0).unwrap();
++        apply_batch(&mut state, &valid_batch, &timestamps_0, &std::collections::HashMap::new()).unwrap();
+ 
+         // 2. Try to apply an invalid block (timestamp not strictly greater)
+         let reward2 = block_reward(state.height);
+@@ -494,7 +541,7 @@
+         let timestamps_1 = vec![state.timestamp];
+ 
+         
+-        let result = apply_batch(&mut state, &invalid_batch, &timestamps_1);
++        let result = apply_batch(&mut state, &invalid_batch, &timestamps_1, &std::collections::HashMap::new());
+         assert!(result.is_err());
+         assert!(result.unwrap_err().to_string().contains("greater than previous"));
+     }
+diff -ruN '--exclude=*.bak' src_orig/core/types.rs src_new/core/types.rs
+--- a/src/core/types.rs	2026-03-11 09:12:19.067210546 +0000
++++ b/src/core/types.rs	2026-03-11 09:12:28.869207699 +0000
+@@ -546,6 +546,9 @@
+ /// Pruning reclaims ~32 KB per block (~98% of batch storage). Pruned batches
+ /// remain fully verifiable via full-chain recomputation in verify_extension.
+ pub const PRUNE_DEPTH: u64 = 1000;
++/// Block height at which WOTS address-reuse is enforced at consensus level.
++/// Blocks below this height are grandfathered (network was live before this rule).
++pub const WOTS_REUSE_ACTIVATION_HEIGHT: u64 = 18_000;
+ // ── Economics ───────────────────────────────────────────────────────────────
+ 
+ /// Blocks per year at TARGET_BLOCK_TIME seconds per block.
+diff -ruN '--exclude=*.bak' src_orig/mempool.rs src_new/mempool.rs
+--- a/src/mempool.rs	2026-03-11 09:12:19.077210544 +0000
++++ b/src/mempool.rs	2026-03-11 09:19:46.338080627 +0000
+@@ -204,7 +204,14 @@
+     /// // 'tx' must carry valid PoW for this to succeed.
+     /// mempool.add(tx, &state).unwrap();
+     /// ```
+-    pub fn add(&mut self, tx: Transaction, state: &State) -> Result<()> {
++    pub fn add(
++        &mut self,
++        tx: Transaction,
++        state: &State,
++        // Pre-flight oracle: WOTS address -> commitment that previously spent it.
++        // Built by the caller from storage. Pass an empty map pre-activation.
++        spent_oracle: &std::collections::HashMap<[u8; 32], [u8; 32]>,
++    ) -> Result<()> {
+         let tx_bytes = bincode::serialized_size(&tx).unwrap_or(0) as u64;
+ 
+         // Extract the values we need from borrowed fields *before* any
+@@ -262,6 +269,40 @@
+             }
+ 
+             reveal_tx @ Transaction::Reveal { .. } => {
++                // WOTS address-reuse pre-flight check.
++                // Gives immediate RPC feedback instead of silent miner rejection.
++                if state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT
++                    && !spent_oracle.is_empty()
++                {
++                    if let Transaction::Reveal { inputs, witnesses, outputs, salt } = &reveal_tx {
++                        let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
++                        let output_hashes: Vec<[u8; 32]> = outputs.iter()
++                            .map(|o| o.hash_for_commitment())
++                            .collect();
++                        let this_commitment = crate::core::types::compute_commitment(
++                            &input_ids, &output_hashes, salt,
++                        );
++                        for (input, witness) in inputs.iter().zip(witnesses.iter()) {
++                            if let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness {
++                                if let Some(sig) = wit_inputs.first() {
++                                    if sig.len() == crate::core::wots::SIG_SIZE {
++                                        let addr = input.predicate.address();
++                                        if let Some(&prior_commitment) = spent_oracle.get(&addr) {
++                                            if prior_commitment != this_commitment {
++                                                anyhow::bail!(
++                                                    "Mempool rejected: WOTS address {} already \
++                                                     spent with a different commitment",
++                                                    hex::encode(addr)
++                                                );
++                                            }
++                                        }
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++
+                 // Admission fee check and stored ordering key use the same
+                 // FEE_RATE_SCALE so they are numerically consistent.
+                 if (reveal_tx.fee() as u128) * FEE_RATE_SCALE
+@@ -847,7 +888,7 @@
+             bad += 1;
+         }
+         let tx = Transaction::Commit { commitment, spam_nonce: bad };
+-        assert!(mp.add(tx, &state).is_err());
++        assert!(mp.add(tx, &state, &std::collections::HashMap::new()).is_err());
+         assert_eq!(mp.len(), 0);
+     }
+ 
+@@ -858,7 +899,7 @@
+         let commitment = hash(b"mempool test good");
+         let n = mine_commit_nonce(&commitment);
+         let tx = Transaction::Commit { commitment, spam_nonce: n };
+-        assert!(mp.add(tx, &state).is_ok());
++        assert!(mp.add(tx, &state, &std::collections::HashMap::new()).is_ok());
+         assert_eq!(mp.len(), 1);
+     }
+ 
+@@ -869,8 +910,8 @@
+         let commitment = hash(b"dup test");
+         let n = mine_commit_nonce(&commitment);
+         let tx = Transaction::Commit { commitment, spam_nonce: n };
+-        assert!(mp.add(tx.clone(), &state).is_ok());
+-        let err = mp.add(tx, &state).unwrap_err();
++        assert!(mp.add(tx.clone(), &state, &std::collections::HashMap::new()).is_ok());
++        let err = mp.add(tx, &state, &std::collections::HashMap::new()).unwrap_err();
+         assert!(err.to_string().contains("already in mempool"));
+     }
+ 
+@@ -900,7 +941,7 @@
+ 
+         let tx = Transaction::Commit { commitment: extra, spam_nonce: n };
+         // High-PoW commit should evict one of the zero-PoW dummies.
+-        assert!(mp.add(tx, &state).is_ok());
++        assert!(mp.add(tx, &state, &std::collections::HashMap::new()).is_ok());
+         assert_eq!(mp.len(), MAX_PENDING_COMMITS, "Pool must not exceed capacity");
+         assert!(mp.commits.contains_key(&extra), "New commit must be present");
+ 
+@@ -930,7 +971,7 @@
+         let commitment = hash(b"equal pow");
+         let nonce = mine_commit_nonce(&commitment); // ~24 bits
+         let tx = Transaction::Commit { commitment, spam_nonce: nonce };
+-        let err = mp.add(tx, &state).unwrap_err();
++        let err = mp.add(tx, &state, &std::collections::HashMap::new()).unwrap_err();
+         assert!(err.to_string().contains("Mempool is busy") || err.to_string().contains("Mempool full of Commits"));
+     }
+ 
+@@ -942,7 +983,7 @@
+             state_with_committed_coin();
+         let mut mp = Mempool::new();
+         let tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
+-        assert!(mp.add(tx, &state).is_ok());
++        assert!(mp.add(tx, &state, &std::collections::HashMap::new()).is_ok());
+         assert_eq!(mp.len(), 1);
+     }
+ 
+@@ -952,9 +993,9 @@
+             state_with_committed_coin();
+         let mut mp = Mempool::new();
+         let tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
+-        mp.add(tx.clone(), &state).unwrap();
++        mp.add(tx.clone(), &state, &std::collections::HashMap::new()).unwrap();
+         // Same tx has same fee rate — RBF requires strictly higher fee rate
+-        let err = mp.add(tx, &state).unwrap_err();
++        let err = mp.add(tx, &state, &std::collections::HashMap::new()).unwrap_err();
+         assert!(err.to_string().contains("RBF rejected"));
+     }
+ 
+@@ -993,7 +1034,7 @@
+         };
+ 
+         let mut mp = Mempool::new();
+-        let err = mp.add(tx, &state).unwrap_err();
++        let err = mp.add(tx, &state, &std::collections::HashMap::new()).unwrap_err();
+         assert!(err.to_string().contains("Fee rate too low"));
+     }
+ 
+@@ -1028,7 +1069,7 @@
+         let tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
+         assert_eq!(tx.fee(), 12);
+ 
+-        assert!(mp.add(tx.clone(), &state).is_ok());
++        assert!(mp.add(tx.clone(), &state, &std::collections::HashMap::new()).is_ok());
+         assert_eq!(mp.reveals.len(), MAX_MEMPOOL_REVEALS, "Pool size must remain constant");
+ 
+         // The new input must now be tracked.
+@@ -1067,7 +1108,7 @@
+         // Our tx has fee = 12, but the pool is full of fee-10 txs that are the
+         // same size, so the rate is comparable and the incoming tx must not evict.
+         let tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
+-        let err = mp.add(tx, &state).unwrap_err();
++        let err = mp.add(tx, &state, &std::collections::HashMap::new()).unwrap_err();
+         assert!(err.to_string().contains("fee rate too low to replace any existing Reveal"));
+     }
+ 
+@@ -1091,7 +1132,7 @@
+         let extra = hash(b"one more");
+         let n = mine_commit_nonce(&extra); // ~24 bits
+         let tx = Transaction::Commit { commitment: extra, spam_nonce: n };
+-        let err = mp.add(tx, &state).unwrap_err();
++        let err = mp.add(tx, &state, &std::collections::HashMap::new()).unwrap_err();
+         assert!(
+             err.to_string().contains("Mempool is busy")
+                 || err.to_string().contains("Mempool full of Commits"),
+@@ -1144,7 +1185,7 @@
+ 
+         // Add a reveal — it should come out first.
+         let reveal_tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
+-        mp.add(reveal_tx, &state).unwrap();
++        mp.add(reveal_tx, &state, &std::collections::HashMap::new()).unwrap();
+ 
+         let drained = mp.drain(2);
+         assert_eq!(drained.len(), 2);
+@@ -1182,7 +1223,7 @@
+             state_with_committed_coin();
+         let mut mp = Mempool::new();
+         let tx = make_reveal_tx(&seed, 20, input_salt, commit_salt, output);
+-        mp.add(tx, &state).unwrap();
++        mp.add(tx, &state, &std::collections::HashMap::new()).unwrap();
+         assert_eq!(mp.len(), 1);
+ 
+         // Pruning against a fresh state (no committed coin) should remove the reveal.
+diff -ruN '--exclude=*.bak' src_orig/node.rs src_new/node.rs
+--- a/src/node.rs	2026-03-11 09:12:19.079210543 +0000
++++ b/src/node.rs	2026-03-11 09:20:02.768075855 +0000
+@@ -512,14 +512,14 @@
+                         state_root, // NEW
+                     };
+                     storage.save_batch(0, &genesis_batch)?;
+-                    apply_batch(&mut state, &genesis_batch, &[])?;
++                    apply_batch(&mut state, &genesis_batch, &[], &std::collections::HashMap::new())?;
+                     state.target = adjust_difficulty(&state);
+                     storage.save_state(&state)?;
+                     tracing::info!("Genesis batch applied, height now {}", state.height);
+                 }
+                 Some(batch) => {
+                     if state.height == 0 {
+-                        apply_batch(&mut state, &batch, &[])?;
++                        apply_batch(&mut state, &batch, &[], &std::collections::HashMap::new())?;
+                         state.target = adjust_difficulty(&state);
+                         storage.save_state(&state)?;
+                     }
+@@ -1680,7 +1680,12 @@
+             // leave a Frankenstein chain on disk: some heights from the peer,
+             // some from our old chain.  Batches are persisted atomically in
+             // perform_reorg only after we decide to adopt.)
+-            apply_batch(candidate_state, batch, recent_ts.make_contiguous())?;
++            let wots_oracle = if candidate_state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
++                self.storage.query_spent_addresses(batch).unwrap_or_default()
++            } else {
++                std::collections::HashMap::new()
++            };
++            apply_batch(candidate_state, batch, recent_ts.make_contiguous(), &wots_oracle)?;
+             
+             recent_ts.push_back(batch.timestamp);
+             if recent_ts.len() > window_size {
+@@ -1762,7 +1767,12 @@
+             }
+         }
+ 
+-        match self.mempool.add(tx.clone(), &self.state) {
++        let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
++            self.storage.query_spent_addresses_for_tx(&tx).unwrap_or_default()
++        } else {
++            std::collections::HashMap::new()
++        };
++        match self.mempool.add(tx.clone(), &self.state, &wots_oracle) {
+             Ok(_) => {
+                 self.metrics.inc_transactions_processed();
+ 
+@@ -1847,7 +1857,7 @@
+         // priority over Dandelion++ anonymity under active spam.
+         if self.stem_pool.len() >= MAX_STEM_POOL_SIZE {
+             tracing::warn!("Stem pool full ({} entries), bypassing Dandelion++ for tx", MAX_STEM_POOL_SIZE);
+-            let _ = self.mempool.add(tx.clone(), &self.state);
++            let _ = self.mempool.add(tx.clone(), &self.state, &std::collections::HashMap::new());
+             self.network.broadcast(Message::Transaction(tx));
+             self.cancel_mining();
+             self.trigger_mining();
+@@ -1857,7 +1867,7 @@
+             if roll < STEM_FLUFF_PERCENT {
+                 // Fluff: add to public mempool and broadcast
+                 tracing::debug!("Dandelion++ fluff: broadcasting tx after stem");
+-                let _ = self.mempool.add(tx.clone(), &self.state);
++                let _ = self.mempool.add(tx.clone(), &self.state, &std::collections::HashMap::new());
+                 self.network.broadcast(Message::Transaction(tx));
+                 self.cancel_mining();
+                 self.trigger_mining();
+@@ -1873,7 +1883,7 @@
+                     tracing::debug!("Dandelion++ stem: forwarded to {}", next);
+                 } else {
+                     // No other peers — fluff immediately
+-                    let _ = self.mempool.add(tx.clone(), &self.state);
++                    let _ = self.mempool.add(tx.clone(), &self.state, &std::collections::HashMap::new());
+                     self.network.broadcast(Message::Transaction(tx));
+                     self.cancel_mining();
+                     self.trigger_mining();
+@@ -1899,7 +1909,7 @@
+                     tracing::debug!("Dandelion++ timeout: fluffing valid stem tx");
+                     
+                     // 2. Try to add to local mempool (might fail if our mempool is full/fee too low)
+-                    let _ = self.mempool.add(tx.clone(), &self.state);
++                    let _ = self.mempool.add(tx.clone(), &self.state, &std::collections::HashMap::new());
+                     
+                     // 3. Broadcast to the network regardless of local mempool admission, 
+                     // so the rest of the network gets a chance to mine it.
+@@ -2008,7 +2018,14 @@
+                 return Ok(None);
+             }
+ 
+-            match apply_batch(&mut candidate_state, batch, recent_headers.make_contiguous()) {
++            match {
++                let wots_oracle = if candidate_state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
++                    self.storage.query_spent_addresses(batch).unwrap_or_default()
++                } else {
++                    std::collections::HashMap::new()
++                };
++                apply_batch(&mut candidate_state, batch, recent_headers.make_contiguous(), &wots_oracle)
++            } {
+ 
+                 Ok(_) => {
+                     recent_headers.push_back(batch.timestamp);
+@@ -2137,6 +2154,14 @@
+         // This is the point of no return. 
+         self.storage.save_state(&self.state)?;
+ 
++        // Burn WOTS addresses for all newly adopted blocks.
++        // Idempotent: reorg replays of the same batch write the same commitment value.
++        for (height, _, batch) in &new_history {
++            if let Err(e) = self.storage.burn_batch_addresses(batch, *height) {
++                tracing::warn!("burn_batch_addresses failed at height {}: {}", height, e);
++            }
++        }
++
+         // 3. APPLY: Rename .tmp files to .bin.
+         // If we crash during this loop, recover_wal() will finish the renames
+         // on the next boot (height <= committed_height).
+@@ -2190,7 +2215,7 @@
+                         if recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
+                             recent_headers.pop_front();
+                         }
+-                        apply_batch(&mut state, &batch, recent_headers.make_contiguous())?;
++                        apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &std::collections::HashMap::new())?;
+                         state.target = adjust_difficulty(&state);
+                     } else {
+                         anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
+@@ -2234,7 +2259,7 @@
+                         if recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
+                             recent_headers.pop_front();
+                         }
+-                        apply_batch(&mut state, &batch, recent_headers.make_contiguous())?;
++                        apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &std::collections::HashMap::new())?;
+                         state.target = adjust_difficulty(&state);
+                     } else {
+                         anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
+@@ -2421,7 +2446,12 @@
+ 
+         // Checks passed — now clone state and apply fully.
+         let mut candidate_state = self.state.clone();
+-        match apply_batch(&mut candidate_state, &batch, self.recent_headers.make_contiguous()) {
++        let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
++            self.storage.query_spent_addresses(&batch).unwrap_or_default()
++        } else {
++            std::collections::HashMap::new()
++        };
++        match apply_batch(&mut candidate_state, &batch, self.recent_headers.make_contiguous(), &wots_oracle) {
+             Ok(_) => {
+                 let best = choose_best_state(&self.state, &candidate_state);
+                 let is_reorg = best.height == self.state.height &&
+@@ -2510,7 +2540,12 @@
+         // Cheap midstate check before expensive state clone.
+         if batches[0].prev_midstate == self.state.midstate {
+             let mut test_state = self.state.clone();
+-            if apply_batch(&mut test_state, &batches[0], self.recent_headers.make_contiguous()).is_ok() {
++            let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
++                self.storage.query_spent_addresses(&batches[0]).unwrap_or_default()
++            } else {
++                std::collections::HashMap::new()
++            };
++            if apply_batch(&mut test_state, &batches[0], self.recent_headers.make_contiguous(), &wots_oracle).is_ok() {
+                 return self.process_linear_extension(batches, from).await;
+             }
+         }
+@@ -2519,7 +2554,12 @@
+         for (i, batch) in batches.iter().enumerate() {
+             if batch.prev_midstate != self.state.midstate { continue; }
+             let mut candidate = self.state.clone();
+-            if apply_batch(&mut candidate, batch, self.recent_headers.make_contiguous()).is_ok() {
++            let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
++                self.storage.query_spent_addresses(batch).unwrap_or_default()
++            } else {
++                std::collections::HashMap::new()
++            };
++            if apply_batch(&mut candidate, batch, self.recent_headers.make_contiguous(), &wots_oracle).is_ok() {
+                 tracing::info!("Found linear extension at batch index {}", i);
+                 return self.process_linear_extension(batches[i..].to_vec(), from).await;
+             }
+@@ -2565,7 +2605,12 @@
+             // Cheap check before expensive clone
+             if batch.prev_midstate != self.state.midstate { break; }
+             let mut candidate = self.state.clone();
+-            if apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous()).is_ok() {
++            let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
++                self.storage.query_spent_addresses(&batch).unwrap_or_default()
++            } else {
++                std::collections::HashMap::new()
++            };
++            if apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous(), &wots_oracle).is_ok() {
+                 self.recent_headers.push_back(batch.timestamp);
+                 if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
+                     self.recent_headers.pop_front();
+@@ -2639,7 +2684,12 @@
+             let mut matched = false;
+             for batch in batches.drain(..) {
+                 let mut candidate = self.state.clone();
+-                if apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous()).is_ok() {
++                let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
++                    self.storage.query_spent_addresses(&batch).unwrap_or_default()
++                } else {
++                    std::collections::HashMap::new()
++                };
++                if apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous(), &wots_oracle).is_ok() {
+                     self.cancel_mining();
+                     self.recent_headers.push_back(batch.timestamp);
+                     if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
+@@ -2952,7 +3002,12 @@
+ 
+         let pre_mine_height = self.state.height;
+ 
+-        match apply_batch(&mut self.state, &batch, self.recent_headers.make_contiguous()) {
++        let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
++            self.storage.query_spent_addresses(&batch).unwrap_or_default()
++        } else {
++            std::collections::HashMap::new()
++        };
++        match apply_batch(&mut self.state, &batch, self.recent_headers.make_contiguous(), &wots_oracle) {
+             Ok(_) => {
+                 self.recent_headers.push_back(batch.timestamp);
+                 if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
+@@ -2969,8 +3024,13 @@
+                 
+                 // 3. NOW SAVE STATE
+                 self.storage.save_state(&self.state)?;
++
++                // 4. BURN WOTS ADDRESSES (immediate, post-activation only)
++                if let Err(e) = self.storage.burn_batch_addresses(&batch, pre_mine_height) {
++                    tracing::warn!("burn_batch_addresses failed at height {}: {}", pre_mine_height, e);
++                }
+                 
+-                // 4. NOW SAVE SNAPSHOT (every SNAPSHOT_INTERVAL blocks)
++                // 5. NOW SAVE SNAPSHOT (every SNAPSHOT_INTERVAL blocks)
+                 if self.state.height > 0 && self.state.height % SNAPSHOT_INTERVAL == 0 {
+                     if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
+                         tracing::warn!("Failed to save state snapshot: {}", e);
+@@ -3611,7 +3671,7 @@
+         let b2_prime = make_valid_batch(&state_at_2, 20, vec![]); 
+         let mut state_at_3_prime = state_at_2.clone();
+         let ts_at_2 = vec![state_at_2.timestamp];
+-        apply_batch(&mut state_at_3_prime, &b2_prime, &ts_at_2).unwrap();
++        apply_batch(&mut state_at_3_prime, &b2_prime, &ts_at_2, &std::collections::HashMap::new()).unwrap();
+         state_at_3_prime.target = adjust_difficulty(&state_at_3_prime);
+         
+         // B3' (extends B2', making Chain B longer)
+@@ -3663,7 +3723,7 @@
+         let window_size = DIFFICULTY_LOOKBACK as usize;
+         for _ in 0..50 {
+             let b = make_valid_batch(&node.state, 10, vec![]);
+-            apply_batch(&mut node.state, &b, &recent_headers).unwrap();
++            apply_batch(&mut node.state, &b, &recent_headers, &std::collections::HashMap::new()).unwrap();
+             recent_headers.push(node.state.timestamp);
+             if recent_headers.len() > window_size { recent_headers.remove(0); }
+             node.state.target = adjust_difficulty(&node.state);
+@@ -4007,7 +4067,7 @@
+ 
+         for i in 0..3 {
+             let b = make_valid_batch(&chain_b_state, 10 + i, vec![]);
+-            apply_batch(&mut chain_b_state, &b, &recent_headers).unwrap();
++            apply_batch(&mut chain_b_state, &b, &recent_headers, &std::collections::HashMap::new()).unwrap();
+             recent_headers.push(chain_b_state.timestamp);
+             if recent_headers.len() > 11 { recent_headers.remove(0); }
+             chain_b_state.target = adjust_difficulty(&chain_b_state);
+@@ -4045,7 +4105,7 @@
+             hdr.height = state.height; 
+             headers.push(hdr);
+ 
+-            crate::core::state::apply_batch(&mut state, &batch, &recent_ts).unwrap();
++            crate::core::state::apply_batch(&mut state, &batch, &recent_ts, &std::collections::HashMap::new()).unwrap();
+             
+             // FIX 2: Push the CURRENT block's timestamp into the history window 
+             // after validating it
+diff -ruN '--exclude=*.bak' src_orig/storage.rs src_new/storage.rs
+--- a/src/storage.rs	2026-03-11 09:12:19.071210545 +0000
++++ b/src/storage.rs	2026-03-11 09:13:01.022198360 +0000
+@@ -10,6 +10,11 @@
+ 
+ const STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
+ const MINING_SEED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("mining_seed");
++/// Maps spent WOTS address -> the commitment hash that legitimately spent it.
++/// Allows safe replay of the exact same transaction during chain reorgs while
++/// permanently blocking any *different* transaction from reusing the key.
++const SPENT_ADDRESSES_TABLE: TableDefinition<&[u8; 32], &[u8; 32]> =
++    TableDefinition::new("spent_addresses");
+ 
+ /// V1 state layout (depth: u64). Used only for one-time migration from
+ /// pre-u128 databases. Identical field order to the old `State` so that
+@@ -118,6 +123,7 @@
+                     {
+                         let _ = write_txn.open_table(STATE_TABLE)?;
+                         let _ = write_txn.open_table(MINING_SEED_TABLE)?;
++                        let _ = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
+                     }
+                     write_txn.commit()?;
+ 
+@@ -319,4 +325,114 @@
+         self.batches.highest()
+     }
+ 
++    /// Burn every WOTS input address from a committed batch, mapping each to the
++    /// commitment hash that authorised the spend.
++    ///
++    /// - Ignores non-WOTS inputs (MSS etc.) by checking witness size == SIG_SIZE.
++    /// - No-op for blocks below WOTS_REUSE_ACTIVATION_HEIGHT.
++    /// - Idempotent: reorg replays of the same batch write the same value.
++    pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, block_height: u64) -> Result<()> {
++        use crate::core::types::{WOTS_REUSE_ACTIVATION_HEIGHT, Witness, compute_commitment};
++        use crate::core::wots::SIG_SIZE;
++
++        if block_height < WOTS_REUSE_ACTIVATION_HEIGHT {
++            return Ok(());
++        }
++
++        let write_txn = self.db.begin_write()?;
++        {
++            let mut table = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
++            for tx in &batch.transactions {
++                if let crate::core::Transaction::Reveal { inputs, witnesses, outputs, salt } = tx {
++                    let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
++                    let output_hashes: Vec<[u8; 32]> = outputs.iter()
++                        .map(|o| o.hash_for_commitment())
++                        .collect();
++                    let commitment = compute_commitment(&input_ids, &output_hashes, salt);
++
++                    for (input, witness) in inputs.iter().zip(witnesses.iter()) {
++                        if let Witness::ScriptInputs(wit_inputs) = witness {
++                            if let Some(sig) = wit_inputs.first() {
++                                // Only burn WOTS keys. MSS and other script types
++                                // have different witness sizes and must not be burned.
++                                if sig.len() == SIG_SIZE {
++                                    let addr = input.predicate.address();
++                                    table.insert(&addr, &commitment)?;
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        write_txn.commit()?;
++        Ok(())
++    }
++
++    /// Build a pre-flight oracle for a batch: returns a map of
++    /// `address -> prior_commitment` for every WOTS address in the batch
++    /// that already exists in the spent-address table.
++    ///
++    /// The caller uses this to detect reuse: an address is being reused if it
++    /// is present in the map AND the prior commitment differs from the current one.
++    pub fn query_spent_addresses(
++        &self,
++        batch: &crate::core::Batch,
++    ) -> Result<std::collections::HashMap<[u8; 32], [u8; 32]>> {
++        use crate::core::types::Witness;
++        use crate::core::wots::SIG_SIZE;
++
++        let mut result = std::collections::HashMap::new();
++        let read_txn = self.db.begin_read()?;
++        let table = read_txn.open_table(SPENT_ADDRESSES_TABLE)?;
++
++        for tx in &batch.transactions {
++            if let crate::core::Transaction::Reveal { inputs, witnesses, .. } = tx {
++                for (input, witness) in inputs.iter().zip(witnesses.iter()) {
++                    if let Witness::ScriptInputs(wit_inputs) = witness {
++                        if let Some(sig) = wit_inputs.first() {
++                            if sig.len() == SIG_SIZE {
++                                let addr = input.predicate.address();
++                                if let Some(existing) = table.get(&addr)? {
++                                    result.insert(addr, *existing.value());
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        Ok(result)
++    }
++
++    /// Single-transaction variant of `query_spent_addresses`.
++    /// Used at mempool admission time when only one tx is being checked.
++    pub fn query_spent_addresses_for_tx(
++        &self,
++        tx: &crate::core::Transaction,
++    ) -> Result<std::collections::HashMap<[u8; 32], [u8; 32]>> {
++        use crate::core::types::Witness;
++        use crate::core::wots::SIG_SIZE;
++
++        let mut result = std::collections::HashMap::new();
++        let read_txn = self.db.begin_read()?;
++        let table = read_txn.open_table(SPENT_ADDRESSES_TABLE)?;
++
++        if let crate::core::Transaction::Reveal { inputs, witnesses, .. } = tx {
++            for (input, witness) in inputs.iter().zip(witnesses.iter()) {
++                if let Witness::ScriptInputs(wit_inputs) = witness {
++                    if let Some(sig) = wit_inputs.first() {
++                        if sig.len() == SIG_SIZE {
++                            let addr = input.predicate.address();
++                            if let Some(existing) = table.get(&addr)? {
++                                result.insert(addr, *existing.value());
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        Ok(result)
++    }
++
+ }
+diff -ruN '--exclude=*.bak' src_orig/sync.rs src_new/sync.rs
+--- a/src/sync.rs	2026-03-11 09:20:17.678071514 +0000
++++ b/src/sync.rs	2026-03-11 09:20:12.077073151 +0000
+@@ -135,7 +135,7 @@
+                 .load_batch(h)?
+                 .ok_or_else(|| anyhow::anyhow!("Missing batch at height {} during rebuild", h))?;
+             
+-            apply_batch(&mut state, &batch, recent_headers.make_contiguous())?;
++            apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &std::collections::HashMap::new())?;
+             
+             recent_headers.push_back(batch.timestamp);
+             if recent_headers.len() > window_size { recent_headers.pop_front(); }
