@@ -328,11 +328,11 @@ impl Storage {
     /// Burn every WOTS input address from a committed batch, mapping each to the
     /// commitment hash that authorised the spend.
     ///
-    /// - Ignores non-WOTS inputs (MSS etc.) by checking witness size == SIG_SIZE.
-    /// - No-op for blocks below WOTS_REUSE_ACTIVATION_HEIGHT.
+    /// - For standard WOTS: burns the address hash.
+    /// - For MSS (post-activation): burns the specific leaf's WOTS public key.
     /// - Idempotent: reorg replays of the same batch write the same value.
     pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, block_height: u64) -> Result<()> {
-        use crate::core::types::{WOTS_REUSE_ACTIVATION_HEIGHT, Witness, compute_commitment};
+        use crate::core::types::{WOTS_REUSE_ACTIVATION_HEIGHT, MSS_REUSE_ACTIVATION_HEIGHT, Witness, compute_commitment};
         use crate::core::wots::SIG_SIZE;
 
         if block_height < WOTS_REUSE_ACTIVATION_HEIGHT {
@@ -350,14 +350,18 @@ impl Storage {
                         .collect();
                     let commitment = compute_commitment(&input_ids, &output_hashes, salt);
 
-                for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                    for (input, witness) in inputs.iter().zip(witnesses.iter()) {
                         let Witness::ScriptInputs(wit_inputs) = witness;
                         if let Some(sig) = wit_inputs.first() {
-                            // Only burn WOTS keys. MSS and other script types
-                            // have different witness sizes and must not be burned.
                             if sig.len() == SIG_SIZE {
+                                // Standard WOTS: burn the address
                                 let addr = input.predicate.address();
                                 table.insert(&addr, &commitment)?;
+                            } else if block_height >= MSS_REUSE_ACTIVATION_HEIGHT {
+                                // NEW: MSS: burn the specific leaf's WOTS public key!
+                                if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                                    table.insert(&mss_sig.wots_pk, &commitment)?;
+                                }
                             }
                         }
                     }
@@ -369,11 +373,8 @@ impl Storage {
     }
 
     /// Build a pre-flight oracle for a batch: returns a map of
-    /// `address -> prior_commitment` for every WOTS address in the batch
+    /// `nullifier -> prior_commitment` for every WOTS address or MSS leaf in the batch
     /// that already exists in the spent-address table.
-    ///
-    /// The caller uses this to detect reuse: an address is being reused if it
-    /// is present in the map AND the prior commitment differs from the current one.
     pub fn query_spent_addresses(
         &self,
         batch: &crate::core::Batch,
@@ -389,14 +390,20 @@ impl Storage {
             if let crate::core::Transaction::Reveal { inputs, witnesses, .. } = tx {
                 for (input, witness) in inputs.iter().zip(witnesses.iter()) {
                     let Witness::ScriptInputs(wit_inputs) = witness;
-                        if let Some(sig) = wit_inputs.first() {
-                            if sig.len() == SIG_SIZE {
-                                let addr = input.predicate.address();
-                                if let Some(existing) = table.get(&addr)? {
-                                    result.insert(addr, *existing.value());
-                                }
+                    if let Some(sig) = wit_inputs.first() {
+                        if sig.len() == SIG_SIZE {
+                            // Standard WOTS query
+                            let addr = input.predicate.address();
+                            if let Some(existing) = table.get(&addr)? {
+                                result.insert(addr, *existing.value());
+                            }
+                        } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                            // NEW: MSS leaf query
+                            if let Some(existing) = table.get(&mss_sig.wots_pk)? {
+                                result.insert(mss_sig.wots_pk, *existing.value());
                             }
                         }
+                    }
                 }
             }
         }    
@@ -419,16 +426,22 @@ impl Storage {
         if let crate::core::Transaction::Reveal { inputs, witnesses, .. } = tx {
             for (input, witness) in inputs.iter().zip(witnesses.iter()) {
                 let Witness::ScriptInputs(wit_inputs) = witness;
-                    if let Some(sig) = wit_inputs.first() {
-                        if sig.len() == SIG_SIZE {
-                            let addr = input.predicate.address();
-                            if let Some(existing) = table.get(&addr)? {
-                                result.insert(addr, *existing.value());
-                            }
+                if let Some(sig) = wit_inputs.first() {
+                    if sig.len() == SIG_SIZE {
+                        // Standard WOTS query
+                        let addr = input.predicate.address();
+                        if let Some(existing) = table.get(&addr)? {
+                            result.insert(addr, *existing.value());
+                        }
+                    } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                        // NEW: MSS leaf query
+                        if let Some(existing) = table.get(&mss_sig.wots_pk)? {
+                            result.insert(mss_sig.wots_pk, *existing.value());
                         }
                     }
                 }
             }
+        }
         
         Ok(result)
     }
