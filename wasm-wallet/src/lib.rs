@@ -96,15 +96,20 @@ impl WebWallet {
         hex::encode(compute_address(&pk))
     }
 
-    /// Derives a reusable MSS address for receiving funds (Height 5 recommended)
-    pub fn get_mss_address(&mut self, index: u32, height: u32) -> Result<String, JsValue> {
+/// Derives a reusable MSS address for receiving funds
+    pub fn get_mss_address(&mut self, index: u32, height: u32, progress_cb: Option<js_sys::Function>) -> Result<String, JsValue> {
         let seed = derive_mss_seed(&self.master_seed, index as u64);
-        let kp = mss::keygen(&seed, height).map_err(|e| JsValue::from_str(&e.to_string()))?;
         
-        // FIX: The address must be the hashed P2PK script, not the raw Master PK
+        let kp = mss::keygen_with_progress(&seed, height, |current, total| {
+            if let Some(cb) = &progress_cb { 
+                let this = JsValue::NULL;
+                let curr = JsValue::from(current);
+                let tot = JsValue::from(total);
+                let _ = cb.call2(&this, &curr, &tot);
+            }
+        }).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        
         let addr = hex::encode(compute_address(&kp.master_pk));
-        
-        // Store in cache using the finalized address as the key
         self.mss_cache.insert(addr.clone(), kp);
         Ok(addr)
     }
@@ -135,7 +140,8 @@ impl WebWallet {
         // PRE-CACHE: Ensure all needed MSS trees are in memory before starting the heavy math
         for utxo in &available {
             if utxo.is_mss && !self.mss_cache.contains_key(&utxo.address) {
-                self.get_mss_address(utxo.index, utxo.mss_height)?;
+                // Pass `None` because we don't need UI feedback during background caching
+                self.get_mss_address(utxo.index, utxo.mss_height, None)?; 
             }
         }
 
