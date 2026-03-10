@@ -166,11 +166,7 @@ impl WebWallet {
                 if total >= needed { break; }
                 
                 let mut coin_to_add = coin.clone();
-                if coin_to_add.is_mss {
-                    let current_leaf = leaf_tracker.entry(coin_to_add.address.clone()).or_insert(coin_to_add.mss_leaf);
-                    coin_to_add.mss_leaf = *current_leaf;
-                    *current_leaf += 1; 
-                }
+
                 
                 selected_set.insert(coin.coin_id.clone());
                 selected.push(coin_to_add);
@@ -188,12 +184,7 @@ impl WebWallet {
             for coin in &available {
                 if grouped_addresses.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
                     let mut coin_to_add = coin.clone();
-                    if coin_to_add.is_mss {
-                        let current_leaf = leaf_tracker.entry(coin_to_add.address.clone()).or_insert(coin_to_add.mss_leaf);
-                        coin_to_add.mss_leaf = *current_leaf;
-                        *current_leaf += 1;
-                    }
-                    
+                   
                     selected_set.insert(coin.coin_id.clone());                    
                     selected.push(coin_to_add);
                     total += coin.value;
@@ -210,11 +201,7 @@ impl WebWallet {
                 for denom in change_denoms {
                     if let Some(pos) = available.iter().position(|c| c.value == denom && !selected_set.contains(&c.coin_id)) {
                         let mut coin_to_add = available[pos].clone();
-                        if coin_to_add.is_mss {
-                            let current_leaf = leaf_tracker.entry(coin_to_add.address.clone()).or_insert(coin_to_add.mss_leaf);
-                            coin_to_add.mss_leaf = *current_leaf;
-                            *current_leaf += 1;
-                        }
+ 
                         selected_set.insert(coin_to_add.coin_id.clone());
                         selected.push(coin_to_add);
                         total += denom;
@@ -233,11 +220,7 @@ impl WebWallet {
             for coin in &available {
                 if final_addresses.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
                     let mut coin_to_add = coin.clone();
-                    if coin_to_add.is_mss {
-                        let current_leaf = leaf_tracker.entry(coin_to_add.address.clone()).or_insert(coin_to_add.mss_leaf);
-                        coin_to_add.mss_leaf = *current_leaf;
-                        *current_leaf += 1;
-                    }
+
                     
                     selected_set.insert(coin.coin_id.clone());                    
                     selected.push(coin_to_add);
@@ -332,19 +315,29 @@ impl WebWallet {
         hex::decode_to_slice(server_commitment_hex, &mut commitment)
             .map_err(|_| JsValue::from_str("Invalid server commitment hex"))?;
 
-        let mut input_reveals = Vec::new();
+let mut input_reveals = Vec::new();
         let mut signatures = Vec::new();
         let mut safety_input_hashes = Vec::new();
+        
+        // NEW: Cache to ensure we only sign once per MSS address per transaction
+        let mut mss_sig_cache: HashMap<String, Vec<u8>> = HashMap::new();
 
         for inp in ctx.selected_inputs {
             let (pk, sig_bytes) = if inp.is_mss {
-                // INSTANT LOOKUP: O(1) time instead of 96 seconds!
                 let kp = self.mss_cache.get_mut(&inp.address)
                     .ok_or_else(|| JsValue::from_str("MSS tree missing from cache."))?;
                 
-                kp.set_next_leaf(inp.mss_leaf as u64);
-                let sig = kp.sign(&commitment).map_err(|e| JsValue::from_str(&e.to_string()))?;
-                (kp.master_pk, sig.to_bytes())
+                // NEW: Check if we already generated a signature for this address
+                if let Some(cached_sig) = mss_sig_cache.get(&inp.address) {
+                    (kp.master_pk, cached_sig.clone())
+                } else {
+                    // First time seeing this MSS key in this tx, generate and cache
+                    kp.set_next_leaf(inp.mss_leaf as u64);
+                    let sig = kp.sign(&commitment).map_err(|e| JsValue::from_str(&e.to_string()))?;
+                    let sig_bytes = sig.to_bytes();
+                    mss_sig_cache.insert(inp.address.clone(), sig_bytes.clone());
+                    (kp.master_pk, sig_bytes)
+                }
             } else {
                 let seed = derive_wots_seed(&self.master_seed, inp.index as u64);
                 let wots_pk = wots::keygen(&seed);
