@@ -172,6 +172,15 @@ export class WebWallet {
             wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
         }
     }
+    /**
+     * @param {string} address_hex
+     * @param {number} leaf_index
+     */
+    set_mss_leaf_index(address_hex, leaf_index) {
+        const ptr0 = passStringToWasm0(address_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.webwallet_set_mss_leaf_index(this.__wbg_ptr, ptr0, len0, leaf_index);
+    }
 }
 if (Symbol.dispose) WebWallet.prototype[Symbol.dispose] = WebWallet.prototype.free;
 

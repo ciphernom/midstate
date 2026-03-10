@@ -83,6 +83,12 @@ impl WebWallet {
         })
     }
 
+    pub fn set_mss_leaf_index(&mut self, address_hex: &str, leaf_index: u32) {
+        if let Some(kp) = self.mss_cache.get_mut(address_hex) {
+            kp.set_next_leaf(leaf_index as u64);
+        }
+    }
+
     /// Derives a single-use WOTS address (used internally for change outputs)
     pub fn get_wots_address(&self, index: u32) -> String {
         let seed = derive_wots_seed(&self.master_seed, index as u64);

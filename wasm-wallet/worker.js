@@ -111,7 +111,7 @@ self.onmessage = async (e) => {
             self.postMessage({ type: 'LOG', payload: "Generating Reusable MSS Address..." });
             await new Promise(r => setTimeout(r, 10)); // Breathe before heavy MSS computation
             
-            deriveNextMss(3); 
+            deriveNextMss(5); 
 
             await saveState();
             self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
@@ -128,7 +128,7 @@ self.onmessage = async (e) => {
         }
         else if (type === 'NEW_ADDRESS') {
             self.postMessage({ type: 'LOG', payload: "Deriving new receiving address..." });
-            deriveNextMss(3);
+            deriveNextMss(5);
             await saveState();
             self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
             self.postMessage({ type: 'LOG', payload: "New address generated successfully." });
@@ -233,8 +233,8 @@ async function performScan() {
                 body: JSON.stringify({ master_pk: addrHex })
             });
             const res = await req.json();
-            if (res.next_index >= mss.next_leaf) {
-                mss.next_leaf = res.next_index + 20; 
+            if (res.next_index > mss.next_leaf) {
+                mss.next_leaf = res.next_index; 
             }
         } catch(e) {}
     }
