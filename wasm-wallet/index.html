@@ -44,8 +44,15 @@
     <div id="authView">
         <div class="panel">
             <h2>Authentication</h2>
-            <label>Node RPC URL:</label><br>
-            <input type="text" id="rpcUrl" value="http://127.0.0.1:8001" style="margin-bottom: 15px;">
+            
+            <details style="margin-bottom: 20px; color: #666;">
+                <summary style="cursor: pointer; font-size: 10px; text-transform: uppercase; letter-spacing: 1px;">⚙️ Node RPC Settings</summary>
+                <div style="margin-top: 10px;">
+                    <label style="color: var(--text-bright);">Node RPC URL:</label><br>
+                    <input type="text" id="rpcUrl" value="https://rpc.cypherpunk.gold" style="margin-bottom: 5px;">
+                    <div style="font-size: 10px;">Leave default to use the community gateway.</div>
+                </div>
+            </details>
             
             <div id="createSection" class="hidden">
                 <label>BIP39 Seed Phrase (Save this!):</label><br>

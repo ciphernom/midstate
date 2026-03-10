@@ -456,16 +456,16 @@ pub async fn get_filters(
     let mut element_counts = Vec::new();
 
     for h in req.start_height..end {
-        let filter_data = match store.load_filter(h) {
-            Ok(Some(data)) => data,
-            _ => break,
-        };
-
-        // Load batch to get the block hash (final_hash) and element count.
-        // Needed for client-side Golomb-Rice filter matching.
+        // 1. Load the block FIRST. If the block doesn't exist, we've reached the chain tip.
         let batch = match store.load(h) {
             Ok(Some(b)) => b,
-            _ => break,
+            _ => break, // It is safe to break here.
+        };
+
+        // 2. Load the filter. If it's missing (e.g., empty block), just use an empty array.
+        let filter_data = match store.load_filter(h) {
+            Ok(Some(data)) => data,
+            _ => Vec::new(), 
         };
 
         // Count unique identifiable elements the same way CompactFilter::build does
