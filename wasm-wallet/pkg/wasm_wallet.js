@@ -51,21 +51,17 @@ export class WebWallet {
      * @param {string} filter_hex
      * @param {string} block_hash_hex
      * @param {number} n
-     * @param {string} addrs_json
      * @returns {boolean}
      */
-    check_filter(filter_hex, block_hash_hex, n, addrs_json) {
+    check_filter(filter_hex, block_hash_hex, n) {
         const ptr0 = passStringToWasm0(filter_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passStringToWasm0(block_hash_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
         const len1 = WASM_VECTOR_LEN;
-        const ptr2 = passStringToWasm0(addrs_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
-        const len2 = WASM_VECTOR_LEN;
-        const ret = wasm.webwallet_check_filter(this.__wbg_ptr, ptr0, len0, ptr1, len1, n, ptr2, len2);
+        const ret = wasm.webwallet_check_filter(this.__wbg_ptr, ptr0, len0, ptr1, len1, n);
         return ret !== 0;
     }
     /**
-     * Derives a reusable MSS address for receiving funds
      * @param {number} index
      * @param {number} height
      * @param {Function | null} [progress_cb]
@@ -96,7 +92,6 @@ export class WebWallet {
         }
     }
     /**
-     * Derives a single-use WOTS address (used internally for change outputs)
      * @param {number} index
      * @returns {string}
      */
@@ -181,6 +176,14 @@ export class WebWallet {
         const ptr0 = passStringToWasm0(address_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
         const len0 = WASM_VECTOR_LEN;
         wasm.webwallet_set_mss_leaf_index(this.__wbg_ptr, ptr0, len0, leaf_index);
+    }
+    /**
+     * @param {string} addrs_json
+     */
+    set_watchlist(addrs_json) {
+        const ptr0 = passStringToWasm0(addrs_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.webwallet_set_watchlist(this.__wbg_ptr, ptr0, len0);
     }
 }
 if (Symbol.dispose) WebWallet.prototype[Symbol.dispose] = WebWallet.prototype.free;
