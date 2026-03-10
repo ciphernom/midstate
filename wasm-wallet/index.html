@@ -150,6 +150,13 @@
         }
         .seed-word span { color: #555; font-size: 10px; margin-right: 8px; user-select: none; font-weight: normal;}
 
+        /* Send Progress 2-Phase UX */
+        .progress-step { padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); transition: all 0.3s; margin-bottom: 10px; }
+        .progress-step.active { border-color: var(--accent); background: rgba(212, 255, 0, 0.05); opacity: 1 !important; }
+        .progress-step.done { border-color: var(--border-bright); opacity: 0.7 !important; }
+        .step-title { font-size: 13px; color: var(--text-max); margin-bottom: 4px; display: flex; align-items: center; gap: 8px; font-weight: bold; }
+        .step-desc { font-size: 11px; color: var(--text-bright); margin-left: 24px; line-height: 1.4; }
+
         /* Desktop UI Adjustments */
         @media (min-width: 768px) {
             body, html { display: flex; align-items: center; justify-content: center; background: #050505; }
@@ -299,6 +306,12 @@
                 <button id="btnReveal" style="background: transparent; color: var(--red); border-color: var(--red); margin-bottom: 0;">Reveal Seed Phrase</button>
             </div>
 
+            <div class="panel">
+                <h3 style="font-size: 14px;">Troubleshooting</h3>
+                <p style="font-size: 11px; color: #888; margin-bottom: 12px;">If your balance is incorrect after restoring a backup or a failed transaction, rescan to rebuild your balance.</p>
+                <button id="btnRescan" style="background: transparent; color: var(--text-max); border-color: var(--border-bright); margin-bottom: 0;">Rescan Blockchain</button>
+            </div>
+
             <details class="terminal">
                 <summary>Developer Terminal</summary>
                 <div class="term-log" id="term-log"></div>
@@ -392,13 +405,19 @@
         </div>
     </div>
 
-    <div id="sendProgressModal" class="modal-overlay">
+<div id="sendProgressModal" class="modal-overlay">
         <div class="modal" style="max-width: 450px;">
             <h2 id="sendProgressTitle">Sending Transaction</h2>
             
             <div id="sendProgressArea" style="margin-bottom: 15px;">
-                <div id="sendProgressText" style="font-size: 12px; color: var(--text-bright); margin-bottom: 8px;">Initializing...</div>
-                <progress id="sendProgressBar" value="0" max="100"></progress>
+                <div class="progress-step active" id="step1">
+                    <div class="step-title"><span id="icon1">🔒</span> Phase 1: Commit</div>
+                    <div class="step-desc" id="desc1">Initializing...</div>
+                </div>
+                <div class="progress-step" id="step2" style="opacity: 0.4; margin-top: 10px;">
+                    <div class="step-title"><span id="icon2">👁️</span> Phase 2: Reveal</div>
+                    <div class="step-desc" id="desc2">Waiting for Commit to be mined...</div>
+                </div>
             </div>
 
             <div id="sendErrorHelp" class="hidden" style="font-size: 12px; color: #ff8888; margin-bottom: 15px; padding: 12px; border: 1px solid var(--red); border-radius: 6px; background: rgba(255,0,0,0.1); white-space: pre-wrap; line-height: 1.5;"></div>
@@ -734,15 +753,28 @@
                     }
                     break;
                 
-                // NEW: Handle SEND_PROGRESS and SEND_COMPLETE
                 case 'SEND_PROGRESS':
-                    document.getElementById('sendProgressBar').value = payload.pct;
-                    document.getElementById('sendProgressText').innerText = payload.msg;
+                    if (payload.phase === 1) {
+                        document.getElementById('desc1').innerText = payload.msg;
+                    } else if (payload.phase === 2) {
+                        // Mark phase 1 done
+                        document.getElementById('step1').className = "progress-step done";
+                        document.getElementById('icon1').innerText = "✅";
+                        
+                        // Activate phase 2
+                        document.getElementById('step2').className = "progress-step active";
+                        document.getElementById('step2').style.opacity = "1";
+                        document.getElementById('icon2').innerText = "🔄";
+                        document.getElementById('desc2').innerText = payload.msg;
+                    }
                     break;
                 case 'SEND_COMPLETE':
-                    document.getElementById('sendProgressTitle').innerText = "Success";
-                    document.getElementById('sendProgressText').innerText = "Transaction finalized and broadcasted.";
-                    document.getElementById('sendProgressBar').value = 100;
+                    document.getElementById('sendProgressTitle').innerText = "Transfer Submitted";
+                    
+                    document.getElementById('step2').className = "progress-step done";
+                    document.getElementById('icon2').innerText = "✅";
+                    document.getElementById('desc2').innerText = "Transaction accepted by the network.";
+                    
                     document.getElementById('btnSendClose').classList.remove('hidden');
                     
                     document.getElementById('sendAmount').value = '';
@@ -781,8 +813,11 @@
                         // Standard error
                         showToast(payload, "error");
                         resetUIState();
-                        document.getElementById('btnLogin').disabled = false;
-                        document.getElementById('btnCreate').classList.remove('hidden');
+                        if (!walletExists) {
+                            document.getElementById('btnCreate').classList.remove('hidden');
+                        } else {
+                            document.getElementById('btnLogin').disabled = false;
+                        }
                     }
                     log(`ERROR: ${payload}`, "var(--red)");
                     break;
@@ -819,6 +854,19 @@
             worker.postMessage({ type: 'SCAN' });
         };
 
+        document.getElementById('btnRescan').onclick = () => {
+            showConfirm(
+                "Rescan Blockchain?",
+                "This will scan the entire blockchain from block 0 to rebuild your balance and history. It may take a few minutes. Continue?",
+                () => {
+                    switchTab('view-home');
+                    document.getElementById('btnScan').disabled = true;
+                    document.getElementById('btnScan').innerText = "Rescanning...";
+                    worker.postMessage({ type: 'RESCAN' });
+                }
+            );
+        };
+
         document.getElementById('btnSend').onclick = (e) => {
             const toAddress = document.getElementById('sendAddress').value;
             const amount = parseInt(document.getElementById('sendAmount').value);
@@ -835,8 +883,17 @@
                     document.getElementById('sendProgressArea').classList.remove('hidden');
                     document.getElementById('sendErrorHelp').classList.add('hidden');
                     document.getElementById('btnSendClose').classList.add('hidden');
-                    document.getElementById('sendProgressBar').value = 0;
-                    document.getElementById('sendProgressText').innerText = "Initializing...";
+                    
+                    // Reset steps
+                    document.getElementById('step1').className = "progress-step active";
+                    document.getElementById('step1').style.opacity = "1";
+                    document.getElementById('icon1').innerText = "🔒";
+                    document.getElementById('desc1').innerText = "Initializing...";
+                    
+                    document.getElementById('step2').className = "progress-step";
+                    document.getElementById('step2').style.opacity = "0.4";
+                    document.getElementById('icon2').innerText = "👁️";
+                    document.getElementById('desc2').innerText = "Waiting for Commit to be mined...";
                     
                     e.target.disabled = true;
                     e.target.innerText = "Processing...";
