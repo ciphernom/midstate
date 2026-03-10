@@ -42,10 +42,12 @@ libp2p = { version = "0.54", features = ["tokio", "noise", "tcp", "yamux", "kad"
 # reqwest: use rustls instead of native openssl — pure Rust, cross-compiles cleanly
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
+# Use jemalloc on Linux/macOS (Not Wasm, Not Windows)
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_env = "msvc")))'.dependencies]
 tikv-jemallocator = "0.5.4"
 
-[target.'cfg(target_env = "msvc")'.dependencies]
+# Use mimalloc on Windows (Not Wasm, Windows MSVC)
+[target.'cfg(all(not(target_arch = "wasm32"), target_env = "msvc"))'.dependencies]
 mimalloc = "0.1.43"
 
 [features]
