@@ -146,7 +146,7 @@ pub fn apply_batch(
     state: &mut State,
     batch: &Batch,
     previous_timestamps: &[u64],
-    // Pre-flight oracle: WOTS address -> commitment that previously spent it.
+    // Pre-flight oracle: WOTS address or MSS leaf PK -> commitment that previously spent it.
     // Built by the caller from storage. Pass an empty map pre-activation or
     // in tests — the check is skipped entirely when the map is empty.
     spent_oracle: &std::collections::HashMap<[u8; 32], [u8; 32]>,
@@ -181,17 +181,20 @@ pub fn apply_batch(
         bail!("Batch exceeds max commit count: {} > {}", commit_count, MAX_BATCH_COMMITS);
     }   
 
-    //timewarp prevention: Validate timestamp
+    // timewarp prevention: Validate timestamp
     if state.height > 0 {
         validate_timestamp(batch.timestamp, previous_timestamps, current_timestamp())?;
     }
 
-    // WOTS address-reuse consensus check (post-activation).
+    // WOTS & MSS address/leaf-reuse consensus check (post-activation).
     // Uses the pre-built oracle so state.rs stays pure (no storage I/O here).
-    // An address is being reused if it is in the oracle AND the commitment
+    // A key is being reused if it is in the oracle AND the commitment
     // for this transaction differs from the one that originally spent it.
     // Same commitment = safe reorg replay of the identical transaction.
-    if state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT && !spent_oracle.is_empty() {
+    let wots_active = state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT;
+    let mss_active = state.height >= crate::core::types::MSS_REUSE_ACTIVATION_HEIGHT;
+
+    if wots_active && !spent_oracle.is_empty() {
         for tx in &batch.transactions {
             if let Transaction::Reveal { inputs, witnesses, outputs, salt } = tx {
                 let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
@@ -205,6 +208,7 @@ pub fn apply_batch(
                     let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
                     if let Some(sig) = wit_inputs.first() {
                         if sig.len() == crate::core::wots::SIG_SIZE {
+                            // Standard WOTS: Check the predicate address
                             let addr = input.predicate.address();
                             if let Some(&prior_commitment) = spent_oracle.get(&addr) {
                                 if prior_commitment != this_commitment {
@@ -215,6 +219,24 @@ pub fn apply_batch(
                                         hex::encode(prior_commitment),
                                         hex::encode(this_commitment),
                                     );
+                                }
+                            }
+                        } else if mss_active {
+                            // NEW: MSS Leaf check! 
+                            // We check the specific leaf's WOTS public key against the oracle.
+                            if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                                let leaf_pk = mss_sig.wots_pk;
+                                if let Some(&prior_commitment) = spent_oracle.get(&leaf_pk) {
+                                    if prior_commitment != this_commitment {
+                                        bail!(
+                                            "Consensus violation: MSS leaf {} (Index {}) reused \
+                                             with different commitment (prior: {}, this: {})",
+                                            hex::encode(leaf_pk),
+                                            mss_sig.leaf_index,
+                                            hex::encode(prior_commitment),
+                                            hex::encode(this_commitment),
+                                        );
+                                    }
                                 }
                             }
                         }

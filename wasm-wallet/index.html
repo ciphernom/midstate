@@ -2,222 +2,663 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#0a0a0a">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="manifest" href="manifest.json">
+    <link rel="apple-touch-icon" href="icon-192.png">
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+    
     <title>MIDSTATE // WALLET</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap');
-        :root { --bg: #0a0a0a; --bg-panel: #111; --border: #1e1e1e; --border-bright: #2a2a2a; --text: #999; --text-bright: #ccc; --text-max: #eee; --accent: #d4ff00; --accent-dim: #6b8000; --red: #ff4444; }
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { background: var(--bg); color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.5; padding: 2rem; max-width: 900px; margin: 0 auto; }
-        h1, h2, h3 { font-weight: normal; color: var(--text-max); margin-bottom: 1rem; }
-        h1 { font-size: 16px; font-weight: 700; letter-spacing: 2px; border-bottom: 1px solid var(--border); padding-bottom: 10px; margin-bottom: 2rem; }
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1.5rem; }
-        input, button { font-family: inherit; background: var(--bg-panel); color: var(--text-max); border: 1px solid var(--border-bright); padding: 10px; width: 100%; font-size: 12px; outline: none;}
-        input:focus { border-color: var(--accent-dim); }
-        button { background: var(--border-bright); color: var(--text-max); cursor: pointer; font-weight: bold; transition: all 0.15s; }
-        button:hover { background: var(--accent); color: #000; border-color: var(--accent); }
-        button:disabled { opacity: 0.5; cursor: not-allowed; background: var(--bg-panel); color: var(--text); }
-        .panel { border: 1px solid var(--border); padding: 1.5rem; background: var(--bg-panel); margin-bottom: 1.5rem;}
-        .hidden { display: none !important; }
-        table { width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: 11px; }
-        th, td { border: 1px solid var(--border); padding: 8px 10px; text-align: left; }
-        th { background: #0d0d0d; color: var(--text-bright); text-transform: uppercase; letter-spacing: 1px;}
-        .stat-box { border: 1px solid var(--border); padding: 1.5rem; background: var(--bg-panel); display: flex; flex-direction: column; justify-content: center; }
-        .stat-lbl { color: #555; text-transform: uppercase; font-size: 10px; letter-spacing: 1px; margin-bottom: 6px; }
-        .stat-val { font-size: 16px; color: var(--text-max); word-break: break-all; }
-        .terminal { height: 200px; border: 1px solid var(--border); background: var(--bg); display: flex; flex-direction: column; margin-top: 2rem;}
-        .term-log { flex: 1; overflow-y: auto; padding: 8px 12px; font-size: 11px; }
-        .term-line { padding: 1px 0; color: var(--text-bright); }
-        ::-webkit-scrollbar { width: 6px; }
-        ::-webkit-scrollbar-track { background: var(--bg); }
-        ::-webkit-scrollbar-thumb { background: #222; }
+        
+        :root { 
+            --bg: #0a0a0a; --bg-panel: #111; --border: #1e1e1e; --border-bright: #2a2a2a; 
+            --text: #999; --text-bright: #ccc; --text-max: #eee; 
+            --accent: #d4ff00; --accent-dim: #6b8000; --red: #ff4444; 
+        }
+        
+        * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+        
+        body, html { 
+            background: var(--bg); color: var(--text); 
+            font-family: 'JetBrains Mono', monospace; 
+            font-size: 14px; line-height: 1.5; 
+            height: 100%; width: 100%; overflow: hidden;
+        }
 
-        progress { width: 100%; height: 12px; border: none; background: var(--border-bright); border-radius: 2px; }
-        progress::-webkit-progress-bar { background: var(--border-bright); border-radius: 2px; }
-        progress::-webkit-progress-value { background: var(--accent); border-radius: 2px; }
-        progress::-moz-progress-bar { background: var(--accent); border-radius: 2px; }
+        h1, h2, h3 { font-weight: normal; color: var(--text-max); margin-bottom: 1rem; }
+        
+        #app-container {
+            display: flex; flex-direction: column; height: 100%; max-width: 600px; margin: 0 auto;
+            border-left: 1px solid var(--border); border-right: 1px solid var(--border);
+        }
+
+        header {
+            padding: env(safe-area-inset-top, 1rem) 1.5rem 1rem 1.5rem;
+            border-bottom: 1px solid var(--border);
+            display: flex; justify-content: center; align-items: center;
+            background: var(--bg-panel); z-index: 10;
+        }
+        header h1 { margin: 0; font-size: 16px; font-weight: 700; letter-spacing: 2px; }
+
+        .page {
+            flex: 1; overflow-y: auto; padding: 1.5rem;
+            padding-bottom: calc(env(safe-area-inset-bottom, 1rem) + 80px);
+            display: none;
+        }
+        .page.active { display: block; animation: fadeIn 0.2s ease; }
+        #authView.active { display: flex; flex-direction: column; justify-content: center; }
+        
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+
+        input, button { 
+            font-family: inherit; background: var(--bg); color: var(--text-max); 
+            border: 1px solid var(--border-bright); padding: 14px; width: 100%; 
+            font-size: 16px; outline: none; border-radius: 8px; margin-bottom: 12px;
+        }
+        input:focus { border-color: var(--accent-dim); }
+        button { background: var(--border-bright); cursor: pointer; font-weight: bold; transition: background 0.15s; }
+        button:active { background: var(--accent); color: #000; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        
+        .panel { border: 1px solid var(--border); padding: 1.25rem; background: var(--bg-panel); margin-bottom: 1rem; border-radius: 12px;}
+        .hidden { display: none !important; }
+        
+        .stat-val { font-size: 28px; color: var(--text-max); font-weight: bold; word-break: break-all; }
+        .list-container { border: 1px solid var(--border); background: var(--bg-panel); border-radius: 8px; overflow: hidden; }
+        .list-item { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; }
+        .list-item:last-child { border-bottom: none; }
+        .flex-row { display: flex; justify-content: space-between; align-items: center; }
+
+        nav {
+            position: fixed; bottom: 0; left: 0; right: 0; max-width: 600px; margin: 0 auto;
+            background: rgba(17, 17, 17, 0.95); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+            border-top: 1px solid var(--border); border-left: 1px solid var(--border); border-right: 1px solid var(--border);
+            display: flex; justify-content: space-around;
+            padding-bottom: env(safe-area-inset-bottom, 0); 
+            z-index: 100; border-top-left-radius: 16px; border-top-right-radius: 16px;
+        }
+        .nav-btn {
+            background: transparent; border: none; color: #666; padding: 12px 0; margin: 0; width: 25%;
+            font-size: 10px; text-transform: uppercase; letter-spacing: 1px; font-weight: normal;
+            display: flex; flex-direction: column; align-items: center; gap: 6px; border-radius: 0;
+        }
+        .nav-btn.active { color: var(--accent); }
+        .nav-icon { font-size: 20px; }
+
+        .terminal { border: 1px solid var(--border); background: var(--bg); border-radius: 8px; }
+        .terminal summary { background: #000; padding: 12px; font-size: 11px; color: #666; text-transform: uppercase; cursor: pointer; list-style: none; display: flex; justify-content: space-between;}
+        .terminal[open] summary { border-bottom: 1px solid var(--border); color: var(--accent); }
+        .term-log { height: 200px; overflow-y: auto; padding: 10px; font-size: 11px; }
+        .term-line { padding: 2px 0; color: var(--text-bright); word-break: break-all; }
+        
+        progress { width: 100%; height: 4px; border: none; background: var(--border); margin-bottom: 1rem; border-radius: 2px;}
+        progress::-webkit-progress-bar { background: var(--border); border-radius: 2px;}
+        progress::-webkit-progress-value { background: var(--accent); border-radius: 2px; transition: width 0.1s; }
+
+        /* --- UI OVERLAYS: TOASTS & MODALS --- */
+        #toast-container { 
+            position: fixed; top: calc(env(safe-area-inset-top, 0px) + 20px); left: 50%; transform: translateX(-50%); 
+            z-index: 9999; display: flex; flex-direction: column; gap: 10px; width: 90%; max-width: 400px; pointer-events: none; 
+        }
+        .toast { 
+            padding: 14px 16px; border-radius: 8px; font-weight: 500; text-align: center; font-size: 13px;
+            opacity: 0; transform: translateY(-20px); transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); 
+            box-shadow: 0 10px 30px rgba(0,0,0,0.8); 
+        }
+        .toast.show { opacity: 1; transform: translateY(0); }
+        .toast.success { background: var(--bg-panel); border: 1px solid var(--accent); color: var(--accent); }
+        .toast.error { background: #3a0000; border: 1px solid var(--red); color: #fff; }
+        .toast.info { background: var(--bg-panel); border: 1px solid var(--border-bright); color: var(--text-max); }
+
+        .modal-overlay { 
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0; 
+            background: rgba(0,0,0,0.85); backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px);
+            z-index: 1000; display: flex; align-items: center; justify-content: center; 
+            opacity: 0; pointer-events: none; transition: opacity 0.2s; padding: 1rem; 
+        }
+        .modal-overlay.active { opacity: 1; pointer-events: auto; }
+        .modal { 
+            background: var(--bg); border: 1px solid var(--border-bright); border-radius: 12px; padding: 1.5rem; 
+            width: 100%; max-width: 400px; transform: scale(0.95); transition: transform 0.2s; box-shadow: 0 20px 40px rgba(0,0,0,0.9); 
+        }
+        .modal-overlay.active .modal { transform: scale(1); }
+        .modal h2 { margin-top: 0; font-size: 18px; margin-bottom: 1rem; color: var(--text-max); border-bottom: 1px solid var(--border); padding-bottom: 10px; }
+        .modal p { color: var(--text-bright); font-size: 13px; margin-bottom: 1.5rem; line-height: 1.6; }
+        .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+        .modal-actions button { margin: 0; width: auto; padding: 10px 20px; min-height: 0; font-size: 13px; }
+        .btn-cancel { background: transparent; border: 1px solid var(--border-bright); }
+        .btn-cancel:active { background: var(--border); }
+
+        /* Scanner overrides */
+        #reader { width: 100%; border-radius: 8px; overflow: hidden; border: 1px solid var(--border-bright); }
+        #reader video { object-fit: cover; }
+
+        .seed-grid { 
+            display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 1.5rem; 
+            max-height: 40vh; overflow-y: auto; padding: 10px; background: var(--bg-panel); 
+            border: 1px inset var(--border); border-radius: 8px; 
+        }
+        .seed-word { 
+            background: var(--bg); border: 1px solid var(--border); padding: 8px; border-radius: 6px; 
+            color: var(--accent); font-weight: bold; font-size: 14px; user-select: all; display: flex; align-items: center;
+        }
+        .seed-word span { color: #555; font-size: 10px; margin-right: 8px; user-select: none; font-weight: normal;}
+
+        /* Desktop UI Adjustments */
+        @media (min-width: 768px) {
+            body, html { display: flex; align-items: center; justify-content: center; background: #050505; }
+            #app-container {
+                width: 100%; max-width: 1000px; height: 85vh; min-height: 600px;
+                border: 1px solid var(--border-bright); border-radius: 12px;
+                box-shadow: 0 20px 50px rgba(0,0,0,0.5); display: grid; background: var(--bg);
+                grid-template-columns: 220px 1fr; grid-template-rows: 60px 1fr;
+                grid-template-areas: "nav header" "nav content";
+            }
+            header { grid-area: header; border-bottom: 1px solid var(--border); justify-content: flex-start; padding: 0 2rem; }
+            header h1 { margin: 0; }
+            #bottom-nav {
+                position: static; grid-area: nav; flex-direction: column; justify-content: flex-start; gap: 8px;
+                border-top: none; border-right: 1px solid var(--border); background: var(--bg-panel); border-radius: 0; padding: 2rem 1rem;
+            }
+            .nav-btn { width: 100%; flex-direction: row; justify-content: flex-start; padding: 12px 16px; font-size: 13px; font-weight: 500; border-radius: 8px; transition: background 0.2s; }
+            .nav-btn:hover { background: var(--border); }
+            .nav-btn.active { background: var(--border-bright); color: var(--text-max); }
+            .nav-icon { font-size: 18px; margin-right: 12px; }
+            .page { grid-area: content; padding: 2.5rem; padding-bottom: 2.5rem; }
+            .list-item { flex-direction: row; justify-content: space-between; align-items: center; }
+            .list-item .flex-row { gap: 2rem; width: auto; }
+            input, button { padding: 10px 14px; font-size: 14px; min-height: auto; }
+        }
     </style>
 </head>
 <body>
-    <h1>MIDSTATE<span style="color:var(--accent);">.</span>WALLET</h1>
+    <div id="app-container">
+        <header>
+            <h1>MIDSTATE<span style="color:var(--accent);">.</span>WALLET</h1>
+        </header>
 
-    <div id="authView">
-        <div class="panel">
-            <h2>Authentication</h2>
-            
-            <details style="margin-bottom: 20px; color: #666;">
-                <summary style="cursor: pointer; font-size: 10px; text-transform: uppercase; letter-spacing: 1px;">⚙️ Node RPC Settings</summary>
-                <div style="margin-top: 10px;">
-                    <label style="color: var(--text-bright);">Node RPC URL:</label><br>
-                    <input type="text" id="rpcUrl" value="https://rpc.cypherpunk.gold" style="margin-bottom: 5px;">
-                    <div style="font-size: 10px;">Leave default to use the community gateway.</div>
-                </div>
-            </details>
-            
-            <div id="createSection" class="hidden">
-                <label>BIP39 Seed Phrase (Save this!):</label><br>
-                <input type="text" id="seedPhrase" placeholder="Enter 24 words to restore or click Generate..." style="margin-bottom: 15px;">
-                <div class="grid" style="margin-bottom: 15px;">
-                    <button id="btnGen">Generate New Phrase</button>
-                </div>
-                <label>Set Local Encryption Password:</label><br>
-                <input type="password" id="newPwd" placeholder="Password" style="margin-bottom: 15px;">
-                <button id="btnCreate" disabled>Initialize Wallet</button>
-            </div>
-
-            <div id="loginSection" class="hidden">
-                <p style="margin-bottom: 15px;">Encrypted wallet found in local storage.</p>
-                <label>Password:</label><br>
-                <input type="password" id="loginPwd" placeholder="Enter password to decrypt" style="margin-bottom: 15px;">
-                <button id="btnLogin" disabled>Unlock Wallet</button>
-            </div>
-            <div style="margin-top: 20px; border-top: 1px solid var(--border); padding-top: 15px; text-align: center;">
-                <input type="file" id="importFile" accept=".json" style="display: none;">
-                <button id="btnImportTrigger" style="width: auto; padding: 6px 16px; background: transparent; border: 1px dashed var(--border-bright);">📂 Import Backup File (.json)</button>
-            </div>
-        </div>
-    </div>
-
-    <div id="mainView" class="hidden">
-        <div class="grid">
-            <div class="stat-box">
-                <div class="stat-lbl">Total Balance</div>
-                <div class="stat-val" id="lblBalance">0</div>
-            </div>
-            <div class="stat-box">
-                <div class="stat-lbl">Current Receiving Address</div>
-                <div class="stat-val" style="font-size: 12px; color: var(--accent);" id="lblAddress">-</div>
-                <div style="margin-top: 10px; display: flex; gap: 10px;">
-                    <button id="btnNewAddr" style="padding: 4px; font-size: 10px;">Get New Address</button>
-                    <button id="btnCopyAddr" style="padding: 4px; font-size: 10px;">Copy to Clipboard</button>
-                </div>
-            </div>
-        </div>
-        
-        <div class="panel" style="display: flex; justify-content: space-between; align-items: center;">
-            <span style="color: var(--text-bright);">Ensure you scan the blockchain before sending funds.</span>
-            <button id="btnScan" style="width: 200px;">Sync Blockchain</button>
-        </div>
-        <progress id="scanProgress" value="0" max="100" style="width: 100%; display: none; margin-bottom: 1rem;"></progress>
-
-        <div class="grid" style="margin-bottom: 0;">
+        <main id="authView" class="page active">
             <div class="panel">
-                <h3 style="border-bottom: 1px solid var(--border); padding-bottom: 8px;">Send Funds</h3>
-                <label>Recipient Address:</label><br>
-                <input type="text" id="sendAddress" placeholder="Hex address..." style="margin-bottom: 10px;">
-                <label>Amount:</label><br>
-                <input type="number" id="sendAmount" placeholder="0" style="margin-bottom: 15px;">
-                <button id="btnSend">Construct & Broadcast</button>
-            </div>
-            
-            <div style="display: flex; flex-direction: column;">
-                <h3 style="border-bottom: 1px solid var(--border); padding-bottom: 8px;">Available UTXOs</h3>
-                <div style="flex: 1; overflow-y: auto; max-height: 250px; border: 1px solid var(--border); background: var(--bg-panel);">
-                    <table style="margin-top: 0; border: none;">
-                        <thead><tr><th>Type</th><th>Value</th><th>ID</th></tr></thead>
-                        <tbody id="utxoTable"><tr><td colspan="3" style="text-align:center;">No UTXOs. Run sync.</td></tr></tbody>
-                    </table>
+                <h2 style="text-align: center; margin-bottom: 2rem;">Authentication</h2>
+                
+                <div id="createSection" class="hidden">
+                    <input type="text" id="seedPhrase" placeholder="Enter 24 words or Generate...">
+                    <button id="btnGen" style="background: transparent; border: 1px dashed var(--border-bright);">Generate New Phrase</button>
+                    <div style="height: 10px;"></div>
+                    <input type="password" id="newPwd" placeholder="Set App Password">
+                    <button id="btnCreate" disabled style="background: var(--text-max); color: #000;">Initialize Wallet</button>
+                    
+                    <div id="createProgressContainer" class="hidden" style="margin-top: 15px;">
+                        <div id="createProgressLabel" style="font-size: 11px; color: var(--accent); margin-bottom: 6px; text-transform: uppercase; text-align: center;">Generating Post-Quantum Keys...</div>
+                        <progress id="createProgress" value="0" max="100"></progress>
+                    </div>
+                </div>
+
+                <div id="loginSection" class="hidden">
+                    <p style="text-align: center; margin-bottom: 1rem; color: var(--text-bright);">Wallet locked.</p>
+                    <input type="password" id="loginPwd" placeholder="Enter password">
+                    <button id="btnLogin" disabled style="background: var(--text-max); color: #000;">Unlock</button>
                 </div>
             </div>
-        </div>
-
-        <div class="panel" style="margin-top: 1.5rem;">
-            <h3 style="border-bottom: 1px solid var(--border); padding-bottom: 8px;">Transaction History</h3>
-            <div style="max-height: 250px; overflow-y: auto; border: 1px solid var(--border); background: var(--bg-panel);">
-                <table style="margin-top: 0; border: none;">
-                    <thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Fee</th></tr></thead>
-                    <tbody id="historyTable"><tr><td colspan="4" style="text-align:center;">No history.</td></tr></tbody>
-                </table>
+            <div style="text-align: center; margin-top: 1rem;">
+                <input type="file" id="importFile" accept=".json" style="display: none;">
+                <button id="btnImportTrigger" style="background: transparent; border: none; color: #666; font-size: 12px; text-decoration: underline;">Import Backup File (.json)</button>
             </div>
-        </div>
+        </main>
 
-        <div class="panel" style="margin-top: 1.5rem;">
-            <h3 style="border-bottom: 1px solid var(--border); padding-bottom: 8px;">Security & Backup</h3>
-            <p style="margin-bottom: 15px; color: #666;">Download your encrypted wallet state or view your raw recovery phrase.</p>
-            <div class="grid" style="margin-bottom: 0;">
-                <button id="btnExport">⬇️ Download Encrypted Backup</button>
-                <button id="btnReveal">👁️ Reveal Seed Phrase</button>
+        <main id="view-home" class="page">
+            
+            <div class="panel flex-row" style="margin-bottom: 2rem; background: transparent; border-color: var(--border-bright);">
+                <div style="display: flex; flex-direction: column; gap: 4px;">
+                    <span style="font-weight: bold; color: var(--text-max); font-size: 16px;">Network Sync</span>
+                    <span style="font-size: 11px; color: #888;" id="lblSyncStatus">Ready to scan for transactions</span>
+                    <progress id="scanProgress" class="hidden" value="0" max="100" style="margin-top: 8px; margin-bottom: 0;"></progress>
+                </div>
+                <button id="btnScan" style="width: auto; margin: 0; padding: 10px 20px; min-height: 40px; border-radius: 6px;">Sync</button>
+            </div>
+
+            <div style="text-align: center; margin: 1rem 0 2.5rem 0;">
+                <div style="color: #666; text-transform: uppercase; font-size: 11px; letter-spacing: 1px; margin-bottom: 8px;">Total Balance</div>
+                <div class="stat-val" id="lblBalance" style="color: var(--accent); font-size: 42px;">0</div>
+            </div>
+
+            <div class="flex-row" style="gap: 12px; margin-bottom: 2rem;">
+                <button class="nav-trigger" data-target="view-send" style="margin:0; background: var(--bg-panel);">💸 Send</button>
+                <button class="nav-trigger" data-target="view-receive" style="margin:0; background: var(--bg-panel);">⬇️ Receive</button>
+            </div>
+
+            <h3>Recent Activity</h3>
+            <div class="list-container" id="historyList">
+                <div class="list-item" style="text-align:center; color:#555;">No history.</div>
+            </div>
+        </main>
+
+        <main id="view-send" class="page">
+            <h2>Send Funds</h2>
+            <div class="panel">
+                <div class="flex-row" style="margin-bottom: 10px;">
+                    <label style="font-size: 11px; color: #666; text-transform: uppercase;">Recipient Address</label>
+                    <button id="btnScanQR" style="background: transparent; border: 1px dashed var(--border-bright); color: var(--accent); padding: 4px 12px; width: auto; min-height: 0; font-size: 11px; margin: 0;">📷 Scan</button>
+                </div>
+                <input type="text" id="sendAddress" placeholder="Paste or scan hex address...">
+                
+                <label style="font-size: 11px; color: #666; text-transform: uppercase;">Amount</label>
+                <input type="number" inputmode="numeric" id="sendAmount" placeholder="0">
+                
+                <button id="btnSend" style="margin-top: 10px; background: var(--text-max); color: #000;">Swipe to Send</button>
+            </div>
+
+            <h3 style="margin-top: 1.5rem; font-size: 12px; color: #666;">Available UTXOs</h3>
+            <div class="list-container" id="utxoList">
+                <div class="list-item" style="text-align:center; color:#555;">No UTXOs.</div>
+            </div>
+        </main>
+
+        <main id="view-receive" class="page">
+            <h2>Receive Funds</h2>
+            <div class="panel" style="text-align: center; padding: 2rem 1rem;">
+                
+                <div id="qrCodeContainer" style="width: 200px; height: 200px; background: #fff; margin: 0 auto 1.5rem auto; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #000;">
+                    <span>[ Loading... ]</span>
+                </div>
+                
+                <div style="font-size: 11px; color: #666; text-transform: uppercase; margin-bottom: 8px;">Your Address</div>
+                <div id="lblAddress" style="color: var(--accent); font-size: 12px; word-break: break-all; margin-bottom: 1.5rem; background: var(--bg); padding: 12px; border-radius: 6px; border: 1px solid var(--border);">
+                    -
+                </div>
+                
+                <div id="mssProgressContainer" class="hidden" style="margin-bottom: 15px;">
+                    <div id="mssProgressLabel" style="font-size: 11px; color: var(--accent); margin-bottom: 6px; text-transform: uppercase;">Generating Post-Quantum Key...</div>
+                    <progress id="mssProgress" value="0" max="100"></progress>
+                </div>
+
+                <div class="flex-row" style="gap: 12px;" id="receiveActionContainer">
+                    <button id="btnCopyAddr" style="margin: 0;">Copy Address</button>
+                    <button id="btnNewAddr" style="margin: 0; background: transparent;">Generate New</button>
+                </div>
+            </div>
+        </main>
+
+        <main id="view-settings" class="page">
+            <h2>Settings</h2>
+            
+            <div class="panel">
+                <label style="font-size: 11px; color: #666; text-transform: uppercase;">Node RPC URL</label>
+                <input type="text" id="rpcUrl" value="https://rpc.cypherpunk.gold" style="margin-bottom: 0;">
+            </div>
+
+            <div class="panel">
+                <h3 style="font-size: 14px;">Security & Backup</h3>
+                <button id="btnExport" style="background: var(--bg-panel);">Export Encrypted Backup</button>
+                <button id="btnReveal" style="background: transparent; color: var(--red); border-color: var(--red); margin-bottom: 0;">Reveal Seed Phrase</button>
+            </div>
+
+            <details class="terminal">
+                <summary>Developer Terminal</summary>
+                <div class="term-log" id="term-log"></div>
+            </details>
+        </main>
+
+        <nav id="bottom-nav" class="hidden">
+            <button class="nav-btn active" data-target="view-home">
+                <span class="nav-icon">🏠</span>
+                <span>Home</span>
+            </button>
+            <button class="nav-btn" data-target="view-send">
+                <span class="nav-icon">💸</span>
+                <span>Send</span>
+            </button>
+            <button class="nav-btn" data-target="view-receive">
+                <span class="nav-icon">⬇️</span>
+                <span>Receive</span>
+            </button>
+            <button class="nav-btn" data-target="view-settings">
+                <span class="nav-icon">⚙️</span>
+                <span>Settings</span>
+            </button>
+        </nav>
+    </div>
+
+    <div id="toast-container"></div>
+
+    <div id="confirmModal" class="modal-overlay">
+        <div class="modal">
+            <h2 id="modalTitle">Confirm Action</h2>
+            <p id="modalMsg">Are you sure?</p>
+            <div class="modal-actions">
+                <button class="btn-cancel" onclick="closeModal('confirmModal')">Cancel</button>
+                <button id="modalConfirmBtn" style="background: var(--accent); color: #000;">Confirm</button>
             </div>
         </div>
     </div>
 
-    <div class="terminal">
-        <div style="background: #0d0d0d; border-bottom: 1px solid var(--border); padding: 4px 10px; font-size: 10px; color: #555; text-transform: uppercase;">Worker Log</div>
-        <div class="term-log" id="term-log"></div>
+    <div id="seedModal" class="modal-overlay">
+        <div class="modal" style="max-width: 500px;">
+            <h2 style="color: var(--red); border-color: var(--red);">🚨 SECURE YOUR SEED 🚨</h2>
+            <p>Anyone with these 24 words can steal your funds. Do not screenshot. Ensure no one is looking at your screen.</p>
+            <div class="seed-grid" id="seedGrid">
+                </div>
+            <div class="modal-actions">
+                <button class="btn-cancel" onclick="closeModal('seedModal')">Close</button>
+                <button id="btnCopySeed" style="background: var(--accent); color: #000;">Copy to Clipboard</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="qrScannerModal" class="modal-overlay">
+        <div class="modal" style="padding: 1rem; width: 95%; max-width: 400px;">
+            <h2 style="font-size: 16px; margin-bottom: 15px;">Scan Recipient QR</h2>
+            <div id="reader"></div>
+            <div class="modal-actions" style="margin-top: 15px; justify-content: center;">
+                <button class="btn-cancel" style="width: 100%;" onclick="closeQRScanner()">Cancel Scanning</button>
+            </div>
+        </div>
+    </div>
+    
+    <div id="txDetailModal" class="modal-overlay">
+        <div class="modal" style="max-width: 500px;">
+            <h2 id="txDetailTitle">Transaction Details</h2>
+            
+            <div class="panel" style="margin-bottom: 1rem; padding: 1rem;">
+                <div class="flex-row" style="margin-bottom: 8px;">
+                    <span style="color: #666; font-size: 11px; text-transform: uppercase;">Amount</span>
+                    <span id="txDetailAmount" style="font-weight: bold; color: var(--text-max);"></span>
+                </div>
+                <div class="flex-row" style="margin-bottom: 8px;">
+                    <span style="color: #666; font-size: 11px; text-transform: uppercase;">Network Fee</span>
+                    <span id="txDetailFee" style="color: var(--text-bright);"></span>
+                </div>
+                <div class="flex-row" style="margin-bottom: 8px;">
+                    <span style="color: #666; font-size: 11px; text-transform: uppercase;">Date</span>
+                    <span id="txDetailDate" style="color: var(--text-bright);"></span>
+                </div>
+            </div>
+            
+            <h3 style="font-size: 12px; color: #666; text-transform: uppercase; margin-bottom: 6px;">Inputs Spent</h3>
+            <div id="txDetailInputs" class="list-container" style="max-height: 120px; margin-bottom: 1rem; font-size: 11px; padding: 8px; word-break: break-all;"></div>
+            
+            <h3 style="font-size: 12px; color: #666; text-transform: uppercase; margin-bottom: 6px;">Outputs Received</h3>
+            <div id="txDetailOutputs" class="list-container" style="max-height: 120px; margin-bottom: 1rem; font-size: 11px; padding: 8px; word-break: break-all;"></div>
+
+            <div class="modal-actions">
+                <button class="btn-cancel" onclick="closeModal('txDetailModal')">Close</button>
+            </div>
+        </div>
     </div>
 
     <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('./sw.js').catch(err => {
+                    console.log('SW registration failed: ', err);
+                });
+            });
+        }
+
+        // --- UI Helper Functions (Toasts & Modals) ---
+        function showToast(message, type = 'info') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            toast.innerText = message;
+            container.appendChild(toast);
+            
+            requestAnimationFrame(() => {
+                toast.classList.add('show');
+            });
+
+            setTimeout(() => {
+                toast.classList.remove('show');
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        }
+
+        function showConfirm(title, htmlMessage, onConfirm) {
+            document.getElementById('modalTitle').innerText = title;
+            document.getElementById('modalMsg').innerHTML = htmlMessage;
+            
+            const confirmBtn = document.getElementById('modalConfirmBtn');
+            const newBtn = confirmBtn.cloneNode(true);
+            confirmBtn.parentNode.replaceChild(newBtn, confirmBtn);
+            
+            newBtn.onclick = () => {
+                closeModal('confirmModal');
+                onConfirm();
+            };
+            
+            document.getElementById('confirmModal').classList.add('active');
+        }
+
+        function showSeedModal(phrase) {
+            const grid = document.getElementById('seedGrid');
+            grid.innerHTML = phrase.split(' ').map((word, i) =>
+                `<div class="seed-word"><span>${(i+1).toString().padStart(2, '0')}</span>${word}</div>`
+            ).join('');
+            
+            document.getElementById('btnCopySeed').onclick = () => {
+                navigator.clipboard.writeText(phrase);
+                showToast('Seed phrase copied to clipboard!', 'success');
+            };
+            
+            document.getElementById('seedModal').classList.add('active');
+        }
+
+        function closeModal(id) {
+            document.getElementById(id).classList.remove('active');
+        }
+
+        // --- QR Scanner Logic ---
+        let html5QrCode;
+
+        document.getElementById('btnScanQR').onclick = () => {
+            document.getElementById('qrScannerModal').classList.add('active');
+            
+            if (!html5QrCode) {
+                html5QrCode = new Html5Qrcode("reader");
+            }
+            
+            // Prefer back camera, constrain scan area for mobile
+            const config = { fps: 10, qrbox: { width: 250, height: 250 }, aspectRatio: 1.0 };
+            
+            html5QrCode.start({ facingMode: "environment" }, config, 
+                (decodedText, decodedResult) => {
+                    // Success! Stop camera, hide modal, and fill input
+                    html5QrCode.stop().then(() => {
+                        document.getElementById('qrScannerModal').classList.remove('active');
+                        document.getElementById('sendAddress').value = decodedText;
+                        showToast("Address scanned successfully", "success");
+                    }).catch(err => {
+                        log("Error stopping scanner: " + err, "var(--red)");
+                    });
+                },
+                (errorMessage) => {
+                    // Ongoing scanning failure, safe to ignore
+                }
+            ).catch(err => {
+                showToast("Camera access denied or unavailable.", "error");
+                document.getElementById('qrScannerModal').classList.remove('active');
+            });
+        };
+
+        function closeQRScanner() {
+            if (html5QrCode && html5QrCode.isScanning) {
+                html5QrCode.stop().then(() => {
+                    document.getElementById('qrScannerModal').classList.remove('active');
+                }).catch(err => {
+                    log("Error stopping scanner: " + err, "var(--red)");
+                    document.getElementById('qrScannerModal').classList.remove('active');
+                });
+            } else {
+                document.getElementById('qrScannerModal').classList.remove('active');
+            }
+        }
+
+        // --- Navigation Logic ---
+        function switchTab(targetId) {
+            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+            document.getElementById(targetId).classList.add('active');
+            
+            document.querySelectorAll('.nav-btn').forEach(btn => {
+                if(btn.dataset.target === targetId) {
+                    btn.classList.add('active');
+                } else {
+                    btn.classList.remove('active');
+                }
+            });
+        }
+
+        document.querySelectorAll('.nav-btn').forEach(btn => {
+            btn.addEventListener('click', () => switchTab(btn.dataset.target));
+        });
+
+        document.querySelectorAll('.nav-trigger').forEach(btn => {
+            btn.addEventListener('click', () => switchTab(btn.dataset.target));
+        });
+
+        // --- Core App Logic ---
         const worker = new Worker('./worker.js', { type: 'module' });
         const authView = document.getElementById('authView');
-        const mainView = document.getElementById('mainView');
+        const bottomNav = document.getElementById('bottom-nav');
         const createSec = document.getElementById('createSection');
         const loginSec = document.getElementById('loginSection');
         const logs = document.getElementById('term-log');
         
         let walletExists = false;
+        window.appHistory = []; // Global state for tx details modal
 
         function log(msg, color = 'var(--text-bright)') {
             const el = document.createElement('div');
             el.className = 'term-line';
             el.style.color = color;
-            el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            el.textContent = `[${new Date().toLocaleTimeString().split(' ')[0]}] ${msg}`;
             logs.appendChild(el);
             logs.scrollTop = logs.scrollHeight;
         }
 
-        // Sanitizes inputs to prevent Safari SyntaxError crashes
         function getCleanRpcUrl() {
             const raw = document.getElementById('rpcUrl').value;
             return raw ? raw.trim().replace(/\s+/g, '') : "";
         }
 
+        function showTxDetail(index) {
+            const tx = window.appHistory[index];
+            if (!tx) return;
+            
+            const isSent = tx.kind === 'sent';
+            const sign = isSent ? '-' : '+';
+            const color = isSent ? 'var(--red)' : 'var(--accent)';
+            
+            document.getElementById('txDetailTitle').innerText = tx.kind.toUpperCase() + " DETAILS";
+            const amtEl = document.getElementById('txDetailAmount');
+            amtEl.innerText = `${sign}${tx.value}`;
+            amtEl.style.color = color;
+            
+            document.getElementById('txDetailFee').innerText = tx.fee || 0;
+            document.getElementById('txDetailDate').innerText = new Date(tx.timestamp * 1000).toLocaleString();
+            
+            const inputsDiv = document.getElementById('txDetailInputs');
+            if (tx.inputs && tx.inputs.length > 0) {
+                inputsDiv.innerHTML = tx.inputs.map(id => `<div style="font-family: monospace; margin-bottom:6px; padding-bottom:6px; border-bottom: 1px solid var(--border);">${id}</div>`).join('');
+            } else {
+                inputsDiv.innerHTML = `<div style="color:#666; font-style:italic;">None (Coinbase/Mint)</div>`;
+            }
+            
+            const outputsDiv = document.getElementById('txDetailOutputs');
+            if (tx.outputs && tx.outputs.length > 0) {
+                outputsDiv.innerHTML = tx.outputs.map(id => `<div style="font-family: monospace; margin-bottom:6px; padding-bottom:6px; border-bottom: 1px solid var(--border);">${id}</div>`).join('');
+            } else {
+                outputsDiv.innerHTML = `<div style="color:#666; font-style:italic;">None</div>`;
+            }
+            
+            document.getElementById('txDetailModal').classList.add('active');
+        }
+
         function updateDashboard(payload) {
             try {
-                if (!payload) {
-                    log("UI Error: Payload is undefined", "var(--red)");
-                    return;
-                }
+                if (!payload) return;
 
+                const primaryAddress = payload.primaryAddress || "None";
                 document.getElementById('lblBalance').innerText = payload.balance !== undefined ? payload.balance : "0";
-                document.getElementById('lblAddress').innerText = payload.primaryAddress || "None";
+                document.getElementById('lblAddress').innerText = primaryAddress;
                 
-                // Update UTXO Table
-                const tbody = document.getElementById('utxoTable');
-                if (!payload.utxos || payload.utxos.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="3" style="text-align:center; color: #555;">No UTXOs synced.</td></tr>';
+                const qrContainer = document.getElementById('qrCodeContainer');
+                qrContainer.innerHTML = ""; 
+                if (primaryAddress !== "None") {
+                    new QRCode(qrContainer, {
+                        text: primaryAddress,
+                        width: 180,
+                        height: 180,
+                        colorDark : "#000000",
+                        colorLight : "#ffffff",
+                        correctLevel : QRCode.CorrectLevel.M
+                    });
                 } else {
-                    tbody.innerHTML = payload.utxos.map(u => `
-                        <tr>
-                            <td style="color: ${u.is_mss ? 'var(--accent)' : '#888'};">${u.is_mss ? 'MSS' : 'WOTS'}</td>
-                            <td style="color: var(--text-max);">${u.value}</td>
-                            <td style="font-size: 9px; color: #555;">${u.coin_id ? u.coin_id.substring(0,12) : 'unknown'}...</td>
-                        </tr>
+                    qrContainer.innerHTML = "<span>[ No Address ]</span>";
+                }
+                
+                const uList = document.getElementById('utxoList');
+                if (!payload.utxos || payload.utxos.length === 0) {
+                    uList.innerHTML = '<div class="list-item" style="text-align:center; color:#555;">No UTXOs synced.</div>';
+                } else {
+                    uList.innerHTML = payload.utxos.map(u => `
+                        <div class="list-item">
+                            <div class="flex-row">
+                                <span style="font-weight:bold; color:var(--text-max);">${u.value}</span>
+                                <span style="font-size:10px; color:${u.is_mss ? 'var(--accent)' : '#888'}; border: 1px solid ${u.is_mss ? 'var(--accent-dim)' : '#333'}; padding: 2px 6px; border-radius: 4px;">${u.is_mss ? 'MSS' : 'WOTS'}</span>
+                            </div>
+                            <div style="font-size: 10px; color: #666; margin-top: 4px; word-break: break-all;">ID: ${u.coin_id.substring(0,16)}...</div>
+                        </div>
                     `).join('');
                 }
 
-                // Update Transaction History Table
-                const hTable = document.getElementById('historyTable');
+                const hList = document.getElementById('historyList');
+                window.appHistory = payload.history || []; // Store globally for modal access
+                
                 if (!payload.history || payload.history.length === 0) {
-                    hTable.innerHTML = '<tr><td colspan="4" style="text-align:center; color: #555;">No transaction history.</td></tr>';
+                    hList.innerHTML = '<div class="list-item" style="text-align:center; color:#555;">No history.</div>';
                 } else {
-                    hTable.innerHTML = payload.history.map(h => {
-                        const date = new Date(h.timestamp * 1000).toLocaleString();
+                    hList.innerHTML = payload.history.map((h, i) => {
+                        const date = new Date(h.timestamp * 1000).toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
                         const isSent = h.kind === 'sent';
                         const color = isSent ? 'var(--red)' : 'var(--accent)';
                         const sign = isSent ? '-' : '+';
                         return `
-                            <tr>
-                                <td style="color: #888; font-size: 10px;">${date}</td>
-                                <td style="text-transform: uppercase; color: ${color};">${h.kind}</td>
-                                <td style="color: var(--text-max);">${sign}${h.value}</td>
-                                <td style="color: #555;">${h.fee || 0}</td>
-                            </tr>
+                            <div class="list-item" onclick="showTxDetail(${i})" style="cursor: pointer; transition: background 0.2s;" onmouseover="this.style.background='var(--border)'" onmouseout="this.style.background='transparent'">
+                                <div class="flex-row">
+                                    <span style="text-transform:uppercase; font-weight:bold; color:${color}; font-size: 12px;">${h.kind}</span>
+                                    <span style="color:var(--text-max); font-weight:bold; font-size: 16px;">${sign}${h.value}</span>
+                                </div>
+                                <div class="flex-row" style="margin-top:4px;">
+                                    <span style="color:#666; font-size:11px;">${date}</span>
+                                    <span style="color:#555; font-size:11px;">Fee: ${h.fee || 0}</span>
+                                </div>
+                            </div>
                         `;
                     }).join('');
                 }
             } catch (err) {
-                log(`UI Render Error: ${err.message}`, 'var(--red)');
+                log(`UI Error: ${err.message}`, 'var(--red)');
             }
+        }
+
+        function resetUIState() {
+            document.getElementById('createProgressContainer').classList.add('hidden');
+            document.getElementById('mssProgressContainer').classList.add('hidden');
+            document.getElementById('receiveActionContainer').classList.remove('hidden');
+            
+            const btnScan = document.getElementById('btnScan');
+            btnScan.disabled = false;
+            btnScan.innerText = "Sync Now";
+            
+            const prog = document.getElementById('scanProgress');
+            prog.classList.add('hidden');
+            document.getElementById('lblSyncStatus').innerText = "Ready to scan for transactions";
         }
 
         worker.onmessage = (e) => {
@@ -237,122 +678,168 @@
                     localStorage.setItem('midstate_wallet', payload);
                     break;
                 case 'SEED_REVEALED':
-                    alert(`🚨 SECURE YOUR SEED PHRASE 🚨\n\nMake sure no one is looking at your screen.\n\n${payload}`);
-                    log("Seed phrase viewed by user.");
+                    showSeedModal(payload);
                     break;
                 case 'PHRASE_GENERATED':
                     document.getElementById('seedPhrase').value = payload;
                     break;
                 case 'WALLET_LOADED':
                 case 'REFRESH_DASHBOARD':
-                    authView.classList.add('hidden');
-                    mainView.classList.remove('hidden');
+                    resetUIState();
+                    authView.classList.remove('active');
+                    bottomNav.classList.remove('hidden');
+                    
+                    if (type === 'WALLET_LOADED') {
+                        switchTab('view-home');
+                        showToast("Wallet unlocked securely.", "success");
+                    }
                     updateDashboard(payload);
-                    if (type === 'WALLET_LOADED') log("Wallet loaded and decrypted.");
+                    break;
+                case 'MSS_PROGRESS':
+                    const cp = document.getElementById('createProgress');
+                    const mp = document.getElementById('mssProgress');
+                    const cLabel = document.getElementById('createProgressLabel');
+                    const mLabel = document.getElementById('mssProgressLabel');
+                    
+                    if (cp && !document.getElementById('createProgressContainer').classList.contains('hidden')) {
+                        cp.max = payload.total;
+                        cp.value = payload.current;
+                        if(payload.label) cLabel.innerText = payload.label;
+                    }
+                    if (mp && !document.getElementById('mssProgressContainer').classList.contains('hidden')) {
+                        mp.max = payload.total;
+                        mp.value = payload.current;
+                        if(payload.label) mLabel.innerText = payload.label;
+                    }
                     break;
                 case 'LOG':
                     log(payload);
                     break;
                 case 'SCAN_PROGRESS':
                     const prog = document.getElementById('scanProgress');
-                    prog.style.display = 'block';
+                    prog.classList.remove('hidden');
                     prog.max = payload.max;
                     prog.value = payload.height;
+                    document.getElementById('lblSyncStatus').innerText = `Scanning block ${payload.height} of ${payload.max}...`;
                     break;
                 case 'SCAN_COMPLETE':
-                    document.getElementById('scanProgress').style.display = 'none';
-                    document.getElementById('btnScan').disabled = false;
-                    log("Synchronization complete.", "var(--accent)");
+                    resetUIState();
+                    showToast("Sync complete.", "success");
                     updateDashboard(payload);
                     break;
                 case 'SEND_COMPLETE':
-                    document.getElementById('btnSend').disabled = false;
+                    const btnSend = document.getElementById('btnSend');
+                    btnSend.disabled = false;
+                    btnSend.innerText = "Swipe to Send";
+                    document.getElementById('sendAmount').value = '';
+                    document.getElementById('sendAddress').value = '';
                     updateDashboard(payload);
-                    log("Transaction finalized on network.", "var(--accent)");
+                    showToast("Transaction successfully broadcasted.", "success");
+                    switchTab('view-home');
                     break;
                 case 'ERROR':
-                    log(`ERROR: ${payload}`, "var(--red)");
-                    document.getElementById('btnScan').disabled = false;
-                    document.getElementById('btnSend').disabled = false;
+                    showToast(payload, "error");
+                    resetUIState();
+                    const bSend = document.getElementById('btnSend');
+                    bSend.disabled = false;
+                    bSend.innerText = "Swipe to Send";
+                    
                     document.getElementById('btnLogin').disabled = false;
-                    document.getElementById('btnCreate').disabled = false;
+                    document.getElementById('btnCreate').classList.remove('hidden');
                     break;
             }
         };
 
         worker.postMessage({ type: 'INIT' });
 
+        // --- Action Listeners ---
         document.getElementById('btnGen').onclick = () => worker.postMessage({ type: 'GENERATE' });
 
         document.getElementById('btnCreate').onclick = () => {
             const phrase = document.getElementById('seedPhrase').value;
             const password = document.getElementById('newPwd').value;
-            if(!phrase || !password) return alert("Phrase and password required.");
-            document.getElementById('btnCreate').disabled = true;
+            if(!phrase || !password) return showToast("Phrase and password required.", "error");
+            
+            document.getElementById('btnCreate').classList.add('hidden');
+            document.getElementById('createProgressContainer').classList.remove('hidden');
+            
             worker.postMessage({ type: 'CREATE', payload: { phrase, password, rpcUrl: getCleanRpcUrl() } });
         };
 
         document.getElementById('btnLogin').onclick = () => {
             const password = document.getElementById('loginPwd').value;
-            if(!password) return alert("Password required.");
+            if(!password) return showToast("Password required.", "error");
             document.getElementById('btnLogin').disabled = true;
-            
             const bundleStr = localStorage.getItem('midstate_wallet');
             worker.postMessage({ type: 'LOGIN', payload: { password, rpcUrl: getCleanRpcUrl(), bundleStr } });
         };
 
         document.getElementById('btnScan').onclick = (e) => {
             e.target.disabled = true;
+            e.target.innerText = "Syncing...";
             worker.postMessage({ type: 'SCAN' });
         };
 
         document.getElementById('btnSend').onclick = (e) => {
             const toAddress = document.getElementById('sendAddress').value;
             const amount = parseInt(document.getElementById('sendAmount').value);
-            if(!toAddress || !amount) return alert("Fill out transaction parameters.");
-            e.target.disabled = true;
-            worker.postMessage({ type: 'SEND', payload: { toAddress, amount } });
+            if(!toAddress || !amount) return showToast("Fill out transaction parameters.", "error");
+            
+            showConfirm(
+                "Confirm Transaction",
+                `Are you sure you want to send <strong style="color:var(--text-max)">${amount}</strong> units to <br><span style="font-size:12px; word-break:break-all; color:var(--accent); display:block; margin-top:8px;">${toAddress}</span>?`,
+                () => {
+                    e.target.disabled = true;
+                    e.target.innerText = "Processing...";
+                    worker.postMessage({ type: 'SEND', payload: { toAddress, amount } });
+                }
+            );
         };
 
-        document.getElementById('btnNewAddr').onclick = () => worker.postMessage({ type: 'NEW_ADDRESS' });
+        document.getElementById('btnNewAddr').onclick = (e) => {
+            document.getElementById('receiveActionContainer').classList.add('hidden');
+            document.getElementById('mssProgressContainer').classList.remove('hidden');
+            worker.postMessage({ type: 'NEW_ADDRESS' });
+        };
         
         document.getElementById('btnCopyAddr').onclick = () => {
             navigator.clipboard.writeText(document.getElementById('lblAddress').innerText);
-            log("Address copied to clipboard.");
+            showToast("Address copied to clipboard.", "success");
         };
         
-        // --- BACKUP FEATURES ---
-        
         document.getElementById('btnReveal').onclick = () => {
-            if (confirm("Warning: Anyone with this phrase can steal your funds. Make sure your screen is private. Continue?")) {
-                worker.postMessage({ type: 'REVEAL_SEED' });
-            }
+            showConfirm(
+                "Security Warning",
+                "Anyone with this phrase can steal your funds. Make sure no one is looking at your screen. Continue?",
+                () => {
+                    worker.postMessage({ type: 'REVEAL_SEED' });
+                }
+            );
         };
 
         document.getElementById('btnExport').onclick = () => {
             const bundleStr = localStorage.getItem('midstate_wallet');
-            if (!bundleStr) return alert("No wallet data found to export.");
-            
+            if (!bundleStr) return showToast("No wallet data found to export.", "error");
             const blob = new Blob([bundleStr], { type: "application/json" });
             const url = URL.createObjectURL(blob);
-            
             const a = document.createElement('a');
             a.href = url;
             a.download = `midstate-backup-${new Date().toISOString().split('T')[0]}.json`;
-            
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
-            
-            log("Encrypted wallet backup downloaded.", "var(--accent)");
+            showToast("Backup exported successfully.", "success");
         };
-        
-        // --- IMPORT BACKUP FEATURE ---
         
         document.getElementById('btnImportTrigger').onclick = () => {
             if (walletExists) {
-                if (!confirm("Warning: Importing a backup will overwrite the wallet currently saved in your browser. Continue?")) return;
+                showConfirm(
+                    "Overwrite Wallet?",
+                    "Warning: Importing a backup will completely overwrite the wallet currently saved in your browser. Ensure you have backed up your current wallet.",
+                    () => { document.getElementById('importFile').click(); }
+                );
+                return;
             }
             document.getElementById('importFile').click();
         };
@@ -360,34 +847,22 @@
         document.getElementById('importFile').addEventListener('change', function(e) {
             const file = e.target.files[0];
             if (!file) return;
-            
             const reader = new FileReader();
             reader.onload = function(event) {
-                const contents = event.target.result;
                 try {
-                    const parsed = JSON.parse(contents);
-                    if (!parsed.salt || !parsed.iv || !parsed.data) {
-                        throw new Error("Invalid Midstate backup file format.");
-                    }
-                    
-                    localStorage.setItem('midstate_wallet', contents);
+                    const parsed = JSON.parse(event.target.result);
+                    if (!parsed.salt || !parsed.iv || !parsed.data) throw new Error("Invalid backup format.");
+                    localStorage.setItem('midstate_wallet', event.target.result);
                     walletExists = true;
-                    
                     createSec.classList.add('hidden');
                     loginSec.classList.remove('hidden');
                     document.getElementById('btnLogin').disabled = false;
-                    
-                    log("Backup file loaded into memory. Ready for decryption.", "var(--accent)");
-                    alert("Backup imported successfully! Enter your password to unlock.");
-                    
+                    showToast("Backup imported! Enter password to unlock.", "success");
                 } catch (err) {
-                    alert(`Import Failed: ${err.message}`);
-                    log(`Import Error: ${err.message}`, "var(--red)");
+                    showToast(`Import Failed: ${err.message}`, "error");
                 }
-                
                 e.target.value = ''; 
             };
-            
             reader.readAsText(file);
         });
     </script>
