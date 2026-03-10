@@ -392,6 +392,23 @@
         </div>
     </div>
 
+    <div id="sendProgressModal" class="modal-overlay">
+        <div class="modal" style="max-width: 450px;">
+            <h2 id="sendProgressTitle">Sending Transaction</h2>
+            
+            <div id="sendProgressArea" style="margin-bottom: 15px;">
+                <div id="sendProgressText" style="font-size: 12px; color: var(--text-bright); margin-bottom: 8px;">Initializing...</div>
+                <progress id="sendProgressBar" value="0" max="100"></progress>
+            </div>
+
+            <div id="sendErrorHelp" class="hidden" style="font-size: 12px; color: #ff8888; margin-bottom: 15px; padding: 12px; border: 1px solid var(--red); border-radius: 6px; background: rgba(255,0,0,0.1); white-space: pre-wrap; line-height: 1.5;"></div>
+
+            <div class="modal-actions">
+                <button id="btnSendClose" class="btn-cancel hidden" onclick="closeSendModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         if ('serviceWorker' in navigator) {
             window.addEventListener('load', () => {
@@ -452,6 +469,14 @@
         function closeModal(id) {
             document.getElementById(id).classList.remove('active');
         }
+        
+        function closeSendModal() {
+            closeModal('sendProgressModal');
+            // Reset the send button so user can try again
+            const btnSend = document.getElementById('btnSend');
+            btnSend.disabled = false;
+            btnSend.innerText = "Swipe to Send";
+        }
 
         // --- QR Scanner Logic ---
         let html5QrCode;
@@ -463,12 +488,10 @@
                 html5QrCode = new Html5Qrcode("reader");
             }
             
-            // Prefer back camera, constrain scan area for mobile
             const config = { fps: 10, qrbox: { width: 250, height: 250 }, aspectRatio: 1.0 };
             
             html5QrCode.start({ facingMode: "environment" }, config, 
                 (decodedText, decodedResult) => {
-                    // Success! Stop camera, hide modal, and fill input
                     html5QrCode.stop().then(() => {
                         document.getElementById('qrScannerModal').classList.remove('active');
                         document.getElementById('sendAddress').value = decodedText;
@@ -477,9 +500,7 @@
                         log("Error stopping scanner: " + err, "var(--red)");
                     });
                 },
-                (errorMessage) => {
-                    // Ongoing scanning failure, safe to ignore
-                }
+                (errorMessage) => { }
             ).catch(err => {
                 showToast("Camera access denied or unavailable.", "error");
                 document.getElementById('qrScannerModal').classList.remove('active');
@@ -618,7 +639,7 @@
                 }
 
                 const hList = document.getElementById('historyList');
-                window.appHistory = payload.history || []; // Store globally for modal access
+                window.appHistory = payload.history || []; 
                 
                 if (!payload.history || payload.history.length === 0) {
                     hList.innerHTML = '<div class="list-item" style="text-align:center; color:#555;">No history.</div>';
@@ -712,6 +733,23 @@
                         if(payload.label) mLabel.innerText = payload.label;
                     }
                     break;
+                
+                // NEW: Handle SEND_PROGRESS and SEND_COMPLETE
+                case 'SEND_PROGRESS':
+                    document.getElementById('sendProgressBar').value = payload.pct;
+                    document.getElementById('sendProgressText').innerText = payload.msg;
+                    break;
+                case 'SEND_COMPLETE':
+                    document.getElementById('sendProgressTitle').innerText = "Success";
+                    document.getElementById('sendProgressText').innerText = "Transaction finalized and broadcasted.";
+                    document.getElementById('sendProgressBar').value = 100;
+                    document.getElementById('btnSendClose').classList.remove('hidden');
+                    
+                    document.getElementById('sendAmount').value = '';
+                    document.getElementById('sendAddress').value = '';
+                    updateDashboard(payload);
+                    break;
+                    
                 case 'LOG':
                     log(payload);
                     break;
@@ -727,25 +765,26 @@
                     showToast("Sync complete.", "success");
                     updateDashboard(payload);
                     break;
-                case 'SEND_COMPLETE':
-                    const btnSend = document.getElementById('btnSend');
-                    btnSend.disabled = false;
-                    btnSend.innerText = "Swipe to Send";
-                    document.getElementById('sendAmount').value = '';
-                    document.getElementById('sendAddress').value = '';
-                    updateDashboard(payload);
-                    showToast("Transaction successfully broadcasted.", "success");
-                    switchTab('view-home');
-                    break;
                 case 'ERROR':
-                    showToast(payload, "error");
-                    resetUIState();
-                    const bSend = document.getElementById('btnSend');
-                    bSend.disabled = false;
-                    bSend.innerText = "Swipe to Send";
-                    
-                    document.getElementById('btnLogin').disabled = false;
-                    document.getElementById('btnCreate').classList.remove('hidden');
+                    const sendModal = document.getElementById('sendProgressModal');
+                    if (sendModal.classList.contains('active')) {
+                        // Error happened during a send
+                        document.getElementById('sendProgressTitle').innerText = "Transaction Failed";
+                        document.getElementById('sendProgressTitle').style.color = "var(--red)";
+                        document.getElementById('sendProgressArea').classList.add('hidden');
+                        
+                        const errDiv = document.getElementById('sendErrorHelp');
+                        errDiv.innerText = payload;
+                        errDiv.classList.remove('hidden');
+                        document.getElementById('btnSendClose').classList.remove('hidden');
+                    } else {
+                        // Standard error
+                        showToast(payload, "error");
+                        resetUIState();
+                        document.getElementById('btnLogin').disabled = false;
+                        document.getElementById('btnCreate').classList.remove('hidden');
+                    }
+                    log(`ERROR: ${payload}`, "var(--red)");
                     break;
             }
         };
@@ -789,6 +828,16 @@
                 "Confirm Transaction",
                 `Are you sure you want to send <strong style="color:var(--text-max)">${amount}</strong> units to <br><span style="font-size:12px; word-break:break-all; color:var(--accent); display:block; margin-top:8px;">${toAddress}</span>?`,
                 () => {
+                    // Activate the progress modal immediately
+                    document.getElementById('sendProgressModal').classList.add('active');
+                    document.getElementById('sendProgressTitle').innerText = "Sending Transaction";
+                    document.getElementById('sendProgressTitle').style.color = "var(--text-max)";
+                    document.getElementById('sendProgressArea').classList.remove('hidden');
+                    document.getElementById('sendErrorHelp').classList.add('hidden');
+                    document.getElementById('btnSendClose').classList.add('hidden');
+                    document.getElementById('sendProgressBar').value = 0;
+                    document.getElementById('sendProgressText').innerText = "Initializing...";
+                    
                     e.target.disabled = true;
                     e.target.innerText = "Processing...";
                     worker.postMessage({ type: 'SEND', payload: { toAddress, amount } });
