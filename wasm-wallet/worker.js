@@ -56,7 +56,6 @@ async function loadState(pwd, bundleStr) {
     if (!bundleStr) throw new Error("No wallet found");
     const bundle = JSON.parse(bundleStr);
     
-    // Bulletproof parsing to prevent TypeError / SyntaxError crashes
     const parseHexArray = (hexStr) => new Uint8Array((hexStr || "").match(/.{1,2}/g)?.map(b => parseInt(b, 16)) || []);
     
     const salt = parseHexArray(bundle.salt);
@@ -71,14 +70,19 @@ async function loadState(pwd, bundleStr) {
         
         wState = loadedState;
         
-        // Backwards compatibility migrations
         if (Array.isArray(wState.utxos)) {
             const utxoMap = {};
             for (const u of wState.utxos) utxoMap[u.coin_id] = u;
             wState.utxos = utxoMap;
         }
-        if (!wState.history) {
+
+        if (wState.history === undefined) {
+            self.postMessage({ type: 'LOG', payload: "Legacy backup detected. Re-indexing chain to rebuild transaction history..." });
             wState.history = [];
+            if (wState.lastScannedHeight > 0) {
+                wState.lastScannedHeight = 0;
+                wState.utxos = {};
+            }
         }
 
         password = pwd;
@@ -105,17 +109,20 @@ self.onmessage = async (e) => {
             wallet = new WebWallet(payload.phrase);
             wState.phrase = payload.phrase;
             
-            self.postMessage({ type: 'LOG', payload: "Deriving 20 WOTS lookahead addresses..." });
-            
+            // Phase 1: WOTS derivation
             for (let i = 0; i < GAP_LIMIT; i++) {
                 deriveNextWots();
-                if (i % 5 === 0) {
-                    self.postMessage({ type: 'LOG', payload: `Derived ${i}/${GAP_LIMIT} addresses...` });
+                if (i % 2 === 0) {
+                    self.postMessage({ 
+                        type: 'MSS_PROGRESS', 
+                        payload: { current: i, total: GAP_LIMIT, label: `Deriving base keys (${i}/${GAP_LIMIT})...` } 
+                    });
                     await new Promise(r => setTimeout(r, 0));
                 }
             }
             
-            self.postMessage({ type: 'LOG', payload: "Generating Reusable MSS Address..." });
+            // Phase 2: MSS derivation
+            self.postMessage({ type: 'MSS_PROGRESS', payload: { current: 0, total: 100, label: "Generating Post-Quantum MSS Address..." } });
             await new Promise(r => setTimeout(r, 10));
             
             deriveNextMss(5); 
@@ -160,7 +167,10 @@ function deriveNextWots() {
 
 function deriveNextMss(height) {
     const progressCallback = (current, total) => {
-        self.postMessage({ type: 'LOG', payload: `Generating Reusable Address: Hashed ${current}/${total} leaves...` });
+        self.postMessage({ 
+            type: 'MSS_PROGRESS', 
+            payload: { current, total, label: `Hashing tree leaves (${current}/${total})...` } 
+        });
     };
     const addr = wallet.get_mss_address(wState.nextMssIndex, height, progressCallback);
     wState.mssAddrs[addr] = { index: wState.nextMssIndex, height, next_leaf: 0 };
@@ -172,12 +182,23 @@ function buildDashboardPayload() {
     const utxoArray = Object.values(wState.utxos);
     const safeBalance = utxoArray.reduce((s, u) => s + Number(u.value), 0);
     
+    const sortedHistory = wState.history.slice().sort((a, b) => b.timestamp - a.timestamp);
+    
     return {
         primaryAddress: mssList.length > 0 ? mssList[mssList.length - 1] : "None",
         balance: safeBalance,
         utxos: utxoArray,
-        history: wState.history.slice().reverse() // Newest first
+        history: sortedHistory 
     };
+}
+
+function updateWasmWatchlist() {
+    const watchList = [
+        ...Object.keys(wState.wotsAddrs), 
+        ...Object.keys(wState.mssAddrs),
+        ...Object.keys(wState.utxos) 
+    ];
+    wallet.set_watchlist(JSON.stringify(watchList));
 }
 
 async function performScan() {
@@ -196,6 +217,8 @@ async function performScan() {
     let currentHeight = wState.lastScannedHeight;
     const BATCH_SIZE = 1000;
 
+    updateWasmWatchlist();
+
     while (currentHeight < chainHeight) {
         const end = Math.min(currentHeight + BATCH_SIZE, chainHeight);
         const filterReq = await fetch(`${rpcUrl}/filters`, {
@@ -208,13 +231,6 @@ async function performScan() {
         const filterData = await filterReq.json();
         const numFilters = filterData.filters ? filterData.filters.length : 0;
 
-        // PERFORMANCE FIX: Generate the JSON string ONCE outside the tight block loop
-        let watchListStr = JSON.stringify([
-            ...Object.keys(wState.wotsAddrs), 
-            ...Object.keys(wState.mssAddrs),
-            ...Object.keys(wState.utxos) 
-        ]);
-
         for (let i = 0; i < numFilters; i++) {
             const height = filterData.start_height + i;
             if (height % 100 === 0) self.postMessage({ type: 'SCAN_PROGRESS', payload: { height, max: chainHeight } });
@@ -224,31 +240,22 @@ async function performScan() {
             const blockHash = filterData.block_hashes ? filterData.block_hashes[i] : undefined;
 
             if (!blockHash) {
-                await processFullBlock(height);
-                // Rebuild watchlist if the block mutated our addresses/UTXOs
-                watchListStr = JSON.stringify([
-                    ...Object.keys(wState.wotsAddrs), 
-                    ...Object.keys(wState.mssAddrs),
-                    ...Object.keys(wState.utxos) 
-                ]);
+                const mutated = await processFullBlock(height);
+                if (mutated) updateWasmWatchlist();
                 continue;
             }
             
-            if (wallet.check_filter(filterData.filters[i], blockHash, n, watchListStr)) {
-                await processFullBlock(height);
-                // Rebuild watchlist if the block mutated our addresses/UTXOs
-                watchListStr = JSON.stringify([
-                    ...Object.keys(wState.wotsAddrs), 
-                    ...Object.keys(wState.mssAddrs),
-                    ...Object.keys(wState.utxos) 
-                ]);
+            if (wallet.check_filter(filterData.filters[i], blockHash, n)) {
+                const mutated = await processFullBlock(height);
+                if (mutated) updateWasmWatchlist();
             }
         }
 
         currentHeight += numFilters;
         if (currentHeight < end) {
             while (currentHeight < end) {
-                await processFullBlock(currentHeight);
+                const mutated = await processFullBlock(currentHeight);
+                if (mutated) updateWasmWatchlist();
                 currentHeight++;
                 if (currentHeight % 100 === 0) self.postMessage({ type: 'SCAN_PROGRESS', payload: { height: currentHeight, max: chainHeight } });
             }
@@ -276,45 +283,17 @@ async function performScan() {
 
 async function processFullBlock(height) {
     const blockResp = await fetch(`${rpcUrl}/block/${height}`);
-    if (!blockResp.ok) return;
+    if (!blockResp.ok) return false;
     const block = await blockResp.json();
     
     let matchFound = false;
-    let receivedInBlock = [];
 
-    // PERFORMANCE FIX: Pre-map our UTXOs by Salt for O(1) lookup 
-    // instead of nested O(N) looping through the dictionary
     const ourSalts = new Map();
     for (const [cid, u] of Object.entries(wState.utxos)) {
         ourSalts.set(u.salt, cid);
     }
 
-    if (block.transactions) {
-        for (const tx of block.transactions) {
-            const reveal = tx.Reveal || tx.reveal;
-            if (reveal && reveal.inputs) {
-                let spentOurCoin = false;
-                for (const inp of reveal.inputs) {
-                    const saltHex = normalizeHex(inp.salt);
-                    const cid = ourSalts.get(saltHex);
-                    
-                    // O(1) instant lookup
-                    if (cid) {
-                        delete wState.utxos[cid];
-                        ourSalts.delete(saltHex); // Remove from temp map too
-                        self.postMessage({ type: 'LOG', payload: `Spent UTXO removed: ${cid.substring(0,8)}` });
-                        spentOurCoin = true;
-                        matchFound = true;
-                    }
-                }
-                if (spentOurCoin) {
-                    self.postMessage({ type: 'LOG', payload: `Spend detected! Advancing derivation window...` });
-                    for (let i = 0; i < GAP_LIMIT; i++) deriveNextWots();
-                }
-            }
-        }
-    }
-
+    let coinbaseReceives = [];
     if (block.coinbase) {
         for (const cb of block.coinbase) {
             const addrHex = normalizeHex(cb.address);
@@ -322,17 +301,54 @@ async function processFullBlock(height) {
             if (wState.wotsAddrs[addrHex] !== undefined || wState.mssAddrs[addrHex] !== undefined) {
                 const coinId = compute_coin_id_hex(addrHex, BigInt(cb.value), saltHex);
                 if (addUtxo(addrHex, Number(cb.value), saltHex, coinId)) {
-                    receivedInBlock.push({ id: coinId, val: Number(cb.value) });
+                    coinbaseReceives.push({ id: coinId, val: Number(cb.value) });
                 }
                 matchFound = true;
             }
         }
     }
     
+    if (coinbaseReceives.length > 0) {
+        const alreadyRecorded = wState.history.some(h => 
+            h.outputs.some(out => coinbaseReceives.map(c=>c.id).includes(out))
+        );
+        if (!alreadyRecorded) {
+            wState.history.push({
+                kind: 'coinbase',
+                timestamp: block.timestamp || Math.floor(Date.now() / 1000),
+                fee: 0,
+                inputs: [],
+                outputs: coinbaseReceives.map(c => c.id),
+                value: coinbaseReceives.reduce((sum, c) => sum + c.val, 0)
+            });
+        }
+    }
+
     if (block.transactions) {
         for (const tx of block.transactions) {
             const reveal = tx.Reveal || tx.reveal;
-            if (reveal && reveal.outputs) {
+            if (!reveal) continue;
+
+            let spentIds = [];
+            let spentValue = 0;
+            let createdOutputs = [];
+
+            if (reveal.inputs) {
+                for (const inp of reveal.inputs) {
+                    const saltHex = normalizeHex(inp.salt);
+                    const cid = ourSalts.get(saltHex);
+                    
+                    if (cid) {
+                        delete wState.utxos[cid];
+                        ourSalts.delete(saltHex);
+                        spentIds.push(cid);
+                        spentValue += Number(inp.value);
+                        matchFound = true;
+                    }
+                }
+            }
+
+            if (reveal.outputs) {
                 for (const out of reveal.outputs) {
                     const outData = out.Standard || out.standard;
                     if (outData) {
@@ -341,32 +357,69 @@ async function processFullBlock(height) {
                         if (wState.wotsAddrs[addrHex] !== undefined || wState.mssAddrs[addrHex] !== undefined) {
                             const coinId = compute_coin_id_hex(addrHex, BigInt(outData.value), saltHex);
                             if (addUtxo(addrHex, Number(outData.value), saltHex, coinId)) {
-                                receivedInBlock.push({ id: coinId, val: Number(outData.value) });
+                                createdOutputs.push({ id: coinId, val: Number(outData.value) });
+                                ourSalts.set(saltHex, coinId); 
                             }
                             matchFound = true;
                         }
                     }
                 }
             }
+
+            if (spentIds.length > 0) {
+                const alreadyRecorded = wState.history.some(h => 
+                    (h.kind === 'sent' || h.kind === 'mixed') && h.inputs.some(inp => spentIds.includes(inp))
+                );
+
+                if (!alreadyRecorded) {
+                    const createdValue = createdOutputs.reduce((sum, c) => sum + c.val, 0);
+                    
+                    // --- NEW: Calculate exact transaction fee ---
+                    let totalTxIn = 0;
+                    let totalTxOut = 0;
+                    if (reveal.inputs) reveal.inputs.forEach(i => totalTxIn += Number(i.value));
+                    if (reveal.outputs) reveal.outputs.forEach(o => {
+                        let od = o.Standard || o.standard;
+                        if (od) totalTxOut += Number(od.value);
+                    });
+                    let actualFee = totalTxIn - totalTxOut;
+                    
+                    // Amount actually sent away = Total spent - Our change - The network fee
+                    let netSent = spentValue - createdValue - actualFee;
+                    if (netSent < 0) netSent = 0; // Handle self-sends gracefully
+                    
+                    wState.history.push({
+                        kind: 'sent',
+                        timestamp: block.timestamp || Math.floor(Date.now() / 1000),
+                        fee: actualFee, 
+                        inputs: spentIds,
+                        outputs: createdOutputs.map(c => c.id),
+                        value: netSent
+                    });
+                }
+                
+            } else if (createdOutputs.length > 0) {
+                const alreadyRecorded = wState.history.some(h => 
+                    h.outputs.some(out => createdOutputs.map(c=>c.id).includes(out))
+                );
+                
+                if (!alreadyRecorded) {
+                    const receivedValue = createdOutputs.reduce((sum, c) => sum + c.val, 0);
+                    wState.history.push({
+                        kind: 'received',
+                        timestamp: block.timestamp || Math.floor(Date.now() / 1000),
+                        fee: 0,
+                        inputs: [],
+                        outputs: createdOutputs.map(c => c.id),
+                        value: receivedValue
+                    });
+                }
+            }
         }
     }
-
-    // Write to transaction history
-    if (receivedInBlock.length > 0) {
-        wState.history.push({
-            kind: 'received',
-            timestamp: block.timestamp || Math.floor(Date.now() / 1000),
-            fee: 0,
-            inputs: [],
-            outputs: receivedInBlock.map(c => c.id),
-            value: receivedInBlock.reduce((sum, c) => sum + c.val, 0)
-        });
-    }
-
-    if (matchFound) self.postMessage({ type: 'LOG', payload: `Processed match at block ${height}.` });
+    return matchFound;
 }
 
-// Helper returns true if the UTXO was newly added
 function addUtxo(address, value, salt, coinId) {
     let index = 0;
     let is_mss = false;
@@ -386,14 +439,13 @@ function addUtxo(address, value, salt, coinId) {
     
     if (!wState.utxos[coinId]) {
         wState.utxos[coinId] = { index, is_mss, mss_height, mss_leaf, address, value, salt, coin_id: coinId };
-        self.postMessage({ type: 'LOG', payload: `>>> UTXO FOUND! Value: ${value}, ID: ${coinId.substring(0,8)}` });
         return true;
     }
     return false;
 }
 
 async function performSend(toAddress, amount) {
-    self.postMessage({ type: 'LOG', payload: "Phase 1: Syncing Wallet State & Selecting Coins..." });
+    self.postMessage({ type: 'LOG', payload: "Syncing Wallet State & Selecting Coins..." });
     
     for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
         wallet.set_mss_leaf_index(addr, mss.next_leaf);
@@ -423,8 +475,7 @@ async function performSend(toAddress, amount) {
     
     await saveState();
 
-    self.postMessage({ type: 'LOG', payload: `Selected ${ctx.selected_inputs.length} inputs. Exact fee calculated: ${ctx.fee}` });
-    self.postMessage({ type: 'LOG', payload: "Submitting Commit to mempool..." });
+    self.postMessage({ type: 'LOG', payload: `Selected ${ctx.selected_inputs.length} inputs. Submitting Commit to mempool...` });
 
     const commitReq = await fetch(`${rpcUrl}/commit`, {
         method: 'POST',
@@ -439,7 +490,7 @@ async function performSend(toAddress, amount) {
     }
     const commitResp = await JSON.parse(await commitReq.text());
 
-    self.postMessage({ type: 'LOG', payload: `Commit submitted (Salt: ${commitResp.salt.substring(0,8)}...). Generating Signatures...` });
+    self.postMessage({ type: 'LOG', payload: `Commit submitted. Generating Signatures...` });
     
     const revealPayloadStr = wallet.build_reveal(spendContextStr, commitResp.commitment, commitResp.salt);
 
@@ -461,7 +512,6 @@ async function performSend(toAddress, amount) {
             try { errText = JSON.parse(errText).error || errText; } catch(e) {}
             
             if (errText.includes("No matching commitment found")) {
-                self.postMessage({ type: 'LOG', payload: `Commit not mined yet (Attempt ${attempts+1}/150). Waiting 2s...` });
                 await new Promise(r => setTimeout(r, 2000));
             } else {
                 throw new Error(errText); 
@@ -487,7 +537,6 @@ async function performSend(toAddress, amount) {
         }
     }
 
-    // Write to transaction history
     wState.history.push({
         kind: 'sent',
         timestamp: Math.floor(Date.now() / 1000),
