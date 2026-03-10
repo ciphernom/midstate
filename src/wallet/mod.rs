@@ -747,6 +747,9 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
 
         let mut input_reveals = Vec::new();
         let mut witnesses = Vec::new();
+        
+        // NEW: Cache to ensure we only burn one MSS leaf per master_pk per transaction
+        let mut mss_sig_cache: std::collections::HashMap<[u8; 32], Vec<u8>> = std::collections::HashMap::new();
 
         for coin_id in &pending.input_coin_ids {
             if let Some(wc) = self.find_coin(coin_id).cloned() {
@@ -758,13 +761,21 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
 
                 let is_mss = self.data.mss_keys.iter().any(|k| k.master_pk == wc.owner_pk);
                 if is_mss {
-                    // MSS coin: sign with the Merkle auth path, not bare WOTS.
-                    let pos = self.data.mss_keys.iter().position(|k| k.master_pk == wc.owner_pk)
-                        .ok_or_else(|| anyhow::anyhow!("MSS key for coin {} not found", short_hex(coin_id)))?;
-                    let keypair = &mut self.data.mss_keys[pos];
-                    if keypair.remaining() == 0 { bail!("MSS key exhausted"); }
-                    let sig = keypair.sign(&commitment)?;
-                    witnesses.push(Witness::sig(sig.to_bytes()));
+                    // Check if we already generated a signature for this MSS tree in this tx
+                    if let Some(cached_sig_bytes) = mss_sig_cache.get(&wc.owner_pk) {
+                        witnesses.push(Witness::sig(cached_sig_bytes.clone()));
+                    } else {
+                        // First time seeing this MSS key in this tx, generate and cache
+                        let pos = self.data.mss_keys.iter().position(|k| k.master_pk == wc.owner_pk).unwrap();
+                        let keypair = &mut self.data.mss_keys[pos];
+                        if keypair.remaining() == 0 { bail!("MSS key exhausted"); }
+                        
+                        let sig = keypair.sign(&commitment)?;
+                        let sig_bytes = sig.to_bytes();
+                        
+                        mss_sig_cache.insert(wc.owner_pk, sig_bytes.clone());
+                        witnesses.push(Witness::sig(sig_bytes));
+                    }
                 } else {
                     if wc.wots_signed {
                         bail!("WOTS key {} already signed — cannot sign again", short_hex(&wc.owner_pk));
