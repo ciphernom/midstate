@@ -354,24 +354,35 @@ function addUtxo(address, value, salt, coinId) {
 async function performSend(toAddress, amount) {
     self.postMessage({ type: 'LOG', payload: "Phase 1: Syncing Wallet State & Selecting Coins..." });
     
-    // CRITICAL: Synchronize the Wasm wallet's internal leaf counters with our tracked JS state
     for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
-        // We tell Wasm: "For this address, the next signature must be leaf X"
         wallet.set_mss_leaf_index(addr, mss.next_leaf);
     }
     
-    const utxoArray = Object.values(wState.utxos);
+    // NEW: Inject the absolute latest leaf index into the UTXOs before sending to Wasm.
+    // This ensures all sibling coins get the exact same, current leaf index.
+    const utxoArray = Object.values(wState.utxos).map(u => {
+        if (u.is_mss && wState.mssAddrs[u.address]) {
+            return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
+        }
+        return u;
+    });
+    
     const spendContextStr = wallet.prepare_spend(JSON.stringify(utxoArray), toAddress, BigInt(amount), wState.nextWotsIndex);
     const ctx = JSON.parse(spendContextStr);
     
-    // FIX: Generate the intermediate addresses so the scanner can find our change outputs later
     while (wState.nextWotsIndex < ctx.next_wots_index) {
         deriveNextWots();
     }
     
+    // NEW: Only increment the leaf counter ONCE per unique MSS address used in this transaction!
+    const usedMssAddrs = new Set();
     for (const inp of ctx.selected_inputs) {
-        if (inp.is_mss) wState.mssAddrs[inp.address].next_leaf++;
+        if (inp.is_mss) usedMssAddrs.add(inp.address);
     }
+    for (const addr of usedMssAddrs) {
+        wState.mssAddrs[addr].next_leaf++;
+    }
+    
     await saveState();
 
     self.postMessage({ type: 'LOG', payload: `Selected ${ctx.selected_inputs.length} inputs. Exact fee calculated: ${ctx.fee}` });
