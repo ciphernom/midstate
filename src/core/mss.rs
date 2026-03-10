@@ -108,87 +108,87 @@ pub fn keygen(master_seed: &[u8; 32], height: u32) -> Result<MssKeypair> {
     let num_leaves = 1u64 << height;
     let tree_size = (num_leaves * 2) as usize;
     let mut tree = vec![[0u8; 32]; tree_size];
-
-    let checkpoint_path = PathBuf::from(format!("mss_h{}.checkpoint", height));
     let leaf_start = num_leaves as usize;
-    
-    // THIS IS THE MISSING VARIABLE!
-    let mut leaves_completed = 0usize;
 
-    // 1. Load Checkpoint if it exists
-    if checkpoint_path.exists() {
-        if let Ok(file) = File::open(&checkpoint_path) {
-            let reader = BufReader::new(file);
-            if let Ok(saved_leaves) = bincode::deserialize_from::<_, Vec<[u8; 32]>>(reader) {
-                if saved_leaves.len() == num_leaves as usize {
-                    tree[leaf_start..].copy_from_slice(&saved_leaves);
-                    
-                    // Count how many leaves were actually finished
-                    leaves_completed = saved_leaves.iter().filter(|&&l| l != [0u8; 32]).count();
-                    tracing::info!("Loaded checkpoint for height {}. Resuming from {} leaves.", height, leaves_completed);
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Wasm-safe: Pure sequential math, no OS features, no threading
+        for i in 0..num_leaves as usize {
+            let global_idx = i as u64;
+            let seed = derive_wots_seed(master_seed, global_idx);
+            tree[leaf_start + i] = wots::keygen_seq(&seed);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Native: Multi-threaded with Rayon, checkpoints, and time tracking
+        let checkpoint_path = std::path::PathBuf::from(format!("mss_h{}.checkpoint", height));
+        let mut leaves_completed = 0usize;
+
+        if checkpoint_path.exists() {
+            if let Ok(file) = std::fs::File::open(&checkpoint_path) {
+                let reader = std::io::BufReader::new(file);
+                if let Ok(saved_leaves) = bincode::deserialize_from::<_, Vec<[u8; 32]>>(reader) {
+                    if saved_leaves.len() == num_leaves as usize {
+                        tree[leaf_start..].copy_from_slice(&saved_leaves);
+                        leaves_completed = saved_leaves.iter().filter(|&&l| l != [0u8; 32]).count();
+                        tracing::info!("Loaded checkpoint for height {}. Resuming from {} leaves.", height, leaves_completed);
+                    }
                 }
             }
         }
-    }
 
-    let start_time = std::time::Instant::now();
-    let total_finished = Arc::new(AtomicUsize::new(leaves_completed));
-    let chunk_size = 4096;
+        let start_time = std::time::Instant::now();
+        let total_finished = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(leaves_completed));
+        let chunk_size = 4096;
 
-    tracing::info!("Starting MSS Leaf Generation (Height {})...", height);
+        tracing::info!("Starting MSS Leaf Generation (Height {})...", height);
 
-    // 2. Iterate ONLY over the remaining leaves
-    for chunk_start_idx in (leaves_completed..num_leaves as usize).step_by(chunk_size) {
-        let chunk_end_idx = (chunk_start_idx + chunk_size).min(num_leaves as usize);
-        
-        // Scope the mutable borrow strictly to this block
-        {
-            let chunk = &mut tree[leaf_start + chunk_start_idx .. leaf_start + chunk_end_idx];
+        for chunk_start_idx in (leaves_completed..num_leaves as usize).step_by(chunk_size) {
+            let chunk_end_idx = (chunk_start_idx + chunk_size).min(num_leaves as usize);
             
-            chunk.par_iter_mut().enumerate().for_each(|(i, leaf)| {
-                let global_idx = (chunk_start_idx + i) as u64;
-                let seed = derive_wots_seed(master_seed, global_idx);
-                *leaf = wots::keygen_seq(&seed);
-                
-                total_finished.fetch_add(1, Ordering::Relaxed);
-            });
-        } // Mutable borrow of 'tree' ends here
+            {
+                let chunk = &mut tree[leaf_start + chunk_start_idx .. leaf_start + chunk_end_idx];
+                use rayon::prelude::*;
+                chunk.par_iter_mut().enumerate().for_each(|(i, leaf)| {
+                    let global_idx = (chunk_start_idx + i) as u64;
+                    let seed = derive_wots_seed(master_seed, global_idx);
+                    *leaf = wots::keygen_seq(&seed);
+                    total_finished.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
 
-        // --- Progress Reporting ---
-        let count = total_finished.load(Ordering::Relaxed);
-        let pct = (count as f64 / num_leaves as f64) * 100.0;
-        
-        // Rate math: Only measure the leaves generated THIS session
-        let leaves_this_session = count - leaves_completed;
-        let elapsed = start_time.elapsed().as_secs_f64();
-        let rate = if elapsed > 0.0 { leaves_this_session as f64 / elapsed } else { 0.0 };
-        let eta = if rate > 0.0 { (num_leaves as usize - count) as f64 / rate } else { 0.0 };
-        
-        print!(
-            "\r[MSS] Progress: {:.2}% ({}/{}) | Rate: {:.1} leaf/s | ETA: {:.1}m    ",
-            pct, count, num_leaves, rate, eta / 60.0
-        );
-        let _ = std::io::stdout().flush();
+            let count = total_finished.load(std::sync::atomic::Ordering::Relaxed);
+            let pct = (count as f64 / num_leaves as f64) * 100.0;
+            let leaves_this_session = count - leaves_completed;
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 { leaves_this_session as f64 / elapsed } else { 0.0 };
+            let eta = if rate > 0.0 { (num_leaves as usize - count) as f64 / rate } else { 0.0 };
+            
+            use std::io::Write;
+            print!(
+                "\r[MSS] Progress: {:.2}% ({}/{}) | Rate: {:.1} leaf/s | ETA: {:.1}m    ",
+                pct, count, num_leaves, rate, eta / 60.0
+            );
+            let _ = std::io::stdout().flush();
 
-        // Safe Checkpointing
-        if (chunk_start_idx / chunk_size) % 10 == 0 || count == num_leaves as usize {
-            save_checkpoint(&checkpoint_path, &tree[leaf_start..]);
+            if (chunk_start_idx / chunk_size) % 10 == 0 || count == num_leaves as usize {
+                save_checkpoint(&checkpoint_path, &tree[leaf_start..]);
+            }
         }
-    }
-    println!();
+        println!();
 
-    // 3. Build Internal Nodes
-    tracing::info!("Building Merkle Tree internal nodes...");
+        if checkpoint_path.exists() {
+            let _ = std::fs::remove_file(&checkpoint_path);
+        }
+        tracing::info!("MSS Keypair generated in {:?}", start_time.elapsed());
+    }
+
+    // Build Internal Nodes
     for i in (1..leaf_start).rev() {
         tree[i] = hash_concat(&tree[2 * i], &tree[2 * i + 1]);
     }
-
-    // 4. Cleanup
-    if checkpoint_path.exists() {
-        let _ = std::fs::remove_file(&checkpoint_path);
-    }
-
-    tracing::info!("MSS Keypair generated in {:?}", start_time.elapsed());
 
     Ok(MssKeypair {
         height,
@@ -199,9 +199,10 @@ pub fn keygen(master_seed: &[u8; 32], height: u32) -> Result<MssKeypair> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn save_checkpoint(path: &std::path::Path, leaves: &[[u8; 32]]) {
-    if let Ok(file) = File::create(path) {
-        let writer = BufWriter::new(file);
+    if let Ok(file) = std::fs::File::create(path) {
+        let writer = std::io::BufWriter::new(file);
         let _ = bincode::serialize_into(writer, leaves);
     }
 }

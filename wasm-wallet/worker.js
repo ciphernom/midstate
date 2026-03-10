@@ -1,7 +1,7 @@
 import init, { WebWallet, generate_phrase, compute_coin_id_hex } from './pkg/wasm_wallet.js';
 
 let wallet = null;
-let rpcUrl = "http://127.0.0.1:8001";
+let rpcUrl = "https://rpc.cypherpunk.gold";
 let password = null;
 
 const GAP_LIMIT = 20;
@@ -95,12 +95,23 @@ self.onmessage = async (e) => {
             rpcUrl = payload.rpcUrl;
             password = payload.password;
             wallet = new WebWallet(payload.phrase);
-            
             wState.phrase = payload.phrase;
-            for (let i = 0; i < GAP_LIMIT; i++) deriveNextWots();
             
-            // FIX: Reduced MSS height to 2 for browser performance (generates 4 signatures instead of 32)
-            deriveNextMss(2); 
+            self.postMessage({ type: 'LOG', payload: "Deriving 20 WOTS lookahead addresses..." });
+            
+            // FIX: Yield to the event loop so the UI doesn't freeze
+            for (let i = 0; i < GAP_LIMIT; i++) {
+                deriveNextWots();
+                if (i % 5 === 0) {
+                    self.postMessage({ type: 'LOG', payload: `Derived ${i}/${GAP_LIMIT} addresses...` });
+                    await new Promise(r => setTimeout(r, 0)); // Let the UI update
+                }
+            }
+            
+            self.postMessage({ type: 'LOG', payload: "Generating Reusable MSS Address..." });
+            await new Promise(r => setTimeout(r, 10)); // Breathe before heavy MSS computation
+            
+            deriveNextMss(3); 
 
             await saveState();
             self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
@@ -117,8 +128,7 @@ self.onmessage = async (e) => {
         }
         else if (type === 'NEW_ADDRESS') {
             self.postMessage({ type: 'LOG', payload: "Deriving new receiving address..." });
-            // FIX: Match the reduced height here as well
-            deriveNextMss(2);
+            deriveNextMss(3);
             await saveState();
             self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
             self.postMessage({ type: 'LOG', payload: "New address generated successfully." });
@@ -332,7 +342,13 @@ function addUtxo(address, value, salt, coinId) {
 }
 
 async function performSend(toAddress, amount) {
-    self.postMessage({ type: 'LOG', payload: "Phase 1: Native Coin Selection (Co-Spend & Snowball Merge)..." });
+    self.postMessage({ type: 'LOG', payload: "Phase 1: Syncing Wallet State & Selecting Coins..." });
+    
+    // CRITICAL: Synchronize the Wasm wallet's internal leaf counters with our tracked JS state
+    for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
+        // We tell Wasm: "For this address, the next signature must be leaf X"
+        wallet.set_mss_leaf_index(addr, mss.next_leaf);
+    }
     
     const utxoArray = Object.values(wState.utxos);
     const spendContextStr = wallet.prepare_spend(JSON.stringify(utxoArray), toAddress, BigInt(amount), wState.nextWotsIndex);
