@@ -67,7 +67,7 @@ struct SpendContext {
 #[wasm_bindgen]
 pub struct WebWallet {
     master_seed: [u8; 32],
-    // CACHE: Stores generated MSS trees to eliminate the 8-minute hang during spending
+    // CACHE: Stores generated MSS trees to eliminate the hang during spending
     mss_cache: HashMap<String, mss::MssKeypair>, 
 }
 
@@ -96,7 +96,7 @@ impl WebWallet {
         hex::encode(compute_address(&pk))
     }
 
-/// Derives a reusable MSS address for receiving funds
+    /// Derives a reusable MSS address for receiving funds
     pub fn get_mss_address(&mut self, index: u32, height: u32, progress_cb: Option<js_sys::Function>) -> Result<String, JsValue> {
         let seed = derive_mss_seed(&self.master_seed, index as u64);
         
@@ -157,25 +157,19 @@ impl WebWallet {
             let mut selected = Vec::new();
             let mut selected_set = HashSet::new();
             let mut total = 0u64;
-            
-            // TRACKER: Auto-increments MSS leaves if multiple coins are selected from the same address
-            let mut leaf_tracker: HashMap<String, u32> = HashMap::new();
 
             // 1. Initial Selection
             for coin in &available {
                 if total >= needed { break; }
                 
-                let mut coin_to_add = coin.clone();
-
-                
                 selected_set.insert(coin.coin_id.clone());
-                selected.push(coin_to_add);
+                selected.push(coin.clone());
                 total += coin.value;
             }
 
             if total < needed { return Err(JsValue::from_str("Insufficient funds.")); }
 
-            // 2. Co-Spend Privacy Grouping
+            // 2. Co-Spend Privacy Grouping (WOTS Only)
             let mut grouped_addresses = HashSet::new();
             for c in &selected { 
                 if !c.is_mss { grouped_addresses.insert(c.address.clone()); }
@@ -183,10 +177,8 @@ impl WebWallet {
             
             for coin in &available {
                 if grouped_addresses.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
-                    let mut coin_to_add = coin.clone();
-                   
                     selected_set.insert(coin.coin_id.clone());                    
-                    selected.push(coin_to_add);
+                    selected.push(coin.clone());
                     total += coin.value;
                 }
             }
@@ -200,8 +192,7 @@ impl WebWallet {
                 
                 for denom in change_denoms {
                     if let Some(pos) = available.iter().position(|c| c.value == denom && !selected_set.contains(&c.coin_id)) {
-                        let mut coin_to_add = available[pos].clone();
- 
+                        let coin_to_add = available[pos].clone();
                         selected_set.insert(coin_to_add.coin_id.clone());
                         selected.push(coin_to_add);
                         total += denom;
@@ -212,18 +203,15 @@ impl WebWallet {
                 if selected.len() >= 250 { break; }
             }
 
-            // 4. Final Grouping Catch
+            // 4. Final Grouping Catch (WOTS Only)
             let mut final_addresses = HashSet::new();
             for c in &selected { 
                 if !c.is_mss { final_addresses.insert(c.address.clone()); }
             }
             for coin in &available {
                 if final_addresses.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
-                    let mut coin_to_add = coin.clone();
-
-                    
                     selected_set.insert(coin.coin_id.clone());                    
-                    selected.push(coin_to_add);
+                    selected.push(coin.clone());
                     total += coin.value;
                 }
             }
@@ -295,7 +283,7 @@ impl WebWallet {
         });
 
         let ctx = SpendContext {
-            selected_inputs: final_selected, // Now correctly contains sequential leaf indexes
+            selected_inputs: final_selected, 
             outputs: final_outputs,
             commit_payload,
             tx_salt: hex::encode(tx_salt),
@@ -315,11 +303,11 @@ impl WebWallet {
         hex::decode_to_slice(server_commitment_hex, &mut commitment)
             .map_err(|_| JsValue::from_str("Invalid server commitment hex"))?;
 
-let mut input_reveals = Vec::new();
+        let mut input_reveals = Vec::new();
         let mut signatures = Vec::new();
         let mut safety_input_hashes = Vec::new();
-        
-        // NEW: Cache to ensure we only sign once per MSS address per transaction
+
+        // CACHE: Ensure we only sign once per MSS address per transaction
         let mut mss_sig_cache: HashMap<String, Vec<u8>> = HashMap::new();
 
         for inp in ctx.selected_inputs {
@@ -327,8 +315,8 @@ let mut input_reveals = Vec::new();
                 let kp = self.mss_cache.get_mut(&inp.address)
                     .ok_or_else(|| JsValue::from_str("MSS tree missing from cache."))?;
                 
-                // NEW: Check if we already generated a signature for this address
                 if let Some(cached_sig) = mss_sig_cache.get(&inp.address) {
+                    // Re-use the exact same signature bytes for siblings in this tx
                     (kp.master_pk, cached_sig.clone())
                 } else {
                     // First time seeing this MSS key in this tx, generate and cache
