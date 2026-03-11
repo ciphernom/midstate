@@ -2,7 +2,7 @@ use anyhow::{Result, Context};
 use clap::{Parser, Subcommand};
 use midstate::*;
 use midstate::compute_address;
-use midstate::wallet::{self, Wallet, short_hex};
+use midstate::wallet::{self, Wallet};
 use midstate::core::wots;
 use midstate::core::state::apply_batch;
 use midstate::network::{MidstateNetwork, NetworkEvent, Message};
@@ -372,9 +372,13 @@ fn parse_hex32(s: &str) -> Result<[u8; 32]> {
 fn parse_output_spec(s: &str) -> Result<([u8; 32], u64)> {
     let parts: Vec<&str> = s.splitn(2, ':').collect();
     if parts.len() != 2 {
-        anyhow::bail!("expected format <owner_pk_hex>:<value>, got: {}", s);
+        anyhow::bail!("expected format <address>:<value>, got: {}", s);
     }
-    let pk = parse_hex32(parts[0])?;
+    
+    // Use the new flexible parser to validate the checksum
+    let pk = midstate::core::types::parse_address_flexible(parts[0])
+        .map_err(|e| anyhow::anyhow!(e))?;
+        
     let value: u64 = parts[1].parse()
         .map_err(|_| anyhow::anyhow!("invalid value: {}", parts[1]))?;
     if value == 0 {
@@ -480,13 +484,13 @@ async fn wallet_scan(path: &PathBuf, rpc_port: u16, rpc_host: String) -> Result<
                             const SAFETY_MARGIN: u64 = 20;
                             let new_leaf = mss_resp.next_index + SAFETY_MARGIN;
                             println!("  MSS {}: advancing leaf {} -> {}",
-                                short_hex(&mss_key.master_pk), mss_key.next_leaf, new_leaf);
+                                hex::encode(&mss_key.master_pk), mss_key.next_leaf, new_leaf);
                             mss_key.next_leaf = new_leaf;
                         }
                     }
                 }
                 Err(e) => {
-                    println!("  MSS {} sync failed: {}", short_hex(&mss_key.master_pk), e);
+                    println!("  MSS {} sync failed: {}", hex::encode(&mss_key.master_pk), e);
                 }
             }
         }
@@ -590,7 +594,7 @@ async fn targeted_scan(
         for cb in &batch.coinbase {
             if addr_set.contains(&cb.address) {
                 if let Some(coin_id) = wallet.import_scanned(cb.address, cb.value, cb.salt)? {
-                    println!("  found: {} (value {}, height {})", short_hex(&coin_id), cb.value, height);
+                    println!("  found: {} (value {}, height {})", hex::encode(&coin_id), cb.value, height);
                     block_coins.push(coin_id);
                     imported += 1;
                 }
@@ -604,7 +608,7 @@ async fn targeted_scan(
                     if addr_set.contains(&out.address()) {
                         if let Some(_cid) = out.coin_id() {
                             if let Some(coin_id) = wallet.import_scanned(out.address(), out.value(), out.salt())? {
-                                println!("  found: {} (value {}, height {})", short_hex(&coin_id), out.value(), height);
+                                println!("  found: {} (value {}, height {})", hex::encode(&coin_id), out.value(), height);
                                 block_coins.push(coin_id);
                                 imported += 1;
                             }
@@ -742,7 +746,7 @@ async fn wallet_spend_script(
         if token.starts_with("AUTO:") {
             let pk_hex = token.strip_prefix("AUTO:").unwrap();
             let pk = parse_hex32(pk_hex)?;
-            println!("Auto-solving signature for {}...", short_hex(&pk));
+            println!("Auto-solving signature for {}...", hex::encode(&pk));
             stack_items.push(wallet.auto_sign(&pk, &server_commitment)?);
         } else {
             stack_items.push(hex::decode(token).context("Invalid hex in --inputs")?);
@@ -989,7 +993,7 @@ fn wallet_receive(path: &PathBuf, label: Option<String>) -> Result<()> {
     let label = label.unwrap_or_else(|| format!("receive #{}", wallet.keys().len() + 1));
     let address = wallet.generate_key(Some(label.clone()))?;
     println!("\n  Your receiving address ({}):\n", label);
-    println!("  {}\n", hex::encode(address));
+    println!("  {}\n", midstate::core::types::encode_address_with_checksum(&address));
     println!("  Share this with the sender.");
     Ok(())
 }
@@ -1004,7 +1008,8 @@ fn wallet_generate(path: &PathBuf, count: usize, label: Option<String>) -> Resul
             label.as_ref().map(|l| format!("{} #{}", l, i + 1))
         };
         let pk = wallet.generate_key(lbl)?;
-        println!("  [{}] {}", wallet.keys().len() - 1, hex::encode(pk));
+        println!("  [{}] {}", wallet.keys().len() - 1, midstate::core::types::encode_address_with_checksum(&pk));
+        
     }
     println!("\nGenerated {} key(s). Total keys: {}, Total coins: {}",
         count, wallet.keys().len(), wallet.coin_count());
@@ -1035,15 +1040,15 @@ async fn wallet_list(path: &PathBuf, rpc_port: u16, rpc_host: String, full: bool
                 Ok(false) => "✗ unset",
                 Err(_) => "? error",
             };
-            let display = if full { coin_hex } else { short_hex(&wc.coin_id) };
+            let display = if full { coin_hex } else { hex::encode(&wc.coin_id) };
             println!("{:<5} {:<15} {:<8} {:<10} {}", i, display, wc.value, status_str, label);
         }
     }
 
-    if !wallet.keys().is_empty() {
+if !wallet.keys().is_empty() {
         println!("\nUNUSED RECEIVING KEYS:");
         for (i, k) in wallet.keys().iter().enumerate() {
-            let display = if full { hex::encode(k.address) } else { short_hex(&k.address) };
+            let display = if full { midstate::core::types::encode_address_with_checksum(&k.address) } else { hex::encode(&k.address) };
             let label = k.label.as_deref().unwrap_or("");
             println!("  [K{}] {} {}", i, display, label);
         }
@@ -1122,7 +1127,7 @@ async fn wallet_send(
                 let new_leaf = mss_resp.next_index + SAFETY_MARGIN;
                 
                 println!("  ⚠️  MSS Key {}: Old state detected (Node: {}, Local: {})", 
-                    short_hex(&master_pk), mss_resp.next_index, current_leaf);
+                    hex::encode(&master_pk), mss_resp.next_index, current_leaf);
                 println!("      Fast-forwarding index to {} to ensure safety.", new_leaf);
                 
                 wallet.data.mss_keys[i].set_next_leaf(new_leaf);
@@ -1197,7 +1202,7 @@ async fn wallet_send(
             });
             wallet.save()?;
 
-            println!("  ✓ Commit submitted ({})", short_hex(&server_commitment));
+            println!("  ✓ Commit submitted ({})", hex::encode(&server_commitment));
 
             if !wait_for_commit_mined(&client, rpc_port,&rpc_host, &commit_resp.commitment, timeout_secs).await {
                 println!("  ⏳ Not mined yet. Run `wallet reveal` later.");
@@ -1357,7 +1362,7 @@ async fn wallet_send(
         });
         wallet.save()?;
 
-        println!("\n✓ Commit submitted ({})", short_hex(&server_commitment));
+        println!("\n✓ Commit submitted ({})", hex::encode(&server_commitment));
         println!("  Waiting for commit to be mined...");
 
         if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &commit_resp.commitment, timeout_secs).await {
@@ -1412,7 +1417,15 @@ async fn do_reveal(
         .ok_or_else(|| anyhow::anyhow!("pending commit not found"))?
         .clone();
 
-    let (input_reveals, signatures) = wallet.sign_reveal(&pending)?;
+    let (input_reveals, signatures) = match wallet.sign_reveal(&pending) {
+            Ok(res) => res,
+            Err(e) => {
+                // If the coins are gone, delete this garbage commit to keep the wallet clean
+                wallet.data.pending.retain(|p| p.commitment != *commitment);
+                let _ = wallet.save();
+                anyhow::bail!("Failed to prepare reveal: {}. Stale commit dropped.", e);
+            }
+        };
 
     let reveal_url = format!("http://{}:{}/send", rpc_host, rpc_port);
     let reveal_req = rpc::SendTransactionRequest {
@@ -1474,11 +1487,11 @@ async fn do_reveal(
     println!("✓ Transfer complete!");
     for id in &pending.input_coin_ids {
         let val = input_reveals.iter().find(|ir| ir.coin_id() == *id).map(|ir| ir.value).unwrap_or(0);
-        println!("  spent:   {} (value {})", short_hex(id), val);
+        println!("  spent:   {} (value {})", hex::encode(id), val);
     }
     for out in &pending.outputs {
         if let Some(c_id) = out.coin_id() {
-            println!("  created: {} (value {})", short_hex(&c_id), out.value());
+            println!("  created: {} (value {})", hex::encode(&c_id), out.value());
         } else {
             println!("  burned: (value {})", out.value());
         }
@@ -1519,14 +1532,14 @@ async fn wallet_mix(
     let mix_coin_id: [u8; 32] = if let Some(ref coin_ref) = coin_arg {
         let resolved = wallet.resolve_coin(coin_ref)?;
         if !live_coins.contains(&resolved) {
-            anyhow::bail!("coin {} is not live on-chain", short_hex(&resolved));
+            anyhow::bail!("coin {} is not live on-chain", hex::encode(&resolved));
         }
         let coin = wallet.find_coin(&resolved)
             .ok_or_else(|| anyhow::anyhow!("coin not in wallet"))?;
         if coin.value != denomination {
             anyhow::bail!(
                 "coin {} has value {} but denomination is {}",
-                short_hex(&resolved), coin.value, denomination
+                hex::encode(&resolved), coin.value, denomination
             );
         }
         resolved
@@ -1542,7 +1555,7 @@ async fn wallet_mix(
 
     println!("CoinJoin Mix");
     println!("  Denomination: {}", denomination);
-    println!("  Input coin:   {}", short_hex(&mix_coin_id));
+    println!("  Input coin:   {}", hex::encode(&mix_coin_id));
 
     // Step 1: Create or join a session
     let mix_id_hex: String = if let Some(ref join_hex) = join_mix_id {
@@ -1618,7 +1631,7 @@ async fn wallet_mix(
                     let error: rpc::ErrorResponse = resp.json().await?;
                     anyhow::bail!("fee failed: {}", error.error);
                 }
-                println!("  ✓ Fee coin registered ({})", short_hex(&fee_cid));
+                println!("  ✓ Fee coin registered ({})", hex::encode(&fee_cid));
                 fee_coin_id = Some(fee_cid);
             }
             Err(e) => {
@@ -1726,10 +1739,10 @@ async fn wallet_mix(
                 wallet.complete_mix(&spent, &output, output_seed)?;
 
                 println!("\n  ✓ CoinJoin mix complete!");
-                println!("  Spent:    {}", short_hex(&mix_coin_id));
-                println!("  Received: {} (value {})", short_hex(&output.coin_id().unwrap()), output.value());
+                println!("  Spent:    {}", hex::encode(&mix_coin_id));
+                println!("  Received: {} (value {})", hex::encode(&output.coin_id().unwrap()), output.value());
                 if let Some(fee_cid) = fee_coin_id {
-                    println!("  Fee paid: {} (value 1)", short_hex(&fee_cid));
+                    println!("  Fee paid: {} (value 1)", hex::encode(&fee_cid));
                 }
                 return Ok(());
             }
@@ -1750,7 +1763,7 @@ fn wallet_import(path: &PathBuf, seed_hex: &str, value: u64, salt_hex: &str, lab
     let seed = parse_hex32(seed_hex)?;
     let salt = parse_hex32(salt_hex)?;
     let coin_id = wallet.import_coin(seed, value, salt, label)?;
-    println!("Imported: {} (value {})", short_hex(&coin_id), value);
+    println!("Imported: {} (value {})", hex::encode(&coin_id), value);
     Ok(())
 }
 
@@ -1778,18 +1791,18 @@ fn wallet_pending(path: &PathBuf) -> Result<()> {
         return Ok(());
     }
     println!("{} pending commit(s):\n", pending.len());
-    for (i, p) in pending.iter().enumerate() {
-        let age = now_secs().saturating_sub(p.created_at);
-        let out_val: u64 = p.outputs.iter().map(|o| o.value()).sum();
-        println!(
-            "  [{}] {} — {} in, {} out (value {}), {}",
-            i, short_hex(&p.commitment),
-            p.input_coin_ids.len(),
-            p.outputs.len(),
-            out_val,
-            format_age(age),
-        );
-    }
+for (i, p) in pending.iter().enumerate() {
+            let age = now_secs().saturating_sub(p.created_at);
+            let out_val: u64 = p.outputs.iter().map(|o| o.value()).sum();
+            println!(
+                "  [{}] {} — {} in, {} out (value {}), {}",
+                i, hex::encode(&p.commitment), // FIX: Use full hex string
+                p.input_coin_ids.len(),
+                p.outputs.len(),
+                out_val,
+                format_age(age),
+            );
+        }
     Ok(())
 }
 
@@ -1812,8 +1825,8 @@ fn wallet_history(path: &PathBuf, count: usize) -> Result<()> {
             _          => "sent",
         };
         println!("  [{}] {} {} (fee: {})", start + i, label, format_age(age), entry.fee);
-        for c in &entry.inputs  { println!("    spent:    {}", short_hex(c)); }
-        for c in &entry.outputs { println!("    created:  {}", short_hex(c)); }
+        for c in &entry.inputs  { println!("    spent:    {}", hex::encode(c)); }
+        for c in &entry.outputs { println!("    created:  {}", hex::encode(c)); }
         println!();
     }
     Ok(())
@@ -1845,19 +1858,28 @@ async fn wallet_reveal(
         let pending = match wallet.find_pending(&commitment) {
             Some(p) => p.clone(),
             None => {
-                println!("  {} — not found, skipping", short_hex(&commitment));
+                println!("  {} — not found, skipping", hex::encode(&commitment));
                 continue;
             }
         };
 
         if pending.reveal_not_before > now_secs() {
             let wait = pending.reveal_not_before - now_secs();
-            println!("  {} — waiting {}s (privacy delay)", short_hex(&commitment), wait);
+            println!("  {} — waiting {}s (privacy delay)", hex::encode(&commitment), wait);
             tokio::time::sleep(Duration::from_secs(wait)).await;
         }
 
-        let (input_reveals, signatures) = wallet.sign_reveal(&pending)?;
-
+let (input_reveals, signatures) = match wallet.sign_reveal(&pending) {
+            Ok(res) => res,
+            Err(e) => {
+                println!("  {} — dropping stale commit ({})", hex::encode(&commitment), e);
+                // Delete the garbage commit to unblock the queue
+                wallet.data.pending.retain(|p| p.commitment != commitment);
+                let _ = wallet.save();
+                continue; // Skip to the next commit instead of crashing
+            }
+        };
+        
         let url = format!("http://{}:{}/send", rpc_host, rpc_port);
         let req = rpc::SendTransactionRequest {
             inputs: input_reveals.iter().map(|ir| rpc::InputRevealJson {
@@ -1888,10 +1910,10 @@ async fn wallet_reveal(
         if response.status().is_success() {
             let _result: rpc::SendTransactionResponse = response.json().await?;
             wallet.complete_reveal(&commitment)?;
-            println!("  {} — revealed ✓", short_hex(&commitment));
+            println!("  {} — revealed ✓", hex::encode(&commitment));
         } else {
             let error: rpc::ErrorResponse = response.json().await?;
-            println!("  {} — failed: {}", short_hex(&commitment), error.error);
+            println!("  {} — failed: {}", hex::encode(&commitment), error.error);
         }
     }
     Ok(())
@@ -2009,14 +2031,13 @@ fn wallet_generate_mss(path: &PathBuf, height: u32, label: Option<String>) -> Re
 
     let root = wallet.generate_mss(height, label.clone())?;
 
-    println!("\n✓ MSS Address Generated!");
+println!("\n✓ MSS Address Generated!");
     if let Some(l) = label {
         println!("  Label:    {}", l);
     }
     println!("  Capacity: {} signatures", capacity);
-    println!("  Address:  {}", hex::encode(root));
+    println!("  Address:  {}", midstate::core::types::encode_address_with_checksum(&root));
     println!("\nThis address is reusable until the capacity is exhausted.");
-
     Ok(())
 }
 
@@ -2224,13 +2245,13 @@ async fn keygen(rpc_port: Option<u16>, rpc_host: String) -> Result<()> {
         println!("Generated WOTS keypair:");
         println!("  Seed:     {}", response.seed);
         println!("  Address:  {}", response.address);
-    } else {
+} else {
         let seed: [u8; 32] = rand::random();
         let owner_pk = wots::keygen(&seed);
         let address = compute_address(&owner_pk);
         println!("Generated WOTS keypair:");
         println!("  Seed:     {}", hex::encode(seed));
-        println!("  Address:  {}", hex::encode(address));
+        println!("  Address:  {}", midstate::core::types::encode_address_with_checksum(&address));
     }
     println!("\n⚠️  Keep the seed safe! Anyone with it can spend coins sent to this address.");
     Ok(())
