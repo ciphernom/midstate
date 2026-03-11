@@ -72,6 +72,21 @@ pub struct WebWallet {
     watchlist: Vec<[u8; 32]>, 
 }
 
+
+#[wasm_bindgen]
+pub fn decrypt_cli_wallet(data: &[u8], password: &str) -> Result<String, JsValue> {
+    // Call the exact same decryption routine the CLI uses
+    let decrypted = midstate::wallet::crypto::decrypt(data, password.as_bytes())
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    
+    // The CLI stores the inner payload as JSON, so we just return the string
+    let json_str = String::from_utf8(decrypted)
+        .map_err(|_| JsValue::from_str("Invalid UTF-8 in decrypted data"))?;
+    
+    Ok(json_str)
+}
+
+
 #[wasm_bindgen]
 impl WebWallet {
     #[wasm_bindgen(constructor)]
@@ -84,7 +99,18 @@ impl WebWallet {
             watchlist: Vec::new(),
         })
     }
-
+    // boot from the raw 32-byte master seed instead of 24 words
+    pub fn from_seed_hex(seed_hex: &str) -> Result<WebWallet, JsValue> {
+        let mut master_seed = [0u8; 32];
+        hex::decode_to_slice(seed_hex, &mut master_seed)
+            .map_err(|_| JsValue::from_str("Invalid master seed hex"))?;
+        
+        Ok(WebWallet { 
+            master_seed,
+            mss_cache: std::collections::HashMap::new(),
+            watchlist: Vec::new(),
+        })
+    }
     pub fn set_mss_leaf_index(&mut self, address_hex: &str, leaf_index: u32) {
         if let Some(kp) = self.mss_cache.get_mut(address_hex) {
             kp.set_next_leaf(leaf_index as u64);
