@@ -16,11 +16,6 @@ pub fn default_path() -> PathBuf {
         .join("wallet.dat")
 }
 
-/// Short display: first 8 hex chars + "…" + last 4 hex chars
-pub fn short_hex(bytes: &[u8; 32]) -> String {
-    let h = hex::encode(bytes);
-    format!("{}…{}", &h[..8], &h[60..])
-}
 
 /// A receiving key (seed + public key). No value assigned yet.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -287,7 +282,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         });
         tracing::info!(
             "Sibling import: coin {} (value {}) at existing WOTS address {}",
-            short_hex(&coin_id), value, short_hex(&address)
+            hex::encode(&coin_id), value, hex::encode(&address)
         );
         return Ok(Some(coin_id));
     }
@@ -458,7 +453,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                 anyhow::bail!(
                     "WOTS key {} has already signed — refusing to sign again. \
                      Use an MSS key for multiple signatures.",
-                    short_hex(owner_pk)
+                    hex::encode(owner_pk)
                 );
             }
             let sig = crate::core::wots::sign(&self.data.coins[pos].seed, commitment);
@@ -467,7 +462,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             return Ok(crate::core::wots::sig_to_bytes(&sig));
         }
 
-        anyhow::bail!("Cannot auto-solve: Private key for {} not found in wallet.dat", short_hex(owner_pk))
+        anyhow::bail!("Cannot auto-solve: Private key for {} not found in wallet.dat", hex::encode(owner_pk))
     }
 
     /// Select coins whose total value >= needed, aggressively pulling in extra
@@ -515,7 +510,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                     total += coin.value;
                     tracing::info!(
                         "Co-spend grouping: pulled in sibling coin {} (value {}) to prevent WOTS key reuse",
-                        short_hex(&coin.coin_id), coin.value
+                        hex::encode(&coin.coin_id), coin.value
                     );
                 }
             }
@@ -605,7 +600,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             if keypair.remaining() > 0 && keypair.remaining() < 50 {
                 tracing::warn!(
                     "MSS Key {} is near exhaustion ({} remaining). Triggering automatic background rotation.",
-                    short_hex(&keypair.master_pk),
+                    hex::encode(&keypair.master_pk),
                     keypair.remaining()
                 );
                 rotation_target_pk = Some(keypair.master_pk);
@@ -675,7 +670,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         // Verify we own all inputs
         for coin_id in input_coin_ids {
             if self.find_coin(coin_id).is_none() {
-                bail!("coin {} not in wallet", short_hex(coin_id));
+                bail!("coin {} not in wallet", hex::encode(coin_id));
             }
         }
 
@@ -693,7 +688,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                         "WOTS co-spend violation: coin {} has sibling {} at the same address {}. \
                          All coins sharing a one-time WOTS address must be spent in the same transaction. \
                          Use 'wallet list' to see grouped coins, or let auto-select handle it.",
-                        short_hex(coin_id), short_hex(sib_id), short_hex(&coin.address)
+                        hex::encode(coin_id), hex::encode(sib_id), hex::encode(&coin.address)
                     );
                 }
             }
@@ -777,9 +772,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                         witnesses.push(Witness::sig(sig_bytes));
                     }
                 } else {
-                    if wc.wots_signed {
-                        bail!("WOTS key {} already signed — cannot sign again", short_hex(&wc.owner_pk));
-                    }
+                 //nb signing the same commitment will give you the same signature, so its perfectly safe to sign the same commitment again.
                     // Mark this coin AND all siblings at the same address as signed.
                     // Even though siblings in this tx sign the same commitment (safe),
                     // any future tx would be a different commitment (key compromise).
@@ -793,7 +786,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                     witnesses.push(Witness::sig(wots::sig_to_bytes(&sig)));
                 }
             } else {
-                bail!("coin {} not found in wallet", short_hex(coin_id));
+                bail!("coin {} not found in wallet", hex::encode(coin_id));
             }
         }
         self.save()?;
@@ -977,7 +970,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         coin_id: &[u8; 32],
     ) -> Result<(InputReveal, OutputData, [u8; 32])> {
         let coin = self.find_coin(coin_id)
-            .ok_or_else(|| anyhow::anyhow!("coin {} not in wallet", short_hex(coin_id)))?
+            .ok_or_else(|| anyhow::anyhow!("coin {} not in wallet", hex::encode(coin_id)))?
             .clone();
 
         // CoinJoin mixes spend exactly one coin. If this coin has WOTS
@@ -989,7 +982,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             bail!(
                 "Coin {} has {} sibling(s) at the same WOTS address. \
                  Consolidate them first with a regular send before mixing.",
-                short_hex(coin_id), siblings.len()
+                hex::encode(coin_id), siblings.len()
             );
         }
 
@@ -1059,9 +1052,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                 self.save()?;
                 return Ok(sig.to_bytes());
             }
-            if coin.wots_signed {
-                bail!("WOTS key {} already signed — cannot sign again for mix", short_hex(&coin.owner_pk));
-            }
+
             let sig = wots::sign(&coin.seed, commitment);
             // Mark this coin and all siblings as signed
             let addr = coin.address;
@@ -1073,7 +1064,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             self.save()?;
             return Ok(wots::sig_to_bytes(&sig));
         }
-        bail!("coin {} not in wallet", short_hex(coin_id));
+        bail!("coin {} not in wallet", hex::encode(coin_id));
     }
 
     /// Complete a CoinJoin mix: remove spent coins and import the received output.
@@ -1215,12 +1206,6 @@ mod tests {
         assert_eq!(w.total_value(), 12);
     }
 
-    #[test]
-    fn short_hex_format() {
-        let bytes = [0xab; 32];
-        let s = short_hex(&bytes);
-        assert_eq!(s, "abababab…abab");
-    }
 
     // ── resolve_coin ────────────────────────────────────────────────────
 

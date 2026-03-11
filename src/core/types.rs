@@ -141,6 +141,46 @@ pub fn decompose_value(mut value: u64) -> Vec<u64> {
     parts
 }
 
+/// Encodes a 32-byte address into a 72-character hex string with a 4-byte checksum.
+pub fn encode_address_with_checksum(address: &[u8; 32]) -> String {
+    let checksum_hash = hash(address);
+    let checksum = &checksum_hash[0..4];
+
+    let mut payload = Vec::with_capacity(36);
+    payload.extend_from_slice(address);
+    payload.extend_from_slice(checksum);
+
+    hex::encode(payload)
+}
+
+/// Safely parses an address, automatically handling both legacy (64-char) 
+/// and new checksummed (72-char) formats.
+pub fn parse_address_flexible(s: &str) -> Result<[u8; 32], String> {
+    if s.len() == 64 {
+        // Legacy Format (No Checksum)
+        let decoded = hex::decode(s).map_err(|e| format!("Invalid hex: {}", e))?;
+        let mut addr = [0u8; 32];
+        addr.copy_from_slice(&decoded);
+        Ok(addr)
+    } else if s.len() == 72 {
+        // New Format (With Checksum)
+        let decoded = hex::decode(s).map_err(|e| format!("Invalid hex: {}", e))?;
+        
+        let address: [u8; 32] = decoded[0..32].try_into().unwrap();
+        let expected_checksum = &decoded[32..36];
+
+        let actual_checksum_hash = hash(&address);
+        let actual_checksum = &actual_checksum_hash[0..4];
+
+        if expected_checksum != actual_checksum {
+            return Err("Checksum mismatch! The address contains a typo.".to_string());
+        }
+        Ok(address)
+    } else {
+        Err(format!("Invalid address length: expected 64 or 72 characters, got {}", s.len()))
+    }
+}
+
 /// The global consensus state
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct State {
