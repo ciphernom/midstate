@@ -920,6 +920,8 @@ async fn wallet_restore(path: &PathBuf, phrase_arg: Option<String>, rpc_port: u1
     const BATCH_SIZE: u64 = 50;
     let mut total_found = 0usize;
     let mut consecutive_empty = 0u64;
+    // Force the wallet to derive your first MSS key so it gets added to watched_addresses()
+    wallet.generate_mss(10, Some("Recovered MSS".to_string()))?; 
 
     loop {
         // Generate a batch of keys

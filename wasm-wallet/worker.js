@@ -125,7 +125,7 @@ self.onmessage = async (e) => {
             self.postMessage({ type: 'MSS_PROGRESS', payload: { current: 0, total: 100, label: "Generating Post-Quantum MSS Address..." } });
             await new Promise(r => setTimeout(r, 10));
             
-            deriveNextMss(5); 
+            deriveNextMss(10); 
 
             await saveState();
             self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
@@ -150,7 +150,7 @@ self.onmessage = async (e) => {
         }
         else if (type === 'NEW_ADDRESS') {
             self.postMessage({ type: 'LOG', payload: "Deriving new receiving address..." });
-            deriveNextMss(5);
+            deriveNextMss(10);
             await saveState();
             self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
             self.postMessage({ type: 'LOG', payload: "New address generated successfully." });
