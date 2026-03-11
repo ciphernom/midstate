@@ -1,4 +1,4 @@
-import init, { WebWallet, generate_phrase, compute_coin_id_hex } from './pkg/wasm_wallet.js';
+import init, { WebWallet, generate_phrase, compute_coin_id_hex, decrypt_cli_wallet } from './pkg/wasm_wallet.js';
 
 let wallet = null;
 let rpcUrl = "https://rpc.cypherpunk.gold";
@@ -106,29 +106,46 @@ self.onmessage = async (e) => {
             self.postMessage({ type: 'PHRASE_GENERATED', payload: generate_phrase() });
         }
         else if (type === 'CREATE') {
-            rpcUrl = payload.rpcUrl;
-            password = payload.password;
-            wallet = new WebWallet(payload.phrase);
-            wState.phrase = payload.phrase;
-            
-            for (let i = 0; i < GAP_LIMIT; i++) {
-                deriveNextWots();
-                if (i % 10 === 0) {
-                    self.postMessage({ 
-                        type: 'MSS_PROGRESS', 
-                        payload: { current: i, total: GAP_LIMIT, label: `Deriving base keys (${i}/${GAP_LIMIT})...` } 
-                    });
-                    await new Promise(r => setTimeout(r, 0));
-                }
-            }
-            
-            self.postMessage({ type: 'MSS_PROGRESS', payload: { current: 0, total: 100, label: "Generating Post-Quantum MSS Address..." } });
-            await new Promise(r => setTimeout(r, 10));
-            
-            deriveNextMss(10); 
+                    rpcUrl = payload.rpcUrl;
+                    password = payload.password;
+                    
+                    // FIX: Explicitly free the old Wasm instance to prevent memory leaks
+                    if (wallet) {
+                        wallet.free(); 
+                    }
+                    
+                    // FIX: Completely reset volatile state on subsequent creation attempts
+                    wState = {
+                        phrase: payload.phrase,
+                        nextWotsIndex: 0,
+                        nextMssIndex: 0,
+                        wotsAddrs: {},
+                        mssAddrs: {},
+                        utxos: {},
+                        history: [],
+                        lastScannedHeight: 0
+                    };
 
-            await saveState();
-            self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
+                    wallet = new WebWallet(payload.phrase);
+                    
+                    for (let i = 0; i < GAP_LIMIT; i++) {
+                        deriveNextWots();
+                        if (i % 10 === 0) {
+                            self.postMessage({ 
+                                type: 'MSS_PROGRESS', 
+                                payload: { current: i, total: GAP_LIMIT, label: `Deriving base keys (${i}/${GAP_LIMIT})...` } 
+                            });
+                            await new Promise(r => setTimeout(r, 0));
+                        }
+                    }
+                    
+                    self.postMessage({ type: 'MSS_PROGRESS', payload: { current: 0, total: 100, label: "Generating Post-Quantum MSS Address..." } });
+                    await new Promise(r => setTimeout(r, 10));
+                    
+                    deriveNextMss(10); 
+
+                    await saveState();
+                    self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
         }
         else if (type === 'LOGIN') {
             rpcUrl = payload.rpcUrl;
@@ -162,6 +179,65 @@ self.onmessage = async (e) => {
                 self.postMessage({ type: 'ERROR', payload: "Seed phrase not found in memory." });
             }
         }
+        else if (type === 'IMPORT_CLI') {
+            try {
+                // 1. Decrypt the binary .dat file using Rust/Wasm (Argon2)
+                const cliJsonStr = decrypt_cli_wallet(payload.fileBytes, payload.password);
+                const cliData = JSON.parse(cliJsonStr);
+
+                if (!cliData.master_seed) throw new Error("Legacy (non-HD) wallets not supported in Web.");
+
+                // 2. Map the CLI WalletData into the Web wState
+                let newUtxos = {};
+                for (const coin of cliData.coins) {
+                    newUtxos[normalizeHex(coin.coin_id)] = {
+                        index: 0, // CLI doesn't track index per coin, but web handles it gracefully
+                        is_mss: cliData.mss_keys.some(k => normalizeHex(k.master_pk) === normalizeHex(coin.owner_pk)),
+                        mss_height: 10,
+                        mss_leaf: 0,
+                        address: normalizeHex(coin.address),
+                        value: coin.value,
+                        salt: normalizeHex(coin.salt),
+                        coin_id: normalizeHex(coin.coin_id)
+                    };
+                }
+
+                let newMssAddrs = {};
+                for (const mss of cliData.mss_keys) {
+                    // Note: In CLI, the address is the hash of the master_pk. 
+                    // Wasm will rebuild this properly during the first spend.
+                    newMssAddrs[normalizeHex(mss.master_pk)] = {
+                        index: 0, 
+                        height: mss.height,
+                        next_leaf: mss.next_leaf
+                    };
+                }
+
+                wState = {
+                    phrase: null, // We don't have the 24 words!
+                    nextWotsIndex: cliData.next_wots_index || 0,
+                    nextMssIndex: cliData.next_mss_index || 0,
+                    wotsAddrs: {}, 
+                    mssAddrs: newMssAddrs,
+                    utxos: newUtxos,
+                    history: cliData.history || [],
+                    lastScannedHeight: cliData.last_scan_height || 0
+                };
+
+                // 3. Boot the Wasm wallet using the raw master seed!
+                const seedHex = normalizeHex(cliData.master_seed);
+                wallet = WebWallet.from_seed_hex(seedHex);
+                password = payload.password; // Keep the password to save into web storage
+
+                // 4. Save to the browser's local storage in the Web format
+                await saveState();
+                
+                self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
+
+            } catch (err) {
+                self.postMessage({ type: 'ERROR', payload: "Failed to import CLI wallet: Incorrect password or corrupt file." });
+            }
+        }
     } catch (err) {
         // Strip the "Error: " prefix if present to keep UI clean
         let errMsg = err.toString();
@@ -175,13 +251,19 @@ function deriveNextWots() {
     wState.wotsAddrs[addr] = wState.nextWotsIndex;
     wState.nextWotsIndex++;
 }
-
+let lastMssUpdate = 0;
 function deriveNextMss(height) {
     const progressCallback = (current, total) => {
-        self.postMessage({ 
-            type: 'MSS_PROGRESS', 
-            payload: { current, total, label: `Hashing tree leaves (${current}/${total})...` } 
-        });
+        const now = Date.now();
+        // FIX: Throttle UI updates to roughly 66ms (~15 FPS)
+        // Always ensure the final 100% update gets sent
+        if (now - lastMssUpdate > 66 || current === total) {
+            lastMssUpdate = now;
+            self.postMessage({ 
+                type: 'MSS_PROGRESS', 
+                payload: { current, total, label: `Hashing tree leaves (${current}/${total})...` } 
+            });
+        }
     };
     const addr = wallet.get_mss_address(wState.nextMssIndex, height, progressCallback);
     wState.mssAddrs[addr] = { index: wState.nextMssIndex, height, next_leaf: 0 };
@@ -214,7 +296,9 @@ function updateWasmWatchlist() {
 
 async function performScan() {
     self.postMessage({ type: 'LOG', payload: "Fetching chain state..." });
-    const stateResp = await fetch(`${rpcUrl}/state`);
+    
+    // FIX: Add cache: 'no-store'
+    const stateResp = await fetch(`${rpcUrl}/state`, { cache: 'no-store' });
     const state = await stateResp.json();
     const chainHeight = state.height;
 
@@ -235,7 +319,8 @@ async function performScan() {
         const filterReq = await fetch(`${rpcUrl}/filters`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ start_height: currentHeight, end_height: end })
+            body: JSON.stringify({ start_height: currentHeight, end_height: end }),
+            cache: 'no-store' 
         });
         
         if (!filterReq.ok) throw new Error("Failed to fetch filters.");
@@ -293,7 +378,11 @@ async function performScan() {
 }
 
 async function processFullBlock(height) {
-    const blockResp = await fetch(`${rpcUrl}/block/${height}`);
+// FIX: Add cache: 'no-store' and keepalive to speed up sequential requests
+    const blockResp = await fetch(`${rpcUrl}/block/${height}`, { 
+        cache: 'no-store',
+        keepalive: true 
+    });
     if (!blockResp.ok) return false;
     const block = await blockResp.json();
     
