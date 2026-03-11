@@ -214,8 +214,8 @@
                 </div>
             </div>
             <div style="text-align: center; margin-top: 1rem;">
-                <input type="file" id="importFile" accept=".json" style="display: none;">
-                <button id="btnImportTrigger" style="background: transparent; border: none; color: #666; font-size: 12px; text-decoration: underline;">Import Backup File (.json)</button>
+                <input type="file" id="importFile" accept=".json,.dat" style="display: none;">
+                <button id="btnImportTrigger" style="background: transparent; border: none; color: #666; font-size: 12px; text-decoration: underline;">Import Backup File (.json, .dat)</button>
             </div>
         </main>
 
@@ -953,8 +953,23 @@
         document.getElementById('importFile').addEventListener('change', function(e) {
             const file = e.target.files[0];
             if (!file) return;
-            const reader = new FileReader();
-            reader.onload = function(event) {
+
+            if (file.name.endsWith('.dat')) {
+                // CLI Import Path
+                const reader = new FileReader();
+                reader.onload = function(event) {
+                    const fileBytes = new Uint8Array(event.target.result);
+                    // We need their password right now to decrypt the Argon2 file
+                    const pwd = prompt("Enter the password for this CLI wallet:");
+                    if (!pwd) return showToast("Password required to decrypt .dat file", "error");
+                    
+                    worker.postMessage({ type: 'IMPORT_CLI', payload: { fileBytes, password: pwd } });
+                    e.target.value = '';
+                };
+                reader.readAsArrayBuffer(file); // MUST read as ArrayBuffer for binary decryption
+            } else {
+                const reader = new FileReader();
+                reader.onload = function(event) {
                 try {
                     const parsed = JSON.parse(event.target.result);
                     if (!parsed.salt || !parsed.iv || !parsed.data) throw new Error("Invalid backup format.");
@@ -968,8 +983,9 @@
                     showToast(`Import Failed: ${err.message}`, "error");
                 }
                 e.target.value = ''; 
-            };
-            reader.readAsText(file);
+                };
+                reader.readAsText(file);
+            }
         });
     </script>
 </body>

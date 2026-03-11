@@ -6,6 +6,7 @@ export class WebWallet {
     [Symbol.dispose](): void;
     build_reveal(spend_context_json: string, server_commitment_hex: string, server_salt_hex: string): string;
     check_filter(filter_hex: string, block_hash_hex: string, n: number): boolean;
+    static from_seed_hex(seed_hex: string): WebWallet;
     get_mss_address(index: number, height: number, progress_cb?: Function | null): string;
     get_wots_address(index: number): string;
     constructor(phrase: string);
@@ -18,6 +19,8 @@ export function compute_coin_id_hex(address_hex: string, value: bigint, salt_hex
 
 export function decompose_amount(amount: bigint): BigUint64Array;
 
+export function decrypt_cli_wallet(data: Uint8Array, password: string): string;
+
 export function generate_phrase(): string;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
@@ -27,9 +30,11 @@ export interface InitOutput {
     readonly __wbg_webwallet_free: (a: number, b: number) => void;
     readonly compute_coin_id_hex: (a: number, b: number, c: number, d: bigint, e: number, f: number) => void;
     readonly decompose_amount: (a: bigint) => number;
+    readonly decrypt_cli_wallet: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly generate_phrase: (a: number) => void;
     readonly webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly webwallet_check_filter: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
+    readonly webwallet_from_seed_hex: (a: number, b: number, c: number) => void;
     readonly webwallet_get_mss_address: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly webwallet_get_wots_address: (a: number, b: number, c: number) => void;
     readonly webwallet_new: (a: number, b: number, c: number) => void;
