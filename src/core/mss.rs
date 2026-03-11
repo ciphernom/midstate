@@ -356,7 +356,6 @@ impl MssSignature {
 
 
 // --- special web wallet function
-#[cfg(target_arch = "wasm32")]
 pub fn keygen_with_progress<F>(master_seed: &[u8; 32], height: u32, mut progress_cb: F) -> Result<MssKeypair>
 where
     F: FnMut(u32, u32),
