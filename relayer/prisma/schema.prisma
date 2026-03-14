@@ -1,0 +1,20 @@
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+generator client {
+  provider = "prisma-client-js"
+}
+model SwapOrder {
+  id                   String     @id @default(uuid())
+  makerMidstateAddress String
+  makerSolanaAddress   String
+  midstateAmount       BigInt
+  timeAmount           BigInt
+  status               String     @default("OPEN")
+  secretHash           String?
+  escrowPda            String?
+  htlcCoinId           String?
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+}

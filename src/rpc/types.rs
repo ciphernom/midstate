@@ -304,3 +304,8 @@ pub struct CheckOutputResponse {
     pub coin_id: String,
     pub exists: bool,
 }
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetTxByInputRequest {
+    /// The 32-byte hex ID of the coin being spent (the HTLC coin)
+    pub coin_id: String,
+}
