@@ -1263,7 +1263,8 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
         // where we left off rather than restarting from scratch every time.
         let start_height = force_start.unwrap_or_else(|| {
             self.last_sync_cursor
-                .filter(|&c| c > self.state.height.saturating_sub(360))
+                .filter(|&c| c > self.state.height.saturating_sub(360) 
+                             && c <= self.state.height.saturating_add(360))
                 .unwrap_or_else(|| self.state.height.saturating_sub(360))
         });
         
