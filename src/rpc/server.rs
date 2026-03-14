@@ -70,6 +70,7 @@ impl RpcServer {
             .route("/axe/overclock", post(axe_apply_overclock))
             .route("/axe/rewards", get(axe_download_rewards))
             .route("/api/internal/submit_batch", post(submit_batch))
+            .route("/tx/by_input", post(get_tx_by_input))
             .layer(TraceLayer::new_for_http())
             .layer(cors)
             .with_state(node_handle);
