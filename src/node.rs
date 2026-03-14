@@ -38,6 +38,8 @@ use rayon::prelude::*;
 
 const MAX_ORPHAN_BATCHES: usize = 32;
 const SYNC_TIMEOUT_SECS: u64 = 300;
+/// Extra grace period for the first chunk (relay handshake, NAT traversal, etc.)
+const SYNC_INITIAL_TIMEOUT_SECS: u64 = 600;
 
 /// Max transactions accepted from a single peer per rate-limit window.
 const MAX_TX_PER_PEER_PER_WINDOW: u32 = 50;
@@ -77,6 +79,9 @@ struct SyncSession {
     peer_depth: u128,
     phase: SyncPhase,
     started_at: std::time::Instant,
+    /// Tracks when we last received useful data. Reset on every header/batch chunk.
+    /// The timeout fires based on this, not `started_at`.
+    last_progress_at: std::time::Instant,
 }
 
 enum SyncPhase {
@@ -762,7 +767,16 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                     if let Some(session) = &self.sync_session {
                         // FIX: Do not timeout if the delay is caused by our own CPU verifying headers.
                         if !matches!(session.phase, SyncPhase::VerifyingHeaders) {
-                            if session.started_at.elapsed().as_secs() > SYNC_TIMEOUT_SECS {
+                            // Use a longer timeout if we haven't received any data yet
+                            // (initial relay handshake, NAT traversal, etc.)
+                            let idle_secs = session.last_progress_at.elapsed().as_secs();
+                            let has_made_progress = session.last_progress_at != session.started_at;
+                            let timeout = if has_made_progress {
+                                SYNC_TIMEOUT_SECS
+                            } else {
+                                SYNC_INITIAL_TIMEOUT_SECS
+                            };
+                            if idle_secs > timeout {
                                 self.abort_sync_session("timed out");
                             }
                         }
@@ -1263,9 +1277,17 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
         // where we left off rather than restarting from scratch every time.
         let start_height = force_start.unwrap_or_else(|| {
             self.last_sync_cursor
-                .filter(|&c| c > self.state.height.saturating_sub(360) 
+                .filter(|&c| c > self.state.height.saturating_sub(360)
                              && c <= self.state.height.saturating_add(360))
-                .unwrap_or_else(|| self.state.height.saturating_sub(360))
+                .unwrap_or_else(|| {
+                    // Fresh node (height <= 360): start from current height (genesis is deterministic).
+                    // Mature node: look back 360 blocks for fork detection.
+                    if self.state.height <= 360 {
+                        self.state.height
+                    } else {
+                        self.state.height.saturating_sub(360)
+                    }
+                })
         });
         
         tracing::info!(
@@ -1273,6 +1295,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
             start_height, peer_height, peer_depth, self.state.height, self.state.depth
         );
         self.sync_in_progress = true;
+        let now = std::time::Instant::now();
         self.sync_session = Some(SyncSession {
             peer,
             peer_height,
@@ -1282,7 +1305,8 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
                 cursor: start_height,
                 snapshot: None, 
             },
-            started_at: std::time::Instant::now(),
+            started_at: now,
+            last_progress_at: now,
         });
         
         let count = 100.min(peer_height.saturating_sub(start_height));
@@ -1345,7 +1369,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
 
             //  Reset idle timeout because we are making progress
             if let Some(s) = &mut self.sync_session {
-                s.started_at = std::time::Instant::now();
+                s.last_progress_at = std::time::Instant::now();
             }
             // Save cursor so a timeout can resume from here rather than height-360
             self.last_sync_cursor = Some(new_cursor);
@@ -1465,6 +1489,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
             peer_depth: session.peer_depth,
             phase: SyncPhase::VerifyingHeaders,
             started_at: session.started_at,
+            last_progress_at: std::time::Instant::now(),
         });
 
         Ok(())
@@ -1571,6 +1596,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
             return Ok(());
         }
 
+        let now = std::time::Instant::now();
         self.sync_session = Some(SyncSession {
             peer,
             peer_height: session.peer_height,
@@ -1583,7 +1609,8 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
                 new_history: Vec::new(),
                 is_fast_forward,
             },
-            started_at: std::time::Instant::now(),
+            started_at: now,
+            last_progress_at: now,
         });
 
         let count = (session.peer_height - fork_height).min(MAX_GETBATCHES_COUNT);
@@ -1709,7 +1736,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
             let count = (peer_height - current_cursor).min(MAX_GETBATCHES_COUNT);
             self.network.send(from, Message::GetBatches { start_height: current_cursor, count });
             // Reset idle timeout
-            session.started_at = std::time::Instant::now();
+            session.last_progress_at = std::time::Instant::now();
             self.sync_session = Some(session); // put session back
             return Ok(());
         }
@@ -4169,6 +4196,7 @@ fn build_divergent_chain(
                 is_fast_forward: false,
             },
             started_at: std::time::Instant::now(),
+            last_progress_at: std::time::Instant::now(),
         });
 
         // 4. Feed only half the alt batches (simulating partial download)
@@ -4240,6 +4268,7 @@ fn build_divergent_chain(
                 is_fast_forward: false,
             },
             started_at: std::time::Instant::now(),
+            last_progress_at: std::time::Instant::now(),
         });
 
         // Feed 4 of 12 alt batches, then abort
@@ -4297,6 +4326,7 @@ fn build_divergent_chain(
                 is_fast_forward: false,
             },
             started_at: std::time::Instant::now(),
+            last_progress_at: std::time::Instant::now(),
         });
 
         // Feed ALL batches — sync should complete and adopt the chain
@@ -4355,6 +4385,7 @@ fn build_divergent_chain(
                 is_fast_forward: false,
             },
             started_at: std::time::Instant::now(),
+            last_progress_at: std::time::Instant::now(),
         });
 
         // Feed some of A's batches
