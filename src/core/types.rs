@@ -338,11 +338,7 @@ pub enum OutputData {
         value: u64,
         salt: [u8; 32],
     },
-    Confidential { 
-        address: [u8; 32], 
-        commitment: [u8; 32], 
-        salt: [u8; 32] 
-    },
+    
     /// A provably unspendable data payload that is ignored by the UTXO SMT
     DataBurn {
         payload: Vec<u8>,
