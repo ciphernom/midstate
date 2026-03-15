@@ -494,7 +494,11 @@ pub async fn new(
                     // -----------------------------------------
 
                     // Hardcoded genesis nonce to avoid PoW on node initialization.
+                    #[cfg(not(feature = "fast-mining"))]
                     let nonce = 438;
+                    #[cfg(feature = "fast-mining")]
+                    let nonce = 9129; // strictly to run tests faster
+                    
                     let extension = create_extension(mining_midstate, nonce);
                     
                     // Safety check: Ensure the hardcoded nonce is still valid in case 
@@ -3108,22 +3112,26 @@ async fn try_apply_orphans(&mut self) {
     /// Preserves identical behavior for all existing tests.
     #[cfg(test)]
     pub async fn try_mine(&mut self) -> Result<()> {
-        // Automatically enable mining for tests if it wasn't enabled
         if self.mining_threads.is_none() {
             self.mining_threads = Some(0); 
         }
         // Short-circuit if a sync is happening so the test doesn't hang forever
-        if self.sync_in_progress || self.mining_cancel.is_some() {
+        if self.sync_in_progress {
             return Ok(());
         }
-        self.spawn_mining_task()?;
+        
+        // If a task isn't already running, spawn one
+        if self.mining_cancel.is_none() {
+            self.spawn_mining_task()?;
+        }
+        
+        // Wait for the block to be mined!
         if let Some(res) = self.mined_batch_rx.recv().await {
             match res {
                 MinedResult::Block(batch) => {
                     self.handle_mined_batch(batch).await?;
                 }
                 MinedResult::Share { .. } => {
-                    // For tests, clear the flag to avoid deadlocking
                     self.mining_cancel = None;
                 }
             }
