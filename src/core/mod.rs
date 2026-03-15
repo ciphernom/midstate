@@ -11,6 +11,7 @@ pub mod stark;
 pub mod filter;
 pub mod simd_mining;
 pub mod wots_simd;
+pub mod confidential;
 
 pub use finality::*;
 pub use types::*;
