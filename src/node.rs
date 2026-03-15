@@ -37,9 +37,9 @@ use tokio::time;
 use rayon::prelude::*;
 
 const MAX_ORPHAN_BATCHES: usize = 32;
-const SYNC_TIMEOUT_SECS: u64 = 300;
+const SYNC_TIMEOUT_SECS: u64 = 900;
 /// Extra grace period for the first chunk (relay handshake, NAT traversal, etc.)
-const SYNC_INITIAL_TIMEOUT_SECS: u64 = 600;
+const SYNC_INITIAL_TIMEOUT_SECS: u64 = 1200;
 
 /// Max transactions accepted from a single peer per rate-limit window.
 const MAX_TX_PER_PEER_PER_WINDOW: u32 = 50;
@@ -3687,12 +3687,12 @@ mod complex_tests {
         // REASONING: We cannot simply use State::genesis() because we need to load 
         // the *exact* genesis batch saved by the node to ensure midstates align.
         let genesis_batch = node.storage.load_batch(0).unwrap().unwrap();
-        apply_batch(&mut state_at_2, &genesis_batch, &[]).unwrap(); // H=1
+apply_batch(&mut state_at_2, &genesis_batch, &[], &std::collections::HashMap::new()).unwrap(); // H=1
         state_at_2.target = adjust_difficulty(&state_at_2);
         
         // Apply B1 (shared history)
        let ts_at_1 = vec![state_at_2.timestamp];
-        apply_batch(&mut state_at_2, &b1, &ts_at_1).unwrap(); // H = 2
+        apply_batch(&mut state_at_2, &b1, &ts_at_1, &std::collections::HashMap::new()).unwrap(); // H = 2
         state_at_2.target = adjust_difficulty(&state_at_2);
 
         // B2' (Alternative block at H=3). Empty, does NOT have the transaction.
