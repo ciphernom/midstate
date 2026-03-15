@@ -1030,3 +1030,45 @@ pub async fn submit_batch(
         .map_err(|e| ErrorResponse { error: e.to_string() })?;
     Ok(axum::Json(serde_json::json!({ "status": "accepted" })))
 }
+
+pub async fn get_tx_by_input(
+    State(node): State<AppState>,
+    Json(req): Json<GetTxByInputRequest>,
+) -> Result<Json<Transaction>, ErrorResponse> {
+    let target_coin = parse_hex32(&req.coin_id, "coin_id")?;
+
+    // 1. Check Mempool (Fast Path - O(N) over a small array)
+    let (_, txs) = node.get_mempool_info().await;
+    for tx in txs {
+        if let Transaction::Reveal { inputs, .. } = &tx {
+            if inputs.iter().any(|i| i.coin_id() == target_coin) {
+                // Return the raw, unstripped transaction containing the witnesses
+                return Ok(Json(tx));
+            }
+        }
+    }
+
+    // 2. Check Chain History (Fallback - Disk I/O)
+    // Scan the last 1,000 blocks to ensure we don't miss a transaction 
+    // that was mined between the relayer's polling intervals.
+    let store = crate::storage::BatchStore::new(&node.batches_path)
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+    
+    let current_height = node.get_state().await.height;
+    let start = current_height.saturating_sub(1000);
+
+    for h in (start..current_height).rev() {
+        if let Ok(Some(batch)) = store.load(h) {
+            for tx in batch.transactions {
+                if let Transaction::Reveal { inputs, .. } = &tx {
+                    if inputs.iter().any(|i| i.coin_id() == target_coin) {
+                        // Return the raw, unstripped transaction containing the witnesses
+                        return Ok(Json(tx));
+                    }
+                }
+            }
+        }
+    }
+
+    Err(ErrorResponse { error: "Transaction spending this coin not found".into() })
+}

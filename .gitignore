@@ -10,6 +10,7 @@ bob_wallet.dat
 *.dat
 tarsrc.sh
 buildroot
+solana_swap
 
 # WASM Wallet Build Artifacts
 wasm-wallet/target/
