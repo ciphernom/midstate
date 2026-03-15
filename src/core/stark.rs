@@ -26,6 +26,8 @@ use winterfell::{
     TraceInfo, TransitionConstraintDegree,
 };
 
+use crate::core::confidential;
+
 // ── Consensus Limits ───────────────────────────────────────────────────────
 
 /// Maximum STARK proof size in bytes. Bounds verifier memory and CPU.
@@ -46,6 +48,7 @@ lazy_static::lazy_static! {
     /// Proves: value v ∈ [0, 2^64) and v == claimed_value.
     /// Public inputs: [value as 8 LE bytes]
     pub static ref RANGE_PROOF_64: [u8; 32] = hash(b"midstate.stark.range_proof_64");
+    pub static ref CONFIDENTIAL_TRANSFER: [u8; 32] = hash(b"midstate.stark.confidential_transfer");
 }
 
 // ── Errors ─────────────────────────────────────────────────────────────────
@@ -447,13 +450,16 @@ pub fn verify_stark_proof(
     if public_inputs.len() > MAX_STARK_PUBLIC_INPUT_SIZE {
         return Err(StarkError::PublicInputsTooLarge);
     }
-
+ 
     if program_id == RANGE_PROOF_64.as_ref() {
         verify_range_proof_64(public_inputs, proof_bytes)
+    } else if program_id == CONFIDENTIAL_TRANSFER.as_ref() {
+        confidential::verify_confidential_transfer(public_inputs, proof_bytes)
     } else {
         Err(StarkError::UnknownProgram)
     }
 }
+ 
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
