@@ -3,16 +3,22 @@
 //! Every UTXO is locked by a compiled bytecode script. The VM executes
 //! witness inputs pushed onto the stack, then evaluates the script.
 //! Execution succeeds iff the final top-of-stack item is exactly `[1]`.
+//!
+//! # STARK Integration (`OP_VERIFY_STARK`)
+//! To prevent massive heap allocations when evaluating ZK-STARKs (~128 KB),
+//! proofs are passed in the witness array but are **intentionally bypassed**
+//! by the `SmallVec` stack. The VM reads the proof payload directly from the 
+//! transaction slice when `OP_VERIFY_STARK` is called.
 
 use super::types::{hash, OutputData};
 use super::wots;
 use super::mss;
 use smallvec::SmallVec;
 
-// Stack element type alias. 32 bytes covers hashes and public keys inline;
-// larger items (e.g. WOTS signatures at 576 bytes) spill to the heap exactly
-// as a Vec would, so there is no correctness change — only fewer allocations
-// for the 99% case.
+/// Stack element type alias. 32 bytes covers hashes and public keys inline;
+/// larger items (e.g. WOTS signatures at 576 bytes) spill to the heap exactly
+/// as a Vec would, so there is no correctness change — only fewer allocations
+/// for the 99% case.
 type StackItem = SmallVec<[u8; 32]>;
 
 // ── Opcodes ────────────────────────────────────────────────────────────────
@@ -40,15 +46,27 @@ pub const OP_ENDIF: u8            = 0x42;
 
 pub const OP_SUM_TO_ADDR: u8      = 0x50;
 
+/// STARK Verifier Opcode.
+/// Stack behavior: pops `public_inputs` and `program_id`. Reads proof payload
+/// directly from the end of the witness array without allocating it to the stack.
+pub const OP_VERIFY_STARK: u8     = 0x60;
+
 // ── Consensus limits ───────────────────────────────────────────────────────
 
 pub const MAX_SCRIPT_SIZE: usize  = 1_024;
 pub const MAX_STACK_DEPTH: usize  = 64;
-pub const MAX_ITEM_SIZE: usize    = 1_536;
+
+/// Large enough for STARK proofs (~20-50 KB). Stack depth of 64 bounds
+/// total memory: 64 × 131,072 = 8 MB worst case, which is acceptable.
+pub const MAX_ITEM_SIZE: usize    = 131_072;
 pub const MAX_SIGOPS_PER_SCRIPT: usize = 3;
+
+/// STARK proofs are expensive to verify — at most 1 per script.
+pub const MAX_STARK_OPS_PER_SCRIPT: usize = 1;
 
 // ── Errors ─────────────────────────────────────────────────────────────────
 
+/// Represents execution failures in the script VM.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptError {
     ScriptTooLarge,
@@ -81,7 +99,7 @@ impl std::fmt::Display for ScriptError {
             Self::InvalidBooleanOnStack => write!(f, "expected boolean on stack"),
             Self::ScriptMustFinishTrue => write!(f, "script did not finish with [1] on top"),
             Self::EmptyStack => write!(f, "stack empty at end of execution"),
-            Self::CleanStackRuleFailed => write!(f, "script execution finished with extra items on the stack (Clean Stack Rule)"), // <-- NEW
+            Self::CleanStackRuleFailed => write!(f, "script execution finished with extra items on the stack (Clean Stack Rule)"),
         }
     }
 }
@@ -100,7 +118,13 @@ pub struct ExecContext<'a> {
 // ── AOT validation ─────────────────────────────────────────────────────────
 
 /// Ahead-of-time structural validation. O(N) single pass.
-pub fn validate_structure(bytecode: &[u8]) -> Result<(), ScriptError> {
+///
+/// ```rust
+/// use midstate::core::script::{validate_structure, OP_IF, OP_ENDIF, OP_ADD};
+/// assert!(validate_structure(&[OP_IF, OP_ADD, OP_ENDIF]).is_ok());
+/// assert!(validate_structure(&[OP_IF, OP_ADD]).is_err()); // Unbalanced
+/// ```
+pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<(), ScriptError> {
     if bytecode.len() > MAX_SCRIPT_SIZE {
         return Err(ScriptError::ScriptTooLarge);
     }
@@ -146,6 +170,13 @@ pub fn validate_structure(bytecode: &[u8]) -> Result<(), ScriptError> {
             OP_ADD | OP_GREATER_OR_EQUAL |
             OP_HASH | OP_CHECKSIG | OP_CHECKSIGVERIFY | OP_CHECKTIMEVERIFY |
             OP_SUM_TO_ADDR => {}
+            
+            OP_VERIFY_STARK => {
+                // Hard fork gate: Opcode is completely invalid before activation height
+                if height < crate::core::types::STARK_ACTIVATION_HEIGHT {
+                    return Err(ScriptError::InvalidOpcode(op));
+                }
+            }
             _ => return Err(ScriptError::InvalidOpcode(op)),
         }
     }
@@ -220,18 +251,48 @@ fn verify_signature(sig_bytes: &[u8], message: &[u8; 32], pk_bytes: &[u8]) -> bo
 
 // ── Main execution engine ──────────────────────────────────────────────────
 
+/// Executes the script VM over the provided bytecode.
+///
+/// **STARK Exception**: If `OP_VERIFY_STARK` is present, the final element in
+/// the `witness` array is treated as the STARK proof payload. It is read
+/// directly from the slice and *not* pushed to the `SmallVec` stack to prevent
+/// huge heap allocation spikes during processing.
+///
+/// ```rust
+/// use midstate::core::script::{execute_script, ExecContext, OP_ADD, OP_EQUAL};
+/// 
+/// // A simple script testing 2 + 2 == 4
+/// let script = vec![OP_ADD, 0x01, 0x01, 0x00, 0x04, OP_EQUAL]; // PUSH 4, EQUAL
+/// let witness = vec![vec![0x02], vec![0x02]];
+/// let ctx = ExecContext { commitment: &[0; 32], height: 0, outputs: &[] };
+/// 
+/// assert!(execute_script(&script, &witness, &ctx).is_ok());
+/// ```
 pub fn execute_script(
     bytecode: &[u8],
     witness: &[Vec<u8>],
     ctx: &ExecContext,
 ) -> Result<(), ScriptError> {
-    validate_structure(bytecode)?;
+    validate_structure(bytecode, ctx.height)?;
+
+    // Bypass the SmallVec stack for STARK proofs to avoid massive memory allocations.
+    let has_stark = bytecode.contains(&OP_VERIFY_STARK);
+    let proof_bytes = if has_stark {
+        witness.last().ok_or(ScriptError::StackUnderflow)?.as_slice()
+    } else {
+        &[]
+    };
+
+    // Only push standard stack items (signatures, public keys, inputs) to the VM stack
+    let push_limit = if has_stark { witness.len().saturating_sub(1) } else { witness.len() };
 
     let mut stack: Vec<StackItem> = Vec::new();
-    for item in witness {
+    for item in &witness[..push_limit] {
         stack_push(&mut stack, SmallVec::from_slice(item))?;
     }
+    
     let mut sigop_count = 0;
+    let mut stark_op_count = 0;
     let mut pc = 0usize;
     let mut exec_stack: Vec<bool> = Vec::new();
 
@@ -271,14 +332,18 @@ pub fn execute_script(
                 continue;
             }
             OP_CHECKSIG | OP_CHECKSIGVERIFY => {
-                // Count sigops only in executing branches. Dead-branch
-                // checksigs don't consume verifier resources, so counting
-                // them penalizes legitimate scripts like HTLCs where both
-                // branches have their own checksig.
                 if executing {
                     sigop_count += 1;
                     if sigop_count > MAX_SIGOPS_PER_SCRIPT {
                         return Err(ScriptError::VerifyFailed); 
+                    }
+                }
+            }
+            OP_VERIFY_STARK => {
+                if executing {
+                    stark_op_count += 1;
+                    if stark_op_count > MAX_STARK_OPS_PER_SCRIPT {
+                        return Err(ScriptError::VerifyFailed);
                     }
                 }
             }
@@ -386,6 +451,25 @@ pub fn execute_script(
                 stack_push(&mut stack, from_u64(sum))?;
             }
 
+            OP_VERIFY_STARK => {
+                // Stack: [... program_id, public_inputs] 
+                // Proof bytes were intercepted directly from the witness array
+                let public_inputs = stack_pop(&mut stack)?;
+                let program_id_item = stack_pop(&mut stack)?;
+
+                if program_id_item.len() != 32 {
+                    return Err(ScriptError::VerifyFailed);
+                }
+                let program_id: [u8; 32] = program_id_item.as_slice().try_into().unwrap();
+
+                super::stark::verify_stark_proof(
+                    &program_id,
+                    &public_inputs,
+                    proof_bytes,
+                ).map_err(|_| ScriptError::VerifyFailed)?;
+                // Does NOT push anything — acts like VERIFY (fails or continues).
+            }
+
             _ => return Err(ScriptError::InvalidOpcode(op)),
         }
     }
@@ -401,6 +485,14 @@ pub fn execute_script(
 // ── Script builders ────────────────────────────────────────────────────────
 
 /// Standard Pay-to-Public-Key script.
+///
+/// ```rust
+/// use midstate::core::script::{compile_p2pk, OP_PUSH_DATA, OP_CHECKSIGVERIFY};
+/// let pk = [0xAA; 32];
+/// let script = compile_p2pk(&pk);
+/// assert_eq!(script[0], OP_PUSH_DATA);
+/// assert_eq!(script[35], OP_CHECKSIGVERIFY);
+/// ```
 pub fn compile_p2pk(owner_pk: &[u8; 32]) -> Vec<u8> {
     let mut bc = Vec::new();
     push_data(&mut bc, owner_pk);
@@ -509,12 +601,13 @@ pub fn assemble(source: &str) -> Result<Vec<u8>, String> {
             "ELSE"              => bc.push(OP_ELSE),
             "ENDIF"             => bc.push(OP_ENDIF),
             "SUM_TO_ADDR"       => bc.push(OP_SUM_TO_ADDR),
+            "VERIFY_STARK"      => bc.push(OP_VERIFY_STARK),
             other => return Err(format!("unknown mnemonic '{}'", other)),
         }
         i += 1;
     }
 
-    validate_structure(&bc).map_err(|e| e.to_string())?;
+    validate_structure(&bc, u64::MAX).map_err(|e| e.to_string())?;
     Ok(bc)
 }
 
@@ -539,38 +632,38 @@ mod tests {
     #[test]
     fn aot_rejects_oversized_script() {
         let big = vec![OP_DUP; MAX_SCRIPT_SIZE + 1];
-        assert_eq!(validate_structure(&big), Err(ScriptError::ScriptTooLarge));
+        assert_eq!(validate_structure(&big, u64::MAX), Err(ScriptError::ScriptTooLarge));
     }
 
     #[test]
     fn aot_rejects_push_data_oob() {
         let bc = vec![OP_PUSH_DATA, 0xFF, 0x00];
-        assert_eq!(validate_structure(&bc), Err(ScriptError::PushDataOutOfBounds));
+       assert_eq!(validate_structure(&bc, u64::MAX),  Err(ScriptError::PushDataOutOfBounds));
     }
 
     #[test]
     fn aot_rejects_unbalanced_if() {
-        assert_eq!(validate_structure(&[OP_IF]), Err(ScriptError::UnbalancedConditional));
+        assert_eq!(validate_structure(&[OP_IF], u64::MAX), Err(ScriptError::UnbalancedConditional));
     }
 
     #[test]
     fn aot_rejects_extra_endif() {
-        assert_eq!(validate_structure(&[OP_ENDIF]), Err(ScriptError::UnbalancedConditional));
+        assert_eq!(validate_structure(&[OP_ENDIF], u64::MAX), Err(ScriptError::UnbalancedConditional));
     }
 
     #[test]
     fn aot_rejects_else_without_if() {
-        assert_eq!(validate_structure(&[OP_ELSE]), Err(ScriptError::UnbalancedConditional));
+        assert_eq!(validate_structure(&[OP_ELSE], u64::MAX), Err(ScriptError::UnbalancedConditional));
     }
 
     #[test]
     fn aot_accepts_balanced_if_else_endif() {
-        assert!(validate_structure(&[OP_IF, OP_ELSE, OP_ENDIF]).is_ok());
+        assert!(validate_structure(&[OP_IF, OP_ELSE, OP_ENDIF], u64::MAX).is_ok());
     }
 
     #[test]
     fn aot_rejects_invalid_opcode() {
-        assert_eq!(validate_structure(&[0xFF]), Err(ScriptError::InvalidOpcode(0xFF)));
+        assert_eq!(validate_structure(&[0xFF], u64::MAX), Err(ScriptError::InvalidOpcode(0xFF)));
     }
 
     #[test]
@@ -855,4 +948,243 @@ mod tests {
         let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[] };
         assert!(execute_script(&bytecode, &witness, &ctx).is_err());
     }
+
+    // Test 1: Basic STARK-gated script — prove a value is in range
+    //
+    // Witness: [program_id, public_inputs, proof_bytes]
+    //   - program_id and public_inputs are pushed to stack
+    //   - proof_bytes (last item) is intercepted directly, NOT pushed to stack
+    //
+    // Script: VERIFY_STARK PUSH_INT 1
+    //   - pops public_inputs (top), then program_id (second)
+    //   - verifies STARK proof
+    //   - pushes 1 for clean stack exit
+    #[cfg(feature = "stark-prover")]
+    #[test]
+    fn stark_range_proof_via_script() {
+        use crate::core::stark::{self, RANGE_PROOF_64, prover::RangeProofProver};
+
+        // 1. Generate proof for value = 1_000_000
+        let value = 1_000_000u64;
+        let prover = RangeProofProver::new(value);
+        let (pub_inputs, proof) = prover.generate_proof().unwrap();
+        let proof_bytes = proof.to_bytes();
+        let value_bytes = pub_inputs.value.as_int().to_le_bytes().to_vec();
+
+        println!("Proof size: {} bytes", proof_bytes.len());
+
+        // 2. Build the script: VERIFY_STARK PUSH_INT 1
+        let mut bytecode = Vec::new();
+        bytecode.push(OP_VERIFY_STARK);
+        push_int(&mut bytecode, 1);
+
+        // 3. Witness: [program_id, public_inputs, proof]
+        //    First two go on stack, last one is intercepted for STARK
+        let witness = vec![
+            RANGE_PROOF_64.to_vec(),  // → stack (program_id)
+            value_bytes,               // → stack (public_inputs)
+            proof_bytes,               // → intercepted (proof)
+        ];
+
+        // 4. Execute
+        let ctx = ExecContext { commitment: &[0u8; 32], height: 100, outputs: &[] };
+        let result = execute_script(&bytecode, &witness, &ctx);
+        assert!(result.is_ok(), "STARK range proof script failed: {:?}", result);
+    }
+
+    // Test 2: STARK proof with wrong value should fail
+    #[cfg(feature = "stark-prover")]
+    #[test]
+    fn stark_range_proof_wrong_value_fails() {
+        use crate::core::stark::{RANGE_PROOF_64, prover::RangeProofProver};
+
+        let prover = RangeProofProver::new(42);
+        let (_, proof) = prover.generate_proof().unwrap();
+        let proof_bytes = proof.to_bytes();
+
+        // Claim value is 99, but proof is for 42
+        let wrong_value_bytes = 99u64.to_le_bytes().to_vec();
+
+        let mut bytecode = Vec::new();
+        bytecode.push(OP_VERIFY_STARK);
+        push_int(&mut bytecode, 1);
+
+        let witness = vec![
+            RANGE_PROOF_64.to_vec(),
+            wrong_value_bytes,
+            proof_bytes,
+        ];
+
+        let ctx = ExecContext { commitment: &[0u8; 32], height: 100, outputs: &[] };
+        let result = execute_script(&bytecode, &witness, &ctx);
+        assert!(result.is_err(), "Should have failed with wrong value");
+    }
+
+    // Test 3: STARK + signature combo — prove value in range AND sign the tx
+    //
+    // This is the real use case: a UTXO locked by
+    //   "prove your value is valid AND you own the key"
+    //
+    // Witness: [signature, program_id, public_inputs, proof_bytes]
+    // Script:  VERIFY_STARK <owner_pk> CHECKSIGVERIFY PUSH_INT 1
+    #[cfg(feature = "stark-prover")]
+    #[test]
+    fn stark_plus_signature_script() {
+        use crate::core::stark::{RANGE_PROOF_64, prover::RangeProofProver};
+        use crate::core::wots;
+        use crate::core::types::hash;
+
+        // 1. Generate STARK proof
+        let value = 500u64;
+        let prover = RangeProofProver::new(value);
+        let (pub_inputs, proof) = prover.generate_proof().unwrap();
+        let proof_bytes = proof.to_bytes();
+        let value_bytes = pub_inputs.value.as_int().to_le_bytes().to_vec();
+
+        // 2. Generate WOTS key and signature
+        let seed = hash(b"stark test key");
+        let pk = wots::keygen(&seed);
+        let commitment = hash(b"stark tx commitment");
+        let sig = wots::sign(&seed, &commitment);
+        let sig_bytes = wots::sig_to_bytes(&sig);
+
+        // 3. Build script: VERIFY_STARK <pk> CHECKSIGVERIFY PUSH_INT 1
+        let mut bytecode = Vec::new();
+        bytecode.push(OP_VERIFY_STARK);
+        push_data(&mut bytecode, &pk);
+        bytecode.push(OP_CHECKSIGVERIFY);
+        push_int(&mut bytecode, 1);
+
+        // 4. Witness: [sig, program_id, public_inputs, proof]
+        //    sig, program_id, public_inputs → stack
+        //    proof → intercepted
+        let witness = vec![
+            sig_bytes,                 // → stack (signature)
+            RANGE_PROOF_64.to_vec(),  // → stack (program_id)
+            value_bytes,               // → stack (public_inputs)
+            proof_bytes,               // → intercepted (proof)
+        ];
+
+        // Stack after witness push: [sig, program_id, public_inputs]
+        // VERIFY_STARK: pops public_inputs, pops program_id → verifies proof
+        // Stack now: [sig]
+        // PUSH_DATA pk: stack = [sig, pk]
+        // CHECKSIGVERIFY: pops pk, pops sig → verifies signature
+        // Stack now: []
+        // PUSH_INT 1: stack = [1]
+        // Clean stack check passes ✓
+
+        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[] };
+        let result = execute_script(&bytecode, &witness, &ctx);
+        assert!(result.is_ok(), "STARK + sig script failed: {:?}", result);
+    }
+
+    // Test 4: STARK + covenant — prove value in range AND enforce output destination
+    //
+    // "These coins can only be spent if you prove the value is valid 
+    //  AND at least 100 units go to address X"
+    #[cfg(feature = "stark-prover")]
+    #[test]
+    fn stark_plus_covenant_script() {
+        use crate::core::stark::{RANGE_PROOF_64, prover::RangeProofProver};
+        use crate::core::types::{hash, OutputData};
+
+        let value = 1000u64;
+        let prover = RangeProofProver::new(value);
+        let (pub_inputs, proof) = prover.generate_proof().unwrap();
+        let proof_bytes = proof.to_bytes();
+        let value_bytes = pub_inputs.value.as_int().to_le_bytes().to_vec();
+
+        let required_addr = [0xAA; 32];
+        let outputs = vec![
+            OutputData::Standard { address: required_addr, value: 128, salt: [0; 32] },
+            OutputData::Standard { address: [0xBB; 32], value: 64, salt: [1; 32] },
+        ];
+
+        // Script: VERIFY_STARK <required_addr> SUM_TO_ADDR <100> GREATER_OR_EQUAL VERIFY PUSH_INT 1
+        let mut bytecode = Vec::new();
+        bytecode.push(OP_VERIFY_STARK);
+        push_data(&mut bytecode, &required_addr);
+        bytecode.push(OP_SUM_TO_ADDR);
+        push_int(&mut bytecode, 100);
+        bytecode.push(OP_GREATER_OR_EQUAL);
+        bytecode.push(OP_VERIFY);
+        push_int(&mut bytecode, 1);
+
+        let witness = vec![
+            RANGE_PROOF_64.to_vec(),
+            value_bytes,
+            proof_bytes,
+        ];
+
+        let ctx = ExecContext { commitment: &[0; 32], height: 100, outputs: &outputs };
+        let result = execute_script(&bytecode, &witness, &ctx);
+        assert!(result.is_ok(), "STARK + covenant script failed: {:?}", result);
+    }
+    
+    // ── End-to-end: Load private_spend.msc, compile, prove, execute ──
+
+    #[cfg(feature = "stark-prover")]
+    #[test]
+    fn private_spend_msc_end_to_end() {
+        use crate::core::stark::{RANGE_PROOF_64, prover::RangeProofProver};
+        use crate::core::wots;
+        use crate::core::types::hash;
+        use std::time::Instant;
+
+        // 1. Generate owner keypair
+        let seed = hash(b"private_spend_msc_test_key");
+        let pk = wots::keygen(&seed);
+        let pk_hex = hex::encode(&pk);
+
+        // 2. Load and compile the .msc file
+        let msc_source = "VERIFY_STARK\nPUSH_HEX OWNER_PK\nCHECKSIGVERIFY\nPUSH_INT 1";
+
+        let source: String = msc_source
+            .lines()
+            .map(|l| l.split('#').next().unwrap().trim())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace("OWNER_PK", &pk_hex);
+
+        println!("Compiled source: {}", source);
+        let bytecode = assemble(&source).expect("Failed to assemble private_spend.msc");
+        println!("Bytecode: {} bytes → {}", bytecode.len(), hex::encode(&bytecode));
+
+        // 3. Generate STARK range proof for 1 block reward
+        let value = 1_073_741_824u64;
+        let t0 = Instant::now();
+        let prover = RangeProofProver::new(value);
+        let (pub_inputs, proof) = prover.generate_proof().unwrap();
+        let proof_bytes = proof.to_bytes();
+        println!("Proof generated in {:?} — {} bytes", t0.elapsed(), proof_bytes.len());
+
+        // 4. Sign
+        let commitment = hash(b"private spend commitment");
+        let sig = wots::sign(&seed, &commitment);
+        let sig_bytes = wots::sig_to_bytes(&sig);
+
+        // 5. Assemble witness and execute
+        let witness = vec![
+            sig_bytes,
+            RANGE_PROOF_64.to_vec(),
+            pub_inputs.value.as_int().to_le_bytes().to_vec(),
+            proof_bytes,
+        ];
+
+        let ctx = ExecContext {
+            commitment: &commitment,
+            height: 30_000,
+            outputs: &[],
+        };
+
+        let t0 = Instant::now();
+        let result = execute_script(&bytecode, &witness, &ctx);
+        println!("Script executed in {:?}", t0.elapsed());
+
+        assert!(result.is_ok(), "private_spend.msc failed: {:?}", result);
+        println!("✅ private_spend.msc — STARK verified, signature verified, script passed");
+    }
+    
 }
