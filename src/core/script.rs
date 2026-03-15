@@ -121,10 +121,9 @@ pub struct ExecContext<'a> {
 ///
 /// ```rust
 /// use midstate::core::script::{validate_structure, OP_IF, OP_ENDIF, OP_ADD};
-/// assert!(validate_structure(&[OP_IF, OP_ADD, OP_ENDIF]).is_ok());
-/// assert!(validate_structure(&[OP_IF, OP_ADD]).is_err()); // Unbalanced
+/// assert!(validate_structure(&[OP_IF, OP_ADD, OP_ENDIF], u64::MAX).is_ok());
+/// assert!(validate_structure(&[OP_IF, OP_ADD], u64::MAX).is_err()); // Unbalanced
 /// ```
-// FIX 1: Change the return type to Result<bool, ScriptError>
 pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<bool, ScriptError> {
     if bytecode.len() > MAX_SCRIPT_SIZE {
         return Err(ScriptError::ScriptTooLarge);
@@ -132,7 +131,7 @@ pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<bool, ScriptEr
 
     let mut pc = 0usize;
     let mut if_depth: i32 = 0;
-    let mut has_stark = false; // <-- Add this tracker
+    let mut has_stark = false;
 
     while pc < bytecode.len() {
         let op = bytecode[pc];

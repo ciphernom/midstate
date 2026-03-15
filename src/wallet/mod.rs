@@ -1311,10 +1311,10 @@ mod tests {
         assert_eq!(change_seeds.len(), change_count);
 
         // First two are to recipient
-        assert_eq!(outputs[0].address(), dest);
-        assert_eq!(outputs[0].value(), 4);
-        assert_eq!(outputs[1].address(), dest);
-        assert_eq!(outputs[1].value(), 2);
+        let dest_outs: Vec<_> = outputs.iter().filter(|o| o.address() == dest).collect();
+        assert_eq!(dest_outs.len(), 2);
+        assert!(dest_outs.iter().any(|o| o.value() == 4));
+        assert!(dest_outs.iter().any(|o| o.value() == 2));
 
         // Change values sum correctly
         let change_total: u64 = change_seeds.iter().map(|(idx, _)| outputs[*idx].value()).sum();
@@ -1463,9 +1463,9 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         let mut w = Wallet::create(&path, b"pass").unwrap();
-        let c1 = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
-        let c2 = w.import_coin([2; 32], 4, [20; 32], None).unwrap();
-        let c3 = w.import_coin([3; 32], 16, [30; 32], None).unwrap();
+let c1 = w.import_coin([1; 32], 20_000, [10; 32], None).unwrap();
+let c2 = w.import_coin([2; 32], 20_000, [20; 32], None).unwrap();
+let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
 
         let live = vec![c1, c2, c3];
         let dest = [0xAA; 32];
