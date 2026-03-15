@@ -7,6 +7,7 @@ pub mod state;
 pub mod mmr;  
 pub mod mss;
 pub mod script;
+pub mod stark;
 pub mod filter;
 pub mod simd_mining;
 pub mod wots_simd;
