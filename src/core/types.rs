@@ -101,6 +101,15 @@ pub fn compute_coin_id(address: &[u8; 32], value: u64, salt: &[u8; 32]) -> [u8; 
      *hasher.finalize().as_bytes()
 }
 
+/// Create a confidential value commitment: Blake3(value_le || blinding_factor).
+/// The blinding_factor must be 32 bytes of cryptographic randomness.
+pub fn compute_value_commitment(value: u64, blinding: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&value.to_le_bytes());
+    hasher.update(blinding);
+    *hasher.finalize().as_bytes()
+}
+
 /// Compute a commitment hash that binds inputs to outputs.
 ///
 /// commitment = BLAKE3(NETWORK_MAGIC || coin_id_1 || ... || new_coin_id_1 || ... || salt)
@@ -338,7 +347,15 @@ pub enum OutputData {
         value: u64,
         salt: [u8; 32],
     },
-    
+    /// A confidential output whose value is hidden behind a Blake3 commitment.
+    /// Balance correctness is proven via OP_VERIFY_STARK with the
+    /// `confidential_transfer` program. The node does not perform arithmetic
+    /// balance checking — the STARK proof covers it.
+    Confidential {
+        address: [u8; 32],
+        commitment: [u8; 32],
+        salt: [u8; 32],
+    },
     /// A provably unspendable data payload that is ignored by the UTXO SMT
     DataBurn {
         payload: Vec<u8>,
@@ -355,6 +372,7 @@ impl<'de> Deserialize<'de> for OutputData {
         #[derive(Deserialize)]
         enum OutputDataHelper {
             Standard { address: [u8; 32], value: u64, salt: [u8; 32] },
+            Confidential { address: [u8; 32], commitment: [u8; 32], salt: [u8; 32] },
             DataBurn { payload: Vec<u8>, value_burned: u64 },
         }
 
@@ -362,6 +380,9 @@ impl<'de> Deserialize<'de> for OutputData {
         match helper {
             OutputDataHelper::Standard { address, value, salt } => {
                 Ok(OutputData::Standard { address, value, salt })
+            }
+            OutputDataHelper::Confidential { address, commitment, salt } => {
+                Ok(OutputData::Confidential { address, commitment, salt })
             }
             OutputDataHelper::DataBurn { payload, value_burned } => {
                 if payload.len() > crate::core::MAX_BURN_DATA_SIZE {
@@ -377,11 +398,19 @@ impl<'de> Deserialize<'de> for OutputData {
 }
 
 impl OutputData {
-    /// Returns the Coin ID if this is a standard spendable UTXO.
+    /// Returns the Coin ID if this is a spendable UTXO (Standard or Confidential).
     pub fn coin_id(&self) -> Option<[u8; 32]> {
         match self {
             OutputData::Standard { address, value, salt } => {
                 Some(compute_coin_id(address, *value, salt))
+            }
+            OutputData::Confidential { address, commitment, salt } => {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"CONFIDENTIAL");
+                hasher.update(address);
+                hasher.update(commitment);
+                hasher.update(salt);
+                Some(*hasher.finalize().as_bytes())
             }
             OutputData::DataBurn { .. } => None,
         }
@@ -394,6 +423,14 @@ impl OutputData {
             OutputData::Standard { address, value, salt } => {
                 compute_coin_id(address, *value, salt)
             }
+            OutputData::Confidential { address, commitment, salt } => {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"CONFIDENTIAL");
+                hasher.update(address);
+                hasher.update(commitment);
+                hasher.update(salt);
+                *hasher.finalize().as_bytes()
+            }
             OutputData::DataBurn { payload, value_burned } => {
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(b"DATABURN");
@@ -404,9 +441,12 @@ impl OutputData {
         }
     }
 
+    /// Returns the visible value. Confidential outputs return 0 —
+    /// their real value is proven via STARK, not visible on-chain.
     pub fn value(&self) -> u64 {
         match self {
             OutputData::Standard { value, .. } => *value,
+            OutputData::Confidential { .. } => 0,
             OutputData::DataBurn { value_burned, .. } => *value_burned,
         }
     }
@@ -414,6 +454,7 @@ impl OutputData {
     pub fn address(&self) -> [u8; 32] {
         match self {
             OutputData::Standard { address, .. } => *address,
+            OutputData::Confidential { address, .. } => *address,
             OutputData::DataBurn { .. } => [0u8; 32],
         }
     }
@@ -421,8 +462,22 @@ impl OutputData {
     pub fn salt(&self) -> [u8; 32] {
         match self {
             OutputData::Standard { salt, .. } => *salt,
+            OutputData::Confidential { salt, .. } => *salt,
             OutputData::DataBurn { .. } => [0u8; 32],
         }
+    }
+
+    /// Returns the commitment hash for confidential outputs, None otherwise.
+    pub fn commitment(&self) -> Option<[u8; 32]> {
+        match self {
+            OutputData::Confidential { commitment, .. } => Some(*commitment),
+            _ => None,
+        }
+    }
+
+    /// True if this output hides its value behind a STARK-verified commitment.
+    pub fn is_confidential(&self) -> bool {
+        matches!(self, OutputData::Confidential { .. })
     }
 }
 
@@ -498,10 +553,18 @@ impl Transaction {
     }
 
     /// Fee = sum(input values) - sum(output values). Zero for Commit.
+    ///
+    /// If any output is Confidential, the "missing" value is accounted for
+    /// by the STARK balance proof in the spending script — the node does not
+    /// do arithmetic balance checking. We return 0 fee so the transaction
+    /// is not rejected for insufficient funds.
     pub fn fee(&self) -> u64 {
         match self {
             Transaction::Commit { .. } => 0,
             Transaction::Reveal { inputs, outputs, .. } => {
+                if outputs.iter().any(|o| o.is_confidential()) {
+                    return 0;
+                }
                 let in_sum = inputs.iter().try_fold(0u64, |acc, i| acc.checked_add(i.value)).unwrap_or(u64::MAX);
                 let out_sum = outputs.iter().try_fold(0u64, |acc, o| acc.checked_add(o.value())).unwrap_or(u64::MAX);
                 in_sum.saturating_sub(out_sum)
@@ -596,6 +659,10 @@ pub const MSS_REUSE_ACTIVATION_HEIGHT: u64 = 25_000;
 
 /// Block height at which STARK proof verification and 128KB witness payloads activate.
 pub const STARK_ACTIVATION_HEIGHT: u64 = 1;
+
+/// Block height at which OutputData::Confidential is accepted in transactions.
+/// Requires STARK_ACTIVATION_HEIGHT to already be active.
+pub const CONFIDENTIAL_ACTIVATION_HEIGHT: u64 = 1;
 
 // ── Economics ───────────────────────────────────────────────────────────────
 
@@ -811,6 +878,93 @@ mod tests {
     fn output_data_coin_id() {
         let o = OutputData::Standard { address: [1u8; 32], value: 8, salt: [2u8; 32] };
         assert_eq!(o.coin_id(), Some(compute_coin_id(&[1u8; 32], 8, &[2u8; 32])));
+    }
+
+    #[test]
+    fn confidential_coin_id_differs_from_standard() {
+        let addr = [1u8; 32];
+        let salt = [2u8; 32];
+        let commitment = compute_value_commitment(8, &[0xAA; 32]);
+        let std = OutputData::Standard { address: addr, value: 8, salt };
+        let conf = OutputData::Confidential { address: addr, commitment, salt };
+        assert_ne!(std.coin_id(), conf.coin_id());
+        assert!(conf.coin_id().is_some());
+    }
+
+    #[test]
+    fn confidential_value_is_zero() {
+        let o = OutputData::Confidential {
+            address: [1u8; 32],
+            commitment: [2u8; 32],
+            salt: [3u8; 32],
+        };
+        assert_eq!(o.value(), 0);
+        assert!(o.is_confidential());
+        assert!(o.commitment().is_some());
+    }
+
+    #[test]
+    fn confidential_address_and_salt() {
+        let addr = [0xAA; 32];
+        let salt = [0xBB; 32];
+        let o = OutputData::Confidential { address: addr, commitment: [0; 32], salt };
+        assert_eq!(o.address(), addr);
+        assert_eq!(o.salt(), salt);
+    }
+
+    #[test]
+    fn confidential_hash_for_commitment_matches_coin_id() {
+        let o = OutputData::Confidential {
+            address: [1u8; 32],
+            commitment: [2u8; 32],
+            salt: [3u8; 32],
+        };
+        assert_eq!(o.hash_for_commitment(), o.coin_id().unwrap());
+    }
+
+    #[test]
+    fn fee_zero_with_confidential_output() {
+        let tx = Transaction::Reveal {
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&[0u8; 32]), value: 100, salt: [0u8; 32] }],
+            witnesses: vec![Witness::sig(vec![])],
+            outputs: vec![OutputData::Confidential {
+                address: [0u8; 32],
+                commitment: [0u8; 32],
+                salt: [0u8; 32],
+            }],
+            salt: [0u8; 32],
+        };
+        assert_eq!(tx.fee(), 0);
+    }
+
+    #[test]
+    fn standard_not_confidential() {
+        let o = OutputData::Standard { address: [0; 32], value: 1, salt: [0; 32] };
+        assert!(!o.is_confidential());
+        assert!(o.commitment().is_none());
+    }
+
+    #[test]
+    fn compute_value_commitment_deterministic() {
+        let c1 = compute_value_commitment(100, &[0xAA; 32]);
+        let c2 = compute_value_commitment(100, &[0xAA; 32]);
+        assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn compute_value_commitment_differs_by_value() {
+        assert_ne!(
+            compute_value_commitment(100, &[0xAA; 32]),
+            compute_value_commitment(101, &[0xAA; 32]),
+        );
+    }
+
+    #[test]
+    fn compute_value_commitment_differs_by_blinding() {
+        assert_ne!(
+            compute_value_commitment(100, &[0xAA; 32]),
+            compute_value_commitment(100, &[0xBB; 32]),
+        );
     }
 
     #[test]
