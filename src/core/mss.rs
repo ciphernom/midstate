@@ -37,12 +37,6 @@ use super::types::hash_concat;
 use super::wots;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Write}; 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::path::PathBuf;
-use rayon::prelude::*; 
 // ── Config ──────────────────────────────────────────────────────────────────
 
 /// Default tree height. 2^10 = 1024 signatures per master key.
