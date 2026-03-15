@@ -338,6 +338,11 @@ pub enum OutputData {
         value: u64,
         salt: [u8; 32],
     },
+    Confidential { 
+        address: [u8; 32], 
+        commitment: [u8; 32], 
+        salt: [u8; 32] 
+    },
     /// A provably unspendable data payload that is ignored by the UTXO SMT
     DataBurn {
         payload: Vec<u8>,
@@ -592,6 +597,9 @@ pub const WOTS_REUSE_ACTIVATION_HEIGHT: u64 = 18_000;
 /// Block height at which MSS leaf reuse is enforced at consensus level.
 /// Uses the leaf's WOTS public key as a nullifier in the spent oracle.
 pub const MSS_REUSE_ACTIVATION_HEIGHT: u64 = 25_000; 
+
+/// Block height at which STARK proof verification and 128KB witness payloads activate.
+pub const STARK_ACTIVATION_HEIGHT: u64 = 1;
 
 // ── Economics ───────────────────────────────────────────────────────────────
 

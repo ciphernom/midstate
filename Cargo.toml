@@ -26,6 +26,8 @@ bip39 = "2.0"
 toml = "1.0.3"
 tracing = "0.1"
 smallvec = "1.15.1"
+winterfell = "0.10.2"
+winter-utils = "=0.10.2" # STRICTLY pinned to match winterfell
 
 # NATIVE ONLY: Networking, File System, OS Allocators, CLI, Web Servers
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -42,6 +44,9 @@ libp2p = { version = "0.54", features = ["tokio", "noise", "tcp", "yamux", "kad"
 # reqwest: use rustls instead of native openssl — pure Rust, cross-compiles cleanly
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 
+winterfell = "0.10"
+lazy_static = "1"
+
 # Use jemalloc on Linux/macOS (Not Wasm, Not Windows)
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_env = "msvc")))'.dependencies]
 tikv-jemallocator = "0.5.4"
@@ -50,8 +55,10 @@ tikv-jemallocator = "0.5.4"
 [target.'cfg(all(not(target_arch = "wasm32"), target_env = "msvc"))'.dependencies]
 mimalloc = "0.1.43"
 
+
 [features]
 fast-mining = []
+stark-prover = []  # Only needed by wallets/miners that generate proofs
 
 [dev-dependencies]
 tempfile = "3.8"

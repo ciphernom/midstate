@@ -958,7 +958,7 @@ mod tests {
 
         // A low-PoW commit should now be rejected outright (pool still full, 30 bits required).
         let bad_tx = Transaction::Commit { commitment: hash(b"bad"), spam_nonce: 0 };
-        let err = mp.add(bad_tx, &state).unwrap_err();
+        let err = mp.add(bad_tx, &state, &std::collections::HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("Mempool is busy"));
     }
 

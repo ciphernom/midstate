@@ -222,13 +222,13 @@ let mut total_balance = 0u64;
         if mss_keypair.remaining() == 0 {
             anyhow::bail!("CRITICAL: MSS key capacity exhausted during payout!");
         }
-        // Save the incremented leaf index to disk BEFORE signing.
-        // If the process crashes between save and sign, the next run's
-        // /mss_state check will see the gap and fast-forward past it.
-        // This is strictly safer than saving after: crash-after-sign = reuse.
-        mss_keypair.set_next_leaf(mss_keypair.next_leaf + 1);
-        save_mss_key(&db, &mss_keypair)?;
+        // sign() internally advances next_leaf. Save to disk immediately
+        // after so a crash mid-loop doesn't lose the advancement.
+        // If we crash AFTER sign but BEFORE save, the next run's
+        // /mss_state startup check will detect the on-chain usage and
+        // fast-forward past it, preventing reuse.
         let sig = mss_keypair.sign(&commitment)?;
+        save_mss_key(&db, &mss_keypair)?;
         signatures.push(hex::encode(sig.to_bytes()));
     }
 

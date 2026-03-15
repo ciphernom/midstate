@@ -62,11 +62,22 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
             if outputs.is_empty() { bail!("Transaction must create at least one new coin"); }
             if inputs.len() > MAX_TX_INPUTS { bail!("Too many inputs (max {})", MAX_TX_INPUTS); }
             if outputs.len() > MAX_TX_OUTPUTS { bail!("Too many outputs (max {})", MAX_TX_OUTPUTS); }
-            if witnesses.len() != inputs.len() { bail!("Witness count must match input count"); }
+            if witnesses.len() != inputs.len() { 
+                bail!("Witness count must match input count"); 
+            }
 
-            let max_witness_size = MAX_SIGNATURE_SIZE * MAX_TX_INPUTS;
+            // STARK Activation Gate: Prevent 128KB block bloat before the hard fork
+            let max_witness_size = if state.height >= crate::core::types::STARK_ACTIVATION_HEIGHT {
+                (crate::core::stark::MAX_STARK_PROOF_SIZE + MAX_SIGNATURE_SIZE) * MAX_TX_INPUTS
+            } else {
+                MAX_SIGNATURE_SIZE * MAX_TX_INPUTS
+            };
+            
             if bincode::serialized_size(&witnesses).unwrap_or(u64::MAX) > max_witness_size as u64 {
-                bail!("Witnesses payload exceeds maximum allowed size");
+                bail!(
+                    "Witnesses payload exceeds maximum allowed size (STARKs inactive until block {})", 
+                    crate::core::types::STARK_ACTIVATION_HEIGHT
+                );
             }
 
             {
@@ -185,13 +196,22 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 bail!("Too many outputs (max {})", MAX_TX_OUTPUTS); 
             }
             
-            if witnesses.len() != inputs.len() {
-                bail!("Witness count must match input count");
+            if witnesses.len() != inputs.len() { 
+                bail!("Witness count must match input count"); 
             }
-            // Arbitrary payload size protection
-            let max_witness_size = MAX_SIGNATURE_SIZE * MAX_TX_INPUTS; 
+
+            // STARK Activation Gate: Prevent 128KB block bloat before the hard fork
+            let max_witness_size = if state.height >= crate::core::types::STARK_ACTIVATION_HEIGHT {
+                (crate::core::stark::MAX_STARK_PROOF_SIZE + MAX_SIGNATURE_SIZE) * MAX_TX_INPUTS
+            } else {
+                MAX_SIGNATURE_SIZE * MAX_TX_INPUTS
+            };
+            
             if bincode::serialized_size(&witnesses).unwrap_or(u64::MAX) > max_witness_size as u64 {
-                bail!("Witnesses payload exceeds maximum allowed size");
+                bail!(
+                    "Witnesses payload exceeds maximum allowed size (STARKs inactive until block {})", 
+                    crate::core::types::STARK_ACTIVATION_HEIGHT
+                );
             }
             {
                 let mut seen = std::collections::HashSet::new();
@@ -340,13 +360,22 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                 bail!("Too many outputs (max {})", MAX_TX_OUTPUTS); 
             }
             
-            if witnesses.len() != inputs.len() {
-                bail!("Witness count must match input count");
+            if witnesses.len() != inputs.len() { 
+                bail!("Witness count must match input count"); 
             }
-            // Arbitrary payload size protection
-            let max_witness_size = MAX_SIGNATURE_SIZE * MAX_TX_INPUTS; 
+
+            // STARK Activation Gate: Prevent 128KB block bloat before the hard fork
+            let max_witness_size = if state.height >= crate::core::types::STARK_ACTIVATION_HEIGHT {
+                (crate::core::stark::MAX_STARK_PROOF_SIZE + MAX_SIGNATURE_SIZE) * MAX_TX_INPUTS
+            } else {
+                MAX_SIGNATURE_SIZE * MAX_TX_INPUTS
+            };
+            
             if bincode::serialized_size(&witnesses).unwrap_or(u64::MAX) > max_witness_size as u64 {
-                bail!("Witnesses payload exceeds maximum allowed size");
+                bail!(
+                    "Witnesses payload exceeds maximum allowed size (STARKs inactive until block {})", 
+                    crate::core::types::STARK_ACTIVATION_HEIGHT
+                );
             }
             {
                 let mut seen = std::collections::HashSet::new();

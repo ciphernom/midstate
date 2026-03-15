@@ -562,7 +562,6 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             if final_addresses.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
                 selected.push(coin.coin_id);
                 selected_set.insert(coin.coin_id);
-                total += coin.value;
             }
         }
 
