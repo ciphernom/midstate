@@ -172,6 +172,13 @@ let inputs: Vec<InputReveal> = req.inputs.iter().map(|i| {
                     value_burned: *value_burned,
                 })
             }
+            OutputDataJson::Confidential { address, commitment, salt } => {
+                Ok(OutputData::Confidential {
+                    address: parse_hex32(address, "address")?,
+                    commitment: parse_hex32(commitment, "commitment")?,
+                    salt: parse_hex32(salt, "output_salt")?,
+                })
+            }
         }
     }).collect::<Result<_, ErrorResponse>>()?;
 
@@ -339,6 +346,9 @@ let input = InputReveal {
         },
         OutputDataJson::DataBurn { .. } => {
             return Err(ErrorResponse { error: "DataBurn payloads are not allowed in CoinJoin mixes".into() })
+        }
+        OutputDataJson::Confidential { .. } => {
+            return Err(ErrorResponse { error: "Confidential outputs are not allowed in CoinJoin mixes".into() })
         }
     };
 

@@ -798,6 +798,11 @@ async fn wallet_spend_script(
                 payload: hex::encode(payload),
                 value_burned: *value_burned,
             },
+            OutputData::Confidential { address, commitment, salt } => rpc::OutputDataJson::Confidential {
+                address: hex::encode(address),
+                commitment: hex::encode(commitment),
+                salt: hex::encode(salt),
+            },
         }).collect(),
         salt: commit_resp.salt,
     };
@@ -1615,6 +1620,11 @@ async fn do_reveal(
                 payload: hex::encode(payload),
                 value_burned: *value_burned,
             },
+            OutputData::Confidential { address, commitment, salt } => rpc::OutputDataJson::Confidential {
+                address: hex::encode(address),
+                commitment: hex::encode(commitment),
+                salt: hex::encode(salt),
+            },
         }).collect(),
         salt: hex::encode(pending.salt),
     };
@@ -2067,6 +2077,11 @@ let (input_reveals, signatures) = match wallet.sign_reveal(&pending) {
             midstate::core::OutputData::DataBurn { payload, value_burned } => rpc::OutputDataJson::DataBurn {
                 payload: hex::encode(payload),
                 value_burned: *value_burned,
+            },
+            midstate::core::OutputData::Confidential { address, commitment, salt } => rpc::OutputDataJson::Confidential {
+                address: hex::encode(address),
+                commitment: hex::encode(commitment),
+                salt: hex::encode(salt),
             },
         }).collect(),
             salt: hex::encode(pending.salt),
