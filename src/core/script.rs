@@ -124,13 +124,15 @@ pub struct ExecContext<'a> {
 /// assert!(validate_structure(&[OP_IF, OP_ADD, OP_ENDIF]).is_ok());
 /// assert!(validate_structure(&[OP_IF, OP_ADD]).is_err()); // Unbalanced
 /// ```
-pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<(), ScriptError> {
+// FIX 1: Change the return type to Result<bool, ScriptError>
+pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<bool, ScriptError> {
     if bytecode.len() > MAX_SCRIPT_SIZE {
         return Err(ScriptError::ScriptTooLarge);
     }
 
     let mut pc = 0usize;
     let mut if_depth: i32 = 0;
+    let mut has_stark = false; // <-- Add this tracker
 
     while pc < bytecode.len() {
         let op = bytecode[pc];
@@ -151,19 +153,13 @@ pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<(), ScriptErro
                 }
                 pc += len;
             }
-            OP_IF => {
-                if_depth += 1;
-            }
+            OP_IF => { if_depth += 1; }
             OP_ELSE => {
-                if if_depth <= 0 {
-                    return Err(ScriptError::UnbalancedConditional);
-                }
+                if if_depth <= 0 { return Err(ScriptError::UnbalancedConditional); }
             }
             OP_ENDIF => {
                 if_depth -= 1;
-                if if_depth < 0 {
-                    return Err(ScriptError::UnbalancedConditional);
-                }
+                if if_depth < 0 { return Err(ScriptError::UnbalancedConditional); }
             }
             OP_DROP | OP_DUP | OP_SWAP |
             OP_EQUAL | OP_VERIFY | OP_EQUALVERIFY |
@@ -172,10 +168,10 @@ pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<(), ScriptErro
             OP_SUM_TO_ADDR => {}
             
             OP_VERIFY_STARK => {
-                // Hard fork gate: Opcode is completely invalid before activation height
                 if height < crate::core::types::STARK_ACTIVATION_HEIGHT {
                     return Err(ScriptError::InvalidOpcode(op));
                 }
+                has_stark = true; // <-- We safely found the actual opcode!
             }
             _ => return Err(ScriptError::InvalidOpcode(op)),
         }
@@ -184,7 +180,8 @@ pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<(), ScriptErro
     if if_depth != 0 {
         return Err(ScriptError::UnbalancedConditional);
     }
-    Ok(())
+    
+    Ok(has_stark) // <-- Return the boolean
 }
 
 // ── Stack helpers ──────────────────────────────────────────────────────────
@@ -273,10 +270,10 @@ pub fn execute_script(
     witness: &[Vec<u8>],
     ctx: &ExecContext,
 ) -> Result<(), ScriptError> {
-    validate_structure(bytecode, ctx.height)?;
+    // FIX 2: Get the boolean safely from the structural parser!
+    let has_stark = validate_structure(bytecode, ctx.height)?;
 
     // Bypass the SmallVec stack for STARK proofs to avoid massive memory allocations.
-    let has_stark = bytecode.contains(&OP_VERIFY_STARK);
     let proof_bytes = if has_stark {
         witness.last().ok_or(ScriptError::StackUnderflow)?.as_slice()
     } else {
@@ -607,7 +604,7 @@ pub fn assemble(source: &str) -> Result<Vec<u8>, String> {
         i += 1;
     }
 
-    validate_structure(&bc, u64::MAX).map_err(|e| e.to_string())?;
+    let _ = validate_structure(&bc, u64::MAX).map_err(|e| e.to_string())?;
     Ok(bc)
 }
 
