@@ -404,7 +404,9 @@ mod tests {
             temp_coins.insert(coin_id);
         }
         
-        let state_root = hash_concat(&temp_coins.root(), &state.chain_mmr.root());
+let mut temp_commitments = state.commitments.clone();
+let smt_root = hash_concat(&temp_coins.root(), &temp_commitments.root());
+let state_root = hash_concat(&smt_root, &state.chain_mmr.root());
         mining_midstate = hash_concat(&mining_midstate, &state_root);
 
         // Search for a nonce that meets the target
