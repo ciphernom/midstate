@@ -615,7 +615,8 @@ async function performSend(toAddress, amount) {
     await new Promise(r => setTimeout(r, 50)); // Yield so toast renders before Wasm locks the thread
 
     // Mine the PoW nonce client-side in Wasm
-    const spamNonce = mine_commitment_pow(ctx.commitment, requiredPow);
+    const spamNonce = Number(mine_commitment_pow(ctx.commitment, requiredPow));
+
 
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Submitting commitment to network..." } });
 
