@@ -1,8 +1,10 @@
-import init, { WebWallet, generate_phrase, compute_coin_id_hex, decrypt_cli_wallet } from './pkg/wasm_wallet.js';
+import init, { WebWallet, generate_phrase, compute_coin_id_hex, decrypt_cli_wallet, mine_commitment_pow } from './pkg/wasm_wallet.js';
 
 let wallet = null;
 let rpcUrl = "https://rpc.cypherpunk.gold";
 let password = null;
+let isSending = false;
+let pendingSends = [];
 
 // Increased from 20 to 100. Change outputs consume multiple WOTS indices. 
 // A higher gap limit ensures we find all coins when restoring from a seed phrase.
@@ -163,7 +165,13 @@ self.onmessage = async (e) => {
             await performScan();
         }
         else if (type === 'SEND') {
-            await performSend(payload.toAddress, payload.amount);
+            if (isSending) throw new Error("A transaction is already in progress. Please wait for it to complete.");
+            isSending = true;
+            try {
+                await performSend(payload.toAddress, payload.amount);
+            } finally {
+                isSending = false;
+            }
         }
         else if (type === 'NEW_ADDRESS') {
             self.postMessage({ type: 'LOG', payload: "Deriving new receiving address..." });
@@ -239,6 +247,11 @@ self.onmessage = async (e) => {
             }
         }
     } catch (err) {
+        if (pendingSends.length > 0) {
+            pendingSends = [];
+            self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+        }
+        
         // Strip the "Error: " prefix if present to keep UI clean
         let errMsg = err.toString();
         if (errMsg.startsWith("Error: ")) errMsg = errMsg.substring(7);
@@ -273,9 +286,13 @@ function deriveNextMss(height) {
 function buildDashboardPayload() {
     const mssList = Object.keys(wState.mssAddrs);
     const utxoArray = Object.values(wState.utxos);
-    const safeBalance = utxoArray.reduce((s, u) => s + Number(u.value), 0);
     
-    const sortedHistory = wState.history.slice().sort((a, b) => b.timestamp - a.timestamp);
+    const totalUtxoValue = utxoArray.reduce((s, u) => s + Number(u.value), 0);
+    const pendingDeduction = pendingSends.reduce((s, tx) => s + tx.value + tx.fee, 0);
+    const safeBalance = Math.max(0, totalUtxoValue - pendingDeduction);
+    
+    const combinedHistory = [...pendingSends, ...wState.history];
+    const sortedHistory = combinedHistory.sort((a, b) => b.timestamp - a.timestamp);
     
     return {
         primaryAddress: mssList.length > 0 ? mssList[mssList.length - 1] : "None",
@@ -543,7 +560,6 @@ function addUtxo(address, value, salt, coinId) {
 }
 
 async function performSend(toAddress, amount) {
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { phase: 1, msg: "Syncing Wallet State & Selecting Coins..." } });
     
     for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
         wallet.set_mss_leaf_index(addr, mss.next_leaf);
@@ -565,6 +581,17 @@ async function performSend(toAddress, amount) {
 
     const ctx = JSON.parse(spendContextStr);
     
+    // Optimistic UI: instantly show pending transaction on the dashboard
+    pendingSends.push({
+        kind: 'pending',
+        timestamp: Math.floor(Date.now() / 1000),
+        fee: ctx.fee,
+        inputs: ctx.selected_inputs.map(i => i.coin_id),
+        outputs: [],
+        value: Number(amount)
+    });
+    self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+    
     while (wState.nextWotsIndex < ctx.next_wots_index) {
         deriveNextWots();
     }
@@ -579,34 +606,40 @@ async function performSend(toAddress, amount) {
     
     await saveState();
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { phase: 1, msg: `Submitting Commit to mempool (${ctx.selected_inputs.length} inputs)...` } });
+    // Fetch current difficulty from the node
+    const stateResp = await fetch(`${rpcUrl}/state`, { cache: 'no-store' });
+    const stateData = await stateResp.json();
+    const requiredPow = stateData.required_pow || 24;
+
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining Proof-of-Work locally..." } });
+    await new Promise(r => setTimeout(r, 50)); // Yield so toast renders before Wasm locks the thread
+
+    // Mine the PoW nonce client-side in Wasm
+    const spamNonce = mine_commitment_pow(ctx.commitment, requiredPow);
+
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Submitting commitment to network..." } });
 
     const commitReq = await fetch(`${rpcUrl}/commit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(ctx.commit_payload)
+        body: JSON.stringify({
+            commitment: ctx.commitment,
+            spam_nonce: spamNonce
+        })
     });
-    
+
     if (!commitReq.ok) {
         let errText = await commitReq.text();
         try { errText = JSON.parse(errText).error || errText; } catch(e) {}
         throw new Error(`Commit rejected by network:\n${errText}\n\nWhat to do: The network might be congested, or your UTXOs might be out of sync. Your funds have not moved. Run a Network Sync and try again.`);
     }
-    const commitResp = await JSON.parse(await commitReq.text());
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { phase: 1, msg: "Generating Post-Quantum Signatures (this requires heavy computation)..." } });
-    
-    // Yield to let the UI update before locking the thread with crypto
-    await new Promise(r => setTimeout(r, 50));
-    
-    const revealPayloadStr = wallet.build_reveal(spendContextStr, commitResp.commitment, commitResp.salt);
+    // Build reveal using the CLIENT's own commitment and salt (server no longer provides these)
+    const revealPayloadStr = wallet.build_reveal(spendContextStr, ctx.commitment, ctx.tx_salt);
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { phase: 1, msg: "Waiting for Commit to be mined into a block..." } });
-    
     // --- WAIT FOR COMMIT TO BE MINED ---
     let mempoolAccepted = false;
     for (let attempts = 0; attempts < 150; attempts++) {
-        if (attempts === 30) self.postMessage({ type: 'SEND_PROGRESS', payload: { phase: 1, msg: "Still waiting for Commit block..." } });
 
         const revealReq = await fetch(`${rpcUrl}/send`, {
             method: 'POST',
@@ -633,7 +666,7 @@ async function performSend(toAddress, amount) {
     if (!mempoolAccepted) throw new Error("Timed out waiting for Commit to be mined.\n\nWhat to do: Your funds are perfectly safe. The network dropped the transaction due to high traffic. Please try sending again in a few minutes.");
 
     // --- TRANSITION TO PHASE 2 ---
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { phase: 2, msg: "Commit mined! Reveal submitted to mempool. Waiting for next block..." } });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commitment mined! Broadcasting transaction..." } });
 
     // --- WAIT FOR REVEAL TO BE MINED ---
     // We verify the Reveal is mined by checking if our input coin has been successfully spent (removed from the UTXO set).
@@ -658,10 +691,9 @@ async function performSend(toAddress, amount) {
 
     if (!revealMined) throw new Error("Timed out waiting for Reveal to be mined. Your transaction is likely stuck in the mempool.");
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { phase: 2, msg: "Reveal mined! Transaction complete." } });
-    await new Promise(r => setTimeout(r, 500)); // Small delay for UI polish
-
     // --- FINALIZE LOCAL STATE ---
+    pendingSends = [];
+    
     for (const inp of ctx.selected_inputs) {
         delete wState.utxos[inp.coin_id];
     }
