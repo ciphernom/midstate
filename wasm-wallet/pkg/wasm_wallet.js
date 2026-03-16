@@ -306,6 +306,18 @@ export function generate_phrase() {
     }
 }
 
+/**
+ * @param {string} commitment_hex
+ * @param {number} required_pow
+ * @returns {bigint}
+ */
+export function mine_commitment_pow(commitment_hex, required_pow) {
+    const ptr0 = passStringToWasm0(commitment_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.mine_commitment_pow(ptr0, len0, required_pow);
+    return BigInt.asUintN(64, ret);
+}
+
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
