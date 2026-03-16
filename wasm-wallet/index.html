@@ -109,7 +109,7 @@
         .toast { 
             padding: 14px 16px; border-radius: 8px; font-weight: 500; text-align: center; font-size: 13px;
             opacity: 0; transform: translateY(-20px); transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); 
-            box-shadow: 0 10px 30px rgba(0,0,0,0.8); 
+            box-shadow: 0 10px 30px rgba(0,0,0,0.8); white-space: pre-wrap;
         }
         .toast.show { opacity: 1; transform: translateY(0); }
         .toast.success { background: var(--bg-panel); border: 1px solid var(--accent); color: var(--accent); }
@@ -149,13 +149,6 @@
             color: var(--accent); font-weight: bold; font-size: 14px; user-select: all; display: flex; align-items: center;
         }
         .seed-word span { color: #555; font-size: 10px; margin-right: 8px; user-select: none; font-weight: normal;}
-
-        /* Send Progress 2-Phase UX */
-        .progress-step { padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); transition: all 0.3s; margin-bottom: 10px; }
-        .progress-step.active { border-color: var(--accent); background: rgba(212, 255, 0, 0.05); opacity: 1 !important; }
-        .progress-step.done { border-color: var(--border-bright); opacity: 0.7 !important; }
-        .step-title { font-size: 13px; color: var(--text-max); margin-bottom: 4px; display: flex; align-items: center; gap: 8px; font-weight: bold; }
-        .step-desc { font-size: 11px; color: var(--text-bright); margin-left: 24px; line-height: 1.4; }
 
         /* Desktop UI Adjustments */
         @media (min-width: 768px) {
@@ -405,29 +398,6 @@
         </div>
     </div>
 
-<div id="sendProgressModal" class="modal-overlay">
-        <div class="modal" style="max-width: 450px;">
-            <h2 id="sendProgressTitle">Sending Transaction</h2>
-            
-            <div id="sendProgressArea" style="margin-bottom: 15px;">
-                <div class="progress-step active" id="step1">
-                    <div class="step-title"><span id="icon1">🔒</span> Phase 1: Commit</div>
-                    <div class="step-desc" id="desc1">Initializing...</div>
-                </div>
-                <div class="progress-step" id="step2" style="opacity: 0.4; margin-top: 10px;">
-                    <div class="step-title"><span id="icon2">👁️</span> Phase 2: Reveal</div>
-                    <div class="step-desc" id="desc2">Waiting for Commit to be mined...</div>
-                </div>
-            </div>
-
-            <div id="sendErrorHelp" class="hidden" style="font-size: 12px; color: #ff8888; margin-bottom: 15px; padding: 12px; border: 1px solid var(--red); border-radius: 6px; background: rgba(255,0,0,0.1); white-space: pre-wrap; line-height: 1.5;"></div>
-
-            <div class="modal-actions">
-                <button id="btnSendClose" class="btn-cancel hidden" onclick="closeSendModal()">Close</button>
-            </div>
-        </div>
-    </div>
-
     <script>
         if ('serviceWorker' in navigator) {
             window.addEventListener('load', () => {
@@ -438,12 +408,14 @@
         }
 
         // --- UI Helper Functions (Toasts & Modals) ---
-        function showToast(message, type = 'info') {
+        function showToast(message, type = 'info', duration) {
             const container = document.getElementById('toast-container');
             const toast = document.createElement('div');
             toast.className = `toast ${type}`;
             toast.innerText = message;
             container.appendChild(toast);
+            
+            const ms = duration || (type === 'error' ? 6000 : 3500);
             
             requestAnimationFrame(() => {
                 toast.classList.add('show');
@@ -452,7 +424,7 @@
             setTimeout(() => {
                 toast.classList.remove('show');
                 setTimeout(() => toast.remove(), 300);
-            }, 3000);
+            }, ms);
         }
 
         function showConfirm(title, htmlMessage, onConfirm) {
@@ -487,14 +459,6 @@
 
         function closeModal(id) {
             document.getElementById(id).classList.remove('active');
-        }
-        
-        function closeSendModal() {
-            closeModal('sendProgressModal');
-            // Reset the send button so user can try again
-            const btnSend = document.getElementById('btnSend');
-            btnSend.disabled = false;
-            btnSend.innerText = "Swipe to Send";
         }
 
         // --- QR Scanner Logic ---
@@ -570,6 +534,7 @@
         const logs = document.getElementById('term-log');
         
         let walletExists = false;
+        let sendInProgress = false;
         window.appHistory = []; // Global state for tx details modal
 
         function log(msg, color = 'var(--text-bright)') {
@@ -591,10 +556,15 @@
             if (!tx) return;
             
             const isSent = tx.kind === 'sent';
-            const sign = isSent ? '-' : '+';
-            const color = isSent ? 'var(--red)' : 'var(--accent)';
+            const isPending = tx.kind === 'pending';
+            const sign = (isSent || isPending) ? '-' : '+';
             
-            document.getElementById('txDetailTitle').innerText = tx.kind.toUpperCase() + " DETAILS";
+            let color = 'var(--accent)';
+            if (isSent) color = 'var(--red)';
+            if (isPending) color = '#ffa500';
+            
+            const displayKind = isPending ? '⏳ PENDING' : tx.kind.toUpperCase();
+            document.getElementById('txDetailTitle').innerText = displayKind + " DETAILS";
             const amtEl = document.getElementById('txDetailAmount');
             amtEl.innerText = `${sign}${tx.value}`;
             amtEl.style.color = color;
@@ -666,12 +636,20 @@
                     hList.innerHTML = payload.history.map((h, i) => {
                         const date = new Date(h.timestamp * 1000).toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
                         const isSent = h.kind === 'sent';
-                        const color = isSent ? 'var(--red)' : 'var(--accent)';
-                        const sign = isSent ? '-' : '+';
+                        const isPending = h.kind === 'pending';
+                        
+                        let color = 'var(--accent)';
+                        if (isSent) color = 'var(--red)';
+                        if (isPending) color = '#ffa500';
+                        
+                        const sign = (isSent || isPending) ? '-' : '+';
+                        const displayKind = isPending ? '⏳ PENDING' : h.kind;
+                        const opacityStyle = isPending ? 'opacity: 0.7; border-style: dashed;' : '';
+                        
                         return `
-                            <div class="list-item" onclick="showTxDetail(${i})" style="cursor: pointer; transition: background 0.2s;" onmouseover="this.style.background='var(--border)'" onmouseout="this.style.background='transparent'">
+                            <div class="list-item" onclick="showTxDetail(${i})" style="cursor: pointer; transition: background 0.2s; ${opacityStyle}" onmouseover="this.style.background='var(--border)'" onmouseout="this.style.background='transparent'">
                                 <div class="flex-row">
-                                    <span style="text-transform:uppercase; font-weight:bold; color:${color}; font-size: 12px;">${h.kind}</span>
+                                    <span style="text-transform:uppercase; font-weight:bold; color:${color}; font-size: 12px;">${displayKind}</span>
                                     <span style="color:var(--text-max); font-weight:bold; font-size: 16px;">${sign}${h.value}</span>
                                 </div>
                                 <div class="flex-row" style="margin-top:4px;">
@@ -754,31 +732,15 @@
                     break;
                 
                 case 'SEND_PROGRESS':
-                    if (payload.phase === 1) {
-                        document.getElementById('desc1').innerText = payload.msg;
-                    } else if (payload.phase === 2) {
-                        // Mark phase 1 done
-                        document.getElementById('step1').className = "progress-step done";
-                        document.getElementById('icon1').innerText = "✅";
-                        
-                        // Activate phase 2
-                        document.getElementById('step2').className = "progress-step active";
-                        document.getElementById('step2').style.opacity = "1";
-                        document.getElementById('icon2').innerText = "🔄";
-                        document.getElementById('desc2').innerText = payload.msg;
-                    }
+                    showToast(payload.msg, "info");
                     break;
                 case 'SEND_COMPLETE':
-                    document.getElementById('sendProgressTitle').innerText = "Transfer Submitted";
+                    sendInProgress = false;
+                    const btnSendDone = document.getElementById('btnSend');
+                    btnSendDone.disabled = false;
+                    btnSendDone.innerText = "Swipe to Send";
                     
-                    document.getElementById('step2').className = "progress-step done";
-                    document.getElementById('icon2').innerText = "✅";
-                    document.getElementById('desc2').innerText = "Transaction accepted by the network.";
-                    
-                    document.getElementById('btnSendClose').classList.remove('hidden');
-                    
-                    document.getElementById('sendAmount').value = '';
-                    document.getElementById('sendAddress').value = '';
+                    showToast("Transaction confirmed on-chain.", "success");
                     updateDashboard(payload);
                     break;
                     
@@ -798,19 +760,13 @@
                     updateDashboard(payload);
                     break;
                 case 'ERROR':
-                    const sendModal = document.getElementById('sendProgressModal');
-                    if (sendModal.classList.contains('active')) {
-                        // Error happened during a send
-                        document.getElementById('sendProgressTitle').innerText = "Transaction Failed";
-                        document.getElementById('sendProgressTitle').style.color = "var(--red)";
-                        document.getElementById('sendProgressArea').classList.add('hidden');
-                        
-                        const errDiv = document.getElementById('sendErrorHelp');
-                        errDiv.innerText = payload;
-                        errDiv.classList.remove('hidden');
-                        document.getElementById('btnSendClose').classList.remove('hidden');
+                    if (sendInProgress) {
+                        sendInProgress = false;
+                        const btnSendErr = document.getElementById('btnSend');
+                        btnSendErr.disabled = false;
+                        btnSendErr.innerText = "Swipe to Send";
+                        showToast(`Send failed: ${payload}`, "error");
                     } else {
-                        // Standard error
                         showToast(payload, "error");
                         resetUIState();
                         if (!walletExists) {
@@ -871,32 +827,22 @@
             const toAddress = document.getElementById('sendAddress').value;
             const amount = parseInt(document.getElementById('sendAmount').value);
             if(!toAddress || !amount) return showToast("Fill out transaction parameters.", "error");
+            if(sendInProgress) return showToast("A transaction is already in progress.", "info");
             
             showConfirm(
                 "Confirm Transaction",
                 `Are you sure you want to send <strong style="color:var(--text-max)">${amount}</strong> units to <br><span style="font-size:12px; word-break:break-all; color:var(--accent); display:block; margin-top:8px;">${toAddress}</span>?`,
                 () => {
-                    // Activate the progress modal immediately
-                    document.getElementById('sendProgressModal').classList.add('active');
-                    document.getElementById('sendProgressTitle').innerText = "Sending Transaction";
-                    document.getElementById('sendProgressTitle').style.color = "var(--text-max)";
-                    document.getElementById('sendProgressArea').classList.remove('hidden');
-                    document.getElementById('sendErrorHelp').classList.add('hidden');
-                    document.getElementById('btnSendClose').classList.add('hidden');
-                    
-                    // Reset steps
-                    document.getElementById('step1').className = "progress-step active";
-                    document.getElementById('step1').style.opacity = "1";
-                    document.getElementById('icon1').innerText = "🔒";
-                    document.getElementById('desc1').innerText = "Initializing...";
-                    
-                    document.getElementById('step2').className = "progress-step";
-                    document.getElementById('step2').style.opacity = "0.4";
-                    document.getElementById('icon2').innerText = "👁️";
-                    document.getElementById('desc2').innerText = "Waiting for Commit to be mined...";
-                    
+                    sendInProgress = true;
                     e.target.disabled = true;
                     e.target.innerText = "Processing...";
+                    
+                    // Clear form and navigate home immediately
+                    document.getElementById('sendAmount').value = '';
+                    document.getElementById('sendAddress').value = '';
+                    switchTab('view-home');
+                    showToast("Transaction submitted. Mining commitment...", "info");
+                    
                     worker.postMessage({ type: 'SEND', payload: { toAddress, amount } });
                 }
             );
