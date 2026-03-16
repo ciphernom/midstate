@@ -101,6 +101,16 @@
         progress::-webkit-progress-bar { background: var(--border); border-radius: 2px;}
         progress::-webkit-progress-value { background: var(--accent); border-radius: 2px; transition: width 0.1s; }
 
+        /* --- ACTIVITY BANNER --- */
+        #activity-banner {
+            display: none; padding: 10px 1.5rem; background: rgba(212, 255, 0, 0.06);
+            border-bottom: 1px solid var(--accent-dim); font-size: 12px; color: var(--accent);
+            align-items: center; gap: 10px; z-index: 10;
+        }
+        #activity-banner.active { display: flex; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .spinner { width: 14px; height: 14px; border: 2px solid var(--accent-dim); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }
+
         /* --- UI OVERLAYS: TOASTS & MODALS --- */
         #toast-container { 
             position: fixed; top: calc(env(safe-area-inset-top, 0px) + 20px); left: 50%; transform: translateX(-50%); 
@@ -157,11 +167,12 @@
                 width: 100%; max-width: 1000px; height: 85vh; min-height: 600px;
                 border: 1px solid var(--border-bright); border-radius: 12px;
                 box-shadow: 0 20px 50px rgba(0,0,0,0.5); display: grid; background: var(--bg);
-                grid-template-columns: 220px 1fr; grid-template-rows: 60px 1fr;
-                grid-template-areas: "nav header" "nav content";
+                grid-template-columns: 220px 1fr; grid-template-rows: 60px auto 1fr;
+                grid-template-areas: "nav header" "nav banner" "nav content";
             }
             header { grid-area: header; border-bottom: 1px solid var(--border); justify-content: flex-start; padding: 0 2rem; }
             header h1 { margin: 0; }
+            #activity-banner { grid-area: banner; }
             #bottom-nav {
                 position: static; grid-area: nav; flex-direction: column; justify-content: flex-start; gap: 8px;
                 border-top: none; border-right: 1px solid var(--border); background: var(--bg-panel); border-radius: 0; padding: 2rem 1rem;
@@ -182,6 +193,11 @@
         <header>
             <h1>MIDSTATE<span style="color:var(--accent);">.</span>WALLET</h1>
         </header>
+
+        <div id="activity-banner">
+            <div class="spinner"></div>
+            <span id="activity-msg">Processing...</span>
+        </div>
 
         <main id="authView" class="page active">
             <div class="panel">
@@ -425,6 +441,15 @@
                 toast.classList.remove('show');
                 setTimeout(() => toast.remove(), 300);
             }, ms);
+        }
+
+        function showActivity(msg) {
+            document.getElementById('activity-msg').innerText = msg;
+            document.getElementById('activity-banner').classList.add('active');
+        }
+
+        function hideActivity() {
+            document.getElementById('activity-banner').classList.remove('active');
         }
 
         function showConfirm(title, htmlMessage, onConfirm) {
@@ -732,9 +757,10 @@
                     break;
                 
                 case 'SEND_PROGRESS':
-                    showToast(payload.msg, "info");
+                    showActivity(payload.msg);
                     break;
                 case 'SEND_COMPLETE':
+                    hideActivity();
                     sendInProgress = false;
                     const btnSendDone = document.getElementById('btnSend');
                     btnSendDone.disabled = false;
@@ -760,6 +786,7 @@
                     updateDashboard(payload);
                     break;
                 case 'ERROR':
+                    hideActivity();
                     if (sendInProgress) {
                         sendInProgress = false;
                         const btnSendErr = document.getElementById('btnSend');
@@ -841,7 +868,7 @@
                     document.getElementById('sendAmount').value = '';
                     document.getElementById('sendAddress').value = '';
                     switchTab('view-home');
-                    showToast("Transaction submitted. Mining commitment...", "info");
+                    showActivity("Preparing transaction...");
                     
                     worker.postMessage({ type: 'SEND', payload: { toAddress, amount } });
                 }
