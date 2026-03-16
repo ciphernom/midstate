@@ -1,4 +1,4 @@
-const CACHE_NAME = 'midstate-wallet-v1';
+const CACHE_NAME = 'midstate-wallet-v2';
 const ASSETS = [
   './',
   './index.html',
@@ -32,7 +32,15 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
-  // Only cache GET requests (don't cache RPC POSTs or the blockchain sync will break)
+  const url = new URL(event.request.url);
+
+  // 1. ONLY intercept requests from our own domain.
+  // Bypass the Service Worker completely for external RPC node traffic.
+  if (url.origin !== location.origin) {
+    return;
+  }
+
+  // 2. Only cache GET requests
   if (event.request.method !== 'GET') return;
 
   event.respondWith(
@@ -40,7 +48,11 @@ self.addEventListener('fetch', (event) => {
       if (cachedResponse) {
         return cachedResponse;
       }
-      return fetch(event.request);
+      
+      // 3. Catch the fetch error so it doesn't throw a red console error
+      return fetch(event.request).catch((err) => {
+        console.error("Service Worker fetch failed for:", event.request.url, err);
+      });
     })
   );
 });

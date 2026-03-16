@@ -2,16 +2,15 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CommitRequest {
-    /// Input coin IDs being spent (hex, 32 bytes each)
-    pub coins: Vec<String>,
-    /// Output coin IDs (hex, 32 bytes each)
-    pub destinations: Vec<String>,
+    /// Client-computed commitment hash (hex, 32 bytes)
+    pub commitment: String,
+    /// Client-mined PoW nonce
+    pub spam_nonce: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CommitResponse {
     pub commitment: String,
-    pub salt: String,
     pub status: String,
 }
 
@@ -89,6 +88,7 @@ pub struct GetStateResponse {
     pub num_commitments: usize,
     pub target: String,
     pub block_reward: u64,
+    pub required_pow: u32,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetMssStateRequest {
