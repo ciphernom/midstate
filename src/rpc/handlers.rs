@@ -1,5 +1,5 @@
 use super::types::*;
-use crate::core::{compute_commitment, compute_coin_id, compute_address, hash_concat, wots,
+use crate::core::{compute_coin_id, compute_address, hash_concat, wots,
                   block_reward, Transaction, InputReveal, OutputData, Predicate, Witness};
 use crate::node::NodeHandle;
 use axum::{
@@ -42,6 +42,7 @@ pub async fn get_mss_state(
 pub async fn get_state(State(node): State<AppState>) -> Json<GetStateResponse> {
     let state = node.get_state().await;
     let safe_depth = node.get_safe_depth().await;
+    let required_pow = crate::mempool::Mempool::calculate_required_pow(state.commitments.len());
 
     Json(GetStateResponse {
         height: state.height,
@@ -52,6 +53,7 @@ pub async fn get_state(State(node): State<AppState>) -> Json<GetStateResponse> {
         num_commitments: state.commitments.len(),
         target: hex::encode(state.target),
         block_reward: block_reward(state.height),
+        required_pow,
     })
 }
 
@@ -68,58 +70,36 @@ pub async fn commit_transaction(
     State(node): State<AppState>,
     Json(req): Json<CommitRequest>,
 ) -> Result<Json<CommitResponse>, ErrorResponse> {
-    
-    // --- Rate Limit Check using Semaphore on NodeHandle ---
-    let _permit = node.commit_limiter.try_acquire().map_err(|_| ErrorResponse {
-        error: "Server is under heavy load computing PoW. Try again later.".into()
-    })?;
 
-    if req.coins.is_empty() {
-        return Err(ErrorResponse { error: "Must provide at least one coin".into() });
-    }
-    if req.destinations.is_empty() {
-        return Err(ErrorResponse { error: "Must provide at least one destination".into() });
-    }
+    let commitment = parse_hex32(&req.commitment, "commitment")?;
 
-    let input_coins: Vec<[u8; 32]> = req.coins.iter()
-        .map(|h| parse_hex32(h, "coin"))
-        .collect::<Result<_, _>>()?;
-
-    let destinations: Vec<[u8; 32]> = req.destinations.iter()
-        .map(|h| parse_hex32(h, "destination"))
-        .collect::<Result<_, _>>()?;
-
-    let salt: [u8; 32] = rand::random();
-    let commitment = compute_commitment(&input_coins, &destinations, &salt);
-
-    // Determine dynamic PoW requirement based on mempool congestion
+    // Verify the client's PoW meets the current dynamic threshold
     let (_, txs) = node.get_mempool_info().await;
     let pending_commits = txs.iter().filter(|t| matches!(t, Transaction::Commit { .. })).count();
-    
-    // Use the dynamic threshold from Mempool
     let required_pow = crate::mempool::Mempool::calculate_required_pow(pending_commits);
 
-    // Mine PoW nonce for anti-spam
-    let spam_nonce = tokio::task::spawn_blocking(move || {
-        let mut n = 0u64;
-        loop {
-            let h = hash_concat(&commitment, &n.to_le_bytes());
-            if crate::core::types::count_leading_zeros(&h) >= required_pow {
-                return n;
-            }
-            n += 1;
-        }
-    }).await.map_err(|_| ErrorResponse { error: "PoW task failed".into() })?;
+    let h = hash_concat(&commitment, &req.spam_nonce.to_le_bytes());
+    if crate::core::types::count_leading_zeros(&h) < required_pow {
+        return Err(ErrorResponse {
+            error: format!(
+                "Insufficient PoW: need {} leading zeros, got {}",
+                required_pow,
+                crate::core::types::count_leading_zeros(&h)
+            ),
+        });
+    }
 
-    let tx = Transaction::Commit { commitment, spam_nonce };
-    
+    let tx = Transaction::Commit {
+        commitment,
+        spam_nonce: req.spam_nonce,
+    };
+
     node.send_transaction(tx)
         .await
         .map_err(|e| ErrorResponse { error: e.to_string() })?;
 
     Ok(Json(CommitResponse {
         commitment: hex::encode(commitment),
-        salt: hex::encode(salt),
         status: "committed".to_string(),
     }))
 }

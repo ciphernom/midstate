@@ -29,6 +29,21 @@ pub fn compute_coin_id_hex(address_hex: &str, value: u64, salt_hex: &str) -> Str
     hex::encode(cid)
 }
 
+#[wasm_bindgen]
+pub fn mine_commitment_pow(commitment_hex: &str, required_pow: u32) -> u64 {
+    let mut commitment = [0u8; 32];
+    hex::decode_to_slice(commitment_hex, &mut commitment).unwrap();
+
+    let mut nonce = 0u64;
+    loop {
+        let h = midstate::core::hash_concat(&commitment, &nonce.to_le_bytes());
+        if midstate::core::count_leading_zeros(&h) >= required_pow {
+            return nonce;
+        }
+        nonce += 1;
+    }
+}
+
 // ─── JSON Interop Structs ───────────────────────────────────────────────────
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
