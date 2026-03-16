@@ -117,8 +117,10 @@ async fn main() {
     // 5. Setup Chain Syncer (polls local full node)
     let height_clone = Arc::clone(&network_height);
     let target_clone = Arc::clone(&network_target);
+    let share_target_check = share_target;
     tokio::spawn(async move {
         let client = reqwest::Client::new();
+        let mut warned_target = false;
         loop {
             if let Ok(res) = client.get("http://127.0.0.1:8545/state").send().await {
                 if let Ok(json) = res.json::<serde_json::Value>().await {
@@ -130,6 +132,15 @@ async fn main() {
                             if t_bytes.len() == 32 {
                                 let mut arr = [0u8; 32];
                                 arr.copy_from_slice(&t_bytes);
+                                // Sanity check: share_target must be EASIER (larger) than network target.
+                                // If not, every share would need to be a full block, defeating the purpose.
+                                if !warned_target && arr > share_target_check {
+                                    tracing::error!(
+                                        "MISCONFIGURED: share_target ({}) is HARDER than network target ({}). No shares will be accepted!",
+                                        hex::encode(share_target_check), hex::encode(arr)
+                                    );
+                                    warned_target = true;
+                                }
                                 *target_clone.write().unwrap() = arr;
                             }
                         }
