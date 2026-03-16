@@ -560,6 +560,8 @@ function addUtxo(address, value, salt, coinId) {
 }
 
 async function performSend(toAddress, amount) {
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Selecting coins and building transaction..." } });
+    await new Promise(r => setTimeout(r, 10));
     
     for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
         wallet.set_mss_leaf_index(addr, mss.next_leaf);
@@ -604,21 +606,23 @@ async function performSend(toAddress, amount) {
         wState.mssAddrs[addr].next_leaf++;
     }
     
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Encrypting and saving wallet state..." } });
+    await new Promise(r => setTimeout(r, 10));
     await saveState();
 
     // Fetch current difficulty from the node
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Fetching network difficulty..." } });
     const stateResp = await fetch(`${rpcUrl}/state`, { cache: 'no-store' });
     const stateData = await stateResp.json();
     const requiredPow = stateData.required_pow || 24;
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining Proof-of-Work locally..." } });
-    await new Promise(r => setTimeout(r, 50)); // Yield so toast renders before Wasm locks the thread
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Mining Proof-of-Work (difficulty: ${requiredPow})...` } });
+    await new Promise(r => setTimeout(r, 50)); // Yield so banner renders before Wasm locks the thread
 
-    // Mine the PoW nonce client-side in Wasm
+    // Mine the PoW nonce client-side in Wasm (Number() to avoid BigInt serialization failure)
     const spamNonce = Number(mine_commitment_pow(ctx.commitment, requiredPow));
 
-
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Submitting commitment to network..." } });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "PoW complete. Submitting commitment..." } });
 
     const commitReq = await fetch(`${rpcUrl}/commit`, {
         method: 'POST',
@@ -635,12 +639,17 @@ async function performSend(toAddress, amount) {
         throw new Error(`Commit rejected by network:\n${errText}\n\nWhat to do: The network might be congested, or your UTXOs might be out of sync. Your funds have not moved. Run a Network Sync and try again.`);
     }
 
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commitment accepted. Waiting for block confirmation..." } });
+
     // Build reveal using the CLIENT's own commitment and salt (server no longer provides these)
     const revealPayloadStr = wallet.build_reveal(spendContextStr, ctx.commitment, ctx.tx_salt);
 
     // --- WAIT FOR COMMIT TO BE MINED ---
     let mempoolAccepted = false;
     for (let attempts = 0; attempts < 150; attempts++) {
+        if (attempts > 0 && attempts % 15 === 0) {
+            self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Still waiting for commit block (${attempts * 2}s)...` } });
+        }
 
         const revealReq = await fetch(`${rpcUrl}/send`, {
             method: 'POST',
@@ -667,13 +676,17 @@ async function performSend(toAddress, amount) {
     if (!mempoolAccepted) throw new Error("Timed out waiting for Commit to be mined.\n\nWhat to do: Your funds are perfectly safe. The network dropped the transaction due to high traffic. Please try sending again in a few minutes.");
 
     // --- TRANSITION TO PHASE 2 ---
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commitment mined! Broadcasting transaction..." } });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commit confirmed! Broadcasting reveal..." } });
 
     // --- WAIT FOR REVEAL TO BE MINED ---
     // We verify the Reveal is mined by checking if our input coin has been successfully spent (removed from the UTXO set).
     const inputCoinToCheck = ctx.selected_inputs[0].coin_id;
     let revealMined = false;
     for (let attempts = 0; attempts < 150; attempts++) {
+        if (attempts > 0 && attempts % 15 === 0) {
+            self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Waiting for reveal to be mined (${attempts * 2}s)...` } });
+        }
+
         const checkReq = await fetch(`${rpcUrl}/check`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
