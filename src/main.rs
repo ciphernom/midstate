@@ -736,22 +736,13 @@ async fn wallet_spend_script(
     let input_coin_ids: Vec<[u8; 32]> = spending_coins.iter().map(|c| c.coin_id).collect();
     let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
     
-    let commit_req = rpc::CommitRequest {
-        coins: input_coin_ids.iter().map(|c| hex::encode(c)).collect(),
-        destinations: output_commit_hashes.iter().map(hex::encode).collect(),
-    };
+    let tx_salt: [u8; 32] = rand::random();
+    let commitment = midstate::core::compute_commitment(&input_coin_ids, &output_commit_hashes, &tx_salt);
 
     println!("Submitting Phase 1 Commit...");
-    let url = format!("http://{}:{}/commit", rpc_host, rpc_port);
-    let resp = client.post(&url).json(&commit_req).send().await?;
-    if !resp.status().is_success() {
-        let err: rpc::ErrorResponse = resp.json().await?;
-        anyhow::bail!("Commit failed: {}", err.error);
-    }
-    let commit_resp: rpc::CommitResponse = resp.json().await?;
-    let server_commitment = parse_hex32(&commit_resp.commitment)?;
+    submit_commit(&client, rpc_port, &rpc_host, &commitment).await?;
 
-    if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &commit_resp.commitment, timeout_secs).await {
+    if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &hex::encode(commitment), timeout_secs).await {
         anyhow::bail!("Timed out waiting for Commit to be mined.");
     }
     println!("✓ Commit mined!");
@@ -763,7 +754,7 @@ async fn wallet_spend_script(
             let pk_hex = token.strip_prefix("AUTO:").unwrap();
             let pk = parse_hex32(pk_hex)?;
             println!("Auto-solving signature for {}...", hex::encode(&pk));
-            stack_items.push(wallet.auto_sign(&pk, &server_commitment)?);
+            stack_items.push(wallet.auto_sign(&pk, &commitment)?);
         } else {
             stack_items.push(hex::decode(token).context("Invalid hex in --inputs")?);
         }
@@ -804,7 +795,7 @@ async fn wallet_spend_script(
                 salt: hex::encode(salt),
             },
         }).collect(),
-        salt: commit_resp.salt,
+        salt: hex::encode(tx_salt),
     };
     
     println!("Submitting Phase 2 Reveal...");
@@ -924,30 +915,21 @@ async fn wallet_spend_stark(
         let input_coin_ids = vec![target_coin_id];
         let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
         
+        let tx_salt: [u8; 32] = rand::random();
+        let commitment = midstate::core::compute_commitment(&input_coin_ids, &output_commit_hashes, &tx_salt);
+
         // 3. Phase 1: Commit
         println!("Submitting Phase 1 Commit...");
-        let commit_req = rpc::CommitRequest {
-            coins: input_coin_ids.iter().map(hex::encode).collect(),
-            destinations: output_commit_hashes.iter().map(hex::encode).collect(),
-        };
+        submit_commit(&client, rpc_port, &rpc_host, &commitment).await?;
 
-        let url = format!("http://{}:{}/commit", rpc_host, rpc_port);
-        let resp = client.post(&url).json(&commit_req).send().await?;
-        if !resp.status().is_success() {
-            let err: rpc::ErrorResponse = resp.json().await?;
-            anyhow::bail!("Commit failed: {}", err.error);
-        }
-        let commit_resp: rpc::CommitResponse = resp.json().await?;
-        let server_commitment = parse_hex32(&commit_resp.commitment)?;
-
-        if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &commit_resp.commitment, timeout_secs).await {
+        if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &hex::encode(commitment), timeout_secs).await {
             anyhow::bail!("Timed out waiting for Commit to be mined.");
         }
         println!("✓ Commit mined!");
 
         // 4. Phase 2: Reveal (Constructing the Witness Stack)
         // Witness stack must match script execution order: [sig, pub_inputs, proof]
-        let sig_bytes = wallet.auto_sign(&target_coin.owner_pk, &server_commitment)?;
+        let sig_bytes = wallet.auto_sign(&target_coin.owner_pk, &commitment)?;
         
         let witness_stack = vec![
             hex::encode(sig_bytes),
@@ -970,7 +952,7 @@ async fn wallet_spend_stark(
                 },
                 _ => unreachable!(),
             }).collect(),
-            salt: commit_resp.salt,
+            salt: hex::encode(tx_salt),
         };
         
         println!("Submitting Phase 2 Reveal (Pushing massive STARK payload to mempool)...");
@@ -1339,32 +1321,19 @@ async fn wallet_send(
             println!("  Pair {}: {} in (value {}) → {} out (value {}, fee {})",
                 pair_idx, inputs.len(), in_val, outputs.len(), out_val, in_val - out_val);
 
-            let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
-
-            let (commitment, _salt) = wallet.prepare_commit(
+            let (commitment, salt) = wallet.prepare_commit(
                 inputs, outputs, change_seeds.clone(), true
             )?;
 
-            let commit_req = rpc::CommitRequest {
-                coins: inputs.iter().map(|c| hex::encode(c)).collect(),
-                destinations: output_commit_hashes.iter().map(|d| hex::encode(d)).collect(),
-            };
-
-            let url = format!("http://{}:{}/commit",rpc_host, rpc_port);
-            let response = client.post(&url).json(&commit_req).send().await?;
-            if !response.status().is_success() {
-                let error: rpc::ErrorResponse = response.json().await?;
-                println!("  Pair {} commit failed: {}", pair_idx, error.error);
+            if let Err(e) = submit_commit(&client, rpc_port, &rpc_host, &commitment).await {
+                println!("  Pair {} commit failed: {}", pair_idx, e);
                 continue;
             }
-            let commit_resp: rpc::CommitResponse = response.json().await?;
-            let server_commitment = parse_hex32(&commit_resp.commitment)?;
-            let server_salt = parse_hex32(&commit_resp.salt)?;
 
             wallet.data.pending.retain(|p| p.commitment != commitment);
             wallet.data.pending.push(wallet::PendingCommit {
-                commitment: server_commitment,
-                salt: server_salt,
+                commitment,
+                salt,
                 input_coin_ids: inputs.clone(),
                 outputs: outputs.clone(),
                 change_seeds: change_seeds.clone(),
@@ -1373,21 +1342,21 @@ async fn wallet_send(
             });
             wallet.save()?;
 
-            println!("  ✓ Commit submitted ({})", hex::encode(&server_commitment));
+            println!("  ✓ Commit submitted ({})", hex::encode(&commitment));
 
-            if !wait_for_commit_mined(&client, rpc_port,&rpc_host, &commit_resp.commitment, timeout_secs).await {
+            if !wait_for_commit_mined(&client, rpc_port,&rpc_host, &hex::encode(commitment), timeout_secs).await {
                 println!("  ⏳ Not mined yet. Run `wallet reveal` later.");
                 continue;
             }
 
-            let pending = wallet.find_pending(&server_commitment).unwrap().clone();
+            let pending = wallet.find_pending(&commitment).unwrap().clone();
             let delay = pending.reveal_not_before.saturating_sub(now_secs());
             if delay > 0 {
                 println!("  Waiting {}s (privacy delay)...", delay);
                 tokio::time::sleep(Duration::from_secs(delay)).await;
             }
 
-            do_reveal(&client, &mut wallet, rpc_port, &rpc_host, &server_commitment, timeout_secs).await?;
+            do_reveal(&client, &mut wallet, rpc_port, &rpc_host, &commitment, timeout_secs).await?;
         }
     } else {
         let mut target_fee = 100u64; // Start with a conservative minimum guess
@@ -1493,8 +1462,6 @@ async fn wallet_send(
             }
         }
 
-        let output_commit_hashes: Vec<[u8; 32]> = all_outputs.iter().map(|o| o.hash_for_commitment()).collect();
-
         println!(
             "Spending {} coin(s) (value {}) → {} output(s) (value {}, fee: {})",
             input_coin_ids.len(), in_sum,
@@ -1502,29 +1469,16 @@ async fn wallet_send(
             final_fee
         );
 
-        let (commitment, _salt) = wallet.prepare_commit(
+        let (commitment, salt) = wallet.prepare_commit(
             &input_coin_ids, &all_outputs, change_seeds.clone(), false
         )?;
 
-        let commit_req = rpc::CommitRequest {
-            coins: input_coin_ids.iter().map(|c| hex::encode(c)).collect(),
-            destinations: output_commit_hashes.iter().map(|d| hex::encode(d)).collect(),
-        };
-
-        let url = format!("http://{}:{}/commit", rpc_host, rpc_port);
-        let response = client.post(&url).json(&commit_req).send().await?;
-        if !response.status().is_success() {
-            let error: rpc::ErrorResponse = response.json().await?;
-            anyhow::bail!("commit failed: {}", error.error);
-        }
-        let commit_resp: rpc::CommitResponse = response.json().await?;
-        let server_commitment = parse_hex32(&commit_resp.commitment)?;
-        let server_salt = parse_hex32(&commit_resp.salt)?;
+        submit_commit(&client, rpc_port, &rpc_host, &commitment).await?;
 
         wallet.data.pending.retain(|p| p.commitment != commitment);
         wallet.data.pending.push(wallet::PendingCommit {
-            commitment: server_commitment,
-            salt: server_salt,
+            commitment,
+            salt,
             input_coin_ids: input_coin_ids.clone(),
             outputs: all_outputs,
             change_seeds,
@@ -1533,18 +1487,61 @@ async fn wallet_send(
         });
         wallet.save()?;
 
-        println!("\n✓ Commit submitted ({})", hex::encode(&server_commitment));
+        println!("\n✓ Commit submitted ({})", hex::encode(&commitment));
         println!("  Waiting for commit to be mined...");
 
-        if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &commit_resp.commitment, timeout_secs).await {
+        if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &hex::encode(commitment), timeout_secs).await {
             println!("⏳ Not mined after {}s. Run `wallet reveal` later.", timeout_secs);
             return Ok(());
         }
         println!("✓ Commit mined!");
 
-        do_reveal(&client, &mut wallet, rpc_port, &rpc_host, &server_commitment, timeout_secs).await?;
+        do_reveal(&client, &mut wallet, rpc_port, &rpc_host, &commitment, timeout_secs).await?;
     }
 
+    Ok(())
+}
+
+fn mine_pow(commitment: &[u8; 32], required_pow: u32) -> u64 {
+    let mut n = 0u64;
+    loop {
+        let h = midstate::core::hash_concat(commitment, &n.to_le_bytes());
+        if midstate::core::types::count_leading_zeros(&h) >= required_pow {
+            return n;
+        }
+        n += 1;
+    }
+}
+
+async fn fetch_required_pow(client: &reqwest::Client, rpc_port: u16, rpc_host: &str) -> Result<u32> {
+    let url = format!("http://{}:{}/state", rpc_host, rpc_port);
+    let resp = client.get(&url).send().await?;
+    let state: rpc::GetStateResponse = resp.json().await?;
+    Ok(state.required_pow)
+}
+
+async fn submit_commit(
+    client: &reqwest::Client,
+    rpc_port: u16,
+    rpc_host: &str,
+    commitment: &[u8; 32],
+) -> Result<()> {
+    let required_pow = fetch_required_pow(client, rpc_port, rpc_host).await?;
+    println!("Mining PoW locally (difficulty: {} leading zeros)...", required_pow);
+    let spam_nonce = mine_pow(commitment, required_pow);
+    println!("✓ PoW found (nonce: {})", spam_nonce);
+
+    let commit_req = rpc::CommitRequest {
+        commitment: hex::encode(commitment),
+        spam_nonce,
+    };
+
+    let url = format!("http://{}:{}/commit", rpc_host, rpc_port);
+    let response = client.post(&url).json(&commit_req).send().await?;
+    if !response.status().is_success() {
+        let error: rpc::ErrorResponse = response.json().await?;
+        anyhow::bail!("Commit failed: {}", error.error);
+    }
     Ok(())
 }
 
@@ -2339,20 +2336,22 @@ async fn commit_transaction(rpc_port: u16, rpc_host: String, coins: Vec<String>,
     if coins.is_empty() { anyhow::bail!("Must provide at least one coin"); }
     if destinations.is_empty() { anyhow::bail!("Must provide at least one destination"); }
 
-    let client = reqwest::Client::new();
-    let url = format!("http://{}:{}/commit", rpc_host, rpc_port);
-    let req = rpc::CommitRequest { coins, destinations };
-    let response = client.post(&url).json(&req).send().await?;
+    let input_coins: Vec<[u8; 32]> = coins.iter()
+        .map(|h| parse_hex32(h))
+        .collect::<Result<_, _>>()?;
+    let dest_hashes: Vec<[u8; 32]> = destinations.iter()
+        .map(|h| parse_hex32(h))
+        .collect::<Result<_, _>>()?;
 
-    if response.status().is_success() {
-        let result: rpc::CommitResponse = response.json().await?;
-        println!("Commitment submitted!");
-        println!("  Commitment: {}", result.commitment);
-        println!("  Salt:       {}", result.salt);
-    } else {
-        let error: rpc::ErrorResponse = response.json().await?;
-        println!("Error: {}", error.error);
-    }
+    let salt: [u8; 32] = rand::random();
+    let commitment = midstate::core::compute_commitment(&input_coins, &dest_hashes, &salt);
+
+    let client = reqwest::Client::new();
+    submit_commit(&client, rpc_port, &rpc_host, &commitment).await?;
+
+    println!("Commitment submitted!");
+    println!("  Commitment: {}", hex::encode(commitment));
+    println!("  Salt:       {}", hex::encode(salt));
     Ok(())
 }
 
