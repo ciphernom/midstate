@@ -3,20 +3,18 @@ name: Build Release Binaries
 on:
   push:
     branches: [ "main" ]
-    # Also trigger on version tags (e.g., v1.0.0)
     tags:
       - 'v*.*.*'
   pull_request:
     branches: [ "main" ]
-  # Allow manual triggering from the GitHub Actions tab
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }} (${{ matrix.target }})
+    name: Build on ${{ matrix.os }} (${{ matrix.artifact_name || matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false # Don't cancel all builds if one OS fails
+      fail-fast: false
       matrix:
         include:
           # Linux (x86_64)
@@ -24,16 +22,40 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: midstate-linux-amd64
             bin_name: midstate
+          
+          # Raspberry Pi 3 & Zero 2 W (Cortex-A53)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: midstate-rpi3-arm64
+            bin_name: midstate
+            rustflags: "-C target-cpu=cortex-a53 -C link-arg=-lgcc"
+
+          # Raspberry Pi 4 (Cortex-A72)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: midstate-rpi4-arm64
+            bin_name: midstate
+            rustflags: "-C target-cpu=cortex-a72 -C link-arg=-lgcc"
+
+          # Raspberry Pi 5 (Cortex-A76)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: midstate-rpi5-arm64
+            bin_name: midstate
+            rustflags: "-C target-cpu=cortex-a76 -C link-arg=-lgcc"
+
           # Windows (x86_64)
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: midstate-windows-amd64.exe
             bin_name: midstate.exe
+          
           # macOS (Intel)
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: midstate-macos-amd64
             bin_name: midstate
+          
           # macOS (Apple Silicon / M1 / M2)
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -46,7 +68,13 @@ jobs:
 
     - name: Install Linux Dependencies
       if: matrix.os == 'ubuntu-latest'
-      run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev build-essential cmake
+      run: |
+        sudo apt-get update 
+        sudo apt-get install -y build-essential cmake
+        # Install aarch64 cross-compiler if the target requires it
+        if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+        fi
 
     - name: Install Rust Toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -56,9 +84,14 @@ jobs:
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
       with:
-        key: ${{ matrix.target }}
+        # Cache keyed by artifact name to prevent the Pi builds from thrashing each other
+        key: ${{ matrix.target }}-${{ matrix.artifact_name }}
 
     - name: Build Release
+      env:
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        RUSTFLAGS: ${{ matrix.rustflags || '' }}
+      # Building with the stark-prover feature enabled
       run: cargo build --release --features stark-prover --target ${{ matrix.target }}
 
     - name: Rename Binary for Artifacts (Linux/macOS)
@@ -76,7 +109,6 @@ jobs:
         path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
         if-no-files-found: error
 
-  # Optional: Automatically create a GitHub Release when a tag is pushed
   release:
     name: Create GitHub Release
     needs: build
