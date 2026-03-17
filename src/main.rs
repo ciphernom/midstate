@@ -1330,18 +1330,6 @@ async fn wallet_send(
                 continue;
             }
 
-            wallet.data.pending.retain(|p| p.commitment != commitment);
-            wallet.data.pending.push(wallet::PendingCommit {
-                commitment,
-                salt,
-                input_coin_ids: inputs.clone(),
-                outputs: outputs.clone(),
-                change_seeds: change_seeds.clone(),
-                created_at: now_secs(),
-                reveal_not_before: now_secs() + 10 + (rand::random::<u64>() % 41),
-            });
-            wallet.save()?;
-
             println!("  ✓ Commit submitted ({})", hex::encode(&commitment));
 
             if !wait_for_commit_mined(&client, rpc_port,&rpc_host, &hex::encode(commitment), timeout_secs).await {
@@ -1475,17 +1463,6 @@ async fn wallet_send(
 
         submit_commit(&client, rpc_port, &rpc_host, &commitment).await?;
 
-        wallet.data.pending.retain(|p| p.commitment != commitment);
-        wallet.data.pending.push(wallet::PendingCommit {
-            commitment,
-            salt,
-            input_coin_ids: input_coin_ids.clone(),
-            outputs: all_outputs,
-            change_seeds,
-            created_at: now_secs(),
-            reveal_not_before: 0,
-        });
-        wallet.save()?;
 
         println!("\n✓ Commit submitted ({})", hex::encode(&commitment));
         println!("  Waiting for commit to be mined...");
