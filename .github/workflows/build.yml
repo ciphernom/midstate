@@ -59,7 +59,7 @@ jobs:
         key: ${{ matrix.target }}
 
     - name: Build Release
-      run: cargo build --release --target ${{ matrix.target }}
+      run: cargo build --release --features stark-prover --target ${{ matrix.target }}
 
     - name: Rename Binary for Artifacts (Linux/macOS)
       if: matrix.os != 'windows-latest'
