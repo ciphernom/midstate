@@ -23,6 +23,8 @@ export function decrypt_cli_wallet(data: Uint8Array, password: string): string;
 
 export function generate_phrase(): string;
 
+export function mine_commitment_pow(commitment_hex: string, required_pow: number): bigint;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -32,6 +34,7 @@ export interface InitOutput {
     readonly decompose_amount: (a: bigint) => number;
     readonly decrypt_cli_wallet: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly generate_phrase: (a: number) => void;
+    readonly mine_commitment_pow: (a: number, b: number, c: number) => bigint;
     readonly webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly webwallet_check_filter: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
     readonly webwallet_from_seed_hex: (a: number, b: number, c: number) => void;
