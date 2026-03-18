@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MIDSTATE | Protocol Architecture</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* ── Minimalist Theme Variables ──────────────────────────────────────────── */
+:root[data-theme="light"] {
+    --bg: #ffffff;
+    --bg-alt: #f7f7f8;
+    --border: #e5e7eb;
+    --text-main: #111827;
+    --text-muted: #6b7280;
+    --code-bg: #f3f4f6;
+    --accent: #000000;
+}
+
+:root[data-theme="dark"] {
+    --bg: #0e0e0e;
+    --bg-alt: #161616;
+    --border: #2c2c2c;
+    --text-main: #ededed;
+    --text-muted: #888888;
+    --code-bg: #1a1a1a;
+    --accent: #ffffff;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    background-color: var(--bg);
+    color: var(--text-main);
+    font-family: 'Inter', -apple-system, sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+    transition: background-color 0.2s, color 0.2s;
+    -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--text-main); text-decoration: underline; text-decoration-color: var(--border); text-underline-offset: 4px; transition: all 0.2s; }
+a:hover { text-decoration-color: var(--text-main); }
+h1, h2, h3, .mono { font-family: 'JetBrains Mono', monospace; font-weight: 500; }
+
+/* ── Top Navigation ─────────────────────────────────────────────────────── */
+.topbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 32px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+}
+
+.brand {
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 600;
+    font-size: 14px;
+    letter-spacing: 1px;
+}
+
+.nav-actions { display: flex; gap: 16px; align-items: center; }
+
+button, .btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-main);
+    font-family: 'Inter', sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    text-decoration: none;
+    transition: all 0.15s;
+}
+
+button:hover, .btn:hover {
+    background: var(--bg-alt);
+    border-color: var(--text-muted);
+}
+
+/* ── Main Layout ───────────────────────────────────────────────────────── */
+.workspace {
+    display: flex;
+    flex: 1;
+    max-width: 1000px;
+    margin: 40px auto;
+    width: 100%;
+}
+
+.sidebar {
+    width: 220px;
+    padding-right: 30px;
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+}
+
+.menu-item {
+    padding: 8px 12px;
+    margin-bottom: 4px;
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: 13px;
+    border-radius: 6px;
+    transition: all 0.1s;
+    font-family: 'JetBrains Mono', monospace;
+}
+
+.menu-item:hover { color: var(--text-main); background: var(--bg-alt); }
+.menu-item.active {
+    color: var(--text-main);
+    font-weight: 500;
+    background: var(--bg-alt);
+}
+
+/* ── Output / Content Area ─────────────────────────────────────────────── */
+.output-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.content-pane {
+    display: none;
+    animation: fadeIn 0.2s ease-out;
+}
+
+.content-pane.active { display: block; }
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(5px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+h2 { font-size: 24px; margin-bottom: 24px; letter-spacing: -0.5px; }
+h3 { font-size: 16px; margin-top: 40px; margin-bottom: 12px; letter-spacing: -0.3px; }
+
+p { margin-bottom: 16px; color: var(--text-muted); }
+ul { padding-left: 20px; margin-bottom: 24px; color: var(--text-muted); }
+li { margin-bottom: 8px; }
+
+code {
+    background: var(--code-bg);
+    padding: 3px 6px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85em;
+    color: var(--text-main);
+}
+
+pre {
+    background: var(--bg-alt);
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow-x: auto;
+    margin-bottom: 20px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.5;
+}
+
+/* ── Deep Dive Accordions ─────────────────────────────────── */
+details.nitty-gritty {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin: 24px 0;
+    overflow: hidden;
+}
+
+details.nitty-gritty summary {
+    padding: 14px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    list-style: none;
+    color: var(--text-main);
+    background: var(--bg-alt);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-family: 'JetBrains Mono', monospace;
+}
+
+details.nitty-gritty summary::-webkit-details-marker { display: none; }
+details.nitty-gritty summary:hover { background: var(--border); }
+details.nitty-gritty summary::after { content: '+'; font-family: 'JetBrains Mono', monospace; color: var(--text-muted); }
+details.nitty-gritty[open] summary::after { content: '-'; }
+
+.ng-content {
+    padding: 20px;
+    border-top: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--text-muted);
+}
+
+.ng-content p:last-child { margin-bottom: 0; }
+
+/* ── Flow Diagrams (Minimalist) ────────────────────────────────────────── */
+.flow-diagram {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 24px 0;
+    padding: 20px;
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow-x: auto;
+}
+
+.flow-box {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    padding: 12px 16px;
+    font-size: 13px;
+    border-radius: 4px;
+    color: var(--text-main);
+    white-space: nowrap;
+}
+
+.flow-arrow {
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', monospace;
+}
+
+/* ── Comparison Table ──────────────────────────────────────────────────── */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 24px;
+    font-size: 13px;
+    border: 1px solid var(--border);
+}
+
+th, td {
+    padding: 16px;
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+}
+
+th { color: var(--text-main); font-weight: 500; background: var(--bg-alt); font-family: 'JetBrains Mono', monospace; }
+td { color: var(--text-muted); }
+td.hl { color: var(--text-main); font-weight: 500;}
+
+/* Nested details inside table */
+tr.details-row td {
+    padding: 0;
+    border-bottom: 2px solid var(--border);
+}
+tr.details-row details.nitty-gritty {
+    margin: 0;
+    border: none;
+    border-radius: 0;
+}
+tr.details-row details.nitty-gritty[open] {
+    border-top: 1px solid var(--border);
+}
+tr.details-row summary {
+    font-size: 11px;
+    padding: 10px 16px;
+    background: transparent;
+}
+
+@media (max-width: 768px) {
+    .workspace { flex-direction: column; padding: 0 20px; }
+    .sidebar { width: 100%; padding-right: 0; margin-bottom: 30px; border-right: none; border-bottom: 1px solid var(--border); padding-bottom: 20px;}
+    .flow-diagram { flex-direction: column; align-items: flex-start; }
+    .flow-arrow { transform: rotate(90deg); margin-left: 20px; }
+}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+    <div class="brand">MIDSTATE</div>
+    <div class="nav-actions">
+        <button id="theme-btn">Dark Mode</button>
+        <a href="https://github.com/ciphernom/midstate" target="_blank" class="btn">GitHub</a>
+        <a href="https://ciphernom.github.io/midstate" target="_blank" class="btn">Web Wallet</a>
+    </div>
+</div>
+
+<div class="workspace">
+    
+    <div class="sidebar">
+        <div class="menu-item active" data-target="overview">01_Overview</div>
+        <div class="menu-item" data-target="crypto">02_Cryptography</div>
+        <div class="menu-item" data-target="consensus">03_Consensus</div>
+        <div class="menu-item" data-target="privacy">04_MEV_&_Privacy</div>
+        <div class="menu-item" data-target="state">05_State_Management</div>
+        <div class="menu-item" data-target="vm">06_Virtual_Machine</div>
+        <div class="menu-item" data-target="vs-legacy">07_Comparison</div>
+    </div>
+
+    <div class="output-area">
+
+        <div class="content-pane active" id="overview">
+            <h2>System Overview</h2>
+            <p>Midstate is a peer-to-peer electronic cash system engineered to reject data-center centralization. It abandons elliptic curve mathematics in favor of post-quantum hash functions, enforces sequential CPU mining, and natively obscures transaction amounts and origins.</p>
+            <p>It is designed to operate and validate the global state entirely on extreme edge hardware, allowing a full node to sync and run on a $15 Raspberry Pi Zero 2 W.</p>
+
+            <details class="nitty-gritty">
+                <summary>Deep Dive: Hardware & Protocol Limits</summary>
+                <div class="ng-content">
+                    <p>The protocol strictly bounds resource consumption to ensure viability on 512MB RAM devices.</p>
+                    <ul>
+                        <li><strong>Max Batch Commits:</strong> 2,000 per block.</li>
+                        <li><strong>Max Batch Reveals:</strong> 500 per block (limits signature verification load).</li>
+                        <li><strong>Max Batch Inputs/Outputs:</strong> 1,024 inputs and 10,000 outputs globally per block.</li>
+                        <li><strong>Max Mempool Size:</strong> 100MB hard cap to prevent OOM attacks from malicious peers flooding large STARK payloads.</li>
+                    </ul>
+                </div>
+            </details>
+        </div>
+
+        <div class="content-pane" id="crypto">
+            <h2>Post-Quantum Cryptography</h2>
+            <p>Midstate uses exactly zero elliptic curve mathematics. It relies strictly on the <code>BLAKE3</code> hash function, rendering it immune to Shor's algorithm running on future quantum computers.</p>
+            
+            <h3>WOTS+ (Single-Use Keys)</h3>
+            <p>Receiving keys and change outputs use Winternitz One-Time Signatures. Because hash-based signatures reveal parts of the private key during use, WOTS keys must never sign more than once.</p>
+
+            <details class="nitty-gritty">
+                <summary>Deep Dive: WOTS+ Parameters</summary>
+                <div class="ng-content">
+                    <p>Midstate implements WOTS+ with parameter <code>w=16</code> (16 bits per digit).</p>
+                    <ul>
+                        <li>The 256-bit message is divided into 16 message chains.</li>
+                        <li>The checksum calculates <code>Σ (65535 - d_i)</code>. The maximum checksum value is 1,048,560 (20 bits), requiring exactly 2 checksum chains.</li>
+                        <li>Total chains: 18. Maximum chain depth: 65,535.</li>
+                        <li>Signature size is highly compact: <code>18 * 32 = 576 bytes</code>.</li>
+                    </ul>
+                </div>
+            </details>
+
+            <h3>MSS (Reusable Addresses)</h3>
+            <p>If a user requires a static, reusable address, Midstate wraps thousands of WOTS keys into a Merkle Signature Scheme (MSS) binary tree.</p>
+
+            <details class="nitty-gritty">
+                <summary>Deep Dive: MSS Implementation</summary>
+                <div class="ng-content">
+                    <p>The Master Public Key is the root of the Merkle tree. The maximum supported tree height is 20 (<code>2^20 = 1,048,576</code> signatures). A standard height-10 tree generates in ~1-2 seconds on modern CPUs.</p>
+                    <p>To prevent key-reuse vulnerabilities across reorgs or malicious coordinator attacks, the consensus verifier enforces the <code>leaf_index</code> against the cryptographic authentication path, explicitly marking the exact WOTS public key leaf as spent in the <code>spent_addresses</code> database table.</p>
+                </div>
+            </details>
+
+            <details class="nitty-gritty">
+                <summary>Deep Dive: HD Key Derivation</summary>
+                <div class="ng-content">
+                    <p>Wallets use BIP39 24-word mnemonics, which generate a 64-byte seed that is hashed via BLAKE3 into a 32-byte master seed. To maintain forward secrecy without BIP32 ECC scalar tweaking, deterministic keys are derived via strict domain separation:</p>
+                    <pre><code>WOTS Seed_i = BLAKE3("midstate/wots/v1" || MasterSeed || i)
+MSS Seed_i  = BLAKE3("midstate/mss/v1"  || MasterSeed || i)</code></pre>
+                </div>
+            </details>
+        </div>
+
+        <div class="content-pane" id="consensus">
+            <h2>Mining & Consensus</h2>
+            <p>Traditional Proof-of-Work allows ASICs to calculate millions of hashes in parallel, centralizing network control.</p>
+            <p>Midstate enforces a <strong>Verifiable Delay Function (VDF) style Sequential Hash</strong>. To mine a block, a node must calculate 1,000,000 BLAKE3 hashes in a strict sequence: <code>x_i = BLAKE3(x_{i-1})</code>. Because calculating the final hash requires the sequential output of every previous step, highly parallelized ASIC farms lose their advantage against standard consumer CPUs.</p>
+
+            <details class="nitty-gritty">
+                <summary>Deep Dive: SIMD Nonce Searching</summary>
+                <div class="ng-content">
+                    <p>While the 1,000,000 hash chain is strictly sequential, finding a valid starting <code>nonce</code> is parallelized locally. The node automatically detects CPU features on startup and utilizes SIMD registers (AVX2: 8-way, NEON: 4-way).</p>
+                    <p>Because different nonces reach the target at different iteration depths, the SIMD implementation uses a <strong>Masking Trick</strong>. It loops up to the maximum iterations required by any lane in the batch, safely extracting a lane's state exactly when its target is reached, while forcing it to "ghost hash" harmlessly for the remainder of the loop to keep the vector registers synchronized.</p>
+                </div>
+            </details>
+
+            <h3>ASERT Difficulty & Finality</h3>
+            <p>Difficulty adjusts continuously on every 60-second block using the ASERT algorithm.</p>
+
+            <details class="nitty-gritty">
+                <summary>Deep Dive: ASERT Fixed-Point Math</summary>
+                <div class="ng-content">
+                    <p>ASERT adjusts difficulty based on absolute time elapsed since genesis, eliminating sliding-window time-warp exploits. It uses a 4-hour half-life (240 blocks).</p>
+                    <p>Floating-point math is strictly banned in consensus due to cross-architecture variations. Midstate uses a 16.16 fixed-point Taylor polynomial approximation to calculate the exponential decay exactly the same way on every processor:</p>
+                    <pre><code>// 16.16 fixed-point Taylor polynomial for 2^x
+let mut factor = 65536i64;
+factor += (frac * 45426) >> 16;
+factor += (frac * frac * 15746) >> 32;
+factor += (frac * frac * frac * 3643) >> 48;</code></pre>
+                </div>
+            </details>
+
+            <details class="nitty-gritty">
+                <summary>Deep Dive: Bayesian Finality Estimator</summary>
+                <div class="ng-content">
+                    <p>Midstate eliminates arbitrary confirmation counts (e.g., "wait 6 blocks"). Nodes locally observe network honesty (linear blocks vs orphaned blocks) and use a Beta-Binomial statistical model.</p>
+                    <p>The estimator continuously calculates a dynamic <code>safe_depth</code>—the exact number of blocks required to guarantee a <code>1e-6</code> (1-in-1,000,000) risk of a successful chain reorganization by an attacker. It caps at a maximum of 10,000 blocks for safety under extreme adversarial conditions.</p>
+                </div>
+            </details>
+        </div>
+
+        <div class="content-pane" id="privacy">
+            <h2>MEV Resistance & Privacy</h2>
+            
+            <h3>Commit-Reveal Lifecycle</h3>
+            <p>Standard mempools broadcast transaction details in cleartext, allowing miners to front-run trades (Miner Extractable Value). Midstate enforces a two-phase protocol.</p>
+            
+            <div class="flow-diagram">
+                <div class="flow-box">1. Commit Hash</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box">Mine Commit</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box">Reveal Tx Data</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box">Execute Spend</div>
+            </div>
+
+            <details class="nitty-gritty">
+                <summary>Deep Dive: Dynamic Commit PoW</summary>
+                <div class="ng-content">
+                    <p>To prevent attackers from flooding the mempool with zero-fee Commits, every Commit requires a Proof-of-Work spam nonce. This threshold scales dynamically based on local mempool congestion:</p>
+                    <ul>
+                        <li>< 500 pending commits: 24 leading zero bits (~16M hashes).</li>
+                        <li>500 - 749 pending commits: 26 leading zero bits.</li>
+                        <li>750 - 899 pending commits: 28 leading zero bits.</li>
+                        <li>>= 900 pending commits: 30 leading zero bits.</li>
+                    </ul>
+                    <p>Commits expire from the global state after a strict Time-to-Live (TTL) of 1,000 blocks to prevent state bloat.</p>
+                </div>
+            </details>
+
+            <h3>Hidden Balances (ZK-STARKs)</h3>
+            <p>Midstate supports Confidential Transfers using ZK-STARKs. The <code>OP_VERIFY_STARK</code> opcode mathematically proves that <code>v ∈ [0, 2^64)</code> and inputs equal outputs without revealing the actual values on the public ledger.</p>
+
+            <details class="nitty-gritty">
+                <summary>Deep Dive: STARK Memory Bypass</summary>
+                <div class="ng-content">
+                    <p>STARK proofs (using Winterfell over the Goldilocks field) are ~128KB in size. Pushing this onto a standard <code>SmallVec</code> script stack would cause massive heap allocation spikes, crashing 512MB edge nodes.</p>
+                    <p>During execution, the script VM intercepts the STARK payload directly from the transaction slice. The proof bytes bypass the active stack memory completely during <code>OP_VERIFY_STARK</code> execution, processing the entire validation natively in Rust before safely returning execution to the VM.</p>
+                </div>
+            </details>
+
+            <h3>Native CoinJoin & Dandelion++</h3>
+            <p>Because Midstate enforces strict power-of-2 denominations for standard UTXOs, coins are inherently indistinguishable. The P2P layer includes a built-in CoinJoin coordinator to mix transactions seamlessly.</p>
+
+            <details class="nitty-gritty">
+                <summary>Deep Dive: Mix Anti-Sybil & Dandelion++</summary>
+                <div class="ng-content">
+                    <p><strong>CoinJoin Anti-Sybil:</strong> To prevent attackers from stalling mix sessions with dummy registrations, joining a mix requires a localized PoW challenge: <code>hash(mix_id || coin_id || peer_id || nonce) >= 24 zero bits</code>. Binding the <code>peer_id</code> prevents attackers from pre-computing nonces across identity rotations.</p>
+                    <p><strong>Dandelion++ Routing:</strong> Commits route through a "stem" phase before public broadcast. They are forwarded linearly to a single peer. At each hop, there is a 10% probability of "fluffing" (broadcasting to all peers). If a transaction sits in the stem pool for 30 seconds without being fluffed, the node broadcasts it locally as a failsafe.</p>
+                </div>
+            </details>
+        </div>
+
+        <div class="content-pane" id="state">
+            <h2>State Management</h2>
+            <p>Midstate discards the traditional unbounded UTXO database model. Unspent outputs and pending commitments are accumulated into a Sparse Merkle Tree (SMT), distilling the global state down to a single 32-byte cryptographic root.</p>
+
+            <details class="nitty-gritty">
+                <summary>Deep Dive: SMT Architecture & Caching</summary>
+                <div class="ng-content">
+                    <p>The UTXO accumulator is a 256-level Sparse Merkle Tree backed by an immutable <code>im::OrdSet</code>. To achieve <code>O(log N)</code> performance without overwhelming memory:</p>
+                    <ul>
+                        <li><strong>Top Cache:</strong> The top 16 levels are cached in memory via HashMap, strictly bounded to a mathematical maximum of 65,536 entries.</li>
+                        <li><strong>Dynamic Folding:</strong> The bottom 240 levels are folded dynamically on the fly when proofs are requested, using a highly optimized binary search (<code>partition_point</code>) over lexicographically sorted coin ID buckets.</li>
+                    </ul>
+                </div>
+            </details>
+
+            <h3>Fast-Forward Syncing</h3>
+            <p>Historical block batches are aggressively pruned. Validating nodes only retain lightweight headers and state snapshots.</p>
+
+            <details class="nitty-gritty">
+                <summary>Deep Dive: Snapshot Auth & Compact Filters</summary>
+                <div class="ng-content">
+                    <p><strong>Snapshots:</strong> During a fast-forward sync, a node downloads a recent State Snapshot. To ensure authenticity, it cryptographically verifies that the 32-byte <code>midstate</code> hash inside the snapshot perfectly aligns with the historical header chain. The node will only trust a snapshot if there are <code>PRUNE_DEPTH</code> (1,000) sequential headers built on top of it.</p>
+                    <p><strong>Compact Filters:</strong> Light clients scan the chain locally using Golomb-Rice coded compact filters built natively into the block structure. Using parameter <code>P=20</code>, they achieve a strict False Positive Rate of 1 in 1,000,000, ensuring high privacy and low bandwidth.</p>
+                </div>
+            </details>
+        </div>
+
+        <div class="content-pane" id="vm">
+            <h2>Virtual Machine</h2>
+            <p>Every UTXO in Midstate is locked by a compiled bytecode script. The VM executes witness inputs pushed onto the stack, then evaluates the script. Execution succeeds if and only if the final top-of-stack item is exactly <code>[1]</code> (The Clean Stack Rule).</p>
+
+            <details class="nitty-gritty">
+                <summary>Deep Dive: Consensus Limits & Opcodes</summary>
+                <div class="ng-content">
+                    <ul>
+                        <li><strong>Execution Limits:</strong> Turing-incomplete. No loops, no backward jumps. Max script size: 1,024 bytes. Max stack depth: 64 items. Max item size: 131,072 bytes (accommodates STARK proofs).</li>
+                        <li><strong>SigOps:</strong> Max 3 cryptographic signature verifications per script. Max 1 STARK verification per script.</li>
+                        <li><strong>Opcodes:</strong> Includes standard control flow (<code>IF/ELSE</code>), hashing, math, plus advanced covenants (<code>CHECKTIMEVERIFY</code>, <code>SUM_TO_ADDR</code>, <code>VERIFY_STARK</code>).</li>
+                    </ul>
+                </div>
+            </details>
+
+            <p><strong>Script Architecture:</strong> Midstate uses a Pay-to-Script-Hash (P2SH) model where the address is the hash of the script bytecode. By default, wallets construct a Pay-to-Public-Key (P2PK) script where the raw public key is embedded directly into the script, rather than a P2PKH model.</p>
+
+            <details class="nitty-gritty">
+                <summary>Worked Example: Standard P2PK</summary>
+                <div class="ng-content">
+                    <pre><code>Script:  PUSH_DATA(&lt;owner_pk&gt;) CHECKSIGVERIFY PUSH_INT(1)
+Witness: [ &lt;signature&gt; ]
+
+Execution Trace:
+1. Stack: [ &lt;signature&gt; ]
+2. PUSH_DATA(&lt;owner_pk&gt;)
+   Stack: [ &lt;signature&gt;, &lt;owner_pk&gt; ]
+3. CHECKSIGVERIFY 
+   (Pops pk, pops sig. Verifies signature against commitment. Aborts if invalid.)
+   Stack: []
+4. PUSH_INT(1)
+   Stack: [ 1 ]
+
+Result: VALID (Clean Stack Rule satisfied).</code></pre>
+                </div>
+            </details>
+
+            <details class="nitty-gritty">
+                <summary>Worked Example: Hash Time-Locked Contract</summary>
+                <div class="ng-content">
+                    <p>HTLCs enable trustless atomic swaps. Coins can be claimed using a secret preimage, or refunded after a specific block height.</p>
+                    <pre><code>Script: 
+IF 
+    HASH PUSH_DATA(&lt;secret_hash&gt;) EQUALVERIFY 
+    PUSH_DATA(&lt;receiver_pk&gt;) CHECKSIGVERIFY 
+ELSE 
+    DROP 
+    PUSH_INT(&lt;timeout_height&gt;) CHECKTIMEVERIFY 
+    PUSH_DATA(&lt;refund_pk&gt;) CHECKSIGVERIFY 
+ENDIF 
+PUSH_INT(1)
+
+Claim Witness:  [ &lt;receiver_sig&gt;, &lt;secret_preimage&gt;, 1 ]
+Refund Witness: [ &lt;refund_sig&gt;, &lt;dummy_data&gt;, 0 ]</code></pre>
+                </div>
+            </details>
+
+            <details class="nitty-gritty">
+                <summary>Worked Example: STARK-Enforced Covenants</summary>
+                <div class="ng-content">
+                    <p>MidstateScript can enforce constraints on where outputs are sent using <code>SUM_TO_ADDR</code>, combined with <code>VERIFY_STARK</code> for zero-knowledge proofs.</p>
+                    
+                    <pre><code>Script:
+VERIFY_STARK 
+PUSH_DATA(&lt;required_addr&gt;) 
+SUM_TO_ADDR PUSH_INT(100) GREATER_OR_EQUAL VERIFY 
+PUSH_INT(1)
+
+Witness: [ &lt;program_id&gt;, &lt;public_inputs&gt;, &lt;128KB_proof_payload&gt; ]
+
+Execution Trace:
+1. Stack: [ &lt;program_id&gt;, &lt;public_inputs&gt; ]
+2. VERIFY_STARK
+   (Pops inputs, intercepts 128KB payload directly from tx memory. Aborts if invalid.)
+   Stack: []
+3. PUSH_DATA(&lt;required_addr&gt;)
+   Stack: [ &lt;required_addr&gt; ]
+4. SUM_TO_ADDR
+   (Pops address, scans all tx outputs, sums the value sent to that address)
+   Stack: [ &lt;actual_sum_sent&gt; ]
+5. PUSH_INT(100)
+   Stack: [ &lt;actual_sum_sent&gt;, 100 ]
+6. GREATER_OR_EQUAL VERIFY
+   (Validates that the tx sent AT LEAST 100 units to required address)
+   Stack: []
+7. PUSH_INT(1)
+   Stack: [ 1 ]</code></pre>
+                </div>
+            </details>
+        </div>
+
+        <div class="content-pane" id="vs-legacy">
+            <h2>Architecture Comparison</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Subsystem</th>
+                        <th>Legacy (Bitcoin/Ethereum)</th>
+                        <th>Midstate</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Cryptography</strong></td>
+                        <td>Elliptic Curve</td>
+                        <td class="hl">BLAKE3 Hash-Based</td>
+                    </tr>
+                    <tr class="details-row">
+                        <td colspan="3">
+                            <details class="nitty-gritty">
+                                <summary>Deep Dive</summary>
+                                <div class="ng-content">Legacy networks use secp256k1, which is vulnerable to Shor's algorithm on quantum computers. Midstate uses Winternitz One-Time Signatures (w=16, 576 bytes) and Merkle Signature Schemes (max height 20) which rely solely on the quantum-resistant BLAKE3 hash function. Domains are separated (<code>midstate/wots/v1</code>) for forward-secret HD derivation.</div>
+                            </details>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><strong>Mining Hardware</strong></td>
+                        <td>Parallel ASICs / GPUs</td>
+                        <td class="hl">Sequential Hashing (CPUs)</td>
+                    </tr>
+                    <tr class="details-row">
+                        <td colspan="3">
+                            <details class="nitty-gritty">
+                                <summary>Deep Dive</summary>
+                                <div class="ng-content">Legacy PoW allows parallel nonce searching, giving ASICs a massive advantage. Midstate enforces 1,000,000 strictly sequential BLAKE3 hashes per extension. SIMD lanes (AVX2/NEON) are only used to parallelize the search for valid starting nonces, while the proof calculation itself remains strictly bound to single-thread CPU performance.</div>
+                            </details>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><strong>Mempool / Ordering</strong></td>
+                        <td>Cleartext Bidding (MEV)</td>
+                        <td class="hl">Commit-Reveal</td>
+                    </tr>
+                    <tr class="details-row">
+                        <td colspan="3">
+                            <details class="nitty-gritty">
+                                <summary>Deep Dive</summary>
+                                <div class="ng-content">Legacy mempools expose transaction contents, allowing miners to reorder trades for profit (MEV). Midstate's Phase 1 (Commit) broadcasts a BLAKE3 hash binding inputs/outputs with a required dynamic PoW nonce. Phase 2 (Reveal) opens the commitment. Miners cannot reorder or censor transactions based on value or destination because they commit to processing them before seeing the contents.</div>
+                            </details>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><strong>Value Privacy</strong></td>
+                        <td>Public cleartext ledgers</td>
+                        <td class="hl">ZK-STARKs & Native CoinJoin</td>
+                    </tr>
+                    <tr class="details-row">
+                        <td colspan="3">
+                            <details class="nitty-gritty">
+                                <summary>Deep Dive</summary>
+                                <div class="ng-content">Legacy ledgers show exact amounts to the public. Midstate supports ZK-STARKs over the Goldilocks field to prove value conservation (inputs = outputs) and range constraints (v ∈ [0, 2^64)) without revealing amounts. Standard UTXOs use strict power-of-2 denominations to facilitate native P2P CoinJoin mixing with anti-Sybil PoW gating.</div>
+                            </details>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><strong>State Storage</strong></td>
+                        <td>Unbounded UTXO DBs</td>
+                        <td class="hl">Pruned Sparse Merkle Tree</td>
+                    </tr>
+                    <tr class="details-row">
+                        <td colspan="3">
+                            <details class="nitty-gritty">
+                                <summary>Deep Dive</summary>
+                                <div class="ng-content">Legacy nodes store every unspent output in an ever-growing database. Midstate accumulates UTXOs into a 256-level SMT (Top 16 levels cached in memory), distilling global state into a 32-byte root. This allows edge nodes (512MB RAM) to operate with O(log N) complexity and fast-forward sync from snapshots via cryptographic midstate linkage.</div>
+                            </details>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+    </div>
+</div>
+
+<script>
+    const themeBtn = document.getElementById('theme-btn');
+    const html = document.documentElement;
+
+    function setTheme(theme) {
+        html.setAttribute('data-theme', theme);
+        localStorage.setItem('midstate-theme', theme);
+        themeBtn.textContent = theme === 'dark' ? 'Light Mode' : 'Dark Mode';
+    }
+
+    const savedTheme = localStorage.getItem('midstate-theme');
+    if (savedTheme) {
+        setTheme(savedTheme);
+    } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {
+        setTheme('light');
+    } else {
+        setTheme('dark');
+    }
+
+    themeBtn.addEventListener('click', () => {
+        const current = html.getAttribute('data-theme');
+        setTheme(current === 'dark' ? 'light' : 'dark');
+    });
+
+    const menuItems = document.querySelectorAll('.menu-item');
+    const panes = document.querySelectorAll('.content-pane');
+    const pathDisplay = document.getElementById('path-display');
+
+    menuItems.forEach(item => {
+        item.addEventListener('click', () => {
+            menuItems.forEach(m => m.classList.remove('active'));
+            panes.forEach(p => p.classList.remove('active'));
+
+            item.classList.add('active');
+            const targetId = item.getAttribute('data-target');
+            document.getElementById(targetId).classList.add('active');
+            pathDisplay.textContent = `Reading: ${item.textContent}`;
+        });
+    });
+</script>
+</body>
+</html>
