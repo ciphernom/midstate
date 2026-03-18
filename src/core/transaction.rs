@@ -39,7 +39,7 @@ pub fn verify_transaction_sigs(tx: &Transaction, height: u64, commitments: &Utxo
         }
 
         for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
-            if !verify_predicate(&input.predicate, witness, &commitment, height, outputs) {
+            if !verify_predicate(&input.predicate, witness, &commitment, height, outputs, input.value) {
                 bail!("Predicate execution failed for input {}", i);
             }
         }
@@ -277,7 +277,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 }
                 
                 // Script Execution Engine
-                if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs) {
+                if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs, input.value) {
                     bail!("Predicate execution failed for input {}", i);
                 }
             }
@@ -322,6 +322,7 @@ fn verify_predicate(
     commitment: &[u8; 32],
     current_height: u64,
     outputs: &[OutputData],
+    input_value: u64,
 ) -> bool {
     match (predicate, witness) {
         (Predicate::Script { bytecode }, Witness::ScriptInputs(inputs)) => {
@@ -329,6 +330,7 @@ fn verify_predicate(
                 commitment,
                 height: current_height,
                 outputs,
+                input_value,
             };
             script::execute_script(bytecode, inputs, &ctx).is_ok()
         }
@@ -425,7 +427,7 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                 if !state.coins.contains(&coin_id) {
                     bail!("Coin {} not found", hex::encode(coin_id));
                 }
-                if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs) {
+                if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs, input.value) {
                     bail!("Predicate execution failed for input {}", i);
                 }
             }

@@ -113,6 +113,7 @@ pub struct ExecContext<'a> {
     pub commitment: &'a [u8; 32],
     pub height: u64,
     pub outputs: &'a [OutputData],
+    pub input_value: u64, // <-- NEW
 }
 
 // ── AOT validation ─────────────────────────────────────────────────────────
@@ -457,6 +458,31 @@ pub fn execute_script(
                     return Err(ScriptError::VerifyFailed);
                 }
                 let program_id: [u8; 32] = program_id_item.as_slice().try_into().unwrap();
+
+                if program_id == *crate::core::stark::CONFIDENTIAL_TRANSFER {
+                    // We expect exactly 2 confidential outputs for a standard CT
+                    let conf_outputs: Vec<_> = ctx.outputs.iter()
+                        .filter(|o| o.is_confidential())
+                        .collect();
+
+                    if conf_outputs.len() != 2 {
+                        return Err(ScriptError::VerifyFailed); // Must have exactly 2 CT outputs
+                    }
+
+                    let c1 = conf_outputs[0].commitment().unwrap();
+                    let c2 = conf_outputs[1].commitment().unwrap();
+
+                    // Reconstruct what the public inputs MUST be
+                    let mut expected_pub_inputs = Vec::with_capacity(72);
+                    expected_pub_inputs.extend_from_slice(&c1);
+                    expected_pub_inputs.extend_from_slice(&c2);
+                    expected_pub_inputs.extend_from_slice(&ctx.input_value.to_le_bytes());
+
+                    // Hard gate: If the attacker's stack inputs don't match reality, kill the script
+                    if public_inputs.as_slice() != expected_pub_inputs.as_slice() {
+                        return Err(ScriptError::VerifyFailed);
+                    }
+                }
 
                 super::stark::verify_stark_proof(
                     &program_id,

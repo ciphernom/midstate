@@ -658,11 +658,14 @@ pub const WOTS_REUSE_ACTIVATION_HEIGHT: u64 = 18_000;
 pub const MSS_REUSE_ACTIVATION_HEIGHT: u64 = 25_000; 
 
 /// Block height at which STARK proof verification and 128KB witness payloads activate.
-pub const STARK_ACTIVATION_HEIGHT: u64 = 1;
+pub const STARK_ACTIVATION_HEIGHT: u64 = 30_000;
+
+/// Block height at which strict STARK public input binding is enforced
+pub const CT_BINDING_ACTIVATION_HEIGHT: u64 = 30_000; 
 
 /// Block height at which OutputData::Confidential is accepted in transactions.
 /// Requires STARK_ACTIVATION_HEIGHT to already be active.
-pub const CONFIDENTIAL_ACTIVATION_HEIGHT: u64 = 1;
+pub const CONFIDENTIAL_ACTIVATION_HEIGHT: u64 = 30_000;
 
 // ── Economics ───────────────────────────────────────────────────────────────
 

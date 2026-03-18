@@ -283,6 +283,20 @@ enum WalletAction {
         #[arg(long, default_value = "120")]
         timeout: u64,
     },
+    SpendConfidential {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
+        #[arg(long)]
+        coin: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "120")]
+        timeout: u64,
+    },
     Import {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
@@ -972,6 +986,178 @@ async fn wallet_spend_stark(
     }
 }
 
+async fn wallet_spend_confidential(
+    path: &PathBuf,
+    rpc_port: u16,
+    rpc_host: String,
+    coin_ref: String,
+    to_arg: String,
+    timeout_secs: u64,
+) -> Result<()> {
+    #[cfg(not(feature = "stark-prover"))]
+    {
+        anyhow::bail!("CLI must be compiled with --features stark-prover");
+    }
+
+    #[cfg(feature = "stark-prover")]
+    {
+        let password = read_password("Password: ")?;
+        let mut wallet = Wallet::open(path, &password)?;
+        let client = reqwest::Client::new();
+
+        let target_coin_id = wallet.resolve_coin(&coin_ref)?;
+        let target_coin = wallet.find_coin(&target_coin_id).cloned()
+            .ok_or_else(|| anyhow::anyhow!("Coin not found in local wallet"))?;
+
+        if wallet.data.last_scan_height < midstate::core::types::STARK_ACTIVATION_HEIGHT {
+            anyhow::bail!("Network has not reached STARK activation height.");
+        }
+
+        let (recipient_addr, send_value) = parse_output_spec(&to_arg)?;
+
+        if target_coin.value <= send_value {
+            anyhow::bail!("Input value ({}) must exceed send value ({})", target_coin.value, send_value);
+        }
+        let change_value = target_coin.value - send_value;
+
+        println!("⚙️ Generating CONFIDENTIAL TRANSFER proof...");
+        println!("   Sending to {}, Change returning to wallet", hex::encode(&recipient_addr));
+
+        // Generate 32-byte cryptographic blinding factors
+        let blind1: [u8; 32] = rand::random();
+        let blind2: [u8; 32] = rand::random();
+
+        let prover = midstate::core::confidential::ct_prover::ConfidentialTransferProver::new(
+            send_value, blind1, change_value, blind2
+        );
+
+        let (pub_inputs, proof) = tokio::task::spawn_blocking(move || {
+            prover.generate_proof()
+        }).await.unwrap().map_err(|e| anyhow::anyhow!(e))?;
+
+        let proof_bytes = proof.to_bytes();
+        println!("✅ STARK Proof generated! Size: {} bytes", proof_bytes.len());
+
+        // Serialize public inputs exactly as verify_confidential_transfer expects (72 bytes)
+        let mut pub_inputs_bytes = Vec::with_capacity(72);
+        for w in &pub_inputs.commitment1 { pub_inputs_bytes.extend_from_slice(&w.to_le_bytes()); }
+        for w in &pub_inputs.commitment2 { pub_inputs_bytes.extend_from_slice(&w.to_le_bytes()); }
+        pub_inputs_bytes.extend_from_slice(&pub_inputs.input_sum.to_le_bytes());
+
+        // 1. Validate the coin is locked by the Confidential Transfer script
+        let mut bc = Vec::new();
+        midstate::core::script::push_data(&mut bc, &*midstate::core::stark::CONFIDENTIAL_TRANSFER);
+        bc.push(midstate::core::script::OP_VERIFY_STARK);
+        midstate::core::script::push_data(&mut bc, &target_coin.owner_pk);
+        bc.push(midstate::core::script::OP_CHECKSIGVERIFY);
+        midstate::core::script::push_int(&mut bc, 1);
+
+        let script_address = midstate::core::types::hash(&bc);
+        if script_address != target_coin.address {
+            anyhow::bail!("Coin is not locked by the STARK Confidential Transfer script. Address mismatch.");
+        }
+        let bytecode_hex = hex::encode(&bc);
+
+        // 2. Build Confidential Outputs using the generated commitments
+        let mut c1_bytes = [0u8; 32];
+        let mut c2_bytes = [0u8; 32];
+        for (i, w) in pub_inputs.commitment1.iter().enumerate() {
+            c1_bytes[i*4..(i+1)*4].copy_from_slice(&w.to_le_bytes());
+        }
+        for (i, w) in pub_inputs.commitment2.iter().enumerate() {
+            c2_bytes[i*4..(i+1)*4].copy_from_slice(&w.to_le_bytes());
+        }
+
+        let salt1: [u8; 32] = rand::random();
+        let salt2: [u8; 32] = rand::random();
+
+        let change_seed = wallet.next_wots_seed();
+        let change_pk = midstate::core::wots::keygen(&change_seed);
+        let change_addr = midstate::core::types::compute_address(&change_pk);
+
+        let outputs = vec![
+            midstate::core::OutputData::Confidential {
+                address: recipient_addr,
+                commitment: c1_bytes,
+                salt: salt1,
+            },
+            midstate::core::OutputData::Confidential {
+                address: change_addr,
+                commitment: c2_bytes,
+                salt: salt2,
+            },
+        ];
+
+        let input_coin_ids = vec![target_coin_id];
+        let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+        let tx_salt: [u8; 32] = rand::random();
+        let commitment = midstate::core::types::compute_commitment(&input_coin_ids, &output_commit_hashes, &tx_salt);
+
+        // 3. Phase 1: Commit
+        println!("Submitting Phase 1 Commit...");
+        submit_commit(&client, rpc_port, &rpc_host, &commitment).await?;
+
+        if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &hex::encode(commitment), timeout_secs).await {
+            anyhow::bail!("Timed out waiting for Commit to be mined.");
+        }
+        println!("✓ Commit mined!");
+
+        // 4. Phase 2: Reveal
+        let sig_bytes = wallet.auto_sign(&target_coin.owner_pk, &commitment)?;
+        
+        // Witness stack MUST exactly match the script execution popping order: [sig, pub_inputs, proof]
+        let witness_stack = vec![
+            hex::encode(sig_bytes),
+            hex::encode(pub_inputs_bytes),
+            hex::encode(proof_bytes),
+        ].join(",");
+
+        let reveal_req = midstate::rpc::SendTransactionRequest {
+            inputs: vec![midstate::rpc::InputRevealJson {
+                bytecode: bytecode_hex,
+                value: target_coin.value,
+                salt: hex::encode(target_coin.salt),
+            }],
+            signatures: vec![witness_stack],
+            outputs: outputs.iter().map(|o| match o {
+                midstate::core::OutputData::Confidential { address, commitment, salt } => midstate::rpc::OutputDataJson::Confidential {
+                    address: hex::encode(address),
+                    commitment: hex::encode(commitment),
+                    salt: hex::encode(salt),
+                },
+                _ => unreachable!(),
+            }).collect(),
+            salt: hex::encode(tx_salt),
+        };
+        
+        println!("Submitting Phase 2 Reveal (Pushing Confidential Transfer payload)...");
+        let reveal_url = format!("http://{}:{}/send", rpc_host, rpc_port);
+        let resp = client.post(&reveal_url).json(&reveal_req).send().await?;
+        if !resp.status().is_success() {
+            let err: midstate::rpc::ErrorResponse = resp.json().await?;
+            anyhow::bail!("Reveal failed: {}", err.error);
+        }
+
+        // Cleanup & Save Change locally so we know what we own
+        wallet.data.coins.retain(|c| c.coin_id != target_coin_id);
+        wallet.data.coins.push(midstate::wallet::WalletCoin {
+            seed: change_seed,
+            owner_pk: change_pk,
+            address: change_addr,
+            value: change_value,
+            salt: salt2,
+            coin_id: outputs[1].coin_id().unwrap(),
+            label: Some(format!("confidential change (hidden)")),
+            wots_signed: false,
+        });
+        wallet.save()?;
+
+        println!("✓ Confidential STARK Transaction sent successfully!");
+        Ok(())
+    }
+}
+
+
 async fn handle_wallet(action: WalletAction) -> Result<()> {
     match action {
         WalletAction::Create { path, legacy } => wallet_create(&path, legacy),
@@ -984,6 +1170,9 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         WalletAction::Scan { path, rpc_port, rpc_host } => wallet_scan(&path, rpc_port, rpc_host).await,
         WalletAction::Send { path, rpc_port, rpc_host, coin, to, timeout, private } => {
             wallet_send(&path, rpc_port, rpc_host, coin, to, timeout, private).await
+        }
+        WalletAction::SpendConfidential { path, rpc_port, rpc_host, coin, to, timeout } => {
+            wallet_spend_confidential(&path, rpc_port, rpc_host, coin, to, timeout).await
         }
         WalletAction::SpendScript { path, rpc_port, rpc_host, coin, bytecode, inputs, burn_data, to, timeout } => {
             wallet_spend_script(&path, rpc_port, rpc_host, coin, bytecode, inputs, burn_data, to, timeout).await
