@@ -838,6 +838,7 @@ async fn wallet_spend_script(
                 coin_id: out.coin_id().unwrap(),
                 label: Some(format!("change ({})", value)),
                 wots_signed: false,
+                commitment: None,
             });
         }
     }
@@ -1015,20 +1016,20 @@ async fn wallet_spend_confidential(
 
         let (recipient_addr, send_value) = parse_output_spec(&to_arg)?;
 
-        if target_coin.value <= send_value {
-            anyhow::bail!("Input value ({}) must exceed send value ({})", target_coin.value, send_value);
-        }
-        let change_value = target_coin.value - send_value;
+        // Fee Deduction Framework (Fix 4)
+        let total_value = target_coin.value;
+        // fees are dynamic, but we use a fixed minimum fee for simple sends.
+        let network_fee = 1500;
+        let change_value = total_value.saturating_sub(send_value).saturating_sub(network_fee);
 
         println!("⚙️ Generating CONFIDENTIAL TRANSFER proof...");
-        println!("   Sending to {}, Change returning to wallet", hex::encode(&recipient_addr));
 
-        // Generate 32-byte cryptographic blinding factors
         let blind1: [u8; 32] = rand::random();
         let blind2: [u8; 32] = rand::random();
 
+        // Include the explicit fee in the public inputs (Fix 4)
         let prover = midstate::core::confidential::ct_prover::ConfidentialTransferProver::new(
-            send_value, blind1, change_value, blind2
+            send_value, blind1, change_value, blind2, network_fee
         );
 
         let (pub_inputs, proof) = tokio::task::spawn_blocking(move || {
@@ -1038,11 +1039,12 @@ async fn wallet_spend_confidential(
         let proof_bytes = proof.to_bytes();
         println!("✅ STARK Proof generated! Size: {} bytes", proof_bytes.len());
 
-        // Serialize public inputs exactly as verify_confidential_transfer expects (72 bytes)
-        let mut pub_inputs_bytes = Vec::with_capacity(72);
+        // Serialize public inputs exactly as verify_confidential_transfer expects (80 bytes)
+        let mut pub_inputs_bytes = Vec::with_capacity(80);
         for w in &pub_inputs.commitment1 { pub_inputs_bytes.extend_from_slice(&w.to_le_bytes()); }
         for w in &pub_inputs.commitment2 { pub_inputs_bytes.extend_from_slice(&w.to_le_bytes()); }
         pub_inputs_bytes.extend_from_slice(&pub_inputs.input_sum.to_le_bytes());
+        pub_inputs_bytes.extend_from_slice(&pub_inputs.fee.to_le_bytes());  
 
         // 1. Validate the coin is locked by the Confidential Transfer script
         let mut bc = Vec::new();
@@ -1138,7 +1140,7 @@ async fn wallet_spend_confidential(
             anyhow::bail!("Reveal failed: {}", err.error);
         }
 
-        // Cleanup & Save Change locally so we know what we own
+// Cleanup & Save Change locally so we know what we own
         wallet.data.coins.retain(|c| c.coin_id != target_coin_id);
         wallet.data.coins.push(midstate::wallet::WalletCoin {
             seed: change_seed,
@@ -1149,6 +1151,8 @@ async fn wallet_spend_confidential(
             coin_id: outputs[1].coin_id().unwrap(),
             label: Some(format!("confidential change (hidden)")),
             wots_signed: false,
+            // FIX 2: Preserve the blinding hash for spending later
+            commitment: Some(c2_bytes), 
         });
         wallet.save()?;
 
@@ -1510,7 +1514,7 @@ async fn wallet_send(
             println!("  Pair {}: {} in (value {}) → {} out (value {}, fee {})",
                 pair_idx, inputs.len(), in_val, outputs.len(), out_val, in_val - out_val);
 
-            let (commitment, salt) = wallet.prepare_commit(
+            let (commitment, _salt) = wallet.prepare_commit(
                 inputs, outputs, change_seeds.clone(), true
             )?;
 
@@ -1646,7 +1650,7 @@ async fn wallet_send(
             final_fee
         );
 
-        let (commitment, salt) = wallet.prepare_commit(
+let (commitment, _salt) = wallet.prepare_commit(
             &input_coin_ids, &all_outputs, change_seeds.clone(), false
         )?;
 
@@ -2332,6 +2336,7 @@ fn wallet_import_rewards(path: &PathBuf, coinbase_file: &PathBuf, data_dir: &Pat
                 coin_id,
                 label: Some(format!("coinbase (value {})", entry.value)),
                 wots_signed: false,
+                commitment: None,
             }
         })
         .collect();

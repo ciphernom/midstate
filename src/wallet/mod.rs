@@ -41,6 +41,9 @@ pub struct WalletCoin {
     /// MSS-backed coins don't use this flag (MSS handles its own leaf counter).
     #[serde(default)]
     pub wots_signed: bool,
+    /// FIX 2: Store the specific Blake3 commitment hash needed to spend this confidential UTXO.
+    #[serde(default)]
+    pub commitment: Option<[u8; 32]>,
 }
 
 /// A commit that has been submitted but not yet revealed.
@@ -233,6 +236,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             coin_id,
             label: key.label,
             wots_signed: false,
+            commitment: None,
         });
         return Ok(Some(coin_id));
     }
@@ -248,6 +252,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             coin_id,
             label: Some(format!("received ({})", value)),
             wots_signed: false,
+            commitment: None,
         });
         return Ok(Some(coin_id));
     }
@@ -279,6 +284,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             coin_id,
             label: existing.label.clone(),
             wots_signed: false,
+            commitment: None,
         });
         tracing::info!(
             "Sibling import: coin {} (value {}) at existing WOTS address {}",
@@ -355,7 +361,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         }
         self.data.coins.push(WalletCoin {
             seed, owner_pk, address, value, salt, coin_id, label,
-            wots_signed: false,
+            wots_signed: false, commitment: None,
         });
         // Remove matching key from unused keys if present
         self.data.keys.retain(|k| k.address != address);
@@ -747,10 +753,13 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
 
         for coin_id in &pending.input_coin_ids {
             if let Some(wc) = self.find_coin(coin_id).cloned() {
+                // FIX 2: Check for confidential transfers where the value is hidden
+                let is_confidential = wc.value == 0;
                 input_reveals.push(InputReveal {
                     predicate: Predicate::p2pk(&wc.owner_pk),
                     value: wc.value,
                     salt: wc.salt,
+                    commitment: if is_confidential { wc.commitment } else { None },
                 });
 
                 let is_mss = self.data.mss_keys.iter().any(|k| k.master_pk == wc.owner_pk);
@@ -833,6 +842,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                         coin_id,
                         label: Some(format!("change ({})", out.value())),
                         wots_signed: false,
+                        commitment: None,
                     });
                 }
             }
@@ -989,6 +999,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             predicate: Predicate::p2pk(&coin.owner_pk),
             value: coin.value,
             salt: coin.salt,
+            commitment: None,
         };
 
         // Fresh one-time key from HD counter (recoverable from mnemonic)
@@ -1031,6 +1042,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             predicate: Predicate::p2pk(&coin.owner_pk),
             value: coin.value,
             salt: coin.salt,
+            commitment: None,
         };
         Ok((input, coin.coin_id))
     }
@@ -1087,6 +1099,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                 coin_id,
                 label: Some(format!("mixed ({})", output.value())),
                 wots_signed: false,
+                commitment: None,
             });
         }
 
