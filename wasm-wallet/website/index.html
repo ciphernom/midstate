@@ -1000,6 +1000,9 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                         <li><strong>Commit Phase:</strong> A 32-byte hash binds the inputs, outputs, and a 32-byte cryptographic salt: <code>BLAKE3(NETWORK_MAGIC || input_coin_ids || output_commit_hashes || salt)</code>. The client must compute a Proof-of-Work nonce yielding 16 to 30 leading zero bits (dynamically scaled based on current mempool congestion) to admit the <code>Commit</code> into the mempool.</li>
                         <li><strong>Reveal Phase:</strong> After the <code>Commit</code> is included in a block, the user broadcasts the <code>Reveal</code> transaction containing the cleartext preimages, executing the state transition. Commitments expire and are garbage-collected from the state after <code>COMMITMENT_TTL</code> (1,000 blocks).</li>
                     </ul>
+                    
+
+                    
                     <details class="deep-dive">
                         <summary>Dynamic Anti-Spam PoW</summary>
                         <div class="dd-content">
@@ -1009,67 +1012,130 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                     </details>
                 </div>
 
-<div class="tab-content" id="coinjoin">
- 
-<h3>Native CoinJoin</h3>
-                    <h4>Ephemeral CoinJoin Coordination</h4>
-                    <p>Multiparty mixing occurs via an off-chain libp2p protocol. Any node can initialize a session by broadcasting a <code>MixAnnounce</code> message.</p>
-                    
-                    
-                    
-                    
-                    <div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
-                    graph LR
-                        subgraph libp2p Network
-                            A[Peer A: Input + PoW] -->|MixJoin| M
-                            B[Peer B: Input + PoW] -->|MixJoin| M
-                            C[Peer C: Fee Input] -->|MixFee| M
-                        end
-                        
-                        M((Ephemeral<br>Coordinator))
-                        
-                        subgraph Canonical Proposal
-                            M -->|Lexicographical Sort| P[MixProposal]
-                            P -.->|Verify & Sign| A
-                            P -.->|Verify & Sign| B
-                            P -.->|Verify & Sign| C
-                        end
-                        
-                        style M fill:#2e1065,stroke:#8b5cf6,stroke-width:2px
-                        style A fill:#1f2937,stroke:#4b5563,color:#fff
-                        style B fill:#1f2937,stroke:#4b5563,color:#fff
-                        style C fill:#1f2937,stroke:#4b5563,color:#fff
-                    </div>
+<div class="tab-content active" id="coinjoin">
+    <h3>Native CoinJoin</h3>
+    <p>Midstate ships a <strong>denomination-uniform CoinJoin</strong> mixer built directly into the wallet and P2P layer. The final on-chain transaction is an ordinary <code>Reveal</code> that passes every validation rule. The privacy guarantee is mathematical: because every input and every output (except the mandatory fee coin) has identical power-of-2 value, subset-sum analysis yields <em>zero</em> information about the input→output mapping.</p>
+    
+    <div class="callout stark">
+        <h4>Core Invariants (from <code>wallet/coinjoin.rs</code>)</h4>
+        <ul>
+            <li><code>MIN_MIX_PARTICIPANTS = 2</code>, <code>MAX_MIX_PARTICIPANTS = 16</code></li>
+            <li>All mix inputs <strong>and</strong> outputs must share the exact same power-of-2 denomination (1, 2, 4, …, 2⁶³)</li>
+            <li>Exactly one additional input of value <code>1</code> covers the mandatory network fee</li>
+            <li>Coordinator is <strong>ephemeral</strong> — any node can start a session; no trusted third party</li>
+        </ul>
+    </div>
 
-                    <ul>
-                        <li><strong>Uniformity Constraints:</strong> A session enforces <code>MIN_MIX_PARTICIPANTS = 2</code> and <code>MAX_MIX_PARTICIPANTS = 16</code>. All mixed inputs and outputs must equal a single power-of-2 denomination. Exactly one input of value 1 must be provided by a participant to cover the network fee.</li>
-                        <li><strong>Anti-Sybil Proof-of-Work:</strong> Submitting a <code>MixJoin</code> or <code>MixFee</code> requires computing a nonce where <code>BLAKE3(mix_id || coin_id || peer_id || nonce)</code> yields at least 24 leading zero bits (<code>MIX_JOIN_POW_BITS</code>). Binding the PoW challenge to the libp2p <code>PeerId</code> prevents identity rotation attacks.</li>
-                        <li><strong>Trustless Proposal Assembly:</strong> The coordinator aggregates inputs and outputs, sorting them lexicographically by <code>coin_id</code> byte order to ensure deterministic serialization. The fee input is appended last. The coordinator broadcasts this canonical <code>MixProposal</code>. Participants cryptographically verify the presence of their registered outputs before signing the resulting commitment hash.</li>
-                    </ul>
+    <h4>Ephemeral CoinJoin Coordination (libp2p)</h4>
+    <p>Any node can initialise a session by broadcasting a <code>MixAnnounce</code> message containing a unique <code>MixID</code> and the target denomination.</p>
 
-                    <div class="callout">
-                        <h4>Dandelion++ Network Routing</h4>
-                        <p>Transactions originate in a stem phase to decouple the payload from the broadcasting IP address before entering the public mempool.</p>
-                        
-                        <div class="mermaid" style="text-align: center; margin: 20px 0;">
-                        graph LR
-                            A([Origin Node]) -.->|Stem phase| B([Node 2])
-                            B -.->|10% Probability| C([Node 3])
-                            C -.->|10% Probability| D([Node 4])
-                            D ==>|Broadcast Trigger| E([Peer A])
-                            D ==>|Broadcast| F([Peer B])
-                            D ==>|Broadcast| G([Peer C])
-                            
-                            style A fill:#2e1065,stroke:#8b5cf6,stroke-width:2px,color:#fff
-                            style D fill:#064e3b,stroke:#10b981,stroke-width:2px,color:#fff
-                        </div>
-                        
-                        <ul>
-                            <li><strong>Routing Logic:</strong> Stem transactions route sequentially to a single connected peer. At each hop, the receiving node evaluates a 10% probability (<code>STEM_FLUFF_PERCENT</code>) to transition the transaction to the fluff phase for global gossip broadcast.</li>
-                            <li><strong>Fallback Mechanisms:</strong> A transaction remaining in the local stem pool for <code>STEM_TIMEOUT_SECS</code> (30 seconds) triggers an automatic broadcast override. The local stem pool is strictly bounded to 1,000 entries (<code>MAX_STEM_POOL_SIZE</code>). If capacity is reached, new transactions bypass the stem phase entirely to prevent memory exhaustion under PoW spam.</li>
-                        </ul>
-                    </div>
-                </div>
+    <!-- Diagram 1: Announcement + PoW Join -->
+    <div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
+    graph TD
+        C(("Coordinator<br>PeerID: QmYw...")) -->|"Broadcast MixAnnounce<br>MixID: 0xabc123...<br>Denom: 8"| N["P2P Network"]
+       
+        subgraph PeerA ["Peer A (PeerID: QmXa...)"]
+            direction TB
+            P1["Receive Announce"] --> P2["Compute PoW Nonce"]
+            P2 -->|"BLAKE3(mix_id || coin_id || peer_id || nonce) ≥ 24 leading zeros"| P3{"Sufficient?"}
+            P3 --Yes--> P4["Send MixJoin"]
+            P3 --No--> P2
+        end
+        N --> P1
+        P4 -->|"Route to QmYw..."| C
+       
+        style C fill:#2e1065,stroke:#8b5cf6,stroke-width:2px,color:#fff
+        style P2 fill:#1f2937,stroke:#8b5cf6,color:#fff,stroke-dasharray: 5 5
+        style P3 fill:#064e3b,stroke:#10b981,color:#fff
+    </div>
+    <p class="callout" style="margin-top:-12px;">The coordinator broadcasts the session. Peers prove they control a real coin (and are not Sybils) by solving a <code>BLAKE3</code> PoW challenge bound to their <code>PeerId</code> and <code>coin_id</code>. This anti-Sybil mechanism is exactly the same 24-bit target used for commit spam protection.</p>
+
+    <!-- Diagram 2: Registration & Canonical Proposal -->
+    <div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
+    graph LR
+        subgraph libp2p Network
+            A[Peer A: Input + PoW] -->|MixJoin| M
+            B[Peer B: Input + PoW] -->|MixJoin| M
+            C[Peer C: Fee Input] -->|MixFee| M
+        end
+       
+        M((Ephemeral<br>Coordinator))
+       
+        subgraph Canonical Proposal
+            M -->|Lexicographical Sort by coin_id<br>Fee input appended last| P[MixProposal]
+            P -.->|Verify MY outputs present?| A
+            P -.->|Verify MY outputs present?| B
+            P -.->|Verify MY outputs present?| C
+        end
+       
+        style M fill:#2e1065,stroke:#8b5cf6,stroke-width:2px
+        style A fill:#1f2937,stroke:#4b5563,color:#fff
+        style B fill:#1f2937,stroke:#4b5563,color:#fff
+        style C fill:#1f2937,stroke:#4b5563,color:#fff
+    </div>
+    <p class="callout" style="margin-top:-12px;"> Participants register their <code>InputReveal</code> and desired <code>OutputData</code>. When the session reaches the minimum participant count and the fee input is supplied, the coordinator produces a <strong>deterministic</strong> <code>MixProposal</code> (see <code>MixSession::proposal()</code>). Inputs are sorted by <code>coin_id</code> (mix coins first, fee last); outputs are sorted by <code>coin_id</code>. This ordering guarantees every honest participant computes the exact same commitment hash.</p>
+
+    <!-- Diagram 3: Verification & Signing -->
+    <div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
+    sequenceDiagram
+        participant C as Coordinator
+        participant P as Peer A
+        participant L as Peer A Local State
+        Note over C: All registrations received.<br/>Inputs/Outputs deterministically sorted.
+        C->>P: Broadcast MixProposal (Registered Inputs + Desired Outputs)
+       
+        Note over P: Begin Verification Procedure
+        P->>L: Retrieve locally registered outputs
+       
+        rect rgb(30, 41, 59)
+        Note over P, L: CRITICAL CHECK: Are MY outputs in the coordinator's proposal?
+       
+        alt Outputs Missing or Altered
+            P--x C: DROP PROPOSAL (Refuse to Sign)
+            Note right of P: Coordinator attempt failed. Funds safe.
+        else Outputs Matched Exactly
+            P->>P: Sign Proposal Commitment Hash
+            P->>C: Send Signature
+        end
+        end
+    </div>
+    <p class="callout" style="margin-top:-12px;"> This is the <strong>trustless verification step</strong>. Each peer independently checks that the coordinator has not altered, omitted, or stolen their outputs before signing the single 32-byte commitment hash. If the check fails, the peer aborts — the coordinator gains nothing. The collected signatures are later assembled into the final <code>Reveal</code> transaction.</p>
+
+    <ul>
+        <li><strong>Uniformity Constraints:</strong> Enforced in <code>MixSession::register</code> and <code>set_fee_input</code>. DataBurn outputs are explicitly forbidden.</li>
+        <li><strong>Anti-Sybil Proof-of-Work:</strong> <code>BLAKE3(mix_id || coin_id || peer_id || nonce) ≥ 24 leading zeros</code> — exactly the same constant used for mempool spam protection (<code>MIX_JOIN_POW_BITS</code>).</li>
+        <li><strong>Trustless Proposal Assembly:</strong> Lexicographical sort by <code>coin_id</code> (see <code>proposal()</code>). Participants sign only the final commitment hash after local verification.</li>
+        <li><strong>On-Chain Detection:</strong> Any observer can call <code>is_uniform_mix(tx)</code> — it simply counts inputs/outputs of identical power-of-2 value plus at most one fee coin. The transaction remains fully valid even if the heuristic is unknown.</li>
+    </ul>
+
+    <h4>Dandelion++ Stem Routing (Post-Mix Privacy)</h4>
+    <p>After the reveal is constructed, the wallet routes the final <code>Reveal</code> transaction through Dandelion++ to decouple the broadcasting node’s IP from the transaction payload.</p>
+    
+    <div class="mermaid" style="text-align: center; margin: 20px 0;">
+    graph LR
+        A([Origin Node]) -.->|Stem phase| B([Node 2])
+        B -.->|10% Probability| C([Node 3])
+        C -.->|10% Probability| D([Node 4])
+        D ==>|Broadcast Trigger| E([Peer A])
+        D ==>|Broadcast| F([Peer B])
+        D ==>|Broadcast| G([Peer C])
+       
+        style A fill:#2e1065,stroke:#8b5cf6,stroke-width:2px,color:#fff
+        style D fill:#064e3b,stroke:#10b981,stroke-width:2px,color:#fff
+    </div>
+    <p class="callout" style="margin-top:-12px;"><strong>Diagram explanation:</strong> Transactions stay in the “stem” (single-peer forwarding) until a random 10% probability (<code>STEM_FLUFF_PERCENT</code>) flips them into the public “fluff” phase. Stem pool is capped at 1,000 entries to prevent memory exhaustion.</p>
+
+    <div class="math-block">
+        // Commitment Hash (identical on every honest node)
+        commitment = BLAKE3(
+            input_coin_ids_sorted ||
+            output_commit_hashes_sorted ||
+            session_salt
+        )
+    </div>
+
+    <p>The entire mixing protocol lives in <code>wallet/coinjoin.rs</code> (≈180 LOC). It is used automatically by the wallet’s <code>--private</code> send flag and can be invoked manually via the CLI or libp2p RPC for advanced users.</p>
+</div>
 
                 <div class="tab-content" id="starks">
                     <h3>Confidential Transfers via ZK-STARKs</h3>
