@@ -1,21 +1,18 @@
-name: Deploy Web Wallet to GitHub Pages
+name: Deploy Web Wallet and Architecture Site to GitHub Pages
 
 on:
   push:
     branches: ["main"]
-    # Only trigger if we actually change wallet or core files
     paths:
       - 'wasm-wallet/**'
       - 'src/core/**'
       - 'src/wallet/**'
 
-# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
 permissions:
   contents: read
   pages: write
   id-token: write
 
-# Allow only one concurrent deployment
 concurrency:
   group: "pages"
   cancel-in-progress: true
@@ -40,11 +37,30 @@ jobs:
           cd wasm-wallet
           wasm-pack build --target web --release
 
+      - name: Prepare Staging Directory
+        run: |
+          # 1. Create a clean staging area with a subfolder for the wallet app
+          mkdir -p staging/wallet
+          
+          # 2. Copy the Architecture Site (now in wasm-wallet/website) to the ROOT of staging
+          cp -r wasm-wallet/website/* staging/
+          
+          # 3. Copy the Wasm Wallet files to the '/wallet' subdirectory
+          # We exclude the 'website' folder itself to keep the deployment clean
+          cp wasm-wallet/index.html staging/wallet/
+          cp wasm-wallet/manifest.json staging/wallet/
+          cp wasm-wallet/sw.js staging/wallet/
+          cp wasm-wallet/worker.js staging/wallet/
+          cp -r wasm-wallet/pkg staging/wallet/
+          
+          # 4. Verification for logs
+          echo "Final Deployment Structure:"
+          ls -R staging
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          # We only want to publish the wasm-wallet folder, not the whole midstate repo
-          path: './wasm-wallet'
+          path: './staging'
 
   deploy:
     environment:
