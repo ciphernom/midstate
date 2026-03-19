@@ -419,7 +419,7 @@ impl Air for ConfidentialTransferAir {
         // ──────────────────────────────────────────────────────────────────────
     }
 
-    fn get_assertions(&self) -> Vec<Assertion<Self::BaseField>> {
+fn get_assertions(&self) -> Vec<Assertion<Self::BaseField>> {
         let mut a = Vec::new();
         let init = Self::initial_blake3_state();
         for i in 0..16 { a.push(Assertion::single(i, self.hash1_start, BaseElement::new(init[i] as u64))); }
@@ -432,8 +432,10 @@ impl Air for ConfidentialTransferAir {
         }
         a.push(Assertion::single(CARRY_BAL, self.range1_start, BaseElement::ZERO));
         
-        // FIX 4: Explicit public fee to prevent inflation
-        a.push(Assertion::single(CARRY_BAL, self.range2_start + 64, BaseElement::new(self.pub_inputs.input_sum - self.pub_inputs.fee)));
+        // FIX 4: Explicit public fee to prevent inflation + Prevent underflow panic
+        let net = self.pub_inputs.input_sum.saturating_sub(self.pub_inputs.fee);
+        a.push(Assertion::single(CARRY_BAL, self.range2_start + 64, BaseElement::new(net)));
+        
         assert_eq!(a.len(), 50);
         a
     }
@@ -505,7 +507,8 @@ pub mod ct_prover {
                 options: ProofOptions::new(32, 8, 0, FieldExtension::None, 8, 31),
                 pub_inputs: ConfidentialTransferInputs {
                     commitment1: blake3_compress(&m1), commitment2: blake3_compress(&m2), 
-                    input_sum: v1 + v2 + fee, fee,
+                    input_sum: v1.checked_add(v2).and_then(|s| s.checked_add(fee)).expect("CT values overflow u64"), 
+                    fee,
                 },
                 v1, blind1, v2, blind2,
             }
@@ -595,7 +598,13 @@ pub mod ct_prover {
                         cols[POW2][row] = BaseElement::new(1u64 << bp);
                         cols[ACC_A][row] = BaseElement::new((0..=bp).map(|b| ((rv>>b)&1)<<b).sum::<u64>());
                         cols[CARRY_BAL][row] = BaseElement::new(bal);
-                        if step.op == OpType::RangeLast { bal += rv; rs += 1; bp = 0; } else { bp += 1; }
+                        if step.op == OpType::RangeLast { 
+                            bal = bal.checked_add(rv).expect("Balance overflow"); 
+                            rs += 1; 
+                            bp = 0; 
+                        } else { 
+                            bp += 1; 
+                        }
                     }
                     OpType::Pass => { cols[CARRY_BAL][row] = BaseElement::new(bal); }
                 }
@@ -706,7 +715,7 @@ mod tests {
     }
     #[cfg(feature = "stark-prover")]
     #[test] fn ct_wrong_sum_rejected() {
-        let p = ct_prover::ConfidentialTransferProver::new(100,[0xAA;32],50,[0xBB;32]);
+        let p = ct_prover::ConfidentialTransferProver::new(100,[0xAA;32],50,[0xBB;32], 0);
         let (mut pi,proof) = p.generate_proof().unwrap(); pi.input_sum = 999;
         let mut pu = Vec::new();
         for w in &pi.commitment1 { pu.extend_from_slice(&w.to_le_bytes()); }
@@ -716,7 +725,7 @@ mod tests {
     }
     #[cfg(feature = "stark-prover")]
     #[test] fn ct_wrong_commitment_rejected() {
-        let p = ct_prover::ConfidentialTransferProver::new(100,[0xAA;32],50,[0xBB;32]);
+        let p = ct_prover::ConfidentialTransferProver::new(100,[0xAA;32],50,[0xBB;32], 0);
         let (mut pi,proof) = p.generate_proof().unwrap(); pi.commitment1[0] ^= 1;
         let mut pu = Vec::new();
         for w in &pi.commitment1 { pu.extend_from_slice(&w.to_le_bytes()); }

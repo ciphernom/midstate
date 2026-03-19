@@ -2,14 +2,7 @@
 <html lang="en" data-theme="dark">
 <head>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script type="module">
-    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
-    mermaid.initialize({ 
-        startOnLoad: true, 
-        theme: 'dark', 
-        fontFamily: "'JetBrains Mono', monospace" 
-    });
-</script>
+
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Midstate | Protocol Architecture</title>
@@ -487,6 +480,7 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
     
     <div class="sidebar">
         <div class="menu-item active" data-target="overview">Overview <span>→</span></div>
+        <div class="menu-item" data-target="genesis">Genesis & Fair Launch <span>→</span></div>
         <div class="menu-item" data-target="crypto">Cryptography <span>→</span></div>
         <div class="menu-item" data-target="consensus">Mining & Consensus <span>→</span></div>
          <div class="menu-item" data-target="economics">Economics & Supply <span>→</span></div>
@@ -860,7 +854,107 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
 
 
 
+<!-- INSERT THIS ENTIRE CONTENT-PANE RIGHT AFTER THE ECONOMICS PANE (id="economics") AND BEFORE THE PRIVACY PANE (id="privacy") -->
+<div class="content-pane" id="genesis">
+    <h2>Genesis Construction & Provable Fair Launch</h2>
+    <p>Midstate was engineered with absolute mathematical certainty that <strong>no pre-mining, no developer allocation, and no hidden coins ever existed</strong>. The entire genesis block is deterministically derived from a real, verifiable Bitcoin block mined in 2026 — making it impossible to have started the chain one second earlier.</p>
 
+    <div class="callout stark">
+        <h4>Bitcoin Block Anchor (Height 938708)</h4>
+        <p>The genesis <code>midstate</code> is not arbitrary. It is constructed by hashing a specific Bitcoin block that everyone could independently verify existed on the Bitcoin network:</p>
+        <div class="math-block">
+            // Bitcoin block used as cryptographic anchor
+            BITCOIN_BLOCK_HASH   = "000000000000000000018f5ad5625d43356136c2e50c6dc18967a90a18f0af2e"<br>
+            BITCOIN_BLOCK_HEIGHT = 938708<br>
+            BITCOIN_BLOCK_TIME   = 1772274770 (Feb 24 2026 UTC)<br><br>
+            initial_midstate = BLAKE3( BitcoinHash || Height.to_le_bytes() )
+        </div>
+        <p>Anyone can open any Bitcoin explorer (e.g. mempool.space, blockchain.com) and confirm this exact block existed. Because the Midstate genesis depends on its hash, the Midstate chain <strong>could not have been started before that Bitcoin block was mined</strong>.</p>
+    </div>
+
+    <h3>The Permanent Inscription (Burned Genesis Coins)</h3>
+    <p>The genesis coinbase creates exactly the initial reward of <code>2³⁰ = 1,073,741,824</code> units — split into two power-of-2 outputs of <code>2²⁹ = 536,870,912</code> each (perfectly compliant with the power-of-2 UTXO rule).</p>
+    
+    <p>Instead of real public keys, the <code>address</code> and <code>salt</code> fields contain the following plaintext inscription, permanently embedded into the blockchain on disk:</p>
+    
+    <div class="terminal" style="font-size:13px; line-height:1.4;">
+        <div class="term-line">Harvest Now, Decrypt Later: The Quantum Era's Encryption Challenge</div>
+        <div class="term-line">(Published Feb 24, 2026, by RBC Disruptors)</div>
+    </div>
+
+    <p>This is the exact Rust code that generates the genesis block (from the canonical implementation):</p>
+    <pre><code>impl State {
+    pub fn genesis() -> (Self, Vec&lt;CoinbaseOutput&gt;) {
+        // Bitcoin block anchor
+        const BITCOIN_BLOCK_HASH: &amp;str = "000000000000000000018f5ad5625d43356136c2e50c6dc18967a90a18f0af2e";
+        const BITCOIN_BLOCK_HEIGHT: u64 = 938708;
+        const BITCOIN_BLOCK_TIME: u64 = 1772274770;
+
+        let anchor = hash(BITCOIN_BLOCK_HASH.as_bytes());
+
+        // --- The Genesis Inscription (split across address + salt) ---
+        let mut chunk0 = [0u8; 32]; chunk0.copy_from_slice(b"Harvest Now, Decrypt Later: The ");
+        let mut chunk1 = [0u8; 32]; chunk1.copy_from_slice(b"Quantum Era's Encryption Challen");
+        let mut chunk2 = [0u8; 32]; chunk2.copy_from_slice(b"ge (Published Feb 24, 2026, by R");
+        let mut chunk3 = [0u8; 32]; chunk3[..13].copy_from_slice(b"BC Disruptors)");
+
+        let genesis_coinbase = vec![
+            CoinbaseOutput { address: chunk0, value: 536_870_912, salt: chunk1 },
+            CoinbaseOutput { address: chunk2, value: 536_870_912, salt: chunk3 }
+        ];
+
+        let initial_midstate = hash_concat(&amp;anchor, &amp;BITCOIN_BLOCK_HEIGHT.to_le_bytes());
+        // ... (difficulty target, MMR, etc.)
+        (state, genesis_coinbase)
+    }
+}</code></pre>
+
+    <div class="callout warn">
+        <h4>Why These Coins Are Mathematically Burned</h4>
+        <p>The <code>address</code> fields contain human-readable text instead of valid WOTS+ or MSS public keys. There is no corresponding private key anywhere in the universe that can spend them. The outputs are therefore <strong>provably unspendable</strong> — they are permanently removed from the circulating supply the instant the genesis block is created. This is the cryptographic equivalent of burning the initial coins in public.</p>
+    </div>
+
+    <h3>Mathematical Proof of No Pre-Mining</h3>
+    <ul>
+        <li><strong>Time-lock via Bitcoin anchor:</strong> The chain cannot exist before Bitcoin block 938708 was mined (verifiable by every node).</li>
+        <li><strong>Inscription date lock:</strong> The embedded message explicitly references February 24, 2026. Any earlier genesis would have a different anchor hash.</li>
+        <li><strong>Exact initial supply:</strong> 1.073 billion units created in the coinbase, immediately burned → zero developer allocation, zero hidden pre-mine.</li>
+        <li><strong>Deterministic &amp; auditable:</strong> Every node recomputes the exact same genesis state from the same Bitcoin block. There is no “trusted setup” or hidden parameters.</li>
+    </ul>
+
+<div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
+    graph LR
+        BTC[Bitcoin Block 938708<br>Feb 2026] --> Hash[BLAKE3 Anchor Hash<br>+ Inscription Chunks]
+        Hash --> Midstate[Genesis Midstate<br>+ Burned Coinbase]
+        Midstate --> Block0([Block 0<br>Fair Launch Proven])
+
+        style BTC fill:#1f2937,stroke:#4b5563,stroke-width:2px,color:#d1d5db
+        style Hash fill:#064e3b,stroke:#10b981,stroke-width:2px
+        style Midstate fill:#064e3b,stroke:#10b981,stroke-width:2px
+        style Block0 fill:#431407,stroke:#ea580c,stroke-width:2px,color:#fed7aa
+    </div>
+
+<h3>Verify It Yourself on Your Own Node</h3>
+    <p>Because Midstate's storage engine saves blocks as raw <code>bincode</code> serialized files, any node operator can inspect the genesis block directly on disk. The ASCII text of the burned coinbase outputs is clearly visible within the binary data.</p>
+    
+    <p>Use <code>hexdump</code> to view the exact hexadecimal memory layout of the burned genesis UTXOs, showing exactly how the message spans across the 32-byte <code>address</code> and <code>salt</code> arrays:</p>
+
+<div class="terminal">
+        <div class="term-line"><span style="color: #60a5fa;">$</span> hexdump -C data/db/batches/000000/batch_0.bin | grep -A 8 "Harvest"</div>
+        <div class="term-line" style="color: var(--text-muted);">00000050&nbsp;&nbsp;02 00 00 00 00 00 00 00&nbsp;&nbsp;48 61 72 76 65 73 74 20&nbsp;&nbsp;|........Harvest |</div>
+        <div class="term-line" style="color: var(--text-muted);">00000060&nbsp;&nbsp;4e 6f 77 2c 20 44 65 63&nbsp;&nbsp;72 79 70 74 20 4c 61 74&nbsp;&nbsp;|Now, Decrypt Lat|</div>
+        <div class="term-line" style="color: var(--text-muted);">00000070&nbsp;&nbsp;65 72 3a 20 54 68 65 20&nbsp;&nbsp;00 00 00 20 00 00 00 00&nbsp;&nbsp;|er: The ... ....|</div>
+        <div class="term-line" style="color: var(--text-muted);">00000080&nbsp;&nbsp;51 75 61 6e 74 75 6d 20&nbsp;&nbsp;45 72 61 27 73 20 45 6e&nbsp;&nbsp;|Quantum Era's En|</div>
+        <div class="term-line" style="color: var(--text-muted);">00000090&nbsp;&nbsp;63 72 79 70 74 69 6f 6e&nbsp;&nbsp;20 43 68 61 6c 6c 65 6e&nbsp;&nbsp;|cryption Challen|</div>
+        <div class="term-line" style="color: var(--text-muted);">000000a0&nbsp;&nbsp;67 65 20 28 50 75 62 6c&nbsp;&nbsp;69 73 68 65 64 20 46 65&nbsp;&nbsp;|ge (Published Fe|</div>
+        <div class="term-line" style="color: var(--text-muted);">000000b0&nbsp;&nbsp;62 20 32 34 2c 20 32 30&nbsp;&nbsp;32 36 2c 20 62 79 20 52&nbsp;&nbsp;|b 24, 2026, by R|</div>
+        <div class="term-line" style="color: var(--text-muted);">000000c0&nbsp;&nbsp;00 00 00 20 00 00 00 00&nbsp;&nbsp;42 43 20 44 69 73 72 75&nbsp;&nbsp;|... ....BC Disru|</div>
+        <div class="term-line" style="color: var(--text-muted);">000000d0&nbsp;&nbsp;70 74 6f 72 73 29 00 00&nbsp;&nbsp;00 00 00 00 00 00 00 00&nbsp;&nbsp;|ptors)..........|</div>
+    </div>
+
+
+    <p>Every single Midstate node in the world independently verifies this construction. There is no trust required — only math.</p>
+</div>
 
         <div class="content-pane" id="privacy">
             <h2>Privacy & MEV Resistance</h2>

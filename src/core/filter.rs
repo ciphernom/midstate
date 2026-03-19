@@ -373,6 +373,7 @@ mod tests {
                 predicate: Predicate::p2pk(&[8; 32]),
                 value: 10,
                 salt: [9; 32],
+                commitment: None,
             }],
             witnesses: vec![],
             outputs: vec![OutputData::Standard {
@@ -472,6 +473,7 @@ mod tests {
                 predicate: Predicate::p2pk(&[8; 32]),
                 value: 10,
                 salt: [9; 32],
+                commitment: None,
             }],
             witnesses: vec![],
             outputs: vec![OutputData::Standard {

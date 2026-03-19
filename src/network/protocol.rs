@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn message_serialize_deserialize_state_info() {
         let msg = Message::StateInfo {
-            height: 100,
+            height: 31000,
             depth: 5000,
             midstate: [0xBB; 32],
         };
@@ -231,7 +231,7 @@ mod tests {
                 depth,
                 midstate,
             } => {
-                assert_eq!(height, 100);
+                assert_eq!(height, 31000);
                 assert_eq!(depth, 5000);
                 assert_eq!(midstate, [0xBB; 32]);
             }
@@ -305,6 +305,7 @@ mod tests {
                     predicate: Predicate::p2pk(&[1; 32]),
                     value: 8,
                     salt: [2; 32],
+                    commitment: None,
                 },
                 output: OutputData::Standard {
                     address: [3; 32],
@@ -389,6 +390,7 @@ mod tests {
                 predicate: Predicate::p2pk(&[1; 32]),
                 value: 8,
                 salt: [2; 32],
+                commitment: None,
             },
             output: OutputData::Standard {
                 address: [3; 32],
@@ -424,11 +426,13 @@ mod tests {
                     predicate: Predicate::p2pk(&[1; 32]),
                     value: 8,
                     salt: [2; 32],
+                    commitment: None,
                 },
                 InputReveal {
                     predicate: Predicate::p2pk(&[3; 32]),
                     value: 1,
                     salt: [4; 32],
+                    commitment: None,
                 },
             ],
             outputs: vec![OutputData::Standard {

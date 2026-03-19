@@ -875,6 +875,7 @@ mod tests {
                 predicate: Predicate::p2pk(&owner_pk),
                 value,
                 salt: input_salt,
+                commitment: None,
             }],
             witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
             outputs: vec![output],
@@ -1037,6 +1038,7 @@ mod tests {
                 predicate: Predicate::p2pk(&owner_pk),
                 value: 1,
                 salt: input_salt,
+                commitment: None,
             }],
             witnesses: vec![Witness::sig(crate::core::wots::sig_to_bytes(&sig))],
             outputs: vec![output],
@@ -1062,6 +1064,7 @@ mod tests {
                 predicate: Predicate::p2pk(&[0; 32]),
                 value: 10,
                 salt: hash(&(i as u64).to_le_bytes()),
+                commitment: None,
             };
             let dummy_output =
                 OutputData::Standard { address: [0; 32], value: 8, salt: [0; 32] };
@@ -1102,6 +1105,7 @@ mod tests {
                 predicate: Predicate::p2pk(&[0; 32]),
                 value: 20,
                 salt: hash(&(i as u64).to_le_bytes()),
+                commitment: None,
             };
             let dummy_output =
                 OutputData::Standard { address: [0; 32], value: 10, salt: [0; 32] };
