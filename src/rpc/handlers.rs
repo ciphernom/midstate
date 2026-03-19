@@ -124,6 +124,7 @@ let inputs: Vec<InputReveal> = req.inputs.iter().map(|i| {
             },
             value: i.value,
             salt: parse_hex32(&i.salt, "input_salt")?,
+            commitment: None,
         })
     }).collect::<Result<_, ErrorResponse>>()?;
 
@@ -317,6 +318,7 @@ let input = InputReveal {
         },
         value: req.input.value,
         salt: parse_hex32(&req.input.salt, "input_salt")?,
+        commitment: None,
     };
     let output = match req.output {
         OutputDataJson::Standard { address, value, salt } => OutputData::Standard {
@@ -368,6 +370,7 @@ let input = InputReveal {
         },
         value: req.input.value,
         salt: parse_hex32(&req.input.salt, "input_salt")?,
+        commitment: None,
     };
     // --- Validate fee coin exists in UTXO set before touching MixManager ---
     {
