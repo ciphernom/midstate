@@ -1,6 +1,15 @@
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ 
+        startOnLoad: true, 
+        theme: 'dark', 
+        fontFamily: "'JetBrains Mono', monospace" 
+    });
+</script>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Midstate | Protocol Architecture</title>
@@ -480,10 +489,13 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
         <div class="menu-item active" data-target="overview">Overview <span>→</span></div>
         <div class="menu-item" data-target="crypto">Cryptography <span>→</span></div>
         <div class="menu-item" data-target="consensus">Mining & Consensus <span>→</span></div>
+         <div class="menu-item" data-target="economics">Economics & Supply <span>→</span></div>
         <div class="menu-item" data-target="privacy">Privacy & ZK-STARKs <span>→</span></div>
         <div class="menu-item" data-target="state">State Mgmt & Sync <span>→</span></div>
         <div class="menu-item" data-target="vm">Virtual Machine <span>→</span></div>
         <div class="menu-item" data-target="axe-hw">MidstateAxe Hardware <span>→</span></div>
+        <div class="menu-item" data-target="adversarial">Adversarial Analysis <span>→</span></div>
+        <div class="menu-item" data-target="quickstart">CLI Quickstart <span>→</span></div>
         <div class="menu-item" data-target="vs-legacy">Comparison <span>→</span></div>
     </div>
 
@@ -498,7 +510,27 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
 <div class="callout">
                 <h4>Why the name "Midstate"?</h4>
                 <p>In traditional blockchains, blocks are distinct data structures linked by their header hashes. Midstate abandons this design. Instead, the entire blockchain is mathematically modeled as a single, continuous <strong>BLAKE3 hash function</strong>.</p>
-                <p>The <code>midstate</code> is the 32-byte internal state of this global hash function. When a miner processes a block, they aren't hashing a static header—they are taking the current network <code>midstate</code> and advancing it by exactly 1,000,000 sequential BLAKE3 compression cycles. Every transaction, commitment, and proof of work permanently mutates this singular, ongoing mathematical state.</p>
+                
+                <div class="mermaid" style="text-align: center; margin: 20px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px;">
+                graph LR
+                    M0([Midstate N-1]) --> Combine1{+ State Root<br>+ Nonce}
+                    Combine1 --> HashLoop1[BLAKE3<br>x 1,000,000]
+                    HashLoop1 --> M1([Midstate N])
+                    
+                    M1 --> Combine2{+ State Root<br>+ Nonce}
+                    Combine2 --> HashLoop2[BLAKE3<br>x 1,000,000]
+                    HashLoop2 --> M2([Midstate N+1])
+                    
+                    M2 -.-> Combine3{...}
+
+                    style M0 fill:#431407,stroke:#ea580c,stroke-width:2px
+                    style M1 fill:#431407,stroke:#ea580c,stroke-width:2px
+                    style M2 fill:#431407,stroke:#ea580c,stroke-width:2px
+                    style HashLoop1 fill:#064e3b,stroke:#10b981,stroke-width:2px
+                    style HashLoop2 fill:#064e3b,stroke:#10b981,stroke-width:2px
+                </div>
+
+                <p>The <code>midstate</code> is the 32-byte internal state of this global hash function. When a miner processes a block, they aren't hashing a static header—they are taking the current network <code>midstate</code>, injecting the new transactions, and advancing it by exactly 1,000,000 sequential BLAKE3 compression cycles. Every transaction permanently mutates this singular, ongoing mathematical state.</p>
             </div>
 
             <h3>How is Midstate Different?</h3>
@@ -597,14 +629,15 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                 </div>
             </div>
         </div>
-
-        <div class="content-pane" id="consensus">
+<div class="content-pane" id="consensus">
             <h2>Mining & Consensus</h2>
             
             <div class="tabs">
                 <div class="tab-nav">
                     <button class="tab-btn active" data-tab="seq-hash">Sequential Hashing & ASICs</button>
                     <button class="tab-btn" data-tab="asert">ASERT Difficulty (16.16)</button>
+                    <button class="tab-btn" data-tab="bayesian">Bayesian Finality</button>
+                    <button class="tab-btn" data-tab="pool-mining">Pool Mining Protocol</button>
                 </div>
 
                 <div class="tab-content active" id="seq-hash">
@@ -613,49 +646,67 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                     
                     <p>Midstate inverts this model using <strong>Sequential Hashing</strong>. Finding a nonce is no longer a lottery; it is a marathon.</p>
 
-                    <div class="flow-diagram">
-                        <div class="flow-box">State Root + Nonce</div>
-                        <div class="flow-arrow">→</div>
-                        <div class="flow-box">BLAKE3</div>
-                        <div class="flow-arrow">→</div>
-                        <div class="flow-box">BLAKE3</div>
-                        <div class="flow-arrow">→ ...x1,000,000... →</div>
-                        <div class="flow-box">Final Hash</div>
+                    <div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
+                    graph TD
+                        subgraph Parallel [Bitcoin: Parallel PoW - ASIC Friendly]
+                            direction LR
+                            N1([Nonce 1]) -.-> H1[SHA256] --> C1{Check}
+                            N2([Nonce 2]) -.-> H2[SHA256] --> C2{Check}
+                            N3([Nonce 3]) -.-> H3[SHA256] --> C3{Check}
+                        end
+
+                        subgraph Sequential [Midstate: Sequential PoW - CPU Friendly]
+                            direction LR
+                            S1([State + Nonce]) --> S2[BLAKE3] --> S3[BLAKE3] --> S4[... x 1,000,000] --> S5[Final Hash] --> C4{Check}
+                        end
+
+                        style Parallel fill:#1f2937,stroke:#4b5563,stroke-width:2px,color:#d1d5db
+                        style Sequential fill:#431407,stroke:#ea580c,stroke-width:2px,color:#fed7aa
+                        style S2 fill:#064e3b,stroke:#10b981,stroke-width:2px
+                        style S3 fill:#064e3b,stroke:#10b981,stroke-width:2px
+                        style S4 fill:#064e3b,stroke:#10b981,stroke-width:2px
+                        style S5 fill:#064e3b,stroke:#10b981,stroke-width:2px
                     </div>
 
                     <p>To mine a block, a node must calculate 1,000,000 BLAKE3 hashes in a strict sequence: <code>H_n = BLAKE3(H_{n-1})</code>. Because the input of the next hash relies entirely on the output of the previous, the computation cannot be unrolled or divided across multiple cores.</p>
                     
-<div class="callout">
-    <h4>The Ratio of Power: Structural ASIC Resistance</h4>
-    <p>In Bitcoin, the power gap between a consumer CPU and a professional ASIC is astronomical—effectively <strong>billions-to-one</strong>. This forces a winner-take-all hardware arms race that centralizes the network into massive industrial data centers. Midstate inverts this by shifting the bottleneck from <strong>Parallel Throughput</strong> to <strong>Single-Thread Latency</strong>.</p>
+                    <div class="callout">
+                        <h4>Proof 1: The Poisson Process (Memorylessness)</h4>
+                        <p>Does sequential hashing make block times predictable (like a VDF)? No. The algorithm does not guarantee a block after 1,000,000 hashes. It guarantees that <em>a single attempt</em> (one nonce) takes exactly 1,000,000 hashes. The miner must still check if the <code>final_hash</code> meets the difficulty target.</p>
+                        <p>Each full sequence remains an independent Bernoulli trial. If the probability of meeting the target is <em>p</em>, and the network computes <em>λ</em> sequences per second, the probability of finding a block in time <em>t</em> follows the standard exponential distribution:</p>
+                        <div class="math-block">
+                            P(T ≤ t) = 1 - e<sup>-λpt</sup>
+                        </div>
+                        <p>Midstate simply scales the duration of the trial. Block arrivals remain a memoryless Poisson process, preserving the exact game theory and security guarantees of Nakamoto Consensus.</p>
+                    </div>
 
-    
-
-    <p>Because each hash in the 1,000,000-step chain requires the output of the previous, specialized hardware cannot "unroll" the loop. This creates a "compression" of hardware efficiency. While a powerful server still wins more blocks, the <em>magnitude</em> of its advantage is capped by physics and clock speed.</p>
-
-    <div class="math-block">
-        // Real-World Benchmarks<br>
-        Pi Zero 2W (Cortex-A53 @ 1.0GHz): ~10 nonces/sec<br>
-        Xeon E5-1650 v3 (6-Core @ 3.5GHz): ~300 nonces/sec<br>
-        High-End Threadripper (64-Core @ 4.5GHz): ~2,000 nonces/sec (Est.)
-    </div>
-
-    <p><strong>The 1,000:1 Ceiling:</strong> In the Midstate ecosystem, a high-end workstation is roughly 30x faster than a $15 Raspberry Pi. Even if an attacker scales to a massive 64-core server with AVX-512, they only achieve a ~1,000x advantage over the smallest node on the network.</p>
-    
-    <div class="callout warn">
-        <p>Compare this to Bitcoin: A standard CPU vs. an Antminer S21. The ratio is so vast it cannot be displayed on the same scale. By keeping the Ratio of Power within a 1,000:1 range, Midstate ensures that hobbyists and edge-node operators remain meaningful participants in the consensus process.</p>
-    </div>
-</div>
+                    <div class="callout">
+                        <h4>Proof 2: The Ratio of Power (ASIC Resistance Bound)</h4>
+                        <p>In Bitcoin, parallel hashrate is <em>H = C / L</em> (where <em>C</em> is cores, <em>L</em> is latency). ASICs win by scaling <em>C</em> to millions.</p>
+                        <p>In Midstate, a trial requires <em>S</em> sequential hashes. The time for one trial is <em>S × L_core</em>. An ASIC designer must optimize <em>L_core</em> (clock speed) because increasing parallel cores requires duplicating the entire 1,000,000-step state machine per core, demanding massive silicon area.</p>
+                        <p>The Maximum Attacker Advantage (<em>A_max</em>) is the ratio of an ASIC's latency to a consumer CPU's latency:</p>
+                        <div class="math-block">
+                            A_max = L_cpu / L_asic
+                        </div>
+                        <p>Because silicon physics caps clock speeds around 4–5 GHz, <em>L_asic</em> cannot physically be millions of times faster than <em>L_cpu</em>. While a datacenter will mine more blocks, their advantage is strictly bounded by single-thread execution limits, creating a provable ~1000:1 hardware ceiling between a supercomputer and a Raspberry Pi.</p>
+                    </div>
                 </div>
 
                 <div class="tab-content" id="asert">
                     <h3>ASERT Difficulty Adjustment</h3>
                     <p>Sliding-window difficulty algorithms (like LWMA or Bitcoin's 2016-block window) are highly vulnerable to time-warp attacks, hash-and-flee exploits, and echo effects. Midstate adjusts difficulty continuously on <em>every block</em> based on the absolute time elapsed since genesis.</p>
 
+                    <ul>
+                        <li><strong>Target Block Time:</strong> 60 Seconds</li>
+                        <li><strong>Adaptation Half-Life:</strong> 4 Hours (240 Blocks)</li>
+                    </ul>
+
+                    <p>If the network hashrate spikes and blocks are mined in 30 seconds, the ASERT algorithm guarantees the difficulty will exactly double every 4 hours until the 60-second equilibrium is restored.</p>
+
                     <div class="math-block">
                         // ASERT Algorithm<br>
-                        drift = actual_elapsed_time - ideal_elapsed_time<br>
-                        target = genesis_target * 2^(drift / half_life)
+                        drift = actual_elapsed_time - (height * 60_seconds)<br>
+                        target = genesis_target * 2<sup>(drift / 4_hours)</sup>
                     </div>
 
                     <div class="callout warn">
@@ -674,8 +725,142 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                         factor += (frac * frac * frac * 3643) >> 48;
                     </div>
                 </div>
+
+<div class="tab-content" id="bayesian">
+                    <h3>Bayesian Finality: Autonomous Risk Management</h3>
+                    <p>Most blockchains rely on arbitrary "magic numbers" for finality (e.g., Bitcoin's 6-block rule). This assumes the network's hashpower distribution is static and universally honest. In reality, networks experience partitions, hashpower drops, and active 51% attacks. A static rule is dangerously fragile during a consensus crisis.</p>
+
+                    <p>Midstate solves this by treating finality as a dynamic probability problem. Every node runs a <strong>Bayesian Finality Estimator</strong> that continuously models network health to calculate the exact depth <em>z</em> required to keep the risk of a chain reorganization below a strict <code>10<sup>-6</sup></code> threshold.</p>
+
+                    <h4>1. The Base Model: Gambler's Ruin</h4>
+                    <p>Assume honest miners control proportion <em>p</em> of the total hashpower, and an attacker controls <em>q = 1 - p</em>. The probability of an attacker successfully rewriting <em>z</em> blocks of history is a classic Gambler's Ruin problem:</p>
+                    
+                    <div class="math-block">
+                        If p > 0.5: P(catchup | p, z) = (q / p)<sup>z</sup> = ((1 - p) / p)<sup>z</sup><br>
+                        If p ≤ 0.5: P(catchup | p, z) = 1.0 (Catchup is mathematically guaranteed)
+                    </div>
+
+                    <h4>2. Modeling Uncertainty (The Beta Distribution)</h4>
+                    <p>In a decentralized network, a node never truly knows the exact value of <em>p</em>. It must infer it from local observations. Midstate models this uncertainty using a <strong>Beta distribution</strong> parameterized by α and β.</p>
+
+                    <p><strong>The Game-Theoretic Prior:</strong> Nodes initialize with a hostile prior (e.g., <code>α=2, β=8</code>), assuming 80% of the network is malicious until proven otherwise. As blocks arrive, the node updates its parameters:</p>
+                    
+                    <div class="math-block">
+                        // Update Rules (Capped at 10,000 to maintain agility)<br>
+                        On valid block extension: α = min(α + 1, 10000)<br>
+                        On orphan or reorg:       β = min(β + 1, 10000)
+                    </div>
+
+                    <p>If we didn't cap these values, a node running for 5 years would have such a high <em>α</em> that it would become completely blind to a sudden 51% attack. The 10,000 cap ensures the node's memory is bounded, allowing the probability density function (PDF) to shift rapidly if hostility spikes.</p>
+
+                    <h4>3. The Expected Risk Integral</h4>
+                    <p>Rather than blindly trusting the average estimate of <em>p</em>, the node calculates the <strong>Expected Risk</strong> by integrating the Gambler's Ruin probability across the entire Beta PDF. It searches for the lowest depth <em>z</em> where this risk drops below 1-in-a-million:</p>
+
+                    <div class="math-block">
+                        Expected Risk = ∫<sub>0</sub><sup>1</sup> P(catchup | p, z) * f<sub>Beta</sub>(p; α, β) dp &nbsp;≤&nbsp; 10<sup>-6</sup>
+                    </div>
+                    <p><span style="color: var(--text-muted); font-size: 13px;"><em>Engineering detail: To prevent IEEE-754 floating-point underflow in Rust, this integral is approximated using Log-Sum-Exp over 1,000 discrete slices.</em></span></p>
+
+                    <div class="callout warn">
+                        <h4>Game Theory: Bankrupting the Attacker</h4>
+                        <p>In Bitcoin, an attacker renting hashpower for a 51% attack simply waits 6 blocks to execute an exchange double-spend. The cost of the attack is fixed and predictable.</p>
+                        <p>In Midstate, an attacker trying to secretly mine a shadow chain will inevitably cause orphan races as their blocks occasionally leak or compete with honest blocks. Every orphan increments <em>β</em> on honest nodes. As <em>β</em> rises, the variance of the Beta distribution widens, increasing the "tail risk" that <em>p ≤ 0.5</em>. <strong>The integral forces the safe depth <em>z</em> to skyrocket.</strong></p>
+                        <p>Instead of waiting 6 blocks, merchants and exchanges are mathematically instructed by their nodes to wait 100+ blocks. The attacker is forced to burn millions of dollars sustaining their 51% hashpower monopoly for hours or days, completely bankrupting them before the victim ever considers the transaction "final."</p>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="pool-mining">
+                    <h3>Pool Mining Protocol</h3>
+                    <p>Because Midstate uses Sequential Hashing, traditional Bitcoin stratum protocols (where the pool builds the block and sends just the header to the miner) do not work. Miners must construct the block template locally to run the 1,000,000-hash state progression.</p>
+                    
+                    <p>To enable pooled mining without allowing miners to steal blocks, Midstate employs a <strong>Cryptographic Watermark</strong> system.</p>
+
+                    <div class="callout stark">
+                        <h4>The Watermark Defense</h4>
+                        <p>When a miner configures their node for a pool, they assign the block's reward address to the Pool's MSS Public Key. To prove they actually did the work, the miner embeds their own payout address deep within the Coinbase transaction's <code>salt</code> parameter.</p>
+                        <code>salt = BLAKE3("pool_share" || miner_address || height || output_idx)</code>
+                        <br><br>
+                        <p>When the miner submits a share, the pool server independently recalculates this hash. If it matches, the pool knows the miner expended the PoW for the pool's benefit. The miner cannot redirect the funds to themselves without changing the address, which would change the state root, invalidating the entire 1,000,000-hash PoW sequence.</p>
+                    </div>
+
+                    <h4>Share Aggregation & Payouts</h4>
+                    <p>The pool server accepts shares at a lower difficulty target (e.g., 20 leading zeros instead of 30) and tallies them in an ACID database (<code>redb</code>). If a submitted share happens to meet the actual network difficulty, the pool server immediately broadcasts it to the network as a full block win.</p>
+
+                    <p>Periodically, an automated Payout Engine scans the chain for the pool's UTXOs. It calculates proportional payouts based on the tallied shares, constructs a massive 1-to-N transaction, and executes the 2-phase Commit-Reveal spend using the pool's reusable MSS keys.</p>
+                </div>
             </div>
         </div>
+
+<div class="content-pane" id="economics">
+            <h2>Economics & Supply</h2>
+            <p>Sound money requires an unforgeable costliness to produce and a strictly bounded, mathematically predictable supply schedule. Midstate enforces a disinflationary emission curve that asymptotically approaches a hard cap, but includes a vital tail emission to ensure perpetual security.</p>
+
+            <div class="tabs">
+                <div class="tab-nav">
+                    <button class="tab-btn active" data-tab="supply-curve">Emission Schedule</button>
+                    <button class="tab-btn" data-tab="fee-market">Two-Dimensional Fee Market</button>
+                </div>
+
+                <div class="tab-content active" id="supply-curve">
+                    <div class="stat-grid">
+                        <div class="stat-card">
+                            <div class="stat-label">Maximum Supply</div>
+                            <div class="stat-value">1.12 Quadrillion</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Halving Interval</div>
+                            <div class="stat-value">525,600 blocks (1 Year)</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Initial Reward</div>
+                            <div class="stat-value">2<sup>30</sup> (1.07 Billion)</div>
+                        </div>
+                    </div>
+
+                    <div class="callout stark">
+                        <h4>The 64-bit Engineering Advantage</h4>
+                        <p>A maximum supply of 1.12 quadrillion sounds massive, but a standard unsigned 64-bit integer (<code>u64</code>) can hold up to <strong>18.4 quintillion</strong>. Midstate's entire lifetime supply uses only <strong>0.006%</strong> of a <code>u64</code>'s capacity.</p>
+                        <p>This is a critical architectural decision: the node never has to perform expensive <code>BigInt</code> or 256-bit math to calculate balances, entirely preventing integer overflow vulnerabilities. Furthermore, it allows the <code>OP_VERIFY_STARK</code> opcode to use highly optimized 64-bit Goldilocks field mathematics for its confidential transfer range proofs.</p>
+                    </div>
+
+                    <h3>The Disinflationary Curve</h3>
+                    <p>The block reward begins at <code>1,073,741,824</code> units per 60-second block. Every 525,600 blocks (exactly one year), the reward is bit-shifted to the right (halved).</p>
+                    
+                    <p>Unlike Bitcoin, which will eventually hit a block reward of exactly 0, Midstate enforces a <strong>Tail Emission</strong>. After 30 years, the block reward reaches a permanent floor of <code>1</code> unit per block. This guarantees miners are always mathematically incentivized to process blocks and secure the chain, even if transaction volume temporarily drops to zero.</p>
+
+                    <div style="background: var(--bg-alt); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-top: 24px;">
+                        <canvas id="supplyChart" height="120"></canvas>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="fee-market">
+                    <h3>The Two-Dimensional Fee Market</h3>
+                    <p>Most blockchains operate a single-dimensional fee market: you pay capital to buy block space. Midstate decouples transaction inclusion into two distinct markets, protecting edge nodes from spam while keeping fees predictable.</p>
+
+                    <div class="flow-diagram">
+                        <div class="flow-box"><strong>Phase 1: Commits</strong><br><span style="color:var(--text-muted); font-size:12px;">Paid via Energy (PoW)</span></div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-box"><strong>Phase 2: Reveals</strong><br><span style="color:var(--text-muted); font-size:12px;">Paid via Capital (Value)</span></div>
+                    </div>
+
+                    <h4>1. The Energy Market (Commits)</h4>
+                    <p>Because Commit transactions do not transfer value, they cannot pay a standard fee. Instead, users pay for mempool inclusion using CPU cycles. The required Proof-of-Work scales dynamically based on mempool congestion. If the network is quiet, a commit takes ~15 milliseconds to generate. If the network is under a DoS attack, the PoW requirement skyrockets, bankrupting the attacker's CPU resources before they can exhaust node RAM.</p>
+
+                    <h4>2. The Capital Market & RBF (Reveals)</h4>
+                    <p>Reveal transactions execute the actual state change and consume block space. Therefore, they must pay a capital fee. The node enforces a minimum relay fee of <strong>10 units per Kilobyte</strong>.</p>
+                    
+                    <div class="callout warn">
+                        <h4>Mempool Bounding & Replace-By-Fee (RBF)</h4>
+                        <p>To guarantee that Midstate can run on a 512MB Raspberry Pi indefinitely, the Mempool is mathematically capped at <strong>100 Megabytes</strong> or <strong>9,000 transactions</strong>, whichever is reached first.</p>
+                        <p>When the mempool fills up, the node initiates deterministic <strong>Replace-By-Fee (RBF)</strong> eviction. The node calculates the fee rate (<code>Fee / Byte Size</code>) of all pending transactions and permanently drops the lowest-paying transactions to make room for higher-paying ones. Because block space is scarce, users must bid against each other to have their Reveals mined during high congestion.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+
+
+
 
         <div class="content-pane" id="privacy">
             <h2>Privacy & MEV Resistance</h2>
@@ -730,10 +915,30 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                         <li><strong>Anti-Sybil PoW:</strong> To prevent attackers from stalling mixes by rotating identities, joining a mix requires a Proof-of-Work nonce cryptographically bound to the sender's libp2p <code>PeerId</code>.</li>
                     </ul>
 
-                    <div class="callout">
+
+
+<div class="callout">
                         <h4>Dandelion++ Routing</h4>
-                        <p>To prevent IP-address correlation, Midstate routes transactions through a "stem" phase before entering the public mempool. A transaction hops between single peers sequentially. At each hop, there is a 10% "fluff" probability where the node will finally broadcast it to the entire network. If a transaction stays in the stem pool for >30 seconds (due to a dead peer), the node automatically fluffs it as a safety net.</p>
+                        <p>To prevent IP-address correlation, Midstate routes transactions through a "stem" phase before entering the public mempool. A transaction hops between single peers sequentially. At each hop, there is a 10% "fluff" probability where the node will finally broadcast it to the entire network.</p>
+                        
+                        <div class="mermaid" style="text-align: center; margin: 20px 0;">
+                        graph LR
+                            A([Tx Origin]) -.->|Stem phase| B([Node 2])
+                            B -.->|10% Fluff| C([Node 3])
+                            C -.->|10% Fluff| D([Node 4])
+                            D ==>|Fluff Trigger!| E([Peer A])
+                            D ==>|Broadcast| F([Peer B])
+                            D ==>|Broadcast| G([Peer C])
+                            
+                            style A fill:#2e1065,stroke:#8b5cf6,stroke-width:2px
+                            style D fill:#064e3b,stroke:#10b981,stroke-width:2px
+                        </div>
+                        
+                        <p>If a transaction stays in the stem pool for >30 seconds (due to a dead peer), the node automatically fluffs it as a safety net.</p>
                     </div>
+                    
+                    
+                    
                     <p><strong>Anti-Spam Bypass:</strong> Anonymity should never crash the node. If an attacker attempts to flood the network with valid commits to OOM (Out-of-Memory) edge devices, Midstate caps the private Stem Pool at 1,000 entries. If full, the node prioritizes survival, bypassing the Dandelion++ privacy phase and immediately broadcasting transactions to the public mempool to clear the queue.</p>
                 </div>
 
@@ -751,30 +956,95 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
             </div>
         </div>
 
-        <div class="content-pane" id="state">
+<div class="content-pane" id="state">
             <h2>State Management & Syncing</h2>
-            <p>Midstate discards the traditional unbounded UTXO database model. Unspent outputs and pending commitments are accumulated into a <strong>Sparse Merkle Tree (SMT)</strong>, mathematically bounding the RAM requirements for the active state.</p>
+            <p>Midstate discards the traditional unbounded UTXO database model (like Bitcoin's LevelDB). Instead, unspent outputs, pending commitments, and chain history are mathematically accumulated into cryptographically verifiable data structures, strictly bounding the RAM requirements for edge devices.</p>
 
-            <h3>SMT Caching Architecture</h3>
-            <p>To achieve <code>O(log N)</code> insertion and verification without overflowing the RAM of edge devices, the 256-level tree is split into two access tiers:</p>
-            <ul>
-                <li><strong>Top Cache:</strong> The top 16 levels are cached persistently in memory, strictly bounded to a maximum of 65,536 nodes.</li>
-                <li><strong>Dynamic Folding:</strong> The bottom 240 levels are computed on the fly when proofs are required. Because coins are sorted lexicographically, this is extremely fast via binary searching over buckets.</li>
-            </ul>
-
-            <details class="deep-dive">
-                <summary>Reorg Defense & Frankenstein Chains</summary>
-                <div class="dd-content">
-                    <p>When a node detects a longer chain, it must perform a reorg. A catastrophic failure mode during sync is the "Frankenstein chain"—where a node writes the peer's alternative blocks to disk, but crashes before updating the <code>STATE_TABLE</code> pointer. Upon reboot, the database has half the old chain and half the new chain, destroying consensus.</p>
-                    <p>Midstate prevents this via strict ACID transactions. Incoming alternative batches are written to <code>.tmp</code> files. Only after the <code>STATE_TABLE</code> pointer is atomically updated in the `redb` database does the node promote the files to <code>.bin</code>. If a crash occurs, the node's WAL recovery checks the committed height and either deletes orphaned <code>.tmp</code> files or finishes the promotion, ensuring the disk is always perfectly coherent.</p>
+            <div class="tabs">
+                <div class="tab-nav">
+                    <button class="tab-btn active" data-tab="state-smt">SMT & MMR Architecture</button>
+                    <button class="tab-btn" data-tab="state-sync">Fast-Forward Sync & Snapshots</button>
+                    <button class="tab-btn" data-tab="state-filters">Compact Filters (Privacy)</button>
                 </div>
-            </details>
 
-            <h3>Fast-Forward Syncing</h3>
-            <p>Historical block batches are aggressively pruned. Validating nodes only retain lightweight headers and state snapshots (saved every 100 blocks). Light clients can scan the chain locally using <strong>Golomb-Rice Compact Filters (P=20)</strong>. Filter elements are securely keyed using the block's <code>final_hash</code> to prevent miner precomputation or filter-bloating attacks.</p>
+                <div class="tab-content active" id="state-smt">
+                    <h3>The SMT & MMR State Root</h3>
+                    <p>The global <code>state_root</code> of the Midstate network is a combination of two distinct data structures:</p>
+                    
+                    <h4>1. The UTXO Sparse Merkle Tree (SMT)</h4>
+                    <p>Active UTXOs and mempool commitments are stored in a 256-level Sparse Merkle Tree. To achieve <code>O(log N)</code> insertion and verification without overflowing the RAM of edge devices, the tree is split into two access tiers:</p>
+                    <ul>
+                        <li><strong>Top Cache:</strong> The top 16 levels are cached persistently in memory, strictly bounded to a maximum of 65,536 nodes.</li>
+                        <li><strong>Dynamic Folding:</strong> The bottom 240 levels are computed on the fly when proofs are required. Because coins are sorted lexicographically by their 32-byte hashes, this is computed near-instantly via binary searching over buckets.</li>
+                    </ul>
+
+                    <h4>2. The Merkle Mountain Range (MMR)</h4>
+                    <p>While the SMT tracks <em>active</em> state, the MMR tracks <em>historical</em> state. Every time a block is mined, its <code>final_hash</code> is appended to the MMR. This provides an append-only log of the entire chain history, allowing light clients to request <code>O(log N)</code> inclusion proofs to verify that a specific block existed at a specific height in the past.</p>
+
+                <div class="mermaid" style="text-align: center; margin: 24px 0; padding: 16px; background: var(--highlight); border: 1px solid var(--border); border-radius: 8px;">
+                    graph TD
+                        Root([Global State Root]) --> SMT([Combined SMT Root])
+                        Root --> MMR([Chain History MMR Root])
+                        
+                        SMT --> Mempool([Pending Commits SMT])
+                        SMT --> UTXO([Active UTXO SMT])
+                        
+                        UTXO --> TopCache[Top 16 Levels<br/>RAM Cache<br/>Max 65,536 Nodes]
+                        TopCache -.-> BottomTree[Bottom 240 Levels<br/>Disk-backed<br/>Dynamic Bucket Folding]
+                        
+                        MMR --> B1[Block 1]
+                        MMR --> B2[Block 2]
+                        MMR --> B3[Block N...]
+                        
+                        style Root fill:#431407,stroke:#ea580c,stroke-width:2px
+                        style TopCache stroke:#3b82f6,stroke-dasharray: 5 5
+                        style BottomTree stroke:#64748b
+                    </div>
+                    
+                    <div class="math-block">
+                        // The Final State Root Equation<br>
+                        smt_root = BLAKE3( utxo_smt_root || pending_commitments_smt_root )<br>
+                        state_root = BLAKE3( smt_root || historical_chain_mmr_root )
+                    </div>
+                </div>
+
+                <div class="tab-content" id="state-sync">
+                    <h3>Fast-Forward Syncing</h3>
+                    <p>A major issue with sequential hashing is the sync time. If a node goes offline for a month, replaying 1,000,000 hashes per block to catch up would take days on a Raspberry Pi. Midstate solves this via cryptographic Fast-Forwarding.</p>
+
+                    <p>Nodes save full state snapshots to disk every 100 blocks. When a node is syncing, it can download a recent snapshot from a peer instead of starting from genesis.</p>
+
+                    <div class="callout stark">
+                        <h4>Snapshot Cryptographic Validation</h4>
+                        <p>How does a node trust a peer's snapshot without replaying the history? It uses the headers. The node downloads the lightweight headers and verifies the Proof-of-Work. If the very first header mathematically builds exactly on top of the downloaded snapshot's <code>midstate</code>, the snapshot is authentic.</p>
+                        <p><strong>The Security Gate:</strong> To prevent an attacker from forging a fake snapshot and mining just 1 or 2 blocks on top of it, Midstate enforces a <code>PRUNE_DEPTH</code> rule. A node will only trust a snapshot if the peer can provide 1,000 valid blocks of Proof-of-Work natively built on top of it (1 billion sequential hashes). This makes state injection economically impossible.</p>
+                    </div>
+
+                    <details class="deep-dive">
+                        <summary>Reorg Defense & Frankenstein Chains</summary>
+                        <div class="dd-content">
+                            <p>When a node detects a longer chain, it must perform a reorg. A catastrophic failure mode during sync is the "Frankenstein chain"—where a node writes the peer's alternative blocks to disk, but crashes before updating the <code>STATE_TABLE</code> pointer. Upon reboot, the database has half the old chain and half the new chain, destroying consensus.</p>
+                            <p>Midstate prevents this via strict ACID transactions. Incoming alternative batches are written to <code>.tmp</code> files. Only after the <code>STATE_TABLE</code> pointer is atomically updated in the <code>redb</code> database does the node promote the files to <code>.bin</code>. If a crash occurs, the node's WAL recovery checks the committed height and either deletes orphaned <code>.tmp</code> files or finishes the promotion, ensuring the disk is always perfectly coherent.</p>
+                        </div>
+                    </details>
+                </div>
+
+                <div class="tab-content" id="state-filters">
+                    <h3>Compact Block Filters (Neutrino Privacy)</h3>
+                    <p>Light wallets need to know when they receive funds, but asking a public RPC node "Do you have any transactions for Address X?" completely destroys user privacy, linking their IP address to their wallet balance.</p>
+
+                    <p>Midstate implements client-side block filtering using <strong>Golomb-Rice Coding (P=20)</strong>. Instead of asking for specific addresses, the wallet downloads a tiny, highly compressed filter (a few kilobytes) for each block.</p>
+
+                    <ul>
+                        <li><strong>Local Matching:</strong> The wallet checks its own addresses against the filter locally. If there is a match (which includes a 1-in-1,000,000 false positive rate), the wallet downloads the <em>entire raw block</em> and scans it locally.</li>
+                        <li><strong>Zero Knowledge Leakage:</strong> The RPC node never learns which addresses the wallet actually owns; it only sees the wallet requesting sequential filter data and occasional full blocks.</li>
+                        <li><strong>Precomputation Defense:</strong> To prevent malicious miners from artificially bloating filters or crafting false positives, all elements inserted into the filter are cryptographically keyed using the block's <code>final_hash</code>.</li>
+                    </ul>
+                </div>
+            </div>
         </div>
 
-<div class="content-pane" id="vm">
+        <div class="content-pane" id="vm">
             <h2>Virtual Machine (MidstateScript)</h2>
             <p>Every UTXO in Midstate is locked by a compiled bytecode script. The VM executes witness inputs pushed onto the <code>SmallVec</code> stack, then evaluates the script. Execution succeeds if and only if the final top-of-stack item is exactly <code>[1]</code>.</p>
 
@@ -879,6 +1149,133 @@ Script: PUSH_HEX &lt;alice_addr&gt; SUM_TO_ADDR PUSH_INT 100 GREATER_OR_EQUAL VE
             </div>
         </div>
 
+        <div class="content-pane" id="axe-hw">
+            <h2>The MidstateAxe Ecosystem</h2>
+            <p>The Midstate node is highly optimized for the <strong>MidstateAxe</strong>—a custom OS image built via Buildroot for Raspberry Pi hardware (Zero 2 W, Pi 3, Pi 4). The node exposes exclusive hardware APIs when it detects the physical device.</p>
+
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Memory Footprint</div>
+                    <div class="stat-value">< 150 MB</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Jemalloc</div>
+                    <div class="stat-value">Anti-Fragmentation</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">OS Environment</div>
+                    <div class="stat-value">Embedded Linux</div>
+                </div>
+            </div>
+
+            <h3>Hardware APIs</h3>
+            <p>When the node detects it is running on Axe hardware (via device tree inspection), it unlocks a suite of captive-portal and management endpoints over the Axum RPC server:</p>
+            
+            <ul>
+                <li><code>/axe/stats</code>: Reads the CPU's thermal zone (in milli-Celsius), system uptime, and fetches the real-time atomic hardware hashrate counter.</li>
+                <li><code>/axe/wifi</code>: Acts as a captive portal, allowing users to configure <code>wpa_supplicant.conf</code> and reload the <code>wlan0</code> interface live via <code>wpa_cli</code>.</li>
+                <li><code>/axe/overclock</code>: Safely modifies <code>/boot/config.txt</code> to adjust <code>arm_freq</code> and <code>over_voltage</code>, then orchestrates a system reboot.</li>
+                <li><code>/axe/rewards</code>: Serves the <code>coinbase_seeds.jsonl</code> file directly to the user so they can import their offline mined rewards into a standard Desktop wallet.</li>
+            </ul>
+
+            <div class="callout warn">
+                <h4>DataBurn UTXOs (OP_RETURN)</h4>
+                <p>The MidstateAxe nodes are protected from state bloat. Users can embed arbitrary data in the blockchain using <code>OutputData::DataBurn</code> (capped at 80 bytes). However, these outputs yield no <code>coin_id</code> and are <strong>completely ignored by the UTXO Sparse Merkle Tree</strong>. Miners process the data, but the RAM of edge devices is never burdened by tracking unspendable data.</p>
+            </div>
+        </div>
+<div class="content-pane" id="quickstart">
+            <h2>CLI Quickstart Guide</h2>
+            <p>Midstate is controlled entirely via a unified command-line interface. This guide covers the essential commands for interacting with the network, managing keys, and sending private transactions.</p>
+
+            <div class="tabs">
+                <div class="tab-nav">
+                    <button class="tab-btn active" data-tab="qs-wallet">Wallet Setup</button>
+                    <button class="tab-btn" data-tab="qs-receive">Receiving Funds</button>
+                    <button class="tab-btn" data-tab="qs-send">Sending & Privacy</button>
+                    <button class="tab-btn" data-tab="qs-node">Running a Node</button>
+                </div>
+
+                <div class="tab-content active" id="qs-wallet">
+                    <h3>Creating a Wallet</h3>
+                    <p>Midstate uses HD (Hierarchical Deterministic) wallets by default. To create a new wallet, run:</p>
+                    <div class="terminal">
+                        $ midstate wallet create<br>
+                        <span class="term-info">INFO</span> Enter a strong password to encrypt your wallet.dat file.<br>
+                        <span class="term-success">SUCCESS</span> Wallet created. Write down your 24-word seed phrase.
+                    </div>
+
+                    <h3>Checking Your Balance</h3>
+                    <p>To view your total balance, live on-chain coins, and pending commits:</p>
+                    <div class="terminal">
+                        $ midstate wallet balance<br>
+                        Coins in wallet:  45<br>
+                        Live on-chain:    42 (value: 10500)<br>
+                        Unused keys:      5<br>
+                        Pending commits:  1
+                    </div>
+
+                    <div class="callout warn">
+                        <h4>Always Scan Before Spending!</h4>
+                        <p>Because Midstate uses client-side compact block filters for privacy, your wallet does not automatically know when it receives funds. You must scan the chain to update your local state:</p>
+                        <code>$ midstate wallet scan</code>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="qs-receive">
+                    <h3>Receiving Funds (One-Time Addresses)</h3>
+                    <p>By default, Midstate uses WOTS+ signatures. These are strictly one-time-use to preserve post-quantum security. To generate a fresh receiving address:</p>
+                    <div class="terminal">
+                        $ midstate wallet receive --label "Payment from Alice"<br>
+                        Your receiving address:<br>
+                        7a9b...c3d4<br>
+                        Share this with the sender.
+                    </div>
+
+                    <h3>Reusable Addresses (MSS)</h3>
+                    <p>If you need a static address (e.g., for a mining pool payout or a donation link), you must generate a Merkle Signature Scheme (MSS) tree. A height-10 tree allows exactly 1,024 signatures.</p>
+                    <div class="terminal">
+                        $ midstate wallet generate-mss --height 10 --label "Donations"<br>
+                        <span class="term-info">INFO</span> Generating MSS tree (Height 10 = 1024 signatures)...<br>
+                        <span class="term-success">SUCCESS</span> Address: 9f8e...1a2b
+                    </div>
+                </div>
+
+                <div class="tab-content" id="qs-send">
+                    <h3>Sending Funds</h3>
+                    <p>To send funds, specify the destination address and the exact amount. The wallet will automatically select the necessary UTXOs, group WOTS siblings to prevent key reuse, and generate exact change.</p>
+                    <div class="terminal">
+                        $ midstate wallet send --to 7a9b...c3d4:500<br>
+                        <span class="term-info">INFO</span> Submitting Phase 1 Commit...<br>
+                        <span class="term-success">SUCCESS</span> Commit mined!<br>
+                        <span class="term-info">INFO</span> Submitting Phase 2 Reveal...<br>
+                        <span class="term-success">SUCCESS</span> Transfer complete!
+                    </div>
+
+                    <h3>Private Sending (Dandelion++)</h3>
+                    <p>To maximize privacy, use the <code>--private</code> flag. This instructs the wallet to split your payment into independent power-of-2 denominations, route them through the Dandelion++ stem network, and add random execution delays to thwart timing analysis.</p>
+                    <div class="terminal">
+                        $ midstate wallet send --to 7a9b...c3d4:500 --private<br>
+                        Private send: 3 independent transaction(s)
+                    </div>
+                </div>
+
+                <div class="tab-content" id="qs-node">
+                    <h3>Running a Full Node & Mining</h3>
+                    <p>To start a full node, sync the chain, and begin CPU mining on all available cores, simply run:</p>
+                    <div class="terminal">
+                        $ midstate node --mine<br>
+                        <span class="term-time">14:02:11</span> <span class="term-info">INFO</span> Node started (mining: true, threads: 8, rpc: 8545)<br>
+                        <span class="term-time">14:02:11</span> <span class="term-info">INFO</span> Mining SIMD: AVX2 8-way (8 nonces/batch)
+                    </div>
+
+                    <h3>Fast-Forward Syncing</h3>
+                    <p>If you are spinning up a new node, you can sync from a specific trusted peer. The node will download the latest state snapshot and cryptographically verify it against the headers.</p>
+                    <div class="terminal">
+                        $ midstate sync --peer /ip4/198.51.100.5/tcp/9333/p2p/12D3K...
+                    </div>
+                </div>
+            </div>
+        </div>
         <div class="content-pane" id="vs-legacy">
             <h2>Architecture Comparison</h2>
             <table>
@@ -926,44 +1323,84 @@ Script: PUSH_HEX &lt;alice_addr&gt; SUM_TO_ADDR PUSH_INT 100 GREATER_OR_EQUAL VE
 
     </div>
     
-    <div class="content-pane" id="axe-hw">
-            <h2>The MidstateAxe Ecosystem</h2>
-            <p>The Midstate node is highly optimized for the <strong>MidstateAxe</strong>—a custom OS image built via Buildroot for Raspberry Pi hardware (Zero 2 W, Pi 3, Pi 4). The node exposes exclusive hardware APIs when it detects the physical device.</p>
+    <div class="content-pane" id="adversarial">
+            <h2>Adversarial Analysis & Edge Cases</h2>
+            <p>A protocol is only as robust as its worst-case scenario. Midstate was designed with strict mathematical bounds to survive hostility, spam, and hardware constraints without relying on benevolent actor assumptions.</p>
 
-            <div class="stat-grid">
-                <div class="stat-card">
-                    <div class="stat-label">Memory Footprint</div>
-                    <div class="stat-value">< 150 MB</div>
+            <div class="tabs">
+                <div class="tab-nav">
+                    <button class="tab-btn active" data-tab="spam-proof">Mempool DoS & Dynamic PoW</button>
+                    <button class="tab-btn" data-tab="frag-proof">UTXO Fragmentation Bound</button>
+                    <button class="tab-btn" data-tab="smt-proof">OOM Defense (SMT Limits)</button>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-label">Jemalloc</div>
-                    <div class="stat-value">Anti-Fragmentation</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">OS Environment</div>
-                    <div class="stat-value">Embedded Linux</div>
-                </div>
-            </div>
 
-            <h3>Hardware APIs</h3>
-            <p>When the node detects it is running on Axe hardware (via device tree inspection), it unlocks a suite of captive-portal and management endpoints over the Axum RPC server:</p>
-            
-            <ul>
-                <li><code>/axe/stats</code>: Reads the CPU's thermal zone (in milli-Celsius), system uptime, and fetches the real-time atomic hardware hashrate counter.</li>
-                <li><code>/axe/wifi</code>: Acts as a captive portal, allowing users to configure <code>wpa_supplicant.conf</code> and reload the <code>wlan0</code> interface live via <code>wpa_cli</code>.</li>
-                <li><code>/axe/overclock</code>: Safely modifies <code>/boot/config.txt</code> to adjust <code>arm_freq</code> and <code>over_voltage</code>, then orchestrates a system reboot.</li>
-                <li><code>/axe/rewards</code>: Serves the <code>coinbase_seeds.jsonl</code> file directly to the user so they can import their offline mined rewards into a standard Desktop wallet.</li>
-            </ul>
+                <div class="tab-content active" id="spam-proof">
+                    <h3>Mempool DoS & Dynamic PoW</h3>
+                    <p><strong>The Threat:</strong> In Midstate's 2-phase mempool, the <em>Commit</em> phase does not require a fee (fees are paid during the <em>Reveal</em>). An attacker could attempt to exhaust node RAM by flooding the network with millions of fake commitments.</p>
+                    
+                    <p><strong>The Mathematical Defense:</strong> Midstate enforces a dynamic Proof-of-Work spam nonce that scales exponentially based on mempool congestion. The target is defined by the number of leading zero bits required in the hash: <code>BLAKE3(commitment || nonce)</code>.</p>
+                    
+                    <ul>
+                        <li><strong>&lt; 500 pending commits:</strong> 24 bits (~16.7 million hashes)</li>
+                        <li><strong>500 - 749 pending commits:</strong> 26 bits (~67.1 million hashes)</li>
+                        <li><strong>750 - 899 pending commits:</strong> 28 bits (~268.4 million hashes)</li>
+                        <li><strong>&gt; 900 pending commits:</strong> 30 bits (~1.07 billion hashes)</li>
+                    </ul>
 
-            <div class="callout warn">
-                <h4>DataBurn UTXOs (OP_RETURN)</h4>
-                <p>The MidstateAxe nodes are protected from state bloat. Users can embed arbitrary data in the blockchain using <code>OutputData::DataBurn</code> (capped at 80 bytes). However, these outputs yield no <code>coin_id</code> and are <strong>completely ignored by the UTXO Sparse Merkle Tree</strong>. Miners process the data, but the RAM of edge devices is never burdened by tracking unspendable data.</p>
+                    <div class="callout warn">
+                        <h4>Attacker Bankruptcy</h4>
+                        <p>If an attacker wants to hold 1,000 garbage commits in the mempool to degrade network performance, the cost per transaction becomes ~1.07 billion hashes. To sustain a flood of 100 tx/sec at this congestion level, the attacker must sustain <strong>107 Billion hashes per second</strong>—all while legitimate users easily bypass the spam by submitting a single transaction taking ~1 second on a standard laptop. The attacker burns immense CPU power, while the node uses just kilobytes of RAM.</p>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="frag-proof">
+                    <h3>UTXO Fragmentation Bound (The Greedy Snowball)</h3>
+                    <p><strong>The Threat:</strong> By forcing all UTXOs to be strict powers of 2 (for privacy), a transaction of value <code>1,023</code> requires 10 distinct UTXOs (512+256+128+64+32+16+8+4+2+1). Critics argue this will cause the global UTXO set to fracture infinitely into "dust," bloating the state.</p>
+
+                    <p><strong>The Mathematical Defense:</strong> The Midstate wallet implements a <em>Greedy Snowball Defragmentation</em> algorithm. It mathematically guarantees that a user's wallet fragmentation is strictly bounded to <code>O(log₂ V)</code>, where <code>V</code> is their total balance.</p>
+
+                    <div class="math-block">
+                        // The Greedy Snowball Algorithm<br>
+                        1. Select minimum coins needed to satisfy payment.<br>
+                        2. Calculate resulting change denominations.<br>
+                        3. IF wallet contains a live coin matching a change denomination:<br>
+                        &nbsp;&nbsp;&nbsp;&nbsp;Pull that coin into the transaction inputs.<br>
+                        &nbsp;&nbsp;&nbsp;&nbsp;GOTO 2 (Merge up to the next power of 2).
+                    </div>
+
+                    <p><strong>Proof by Example:</strong> You need to pay <code>6</code>. Your wallet contains <code>[8, 2, 2]</code>.<br>
+                    - Normal selection picks <code>8</code>. Change is <code>2</code>. Wallet becomes <code>[2, 2, 2]</code> (Fragmentation worsened).<br>
+                    - <strong>Greedy selection</strong> picks <code>8</code>. Sees change is <code>2</code>. Pulls in an existing <code>2</code>. Total input <code>10</code>. Change is <code>4</code>. Wallet becomes <code>[4, 2]</code> (Defragmented!). Every transaction actively cleans the global UTXO set.</p>
+                </div>
+
+                <div class="tab-content" id="smt-proof">
+                    <h3>OOM Defense: SMT Memory Bounding</h3>
+                    <p><strong>The Threat:</strong> Bitcoin relies on an unbounded LevelDB database for its chainstate. As the network grows to billions of UTXOs, edge devices (like Raspberry Pis) will inevitably suffer Out-Of-Memory (OOM) panics or fatal disk I/O bottlenecks.</p>
+
+                    <p><strong>The Mathematical Defense:</strong> Midstate replaces the unbounded database with a 256-level Sparse Merkle Tree (SMT). We mathematically guarantee that the node's RAM requirements will never exceed a fixed threshold, regardless of how many UTXOs exist.</p>
+
+                    <div class="callout stark">
+                        <h4>The Cache Boundary Theorem</h4>
+                        <p>A full 256-level binary tree contains ~10<sup>77</sup> nodes, which is impossible to store. Midstate truncates memory allocation exactly at <code>CACHE_MIN_HEIGHT = 240</code>.</p>
+                        <p>The top 16 levels of the tree are cached in RAM. <code>2^16 = 65,536</code> maximum possible nodes. At 32 bytes per node hash, the absolute maximum memory footprint for the entire global state root index is exactly <strong>2.09 MB</strong>. The bottom 240 levels are never stored; they are dynamically folded in <code>O(log N)</code> time using a binary search over bucketed UTXOs on disk. The node cannot be OOM-crashed by state bloat, period.</p>
+                    </div>
+                </div>
             </div>
         </div>
     
 </div>
 
-<script>
+<script type="module">
+    // 1. Import Mermaid
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+    
+    // 2. Initialize WITHOUT auto-loading
+    mermaid.initialize({ 
+        startOnLoad: false, 
+        theme: 'dark', 
+        fontFamily: "'JetBrains Mono', monospace" 
+    });
+
     // Theme toggling
     const themeBtn = document.getElementById('theme-btn');
     const html = document.documentElement;
@@ -987,12 +1424,27 @@ Script: PUSH_HEX &lt;alice_addr&gt; SUM_TO_ADDR PUSH_INT 100 GREATER_OR_EQUAL VE
         setTheme(current === 'dark' ? 'light' : 'dark');
     });
 
+    // --- FIX: Robust visibility check for both tabbed and non-tabbed sections ---
+    async function renderVisibleDiagrams() {
+        // Find all unrendered mermaid divs in the active pane
+        const unrendered = Array.from(document.querySelectorAll('.content-pane.active .mermaid:not([data-processed="true"])'))
+            .filter(el => {
+                // If it's inside a tab, ensure that specific tab is active
+                const parentTab = el.closest('.tab-content');
+                return !parentTab || parentTab.classList.contains('active');
+            });
+
+        if (unrendered.length > 0) {
+            await mermaid.run({ nodes: unrendered });
+        }
+    }
+
     // Sidebar navigation
     const menuItems = document.querySelectorAll('.menu-item');
     const panes = document.querySelectorAll('.content-pane');
 
     menuItems.forEach(item => {
-        item.addEventListener('click', () => {
+        item.addEventListener('click', async () => {
             menuItems.forEach(m => m.classList.remove('active'));
             panes.forEach(p => p.classList.remove('active'));
 
@@ -1000,6 +1452,8 @@ Script: PUSH_HEX &lt;alice_addr&gt; SUM_TO_ADDR PUSH_INT 100 GREATER_OR_EQUAL VE
             const targetId = item.getAttribute('data-target');
             document.getElementById(targetId).classList.add('active');
             window.scrollTo(0,0);
+
+            await renderVisibleDiagrams();
         });
     });
 
@@ -1007,7 +1461,7 @@ Script: PUSH_HEX &lt;alice_addr&gt; SUM_TO_ADDR PUSH_INT 100 GREATER_OR_EQUAL VE
     const tabBtns = document.querySelectorAll('.tab-btn');
 
     tabBtns.forEach(btn => {
-        btn.addEventListener('click', () => {
+        btn.addEventListener('click', async () => {
             const targetContainer = btn.closest('.tabs');
             
             // Deactivate all in this specific container
@@ -1018,8 +1472,99 @@ Script: PUSH_HEX &lt;alice_addr&gt; SUM_TO_ADDR PUSH_INT 100 GREATER_OR_EQUAL VE
             btn.classList.add('active');
             const tabId = btn.getAttribute('data-tab');
             targetContainer.querySelector(`#${tabId}`).classList.add('active');
+
+            await renderVisibleDiagrams();
         });
     });
+
+    // On Initial Load
+    document.addEventListener("DOMContentLoaded", async () => {
+        await renderVisibleDiagrams();
+        setTimeout(initChart, 100);
+    });
+
+    // --- Supply Curve Chart ---
+    function initChart() {
+        const ctx = document.getElementById('supplyChart');
+        if (!ctx) return;
+
+        const years = Array.from({length: 35}, (_, i) => i);
+        const blocksPerYear = 525600;
+        let currentReward = 1073741824; // 2^30
+        
+        let supplyData = [];
+        let rewardData = [];
+        let circulating = 0;
+
+        for (let i = 0; i < 35; i++) {
+            circulating += currentReward * blocksPerYear;
+            supplyData.push(circulating / 1e12); // Trillions for readability
+            rewardData.push(currentReward);
+            
+            // Halve the reward, floor at 1
+            currentReward = Math.max(1, Math.floor(currentReward / 2));
+        }
+
+        const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+        const gridColor = isDark ? '#2c2c2c' : '#e5e7eb';
+        const textColor = isDark ? '#a1a1aa' : '#4b5563';
+
+        new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: years.map(y => `Year ${y}`),
+                datasets: [
+                    {
+                        label: 'Circulating Supply (Trillions)',
+                        data: supplyData,
+                        borderColor: '#3b82f6',
+                        backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                        borderWidth: 2,
+                        fill: true,
+                        yAxisID: 'y'
+                    },
+                    {
+                        label: 'Block Reward',
+                        data: rewardData,
+                        borderColor: '#10b981',
+                        borderDash: [5, 5],
+                        borderWidth: 2,
+                        yAxisID: 'y1'
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                interaction: { mode: 'index', intersect: false },
+                plugins: {
+                    legend: { labels: { color: textColor, font: { family: "'JetBrains Mono', monospace" } } },
+                    tooltip: { titleFont: { family: "'JetBrains Mono', monospace" }, bodyFont: { family: "'JetBrains Mono', monospace" } }
+                },
+                scales: {
+                    x: {
+                        grid: { color: gridColor },
+                        ticks: { color: textColor, font: { family: "'JetBrains Mono', monospace" } }
+                    },
+                    y: {
+                        type: 'linear',
+                        display: true,
+                        position: 'left',
+                        title: { display: true, text: 'Total Supply (Trillions)', color: textColor },
+                        grid: { color: gridColor },
+                        ticks: { color: textColor, font: { family: "'JetBrains Mono', monospace" } }
+                    },
+                    y1: {
+                        type: 'logarithmic',
+                        display: true,
+                        position: 'right',
+                        title: { display: true, text: 'Block Reward (Log Scale)', color: textColor },
+                        grid: { drawOnChartArea: false },
+                        ticks: { color: textColor, font: { family: "'JetBrains Mono', monospace" } }
+                    }
+                }
+            }
+        });
+    }
 </script>
 </body>
 </html>
