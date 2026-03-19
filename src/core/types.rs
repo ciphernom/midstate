@@ -321,8 +321,10 @@ impl Batch {
             midstate = hash_concat(&midstate, &cb.coin_id());
         }
 
-        // 3. Hash in the state root
-        midstate = hash_concat(&midstate, &self.state_root);
+// 3. Hash in the state root (Bypass for legacy blocks!)
+        if self.state_root != [0u8; 32] {
+            midstate = hash_concat(&midstate, &self.state_root);
+        }
 
         BatchHeader {
             height: 0, // Caller assigns this
