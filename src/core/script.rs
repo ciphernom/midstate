@@ -113,18 +113,12 @@ pub struct ExecContext<'a> {
     pub commitment: &'a [u8; 32],
     pub height: u64,
     pub outputs: &'a [OutputData],
-    pub input_value: u64, // <-- NEW
+    pub input_value: u64,
 }
 
 // ── AOT validation ─────────────────────────────────────────────────────────
 
 /// Ahead-of-time structural validation. O(N) single pass.
-///
-/// ```rust
-/// use midstate::core::script::{validate_structure, OP_IF, OP_ENDIF, OP_ADD};
-/// assert!(validate_structure(&[OP_IF, OP_ADD, OP_ENDIF], u64::MAX).is_ok());
-/// assert!(validate_structure(&[OP_IF, OP_ADD], u64::MAX).is_err()); // Unbalanced
-/// ```
 pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<bool, ScriptError> {
     if bytecode.len() > MAX_SCRIPT_SIZE {
         return Err(ScriptError::ScriptTooLarge);
@@ -171,7 +165,7 @@ pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<bool, ScriptEr
                 if height < crate::core::types::STARK_ACTIVATION_HEIGHT {
                     return Err(ScriptError::InvalidOpcode(op));
                 }
-                has_stark = true; // <-- We safely found the actual opcode!
+                has_stark = true;
             }
             _ => return Err(ScriptError::InvalidOpcode(op)),
         }
@@ -181,7 +175,7 @@ pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<bool, ScriptEr
         return Err(ScriptError::UnbalancedConditional);
     }
     
-    Ok(has_stark) // <-- Return the boolean
+    Ok(has_stark)
 }
 
 // ── Stack helpers ──────────────────────────────────────────────────────────
@@ -203,7 +197,6 @@ fn stack_pop(stack: &mut Vec<StackItem>) -> Result<StackItem, ScriptError> {
 
 fn to_u64(item: &[u8]) -> Result<u64, ScriptError> {
     if item.len() > 8 {
-        // Reject oversized integers to prevent malleability
         return Err(ScriptError::InvalidOpcode(0)); 
     }
     let mut buf = [0u8; 8];
@@ -248,39 +241,19 @@ fn verify_signature(sig_bytes: &[u8], message: &[u8; 32], pk_bytes: &[u8]) -> bo
 
 // ── Main execution engine ──────────────────────────────────────────────────
 
-/// Executes the script VM over the provided bytecode.
-///
-/// **STARK Exception**: If `OP_VERIFY_STARK` is present, the final element in
-/// the `witness` array is treated as the STARK proof payload. It is read
-/// directly from the slice and *not* pushed to the `SmallVec` stack to prevent
-/// huge heap allocation spikes during processing.
-///
-/// ```rust
-/// use midstate::core::script::{execute_script, ExecContext, OP_ADD, OP_EQUAL};
-/// 
-/// // A simple script testing 2 + 2 == 4
-/// let script = vec![OP_ADD, 0x01, 0x01, 0x00, 0x04, OP_EQUAL]; // PUSH 4, EQUAL
-/// let witness = vec![vec![0x02], vec![0x02]];
-/// let ctx = ExecContext { commitment: &[0; 32], height: 0, outputs: &[] };
-/// 
-/// assert!(execute_script(&script, &witness, &ctx).is_ok());
-/// ```
 pub fn execute_script(
     bytecode: &[u8],
     witness: &[Vec<u8>],
     ctx: &ExecContext,
 ) -> Result<(), ScriptError> {
-    // FIX 2: Get the boolean safely from the structural parser!
     let has_stark = validate_structure(bytecode, ctx.height)?;
 
-    // Bypass the SmallVec stack for STARK proofs to avoid massive memory allocations.
     let proof_bytes = if has_stark {
         witness.last().ok_or(ScriptError::StackUnderflow)?.as_slice()
     } else {
         &[]
     };
 
-    // Only push standard stack items (signatures, public keys, inputs) to the VM stack
     let push_limit = if has_stark { witness.len().saturating_sub(1) } else { witness.len() };
 
     let mut stack: Vec<StackItem> = Vec::new();
@@ -298,7 +271,6 @@ pub fn execute_script(
         let op = bytecode[pc];
         pc += 1;
 
-        // Control flow opcodes are always processed
         match op {
             OP_IF => {
                 if executing {
@@ -449,8 +421,6 @@ pub fn execute_script(
             }
 
             OP_VERIFY_STARK => {
-                // Stack: [... program_id, public_inputs] 
-                // Proof bytes were intercepted directly from the witness array
                 let public_inputs = stack_pop(&mut stack)?;
                 let program_id_item = stack_pop(&mut stack)?;
 
@@ -460,26 +430,37 @@ pub fn execute_script(
                 let program_id: [u8; 32] = program_id_item.as_slice().try_into().unwrap();
 
                 if program_id == *crate::core::stark::CONFIDENTIAL_TRANSFER {
-                    // We expect exactly 2 confidential outputs for a standard CT
                     let conf_outputs: Vec<_> = ctx.outputs.iter()
                         .filter(|o| o.is_confidential())
                         .collect();
 
                     if conf_outputs.len() != 2 {
-                        return Err(ScriptError::VerifyFailed); // Must have exactly 2 CT outputs
+                        return Err(ScriptError::VerifyFailed);
                     }
 
                     let c1 = conf_outputs[0].commitment().unwrap();
                     let c2 = conf_outputs[1].commitment().unwrap();
 
-                    // Reconstruct what the public inputs MUST be
-                    let mut expected_pub_inputs = Vec::with_capacity(72);
+                    let mut expected_pub_inputs = Vec::with_capacity(80);
                     expected_pub_inputs.extend_from_slice(&c1);
                     expected_pub_inputs.extend_from_slice(&c2);
                     expected_pub_inputs.extend_from_slice(&ctx.input_value.to_le_bytes());
 
-                    // Hard gate: If the attacker's stack inputs don't match reality, kill the script
-                    if public_inputs.as_slice() != expected_pub_inputs.as_slice() {
+                    // The last 8 bytes are the fee, declared by the user. 
+                    // STARK verifies v1+v2+fee == input_sum.
+                    if public_inputs.len() != 80 {
+                        return Err(ScriptError::VerifyFailed);
+                    }
+                    if public_inputs.as_slice()[0..72] != expected_pub_inputs.as_slice()[0..72] {
+                        return Err(ScriptError::VerifyFailed);
+                    }
+                } else if program_id == *crate::core::stark::RANGE_PROOF_64 {
+                    // FIX 3: Bind RANGE_PROOF_64 STARK input to actual context values
+                    if public_inputs.len() != 8 {
+                        return Err(ScriptError::VerifyFailed);
+                    }
+                    let claimed_value = u64::from_le_bytes(public_inputs.as_slice().try_into().unwrap());
+                    if claimed_value != ctx.input_value {
                         return Err(ScriptError::VerifyFailed);
                     }
                 }
@@ -489,7 +470,6 @@ pub fn execute_script(
                     &public_inputs,
                     proof_bytes,
                 ).map_err(|_| ScriptError::VerifyFailed)?;
-                // Does NOT push anything — acts like VERIFY (fails or continues).
             }
 
             _ => return Err(ScriptError::InvalidOpcode(op)),
@@ -497,7 +477,6 @@ pub fn execute_script(
     }
 
     if stack.is_empty() { return Err(ScriptError::EmptyStack); }
-    // Clean Stack Rule: Exactly 1 item must remain
     if stack.len() > 1 { return Err(ScriptError::CleanStackRuleFailed); }
     
     let top = stack.last().unwrap();

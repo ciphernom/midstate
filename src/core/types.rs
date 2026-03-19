@@ -488,12 +488,25 @@ pub struct InputReveal {
     pub predicate: Predicate,
     pub value: u64,
     pub salt: [u8; 32],
+    /// FIX 2: For spending a Confidential UTXO, the spender must provide the
+    /// commitment hash so the node can reconstruct the correct coin_id.
+    #[serde(default)]
+    pub commitment: Option<[u8; 32]>,
 }
 
 impl InputReveal {
     pub fn coin_id(&self) -> [u8; 32] {
-        // The coin_id now commits to the Predicate's address hash
-        compute_coin_id(&self.predicate.address(), self.value, &self.salt)
+        match self.commitment {
+            Some(ref c) => {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"CONFIDENTIAL");
+                hasher.update(&self.predicate.address());
+                hasher.update(c);
+                hasher.update(&self.salt);
+                *hasher.finalize().as_bytes()
+            }
+            None => compute_coin_id(&self.predicate.address(), self.value, &self.salt),
+        }
     }
 }
 
@@ -553,20 +566,35 @@ impl Transaction {
     }
 
     /// Fee = sum(input values) - sum(output values). Zero for Commit.
-    ///
-    /// If any output is Confidential, the "missing" value is accounted for
-    /// by the STARK balance proof in the spending script — the node does not
-    /// do arithmetic balance checking. We return 0 fee so the transaction
-    /// is not rejected for insufficient funds.
     pub fn fee(&self) -> u64 {
         match self {
             Transaction::Commit { .. } => 0,
-            Transaction::Reveal { inputs, outputs, .. } => {
+            Transaction::Reveal { inputs, outputs, witnesses, .. } => {
                 if outputs.iter().any(|o| o.is_confidential()) {
+                    // FIX 4: For confidential transfers, the fee is declared
+                    // explicitly in the STARK public inputs and enforced by the
+                    // AIR constraint v1 + v2 + fee == input_sum. Read it directly
+                    // from the witness rather than computing by subtraction.
+                    for witness in witnesses.iter() {
+                        let Witness::ScriptInputs(items) = witness;
+                            if items.len() >= 2 {
+                                let pub_inputs = &items[items.len() - 2];
+                                if pub_inputs.len() >= 80 {
+                                    if let Ok(fee_bytes) = pub_inputs[72..80].try_into() {
+                                        return u64::from_le_bytes(fee_bytes);
+                                    }
+                                }
+                            }
+                        
+                    }
                     return 0;
                 }
-                let in_sum = inputs.iter().try_fold(0u64, |acc, i| acc.checked_add(i.value)).unwrap_or(u64::MAX);
-                let out_sum = outputs.iter().try_fold(0u64, |acc, o| acc.checked_add(o.value())).unwrap_or(u64::MAX);
+                let in_sum = inputs.iter()
+                    .try_fold(0u64, |acc, i| acc.checked_add(i.value))
+                    .unwrap_or(u64::MAX);
+                let out_sum = outputs.iter()
+                    .try_fold(0u64, |acc, o| acc.checked_add(o.value()))
+                    .unwrap_or(u64::MAX);
                 in_sum.saturating_sub(out_sum)
             }
         }
@@ -694,7 +722,6 @@ pub fn block_reward(height: u64) -> u64 {
     let halvings = height / BLOCKS_PER_YEAR;
     INITIAL_REWARD >> halvings.min(30)
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -4,10 +4,10 @@
 //!   1. Blake3(v1 || blind1) = commitment1   (commitment binding)
 //!   2. Blake3(v2 || blind2) = commitment2   (commitment binding)
 //!   3. v1, v2 ∈ [0, 2^64)                  (range proofs)
-//!   4. v1 + v2 = input_sum                  (value balance)
+//!   4. v1 + v2 + fee = input_sum           (value balance)
 //!
-//! Trace layout: 24 columns × 16384 rows.
-//! Periodic columns: 57 (9 selectors + 48 one-hot index indicators).
+//! Trace layout: 28 columns × 16384 rows.
+//! Periodic columns: 63
 
 use super::stark::{Blake3Hasher, StarkError};
 
@@ -32,10 +32,10 @@ const BLAKE3_BLOCK_LEN: u32 = 40;
 const TWO_POW_32: u64 = 1u64 << 32;
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Trace Layout — 24 columns
+// Trace Layout — 28 columns
 // ═══════════════════════════════════════════════════════════════════════════
 
-const NUM_COLS: usize = 24;
+const NUM_COLS: usize = 28;
 const S0: usize = 0;
 const BIT_A: usize = 16;
 const BIT_B: usize = 17;
@@ -45,6 +45,11 @@ const ACC_XOR: usize = 20;
 const POW2: usize = 21;
 const CARRY_BAL: usize = 22;
 const AUX: usize = 23;
+// Added for Secure Trace Binding (Fix 1)
+const V1_LO: usize = 24;
+const V1_HI: usize = 25;
+const V2_LO: usize = 26;
+const V2_HI: usize = 27;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Step Schedule
@@ -121,11 +126,10 @@ fn generate_full_schedule() -> Vec<Step> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Periodic Columns — 57 total
-// 9 selectors + 16 one-hot rd1 + 16 one-hot rd2 + 16 one-hot wr
+// Periodic Columns — 63 total
 // ═══════════════════════════════════════════════════════════════════════════
 
-const NUM_PERIODIC: usize = 57;
+const NUM_PERIODIC: usize = 63;
 const P_IS_ADD: usize = 0;
 const P_IS_ADD_MSG: usize = 1;
 const P_IS_XOR: usize = 2;
@@ -135,18 +139,48 @@ const P_IS_RANGE: usize = 5;
 const P_IS_RANGE_FIRST: usize = 6;
 const P_IS_RANGE_LAST: usize = 7;
 const P_IS_ACTIVE: usize = 8;
-const P_R1: usize = 9;   // 9..24:  R1[i]=1 iff rd1==i
-const P_R2: usize = 25;  // 25..40: R2[i]=1 iff rd2==i
-const P_WR: usize = 41;  // 41..56: WR[i]=1 iff wr==i
+const P_R1: usize = 9;   // 9..24
+const P_R2: usize = 25;  // 25..40
+const P_WR: usize = 41;  // 41..56
+// Added for Secure Trace Binding (Fix 1)
+const P_IS_B1_LO: usize = 57;
+const P_IS_B1_HI: usize = 58;
+const P_IS_B2_LO: usize = 59;
+const P_IS_B2_HI: usize = 60;
+const P_IS_R1_LAST: usize = 61;
+const P_IS_R2_LAST: usize = 62;
 
 fn generate_periodic_columns(steps: &[Step]) -> Vec<Vec<BaseElement>> {
     let n = steps.len();
     let mut cols = vec![vec![BaseElement::ZERO; n]; NUM_PERIODIC];
+    let mut hash_block = 0;
+    let mut range_block = 0;
+
     for (row, step) in steps.iter().enumerate() {
         let one = BaseElement::ONE;
+        
+        if step.op == OpType::Reset { hash_block += 1; }
+        if step.op == OpType::RangeLast {
+            if range_block == 0 { cols[P_IS_R1_LAST][row] = one; }
+            if range_block == 1 { cols[P_IS_R2_LAST][row] = one; }
+            range_block += 1;
+        }
+
         match step.op {
-            OpType::Add     => { cols[P_IS_ADD][row] = one; cols[P_IS_ACTIVE][row] = one; }
-            OpType::AddMsg  => { cols[P_IS_ADD][row] = one; cols[P_IS_ADD_MSG][row] = one; cols[P_IS_ACTIVE][row] = one; }
+            OpType::Add      => { cols[P_IS_ADD][row] = one; cols[P_IS_ACTIVE][row] = one; }
+            OpType::AddMsg   => { 
+                cols[P_IS_ADD][row] = one; cols[P_IS_ADD_MSG][row] = one; cols[P_IS_ACTIVE][row] = one; 
+                if let Some((round, word_idx)) = step.msg_idx {
+                    if round == 0 && word_idx == 0 {
+                        if hash_block == 0 { cols[P_IS_B1_LO][row] = one; }
+                        if hash_block == 1 { cols[P_IS_B2_LO][row] = one; }
+                    }
+                    if round == 0 && word_idx == 1 {
+                        if hash_block == 0 { cols[P_IS_B1_HI][row] = one; }
+                        if hash_block == 1 { cols[P_IS_B2_HI][row] = one; }
+                    }
+                }
+            }
             OpType::XorFirst => { cols[P_IS_XOR][row] = one; cols[P_IS_XOR_FIRST][row] = one; cols[P_IS_ACTIVE][row] = one; }
             OpType::XorMid   => { cols[P_IS_XOR][row] = one; cols[P_IS_ACTIVE][row] = one; }
             OpType::XorLast  => { cols[P_IS_XOR][row] = one; cols[P_IS_XOR_LAST][row] = one; cols[P_IS_ACTIVE][row] = one; }
@@ -182,6 +216,7 @@ pub struct ConfidentialTransferInputs {
     pub commitment1: [u32; 8],
     pub commitment2: [u32; 8],
     pub input_sum: u64,
+    pub fee: u64, // ADDED: Fix 4
 }
 
 impl ToElements<BaseElement> for ConfidentialTransferInputs {
@@ -190,15 +225,16 @@ impl ToElements<BaseElement> for ConfidentialTransferInputs {
         for &w in &self.commitment1 { r.push(BaseElement::new(w as u64)); }
         for &w in &self.commitment2 { r.push(BaseElement::new(w as u64)); }
         r.push(BaseElement::new(self.input_sum));
+        r.push(BaseElement::new(self.fee));
         r
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// AIR — 36 constraints, 50 assertions
+// AIR — 42 constraints, 50 assertions
 // ═══════════════════════════════════════════════════════════════════════════
 
-const NUM_CONSTRAINTS: usize = 36;
+const NUM_CONSTRAINTS: usize = 42;
 
 pub struct ConfidentialTransferAir {
     context: AirContext<BaseElement>,
@@ -237,11 +273,6 @@ impl Air for ConfidentialTransferAir {
         let r1 = h2 + hl + 1;
         let r2 = r1 + 64;
 
-        // Degrees with one-hot selection (no Lagrange explosion):
-        // State transitions: is_active × (next - curr - is_writing × WR_i × (write_val - curr))
-        //   write_val = is_add × (Σ R1*state + Σ R2*state + aux - carry*2^32) + is_xor_last × acc_xor
-        //   Max chain: p × (t + p × p × (p × p×t)) = ~6 periodic × 1 trace
-        //   Declare 7 to be safe.
         let mut d = Vec::with_capacity(NUM_CONSTRAINTS);
         for _ in 0..16 { d.push(TransitionConstraintDegree::new(6)); }
         d.push(TransitionConstraintDegree::new(4)); // 16: carry
@@ -255,8 +286,8 @@ impl Air for ConfidentialTransferAir {
         d.push(TransitionConstraintDegree::new(3)); // 24
         d.push(TransitionConstraintDegree::new(3)); // 25
         d.push(TransitionConstraintDegree::new(4)); // 26
-        d.push(TransitionConstraintDegree::new(3)); // 27: operand verify a
-        d.push(TransitionConstraintDegree::new(3)); // 28: operand verify b
+        d.push(TransitionConstraintDegree::new(3)); // 27
+        d.push(TransitionConstraintDegree::new(3)); // 28
         d.push(TransitionConstraintDegree::new(4)); // 29
         d.push(TransitionConstraintDegree::new(2)); // 30
         d.push(TransitionConstraintDegree::new(2)); // 31
@@ -264,6 +295,15 @@ impl Air for ConfidentialTransferAir {
         d.push(TransitionConstraintDegree::new(3)); // 33
         d.push(TransitionConstraintDegree::new(2)); // 34
         d.push(TransitionConstraintDegree::new(2)); // 35
+        
+        // ADDED: Fix 1 Trace Binding Constraints
+        d.push(TransitionConstraintDegree::new(2)); // 36: V1_LO
+        d.push(TransitionConstraintDegree::new(2)); // 37: V1_HI
+        d.push(TransitionConstraintDegree::new(2)); // 38: V2_LO
+        d.push(TransitionConstraintDegree::new(2)); // 39: V2_HI
+        d.push(TransitionConstraintDegree::new(2)); // 40: ACC_A == V1
+        d.push(TransitionConstraintDegree::new(2)); // 41: ACC_A == V2
+        
         assert_eq!(d.len(), NUM_CONSTRAINTS);
 
         let ctx = AirContext::new(trace_info, d, 50, options);
@@ -358,6 +398,25 @@ impl Air for ConfidentialTransferAir {
         // 34-35: balance
         result[34] = is_range_not_last * (next[CARRY_BAL] - curr[CARRY_BAL]);
         result[35] = is_range_last * (next[CARRY_BAL] - curr[CARRY_BAL] - curr[ACC_A]);
+        
+        // ── FIX 1: SECURE TRACE BINDING ───────────────────────────────────────
+        let is_b1_lo = pv[P_IS_B1_LO];
+        let is_b1_hi = pv[P_IS_B1_HI];
+        let is_b2_lo = pv[P_IS_B2_LO];
+        let is_b2_hi = pv[P_IS_B2_HI];
+        let is_r1_last = pv[P_IS_R1_LAST];
+        let is_r2_last = pv[P_IS_R2_LAST];
+
+        // Ensure the binding registers hold the value extracted from the hash payload.
+        result[36] = is_b1_lo * (curr[V1_LO] - curr[AUX]) + (one - is_b1_lo) * is_active * (next[V1_LO] - curr[V1_LO]);
+        result[37] = is_b1_hi * (curr[V1_HI] - curr[AUX]) + (one - is_b1_hi) * is_active * (next[V1_HI] - curr[V1_HI]);
+        result[38] = is_b2_lo * (curr[V2_LO] - curr[AUX]) + (one - is_b2_lo) * is_active * (next[V2_LO] - curr[V2_LO]);
+        result[39] = is_b2_hi * (curr[V2_HI] - curr[AUX]) + (one - is_b2_hi) * is_active * (next[V2_HI] - curr[V2_HI]);
+
+        // Require the final accumulator in the range proof to match the bound values!
+        result[40] = is_r1_last * (curr[ACC_A] - (curr[V1_LO] + curr[V1_HI] * two32));
+        result[41] = is_r2_last * (curr[ACC_A] - (curr[V2_LO] + curr[V2_HI] * two32));
+        // ──────────────────────────────────────────────────────────────────────
     }
 
     fn get_assertions(&self) -> Vec<Assertion<Self::BaseField>> {
@@ -372,7 +431,9 @@ impl Air for ConfidentialTransferAir {
             a.push(Assertion::single(ACC_XOR, r, BaseElement::new(self.pub_inputs.commitment2[i] as u64)));
         }
         a.push(Assertion::single(CARRY_BAL, self.range1_start, BaseElement::ZERO));
-        a.push(Assertion::single(CARRY_BAL, self.range2_start + 64, BaseElement::new(self.pub_inputs.input_sum)));
+        
+        // FIX 4: Explicit public fee to prevent inflation
+        a.push(Assertion::single(CARRY_BAL, self.range2_start + 64, BaseElement::new(self.pub_inputs.input_sum - self.pub_inputs.fee)));
         assert_eq!(a.len(), 50);
         a
     }
@@ -437,13 +498,14 @@ pub mod ct_prover {
     }
 
     impl ConfidentialTransferProver {
-        pub fn new(v1: u64, blind1: [u8;32], v2: u64, blind2: [u8;32]) -> Self {
+        pub fn new(v1: u64, blind1: [u8;32], v2: u64, blind2: [u8;32], fee: u64) -> Self {
             let m1 = build_msg_block(v1, &blind1);
             let m2 = build_msg_block(v2, &blind2);
             Self {
                 options: ProofOptions::new(32, 8, 0, FieldExtension::None, 8, 31),
                 pub_inputs: ConfidentialTransferInputs {
-                    commitment1: blake3_compress(&m1), commitment2: blake3_compress(&m2), input_sum: v1+v2,
+                    commitment1: blake3_compress(&m1), commitment2: blake3_compress(&m2), 
+                    input_sum: v1 + v2 + fee, fee,
                 },
                 v1, blind1, v2, blind2,
             }
@@ -463,9 +525,33 @@ pub mod ct_prover {
             let mut h2 = false;
             let mut rv: u64 = 0;
             let mut rs = 0usize;
+            
+            // Add binding registers
+            let mut v1_lo = 0u64; let mut v1_hi = 0u64;
+            let mut v2_lo = 0u64; let mut v2_hi = 0u64;
+            let mut hb = 0;
 
             for (row, step) in steps.iter().enumerate() {
                 for i in 0..16 { cols[i][row] = BaseElement::new(state[i] as u64); }
+                
+                if step.op == OpType::Reset { hb += 1; }
+                if let OpType::AddMsg = step.op {
+                    if let Some((round, w)) = step.msg_idx {
+                        if round == 0 && w == 0 {
+                            if hb == 0 { v1_lo = cmsg[sch[round][w]] as u64; }
+                            if hb == 1 { v2_lo = cmsg[sch[round][w]] as u64; }
+                        }
+                        if round == 0 && w == 1 {
+                            if hb == 0 { v1_hi = cmsg[sch[round][w]] as u64; }
+                            if hb == 1 { v2_hi = cmsg[sch[round][w]] as u64; }
+                        }
+                    }
+                }
+                cols[V1_LO][row] = BaseElement::new(v1_lo);
+                cols[V1_HI][row] = BaseElement::new(v1_hi);
+                cols[V2_LO][row] = BaseElement::new(v2_lo);
+                cols[V2_HI][row] = BaseElement::new(v2_hi);
+
                 match step.op {
                     OpType::Add | OpType::AddMsg => {
                         let a = state[step.rd1] as u64;
@@ -549,14 +635,15 @@ fn ct_acceptable_options() -> winterfell::AcceptableOptions {
 }
 
 pub fn verify_confidential_transfer(public_inputs: &[u8], proof_bytes: &[u8]) -> Result<(), StarkError> {
-    if public_inputs.len() != 72 {
-        return Err(StarkError::InvalidPublicInputs(format!("expected 72 bytes, got {}", public_inputs.len())));
+    if public_inputs.len() != 80 { // FIX 4: 72 + 8 (fee) = 80
+        return Err(StarkError::InvalidPublicInputs(format!("expected 80 bytes, got {}", public_inputs.len())));
     }
     let mut c1 = [0u32;8]; let mut c2 = [0u32;8];
     for i in 0..8 { c1[i] = u32::from_le_bytes(public_inputs[i*4..(i+1)*4].try_into().unwrap()); }
     for i in 0..8 { c2[i] = u32::from_le_bytes(public_inputs[32+i*4..32+(i+1)*4].try_into().unwrap()); }
     let sum = u64::from_le_bytes(public_inputs[64..72].try_into().unwrap());
-    let pi = ConfidentialTransferInputs { commitment1: c1, commitment2: c2, input_sum: sum };
+    let fee = u64::from_le_bytes(public_inputs[72..80].try_into().unwrap());
+    let pi = ConfidentialTransferInputs { commitment1: c1, commitment2: c2, input_sum: sum, fee };
     let proof = Proof::from_bytes(proof_bytes).map_err(|e| StarkError::DeserializationFailed(format!("{}", e)))?;
     winterfell::verify::<ConfidentialTransferAir, Blake3Hasher, DefaultRandomCoin<Blake3Hasher>, MerkleTree<Blake3Hasher>>(proof, pi, &ct_acceptable_options())
         .map_err(|e| StarkError::VerificationFailed(format!("{}", e)))
@@ -592,7 +679,7 @@ mod tests {
         let r2 = r1+64; assert_eq!(s[r2].op, OpType::RangeFirst); assert_eq!(s[r2+63].op, OpType::RangeLast);
     }
     #[test] fn periodic_columns_correct_count() {
-        assert_eq!(generate_periodic_columns(&generate_full_schedule()).len(), 57);
+        assert_eq!(generate_periodic_columns(&generate_full_schedule()).len(), 63);
     }
     #[test] fn onehot_select_exact() {
         let state: Vec<BaseElement> = (0..16).map(|i| BaseElement::new(100+i)).collect();
@@ -604,7 +691,8 @@ mod tests {
 
     #[cfg(feature = "stark-prover")]
     #[test] fn ct_round_trip() {
-        let p = ct_prover::ConfidentialTransferProver::new(100,[0xAA;32],50,[0xBB;32]);
+        let p = ct_prover::ConfidentialTransferProver::new(100,[0xAA;32],50,[0xBB;32], 0);
+
         let (pi,proof) = p.generate_proof().expect("proof failed");
         let pb = proof.to_bytes();
         eprintln!("CT proof: {} bytes ({:.1} KB)", pb.len(), pb.len() as f64/1024.0);
@@ -612,6 +700,8 @@ mod tests {
         for w in &pi.commitment1 { pu.extend_from_slice(&w.to_le_bytes()); }
         for w in &pi.commitment2 { pu.extend_from_slice(&w.to_le_bytes()); }
         pu.extend_from_slice(&pi.input_sum.to_le_bytes());
+        pu.extend_from_slice(&pi.fee.to_le_bytes()); // after input_sum
+
         assert!(verify_confidential_transfer(&pu, &pb).is_ok());
     }
     #[cfg(feature = "stark-prover")]
@@ -639,7 +729,8 @@ mod tests {
         let (v1,v2) = (500_000_000u64, 573_741_824u64); assert_eq!(v1+v2, 1_073_741_824);
         let b1 = *blake3::hash(b"alice_blind_1").as_bytes();
         let b2 = *blake3::hash(b"alice_blind_2").as_bytes();
-        let p = ct_prover::ConfidentialTransferProver::new(v1,b1,v2,b2);
+        let p = ct_prover::ConfidentialTransferProver::new(v1,b1,v2,b2, 0);
+
         let (pi,proof) = p.generate_proof().expect("split failed");
         let pb = proof.to_bytes();
         eprintln!("Block reward split: {} bytes ({:.1} KB)", pb.len(), pb.len() as f64/1024.0);
@@ -647,6 +738,8 @@ mod tests {
         for w in &pi.commitment1 { pu.extend_from_slice(&w.to_le_bytes()); }
         for w in &pi.commitment2 { pu.extend_from_slice(&w.to_le_bytes()); }
         pu.extend_from_slice(&pi.input_sum.to_le_bytes());
+        pu.extend_from_slice(&pi.fee.to_le_bytes());
+
         assert!(verify_confidential_transfer(&pu, &pb).is_ok());
     }
 }
