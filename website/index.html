@@ -3,9 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MIDSTATE | Protocol Architecture</title>
+<title>Midstate | Protocol Architecture</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
 
 /* ── Minimalist Theme Variables ──────────────────────────────────────────── */
 :root[data-theme="light"] {
@@ -13,9 +13,17 @@
     --bg-alt: #f7f7f8;
     --border: #e5e7eb;
     --text-main: #111827;
-    --text-muted: #6b7280;
+    --text-muted: #4b5563;
     --code-bg: #f3f4f6;
     --accent: #000000;
+    --highlight: #eff6ff;
+    --terminal-bg: #111827;
+    --terminal-text: #10b981;
+    --stark-accent: #8b5cf6;
+    --stark-bg: #f5f3ff;
+    --warn-accent: #ea580c;
+    --warn-bg: #fff7ed;
+    --link-color: #2563eb;
 }
 
 :root[data-theme="dark"] {
@@ -23,9 +31,17 @@
     --bg-alt: #161616;
     --border: #2c2c2c;
     --text-main: #ededed;
-    --text-muted: #888888;
+    --text-muted: #a1a1aa;
     --code-bg: #1a1a1a;
     --accent: #ffffff;
+    --highlight: #1e1e1e;
+    --terminal-bg: #000000;
+    --terminal-text: #4ade80;
+    --stark-accent: #a78bfa;
+    --stark-bg: #2e1065;
+    --warn-accent: #fb923c;
+    --warn-bg: #431407;
+    --link-color: #60a5fa;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -34,8 +50,8 @@ body {
     background-color: var(--bg);
     color: var(--text-main);
     font-family: 'Inter', -apple-system, sans-serif;
-    font-size: 14px;
-    line-height: 1.6;
+    font-size: 15px;
+    line-height: 1.65;
     display: flex;
     flex-direction: column;
     min-height: 100vh;
@@ -43,9 +59,9 @@ body {
     -webkit-font-smoothing: antialiased;
 }
 
-a { color: var(--text-main); text-decoration: underline; text-decoration-color: var(--border); text-underline-offset: 4px; transition: all 0.2s; }
-a:hover { text-decoration-color: var(--text-main); }
-h1, h2, h3, .mono { font-family: 'JetBrains Mono', monospace; font-weight: 500; }
+a { color: var(--link-color); text-decoration: none; transition: all 0.2s; }
+a:hover { text-decoration: underline; text-underline-offset: 4px; }
+h1, h2, h3, h4, .mono { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
 
 /* ── Top Navigation ─────────────────────────────────────────────────────── */
 .topbar {
@@ -55,18 +71,37 @@ h1, h2, h3, .mono { font-family: 'JetBrains Mono', monospace; font-weight: 500; 
     padding: 16px 32px;
     border-bottom: 1px solid var(--border);
     background: var(--bg);
+    position: sticky;
+    top: 0;
+    z-index: 100;
 }
 
 .brand {
     font-family: 'JetBrains Mono', monospace;
-    font-weight: 600;
-    font-size: 14px;
+    font-size: 16px;
     letter-spacing: 1px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
 }
 
-.nav-actions { display: flex; gap: 16px; align-items: center; }
+.brand-indicator {
+    width: 8px;
+    height: 8px;
+    background-color: var(--text-main);
+    border-radius: 50%;
+    animation: pulse 2s infinite;
+}
 
-button, .btn {
+@keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(150, 150, 150, 0.4); }
+    70% { box-shadow: 0 0 0 6px rgba(150, 150, 150, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(150, 150, 150, 0); }
+}
+
+.nav-actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+
+.btn {
     background: transparent;
     border: 1px solid var(--border);
     color: var(--text-main);
@@ -76,48 +111,65 @@ button, .btn {
     padding: 6px 12px;
     border-radius: 6px;
     cursor: pointer;
-    text-decoration: none;
+    text-decoration: none !important;
     transition: all 0.15s;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
 }
 
-button:hover, .btn:hover {
+.btn:hover {
     background: var(--bg-alt);
     border-color: var(--text-muted);
 }
+
+/* Theme Toggle Icons */
+#theme-btn { padding: 6px 10px; background: transparent; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; color: var(--text-main); transition: all 0.15s;}
+#theme-btn:hover { background: var(--bg-alt); border-color: var(--text-muted); }
+.sun-icon, .moon-icon { width: 16px; height: 16px; fill: currentColor; }
+:root[data-theme="light"] .sun-icon { display: none; }
+:root[data-theme="dark"] .moon-icon { display: none; }
 
 /* ── Main Layout ───────────────────────────────────────────────────────── */
 .workspace {
     display: flex;
     flex: 1;
-    max-width: 1000px;
+    max-width: 1200px;
     margin: 40px auto;
     width: 100%;
 }
 
 .sidebar {
-    width: 220px;
-    padding-right: 30px;
+    width: 240px;
+    padding-right: 40px;
     display: flex;
     flex-direction: column;
     flex-shrink: 0;
+    position: sticky;
+    top: 100px;
+    align-self: flex-start;
 }
 
 .menu-item {
-    padding: 8px 12px;
-    margin-bottom: 4px;
+    padding: 10px 14px;
+    margin-bottom: 6px;
     cursor: pointer;
     color: var(--text-muted);
-    font-size: 13px;
+    font-size: 14px;
     border-radius: 6px;
     transition: all 0.1s;
-    font-family: 'JetBrains Mono', monospace;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
 }
 
 .menu-item:hover { color: var(--text-main); background: var(--bg-alt); }
 .menu-item.active {
     color: var(--text-main);
-    font-weight: 500;
+    font-weight: 600;
     background: var(--bg-alt);
+    border-left: 3px solid var(--text-main);
+    border-radius: 0 6px 6px 0;
 }
 
 /* ── Output / Content Area ─────────────────────────────────────────────── */
@@ -126,26 +178,29 @@ button:hover, .btn:hover {
     display: flex;
     flex-direction: column;
     min-width: 0;
+    padding-bottom: 100px;
 }
 
 .content-pane {
     display: none;
-    animation: fadeIn 0.2s ease-out;
+    animation: fadeIn 0.3s ease-out;
 }
 
 .content-pane.active { display: block; }
 
 @keyframes fadeIn {
-    from { opacity: 0; transform: translateY(5px); }
+    from { opacity: 0; transform: translateY(10px); }
     to { opacity: 1; transform: translateY(0); }
 }
 
-h2 { font-size: 24px; margin-bottom: 24px; letter-spacing: -0.5px; }
-h3 { font-size: 16px; margin-top: 40px; margin-bottom: 12px; letter-spacing: -0.3px; }
+h2 { font-size: 28px; margin-bottom: 24px; letter-spacing: -0.5px; border-bottom: 2px solid var(--border); padding-bottom: 12px;}
+h3 { font-size: 20px; margin-top: 48px; margin-bottom: 16px; letter-spacing: -0.3px; color: var(--text-main);}
+h4 { font-size: 15px; margin-top: 24px; margin-bottom: 12px; font-weight: 600; color: var(--text-main); }
 
-p { margin-bottom: 16px; color: var(--text-muted); }
+p { margin-bottom: 18px; color: var(--text-muted); }
 ul { padding-left: 20px; margin-bottom: 24px; color: var(--text-muted); }
-li { margin-bottom: 8px; }
+li { margin-bottom: 10px; }
+strong { color: var(--text-main); }
 
 code {
     background: var(--code-bg);
@@ -163,76 +218,210 @@ pre {
     border: 1px solid var(--border);
     border-radius: 6px;
     overflow-x: auto;
-    margin-bottom: 20px;
+    margin-bottom: 24px;
     font-family: 'JetBrains Mono', monospace;
-    font-size: 12px;
+    font-size: 13px;
     color: var(--text-muted);
     line-height: 1.5;
 }
 
-/* ── Deep Dive Accordions ─────────────────────────────────── */
-details.nitty-gritty {
+/* ── Deep Dive Accordions ──────────────────────────────────────────────── */
+details.deep-dive {
     background: var(--bg);
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: 8px;
     margin: 24px 0;
     overflow: hidden;
 }
 
-details.nitty-gritty summary {
-    padding: 14px 16px;
-    font-size: 13px;
-    font-weight: 500;
+details.deep-dive summary {
+    padding: 14px 20px;
+    font-size: 14px;
+    font-weight: 600;
     cursor: pointer;
     list-style: none;
     color: var(--text-main);
     background: var(--bg-alt);
     display: flex;
-    justify-content: space-between;
     align-items: center;
     font-family: 'JetBrains Mono', monospace;
 }
 
-details.nitty-gritty summary::-webkit-details-marker { display: none; }
-details.nitty-gritty summary:hover { background: var(--border); }
-details.nitty-gritty summary::after { content: '+'; font-family: 'JetBrains Mono', monospace; color: var(--text-muted); }
-details.nitty-gritty[open] summary::after { content: '-'; }
+details.deep-dive summary::-webkit-details-marker { display: none; }
+details.deep-dive summary::before { 
+    content: '▶'; 
+    display: inline-block; 
+    width: 20px; 
+    color: var(--text-muted);
+    transition: transform 0.2s;
+}
+details.deep-dive[open] summary::before { transform: rotate(90deg); }
+details.deep-dive summary:hover { background: var(--code-bg); }
 
-.ng-content {
+.dd-content {
     padding: 20px;
     border-top: 1px solid var(--border);
-    font-size: 13px;
-    color: var(--text-muted);
+    font-size: 14px;
+}
+.dd-content p:last-child { margin-bottom: 0; }
+
+/* ── Stats Grid ────────────────────────────────────────────────────────── */
+.stat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 32px;
 }
 
-.ng-content p:last-child { margin-bottom: 0; }
+.stat-card {
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    padding: 20px;
+    border-radius: 8px;
+}
 
-/* ── Flow Diagrams (Minimalist) ────────────────────────────────────────── */
+.stat-label {
+    font-size: 12px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+}
+
+.stat-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 24px;
+    color: var(--text-main);
+}
+
+/* ── Interactive Tabs ──────────────────────────────────────────────────── */
+.tabs {
+    margin: 24px 0;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.tab-nav {
+    display: flex;
+    background: var(--bg-alt);
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+}
+
+.tab-btn {
+    flex: 1;
+    text-align: center;
+    padding: 14px 12px;
+    border: none;
+    border-radius: 0;
+    border-right: 1px solid var(--border);
+    background: transparent;
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: pointer;
+    color: var(--text-muted);
+    transition: all 0.2s;
+}
+.tab-btn:hover { color: var(--text-main); background: var(--bg); }
+.tab-btn:last-child { border-right: none; }
+.tab-btn.active {
+    background: var(--bg);
+    color: var(--text-main);
+    border-bottom: 2px solid var(--text-main);
+}
+
+.tab-content {
+    padding: 24px;
+    display: none;
+    background: var(--bg);
+}
+.tab-content.active { display: block; }
+
+/* ── Callout Boxes ─────────────────────────────────────────────────────── */
+.callout {
+    padding: 20px;
+    border-radius: 8px;
+    border-left: 4px solid var(--border);
+    background: var(--bg-alt);
+    margin-bottom: 24px;
+}
+.callout.stark { border-left-color: var(--stark-accent); background: var(--stark-bg); }
+.callout.warn { border-left-color: var(--warn-accent); background: var(--warn-bg); }
+
+.callout h4 { margin-top: 0; margin-bottom: 12px; font-size: 16px; }
+.callout.stark h4 { color: var(--stark-accent); }
+.callout.warn h4 { color: var(--warn-accent); }
+
+.callout p { margin-bottom: 12px; font-size: 14px; color: var(--text-main); }
+.callout p:last-child { margin-bottom: 0; }
+.callout code { background: rgba(0,0,0,0.1); border: none;}
+
+/* ── Terminal Simulation ───────────────────────────────────────────────── */
+.terminal {
+    background: var(--terminal-bg);
+    border-radius: 8px;
+    padding: 20px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: var(--text-muted);
+    margin: 24px 0;
+    box-shadow: inset 0 0 20px rgba(0,0,0,0.8);
+    overflow-x: auto;
+}
+
+.term-line { margin-bottom: 6px; display: flex; gap: 16px; }
+.term-time { color: #6b7280; min-width: 90px;}
+.term-info { color: #3b82f6; min-width: 45px;}
+.term-success { color: var(--terminal-text); }
+.term-warn { color: #f59e0b; }
+
+/* ── Flow Diagrams ─────────────────────────────────────────────────────── */
 .flow-diagram {
     display: flex;
     align-items: center;
     gap: 12px;
     margin: 24px 0;
-    padding: 20px;
-    background: var(--bg-alt);
+    padding: 24px;
+    background: var(--highlight);
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: 8px;
     overflow-x: auto;
 }
 
 .flow-box {
     background: var(--bg);
     border: 1px solid var(--border);
-    padding: 12px 16px;
+    padding: 14px 20px;
     font-size: 13px;
-    border-radius: 4px;
+    border-radius: 6px;
     color: var(--text-main);
     white-space: nowrap;
+    font-family: 'JetBrains Mono', monospace;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+    text-align: center;
 }
+.flow-box.stark { border-color: var(--stark-accent); border-width: 2px; }
+.flow-box.warn { border-color: var(--warn-accent); border-width: 2px; }
 
 .flow-arrow {
     color: var(--text-muted);
     font-family: 'JetBrains Mono', monospace;
+    font-weight: bold;
+}
+
+/* ── Math Blocks ───────────────────────────────────────────────────────── */
+.math-block {
+    background: var(--bg-alt);
+    padding: 20px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    margin-bottom: 24px;
+    color: var(--text-main);
+    overflow-x: auto;
+    border-left: 3px solid var(--text-muted);
 }
 
 /* ── Comparison Table ──────────────────────────────────────────────────── */
@@ -240,8 +429,10 @@ table {
     width: 100%;
     border-collapse: collapse;
     margin-top: 24px;
-    font-size: 13px;
+    font-size: 14px;
     border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
 }
 
 th, td {
@@ -250,260 +441,333 @@ th, td {
     text-align: left;
 }
 
-th { color: var(--text-main); font-weight: 500; background: var(--bg-alt); font-family: 'JetBrains Mono', monospace; }
-td { color: var(--text-muted); }
-td.hl { color: var(--text-main); font-weight: 500;}
+th { background: var(--bg-alt); color: var(--text-main); font-weight: 600; font-family: 'JetBrains Mono', monospace;}
+td { color: var(--text-muted); background: var(--bg); }
+td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight); }
 
-/* Nested details inside table */
-tr.details-row td {
-    padding: 0;
-    border-bottom: 2px solid var(--border);
-}
-tr.details-row details.nitty-gritty {
-    margin: 0;
-    border: none;
-    border-radius: 0;
-}
-tr.details-row details.nitty-gritty[open] {
-    border-top: 1px solid var(--border);
-}
-tr.details-row summary {
-    font-size: 11px;
-    padding: 10px 16px;
-    background: transparent;
-}
-
-@media (max-width: 768px) {
+@media (max-width: 900px) {
+    .nav-actions { justify-content: flex-end; }
     .workspace { flex-direction: column; padding: 0 20px; }
-    .sidebar { width: 100%; padding-right: 0; margin-bottom: 30px; border-right: none; border-bottom: 1px solid var(--border); padding-bottom: 20px;}
+    .sidebar { width: 100%; padding-right: 0; margin-bottom: 30px; position: static; flex-direction: row; flex-wrap: wrap; gap: 8px; border-bottom: 1px solid var(--border); padding-bottom: 20px;}
+    .menu-item { flex: 1 1 auto; justify-content: center; text-align: center; border-left: none; border-bottom: 3px solid transparent; border-radius: 6px 6px 0 0; }
+    .menu-item.active { border-left: none; border-bottom-color: var(--text-main); }
     .flow-diagram { flex-direction: column; align-items: flex-start; }
     .flow-arrow { transform: rotate(90deg); margin-left: 20px; }
+    .tab-btn { border-right: none; border-bottom: 1px solid var(--border); width: 100%; text-align: left;}
 }
 </style>
 </head>
 <body>
 
 <div class="topbar">
-    <div class="brand">MIDSTATE</div>
+    <div class="brand"><div class="brand-indicator"></div> MIDSTATE</div>
     <div class="nav-actions">
-        <button id="theme-btn">Dark Mode</button>
-        <a href="https://github.com/ciphernom/midstate" target="_blank" class="btn">GitHub</a>
         <a href="https://ciphernom.github.io/midstate" target="_blank" class="btn">Web Wallet</a>
+        <a href="https://github.com/ciphernom/midstate/blob/main/whypaper.md" target="_blank" class="btn">Whypaper</a>
+        <a href="https://github.com/ciphernom/midstate/releases" target="_blank" class="btn">Releases</a>
+        <a href="https://github.com/ciphernom/midstate" target="_blank" class="btn">GitHub</a>
+        <button id="theme-btn" aria-label="Toggle Theme">
+            <svg class="sun-icon" viewBox="0 0 24 24"><path d="M12 2.25a.75.75 0 01.75.75v2.25a.75.75 0 01-1.5 0V3a.75.75 0 01.75-.75zM7.5 12a4.5 4.5 0 119 0 4.5 4.5 0 01-9 0zM18.894 6.166a.75.75 0 00-1.06-1.06l-1.591 1.59a.75.75 0 101.06 1.061l1.591-1.59zM21.75 12a.75.75 0 01-.75.75h-2.25a.75.75 0 010-1.5H21a.75.75 0 01.75.75zM17.834 18.894a.75.75 0 001.06-1.06l-1.59-1.591a.75.75 0 10-1.061 1.06l1.59 1.591zM12 18a.75.75 0 01.75.75V21a.75.75 0 01-1.5 0v-2.25A.75.75 0 0112 18zM7.758 17.303a.75.75 0 00-1.061-1.06l-1.591 1.59a.75.75 0 001.06 1.061l1.591-1.59zM6 12a.75.75 0 01-.75.75H3a.75.75 0 010-1.5h2.25A.75.75 0 016 12zM6.697 7.757a.75.75 0 001.06-1.06l-1.59-1.591a.75.75 0 00-1.061 1.06l1.59 1.591z" /></svg>
+            <svg class="moon-icon" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M9.528 1.718a.75.75 0 01.162.819A8.97 8.97 0 009 6a9 9 0 009 9 8.97 8.97 0 003.463-.69.75.75 0 01.981.98 10.503 10.503 0 01-9.694 6.46c-5.799 0-10.5-4.701-10.5-10.5 0-4.368 2.667-8.112 6.46-9.694a.75.75 0 01.818.162z" clip-rule="evenodd" /></svg>
+        </button>
     </div>
 </div>
 
 <div class="workspace">
     
     <div class="sidebar">
-        <div class="menu-item active" data-target="overview">01_Overview</div>
-        <div class="menu-item" data-target="crypto">02_Cryptography</div>
-        <div class="menu-item" data-target="consensus">03_Consensus</div>
-        <div class="menu-item" data-target="privacy">04_MEV_&_Privacy</div>
-        <div class="menu-item" data-target="state">05_State_Management</div>
-        <div class="menu-item" data-target="vm">06_Virtual_Machine</div>
-        <div class="menu-item" data-target="vs-legacy">07_Comparison</div>
+        <div class="menu-item active" data-target="overview">Overview <span>→</span></div>
+        <div class="menu-item" data-target="crypto">Cryptography <span>→</span></div>
+        <div class="menu-item" data-target="consensus">Mining & Consensus <span>→</span></div>
+        <div class="menu-item" data-target="privacy">Privacy & ZK-STARKs <span>→</span></div>
+        <div class="menu-item" data-target="state">State Mgmt & Sync <span>→</span></div>
+        <div class="menu-item" data-target="vm">Virtual Machine <span>→</span></div>
+        <div class="menu-item" data-target="vs-legacy">Comparison <span>→</span></div>
     </div>
 
     <div class="output-area">
 
         <div class="content-pane active" id="overview">
             <h2>System Overview</h2>
-            <p>Midstate is a peer-to-peer electronic cash system engineered to reject data-center centralization. It abandons elliptic curve mathematics in favor of post-quantum hash functions, enforces sequential CPU mining, and natively obscures transaction amounts and origins.</p>
-            <p>It is designed to operate and validate the global state entirely on extreme edge hardware, allowing a full node to sync and run on a $15 Raspberry Pi Zero 2 W.</p>
+            <p>Midstate is a peer-to-peer electronic cash system engineered from the ground up for constrained edge environments (specifically Cortex-A53/A72/A76 architectures). It entirely abandons elliptic curve mathematics in favor of post-quantum hash functions.</p>
+            
+            <p>By enforcing sequential CPU mining, forcing all UTXOs into uniform power-of-2 denominations, and utilizing Winterfell ZK-STARKs for confidential transfers, it creates a robust, highly private financial network that cannot be dominated by parallel ASICs or dismantled by blockchain surveillance firms.</p>
 
-            <details class="nitty-gritty">
-                <summary>Deep Dive: Hardware & Protocol Limits</summary>
-                <div class="ng-content">
-                    <p>The protocol strictly bounds resource consumption to ensure viability on 512MB RAM devices.</p>
-                    <ul>
-                        <li><strong>Max Batch Commits:</strong> 2,000 per block.</li>
-                        <li><strong>Max Batch Reveals:</strong> 500 per block (limits signature verification load).</li>
-                        <li><strong>Max Batch Inputs/Outputs:</strong> 1,024 inputs and 10,000 outputs globally per block.</li>
-                        <li><strong>Max Mempool Size:</strong> 100MB hard cap to prevent OOM attacks from malicious peers flooding large STARK payloads.</li>
-                    </ul>
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Core Hash Primitive</div>
+                    <div class="stat-value">BLAKE3</div>
                 </div>
-            </details>
+                <div class="stat-card">
+                    <div class="stat-label">Block Time & Diff</div>
+                    <div class="stat-value">60s / ASERT</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">UTXO Model</div>
+                    <div class="stat-value">Powers of 2 Only</div>
+                </div>
+            </div>
+
+            <div class="terminal">
+                <div class="term-line"><span class="term-time">22:49:44.101</span> <span class="term-info">INFO</span> <span>Loaded state: height=29000 depth=14859300 coins=4582 commitments=12</span></div>
+                <div class="term-line"><span class="term-time">22:49:44.150</span> <span class="term-info">INFO</span> <span>Node started (mining: true, threads: 4, rpc: 8545)</span></div>
+                <div class="term-line"><span class="term-time">22:49:44.152</span> <span class="term-info">INFO</span> <span>Mining SIMD: NEON 4-way (4 nonces/batch)</span></div>
+                <div class="term-line"><span class="term-time">22:50:11.883</span> <span class="term-success">INFO</span> <span class="term-success">Mined batch! height=29001 outputs=2 target=000ffff...</span></div>
+            </div>
+
+            <p>A full Midstate node can sync, validate 128KB ZK proofs, and mine blocks concurrently on a $15 Raspberry Pi Zero 2 W with 512MB of RAM.</p>
         </div>
 
         <div class="content-pane" id="crypto">
             <h2>Post-Quantum Cryptography</h2>
-            <p>Midstate uses exactly zero elliptic curve mathematics. It relies strictly on the <code>BLAKE3</code> hash function, rendering it immune to Shor's algorithm running on future quantum computers.</p>
+            <p>Elliptic Curve Cryptography (secp256k1) is vulnerable to Shor's algorithm via quantum computers. Midstate uses exactly zero elliptic curve mathematics, relying strictly on the <code>BLAKE3</code> hash function for all cryptographic signatures, commitments, and proofs.</p>
             
-            <h3>WOTS+ (Single-Use Keys)</h3>
-            <p>Receiving keys and change outputs use Winternitz One-Time Signatures. Because hash-based signatures reveal parts of the private key during use, WOTS keys must never sign more than once.</p>
-
-            <details class="nitty-gritty">
-                <summary>Deep Dive: WOTS+ Parameters</summary>
-                <div class="ng-content">
-                    <p>Midstate implements WOTS+ with parameter <code>w=16</code> (16 bits per digit).</p>
-                    <ul>
-                        <li>The 256-bit message is divided into 16 message chains.</li>
-                        <li>The checksum calculates <code>Σ (65535 - d_i)</code>. The maximum checksum value is 1,048,560 (20 bits), requiring exactly 2 checksum chains.</li>
-                        <li>Total chains: 18. Maximum chain depth: 65,535.</li>
-                        <li>Signature size is highly compact: <code>18 * 32 = 576 bytes</code>.</li>
-                    </ul>
+            <div class="tabs">
+                <div class="tab-nav">
+                    <button class="tab-btn active" data-tab="wots">WOTS+ (One-Time Keys)</button>
+                    <button class="tab-btn" data-tab="mss">MSS (Reusable Keys)</button>
+                    <button class="tab-btn" data-tab="simd">SIMD Ghost Hashing</button>
                 </div>
-            </details>
+                
+                <div class="tab-content active" id="wots">
+                    <h3>Winternitz One-Time Signatures (WOTS+)</h3>
+                    <p>Standard receiving keys and change outputs use WOTS+. Because hash-based signatures reveal parts of the private key during use, WOTS keys must <strong>never sign more than once</strong>.</p>
+                    
+                    <p>To prevent accidental key reuse across sibling UTXOs (coins sent to the same address), Midstate enforces a strict "co-spend grouping" rule in the wallet. If a user attempts to spend one coin, the wallet will autonomously pull in all sibling coins at that address. Spending them in the exact same transaction produces an identical commitment hash, meaning the WOTS signature is identical, resulting in zero additional key leakage.</p>
 
-            <h3>MSS (Reusable Addresses)</h3>
-            <p>If a user requires a static, reusable address, Midstate wraps thousands of WOTS keys into a Merkle Signature Scheme (MSS) binary tree.</p>
-
-            <details class="nitty-gritty">
-                <summary>Deep Dive: MSS Implementation</summary>
-                <div class="ng-content">
-                    <p>The Master Public Key is the root of the Merkle tree. The maximum supported tree height is 20 (<code>2^20 = 1,048,576</code> signatures). A standard height-10 tree generates in ~1-2 seconds on modern CPUs.</p>
-                    <p>To prevent key-reuse vulnerabilities across reorgs or malicious coordinator attacks, the consensus verifier enforces the <code>leaf_index</code> against the cryptographic authentication path, explicitly marking the exact WOTS public key leaf as spent in the <code>spent_addresses</code> database table.</p>
+                    <details class="deep-dive">
+                        <summary>The Mathematics of w=16</summary>
+                        <div class="dd-content">
+                            <p>Most WOTS implementations use <code>w=8</code> (8 bits per digit), which creates 32 message chains of max depth 255. Midstate uses an extreme parameter of <code>w=16</code>.</p>
+                            <div class="math-block">
+                                Message Chains: 256 bits / 16 = 16 chains<br>
+                                Checksum Chains: Σ(65535 - d_i) fits in 20 bits → 2 chains<br>
+                                Total Chains: 18<br>
+                                Max Chain Depth: 65,535 hashes
+                            </div>
+                            <p><strong>The Tradeoff:</strong> By using <code>w=16</code>, the signature size shrinks from ~1,088 bytes down to exactly <strong>576 bytes</strong> (18 chains × 32 bytes). The cost is CPU computation: signing or verifying requires up to 65,535 hashes per chain. This is solved via SIMD acceleration.</p>
+                        </div>
+                    </details>
                 </div>
-            </details>
 
-            <details class="nitty-gritty">
-                <summary>Deep Dive: HD Key Derivation</summary>
-                <div class="ng-content">
-                    <p>Wallets use BIP39 24-word mnemonics, which generate a 64-byte seed that is hashed via BLAKE3 into a 32-byte master seed. To maintain forward secrecy without BIP32 ECC scalar tweaking, deterministic keys are derived via strict domain separation:</p>
-                    <pre><code>WOTS Seed_i = BLAKE3("midstate/wots/v1" || MasterSeed || i)
-MSS Seed_i  = BLAKE3("midstate/mss/v1"  || MasterSeed || i)</code></pre>
+                <div class="tab-content" id="mss">
+                    <h3>Merkle Signature Scheme (MSS)</h3>
+                    <p>If a user requires a static, reusable address (e.g., for a donation page or a mining pool payout), Midstate wraps thousands of WOTS keys into an MSS binary tree. The Master Public Key is the root of the Merkle tree.</p>
+                    
+                    <p>Generating a default height-10 tree (1,024 signatures) locally takes ~1-2 seconds on modern CPUs. The signature size increases logarithmically: a 576-byte WOTS payload + (Height × 33 bytes for the authentication path).</p>
+
+                    <details class="deep-dive">
+                        <summary>The Replay Defense (Spent Oracle)</summary>
+                        <div class="dd-content">
+                            <p>To prevent replay attacks during chain reorgs, the consensus engine maintains a <code>spent_addresses</code> database table.</p>
+                            <p>For standard WOTS, the address hash is burned. For MSS, burning the address would destroy the entire tree. Instead, the protocol dynamically extracts the <strong>specific leaf's WOTS public key</strong> from the MSS signature and burns that specific nullifier. If the exact same transaction is replayed during a reorg, the commitment hashes match and it is accepted. If a <em>different</em> transaction attempts to reuse that leaf, it is rejected by consensus.</p>
+                        </div>
+                    </details>
                 </div>
-            </details>
+
+                <div class="tab-content" id="simd">
+                    <h3>The SIMD Masking Trick</h3>
+                    <p>With <code>w=16</code>, WOTS chain iterations vary wildly. Chain 0 might need 5 hashes, while Chain 1 needs 60,000 hashes. Standard scalar execution handles these one by one.</p>
+                    
+                    <p>Midstate accelerates this using hardware SIMD registers (AVX2 256-bit on x86, NEON 128-bit on ARM). But because SIMD lanes execute in strict lockstep, how do you handle varying lengths?</p>
+
+                    <div class="callout">
+                        <h4>Ghost Hashing</h4>
+                        <p>Midstate feeds 8 chains (AVX2) into a single register. It loops up to the maximum iterations required by the longest chain in the batch. As the loop progresses, it checks if the current step matches a lane's target depth. If it does, it extracts and saves that lane's 32-byte state. The lane then continues to compute garbage hashes ("ghost hashing") alongside its neighbors until the longest chain finishes.</p>
+                        <p>Even with millions of wasted "ghost" cycles, keeping the CPU pipeline saturated via SIMD results in a <strong>10x faster signature generation</strong> on edge devices.</p>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <div class="content-pane" id="consensus">
             <h2>Mining & Consensus</h2>
-            <p>Traditional Proof-of-Work allows ASICs to calculate millions of hashes in parallel, centralizing network control.</p>
-            <p>Midstate enforces a <strong>Verifiable Delay Function (VDF) style Sequential Hash</strong>. To mine a block, a node must calculate 1,000,000 BLAKE3 hashes in a strict sequence: <code>x_i = BLAKE3(x_{i-1})</code>. Because calculating the final hash requires the sequential output of every previous step, highly parallelized ASIC farms lose their advantage against standard consumer CPUs.</p>
-
-            <details class="nitty-gritty">
-                <summary>Deep Dive: SIMD Nonce Searching</summary>
-                <div class="ng-content">
-                    <p>While the 1,000,000 hash chain is strictly sequential, finding a valid starting <code>nonce</code> is parallelized locally. The node automatically detects CPU features on startup and utilizes SIMD registers (AVX2: 8-way, NEON: 4-way).</p>
-                    <p>Because different nonces reach the target at different iteration depths, the SIMD implementation uses a <strong>Masking Trick</strong>. It loops up to the maximum iterations required by any lane in the batch, safely extracting a lane's state exactly when its target is reached, while forcing it to "ghost hash" harmlessly for the remainder of the loop to keep the vector registers synchronized.</p>
+            
+            <div class="tabs">
+                <div class="tab-nav">
+                    <button class="tab-btn active" data-tab="seq-hash">Sequential Hashing & ASICs</button>
+                    <button class="tab-btn" data-tab="asert">ASERT Difficulty (16.16)</button>
                 </div>
-            </details>
 
-            <h3>ASERT Difficulty & Finality</h3>
-            <p>Difficulty adjusts continuously on every 60-second block using the ASERT algorithm.</p>
+                <div class="tab-content active" id="seq-hash">
+                    <h3>Neutralizing Parallel ASICs</h3>
+                    <p>Traditional Proof-of-Work (like SHA-256) operates in <code>O(1)</code> time and <code>O(N)</code> space. Finding a nonce is like buying lottery tickets: if you buy 100,000 tickets at once, you find the winner 100,000 times faster. ASICs achieve massive hashrates by stamping millions of parallel hash cores onto a single silicon die.</p>
+                    
+                    <p>Midstate inverts this model using <strong>Sequential Hashing</strong>. Finding a nonce is no longer a lottery; it is a marathon.</p>
 
-            <details class="nitty-gritty">
-                <summary>Deep Dive: ASERT Fixed-Point Math</summary>
-                <div class="ng-content">
-                    <p>ASERT adjusts difficulty based on absolute time elapsed since genesis, eliminating sliding-window time-warp exploits. It uses a 4-hour half-life (240 blocks).</p>
-                    <p>Floating-point math is strictly banned in consensus due to cross-architecture variations. Midstate uses a 16.16 fixed-point Taylor polynomial approximation to calculate the exponential decay exactly the same way on every processor:</p>
-                    <pre><code>// 16.16 fixed-point Taylor polynomial for 2^x
-let mut factor = 65536i64;
-factor += (frac * 45426) >> 16;
-factor += (frac * frac * 15746) >> 32;
-factor += (frac * frac * frac * 3643) >> 48;</code></pre>
+                    <div class="flow-diagram">
+                        <div class="flow-box">State Root + Nonce</div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-box">BLAKE3</div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-box">BLAKE3</div>
+                        <div class="flow-arrow">→ ...x1,000,000... →</div>
+                        <div class="flow-box">Final Hash</div>
+                    </div>
+
+                    <p>To mine a block, a node must calculate 1,000,000 BLAKE3 hashes in a strict sequence: <code>H_n = BLAKE3(H_{n-1})</code>. Because the input of the next hash relies entirely on the output of the previous, the computation cannot be unrolled or divided across multiple cores.</p>
+                    
+<div class="callout">
+    <h4>The Ratio of Power: Structural ASIC Resistance</h4>
+    <p>In Bitcoin, the power gap between a consumer CPU and a professional ASIC is astronomical—effectively <strong>billions-to-one</strong>. This forces a winner-take-all hardware arms race that centralizes the network into massive industrial data centers. Midstate inverts this by shifting the bottleneck from <strong>Parallel Throughput</strong> to <strong>Single-Thread Latency</strong>.</p>
+
+    
+
+    <p>Because each hash in the 1,000,000-step chain requires the output of the previous, specialized hardware cannot "unroll" the loop. This creates a "compression" of hardware efficiency. While a powerful server still wins more blocks, the <em>magnitude</em> of its advantage is capped by physics and clock speed.</p>
+
+    <div class="math-block">
+        // Real-World Benchmarks<br>
+        Pi Zero 2W (Cortex-A53 @ 1.0GHz): ~10 nonces/sec<br>
+        Xeon E5-1650 v3 (6-Core @ 3.5GHz): ~300 nonces/sec<br>
+        High-End Threadripper (64-Core @ 4.5GHz): ~2,000 nonces/sec (Est.)
+    </div>
+
+    <p><strong>The 1,000:1 Ceiling:</strong> In the Midstate ecosystem, a high-end workstation is roughly 30x faster than a $15 Raspberry Pi. Even if an attacker scales to a massive 64-core server with AVX-512, they only achieve a ~1,000x advantage over the smallest node on the network.</p>
+    
+    <div class="callout warn">
+        <p>Compare this to Bitcoin: A standard CPU vs. an Antminer S21. The ratio is so vast it cannot be displayed on the same scale. By keeping the Ratio of Power within a 1,000:1 range, Midstate ensures that hobbyists and edge-node operators remain meaningful participants in the consensus process.</p>
+    </div>
+</div>
                 </div>
-            </details>
 
-            <details class="nitty-gritty">
-                <summary>Deep Dive: Bayesian Finality Estimator</summary>
-                <div class="ng-content">
-                    <p>Midstate eliminates arbitrary confirmation counts (e.g., "wait 6 blocks"). Nodes locally observe network honesty (linear blocks vs orphaned blocks) and use a Beta-Binomial statistical model.</p>
-                    <p>The estimator continuously calculates a dynamic <code>safe_depth</code>—the exact number of blocks required to guarantee a <code>1e-6</code> (1-in-1,000,000) risk of a successful chain reorganization by an attacker. It caps at a maximum of 10,000 blocks for safety under extreme adversarial conditions.</p>
+                <div class="tab-content" id="asert">
+                    <h3>ASERT Difficulty Adjustment</h3>
+                    <p>Sliding-window difficulty algorithms (like LWMA or Bitcoin's 2016-block window) are highly vulnerable to time-warp attacks, hash-and-flee exploits, and echo effects. Midstate adjusts difficulty continuously on <em>every block</em> based on the absolute time elapsed since genesis.</p>
+
+                    <div class="math-block">
+                        // ASERT Algorithm<br>
+                        drift = actual_elapsed_time - ideal_elapsed_time<br>
+                        target = genesis_target * 2^(drift / half_life)
+                    </div>
+
+                    <div class="callout warn">
+                        <h4>The Determinism Problem</h4>
+                        <p>Calculating <code>2^x</code> requires floating-point math (IEEE 754). Different CPU architectures (x86 vs ARM) or even different compiler optimization flags can yield slightly different results at the far decimal places. In a consensus system, a 1-bit discrepancy results in a permanent chain fork.</p>
+                    </div>
+
+                    <p>Midstate solves this natively using deterministic integer math via a <strong>16.16 fixed-point Taylor polynomial</strong> approximation. It calculates the fractional exponent strictly using bitwise shifts, guaranteeing cross-architecture determinism.</p>
+
+                    <div class="math-block">
+                        let shifts = exponent >> 16;       // whole powers of 2<br>
+                        let frac = exponent & 0xFFFF;      // fractional part<br><br>
+                        let mut factor = 65536i64;<br>
+                        factor += (frac * 45426) >> 16;<br>
+                        factor += (frac * frac * 15746) >> 32;<br>
+                        factor += (frac * frac * frac * 3643) >> 48;
+                    </div>
                 </div>
-            </details>
+            </div>
         </div>
 
         <div class="content-pane" id="privacy">
-            <h2>MEV Resistance & Privacy</h2>
-            
-            <h3>Commit-Reveal Lifecycle</h3>
-            <p>Standard mempools broadcast transaction details in cleartext, allowing miners to front-run trades (Miner Extractable Value). Midstate enforces a two-phase protocol.</p>
-            
-            <div class="flow-diagram">
-                <div class="flow-box">1. Commit Hash</div>
-                <div class="flow-arrow">→</div>
-                <div class="flow-box">Mine Commit</div>
-                <div class="flow-arrow">→</div>
-                <div class="flow-box">Reveal Tx Data</div>
-                <div class="flow-arrow">→</div>
-                <div class="flow-box">Execute Spend</div>
-            </div>
+            <h2>Privacy & MEV Resistance</h2>
+            <p>Midstate achieves profound transaction privacy without compromising the auditability of the global state.</p>
 
-            <details class="nitty-gritty">
-                <summary>Deep Dive: Dynamic Commit PoW</summary>
-                <div class="ng-content">
-                    <p>To prevent attackers from flooding the mempool with zero-fee Commits, every Commit requires a Proof-of-Work spam nonce. This threshold scales dynamically based on local mempool congestion:</p>
+            <div class="tabs">
+                <div class="tab-nav">
+                    <button class="tab-btn active" data-tab="pow2-utxo">Power-of-2 UTXOs</button>
+                    <button class="tab-btn" data-tab="commit-reveal">Commit-Reveal Mempool</button>
+                    <button class="tab-btn" data-tab="coinjoin">Native CoinJoin</button>
+                    <button class="tab-btn" data-tab="starks">ZK-STARKs (The Nuclear Option)</button>
+                </div>
+
+                <div class="tab-content active" id="pow2-utxo">
+                    <h3>The Fingerprint Problem & Power-of-2 UTXOs</h3>
+                    <p>In standard blockchains, UTXOs have unique, highly specific amounts (e.g., <code>1.45239</code> coins). These exact amounts act as cryptographic fingerprints. When a user sends <code>1.0</code> coins and receives <code>0.45239</code> back as change, blockchain surveillance firms can easily deduce which output was the payment and which was the change, tracing value graphs across dozens of hops even through naive mixers.</p>
+
+                    <p><strong>Midstate radically solves this by forcing all UTXOs to be strict powers of 2 (1, 2, 4, 8, 16, 32...).</strong></p>
+
+                    <p>Because there are no arbitrary denominations, every 16-value coin looks identical to every other 16-value coin on the network. A user cannot send <code>10</code> coins; their wallet automatically breaks the transaction down into independent <code>8</code> and <code>2</code> coin sends. This naturally fractures tracking graphs.</p>
+                </div>
+
+                <div class="tab-content" id="commit-reveal">
+                    <h3>MEV Resistance: Two-Phase Mempool</h3>
+                    <p>Standard mempools broadcast transaction details in cleartext, allowing miners to reorder or front-run trades (Miner Extractable Value). Midstate enforces a two-phase Commit-Reveal protocol:</p>
+
+                    <div class="flow-diagram">
+                        <div class="flow-box"><strong>1. Commit</strong><br><span style="color:var(--text-muted); font-size:12px;">Blinded hash + Anti-Spam PoW</span></div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-box"><strong>2. Mine</strong><br><span style="color:var(--text-muted); font-size:12px;">Miner commits to processing tx</span></div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-box"><strong>3. Reveal</strong><br><span style="color:var(--text-muted); font-size:12px;">Reveal details and pay fee</span></div>
+                    </div>
+                    
+                    <p>The Commit phase binds the transaction inputs and outputs via a <code>BLAKE3</code> hash. The network sees a commit, but has no idea who is sending money to whom, or how much. Only after the commit is permanently mined into a block does the user broadcast the Reveal, providing the signatures to execute the spend.</p>
+
+                    <details class="deep-dive">
+                        <summary>Dynamic Anti-Spam PoW</summary>
+                        <div class="dd-content">
+                            <p>To prevent attackers from filling the mempool with free commitments (which cost zero fees), the node dynamically enforces an anti-spam PoW requirement (<code>spam_nonce</code>) that scales automatically under network congestion.</p>
+                            <p>If the mempool has &lt;500 pending commits, the requirement is 24 leading zero bits (~16M hashes, ~15ms). If the pool fills to 900+, the requirement jumps to 30 bits (~1B hashes, ~1s), throttling spam while remaining virtually instant for legitimate users submitting a single transaction.</p>
+                        </div>
+                    </details>
+                </div>
+
+                <div class="tab-content" id="coinjoin">
+                    <h3>Native CoinJoin & Dandelion++</h3>
+                    <p>Because Midstate forces UTXOs into exact power-of-2 denominations, coins look identical. The P2P layer includes a built-in CoinJoin coordinator to seamlessly mix transactions.</p>
+                    
                     <ul>
-                        <li>< 500 pending commits: 24 leading zero bits (~16M hashes).</li>
-                        <li>500 - 749 pending commits: 26 leading zero bits.</li>
-                        <li>750 - 899 pending commits: 28 leading zero bits.</li>
-                        <li>>= 900 pending commits: 30 leading zero bits.</li>
+                        <li><strong>Denomination-Uniform Mixing:</strong> <code>N</code> participants contribute an input of value <code>V</code>, and receive an output of value <code>V</code>. The resulting transaction is a perfect permutation.</li>
+                        <li><strong>Anti-Sybil PoW:</strong> To prevent attackers from stalling mixes by rotating identities, joining a mix requires a Proof-of-Work nonce cryptographically bound to the sender's libp2p <code>PeerId</code>.</li>
                     </ul>
-                    <p>Commits expire from the global state after a strict Time-to-Live (TTL) of 1,000 blocks to prevent state bloat.</p>
+
+                    <div class="callout">
+                        <h4>Dandelion++ Routing</h4>
+                        <p>To prevent IP-address correlation, Midstate routes transactions through a "stem" phase before entering the public mempool. A transaction hops between single peers sequentially. At each hop, there is a 10% "fluff" probability where the node will finally broadcast it to the entire network. If a transaction stays in the stem pool for >30 seconds (due to a dead peer), the node automatically fluffs it as a safety net.</p>
+                    </div>
                 </div>
-            </details>
 
-            <h3>Hidden Balances (ZK-STARKs)</h3>
-            <p>Midstate supports Confidential Transfers using ZK-STARKs. The <code>OP_VERIFY_STARK</code> opcode mathematically proves that <code>v ∈ [0, 2^64)</code> and inputs equal outputs without revealing the actual values on the public ledger.</p>
+                <div class="tab-content" id="starks">
+                    <h3>Confidential Transfers via ZK-STARKs</h3>
+                    <p>When absolute, mathematical opacity is required, Midstate supports <code>OutputData::Confidential</code> payloads. The network never sees the value; it only sees a 32-byte Blake3 commitment: <code>BLAKE3(value_le || blinding_factor)</code>.</p>
+                    
+                    <p>The <code>OP_VERIFY_STARK</code> opcode evaluates a Winterfell STARK proof over the Goldilocks field (<code>p = 2^64 - 2^32 + 1</code>), guaranteeing over a 24-column × 16,384-row trace that <code>v1 + v2 = input_sum</code> and <code>v1, v2 ∈ [0, 2^64)</code> without revealing the specific integers.</p>
 
-            <details class="nitty-gritty">
-                <summary>Deep Dive: STARK Memory Bypass</summary>
-                <div class="ng-content">
-                    <p>STARK proofs (using Winterfell over the Goldilocks field) are ~128KB in size. Pushing this onto a standard <code>SmallVec</code> script stack would cause massive heap allocation spikes, crashing 512MB edge nodes.</p>
-                    <p>During execution, the script VM intercepts the STARK payload directly from the transaction slice. The proof bytes bypass the active stack memory completely during <code>OP_VERIFY_STARK</code> execution, processing the entire validation natively in Rust before safely returning execution to the VM.</p>
+                    <div class="callout warn">
+                        <h4>Limitations & Cost</h4>
+                        <p>STARKs are the "nuclear option." A single proof is ~128KB, heavily inflating block sizes. The computation required to generate a proof takes seconds on a high-end desktop and is essentially impossible on an edge device like a Raspberry Pi. Furthermore, <code>MAX_STARK_OPS_PER_SCRIPT</code> strictly limits throughput to 1 per transaction. Normal users should rely on Power-of-2 CoinJoins for daily privacy.</p>
+                    </div>
                 </div>
-            </details>
-
-            <h3>Native CoinJoin & Dandelion++</h3>
-            <p>Because Midstate enforces strict power-of-2 denominations for standard UTXOs, coins are inherently indistinguishable. The P2P layer includes a built-in CoinJoin coordinator to mix transactions seamlessly.</p>
-
-            <details class="nitty-gritty">
-                <summary>Deep Dive: Mix Anti-Sybil & Dandelion++</summary>
-                <div class="ng-content">
-                    <p><strong>CoinJoin Anti-Sybil:</strong> To prevent attackers from stalling mix sessions with dummy registrations, joining a mix requires a localized PoW challenge: <code>hash(mix_id || coin_id || peer_id || nonce) >= 24 zero bits</code>. Binding the <code>peer_id</code> prevents attackers from pre-computing nonces across identity rotations.</p>
-                    <p><strong>Dandelion++ Routing:</strong> Commits route through a "stem" phase before public broadcast. They are forwarded linearly to a single peer. At each hop, there is a 10% probability of "fluffing" (broadcasting to all peers). If a transaction sits in the stem pool for 30 seconds without being fluffed, the node broadcasts it locally as a failsafe.</p>
-                </div>
-            </details>
+            </div>
         </div>
 
         <div class="content-pane" id="state">
-            <h2>State Management</h2>
-            <p>Midstate discards the traditional unbounded UTXO database model. Unspent outputs and pending commitments are accumulated into a Sparse Merkle Tree (SMT), distilling the global state down to a single 32-byte cryptographic root.</p>
+            <h2>State Management & Syncing</h2>
+            <p>Midstate discards the traditional unbounded UTXO database model. Unspent outputs and pending commitments are accumulated into a <strong>Sparse Merkle Tree (SMT)</strong>, mathematically bounding the RAM requirements for the active state.</p>
 
-            <details class="nitty-gritty">
-                <summary>Deep Dive: SMT Architecture & Caching</summary>
-                <div class="ng-content">
-                    <p>The UTXO accumulator is a 256-level Sparse Merkle Tree backed by an immutable <code>im::OrdSet</code>. To achieve <code>O(log N)</code> performance without overwhelming memory:</p>
-                    <ul>
-                        <li><strong>Top Cache:</strong> The top 16 levels are cached in memory via HashMap, strictly bounded to a mathematical maximum of 65,536 entries.</li>
-                        <li><strong>Dynamic Folding:</strong> The bottom 240 levels are folded dynamically on the fly when proofs are requested, using a highly optimized binary search (<code>partition_point</code>) over lexicographically sorted coin ID buckets.</li>
-                    </ul>
+            <h3>SMT Caching Architecture</h3>
+            <p>To achieve <code>O(log N)</code> insertion and verification without overflowing the RAM of edge devices, the 256-level tree is split into two access tiers:</p>
+            <ul>
+                <li><strong>Top Cache:</strong> The top 16 levels are cached persistently in memory, strictly bounded to a maximum of 65,536 nodes.</li>
+                <li><strong>Dynamic Folding:</strong> The bottom 240 levels are computed on the fly when proofs are required. Because coins are sorted lexicographically, this is extremely fast via binary searching over buckets.</li>
+            </ul>
+
+            <details class="deep-dive">
+                <summary>Reorg Defense & Frankenstein Chains</summary>
+                <div class="dd-content">
+                    <p>When a node detects a longer chain, it must perform a reorg. A catastrophic failure mode during sync is the "Frankenstein chain"—where a node writes the peer's alternative blocks to disk, but crashes before updating the <code>STATE_TABLE</code> pointer. Upon reboot, the database has half the old chain and half the new chain, destroying consensus.</p>
+                    <p>Midstate prevents this via strict ACID transactions. Incoming alternative batches are written to <code>.tmp</code> files. Only after the <code>STATE_TABLE</code> pointer is atomically updated in the `redb` database does the node promote the files to <code>.bin</code>. If a crash occurs, the node's WAL recovery checks the committed height and either deletes orphaned <code>.tmp</code> files or finishes the promotion, ensuring the disk is always perfectly coherent.</p>
                 </div>
             </details>
 
             <h3>Fast-Forward Syncing</h3>
-            <p>Historical block batches are aggressively pruned. Validating nodes only retain lightweight headers and state snapshots.</p>
-
-            <details class="nitty-gritty">
-                <summary>Deep Dive: Snapshot Auth & Compact Filters</summary>
-                <div class="ng-content">
-                    <p><strong>Snapshots:</strong> During a fast-forward sync, a node downloads a recent State Snapshot. To ensure authenticity, it cryptographically verifies that the 32-byte <code>midstate</code> hash inside the snapshot perfectly aligns with the historical header chain. The node will only trust a snapshot if there are <code>PRUNE_DEPTH</code> (1,000) sequential headers built on top of it.</p>
-                    <p><strong>Compact Filters:</strong> Light clients scan the chain locally using Golomb-Rice coded compact filters built natively into the block structure. Using parameter <code>P=20</code>, they achieve a strict False Positive Rate of 1 in 1,000,000, ensuring high privacy and low bandwidth.</p>
-                </div>
-            </details>
+            <p>Historical block batches are aggressively pruned. Validating nodes only retain lightweight headers and state snapshots (saved every 100 blocks). Light clients can scan the chain locally using <strong>Golomb-Rice Compact Filters (P=20)</strong>. Filter elements are securely keyed using the block's <code>final_hash</code> to prevent miner precomputation or filter-bloating attacks.</p>
         </div>
 
         <div class="content-pane" id="vm">
-            <h2>Virtual Machine</h2>
-            <p>Every UTXO in Midstate is locked by a compiled bytecode script. The VM executes witness inputs pushed onto the stack, then evaluates the script. Execution succeeds if and only if the final top-of-stack item is exactly <code>[1]</code> (The Clean Stack Rule).</p>
+            <h2>Virtual Machine (MidstateScript)</h2>
+            <p>Every UTXO in Midstate is locked by a compiled bytecode script. The VM executes witness inputs pushed onto the <code>SmallVec</code> stack, then evaluates the script. Execution succeeds if and only if the final top-of-stack item is exactly <code>[1]</code>.</p>
 
-            <details class="nitty-gritty">
-                <summary>Deep Dive: Consensus Limits & Opcodes</summary>
-                <div class="ng-content">
-                    <ul>
-                        <li><strong>Execution Limits:</strong> Turing-incomplete. No loops, no backward jumps. Max script size: 1,024 bytes. Max stack depth: 64 items. Max item size: 131,072 bytes (accommodates STARK proofs).</li>
-                        <li><strong>SigOps:</strong> Max 3 cryptographic signature verifications per script. Max 1 STARK verification per script.</li>
-                        <li><strong>Opcodes:</strong> Includes standard control flow (<code>IF/ELSE</code>), hashing, math, plus advanced covenants (<code>CHECKTIMEVERIFY</code>, <code>SUM_TO_ADDR</code>, <code>VERIFY_STARK</code>).</li>
-                    </ul>
+            <div class="tabs">
+                <div class="tab-nav">
+                    <button class="tab-btn active" data-tab="p2pk-trace">Standard P2PK</button>
+                    <button class="tab-btn" data-tab="stark-trace">Confidential ZK-STARKs</button>
                 </div>
-            </details>
-
-            <p><strong>Script Architecture:</strong> Midstate uses a Pay-to-Script-Hash (P2SH) model where the address is the hash of the script bytecode. By default, wallets construct a Pay-to-Public-Key (P2PK) script where the raw public key is embedded directly into the script, rather than a P2PKH model.</p>
-
-            <details class="nitty-gritty">
-                <summary>Worked Example: Standard P2PK</summary>
-                <div class="ng-content">
+                
+                <div class="tab-content active" id="p2pk-trace">
+                    <h3>Pay-to-Public-Key (P2PK)</h3>
+                    <p>By default, wallets construct a P2PK script where the raw public key is embedded directly into the script (evaluated as a P2SH address).</p>
                     <pre><code>Script:  PUSH_DATA(&lt;owner_pk&gt;) CHECKSIGVERIFY PUSH_INT(1)
 Witness: [ &lt;signature&gt; ]
 
@@ -512,67 +776,49 @@ Execution Trace:
 2. PUSH_DATA(&lt;owner_pk&gt;)
    Stack: [ &lt;signature&gt;, &lt;owner_pk&gt; ]
 3. CHECKSIGVERIFY 
-   (Pops pk, pops sig. Verifies signature against commitment. Aborts if invalid.)
+   (Pops pk, pops sig. Verifies signature against the commitment.)
    Stack: []
 4. PUSH_INT(1)
    Stack: [ 1 ]
 
-Result: VALID (Clean Stack Rule satisfied).</code></pre>
+Result: VALID.</code></pre>
                 </div>
-            </details>
 
-            <details class="nitty-gritty">
-                <summary>Worked Example: Hash Time-Locked Contract</summary>
-                <div class="ng-content">
-                    <p>HTLCs enable trustless atomic swaps. Coins can be claimed using a secret preimage, or refunded after a specific block height.</p>
-                    <pre><code>Script: 
-IF 
-    HASH PUSH_DATA(&lt;secret_hash&gt;) EQUALVERIFY 
-    PUSH_DATA(&lt;receiver_pk&gt;) CHECKSIGVERIFY 
-ELSE 
-    DROP 
-    PUSH_INT(&lt;timeout_height&gt;) CHECKTIMEVERIFY 
-    PUSH_DATA(&lt;refund_pk&gt;) CHECKSIGVERIFY 
-ENDIF 
-PUSH_INT(1)
-
-Claim Witness:  [ &lt;receiver_sig&gt;, &lt;secret_preimage&gt;, 1 ]
-Refund Witness: [ &lt;refund_sig&gt;, &lt;dummy_data&gt;, 0 ]</code></pre>
-                </div>
-            </details>
-
-            <details class="nitty-gritty">
-                <summary>Worked Example: STARK-Enforced Covenants</summary>
-                <div class="ng-content">
-                    <p>MidstateScript can enforce constraints on where outputs are sent using <code>SUM_TO_ADDR</code>, combined with <code>VERIFY_STARK</code> for zero-knowledge proofs.</p>
+                <div class="tab-content" id="stark-trace">
+                    <h3>Confidential Transfers via OP_VERIFY_STARK</h3>
                     
-                    <pre><code>Script:
-VERIFY_STARK 
-PUSH_DATA(&lt;required_addr&gt;) 
-SUM_TO_ADDR PUSH_INT(100) GREATER_OR_EQUAL VERIFY 
-PUSH_INT(1)
+                    <div class="callout stark">
+                        <h4>The Memory Bypass Trick</h4>
+                        <p>Because STARK proofs are massive (~128KB), pushing them onto a standard <code>SmallVec</code> script stack would cause devastating heap allocation spikes, instantly crashing 512MB nodes. During execution, <code>OP_VERIFY_STARK</code> intercepts the proof payload directly from the transaction slice in memory, bypassing the active stack completely.</p>
+                    </div>
 
-Witness: [ &lt;program_id&gt;, &lt;public_inputs&gt;, &lt;128KB_proof_payload&gt; ]
+                    <div class="callout warn">
+                        <h4>Cryptographic Binding (The Inflation Patch)</h4>
+                        <p>If the VM blindly accepted the public inputs provided by the user in the witness stack, an attacker could submit a STARK proof for fake amounts ($1,000,000) while the actual outputs only contained dust. To prevent infinite money printing, <code>OP_VERIFY_STARK</code> actively introspects the <code>ExecContext</code>. It dynamically reconstructs the required 72-byte <code>public_inputs</code> array directly from the transaction's actual <code>OutputData::Confidential</code> commitments and the input value being destroyed. If the attacker's stack inputs deviate from cryptographic reality, the script hard-fails.</p>
+                    </div>
+
+                    <pre><code>Script:  PUSH_DATA(&lt;CT_PROGRAM_ID&gt;) OP_VERIFY_STARK PUSH_DATA(&lt;owner_pk&gt;) CHECKSIGVERIFY PUSH_INT(1)
+Witness: [ &lt;signature&gt;, &lt;public_inputs&gt;, &lt;128kb_stark_proof&gt; ]
 
 Execution Trace:
-1. Stack: [ &lt;program_id&gt;, &lt;public_inputs&gt; ]
-2. VERIFY_STARK
-   (Pops inputs, intercepts 128KB payload directly from tx memory. Aborts if invalid.)
+1. Stack: [ &lt;signature&gt;, &lt;public_inputs&gt;, &lt;128kb_stark_proof&gt; ]
+2. PUSH_DATA(&lt;CT_PROGRAM_ID&gt;)
+   Stack: [ &lt;signature&gt;, &lt;public_inputs&gt;, &lt;128kb_stark_proof&gt;, &lt;CT_PROGRAM_ID&gt; ]
+3. OP_VERIFY_STARK
+   (Pops program ID and public_inputs. Intercepts proof_bytes directly from witness.)
+   (Reconstructs actual transaction context. Verifies ZK-STARK constraints.)
+   Stack: [ &lt;signature&gt; ]
+4. PUSH_DATA(&lt;owner_pk&gt;)
+   Stack: [ &lt;signature&gt;, &lt;owner_pk&gt; ]
+5. CHECKSIGVERIFY
+   (Pops pk, pops sig. Verifies identity.)
    Stack: []
-3. PUSH_DATA(&lt;required_addr&gt;)
-   Stack: [ &lt;required_addr&gt; ]
-4. SUM_TO_ADDR
-   (Pops address, scans all tx outputs, sums the value sent to that address)
-   Stack: [ &lt;actual_sum_sent&gt; ]
-5. PUSH_INT(100)
-   Stack: [ &lt;actual_sum_sent&gt;, 100 ]
-6. GREATER_OR_EQUAL VERIFY
-   (Validates that the tx sent AT LEAST 100 units to required address)
-   Stack: []
-7. PUSH_INT(1)
-   Stack: [ 1 ]</code></pre>
+6. PUSH_INT(1)
+   Stack: [ 1 ]
+
+Result: VALID. Amounts successfully hidden.</code></pre>
                 </div>
-            </details>
+            </div>
         </div>
 
         <div class="content-pane" id="vs-legacy">
@@ -581,75 +827,40 @@ Execution Trace:
                 <thead>
                     <tr>
                         <th>Subsystem</th>
-                        <th>Legacy (Bitcoin/Ethereum)</th>
+                        <th>Legacy Chains</th>
                         <th>Midstate</th>
                     </tr>
                 </thead>
                 <tbody>
                     <tr>
                         <td><strong>Cryptography</strong></td>
-                        <td>Elliptic Curve</td>
-                        <td class="hl">BLAKE3 Hash-Based</td>
-                    </tr>
-                    <tr class="details-row">
-                        <td colspan="3">
-                            <details class="nitty-gritty">
-                                <summary>Deep Dive</summary>
-                                <div class="ng-content">Legacy networks use secp256k1, which is vulnerable to Shor's algorithm on quantum computers. Midstate uses Winternitz One-Time Signatures (w=16, 576 bytes) and Merkle Signature Schemes (max height 20) which rely solely on the quantum-resistant BLAKE3 hash function. Domains are separated (<code>midstate/wots/v1</code>) for forward-secret HD derivation.</div>
-                            </details>
-                        </td>
+                        <td>Elliptic Curve (Shor vulnerable)</td>
+                        <td class="hl">BLAKE3, WOTS+, MSS</td>
                     </tr>
                     <tr>
                         <td><strong>Mining Hardware</strong></td>
                         <td>Parallel ASICs / GPUs</td>
                         <td class="hl">Sequential Hashing (CPUs)</td>
                     </tr>
-                    <tr class="details-row">
-                        <td colspan="3">
-                            <details class="nitty-gritty">
-                                <summary>Deep Dive</summary>
-                                <div class="ng-content">Legacy PoW allows parallel nonce searching, giving ASICs a massive advantage. Midstate enforces 1,000,000 strictly sequential BLAKE3 hashes per extension. SIMD lanes (AVX2/NEON) are only used to parallelize the search for valid starting nonces, while the proof calculation itself remains strictly bound to single-thread CPU performance.</div>
-                            </details>
-                        </td>
-                    </tr>
                     <tr>
-                        <td><strong>Mempool / Ordering</strong></td>
+                        <td><strong>Transaction Ordering</strong></td>
                         <td>Cleartext Bidding (MEV)</td>
-                        <td class="hl">Commit-Reveal</td>
-                    </tr>
-                    <tr class="details-row">
-                        <td colspan="3">
-                            <details class="nitty-gritty">
-                                <summary>Deep Dive</summary>
-                                <div class="ng-content">Legacy mempools expose transaction contents, allowing miners to reorder trades for profit (MEV). Midstate's Phase 1 (Commit) broadcasts a BLAKE3 hash binding inputs/outputs with a required dynamic PoW nonce. Phase 2 (Reveal) opens the commitment. Miners cannot reorder or censor transactions based on value or destination because they commit to processing them before seeing the contents.</div>
-                            </details>
-                        </td>
+                        <td class="hl">2-Phase Commit-Reveal</td>
                     </tr>
                     <tr>
                         <td><strong>Value Privacy</strong></td>
                         <td>Public cleartext ledgers</td>
-                        <td class="hl">ZK-STARKs & Native CoinJoin</td>
-                    </tr>
-                    <tr class="details-row">
-                        <td colspan="3">
-                            <details class="nitty-gritty">
-                                <summary>Deep Dive</summary>
-                                <div class="ng-content">Legacy ledgers show exact amounts to the public. Midstate supports ZK-STARKs over the Goldilocks field to prove value conservation (inputs = outputs) and range constraints (v ∈ [0, 2^64)) without revealing amounts. Standard UTXOs use strict power-of-2 denominations to facilitate native P2P CoinJoin mixing with anti-Sybil PoW gating.</div>
-                            </details>
-                        </td>
+                        <td class="hl">Power-of-2 UTXOs & ZK-STARKs</td>
                     </tr>
                     <tr>
                         <td><strong>State Storage</strong></td>
-                        <td>Unbounded UTXO DBs</td>
+                        <td>Unbounded UTXO LevelDB</td>
                         <td class="hl">Pruned Sparse Merkle Tree</td>
                     </tr>
-                    <tr class="details-row">
-                        <td colspan="3">
-                            <details class="nitty-gritty">
-                                <summary>Deep Dive</summary>
-                                <div class="ng-content">Legacy nodes store every unspent output in an ever-growing database. Midstate accumulates UTXOs into a 256-level SMT (Top 16 levels cached in memory), distilling global state into a 32-byte root. This allows edge nodes (512MB RAM) to operate with O(log N) complexity and fast-forward sync from snapshots via cryptographic midstate linkage.</div>
-                            </details>
-                        </td>
+                    <tr>
+                        <td><strong>Difficulty Target</strong></td>
+                        <td>Sliding-window average</td>
+                        <td class="hl">ASERT (16.16 Fixed Point)</td>
                     </tr>
                 </tbody>
             </table>
@@ -659,13 +870,13 @@ Execution Trace:
 </div>
 
 <script>
+    // Theme toggling
     const themeBtn = document.getElementById('theme-btn');
     const html = document.documentElement;
 
     function setTheme(theme) {
         html.setAttribute('data-theme', theme);
         localStorage.setItem('midstate-theme', theme);
-        themeBtn.textContent = theme === 'dark' ? 'Light Mode' : 'Dark Mode';
     }
 
     const savedTheme = localStorage.getItem('midstate-theme');
@@ -682,9 +893,9 @@ Execution Trace:
         setTheme(current === 'dark' ? 'light' : 'dark');
     });
 
+    // Sidebar navigation
     const menuItems = document.querySelectorAll('.menu-item');
     const panes = document.querySelectorAll('.content-pane');
-    const pathDisplay = document.getElementById('path-display');
 
     menuItems.forEach(item => {
         item.addEventListener('click', () => {
@@ -694,7 +905,25 @@ Execution Trace:
             item.classList.add('active');
             const targetId = item.getAttribute('data-target');
             document.getElementById(targetId).classList.add('active');
-            pathDisplay.textContent = `Reading: ${item.textContent}`;
+            window.scrollTo(0,0);
+        });
+    });
+
+    // Internal Tabs logic
+    const tabBtns = document.querySelectorAll('.tab-btn');
+
+    tabBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            const targetContainer = btn.closest('.tabs');
+            
+            // Deactivate all in this specific container
+            targetContainer.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            targetContainer.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            
+            // Activate clicked
+            btn.classList.add('active');
+            const tabId = btn.getAttribute('data-tab');
+            targetContainer.querySelector(`#${tabId}`).classList.add('active');
         });
     });
 </script>
