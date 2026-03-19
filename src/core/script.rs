@@ -627,6 +627,7 @@ mod tests {
             commitment: &ZERO,
             height: 100,
             outputs: &OUTPUTS,
+            input_value: 0,
         }
     }
 
@@ -760,7 +761,7 @@ mod tests {
         let sig = wots::sign(&seed, &commitment);
         let sig_bytes = wots::sig_to_bytes(&sig);
         let bytecode = compile_p2pk(&pk);
-        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[] };
+        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[] , input_value: 0 };
         assert!(execute_script(&bytecode, &[sig_bytes], &ctx).is_ok());
     }
 
@@ -771,7 +772,7 @@ mod tests {
         let commitment = hash(b"test commitment");
         let wrong_sig = vec![0u8; wots::SIG_SIZE];
         let bytecode = compile_p2pk(&pk);
-        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[] };
+        let ctx = ExecContext { commitment: &commitment, height: 31000, outputs: &[] , input_value: 0 };
         assert!(execute_script(&bytecode, &[wrong_sig], &ctx).is_err());
     }
 
@@ -827,7 +828,7 @@ mod tests {
         let sig = wots::sign(&receiver_seed, &commitment);
         let sig_bytes = wots::sig_to_bytes(&sig);
         let witness = vec![sig_bytes, secret.to_vec(), vec![1u8]];
-        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[] };
+        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[] , input_value: 0 };
         assert!(execute_script(&bytecode, &witness, &ctx).is_ok());
     }
 
@@ -842,7 +843,7 @@ mod tests {
         let sig = wots::sign(&refund_seed, &commitment);
         let sig_bytes = wots::sig_to_bytes(&sig);
         let witness = vec![sig_bytes, vec![0u8; 32], vec![0u8]];
-        let ctx = ExecContext { commitment: &commitment, height: 600, outputs: &[] };
+        let ctx = ExecContext { commitment: &commitment, height: 31000, outputs: &[] , input_value: 0 };
         assert!(execute_script(&bytecode, &witness, &ctx).is_ok());
     }
 
@@ -857,7 +858,7 @@ mod tests {
         let sig = wots::sign(&refund_seed, &commitment);
         let sig_bytes = wots::sig_to_bytes(&sig);
         let witness = vec![sig_bytes, vec![0u8; 32], vec![0u8]];
-        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[] };
+        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[] , input_value: 0 };
         assert!(execute_script(&bytecode, &witness, &ctx).is_err());
     }
 
@@ -877,7 +878,7 @@ mod tests {
         bc.push(OP_GREATER_OR_EQUAL);
         bc.push(OP_VERIFY);
         push_int(&mut bc, 1);
-        let ctx = ExecContext { commitment: &[0; 32], height: 0, outputs: &outputs };
+        let ctx = ExecContext { commitment: &[0; 32], height: 0, outputs: &outputs , input_value: 0 };
         assert!(execute_script(&bc, &[], &ctx).is_ok());
     }
 
@@ -892,7 +893,7 @@ mod tests {
         bc.push(OP_GREATER_OR_EQUAL);
         bc.push(OP_VERIFY);
         push_int(&mut bc, 1);
-        let ctx = ExecContext { commitment: &[0; 32], height: 0, outputs: &outputs };
+        let ctx = ExecContext { commitment: &[0; 32], height: 0, outputs: &outputs , input_value: 0 };
         assert!(execute_script(&bc, &[], &ctx).is_err());
     }
 
@@ -930,7 +931,7 @@ mod tests {
         let sig1 = wots::sig_to_bytes(&wots::sign(&seed1, &commitment));
         let sig2 = wots::sig_to_bytes(&wots::sign(&seed2, &commitment));
         let witness = vec![sig1, sig2, vec![0u8]];
-        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[] };
+        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[] , input_value: 0 };
         assert!(execute_script(&bytecode, &witness, &ctx).is_ok());
     }
 
@@ -946,7 +947,7 @@ mod tests {
         let bytecode = compile_multisig_2of3(&pk1, &pk2, &pk3);
         let sig1 = wots::sig_to_bytes(&wots::sign(&seed1, &commitment));
         let witness = vec![sig1, vec![0u8], vec![0u8]];
-        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[] };
+        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[] , input_value: 0 };
         assert!(execute_script(&bytecode, &witness, &ctx).is_err());
     }
 
@@ -963,7 +964,7 @@ mod tests {
     #[cfg(feature = "stark-prover")]
     #[test]
     fn stark_range_proof_via_script() {
-        use crate::core::stark::{self, RANGE_PROOF_64, prover::RangeProofProver};
+        use crate::core::stark::{RANGE_PROOF_64, prover::RangeProofProver};
 
         // 1. Generate proof for value = 1_000_000
         let value = 1_000_000u64;
@@ -988,8 +989,12 @@ mod tests {
         ];
 
         // 4. Execute
-        let ctx = ExecContext { commitment: &[0u8; 32], height: 100, outputs: &[] };
+        let ctx = ExecContext { commitment: &[0u8; 32], height: 31_000, outputs: &[], input_value: value };
+
         let result = execute_script(&bytecode, &witness, &ctx);
+        println!("value = {}", value);
+println!("pub_inputs.value.as_int() = {}", pub_inputs.value.as_int());
+println!("ctx.input_value = {}", ctx.input_value); // should match above
         assert!(result.is_ok(), "STARK range proof script failed: {:?}", result);
     }
 
@@ -1016,7 +1021,7 @@ mod tests {
             proof_bytes,
         ];
 
-        let ctx = ExecContext { commitment: &[0u8; 32], height: 100, outputs: &[] };
+        let ctx = ExecContext { commitment: &[0u8; 32], height: 31000, outputs: &[] , input_value: 0 };
         let result = execute_script(&bytecode, &witness, &ctx);
         assert!(result.is_err(), "Should have failed with wrong value");
     }
@@ -1075,8 +1080,12 @@ mod tests {
         // PUSH_INT 1: stack = [1]
         // Clean stack check passes ✓
 
-        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[] };
+        let ctx = ExecContext { commitment: &commitment, height: 31_000, outputs: &[], input_value: value };
+
         let result = execute_script(&bytecode, &witness, &ctx);
+        println!("value = {}", value);
+println!("pub_inputs.value.as_int() = {}", pub_inputs.value.as_int());
+println!("ctx.input_value = {}", ctx.input_value); // should match above
         assert!(result.is_ok(), "STARK + sig script failed: {:?}", result);
     }
 
@@ -1088,7 +1097,7 @@ mod tests {
     #[test]
     fn stark_plus_covenant_script() {
         use crate::core::stark::{RANGE_PROOF_64, prover::RangeProofProver};
-        use crate::core::types::{hash, OutputData};
+        use crate::core::types::{OutputData};
 
         let value = 1000u64;
         let prover = RangeProofProver::new(value);
@@ -1118,8 +1127,14 @@ mod tests {
             proof_bytes,
         ];
 
-        let ctx = ExecContext { commitment: &[0; 32], height: 100, outputs: &outputs };
+        let ctx = ExecContext { commitment: &[0; 32], height: 31_000, outputs: &outputs, input_value: value };
+
         let result = execute_script(&bytecode, &witness, &ctx);
+        
+        println!("value = {}", value);
+        println!("pub_inputs.value.as_int() = {}", pub_inputs.value.as_int());
+        println!("ctx.input_value = {}", ctx.input_value); // should match above
+        
         assert!(result.is_ok(), "STARK + covenant script failed: {:?}", result);
     }
     
@@ -1176,8 +1191,9 @@ mod tests {
 
         let ctx = ExecContext {
             commitment: &commitment,
-            height: 30_000,
+            height: 31_000,
             outputs: &[],
+            input_value: value,
         };
 
         let t0 = Instant::now();

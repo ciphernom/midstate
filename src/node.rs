@@ -2781,7 +2781,7 @@ async fn try_apply_orphans(&mut self) {
         pool_target: Option<([u8; 32], [u8; 32])>, // (Pool MSS Address, Miner Payout Address)
     ) -> Vec<CoinbaseOutput> {
         let reward = block_reward(height);
-        let total_value = reward + total_fees;
+        let total_value = reward.saturating_add(total_fees);
         let denominations = decompose_value(total_value);
 
         let mining_seed = self.mining_seed;
@@ -2925,7 +2925,7 @@ async fn try_apply_orphans(&mut self) {
             let tx = Arc::unwrap_or_clone(arc_tx);
             match apply_transaction(&mut candidate_state, &tx) {
                 Ok(_) => {
-                    total_fees += tx.fee();
+                    total_fees = total_fees.saturating_add(tx.fee());
                     transactions.push(tx);
                 }
                 Err(e) => tracing::debug!("Skipping stale commit during mining: {}", e),
@@ -2951,7 +2951,7 @@ async fn try_apply_orphans(&mut self) {
                         current_inputs += inputs.len();
                         current_outputs += outputs.len();
                     }
-                    total_fees += tx.fee();
+                    total_fees = total_fees.saturating_add(tx.fee());
                     transactions.push(tx);
                 }
                 Err(e) => tracing::warn!("Skipping stale reveal during mining: {}", e),
@@ -3297,6 +3297,7 @@ mod tests {
                     predicate: Predicate::p2pk(&master_pk),
                     value: 1,
                     salt: [i; 32],
+                    commitment: None,
                 }],
                 witnesses: vec![Witness::sig(sig_bytes)],
                 outputs: vec![OutputData::Standard {
@@ -3328,6 +3329,7 @@ mod tests {
                 predicate: Predicate::p2pk(&kp1.public_key()),
                 value: 1,
                 salt: [0; 32],
+                commitment: None,
             }],
             witnesses: vec![Witness::sig(sig.to_bytes())],
             outputs: vec![OutputData::Standard {
@@ -3357,6 +3359,7 @@ mod tests {
                     predicate: Predicate::p2pk(&master_pk),
                     value: 1,
                     salt: [i; 32],
+                    commitment: None,
                 }],
                 witnesses: vec![Witness::sig(sig.to_bytes())],
                 outputs: vec![OutputData::Standard {
@@ -3399,6 +3402,7 @@ mod tests {
                 predicate: Predicate::p2pk(&keypair.public_key()),
                 value: 1,
                 salt: [0; 32],
+                commitment: None,
             }],
             witnesses: vec![Witness::sig(sig.to_bytes())],
             outputs: vec![OutputData::Standard {
@@ -3435,6 +3439,7 @@ mod tests {
                 predicate: Predicate::p2pk(&pk),
                 value: 1,
                 salt: [0; 32],
+                commitment: None,
             }],
             witnesses: vec![Witness::sig(sig_bytes)],
             outputs: vec![OutputData::Standard {
@@ -3489,6 +3494,7 @@ mod tests {
                 predicate: Predicate::p2pk(&pk),
                 value: 1,
                 salt: [0; 32],
+                commitment: None,
             }],
             witnesses: vec![Witness::sig(garbage)],
             outputs: vec![OutputData::Standard {
@@ -3984,6 +3990,7 @@ apply_batch(&mut state_at_2, &genesis_batch, &[], &std::collections::HashMap::ne
                 predicate: Predicate::p2pk(&cb_owner_pk),
                 value: first_denom,
                 salt: cb_salt,
+                commitment: None,
             }],
             witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
             outputs,

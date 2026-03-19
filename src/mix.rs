@@ -523,7 +523,7 @@ mod tests {
     fn make_input(name: &[u8], value: u64) -> InputReveal {
         let seed = hash(name);
         let pk = wots::keygen(&seed);
-        InputReveal { predicate: Predicate::p2pk(&pk), value, salt: hash_concat(name, b"salt") }
+        InputReveal { predicate: Predicate::p2pk(&pk), value, salt: hash_concat(name, b"salt"),commitment: None }
     }
     // Helper to dynamically generate a valid signature for the test inputs
     fn test_sig(name: &[u8], mix_id: &[u8; 32]) -> Vec<u8> {

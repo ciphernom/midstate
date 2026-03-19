@@ -31,21 +31,21 @@
 //! let seed_a = hash(b"alice");
 //! let pk_a = wots::keygen(&seed_a);
 //! // Update: Use Predicate::p2pk
-//! let input_a = InputReveal { predicate: Predicate::p2pk(&pk_a), value: 8, salt: [0xAA; 32] };
+//! let input_a = InputReveal { predicate: Predicate::p2pk(&pk_a), value: 8, salt: [0xAA; 32], commitment: None };
 //! let output_a = OutputData::Standard { address: hash(b"alice-dest"), value: 8, salt: [0xBB; 32] };
 //! session.register(input_a, output_a).unwrap();
 //!
 //! // Bob: input 8, output 8 to fresh address
 //! let seed_b = hash(b"bob");
 //! let pk_b = wots::keygen(&seed_b);
-//! let input_b = InputReveal { predicate: Predicate::p2pk(&pk_b), value: 8, salt: [0xCC; 32] };
+//! let input_b = InputReveal { predicate: Predicate::p2pk(&pk_b), value: 8, salt: [0xCC; 32] , commitment: None};
 //! let output_b = OutputData::Standard { address: hash(b"bob-dest"), value: 8, salt: [0xDD; 32] };
 //! session.register(input_b, output_b).unwrap();
 //!
 //! // Fee coin (denomination 1)
 //! let seed_f = hash(b"fee");
 //! let pk_f = wots::keygen(&seed_f);
-//! let fee_input = InputReveal { predicate: Predicate::p2pk(&pk_f), value: 1, salt: [0xEE; 32] };
+//! let fee_input = InputReveal { predicate: Predicate::p2pk(&pk_f), value: 1, salt: [0xEE; 32], commitment: None };
 //! session.set_fee_input(fee_input).unwrap();
 //!
 //! let proposal = session.proposal().unwrap();
@@ -329,6 +329,7 @@ mod tests {
             predicate: Predicate::p2pk(&pk),
             value: 8,
             salt: hash_concat(name, b"input-salt"),
+            commitment: None,
         };
         let output = OutputData::Standard {
             address: hash_concat(name, b"dest"),
@@ -345,6 +346,7 @@ mod tests {
             predicate: Predicate::p2pk(&pk),
             value: 1,
             salt: hash_concat(name, b"fee-salt"),
+            commitment: None,
         };
         (seed, input)
     }
@@ -413,7 +415,7 @@ mod tests {
         let mut s = MixSession::new(8, 2).unwrap();
         let seed = hash(b"bad");
         let pk = wots::keygen(&seed);
-        let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 4, salt: [0; 32] };
+        let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 4, salt: [0; 32] , commitment: None };
         let output = OutputData::Standard { address: [0; 32], value: 8, salt: [0; 32] };
         assert!(s.register(input, output).is_err());
     }
@@ -423,7 +425,7 @@ mod tests {
         let mut s = MixSession::new(8, 2).unwrap();
         let seed = hash(b"bad");
         let pk = wots::keygen(&seed);
-        let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 8, salt: [0; 32] };
+        let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 8, salt: [0; 32] , commitment: None };
         let output = OutputData::Standard { address: [0; 32], value: 4, salt: [0; 32] };
         assert!(s.register(input, output).is_err());
     }
@@ -464,7 +466,7 @@ mod tests {
         let mut s = MixSession::new(8, 2).unwrap();
         let seed = hash(b"bad-fee");
         let pk = wots::keygen(&seed);
-        let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 2, salt: [0; 32] };
+        let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 2, salt: [0; 32] , commitment: None };
         assert!(s.set_fee_input(input).is_err());
     }
 
@@ -483,7 +485,7 @@ mod tests {
         // Register a denomination-1 mix input
         let seed = hash(b"collider");
         let pk = wots::keygen(&seed);
-        let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 1, salt: [0xAA; 32] };
+        let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 1, salt: [0xAA; 32] , commitment: None };
         let output = OutputData::Standard { address: hash(b"dest"), value: 1, salt: [0xBB; 32] };
         s.register(input.clone(), output).unwrap();
 
@@ -698,9 +700,9 @@ mod tests {
     fn is_uniform_mix_false_for_non_uniform_outputs() {
         let tx = Transaction::Reveal {
             inputs: vec![
-                InputReveal { predicate: Predicate::p2pk(&[1; 32]), value: 8, salt: [0; 32] },
-                InputReveal { predicate: Predicate::p2pk(&[2; 32]), value: 8, salt: [0; 32] },
-                InputReveal { predicate: Predicate::p2pk(&[3; 32]), value: 1, salt: [0; 32] },
+                InputReveal { predicate: Predicate::p2pk(&[1; 32]), value: 8, salt: [0; 32] , commitment: None },
+                InputReveal { predicate: Predicate::p2pk(&[2; 32]), value: 8, salt: [0; 32] , commitment: None },
+                InputReveal { predicate: Predicate::p2pk(&[3; 32]), value: 1, salt: [0; 32] , commitment: None },
             ],
             witnesses: vec![Witness::sig(vec![]); 3],
             outputs: vec![
@@ -717,8 +719,8 @@ mod tests {
         // 1 mix input + 1 fee = 2 inputs, 1 output → below MIN_MIX_PARTICIPANTS
         let tx = Transaction::Reveal {
             inputs: vec![
-                InputReveal { predicate: Predicate::p2pk(&[1; 32]), value: 8, salt: [0; 32] },
-                InputReveal { predicate: Predicate::p2pk(&[2; 32]), value: 1, salt: [0; 32] },
+                InputReveal { predicate: Predicate::p2pk(&[1; 32]), value: 8, salt: [0; 32] , commitment: None },
+                InputReveal { predicate: Predicate::p2pk(&[2; 32]), value: 1, salt: [0; 32], commitment: None  },
             ],
             witnesses: vec![Witness::sig(vec![]); 2],
             outputs: vec![
@@ -829,7 +831,7 @@ mod tests {
             let name = [i; 4];
             let seed = hash(&name);
             let pk = wots::keygen(&seed);
-            let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 16, salt: hash(&[i + 100]) };
+            let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 16, salt: hash(&[i + 100]) , commitment: None };
             let output = OutputData::Standard {
                 address: hash(&[i + 200]),
                 value: 16,
@@ -898,7 +900,7 @@ mod tests {
         for i in 0..2u8 {
             let seed = hash(&[i]);
             let pk = wots::keygen(&seed);
-            let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 1, salt: [i + 10; 32] };
+            let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 1, salt: [i + 10; 32] , commitment: None };
             let output = OutputData::Standard { address: hash(&[i + 20]), value: 1, salt: [i + 30; 32] };
             session.register(input, output).unwrap();
         }

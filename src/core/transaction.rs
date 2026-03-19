@@ -579,7 +579,8 @@ mod tests {
             inputs: vec![InputReveal { 
                 predicate: Predicate::p2pk(&owner_pk), 
                 value: 16, 
-                salt: input_salt 
+                salt: input_salt,
+                commitment: None,
             }],
             witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
             outputs: vec![output],
@@ -602,7 +603,7 @@ mod tests {
         let sig = wots::sign(&seed, &fake_commitment);
 
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt }],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt , commitment: None }],
             witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
             outputs: vec![output],
             salt: [0; 32],
@@ -623,7 +624,7 @@ mod tests {
         let bad_sig = wots::sign(&wrong_seed, &commitment);
 
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt }],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt , commitment: None }],
             witnesses: vec![Witness::sig(wots::sig_to_bytes(&bad_sig))],
             outputs: vec![output],
             salt: commit_salt,
@@ -649,7 +650,7 @@ mod tests {
         let sig = wots::sign(&seed, &commitment);
 
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt }],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt , commitment: None }],
             witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
             outputs: vec![output],
             salt: commit_salt,
@@ -670,7 +671,7 @@ mod tests {
 
         // output value == input value, no fee → rejected
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 8, salt: input_salt }],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 8, salt: input_salt , commitment: None }],
             witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
             outputs: vec![output],
             salt: commit_salt,
@@ -697,7 +698,7 @@ mod tests {
         let (mut state, seed, _coin_id, input_salt) = state_with_coin(8);
         let owner_pk = wots::keygen(&seed);
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 8, salt: input_salt }],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 8, salt: input_salt , commitment: None }],
             witnesses: vec![Witness::sig(vec![0; wots::SIG_SIZE])],
             outputs: vec![],
             salt: [0; 32],
@@ -710,7 +711,7 @@ mod tests {
         let (mut state, seed, _coin_id, input_salt) = state_with_coin(8);
         let owner_pk = wots::keygen(&seed);
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 8, salt: input_salt }],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 8, salt: input_salt , commitment: None }],
             witnesses: vec![], // 0 sigs for 1 input
             outputs: vec![OutputData::Standard { address: [0; 32], value: 4, salt: [0; 32] }],
             salt: [0; 32],
@@ -728,7 +729,7 @@ mod tests {
         let sig = wots::sign(&seed, &commitment);
 
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 8, salt: input_salt }],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 8, salt: input_salt , commitment: None }],
             witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
             outputs: vec![output],
             salt: commit_salt,
@@ -746,7 +747,7 @@ mod tests {
         let sig = wots::sign(&seed, &commitment);
 
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt }],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt , commitment: None }],
             witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
             outputs: vec![output],
             salt: commit_salt,
@@ -758,7 +759,7 @@ mod tests {
     fn reveal_rejects_duplicate_inputs() {
         let (mut state, seed, _coin_id, input_salt) = state_with_coin(16);
         let owner_pk = wots::keygen(&seed);
-        let same_input = InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt };
+        let same_input = InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt , commitment: None };
         let tx = Transaction::Reveal {
             inputs: vec![same_input.clone(), same_input],
             witnesses: vec![Witness::sig(vec![0; wots::SIG_SIZE]), Witness::sig(vec![0; wots::SIG_SIZE])],
@@ -779,7 +780,7 @@ mod tests {
         let commitment1 = do_commit(&mut state, &[coin_id], &[out1.coin_id().unwrap()], &salt1);
         let sig1 = wots::sign(&seed, &commitment1);
         let tx1 = Transaction::Reveal {
-            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt }],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt , commitment: None }],
             witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig1))],
             outputs: vec![out1],
             salt: salt1,
@@ -792,7 +793,7 @@ mod tests {
         let commitment2 = do_commit(&mut state, &[coin_id], &[out2.coin_id().unwrap()], &salt2);
         let sig2 = wots::sign(&seed, &commitment2);
         let tx2 = Transaction::Reveal {
-            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt }],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&owner_pk), value: 16, salt: input_salt , commitment: None }],
             witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig2))],
             outputs: vec![out2],
             salt: salt2,
@@ -827,7 +828,7 @@ mod tests {
         let sig_bytes = mss_sig.to_bytes();
 
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { predicate: Predicate::p2pk(&master_pk), value, salt: input_salt }],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&master_pk), value, salt: input_salt , commitment: None }],
             witnesses: vec![Witness::sig(sig_bytes)],
             outputs: vec![output],
             salt: commit_salt,

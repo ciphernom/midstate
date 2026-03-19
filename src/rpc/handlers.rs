@@ -168,9 +168,13 @@ let inputs: Vec<InputReveal> = req.inputs.iter().map(|i| {
     let input_coin_ids: Vec<String> = inputs.iter().map(|i| hex::encode(i.coin_id())).collect();
     let output_commit_hashes: Vec<String> = outputs.iter().map(|o| hex::encode(o.hash_for_commitment())).collect();
     
-    let fee = {
-        let in_sum: u64 = inputs.iter().map(|i| i.value).sum();
-        let out_sum: u64 = outputs.iter().map(|o| o.value()).sum();
+let fee = {
+        let in_sum = inputs.iter()
+            .try_fold(0u64, |acc, i| acc.checked_add(i.value))
+            .ok_or_else(|| ErrorResponse { error: "Input value overflow".into() })?;
+        let out_sum = outputs.iter()
+            .try_fold(0u64, |acc, o| acc.checked_add(o.value()))
+            .ok_or_else(|| ErrorResponse { error: "Output value overflow".into() })?;
         in_sum.saturating_sub(out_sum)
     };
 

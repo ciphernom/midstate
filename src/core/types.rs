@@ -955,7 +955,7 @@ mod tests {
     #[test]
     fn fee_zero_with_confidential_output() {
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { predicate: Predicate::p2pk(&[0u8; 32]), value: 100, salt: [0u8; 32] }],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&[0u8; 32]), value: 100, salt: [0u8; 32] , commitment: None }],
             witnesses: vec![Witness::sig(vec![])],
             outputs: vec![OutputData::Confidential {
                 address: [0u8; 32],
@@ -1000,7 +1000,7 @@ mod tests {
     #[test]
     fn input_reveal_coin_id_uses_address() {
         let pk = [0xAA; 32];
-        let ir = InputReveal { predicate: Predicate::p2pk(&pk), value: 4, salt: [0u8; 32] };
+        let ir = InputReveal { predicate: Predicate::p2pk(&pk), value: 4, salt: [0u8; 32] , commitment: None };
         let expected_addr = Predicate::p2pk(&pk).address();
         assert_eq!(ir.coin_id(), compute_coin_id(&expected_addr, 4, &[0u8; 32]));
     }
@@ -1024,7 +1024,7 @@ mod tests {
     #[test]
     fn reveal_fee_computed() {
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { predicate: Predicate::p2pk(&[0u8; 32]), value: 10, salt: [0u8; 32] }],
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&[0u8; 32]), value: 10, salt: [0u8; 32] , commitment: None }],
             witnesses: vec![Witness::sig(vec![])],
             outputs: vec![OutputData::Standard { address: [0u8; 32], value: 8, salt: [0u8; 32] }],
             salt: [0u8; 32],
@@ -1034,7 +1034,7 @@ mod tests {
 
     #[test]
     fn reveal_input_output_coin_ids() {
-        let input = InputReveal { predicate: Predicate::p2pk(&[1u8; 32]), value: 8, salt: [2u8; 32] };
+        let input = InputReveal { predicate: Predicate::p2pk(&[1u8; 32]), value: 8, salt: [2u8; 32] , commitment: None };
         let output = OutputData::Standard { address: [3u8; 32], value: 4, salt: [4u8; 32] };
         let tx = Transaction::Reveal {
             inputs: vec![input.clone()],
