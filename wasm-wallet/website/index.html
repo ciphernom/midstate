@@ -991,6 +991,15 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                     
                     <p>The Commit phase binds the transaction inputs and outputs via a <code>BLAKE3</code> hash. The network sees a commit, but has no idea who is sending money to whom, or how much. Only after the commit is permanently mined into a block does the user broadcast the Reveal, providing the signatures to execute the spend.</p>
 
+                    <p>This mechanism blinds transaction topology prior to block inclusion and enforces perfect subset sum ambiguity upon execution.</p>
+
+
+                    <h4>Two-Phase Dark Pool Execution</h4>
+                    <p>Transactions are split into <code>Commit</code> and <code>Reveal</code> phases to decouple mempool admission from the cleartext execution of the state transition.</p>
+                    <ul>
+                        <li><strong>Commit Phase:</strong> A 32-byte hash binds the inputs, outputs, and a 32-byte cryptographic salt: <code>BLAKE3(NETWORK_MAGIC || input_coin_ids || output_commit_hashes || salt)</code>. The client must compute a Proof-of-Work nonce yielding 16 to 30 leading zero bits (dynamically scaled based on current mempool congestion) to admit the <code>Commit</code> into the mempool.</li>
+                        <li><strong>Reveal Phase:</strong> After the <code>Commit</code> is included in a block, the user broadcasts the <code>Reveal</code> transaction containing the cleartext preimages, executing the state transition. Commitments expire and are garbage-collected from the state after <code>COMMITMENT_TTL</code> (1,000 blocks).</li>
+                    </ul>
                     <details class="deep-dive">
                         <summary>Dynamic Anti-Spam PoW</summary>
                         <div class="dd-content">
@@ -1000,40 +1009,66 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                     </details>
                 </div>
 
-                <div class="tab-content" id="coinjoin">
-                    <h3>Native CoinJoin & Dandelion++</h3>
-                    <p>Because Midstate forces UTXOs into exact power-of-2 denominations, coins look identical. The P2P layer includes a built-in CoinJoin coordinator to seamlessly mix transactions.</p>
+<div class="tab-content" id="coinjoin">
+ 
+<h3>Native CoinJoin</h3>
+                    <h4>Ephemeral CoinJoin Coordination</h4>
+                    <p>Multiparty mixing occurs via an off-chain libp2p protocol. Any node can initialize a session by broadcasting a <code>MixAnnounce</code> message.</p>
                     
+                    
+                    
+                    
+                    <div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
+                    graph LR
+                        subgraph libp2p Network
+                            A[Peer A: Input + PoW] -->|MixJoin| M
+                            B[Peer B: Input + PoW] -->|MixJoin| M
+                            C[Peer C: Fee Input] -->|MixFee| M
+                        end
+                        
+                        M((Ephemeral<br>Coordinator))
+                        
+                        subgraph Canonical Proposal
+                            M -->|Lexicographical Sort| P[MixProposal]
+                            P -.->|Verify & Sign| A
+                            P -.->|Verify & Sign| B
+                            P -.->|Verify & Sign| C
+                        end
+                        
+                        style M fill:#2e1065,stroke:#8b5cf6,stroke-width:2px
+                        style A fill:#1f2937,stroke:#4b5563,color:#fff
+                        style B fill:#1f2937,stroke:#4b5563,color:#fff
+                        style C fill:#1f2937,stroke:#4b5563,color:#fff
+                    </div>
+
                     <ul>
-                        <li><strong>Denomination-Uniform Mixing:</strong> <code>N</code> participants contribute an input of value <code>V</code>, and receive an output of value <code>V</code>. The resulting transaction is a perfect permutation.</li>
-                        <li><strong>Anti-Sybil PoW:</strong> To prevent attackers from stalling mixes by rotating identities, joining a mix requires a Proof-of-Work nonce cryptographically bound to the sender's libp2p <code>PeerId</code>.</li>
+                        <li><strong>Uniformity Constraints:</strong> A session enforces <code>MIN_MIX_PARTICIPANTS = 2</code> and <code>MAX_MIX_PARTICIPANTS = 16</code>. All mixed inputs and outputs must equal a single power-of-2 denomination. Exactly one input of value 1 must be provided by a participant to cover the network fee.</li>
+                        <li><strong>Anti-Sybil Proof-of-Work:</strong> Submitting a <code>MixJoin</code> or <code>MixFee</code> requires computing a nonce where <code>BLAKE3(mix_id || coin_id || peer_id || nonce)</code> yields at least 24 leading zero bits (<code>MIX_JOIN_POW_BITS</code>). Binding the PoW challenge to the libp2p <code>PeerId</code> prevents identity rotation attacks.</li>
+                        <li><strong>Trustless Proposal Assembly:</strong> The coordinator aggregates inputs and outputs, sorting them lexicographically by <code>coin_id</code> byte order to ensure deterministic serialization. The fee input is appended last. The coordinator broadcasts this canonical <code>MixProposal</code>. Participants cryptographically verify the presence of their registered outputs before signing the resulting commitment hash.</li>
                     </ul>
 
-
-
-<div class="callout">
-                        <h4>Dandelion++ Routing</h4>
-                        <p>To prevent IP-address correlation, Midstate routes transactions through a "stem" phase before entering the public mempool. A transaction hops between single peers sequentially. At each hop, there is a 10% "fluff" probability where the node will finally broadcast it to the entire network.</p>
+                    <div class="callout">
+                        <h4>Dandelion++ Network Routing</h4>
+                        <p>Transactions originate in a stem phase to decouple the payload from the broadcasting IP address before entering the public mempool.</p>
                         
                         <div class="mermaid" style="text-align: center; margin: 20px 0;">
                         graph LR
-                            A([Tx Origin]) -.->|Stem phase| B([Node 2])
-                            B -.->|10% Fluff| C([Node 3])
-                            C -.->|10% Fluff| D([Node 4])
-                            D ==>|Fluff Trigger!| E([Peer A])
+                            A([Origin Node]) -.->|Stem phase| B([Node 2])
+                            B -.->|10% Probability| C([Node 3])
+                            C -.->|10% Probability| D([Node 4])
+                            D ==>|Broadcast Trigger| E([Peer A])
                             D ==>|Broadcast| F([Peer B])
                             D ==>|Broadcast| G([Peer C])
                             
-                            style A fill:#2e1065,stroke:#8b5cf6,stroke-width:2px
-                            style D fill:#064e3b,stroke:#10b981,stroke-width:2px
+                            style A fill:#2e1065,stroke:#8b5cf6,stroke-width:2px,color:#fff
+                            style D fill:#064e3b,stroke:#10b981,stroke-width:2px,color:#fff
                         </div>
                         
-                        <p>If a transaction stays in the stem pool for >30 seconds (due to a dead peer), the node automatically fluffs it as a safety net.</p>
+                        <ul>
+                            <li><strong>Routing Logic:</strong> Stem transactions route sequentially to a single connected peer. At each hop, the receiving node evaluates a 10% probability (<code>STEM_FLUFF_PERCENT</code>) to transition the transaction to the fluff phase for global gossip broadcast.</li>
+                            <li><strong>Fallback Mechanisms:</strong> A transaction remaining in the local stem pool for <code>STEM_TIMEOUT_SECS</code> (30 seconds) triggers an automatic broadcast override. The local stem pool is strictly bounded to 1,000 entries (<code>MAX_STEM_POOL_SIZE</code>). If capacity is reached, new transactions bypass the stem phase entirely to prevent memory exhaustion under PoW spam.</li>
+                        </ul>
                     </div>
-                    
-                    
-                    
-                    <p><strong>Anti-Spam Bypass:</strong> Anonymity should never crash the node. If an attacker attempts to flood the network with valid commits to OOM (Out-of-Memory) edge devices, Midstate caps the private Stem Pool at 1,000 entries. If full, the node prioritizes survival, bypassing the Dandelion++ privacy phase and immediately broadcasting transactions to the public mempool to clear the queue.</p>
                 </div>
 
                 <div class="tab-content" id="starks">
