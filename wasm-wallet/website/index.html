@@ -463,6 +463,7 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
     <div class="brand"><div class="brand-indicator"></div> MIDSTATE</div>
     <div class="nav-actions">
         <a href="./wallet/" target="_blank" class="btn">Web Wallet</a>
+        <a href="https://rpc.cypherpunk.gold" target="_blank" class="btn">Explorer</a>
         <a href="https://github.com/ciphernom/midstate/blob/main/whypaper.md" target="_blank" class="btn">Whypaper</a>
         <a href="https://github.com/ciphernom/midstate/releases" target="_blank" class="btn">Releases</a>
         <a href="https://github.com/ciphernom/midstate" target="_blank" class="btn">GitHub</a>
@@ -482,6 +483,7 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
         <div class="menu-item" data-target="privacy">Privacy & ZK-STARKs <span>→</span></div>
         <div class="menu-item" data-target="state">State Mgmt & Sync <span>→</span></div>
         <div class="menu-item" data-target="vm">Virtual Machine <span>→</span></div>
+        <div class="menu-item" data-target="axe-hw">MidstateAxe Hardware <span>→</span></div>
         <div class="menu-item" data-target="vs-legacy">Comparison <span>→</span></div>
     </div>
 
@@ -716,6 +718,7 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                         <h4>Dandelion++ Routing</h4>
                         <p>To prevent IP-address correlation, Midstate routes transactions through a "stem" phase before entering the public mempool. A transaction hops between single peers sequentially. At each hop, there is a 10% "fluff" probability where the node will finally broadcast it to the entire network. If a transaction stays in the stem pool for >30 seconds (due to a dead peer), the node automatically fluffs it as a safety net.</p>
                     </div>
+                    <p><strong>Anti-Spam Bypass:</strong> Anonymity should never crash the node. If an attacker attempts to flood the network with valid commits to OOM (Out-of-Memory) edge devices, Midstate caps the private Stem Pool at 1,000 entries. If full, the node prioritizes survival, bypassing the Dandelion++ privacy phase and immediately broadcasting transactions to the public mempool to clear the queue.</p>
                 </div>
 
                 <div class="tab-content" id="starks">
@@ -755,7 +758,7 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
             <p>Historical block batches are aggressively pruned. Validating nodes only retain lightweight headers and state snapshots (saved every 100 blocks). Light clients can scan the chain locally using <strong>Golomb-Rice Compact Filters (P=20)</strong>. Filter elements are securely keyed using the block's <code>final_hash</code> to prevent miner precomputation or filter-bloating attacks.</p>
         </div>
 
-        <div class="content-pane" id="vm">
+<div class="content-pane" id="vm">
             <h2>Virtual Machine (MidstateScript)</h2>
             <p>Every UTXO in Midstate is locked by a compiled bytecode script. The VM executes witness inputs pushed onto the <code>SmallVec</code> stack, then evaluates the script. Execution succeeds if and only if the final top-of-stack item is exactly <code>[1]</code>.</p>
 
@@ -763,6 +766,8 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                 <div class="tab-nav">
                     <button class="tab-btn active" data-tab="p2pk-trace">Standard P2PK</button>
                     <button class="tab-btn" data-tab="stark-trace">Confidential ZK-STARKs</button>
+                    <button class="tab-btn" data-tab="script-dev">Writing MidstateScript</button>
+                    <button class="tab-btn" data-tab="covenants">Covenants</button>
                 </div>
                 
                 <div class="tab-content active" id="p2pk-trace">
@@ -818,6 +823,43 @@ Execution Trace:
 
 Result: VALID. Amounts successfully hidden.</code></pre>
                 </div>
+
+                <div class="tab-content" id="script-dev">
+                    <h3>Writing & Compiling MidstateScript</h3>
+                    <p>MidstateScript is a Turing-incomplete, stack-based language. To prevent memory exhaustion, the VM enforces strict limits: scripts cannot exceed <strong>1,024 bytes</strong>, the stack depth is capped at <strong>64 items</strong>, and execution must satisfy the <strong>Clean Stack Rule</strong> (exactly one item must remain on the stack at the end, and it must evaluate to <code>true</code> / <code>[1]</code>).</p>
+                    
+                    <p>Developers can write <code>.msc</code> files and compile them using the CLI:</p>
+                    <div class="terminal">
+                        $ midstate wallet compile --file my_script.msc
+                    </div>
+
+                    <h4>Available Mnemonics</h4>
+                    <p>The assembler recognizes the following opcodes natively:</p>
+                    <ul>
+                        <li><strong>Stack:</strong> <code>PUSH_INT &lt;val&gt;</code>, <code>PUSH_HEX &lt;hex&gt;</code>, <code>DROP</code>, <code>DUP</code>, <code>SWAP</code></li>
+                        <li><strong>Control Flow:</strong> <code>IF</code>, <code>ELSE</code>, <code>ENDIF</code></li>
+                        <li><strong>Arithmetic/Logic:</strong> <code>ADD</code>, <code>EQUAL</code>, <code>GREATER_OR_EQUAL</code></li>
+                        <li><strong>Crypto:</strong> <code>HASH</code>, <code>CHECKSIG</code>, <code>CHECKSIGVERIFY</code>, <code>VERIFY_STARK</code></li>
+                        <li><strong>Utility:</strong> <code>VERIFY</code>, <code>EQUALVERIFY</code>, <code>CHECKTIMEVERIFY</code> (for Timelocks), <code>SUM_TO_ADDR</code> (for Covenants)</li>
+                    </ul>
+
+                    <div class="callout">
+                        <h4>Atomic Swaps (HTLCs)</h4>
+                        <p>Midstate natively supports Hash Time-Locked Contracts. A standard HTLC compiles down to:</p>
+                        <code>IF HASH PUSH_HEX &lt;secret_hash&gt; EQUALVERIFY PUSH_HEX &lt;receiver_pk&gt; CHECKSIGVERIFY ELSE DROP PUSH_INT &lt;timeout_height&gt; CHECKTIMEVERIFY PUSH_HEX &lt;refund_pk&gt; CHECKSIGVERIFY ENDIF PUSH_INT 1</code>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="covenants">
+                    <h3>Native Covenants (OP_SUM_TO_ADDR)</h3>
+                    <p>Unlike Bitcoin, which requires complex opcode proposals (like OP_CTV or OP_CAT) to restrict how funds are spent, Midstate features native covenant capabilities via <code>OP_SUM_TO_ADDR</code>.</p>
+                    
+                    <p>This opcode introspects the transaction's <code>OutputData</code>. It pops an address from the stack, sums the value of all outputs being sent to that address in the current transaction, and pushes the total back onto the stack.</p>
+
+                    <pre><code># Example: "You can spend this coin, but ONLY IF you send at least 100 units to Alice"
+Script: PUSH_HEX &lt;alice_addr&gt; SUM_TO_ADDR PUSH_INT 100 GREATER_OR_EQUAL VERIFY PUSH_INT 1</code></pre>
+                    <p>This allows for native crowdfunding, non-interactive conditional payments, and decentralized autonomous organizations (DAOs) without requiring Turing-complete smart contracts.</p>
+                </div>
             </div>
         </div>
 
@@ -867,6 +909,42 @@ Result: VALID. Amounts successfully hidden.</code></pre>
         </div>
 
     </div>
+    
+    <div class="content-pane" id="axe-hw">
+            <h2>The MidstateAxe Ecosystem</h2>
+            <p>The Midstate node is highly optimized for the <strong>MidstateAxe</strong>—a custom OS image built via Buildroot for Raspberry Pi hardware (Zero 2 W, Pi 3, Pi 4). The node exposes exclusive hardware APIs when it detects the physical device.</p>
+
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Memory Footprint</div>
+                    <div class="stat-value">< 150 MB</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Jemalloc</div>
+                    <div class="stat-value">Anti-Fragmentation</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">OS Environment</div>
+                    <div class="stat-value">Embedded Linux</div>
+                </div>
+            </div>
+
+            <h3>Hardware APIs</h3>
+            <p>When the node detects it is running on Axe hardware (via device tree inspection), it unlocks a suite of captive-portal and management endpoints over the Axum RPC server:</p>
+            
+            <ul>
+                <li><code>/axe/stats</code>: Reads the CPU's thermal zone (in milli-Celsius), system uptime, and fetches the real-time atomic hardware hashrate counter.</li>
+                <li><code>/axe/wifi</code>: Acts as a captive portal, allowing users to configure <code>wpa_supplicant.conf</code> and reload the <code>wlan0</code> interface live via <code>wpa_cli</code>.</li>
+                <li><code>/axe/overclock</code>: Safely modifies <code>/boot/config.txt</code> to adjust <code>arm_freq</code> and <code>over_voltage</code>, then orchestrates a system reboot.</li>
+                <li><code>/axe/rewards</code>: Serves the <code>coinbase_seeds.jsonl</code> file directly to the user so they can import their offline mined rewards into a standard Desktop wallet.</li>
+            </ul>
+
+            <div class="callout warn">
+                <h4>DataBurn UTXOs (OP_RETURN)</h4>
+                <p>The MidstateAxe nodes are protected from state bloat. Users can embed arbitrary data in the blockchain using <code>OutputData::DataBurn</code> (capped at 80 bytes). However, these outputs yield no <code>coin_id</code> and are <strong>completely ignored by the UTXO Sparse Merkle Tree</strong>. Miners process the data, but the RAM of edge devices is never burdened by tracking unspendable data.</p>
+            </div>
+        </div>
+    
 </div>
 
 <script>
