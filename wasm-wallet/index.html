@@ -422,7 +422,15 @@
                 });
             });
         }
-
+// Migration Banner for old domain users
+if (window.location.hostname === "ciphernom.github.io") {
+    const banner = document.createElement('div');
+    banner.style = "background: #ff4444; color: white; padding: 12px; text-align: center; font-size: 13px; font-weight: bold; position: fixed; top: 0; left: 0; right: 0; z-index: 10000; border-bottom: 2px solid black;";
+    banner.innerHTML = "NOTICE: We are moving to <a href='https://cypherpunk.gold/wallet' style='color: white; text-decoration: underline;'>cypherpunk.gold</a>. Please export your backup and import it on the new domain.";
+    document.body.prepend(banner);
+    // Push the app container down so it doesn't overlap
+    document.getElementById('app-container').style.marginTop = "45px";
+}
         // --- UI Helper Functions (Toasts & Modals) ---
         function showToast(message, type = 'info', duration) {
             const container = document.getElementById('toast-container');

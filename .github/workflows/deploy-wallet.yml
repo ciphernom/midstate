@@ -45,6 +45,9 @@ jobs:
           # 2. Copy the Architecture Site (now in wasm-wallet/website) to the ROOT of staging
           cp -r wasm-wallet/website/* staging/
           
+          # Add this line to tell GitHub about the custom domain
+          echo "cypherpunk.gold" > staging/CNAME
+          
           # 3. Copy the Wasm Wallet files to the '/wallet' subdirectory
           # We exclude the 'website' folder itself to keep the deployment clean
           cp wasm-wallet/index.html staging/wallet/

@@ -1,12 +1,10 @@
 const CACHE_NAME = 'midstate-wallet-v2';
 const ASSETS = [
-  './',
-  './index.html',
-  './worker.js',
-  './manifest.json',
-  // You must include your compiled WASM files here:
-  './pkg/wasm_wallet.js',
-  './pkg/wasm_wallet_bg.wasm'
+  'index.html',
+  'worker.js',
+  'manifest.json',
+  'pkg/wasm_wallet.js',
+  'pkg/wasm_wallet_bg.wasm'
 ];
 
 self.addEventListener('install', (event) => {
