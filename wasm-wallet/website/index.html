@@ -495,6 +495,22 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
             
             <p>By enforcing sequential CPU mining, forcing all UTXOs into uniform power-of-2 denominations, and utilizing Winterfell ZK-STARKs for confidential transfers, it creates a robust, highly private financial network that cannot be dominated by parallel ASICs or dismantled by blockchain surveillance firms.</p>
 
+<div class="callout">
+                <h4>Why the name "Midstate"?</h4>
+                <p>In traditional blockchains, blocks are distinct data structures linked by their header hashes. Midstate abandons this design. Instead, the entire blockchain is mathematically modeled as a single, continuous <strong>BLAKE3 hash function</strong>.</p>
+                <p>The <code>midstate</code> is the 32-byte internal state of this global hash function. When a miner processes a block, they aren't hashing a static header—they are taking the current network <code>midstate</code> and advancing it by exactly 1,000,000 sequential BLAKE3 compression cycles. Every transaction, commitment, and proof of work permanently mutates this singular, ongoing mathematical state.</p>
+            </div>
+
+            <h3>How is Midstate Different?</h3>
+            <p>Unlike first-generation blockchains (like Bitcoin or Ethereum), Midstate was engineered specifically to solve hardware centralization and on-chain surveillance:</p>
+            <ul>
+                <li><strong>No Elliptic Curves (Post-Quantum):</strong> It uses zero ECC math (no secp256k1). Every signature, commitment, and ZK proof relies solely on the BLAKE3 hash function, immunizing the network against Shor's algorithm.</li>
+                <li><strong>Sequential vs. Parallel Mining:</strong> Typical PoW allows ASICs to run trillions of hashes in parallel. Midstate forces miners to compute hashes in a strict, unrollable sequence, shifting the bottleneck from parallel throughput to single-thread latency.</li>
+                <li><strong>Power-of-2 UTXOs:</strong> Standard UTXOs use exact amounts (e.g., 1.452 coins), creating unique cryptographic fingerprints. Midstate forces all coins into identical power-of-2 denominations, fracturing surveillance graphs.</li>
+                <li><strong>Commit-Reveal Mempool:</strong> Standard mempools broadcast cleartext trades, enabling MEV (Miner Extractable Value) front-running. Midstate blinds transactions in the mempool until a miner cryptographically commits to processing them.</li>
+                <li><strong>Bounded State (Sparse Merkle Trees):</strong> Instead of an infinitely growing LevelDB database, Midstate accumulates UTXOs into a rolling Sparse Merkle Tree, heavily capping the RAM required to run a full node.</li>
+            </ul>
+
             <div class="stat-grid">
                 <div class="stat-card">
                     <div class="stat-label">Core Hash Primitive</div>
