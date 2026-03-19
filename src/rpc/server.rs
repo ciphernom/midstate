@@ -30,7 +30,9 @@ impl RpcServer {
         let allowed_origins = [
             "http://localhost:8080".parse::<HeaderValue>().unwrap(),
             "https://ciphernom.github.io".parse::<HeaderValue>().unwrap(), 
-        ];
+            "https://cypherpunk.gold".parse::<HeaderValue>().unwrap(), 
+            "https://www.cypherpunk.gold".parse::<HeaderValue>().unwrap(), 
+            ];
         
         let cors = CorsLayer::new()
             .allow_origin(allowed_origins)
