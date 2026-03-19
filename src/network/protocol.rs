@@ -99,7 +99,7 @@ impl Message {
 }
 
 // ── libp2p request-response codec ───────────────────────────────────────────
-pub const MIDSTATE_PROTOCOL: StreamProtocol = StreamProtocol::new("/midstate/1.0.0");
+pub const MIDSTATE_PROTOCOL: StreamProtocol = StreamProtocol::new("/midstate/1.1.0");
 const MAX_MSG_SIZE: usize = 10_000_000;
 
 #[derive(Debug, Clone, Default)]
