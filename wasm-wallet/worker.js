@@ -31,6 +31,10 @@ function normalizeHex(data) {
 }
 
 async function deriveCryptoKey(pwd, salt) {
+    // Safety check for Secure Context
+    if (!self.crypto || !self.crypto.subtle) {
+        throw new Error("Cryptography unavailable: This wallet requires a secure (HTTPS) connection.");
+    }
     const enc = new TextEncoder();
     const keyMaterial = await crypto.subtle.importKey("raw", enc.encode(pwd), { name: "PBKDF2" }, false, ["deriveKey"]);
     return await crypto.subtle.deriveKey(
