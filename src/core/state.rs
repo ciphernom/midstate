@@ -300,7 +300,7 @@ pub fn apply_batch(
               coinbase_total, allowed_value, reward, total_fees);
     }
 
-    // 4. Compute future midstate with coinbase coin IDs
+// 4. Compute future midstate with coinbase coin IDs
     let mut future_midstate = state.midstate;
     let coinbase_ids: Vec<[u8; 32]> = batch.coinbase.iter().map(|cb| cb.coin_id()).collect();
     for coin_id in &coinbase_ids {
@@ -308,25 +308,26 @@ pub fn apply_batch(
     }
 
     // --- NEW: State Root Validation ---
-    // Simulate adding coinbase coins to calculate the exact state root
-    let mut temp_state_coins = state.coins.clone();
-    for coin_id in &coinbase_ids {
-        temp_state_coins.insert(*coin_id);
+    if batch.state_root != [0u8; 32] { // Bypass for legacy blocks
+        // Simulate adding coinbase coins to calculate the exact state root
+        let mut temp_state_coins = state.coins.clone();
+        for coin_id in &coinbase_ids {
+            temp_state_coins.insert(*coin_id);
+        }
+        let smt_root = hash_concat(&temp_state_coins.root(), &state.commitments.root());
+        let expected_state_root = hash_concat(&smt_root, &state.chain_mmr.root());
+        
+        if batch.state_root != expected_state_root {
+            bail!("State root mismatch: expected {}, got {}", hex::encode(expected_state_root), hex::encode(batch.state_root));
+        }
+        
+        // Hash the state root into the midstate BEFORE verifying the PoW!
+        future_midstate = hash_concat(&future_midstate, &batch.state_root);
     }
-    let smt_root = hash_concat(&temp_state_coins.root(), &state.commitments.root());
-    let expected_state_root = hash_concat(&smt_root, &state.chain_mmr.root());
-    
-    if batch.state_root != expected_state_root {
-        bail!("State root mismatch: expected {}, got {}", hex::encode(expected_state_root), hex::encode(batch.state_root));
-    }
-    
-    // Hash the state root into the midstate BEFORE verifying the PoW!
-    future_midstate = hash_concat(&future_midstate, &batch.state_root);
     // -----------------------------------
 
     // 5. Verify extension against future midstate
     verify_extension(future_midstate, &batch.extension, &batch.target)?;
-
     // 6. Add coinbase coins to state
     for coin_id in &coinbase_ids {
         if !state.coins.insert(*coin_id) {

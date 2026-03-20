@@ -9,6 +9,131 @@ pub struct BatchStore {
     base_path: PathBuf,
 }
 
+
+use crate::core::types::{Predicate, Witness, OutputData}; // Added for legacy mapping
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct LegacyInputReveal {
+    pub predicate: Predicate,
+    pub value: u64,
+    pub salt: [u8; 32],
+    // Missing: pub commitment: Option<[u8; 32]>
+}
+
+impl LegacyInputReveal {
+    fn into_current(self) -> crate::core::InputReveal {
+        crate::core::InputReveal {
+            predicate: self.predicate,
+            value: self.value,
+            salt: self.salt,
+            commitment: None, // Sentinel for old inputs
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+enum LegacyTransaction {
+    Commit {
+        commitment: [u8; 32],
+        spam_nonce: u64,
+    },
+    Reveal {
+        inputs: Vec<LegacyInputReveal>,
+        witnesses: Vec<Witness>,
+        outputs: Vec<OutputData>,
+        salt: [u8; 32],
+    },
+}
+
+impl LegacyTransaction {
+    fn into_current(self) -> crate::core::Transaction {
+        match self {
+            Self::Commit { commitment, spam_nonce } => crate::core::Transaction::Commit { commitment, spam_nonce },
+            Self::Reveal { inputs, witnesses, outputs, salt } => crate::core::Transaction::Reveal {
+                inputs: inputs.into_iter().map(|i| i.into_current()).collect(),
+                witnesses,
+                outputs,
+                salt,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct LegacyBatch {
+    pub prev_midstate: [u8; 32],
+    pub transactions: Vec<LegacyTransaction>,
+    pub extension: crate::core::Extension,
+    #[serde(default)]
+    pub coinbase: Vec<crate::core::CoinbaseOutput>,
+    pub timestamp: u64,
+    pub target: [u8; 32],
+    // Missing: pub state_root: [u8; 32]
+}
+
+impl LegacyBatch {
+    fn into_current(self) -> crate::core::Batch {
+        crate::core::Batch {
+            prev_midstate: self.prev_midstate,
+            transactions: self.transactions.into_iter().map(|t| t.into_current()).collect(),
+            extension: self.extension,
+            coinbase: self.coinbase,
+            timestamp: self.timestamp,
+            target: self.target,
+            state_root: [0u8; 32], // Sentinel for old blocks
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct LegacyBatchHeader {
+    pub height: u64,
+    pub prev_midstate: [u8; 32],
+    pub post_tx_midstate: [u8; 32],
+    pub extension: crate::core::Extension,
+    pub timestamp: u64,
+    pub target: [u8; 32],
+    // Missing: pub state_root: [u8; 32]
+}
+
+impl LegacyBatchHeader {
+    fn into_current(self) -> crate::core::BatchHeader {
+        crate::core::BatchHeader {
+            height: self.height,
+            prev_midstate: self.prev_midstate,
+            post_tx_midstate: self.post_tx_midstate,
+            extension: self.extension,
+            timestamp: self.timestamp,
+            target: self.target,
+            state_root: [0u8; 32], // Sentinel for old headers
+        }
+    }
+}
+
+
+fn deserialize_batch_with_migration(bytes: &[u8], height: u64) -> Result<crate::core::Batch> {
+    match bincode::deserialize::<crate::core::Batch>(bytes) {
+        Ok(batch) => Ok(batch),
+        Err(_) => {
+            let legacy: LegacyBatch = bincode::deserialize(bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize batch at height {} in all formats: {}", height, e))?;
+            tracing::info!("Migrated legacy block at height {}", height);
+            Ok(legacy.into_current())
+        }
+    }
+}
+
+fn deserialize_header_with_migration(bytes: &[u8], height: u64) -> Result<crate::core::BatchHeader> {
+    match bincode::deserialize::<crate::core::BatchHeader>(bytes) {
+        Ok(hdr) => Ok(hdr),
+        Err(_) => {
+            let legacy: LegacyBatchHeader = bincode::deserialize(bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize header at height {} in all formats: {}", height, e))?;
+            Ok(legacy.into_current())
+        }
+    }
+}
+
 impl BatchStore {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let base_path = path.as_ref().to_path_buf();
@@ -170,7 +295,7 @@ impl BatchStore {
         }
         
         let bytes = fs::read(file_path)?;
-        let batch = bincode::deserialize(&bytes)?;
+        let batch = deserialize_batch_with_migration(&bytes, height)?;
         Ok(Some(batch))
     }
 
@@ -182,7 +307,7 @@ impl BatchStore {
 
         if hdr_path.exists() {
             let bytes = fs::read(hdr_path)?;
-            let header: BatchHeader = bincode::deserialize(&bytes)?;
+            let header = deserialize_header_with_migration(&bytes, height)?;
             return Ok(Some(header));
         }
 
