@@ -1279,19 +1279,21 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
         // Prefer: explicit override > last known cursor > 360-block lookback.
         // The last_sync_cursor lets us resume a timed-out header download from
         // where we left off rather than restarting from scratch every time.
-        let start_height = force_start.unwrap_or_else(|| {
-            self.last_sync_cursor
+let start_height = force_start.unwrap_or_else(|| {
+            let base_start = self.last_sync_cursor
                 .filter(|&c| c > self.state.height.saturating_sub(360)
-                             && c <= self.state.height.saturating_add(360))
+                             && c <= self.state.height) // FIX: Do not allow cursor to be ahead of tip
                 .unwrap_or_else(|| {
-                    // Fresh node (height <= 360): start from current height (genesis is deterministic).
-                    // Mature node: look back 360 blocks for fork detection.
                     if self.state.height <= 360 {
                         self.state.height
                     } else {
                         self.state.height.saturating_sub(360)
                     }
-                })
+                });
+
+            // SAFETY CAP: Always ensure we overlap with our current tip.
+            // If the calculated start is ahead of us, force it back to our tip.
+            base_start.min(self.state.height)
         });
         
         tracing::info!(
