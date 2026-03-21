@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use async_trait::async_trait;
 
-pub const MAX_GETBATCHES_COUNT: u64 = 100;
+pub const MAX_GETBATCHES_COUNT: u64 = 2000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Message {

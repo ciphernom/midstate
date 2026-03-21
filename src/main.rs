@@ -2643,7 +2643,7 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
     let mut headers = Vec::new();
     let mut cursor = 0u64;
     while cursor < peer_height {
-        let count = 100.min(peer_height - cursor);
+        let count = 2000.min(peer_height - cursor);
         network.send(peer_id, Message::GetHeaders { start_height: cursor, count });
         let received = loop {
             match network.next_event().await {
