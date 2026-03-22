@@ -101,6 +101,11 @@ impl Syncer {
         headers_start_height: u64, 
         our_height: u64,
     ) -> Result<u64> {
+        // If the peer's headers start way ahead of our local tip, 
+        // force the fork point to the start of their headers to trigger the deep fork guard.
+        if our_height <= headers_start_height {
+            return Ok(headers_start_height);
+        }
         let compare_end = our_height.min(headers_start_height + peer_headers.len() as u64);
 
         for h in headers_start_height..compare_end {

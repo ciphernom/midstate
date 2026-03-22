@@ -67,7 +67,7 @@ const HEADER_REQ_WINDOW_SECS: u64 = 60;
 
 /// GetBatches requests are expensive (up to 8 MB each). Limit them separately.
 /// 500 per 60 seconds allows fast sync while still bounding worst-case CPU/disk load.
-const MAX_BATCH_REQS_PER_PEER: u32 = 500;
+const MAX_BATCH_REQS_PER_PEER: u32 = 5000;
 const BATCH_REQ_WINDOW_SECS: u64 = 60;
 
 /// Non-blocking sync session driven by the main event loop.
@@ -1315,7 +1315,7 @@ let start_height = force_start.unwrap_or_else(|| {
             last_progress_at: now,
         });
         
-        let count = 100.min(peer_height.saturating_sub(start_height));
+        let count = 2000.min(peer_height.saturating_sub(start_height));
         self.network.send(peer, Message::GetHeaders { start_height, count });
     }
 
@@ -1370,7 +1370,7 @@ let start_height = force_start.unwrap_or_else(|| {
 
         if new_cursor < peer_height {
             // Need more headers — request next chunk
-            let count = 100.min(peer_height - new_cursor);
+            let count = 2000.min(peer_height - new_cursor);
             self.network.send(from, Message::GetHeaders { start_height: new_cursor, count });
 
             //  Reset idle timeout because we are making progress
@@ -1684,6 +1684,12 @@ let start_height = force_start.unwrap_or_else(|| {
 // Apply each batch, verifying against the already-validated headers
         for batch in &batches {
             let height = *cursor;
+            
+            if height < header_start_height {
+                tracing::error!("Fatal sync error: batch height {} is below header_start_height {}. Aborting to prevent underflow.", height, header_start_height);
+                self.abort_sync_session("Batch height below header start");
+                return Ok(());
+            }
             
             // Map absolute height to relative array index
             let hdr_idx = (height - header_start_height) as usize;
