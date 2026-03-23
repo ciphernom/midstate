@@ -1,7 +1,7 @@
 [package]
 name = "midstate"
-version = "0.1.0"
-edition = "2021"
+version = "1.0.2"
+edition = "2026"
 
 [dependencies]
 # PURE RUST / WASM-SAFE: Cryptography, Math, Data Structures, Serialization
