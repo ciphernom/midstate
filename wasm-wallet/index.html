@@ -634,12 +634,26 @@ if ('serviceWorker' in navigator) {
     });
 }
 
-        if (window.location.hostname === "ciphernom.github.io") {
+        if (window.location.hostname === "ciphernom.github.io" && !localStorage.getItem('hideMigrationBanner')) {
             const banner = document.createElement('div');
-            banner.style = "background: #ff4444; color: white; padding: 12px; text-align: center; font-size: 13px; font-weight: bold; position: fixed; top: 0; left: 0; right: 0; z-index: 10000; border-bottom: 2px solid black;";
-            banner.innerHTML = "NOTICE: We are moving to <a href='https://cypherpunk.gold/wallet' style='color: white; text-decoration: underline;'>cypherpunk.gold</a>. Please export your backup and import it on the new domain.";
+            // We added display: flex here to easily push the text to the center and the X to the right
+            banner.style = "background: #ff4444; color: white; padding: 12px; text-align: center; font-size: 13px; font-weight: bold; position: fixed; top: 0; left: 0; right: 0; z-index: 10000; border-bottom: 2px solid black; display: flex; justify-content: space-between; align-items: center;";
+            
+            banner.innerHTML = `
+                <div style="flex: 1;">NOTICE: We are moving to <a href='https://cypherpunk.gold/wallet' style='color: white; text-decoration: underline;'>cypherpunk.gold</a>. Please export your backup and import it on the new domain.</div>
+                <button id="closeBannerBtn" style="background: transparent; border: none; color: white; font-size: 18px; cursor: pointer; padding: 0 10px; width: auto; margin: 0; min-height: auto;">✕</button>
+            `;
+            
             document.body.prepend(banner);
-            document.getElementById('app-container').style.marginTop = "45px";
+            const appContainer = document.getElementById('app-container');
+            appContainer.style.marginTop = "45px";
+
+            // Add the click listener to dismiss the banner
+            document.getElementById('closeBannerBtn').onclick = () => {
+                banner.remove(); // Remove the element from the DOM
+                appContainer.style.marginTop = "0px"; // Reset the app container's margin
+                localStorage.setItem('hideMigrationBanner', 'true'); // Remember that they closed it
+            };
         }
 
         // ═══════════════════════════════════════════════════════════════
