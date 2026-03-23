@@ -8,10 +8,8 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <link rel="manifest" href="manifest.json">
     <link rel="apple-touch-icon" href="icon-192.png">
-    
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
     <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
-    
     <title>MIDSTATE // WALLET</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap');
@@ -66,9 +64,8 @@
         button:active { background: var(--accent); color: #000; }
         button:disabled { opacity: 0.5; cursor: not-allowed; }
         
-        .panel { border: 1px solid var(--border); padding: 1.25rem; background: var(--bg-panel); margin-bottom: 1rem; border-radius: 12px;}
+        .panel { border: 1px solid var(--border); padding: 1.25rem; background: var(--bg-panel); margin-bottom: 1rem; border-radius: 12px; }
         .hidden { display: none !important; }
-        
         .stat-val { font-size: 28px; color: var(--text-max); font-weight: bold; word-break: break-all; }
         .list-container { border: 1px solid var(--border); background: var(--bg-panel); border-radius: 8px; overflow: hidden; }
         .list-item { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; }
@@ -84,7 +81,7 @@
             z-index: 100; border-top-left-radius: 16px; border-top-right-radius: 16px;
         }
         .nav-btn {
-            background: transparent; border: none; color: #666; padding: 12px 0; margin: 0; width: 25%;
+            background: transparent; border: none; color: #666; padding: 12px 0; margin: 0; width: 20%;
             font-size: 10px; text-transform: uppercase; letter-spacing: 1px; font-weight: normal;
             display: flex; flex-direction: column; align-items: center; gap: 6px; border-radius: 0;
         }
@@ -92,16 +89,15 @@
         .nav-icon { font-size: 20px; }
 
         .terminal { border: 1px solid var(--border); background: var(--bg); border-radius: 8px; }
-        .terminal summary { background: #000; padding: 12px; font-size: 11px; color: #666; text-transform: uppercase; cursor: pointer; list-style: none; display: flex; justify-content: space-between;}
+        .terminal summary { background: #000; padding: 12px; font-size: 11px; color: #666; text-transform: uppercase; cursor: pointer; list-style: none; display: flex; justify-content: space-between; }
         .terminal[open] summary { border-bottom: 1px solid var(--border); color: var(--accent); }
         .term-log { height: 200px; overflow-y: auto; padding: 10px; font-size: 11px; }
         .term-line { padding: 2px 0; color: var(--text-bright); word-break: break-all; }
         
-        progress { width: 100%; height: 4px; border: none; background: var(--border); margin-bottom: 1rem; border-radius: 2px;}
-        progress::-webkit-progress-bar { background: var(--border); border-radius: 2px;}
+        progress { width: 100%; height: 4px; border: none; background: var(--border); margin-bottom: 1rem; border-radius: 2px; }
+        progress::-webkit-progress-bar { background: var(--border); border-radius: 2px; }
         progress::-webkit-progress-value { background: var(--accent); border-radius: 2px; transition: width 0.1s; }
 
-        /* --- ACTIVITY BANNER --- */
         #activity-banner {
             display: none; padding: 10px 1.5rem; background: rgba(212, 255, 0, 0.06);
             border-bottom: 1px solid var(--accent-dim); font-size: 12px; color: var(--accent);
@@ -111,7 +107,7 @@
         @keyframes spin { to { transform: rotate(360deg); } }
         .spinner { width: 14px; height: 14px; border: 2px solid var(--accent-dim); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }
 
-        /* --- UI OVERLAYS: TOASTS & MODALS --- */
+        /* Toasts */
         #toast-container { 
             position: fixed; top: calc(env(safe-area-inset-top, 0px) + 20px); left: 50%; transform: translateX(-50%); 
             z-index: 9999; display: flex; flex-direction: column; gap: 10px; width: 90%; max-width: 400px; pointer-events: none; 
@@ -126,6 +122,7 @@
         .toast.error { background: #3a0000; border: 1px solid var(--red); color: #fff; }
         .toast.info { background: var(--bg-panel); border: 1px solid var(--border-bright); color: var(--text-max); }
 
+        /* Modals */
         .modal-overlay { 
             position: fixed; top: 0; left: 0; right: 0; bottom: 0; 
             background: rgba(0,0,0,0.85); backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px);
@@ -145,7 +142,6 @@
         .btn-cancel { background: transparent; border: 1px solid var(--border-bright); }
         .btn-cancel:active { background: var(--border); }
 
-        /* Scanner overrides */
         #reader { width: 100%; border-radius: 8px; overflow: hidden; border: 1px solid var(--border-bright); }
         #reader video { object-fit: cover; }
 
@@ -158,9 +154,97 @@
             background: var(--bg); border: 1px solid var(--border); padding: 8px; border-radius: 6px; 
             color: var(--accent); font-weight: bold; font-size: 14px; user-select: all; display: flex; align-items: center;
         }
-        .seed-word span { color: #555; font-size: 10px; margin-right: 8px; user-select: none; font-weight: normal;}
+        .seed-word span { color: #555; font-size: 10px; margin-right: 8px; user-select: none; font-weight: normal; }
 
-        /* Desktop UI Adjustments */
+        /* ═══ Mining Dashboard ═══ */
+        .mine-hero { text-align: center; padding: 1.5rem 0 1rem 0; }
+        .mine-hero-label { font-size: 10px; text-transform: uppercase; letter-spacing: 2px; color: #555; margin-bottom: 4px; }
+        .mine-hero-rate { font-size: 48px; font-weight: 700; color: #333; transition: color 0.3s; font-variant-numeric: tabular-nums; }
+        .mine-hero-rate.active { color: var(--accent); }
+        .mine-hero-unit { font-size: 14px; color: #555; font-weight: 300; margin-left: 4px; }
+        .mine-hero-rate.active .mine-hero-unit { color: var(--accent-dim); }
+        @keyframes hashPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
+        .mine-hero-rate.active { animation: hashPulse 2s ease-in-out infinite; }
+
+        .mine-stats {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 1px;
+            background: var(--border); border: 1px solid var(--border); border-radius: 8px;
+            overflow: hidden; margin-bottom: 1rem;
+        }
+        .mine-stat { background: var(--bg-panel); padding: 12px 14px; display: flex; flex-direction: column; gap: 2px; }
+        .mine-stat-label { font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px; color: #555; }
+        .mine-stat-val { font-size: 15px; color: var(--text-bright); font-weight: 500; font-variant-numeric: tabular-nums; }
+
+        .mine-hw-badge {
+            display: inline-flex; align-items: center; gap: 6px;
+            font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+            color: var(--accent-dim); border: 1px solid var(--border);
+            padding: 6px 10px; border-radius: 4px; background: rgba(212, 255, 0, 0.03);
+            margin-bottom: 1rem;
+        }
+        .mine-hw-dot { width: 6px; height: 6px; border-radius: 50%; background: #333; }
+        .mine-hw-dot.on { background: var(--accent); box-shadow: 0 0 6px var(--accent-dim); }
+
+        .mine-toggle {
+            width: 100%; padding: 16px; font-size: 15px; font-weight: 700;
+            text-transform: uppercase; letter-spacing: 2px; border-radius: 8px;
+            margin-bottom: 1.5rem; transition: all 0.2s;
+        }
+        .mine-toggle.off { background: var(--accent); color: #000; border-color: var(--accent); }
+        .mine-toggle.on { background: transparent; color: var(--red); border: 2px solid var(--red); }
+
+        .mine-throttle { padding: 0 1rem; margin-bottom: 1.25rem; }
+        .mine-throttle-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+        .mine-throttle-label { font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px; color: #555; flex-shrink: 0; min-width: 70px; }
+        .mine-throttle-val { font-size: 13px; color: var(--text-bright); font-weight: 500; min-width: 48px; text-align: right; font-variant-numeric: tabular-nums; }
+        .mine-throttle input[type="range"] {
+            flex: 1; -webkit-appearance: none; appearance: none; height: 4px;
+            background: var(--border-bright); border-radius: 2px; outline: none;
+        }
+        .mine-throttle input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%;
+            background: var(--accent); cursor: pointer; border: none;
+        }
+        .mine-throttle input[type="range"]::-moz-range-thumb {
+            width: 16px; height: 16px; border-radius: 50%;
+            background: var(--accent); cursor: pointer; border: none;
+        }
+
+        .mine-blocks-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.75rem; }
+        .mine-blocks-count { font-size: 11px; color: var(--accent); font-weight: 700; background: rgba(212, 255, 0, 0.1); padding: 2px 8px; border-radius: 4px; }
+
+        .mined-block-entry { padding: 14px 16px; border-bottom: 1px solid var(--border); animation: blockSlideIn 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+        .mined-block-entry:last-child { border-bottom: none; }
+        @keyframes blockSlideIn { from { opacity: 0; transform: translateX(-20px); } to { opacity: 1; transform: translateX(0); } }
+        .mined-block-reward { font-size: 18px; font-weight: 700; color: var(--accent); }
+        .mined-block-hash { font-size: 10px; color: #555; word-break: break-all; margin-top: 4px; }
+        .mined-block-meta { font-size: 11px; color: #666; margin-top: 6px; display: flex; gap: 12px; flex-wrap: wrap; }
+        .mined-block-status { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; padding: 2px 6px; border-radius: 3px; }
+        .mined-block-status.accepted { color: var(--accent); background: rgba(212, 255, 0, 0.1); }
+        .mined-block-status.rejected { color: var(--red); background: rgba(255, 68, 68, 0.1); }
+
+        /* Block Found Celebration */
+        #blockCelebration { position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 2000; pointer-events: none; display: none; align-items: center; justify-content: center; }
+        #blockCelebration.active { display: flex; }
+        .cele-flash { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: var(--accent); opacity: 0; animation: celeFlash 0.6s ease-out; }
+        @keyframes celeFlash { 0% { opacity: 0.3; } 100% { opacity: 0; } }
+        .cele-text { position: relative; text-align: center; animation: celeText 2s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+        @keyframes celeText { 0% { opacity: 0; transform: scale(0.5); } 15% { opacity: 1; transform: scale(1.1); } 25% { transform: scale(1); } 80% { opacity: 1; } 100% { opacity: 0; transform: scale(0.95) translateY(-10px); } }
+        .cele-title { font-size: 42px; font-weight: 700; color: var(--accent); text-shadow: 0 0 40px rgba(212, 255, 0, 0.4), 0 0 80px rgba(212, 255, 0, 0.15); letter-spacing: 4px; }
+        .cele-subtitle { font-size: 14px; color: var(--text-bright); margin-top: 8px; letter-spacing: 2px; }
+        .cele-reward { font-size: 28px; font-weight: 700; color: #fff; margin-top: 12px; }
+        .cele-particle { position: absolute; width: 4px; height: 4px; border-radius: 50%; background: var(--accent); animation: particleFly 1.5s ease-out forwards; }
+        @keyframes particleFly { 0% { opacity: 1; transform: translate(0, 0) scale(1); } 100% { opacity: 0; transform: translate(var(--tx), var(--ty)) scale(0); } }
+
+        /* Home mining widget */
+        .home-mine-widget { border: 1px solid var(--border); border-radius: 12px; background: var(--bg-panel); padding: 1.25rem; margin-bottom: 1rem; cursor: pointer; transition: border-color 0.2s; }
+        .home-mine-widget:hover { border-color: var(--border-bright); }
+        .home-mine-widget.mining { border-color: var(--accent-dim); background: rgba(212, 255, 0, 0.02); }
+        .home-mine-indicator { width: 8px; height: 8px; border-radius: 50%; background: #333; flex-shrink: 0; }
+        .home-mine-indicator.on { background: var(--accent); box-shadow: 0 0 8px var(--accent-dim); animation: indicatorPulse 1.5s ease-in-out infinite; }
+        @keyframes indicatorPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+
+        /* Desktop */
         @media (min-width: 768px) {
             body, html { display: flex; align-items: center; justify-content: center; background: #050505; }
             #app-container {
@@ -185,6 +269,7 @@
             .list-item { flex-direction: row; justify-content: space-between; align-items: center; }
             .list-item .flex-row { gap: 2rem; width: auto; }
             input, button { padding: 10px 14px; font-size: 14px; min-height: auto; }
+            .mine-stats { grid-template-columns: 1fr 1fr 1fr; }
         }
     </style>
 </head>
@@ -199,23 +284,21 @@
             <span id="activity-msg">Processing...</span>
         </div>
 
+        <!-- AUTH -->
         <main id="authView" class="page active">
             <div class="panel">
                 <h2 style="text-align: center; margin-bottom: 2rem;">Authentication</h2>
-                
                 <div id="createSection" class="hidden">
                     <input type="text" id="seedPhrase" placeholder="Enter 24 words or Generate...">
                     <button id="btnGen" style="background: transparent; border: 1px dashed var(--border-bright);">Generate New Phrase</button>
                     <div style="height: 10px;"></div>
                     <input type="password" id="newPwd" placeholder="Set App Password">
                     <button id="btnCreate" disabled style="background: var(--text-max); color: #000;">Initialize Wallet</button>
-                    
                     <div id="createProgressContainer" class="hidden" style="margin-top: 15px;">
                         <div id="createProgressLabel" style="font-size: 11px; color: var(--accent); margin-bottom: 6px; text-transform: uppercase; text-align: center;">Generating Post-Quantum Keys...</div>
                         <progress id="createProgress" value="0" max="100"></progress>
                     </div>
                 </div>
-
                 <div id="loginSection" class="hidden">
                     <p style="text-align: center; margin-bottom: 1rem; color: var(--text-bright);">Wallet locked.</p>
                     <input type="password" id="loginPwd" placeholder="Enter password">
@@ -228,8 +311,8 @@
             </div>
         </main>
 
+        <!-- HOME -->
         <main id="view-home" class="page">
-            
             <div class="panel flex-row" style="margin-bottom: 2rem; background: transparent; border-color: var(--border-bright);">
                 <div style="display: flex; flex-direction: column; gap: 4px;">
                     <span style="font-weight: bold; color: var(--text-max); font-size: 16px;">Network Sync</span>
@@ -244,17 +327,133 @@
                 <div class="stat-val" id="lblBalance" style="color: var(--accent); font-size: 42px;">0</div>
             </div>
 
+            <!-- Compact mining widget -->
+            <div class="home-mine-widget" id="homeMineWidget" onclick="switchTab('view-mine')">
+                <div class="flex-row">
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <div class="home-mine-indicator" id="homeMineIndicator"></div>
+                        <div>
+                            <div style="font-weight: bold; color: var(--text-max); font-size: 14px;">Web Miner</div>
+                            <div style="font-size: 11px; color: #555;" id="homeMineStatus">Idle</div>
+                        </div>
+                    </div>
+                    <div style="text-align: right;">
+                        <div style="font-size: 18px; font-weight: 700; color: #333; font-variant-numeric: tabular-nums;" id="homeMineRate">—</div>
+                        <div style="font-size: 10px; color: #555;">nonces/sec</div>
+                    </div>
+                </div>
+            </div>
+
             <div class="flex-row" style="gap: 12px; margin-bottom: 2rem;">
-                <button class="nav-trigger" data-target="view-send" style="margin:0; background: var(--bg-panel);">💸 Send</button>
-                <button class="nav-trigger" data-target="view-receive" style="margin:0; background: var(--bg-panel);">⬇️ Receive</button>
+                <button class="nav-trigger" data-target="view-send" style="margin: 0; background: var(--bg-panel);">💸 Send</button>
+                <button class="nav-trigger" data-target="view-receive" style="margin: 0; background: var(--bg-panel);">⬇️ Receive</button>
             </div>
 
             <h3>Recent Activity</h3>
             <div class="list-container" id="historyList">
-                <div class="list-item" style="text-align:center; color:#555;">No history.</div>
+                <div class="list-item" style="text-align: center; color: #555;">No history.</div>
             </div>
         </main>
 
+        <!-- MINING DASHBOARD -->
+        <main id="view-mine" class="page">
+            <div class="mine-hero">
+                <div class="mine-hero-label">Hashrate</div>
+                <div class="mine-hero-rate" id="mineHeroRate">0<span class="mine-hero-unit">N/s</span></div>
+            </div>
+
+            <!-- Hashrate Sparkline -->
+            <div style="padding: 0 1rem; margin-bottom: 1rem;">
+                <svg id="mineSparkline" width="100%" height="48" preserveAspectRatio="none" style="display: block;">
+                    <defs>
+                        <linearGradient id="sparkFill" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.15"/>
+                            <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
+                        </linearGradient>
+                    </defs>
+                    <path id="sparkArea" fill="url(#sparkFill)" d=""/>
+                    <polyline id="sparkLine" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" points=""/>
+                </svg>
+            </div>
+
+            <div style="text-align: center; margin-bottom: 1.25rem;">
+                <div class="mine-hw-badge">
+                    <div class="mine-hw-dot" id="mineHwDot"></div>
+                    <span>WASM SIMD128 · 4-Lane · <span id="minerCoreCount">?</span> Cores</span>
+                </div>
+            </div>
+
+            <!-- Thread & CPU Throttle -->
+            <div class="mine-throttle">
+                <div class="mine-throttle-row">
+                    <span class="mine-throttle-label">Threads</span>
+                    <input type="range" id="mineThreadSlider" min="1" max="4" value="2">
+                    <span class="mine-throttle-val" id="mineThreadVal">2</span>
+                </div>
+                <div class="mine-throttle-row">
+                    <span class="mine-throttle-label">CPU</span>
+                    <input type="range" id="mineCpuSlider" min="0" max="4" value="2">
+                    <span class="mine-throttle-val" id="mineCpuVal">Balanced</span>
+                </div>
+            </div>
+
+            <button class="mine-toggle off" id="btnMineToggle">Start Mining</button>
+
+            <!-- Time to Block estimate -->
+            <div class="panel" style="text-align: center; padding: 1rem; margin-bottom: 1rem; border-color: var(--border);">
+                <div style="font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px; color: #555; margin-bottom: 4px;">Estimated Time to Block</div>
+                <div id="mineStatEta" style="font-size: 22px; font-weight: 700; color: var(--text-bright); font-variant-numeric: tabular-nums;">—</div>
+                <div style="font-size: 10px; color: #444; margin-top: 2px;">based on current hashrate &amp; difficulty</div>
+            </div>
+
+            <div class="mine-stats">
+                <div class="mine-stat">
+                    <span class="mine-stat-label">Chain Tip</span>
+                    <span class="mine-stat-val" id="mineStatHeight">—</span>
+                </div>
+                <div class="mine-stat">
+                    <span class="mine-stat-label">Difficulty</span>
+                    <span class="mine-stat-val" id="mineStatDifficulty">—</span>
+                </div>
+                <div class="mine-stat">
+                    <span class="mine-stat-label">Reward</span>
+                    <span class="mine-stat-val" id="mineStatReward">—</span>
+                </div>
+                <div class="mine-stat">
+                    <span class="mine-stat-label">Uptime</span>
+                    <span class="mine-stat-val" id="mineStatUptime">—</span>
+                </div>
+                <div class="mine-stat">
+                    <span class="mine-stat-label">Nonces Searched</span>
+                    <span class="mine-stat-val" id="mineStatNonces">0</span>
+                </div>
+                <div class="mine-stat">
+                    <span class="mine-stat-label">Blocks Found</span>
+                    <span class="mine-stat-val" id="mineStatBlocks" style="color: var(--accent);">0</span>
+                </div>
+                <div class="mine-stat">
+                    <span class="mine-stat-label">Mempool Txs</span>
+                    <span class="mine-stat-val" id="mineStatMempoolTxs">0</span>
+                </div>
+                <div class="mine-stat">
+                    <span class="mine-stat-label">Pending Fees</span>
+                    <span class="mine-stat-val" id="mineStatMempoolFees">0</span>
+                </div>
+            </div>
+
+            <div class="mine-blocks-header">
+                <h3 style="margin: 0; font-size: 13px;">Mined Blocks</h3>
+                <span class="mine-blocks-count" id="mineBlocksCount" style="display: none;">0</span>
+            </div>
+            <div class="list-container" id="minedBlocksList">
+                <div class="list-item" style="text-align: center; color: #444; font-size: 12px; padding: 2rem;">
+                    No blocks mined yet this session.<br>
+                    <span style="color: #333; font-size: 11px;">Start mining to begin searching for blocks.</span>
+                </div>
+            </div>
+        </main>
+
+        <!-- SEND -->
         <main id="view-send" class="page">
             <h2>Send Funds</h2>
             <div class="panel">
@@ -263,37 +462,29 @@
                     <button id="btnScanQR" style="background: transparent; border: 1px dashed var(--border-bright); color: var(--accent); padding: 4px 12px; width: auto; min-height: 0; font-size: 11px; margin: 0;">📷 Scan</button>
                 </div>
                 <input type="text" id="sendAddress" placeholder="Paste or scan hex address...">
-                
                 <label style="font-size: 11px; color: #666; text-transform: uppercase;">Amount</label>
                 <input type="number" inputmode="numeric" id="sendAmount" placeholder="0">
-                
                 <button id="btnSend" style="margin-top: 10px; background: var(--text-max); color: #000;">Swipe to Send</button>
             </div>
-
             <h3 style="margin-top: 1.5rem; font-size: 12px; color: #666;">Available UTXOs</h3>
             <div class="list-container" id="utxoList">
-                <div class="list-item" style="text-align:center; color:#555;">No UTXOs.</div>
+                <div class="list-item" style="text-align: center; color: #555;">No UTXOs.</div>
             </div>
         </main>
 
+        <!-- RECEIVE -->
         <main id="view-receive" class="page">
             <h2>Receive Funds</h2>
             <div class="panel" style="text-align: center; padding: 2rem 1rem;">
-                
                 <div id="qrCodeContainer" style="width: 200px; height: 200px; background: #fff; margin: 0 auto 1.5rem auto; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #000;">
                     <span>[ Loading... ]</span>
                 </div>
-                
                 <div style="font-size: 11px; color: #666; text-transform: uppercase; margin-bottom: 8px;">Your Address</div>
-                <div id="lblAddress" style="color: var(--accent); font-size: 12px; word-break: break-all; margin-bottom: 1.5rem; background: var(--bg); padding: 12px; border-radius: 6px; border: 1px solid var(--border);">
-                    -
-                </div>
-                
+                <div id="lblAddress" style="color: var(--accent); font-size: 12px; word-break: break-all; margin-bottom: 1.5rem; background: var(--bg); padding: 12px; border-radius: 6px; border: 1px solid var(--border);">-</div>
                 <div id="mssProgressContainer" class="hidden" style="margin-bottom: 15px;">
                     <div id="mssProgressLabel" style="font-size: 11px; color: var(--accent); margin-bottom: 6px; text-transform: uppercase;">Generating Post-Quantum Key...</div>
                     <progress id="mssProgress" value="0" max="100"></progress>
                 </div>
-
                 <div class="flex-row" style="gap: 12px;" id="receiveActionContainer">
                     <button id="btnCopyAddr" style="margin: 0;">Copy Address</button>
                     <button id="btnNewAddr" style="margin: 0; background: transparent;">Generate New</button>
@@ -301,54 +492,60 @@
             </div>
         </main>
 
+        <!-- SETTINGS -->
         <main id="view-settings" class="page">
             <h2>Settings</h2>
-            
-            <div class="panel">
-                <label style="font-size: 11px; color: #666; text-transform: uppercase;">Node RPC URL</label>
-                <input type="text" id="rpcUrl" value="https://rpc.cypherpunk.gold" style="margin-bottom: 0;">
-            </div>
-
+<!-- AFTER -->
+<div class="panel">
+    <label style="font-size: 11px; color: #666; text-transform: uppercase;">HTTPS Fallback RPC URL</label>
+    <input type="text" id="rpcUrl" value="https://rpc.cypherpunk.gold" style="margin-bottom: 8px;">
+    <label style="font-size: 11px; color: #666; text-transform: uppercase;">WebRTC Node Multiaddr</label>
+    <input type="text" id="bootstrapAddr" placeholder="/ip4/…/udp/9335/webrtc-direct/certhash/uEi…" style="margin-bottom: 8px;">
+    <div style="display: flex; gap: 8px;">
+        <button id="btnConnectWebRTC" style="flex:1; background: var(--accent); color: #000; margin: 0;">Connect</button>
+        <button id="btnDisconnectWebRTC" style="flex:1; background: transparent; color: var(--red); border-color: var(--red); margin: 0;">Disconnect</button>
+    </div>
+    <div id="webrtcStatus" style="font-size: 11px; color: #666; margin-top: 8px; text-align: center;">WebRTC: not connected</div>
+</div>
             <div class="panel">
                 <h3 style="font-size: 14px;">Security & Backup</h3>
                 <button id="btnExport" style="background: var(--bg-panel);">Export Encrypted Backup</button>
                 <button id="btnReveal" style="background: transparent; color: var(--red); border-color: var(--red); margin-bottom: 0;">Reveal Seed Phrase</button>
             </div>
-
             <div class="panel">
                 <h3 style="font-size: 14px;">Troubleshooting</h3>
                 <p style="font-size: 11px; color: #888; margin-bottom: 12px;">If your balance is incorrect after restoring a backup or a failed transaction, rescan to rebuild your balance.</p>
                 <button id="btnRescan" style="background: transparent; color: var(--text-max); border-color: var(--border-bright); margin-bottom: 0;">Rescan Blockchain</button>
             </div>
-
             <details class="terminal">
                 <summary>Developer Terminal</summary>
                 <div class="term-log" id="term-log"></div>
             </details>
         </main>
 
+        <!-- NAV (5 tabs) -->
         <nav id="bottom-nav" class="hidden">
-            <button class="nav-btn active" data-target="view-home">
-                <span class="nav-icon">🏠</span>
-                <span>Home</span>
-            </button>
-            <button class="nav-btn" data-target="view-send">
-                <span class="nav-icon">💸</span>
-                <span>Send</span>
-            </button>
-            <button class="nav-btn" data-target="view-receive">
-                <span class="nav-icon">⬇️</span>
-                <span>Receive</span>
-            </button>
-            <button class="nav-btn" data-target="view-settings">
-                <span class="nav-icon">⚙️</span>
-                <span>Settings</span>
-            </button>
+            <button class="nav-btn active" data-target="view-home"><span class="nav-icon">🏠</span><span>Home</span></button>
+            <button class="nav-btn" data-target="view-mine"><span class="nav-icon">⛏️</span><span>Mine</span></button>
+            <button class="nav-btn" data-target="view-send"><span class="nav-icon">💸</span><span>Send</span></button>
+            <button class="nav-btn" data-target="view-receive"><span class="nav-icon">⬇️</span><span>Receive</span></button>
+            <button class="nav-btn" data-target="view-settings"><span class="nav-icon">⚙️</span><span>Settings</span></button>
         </nav>
     </div>
 
     <div id="toast-container"></div>
 
+    <!-- Block Found Celebration -->
+    <div id="blockCelebration">
+        <div class="cele-flash"></div>
+        <div class="cele-text">
+            <div class="cele-title">BLOCK FOUND</div>
+            <div class="cele-subtitle" id="celeSubtitle">Height 0</div>
+            <div class="cele-reward" id="celeReward">+0</div>
+        </div>
+    </div>
+
+    <!-- Modals -->
     <div id="confirmModal" class="modal-overlay">
         <div class="modal">
             <h2 id="modalTitle">Confirm Action</h2>
@@ -363,9 +560,8 @@
     <div id="seedModal" class="modal-overlay">
         <div class="modal" style="max-width: 500px;">
             <h2 style="color: var(--red); border-color: var(--red);">🚨 SECURE YOUR SEED 🚨</h2>
-            <p>Anyone with these 24 words can steal your funds. Do not screenshot. Ensure no one is looking at your screen.</p>
-            <div class="seed-grid" id="seedGrid">
-                </div>
+            <p>Anyone with these 24 words can steal your funds. Do not screenshot.</p>
+            <div class="seed-grid" id="seedGrid"></div>
             <div class="modal-actions">
                 <button class="btn-cancel" onclick="closeModal('seedModal')">Close</button>
                 <button id="btnCopySeed" style="background: var(--accent); color: #000;">Copy to Clipboard</button>
@@ -386,7 +582,6 @@
     <div id="txDetailModal" class="modal-overlay">
         <div class="modal" style="max-width: 500px;">
             <h2 id="txDetailTitle">Transaction Details</h2>
-            
             <div class="panel" style="margin-bottom: 1rem; padding: 1rem;">
                 <div class="flex-row" style="margin-bottom: 8px;">
                     <span style="color: #666; font-size: 11px; text-transform: uppercase;">Amount</span>
@@ -401,50 +596,64 @@
                     <span id="txDetailDate" style="color: var(--text-bright);"></span>
                 </div>
             </div>
-            
             <h3 style="font-size: 12px; color: #666; text-transform: uppercase; margin-bottom: 6px;">Inputs Spent</h3>
             <div id="txDetailInputs" class="list-container" style="max-height: 120px; margin-bottom: 1rem; font-size: 11px; padding: 8px; word-break: break-all;"></div>
-            
             <h3 style="font-size: 12px; color: #666; text-transform: uppercase; margin-bottom: 6px;">Outputs Received</h3>
             <div id="txDetailOutputs" class="list-container" style="max-height: 120px; margin-bottom: 1rem; font-size: 11px; padding: 8px; word-break: break-all;"></div>
-
             <div class="modal-actions">
                 <button class="btn-cancel" onclick="closeModal('txDetailModal')">Close</button>
             </div>
         </div>
     </div>
-
     <script>
-        if ('serviceWorker' in navigator) {
-            window.addEventListener('load', () => {
-                navigator.serviceWorker.register('./sw.js').catch(err => {
-                    console.log('SW registration failed: ', err);
-                });
-            });
-        }
-// Migration Banner for old domain users
-if (window.location.hostname === "ciphernom.github.io") {
-    const banner = document.createElement('div');
-    banner.style = "background: #ff4444; color: white; padding: 12px; text-align: center; font-size: 13px; font-weight: bold; position: fixed; top: 0; left: 0; right: 0; z-index: 10000; border-bottom: 2px solid black;";
-    banner.innerHTML = "NOTICE: We are moving to <a href='https://cypherpunk.gold/wallet' style='color: white; text-decoration: underline;'>cypherpunk.gold</a>. Please export your backup and import it on the new domain.";
-    document.body.prepend(banner);
-    // Push the app container down so it doesn't overlap
-    document.getElementById('app-container').style.marginTop = "45px";
+        // ═══════════════════════════════════════════════════════════════
+        //  Service Worker & Migration
+        // ═══════════════════════════════════════════════════════════════
+
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js').catch(err => {
+            console.log('SW registration failed:', err);
+        });
+        
+        // Listen for the new Service Worker taking control
+        let refreshing = false;
+        navigator.serviceWorker.addEventListener('controllerchange', () => {
+            if (refreshing) return;
+            refreshing = true;
+            
+            // Use your existing custom modal to safely prompt the user
+            showConfirm(
+                "Update Available 🚀",
+                "A new version of Midstate Wallet has been downloaded. Do you want to refresh now to apply the update? <br><br><span style='color:var(--red);font-size:11px;'>Warning: This will interrupt active mining.</span>",
+                () => {
+                    window.location.reload();
+                }
+            );
+        });
+    });
 }
-        // --- UI Helper Functions (Toasts & Modals) ---
+
+        if (window.location.hostname === "ciphernom.github.io") {
+            const banner = document.createElement('div');
+            banner.style = "background: #ff4444; color: white; padding: 12px; text-align: center; font-size: 13px; font-weight: bold; position: fixed; top: 0; left: 0; right: 0; z-index: 10000; border-bottom: 2px solid black;";
+            banner.innerHTML = "NOTICE: We are moving to <a href='https://cypherpunk.gold/wallet' style='color: white; text-decoration: underline;'>cypherpunk.gold</a>. Please export your backup and import it on the new domain.";
+            document.body.prepend(banner);
+            document.getElementById('app-container').style.marginTop = "45px";
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  UI Helpers
+        // ═══════════════════════════════════════════════════════════════
+
         function showToast(message, type = 'info', duration) {
             const container = document.getElementById('toast-container');
             const toast = document.createElement('div');
             toast.className = `toast ${type}`;
             toast.innerText = message;
             container.appendChild(toast);
-            
             const ms = duration || (type === 'error' ? 6000 : 3500);
-            
-            requestAnimationFrame(() => {
-                toast.classList.add('show');
-            });
-
+            requestAnimationFrame(() => toast.classList.add('show'));
             setTimeout(() => {
                 toast.classList.remove('show');
                 setTimeout(() => toast.remove(), 300);
@@ -463,30 +672,25 @@ if (window.location.hostname === "ciphernom.github.io") {
         function showConfirm(title, htmlMessage, onConfirm) {
             document.getElementById('modalTitle').innerText = title;
             document.getElementById('modalMsg').innerHTML = htmlMessage;
-            
             const confirmBtn = document.getElementById('modalConfirmBtn');
             const newBtn = confirmBtn.cloneNode(true);
             confirmBtn.parentNode.replaceChild(newBtn, confirmBtn);
-            
             newBtn.onclick = () => {
                 closeModal('confirmModal');
                 onConfirm();
             };
-            
             document.getElementById('confirmModal').classList.add('active');
         }
 
         function showSeedModal(phrase) {
             const grid = document.getElementById('seedGrid');
             grid.innerHTML = phrase.split(' ').map((word, i) =>
-                `<div class="seed-word"><span>${(i+1).toString().padStart(2, '0')}</span>${word}</div>`
+                `<div class="seed-word"><span>${(i + 1).toString().padStart(2, '0')}</span>${word}</div>`
             ).join('');
-            
             document.getElementById('btnCopySeed').onclick = () => {
                 navigator.clipboard.writeText(phrase);
                 showToast('Seed phrase copied to clipboard!', 'success');
             };
-            
             document.getElementById('seedModal').classList.add('active');
         }
 
@@ -494,30 +698,28 @@ if (window.location.hostname === "ciphernom.github.io") {
             document.getElementById(id).classList.remove('active');
         }
 
-        // --- QR Scanner Logic ---
+        // ═══════════════════════════════════════════════════════════════
+        //  QR Scanner
+        // ═══════════════════════════════════════════════════════════════
+
         let html5QrCode;
 
         document.getElementById('btnScanQR').onclick = () => {
             document.getElementById('qrScannerModal').classList.add('active');
-            
             if (!html5QrCode) {
                 html5QrCode = new Html5Qrcode("reader");
             }
-            
             const config = { fps: 10, qrbox: { width: 250, height: 250 }, aspectRatio: 1.0 };
-            
-            html5QrCode.start({ facingMode: "environment" }, config, 
-                (decodedText, decodedResult) => {
+            html5QrCode.start({ facingMode: "environment" }, config,
+                (decodedText) => {
                     html5QrCode.stop().then(() => {
                         document.getElementById('qrScannerModal').classList.remove('active');
                         document.getElementById('sendAddress').value = decodedText;
                         showToast("Address scanned successfully", "success");
-                    }).catch(err => {
-                        log("Error stopping scanner: " + err, "var(--red)");
-                    });
+                    }).catch(err => log("Error stopping scanner: " + err, "var(--red)"));
                 },
-                (errorMessage) => { }
-            ).catch(err => {
+                () => {}
+            ).catch(() => {
                 showToast("Camera access denied or unavailable.", "error");
                 document.getElementById('qrScannerModal').classList.remove('active');
             });
@@ -536,39 +738,776 @@ if (window.location.hostname === "ciphernom.github.io") {
             }
         }
 
-        // --- Navigation Logic ---
+        // ═══════════════════════════════════════════════════════════════
+        //  Navigation
+        // ═══════════════════════════════════════════════════════════════
+
         function switchTab(targetId) {
             document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
             document.getElementById(targetId).classList.add('active');
-            
             document.querySelectorAll('.nav-btn').forEach(btn => {
-                if(btn.dataset.target === targetId) {
-                    btn.classList.add('active');
-                } else {
-                    btn.classList.remove('active');
-                }
+                btn.classList.toggle('active', btn.dataset.target === targetId);
             });
         }
 
         document.querySelectorAll('.nav-btn').forEach(btn => {
             btn.addEventListener('click', () => switchTab(btn.dataset.target));
         });
-
         document.querySelectorAll('.nav-trigger').forEach(btn => {
             btn.addEventListener('click', () => switchTab(btn.dataset.target));
         });
 
-        // --- Core App Logic ---
+        // ═══════════════════════════════════════════════════════════════
+        //  Mining Coordinator (Multi-Worker)
+        // ═══════════════════════════════════════════════════════════════
+
+        let isMiningActive = false;
+        let minedBlocksLog = [];
+        let hashrateHistory = [];
+        const SPARKLINE_MAX_POINTS = 60;
+        let wakeLock = null;
+
+        // Mining state
+        let miners = [];
+        let currentTemplate = null;
+        let miningSessionStart = 0;
+        let totalNoncesSession = 0;
+        let blocksFoundSession = 0;
+        let lastTemplateHeight = -1;
+        let templatePollTimer = null;
+        let uiRefreshTimer = null;
+
+        const TEMPLATE_POLL_INTERVAL = 10_000;
+        const MAX_CORES = Math.max(1, navigator.hardwareConcurrency || 4);
+        // Default: leave 2 cores free for main thread + wallet worker + OS
+        const DEFAULT_THREADS = Math.max(1, MAX_CORES - 2);
+
+        // CPU throttle presets: [label, throttle_ms]
+        // throttle_ms = how many ms to sleep between search_nonces() calls.
+        // Each call already takes ~800ms (4 nonces × expensive iterated hashing),
+        // so the throttle is the extra pause ON TOP of compute time.
+        const CPU_PRESETS = [
+            { label: 'Low',      ms: 4000 },  // ~0.8 N/s/core  (17% duty)
+            { label: 'Moderate', ms: 1500 },  // ~1.7 N/s/core  (35% duty)
+            { label: 'Balanced', ms: 400 },   // ~3.3 N/s/core  (67% duty)
+            { label: 'High',     ms: 50 },    // ~4.7 N/s/core  (94% duty)
+            { label: 'Max',      ms: 0 },     // ~5.0 N/s/core (100% duty)
+        ];
+        let currentThrottleMs = CPU_PRESETS[2].ms; // default: Balanced
+
+        // ─── Slider Setup ───────────────────────────────────────────
+        const threadSlider = document.getElementById('mineThreadSlider');
+        const threadValEl = document.getElementById('mineThreadVal');
+        const cpuSlider = document.getElementById('mineCpuSlider');
+        const cpuValEl = document.getElementById('mineCpuVal');
+
+        threadSlider.min = 1;
+        threadSlider.max = MAX_CORES;
+        threadSlider.value = DEFAULT_THREADS;
+        threadValEl.innerText = DEFAULT_THREADS;
+        document.getElementById('minerCoreCount').innerText = DEFAULT_THREADS;
+
+        cpuSlider.min = 0;
+        cpuSlider.max = CPU_PRESETS.length - 1;
+        cpuSlider.value = 2; // Balanced
+        cpuValEl.innerText = CPU_PRESETS[2].label;
+
+        threadSlider.oninput = () => {
+            const count = parseInt(threadSlider.value);
+            threadValEl.innerText = count;
+            document.getElementById('minerCoreCount').innerText = count;
+            if (isMiningActive) resizeMiners(count);
+        };
+
+        cpuSlider.oninput = () => {
+            const idx = parseInt(cpuSlider.value);
+            const preset = CPU_PRESETS[idx];
+            cpuValEl.innerText = preset.label;
+            currentThrottleMs = preset.ms;
+            // Push new throttle to all active miners
+            for (const m of miners) {
+                m.worker.postMessage({ type: 'THROTTLE', payload: { throttle_ms: currentThrottleMs } });
+            }
+        };
+
+        const btnMineToggle = document.getElementById('btnMineToggle');
+
+        btnMineToggle.onclick = () => {
+            if (isMiningActive) {
+                stopMining();
+            } else {
+                startMining();
+            }
+        };
+
+        // ─── Core Mining Lifecycle ──────────────────────────────────
+
+        async function startMining() {
+            isMiningActive = true;
+            miningSessionStart = Date.now();
+            totalNoncesSession = 0;
+            blocksFoundSession = 0;
+            setMiningUI(true, 0);
+            log('Starting miners...');
+
+            const targetCount = parseInt(threadSlider.value);
+            spawnMiners(targetCount);
+
+            // Periodic UI refresh (even if no HASHRATE messages arrive)
+            uiRefreshTimer = setInterval(() => {
+                if (isMiningActive) updateAggregateHashrate();
+            }, 1500);
+        }
+
+        function stopMining() {
+            isMiningActive = false;
+
+            for (const m of miners) {
+                m.worker.postMessage({ type: 'STOP' });
+                m.worker.terminate();
+            }
+            miners = [];
+
+            if (templatePollTimer) { clearInterval(templatePollTimer); templatePollTimer = null; }
+            if (uiRefreshTimer) { clearInterval(uiRefreshTimer); uiRefreshTimer = null; }
+
+            currentTemplate = null;
+            lastTemplateHeight = -1;
+            setMiningUI(false, 0);
+            log('Mining stopped.');
+        }
+
+        function spawnMiners(count) {
+            miners = [];
+            let readyCount = 0;
+
+            for (let i = 0; i < count; i++) {
+                const idx = i;
+                const m = new Worker('./miner.js', { type: 'module' });
+                const minerState = { worker: m, nps: 0, nonces: 0 };
+
+                m.onerror = (err) => {
+                    log(`Miner ${idx} error: ${err.message || err}`, 'var(--red)');
+                };
+
+                m.onmessage = (e) => {
+                    const { type, payload } = e.data;
+
+                    if (type === 'READY') {
+                        readyCount++;
+                        log(`Miner ${readyCount}/${count} ready`);
+                        if (readyCount === count) {
+                            log(`All ${count} miners ready. Requesting template...`);
+                            requestTemplate();
+                            templatePollTimer = setInterval(requestTemplate, TEMPLATE_POLL_INTERVAL);
+                        }
+                    }
+                    else if (type === 'HASHRATE') {
+                        minerState.nps = payload.nps;
+                        minerState.nonces = payload.nonces;
+                        totalNoncesSession += payload.nonces;
+                        updateAggregateHashrate();
+                    }
+                    else if (type === 'FOUND') {
+                        handleBlockFound(payload.nonce);
+                    }
+                    else if (type === 'LOG') {
+                        log(`[miner ${idx}] ${payload}`);
+                    }
+                    else if (type === 'ERROR') {
+                        log(`[miner ${idx}] ${payload}`, 'var(--red)');
+                    }
+                };
+
+                m.postMessage({ type: 'INIT' });
+                miners.push(minerState);
+            }
+        }
+
+        function resizeMiners(targetCount) {
+            const current = miners.length;
+            if (targetCount === current) return;
+
+            document.getElementById('minerCoreCount').innerText = targetCount;
+
+            if (targetCount < current) {
+                const removed = miners.splice(targetCount);
+                for (const m of removed) {
+                    m.worker.postMessage({ type: 'STOP' });
+                    m.worker.terminate();
+                }
+                log(`Reduced to ${targetCount} miners`);
+            } else {
+                let newReady = 0;
+                const newCount = targetCount - current;
+                for (let i = 0; i < newCount; i++) {
+                    const idx = current + i;
+                    const m = new Worker('./miner.js', { type: 'module' });
+                    const minerState = { worker: m, nps: 0, nonces: 0 };
+
+                    m.onerror = (err) => {
+                        log(`Miner ${idx} error: ${err.message || err}`, 'var(--red)');
+                    };
+
+                    m.onmessage = (e) => {
+                        const { type, payload } = e.data;
+
+                        if (type === 'READY') {
+                            newReady++;
+                            if (currentTemplate) {
+                                m.postMessage({
+                                    type: 'START',
+                                    payload: {
+                                        midstate: currentTemplate.mining_midstate,
+                                        target: currentTemplate.target,
+                                        throttle_ms: currentThrottleMs
+                                    }
+                                });
+                            }
+                            if (newReady === newCount) log(`Scaled up to ${targetCount} miners`);
+                        }
+                        else if (type === 'HASHRATE') {
+                            minerState.nps = payload.nps;
+                            minerState.nonces = payload.nonces;
+                            totalNoncesSession += payload.nonces;
+                            updateAggregateHashrate();
+                        }
+                        else if (type === 'FOUND') {
+                            handleBlockFound(payload.nonce);
+                        }
+                        else if (type === 'LOG') {
+                            log(`[miner ${idx}] ${payload}`);
+                        }
+                        else if (type === 'ERROR') {
+                            log(`[miner ${idx}] ${payload}`, 'var(--red)');
+                        }
+                    };
+
+                    m.postMessage({ type: 'INIT' });
+                    miners.push(minerState);
+                }
+            }
+        }
+
+        function requestTemplate() {
+            if (!isMiningActive) return;
+            worker.postMessage({ type: 'GET_TEMPLATE' });
+        }
+
+        function broadcastToMiners(midstate, target) {
+            log(`Broadcasting to ${miners.length} miners (throttle=${currentThrottleMs}ms)`);
+            for (const m of miners) {
+                m.worker.postMessage({
+                    type: 'START',
+                    payload: { midstate, target, throttle_ms: currentThrottleMs }
+                });
+            }
+        }
+
+        function stopMinersKeepAlive() {
+            for (const m of miners) {
+                m.worker.postMessage({ type: 'STOP' });
+                m.nps = 0;
+                m.nonces = 0;
+            }
+        }
+
+        function updateAggregateHashrate() {
+            if (!isMiningActive) return;
+            const totalNps = miners.reduce((sum, m) => sum + m.nps, 0);
+            const uptime = Math.floor((Date.now() - miningSessionStart) / 1000);
+
+            setMiningUI(true, totalNps);
+            updateMiningDashboard({
+                nps: totalNps,
+                chainHeight: currentTemplate?.chainHeight || 0,
+                target: currentTemplate?.target || "",
+                blockReward: currentTemplate?.blockReward || 0,
+                totalNonces: totalNoncesSession,
+                blocksFound: blocksFoundSession,
+                uptime,
+                mempoolTxs: currentTemplate?.mempoolTxs || 0,
+                mempoolFees: currentTemplate?.mempoolFees || 0
+            });
+        }
+
+        async function handleBlockFound(nonce) {
+            if (!currentTemplate) return;
+
+            stopMinersKeepAlive();
+            blocksFoundSession++;
+
+            worker.postMessage({
+                type: 'SUBMIT_MINED_BLOCK',
+                payload: { template: currentTemplate, nonce }
+            });
+        }
+
+        function setMiningUI(active, nps) {
+            isMiningActive = active;
+            const heroRate = document.getElementById('mineHeroRate');
+            const hwDot = document.getElementById('mineHwDot');
+            const homeInd = document.getElementById('homeMineIndicator');
+            const homeWidget = document.getElementById('homeMineWidget');
+
+            if (active) {
+                heroRate.classList.add('active');
+                hwDot.classList.add('on');
+                homeInd.classList.add('on');
+                homeWidget.classList.add('mining');
+                btnMineToggle.className = 'mine-toggle on';
+                btnMineToggle.innerText = 'Stop Mining';
+                btnMineToggle.disabled = false;
+                document.getElementById('homeMineStatus').innerText = `${nps.toLocaleString()} N/s`;
+                document.getElementById('homeMineRate').innerText = nps.toLocaleString();
+                document.getElementById('homeMineRate').style.color = 'var(--accent)';
+                if ('wakeLock' in navigator && !wakeLock) {
+                    navigator.wakeLock.request('screen').then(lock => {
+                        wakeLock = lock;
+                        wakeLock.addEventListener('release', () => { wakeLock = null; });
+                    }).catch(() => {});
+                }
+            } else {
+                heroRate.classList.remove('active');
+                heroRate.innerHTML = '0<span class="mine-hero-unit">N/s</span>';
+                hwDot.classList.remove('on');
+                homeInd.classList.remove('on');
+                homeWidget.classList.remove('mining');
+                btnMineToggle.className = 'mine-toggle off';
+                btnMineToggle.innerText = 'Start Mining';
+                btnMineToggle.disabled = false;
+                document.getElementById('homeMineStatus').innerText = 'Idle';
+                document.getElementById('homeMineRate').innerText = '—';
+                document.getElementById('homeMineRate').style.color = '#333';
+                document.getElementById('mineStatEta').innerText = '—';
+                if (wakeLock) {
+                    wakeLock.release().catch(() => {});
+                    wakeLock = null;
+                }
+                hashrateHistory = [];
+                document.getElementById('sparkLine').setAttribute('points', '');
+                document.getElementById('sparkArea').setAttribute('d', '');
+            }
+        }
+
+        function formatUptime(secs) {
+            if (!secs || secs < 1) return '—';
+            const h = Math.floor(secs / 3600);
+            const m = Math.floor((secs % 3600) / 60);
+            const s = secs % 60;
+            if (h > 0) return `${h}h ${m}m`;
+            if (m > 0) return `${m}m ${s}s`;
+            return `${s}s`;
+        }
+
+        function formatNonces(n) {
+            if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+            if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+            if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+            return n.toString();
+        }
+
+        function difficultyBitsFromTarget(targetHex) {
+            if (!targetHex) return 0;
+            let bits = 0;
+            for (const ch of targetHex) {
+                const nibble = parseInt(ch, 16);
+                if (nibble === 0) { bits += 4; continue; }
+                if (nibble <= 1) bits += 3;
+                else if (nibble <= 3) bits += 2;
+                else if (nibble <= 7) bits += 1;
+                break;
+            }
+            return bits;
+        }
+
+        function difficultyFromTarget(targetHex) {
+            const bits = difficultyBitsFromTarget(targetHex);
+            return bits > 0 ? `${bits}-bit` : '—';
+        }
+
+        function estimateTimeToBlock(nps, targetHex) {
+            if (!nps || nps <= 0 || !targetHex) return '—';
+            const bits = difficultyBitsFromTarget(targetHex);
+            if (bits <= 0) return '—';
+            // Expected nonces to find a hash below target ≈ 2^bits
+            const expectedNonces = Math.pow(2, bits);
+            const seconds = expectedNonces / nps;
+
+            if (seconds < 60) return `~${Math.round(seconds)}s`;
+            if (seconds < 3600) return `~${Math.round(seconds / 60)}m`;
+            if (seconds < 86400) {
+                const h = Math.floor(seconds / 3600);
+                const m = Math.round((seconds % 3600) / 60);
+                return `~${h}h ${m}m`;
+            }
+            if (seconds < 86400 * 365) {
+                const d = Math.round(seconds / 86400);
+                return d === 1 ? '~1 day' : `~${d} days`;
+            }
+            const y = (seconds / (86400 * 365)).toFixed(1);
+            return `~${y} years`;
+        }
+
+        function updateSparkline(nps) {
+            hashrateHistory.push(nps);
+            if (hashrateHistory.length > SPARKLINE_MAX_POINTS) {
+                hashrateHistory.shift();
+            }
+
+            const svg = document.getElementById('mineSparkline');
+            const line = document.getElementById('sparkLine');
+            const area = document.getElementById('sparkArea');
+
+            if (hashrateHistory.length < 2) {
+                line.setAttribute('points', '');
+                area.setAttribute('d', '');
+                return;
+            }
+
+            const w = svg.clientWidth || 400;
+            const h = 48;
+            const padding = 2;
+            const maxVal = Math.max(...hashrateHistory, 1);
+            const len = hashrateHistory.length;
+
+            let points = '';
+            let areaPath = `M ${padding} ${h - padding}`;
+
+            for (let i = 0; i < len; i++) {
+                const x = padding + (i / (SPARKLINE_MAX_POINTS - 1)) * (w - padding * 2);
+                const y = h - padding - ((hashrateHistory[i] / maxVal) * (h - padding * 2));
+                points += `${x},${y} `;
+                areaPath += ` L ${x},${y}`;
+            }
+
+            // Close the area path
+            const lastX = padding + ((len - 1) / (SPARKLINE_MAX_POINTS - 1)) * (w - padding * 2);
+            areaPath += ` L ${lastX},${h - padding} Z`;
+
+            line.setAttribute('points', points.trim());
+            area.setAttribute('d', areaPath);
+        }
+
+        function updateMiningDashboard(p) {
+            document.getElementById('mineHeroRate').innerHTML =
+                `${p.nps.toLocaleString()}<span class="mine-hero-unit">N/s</span>`;
+            document.getElementById('mineStatHeight').innerText = p.chainHeight || '—';
+            document.getElementById('mineStatDifficulty').innerText = difficultyFromTarget(p.target);
+            document.getElementById('mineStatReward').innerText = p.blockReward || '—';
+            document.getElementById('mineStatUptime').innerText = formatUptime(p.uptime);
+            document.getElementById('mineStatNonces').innerText = formatNonces(p.totalNonces || 0);
+            document.getElementById('mineStatBlocks').innerText = p.blocksFound || 0;
+            document.getElementById('mineStatMempoolTxs').innerText = p.mempoolTxs || 0;
+            document.getElementById('mineStatMempoolFees').innerText = p.mempoolFees ? `+${p.mempoolFees}` : '0';
+
+            // Time to block estimate
+            document.getElementById('mineStatEta').innerText = estimateTimeToBlock(p.nps, p.target);
+
+            // Sparkline
+            updateSparkline(p.nps);
+        }
+
+        function showBlockCelebration(data) {
+            const cele = document.getElementById('blockCelebration');
+            document.getElementById('celeSubtitle').innerText = `Height ${data.height}`;
+            document.getElementById('celeReward').innerText = `+${data.reward}`;
+
+            // Spawn particles
+            cele.querySelectorAll('.cele-particle').forEach(p => p.remove());
+            for (let i = 0; i < 24; i++) {
+                const p = document.createElement('div');
+                p.className = 'cele-particle';
+                const angle = (Math.PI * 2 * i) / 24;
+                const dist = 80 + Math.random() * 160;
+                p.style.setProperty('--tx', `${Math.cos(angle) * dist}px`);
+                p.style.setProperty('--ty', `${Math.sin(angle) * dist}px`);
+                p.style.left = '50%';
+                p.style.top = '50%';
+                p.style.animationDelay = `${Math.random() * 0.2}s`;
+                if (Math.random() > 0.5) p.style.background = '#fff';
+                cele.appendChild(p);
+            }
+
+            cele.classList.add('active');
+            setTimeout(() => cele.classList.remove('active'), 2200);
+        }
+
+        function addMinedBlockEntry(data) {
+            minedBlocksLog.unshift(data);
+            const container = document.getElementById('minedBlocksList');
+            const countEl = document.getElementById('mineBlocksCount');
+            countEl.style.display = 'inline';
+            countEl.innerText = minedBlocksLog.length;
+
+            const time = new Date(data.timestamp * 1000);
+            const timeStr = time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            const statusClass = data.accepted ? 'accepted' : 'rejected';
+            const statusText = data.accepted ? 'Accepted' : 'Rejected';
+            const hashDisplay = data.finalHash ? data.finalHash.substring(0, 24) + '...' : '—';
+
+            const entry = document.createElement('div');
+            entry.className = 'mined-block-entry';
+            entry.innerHTML = `
+                <div class="flex-row">
+                    <div class="mined-block-reward">+${data.reward}</div>
+                    <span class="mined-block-status ${statusClass}">${statusText}</span>
+                </div>
+                <div class="mined-block-hash">${hashDisplay}</div>
+                <div class="mined-block-meta">
+                    <span>Height ${data.height}</span>
+                    <span>${timeStr}</span>
+                    <span>Nonce: ${data.nonce}</span>
+                    ${data.txCount ? `<span>${data.txCount} txs</span>` : ''}
+                </div>
+            `;
+
+            // Clear the placeholder if present
+            if (container.querySelector('.list-item')) {
+                container.innerHTML = '';
+            }
+            container.prepend(entry);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Core App Logic
+        // ═══════════════════════════════════════════════════════════════
+
+        // ═══════════════════════════════════════════════════════════════
+        //  WebRTC Light Client (main thread)
+        //  RTCPeerConnection is not available in Web Workers, so the
+        //  LightClient lives here. worker.js sends RPC_REQUEST messages;
+        //  we execute them and post back RPC_RESPONSE.
+        // ═══════════════════════════════════════════════════════════════
+
+        let lightClient = null;
+        let _rpcUrl = "https://rpc.cypherpunk.gold";
+
+        async function createLightClient() {
+            const { LightClient } = await import('./light_client.bundle.js');
+            return new LightClient();
+        }
+
+        function updateWebRTCStatus(status) {
+            const statusEl = document.getElementById('webrtcStatus');
+            if (!statusEl) return;
+            const labels = { connected: 'WebRTC: connected ✓', disconnected: 'WebRTC: not connected', connecting: 'WebRTC: connecting…', failed: 'WebRTC: failed — using HTTPS fallback' };
+            const colors  = { connected: 'var(--accent)', disconnected: '#666', connecting: 'var(--accent-dim)', failed: 'var(--red)' };
+            statusEl.innerText    = labels[status] || `WebRTC: ${status}`;
+            statusEl.style.color  = colors[status] || '#666';
+            if (status === 'connected') showToast('WebRTC node connected.', 'success');
+            if (status === 'failed')    showToast('WebRTC failed. Using HTTPS fallback.', 'info');
+        }
+
+async function connectWebRTC(bootstrapAddr) {
+            updateWebRTCStatus('connecting');
+            try {
+                // --- NEW: Fetch the dynamic WebRTC address from the node ---
+                let actualWebrtcAddr = bootstrapAddr;
+                
+                try {
+                    // Extract the IP from the multiaddr (e.g., "/ip4/134.199.148.215/...")
+                    const parts = bootstrapAddr.split('/');
+                    if (parts[1] === 'ip4' || parts[1] === 'ip6') {
+                        const ip = parts[2];
+                        const rpcPort = 8545; // Default Midstate RPC port
+                        
+                        log(`[light] Fetching dynamic WebRTC certhash from http://${ip}:${rpcPort}/state...`);
+                        
+                        // Fetch the state (with a 3-second timeout so it doesn't hang forever)
+                        const resp = await fetch(`http://${ip}:${rpcPort}/state`, { 
+                            signal: AbortSignal.timeout(3000) 
+                        });
+                        const state = await resp.json();
+                        
+                        // Find the address containing 'webrtc-direct'
+                        const webrtcAddr = state.webrtc_addrs.find(a => a.includes('webrtc-direct'));
+                        if (webrtcAddr) {
+                            actualWebrtcAddr = webrtcAddr;
+                            log(`[light] Found active WebRTC address: ${actualWebrtcAddr}`);
+                        }
+                    }
+                } catch (fetchErr) {
+                    log(`[light] Could not fetch dynamic WebRTC address: ${fetchErr.message}. Trying original address...`, 'var(--yellow)');
+                }
+                // -----------------------------------------------------------
+
+                if (lightClient) { await lightClient.stop(); lightClient = null; }
+                lightClient = await createLightClient();
+                
+                lightClient.onStatusChange((status) => {
+                    updateWebRTCStatus(status);
+                    if (status === 'connected') {
+                        log('[light] WebRTC connected to full node.');
+                        lightClient.discoverPeers().catch(() => {});
+                    } else if (status === 'failed') {
+                        log('[light] WebRTC failed. Falling back to HTTPS.');
+                    }
+                });
+                
+                // Use the dynamically fetched address instead of the hardcoded one!
+                await lightClient.start(actualWebrtcAddr);
+                
+            } catch (e) {
+                log(`[light] WebRTC connect error: ${e.message}`, 'var(--red)');
+                updateWebRTCStatus('failed');
+                lightClient = null;
+            }
+        }
+
+        async function disconnectWebRTC() {
+            if (lightClient) { await lightClient.stop(); lightClient = null; }
+            updateWebRTCStatus('disconnected');
+        }
+
+        async function autoConnectWebRTC() {
+            try {
+                _rpcUrl = document.getElementById('rpcUrl')?.value?.trim() || _rpcUrl;
+                const state = await fetch(`${_rpcUrl}/state`, { cache: 'no-store' }).then(r => r.json());
+                const addrs = state.webrtc_addrs;
+                if (!addrs || addrs.length === 0) {
+                    log('[light] Node advertises no WebRTC addrs — staying on HTTPS.');
+                    return;
+                }
+                if (lightClient) { await lightClient.stop(); lightClient = null; }
+                lightClient = await createLightClient();
+                lightClient.onStatusChange((status) => {
+                    updateWebRTCStatus(status);
+                    if (status === 'connected') {
+                        log('[light] WebRTC auto-connected.');
+                        lightClient.discoverPeers().catch(() => {});
+                    } else if (status === 'failed') {
+                        log('[light] WebRTC auto-connect failed. Using HTTPS.');
+                    }
+                });
+                await lightClient.start(addrs[0]);
+                for (const addr of addrs.slice(1)) lightClient.knownMultiaddrs.add(addr);
+            } catch (e) {
+                log(`[light] WebRTC auto-connect error: ${e.message}`);
+            }
+        }
+
+        // ── RPC Bridge ──────────────────────────────────────────────────────────
+        // Handles RPC_REQUEST messages from worker.js. Executes the network call
+        // (via LightClient if connected, else plain HTTPS fetch) and posts back
+        // RPC_RESPONSE so the worker's awaiting promise resolves.
+
+        async function handleRpcRequest(id, method, params) {
+            const respond = (result, error) => worker.postMessage({ type: 'RPC_RESPONSE', payload: { id, result, error } });
+            try {
+                const lc  = lightClient?.isConnected ? lightClient : null;
+                const url = _rpcUrl;
+                let result;
+
+                if (method === 'getState') {
+                    result = lc
+                        ? await lc.getState()
+                        : await fetch(`${url}/state`, { cache: 'no-store' }).then(r => r.json());
+
+                } else if (method === 'getMempool') {
+                    if (lc) { result = await lc.getMempool(); }
+                    else { const r = await fetch(`${url}/mempool`, { cache: 'no-store' }); result = r.ok ? await r.json() : { size: 0, transactions: [] }; }
+
+                } else if (method === 'getBlock') {
+                    if (lc) { result = await lc.getBlock(params.height); }
+                    else { const r = await fetch(`${url}/block/${params.height}`, { cache: 'no-store', keepalive: true }); result = r.ok ? await r.json() : null; }
+
+                } else if (method === 'getFilters') {
+                    if (lc) { result = await lc.getFilters(params.startHeight, params.endHeight); }
+                    else {
+                        const r = await fetch(`${url}/filters`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ start_height: params.startHeight, end_height: params.endHeight }), cache: 'no-store' });
+                        if (!r.ok) throw new Error('Failed to fetch filters.');
+                        result = await r.json();
+                    }
+
+                } else if (method === 'getMssState') {
+                    if (lc) { result = await lc.mssState(params.masterPkHex); }
+                    else { const r = await fetch(`${url}/mss_state`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ master_pk: params.masterPkHex }) }); result = await r.json(); }
+
+                } else if (method === 'getBlockTemplate') {
+                    if (lc) {
+                        const resp = await lc.getBlockTemplate(params.coinbase);
+                        result = { ok: resp.ok, status: resp.status ?? (resp.ok ? 200 : 500), body: resp.ok ? await resp.json() : await resp.text() };
+                    } else {
+                        const r = await fetch(`${url}/block_template`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ coinbase: params.coinbase }) });
+                        result = { ok: r.ok, status: r.status, body: r.ok ? await r.json() : await r.text() };
+                    }
+
+                } else if (method === 'submitBatch') {
+                    // Try light client first, fall back to HTTPS
+                    let submitted = false;
+                    if (lc) {
+                        try {
+                            const resp = await lc.submitBatch(params.batch);
+                            result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
+                            submitted = true;
+                        } catch (e) {
+                            console.warn('[rpc] submitBatch via WebRTC failed, trying HTTPS:', e.message);
+                        }
+                    }
+                    if (!submitted) {
+                        try {
+                            const r = await fetch(`${url}/api/internal/submit_batch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params.batch) });
+                            result = { ok: r.ok, body: r.ok ? null : await r.text() };
+                        } catch (fetchErr) {
+                            // If both WebRTC and HTTPS fail, try to reconnect and retry once
+                            if (lightClient && !lightClient.isConnected) {
+                                for (const addr of lightClient.knownMultiaddrs) {
+                                    try { await lightClient.connectTo(addr); break; } catch(_) {}
+                                }
+                            }
+                            if (lightClient?.isConnected) {
+                                const resp = await lightClient.submitBatch(params.batch);
+                                result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
+                            } else {
+                                throw new Error('Block submission failed: no connection to any node');
+                            }
+                        }
+                    }
+
+                } else if (method === 'commit') {
+                    if (lc) {
+                        const resp = await lc.commit(params.commitmentHex, params.spamNonce);
+                        result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
+                    } else {
+                        const r = await fetch(`${url}/commit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ commitment: params.commitmentHex, spam_nonce: params.spamNonce }) });
+                        result = { ok: r.ok, body: r.ok ? null : await r.text() };
+                    }
+
+                } else if (method === 'send') {
+                    if (lc) {
+                        const parsed = typeof params.revealPayload === 'string' ? JSON.parse(params.revealPayload) : params.revealPayload;
+                        const resp = await lc.send(parsed);
+                        result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
+                    } else {
+                        const r = await fetch(`${url}/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: params.revealPayload });
+                        result = { ok: r.ok, body: r.ok ? null : await r.text() };
+                    }
+
+                } else if (method === 'checkCoin') {
+                    if (lc) { result = await lc.checkCoin(params.coinHex); }
+                    else { const r = await fetch(`${url}/check`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ coin: params.coinHex }) }); result = r.ok ? await r.json() : null; }
+
+                } else {
+                    throw new Error(`Unknown RPC method: ${method}`);
+                }
+
+                respond(result);
+            } catch (e) {
+                respond(undefined, e.message);
+            }
+        }
+
         const worker = new Worker('./worker.js', { type: 'module' });
         const authView = document.getElementById('authView');
         const bottomNav = document.getElementById('bottom-nav');
         const createSec = document.getElementById('createSection');
         const loginSec = document.getElementById('loginSection');
         const logs = document.getElementById('term-log');
-        
+
         let walletExists = false;
         let sendInProgress = false;
-        window.appHistory = []; // Global state for tx details modal
+        window.appHistory = [];
 
         function log(msg, color = 'var(--text-bright)') {
             const el = document.createElement('div');
@@ -587,38 +1526,43 @@ if (window.location.hostname === "ciphernom.github.io") {
         function showTxDetail(index) {
             const tx = window.appHistory[index];
             if (!tx) return;
-            
+
             const isSent = tx.kind === 'sent';
             const isPending = tx.kind === 'pending';
             const sign = (isSent || isPending) ? '-' : '+';
-            
+
             let color = 'var(--accent)';
             if (isSent) color = 'var(--red)';
             if (isPending) color = '#ffa500';
-            
+
             const displayKind = isPending ? '⏳ PENDING' : tx.kind.toUpperCase();
             document.getElementById('txDetailTitle').innerText = displayKind + " DETAILS";
+
             const amtEl = document.getElementById('txDetailAmount');
             amtEl.innerText = `${sign}${tx.value}`;
             amtEl.style.color = color;
-            
+
             document.getElementById('txDetailFee').innerText = tx.fee || 0;
             document.getElementById('txDetailDate').innerText = new Date(tx.timestamp * 1000).toLocaleString();
-            
+
             const inputsDiv = document.getElementById('txDetailInputs');
             if (tx.inputs && tx.inputs.length > 0) {
-                inputsDiv.innerHTML = tx.inputs.map(id => `<div style="font-family: monospace; margin-bottom:6px; padding-bottom:6px; border-bottom: 1px solid var(--border);">${id}</div>`).join('');
+                inputsDiv.innerHTML = tx.inputs.map(id =>
+                    `<div style="font-family: monospace; margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid var(--border);">${id}</div>`
+                ).join('');
             } else {
-                inputsDiv.innerHTML = `<div style="color:#666; font-style:italic;">None (Coinbase/Mint)</div>`;
+                inputsDiv.innerHTML = `<div style="color: #666; font-style: italic;">None (Coinbase/Mint)</div>`;
             }
-            
+
             const outputsDiv = document.getElementById('txDetailOutputs');
             if (tx.outputs && tx.outputs.length > 0) {
-                outputsDiv.innerHTML = tx.outputs.map(id => `<div style="font-family: monospace; margin-bottom:6px; padding-bottom:6px; border-bottom: 1px solid var(--border);">${id}</div>`).join('');
+                outputsDiv.innerHTML = tx.outputs.map(id =>
+                    `<div style="font-family: monospace; margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid var(--border);">${id}</div>`
+                ).join('');
             } else {
-                outputsDiv.innerHTML = `<div style="color:#666; font-style:italic;">None</div>`;
+                outputsDiv.innerHTML = `<div style="color: #666; font-style: italic;">None</div>`;
             }
-            
+
             document.getElementById('txDetailModal').classList.add('active');
         }
 
@@ -629,65 +1573,62 @@ if (window.location.hostname === "ciphernom.github.io") {
                 const primaryAddress = payload.primaryAddress || "None";
                 document.getElementById('lblBalance').innerText = payload.balance !== undefined ? payload.balance : "0";
                 document.getElementById('lblAddress').innerText = primaryAddress;
-                
+
                 const qrContainer = document.getElementById('qrCodeContainer');
-                qrContainer.innerHTML = ""; 
+                qrContainer.innerHTML = "";
                 if (primaryAddress !== "None") {
                     new QRCode(qrContainer, {
-                        text: primaryAddress,
-                        width: 180,
-                        height: 180,
-                        colorDark : "#000000",
-                        colorLight : "#ffffff",
-                        correctLevel : QRCode.CorrectLevel.M
+                        text: primaryAddress, width: 180, height: 180,
+                        colorDark: "#000000", colorLight: "#ffffff",
+                        correctLevel: QRCode.CorrectLevel.M
                     });
                 } else {
                     qrContainer.innerHTML = "<span>[ No Address ]</span>";
                 }
-                
+
                 const uList = document.getElementById('utxoList');
                 if (!payload.utxos || payload.utxos.length === 0) {
-                    uList.innerHTML = '<div class="list-item" style="text-align:center; color:#555;">No UTXOs synced.</div>';
+                    uList.innerHTML = '<div class="list-item" style="text-align: center; color: #555;">No UTXOs synced.</div>';
                 } else {
                     uList.innerHTML = payload.utxos.map(u => `
                         <div class="list-item">
                             <div class="flex-row">
-                                <span style="font-weight:bold; color:var(--text-max);">${u.value}</span>
-                                <span style="font-size:10px; color:${u.is_mss ? 'var(--accent)' : '#888'}; border: 1px solid ${u.is_mss ? 'var(--accent-dim)' : '#333'}; padding: 2px 6px; border-radius: 4px;">${u.is_mss ? 'MSS' : 'WOTS'}</span>
+                                <span style="font-weight: bold; color: var(--text-max);">${u.value}</span>
+                                <span style="font-size: 10px; color: ${u.is_mss ? 'var(--accent)' : '#888'}; border: 1px solid ${u.is_mss ? 'var(--accent-dim)' : '#333'}; padding: 2px 6px; border-radius: 4px;">${u.is_mss ? 'MSS' : 'WOTS'}</span>
                             </div>
-                            <div style="font-size: 10px; color: #666; margin-top: 4px; word-break: break-all;">ID: ${u.coin_id.substring(0,16)}...</div>
+                            <div style="font-size: 10px; color: #666; margin-top: 4px; word-break: break-all;">ID: ${u.coin_id.substring(0, 16)}...</div>
                         </div>
                     `).join('');
                 }
 
                 const hList = document.getElementById('historyList');
-                window.appHistory = payload.history || []; 
-                
+                window.appHistory = payload.history || [];
+
                 if (!payload.history || payload.history.length === 0) {
-                    hList.innerHTML = '<div class="list-item" style="text-align:center; color:#555;">No history.</div>';
+                    hList.innerHTML = '<div class="list-item" style="text-align: center; color: #555;">No history.</div>';
                 } else {
                     hList.innerHTML = payload.history.map((h, i) => {
-                        const date = new Date(h.timestamp * 1000).toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
+                        const date = new Date(h.timestamp * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
                         const isSent = h.kind === 'sent';
                         const isPending = h.kind === 'pending';
-                        
+
                         let color = 'var(--accent)';
                         if (isSent) color = 'var(--red)';
                         if (isPending) color = '#ffa500';
-                        
+
                         const sign = (isSent || isPending) ? '-' : '+';
                         const displayKind = isPending ? '⏳ PENDING' : h.kind;
                         const opacityStyle = isPending ? 'opacity: 0.7; border-style: dashed;' : '';
-                        
+
                         return `
                             <div class="list-item" onclick="showTxDetail(${i})" style="cursor: pointer; transition: background 0.2s; ${opacityStyle}" onmouseover="this.style.background='var(--border)'" onmouseout="this.style.background='transparent'">
                                 <div class="flex-row">
-                                    <span style="text-transform:uppercase; font-weight:bold; color:${color}; font-size: 12px;">${displayKind}</span>
-                                    <span style="color:var(--text-max); font-weight:bold; font-size: 16px;">${sign}${h.value}</span>
+                                    <span style="text-transform: uppercase; font-weight: bold; color: ${color}; font-size: 12px;">${displayKind}</span>
+                                    <span style="color: var(--text-max); font-weight: bold; font-size: 16px;">${sign}${h.value}</span>
                                 </div>
-                                <div class="flex-row" style="margin-top:4px;">
-                                    <span style="color:#666; font-size:11px;">${date}</span>
-                                    <span style="color:#555; font-size:11px;">Fee: ${h.fee || 0}</span>
+                                <div class="flex-row" style="margin-top: 4px;">
+                                    <span style="color: #666; font-size: 11px;">${date}</span>
+                                    <span style="color: #555; font-size: 11px;">Fee: ${h.fee || 0}</span>
                                 </div>
                             </div>
                         `;
@@ -702,19 +1643,21 @@ if (window.location.hostname === "ciphernom.github.io") {
             document.getElementById('createProgressContainer').classList.add('hidden');
             document.getElementById('mssProgressContainer').classList.add('hidden');
             document.getElementById('receiveActionContainer').classList.remove('hidden');
-            
             const btnScan = document.getElementById('btnScan');
             btnScan.disabled = false;
             btnScan.innerText = "Sync Now";
-            
-            const prog = document.getElementById('scanProgress');
-            prog.classList.add('hidden');
+            document.getElementById('scanProgress').classList.add('hidden');
             document.getElementById('lblSyncStatus').innerText = "Ready to scan for transactions";
         }
 
+        // ═══════════════════════════════════════════════════════════════
+        //  Worker Message Handler
+        // ═══════════════════════════════════════════════════════════════
+
         worker.onmessage = (e) => {
             const { type, payload } = e.data;
-            switch(type) {
+
+            switch (type) {
                 case 'INIT_DONE':
                     walletExists = localStorage.getItem('midstate_wallet') !== null;
                     if (walletExists) {
@@ -725,74 +1668,130 @@ if (window.location.hostname === "ciphernom.github.io") {
                         document.getElementById('btnCreate').disabled = false;
                     }
                     break;
+
+                case 'RPC_REQUEST':
+                    // worker.js needs a network call — execute it here where LightClient lives
+                    handleRpcRequest(payload.id, payload.method, payload.params);
+                    break;
+
+                case 'AUTO_CONNECT_WEBRTC':
+                    // Triggered after LOGIN or CREATE — try to auto-connect via WebRTC
+                    autoConnectWebRTC().catch(() => {});
+                    break;
+
                 case 'SAVE_WALLET':
                     localStorage.setItem('midstate_wallet', payload);
                     break;
+
                 case 'SEED_REVEALED':
                     showSeedModal(payload);
                     break;
+
                 case 'PHRASE_GENERATED':
                     document.getElementById('seedPhrase').value = payload;
                     break;
+
                 case 'WALLET_LOADED':
                 case 'REFRESH_DASHBOARD':
                     resetUIState();
                     authView.classList.remove('active');
                     bottomNav.classList.remove('hidden');
-                    
                     if (type === 'WALLET_LOADED') {
                         switchTab('view-home');
                         showToast("Wallet unlocked securely.", "success");
                     }
                     updateDashboard(payload);
                     break;
-                case 'MSS_PROGRESS':
+
+                // ─── Mining Messages ─────────────────────────────
+                case 'TEMPLATE_READY':
+                    if (payload && isMiningActive) {
+                        currentTemplate = payload;
+                        if (payload.chainHeight !== lastTemplateHeight) {
+                            lastTemplateHeight = payload.chainHeight;
+                            log(`Template received (height ${payload.chainHeight}). Broadcasting to ${miners.length} miners...`);
+                            broadcastToMiners(payload.mining_midstate, payload.target);
+                        }
+                    } else if (!payload && isMiningActive) {
+                        log('Template returned null — wallet may need sync.', 'var(--red)');
+                    }
+                    break;
+
+                case 'TEMPLATE_ERROR':
+                    log(`Template error: ${payload}`, 'var(--red)');
+                    break;
+
+                case 'BLOCK_SUBMITTED':
+                    // Show celebration
+                    showBlockCelebration({
+                        ...payload,
+                        nonce: payload.nonce || 0,
+                        sessionBlock: blocksFoundSession,
+                        totalNonces: totalNoncesSession
+                    });
+                    addMinedBlockEntry(payload);
+                    switchTab('view-mine');
+                    // Request fresh template and restart miners
+                    if (isMiningActive) {
+                        currentTemplate = null;
+                        lastTemplateHeight = -1;
+                        setTimeout(requestTemplate, 2000); // Let chain advance
+                    }
+                    break;
+
+                // ─── Other Messages ──────────────────────────────
+                case 'MSS_PROGRESS': {
                     const cp = document.getElementById('createProgress');
                     const mp = document.getElementById('mssProgress');
                     const cLabel = document.getElementById('createProgressLabel');
                     const mLabel = document.getElementById('mssProgressLabel');
-                    
+
                     if (cp && !document.getElementById('createProgressContainer').classList.contains('hidden')) {
                         cp.max = payload.total;
                         cp.value = payload.current;
-                        if(payload.label) cLabel.innerText = payload.label;
+                        if (payload.label) cLabel.innerText = payload.label;
                     }
                     if (mp && !document.getElementById('mssProgressContainer').classList.contains('hidden')) {
                         mp.max = payload.total;
                         mp.value = payload.current;
-                        if(payload.label) mLabel.innerText = payload.label;
+                        if (payload.label) mLabel.innerText = payload.label;
                     }
                     break;
-                
+                }
+
                 case 'SEND_PROGRESS':
                     showActivity(payload.msg);
                     break;
+
                 case 'SEND_COMPLETE':
                     hideActivity();
                     sendInProgress = false;
                     const btnSendDone = document.getElementById('btnSend');
                     btnSendDone.disabled = false;
                     btnSendDone.innerText = "Swipe to Send";
-                    
                     showToast("Transaction confirmed on-chain.", "success");
                     updateDashboard(payload);
                     break;
-                    
+
                 case 'LOG':
                     log(payload);
                     break;
-                case 'SCAN_PROGRESS':
+
+                case 'SCAN_PROGRESS': {
                     const prog = document.getElementById('scanProgress');
                     prog.classList.remove('hidden');
                     prog.max = payload.max;
                     prog.value = payload.height;
                     document.getElementById('lblSyncStatus').innerText = `Scanning block ${payload.height} of ${payload.max}...`;
                     break;
+                }
+
                 case 'SCAN_COMPLETE':
                     resetUIState();
                     showToast("Sync complete.", "success");
                     updateDashboard(payload);
                     break;
+
                 case 'ERROR':
                     hideActivity();
                     if (sendInProgress) {
@@ -817,23 +1816,45 @@ if (window.location.hostname === "ciphernom.github.io") {
 
         worker.postMessage({ type: 'INIT' });
 
-        // --- Action Listeners ---
+        // Re-acquire wake lock when returning to the tab while mining
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible' && isMiningActive && !wakeLock && 'wakeLock' in navigator) {
+                navigator.wakeLock.request('screen').then(lock => {
+                    wakeLock = lock;
+                    wakeLock.addEventListener('release', () => { wakeLock = null; });
+                }).catch(() => {});
+            }
+        });
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Action Listeners
+        // ═══════════════════════════════════════════════════════════════
+
         document.getElementById('btnGen').onclick = () => worker.postMessage({ type: 'GENERATE' });
+
+        document.getElementById('btnConnectWebRTC').onclick = () => {
+            const addr = document.getElementById('bootstrapAddr').value.trim();
+            if (!addr) return showToast('Enter a WebRTC multiaddr first.', 'error');
+            _rpcUrl = document.getElementById('rpcUrl')?.value?.trim() || _rpcUrl;
+            connectWebRTC(addr);
+        };
+
+        document.getElementById('btnDisconnectWebRTC').onclick = () => {
+            disconnectWebRTC();
+        };
 
         document.getElementById('btnCreate').onclick = () => {
             const phrase = document.getElementById('seedPhrase').value;
             const password = document.getElementById('newPwd').value;
-            if(!phrase || !password) return showToast("Phrase and password required.", "error");
-            
+            if (!phrase || !password) return showToast("Phrase and password required.", "error");
             document.getElementById('btnCreate').classList.add('hidden');
             document.getElementById('createProgressContainer').classList.remove('hidden');
-            
             worker.postMessage({ type: 'CREATE', payload: { phrase, password, rpcUrl: getCleanRpcUrl() } });
         };
 
         document.getElementById('btnLogin').onclick = () => {
             const password = document.getElementById('loginPwd').value;
-            if(!password) return showToast("Password required.", "error");
+            if (!password) return showToast("Password required.", "error");
             document.getElementById('btnLogin').disabled = true;
             const bundleStr = localStorage.getItem('midstate_wallet');
             worker.postMessage({ type: 'LOGIN', payload: { password, rpcUrl: getCleanRpcUrl(), bundleStr } });
@@ -861,9 +1882,9 @@ if (window.location.hostname === "ciphernom.github.io") {
         document.getElementById('btnSend').onclick = (e) => {
             const toAddress = document.getElementById('sendAddress').value;
             const amount = parseInt(document.getElementById('sendAmount').value);
-            if(!toAddress || !amount) return showToast("Fill out transaction parameters.", "error");
-            if(sendInProgress) return showToast("A transaction is already in progress.", "info");
-            
+            if (!toAddress || !amount) return showToast("Fill out transaction parameters.", "error");
+            if (sendInProgress) return showToast("A transaction is already in progress.", "info");
+
             showConfirm(
                 "Confirm Transaction",
                 `Are you sure you want to send <strong style="color:var(--text-max)">${amount}</strong> units to <br><span style="font-size:12px; word-break:break-all; color:var(--accent); display:block; margin-top:8px;">${toAddress}</span>?`,
@@ -871,36 +1892,31 @@ if (window.location.hostname === "ciphernom.github.io") {
                     sendInProgress = true;
                     e.target.disabled = true;
                     e.target.innerText = "Processing...";
-                    
-                    // Clear form and navigate home immediately
                     document.getElementById('sendAmount').value = '';
                     document.getElementById('sendAddress').value = '';
                     switchTab('view-home');
                     showActivity("Preparing transaction...");
-                    
                     worker.postMessage({ type: 'SEND', payload: { toAddress, amount } });
                 }
             );
         };
 
-        document.getElementById('btnNewAddr').onclick = (e) => {
+        document.getElementById('btnNewAddr').onclick = () => {
             document.getElementById('receiveActionContainer').classList.add('hidden');
             document.getElementById('mssProgressContainer').classList.remove('hidden');
             worker.postMessage({ type: 'NEW_ADDRESS' });
         };
-        
+
         document.getElementById('btnCopyAddr').onclick = () => {
             navigator.clipboard.writeText(document.getElementById('lblAddress').innerText);
             showToast("Address copied to clipboard.", "success");
         };
-        
+
         document.getElementById('btnReveal').onclick = () => {
             showConfirm(
                 "Security Warning",
                 "Anyone with this phrase can steal your funds. Make sure no one is looking at your screen. Continue?",
-                () => {
-                    worker.postMessage({ type: 'REVEAL_SEED' });
-                }
+                () => worker.postMessage({ type: 'REVEAL_SEED' })
             );
         };
 
@@ -918,7 +1934,7 @@ if (window.location.hostname === "ciphernom.github.io") {
             URL.revokeObjectURL(url);
             showToast("Backup exported successfully.", "success");
         };
-        
+
         document.getElementById('btnImportTrigger').onclick = () => {
             if (walletExists) {
                 showConfirm(
@@ -936,34 +1952,31 @@ if (window.location.hostname === "ciphernom.github.io") {
             if (!file) return;
 
             if (file.name.endsWith('.dat')) {
-                // CLI Import Path
                 const reader = new FileReader();
                 reader.onload = function(event) {
                     const fileBytes = new Uint8Array(event.target.result);
-                    // We need their password right now to decrypt the Argon2 file
                     const pwd = prompt("Enter the password for this CLI wallet:");
                     if (!pwd) return showToast("Password required to decrypt .dat file", "error");
-                    
                     worker.postMessage({ type: 'IMPORT_CLI', payload: { fileBytes, password: pwd } });
                     e.target.value = '';
                 };
-                reader.readAsArrayBuffer(file); // MUST read as ArrayBuffer for binary decryption
+                reader.readAsArrayBuffer(file);
             } else {
                 const reader = new FileReader();
                 reader.onload = function(event) {
-                try {
-                    const parsed = JSON.parse(event.target.result);
-                    if (!parsed.salt || !parsed.iv || !parsed.data) throw new Error("Invalid backup format.");
-                    localStorage.setItem('midstate_wallet', event.target.result);
-                    walletExists = true;
-                    createSec.classList.add('hidden');
-                    loginSec.classList.remove('hidden');
-                    document.getElementById('btnLogin').disabled = false;
-                    showToast("Backup imported! Enter password to unlock.", "success");
-                } catch (err) {
-                    showToast(`Import Failed: ${err.message}`, "error");
-                }
-                e.target.value = ''; 
+                    try {
+                        const parsed = JSON.parse(event.target.result);
+                        if (!parsed.salt || !parsed.iv || !parsed.data) throw new Error("Invalid backup format.");
+                        localStorage.setItem('midstate_wallet', event.target.result);
+                        walletExists = true;
+                        createSec.classList.add('hidden');
+                        loginSec.classList.remove('hidden');
+                        document.getElementById('btnLogin').disabled = false;
+                        showToast("Backup imported! Enter password to unlock.", "success");
+                    } catch (err) {
+                        showToast(`Import Failed: ${err.message}`, "error");
+                    }
+                    e.target.value = '';
                 };
                 reader.readAsText(file);
             }

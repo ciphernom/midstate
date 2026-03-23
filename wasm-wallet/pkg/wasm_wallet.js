@@ -19,6 +19,37 @@ export class WebWallet {
         wasm.__wbg_webwallet_free(ptr, 0);
     }
     /**
+     * Derive fresh WOTS coinbase outputs for a given total value.
+     *
+     * Returns JSON:
+     * ```json
+     * {
+     *   "coinbase": [ { "address": "hex", "value": N, "salt": "hex" }, ... ],
+     *   "mining_addrs": [ { "address": "hex", "index": N }, ... ],
+     *   "next_wots_index": N
+     * }
+     * ```
+     * @param {bigint} total_value
+     * @param {number} next_wots_index
+     * @returns {string | undefined}
+     */
+    build_coinbase(total_value, next_wots_index) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.webwallet_build_coinbase(retptr, this.__wbg_ptr, total_value, next_wots_index);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v1;
+            if (r0 !== 0) {
+                v1 = getStringFromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * @param {string} spend_context_json
      * @param {string} server_commitment_hex
      * @param {string} server_salt_hex
@@ -52,6 +83,32 @@ export class WebWallet {
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
             wasm.__wbindgen_export4(deferred5_0, deferred5_1, 1);
+        }
+    }
+    /**
+     * Recompute the full extension for a winning nonce.
+     *
+     * Returns JSON: `{ "nonce": N, "final_hash": "hex" }`
+     * @param {string} midstate_hex
+     * @param {bigint} nonce
+     * @returns {string | undefined}
+     */
+    build_solo_extension(midstate_hex, nonce) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(midstate_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.webwallet_build_solo_extension(retptr, this.__wbg_ptr, ptr0, len0, nonce);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v2;
+            if (r0 !== 0) {
+                v2 = getStringFromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v2;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
         }
     }
     /**
@@ -316,6 +373,33 @@ export function mine_commitment_pow(commitment_hex, required_pow) {
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.mine_commitment_pow(ptr0, len0, required_pow);
     return BigInt.asUintN(64, ret);
+}
+
+/**
+ * SIMD-accelerated nonce search. Returns winning nonce or null.
+ *
+ * Each iteration evaluates 4 nonces in parallel via WASM SIMD128.
+ * Total nonces searched per call = `iterations * 4`.
+ * @param {string} midstate_hex
+ * @param {string} target_hex
+ * @param {bigint} start_nonce
+ * @param {number} iterations
+ * @returns {bigint | undefined}
+ */
+export function search_nonces(midstate_hex, target_hex, start_nonce, iterations) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(midstate_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(target_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.search_nonces(retptr, ptr0, len0, ptr1, len1, start_nonce, iterations);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r2 = getDataViewMemory0().getBigInt64(retptr + 8 * 1, true);
+        return r0 === 0 ? undefined : BigInt.asUintN(64, r2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
 }
 
 function __wbg_get_imports() {

@@ -7,7 +7,7 @@ use crate::core::transaction::{apply_transaction, validate_transaction};
 use crate::mempool::Mempool;
 use crate::metrics::Metrics;
 use crate::mix::{MixManager, MixPhase, MixStatusSnapshot};
-use crate::network::{Message, MidstateNetwork, NetworkEvent, MAX_GETBATCHES_COUNT};
+use crate::network::{Message, MidstateNetwork, NetworkEvent, MAX_GETBATCHES_COUNT, MAX_GETHEADERS_COUNT};
 use crate::storage::Storage;
 use crate::wallet::{coinbase_seed, coinbase_salt};
 use crate::core::mss;
@@ -186,6 +186,7 @@ pub struct NodeHandle {
     mempool_size: Arc<RwLock<usize>>,
     mempool_txs: Arc<RwLock<Vec<Transaction>>>,
     peer_addrs: Arc<RwLock<Vec<String>>>,
+    webrtc_addrs: Arc<RwLock<Vec<String>>>, 
     tx_sender: tokio::sync::mpsc::UnboundedSender<NodeCommand>,
     pub batches_path: PathBuf,
     pub mix_manager: Arc<RwLock<MixManager>>,
@@ -223,6 +224,7 @@ impl NodeHandle {
         self.state.read().await.clone()
     }
 
+
     /// Returns the current dynamic safe depth calculated by the Bayesian finality estimator.
     ///
     /// # Examples
@@ -252,10 +254,130 @@ impl NodeHandle {
         (size, txs)
     }
 
+
+    /// Build a block template for external miners.
+    ///
+    /// Clones the current state, applies valid mempool transactions,
+    /// validates the miner's coinbase, computes state_root and mining
+    /// midstate, and returns everything the miner needs to search nonces.
+    pub async fn build_block_template(
+        &self,
+        req: crate::rpc::types::BlockTemplateRequest,
+    ) -> Result<crate::rpc::types::BlockTemplateResponse, axum::response::Response> {
+        use crate::core::transaction::apply_transaction;
+        use axum::http::StatusCode;
+        use axum::Json;
+        use axum::response::IntoResponse;
+
+        let state = self.state.read().await;
+        let mut candidate = state.clone();
+        let height = state.height;
+        let target = state.target;
+        let prev_midstate = state.midstate;
+        drop(state);
+
+        let mempool_txs = self.mempool_txs.read().await.clone();
+
+        // Select valid mempool transactions
+        let mut total_fees: u64 = 0;
+        let mut transactions = Vec::new();
+        let mut current_inputs = 0;
+        let mut current_outputs = 0;
+
+        for tx in &mempool_txs {
+            match tx {
+                Transaction::Commit { .. } => {
+                    if transactions.iter().filter(|t| matches!(t, Transaction::Commit { .. })).count()
+                        >= MAX_BATCH_COMMITS { continue; }
+                    match apply_transaction(&mut candidate, tx) {
+                        Ok(_) => { total_fees += tx.fee(); transactions.push(tx.clone()); }
+                        Err(_) => {}
+                    }
+                }
+                Transaction::Reveal { inputs, outputs, .. } => {
+                    if transactions.iter().filter(|t| matches!(t, Transaction::Reveal { .. })).count()
+                        >= MAX_BATCH_REVEALS { continue; }
+                    if current_inputs + inputs.len() > MAX_BATCH_INPUTS { continue; }
+                    if current_outputs + outputs.len() > MAX_BATCH_OUTPUTS { continue; }
+                    match apply_transaction(&mut candidate, tx) {
+                        Ok(_) => {
+                            current_inputs += inputs.len();
+                            current_outputs += outputs.len();
+                            total_fees += tx.fee();
+                            transactions.push(tx.clone());
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+
+        // Parse and validate coinbase
+        let reward = block_reward(height);
+        let expected_total = reward + total_fees;
+        let mut coinbase = Vec::with_capacity(req.coinbase.len());
+        let mut coinbase_total: u64 = 0;
+
+        for cb in &req.coinbase {
+            let mut address = [0u8; 32];
+            let mut salt = [0u8; 32];
+            if hex::decode_to_slice(&cb.address, &mut address).is_err()
+                || hex::decode_to_slice(&cb.salt, &mut salt).is_err()
+                || cb.value == 0 || !cb.value.is_power_of_two()
+            {
+                return Err((StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid coinbase output"}))).into_response());
+            }
+            coinbase_total += cb.value;
+            coinbase.push(CoinbaseOutput { address, value: cb.value, salt });
+        }
+
+        if coinbase_total != expected_total {
+            return Err((StatusCode::CONFLICT, Json(
+                crate::rpc::types::BlockTemplateMismatchError {
+                    error: "Coinbase total mismatch".into(),
+                    expected_total,
+                    block_reward: reward,
+                    total_fees,
+                }
+            )).into_response());
+        }
+
+        // Compute mining midstate
+        for cb in &coinbase {
+            candidate.midstate = hash_concat(&candidate.midstate, &cb.coin_id());
+            candidate.coins.insert(cb.coin_id());
+        }
+
+        let smt_root = hash_concat(&candidate.coins.root(), &candidate.commitments.root());
+        let state_root = hash_concat(&smt_root, &candidate.chain_mmr.root());
+        candidate.midstate = hash_concat(&candidate.midstate, &state_root);
+
+        let batch = Batch {
+            prev_midstate,
+            transactions,
+            extension: Extension { nonce: 0, final_hash: [0u8; 32] },
+            coinbase,
+            timestamp: 0,
+            target,
+            state_root,
+        };
+
+        Ok(crate::rpc::types::BlockTemplateResponse {
+            mining_midstate: hex::encode(candidate.midstate),
+            target: hex::encode(target),
+            batch_template: serde_json::to_value(&batch).unwrap(),
+            total_fees,
+            block_reward: reward,
+        })
+    }
+
     pub async fn get_peers(&self) -> Vec<String> {
         self.peer_addrs.read().await.clone()
     }
-
+    pub async fn get_webrtc_addrs(&self) -> Vec<String> {
+        self.webrtc_addrs.read().await.clone()
+    }
     pub async fn send_transaction(&self, tx: Transaction) -> Result<()> {
         let state_guard = self.state.read().await;
         validate_transaction(&state_guard, &tx)?;
@@ -623,6 +745,306 @@ pub async fn new(
     }
 
 
+    /// Handle a request from a browser light client over WebRTC.
+    ///
+    /// This mirrors the RPC handler logic but communicates via libp2p
+    /// instead of HTTP, allowing browsers to reach any node directly
+    /// without HTTPS, domains, or certificates.
+    async fn handle_light_request(
+        &self,
+        _from: PeerId,
+        request: crate::network::light_protocol::LightRequest,
+    ) -> crate::network::light_protocol::LightResponse {
+        use crate::network::light_protocol::{LightRequest, LightResponse};
+
+        match request {
+            LightRequest::GetState => {
+                let state = &self.state;
+                LightResponse::success(serde_json::json!({
+                    "height": state.height,
+                    "target": hex::encode(state.target),
+                    "midstate": hex::encode(state.midstate),
+                    "block_reward": crate::core::block_reward(state.height),
+                    "required_pow": self.mempool.required_commit_pow(),
+                    "timestamp": state.timestamp,
+                }))
+            }
+
+            LightRequest::GetBlock { height } => {
+                match self.storage.load_batch(height) {
+                    Ok(Some(batch)) => {
+                        match serde_json::to_value(&batch) {
+                            Ok(val) => LightResponse::success(val),
+                            Err(e) => LightResponse::error(format!("Serialization error: {}", e)),
+                        }
+                    }
+                    Ok(None) => LightResponse::error("Block not found"),
+                    Err(e) => LightResponse::error(format!("Storage error: {}", e)),
+                }
+            }
+
+            LightRequest::GetFilters { start_height, end_height } => {
+                let end = end_height.min(self.state.height);
+                let store = crate::storage::BatchStore::new(
+                    &self.data_dir.join("db").join("batches")
+                );
+                match store {
+                    Ok(store) => {
+                        let mut filters = Vec::new();
+                        let mut element_counts = Vec::new();
+                        let mut block_hashes = Vec::new();
+                        for h in start_height..end {
+                            match (store.load(h), store.load_filter(h)) {
+                                (Ok(Some(batch)), Ok(Some(filter_data))) => {
+                                    // Count elements the same way the RPC handler does
+                                    let mut items = std::collections::HashSet::new();
+                                    for tx in &batch.transactions {
+                                        match tx {
+                                            crate::core::Transaction::Commit { commitment, .. } => {
+                                                items.insert(*commitment);
+                                            }
+                                            crate::core::Transaction::Reveal { inputs, outputs, .. } => {
+                                                for input in inputs {
+                                                    items.insert(input.coin_id());
+                                                    items.insert(input.predicate.address());
+                                                }
+                                                for output in outputs {
+                                                    if let Some(cid) = output.coin_id() { items.insert(cid); }
+                                                    items.insert(output.address());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    for cb in &batch.coinbase {
+                                        items.insert(cb.coin_id());
+                                        items.insert(cb.address);
+                                    }
+                                    filters.push(hex::encode(filter_data));
+                                    block_hashes.push(hex::encode(batch.extension.final_hash));
+                                    element_counts.push(items.len() as u64);
+                                }
+                                (Ok(Some(batch)), _) => {
+                                    filters.push(String::new());
+                                    block_hashes.push(hex::encode(batch.extension.final_hash));
+                                    element_counts.push(0);
+                                }
+                                _ => break,
+                            }
+                        }
+                        LightResponse::success(serde_json::json!({
+                            "start_height": start_height,
+                            "filters": filters,
+                            "element_counts": element_counts,
+                            "block_hashes": block_hashes,
+                        }))
+                    }
+                    Err(e) => LightResponse::error(format!("Storage error: {}", e)),
+                }
+            }
+
+            LightRequest::GetMempool => {
+                let size = self.mempool.len();
+                let txs = self.mempool.transactions_cloned();
+                let tx_json: Vec<serde_json::Value> = txs.iter()
+                    .filter_map(|tx| serde_json::to_value(tx).ok())
+                    .collect();
+                LightResponse::success(serde_json::json!({
+                    "size": size,
+                    "transactions": tx_json,
+                }))
+            }
+
+            LightRequest::BlockTemplate { coinbase } => {
+                let req: crate::rpc::types::BlockTemplateRequest = match serde_json::from_value(
+                    serde_json::json!({ "coinbase": coinbase })
+                ) {
+                    Ok(r) => r,
+                    Err(e) => return LightResponse::error(format!("Invalid coinbase: {}", e)),
+                };
+
+                let mut candidate = self.state.clone();
+                let height = self.state.height;
+                let target = self.state.target;
+                let prev_midstate = self.state.midstate;
+
+                let mempool_txs = self.mempool.transactions_cloned();
+
+                let mut total_fees: u64 = 0;
+                let mut transactions = Vec::new();
+                let mut current_inputs = 0;
+                let mut current_outputs = 0;
+
+                for tx in &mempool_txs {
+                    match tx {
+                        Transaction::Commit { .. } => {
+                            if transactions.iter().filter(|t| matches!(t, Transaction::Commit { .. })).count()
+                                >= MAX_BATCH_COMMITS { continue; }
+                            if let Ok(_) = apply_transaction(&mut candidate, tx) {
+                                total_fees += tx.fee();
+                                transactions.push(tx.clone());
+                            }
+                        }
+                        Transaction::Reveal { inputs, outputs, .. } => {
+                            if transactions.iter().filter(|t| matches!(t, Transaction::Reveal { .. })).count()
+                                >= MAX_BATCH_REVEALS { continue; }
+                            if current_inputs + inputs.len() > MAX_BATCH_INPUTS { continue; }
+                            if current_outputs + outputs.len() > MAX_BATCH_OUTPUTS { continue; }
+                            if let Ok(_) = apply_transaction(&mut candidate, tx) {
+                                current_inputs += inputs.len();
+                                current_outputs += outputs.len();
+                                total_fees += tx.fee();
+                                transactions.push(tx.clone());
+                            }
+                        }
+                    }
+                }
+
+                let reward = block_reward(height);
+                let expected_total = reward + total_fees;
+                let mut coinbase_out = Vec::with_capacity(req.coinbase.len());
+                let mut coinbase_total: u64 = 0;
+
+                for cb in &req.coinbase {
+                    let mut address = [0u8; 32];
+                    let mut salt = [0u8; 32];
+                    if hex::decode_to_slice(&cb.address, &mut address).is_err()
+                        || hex::decode_to_slice(&cb.salt, &mut salt).is_err()
+                        || cb.value == 0 || !cb.value.is_power_of_two()
+                    {
+                        return LightResponse::error("Invalid coinbase output");
+                    }
+                    coinbase_total += cb.value;
+                    coinbase_out.push(CoinbaseOutput { address, value: cb.value, salt });
+                }
+
+                if coinbase_total != expected_total {
+                    return LightResponse::error(format!(
+                        "Coinbase total mismatch: expected {} (reward {} + fees {}), got {}",
+                        expected_total, reward, total_fees, coinbase_total
+                    ));
+                }
+
+                for cb in &coinbase_out {
+                    candidate.midstate = hash_concat(&candidate.midstate, &cb.coin_id());
+                    candidate.coins.insert(cb.coin_id());
+                }
+
+                let smt_root = hash_concat(&candidate.coins.root(), &candidate.commitments.root());
+                let state_root = hash_concat(&smt_root, &candidate.chain_mmr.root());
+                candidate.midstate = hash_concat(&candidate.midstate, &state_root);
+
+                let batch = Batch {
+                    prev_midstate,
+                    transactions,
+                    extension: Extension { nonce: 0, final_hash: [0u8; 32] },
+                    coinbase: coinbase_out,
+                    timestamp: 0,
+                    target,
+                    state_root,
+                };
+
+                let resp = crate::rpc::types::BlockTemplateResponse {
+                    mining_midstate: hex::encode(candidate.midstate),
+                    target: hex::encode(target),
+                    batch_template: serde_json::to_value(&batch).unwrap(),
+                    total_fees,
+                    block_reward: reward,
+                };
+
+                match serde_json::to_value(&resp) {
+                    Ok(val) => LightResponse::success(val),
+                    Err(e) => LightResponse::error(format!("Serialization error: {}", e)),
+                }
+            }
+
+            LightRequest::SubmitBatch { batch } => {
+                match serde_json::from_value::<crate::core::Batch>(batch) {
+                    Ok(batch) => {
+                        // Submit via the command channel
+                        if let Some(tx) = &self.cmd_tx {
+                            match tx.send(NodeCommand::SubmitMinedBlock(batch)) {
+                                Ok(_) => LightResponse::success(serde_json::json!({ "accepted": true })),
+                                Err(e) => LightResponse::error(format!("Submit failed: {}", e)),
+                            }
+                        } else {
+                            LightResponse::error("Node command channel unavailable")
+                        }
+                    }
+                    Err(e) => LightResponse::error(format!("Invalid batch JSON: {}", e)),
+                }
+            }
+
+            LightRequest::Commit { commitment, spam_nonce } => {
+                let mut commitment_bytes = [0u8; 32];
+                if hex::decode_to_slice(&commitment, &mut commitment_bytes).is_err() {
+                    return LightResponse::error("Invalid commitment hex");
+                }
+
+                let tx = crate::core::Transaction::Commit {
+                    commitment: commitment_bytes,
+                    spam_nonce,
+                };
+
+                match crate::core::transaction::validate_transaction(&self.state, &tx) {
+                    Ok(_) => {
+                        if let Some(cmd_tx) = &self.cmd_tx {
+                            let _ = cmd_tx.send(NodeCommand::SendTransaction(tx));
+                            LightResponse::success(serde_json::json!({ "accepted": true }))
+                        } else {
+                            LightResponse::error("Node command channel unavailable")
+                        }
+                    }
+                    Err(e) => LightResponse::error(format!("{}", e)),
+                }
+            }
+
+            LightRequest::Send { reveal } => {
+                // Parse the reveal JSON into a Transaction::Reveal
+                // The format matches what the web wallet sends to POST /send
+                match crate::rpc::handlers::parse_reveal_json(reveal){
+                    Ok(tx) => {
+                        match crate::core::transaction::validate_transaction(&self.state, &tx) {
+                            Ok(_) => {
+                                if let Some(cmd_tx) = &self.cmd_tx {
+                                    let _ = cmd_tx.send(NodeCommand::SendTransaction(tx));
+                                    LightResponse::success(serde_json::json!({ "accepted": true }))
+                                } else {
+                                    LightResponse::error("Node command channel unavailable")
+                                }
+                            }
+                            Err(e) => LightResponse::error(format!("{}", e)),
+                        }
+                    }
+                    Err(e) => LightResponse::error(format!("Invalid reveal: {}", e)),
+                }
+            }
+
+            LightRequest::CheckCoin { coin } => {
+                let mut coin_bytes = [0u8; 32];
+                if hex::decode_to_slice(&coin, &mut coin_bytes).is_err() {
+                    return LightResponse::error("Invalid coin hex");
+                }
+                let exists = self.state.coins.contains(&coin_bytes);
+                LightResponse::success(serde_json::json!({ "exists": exists }))
+            }
+
+            LightRequest::MssState { master_pk } => {
+                let mut pk_bytes = [0u8; 32];
+                if hex::decode_to_slice(&master_pk, &mut pk_bytes).is_err() {
+                    return LightResponse::error("Invalid master_pk hex");
+                }
+                let mut max_idx: u64 = 0;
+                for h in 0..self.state.height {
+                    if let Ok(Some(batch)) = self.storage.load_batch(h) {
+                        max_idx = max_idx.max(scan_txs_for_mss_index(&batch.transactions, &pk_bytes));
+                    }
+                }
+                LightResponse::success(serde_json::json!({ "next_index": max_idx }))
+            }
+        }
+    }
+
+
     pub fn local_peer_id(&self) -> PeerId {
         self.network.local_peer_id()
     }
@@ -644,6 +1066,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
             mempool_size: Arc::new(RwLock::new(self.mempool.len())),
             mempool_txs: Arc::new(RwLock::new(self.mempool.transactions_cloned())),
             peer_addrs: Arc::new(RwLock::new(Vec::new())),
+            webrtc_addrs: Arc::new(RwLock::new(Vec::new())),
             tx_sender: tx,
             batches_path: self.data_dir.join("db").join("batches"),
             mix_manager: Arc::clone(&self.mix_manager),
@@ -694,6 +1117,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
             tracing::info!("Requesting chain state from {} peer(s)...", self.network.peer_count());
             self.sync_in_progress = true;
             for peer in self.network.connected_peers() {
+                if self.network.is_light_peer(&peer) { continue; }
                 self.network.send(peer, Message::GetState);
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -751,6 +1175,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                     *handle.mempool_size.write().await = self.mempool.len();
                     *handle.mempool_txs.write().await = self.mempool.transactions_cloned();
                     *handle.peer_addrs.write().await = self.network.peer_addrs();
+                    *handle.webrtc_addrs.write().await = self.network.advertisable_addrs();  
                 }
                 _ = metrics_interval.tick() => {
                     self.metrics.report();
@@ -872,6 +1297,10 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                                 tracing::warn!("Error from peer {}: {}", peer, e);
                             }
                         }
+                        NetworkEvent::LightRequest { peer, request, respond } => {
+                            let resp = self.handle_light_request(peer, request).await;
+                            let _ = respond.send(resp);
+                        }
                         NetworkEvent::PeerConnected(peer) => {
                             // --- BANNED SUBNET DEFENSE ---
                             if let Some(subnet) = self.network.peer_subnet(&peer) {
@@ -885,14 +1314,13 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                                 // Already connected via another transport — skip
                                 continue;
                             }
+                            // Light (WebRTC browser) peers don't speak the binary protocol.
+                            // Don't send them GetState/GetAddr — it just causes errors.
+                            if self.network.is_light_peer(&peer) {
+                                tracing::info!("Light peer connected: {}", peer);
+                                continue;
+                            }
                             tracing::info!("Peer connected: {}", peer);
-                            // Ask the peer for their chain state. If they are ahead,
-                            // the StateInfo handler will call start_sync_session()
-                            // which sets sync_in_progress and cancels mining.
-                            // We must NOT set sync_in_progress here — doing so causes
-                            // the StateInfo handler to ignore the reply (it thinks a
-                            // real sync is already running), leaving the flag stuck
-                            // true and mining permanently dead.
                             self.network.send(peer, Message::GetState);
                             self.network.send(peer, Message::GetAddr);
                         }
@@ -968,7 +1396,9 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                 } else if depth > self.state.depth || height > self.state.height
                     || (depth == self.state.depth && midstate < self.state.midstate)
                 {
-                    if self.sync_session.is_some() {
+                // FIX: also guard on sync_in_progress, which stays true even when
+                // sync_session is temporarily None during background PoW verification
+                if self.sync_session.is_some() || self.sync_in_progress {
                         tracing::debug!("Sync session already active. Ignoring StateInfo from {} to prevent thrashing.", from);
                     } else {
                         // --- FIX: Disable insecure Fast-Forward Sync ---
@@ -1117,7 +1547,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                     return Ok(());
                 }
 
-                let count = count.min(MAX_GETBATCHES_COUNT);
+                let count = count.min(MAX_GETHEADERS_COUNT);
                 let end = (start_height + count).min(self.state.height + 1);
                 
                 match self.storage.batches.load_headers(start_height, end) {
@@ -1315,8 +1745,8 @@ let start_height = force_start.unwrap_or_else(|| {
             last_progress_at: now,
         });
         
-        let count = 2000.min(peer_height.saturating_sub(start_height));
-        self.network.send(peer, Message::GetHeaders { start_height, count });
+let count = MAX_GETHEADERS_COUNT.min(peer_height.saturating_sub(start_height));
+self.network.send(peer, Message::GetHeaders { start_height, count });
     }
 
 
@@ -1370,8 +1800,8 @@ let start_height = force_start.unwrap_or_else(|| {
 
         if new_cursor < peer_height {
             // Need more headers — request next chunk
-            let count = 2000.min(peer_height - new_cursor);
-            self.network.send(from, Message::GetHeaders { start_height: new_cursor, count });
+let count = MAX_GETHEADERS_COUNT.min(peer_height - new_cursor);
+self.network.send(from, Message::GetHeaders { start_height: new_cursor, count });
 
             //  Reset idle timeout because we are making progress
             if let Some(s) = &mut self.sync_session {
@@ -1703,17 +2133,28 @@ let start_height = force_start.unwrap_or_else(|| {
             let header = &headers[hdr_idx];
 
             // Integrity: batch PoW must match the already-verified header
-            if batch.extension.final_hash != header.extension.final_hash {
-                tracing::warn!("Batch at height {} does not match verified header PoW", height);
-                self.sync_in_progress = false;
-                return Ok(());
-            }
+if batch.extension.final_hash != header.extension.final_hash {
+    tracing::warn!("Batch at height {} does not match verified header PoW — peer has corrupt data, trying different peer", height);
+    // Save cursor so we restart from here, not from height 10
+    self.last_sync_cursor = Some(height.saturating_sub(1));
+    self.abort_sync_session("peer sent corrupt batch");
+    return Ok(());
+}
             let calc = batch.header();
-            if calc.post_tx_midstate != header.post_tx_midstate {
-                tracing::warn!("Batch at height {} tx commitment does not match header", height);
-                self.sync_in_progress = false;
-                return Ok(());
-            }
+if calc.post_tx_midstate != header.post_tx_midstate {
+    // Legacy blocks mined before state_root was added have state_root = [0;32].
+    // Re-check with zeroed state_root to allow syncing pre-migration blocks.
+    let mut legacy_batch = batch.clone();
+    legacy_batch.state_root = [0u8; 32];
+    let legacy_calc = legacy_batch.header();
+    if legacy_calc.post_tx_midstate != header.post_tx_midstate {
+        tracing::warn!("Batch at height {} tx commitment does not match header", height);
+        self.last_sync_cursor = Some(height.saturating_sub(1));
+        self.abort_sync_session("peer sent corrupt batch");
+        return Ok(());
+    }
+    // Legacy block accepted — continue with the actual batch (state_root already zeroed on disk)
+}
 
             // Apply to candidate state (do NOT save to disk yet — if sync
             // aborts before the reorg is committed, premature writes would

@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use async_trait::async_trait;
 
-pub const MAX_GETBATCHES_COUNT: u64 = 2000;
+pub const MAX_GETBATCHES_COUNT: u64 = 1000;  // heavy, OOM risk
+pub const MAX_GETHEADERS_COUNT: u64 = 8000; // lightweight, ~1.6MB max
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Message {

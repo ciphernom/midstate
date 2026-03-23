@@ -24,6 +24,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # --- RUST & WASM BUILD ---
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -37,6 +38,19 @@ jobs:
           cd wasm-wallet
           wasm-pack build --target web --release
 
+      # --- NODE & JS BUNDLE BUILD ---
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build WebRTC Light Client
+        run: |
+          cd wasm-wallet
+          npm install
+          npx rollup -c rollup.config.mjs
+
+      # --- STAGING & DEPLOYMENT ---
       - name: Prepare Staging Directory
         run: |
           # 1. Create a clean staging area with a subfolder for the wallet app
@@ -49,11 +63,13 @@ jobs:
           echo "cypherpunk.gold" > staging/CNAME
           
           # 3. Copy the Wasm Wallet files to the '/wallet' subdirectory
-          # We exclude the 'website' folder itself to keep the deployment clean
           cp wasm-wallet/index.html staging/wallet/
           cp wasm-wallet/manifest.json staging/wallet/
           cp wasm-wallet/sw.js staging/wallet/
           cp wasm-wallet/worker.js staging/wallet/
+          # Copy the new miner worker and the bundled WebRTC client
+          cp wasm-wallet/miner.js staging/wallet/
+          cp wasm-wallet/light_client.bundle.js staging/wallet/
           cp -r wasm-wallet/pkg staging/wallet/
           
           # 4. Verification for logs

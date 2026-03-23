@@ -89,6 +89,7 @@ pub struct GetStateResponse {
     pub target: String,
     pub block_reward: u64,
     pub required_pow: u32,
+    pub webrtc_addrs: Vec<String>, 
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetMssStateRequest {
@@ -313,4 +314,65 @@ pub struct CheckOutputResponse {
 pub struct GetTxByInputRequest {
     /// The 32-byte hex ID of the coin being spent (the HTLC coin)
     pub coin_id: String,
+}
+
+// ── Block Template Types (web miner) ────────────────────────────────────
+
+/// Request from a web miner to build a block template.
+///
+/// The miner provides its coinbase outputs (with pre-derived WOTS addresses).
+/// The node validates the total, selects mempool transactions, computes the
+/// state root and mining midstate, and returns a ready-to-mine template.
+///
+/// # Example
+///
+/// ```json
+/// {
+///   "coinbase": [
+///     { "address": "ab01...ff", "value": 512, "salt": "cd23...ee" },
+///     { "address": "ef45...aa", "value": 256, "salt": "01ab...99" }
+///   ]
+/// }
+/// ```
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BlockTemplateRequest {
+    pub coinbase: Vec<CoinbaseOutputJson>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CoinbaseOutputJson {
+    pub address: String,
+    pub value: u64,
+    pub salt: String,
+}
+
+/// Response containing a complete block template ready for nonce searching.
+///
+/// The web miner searches nonces against `mining_midstate`, then fills in
+/// the `extension` field of `batch_template` with `{ nonce, final_hash }`
+/// and submits to `/api/internal/submit_batch`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BlockTemplateResponse {
+    /// Post-tx, post-coinbase, post-state-root midstate to mine against (hex).
+    pub mining_midstate: String,
+    /// Current difficulty target (hex).
+    pub target: String,
+    /// A serialized `Batch` with placeholder extension. Client fills in
+    /// `extension` and `timestamp` after finding a valid nonce.
+    pub batch_template: serde_json::Value,
+    /// Total fees from included mempool transactions.
+    pub total_fees: u64,
+    /// Block reward at the current height.
+    pub block_reward: u64,
+}
+
+/// Returned as a 409 when the miner's coinbase total doesn't match
+/// `block_reward + mempool_fees`. The client should rebuild its coinbase
+/// for `expected_total` and retry.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BlockTemplateMismatchError {
+    pub error: String,
+    pub expected_total: u64,
+    pub block_reward: u64,
+    pub total_fees: u64,
 }

@@ -32,5 +32,5 @@ panic = "abort"      # Removes stack unwinding code, shrinking the Wasm binary
 strip = true         # Strips symbols from the binary
 
 [package.metadata.wasm-pack.profile.release]
-# Tell wasm-opt to run at max optimization (-O3) AND allow bulk memory operations
-wasm-opt = ["-O3", "--enable-bulk-memory"]
+# Tell wasm-opt to run at max optimization (-O3) AND allow bulk memory operations AND enable SIMD
+wasm-opt = ["-O3", "--enable-simd", "--enable-bulk-memory"]
