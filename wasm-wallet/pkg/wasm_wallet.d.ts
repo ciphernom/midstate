@@ -4,7 +4,26 @@
 export class WebWallet {
     free(): void;
     [Symbol.dispose](): void;
+    /**
+     * Derive fresh WOTS coinbase outputs for a given total value.
+     *
+     * Returns JSON:
+     * ```json
+     * {
+     *   "coinbase": [ { "address": "hex", "value": N, "salt": "hex" }, ... ],
+     *   "mining_addrs": [ { "address": "hex", "index": N }, ... ],
+     *   "next_wots_index": N
+     * }
+     * ```
+     */
+    build_coinbase(total_value: bigint, next_wots_index: number): string | undefined;
     build_reveal(spend_context_json: string, server_commitment_hex: string, server_salt_hex: string): string;
+    /**
+     * Recompute the full extension for a winning nonce.
+     *
+     * Returns JSON: `{ "nonce": N, "final_hash": "hex" }`
+     */
+    build_solo_extension(midstate_hex: string, nonce: bigint): string | undefined;
     check_filter(filter_hex: string, block_hash_hex: string, n: number): boolean;
     static from_seed_hex(seed_hex: string): WebWallet;
     get_mss_address(index: number, height: number, progress_cb?: Function | null): string;
@@ -25,6 +44,14 @@ export function generate_phrase(): string;
 
 export function mine_commitment_pow(commitment_hex: string, required_pow: number): bigint;
 
+/**
+ * SIMD-accelerated nonce search. Returns winning nonce or null.
+ *
+ * Each iteration evaluates 4 nonces in parallel via WASM SIMD128.
+ * Total nonces searched per call = `iterations * 4`.
+ */
+export function search_nonces(midstate_hex: string, target_hex: string, start_nonce: bigint, iterations: number): bigint | undefined;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -35,7 +62,10 @@ export interface InitOutput {
     readonly decrypt_cli_wallet: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly generate_phrase: (a: number) => void;
     readonly mine_commitment_pow: (a: number, b: number, c: number) => bigint;
+    readonly search_nonces: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => void;
+    readonly webwallet_build_coinbase: (a: number, b: number, c: bigint, d: number) => void;
     readonly webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+    readonly webwallet_build_solo_extension: (a: number, b: number, c: number, d: number, e: bigint) => void;
     readonly webwallet_check_filter: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
     readonly webwallet_from_seed_hex: (a: number, b: number, c: number) => void;
     readonly webwallet_get_mss_address: (a: number, b: number, c: number, d: number, e: number) => void;

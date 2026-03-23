@@ -43,6 +43,7 @@ pub async fn get_state(State(node): State<AppState>) -> Json<GetStateResponse> {
     let state = node.get_state().await;
     let safe_depth = node.get_safe_depth().await;
     let required_pow = crate::mempool::Mempool::calculate_required_pow(state.commitments.len());
+     let webrtc_addrs = node.get_webrtc_addrs().await; 
 
     Json(GetStateResponse {
         height: state.height,
@@ -54,6 +55,7 @@ pub async fn get_state(State(node): State<AppState>) -> Json<GetStateResponse> {
         target: hex::encode(state.target),
         block_reward: block_reward(state.height),
         required_pow,
+        webrtc_addrs, 
     })
 }
 
@@ -1068,4 +1070,96 @@ pub async fn get_tx_by_input(
     }
 
     Err(ErrorResponse { error: "Transaction spending this coin not found".into() })
+}
+
+
+/// Parse a reveal JSON payload into a Transaction::Reveal.
+/// Used by both the /send RPC handler and the light protocol handler.
+pub fn parse_reveal_json(value: serde_json::Value) -> Result<Transaction, String> {
+    let req: SendTransactionRequest = serde_json::from_value(value)
+        .map_err(|e| format!("Invalid reveal JSON: {}", e))?;
+
+    if req.inputs.is_empty() {
+        return Err("Must provide at least one input".into());
+    }
+    if req.signatures.len() != req.inputs.len() {
+        return Err("Signature count must match input count".into());
+    }
+
+    let inputs: Vec<InputReveal> = req.inputs.iter().map(|i| {
+        Ok(InputReveal {
+            predicate: Predicate::Script {
+                bytecode: hex::decode(&i.bytecode).map_err(|e| format!("Invalid bytecode hex: {}", e))?
+            },
+            value: i.value,
+            salt: {
+                let b = hex::decode(&i.salt).map_err(|e| format!("Invalid salt hex: {}", e))?;
+                <[u8; 32]>::try_from(b).map_err(|_| "salt must be 32 bytes".to_string())?
+            },
+            commitment: None,
+        })
+    }).collect::<Result<_, String>>()?;
+
+    let mut witnesses = Vec::new();
+    for sig_string in &req.signatures {
+        let stack_items = sig_string.split(',')
+            .filter(|s| !s.is_empty())
+            .map(hex::decode)
+            .collect::<Result<Vec<Vec<u8>>, _>>()
+            .map_err(|e| format!("Invalid hex in witness stack: {}", e))?;
+        witnesses.push(Witness::ScriptInputs(stack_items));
+    }
+
+    let outputs: Vec<OutputData> = req.outputs.iter().map(|o| {
+        match o {
+            OutputDataJson::Standard { address, value, salt } => {
+                let a = hex::decode(address).map_err(|e| format!("Invalid address hex: {}", e))?;
+                let s = hex::decode(salt).map_err(|e| format!("Invalid salt hex: {}", e))?;
+                Ok(OutputData::Standard {
+                    address: <[u8; 32]>::try_from(a).map_err(|_| "address must be 32 bytes")?,
+                    value: *value,
+                    salt: <[u8; 32]>::try_from(s).map_err(|_| "salt must be 32 bytes")?,
+                })
+            }
+            OutputDataJson::DataBurn { payload, value_burned } => {
+                Ok(OutputData::DataBurn {
+                    payload: hex::decode(payload).map_err(|_| "Invalid payload hex")?,
+                    value_burned: *value_burned,
+                })
+            }
+            OutputDataJson::Confidential { address, commitment, salt } => {
+                let a = hex::decode(address).map_err(|e| format!("Invalid address hex: {}", e))?;
+                let c = hex::decode(commitment).map_err(|e| format!("Invalid commitment hex: {}", e))?;
+                let s = hex::decode(salt).map_err(|e| format!("Invalid salt hex: {}", e))?;
+                Ok(OutputData::Confidential {
+                    address: <[u8; 32]>::try_from(a).map_err(|_| "address must be 32 bytes")?,
+                    commitment: <[u8; 32]>::try_from(c).map_err(|_| "commitment must be 32 bytes")?,
+                    salt: <[u8; 32]>::try_from(s).map_err(|_| "salt must be 32 bytes")?,
+                })
+            }
+        }
+    }).collect::<Result<_, String>>()?;
+
+    let salt_bytes = hex::decode(&req.salt).map_err(|e| format!("Invalid salt hex: {}", e))?;
+    let salt = <[u8; 32]>::try_from(salt_bytes).map_err(|_| "salt must be 32 bytes".to_string())?;
+
+    Ok(Transaction::Reveal { inputs, witnesses, outputs, salt })
+}
+
+/// Build a block template for an external miner (web wallet).
+///
+/// The miner supplies its coinbase outputs. The node selects mempool
+/// transactions, validates the coinbase total, computes the state root
+/// and mining midstate, and returns a ready-to-mine template.
+///
+/// Returns 409 with `BlockTemplateMismatchError` if the coinbase total
+/// doesn't match `block_reward + mempool_fees`.
+pub async fn block_template(
+    State(node): State<AppState>,
+    Json(req): Json<BlockTemplateRequest>,
+) -> Result<Json<BlockTemplateResponse>, Response> {
+    match node.build_block_template(req).await {
+        Ok(resp) => Ok(Json(resp)),
+        Err(resp) => Err(resp),
+    }
 }

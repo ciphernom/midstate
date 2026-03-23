@@ -41,12 +41,11 @@ tower-http = { version = "0.5", features = ["trace", "cors"] }
 rpassword = "7.3"
 dirs = "5.0"
 libp2p = { version = "0.54", features = ["tokio", "noise", "tcp", "yamux", "kad", "identify", "request-response", "macros","quic","relay", "dcutr", "autonat"] }
+libp2p-stream = "0.2.0-alpha"
+libp2p-webrtc = { version = "0.8.0-alpha", features = ["tokio"] }
 
 # reqwest: use rustls instead of native openssl — pure Rust, cross-compiles cleanly
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
-
-winterfell = "0.10.2"
-
 
 # Use jemalloc on Linux/macOS (Not Wasm, Not Windows)
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_env = "msvc")))'.dependencies]

@@ -1,6 +1,8 @@
 pub mod protocol;
+pub mod light_protocol;
+use light_protocol::{LightRequest, LightResponse, LIGHT_PROTOCOL};
 
-pub use protocol::{Message, MidstateCodec, MIDSTATE_PROTOCOL, MAX_GETBATCHES_COUNT};
+pub use protocol::{Message, MidstateCodec, MIDSTATE_PROTOCOL, MAX_GETBATCHES_COUNT, MAX_GETHEADERS_COUNT};
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -18,15 +20,182 @@ use libp2p::{
     tcp, yamux,
     identity::Keypair,
     Multiaddr, PeerId, Swarm,
-    core::ConnectedPoint
+    core::ConnectedPoint,
+    Transport,
 };
+
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::Instant;
 
 /// Max addresses to send in a single PEX Addr message.
 pub const MAX_PEX_ADDRS: usize = 50;
+
+// ── Light Client Protection Constants ────────────────────────────────────────
+
+/// Maximum concurrent WebRTC light client connections.
+const MAX_LIGHT_PEERS: usize = 30;
+/// Maximum concurrent streams (requests in flight) per light peer.
+const MAX_LIGHT_STREAMS_PER_PEER: usize = 5;
+/// Rate limit window in seconds.
+const LIGHT_RATE_WINDOW_SECS: u64 = 60;
+/// Maximum requests per peer per window (general).
+const LIGHT_RATE_LIMIT: u32 = 120;
+/// Maximum expensive requests (BlockTemplate) per peer per window.
+const LIGHT_EXPENSIVE_LIMIT: u32 = 12;
+/// Number of rate-limit violations before temporary ban.
+const LIGHT_BAN_THRESHOLD: u32 = 3;
+/// Duration of a temporary ban in seconds.
+const LIGHT_BAN_DURATION_SECS: u64 = 300;
+/// Timeout waiting for a light client to send its request data.
+const LIGHT_READ_TIMEOUT_SECS: u64 = 10;
+/// Timeout waiting for the node to produce a response.
+const LIGHT_RESPONSE_TIMEOUT_SECS: u64 = 30;
+
+// ── Light Client Rate Limiter ────────────────────────────────────────────────
+
+struct LightPeerState {
+    /// General request counter for this window.
+    request_count: u32,
+    /// Expensive request counter (BlockTemplate).
+    expensive_count: u32,
+    /// Window start time.
+    window_start: Instant,
+    /// Currently active streams (incremented on open, decremented on close).
+    active_streams: u32,
+    /// Number of rate-limit violations.
+    violations: u32,
+    /// If banned, when the ban expires.
+    banned_until: Option<Instant>,
+}
+
+impl LightPeerState {
+    fn new() -> Self {
+        Self {
+            request_count: 0,
+            expensive_count: 0,
+            window_start: Instant::now(),
+            active_streams: 0,
+            violations: 0,
+            banned_until: None,
+        }
+    }
+
+    /// Reset counters if the window has elapsed.
+    fn maybe_reset_window(&mut self) {
+        if self.window_start.elapsed().as_secs() >= LIGHT_RATE_WINDOW_SECS {
+            self.request_count = 0;
+            self.expensive_count = 0;
+            self.window_start = Instant::now();
+        }
+    }
+
+    fn is_banned(&self) -> bool {
+        self.banned_until.map_or(false, |t| Instant::now() < t)
+    }
+}
+
+/// Thread-safe light client rate limiter shared between the event loop
+/// and spawned stream-handling tasks.
+#[derive(Clone)]
+struct LightGuard {
+    inner: Arc<tokio::sync::Mutex<LightGuardInner>>,
+}
+
+struct LightGuardInner {
+    peers: HashMap<PeerId, LightPeerState>,
+}
+
+impl LightGuard {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(LightGuardInner {
+                peers: HashMap::new(),
+            })),
+        }
+    }
+
+    /// Check if a new stream should be allowed. Returns Err(reason) if denied.
+    async fn try_open_stream(&self, peer: PeerId) -> Result<(), &'static str> {
+        let mut guard = self.inner.lock().await;
+        let state = guard.peers.entry(peer).or_insert_with(LightPeerState::new);
+
+        if state.is_banned() {
+            return Err("peer is temporarily banned");
+        }
+
+        state.maybe_reset_window();
+
+        if state.active_streams >= MAX_LIGHT_STREAMS_PER_PEER as u32 {
+            state.violations += 1;
+            if state.violations >= LIGHT_BAN_THRESHOLD {
+                state.banned_until = Some(Instant::now() + Duration::from_secs(LIGHT_BAN_DURATION_SECS));
+                return Err("banned: too many concurrent streams");
+            }
+            return Err("too many concurrent streams");
+        }
+
+        if state.request_count >= LIGHT_RATE_LIMIT {
+            state.violations += 1;
+            if state.violations >= LIGHT_BAN_THRESHOLD {
+                state.banned_until = Some(Instant::now() + Duration::from_secs(LIGHT_BAN_DURATION_SECS));
+                return Err("banned: rate limit exceeded");
+            }
+            return Err("rate limit exceeded");
+        }
+
+        state.active_streams += 1;
+        state.request_count += 1;
+        Ok(())
+    }
+
+    /// Check if an expensive request (BlockTemplate) is allowed.
+    /// Call AFTER try_open_stream succeeds.
+    async fn check_expensive(&self, peer: PeerId) -> bool {
+        let mut guard = self.inner.lock().await;
+        if let Some(state) = guard.peers.get_mut(&peer) {
+            state.maybe_reset_window();
+            if state.expensive_count >= LIGHT_EXPENSIVE_LIMIT {
+                state.violations += 1;
+                if state.violations >= LIGHT_BAN_THRESHOLD {
+                    state.banned_until = Some(Instant::now() + Duration::from_secs(LIGHT_BAN_DURATION_SECS));
+                }
+                return false;
+            }
+            state.expensive_count += 1;
+        }
+        true
+    }
+
+    /// Decrement the active stream counter when a stream finishes.
+    async fn close_stream(&self, peer: PeerId) {
+        let mut guard = self.inner.lock().await;
+        if let Some(state) = guard.peers.get_mut(&peer) {
+            state.active_streams = state.active_streams.saturating_sub(1);
+        }
+    }
+
+    /// Remove all state for a disconnected peer.
+    async fn remove_peer(&self, peer: &PeerId) {
+        let mut guard = self.inner.lock().await;
+        guard.peers.remove(peer);
+    }
+
+    /// Check if a peer is currently banned.
+    async fn is_banned(&self, peer: &PeerId) -> bool {
+        let guard = self.inner.lock().await;
+        guard.peers.get(peer).map_or(false, |s| s.is_banned())
+    }
+
+    /// Total number of tracked light peers.
+    async fn peer_count(&self) -> usize {
+        let guard = self.inner.lock().await;
+        guard.peers.len()
+    }
+}
 
 
 
@@ -35,6 +204,7 @@ pub const MAX_PEX_ADDRS: usize = 50;
 #[derive(NetworkBehaviour)]
 pub struct MidstateBehaviour {
     pub rr: request_response::Behaviour<MidstateCodec>,
+    pub light: libp2p_stream::Behaviour,
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     pub identify: identify::Behaviour,
     pub relay_client: relay::client::Behaviour,
@@ -60,6 +230,13 @@ pub enum NetworkEvent {
         message: Message,
         channel: Option<ResponseChannel<Message>>,
     },
+    LightRequest {
+        peer: PeerId,
+        request: LightRequest,
+        /// Oneshot sender: drop it or send the response; the stream-writing
+        /// task in next_event() will write it back to the browser.
+        respond: tokio::sync::oneshot::Sender<LightResponse>,
+    },
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
     OutgoingConnectionFailed(String),
@@ -69,6 +246,23 @@ pub enum NetworkEvent {
 
 pub struct MidstateNetwork {
     swarm: Swarm<MidstateBehaviour>,
+    /// Incoming raw streams from browser light clients.
+    light_incoming: libp2p_stream::IncomingStreams,
+    /// Light requests parsed in spawned tasks (so swarm keeps being polled).
+    light_rx: tokio::sync::mpsc::UnboundedReceiver<(
+        PeerId,
+        LightRequest,
+        tokio::sync::oneshot::Sender<LightResponse>,
+    )>,
+    light_tx: tokio::sync::mpsc::UnboundedSender<(
+        PeerId,
+        LightRequest,
+        tokio::sync::oneshot::Sender<LightResponse>,
+    )>,
+    /// Rate limiter / abuse protection for light protocol.
+    light_guard: LightGuard,
+    /// Peers that connected via WebRTC (light-only, don't speak binary protocol).
+    light_peers: HashSet<PeerId>,
     connected: HashMap<PeerId, ConnectedPoint>,
     pending_requests: HashMap<OutboundRequestId, PeerId>,
     nat_status: NatStatus,
@@ -87,7 +281,7 @@ impl MidstateNetwork {
         let peer_id = keypair.public().to_peer_id();
         tracing::info!("Local peer id: {}", peer_id);
 
-        let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
+        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
             .with_tokio()
             .with_tcp(
                 tcp::Config::default().nodelay(true),
@@ -95,8 +289,17 @@ impl MidstateNetwork {
                 yamux::Config::default,
             )?
             .with_quic()
+.with_other_transport(|keypair| {
+                let certificate = libp2p_webrtc::tokio::Certificate::generate(&mut rand::rngs::OsRng)
+                    .expect("WebRTC certificate generation");
+                    
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                    libp2p_webrtc::tokio::Transport::new(keypair.clone(), certificate)
+                        .map(|(peer_id, conn), _| (peer_id, libp2p::core::muxing::StreamMuxerBox::new(conn)))
+                )
+            })?
             .with_relay_client(noise::Config::new, yamux::Config::default)?
-            .with_behaviour(|key, relay_client| {
+            .with_behaviour(|key: &libp2p::identity::Keypair, relay_client| {
                 let local_peer = key.public().to_peer_id();
 
             // --- Increase timeout from 10s to 60s ---
@@ -109,6 +312,7 @@ impl MidstateNetwork {
                 );
                 // -------------------------------------------------
 
+                let light = libp2p_stream::Behaviour::new();
                 let kad_store = kad::store::MemoryStore::new(local_peer);
                 let mut kademlia = kad::Behaviour::new(local_peer, kad_store);
                 kademlia.set_mode(Some(kad::Mode::Client));
@@ -143,6 +347,7 @@ impl MidstateNetwork {
 
                 MidstateBehaviour {
                     rr,
+                    light,
                     kademlia,
                     identify,
                     relay_client,
@@ -151,13 +356,25 @@ impl MidstateNetwork {
                     autonat,
                 }
             })?
-            .with_swarm_config(|c| {
+            .with_swarm_config(|c: libp2p::swarm::Config| {
                 c.with_idle_connection_timeout(Duration::from_secs(120))
             })
             .build();
 
+        let (light_tx, light_rx) = tokio::sync::mpsc::unbounded_channel();
+
         let mut net = Self {
+            light_incoming: swarm
+                .behaviour_mut()
+                .light
+                .new_control()
+                .accept(LIGHT_PROTOCOL)
+                .expect("light protocol already registered"),
             swarm,
+            light_rx,
+            light_tx,
+            light_guard: LightGuard::new(),
+            light_peers: HashSet::new(),
             connected: HashMap::new(),
             pending_requests: HashMap::new(),
             nat_status: NatStatus::Unknown,
@@ -175,6 +392,14 @@ impl MidstateNetwork {
                 Err(e) => tracing::debug!("QUIC listen failed (non-fatal): {}", e),
             }
         }
+        // Listen for WebRTC direct connections from browsers
+        if let Some(webrtc_addr) = tcp_to_webrtc(&listen_addr) {
+            match net.swarm.listen_on(webrtc_addr.clone()) {
+                Ok(_) => tracing::info!("WebRTC listening on {}", webrtc_addr),
+                Err(e) => tracing::debug!("WebRTC listen failed (non-fatal): {}", e),
+            }
+        }
+        
 
         for addr in &bootstrap_peers {
             if let Some(peer) = extract_peer_id(addr) {
@@ -216,7 +441,9 @@ impl MidstateNetwork {
     }
 
     pub fn broadcast(&mut self, msg: Message) {
-        let peers: Vec<PeerId> = self.connected.keys().copied().collect();
+        let peers: Vec<PeerId> = self.connected.keys()
+            .filter(|p| !self.light_peers.contains(p))
+            .copied().collect();
         for peer in peers {
             self.send(peer, msg.clone());
         }
@@ -225,12 +452,17 @@ impl MidstateNetwork {
     pub fn broadcast_except(&mut self, exclude: Option<PeerId>, msg: Message) {
         let peers: Vec<PeerId> = self.connected
             .keys()
-            .filter(|&&p| Some(p) != exclude)
+            .filter(|&&p| Some(p) != exclude && !self.light_peers.contains(&p))
             .copied()
             .collect();
         for peer in peers {
             self.send(peer, msg.clone());
         }
+    }
+
+    /// Returns true if this peer is a light-only client (WebRTC browser).
+    pub fn is_light_peer(&self, peer: &PeerId) -> bool {
+        self.light_peers.contains(peer)
     }
 
     pub fn respond(&mut self, channel: ResponseChannel<Message>, msg: Message) {
@@ -271,6 +503,7 @@ impl MidstateNetwork {
         use rand::seq::IteratorRandom;
         self.connected
             .keys()
+            .filter(|p| !self.light_peers.contains(p))
             .copied()
             .choose(&mut rand::thread_rng())
     }
@@ -283,23 +516,28 @@ impl MidstateNetwork {
         let local_id = *self.swarm.local_peer_id();
         let p2p_suffix = libp2p::multiaddr::Protocol::P2p(local_id);
 
-        let base = if !self.external_addrs.is_empty() {
-            &self.external_addrs
-        } else {
-            &self.listen_addrs
-        };
+        // Get the confirmed external IP from external_addrs if available
+        let external_ip = self.external_addrs.iter()
+            .find_map(|a| extract_ip(a));
 
-        base.iter()
-            .filter(|a| !is_localhost(a))
-            .map(|a| {
-                // Append /p2p/<our_id> if not already present
-                if extract_peer_id(a).is_some() {
-                    a.to_string()
+        let mut addrs: Vec<String> = self.listen_addrs.iter()
+            .filter_map(|a| {
+                // Only include webrtc-direct addresses
+                if !a.to_string().contains("webrtc-direct") { return None; }
+                // If we know our external IP, substitute it in
+                if let Some(ip) = external_ip {
+                    let replaced = replace_ip(a, ip);
+                    Some(replaced.with(p2p_suffix.clone()).to_string())
                 } else {
-                    a.clone().with(p2p_suffix.clone()).to_string()
+                    // Fall back to non-localhost listen addrs
+                    if is_localhost(a) { return None; }
+                    Some(a.clone().with(p2p_suffix.clone()).to_string())
                 }
             })
-            .collect()
+            .collect();
+
+        addrs.dedup();
+        addrs
     }
 
     /// Multiaddrs of connected peers (from Kademlia routing table).
@@ -375,7 +613,104 @@ impl MidstateNetwork {
 
     pub async fn next_event(&mut self) -> NetworkEvent {
         loop {
-            match self.swarm.select_next_some().await {
+            tokio::select! {
+                // ── Incoming raw stream from a browser light client ──────
+                Some((peer, stream)) = self.light_incoming.next() => {
+                    // ── Gate 1: Is peer banned? ──
+                    if self.light_guard.is_banned(&peer).await {
+                        tracing::debug!("Light stream from banned peer {}, dropping", peer);
+                        continue;
+                    }
+
+                    // ── Gate 2: Rate limit / concurrent stream check ──
+                    match self.light_guard.try_open_stream(peer).await {
+                        Ok(()) => {}
+                        Err(reason) => {
+                            tracing::warn!("Light stream from {} denied: {}", peer, reason);
+                            // If banned, disconnect them entirely
+                            if reason.starts_with("banned") {
+                                let _ = self.swarm.disconnect_peer_id(peer);
+                            }
+                            continue;
+                        }
+                    }
+
+                    let tx = self.light_tx.clone();
+                    let guard = self.light_guard.clone();
+                    tokio::spawn(async move {
+                        use light_protocol::{read_request_raw, write_response_raw, LightResponse};
+                        let mut stream = stream;
+
+                        // ── Read with timeout ──
+                        let read_result = tokio::time::timeout(
+                            Duration::from_secs(LIGHT_READ_TIMEOUT_SECS),
+                            read_request_raw(&mut stream),
+                        ).await;
+
+                        let request = match read_result {
+                            Ok(Ok(req)) => req,
+                            Ok(Err(e)) => {
+                                tracing::debug!("Light read error from {}: {}", peer, e);
+                                guard.close_stream(peer).await;
+                                return;
+                            }
+                            Err(_) => {
+                                tracing::debug!("Light read timeout from {}", peer);
+                                guard.close_stream(peer).await;
+                                return;
+                            }
+                        };
+
+                        // ── Gate 3: Expensive request throttle ──
+                        let is_expensive = matches!(request, LightRequest::BlockTemplate { .. });
+                        if is_expensive && !guard.check_expensive(peer).await {
+                            tracing::warn!("Light {}: BlockTemplate rate limit hit", peer);
+                            let _ = write_response_raw(
+                                &mut stream,
+                                LightResponse::error("rate limit: too many template requests"),
+                            ).await;
+                            guard.close_stream(peer).await;
+                            return;
+                        }
+
+                        tracing::debug!("Light request from {}: {:?}", peer, request);
+
+                        // ── Send to node for processing ──
+                        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<LightResponse>();
+                        if tx.send((peer, request, resp_tx)).is_err() {
+                            guard.close_stream(peer).await;
+                            return;
+                        }
+
+                        // ── Await response with timeout ──
+                        let resp = match tokio::time::timeout(
+                            Duration::from_secs(LIGHT_RESPONSE_TIMEOUT_SECS),
+                            resp_rx,
+                        ).await {
+                            Ok(Ok(resp)) => resp,
+                            Ok(Err(_)) => LightResponse::error("internal error"),
+                            Err(_) => {
+                                tracing::warn!("Light {}: node response timeout", peer);
+                                LightResponse::error("server timeout")
+                            }
+                        };
+
+                        // ── Write response ──
+                        if let Err(e) = write_response_raw(&mut stream, resp).await {
+                            tracing::debug!("Light {}: write failed: {}", peer, e);
+                        }
+
+                        guard.close_stream(peer).await;
+                    });
+                    continue;
+                }
+
+                // ── Light requests parsed by spawned tasks ──────────────
+                Some((peer, request, respond)) = self.light_rx.recv() => {
+                    return NetworkEvent::LightRequest { peer, request, respond };
+                }
+
+                event = self.swarm.select_next_some() => match event {
                 // ── Request-Response ────────────────────────────────
                 SwarmEvent::Behaviour(MidstateBehaviourEvent::Rr(
                     request_response::Event::Message { peer, message },
@@ -435,6 +770,10 @@ impl MidstateNetwork {
                         .autonat
                         .add_server(peer_id, Some(info.observed_addr.clone()));
                 }
+
+                // ── libp2p_stream produces no swarm events for light ─────
+                SwarmEvent::Behaviour(MidstateBehaviourEvent::Light(_)) => {}
+
 
                 // ── AutoNAT ─────────────────────────────────────────
                 SwarmEvent::Behaviour(MidstateBehaviourEvent::Autonat(
@@ -516,8 +855,24 @@ impl MidstateNetwork {
                     }
                     // ------------------------------------------------------------------
 
-                    // --- Subnet Limit Defense ---
                     let remote_addr = endpoint.get_remote_address();
+                    let is_webrtc = remote_addr.to_string().contains("webrtc-direct");
+
+                    // --- Light peer cap ---
+                    if is_webrtc && self.light_peers.len() >= MAX_LIGHT_PEERS {
+                        tracing::warn!("Max light peers ({}) reached, dropping {}", MAX_LIGHT_PEERS, peer_id);
+                        let _ = self.swarm.disconnect_peer_id(peer_id);
+                        continue;
+                    }
+
+                    // --- Check if this light peer is banned ---
+                    if is_webrtc && self.light_guard.is_banned(&peer_id).await {
+                        tracing::warn!("Banned light peer {} reconnected, dropping", peer_id);
+                        let _ = self.swarm.disconnect_peer_id(peer_id);
+                        continue;
+                    }
+
+                    // --- Subnet Limit Defense ---
                     if let Some(subnet) = extract_subnet(remote_addr) {
                         let peers = self.subnet_peers.entry(subnet).or_default();
                         if !peers.contains(&peer_id) {
@@ -540,15 +895,20 @@ impl MidstateNetwork {
                         }
                     }
 
-                    // NEW: Only add to Kademlia AFTER a successful cryptographic handshake
-                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, remote_addr.clone());
+                    // Track WebRTC peers separately (don't add to Kademlia)
+                    if is_webrtc {
+                        self.light_peers.insert(peer_id);
+                    } else {
+                        self.swarm.behaviour_mut().kademlia.add_address(&peer_id, remote_addr.clone());
+                    }
 
                     self.connected.insert(peer_id, endpoint.clone());
                     tracing::info!(
-                        "Peer connected: {} via {:?} (total: {})",
+                        "Peer connected: {} via {:?} (total: {}, light: {})",
                         peer_id,
                         remote_addr,
-                        self.connected.len()
+                        self.connected.len(),
+                        self.light_peers.len()
                     );
                     return NetworkEvent::PeerConnected(peer_id);
                 }
@@ -566,8 +926,13 @@ impl MidstateNetwork {
                     
                     if num_established == 0 {
                         self.connected.remove(&peer_id);
+
+                        // --- Light peer cleanup ---
+                        if self.light_peers.remove(&peer_id) {
+                            self.light_guard.remove_peer(&peer_id).await;
+                        }
                         
-                        // --- NEW: Subnet Limit Defense Cleanup ---
+                        // --- Subnet Limit Defense Cleanup ---
                         if let Some(subnet) = extract_subnet(endpoint.get_remote_address()) {
                             if let std::collections::hash_map::Entry::Occupied(mut entry) = self.subnet_peers.entry(subnet) {
                                 entry.get_mut().remove(&peer_id);
@@ -579,9 +944,10 @@ impl MidstateNetwork {
                         // -----------------------------------------
 
                         tracing::info!(
-                            "Peer disconnected: {} (total: {})",
+                            "Peer disconnected: {} (total: {}, light: {})",
                             peer_id,
-                            self.connected.len()
+                            self.connected.len(),
+                            self.light_peers.len()
                         );
                         return NetworkEvent::PeerDisconnected(peer_id);
                     }
@@ -609,12 +975,20 @@ impl MidstateNetwork {
                     }
                 }
                 _ => {}
-            }
-        }
+            } // match event
+            } // tokio::select!
+        } // loop
     }
     
     pub fn outbound_peer_count(&self) -> usize {
         self.connected.values().filter(|e| e.is_dialer()).count()
+    }
+    // respond_light is superseded: use the oneshot sender in NetworkEvent::LightRequest.
+    // Kept as a stub so any stale call site produces a compile error rather than
+    // a silent behaviour change.
+    #[deprecated(note = "Send the response via the `respond` oneshot in NetworkEvent::LightRequest")]
+    pub fn respond_light(&mut self, _resp: LightResponse) {
+        unimplemented!("use NetworkEvent::LightRequest::respond oneshot")
     }
 }
 
@@ -629,6 +1003,26 @@ pub fn socket_to_multiaddr(addr: SocketAddr) -> Multiaddr {
     }
     ma.push(libp2p::multiaddr::Protocol::Tcp(addr.port()));
     ma
+}
+
+/// Convert a TCP multiaddr to its WebRTC-direct equivalent.
+/// /ip4/0.0.0.0/tcp/9333 → /ip4/0.0.0.0/udp/9091/webrtc-direct
+fn tcp_to_webrtc(addr: &Multiaddr) -> Option<Multiaddr> {
+    let mut components = addr.iter().collect::<Vec<_>>();
+    let tcp_idx = components.iter().position(|p| matches!(p, libp2p::multiaddr::Protocol::Tcp(_)))?;
+    let port = match components[tcp_idx] {
+        libp2p::multiaddr::Protocol::Tcp(p) => p,
+        _ => return None,
+    };
+    // Use port + 2 to avoid colliding with QUIC (port + 0)
+    let webrtc_port = port.checked_add(2).unwrap_or(port);
+    components[tcp_idx] = libp2p::multiaddr::Protocol::Udp(webrtc_port);
+    components.insert(tcp_idx + 1, libp2p::multiaddr::Protocol::WebRTCDirect);
+    let mut ma = Multiaddr::empty();
+    for c in components {
+        ma.push(c);
+    }
+    Some(ma)
 }
 
 /// Convert a TCP multiaddr to its QUIC-v1 equivalent.
@@ -691,6 +1085,31 @@ fn is_localhost(addr: &Multiaddr) -> bool {
         libp2p::multiaddr::Protocol::Ip6(ip) => ip.is_loopback(),
         _ => false,
     })
+}
+
+fn extract_ip(addr: &Multiaddr) -> Option<std::net::IpAddr> {
+    for proto in addr.iter() {
+        match proto {
+            libp2p::multiaddr::Protocol::Ip4(ip) => return Some(std::net::IpAddr::V4(ip)),
+            libp2p::multiaddr::Protocol::Ip6(ip) => return Some(std::net::IpAddr::V6(ip)),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn replace_ip(addr: &Multiaddr, new_ip: std::net::IpAddr) -> Multiaddr {
+    addr.iter().map(|proto| match proto {
+        libp2p::multiaddr::Protocol::Ip4(_) => match new_ip {
+            std::net::IpAddr::V4(ip) => libp2p::multiaddr::Protocol::Ip4(ip),
+            std::net::IpAddr::V6(ip) => libp2p::multiaddr::Protocol::Ip6(ip),
+        },
+        libp2p::multiaddr::Protocol::Ip6(_) => match new_ip {
+            std::net::IpAddr::V4(ip) => libp2p::multiaddr::Protocol::Ip4(ip),
+            std::net::IpAddr::V6(ip) => libp2p::multiaddr::Protocol::Ip6(ip),
+        },
+        other => other,
+    }).collect()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

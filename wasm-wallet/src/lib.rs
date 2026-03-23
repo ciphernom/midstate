@@ -44,6 +44,47 @@ pub fn mine_commitment_pow(commitment_hex: &str, required_pow: u32) -> u64 {
     }
 }
 
+// ─── Solo Mining: Hot-Loop Nonce Search ─────────────────────────────────────
+//
+// Free function called thousands of times per second from the JS mining loop.
+// Processes `iterations` batches of 4 nonces each via WASM SIMD128.
+// Returns the first nonce whose final_hash beats the target, or null.
+//
+// The midstate and target come from the node's `/block_template` response,
+// so this function includes real mempool transactions and a valid state_root.
+
+/// SIMD-accelerated nonce search. Returns winning nonce or null.
+///
+/// Each iteration evaluates 4 nonces in parallel via WASM SIMD128.
+/// Total nonces searched per call = `iterations * 4`.
+#[wasm_bindgen]
+pub fn search_nonces(midstate_hex: &str, target_hex: &str, start_nonce: u64, iterations: u32) -> Option<u64> {
+    let mut midstate = [0u8; 32];
+    if hex::decode_to_slice(midstate_hex, &mut midstate).is_err() {
+        return None;
+    }
+
+    let mut target = [0u8; 32];
+    if hex::decode_to_slice(target_hex, &mut target).is_err() {
+        return None;
+    }
+
+    for i in 0..iterations {
+        let base = start_nonce + (i as u64 * 4);
+        let nonces = [base, base + 1, base + 2, base + 3];
+
+        let results = midstate::core::simd_mining::create_extensions_4way(midstate, nonces);
+
+        for (nonce, final_hash) in results {
+            if final_hash < target {
+                return Some(nonce);
+            }
+        }
+    }
+
+    None
+}
+
 // ─── JSON Interop Structs ───────────────────────────────────────────────────
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -114,6 +155,91 @@ impl WebWallet {
             watchlist: Vec::new(),
         })
     }
+
+    // ─── Solo Mining: Coinbase Builder ──────────────────────────────────
+    //
+    // Called once per template build. Derives fresh WOTS addresses for
+    // each power-of-2 denomination of `total_value`, generates random
+    // salts, and returns the coinbase JSON for POST /block_template.
+    //
+    // The WOTS addresses are only registered in JS wallet state if the
+    // block is actually found and accepted by the network.
+
+    /// Derive fresh WOTS coinbase outputs for a given total value.
+    ///
+    /// Returns JSON:
+    /// ```json
+    /// {
+    ///   "coinbase": [ { "address": "hex", "value": N, "salt": "hex" }, ... ],
+    ///   "mining_addrs": [ { "address": "hex", "index": N }, ... ],
+    ///   "next_wots_index": N
+    /// }
+    /// ```
+    #[wasm_bindgen]
+    pub fn build_coinbase(
+        &self,
+        total_value: u64,
+        next_wots_index: u32,
+    ) -> Option<String> {
+        let denominations = decompose_value(total_value);
+
+        let mut coinbase_json = Vec::with_capacity(denominations.len());
+        let mut mining_addrs = Vec::with_capacity(denominations.len());
+        let mut wots_idx = next_wots_index;
+
+        for &denom in &denominations {
+            let seed = derive_wots_seed(&self.master_seed, wots_idx as u64);
+            let pk = wots::keygen(&seed);
+            let address = compute_address(&pk);
+
+            let mut salt = [0u8; 32];
+            getrandom_02::getrandom(&mut salt).ok()?;
+
+            coinbase_json.push(serde_json::json!({
+                "address": hex::encode(address),
+                "value": denom,
+                "salt": hex::encode(salt)
+            }));
+
+            mining_addrs.push(serde_json::json!({
+                "address": hex::encode(address),
+                "index": wots_idx
+            }));
+
+            wots_idx += 1;
+        }
+
+        Some(serde_json::json!({
+            "coinbase": coinbase_json,
+            "mining_addrs": mining_addrs,
+            "next_wots_index": wots_idx
+        }).to_string())
+    }
+
+    // ─── Solo Mining: Extension Recomputation ───────────────────────────
+    //
+    // Called once when search_nonces finds a winning nonce. Recomputes the
+    // full EXTENSION_ITERATIONS hash chain to produce the final_hash that
+    // goes into the submitted block.
+
+    /// Recompute the full extension for a winning nonce.
+    ///
+    /// Returns JSON: `{ "nonce": N, "final_hash": "hex" }`
+    #[wasm_bindgen]
+    pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<String> {
+        let mut midstate = [0u8; 32];
+        hex::decode_to_slice(midstate_hex, &mut midstate).ok()?;
+
+        let ext = midstate::core::extension::create_extension(midstate, nonce);
+
+        Some(serde_json::json!({
+            "nonce": ext.nonce,
+            "final_hash": hex::encode(ext.final_hash)
+        }).to_string())
+    }
+
+    // ─── Existing Wallet Methods (unchanged) ────────────────────────────
+
     // boot from the raw 32-byte master seed instead of 24 words
     pub fn from_seed_hex(seed_hex: &str) -> Result<WebWallet, JsValue> {
         let mut master_seed = [0u8; 32];

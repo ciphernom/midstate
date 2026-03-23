@@ -59,6 +59,7 @@ impl RpcServer {
             .route("/metrics", get(get_metrics))
             .route("/scan", post(scan_addresses))
             .route("/mss_state", post(get_mss_state))
+            .route("/block_template", post(block_template))
             .route("/mix/create", post(mix_create))
             .route("/mix/register", post(mix_register))
             .route("/mix/fee", post(mix_fee))

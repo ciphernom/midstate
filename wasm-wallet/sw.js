@@ -1,8 +1,9 @@
-const CACHE_NAME = 'midstate-wallet-v3';
+const CACHE_NAME = 'midstate-wallet-v5';
 
 const ASSETS = [
   'index.html',
   'worker.js',
+  'miner.js',
   'manifest.json',
   'pkg/wasm_wallet.js',
   'pkg/wasm_wallet_bg.wasm'
@@ -33,24 +34,37 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
 
-  // 1. ONLY intercept requests from our own domain.
-  // Bypass the Service Worker completely for external RPC node traffic.
-  if (url.origin !== location.origin) {
+  if (url.origin !== location.origin) return;
+  if (event.request.method !== 'GET') return;
+
+  // 1. Network-First for HTML (Navigation requests)
+  // Ensures the user always gets the freshest index.html on their first visit.
+  if (event.request.mode === 'navigate' || event.request.headers.get('accept').includes('text/html')) {
+    event.respondWith(
+      fetch(event.request)
+        .then((networkResponse) => {
+          // Save the fresh HTML to the cache for offline use
+          const clone = networkResponse.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+          return networkResponse;
+        })
+        .catch(() => {
+          // If the network fails (offline), fall back to the cached HTML
+          return caches.match(event.request);
+        })
+    );
     return;
   }
 
-  // 2. Only cache GET requests
-  if (event.request.method !== 'GET') return;
-
+  // 2. Cache-First for everything else (WASM, JS, CSS, JSON)
+  // Keeps the app lightning fast and offline-capable.
   event.respondWith(
     caches.match(event.request).then((cachedResponse) => {
       if (cachedResponse) {
         return cachedResponse;
       }
-      
-      // 3. Catch the fetch error so it doesn't throw a red console error
-      return fetch(event.request).catch((err) => {
-        console.error("Service Worker fetch failed for:", event.request.url, err);
+      return fetch(event.request).catch(() => {
+        return new Response('Offline', { status: 503, statusText: 'Offline' });
       });
     })
   );
