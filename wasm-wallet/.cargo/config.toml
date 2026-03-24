@@ -1,0 +1,4 @@
+[build]
+# Apply these flags whenever compiling for Wasm
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128,+bulk-memory"]
