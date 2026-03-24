@@ -9,6 +9,8 @@ use axum::{
 use tower_http::trace::TraceLayer;
 use tower_http::cors::CorsLayer;
 use axum::http::{Method, HeaderValue, header};
+use axum::extract::DefaultBodyLimit;
+
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
@@ -74,6 +76,7 @@ impl RpcServer {
             .route("/axe/rewards", get(axe_download_rewards))
             .route("/api/internal/submit_batch", post(submit_batch))
             .route("/tx/by_input", post(get_tx_by_input))
+            .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB max request body
             .layer(TraceLayer::new_for_http())
             .layer(cors)
             .with_state(node_handle);

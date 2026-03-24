@@ -323,6 +323,7 @@ impl BatchStore {
 
     /// Load headers for a range — uses lightweight header files when available
     pub fn load_headers(&self, start: u64, end: u64) -> Result<Vec<BatchHeader>> {
+        if end <= start { return Ok(Vec::new()); }
         let mut headers = Vec::with_capacity((end - start) as usize);
         for h in start..end {
             if let Some(header) = self.load_header(h)? {

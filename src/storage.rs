@@ -4,7 +4,7 @@ pub use batch_store::BatchStore;
 use crate::core::State;
 use crate::core::mmr::{MerkleMountainRange, UtxoAccumulator};
 use anyhow::Result;
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -15,6 +15,12 @@ const MINING_SEED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("mi
 /// permanently blocking any *different* transaction from reusing the key.
 const SPENT_ADDRESSES_TABLE: TableDefinition<&[u8; 32], &[u8; 32]> =
     TableDefinition::new("spent_addresses");
+
+/// Maps MSS master_pk -> highest (leaf_index + 1) seen on-chain.
+/// Gives O(1) lookup for the /mss_state endpoint instead of scanning
+/// every block from genesis.
+const MSS_LEAF_INDEX_TABLE: TableDefinition<&[u8; 32], u64> =
+    TableDefinition::new("mss_leaf_index");
 
 /// V1 state layout (depth: u64). Used only for one-time migration from
 /// pre-u128 databases. Identical field order to the old `State` so that
@@ -120,10 +126,11 @@ impl Storage {
                     }
                     // Initialize tables
                     let write_txn = db.begin_write()?;
-                    {
+{
                         let _ = write_txn.open_table(STATE_TABLE)?;
                         let _ = write_txn.open_table(MINING_SEED_TABLE)?;
                         let _ = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
+                        let _ = write_txn.open_table(MSS_LEAF_INDEX_TABLE)?;
                     }
                     write_txn.commit()?;
 
@@ -331,7 +338,7 @@ impl Storage {
     /// - For standard WOTS: burns the address hash.
     /// - For MSS (post-activation): burns the specific leaf's WOTS public key.
     /// - Idempotent: reorg replays of the same batch write the same value.
-    pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, block_height: u64) -> Result<()> {
+pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, block_height: u64) -> Result<()> {
         use crate::core::types::{WOTS_REUSE_ACTIVATION_HEIGHT, MSS_REUSE_ACTIVATION_HEIGHT, Witness, compute_commitment};
         use crate::core::wots::SIG_SIZE;
 
@@ -341,7 +348,9 @@ impl Storage {
 
         let write_txn = self.db.begin_write()?;
         {
-            let mut table = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
+            let mut spent_table = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
+            let mut mss_idx_table = write_txn.open_table(MSS_LEAF_INDEX_TABLE)?;
+
             for tx in &batch.transactions {
                 if let crate::core::Transaction::Reveal { inputs, witnesses, outputs, salt } = tx {
                     let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
@@ -354,13 +363,20 @@ impl Storage {
                         let Witness::ScriptInputs(wit_inputs) = witness;
                         if let Some(sig) = wit_inputs.first() {
                             if sig.len() == SIG_SIZE {
-                                // Standard WOTS: burn the address
                                 let addr = input.predicate.address();
-                                table.insert(&addr, &commitment)?;
+                                spent_table.insert(&addr, &commitment)?;
                             } else if block_height >= MSS_REUSE_ACTIVATION_HEIGHT {
-                                // NEW: MSS: burn the specific leaf's WOTS public key!
                                 if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                                    table.insert(&mss_sig.wots_pk, &commitment)?;
+                                    spent_table.insert(&mss_sig.wots_pk, &commitment)?;
+
+                                    // O(1) MSS leaf index tracker
+                                    if let Some(master_pk) = input.predicate.owner_pk() {
+                                        let next = mss_sig.leaf_index + 1;
+                                        let current = mss_idx_table.get(&master_pk)?.map(|v: redb::AccessGuard<'_, u64>| v.value()).unwrap_or(0);
+                                        if next > current {
+                                            mss_idx_table.insert(&master_pk, next)?;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -445,5 +461,11 @@ impl Storage {
         
         Ok(result)
     }
-
+    /// O(1) lookup of the highest MSS leaf index used on-chain for a given master_pk.
+    /// Returns 0 if the master_pk has never been seen (or pre-activation blocks only).
+    pub fn query_mss_leaf_index(&self, master_pk: &[u8; 32]) -> Result<u64> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(MSS_LEAF_INDEX_TABLE)?;
+        Ok(table.get(master_pk)?.map(|v| v.value()).unwrap_or(0))
+    }
 }
