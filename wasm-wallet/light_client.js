@@ -229,16 +229,31 @@ async request(req, _retries = 2) {
                     merged.set(rawBuf);
                     merged.set(bytes, rawBuf.length);
                     rawBuf = merged;
-                    // Check for RESET — server killed the stream (e.g. first
-                    // request after connect gets clobbered by binary protocol probe).
-                    // Flag can be standalone or appended to a data chunk.
+
+                    // Check for RESET first — server killed the stream
                     if (chunkContainsReset(bytes)) {
                         gotReset = true;
                         break;
                     }
-                    // Check for FIN — server is done writing.
-                    // For large responses FIN arrives in the same chunk as
-                    // the last data, not as a separate 3-byte chunk.
+
+                    // PRIMARY EXIT: Check if we have the complete response
+                    // by decoding the protobuf framing and reading the
+                    // application-layer length prefix. This is reliable
+                    // regardless of whether FIN arrives.
+                    try {
+                        const appData = decodeWebRTCStreamData(rawBuf);
+                        if (appData.length >= 4) {
+                            const respLen = new DataView(appData.buffer, appData.byteOffset).getUint32(0, true);
+                            if (appData.length >= 4 + respLen) {
+                                break; // Full response received
+                            }
+                        }
+                    } catch (_) {
+                        // Partial data — keep reading
+                    }
+
+                    // FALLBACK: FIN detection (still useful for error
+                    // responses that might not have a valid length prefix)
                     if (chunkContainsFin(bytes)) {
                         break;
                     }

@@ -1701,6 +1701,21 @@ async function connectWebRTC(bootstrapAddr) {
                     showSeedModal(payload);
                     break;
 
+                case 'BACKUP_READY': {
+                    const blob = new Blob([payload], { type: "application/json" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `midstate-backup-${new Date().toISOString().split('T')[0]}.json`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                    showToast("Backup exported successfully.", "success");
+                    break;
+                }
+
+
                 case 'PHRASE_GENERATED':
                     document.getElementById('seedPhrase').value = payload;
                     break;
@@ -1760,15 +1775,27 @@ async function connectWebRTC(bootstrapAddr) {
                     const cLabel = document.getElementById('createProgressLabel');
                     const mLabel = document.getElementById('mssProgressLabel');
 
+                    let isVisible = false;
+
                     if (cp && !document.getElementById('createProgressContainer').classList.contains('hidden')) {
                         cp.max = payload.total;
                         cp.value = payload.current;
                         if (payload.label) cLabel.innerText = payload.label;
+                        isVisible = true;
                     }
                     if (mp && !document.getElementById('mssProgressContainer').classList.contains('hidden')) {
                         mp.max = payload.total;
                         mp.value = payload.current;
                         if (payload.label) mLabel.innerText = payload.label;
+                        isVisible = true;
+                    }
+
+                    // FIX: If UI progress bars are hidden (like during Login), use the top activity banner!
+                    if (!isVisible) {
+                        showActivity(payload.label || `Regenerating Keys... (${payload.current}/${payload.total})`);
+                        if (payload.current >= payload.total) {
+                            setTimeout(hideActivity, 1000); // Hide banner when done
+                        }
                     }
                     break;
                 }
@@ -1935,18 +1962,7 @@ async function connectWebRTC(bootstrapAddr) {
         };
 
         document.getElementById('btnExport').onclick = () => {
-            const bundleStr = localStorage.getItem('midstate_wallet');
-            if (!bundleStr) return showToast("No wallet data found to export.", "error");
-            const blob = new Blob([bundleStr], { type: "application/json" });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `midstate-backup-${new Date().toISOString().split('T')[0]}.json`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-            showToast("Backup exported successfully.", "success");
+            worker.postMessage({ type: 'EXPORT_BACKUP' });
         };
 
         document.getElementById('btnImportTrigger').onclick = () => {

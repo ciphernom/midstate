@@ -91,11 +91,34 @@ impl Message {
             .expect("Serialization failed")
     }
 
-    pub fn deserialize_bin(bytes: &[u8]) -> anyhow::Result<Self> {
+pub fn deserialize_bin(bytes: &[u8]) -> anyhow::Result<Self> {
         use bincode::Options;
-        Ok(bincode::DefaultOptions::new()
+        let msg: Message = bincode::DefaultOptions::new()
             .with_limit(MAX_MSG_SIZE as u64)
-            .deserialize(bytes)?)
+            .deserialize(bytes)?;
+
+        // Post-deserialization bounds check: reject messages with
+        // unreasonably large collections that survived bincode's byte limit.
+        match &msg {
+            Message::Headers { headers, .. } => {
+                if headers.len() > MAX_GETHEADERS_COUNT as usize {
+                    anyhow::bail!("Headers count {} exceeds max {}", headers.len(), MAX_GETHEADERS_COUNT);
+                }
+            }
+            Message::Batches { batches, .. } => {
+                if batches.len() > MAX_GETBATCHES_COUNT as usize {
+                    anyhow::bail!("Batches count {} exceeds max {}", batches.len(), MAX_GETBATCHES_COUNT);
+                }
+            }
+            Message::Addr(addrs) => {
+                if addrs.len() > 1000 {
+                    anyhow::bail!("Addr count {} exceeds max 1000", addrs.len());
+                }
+            }
+            _ => {}
+        }
+
+        Ok(msg)
     }
 }
 
@@ -180,7 +203,16 @@ async fn read_message<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<Mes
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete message"));
     }
     
-    Message::deserialize_bin(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+// Catch panics from malicious bincode payloads (e.g., crafted Vec length
+    // fields that cause capacity overflow during allocation, before the
+    // byte-count limit can kick in).
+    match std::panic::catch_unwind(|| Message::deserialize_bin(&buf)) {
+        Ok(result) => result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "malformed message caused allocation panic (possible exploit attempt)",
+        )),
+    }
 }
 
 async fn write_message<T: AsyncWrite + Unpin + Send>(io: &mut T, msg: &Message) -> io::Result<()> {

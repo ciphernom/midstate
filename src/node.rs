@@ -173,6 +173,10 @@ pub struct Node {
     peer_header_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     hash_counter: Arc<AtomicU64>,
     banned_subnets: HashMap<IpAddr, std::time::Instant>,
+    /// Tarpitted peers: kept connected but fed garbage responses.
+    /// They don't know they're banned, so they don't reconnect from new IPs.
+    tarpitted_peers: HashSet<PeerId>,
+    
     /// Ring buffer of recent states for instant reorg rollback.
     /// Keyed by height: state_cache[i] = (height, State) where the State
     /// is the result of applying all blocks through height-1.
@@ -740,6 +744,7 @@ pub async fn new(
             peer_header_req_counts: HashMap::new(),
             hash_counter: Arc::new(AtomicU64::new(0)),
             banned_subnets: HashMap::new(),
+            tarpitted_peers: HashSet::new(),
             state_cache: VecDeque::with_capacity(STATE_CACHE_SIZE + 1),
         })
     }
@@ -1303,11 +1308,16 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                         }
                         NetworkEvent::PeerConnected(peer) => {
                             // --- BANNED SUBNET DEFENSE ---
-                            if let Some(subnet) = self.network.peer_subnet(&peer) {
-                                if self.banned_subnets.contains_key(&subnet) {
-                                    tracing::debug!("Rejected connection from banned subnet: {}", subnet);
-                                    self.network.disconnect_peer(peer);
-                                    continue;
+if let Some(subnet) = self.network.peer_subnet(&peer) {
+                                if let Some(&ban_time) = self.banned_subnets.get(&subnet) {
+                                    // Bans expire after 1 hour
+                                    if ban_time.elapsed().as_secs() < 3600 {
+                                        tracing::debug!("Rejected connection from banned subnet: {}", subnet);
+                                        self.network.disconnect_peer(peer);
+                                        continue;
+                                    } else {
+                                        self.banned_subnets.remove(&subnet);
+                                    }
                                 }
                             }
                             if !self.connected_peers.insert(peer) {
@@ -1328,6 +1338,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                             self.connected_peers.remove(&peer);
                             self.peer_tx_counts.remove(&peer); 
                             tracing::info!("Peer disconnected: {}", peer);
+                            self.tarpitted_peers.remove(&peer);
                             if self.sync_session.as_ref().map_or(false, |s| s.peer == peer) {
                                 self.abort_sync_session("sync peer disconnected");
                             }
@@ -1357,12 +1368,48 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
         self.send_response(channel, Message::Pong { nonce: 0 });
     }
 
-    async fn handle_message(
+async fn handle_message(
         &mut self,
         from: PeerId,
         msg: Message,
         channel: Option<ResponseChannel<Message>>,
     ) -> Result<()> {
+        // ── Tarpit: feed garbage to known-malicious peers ───────────
+        if self.tarpitted_peers.contains(&from) {
+            match &msg {
+                Message::GetState => {
+                    // Claim to be at height 0 with impossibly high depth —
+                    // they'll try to sync from us and get nothing useful.
+                    self.send_response(channel, Message::StateInfo {
+                        height: 0,
+                        depth: u128::MAX,
+                        midstate: [0xFF; 32],
+                    });
+                }
+                Message::GetHeaders { .. } | Message::GetBatches { .. } => {
+                    // Send empty responses — they burn time waiting
+                    self.ack(channel);
+                }
+                Message::GetAddr => {
+                    // Feed them fake addresses pointing to themselves
+                    self.send_response(channel, Message::Addr(vec![
+                        "/ip4/127.0.0.1/tcp/1/p2p/12D3KooWDEADBEEF00000000000000000000000000000000000".into(),
+                    ]));
+                }
+                Message::Ping { nonce } => {
+                    // Keep the connection alive — respond normally so they
+                    // don't detect the tarpit from a broken keepalive
+                    self.send_response(channel, Message::Pong { nonce: *nonce });
+                }
+                _ => {
+                    // Silently consume everything else
+                    self.ack(channel);
+                }
+            }
+            return Ok(());
+        }
+        // ── End tarpit ──────────────────────────────────────────────
+
         match msg {
             Message::Transaction(tx) => {
                 self.ack(channel);
@@ -1562,11 +1609,12 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                     }
                 }
             }
-            Message::Headers { start_height: _, headers } => {
+Message::Headers { start_height: _, headers } => {
                 self.ack(channel);
                 if let Err(e) = self.handle_sync_headers(from, headers).await {
-                    tracing::warn!("Error processing sync headers: {}", e);
+                    tracing::warn!("Error processing sync headers from {}: {}", from, e);
                     self.abort_sync_session("header processing error");
+                    self.ban_peer(from, &format!("malicious headers: {}", e));
                 }
             }
 
@@ -1760,6 +1808,24 @@ self.network.send(peer, Message::GetHeaders { start_height, count });
         // Don't clear last_sync_cursor here — keep it so the next attempt resumes
     }
 
+/// Tarpit a malicious peer: keep them connected but feed them garbage.
+    /// They waste CPU on fake PoW requirements and never realize they're banned,
+    /// so they don't reconnect from a different IP.
+    ///
+    /// Also bans their subnet so new connections from the same range are rejected.
+    fn ban_peer(&mut self, peer: PeerId, reason: &str) {
+        tracing::error!(
+            "TARPITTING peer {} — {}", peer, reason
+        );
+        self.tarpitted_peers.insert(peer);
+
+        // Also ban the subnet for new connection attempts
+        if let Some(subnet) = self.network.peer_subnet(&peer) {
+            self.banned_subnets.insert(subnet, std::time::Instant::now());
+            tracing::warn!("Banned subnet {} — peer {} tarpitted", subnet, peer);
+        }
+    }
+
  pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHeader>) -> Result<()> {
         // Extract state from the session — only accept headers from the sync peer
         let (peer_height, cursor, snapshot) = match &mut self.sync_session {
@@ -1946,9 +2012,10 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
             }
         };
 
-        if !is_valid {
+if !is_valid {
             tracing::warn!("Peer header chain invalid (PoW or linkage failed)");
             self.sync_in_progress = false;
+            self.ban_peer(peer, "invalid header chain (PoW or linkage failed)");
             return Ok(());
         }
 

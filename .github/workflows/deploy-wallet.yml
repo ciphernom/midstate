@@ -34,6 +34,8 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Build Wasm Wallet
+        env:
+          RUSTFLAGS: "-C target-feature=+simd128"
         run: |
           cd wasm-wallet
           wasm-pack build --target web --release
