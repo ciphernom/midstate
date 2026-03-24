@@ -86,6 +86,21 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
                     if !seen.insert(input.coin_id()) {
                         bail!("Duplicate input coin");
                     }
+                    // SECURITY: Block spending of confidential UTXOs until the
+                    // STARK AIR is upgraded to prove input commitment binding.
+                    // Without this, InputReveal.value is unverified for
+                    // confidential inputs (coin_id does not include value),
+                    // allowing a miner to claim arbitrary fees via inflated
+                    // input values. Creating confidential outputs from standard
+                    // inputs remains safe and allowed.
+                    if input.commitment.is_some()
+                        && state.height >= crate::core::types::CONFIDENTIAL_ACTIVATION_HEIGHT
+                    {
+                        bail!(
+                            "Spending confidential UTXOs is disabled pending \
+                             STARK input-commitment binding upgrade"
+                        );
+                    }
                 }
             }
 
@@ -218,6 +233,15 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 for input in inputs {
                     if !seen.insert(input.coin_id()) {
                         bail!("Duplicate input coin");
+                    }
+                    // SECURITY: See matching check in apply_transaction_no_sig_check.
+                    if input.commitment.is_some()
+                        && state.height >= crate::core::types::CONFIDENTIAL_ACTIVATION_HEIGHT
+                    {
+                        bail!(
+                            "Spending confidential UTXOs is disabled pending \
+                             STARK input-commitment binding upgrade"
+                        );
                     }
                 }
             }

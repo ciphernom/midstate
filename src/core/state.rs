@@ -284,6 +284,17 @@ pub fn apply_batch(
     let reward = block_reward(state.height);
     let allowed_value = reward.checked_add(total_fees).ok_or_else(|| anyhow::anyhow!("Reward overflow"))?;
 
+    // Pre-check: reject duplicate coinbase coin IDs (same address+value+salt).
+    // Duplicates would silently lose coins since the second insert returns false.
+    {
+        let mut seen_cb = std::collections::HashSet::new();
+        for (i, cb) in batch.coinbase.iter().enumerate() {
+            if !seen_cb.insert(cb.coin_id()) {
+                bail!("Duplicate coinbase output coin ID at index {}", i);
+            }
+        }
+    }
+
     let mut coinbase_total: u64 = 0;
     for (i, cb) in batch.coinbase.iter().enumerate() {
         if cb.value == 0 {
@@ -307,7 +318,16 @@ pub fn apply_batch(
         future_midstate = hash_concat(&future_midstate, coin_id);
     }
 
-    // --- NEW: State Root Validation ---
+    // --- State Root Validation ---
+    // After activation, state_root is mandatory. Before activation, [0; 32] bypasses.
+    if state.height >= crate::core::types::STATE_ROOT_ACTIVATION_HEIGHT
+        && batch.state_root == [0u8; 32]
+    {
+        bail!(
+            "state_root is mandatory after height {} (got all-zeros)",
+            crate::core::types::STATE_ROOT_ACTIVATION_HEIGHT
+        );
+    }
     if batch.state_root != [0u8; 32] { // Bypass for legacy blocks
         // Simulate adding coinbase coins to calculate the exact state root
         let mut temp_state_coins = state.coins.clone();

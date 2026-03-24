@@ -74,7 +74,7 @@ const MSG_SCHEDULE: [[usize; 16]; 7] = [
 /// # Examples
 ///
 /// ```
-/// # use crate::wots_simd::{SimdLevel, detect};
+/// # use crate::midstate::core::wots_simd::{SimdLevel, detect};
 /// let level = detect();
 /// assert!(level.lanes() >= 1);
 /// ```
@@ -106,7 +106,7 @@ impl SimdLevel {
     /// # Examples
     ///
     /// ```
-    /// # use crate::wots_simd::SimdLevel;
+    /// # use crate::midstate::core::wots_simd::SimdLevel;
     /// assert_eq!(SimdLevel::Scalar.lanes(), 1);
     /// ```
     pub fn lanes(self) -> usize {
@@ -134,7 +134,7 @@ impl SimdLevel {
 /// # Examples
 ///
 /// ```
-/// # use crate::wots_simd::{detect, SimdLevel};
+/// # use crate::midstate::core::wots_simd::{detect, SimdLevel};
 /// let level = detect();
 /// // On any platform the result is always a valid, usable level.
 /// assert!(level.lanes() >= 1);
@@ -165,7 +165,7 @@ pub fn detect() -> SimdLevel {
 /// # Examples
 ///
 /// ```
-/// # use crate::wots_simd::detected_level;
+/// # use crate::midstate::core::wots_simd::detected_level;
 /// let a = detected_level();
 /// let b = detected_level();
 /// assert_eq!(a, b); // Always the same once cached.
@@ -186,7 +186,7 @@ pub fn detected_level() -> SimdLevel {
 /// # Examples
 ///
 /// ```
-/// # use crate::wots_simd::scalar_wots_chain;
+/// # use crate::midstate::core::wots_simd::scalar_wots_chain;
 /// let input = [0u8; 32];
 ///
 /// // Zero iterations: identity.
@@ -221,8 +221,8 @@ pub fn scalar_wots_chain(mut val: [u8; 32], iters: usize) -> [u8; 32] {
 /// # Examples
 ///
 /// ```
-/// # use crate::wots_simd::{process_wots_batch, scalar_wots_chain};
-/// # use crate::core::types::hash;
+/// # use crate::midstate::core::wots_simd::{process_wots_batch, scalar_wots_chain};
+/// # use crate::midstate::core::types::hash;
 /// let inputs = [hash(b"key0"), hash(b"key1"), hash(b"key2")];
 /// let iters  = [3usize, 0, 7];
 ///

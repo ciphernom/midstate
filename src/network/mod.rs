@@ -195,6 +195,20 @@ impl LightGuard {
         let guard = self.inner.lock().await;
         guard.peers.len()
     }
+
+    /// Garbage-collect stale peer entries that have no active streams and
+    /// whose rate-limit window hasn't been touched in over an hour.
+    /// Prevents unbounded memory growth from peers that connect once and vanish.
+    async fn gc_stale(&self) {
+        let mut guard = self.inner.lock().await;
+        let stale_threshold = Duration::from_secs(3600);
+        guard.peers.retain(|_, state| {
+            // Keep peers with active streams, active bans, or recent activity
+            state.active_streams > 0
+                || state.is_banned()
+                || state.window_start.elapsed() < stale_threshold
+        });
+    }
 }
 
 
@@ -989,6 +1003,12 @@ impl MidstateNetwork {
     #[deprecated(note = "Send the response via the `respond` oneshot in NetworkEvent::LightRequest")]
     pub fn respond_light(&mut self, _resp: LightResponse) {
         unimplemented!("use NetworkEvent::LightRequest::respond oneshot")
+    }
+
+    /// Garbage-collect stale light client rate-limiter entries.
+    /// Call periodically (e.g. every 60s) to prevent unbounded growth.
+    pub async fn gc_stale_light_peers(&self) {
+        self.light_guard.gc_stale().await;
     }
 }
 
