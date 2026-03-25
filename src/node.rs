@@ -430,10 +430,10 @@ impl NodeHandle {
         }
         Ok(found)
     }
-    pub fn scan_mss_index(&self, master_pk: &[u8; 32], height: u64) -> Result<u64> {
+pub fn scan_mss_index(&self, master_pk: &[u8; 32], start: u64, end: u64) -> Result<u64> {
         let store = crate::storage::BatchStore::new(&self.batches_path)?;
         let mut max_idx: u64 = 0;
-        for h in 0..height {
+        for h in start..end {
             if let Some(batch) = store.load(h)? {
                 max_idx = max_idx.max(scan_txs_for_mss_index(&batch.transactions, master_pk));
             }
@@ -788,8 +788,10 @@ pub async fn new(
                 }
             }
 
-            LightRequest::GetFilters { start_height, end_height } => {
-                let end = end_height.min(self.state.height);
+LightRequest::GetFilters { start_height, end_height } => {
+                let end = end_height
+                    .min(self.state.height)
+                    .min(start_height.saturating_add(1000));
                 let store = crate::storage::BatchStore::new(
                     &self.data_dir.join("db").join("batches")
                 );
@@ -922,11 +924,17 @@ pub async fn new(
                     coinbase_out.push(CoinbaseOutput { address, value: cb.value, salt });
                 }
 
-                if coinbase_total != expected_total {
-                    return LightResponse::error(format!(
-                        "Coinbase total mismatch: expected {} (reward {} + fees {}), got {}",
-                        expected_total, reward, total_fees, coinbase_total
-                    ));
+if coinbase_total != expected_total {
+                    return LightResponse {
+                        ok: false,
+                        data: Some(serde_json::json!({
+                            "error": "Coinbase total mismatch",
+                            "expected_total": expected_total,
+                            "block_reward": reward,
+                            "total_fees": total_fees,
+                        })),
+                        error: None,
+                    };
                 }
 
                 for cb in &coinbase_out {
@@ -1038,13 +1046,15 @@ pub async fn new(
                 if hex::decode_to_slice(&master_pk, &mut pk_bytes).is_err() {
                     return LightResponse::error("Invalid master_pk hex");
                 }
-                let mut max_idx: u64 = 0;
-                for h in 0..self.state.height {
-                    if let Ok(Some(batch)) = self.storage.load_batch(h) {
-                        max_idx = max_idx.max(scan_txs_for_mss_index(&batch.transactions, &pk_bytes));
-                    }
-                }
-                LightResponse::success(serde_json::json!({ "next_index": max_idx }))
+                // O(1) DB lookup instead of scanning every block from genesis
+                let chain_max = self.storage.query_mss_leaf_index(&pk_bytes).unwrap_or(0);
+
+                // Also check mempool for in-flight but unmined transactions
+                let mempool_max = scan_txs_for_mss_index(
+                    &self.mempool.transactions_cloned(), &pk_bytes
+                );
+
+                LightResponse::success(serde_json::json!({ "next_index": chain_max.max(mempool_max) }))
             }
         }
     }
@@ -1514,7 +1524,11 @@ async fn handle_message(
                 }
 
                 let count = count.min(MAX_GETBATCHES_COUNT);
-                let end = (start_height + count).min(self.state.height);
+                let end = start_height.saturating_add(count).min(self.state.height);
+                if end <= start_height {
+                    self.send_response(channel, Message::Batches { start_height, batches: vec![] });
+                    return Ok(());
+                }
                 match self.storage.load_batches(start_height, end) {
                     Ok(tagged) => {
                         let actual_start = tagged.first().map(|(h, _)| *h).unwrap_or(start_height);
@@ -1595,7 +1609,11 @@ async fn handle_message(
                 }
 
                 let count = count.min(MAX_GETHEADERS_COUNT);
-                let end = (start_height + count).min(self.state.height + 1);
+                let end = start_height.saturating_add(count).min(self.state.height + 1);
+                if end <= start_height {
+                    self.ack(channel);
+                    return Ok(());
+                }
                 
                 match self.storage.batches.load_headers(start_height, end) {
                     Ok(headers) => {

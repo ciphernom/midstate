@@ -28,7 +28,8 @@ pub async fn get_mss_state(
     let state = node.get_state().await;
 
     // Scan chain history
-    let chain_max = node.scan_mss_index(&master_pk, state.height)
+let scan_start = state.height.saturating_sub(2000);
+    let chain_max = node.scan_mss_index(&master_pk, scan_start, state.height)
         .map_err(|e| ErrorResponse { error: e.to_string() })?;
 
     // Scan mempool
