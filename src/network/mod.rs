@@ -403,9 +403,18 @@ impl MidstateNetwork {
                     .with_interval(Duration::from_secs(60)),
                 );
 
+// RELAY CHOKE: Protect our outbound bandwidth from free-riders.
+                // We provide just enough bandwidth for light clients to submit
+                // transactions, but cut off heavy data streaming.
+                let mut relay_config = relay::Config::default();
+                relay_config.max_circuits = 16;                 // Max 16 total relayed connections
+                relay_config.max_circuits_per_peer = 2;         // Prevent 1 peer taking all 16 slots
+                relay_config.max_circuit_duration = std::time::Duration::from_secs(2 * 60); // 2 min max
+                relay_config.max_circuit_bytes = 1_048_576;     // 1 MB data limit per circuit
+
                 let relay_server = relay::Behaviour::new(
                     local_peer,
-                    relay::Config::default(),
+                    relay_config,
                 );
 
                 let dcutr = dcutr::Behaviour::new(local_peer);
@@ -541,6 +550,14 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
     }
     pub async fn observe_adversarial_light_peer(&self, peer: PeerId) {
         self.light_guard.observe_adversarial(peer).await;
+    }
+    pub async fn peer_honesty_probability(&self, peer: &PeerId) -> f32 {
+        let guard = self.light_guard.inner.lock().await;
+        if let Some(state) = guard.peers.get(peer) {
+            state.alpha as f32 / (state.alpha + state.beta) as f32
+        } else {
+            0.5 // Unknown peers start at 50% probability of honesty
+        }
     }
     /// Returns true if this peer is a light-only client (WebRTC browser).
     pub fn is_light_peer(&self, peer: &PeerId) -> bool {

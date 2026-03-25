@@ -472,7 +472,8 @@ pub fn scan_mss_index(&self, master_pk: &[u8; 32], start: u64, end: u64) -> Resu
                 let coin_id = input.coin_id();
                 let peer_id_bytes = self.local_peer_id.to_bytes();
                 let join_nonce = tokio::task::spawn_blocking(move || {
-                    crate::mix::mine_mix_join_pow(&mix_id, &coin_id, &peer_id_bytes)
+                    crate::mix::mine_mix_join_pow(&mix_id, &coin_id, &peer_id_bytes, crate::mix::MIX_JOIN_POW_BITS)
+
                 }).await.map_err(|e| anyhow::anyhow!("PoW task failed: {}", e))?;
 
                 self.tx_sender.send(NodeCommand::SendMixJoin { 
@@ -506,7 +507,7 @@ pub fn scan_mss_index(&self, master_pk: &[u8; 32], start: u64, end: u64) -> Resu
                 let coin_id = input.coin_id();
                 let peer_id_bytes = self.local_peer_id.to_bytes();
                 let join_nonce = tokio::task::spawn_blocking(move || {
-                    crate::mix::mine_mix_join_pow(&mix_id, &coin_id, &peer_id_bytes)
+                    crate::mix::mine_mix_join_pow(&mix_id, &coin_id, &peer_id_bytes, crate::mix::MIX_JOIN_POW_BITS)
                 }).await.map_err(|e| anyhow::anyhow!("PoW task failed: {}", e))?;
 
                 self.tx_sender.send(NodeCommand::SendMixFee { coordinator: peer, mix_id, input, join_nonce })?;
@@ -1408,14 +1409,23 @@ async fn handle_message(
         msg: Message,
         channel: Option<ResponseChannel<Message>>,
     ) -> Result<()> {
-        // ── Tarpit: feed garbage to known-malicious peers ───────────
+// ── Tarpit: feed garbage to known-malicious peers ───────────
         if self.tarpitted_peers.contains(&from) {
-                // Randomly disconnect 1% of tarpitted peers every message 
-                // to cycle file descriptors while still being annoying.
-                if rand::random::<u8>() < 2 {
-                    self.network.disconnect_peer(from);
-                    return Ok(());
-                }
+            // Randomly disconnect 1% of tarpitted peers every message 
+            // to cycle file descriptors while still being annoying.
+            if rand::random::<u8>() < 2 {
+                self.network.disconnect_peer(from);
+                return Ok(());
+            }
+
+            // STOCHASTIC TARPITTING: Exponential distribution delay
+            // We mathematically paralyze the attacker's async event loop
+            // Delay = -ln(1 - U) * mean_delay
+            let u: f32 = rand::random::<f32>().max(0.0001); // Prevent ln(0)
+            let mean_delay = 10.0; // 10 seconds average
+            let delay_secs = (-u.ln() * mean_delay).min(60.0); // Cap at 60s
+            tokio::time::sleep(std::time::Duration::from_secs_f32(delay_secs)).await;
+
             match &msg {
                 Message::GetState => {
                     // Claim to be at height 0 with impossibly high depth —
@@ -1700,9 +1710,12 @@ Message::Headers { start_height: _, headers } => {
                     return Ok(());
                 }
 
-                // Anti-Sybil: verify join PoW bound to sender's PeerId
-                if !crate::mix::verify_mix_join_pow(&mix_id, &coin_id, &from.to_bytes(), join_nonce) {
-                    tracing::debug!("MixJoin rejected from peer {}: insufficient join PoW", from);
+// BAYESIAN SYBIL DEFENSE: Trust score dictates PoW requirement
+                let prob = self.network.peer_honesty_probability(&from).await;
+                let required_pow = if prob > 0.80 { 16 } else if prob > 0.20 { crate::mix::MIX_JOIN_POW_BITS } else { 28 };
+
+                if !crate::mix::verify_mix_join_pow(&mix_id, &coin_id, &from.to_bytes(), join_nonce, required_pow) {
+                    tracing::debug!("MixJoin rejected from peer {}: insufficient join PoW (needed {})", from, required_pow);
                     return Ok(());
                 }
 
@@ -1741,9 +1754,12 @@ Message::Headers { start_height: _, headers } => {
                     return Ok(());
                 }
 
-                // Anti-Sybil: verify join PoW bound to sender's PeerId
-                if !crate::mix::verify_mix_join_pow(&mix_id, &coin_id, &from.to_bytes(), join_nonce) {
-                    tracing::debug!("MixFee rejected from peer {}: insufficient join PoW", from);
+// BAYESIAN SYBIL DEFENSE: Trust score dictates PoW requirement
+                let prob = self.network.peer_honesty_probability(&from).await;
+                let required_pow = if prob > 0.80 { 16 } else if prob > 0.20 { crate::mix::MIX_JOIN_POW_BITS } else { 28 };
+
+                if !crate::mix::verify_mix_join_pow(&mix_id, &coin_id, &from.to_bytes(), join_nonce, required_pow) {
+                    tracing::debug!("MixFee rejected from peer {}: insufficient join PoW (needed {})", from, required_pow);
                     return Ok(());
                 }
 
@@ -2307,15 +2323,30 @@ if calc.post_tx_midstate != header.post_tx_midstate {
 
         tracing::info!("Applied sync batches up to height {}/{}", current_cursor, peer_height);
 
+// FAT FORK DEFENSE: If we are doing a fast-forward sync, we don't need to 
+        // hold the entire chain in RAM waiting for a reorg conflict to resolve. 
+        // We can commit the chunk immediately to clear RAM.
+        let mut session_phase = session.phase;
+        if let SyncPhase::Batches { is_fast_forward: true, new_history, candidate_state, .. } = &mut session_phase {
+            if new_history.len() >= 500 {
+                tracing::info!("Flushing 500 synced batches to disk to free RAM...");
+                let history_to_flush = std::mem::take(new_history);
+                self.perform_reorg(candidate_state.clone(), history_to_flush, true)?;
+            }
+        }
+
         if current_cursor < peer_height {
             // Need more batches — request next chunk
             let count = (peer_height - current_cursor).min(MAX_GETBATCHES_COUNT);
             self.network.send(from, Message::GetBatches { start_height: current_cursor, count });
-            // Reset idle timeout
             session.last_progress_at = std::time::Instant::now();
-            self.sync_session = Some(session); // put session back
+            session.phase = session_phase;
+            self.sync_session = Some(session); 
             return Ok(());
         }
+        
+        // Restore phase for the final block
+        session.phase = session_phase;
 
         // All batches applied — check if we should adopt this chain
         let (final_state, final_history, is_ff) = match session.phase {
@@ -2371,11 +2402,27 @@ if calc.post_tx_midstate != header.post_tx_midstate {
             }
         }
 
-        let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
             self.storage.query_spent_addresses_for_tx(&tx).unwrap_or_default()
         } else {
             std::collections::HashMap::new()
         };
+
+        // EVENT LOOP DEFENSE: Validate cryptography on a background thread.
+        // We clone the state (O(1) cost due to immutable data structures) and the tx,
+        // so the heavy STARK/WOTS math doesn't stall the Tokio networking reactor.
+        let state_clone = self.state.clone();
+        let tx_clone = tx.clone();
+        let is_valid = tokio::task::spawn_blocking(move || {
+            crate::core::transaction::validate_transaction(&state_clone, &tx_clone)
+        }).await.unwrap();
+
+        if let Err(e) = is_valid {
+            self.metrics.inc_invalid_transactions();
+            return Err(e); // Abort before locking mempool
+        }
+
+        // The transaction is cryptographically valid. Now add it to the mempool.
         match self.mempool.add(tx.clone(), &self.state, &wots_oracle) {
             Ok(_) => {
                 self.metrics.inc_transactions_processed();
@@ -2471,9 +2518,13 @@ if calc.post_tx_midstate != header.post_tx_midstate {
             self.cancel_mining();
             self.trigger_mining();
         } else {
+// ADAPTIVE DANDELION++: Dynamic fluff probability based on network size.
+            let outbound_count = self.network.outbound_peer_count().max(1) as u32;
+            let dynamic_fluff_percent = (100 / outbound_count).clamp(2, 50);
+
             // Flip the coin: fluff or continue stemming?
             let roll = rand::random::<u32>() % 100;
-            if roll < STEM_FLUFF_PERCENT {
+            if roll < dynamic_fluff_percent {
                 // Fluff: add to public mempool and broadcast
                 tracing::debug!("Dandelion++ fluff: broadcasting tx after stem");
                 let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
