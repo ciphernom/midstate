@@ -1388,6 +1388,12 @@ async fn handle_message(
     ) -> Result<()> {
         // ── Tarpit: feed garbage to known-malicious peers ───────────
         if self.tarpitted_peers.contains(&from) {
+                // Randomly disconnect 1% of tarpitted peers every message 
+                // to cycle file descriptors while still being annoying.
+                if rand::random::<u8>() < 2 {
+                    self.network.disconnect_peer(from);
+                    return Ok(());
+                }
             match &msg {
                 Message::GetState => {
                     // Claim to be at height 0 with impossibly high depth —
@@ -1492,7 +1498,11 @@ async fn handle_message(
                 
                 // 1. Cap intake: Do not let one peer flood the table in a single message
                 for addr_str in addrs.into_iter().take(20) {
-                    if !self.known_pex_addrs.contains(&addr_str) {
+                    let is_valid = addr_str.parse::<Multiaddr>()
+                        .map(|ma| crate::network::is_routable(&ma)) 
+                        .unwrap_or(false);
+
+                    if is_valid && !self.known_pex_addrs.contains(&addr_str) {
                         
                         // 2. Churn: If the table is full, evict a random address
                         // to prevent deterministic eclipse attacks.

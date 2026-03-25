@@ -258,6 +258,23 @@ pub enum NetworkEvent {
 
 // ── Network API ─────────────────────────────────────────────────────────────
 
+    pub fn is_routable(addr: &Multiaddr) -> bool {
+        for proto in addr.iter() {
+            match proto {
+                libp2p::multiaddr::Protocol::Ip4(ip) => {
+                    // Reject Loopback, Private (RFC 1918), and Link-local
+                    if ip.is_loopback() || ip.is_private() || ip.is_link_local() { return false; }
+                }
+                libp2p::multiaddr::Protocol::Ip6(ip) => {
+                    // Reject Loopback and Link-local
+                    if ip.is_loopback() || (ip.segments()[0] & 0xff00 == 0xfe00) { return false; }
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
 pub struct MidstateNetwork {
     swarm: Swarm<MidstateBehaviour>,
     /// Incoming raw streams from browser light clients.
@@ -588,11 +605,19 @@ impl MidstateNetwork {
         all
     }
 
+
+
     /// Try to dial a multiaddr string. Ignores bad parses or dial failures.
     pub fn dial_addr(&mut self, addr_str: &str) {
         match addr_str.parse::<Multiaddr>() {
             Ok(addr) => {
-                if let Some(peer) = extract_peer_id(&addr) {
+            // NEW: Add the is_routable check here
+            if !is_routable(&addr) {
+                tracing::debug!("PEX ignoring non-routable address: {}", addr_str);
+                return;
+            }
+
+            if let Some(peer) = extract_peer_id(&addr) {
                     if self.connected.contains_key(&peer) || peer == *self.swarm.local_peer_id() {
                         return; 
                     }
