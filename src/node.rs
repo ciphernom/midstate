@@ -67,7 +67,7 @@ const HEADER_REQ_WINDOW_SECS: u64 = 60;
 
 /// GetBatches requests are expensive (up to 8 MB each). Limit them separately.
 /// 500 per 60 seconds allows fast sync while still bounding worst-case CPU/disk load.
-const MAX_BATCH_REQS_PER_PEER: u32 = 5000;
+const MAX_BATCH_REQS_PER_PEER: u32 = 200;
 const BATCH_REQ_WINDOW_SECS: u64 = 60;
 
 /// Non-blocking sync session driven by the main event loop.
@@ -147,7 +147,8 @@ pub struct Node {
     /// Last header cursor reached during sync. Used to resume after timeout
     /// instead of restarting from height - 360 every time.
     last_sync_cursor: Option<u64>,
-    known_pex_addrs: HashSet<String>,
+    known_pex_addrs: HashMap<String, (u32, u32)>, // Bayesian Routing (Alpha, Beta)
+
     connected_peers: HashSet<PeerId>,
     // Background mining concurrency
     mining_cancel: Option<Arc<AtomicBool>>,
@@ -730,7 +731,7 @@ pub async fn new(
             cached_safe_depth: crate::core::finality::FinalityEstimator::new(2, 8).calculate_safe_depth(1e-6),
             last_sync_cursor: None,
             sync_session: None,
-            known_pex_addrs: HashSet::new(),
+            known_pex_addrs: HashMap::new(),
             connected_peers: HashSet::new(),
             mining_cancel: None,
             mined_batch_rx,
@@ -755,9 +756,9 @@ pub async fn new(
     /// This mirrors the RPC handler logic but communicates via libp2p
     /// instead of HTTP, allowing browsers to reach any node directly
     /// without HTTPS, domains, or certificates.
-    async fn handle_light_request(
+async fn handle_light_request(
         &self,
-        _from: PeerId,
+        from: PeerId,
         request: crate::network::light_protocol::LightRequest,
     ) -> crate::network::light_protocol::LightResponse {
         use crate::network::light_protocol::{LightRequest, LightResponse};
@@ -998,8 +999,9 @@ if coinbase_total != expected_total {
                     spam_nonce,
                 };
 
-                match crate::core::transaction::validate_transaction(&self.state, &tx) {
+            match crate::core::transaction::validate_transaction(&self.state, &tx) {
                     Ok(_) => {
+                        self.network.observe_honest_light_peer(from).await; // SMART GUARD REWARD
                         if let Some(cmd_tx) = &self.cmd_tx {
                             let _ = cmd_tx.send(NodeCommand::SendTransaction(tx));
                             LightResponse::success(serde_json::json!({ "accepted": true }))
@@ -1007,7 +1009,10 @@ if coinbase_total != expected_total {
                             LightResponse::error("Node command channel unavailable")
                         }
                     }
-                    Err(e) => LightResponse::error(format!("{}", e)),
+                    Err(e) => {
+                        self.network.observe_adversarial_light_peer(from).await; // SMART GUARD PENALTY
+                        LightResponse::error(format!("{}", e))
+                    }
                 }
             }
 
@@ -1018,6 +1023,7 @@ if coinbase_total != expected_total {
                     Ok(tx) => {
                         match crate::core::transaction::validate_transaction(&self.state, &tx) {
                             Ok(_) => {
+                                self.network.observe_honest_light_peer(from).await; // SMART GUARD REWARD
                                 if let Some(cmd_tx) = &self.cmd_tx {
                                     let _ = cmd_tx.send(NodeCommand::SendTransaction(tx));
                                     LightResponse::success(serde_json::json!({ "accepted": true }))
@@ -1025,7 +1031,10 @@ if coinbase_total != expected_total {
                                     LightResponse::error("Node command channel unavailable")
                                 }
                             }
-                            Err(e) => LightResponse::error(format!("{}", e)),
+                            Err(e) => {
+                                self.network.observe_adversarial_light_peer(from).await; // SMART GUARD PENALTY
+                                LightResponse::error(format!("{}", e))
+                            }
                         }
                     }
                     Err(e) => LightResponse::error(format!("Invalid reveal: {}", e)),
@@ -1243,11 +1252,19 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                         // Pick random addresses from our known pool
                         use rand::seq::IteratorRandom;
                         let mut rng = rand::thread_rng();
-                        let to_dial: Vec<String> = self.known_pex_addrs
-                            .iter()
+// Bayesian Weighted Routing: Prefer peers with high honest probability
+                        let mut candidates: Vec<_> = self.known_pex_addrs.iter().collect();
+                        candidates.sort_by(|a, b| {
+                            let p_a = a.1.0 as f32 / (a.1.0 + a.1.1) as f32;
+                            let p_b = b.1.0 as f32 / (b.1.0 + b.1.1) as f32;
+                            p_b.partial_cmp(&p_a).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        
+                        let to_dial: Vec<String> = candidates.into_iter()
+                            .take(needed.max(10)) // Only pull from the highest-probability tier
                             .choose_multiple(&mut rng, needed)
                             .into_iter()
-                            .cloned()
+                            .map(|(k, _)| k.clone())
                             .collect();
 
                         for addr in to_dial {
@@ -1358,10 +1375,15 @@ if let Some(subnet) = self.network.peer_subnet(&peer) {
                             // Fail any mixes relying on this peer
                             self.mix_manager.write().await.handle_peer_disconnect(peer);
                         }
-                        // Eclipse Defense Purge 
+// Bayesian Eclipse Defense 
                         NetworkEvent::OutgoingConnectionFailed(addr_str) => {
-                            if self.known_pex_addrs.remove(&addr_str) {
-                                tracing::info!("Eclipse Defense: Purged unreachable PEX address: {}", addr_str);
+                            if let Some(stats) = self.known_pex_addrs.get_mut(&addr_str) {
+                                stats.1 = stats.1.saturating_add(5); // Heavy penalty for failing to connect
+                                let prob = stats.0 as f32 / (stats.0 + stats.1) as f32;
+                                if prob < 0.1 {
+                                    self.known_pex_addrs.remove(&addr_str);
+                                    tracing::info!("Eclipse Defense: Purged statistically unreachable PEX address: {}", addr_str);
+                                }
                             }
                         }
                     }
@@ -1502,18 +1524,21 @@ async fn handle_message(
                         .map(|ma| crate::network::is_routable(&ma)) 
                         .unwrap_or(false);
 
-                    if is_valid && !self.known_pex_addrs.contains(&addr_str) {
-                        
-                        // 2. Churn: If the table is full, evict a random address
-                        // to prevent deterministic eclipse attacks.
+if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
+                        // Evict the lowest probability peer if full
                         if self.known_pex_addrs.len() >= 1_000 {
-                            use rand::Rng;
-                            let skip = rand::thread_rng().gen_range(0..self.known_pex_addrs.len());
-                            let victim = self.known_pex_addrs.iter().nth(skip).cloned().unwrap();
-                            self.known_pex_addrs.remove(&victim);
+                            if let Some(worst) = self.known_pex_addrs.iter()
+                                .min_by(|a, b| {
+                                    let p_a = a.1.0 as f32 / (a.1.0 + a.1.1) as f32;
+                                    let p_b = b.1.0 as f32 / (b.1.0 + b.1.1) as f32;
+                                    p_a.partial_cmp(&p_b).unwrap_or(std::cmp::Ordering::Equal)
+                                })
+                                .map(|(k, _)| k.clone()) {
+                                self.known_pex_addrs.remove(&worst);
+                            }
                         }
-                        
-                        self.known_pex_addrs.insert(addr_str);
+                        // Bayesian Prior: 1 honest connect, 1 failed (50% probability baseline)
+                        self.known_pex_addrs.insert(addr_str, (1, 1));
                         new_count += 1;
                     }
                 }

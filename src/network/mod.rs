@@ -58,18 +58,18 @@ const LIGHT_RESPONSE_TIMEOUT_SECS: u64 = 30;
 // ── Light Client Rate Limiter ────────────────────────────────────────────────
 
 struct LightPeerState {
-    /// General request counter for this window.
     request_count: u32,
-    /// Expensive request counter (BlockTemplate).
     expensive_count: u32,
-    /// Window start time.
     window_start: Instant,
-    /// Currently active streams (incremented on open, decremented on close).
     active_streams: u32,
-    /// Number of rate-limit violations.
     violations: u32,
-    /// If banned, when the ban expires.
     banned_until: Option<Instant>,
+    
+    // --- BAYESIAN REPUTATION (Beta Distribution) ---
+    /// Prior: successful cryptographic proofs (Honest)
+    alpha: u32, 
+    /// Prior: failed proofs, spam, or timeouts (Adversarial)
+    beta: u32,  
 }
 
 impl LightPeerState {
@@ -81,7 +81,31 @@ impl LightPeerState {
             active_streams: 0,
             violations: 0,
             banned_until: None,
+            // Uniform prior: We start neutral, assuming 1 good and 1 bad interaction
+            alpha: 1, 
+            beta: 1,
         }
+    }
+
+    /// Calculate dynamic rate limit based on the Expected Value of the Beta distribution
+    fn current_rate_limit(&self) -> u32 {
+        // E[X] = alpha / (alpha + beta). 
+        // Approaches 1.0 for honest peers, approaches 0.0 for malicious peers.
+        let probability_honest = self.alpha as f32 / (self.alpha + self.beta) as f32;
+
+        // If the probability they are honest drops below 10%, throttle them to the floor
+        if probability_honest < 0.1 {
+            return 5; // 5 requests per minute maximum
+        }
+
+        // Base rate for unknown peers is ~60. Highly trusted peers scale up to ~240.
+        (20.0 + (220.0 * probability_honest)) as u32
+    }
+
+    fn current_expensive_limit(&self) -> u32 {
+        let probability_honest = self.alpha as f32 / (self.alpha + self.beta) as f32;
+        if probability_honest < 0.2 { return 1; }
+        (2.0 + (20.0 * probability_honest)) as u32
     }
 
     /// Reset counters if the window has elapsed.
@@ -138,7 +162,7 @@ impl LightGuard {
             return Err("too many concurrent streams");
         }
 
-        if state.request_count >= LIGHT_RATE_LIMIT {
+        if state.request_count >= state.current_rate_limit() {
             state.violations += 1;
             if state.violations >= LIGHT_BAN_THRESHOLD {
                 state.banned_until = Some(Instant::now() + Duration::from_secs(LIGHT_BAN_DURATION_SECS));
@@ -158,7 +182,7 @@ impl LightGuard {
         let mut guard = self.inner.lock().await;
         if let Some(state) = guard.peers.get_mut(&peer) {
             state.maybe_reset_window();
-            if state.expensive_count >= LIGHT_EXPENSIVE_LIMIT {
+            if state.expensive_count >= state.current_expensive_limit() {
                 state.violations += 1;
                 if state.violations >= LIGHT_BAN_THRESHOLD {
                     state.banned_until = Some(Instant::now() + Duration::from_secs(LIGHT_BAN_DURATION_SECS));
@@ -195,7 +219,29 @@ impl LightGuard {
         let guard = self.inner.lock().await;
         guard.peers.len()
     }
+/// BAYESIAN INFERENCE: Observe an honest interaction
+    async fn observe_honest(&self, peer: PeerId) {
+        let mut guard = self.inner.lock().await;
+        if let Some(state) = guard.peers.get_mut(&peer) {
+            // Cap at 10,000 exactly like your FinalityEstimator to prevent overflow
+            state.alpha = state.alpha.saturating_add(1).min(10_000);
+        }
+    }
 
+    /// BAYESIAN INFERENCE: Observe an adversarial interaction
+    async fn observe_adversarial(&self, peer: PeerId) {
+        let mut guard = self.inner.lock().await;
+        if let Some(state) = guard.peers.get_mut(&peer) {
+            // Penalize faster than we reward (1 bad act = 10 good acts)
+            state.beta = state.beta.saturating_add(10).min(10_000);
+            
+            // Auto-ban if the probability of honesty collapses completely
+            if state.beta > state.alpha * 10 {
+                state.banned_until = Some(Instant::now() + Duration::from_secs(LIGHT_BAN_DURATION_SECS));
+            }
+        }
+    }
+    
     /// Garbage-collect stale peer entries that have no active streams and
     /// whose rate-limit window hasn't been touched in over an hour.
     /// Prevents unbounded memory growth from peers that connect once and vanish.
@@ -490,7 +536,12 @@ impl MidstateNetwork {
             self.send(peer, msg.clone());
         }
     }
-
+pub async fn observe_honest_light_peer(&self, peer: PeerId) {
+        self.light_guard.observe_honest(peer).await;
+    }
+    pub async fn observe_adversarial_light_peer(&self, peer: PeerId) {
+        self.light_guard.observe_adversarial(peer).await;
+    }
     /// Returns true if this peer is a light-only client (WebRTC browser).
     pub fn is_light_peer(&self, peer: &PeerId) -> bool {
         self.light_peers.contains(peer)
@@ -701,7 +752,10 @@ impl MidstateNetwork {
                         };
 
                         // ── Gate 3: Expensive request throttle ──
-                        let is_expensive = matches!(request, LightRequest::BlockTemplate { .. });
+                        let is_expensive = matches!(
+                            request, 
+                            LightRequest::BlockTemplate { .. } | LightRequest::GetFilters { .. }
+                        );
                         if is_expensive && !guard.check_expensive(peer).await {
                             tracing::warn!("Light {}: BlockTemplate rate limit hit", peer);
                             let _ = write_response_raw(
