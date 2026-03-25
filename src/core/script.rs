@@ -276,6 +276,9 @@ pub fn execute_script(
                 if executing {
                     let cond = stack_pop(&mut stack)?;
                     exec_stack.push(is_true(&cond));
+                    if exec_stack.len() > MAX_STACK_DEPTH {
+                        return Err(ScriptError::UnbalancedConditional);
+                    }
                 } else {
                     exec_stack.push(false);
                 }

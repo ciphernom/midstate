@@ -45,10 +45,43 @@ impl Predicate {
 }
 
 /// The proof provided to satisfy a Predicate.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Hash)]
 pub enum Witness {
     /// Raw byte arrays pushed onto the stack before script execution.
     ScriptInputs(Vec<Vec<u8>>),
+}
+
+/// Maximum size of a single witness stack item at deserialization time.
+/// Matches MAX_ITEM_SIZE from the script VM (131,072 bytes / 128 KB).
+/// Rejects oversized items before they reach the script engine, preventing
+/// multi-megabyte heap allocations from malicious P2P messages.
+const MAX_WITNESS_ITEM_SIZE: usize = 131_072;
+
+impl<'de> Deserialize<'de> for Witness {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        enum WitnessHelper {
+            ScriptInputs(Vec<Vec<u8>>),
+        }
+
+        let helper = WitnessHelper::deserialize(deserializer)?;
+        match helper {
+            WitnessHelper::ScriptInputs(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    if item.len() > MAX_WITNESS_ITEM_SIZE {
+                        return Err(serde::de::Error::custom(format!(
+                            "Witness stack item {} is {} bytes (max {})",
+                            i, item.len(), MAX_WITNESS_ITEM_SIZE
+                        )));
+                    }
+                }
+                Ok(Witness::ScriptInputs(items))
+            }
+        }
+    }
 }
 
 impl Witness {
@@ -696,6 +729,11 @@ pub const CT_BINDING_ACTIVATION_HEIGHT: u64 = 30_000;
 /// Block height at which OutputData::Confidential is accepted in transactions.
 /// Requires STARK_ACTIVATION_HEIGHT to already be active.
 pub const CONFIDENTIAL_ACTIVATION_HEIGHT: u64 = 30_000;
+
+/// Block height at which state_root in batches becomes mandatory.
+/// Before this height, blocks may omit the state root (legacy blocks).
+/// After this height, state_root must be non-zero and match the expected value.
+pub const STATE_ROOT_ACTIVATION_HEIGHT: u64 = 30_000;
 
 // ── Economics ───────────────────────────────────────────────────────────────
 

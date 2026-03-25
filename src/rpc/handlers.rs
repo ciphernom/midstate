@@ -250,7 +250,14 @@ pub async fn scan_addresses(
 ) -> Result<Json<ScanResponse>, ErrorResponse> {
     // Cap scan window to prevent disk I/O exhaustion on constrained hardware
     const MAX_SCAN_RANGE: u64 = 10_000;
+    const MAX_SCAN_ADDRESSES: usize = 1_000;
     let capped_end = req.start_height.saturating_add(MAX_SCAN_RANGE).min(req.end_height);
+
+    if req.addresses.len() > MAX_SCAN_ADDRESSES {
+        return Err(ErrorResponse {
+            error: format!("Too many addresses: {} (max {})", req.addresses.len(), MAX_SCAN_ADDRESSES),
+        });
+    }
 
     let addresses: Vec<[u8; 32]> = req.addresses.iter()
         .map(|h| parse_hex32(h, "address"))
@@ -1049,13 +1056,13 @@ pub async fn get_tx_by_input(
     }
 
     // 2. Check Chain History (Fallback - Disk I/O)
-    // Scan the last 1,000 blocks to ensure we don't miss a transaction 
-    // that was mined between the relayer's polling intervals.
+    // Scan the last 100 blocks to catch txs mined between polling intervals.
+    // Capped to prevent disk I/O exhaustion from repeated requests.
     let store = crate::storage::BatchStore::new(&node.batches_path)
         .map_err(|e| ErrorResponse { error: e.to_string() })?;
     
     let current_height = node.get_state().await.height;
-    let start = current_height.saturating_sub(1000);
+    let start = current_height.saturating_sub(100);
 
     for h in (start..current_height).rev() {
         if let Ok(Some(batch)) = store.load(h) {

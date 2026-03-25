@@ -528,6 +528,8 @@ impl Mempool {
 
         if restored > 0 {
             tracing::info!("Restored {} transactions to mempool after reorg", restored);
+            // Enforce capacity after bulk restore to prevent unbounded growth
+            self.prune_invalid(state);
         }
     }
 

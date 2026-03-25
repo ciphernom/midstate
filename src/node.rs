@@ -1198,6 +1198,8 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                 _ = mempool_prune_interval.tick() => {
                     // CoinJoin: clean up stale mix sessions
                     self.mix_manager.write().await.cleanup();
+                    // Light client: GC stale rate-limiter entries
+                    self.network.gc_stale_light_peers().await;
                 }
                 _ = stem_flush_interval.tick() => {
                     self.flush_stem_pool();
@@ -1495,7 +1497,8 @@ async fn handle_message(
                         // 2. Churn: If the table is full, evict a random address
                         // to prevent deterministic eclipse attacks.
                         if self.known_pex_addrs.len() >= 1_000 {
-                            let skip = rand::random::<usize>() % self.known_pex_addrs.len();
+                            use rand::Rng;
+                            let skip = rand::thread_rng().gen_range(0..self.known_pex_addrs.len());
                             let victim = self.known_pex_addrs.iter().nth(skip).cloned().unwrap();
                             self.known_pex_addrs.remove(&victim);
                         }
@@ -2423,7 +2426,12 @@ if calc.post_tx_midstate != header.post_tx_midstate {
         // priority over Dandelion++ anonymity under active spam.
         if self.stem_pool.len() >= MAX_STEM_POOL_SIZE {
             tracing::warn!("Stem pool full ({} entries), bypassing Dandelion++ for tx", MAX_STEM_POOL_SIZE);
-            let _ = self.mempool.add(tx.clone(), &self.state, &std::collections::HashMap::new());
+            let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                self.storage.query_spent_addresses_for_tx(&tx).unwrap_or_default()
+            } else {
+                std::collections::HashMap::new()
+            };
+            let _ = self.mempool.add(tx.clone(), &self.state, &wots_oracle);
             self.network.broadcast(Message::Transaction(tx));
             self.cancel_mining();
             self.trigger_mining();
@@ -2433,7 +2441,12 @@ if calc.post_tx_midstate != header.post_tx_midstate {
             if roll < STEM_FLUFF_PERCENT {
                 // Fluff: add to public mempool and broadcast
                 tracing::debug!("Dandelion++ fluff: broadcasting tx after stem");
-                let _ = self.mempool.add(tx.clone(), &self.state, &std::collections::HashMap::new());
+                let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                    self.storage.query_spent_addresses_for_tx(&tx).unwrap_or_default()
+                } else {
+                    std::collections::HashMap::new()
+                };
+                let _ = self.mempool.add(tx.clone(), &self.state, &wots_oracle);
                 self.network.broadcast(Message::Transaction(tx));
                 self.cancel_mining();
                 self.trigger_mining();
@@ -2449,7 +2462,12 @@ if calc.post_tx_midstate != header.post_tx_midstate {
                     tracing::debug!("Dandelion++ stem: forwarded to {}", next);
                 } else {
                     // No other peers — fluff immediately
-                    let _ = self.mempool.add(tx.clone(), &self.state, &std::collections::HashMap::new());
+                    let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                        self.storage.query_spent_addresses_for_tx(&tx).unwrap_or_default()
+                    } else {
+                        std::collections::HashMap::new()
+                    };
+                    let _ = self.mempool.add(tx.clone(), &self.state, &wots_oracle);
                     self.network.broadcast(Message::Transaction(tx));
                     self.cancel_mining();
                     self.trigger_mining();
@@ -2475,7 +2493,12 @@ if calc.post_tx_midstate != header.post_tx_midstate {
                     tracing::debug!("Dandelion++ timeout: fluffing valid stem tx");
                     
                     // 2. Try to add to local mempool (might fail if our mempool is full/fee too low)
-                    let _ = self.mempool.add(tx.clone(), &self.state, &std::collections::HashMap::new());
+                    let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                        self.storage.query_spent_addresses_for_tx(&tx).unwrap_or_default()
+                    } else {
+                        std::collections::HashMap::new()
+                    };
+                    let _ = self.mempool.add(tx.clone(), &self.state, &wots_oracle);
                     
                     // 3. Broadcast to the network regardless of local mempool admission, 
                     // so the rest of the network gets a chance to mine it.
