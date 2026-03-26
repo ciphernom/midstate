@@ -426,18 +426,20 @@ impl WebWallet {
     /// # Returns
     ///
     /// `None` if `midstate_hex` is not valid 64-character hex.
-    #[wasm_bindgen]
-    pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<String> {
-        let mut midstate = [0u8; 32];
-        hex::decode_to_slice(midstate_hex, &mut midstate).ok()?;
+#[wasm_bindgen]
+pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<String> {
+    let mut midstate = [0u8; 32];
+    hex::decode_to_slice(midstate_hex, &mut midstate).ok()?;
 
-        let ext = midstate::core::extension::create_extension(midstate, nonce);
+    let ext = midstate::core::extension::create_extension(midstate, nonce);
 
-        Some(serde_json::json!({
-            "nonce": ext.nonce,
-            "final_hash": hex::encode(ext.final_hash)
-        }).to_string())
-    }
+    Some(serde_json::json!({
+        "nonce": ext.nonce,
+        // FIX: Serialize as an array of numbers so it maps properly 
+        // to `[u8; 32]` when deserialized by the Node.
+        "final_hash": ext.final_hash.to_vec() 
+    }).to_string())
+}
 
     /// Create a wallet from a raw 32-byte master seed (hex-encoded).
     ///

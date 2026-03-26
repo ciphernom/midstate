@@ -46,10 +46,11 @@ self.onmessage = async (e) => {
             return;
         }
 
-        // Each worker starts at a random nonce offset to avoid overlap.
-        const randomHigh = Math.floor(Math.random() * 0xFFFFFFFF);
-        const randomLow = Math.floor(Math.random() * 0xFFFFFFFF);
-        let nonce = BigInt(randomHigh) * BigInt(0x100000000) + BigInt(randomLow);
+// Each worker starts at a random nonce offset to avoid overlap.
+        // Capped to JS MAX_SAFE_INTEGER to prevent JSON.parse corruption over the network.
+        const MAX_SAFE = 9007199254740991; 
+        const startRange = Math.floor(Math.random() * (MAX_SAFE - 1000000000));
+        let nonce = BigInt(startRange););
 
         // CHUNK controls how many SIMD iterations per search_nonces() call.
         // Each iteration = 4 SIMD lanes = 4 nonces. This chain uses expensive

@@ -41,6 +41,9 @@ let isSending = false;
 /** @type {boolean} Guard against concurrent block submissions. */
 let isSubmitting = false;
 
+/** @type {boolean} Guard against concurrent template requests to prevent WebRTC stream exhaustion. */
+let isFetchingTemplate = false;
+
 /**
  * @type {Array<Object>} Pending send transactions displayed in the UI.
  * Cleared when the send completes or fails.
@@ -53,6 +56,8 @@ let pendingSends = [];
  * addresses beyond the currently synced range.
  */
 const GAP_LIMIT = 100;
+
+
 
 /**
  * @typedef {Object} WalletState
@@ -476,9 +481,13 @@ async function loadState(pwd, bundleStr) {
     }
 }
 
+
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Mining
 // ═══════════════════════════════════════════════════════════════════════════════
+
+
 
 /**
  * Request and return a mining template from the network.
@@ -492,39 +501,47 @@ async function loadState(pwd, bundleStr) {
  */
 async function handleGetTemplate() {
     if (!wallet) throw new Error("Wallet not initialized.");
+    
+    // FIX: Prevent concurrent executions which would spam the node and trigger a peer ban
+    if (isFetchingTemplate) return null;
+    isFetchingTemplate = true;
 
-    const stateObj = await rpc.getState();
-
-    let mempoolTxs = 0, mempoolFees = 0;
     try {
-        const mempool = await rpc.getMempool();
-        mempoolTxs = mempool.size || 0;
-        mempoolFees = (mempool.transactions || []).reduce((s, tx) => s + (tx.fee || 0), 0);
-    } catch (e) {}
+        const stateObj = await rpc.getState();
 
-    if (stateObj.height > wState.lastScannedHeight) {
-        self.postMessage({ type: 'LOG', payload: "Chain advanced! Auto-syncing..." });
-        await performScan();
+        let mempoolTxs = 0, mempoolFees = 0;
+        try {
+            const mempool = await rpc.getMempool();
+            mempoolTxs = mempool.size || 0;
+            mempoolFees = (mempool.transactions || []).reduce((s, tx) => s + (tx.fee || 0), 0);
+        } catch (e) {}
+
+        if (stateObj.height > wState.lastScannedHeight) {
+            self.postMessage({ type: 'LOG', payload: "Chain advanced! Auto-syncing..." });
+            await performScan();
+        }
+
+        const template = await buildMiningTemplate(stateObj);
+        if (!template) return null;
+
+        const txCount = template.batch_template.transactions?.length || 0;
+        self.postMessage({ type: 'LOG', payload: `Template at height ${stateObj.height} | ${txCount} txs | fees: ${template.total_fees}` });
+
+        return {
+            mining_midstate: template.mining_midstate,
+            target:          template.target,
+            batch_template:  template.batch_template,
+            mining_addrs:    template.mining_addrs,
+            next_wots_index: template.next_wots_index,
+            total_fees:      template.total_fees,
+            chainHeight:     stateObj.height,
+            blockReward:     stateObj.block_reward || 0,
+            mempoolTxs,
+            mempoolFees
+        };
+    } finally {
+        isFetchingTemplate = false;
     }
-
-    const template = await buildMiningTemplate(stateObj);
-    if (!template) return null;
-
-    const txCount = template.batch_template.transactions?.length || 0;
-    self.postMessage({ type: 'LOG', payload: `Template at height ${stateObj.height} | ${txCount} txs | fees: ${template.total_fees}` });
-
-    return {
-        mining_midstate: template.mining_midstate,
-        target:          template.target,
-        batch_template:  template.batch_template,
-        mining_addrs:    template.mining_addrs,
-        next_wots_index: template.next_wots_index,
-        total_fees:      template.total_fees,
-        chainHeight:     stateObj.height,
-        blockReward:     stateObj.block_reward || 0,
-        mempoolTxs,
-        mempoolFees
-    };
 }
 
 /**
@@ -565,11 +582,12 @@ async function handleSubmitMinedBlock(template, nonce) {
             await saveState();
         }
 
+        const finalHashHex = Array.from(batch.extension.final_hash).map(b => b.toString(16).padStart(2, '0')).join('');
         return {
             accepted, rejectReason,
             reward:    (template.blockReward || 0) + (template.total_fees || 0),
             height:    template.chainHeight,
-            finalHash: batch.extension.final_hash,
+            finalHash: finalHashHex,
             timestamp: batch.timestamp,
             txCount:   batch.transactions?.length || 0,
             fees:      template.total_fees || 0

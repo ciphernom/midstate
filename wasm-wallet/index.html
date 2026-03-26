@@ -1513,6 +1513,11 @@ async function connectWebRTC(bootstrapAddr) {
         }
 
         const worker = new Worker('./worker.js', { type: 'module' });
+        worker.onerror = (err) => {
+            console.error("Worker failed to load:", err);
+            alert(`Fatal Error: The Web Worker failed to load.\n\n${err.message}\n\nPlease ensure your cache is cleared and 'pkg/' is deployed.`);
+            document.getElementById('activity-msg').innerText = "App crashed. See console.";
+        };
         const authView = document.getElementById('authView');
         const bottomNav = document.getElementById('bottom-nav');
         const createSec = document.getElementById('createSection');
