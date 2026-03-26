@@ -136,16 +136,20 @@ impl Mempool {
         }
     }
 
-    /// Calculates the required Proof-of-Work (number of leading zero bits)
-    /// based on the provided number of pending commits. Scales dynamically
-    /// to deter spam when the commit pool is congested.
+/// Calculates the required Proof-of-Work (number of leading zero bits)
+    /// based on the provided number of pending commits.
     ///
-    /// | Pending commits | Required zeros (normal) | Required zeros (fast-mining) |
-    /// |-----------------|-------------------------|------------------------------|
-    /// | < 500           | 24                      | 16                           |
-    /// | 500 – 749       | 26                      | 18                           |
-    /// | 750 – 899       | 28                      | 20                           |
-    /// | >= 900          | 30                      | 22                           |
+    /// Uses a continuous logistic function (Sigmoid curve) to scale difficulty 
+    /// smoothly as the mempool congests, preventing exploitable difficulty "cliffs".
+    /// 
+    /// Formula: `Base_PoW + round(6.0 / (1.0 + e^(-0.015 * (commits - 750))))`
+    ///
+    /// | Pending commits | Added PoW | Total zeros (normal) | Total zeros (fast) |
+    /// |-----------------|-----------|----------------------|--------------------|
+    /// | 0 - 500         | +0 bits   | 24                   | 16                 |
+    /// | 750 (midpoint)  | +3 bits   | 27                   | 19                 |
+    /// | 900             | +5 bits   | 29                   | 21                 |
+    /// | >= 1000 (max)   | +6 bits   | 30                   | 22                 |
     ///
     /// # Examples
     /// ```
@@ -154,21 +158,22 @@ impl Mempool {
     /// let pow = Mempool::calculate_required_pow(100);
     /// assert!(pow >= 16);
     /// ```
-    pub fn calculate_required_pow(commits: usize) -> u32 {
+pub fn calculate_required_pow(commits: usize) -> u32 {
+        // Continuous Sigmoid Probability Curve
+        // Maps mempool congestion to a smooth difficulty increase
+        let x = commits as f64;
+        let x0 = 750.0;   // Midpoint of congestion
+        let k = 0.015;    // Steepness of the curve
+        let max_add = 6.0; // Maximum bits to add under heavy spam
+
+        let exp_term = (-k * (x - x0)).exp();
+        let added_pow = (max_add / (1.0 + exp_term)).round() as u32;
+
         #[cfg(not(feature = "fast-mining"))]
-        {
-            if commits < 500      { 24 }
-            else if commits < 750 { 26 }
-            else if commits < 900 { 28 }
-            else                  { 30 }
-        }
+        return 24 + added_pow;
+
         #[cfg(feature = "fast-mining")]
-        {
-            if commits < 500      { 16 }
-            else if commits < 750 { 18 }
-            else if commits < 900 { 20 }
-            else                  { 22 }
-        }
+        return 16 + added_pow;
     }
 
     /// Convenience method to get the required Proof-of-Work based on the
