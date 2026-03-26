@@ -25,22 +25,22 @@ pub const MIX_JOIN_POW_BITS: u32 = 24;
 
 /// Verify the PoW accompanying a MixJoin or MixFee message.
 /// The challenge is: hash(mix_id || coin_id || peer_id || nonce_le)
-/// must have at least MIX_JOIN_POW_BITS leading zero bits.
+/// must have at least required_pow leading zero bits.
 /// Binding the peer_id prevents pre-computing nonces across identity rotations.
-pub fn verify_mix_join_pow(mix_id: &[u8; 32], coin_id: &[u8; 32], peer_id: &[u8], nonce: u64) -> bool {
+pub fn verify_mix_join_pow(mix_id: &[u8; 32], coin_id: &[u8; 32], peer_id: &[u8], nonce: u64, required_pow: u32) -> bool {
     let mut data = Vec::with_capacity(72 + peer_id.len());
     data.extend_from_slice(mix_id);
     data.extend_from_slice(coin_id);
     data.extend_from_slice(peer_id);
     data.extend_from_slice(&nonce.to_le_bytes());
     let h = hash(&data);
-    count_leading_zeros(&h) >= MIX_JOIN_POW_BITS
+    count_leading_zeros(&h) >= required_pow
 }
 
 /// Mine a MixJoin PoW nonce for the given mix_id, coin_id, and our peer_id.
-pub fn mine_mix_join_pow(mix_id: &[u8; 32], coin_id: &[u8; 32], peer_id: &[u8]) -> u64 {
+pub fn mine_mix_join_pow(mix_id: &[u8; 32], coin_id: &[u8; 32], peer_id: &[u8], required_pow: u32) -> u64 {
     for nonce in 0u64.. {
-        if verify_mix_join_pow(mix_id, coin_id, peer_id, nonce) {
+        if verify_mix_join_pow(mix_id, coin_id, peer_id, nonce, required_pow) {
             return nonce;
         }
     }
