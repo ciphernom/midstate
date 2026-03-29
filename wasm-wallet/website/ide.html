@@ -382,21 +382,20 @@ select.tb-sel option{background:#071522;color:var(--text);}
 
 <!-- WASM -->
 <script type="module">
+  import init, { blake3_hash_hex } from './wallet/pkg/wasm_wallet.js';
+
   try {
-    const { default: init, blake3_hash_hex } = await import('wallet/pkg/wasm_wallet.js');
     await init();
     window.blake3_hash_hex = blake3_hash_hex;
-  } catch {
-    window.blake3_hash_hex = async hex => {
-      const bytes = new Uint8Array(hex.match(/.{1,2}/g).map(b=>parseInt(b,16)));
-      const buf = await hashwasm.blake3(bytes);
-      return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
-    };
+    
+    document.getElementById('loader').style.opacity = '0';
+    setTimeout(()=>document.getElementById('loader').style.display='none', 400);
+    window.wasmLoaded = true;
+    window.loadTemplate();
+  } catch (e) {
+    console.error("Fatal: Failed to load Midstate WASM runtime", e);
+    document.getElementById('loader').innerHTML = "<h2 style='color:var(--fail)'>FATAL ERROR</h2><p>Failed to load core cryptography engine. Check console for 404 errors on the WASM files.</p>";
   }
-  document.getElementById('loader').style.opacity = '0';
-  setTimeout(()=>document.getElementById('loader').style.display='none', 400);
-  window.wasmLoaded = true;
-  window.loadTemplate();
 </script>
 
 <script>
