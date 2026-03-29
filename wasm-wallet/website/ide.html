@@ -383,7 +383,7 @@ select.tb-sel option{background:#071522;color:var(--text);}
 <!-- WASM -->
 <script type="module">
   try {
-    const { default: init, blake3_hash_hex } = await import('../pkg/wasm_wallet.js');
+    const { default: init, blake3_hash_hex } = await import('wallet/pkg/wasm_wallet.js');
     await init();
     window.blake3_hash_hex = blake3_hash_hex;
   } catch {
