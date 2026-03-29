@@ -1,0 +1,65 @@
+// The stack starts as: [Signature, Path_Choice]
+
+// Copy the Path_Choice to test it
+DUP PUSH_INT 0 EQUAL
+IF 
+    // ==========================================
+    // PATH 0: OWNER SPEND
+    // ==========================================
+    DROP // Drop the Path_Choice
+    
+    PUSH_HEX 86b4018ed52f022db75b468676e26e611893c3f6300b244f56fb975ecce80ecfd0741ddc
+    CHECKSIGVERIFY 
+    
+    PUSH_INT 1 // Push True to finish the script successfully
+
+ELSE DUP PUSH_INT 1 EQUAL
+IF
+    // ==========================================
+    // PATH 1: DEAD MAN'S SWITCH (TIME-LOCKED)
+    // ==========================================
+    DROP // Drop the Path_Choice
+    
+    // 1. Verify we have passed Block 500,000
+    PUSH_INT 500000 
+    CHECKTIMEVERIFY
+    
+    // 2. Verify the Child's Hot Wallet signature
+    PUSH_HEX <Child_Hot_PubKey>
+    CHECKSIGVERIFY
+    
+    // 3. THE COVENANT: Force 1,000,000 coins to Cold Storage
+    PUSH_HEX <Child_Cold_Address>
+    SUM_TO_ADDR
+    PUSH_INT 1000000 
+    EQUALVERIFY
+    
+    PUSH_INT 1 // Push True 
+
+ELSE DUP PUSH_INT 2 EQUAL
+IF
+    // ==========================================
+    // PATH 2: ORACLE EARLY RELEASE
+    // ==========================================
+    DROP // Drop the Path_Choice
+    
+    // 1. Verify the Lawyer's signature
+    PUSH_HEX <Lawyer_Oracle_PubKey>
+    CHECKSIGVERIFY
+    
+    // 2. THE COVENANT: The Lawyer can ONLY send it to the Cold Storage
+    PUSH_HEX <Child_Cold_Address>
+    SUM_TO_ADDR
+    PUSH_INT 1000000
+    EQUALVERIFY
+    
+    PUSH_INT 1 // Push True 
+
+ELSE
+    // ==========================================
+    // INVALID PATH
+    // ==========================================
+    DROP DROP    // Clean up the stack
+    PUSH_INT 0   // Push False (Fails the script)
+
+ENDIF ENDIF ENDIF

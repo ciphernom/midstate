@@ -2,6 +2,7 @@
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
 export const __wbg_webwallet_free: (a: number, b: number) => void;
+export const blake3_hash_hex: (a: number, b: number, c: number) => void;
 export const compute_coin_id_hex: (a: number, b: number, c: number, d: bigint, e: number, f: number) => void;
 export const decrypt_cli_wallet: (a: number, b: number, c: number, d: number, e: number) => void;
 export const generate_phrase: (a: number) => void;

@@ -1,0 +1,1423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MIDSTATE // IDE</title>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.3/ace.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:#080c14; --panel:#0e1a2b; --titlebar:#060f1c;
+  --border:#1e3a5f; --border2:#2a5080;
+  --text:#cde4ff; --dim:#4a7aa0;
+  --accent:#00d4ff; --accent2:#0088cc;
+  --ok:#00ff88; --fail:#ff3355; --warn:#ffaa00;
+  --glow:rgba(0,212,255,0.12);
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'JetBrains Mono',monospace;background:var(--bg);color:var(--text);height:100vh;overflow:hidden;position:relative;}
+body::before{content:'';position:fixed;inset:0;background-image:radial-gradient(circle,#1a3a5c 1px,transparent 1px);background-size:28px 28px;opacity:.3;pointer-events:none;z-index:0;}
+
+/* TOPBAR */
+#topbar{position:fixed;top:0;left:0;right:0;height:44px;background:linear-gradient(90deg,#040c18,#071522,#040c18);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 14px;gap:12px;z-index:10000;box-shadow:0 2px 20px rgba(0,0,0,.7);}
+#topbar h1{font-family:'Orbitron',monospace;font-size:13px;font-weight:900;color:var(--accent);letter-spacing:4px;text-shadow:0 0 18px var(--accent);white-space:nowrap;}
+.tb-sep{width:1px;height:22px;background:var(--border);flex-shrink:0;}
+.tb-btn{background:transparent;border:1px solid var(--border);color:var(--dim);padding:4px 11px;border-radius:3px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer;transition:all .15s;white-space:nowrap;letter-spacing:.5px;}
+.tb-btn:hover:not(:disabled){border-color:var(--accent);color:var(--accent);background:var(--glow);}
+.tb-btn:disabled{opacity:.35;cursor:not-allowed;}
+.tb-btn.ok-btn{border-color:#006630;color:var(--ok);}
+.tb-btn.ok-btn:hover:not(:disabled){background:rgba(0,255,136,.08);}
+select.tb-sel{background:#040c18;border:1px solid var(--border);color:var(--dim);padding:4px 8px;border-radius:3px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer;outline:none;}
+select.tb-sel:focus{border-color:var(--accent);}
+select.tb-sel option{background:#071522;color:var(--text);}
+.tb-stat{font-size:10px;color:var(--dim);white-space:nowrap;letter-spacing:.5px;}
+.tb-stat b{color:var(--text);}
+.tb-stat b.err{color:var(--fail);}
+#tb-addr{font-size:10px;color:var(--accent2);margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px;cursor:pointer;letter-spacing:.3px;}
+#tb-addr:hover{color:var(--accent);}
+
+/* DESKTOP */
+#desktop{position:fixed;inset:44px 0 34px 0;z-index:1;overflow:hidden;}
+
+/* WINDOWS */
+.win{position:absolute;background:var(--panel);border:1px solid var(--border);border-radius:6px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 40px rgba(0,0,0,.75);min-width:180px;min-height:80px;transition:box-shadow .15s;}
+.win.focused{border-color:var(--border2);box-shadow:0 12px 50px rgba(0,0,0,.85),0 0 0 1px rgba(0,212,255,.1),0 0 28px rgba(0,212,255,.04);z-index:200;}
+.win.minimised{display:none;}
+
+.win-tb{background:var(--titlebar);border-bottom:1px solid var(--border);padding:0 10px;height:30px;display:flex;align-items:center;gap:8px;cursor:move;user-select:none;flex-shrink:0;}
+.win-label{font-family:'Orbitron',monospace;font-size:9px;font-weight:700;color:var(--dim);letter-spacing:2px;text-transform:uppercase;flex:1;}
+.win-label .ico{margin-right:5px;font-size:10px;}
+.win-btns{display:flex;gap:5px;}
+.wbtn{width:13px;height:13px;border-radius:50%;border:none;cursor:pointer;transition:opacity .15s,transform .1s;flex-shrink:0;}
+.wbtn:hover{opacity:.8;transform:scale(1.15);}
+.wbtn.cl{background:#ff5f57;}
+.wbtn.mn{background:#febc2e;}
+.wbtn.mx{background:#28c840;}
+
+.win-body{flex:1;overflow:hidden;display:flex;flex-direction:column;position:relative;}
+
+/* RESIZE */
+.rz{position:absolute;z-index:10;background:transparent;}
+.rz-r{top:4px;right:0;width:6px;bottom:4px;cursor:ew-resize;}
+.rz-b{left:4px;bottom:0;height:6px;right:4px;cursor:ns-resize;}
+.rz-l{top:4px;left:0;width:6px;bottom:4px;cursor:ew-resize;}
+.rz-t{left:4px;top:30px;height:6px;right:4px;cursor:ns-resize;}
+.rz-br{right:0;bottom:0;width:12px;height:12px;cursor:nwse-resize;}
+.rz-bl{left:0;bottom:0;width:12px;height:12px;cursor:nesw-resize;}
+.rz-tr{right:0;top:30px;width:12px;height:12px;cursor:nesw-resize;}
+.rz-tl{left:0;top:30px;width:12px;height:12px;cursor:nwse-resize;}
+
+/* PANEL HEADER */
+.ph{padding:6px 12px;background:rgba(0,0,0,.4);border-bottom:1px solid var(--border);font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:1.5px;display:flex;align-items:center;gap:7px;flex-shrink:0;}
+.ph-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;}
+.ph-dot.blue{background:var(--accent);box-shadow:0 0 6px var(--accent);}
+.ph-dot.yellow{background:var(--warn);box-shadow:0 0 6px var(--warn);}
+.ph-dot.green{background:var(--ok);box-shadow:0 0 6px var(--ok);}
+
+/* EDITOR */
+#ace-wrap{flex:1;overflow:hidden;position:relative;}
+#editor{width:100%;height:100%;}
+.stats-row{display:flex;flex-shrink:0;border-top:1px solid var(--border);}
+.stat-cell{flex:1;padding:5px 11px;border-right:1px solid var(--border);font-size:10px;color:var(--dim);}
+.stat-cell:last-child{border-right:none;flex:2;}
+.sv{display:block;font-size:12px;font-weight:700;color:var(--text);margin-top:2px;}
+.sv.err{color:var(--fail);}
+
+/* BYTECODE */
+.bc-box{flex:1;overflow-y:auto;overflow-x:hidden;padding:11px 13px;font-size:11px;color:#4a8fc0;word-break:break-all;line-height:1.65;background:#040b14;}
+.deploy-wrap{overflow-y:auto;padding:11px;flex:1;}
+.deploy-step{margin-bottom:10px;padding:9px;background:rgba(0,0,0,.4);border:1px solid var(--border);border-radius:4px;}
+.deploy-title{color:var(--accent);font-size:9px;text-transform:uppercase;letter-spacing:2px;margin-bottom:6px;font-weight:700;}
+.deploy-code{background:#020810;padding:8px;border-radius:3px;border:1px solid var(--border);color:var(--ok);font-size:10px;word-break:break-all;white-space:pre-wrap;line-height:1.5;}
+
+/* CONTEXT */
+.ctx-body{padding:11px;overflow-y:auto;flex:1;}
+.ctx-lbl{font-size:10px;color:var(--dim);margin-bottom:4px;display:block;text-transform:uppercase;letter-spacing:1px;}
+.ctx-inp{width:100%;background:#040b14;color:var(--text);border:1px solid var(--border);padding:6px 9px;border-radius:3px;font-family:'JetBrains Mono',monospace;font-size:12px;outline:none;margin-bottom:10px;transition:border-color .15s;}
+.ctx-inp:focus{border-color:var(--accent);}
+.ctx-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+
+/* VM */
+.asm-scroll{flex:1;overflow-y:auto;padding:8px;background:#040b14;}
+.asm-line{font-family:'JetBrains Mono',monospace;font-size:12px;padding:3px 8px;border-radius:3px;margin-bottom:1px;color:var(--dim);border-left:2px solid transparent;white-space:nowrap;}
+.asm-line .ln{color:#1e3a5f;font-size:10px;margin-right:8px;width:22px;display:inline-block;text-align:right;}
+.asm-line.active{background:rgba(0,212,255,.14);color:var(--accent);border-left-color:var(--accent);font-weight:700;}
+.asm-line.done{color:#1e3a5f;}
+.asm-line.skipped{opacity:.2;}
+.asm-line:not(.active):not(.done):not(.skipped){color:#6a9ec0;}
+
+.stack-scroll{flex:1;overflow-y:auto;padding:8px;background:#040b14;display:flex;flex-direction:column-reverse;gap:4px;}
+.sitem{background:linear-gradient(90deg,#0d1927,#080f1a);border:1px solid var(--border);border-radius:3px;padding:7px 10px;display:flex;align-items:center;gap:8px;animation:sIn .12s ease;}
+@keyframes sIn{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:none}}
+.si{color:var(--border2);font-size:9px;width:16px;text-align:right;flex-shrink:0;}
+.sv2{color:var(--accent);word-break:break-all;font-family:'JetBrains Mono',monospace;font-size:11px;}
+.sempty{color:#1e3a5f;font-size:11px;text-align:center;padding:18px;}
+
+.vm-status{padding:5px 11px;font-size:11px;flex-shrink:0;border-top:1px solid var(--border);background:rgba(0,0,0,.3);min-height:26px;}
+.vm-status.ok{color:var(--ok);}
+.vm-status.err{color:var(--fail);}
+.vm-status.neu{color:var(--dim);}
+
+/* LOG */
+.log-scroll{flex:1;overflow-y:auto;padding:7px 12px;font-family:'JetBrains Mono',monospace;font-size:11px;}
+.log-line{margin-bottom:3px;line-height:1.5;border-bottom:1px solid rgba(255,255,255,.03);padding-bottom:3px;}
+.lt{color:#1e3a5f;margin-right:8px;font-size:10px;}
+.li{color:#5a8ab0;}.ls{color:var(--ok);}.le{color:var(--fail);font-weight:700;}.lw{color:var(--warn);}
+
+/* TASKBAR */
+#taskbar{position:fixed;bottom:0;left:0;right:0;height:34px;background:#040c18;border-top:1px solid var(--border);display:flex;align-items:center;padding:0 10px;gap:5px;z-index:10000;}
+.task-btn{height:22px;padding:0 9px;border-radius:3px;background:transparent;border:1px solid var(--border);color:var(--dim);font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer;transition:all .15s;white-space:nowrap;display:flex;align-items:center;gap:5px;letter-spacing:.3px;}
+.task-btn:hover{border-color:var(--border2);color:var(--text);}
+.task-btn.open{border-color:var(--border2);color:var(--text);background:rgba(0,136,204,.07);}
+.task-btn.focused{border-color:var(--accent);color:var(--accent);background:rgba(0,212,255,.08);}
+.tdot{width:5px;height:5px;border-radius:50%;background:var(--accent);flex-shrink:0;}
+.tdot.off{background:var(--border);}
+#tb-clock{margin-left:auto;font-size:10px;color:var(--dim);letter-spacing:1px;}
+
+/* TOAST */
+#toast-wrap{position:fixed;top:52px;right:14px;z-index:99999;display:flex;flex-direction:column;gap:5px;pointer-events:none;}
+.toast{padding:9px 13px;border-radius:4px;font-size:11px;font-family:'JetBrains Mono',monospace;opacity:0;transform:translateX(16px);transition:all .2s;box-shadow:0 4px 20px rgba(0,0,0,.6);max-width:300px;}
+.toast.show{opacity:1;transform:none;}
+.toast.success{background:#031209;border:1px solid var(--ok);color:var(--ok);}
+.toast.error{background:#120308;border:1px solid var(--fail);color:var(--fail);}
+.toast.info{background:#031220;border:1px solid var(--accent2);color:var(--accent);}
+
+/* LOADER */
+#loader{position:fixed;inset:0;background:var(--bg);z-index:99999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;transition:opacity .4s;}
+#loader h2{font-family:'Orbitron',monospace;color:var(--accent);font-size:15px;letter-spacing:5px;text-shadow:0 0 18px var(--accent);}
+#loader p{color:var(--dim);font-size:11px;}
+
+/* SCROLLBARS */
+::-webkit-scrollbar{width:4px;height:4px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px;}
+::-webkit-scrollbar-thumb:hover{background:var(--border2);}
+
+/* MODAL OVERLAY */
+#modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  backdrop-filter: blur(3px);
+  z-index: 100000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s;
+}
+#modal-overlay.show {
+  opacity: 1;
+  pointer-events: auto;
+}
+#save-modal {
+  position: relative;
+  width: 300px;
+  min-height: auto;
+  transform: translateY(-20px);
+  transition: transform 0.2s;
+  box-shadow: 0 10px 40px rgba(0,0,0,0.9), 0 0 0 1px var(--border2);
+}
+#modal-overlay.show #save-modal {
+  transform: translateY(0);
+}
+
+</style>
+</head>
+<body>
+
+<div id="loader"><h2>MIDSTATE IDE</h2><p>Initializing WASM runtime...</p></div>
+<div id="toast-wrap"></div>
+
+<!-- TOP BAR -->
+<div id="topbar">
+  <h1>MIDSTATE</h1>
+  <div class="tb-sep"></div>
+  <button class="tb-btn" onclick="compileCode()" title="Ctrl+Enter">▶ Compile</button>
+  <button class="tb-btn" id="btnStep" onclick="vmStep()" disabled title="F10">⬇ Step</button>
+  <button class="tb-btn ok-btn" id="btnRun" onclick="vmRun()" disabled>⚡ Run</button>
+<div class="tb-sep"></div>
+  <select class="tb-sel" id="projectSelect" onchange="loadProject(this.value)">
+    <option value="">-- Load Project --</option>
+  </select>
+  <button class="tb-btn" onclick="saveProject()">💾 Save</button>
+  <button class="tb-btn" onclick="newProject()">＋ New</button>
+  <div class="tb-sep"></div>
+  <select class="tb-sel" id="templateSelect" onchange="loadTemplate()">
+    <option value="deadman">Dead Man's Switch</option>
+    <option value="htlc">Atomic Swap (HTLC)</option>
+    <option value="multisig">2-of-3 Multisig</option>
+    <option value="math">Math &amp; Logic</option>
+    <option value="escrow">Trustless Escrow (Let/Macro)</option>
+  </select>
+  <div class="tb-sep"></div>
+  <div class="tb-stat">Size&nbsp;<b id="statSize">—</b></div>
+  <div class="tb-stat">SigOps&nbsp;<b id="statSigops">—</b></div>
+  <div id="tb-addr" title="P2SH address — click to copy" onclick="copyAddr()">— compile to get address —</div>
+</div>
+
+<!-- DESKTOP -->
+<div id="desktop">
+
+  <!-- EDITOR -->
+  <div class="win focused" id="win-editor" style="left:8px;top:8px;width:545px;height:420px;z-index:201;">
+    <div class="win-tb" onmousedown="startDrag(event,'win-editor')">
+      <span class="win-label"><span class="ico">✦</span>SOURCE EDITOR</span>
+      <div class="win-btns">
+        <button class="wbtn mn" onclick="minimiseWin('win-editor')" title="Minimise"></button>
+        <button class="wbtn mx" onclick="maximiseWin('win-editor')" title="Maximise/Restore"></button>
+      </div>
+    </div>
+    <div class="win-body">
+      <div id="ace-wrap"><div id="editor"></div></div>
+      <div class="stats-row">
+        <div class="stat-cell">Size<span class="sv" id="sv-size">—</span></div>
+        <div class="stat-cell">SigOps<span class="sv" id="sv-sigops">—</span></div>
+        <div class="stat-cell">P2SH<span class="sv" id="sv-addr" style="color:var(--accent);font-size:10px;cursor:pointer;" onclick="copyAddr()">—</span></div>
+      </div>
+    </div>
+    <div class="rz rz-r" onmousedown="startResize(event,'win-editor','r')"></div>
+    <div class="rz rz-b" onmousedown="startResize(event,'win-editor','b')"></div>
+    <div class="rz rz-l" onmousedown="startResize(event,'win-editor','l')"></div>
+    <div class="rz rz-br" onmousedown="startResize(event,'win-editor','br')"></div>
+    <div class="rz rz-bl" onmousedown="startResize(event,'win-editor','bl')"></div>
+  </div>
+
+  <!-- BYTECODE -->
+  <div class="win" id="win-bytecode" style="left:563px;top:8px;width:390px;height:420px;z-index:200;">
+    <div class="win-tb" onmousedown="startDrag(event,'win-bytecode')">
+      <span class="win-label"><span class="ico">◈</span>BYTECODE &amp; DEPLOY</span>
+      <div class="win-btns">
+        <button class="wbtn mn" onclick="minimiseWin('win-bytecode')" title="Minimise"></button>
+        <button class="wbtn mx" onclick="maximiseWin('win-bytecode')" title="Maximise/Restore"></button>
+      </div>
+    </div>
+    <div class="win-body">
+      <div class="ph"><span class="ph-dot blue"></span>Raw Bytecode</div>
+      <div class="bc-box" id="bytecodeOutput" style="flex:0 0 90px;">Click Compile to generate bytecode...</div>
+      <div class="ph" style="border-top:1px solid var(--border);"><span class="ph-dot yellow"></span>CLI Deploy Instructions</div>
+      <div class="deploy-wrap">
+        <div class="deploy-step">
+          <div class="deploy-title">1 · Fund Contract</div>
+          <div class="deploy-code" id="cliFund">midstate wallet send --to &lt;P2SH&gt;:&lt;amount&gt;</div>
+        </div>
+        <div class="deploy-step">
+          <div class="deploy-title">2 · Get Coin ID</div>
+          <div class="deploy-code">midstate wallet list --full</div>
+        </div>
+        <div class="deploy-step">
+          <div class="deploy-title">3 · Spend Contract</div>
+          <div class="deploy-code" id="cliSpend">midstate wallet spend-script --coin &lt;ID&gt; --bytecode &lt;HEX&gt; --inputs "&lt;witness&gt;" --to &lt;dest&gt;:&lt;amt&gt;</div>
+        </div>
+      </div>
+    </div>
+    <div class="rz rz-r" onmousedown="startResize(event,'win-bytecode','r')"></div>
+    <div class="rz rz-l" onmousedown="startResize(event,'win-bytecode','l')"></div>
+    <div class="rz rz-b" onmousedown="startResize(event,'win-bytecode','b')"></div>
+    <div class="rz rz-br" onmousedown="startResize(event,'win-bytecode','br')"></div>
+    <div class="rz rz-bl" onmousedown="startResize(event,'win-bytecode','bl')"></div>
+  </div>
+
+  <!-- CONTEXT -->
+  <div class="win" id="win-ctx" style="left:8px;top:438px;width:545px;height:185px;">
+    <div class="win-tb" onmousedown="startDrag(event,'win-ctx')">
+      <span class="win-label"><span class="ico">⬡</span>EMULATOR CONTEXT</span>
+      <div class="win-btns">
+        <button class="wbtn mn" onclick="minimiseWin('win-ctx')" title="Minimise"></button>
+        <button class="wbtn mx" onclick="maximiseWin('win-ctx')" title="Maximise/Restore"></button>
+      </div>
+    </div>
+    <div class="win-body">
+      <div class="ctx-body">
+        <label class="ctx-lbl">Witness Stack (comma-separated hex, pushed L→R)</label>
+        <input class="ctx-inp" id="ctxWitness" value="" placeholder="e.g. BB, 01">
+        <div class="ctx-row">
+          <div>
+            <label class="ctx-lbl">Block Height</label>
+            <input class="ctx-inp" type="number" id="ctxHeight" value="500001">
+          </div>
+          <div>
+            <label class="ctx-lbl">Tx Outputs (addr:value)</label>
+            <input class="ctx-inp" id="ctxOutputs" value="" placeholder="CC:1000000, DD:5000">
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="rz rz-r" onmousedown="startResize(event,'win-ctx','r')"></div>
+    <div class="rz rz-b" onmousedown="startResize(event,'win-ctx','b')"></div>
+    <div class="rz rz-l" onmousedown="startResize(event,'win-ctx','l')"></div>
+    <div class="rz rz-t" onmousedown="startResize(event,'win-ctx','t')"></div>
+    <div class="rz rz-br" onmousedown="startResize(event,'win-ctx','br')"></div>
+    <div class="rz rz-bl" onmousedown="startResize(event,'win-ctx','bl')"></div>
+    <div class="rz rz-tr" onmousedown="startResize(event,'win-ctx','tr')"></div>
+    <div class="rz rz-tl" onmousedown="startResize(event,'win-ctx','tl')"></div>
+  </div>
+
+  <!-- VM -->
+  <div class="win" id="win-vm" style="left:563px;top:438px;width:390px;height:370px;">
+    <div class="win-tb" onmousedown="startDrag(event,'win-vm')">
+      <span class="win-label"><span class="ico">⚙</span>VM EMULATOR</span>
+      <div class="win-btns">
+        <button class="wbtn mn" onclick="minimiseWin('win-vm')" title="Minimise"></button>
+        <button class="wbtn mx" onclick="maximiseWin('win-vm')" title="Maximise/Restore"></button>
+      </div>
+    </div>
+    <div class="win-body" style="flex-direction:row;">
+      <div style="flex:1;display:flex;flex-direction:column;border-right:1px solid var(--border);overflow:hidden;">
+        <div class="ph"><span class="ph-dot blue"></span>Assembly</div>
+        <div class="asm-scroll" id="asmOutput"><div style="color:#1e3a5f;padding:12px;font-size:11px;">Awaiting compilation...</div></div>
+      </div>
+      <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
+        <div class="ph"><span class="ph-dot yellow"></span>Stack</div>
+        <div class="stack-scroll" id="stackView"><div class="sempty">Stack Empty</div></div>
+      </div>
+    </div>
+    <div class="vm-status neu" id="vmStatus">Ready.</div>
+    <div class="rz rz-r" onmousedown="startResize(event,'win-vm','r')"></div>
+    <div class="rz rz-l" onmousedown="startResize(event,'win-vm','l')"></div>
+    <div class="rz rz-b" onmousedown="startResize(event,'win-vm','b')"></div>
+    <div class="rz rz-t" onmousedown="startResize(event,'win-vm','t')"></div>
+    <div class="rz rz-br" onmousedown="startResize(event,'win-vm','br')"></div>
+    <div class="rz rz-bl" onmousedown="startResize(event,'win-vm','bl')"></div>
+    <div class="rz rz-tr" onmousedown="startResize(event,'win-vm','tr')"></div>
+    <div class="rz rz-tl" onmousedown="startResize(event,'win-vm','tl')"></div>
+  </div>
+
+  <!-- LOG -->
+  <div class="win" id="win-log" style="left:8px;top:633px;width:945px;height:175px;">
+    <div class="win-tb" onmousedown="startDrag(event,'win-log')">
+      <span class="win-label"><span class="ico">▸</span>TERMINAL LOG</span>
+      <div class="win-btns">
+        <button class="wbtn mn" onclick="minimiseWin('win-log')" title="Minimise"></button>
+        <button class="wbtn mx" onclick="maximiseWin('win-log')" title="Maximise/Restore"></button>
+      </div>
+    </div>
+    <div class="win-body">
+      <div class="log-scroll" id="terminalLogs"></div>
+    </div>
+    <div class="rz rz-r" onmousedown="startResize(event,'win-log','r')"></div>
+    <div class="rz rz-b" onmousedown="startResize(event,'win-log','b')"></div>
+    <div class="rz rz-l" onmousedown="startResize(event,'win-log','l')"></div>
+    <div class="rz rz-t" onmousedown="startResize(event,'win-log','t')"></div>
+    <div class="rz rz-br" onmousedown="startResize(event,'win-log','br')"></div>
+    <div class="rz rz-bl" onmousedown="startResize(event,'win-log','bl')"></div>
+    <div class="rz rz-tr" onmousedown="startResize(event,'win-log','tr')"></div>
+    <div class="rz rz-tl" onmousedown="startResize(event,'win-log','tl')"></div>
+  </div>
+
+</div><!-- /desktop -->
+
+<!-- TASKBAR -->
+<div id="taskbar">
+  <button class="task-btn open focused" id="task-win-editor"   onclick="toggleWin('win-editor')">  <span class="tdot" id="td-win-editor"></span>Editor</button>
+  <button class="task-btn open"         id="task-win-bytecode" onclick="toggleWin('win-bytecode')"><span class="tdot" id="td-win-bytecode"></span>Bytecode</button>
+  <button class="task-btn open"         id="task-win-ctx"      onclick="toggleWin('win-ctx')">     <span class="tdot" id="td-win-ctx"></span>Context</button>
+  <button class="task-btn open"         id="task-win-vm"       onclick="toggleWin('win-vm')">      <span class="tdot" id="td-win-vm"></span>VM</button>
+  <button class="task-btn open"         id="task-win-log"      onclick="toggleWin('win-log')">     <span class="tdot" id="td-win-log"></span>Log</button>
+  <span id="tb-clock"></span>
+</div>
+
+<!-- WASM -->
+<script type="module">
+  try {
+    const { default: init, blake3_hash_hex } = await import('../pkg/wasm_wallet.js');
+    await init();
+    window.blake3_hash_hex = blake3_hash_hex;
+  } catch {
+    window.blake3_hash_hex = async hex => {
+      const bytes = new Uint8Array(hex.match(/.{1,2}/g).map(b=>parseInt(b,16)));
+      const buf = await hashwasm.blake3(bytes);
+      return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+    };
+  }
+  document.getElementById('loader').style.opacity = '0';
+  setTimeout(()=>document.getElementById('loader').style.display='none', 400);
+  window.wasmLoaded = true;
+  window.loadTemplate();
+</script>
+
+<script>
+// ═══════════════════════════════════════════
+// WINDOW MANAGER
+// ═══════════════════════════════════════════
+let zTop = 210;
+const wstate = {}; // id -> { min, maxed }
+const preMax = {};
+
+function focusWin(id) {
+  document.querySelectorAll('.win').forEach(w=>w.classList.remove('focused'));
+  document.querySelectorAll('.task-btn').forEach(b=>b.classList.remove('focused'));
+  const el = document.getElementById(id);
+  if (el && !el.classList.contains('minimised')) {
+    el.classList.add('focused');
+    el.style.zIndex = ++zTop;
+  }
+  const tb = document.getElementById('task-'+id);
+  if (tb && !document.getElementById(id).classList.contains('minimised')) tb.classList.add('focused');
+}
+
+function minimiseWin(id) {
+  const el = document.getElementById(id);
+  const tb = document.getElementById('task-'+id);
+  const td = document.getElementById('td-'+id);
+  if (!wstate[id]) wstate[id] = {};
+  wstate[id].min = true;
+  el.classList.add('minimised');
+  el.classList.remove('focused');
+  if (tb) { tb.classList.remove('open','focused'); }
+  if (td) td.classList.add('off');
+  // pick another to focus
+  const others = [...document.querySelectorAll('.win:not(.minimised)')];
+  if (others.length) focusWin(others[others.length-1].id);
+}
+
+function restoreWin(id) {
+  const el = document.getElementById(id);
+  const tb = document.getElementById('task-'+id);
+  const td = document.getElementById('td-'+id);
+  if (!wstate[id]) wstate[id] = {};
+  wstate[id].min = false;
+  el.classList.remove('minimised');
+  if (tb) tb.classList.add('open');
+  if (td) td.classList.remove('off');
+  focusWin(id);
+  if (id==='win-editor' && window._ace) window._ace.resize();
+}
+
+function toggleWin(id) {
+  const el = document.getElementById(id);
+  if (el.classList.contains('minimised')) restoreWin(id);
+  else if (el.classList.contains('focused')) minimiseWin(id);
+  else focusWin(id);
+}
+
+function maximiseWin(id) {
+  const el = document.getElementById(id);
+  if (!wstate[id]) wstate[id] = {};
+  if (wstate[id].maxed) {
+    const p = preMax[id];
+    if (p) { el.style.left=p.l; el.style.top=p.t; el.style.width=p.w; el.style.height=p.h; }
+    wstate[id].maxed = false;
+  } else {
+    preMax[id] = { l:el.style.left, t:el.style.top, w:el.style.width, h:el.style.height };
+    const desk = document.getElementById('desktop');
+    el.style.left='0px'; el.style.top='0px';
+    el.style.width = desk.clientWidth+'px';
+    el.style.height = desk.clientHeight+'px';
+    wstate[id].maxed = true;
+    focusWin(id);
+  }
+  if (window._ace) window._ace.resize();
+}
+
+// DRAG
+let drag = null;
+function startDrag(e, id) {
+  if (e.target.classList.contains('wbtn')) return;
+  focusWin(id);
+  const el = document.getElementById(id);
+  drag = { id, el, ox: e.clientX-el.offsetLeft, oy: e.clientY-el.offsetTop };
+  e.preventDefault();
+}
+document.addEventListener('mousemove', e => {
+  if (!drag) return;
+  const desk = document.getElementById('desktop');
+  let nx = e.clientX-drag.ox, ny = e.clientY-drag.oy;
+  nx = Math.max(-drag.el.offsetWidth+60, Math.min(desk.clientWidth-60, nx));
+  ny = Math.max(0, Math.min(desk.clientHeight-30, ny));
+  drag.el.style.left=nx+'px'; drag.el.style.top=ny+'px';
+});
+document.addEventListener('mouseup', () => {
+  drag = null;
+  if (window._ace) window._ace.resize();
+});
+
+// RESIZE
+let rz = null;
+function startResize(e, id, dir) {
+  e.stopPropagation(); e.preventDefault();
+  focusWin(id);
+  const el = document.getElementById(id);
+  rz = { el, dir, sx:e.clientX, sy:e.clientY, sw:el.offsetWidth, sh:el.offsetHeight, sl:el.offsetLeft, st:el.offsetTop };
+}
+document.addEventListener('mousemove', e => {
+  if (!rz) return;
+  const {el,dir,sx,sy,sw,sh,sl,st} = rz;
+  const dx=e.clientX-sx, dy=e.clientY-sy;
+  const MW=180, MH=80;
+  if (dir.includes('r')) el.style.width  = Math.max(MW,sw+dx)+'px';
+  if (dir.includes('b')) el.style.height = Math.max(MH,sh+dy)+'px';
+  if (dir.includes('l')) { const nw=Math.max(MW,sw-dx); el.style.width=nw+'px'; el.style.left=(sl+sw-nw)+'px'; }
+  if (dir.includes('t')) { const nh=Math.max(MH,sh-dy); el.style.height=nh+'px'; el.style.top=(st+sh-nh)+'px'; }
+  if (window._ace) window._ace.resize();
+});
+document.addEventListener('mouseup', () => { rz = null; });
+
+// click-to-focus
+document.querySelectorAll('.win').forEach(w => w.addEventListener('mousedown',()=>focusWin(w.id)));
+
+// clock
+function tick() { const el=document.getElementById('tb-clock'); if(el) el.textContent=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}); }
+setInterval(tick,1000); tick();
+
+// ═══════════════════════════════════════════
+// ACE EDITOR
+// ═══════════════════════════════════════════
+const editor = ace.edit('editor');
+editor.setTheme('ace/theme/tomorrow_night_bright');
+editor.session.setMode('ace/mode/javascript');
+editor.setOptions({ fontFamily:"'JetBrains Mono',monospace", fontSize:'13px', showPrintMargin:false, highlightActiveLine:true, tabSize:4, wrap:false });
+window._ace = editor;
+
+// Disable default JS syntax checker
+editor.session.setUseWorker(false);
+
+// Custom Midscript Linter
+let validateTimeout;
+function validateMidscript() {
+    const code = editor.getValue();
+    const annotations = [];
+
+    try {
+        const tokens = new Lexer(code).tokenize();
+        new Parser(tokens).parse();
+    } catch (e) {
+        let row = 0;
+        let column = 0;
+        let text = e.toString();
+
+        // Extract line and col from your parser's error strings (e.g., "Syntax Error at 7:9: ...")
+        const match = text.match(/at (\d+):(\d+)/);
+        if (match) {
+            row = parseInt(match[1], 10) - 1;    // Ace rows are 0-indexed
+            column = parseInt(match[2], 10) - 1; // Ace columns are 0-indexed
+        }
+
+        annotations.push({
+            row: row,
+            column: column,
+            text: text,
+            type: "error" // Creates the red "x"
+        });
+    }
+
+    editor.session.setAnnotations(annotations);
+}
+
+// Run linter on code change (debounced by 300ms)
+editor.session.on('change', () => {
+    clearTimeout(validateTimeout);
+    validateTimeout = setTimeout(validateMidscript, 300);
+});
+
+// Run linter when loading a template
+const originalLoadTemplate = window.loadTemplate;
+window.loadTemplate = function() {
+    originalLoadTemplate();
+    validateMidscript();
+};
+
+// ═══════════════════════════════════════════
+// TEMPLATES
+// ═══════════════════════════════════════════
+const TEMPLATES = {
+  deadman:{
+    code:`// The Trust-Fund Contract
+// Witness stack expected: [Signature, Path]
+
+if (peek() == 0) {
+    // Path 0: Owner Spend
+    drop();
+    require_sig("AA");
+
+} else if (peek() == 1) {
+    // Path 1: Dead Man's Switch
+    drop();
+    require_time(500000);
+    require_sig("BB");
+    require_transfer("CC", 1000000);
+
+} else if (peek() == 2) {
+    // Path 2: Oracle Release
+    drop();
+    require_sig("DD");
+    require_transfer("CC", 1000000);
+
+} else {
+    drop();
+    drop();
+    fail();
+}
+
+true;`,
+    witness:'BB, 01', outputs:'CC:1000000, DD:5000'
+  },
+  htlc:{
+    code:`// Hash Time-Locked Contract (Atomic Swaps)
+// Alice claim: [Alice_Sig, Secret_Preimage, 01]
+// Bob refund:  [Bob_Sig, 00, 00]
+
+if (peek() == 1) {
+    drop();
+    require_preimage("5fbf08af2b116ab8f7f3c14b8ec01a46ce23d290e2ebc7a752d0982d54c054f2");
+    require_sig("ALICE_PUBKEY");
+} else {
+    drop();
+    drop();
+    require_time(600000);
+    require_sig("BOB_PUBKEY");
+}
+
+true;`,
+    witness:'ALICE_PUBKEY, 736563726574, 01', outputs:'ALICE_DEST:50000'
+  },
+  multisig:{
+    code:`// 2-of-3 Multi-Signature Wallet
+// Witness expected: [Sig_C, Sig_B, Sig_A]
+
+check_sig("PUBKEY_A");
+
+swap();
+check_sig("PUBKEY_B");
+add();
+
+swap();
+check_sig("PUBKEY_C");
+add();
+
+verify_gte(2);
+
+true;`,
+    witness:'00, PUBKEY_B, PUBKEY_A', outputs:'DEST:50000'
+  },
+math:{
+    code:`// Math & Logic Test
+// Witness: [Number_A, Number_B]
+
+swap();
+if (peek() >= 10) {
+    add();
+    if (peek() == 50) {
+        drop();
+        true;
+    } else {
+        drop();
+        fail();
+    }
+} else {
+    drop();
+    drop();
+    fail();
+}`,
+    witness:'28, 0a', outputs:''
+  },
+escrow:{
+    code:`// Trustless Escrow with Arbiter & Timeout
+// -----------------------------------------------------------------
+// Path 0 (Coop):    [Sig_Buyer, Sig_Seller, 00]
+// Path 1 (Dispute): [Sig_Arbiter, Sig_Winner, 01]
+// Path 2 (Timeout): [Sig_Buyer, 02]
+
+let BUYER_PK    = "02aaaa1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+let SELLER_PK   = "03bbbb1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+let ARBITER_PK  = "04cccc1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+let REFUND_TIME = 2000000;
+
+if (peek() == 0) {
+    drop(); // Consume routing int
+    
+    // Cooperative Path: Requires both Buyer and Seller
+    swap();
+    check_sig(BUYER_PK);
+    swap();
+    check_sig(SELLER_PK);
+    add();
+    
+    if (peek() == 2) {
+        drop(); // Drop the sum
+        true;
+    } else {
+        drop(); // Drop the sum
+        fail();
+    }
+
+} else if (peek() == 1) {
+    drop(); // Consume routing int
+    
+    // Dispute Path: Arbiter + (Buyer OR Seller)
+    swap();
+    check_sig(ARBITER_PK);
+    
+    if (peek() == 1) {
+        drop(); // Drop arbiter success bool
+        
+        // Check remaining sig against both parties
+        dup();
+        check_sig(BUYER_PK);
+        swap();
+        check_sig(SELLER_PK);
+        add();
+        
+        if (peek() == 1) {
+            drop(); // Drop the sum
+            true;
+        } else {
+            drop(); // Drop the sum
+            fail();
+        }
+    } else {
+        drop(); // Drop arbiter failure bool
+        drop(); // Drop winner sig
+        fail();
+    }
+
+} else if (peek() == 2) {
+    drop(); // Consume routing int
+    
+    // Timeout Path: Buyer gets refund if escrow stalls
+    require_time(REFUND_TIME);
+    require_sig(BUYER_PK);
+    true;
+
+} else {
+    drop();
+    fail();
+}`,
+    witness:'02aaaa1234567890abcdef1234567890abcdef1234567890abcdef1234567890, 03bbbb1234567890abcdef1234567890abcdef1234567890abcdef1234567890, 00', 
+    outputs:''
+  }
+};
+
+window.loadTemplate = function() {
+  const key = document.getElementById('templateSelect').value;
+  const t = TEMPLATES[key];
+  editor.setValue(t.code, -1);
+  document.getElementById('ctxWitness').value = t.witness;
+  document.getElementById('ctxOutputs').value = t.outputs;
+  document.getElementById('bytecodeOutput').textContent = 'Click Compile to generate bytecode...';
+  document.getElementById('asmOutput').innerHTML = "<div style='color:#1e3a5f;padding:12px;font-size:11px;'>Awaiting compilation...</div>";
+  setVmStatus('Ready.','neu');
+  setAddr('—');
+  document.getElementById('btnStep').disabled = true;
+  document.getElementById('btnRun').disabled = true;
+  log('Template loaded: '+key,'i');
+};
+
+// ═══════════════════════════════════════════
+// UTILS
+// ═══════════════════════════════════════════
+function intToHexLE(n){if(n===0)return'00';let h=n.toString(16);if(h.length%2)h='0'+h;return h.match(/.{2}/g).reverse().join('');}
+function hexLEToInt(h){if(!h)return 0;return parseInt(h.match(/.{2}/g).reverse().join(''),16);}
+function isTrue(h){if(!h)return false;return h.match(/.{2}/g).some(b=>parseInt(b,16)!==0);}
+
+function setAddr(a) {
+  const short = a.length>32 ? a.slice(0,30)+'…' : a;
+  document.getElementById('sv-addr').textContent = short;
+  document.getElementById('tb-addr').textContent = a==='—' ? '— compile to get address —' : a;
+  window._lastAddr = a;
+}
+function copyAddr() {
+  if (window._lastAddr && window._lastAddr!=='—')
+    navigator.clipboard.writeText(window._lastAddr).then(()=>showToast('Address copied','info'));
+}
+function showToast(msg,type='info') {
+  const w=document.getElementById('toast-wrap');
+  const t=document.createElement('div');
+  t.className='toast '+type; t.textContent=msg;
+  w.appendChild(t);
+  requestAnimationFrame(()=>t.classList.add('show'));
+  setTimeout(()=>{t.classList.remove('show');setTimeout(()=>t.remove(),200);},3000);
+}
+function log(msg,type='i') {
+  const c=document.getElementById('terminalLogs');
+  const d=document.createElement('div');
+  d.className='log-line';
+  const ts=new Date().toLocaleTimeString([],{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit',fractionalSecondDigits:2});
+  d.innerHTML=`<span class="lt">[${ts}]</span><span class="l${type}">${msg}</span>`;
+  c.appendChild(d);
+  c.scrollTop=c.scrollHeight;
+}
+function setVmStatus(msg,cls='neu') {
+  const el=document.getElementById('vmStatus');
+  el.textContent=msg; el.className='vm-status '+cls;
+}
+
+// ═══════════════════════════════════════════
+// ASSEMBLER
+// ═══════════════════════════════════════════
+const OPS={PUSH_DATA:0x01,DROP:0x10,DUP:0x11,SWAP:0x12,OVER:0x13,ROT:0x14,EQUAL:0x20,VERIFY:0x21,EQUALVERIFY:0x22,ADD:0x23,GREATER_OR_EQUAL:0x24,SUB:0x25,HASH:0x30,CHECKSIG:0x31,CHECKSIGVERIFY:0x32,CHECKTIMEVERIFY:0x33,IF:0x40,ELSE:0x41,ENDIF:0x42,SUM_TO_ADDR:0x50};
+
+function assembleBytecode(asm) {
+  let bc=[];
+  for(let inst of asm){
+    let [op,...rest]=inst.split(' ');
+    if(op==='PUSH_HEX'||op==='PUSH_INT'){
+      bc.push(OPS.PUSH_DATA);
+      let hex=op==='PUSH_INT'?intToHexLE(parseInt(rest[0])):rest[0].toLowerCase();
+      let len=hex.length/2, lh=len.toString(16).padStart(4,'0');
+      bc.push(parseInt(lh.slice(2,4),16),parseInt(lh.slice(0,2),16));
+      for(let i=0;i<hex.length;i+=2)bc.push(parseInt(hex.slice(i,i+2),16));
+    } else {
+      if(OPS[op]===undefined)throw`Unknown opcode: ${op}`;
+      bc.push(OPS[op]);
+    }
+  }
+  return bc.map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+
+// ═══════════════════════════════════════════
+// LEXER
+// ═══════════════════════════════════════════
+class Lexer {
+  constructor(src){
+    this.src=src.replace(/\/\*[\s\S]*?\*\//g,'').replace(/\/\/.*/g,'');
+    this.pos=0;this.line=1;this.col=1;
+  }
+  adv(){let c=this.src[this.pos++];if(c==='\n'){this.line++;this.col=1;}else this.col++;return c;}
+    tokenize(){
+    const toks=[];
+    const AOPS=['PUSH_INT','PUSH_HEX','DUP','DROP','SWAP','OVER','ROT','EQUAL','EQUALVERIFY','CHECKSIG','CHECKSIGVERIFY','ADD','SUB','GREATER_OR_EQUAL','HASH','CHECKTIMEVERIFY','VERIFY','SUM_TO_ADDR'];
+    const KWS=['if','else','repeat','true','false','macro','let'];
+    while(this.pos<this.src.length){
+      let c=this.src[this.pos];
+      if(/\s/.test(c)){this.adv();continue;}
+      let sl=this.line,sc=this.col;
+      if(/\d/.test(c)){let n='';while(this.pos<this.src.length&&/\d/.test(this.src[this.pos]))n+=this.adv();toks.push({t:'NUM',v:parseInt(n),l:sl,c:sc});continue;}
+      if(c==='"'||c==="'"){let q=this.adv(),s='';while(this.pos<this.src.length&&this.src[this.pos]!==q)s+=this.adv();if(this.pos>=this.src.length)throw`Unterminated string at ${sl}:${sc}`;this.adv();toks.push({t:'HEX',v:s,l:sl,c:sc});continue;}
+      if(c==='='&&this.src[this.pos+1]==='='){toks.push({t:'OP',v:'==',l:sl,c:sc});this.adv();this.adv();continue;}
+      if(c==='>'&&this.src[this.pos+1]==='='){toks.push({t:'OP',v:'>=',l:sl,c:sc});this.adv();this.adv();continue;}
+      if(c==='&'&&this.src[this.pos+1]==='&'){toks.push({t:'OP',v:'&&',l:sl,c:sc});this.adv();this.adv();continue;}
+      if(c==='|'&&this.src[this.pos+1]==='|'){toks.push({t:'OP',v:'||',l:sl,c:sc});this.adv();this.adv();continue;}
+      if(['+','-','{','}','(',')','.',';',','].includes(c)){toks.push({t:'P',v:c,l:sl,c:sc});this.adv();continue;}
+      if(c==='='||c==='>'||c==='<'){let op=this.adv();if(this.src[this.pos]==='=')op+=this.adv();toks.push({t:'ROP',v:op,l:sl,c:sc});continue;}
+      if(/[a-zA-Z_]/.test(c)){let id='';while(this.pos<this.src.length&&/[a-zA-Z0-9_]/.test(this.src[this.pos]))id+=this.adv();if(AOPS.includes(id.toUpperCase()))toks.push({t:'ASM',v:id.toUpperCase(),l:sl,c:sc});else if(KWS.includes(id))toks.push({t:'KW',v:id,l:sl,c:sc});else toks.push({t:'ID',v:id,l:sl,c:sc});continue;}
+      throw`Unknown char '${c}' at ${this.line}:${this.col}`;
+    }
+    return toks;
+  }
+}
+
+// ═══════════════════════════════════════════
+// PARSER
+// ═══════════════════════════════════════════
+class Parser {
+  constructor(toks){this.toks=toks;this.pos=0;}
+  pk(){return this.toks[this.pos];}
+  consume(et,ev){let t=this.toks[this.pos];if(!t)throw'Unexpected EOF';if(et&&t.t!==et)throw`Syntax Error at ${t.l}:${t.c}: Expected ${et}, got '${t.v}'`;if(ev&&t.v!==ev)throw`Syntax Error at ${t.l}:${t.c}: Expected '${ev}', got '${t.v}'`;return this.toks[this.pos++];}
+  match(v){if(this.pk()&&this.pk().v===v){this.pos++;return true;}return false;}
+  parse(){let s=[];while(this.pos<this.toks.length){let st=this.parseStmt();if(st)s.push(st);}return s;}
+parseStmt(){
+    let t=this.pk();if(!t)return null;
+    if(t.t==='KW'&&t.v==='let'){
+      this.consume(); 
+      let id=this.consume('ID').v; 
+      this.consume('ROP','='); 
+      let expr=this.parseExpr(); 
+      this.match(';');
+      return {type:'LetStmt', id, expr};
+    }
+    if(t.t==='KW'&&t.v==='macro'){
+      this.consume(); 
+      let name=this.consume('ID').v; 
+      this.consume('P','('); 
+      this.consume('P',')'); 
+      let body=this.parseBlock();
+      return {type:'MacroDefStmt', name, body};
+    }
+    if(t.t==='KW'&&t.v==='if')return this.parseIf();
+    if(t.t==='KW'&&t.v==='repeat')return this.parseRepeat();
+    if(t.t==='P'&&t.v==='{')return this.parseBlock();
+    if(t.t==='P'&&t.v===';'){this.consume();return null;}
+    if(t.t==='ASM'){
+      this.consume();
+      if(t.v==='PUSH_HEX'||t.v==='PUSH_INT'){
+        if(this.match('(')){let a=this.consume();if(!this.match(')'))throw`Expected ')' after ${t.v} arg`;this.match(';');return{type:'RawASM',op:t.v,arg:a.v.toString()};}
+        let a=this.consume();this.match(';');return{type:'RawASM',op:t.v,arg:a.v.toString()};
+      }
+      if(this.match('(')){if(!this.match(')'))throw`ASM '${t.v}' takes no args — expected ')'`;}
+      this.match(';');return{type:'RawASM',op:t.v};
+    }
+    if(t.t==='P'&&t.v==='+'){this.consume();this.match(';');return{type:'RawASM',op:'ADD'};}
+    if(t.t==='ROP'&&t.v==='=='){this.consume();this.match(';');return{type:'RawASM',op:'EQUAL'};}
+    if(t.t==='ROP'&&t.v==='>='){this.consume();this.match(';');return{type:'RawASM',op:'GREATER_OR_EQUAL'};}
+    let expr=this.parseExpr();this.match(';');return{type:'ExprStmt',expr};
+  }
+  parseBlock(){let s=this.consume('P','{');let stmts=[];while(this.pos<this.toks.length&&(!this.pk()||this.pk().v!=='}')){let st=this.parseStmt();if(st)stmts.push(st);}if(!this.match('}'))throw`Missing '}' for block at ${s.l}`;return{type:'BlockStmt',stmts};}
+  parseIf(){let t=this.consume('KW','if');if(!this.match('('))throw`Expected '(' after 'if'`;let cond=this.parseExpr();if(!this.match(')'))throw`Expected ')' after if condition`;let thenB=this.parseBlock(),elseB=null;if(this.match('else')){if(this.pk()&&this.pk().v==='if')elseB=this.parseIf();else elseB=this.parseBlock();}return{type:'IfStmt',cond,thenB,elseB};}
+  parseRepeat(){let t=this.consume('KW','repeat');if(!this.match('('))throw`Expected '(' after 'repeat'`;let n=this.consume('NUM');if(!this.match(')'))throw`Expected ')'`;return{type:'RepeatStmt',count:n.v,body:this.parseBlock()};}
+  parseExpr(){return this.parseLOr();}
+  parseLOr(){let e=this.parseLAnd();while(this.match('||'))e={type:'Bin',l:e,op:'||',r:this.parseLAnd()};return e;}
+  parseLAnd(){let e=this.parseEq();while(this.match('&&'))e={type:'Bin',l:e,op:'&&',r:this.parseEq()};return e;}
+  parseEq(){let e=this.parseAdd();while(this.match('==')||this.match('>=')){let op=this.toks[this.pos-1].v;e={type:'Bin',l:e,op,r:this.parseAdd()};}return e;}
+  parseAdd(){let e=this.parsePrim();while(this.match('+')||this.match('-')){let op=this.toks[this.pos-1].v;e={type:'Bin',l:e,op,r:this.parsePrim()};}return e;}
+  parsePrim(){
+    let t=this.pk();if(!t)throw'Unexpected EOF in expression';
+    if(this.match('(')){let e=this.parseExpr();if(!this.match(')'))throw`Missing ')' at ${t.l}:${t.c}`;return e;}
+    t=this.consume();
+    if(t.t==='NUM')return{type:'Lit',v:t.v,k:'int'};
+    if(t.t==='HEX')return{type:'Lit',v:t.v,k:'hex'};
+    if(t.t==='KW'&&t.v==='true')return{type:'Lit',v:1,k:'int'};
+    if(t.t==='KW'&&t.v==='false')return{type:'Lit',v:0,k:'int'};
+    if(t.t==='ID'){if(this.match('(')){let args=[];while(this.pk()&&this.pk().v!==')'){args.push(this.parseExpr());this.match(',');}if(!this.match(')'))throw`Missing ')' for '${t.v}'`;return{type:'Call',name:t.v,args};}return{type:'Lit',v:t.v,k:'hex'};}
+    throw`Syntax Error at ${t.l}:${t.c}: Unexpected token '${t.v}'`;
+  }
+}
+
+// ═══════════════════════════════════════════
+// CODE GEN
+// ═══════════════════════════════════════════
+class CodeGen {
+  constructor(){this.asm=[]; this.macros={}; this.constants={};}
+  emit(op){this.asm.push(op);}
+  generate(ast){for(let n of ast)if(n)this.genStmt(n);return this.asm;}
+  
+  genStmt(s){
+    if(s.type==='MacroDefStmt'){this.macros[s.name]=s.body;}
+    else if(s.type==='LetStmt'){this.constants[s.id]=s.expr;}
+    else if(s.type==='BlockStmt')for(let c of s.stmts)this.genStmt(c);
+    else if(s.type==='ExprStmt')this.genExpr(s.expr);
+    else if(s.type==='RawASM')this.emit(s.arg!==undefined?`${s.op} ${s.arg}`:s.op);
+    else if(s.type==='IfStmt'){this.genExpr(s.cond);this.emit('IF');this.genStmt(s.thenB);if(s.elseB){this.emit('ELSE');this.genStmt(s.elseB);}this.emit('ENDIF');}
+    else if(s.type==='RepeatStmt'){for(let i=0;i<s.count;i++)this.genStmt(s.body);}
+  }
+  
+genExpr(e){
+    if(e.type==='Lit'){
+      if(this.constants[e.v]) {
+          this.genExpr(this.constants[e.v]); // Expand alias
+      } else {
+          this.emit(e.k==='int'?`PUSH_INT ${e.v}`:`PUSH_HEX ${e.v}`);
+      }
+    }
+    else if(e.type==='Bin'){
+      this.genExpr(e.l);this.genExpr(e.r);
+      if(e.op==='==')this.emit('EQUAL');
+      if(e.op==='>=')this.emit('GREATER_OR_EQUAL');
+      if(e.op==='+')this.emit('ADD');
+      if(e.op==='-')this.emit('SUB');
+      if(e.op==='&&'){this.emit('ADD');this.emit('PUSH_INT 2');this.emit('EQUAL');}
+      if(e.op==='||'){this.emit('ADD');this.emit('PUSH_INT 0');this.emit('GREATER_OR_EQUAL');}
+    } else if(e.type==='Call'){
+      const fn=e.name;
+      if(this.macros[fn]){
+          this.genStmt(this.macros[fn]); // Inline macro block
+      }
+      else if(fn==='peek')this.emit('DUP');
+      else if(fn==='drop')this.emit('DROP');
+      else if(fn==='swap')this.emit('SWAP');
+      else if(fn==='over')this.emit('OVER');
+      else if(fn==='rot')this.emit('ROT');
+      else if(fn==='add')this.emit('ADD');
+      else if(fn==='sub')this.emit('SUB');
+      else if(fn==='hash')this.emit('HASH');
+      else if(fn==='fail')this.emit('PUSH_INT 0');
+      else if(fn==='verify_gte'){this.genExpr(e.args[0]);this.emit('GREATER_OR_EQUAL');this.emit('VERIFY');}
+      else if(fn==='require_preimage'){this.emit('HASH');this.genExpr(e.args[0]);this.emit('EQUALVERIFY');}
+      else if(fn==='require_time'){this.genExpr(e.args[0]);this.emit('CHECKTIMEVERIFY');}
+      else if(fn==='require_sig'){this.genExpr(e.args[0]);this.emit('CHECKSIGVERIFY');}
+      else if(fn==='check_sig'){this.genExpr(e.args[0]);this.emit('CHECKSIG');}
+      else if(fn==='require_transfer'){this.genExpr(e.args[0]);this.emit('SUM_TO_ADDR');this.genExpr(e.args[1]);this.emit('EQUALVERIFY');}
+      else throw `Unknown function or macro '${fn}'`;
+    }
+  }
+}
+
+// ═══════════════════════════════════════════
+// COMPILE
+// ═══════════════════════════════════════════
+let compiledTokens=[], stack=[], execStack=[], pc=0, isHalted=false;
+
+async function compileCode() {
+  if(!window.wasmLoaded){showToast('WASM not ready','error');return;}
+  log('Starting compilation...','i');
+  try {
+    const asm = new CodeGen().generate(new Parser(new Lexer(editor.getValue()).tokenize()).parse());
+    const hex = assembleBytecode(asm);
+    document.getElementById('bytecodeOutput').textContent = hex;
+    
+    // one-time copy buttons
+if (!document.getElementById('btnCopyBc')) {
+  const bcBox = document.getElementById('bytecodeOutput');
+  const copyBc = document.createElement('button');
+  copyBc.className = 'tb-btn';
+  copyBc.style.cssText = 'position:absolute;top:8px;right:8px;font-size:9px;padding:2px 6px;';
+  copyBc.innerHTML = '📋';
+  copyBc.onclick = () => { navigator.clipboard.writeText(bcBox.textContent); showToast('Bytecode copied','info'); };
+  copyBc.id = 'btnCopyBc';
+  bcBox.parentElement.style.position = 'relative';
+  bcBox.parentElement.appendChild(copyBc);
+}
+    
+    const addr = window.blake3_hash_hex(hex);
+    setAddr(addr);
+    const size=hex.length/2, sigops=asm.filter(i=>i==='CHECKSIG'||i==='CHECKSIGVERIFY').length;
+    const ss=document.getElementById('sv-size'); ss.textContent=`${size} B`; ss.className='sv'+(size>1024?' err':'');
+    document.getElementById('statSize').textContent=`${size} B`;
+    document.getElementById('statSigops').textContent=sigops;
+    if(size>1024)throw`MAX_SCRIPT_SIZE exceeded (${size} B)`;
+    document.getElementById('cliFund').textContent=`midstate wallet send --to ${addr}:<amount>`;
+    document.getElementById('cliSpend').textContent=`midstate wallet spend-script --coin <ID> --bytecode ${hex} --inputs "${document.getElementById('ctxWitness').value}" --to <dest>:<amt>`;
+    compiledTokens=[];
+    let html='';
+    asm.forEach((inst,i)=>{
+      const parts=inst.split(' ');
+      compiledTokens.push(parts.length>1?{op:parts[0],arg:parts[1]}:{op:parts[0]});
+      const disp=parts.length>1?`${parts[0]} <span style="color:var(--warn)">${parts[1]}</span>`:parts[0];
+      html+=`<div class="asm-line" id="aln-${i}"><span class="ln">${i}</span>${disp}</div>`;
+    });
+    document.getElementById('asmOutput').innerHTML=html||"<div style='color:#1e3a5f;padding:12px'>No instructions</div>";
+    resetVM();
+    setVmStatus('Compiled — ready to run.','ok');
+    log(`Compiled: ${size} B, ${sigops} sigops`,'s');
+    showToast('Compiled successfully','success');
+  } catch(e) {
+    document.getElementById('asmOutput').innerHTML=`<div style="color:var(--fail);padding:12px;font-size:11px;line-height:1.7">Error:<br>${e}</div>`;
+    document.getElementById('bytecodeOutput').textContent='Compilation failed.';
+    setAddr('—');
+    setVmStatus('Compilation error','err');
+    log(`Compilation failed: ${e}`,'e');
+    document.getElementById('btnStep').disabled=true;
+    document.getElementById('btnRun').disabled=true;
+  }
+}
+
+function resetVM() {
+  window.runtimeSigops = 0;
+  stack=[];execStack=[];pc=0;isHalted=false;
+  const ws=document.getElementById('ctxWitness').value;
+  if(ws.trim())ws.split(',').forEach(w=>stack.push(w.trim().toLowerCase()));
+  updateStackUI();
+  document.getElementById('btnStep').disabled=false;
+  document.getElementById('btnRun').disabled=false;
+  document.querySelectorAll('.asm-line').forEach(el=>el.className='asm-line');
+  log(`VM reset. Witness: [${stack.join(', ')}]`,'i');
+}
+
+// ═══════════════════════════════════════════
+// VM
+// ═══════════════════════════════════════════
+async function vmStep() {
+  if(isHalted||pc>=compiledTokens.length){endVM();return;}
+  const tok=compiledTokens[pc];
+  const exec=execStack.every(e=>e===true);
+  document.querySelectorAll('.asm-line').forEach((el,i)=>{
+    if(i<pc)el.className='asm-line done';
+    else if(i===pc)el.className='asm-line active';
+    else el.className='asm-line'+(!exec&&!['IF','ELSE','ENDIF'].includes(tok.op)?' skipped':'');
+  });
+  const activeEl=document.getElementById('aln-'+pc);
+  if(activeEl)activeEl.scrollIntoView({behavior:'smooth',block:'nearest'});
+  const opStr=tok.arg?`${tok.op} <${tok.arg}>`:tok.op;
+  if(!exec&&!['IF','ELSE','ENDIF'].includes(tok.op)) log(`[${pc}] skip: ${opStr}`,'w');
+  else log(`[${pc}] exec: ${opStr}`,'i');
+try {
+    if(tok.op==='IF'){if(exec){const c=stack.pop();execStack.push(isTrue(c));log(`  → condition: ${isTrue(c)}`,'i');}else execStack.push(false);}
+    else if(tok.op==='ELSE'){const pe=execStack.length<=1||execStack.slice(0,-1).every(e=>e===true);if(pe)execStack[execStack.length-1]=!execStack[execStack.length-1];}
+    else if(tok.op==='ENDIF'){execStack.pop();}
+    else if(exec){
+      // Enforce dynamic SigOp limit before execution
+      if (tok.op === 'CHECKSIG' || tok.op === 'CHECKSIGVERIFY') {
+          window.runtimeSigops++;
+          if (window.runtimeSigops > 3) throw 'VerifyFailed: MAX_SIGOPS_PER_SCRIPT exceeded';
+      }
+      await execOp(tok);
+    }
+    pc++;updateStackUI();
+    if(pc>=compiledTokens.length)endVM();
+  } catch(e) {log(`[${pc}] FATAL: ${e}`,'e');haltVM(`✗ ${e}`);}
+}
+
+async function execOp(tok) {
+  const pop=()=>{if(!stack.length)throw'Stack underflow';return stack.pop();};
+  const push=v=>stack.push(v);
+  switch(tok.op){
+    case 'PUSH_HEX':push(tok.arg.toLowerCase());break;
+    case 'PUSH_INT':push(intToHexLE(parseInt(tok.arg)));break;
+    case 'DROP':{let a=pop();log(`  → dropped: ${a}`,'i');break;}
+    case 'DUP':{let a=pop();push(a);push(a);break;}
+    case 'SWAP':{let a=pop(),b=pop();push(a);push(b);break;}
+    case 'OVER':{if(stack.length<2)throw'Stack underflow';push(stack[stack.length-2]);break;}
+    case 'ROT':{if(stack.length<3)throw'Stack underflow';push(stack.splice(stack.length-3,1)[0]);break;}
+    case 'EQUAL':{let b=pop(),a=pop();push(a===b?'01':'00');break;}
+    case 'VERIFY':{if(!isTrue(pop()))throw'VERIFY failed';break;}
+    case 'EQUALVERIFY':{let b=pop(),a=pop();if(a!==b)throw`EQUALVERIFY failed (${a} ≠ ${b})`;break;}
+    case 'ADD':{let b=pop(),a=pop();push(intToHexLE(hexLEToInt(a)+hexLEToInt(b)));break;}
+    case 'SUB':{let b=pop(),a=pop();let d=hexLEToInt(a)-hexLEToInt(b);if(d<0)throw'Math overflow';push(intToHexLE(d));break;}
+    case 'GREATER_OR_EQUAL':{let b=pop(),a=pop();push(hexLEToInt(a)>=hexLEToInt(b)?'01':'00');break;}
+    case 'HASH':{
+      let a=pop(),hex=a;
+      if(!/^[0-9A-Fa-f]+$/.test(a)||a.length%2!==0)hex=Array.from(new TextEncoder().encode(a)).map(b=>b.toString(16).padStart(2,'0')).join('');
+      let h=window.blake3_hash_hex(hex);push(h);log(`  → hash: ${h.slice(0,16)}…`,'i');break;
+    }
+    case 'CHECKSIG':{let pk=pop(),sig=pop();push(pk===sig?'01':'00');break;}
+    case 'CHECKSIGVERIFY':{let pk=pop(),sig=pop();if(pk!==sig)throw`CHECKSIGVERIFY failed (sig '${sig}' ≠ pk '${pk}')`;break;}
+    case 'CHECKTIMEVERIFY':{let r=hexLEToInt(pop()),cur=parseInt(document.getElementById('ctxHeight').value);if(cur<r)throw`CHECKTIMEVERIFY failed (height ${cur} < ${r})`;break;}
+    case 'SUM_TO_ADDR':{
+      let addr=pop(),sum=0;
+      document.getElementById('ctxOutputs').value.split(',').forEach(o=>{let p=o.split(':');if(p.length===2&&p[0].trim().toLowerCase()===addr.toLowerCase())sum+=parseInt(p[1]);});
+      push(intToHexLE(sum));log(`  → sum for ${addr.slice(0,8)}: ${sum}`,'i');break;
+    }
+    default:throw`Unknown opcode: ${tok.op}`;
+  }
+}
+
+async function vmRun() {
+  log('Running to completion...','i');
+  while(!isHalted&&pc<compiledTokens.length){
+    await vmStep();
+    if(pc%5===0)await new Promise(r=>setTimeout(r,8));
+  }
+}
+
+function updateStackUI() {
+  const sv=document.getElementById('stackView');
+  if(!stack.length){sv.innerHTML='<div class="sempty">Stack Empty</div>';return;}
+  sv.innerHTML=stack.map((v,i)=>`<div class="sitem"><span class="si">[${i}]</span><span class="sv2">${v}</span></div>`).reverse().join('');
+}
+
+function endVM() {
+  isHalted=true;
+  document.getElementById('btnStep').disabled=true;
+  document.getElementById('btnRun').disabled=true;
+  document.querySelectorAll('.asm-line').forEach(el=>el.classList.remove('active'));
+  if(stack.length===1&&stack[0]==='01'){
+    setVmStatus('✓ Success — valid spend!','ok');
+    log('Execution succeeded. Stack: [01]','s');
+    showToast('✓ Valid spend!','success');
+  } else {
+    const msg=`✗ Failed — stack: [${stack.join(', ')}]`;
+    setVmStatus(msg,'err');
+    log(msg,'e');
+    showToast('Script failed','error');
+  }
+}
+
+// ═══════════════════════════════════════════
+// PROJECT STATE MANAGEMENT
+// ═══════════════════════════════════════════
+function getProjects() {
+    return JSON.parse(localStorage.getItem('midscript_projects') || '{}');
+}
+
+function refreshProjectList() {
+    const sel = document.getElementById('projectSelect');
+    const projects = getProjects();
+    const currentVal = sel.value;
+    
+    sel.innerHTML = '<option value="">-- Load Project --</option>';
+    for (let name in projects) {
+        let opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        sel.appendChild(opt);
+    }
+    if (projects[currentVal]) sel.value = currentVal;
+}
+
+function saveProject() {
+  const sel = document.getElementById('projectSelect');
+  let name = sel.value;
+  if (!name || confirm('Save as new project?')) {
+    openSaveModal();           // always open modal when no name or user wants "Save As"
+  } else {
+    executeSave(name);
+  }
+}
+
+function openSaveModal() {
+    const overlay = document.getElementById('modal-overlay');
+    const inp = document.getElementById('modal-proj-name');
+    overlay.classList.add('show');
+    inp.value = '';
+    inp.focus();
+    
+    inp.onkeydown = (e) => { 
+        if(e.key === 'Enter') confirmSave(); 
+        if(e.key === 'Escape') closeSaveModal(); 
+    };
+}
+
+function closeSaveModal() {
+    document.getElementById('modal-overlay').classList.remove('show');
+}
+
+function confirmSave() {
+    const name = document.getElementById('modal-proj-name').value.trim();
+    if (!name) return;
+    closeSaveModal();
+    executeSave(name);
+}
+
+function executeSave(name) {
+    const state = {
+        source: editor.getValue(),
+        witness: document.getElementById('ctxWitness').value,
+        height: document.getElementById('ctxHeight').value,
+        outputs: document.getElementById('ctxOutputs').value,
+        log: document.getElementById('terminalLogs').innerHTML,
+        windows: {}
+    };
+
+    // Capture exact layout, ignoring the save modal
+    document.querySelectorAll('.win:not(#save-modal)').forEach(w => {
+        state.windows[w.id] = {
+            l: w.style.left, 
+            t: w.style.top,
+            w: w.style.width, 
+            h: w.style.height,
+            min: w.classList.contains('minimised'),
+            max: wstate[w.id] ? wstate[w.id].maxed : false
+        };
+    });
+
+    const projects = getProjects();
+    projects[name] = state;
+    localStorage.setItem('midscript_projects', JSON.stringify(projects));
+    
+    refreshProjectList();
+    document.getElementById('projectSelect').value = name;
+    showToast(`Project '${name}' saved`, 'success');
+}
+
+function newProject() {
+  if (confirm('Discard current work and start fresh?')) {
+    editor.setValue('// New Midscript contract\ntrue;', -1);
+    document.getElementById('ctxWitness').value = '';
+    document.getElementById('ctxOutputs').value = '';
+    document.getElementById('ctxHeight').value = '500001';
+    document.getElementById('terminalLogs').innerHTML = '';
+    document.getElementById('bytecodeOutput').textContent = 'Click Compile to generate bytecode...';
+    document.getElementById('asmOutput').innerHTML = "<div style='color:#1e3a5f;padding:12px;font-size:11px;'>Awaiting compilation...</div>";
+    setVmStatus('Ready.','neu');
+    setAddr('—');
+    document.getElementById('projectSelect').value = '';
+    log('New project created','i');
+  }
+}
+
+function loadProject(name) {
+    if (!name) return;
+    const projects = getProjects();
+    const state = projects[name];
+    if (!state) return;
+
+    // Restore text and context
+    editor.setValue(state.source, -1);
+    document.getElementById('ctxWitness').value = state.witness || '';
+    document.getElementById('ctxHeight').value = state.height || '500001';
+    document.getElementById('ctxOutputs').value = state.outputs || '';
+    
+    // Restore logs
+    const logs = document.getElementById('terminalLogs');
+    logs.innerHTML = state.log || '';
+    logs.scrollTop = logs.scrollHeight;
+
+    // Restore window layout
+    for (let id in state.windows) {
+        const w = state.windows[id];
+        const el = document.getElementById(id);
+        if (!el) continue;
+        
+        el.style.left = w.l; 
+        el.style.top = w.t;
+        el.style.width = w.w; 
+        el.style.height = w.h;
+        
+        if (!wstate[id]) wstate[id] = {};
+        wstate[id].maxed = w.max;
+        
+        if (w.min) minimiseWin(id);
+        else restoreWin(id);
+    }
+    
+    if (window._ace) window._ace.resize();
+    
+    // Clear volatile VM outputs
+    document.getElementById('bytecodeOutput').textContent = 'Click Compile to generate bytecode...';
+    document.getElementById('asmOutput').innerHTML = "<div style='color:#1e3a5f;padding:12px;font-size:11px;'>Awaiting compilation...</div>";
+    setVmStatus('Ready.','neu');
+    setAddr('—');
+    
+    showToast(`Project '${name}' loaded`, 'info');
+}
+
+// Initialize the dropdown on startup
+refreshProjectList();
+
+function saveLocal() {
+    localStorage.setItem('midscript_saved', editor.getValue());
+    showToast('Script saved locally', 'success');
+}
+
+function loadLocal() {
+    const code = localStorage.getItem('midscript_saved');
+    if (code) {
+        editor.setValue(code, -1);
+        showToast('Script loaded', 'info');
+    } else {
+        showToast('No saved script found', 'error');
+    }
+}
+function haltVM(msg,cls='err'){
+  isHalted=true;
+  document.getElementById('btnStep').disabled=true;
+  document.getElementById('btnRun').disabled=true;
+  setVmStatus(msg,cls);
+}
+
+// ═══════════════════════════════════════════
+// WORKSPACE CENTERING
+// ═══════════════════════════════════════════
+function centerWorkspace() {
+  const desk = document.getElementById('desktop');
+  // Total layout is 945px wide and 808px tall. Math.max keeps it from going off-screen on small monitors.
+  const offsetX = Math.max(8, (desk.clientWidth - 945) / 2);
+  const offsetY = Math.max(8, (desk.clientHeight - 808) / 2);
+  
+  // The relative grid positions of your windows
+  const grid = {
+    'win-editor':   { x: 0,   y: 0 },
+    'win-bytecode': { x: 555, y: 0 },
+    'win-ctx':      { x: 0,   y: 430 },
+    'win-vm':       { x: 555, y: 430 },
+    'win-log':      { x: 0,   y: 625 }
+  };
+
+  for (let [id, pos] of Object.entries(grid)) {
+    const el = document.getElementById(id);
+    if (el) {
+      el.style.left = (offsetX + pos.x) + 'px';
+      el.style.top = (offsetY + pos.y) + 'px';
+    }
+  }
+}
+
+// Run once immediately on startup
+centerWorkspace();
+
+// Make layout responsive
+function updateLayout() {
+  const desk = document.getElementById('desktop');
+  const offsetX = Math.max(8, (desk.clientWidth - 945) / 2);
+  const offsetY = Math.max(8, (desk.clientHeight - 808) / 2);
+
+  const grid = {
+    'win-editor':   { x: 0,   y: 0 },
+    'win-bytecode': { x: 555, y: 0 },
+    'win-ctx':      { x: 0,   y: 430 },
+    'win-vm':       { x: 555, y: 430 },
+    'win-log':      { x: 0,   y: 625 }
+  };
+
+  Object.entries(grid).forEach(([id, pos]) => {
+    const el = document.getElementById(id);
+    if (el && !wstate[id]?.maxed) {
+      el.style.left = (offsetX + pos.x) + 'px';
+      el.style.top  = (offsetY + pos.y) + 'px';
+    }
+  });
+}
+
+window.addEventListener('resize', updateLayout);
+// Also call once after projects load
+const originalLoadProject = window.loadProject;
+window.loadProject = function(name) {
+  originalLoadProject(name);
+  setTimeout(updateLayout, 50);
+};
+
+// Keyboard shortcuts
+document.addEventListener('keydown', e=>{
+  if(e.key==='F10'&&!document.getElementById('btnStep').disabled){e.preventDefault();vmStep();}
+  if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();compileCode();}
+});
+
+// Auto-update CLI on witness change
+document.getElementById('ctxWitness').addEventListener('input', e=>{
+  const bc=document.getElementById('bytecodeOutput').textContent;
+  if(bc&&bc!=='Click Compile to generate bytecode...')
+    document.getElementById('cliSpend').textContent=`midstate wallet spend-script --coin <ID> --bytecode ${bc} --inputs "${e.target.value}" --to <dest>:<amt>`;
+});
+</script>
+
+<!-- CUSTOM PROMPT MODAL -->
+<div id="modal-overlay">
+  <div id="save-modal" class="win">
+    <div class="win-tb">
+      <span class="win-label"><span class="ico">💾</span>SAVE PROJECT</span>
+    </div>
+    <div class="win-body" style="padding:15px; display:flex; flex-direction:column; gap:12px;">
+      <label class="ctx-lbl">Project Name</label>
+      <input type="text" id="modal-proj-name" class="ctx-inp" style="margin:0;" placeholder="e.g., My Contract">
+      <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:4px;">
+        <button class="tb-btn" onclick="closeSaveModal()">Cancel</button>
+        <button class="tb-btn ok-btn" onclick="confirmSave()">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
