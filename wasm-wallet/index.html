@@ -1377,7 +1377,8 @@ async function connectWebRTC(bootstrapAddr) {
         async function autoConnectWebRTC() {
             try {
                 _rpcUrl = document.getElementById('rpcUrl')?.value?.trim() || _rpcUrl;
-                const state = await fetch(`${_rpcUrl}/state`, { cache: 'no-store' }).then(r => r.json());
+                const url = _rpcUrl.replace(/\/+$/, '');
+                const state = await fetch(`${url}/state`, { cache: 'no-store' }).then(r => r.json());
                 const addrs = state.webrtc_addrs;
                 if (!addrs || addrs.length === 0) {
                     log('[light] Node advertises no WebRTC addrs — staying on HTTPS.');
@@ -1410,7 +1411,7 @@ async function connectWebRTC(bootstrapAddr) {
             const respond = (result, error) => worker.postMessage({ type: 'RPC_RESPONSE', payload: { id, result, error } });
             try {
                 const lc  = lightClient?.isConnected ? lightClient : null;
-                const url = _rpcUrl;
+                const url = _rpcUrl.replace(/\/+$/, '');
                 let result;
 
                 if (method === 'getState') {
@@ -1422,13 +1423,28 @@ async function connectWebRTC(bootstrapAddr) {
                     if (lc) { result = await lc.getMempool(); }
                     else { const r = await fetch(`${url}/mempool`, { cache: 'no-store' }); result = r.ok ? await r.json() : { size: 0, transactions: [] }; }
 
-                } else if (method === 'getBlock') {
-                    if (lc) { result = await lc.getBlock(params.height); }
-                    else { const r = await fetch(`${url}/block/${params.height}`, { cache: 'no-store', keepalive: true }); result = r.ok ? await r.json() : null; }
+ } else if (method === 'getBlock') {
+                    let success = false;
+                    if (lc) { 
+                        try { 
+                            result = await lc.getBlock(params.height); 
+                            success = true;
+                        } catch(e) {}
+                    }
+                    if (!success) { 
+                        const r = await fetch(`${url}/block/${params.height}`, { cache: 'no-store', keepalive: true }); 
+                        result = r.ok ? await r.json() : null; 
+                    }
 
-                } else if (method === 'getFilters') {
-                    if (lc) { result = await lc.getFilters(params.startHeight, params.endHeight); }
-                    else {
+} else if (method === 'getFilters') {
+                    let success = false;
+                    if (lc) { 
+                        try { 
+                            result = await lc.getFilters(params.startHeight, params.endHeight); 
+                            success = true;
+                        } catch(e) { console.warn("WebRTC filter fetch failed, falling back to HTTPS"); }
+                    }
+                    if (!success) {
                         const r = await fetch(`${url}/filters`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ start_height: params.startHeight, end_height: params.endHeight }), cache: 'no-store' });
                         if (!r.ok) throw new Error('Failed to fetch filters.');
                         result = await r.json();
@@ -1464,6 +1480,7 @@ async function connectWebRTC(bootstrapAddr) {
                             const r = await fetch(`${url}/api/internal/submit_batch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params.batch) });
                             result = { ok: r.ok, body: r.ok ? null : await r.text() };
                         } catch (fetchErr) {
+                            console.warn('[rpc] HTTPS submitBatch failed:', fetchErr.message);
                             // If both WebRTC and HTTPS fail, try to reconnect and retry once
                             if (lightClient && !lightClient.isConnected) {
                                 for (const addr of lightClient.knownMultiaddrs) {
@@ -1474,7 +1491,7 @@ async function connectWebRTC(bootstrapAddr) {
                                 const resp = await lightClient.submitBatch(params.batch);
                                 result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
                             } else {
-                                throw new Error('Block submission failed: no connection to any node');
+                                throw new Error(`Block submission failed: HTTPS rejected (${fetchErr.message}) and no WebRTC connection`);
                             }
                         }
                     }
@@ -1756,17 +1773,22 @@ async function connectWebRTC(bootstrapAddr) {
                     break;
 
                 case 'BLOCK_SUBMITTED':
-                    // Show celebration
-                    showBlockCelebration({
-                        ...payload,
-                        nonce: payload.nonce || 0,
-                        sessionBlock: blocksFoundSession,
-                        totalNonces: totalNoncesSession
-                    });
+                    // Ignore duplicate rejection events so they don't spam the UI
+                    if (payload.rejectReason === 'duplicate') return;
+
+                    if (payload.accepted) {
+                        showBlockCelebration({
+                            ...payload,
+                            nonce: payload.nonce || 0,
+                            sessionBlock: blocksFoundSession,
+                            totalNonces: totalNoncesSession
+                        });
+                    }
                     addMinedBlockEntry(payload);
                     switchTab('view-mine');
+                    
                     // Request fresh template and restart miners
-                    if (isMiningActive) {
+                    if (isMiningActive && payload.accepted) {
                         currentTemplate = null;
                         lastTemplateHeight = -1;
                         setTimeout(requestTemplate, 2000); // Let chain advance

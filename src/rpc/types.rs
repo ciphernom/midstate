@@ -29,11 +29,6 @@ pub enum OutputDataJson {
         value: u64,
         salt: String,
     },
-    Confidential {
-        address: String,
-        commitment: String,
-        salt: String,
-    },
     DataBurn {
         payload: String,
         value_burned: u64,

@@ -50,7 +50,8 @@ self.onmessage = async (e) => {
         // Capped to JS MAX_SAFE_INTEGER to prevent JSON.parse corruption over the network.
         const MAX_SAFE = 9007199254740991; 
         const startRange = Math.floor(Math.random() * (MAX_SAFE - 1000000000));
-        let nonce = BigInt(startRange););
+        let nonce = BigInt(startRange);
+
 
         // CHUNK controls how many SIMD iterations per search_nonces() call.
         // Each iteration = 4 SIMD lanes = 4 nonces. This chain uses expensive

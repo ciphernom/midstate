@@ -7,8 +7,8 @@ use axum::{
 };
 
 use tower_http::trace::TraceLayer;
-use tower_http::cors::CorsLayer;
-use axum::http::{Method, HeaderValue, header};
+use tower_http::cors::{CorsLayer, Any};  
+use axum::http::{Method, HeaderValue};
 use axum::extract::DefaultBodyLimit;
 
 use std::net::{IpAddr, SocketAddr};
@@ -28,18 +28,18 @@ impl RpcServer {
 
     pub async fn run(self, node_handle: NodeHandle) -> Result<()> {
         
-        // Create a strict list of allowed origins
+        // Strict whitelist for Origins, but permissive for Preflight (OPTIONS) and Headers
         let allowed_origins = [
             "http://localhost:8080".parse::<HeaderValue>().unwrap(),
             "https://ciphernom.github.io".parse::<HeaderValue>().unwrap(), 
             "https://cypherpunk.gold".parse::<HeaderValue>().unwrap(), 
             "https://www.cypherpunk.gold".parse::<HeaderValue>().unwrap(), 
-            ];
+        ];
         
         let cors = CorsLayer::new()
             .allow_origin(allowed_origins)
-            .allow_methods([Method::GET, Method::POST])
-            .allow_headers([header::CONTENT_TYPE, header::ACCEPT]);
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS]) // <-- Explicitly allow OPTIONS for preflight
+            .allow_headers(Any); // <-- Allow any headers the browser wants to send in the preflight
             
         let app = Router::new()
             .route("/", get(explorer_ui))

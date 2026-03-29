@@ -66,19 +66,12 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
                 bail!("Witness count must match input count"); 
             }
 
-            // STARK Activation Gate: Prevent 128KB block bloat before the hard fork
-            let max_witness_size = if state.height >= crate::core::types::STARK_ACTIVATION_HEIGHT {
-                (crate::core::stark::MAX_STARK_PROOF_SIZE + MAX_SIGNATURE_SIZE) * MAX_TX_INPUTS
-            } else {
-                MAX_SIGNATURE_SIZE * MAX_TX_INPUTS
-            };
-            
+            let max_witness_size = MAX_SIGNATURE_SIZE * MAX_TX_INPUTS;
             if bincode::serialized_size(&witnesses).unwrap_or(u64::MAX) > max_witness_size as u64 {
-                bail!(
-                    "Witnesses payload exceeds maximum allowed size (STARKs inactive until block {})", 
-                    crate::core::types::STARK_ACTIVATION_HEIGHT
-                );
+                bail!("Witnesses payload exceeds maximum allowed size");
             }
+            
+
 
             {
                 let mut seen = std::collections::HashSet::new();
@@ -86,20 +79,8 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
                     if !seen.insert(input.coin_id()) {
                         bail!("Duplicate input coin");
                     }
-                    // SECURITY: Block spending of confidential UTXOs until the
-                    // STARK AIR is upgraded to prove input commitment binding.
-                    // Without this, InputReveal.value is unverified for
-                    // confidential inputs (coin_id does not include value),
-                    // allowing a miner to claim arbitrary fees via inflated
-                    // input values. Creating confidential outputs from standard
-                    // inputs remains safe and allowed.
-                    if input.commitment.is_some()
-                        && state.height >= crate::core::types::CONFIDENTIAL_ACTIVATION_HEIGHT
-                    {
-                        bail!(
-                            "Spending confidential UTXOs is disabled pending \
-                             STARK input-commitment binding upgrade"
-                        );
+                    if input.commitment.is_some() {
+                        bail!("Confidential UTXOs are deprecated and disabled at the consensus level.");
                     }
                 }
             }
@@ -215,33 +196,20 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 bail!("Witness count must match input count"); 
             }
 
-            // STARK Activation Gate: Prevent 128KB block bloat before the hard fork
-            let max_witness_size = if state.height >= crate::core::types::STARK_ACTIVATION_HEIGHT {
-                (crate::core::stark::MAX_STARK_PROOF_SIZE + MAX_SIGNATURE_SIZE) * MAX_TX_INPUTS
-            } else {
-                MAX_SIGNATURE_SIZE * MAX_TX_INPUTS
-            };
-            
+            let max_witness_size = MAX_SIGNATURE_SIZE * MAX_TX_INPUTS;
             if bincode::serialized_size(&witnesses).unwrap_or(u64::MAX) > max_witness_size as u64 {
-                bail!(
-                    "Witnesses payload exceeds maximum allowed size (STARKs inactive until block {})", 
-                    crate::core::types::STARK_ACTIVATION_HEIGHT
-                );
+                bail!("Witnesses payload exceeds maximum allowed size");
             }
+            
+
             {
                 let mut seen = std::collections::HashSet::new();
                 for input in inputs {
                     if !seen.insert(input.coin_id()) {
                         bail!("Duplicate input coin");
                     }
-                    // SECURITY: See matching check in apply_transaction_no_sig_check.
-                    if input.commitment.is_some()
-                        && state.height >= crate::core::types::CONFIDENTIAL_ACTIVATION_HEIGHT
-                    {
-                        bail!(
-                            "Spending confidential UTXOs is disabled pending \
-                             STARK input-commitment binding upgrade"
-                        );
+                    if input.commitment.is_some() {
+                        bail!("Confidential UTXOs are deprecated and disabled at the consensus level.");
                     }
                 }
             }
@@ -390,24 +358,20 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                 bail!("Witness count must match input count"); 
             }
 
-            // STARK Activation Gate: Prevent 128KB block bloat before the hard fork
-            let max_witness_size = if state.height >= crate::core::types::STARK_ACTIVATION_HEIGHT {
-                (crate::core::stark::MAX_STARK_PROOF_SIZE + MAX_SIGNATURE_SIZE) * MAX_TX_INPUTS
-            } else {
-                MAX_SIGNATURE_SIZE * MAX_TX_INPUTS
-            };
-            
+            let max_witness_size = MAX_SIGNATURE_SIZE * MAX_TX_INPUTS;
             if bincode::serialized_size(&witnesses).unwrap_or(u64::MAX) > max_witness_size as u64 {
-                bail!(
-                    "Witnesses payload exceeds maximum allowed size (STARKs inactive until block {})", 
-                    crate::core::types::STARK_ACTIVATION_HEIGHT
-                );
+                bail!("Witnesses payload exceeds maximum allowed size");
             }
+                        
+
             {
                 let mut seen = std::collections::HashSet::new();
                 for input in inputs {
                     if !seen.insert(input.coin_id()) {
                         bail!("Duplicate input coin");
+                    }
+                    if input.commitment.is_some() {
+                        bail!("Confidential UTXOs are deprecated and disabled at the consensus level.");
                     }
                 }
             }

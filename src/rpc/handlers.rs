@@ -156,13 +156,6 @@ let inputs: Vec<InputReveal> = req.inputs.iter().map(|i| {
                     value_burned: *value_burned,
                 })
             }
-            OutputDataJson::Confidential { address, commitment, salt } => {
-                Ok(OutputData::Confidential {
-                    address: parse_hex32(address, "address")?,
-                    commitment: parse_hex32(commitment, "commitment")?,
-                    salt: parse_hex32(salt, "output_salt")?,
-                })
-            }
         }
     }).collect::<Result<_, ErrorResponse>>()?;
 
@@ -343,9 +336,7 @@ let input = InputReveal {
         OutputDataJson::DataBurn { .. } => {
             return Err(ErrorResponse { error: "DataBurn payloads are not allowed in CoinJoin mixes".into() })
         }
-        OutputDataJson::Confidential { .. } => {
-            return Err(ErrorResponse { error: "Confidential outputs are not allowed in CoinJoin mixes".into() })
-        }
+
     };
 
     // --- Validate coin exists in UTXO set before touching MixManager ---
@@ -1133,16 +1124,6 @@ pub fn parse_reveal_json(value: serde_json::Value) -> Result<Transaction, String
                 Ok(OutputData::DataBurn {
                     payload: hex::decode(payload).map_err(|_| "Invalid payload hex")?,
                     value_burned: *value_burned,
-                })
-            }
-            OutputDataJson::Confidential { address, commitment, salt } => {
-                let a = hex::decode(address).map_err(|e| format!("Invalid address hex: {}", e))?;
-                let c = hex::decode(commitment).map_err(|e| format!("Invalid commitment hex: {}", e))?;
-                let s = hex::decode(salt).map_err(|e| format!("Invalid salt hex: {}", e))?;
-                Ok(OutputData::Confidential {
-                    address: <[u8; 32]>::try_from(a).map_err(|_| "address must be 32 bytes")?,
-                    commitment: <[u8; 32]>::try_from(c).map_err(|_| "commitment must be 32 bytes")?,
-                    salt: <[u8; 32]>::try_from(s).map_err(|_| "salt must be 32 bytes")?,
                 })
             }
         }

@@ -42,10 +42,7 @@ const MAX_LIGHT_PEERS: usize = 30;
 const MAX_LIGHT_STREAMS_PER_PEER: usize = 5;
 /// Rate limit window in seconds.
 const LIGHT_RATE_WINDOW_SECS: u64 = 60;
-/// Maximum requests per peer per window (general).
-const LIGHT_RATE_LIMIT: u32 = 120;
-/// Maximum expensive requests (BlockTemplate) per peer per window.
-const LIGHT_EXPENSIVE_LIMIT: u32 = 12;
+
 /// Number of rate-limit violations before temporary ban.
 const LIGHT_BAN_THRESHOLD: u32 = 3;
 /// Duration of a temporary ban in seconds.
@@ -87,7 +84,7 @@ impl LightPeerState {
         }
     }
 
-    /// Calculate dynamic rate limit based on the Expected Value of the Beta distribution
+/// Calculate dynamic rate limit based on the Expected Value of the Beta distribution
     fn current_rate_limit(&self) -> u32 {
         // E[X] = alpha / (alpha + beta). 
         // Approaches 1.0 for honest peers, approaches 0.0 for malicious peers.
@@ -98,8 +95,8 @@ impl LightPeerState {
             return 5; // 5 requests per minute maximum
         }
 
-        // Base rate for unknown peers is ~60. Highly trusted peers scale up to ~240.
-        (20.0 + (220.0 * probability_honest)) as u32
+        // Base rate for unknown peers (0.5 prob) is ~275. Highly trusted peers scale up to ~500.
+        (50.0 + (450.0 * probability_honest)) as u32
     }
 
     fn current_expensive_limit(&self) -> u32 {
@@ -214,11 +211,7 @@ impl LightGuard {
         guard.peers.get(peer).map_or(false, |s| s.is_banned())
     }
 
-    /// Total number of tracked light peers.
-    async fn peer_count(&self) -> usize {
-        let guard = self.inner.lock().await;
-        guard.peers.len()
-    }
+  
 /// BAYESIAN INFERENCE: Observe an honest interaction
     async fn observe_honest(&self, peer: PeerId) {
         let mut guard = self.inner.lock().await;

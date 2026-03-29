@@ -46,9 +46,6 @@ const MAX_TX_PER_PEER_PER_WINDOW: u32 = 50;
 /// Rate-limit window duration in seconds.
 const TX_RATE_WINDOW_SECS: u64 = 10;
 
-/// Dandelion++: probability (out of 100) that a stem-phase tx gets "fluffed"
-/// (broadcast to all peers) at each hop. ~10% means ~10 hops on average.
-const STEM_FLUFF_PERCENT: u32 = 10;
 /// Dandelion++: if a stem tx hasn't been fluffed within this many seconds,
 /// we fluff it ourselves as a safety net.
 const STEM_TIMEOUT_SECS: u64 = 30;

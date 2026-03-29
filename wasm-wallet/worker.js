@@ -982,10 +982,14 @@ async function performScan() {
     let currentHeight = wState.lastScannedHeight;
     updateWasmWatchlist();
 
-    while (currentHeight < chainHeight) {
+while (currentHeight < chainHeight) {
+        // Increase chunk size to 1000 to drastically reduce the number of network requests
         const end        = Math.min(currentHeight + 1000, chainHeight);
         const filterData = await rpc.getFilters(currentHeight, end);
         const numFilters = filterData.filters ? filterData.filters.length : 0;
+        
+        // Add a tiny delay to appease Nginx/Cloudflare rate limiters
+        await new Promise(r => setTimeout(r, 15));
 
         for (let i = 0; i < numFilters; i++) {
             const height = filterData.start_height + i;

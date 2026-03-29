@@ -604,26 +604,7 @@ impl Transaction {
     pub fn fee(&self) -> u64 {
         match self {
             Transaction::Commit { .. } => 0,
-            Transaction::Reveal { inputs, outputs, witnesses, .. } => {
-                if outputs.iter().any(|o| o.is_confidential()) {
-                    // FIX 4: For confidential transfers, the fee is declared
-                    // explicitly in the STARK public inputs and enforced by the
-                    // AIR constraint v1 + v2 + fee == input_sum. Read it directly
-                    // from the witness rather than computing by subtraction.
-                    for witness in witnesses.iter() {
-                        let Witness::ScriptInputs(items) = witness;
-                            if items.len() >= 2 {
-                                let pub_inputs = &items[items.len() - 2];
-                                if pub_inputs.len() >= 80 {
-                                    if let Ok(fee_bytes) = pub_inputs[72..80].try_into() {
-                                        return u64::from_le_bytes(fee_bytes);
-                                    }
-                                }
-                            }
-                        
-                    }
-                    return 0;
-                }
+            Transaction::Reveal { inputs, outputs, .. } => {
                 let in_sum = inputs.iter()
                     .try_fold(0u64, |acc, i| acc.checked_add(i.value))
                     .unwrap_or(u64::MAX);
@@ -719,16 +700,6 @@ pub const WOTS_REUSE_ACTIVATION_HEIGHT: u64 = 18_000;
 /// Block height at which MSS leaf reuse is enforced at consensus level.
 /// Uses the leaf's WOTS public key as a nullifier in the spent oracle.
 pub const MSS_REUSE_ACTIVATION_HEIGHT: u64 = 25_000; 
-
-/// Block height at which STARK proof verification and 128KB witness payloads activate.
-pub const STARK_ACTIVATION_HEIGHT: u64 = 30_000;
-
-/// Block height at which strict STARK public input binding is enforced
-pub const CT_BINDING_ACTIVATION_HEIGHT: u64 = 30_000; 
-
-/// Block height at which OutputData::Confidential is accepted in transactions.
-/// Requires STARK_ACTIVATION_HEIGHT to already be active.
-pub const CONFIDENTIAL_ACTIVATION_HEIGHT: u64 = 30_000;
 
 /// Block height at which state_root in batches becomes mandatory.
 /// Before this height, blocks may omit the state root (legacy blocks).

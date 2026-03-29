@@ -26,8 +26,6 @@ bip39 = "2.0"
 toml = "1.0.3"
 tracing = "0.1"
 smallvec = "1.15.1"
-winterfell = "0.10.2"
-winter-utils = "=0.10.2" # STRICTLY pinned to match winterfell
 lazy_static = "1"
 
 # NATIVE ONLY: Networking, File System, OS Allocators, CLI, Web Servers
@@ -58,7 +56,6 @@ mimalloc = "0.1.43"
 
 [features]
 fast-mining = []
-stark-prover = []  # Only needed by wallets/miners that generate proofs
 
 [dev-dependencies]
 tempfile = "3.8"

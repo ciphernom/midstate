@@ -272,7 +272,7 @@ async request(req, _retries = 2) {
         // If we got RESET, retry (server's initial binary protocol probe
         // can kill the first light stream after a new connection)
         if (gotReset && _retries > 0) {
-            try { stream.close(); } catch (_) {}
+            try { stream.abort(new Error('reset')); } catch (_) {}
             return this.request(req, _retries - 1);
         }
 
@@ -284,6 +284,7 @@ async request(req, _retries = 2) {
         const respJson = new TextDecoder().decode(appData.slice(4, 4 + respLen));
         return JSON.parse(respJson);
     } finally {
+        try { stream.abort(new Error('done')); } catch (_) {}
         try { stream.close(); } catch (_) {}
     }
 }
