@@ -1490,9 +1490,19 @@ async fn handle_message(
                 } else if depth > self.state.depth || height > self.state.height
                     || (depth == self.state.depth && midstate < self.state.midstate)
                 {
-                // FIX: also guard on sync_in_progress, which stays true even when
-                // sync_session is temporarily None during background PoW verification
-                if self.sync_session.is_some() || self.sync_in_progress {
+                    // --- FIX 2: Sanity Check Depth Claims ---
+                    // Do not trust a massive depth claim if the height is impossibly low
+                    let safe_depth = self.cached_safe_depth;
+                    if depth > self.state.depth && height < self.state.height.saturating_sub(safe_depth * 2) {
+                        tracing::warn!("Peer {} claims impossible depth ({}) for low height ({}). Ignoring.", from, depth, height);
+                        return Ok(());
+                    }
+                    // ----------------------------------------
+                
+                
+                    // FIX: also guard on sync_in_progress, which stays true even when
+                    // sync_session is temporarily None during background PoW verification
+                    if self.sync_session.is_some() || self.sync_in_progress {
                         tracing::debug!("Sync session already active. Ignoring StateInfo from {} to prevent thrashing.", from);
                     } else {
                         // --- FIX: Disable insecure Fast-Forward Sync ---
@@ -1842,6 +1852,16 @@ let start_height = force_start.unwrap_or_else(|| {
             // If the calculated start is ahead of us, force it back to our tip.
             base_start.min(self.state.height)
         });
+        
+        
+        // --- FIX 3: Prevent zero-header sync traps ---
+        if peer_height <= start_height {
+            tracing::debug!("Peer height {} is <= our sync cursor {}, ignoring.", peer_height, start_height);
+            self.sync_in_progress = false;
+            self.trigger_mining();
+            return;
+        }
+        // ---------------------------------------------
         
         tracing::info!(
             "Starting headers-first sync from height {}: peer(h={}, d={}) vs us(h={}, d={})",
@@ -3055,6 +3075,15 @@ fn perform_reorg(
         // Extract the midstate before we potentially move the batch
         let prev_midstate = batch.prev_midstate;
 
+        // --- FIX 1: Ignore Redundant Blocks ---
+        // If this is the block we just applied, or it is in our recent history, drop it.
+        if batch.extension.final_hash == self.state.midstate || 
+           self.chain_history.iter().any(|&(_, ms)| ms == batch.extension.final_hash) {
+            tracing::debug!("Received already-applied block, ignoring.");
+            return Ok(());
+        }
+        // --------------------------------------
+
         // Fast pre-checks BEFORE cloning state (O(1) shallow clone via structural sharing).
         if prev_midstate != self.state.midstate {
             // --- FIX: Prevent Orphan OOM Attack ---
@@ -3080,14 +3109,22 @@ fn perform_reorg(
 
             let list = self.orphan_batches.entry(prev_midstate).or_default();
             
+            // --- EFFICIENCY FIX: Deduplicate identical orphans ---
+            // Don't store 5 copies of the exact same 8MB block from 5 different peers.
+            if list.iter().any(|b| b.extension.final_hash == batch.extension.final_hash) {
+                tracing::debug!("Already tracking this exact orphan block. Ignoring duplicate.");
+                return Ok(());
+            }
+            // -----------------------------------------------------
+
             // CRITICAL FIX: Prevent infinite vector growth on a single midstate
             if list.len() < 4 {
                 list.push(batch); // batch is moved here
                 if list.len() == 1 { // Only push to order queue on first entry
-                    self.orphan_order.push_back(prev_midstate); // Use the extracted variable here!
+                    self.orphan_order.push_back(prev_midstate);
                 }
             } else {
-                tracing::warn!("Too many orphans for midstate, dropping to prevent RAM exhaustion.");
+                tracing::warn!("Too many UNIQUE competing orphans for midstate, dropping to prevent RAM exhaustion.");
             }
 
             const ORPHAN_LIMIT: usize = 8;
