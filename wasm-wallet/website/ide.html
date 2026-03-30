@@ -768,8 +768,17 @@ window.loadTemplate = function() {
 // ═══════════════════════════════════════════
 // UTILS
 // ═══════════════════════════════════════════
-function intToHexLE(n){if(n===0)return'00';let h=n.toString(16);if(h.length%2)h='0'+h;return h.match(/.{2}/g).reverse().join('');}
-function hexLEToInt(h){if(!h)return 0;return parseInt(h.match(/.{2}/g).reverse().join(''),16);}
+function intToHexLE(n){
+  if(typeof n !== 'bigint') n = BigInt(n);
+  if(n === 0n) return '00';
+  let h = n.toString(16);
+  if(h.length % 2) h = '0' + h;
+  return h.match(/.{2}/g).reverse().join('');
+}
+function hexLEToInt(h){
+  if(!h) return 0n;
+  return BigInt('0x' + h.match(/.{2}/g).reverse().join(''));
+}
 function isTrue(h){if(!h)return false;return h.match(/.{2}/g).some(b=>parseInt(b,16)!==0);}
 
 function setAddr(a) {
@@ -815,7 +824,7 @@ function assembleBytecode(asm) {
     let [op,...rest]=inst.split(' ');
     if(op==='PUSH_HEX'||op==='PUSH_INT'){
       bc.push(OPS.PUSH_DATA);
-      let hex=op==='PUSH_INT'?intToHexLE(parseInt(rest[0])):rest[0].toLowerCase();
+      let hex=op==='PUSH_INT'?intToHexLE(BigInt(rest[0])):rest[0].toLowerCase();
       let len=hex.length/2, lh=len.toString(16).padStart(4,'0');
       bc.push(parseInt(lh.slice(2,4),16),parseInt(lh.slice(0,2),16));
       for(let i=0;i<hex.length;i+=2)bc.push(parseInt(hex.slice(i,i+2),16));
@@ -957,8 +966,8 @@ genExpr(e){
       if(e.op==='>=')this.emit('GREATER_OR_EQUAL');
       if(e.op==='+')this.emit('ADD');
       if(e.op==='-')this.emit('SUB');
-      if(e.op==='&&'){this.emit('ADD');this.emit('PUSH_INT 2');this.emit('EQUAL');}
-      if(e.op==='||'){this.emit('ADD');this.emit('PUSH_INT 0');this.emit('GREATER_OR_EQUAL');}
+        if(e.op==='&&'){this.emit('ADD');this.emit('PUSH_INT 2');this.emit('EQUAL');}
+      if(e.op==='||'){this.emit('ADD');this.emit('PUSH_INT 1');this.emit('GREATER_OR_EQUAL');}
     } else if(e.type==='Call'){
       const fn=e.name;
       if(this.macros[fn]){
@@ -979,6 +988,7 @@ genExpr(e){
       else if(fn==='require_sig'){this.genExpr(e.args[0]);this.emit('CHECKSIGVERIFY');}
       else if(fn==='check_sig'){this.genExpr(e.args[0]);this.emit('CHECKSIG');}
       else if(fn==='require_transfer'){this.genExpr(e.args[0]);this.emit('SUM_TO_ADDR');this.genExpr(e.args[1]);this.emit('EQUALVERIFY');}
+      else if(fn==='sum_to_addr'){this.genExpr(e.args[0]);this.emit('SUM_TO_ADDR');}
       else throw `Unknown function or macro '${fn}'`;
     }
   }
@@ -1103,20 +1113,30 @@ async function execOp(tok) {
     case 'EQUAL':{let b=pop(),a=pop();push(a===b?'01':'00');break;}
     case 'VERIFY':{if(!isTrue(pop()))throw'VERIFY failed';break;}
     case 'EQUALVERIFY':{let b=pop(),a=pop();if(a!==b)throw`EQUALVERIFY failed (${a} ≠ ${b})`;break;}
-    case 'ADD':{let b=pop(),a=pop();push(intToHexLE(hexLEToInt(a)+hexLEToInt(b)));break;}
-    case 'SUB':{let b=pop(),a=pop();let d=hexLEToInt(a)-hexLEToInt(b);if(d<0)throw'Math overflow';push(intToHexLE(d));break;}
+case 'ADD':{let b=pop(),a=pop();push(intToHexLE(hexLEToInt(a)+hexLEToInt(b)));break;}
+    case 'SUB':{let b=pop(),a=pop();let d=hexLEToInt(a)-hexLEToInt(b);if(d<0n)throw'Math overflow';push(intToHexLE(d));break;}
     case 'GREATER_OR_EQUAL':{let b=pop(),a=pop();push(hexLEToInt(a)>=hexLEToInt(b)?'01':'00');break;}
     case 'HASH':{
       let a=pop(),hex=a;
       if(!/^[0-9A-Fa-f]+$/.test(a)||a.length%2!==0)hex=Array.from(new TextEncoder().encode(a)).map(b=>b.toString(16).padStart(2,'0')).join('');
       let h=window.blake3_hash_hex(hex);push(h);log(`  → hash: ${h.slice(0,16)}…`,'i');break;
     }
-    case 'CHECKSIG':{let pk=pop(),sig=pop();push(pk===sig?'01':'00');break;}
-    case 'CHECKSIGVERIFY':{let pk=pop(),sig=pop();if(pk!==sig)throw`CHECKSIGVERIFY failed (sig '${sig}' ≠ pk '${pk}')`;break;}
-    case 'CHECKTIMEVERIFY':{let r=hexLEToInt(pop()),cur=parseInt(document.getElementById('ctxHeight').value);if(cur<r)throw`CHECKTIMEVERIFY failed (height ${cur} < ${r})`;break;}
+    case 'CHECKSIG':{
+      let pk=pop(),sig=pop();
+      push(pk===sig?'01':'00');
+      log(`  → CHECKSIG Emulator bypass: comparing string equality`,'w');
+      break;
+    }
+    case 'CHECKSIGVERIFY':{
+      let pk=pop(),sig=pop();
+      if(pk!==sig)throw`CHECKSIGVERIFY failed (sig '${sig}' ≠ pk '${pk}')`;
+      log(`  → CHECKSIGVERIFY Emulator bypass: comparing string equality`,'w');
+      break;
+    }
+    case 'CHECKTIMEVERIFY':{let r=hexLEToInt(pop()),cur=BigInt(document.getElementById('ctxHeight').value);if(cur<r)throw`CHECKTIMEVERIFY failed (height ${cur} < ${r})`;break;}
     case 'SUM_TO_ADDR':{
-      let addr=pop(),sum=0;
-      document.getElementById('ctxOutputs').value.split(',').forEach(o=>{let p=o.split(':');if(p.length===2&&p[0].trim().toLowerCase()===addr.toLowerCase())sum+=parseInt(p[1]);});
+      let addr=pop(),sum=0n;
+      document.getElementById('ctxOutputs').value.split(',').forEach(o=>{let p=o.split(':');if(p.length===2&&p[0].trim().toLowerCase()===addr.toLowerCase())sum+=BigInt(p[1]);});
       push(intToHexLE(sum));log(`  → sum for ${addr.slice(0,8)}: ${sum}`,'i');break;
     }
     default:throw`Unknown opcode: ${tok.op}`;
@@ -1146,8 +1166,13 @@ function endVM() {
     setVmStatus('✓ Success — valid spend!','ok');
     log('Execution succeeded. Stack: [01]','s');
     showToast('✓ Valid spend!','success');
+  } else if(stack.length > 1) {
+    const msg=`✗ Clean Stack Rule violation (${stack.length} items left): [${stack.join(', ')}]`;
+    setVmStatus(msg,'err');
+    log(msg,'e');
+    showToast('Clean Stack Rule failed','error');
   } else {
-    const msg=`✗ Failed — stack: [${stack.join(', ')}]`;
+    const msg=`✗ Failed — Script must evaluate to [01]. Stack: [${stack.join(', ')}]`;
     setVmStatus(msg,'err');
     log(msg,'e');
     showToast('Script failed','error');
