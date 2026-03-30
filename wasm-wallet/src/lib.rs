@@ -990,6 +990,16 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
     }
 }
 
+/// Hash a hex-encoded byte string with BLAKE3.
+/// Returns the 32-byte hash as a 64-character hex string.
+/// Used by the IDE to generate P2SH addresses.
+#[wasm_bindgen]
+pub fn blake3_hash_hex(hex_data: &str) -> String {
+    let bytes = hex::decode(hex_data).unwrap_or_default();
+    let h = midstate::core::types::hash(&bytes);
+    hex::encode(h)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Tests
 // ═══════════════════════════════════════════════════════════════════════════════

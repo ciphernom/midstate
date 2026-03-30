@@ -511,6 +511,32 @@ export class WebWallet {
 if (Symbol.dispose) WebWallet.prototype[Symbol.dispose] = WebWallet.prototype.free;
 
 /**
+ * Hash a hex-encoded byte string with BLAKE3.
+ * Returns the 32-byte hash as a 64-character hex string.
+ * Used by the IDE to generate P2SH addresses.
+ * @param {string} hex_data
+ * @returns {string}
+ */
+export function blake3_hash_hex(hex_data) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(hex_data, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.blake3_hash_hex(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred2_0 = r0;
+        deferred2_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
  * Compute the coin ID (UTXO identifier) from an address, value, and salt.
  *
  * `coin_id = BLAKE3(address || value_le_bytes || salt)`

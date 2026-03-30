@@ -39,6 +39,11 @@ pub const OP_ENDIF: u8            = 0x42;
 
 pub const OP_SUM_TO_ADDR: u8      = 0x50;
 
+///v3 opcodes
+pub const VM_UPGRADE_ACTIVATION_HEIGHT: u64 = 60_000;
+pub const OP_OVER: u8             = 0x13;
+pub const OP_ROT: u8              = 0x14;
+pub const OP_SUB: u8              = 0x25;
 
 
 // ── Consensus limits ───────────────────────────────────────────────────────
@@ -107,7 +112,7 @@ pub struct ExecContext<'a> {
 // ── AOT validation ─────────────────────────────────────────────────────────
 
 /// Ahead-of-time structural validation. O(N) single pass.
-pub fn validate_structure(bytecode: &[u8], _height: u64) -> Result<(), ScriptError> {
+pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<(), ScriptError> {
     if bytecode.len() > MAX_SCRIPT_SIZE {
         return Err(ScriptError::ScriptTooLarge);
     }
@@ -147,7 +152,11 @@ pub fn validate_structure(bytecode: &[u8], _height: u64) -> Result<(), ScriptErr
             OP_ADD | OP_GREATER_OR_EQUAL |
             OP_HASH | OP_CHECKSIG | OP_CHECKSIGVERIFY | OP_CHECKTIMEVERIFY |
             OP_SUM_TO_ADDR => {}
-            
+            OP_OVER | OP_ROT | OP_SUB => {
+                if height < VM_UPGRADE_ACTIVATION_HEIGHT {
+                    return Err(ScriptError::InvalidOpcode(op));
+                }
+            }
             _ => return Err(ScriptError::InvalidOpcode(op)),
         }
     }
@@ -317,7 +326,20 @@ pub fn execute_script(
                 if len < 2 { return Err(ScriptError::StackUnderflow); }
                 stack.swap(len - 1, len - 2);
             }
-
+            OP_OVER => {
+                if ctx.height < VM_UPGRADE_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
+                let len = stack.len();
+                if len < 2 { return Err(ScriptError::StackUnderflow); }
+                let over_item = stack[len - 2].clone();
+                stack_push(&mut stack, over_item)?;
+            }
+            OP_ROT => {
+                if ctx.height < VM_UPGRADE_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
+                let len = stack.len();
+                if len < 3 { return Err(ScriptError::StackUnderflow); }
+                let item = stack.remove(len - 3);
+                stack.push(item);
+            }
             OP_EQUAL => {
                 let b = stack_pop(&mut stack)?;
                 let a = stack_pop(&mut stack)?;
@@ -338,6 +360,13 @@ pub fn execute_script(
                 let a = stack_pop(&mut stack)?;
                 let sum = to_u64(&a)?.checked_add(to_u64(&b)?).ok_or(ScriptError::MathOverflow)?;
                 stack_push(&mut stack, from_u64(sum))?;
+            }
+            OP_SUB => {
+                if ctx.height < VM_UPGRADE_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
+                let b = stack_pop(&mut stack)?;
+                let a = stack_pop(&mut stack)?;
+                let diff = to_u64(&a)?.checked_sub(to_u64(&b)?).ok_or(ScriptError::MathOverflow)?;
+                stack_push(&mut stack, from_u64(diff))?;
             }
             OP_GREATER_OR_EQUAL => {
                 let b = stack_pop(&mut stack)?;
@@ -481,7 +510,19 @@ pub fn push_int(bc: &mut Vec<u8>, value: u64) {
 
 pub fn assemble(source: &str) -> Result<Vec<u8>, String> {
     let mut bc = Vec::new();
-    let tokens: Vec<&str> = source.split_whitespace().collect();
+    
+    // NEW: Strip out comments (// or #) and rebuild a clean string
+    let clean_source: String = source
+        .lines()
+        .map(|line| {
+            let no_slashes = line.split("//").next().unwrap_or("");
+            no_slashes.split('#').next().unwrap_or("").trim()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // Tokenize the clean string
+    let tokens: Vec<&str> = clean_source.split_whitespace().collect();
     let mut i = 0;
 
     while i < tokens.len() {
@@ -505,10 +546,13 @@ pub fn assemble(source: &str) -> Result<Vec<u8>, String> {
             "DROP"              => bc.push(OP_DROP),
             "DUP"               => bc.push(OP_DUP),
             "SWAP"              => bc.push(OP_SWAP),
+            "OVER"              => bc.push(OP_OVER),
+            "ROT"               => bc.push(OP_ROT),
             "EQUAL"             => bc.push(OP_EQUAL),
             "VERIFY"            => bc.push(OP_VERIFY),
             "EQUALVERIFY"       => bc.push(OP_EQUALVERIFY),
             "ADD"               => bc.push(OP_ADD),
+            "SUB"               => bc.push(OP_SUB),
             "GREATER_OR_EQUAL"  => bc.push(OP_GREATER_OR_EQUAL),
             "HASH"              => bc.push(OP_HASH),
             "CHECKSIG"          => bc.push(OP_CHECKSIG),
@@ -866,7 +910,71 @@ mod tests {
         assert!(execute_script(&bytecode, &witness, &ctx).is_err());
     }
 
- 
+ #[test]
+    fn over_works() {
+        let mut bc = Vec::new();
+        bc.push(OP_OVER);
+        bc.push(OP_ADD);
+        bc.push(OP_ADD);
+        push_int(&mut bc, 4);
+        bc.push(OP_EQUAL);
+
+        let witness = vec![vec![1u8], vec![2u8]];
+        let mut ctx = empty_ctx();
+        ctx.height = VM_UPGRADE_ACTIVATION_HEIGHT;
+        assert!(execute_script(&bc, &witness, &ctx).is_ok());
+    }
+
+    #[test]
+    fn rot_works() {
+        let mut bc = Vec::new();
+        bc.push(OP_ROT);
+        push_int(&mut bc, 1);
+        bc.push(OP_EQUALVERIFY);
+        push_int(&mut bc, 3);
+        bc.push(OP_EQUALVERIFY);
+        push_int(&mut bc, 2);
+        bc.push(OP_EQUAL);
+
+        let witness = vec![vec![1u8], vec![2u8], vec![3u8]];
+        let mut ctx = empty_ctx();
+        ctx.height = VM_UPGRADE_ACTIVATION_HEIGHT;
+        assert!(execute_script(&bc, &witness, &ctx).is_ok());
+    }
+
+    #[test]
+    fn sub_works() {
+        let mut bc = Vec::new();
+        bc.push(OP_SUB);
+        push_int(&mut bc, 2);
+        bc.push(OP_EQUAL);
+
+        let witness = vec![vec![5u8], vec![3u8]];
+        let mut ctx = empty_ctx();
+        ctx.height = VM_UPGRADE_ACTIVATION_HEIGHT;
+        assert!(execute_script(&bc, &witness, &ctx).is_ok());
+    }
+
+    #[test]
+    fn sub_underflow_fails() {
+        let mut bc = Vec::new();
+        bc.push(OP_SUB);
+
+        let witness = vec![vec![3u8], vec![5u8]];
+        let mut ctx = empty_ctx();
+        ctx.height = VM_UPGRADE_ACTIVATION_HEIGHT;
+        assert_eq!(execute_script(&bc, &witness, &ctx), Err(ScriptError::MathOverflow));
+    }
+
+    #[test]
+    fn opcodes_fail_before_activation() {
+        let mut ctx = empty_ctx();
+        ctx.height = VM_UPGRADE_ACTIVATION_HEIGHT - 1;
+
+        assert_eq!(execute_script(&[OP_OVER], &[vec![1u8], vec![2u8]], &ctx), Err(ScriptError::InvalidOpcode(OP_OVER)));
+        assert_eq!(execute_script(&[OP_ROT], &[vec![1u8], vec![2u8], vec![3u8]], &ctx), Err(ScriptError::InvalidOpcode(OP_ROT)));
+        assert_eq!(execute_script(&[OP_SUB], &[vec![5u8], vec![3u8]], &ctx), Err(ScriptError::InvalidOpcode(OP_SUB)));
+    }
  
     
 }

@@ -244,6 +244,13 @@ export class WebWallet {
 }
 
 /**
+ * Hash a hex-encoded byte string with BLAKE3.
+ * Returns the 32-byte hash as a 64-character hex string.
+ * Used by the IDE to generate P2SH addresses.
+ */
+export function blake3_hash_hex(hex_data: string): string;
+
+/**
  * Compute the coin ID (UTXO identifier) from an address, value, and salt.
  *
  * `coin_id = BLAKE3(address || value_le_bytes || salt)`
@@ -349,6 +356,7 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_webwallet_free: (a: number, b: number) => void;
+    readonly blake3_hash_hex: (a: number, b: number, c: number) => void;
     readonly compute_coin_id_hex: (a: number, b: number, c: number, d: bigint, e: number, f: number) => void;
     readonly decrypt_cli_wallet: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly generate_phrase: (a: number) => void;
