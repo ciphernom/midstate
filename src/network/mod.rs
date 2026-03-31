@@ -264,6 +264,7 @@ pub struct MidstateBehaviour {
     pub relay_server: relay::Behaviour,
     pub dcutr: dcutr::Behaviour,
     pub autonat: autonat::Behaviour,
+    pub connection_limits: libp2p::connection_limits::Behaviour, 
 }
 
 // ── NAT status ──────────────────────────────────────────────────────────────
@@ -412,7 +413,7 @@ impl MidstateNetwork {
 
                 let dcutr = dcutr::Behaviour::new(local_peer);
 
-                let autonat = autonat::Behaviour::new(
+let autonat = autonat::Behaviour::new(
                     local_peer,
                     autonat::Config {
                         boot_delay: Duration::from_secs(10),
@@ -424,6 +425,15 @@ impl MidstateNetwork {
                     },
                 );
 
+                // --- EFFICIENCY FIX: Prevent File Descriptor / Socket Exhaustion ---
+                // In libp2p v0.52+, ConnectionLimits is a Behaviour, not a Swarm Config.
+                let limits = libp2p::connection_limits::ConnectionLimits::default()
+                    .with_max_established_per_peer(Some(2)) // Prevent buggy peers from spamming parallel connections
+                    .with_max_pending_incoming(Some(50))
+                    .with_max_established_incoming(Some(200)); // Hard cap to prevent OS error 24
+                let connection_limits = libp2p::connection_limits::Behaviour::new(limits);
+                // -------------------------------------------------------------------
+
                 MidstateBehaviour {
                     rr,
                     light,
@@ -433,6 +443,7 @@ impl MidstateNetwork {
                     relay_server,
                     dcutr,
                     autonat,
+                    connection_limits, 
                 }
             })?
             .with_swarm_config(|c: libp2p::swarm::Config| {
