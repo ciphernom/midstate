@@ -1265,163 +1265,236 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
             <button class="tab-btn" data-tab="vm-opcodes">Opcode Reference</button>
         </div>
 <!-- ── MIDSCRIPT ─────────────────────────────────────────────────── -->
-        <div class="tab-content active" id="vm-midscript">
-            <h3>Midscript: Language Reference</h3>
-            <p>Writing raw stack manipulation assembly is hostile to developers and difficult to audit. <strong>Midscript</strong> is a high-level, expression-oriented language built directly into the Web IDE. It compiles down to zero-overhead Midstate stack machine bytecode, allowing you to write readable contracts without sacrificing VM performance or hitting the 1,024-byte limit.</p>
+      <div class="tab-content active" id="vm-midscript">
+    <h2>Midscript: The Definitive Reference Manual</h2>
+    <p>Midscript is a high-level, expression-oriented language that compiles strictly into zero-overhead Midstate stack machine bytecode. Unlike Solidity or Rust-based smart contracts, Midscript operates purely as an advanced static analyzer and pre-processor: it manages stack depth, type safety, and memory offsets entirely at compile time, eliminating the need for runtime memory allocation, garbage collection, or local variable storage.</p>
 
-            <div class="stat-grid">
-                <div class="stat-card">
-                    <div class="stat-label">Compile-Time Types</div>
-                    <div class="stat-value">Hex, Int, Bool</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Memory Allocation</div>
-                    <div class="stat-value">Zero</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Paradigm</div>
-                    <div class="stat-value">Stack-Oriented</div>
-                </div>
-            </div>
+    <div class="stat-grid">
+        <div class="stat-card">
+            <div class="stat-label">Memory Allocation</div>
+            <div class="stat-value">Zero (Stack Only)</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Execution Paradigm</div>
+            <div class="stat-value">Expression-Oriented</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Turing Completeness</div>
+            <div class="stat-value">Incomplete (Bounded)</div>
+        </div>
+    </div>
 
-            <div class="callout stark">
-                <h4>The Zero-Cost Abstraction Guarantee</h4>
-                <p>Midscript has no concept of on-chain memory, heap allocation, or local variables. Constructs like <code>let</code>, <code>macro</code>, and <code>repeat</code> are evaluated <strong>entirely at compile time</strong>. They act as pre-processor directives that unroll and inline your logic directly into raw <code>PUSH</code> and stack opcodes.</p>
-            </div>
+    <div class="callout stark">
+        <h4>The Zero-Cost Abstraction Guarantee</h4>
+        <p>Midscript has no concept of a heap, stack frames, or runtime variables. Constructs like <code>let</code>, <code>var</code>, <code>macro</code>, <code>state</code>, <code>struct</code>, and <code>repeat</code> exist only in the compiler. The compiler tracks the physical depth of every item on the stack and dynamically generates <code>DUP</code>, <code>SWAP</code>, <code>OVER</code>, and <code>ROT</code> opcodes to route data to the execution head exactly when needed.</p>
+    </div>
 
-            <h4>1. Syntax & Data Types</h4>
-            <p>Midscript supports three literal types, which are all ultimately pushed to the stack as byte arrays.</p>
-            <ul>
-                <li><strong>Hex Strings:</strong> <code>"a1b2c3d4"</code> compiles to <code>PUSH_HEX a1b2c3d4</code>.</li>
-                <li><strong>Integers:</strong> <code>10000</code> compiles to <code>PUSH_INT 10000</code> (little-endian byte array).</li>
-                <li><strong>Booleans:</strong> <code>true</code> and <code>false</code> compile to <code>PUSH_INT 1</code> and <code>PUSH_INT 0</code>.</li>
-            </ul>
+    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">1. The Compilation Pipeline</h3>
+    <p>Midscript compiles code entirely within the browser using a custom three-stage pipeline: Lexer, Parser, and CodeGen. There is no intermediate representation (IR) or optimization pass beyond basic peephole reduction.</p>
 
-            <h4>2. Compile-Time Metaprogramming</h4>
-            <p>Because there are no local variables on the blockchain, Midscript provides powerful compile-time aliases and inlining.</p>
-            
-            <pre><code>// 1. Constants (Aliases)
-// Aliases inject their value wherever referenced. They do not consume stack space.
-let TIMEOUT = 500000;
-let ALICE_PK = "02aaaa1234567890abcdef...";
+<div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
+    flowchart TD
+        Src[Midscript Source Code] -->|Lexer| Tokens[Token Stream]
+        Tokens -->|Parser| AST[Abstract Syntax Tree]
+        AST -->|CodeGen| ASM[Raw Stack Assembly]
+        ASM -->|Assembler| Hex[Executable Bytecode]
 
-// 2. Macros (Inline functions)
-// Macros unroll into the bytecode exactly where they are called.
-macro check_both_sigs() {
-    swap();
-    check_sig(ALICE_PK);
-    swap();
-    check_sig("03bbbb...");
-    add();
-}
+        subgraph CodeGenPhase [CodeGen Constraints]
+            direction LR
+            Scope[Macro Unrolling]
+            Depth[Stack Depth Tracker]
+            Type[Type Checker]
+        end
+        AST -.-> CodeGenPhase
 
-// 3. Compile-Time Loops
-// Unrolls the block N times in the final bytecode.
-// Useful for batch processing without adding looping opcodes to the VM.
-repeat(3) {
-    drop();
+        style Src fill:#1f2937,stroke:#4b5563,color:#d1d5db
+        style Hex fill:#431407,stroke:#ea580c,stroke-width:2px,color:#fed7aa
+        style CodeGenPhase fill:#064e3b,stroke:#10b981,stroke-width:2px,color:#d1d5db
+    </div>
+
+    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">2. Type System & Physical Stack Tracking</h3>
+    <p>Midscript enforces strict compile-time typing to prevent invalid opcode operations. All literals are pushed to the physical VM stack as little-endian byte arrays.</p>
+
+    <ul>
+        <li><strong>Hexadecimal Strings (<code>hex</code>):</strong> Enclosed in quotes. Compiles directly to <code>PUSH_HEX</code>. Example: <code>"a1b2c3d4"</code></li>
+        <li><strong>Integers (<code>int</code>):</strong> Base-10 numerical literals. The compiler converts these to little-endian hex representations and emits <code>PUSH_INT</code>. Example: <code>10000</code></li>
+        <li><strong>Booleans (<code>int</code>):</strong> The keywords <code>true</code> and <code>false</code> compile to <code>PUSH_INT 1</code> and <code>PUSH_INT 0</code>.</li>
+    </ul>
+
+    <h4>Variable Binding (<code>var</code>)</h4>
+    <p>The <code>var</code> keyword binds an identifier to the item currently at the top of the physical stack. The compiler maintains a <code>locals</code> array that tracks the relative depth of these variables. When a <code>var</code> is referenced, the CodeGen engine calculates its current depth offset and issues the appropriate fetch opcode.</p>
+
+    <div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
+    graph LR
+        subgraph Physical Stack
+            direction TB
+            S0[Depth 0: Top]
+            S1[Depth 1: Middle]
+            S2[Depth 2: Bottom]
+        end
+
+        subgraph Compiler Ast Resolution
+            direction TB
+            R0(var c) -.->|Emits: DUP| S0
+            R1(var b) -.->|Emits: OVER| S1
+            R2(var a) -.->|Emits: ROT| S2
+        end
+
+        style Physical Stack fill:#1f2937,stroke:#4b5563,color:#d1d5db
+        style Compiler Ast Resolution fill:#2e1065,stroke:#a78bfa,color:#d1d5db
+    </div>
+
+    <div class="math-block">
+        // Maximum Fetch Depth Limit<br>
+        Because the VM lacks opcodes to fetch arbitrarily deep items (e.g., OP_PICK is not supported), Midscript restricts variable fetching to depth 0, 1, and 2. Referencing a variable deeper than depth 2 results in a compile-time Semantic Error: "Variable 'x' is too deep. Max fetch depth is 2."
+    </div>
+
+    <h4>Variable Mutation (Reassignment)</h4>
+    <p>Reassigning a variable does not alter memory. The compiler calculates the variable's depth and generates surgical opcodes to overwrite that specific stack slot without disrupting adjacent items.</p>
+    <pre><code>var a = pop_int();
+var b = pop_int();
+
+// To reassign 'a' (currently at Depth 1), the compiler emits:
+// [Evaluate Expression] -> SWAP -> DROP -> [Insert New Value] -> SWAP
+a = b + 10; </code></pre>
+
+    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">3. Extended UTXO State & Structs</h3>
+    <p>To support advanced smart contracts (AMMs, DAOs, CDP Vaults), Midscript maps high-level object fields to specific byte offsets within a 32-byte <code>state</code> payload using dot-notation.</p>
+    
+    <pre><code>state Vault {
+    col: 8,      // Offset 0, Size 8 bytes
+    debt: 8,     // Offset 8, Size 8 bytes
+    padding: 16  // Offset 16, Size 16 bytes
 }</code></pre>
 
-            <h4>3. Built-In Standard Library</h4>
-            <p>Midscript provides syntactic sugar for standard stack manipulations and cryptographic checks. These map directly to underlying opcodes.</p>
-            
-            <table>
-                <thead><tr><th>Function</th><th>Compiled Opcodes</th><th>Description</th></tr></thead>
-                <tbody>
-                    <tr><td class="hl"><code>peek()</code></td><td><code>DUP</code></td><td>Duplicates the top stack item.</td></tr>
-                    <tr><td class="hl"><code>drop()</code></td><td><code>DROP</code></td><td>Discards the top stack item.</td></tr>
-                    <tr><td class="hl"><code>swap()</code></td><td><code>SWAP</code></td><td>Swaps the top two stack items.</td></tr>
-                    <tr><td class="hl"><code>over()</code></td><td><code>OVER</code></td><td>Copies the second-to-top item to the top.</td></tr>
-                    <tr><td class="hl"><code>rot()</code></td><td><code>ROT</code></td><td>Rotates the top three items (3rd to top).</td></tr>
-                    <tr><td class="hl"><code>fail()</code></td><td><code>PUSH_INT 0</code></td><td>Pushes 0 (forces a failure if left at end of execution).</td></tr>
-                    <tr><td class="hl"><code>check_sig(pk)</code></td><td><code>pk CHECKSIG</code></td><td>Verifies signature against pubkey. Pushes 1 (valid) or 0 (invalid).</td></tr>
-                    <tr><td class="hl"><code>require_sig(pk)</code></td><td><code>pk CHECKSIGVERIFY</code></td><td>Verifies signature and aborts script immediately if invalid.</td></tr>
-                    <tr><td class="hl"><code>require_time(h)</code></td><td><code>h CHECKTIMEVERIFY</code></td><td>Aborts if block height is less than <code>h</code>.</td></tr>
-                    <tr><td class="hl"><code>require_preimage(h)</code></td><td><code>HASH h EQUALVERIFY</code></td><td>Hashes top item and aborts if it doesn't equal <code>h</code>.</td></tr>
-                    <tr><td class="hl"><code>require_transfer(a, v)</code></td><td><code>a SUM_TO_ADDR v EQUALVERIFY</code></td><td>Covenant: Aborts if transaction doesn't send exactly <code>v</code> units to address <code>a</code>.</td></tr>
-                    <tr><td class="hl"><code>verify_gte(v)</code></td><td><code>v GREATER_OR_EQUAL VERIFY</code></td><td>Aborts if the top item is less than <code>v</code>.</td></tr>
-                </tbody>
-            </table>
+    <div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
+    sequenceDiagram
+        participant Code as AST Node
+        participant Gen as CodeGen Engine
+        participant VM as Midstate VM
 
-            <h4>4. Math & Logic Operators</h4>
-            <p>You can use standard infix operators. The compiler automatically translates these into postfix stack operations.</p>
-            <ul>
-                <li><code>+</code> compiles to <code>ADD</code></li>
-                <li><code>-</code> compiles to <code>SUB</code></li>
-                <li><code>==</code> compiles to <code>EQUAL</code></li>
-                <li><code>>=</code> compiles to <code>GREATER_OR_EQUAL</code></li>
-                <li><code>&&</code> compiles to <code>ADD PUSH_INT 2 EQUAL</code></li>
-                <li><code>||</code> compiles to <code>ADD PUSH_INT 0 GREATER_OR_EQUAL</code></li>
-            </ul>
+        Code->>Gen: Access 'Vault.debt'
+        Gen->>VM: Emits READ_INPUT_STATE
+        Gen->>VM: Emits PUSH_INT 8 (Offset)
+        Gen->>VM: Emits PUSH_INT 8 (Size)
+        Gen->>VM: Emits SLICE
+        Note over Gen, VM: Automatic Type Casting: Size <= 8
+        Gen->>VM: Emits PUSH_INT 0
+        Gen->>VM: Emits ADD (Casts hex to int)
+    </div>
 
-            <h4>5. Raw Assembly Interop</h4>
-            <p>If you need to drop down to bare metal, you can write raw opcodes directly in Midscript by typing them in all-caps.</p>
-            <pre><code>let ADMIN = "a1b2...";
+    <p><strong>Automatic Casting:</strong> If the defined field size is 8 bytes or fewer, the CodeGen engine automatically appends <code>PUSH_INT 0 ADD</code>, casting the raw hex slice into an actionable integer for immediate arithmetic use. Sizes larger than 8 bytes remain raw <code>hex</code> strings (useful for hashes and public keys).</p>
+
+
+    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">4. Control Flow & Routing</h3>
+    <p>Midscript abstracts stack-based conditional jumps into standard bracketed control flows.</p>
+
+    <ul>
+        <li><strong>If / Else:</strong> Compiles to <code>IF</code>, <code>ELSE</code>, and <code>ENDIF</code>. Note that Midstate's <code>IF</code> opcode strictly consumes the top stack item. The compiler implicitly leaves the evaluation result on the stack prior to the jump.</li>
+        
+        <li><strong>Switch Statements:</strong> Evaluates an expression and sequentially executes equality checks.
+        <pre><code>switch(Vault.debt) {
+    case 0: { /* Emits: DUP 0 EQUAL IF DROP ... ELSE */ }
+    case 100: { /* Emits: DUP 100 EQUAL IF DROP ... ELSE */ }
+    default: { fail(); }
+} // Compiler appends ENDIF for every evaluated case</code></pre></li>
+
+        <li><strong>Route:</strong> A specialized version of <code>switch</code> designed for the top-level contract entry point. It implicitly reads the top integer off the stack (pushed by the Witness as the execution path) without requiring an explicit parameter.
+        <pre><code>route {
+    case 0: { require_signed_by(OWNER_PK); }
+    case 1: { require_timelock(TIMEOUT); }
+    default: { fail(); }
+}</code></pre></li>
+
+        <li><strong>Repeat (Compile-Time Loops):</strong> Because the Midstate VM lacks native loop opcodes (to prevent infinite execution vectors and guarantee <code>O(1)</code> verification time per opcode), <code>repeat(N)</code> instructs the CodeGen engine to physically unroll the AST block <code>N</code> times into the bytecode.
+        <pre><code>repeat(3) { merkle_update_step(); }</code></pre></li>
+    </ul>
+
+    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">5. Operators & Safe Math</h3>
+    <p>Midscript compiles standard infix operators into postfix stack operations. The CodeGen engine enforces strict type-checking: math operations (`+`, `-`, `*`, `/`) will throw a Semantic Error if either operand is determined to be a raw <code>hex</code> string or an unevaluated boolean.</p>
+
+    <div class="math-block">
+        // Safe Math Guarantees<br>
+        Addition, Subtraction, Multiplication, and Division are clamped to 64-bit integers. <code>SUB</code> natively halts the VM on underflow. <code>DIV</code> natively halts on division by zero. There is no need for SafeMath libraries; overflows are prevented at the protocol layer.
+    </div>
+
+    <ul>
+        <li><strong>Comparison:</strong> <code>==</code> (EQUAL), <code>>=</code> (GREATER_OR_EQUAL). 
+        <br><br><em>Synthesized Comparisons:</em> Midstate VM only supports two native comparison opcodes to save space. Midscript synthesizes the rest:
+        <ul>
+            <li><code>></code> compiles to: <code>PUSH_INT 1 ADD GREATER_OR_EQUAL</code></li>
+            <li><code><=</code> compiles to: <code>SWAP GREATER_OR_EQUAL</code></li>
+            <li><code><</code> compiles to: <code>SWAP PUSH_INT 1 ADD GREATER_OR_EQUAL</code></li>
+        </ul>
+        </li>
+        <li><strong>Logical:</strong> <code>&&</code> is synthesized using <code>ADD PUSH_INT 2 EQUAL</code>. <code>||</code> is synthesized using <code>ADD PUSH_INT 1 GREATER_OR_EQUAL</code>.</li>
+    </ul>
+
+
+    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">6. Macros vs Functions</h3>
+    <p>Midscript does not support functions, call stacks, or return addresses. The <code>macro</code> keyword defines a reusable AST fragment. When a macro is invoked, the compiler takes a snapshot of the current <code>locals</code> array, registers the arguments as new physical variables, unrolls the macro body into the CodeGen stream, and then issues <code>DROP</code> opcodes to wipe the macro's scope before restoring the original <code>locals</code> snapshot.</p>
+
+    <pre><code>macro check_both_sigs(pk_a, pk_b) {
+    swap();
+    check_sig(pk_a);
+    swap();
+    check_sig(pk_b);
+    add();
+}</code></pre>
+
+    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">7. The Standard Library</h3>
+    
+    <table>
+        <thead><tr><th>Built-in Function</th><th>Compiled Opcodes</th><th>Description</th></tr></thead>
+        <tbody>
+            <tr><td class="hl"><code>pop_int() / pop_hex()</code></td><td>(Context Update)</td><td>Registers the top stack item to the compiler's type-tracker without emitting code.</td></tr>
+            <tr><td class="hl"><code>peek() / dup()</code></td><td><code>DUP</code></td><td>Duplicates the top stack item.</td></tr>
+            <tr><td class="hl"><code>drop()</code></td><td><code>DROP</code></td><td>Discards the top stack item.</td></tr>
+            <tr><td class="hl"><code>swap()</code></td><td><code>SWAP</code></td><td>Swaps the top two stack items.</td></tr>
+            <tr><td class="hl"><code>over()</code></td><td><code>OVER</code></td><td>Copies the second-to-top item to the top.</td></tr>
+            <tr><td class="hl"><code>rot()</code></td><td><code>ROT</code></td><td>Rotates the third item to the top.</td></tr>
+            <tr><td class="hl"><code>assert(expr)</code></td><td><code>[expr] VERIFY</code></td><td>Evaluates an expression and aborts execution if it resolves to 0.</td></tr>
+            <tr><td class="hl"><code>fail()</code></td><td><code>PUSH_INT 0 VERIFY</code></td><td>Guarantees script termination and failure.</td></tr>
+            <tr><td class="hl"><code>verify_gte(v)</code></td><td><code>v GREATER_OR_EQUAL VERIFY</code></td><td>Aborts if the top item is less than <code>v</code>.</td></tr>
+            <tr><td class="hl"><code>check_sig(pk)</code></td><td><code>pk CHECKSIG</code></td><td>Verifies signature against pubkey. Pushes 1 (valid) or 0 (invalid).</td></tr>
+            <tr><td class="hl"><code>require_sig(pk)<br>require_signed_by(pk)</code></td><td><code>pk CHECKSIGVERIFY</code></td><td>Verifies signature. Aborts immediately if invalid.</td></tr>
+            <tr><td class="hl"><code>hash()</code></td><td><code>HASH</code></td><td>Executes a BLAKE3 hash on the top item.</td></tr>
+            <tr><td class="hl"><code>require_preimage(h)</code></td><td><code>HASH h EQUALVERIFY</code></td><td>Hashes the top item and aborts if it does not equal <code>h</code>.</td></tr>
+            <tr><td class="hl"><code>require_time(h)<br>require_timelock(h)</code></td><td><code>h CHECKTIMEVERIFY</code></td><td>Aborts if current block height is less than <code>h</code>.</td></tr>
+            <tr><td class="hl"><code>sum_to_addr(a)</code></td><td><code>a SUM_TO_ADDR</code></td><td>Sums transaction outputs sent to address <code>a</code> and pushes total.</td></tr>
+            <tr><td class="hl"><code>require_transfer(a, v)<br>require_funds_transferred(a, v)</code></td><td><code>a SUM_TO_ADDR v EQUALVERIFY</code></td><td>Asserts that exactly <code>v</code> units are sent to address <code>a</code>.</td></tr>
+            <tr><td class="hl"><code>read_input_state()</code></td><td><code>READ_INPUT_STATE</code></td><td>Pushes the 32-byte state of the currently executing input.</td></tr>
+            <tr><td class="hl"><code>read_output_state(i)</code></td><td><code>i READ_OUTPUT_STATE</code></td><td>Pushes the 32-byte state of the newly created output at index <code>i</code>.</td></tr>
+            <tr><td class="hl"><code>slice(val, off, len)</code></td><td><code>val off len SLICE</code></td><td>Extracts a substring of bytes.</td></tr>
+            <tr><td class="hl"><code>concat(a, b)</code></td><td><code>a b CONCAT</code></td><td>Concatenates two byte arrays.</td></tr>
+            <tr><td class="hl"><code>merkle_step()</code></td><td>(Macro Unroll)</td><td>Processes a standard static Merkle Proof step. Expects <code>[..., Sibling, Dir, Current]</code>.</td></tr>
+            <tr><td class="hl"><code>merkle_update_step()</code></td><td>(Macro Unroll)</td><td>Simultaneously verifies an old root and calculates a new root. Expects <code>[..., Sibling, Dir, Old_Acc, New_Acc]</code>.</td></tr>
+        </tbody>
+    </table>
+
+    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">8. Raw Assembly Interop</h3>
+    <p>If required, developers can bypass the Midscript type-checker and stack-tracker by injecting raw Midstate Assembly directly into the code using all-caps mnemonics. The compiler treats these as raw string arguments and pushes them directly to the bytecode array without analysis.</p>
+    <pre><code>let ADMIN = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
 PUSH_HEX(ADMIN);
 CHECKSIGVERIFY;
 PUSH_INT(1);</code></pre>
+    <p>Supported raw opcodes: <code>PUSH_HEX</code>, <code>PUSH_INT</code>, <code>DROP</code>, <code>DUP</code>, <code>SWAP</code>, <code>OVER</code>, <code>ROT</code>, <code>SLICE</code>, <code>CONCAT</code>, <code>EQUAL</code>, <code>VERIFY</code>, <code>EQUALVERIFY</code>, <code>ADD</code>, <code>SUB</code>, <code>MUL</code>, <code>DIV</code>, <code>GREATER_OR_EQUAL</code>, <code>HASH</code>, <code>CHECKSIG</code>, <code>CHECKSIGVERIFY</code>, <code>CHECKTIMEVERIFY</code>, <code>SUM_TO_ADDR</code>, <code>READ_INPUT_STATE</code>, <code>READ_OUTPUT_STATE</code>.</p>
 
-            <h3 style="border-bottom: 2px solid var(--border); padding-bottom: 12px;">Contract Examples</h3>
-
-            <h4>Example 1: Atomic Swap (HTLC)</h4>
-            <p>A cross-chain atomic swap. Alice can claim the funds if she reveals the preimage to a hash. If she doesn't, Bob can take the funds back after a timeout.</p>
-            <pre><code>let SECRET_HASH = "5fbf08af2b116ab8f7f3c14b8ec01a46ce23d290e2ebc7a752d0982d54c054f2";
-let ALICE_PK = "02aaaa...";
-let BOB_PK = "03bbbb...";
-let TIMEOUT = 600000;
-
-// Witness expected:
-// Alice claim: [Alice_Sig, Secret_Preimage, 1]
-// Bob refund:  [Bob_Sig, 0, 0]
-
-if (peek() == 1) {
-    drop(); // Drop the routing boolean
-    require_preimage(SECRET_HASH);
-    require_sig(ALICE_PK);
-} else {
-    drop(); // Drop routing boolean
-    drop(); // Drop empty preimage
-    require_time(TIMEOUT);
-    require_sig(BOB_PK);
-}
-true; // Clean stack rule</code></pre>
-
-            <h4>Example 2: Decentralized Limit Order (AMM)</h4>
-            <p>Using covenants to enforce a trade. Anyone can spend this UTXO, <em>provided</em> the transaction routes exactly 500 units to the Maker's address.</p>
-            <pre><code>let MAKER_ADDR = "9f8e1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-let PRICE = 500;
-let FEE = 10;
-
-// Covenant: Enforce that the transaction pays MAKER_ADDR (PRICE - FEE)
-require_transfer(MAKER_ADDR, PRICE - FEE);
-
-// Taker must authorize the spend
-require_sig("TAKER_PK");
-true;</code></pre>
-
-            <h4>Example 3: 2-of-3 Multisig using Arithmetic</h4>
-            <p>Requires signatures from any two of the three defined public keys.</p>
-            <pre><code>let PK_A = "02aaaa...";
-let PK_B = "03bbbb...";
-let PK_C = "04cccc...";
-
-// Witness expected: [Sig_C, Sig_B, Sig_A] (use "00" for missing sigs)
-
-check_sig(PK_A);
-
-swap();
-check_sig(PK_B);
-add(); // Sum the successful signatures
-
-swap();
-check_sig(PK_C);
-add(); // Sum again
-
-// Check if total valid signatures >= 2
-verify_gte(2);
-true;</code></pre>
-
-        </div>
+    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">9. Headless Unit Testing</h3>
+    <p>Midscript features a native test runner that compiles and executes against a headless simulation of the VM. Tests evaluate the physical stack output without requiring network deployment. A test passes if it terminates successfully and conforms to the Clean Stack Rule (leaving exactly <code>[1]</code> on the stack).</p>
+    <pre><code>test "Validates a Left-Sibling Merkle Step" {
+    // Setup Mock Stack: [Sibling, Direction(Left=1), Current]
+    push_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    push_int(1); 
+    push_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    
+    merkle_step();
+    
+    // Assert against expected concatenated hash
+    push_hex("7e244b7fa716d86fb5a0f274291c984caebef9df451e0ff0d48cb96d66e74b3e"); 
+    assert(pop_hex() == pop_hex()); 
+}</code></pre>
+</div>
         
         <!-- ── STATE THREADS ─────────────────────────────────────────────── -->
         <div class="tab-content" id="vm-state">

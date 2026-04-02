@@ -109,6 +109,32 @@ pub struct Storage {
 }
 
 impl Storage {
+    
+    /// Deletes any state snapshots at or above the given fork height.
+    /// Called during a reorg to prevent stale snapshots from a dead chain 
+    /// from corrupting future state rebuilds.
+    pub fn delete_snapshots_above(&self, fork_height: u64) -> Result<()> {
+        let snapshot_dir = self.batches.base_path().parent().unwrap().join("snapshots");
+        if !snapshot_dir.exists() { return Ok(()); }
+        
+        for entry in std::fs::read_dir(&snapshot_dir)? {
+            if let Ok(entry) = entry {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("state_") && name.ends_with(".bin") {
+                    if let Some(h_str) = name.strip_prefix("state_").and_then(|s| s.strip_suffix(".bin")) {
+                        if let Ok(h) = h_str.parse::<u64>() {
+                            if h >= fork_height {
+                                let _ = std::fs::remove_file(entry.path());
+                                tracing::debug!("Deleted stale snapshot at height {}", h);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;

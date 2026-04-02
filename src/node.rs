@@ -2800,6 +2800,10 @@ fn perform_reorg(
         // Update in-memory state FIRST
         // Trim state cache: discard all entries at or above the fork
         self.trim_cache_above(fork_height);
+        
+        // Delete stale snapshots from the abandoned chain
+        let _ = self.storage.delete_snapshots_above(fork_height);
+        
         self.state = new_state;
         while self.chain_history.back().map_or(false, |&(h, _)| h >= fork_height) {
             self.chain_history.pop_back();
