@@ -709,6 +709,9 @@ pub const STATE_ROOT_ACTIVATION_HEIGHT: u64 = 30_000;
 /// Block height at which ZK remnants are repurposed into Zero-Value State Threads.
 pub const STATE_THREAD_ACTIVATION_HEIGHT: u64 = 65_000;
 
+pub const RECENT_POW_ACTIVATION_HEIGHT: u64 = 80_000;
+pub const COMMIT_POW_WINDOW: u64 = 1000;
+
 // ── Economics ───────────────────────────────────────────────────────────────
 
 /// Blocks per year at TARGET_BLOCK_TIME seconds per block.

@@ -3014,10 +3014,11 @@ fn perform_reorg(
 
         // Mine spam nonce for the Commit (respecting dynamic mempool difficulty)
         let required_pow = self.mempool.required_commit_pow();
+        let current_height = self.state.height;
         let spam_nonce = tokio::task::spawn_blocking(move || {
             let mut n = 0u64;
             loop {
-                let h = hash_concat(&commitment, &n.to_le_bytes());
+                let h = crate::core::transaction::commit_pow_hash(&commitment, n, current_height);
                 if crate::core::types::count_leading_zeros(&h) >= required_pow {
                     return n;
                 }

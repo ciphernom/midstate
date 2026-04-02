@@ -81,13 +81,18 @@ pub async fn commit_transaction(
     let pending_commits = txs.iter().filter(|t| matches!(t, Transaction::Commit { .. })).count();
     let required_pow = crate::mempool::Mempool::calculate_required_pow(pending_commits);
 
-    let h = hash_concat(&commitment, &req.spam_nonce.to_le_bytes());
-    if crate::core::types::count_leading_zeros(&h) < required_pow {
+    let state = node.get_state().await;
+    let actual_zeros = match crate::core::transaction::evaluate_commit_pow(&commitment, req.spam_nonce, state.height) {
+        Ok(z) => z,
+        Err(e) => return Err(ErrorResponse { error: e.to_string() }),
+    };
+
+    if actual_zeros < required_pow {
         return Err(ErrorResponse {
             error: format!(
                 "Insufficient PoW: need {} leading zeros, got {}",
                 required_pow,
-                crate::core::types::count_leading_zeros(&h)
+                actual_zeros
             ),
         });
     }

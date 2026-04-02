@@ -239,8 +239,10 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
         // references into `tx` are gone by the time we call `Arc::new(tx)`.
         let (actual_zeros, _commitment_key) = match &tx {
             Transaction::Commit { commitment, spam_nonce } => {
-                let h = crate::core::types::hash_concat(commitment, &spam_nonce.to_le_bytes());
-                (Some(crate::core::types::count_leading_zeros(&h)), Some(*commitment))
+                match crate::core::transaction::evaluate_commit_pow(commitment, *spam_nonce, state.height) {
+                    Ok(zeros) => (Some(zeros), Some(*commitment)),
+                    Err(e) => anyhow::bail!(e),
+                }
             }
             Transaction::Reveal { .. } => (None, None),
         };
@@ -503,14 +505,11 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
             // borrow-after-move error.
             match tx {
                 Transaction::Commit { commitment, spam_nonce } => {
-                    let h = crate::core::types::hash_concat(
-                        &commitment,
-                        &spam_nonce.to_le_bytes(),
-                    );
-                    let zeros = crate::core::types::count_leading_zeros(&h);
-                    let arc_tx = Arc::new(Transaction::Commit { commitment, spam_nonce });
-                    self.commits.insert(commitment, arc_tx);
-                    self.commits_by_pow.insert((zeros, commitment));
+                    if let Ok(zeros) = crate::core::transaction::evaluate_commit_pow(&commitment, spam_nonce, state.height) {
+                        let arc_tx = Arc::new(Transaction::Commit { commitment, spam_nonce });
+                        self.commits.insert(commitment, arc_tx);
+                        self.commits_by_pow.insert((zeros, commitment));
+                    }
                 }
                 reveal_tx @ Transaction::Reveal { .. } => {
                     let tx_bytes =
@@ -683,12 +682,8 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
 
         // 2. O(K) Prune mined Commits
         for commit in newly_mined_commits {
-            if let Some(arc_tx) = self.commits.remove(commit) {
-                if let Transaction::Commit { spam_nonce, .. } = &*arc_tx {
-                    let h = crate::core::types::hash_concat(commit, &spam_nonce.to_le_bytes());
-                    let zeros = crate::core::types::count_leading_zeros(&h);
-                    self.commits_by_pow.remove(&(zeros, *commit));
-                }
+            if self.commits.remove(commit).is_some() {
+                self.commits_by_pow.retain(|(_, c)| c != commit);
             }
         }
 
@@ -736,15 +731,8 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
             .collect();
 
         for comm in commits_to_remove {
-            if let Some(arc_tx) = self.commits.remove(&comm) {
-                if let Transaction::Commit { commitment, spam_nonce } = &*arc_tx {
-                    let h = crate::core::types::hash_concat(
-                        commitment,
-                        &spam_nonce.to_le_bytes(),
-                    );
-                    let zeros = crate::core::types::count_leading_zeros(&h);
-                    self.commits_by_pow.remove(&(zeros, *commitment));
-                }
+            if self.commits.remove(&comm).is_some() {
+                self.commits_by_pow.retain(|(_, c)| *c != comm);
             }
         }
 
