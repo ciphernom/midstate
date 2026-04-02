@@ -12,11 +12,48 @@ pub const MIN_COMMIT_POW_BITS: u32 = 24;
 #[cfg(feature = "fast-mining")]
 pub const MIN_COMMIT_POW_BITS: u32 = 16;
 
-fn validate_commit_pow(commitment: &[u8; 32], nonce: u64) -> Result<()> {
-    let h = super::types::hash_concat(commitment, &nonce.to_le_bytes());
-    if count_leading_zeros(&h) < MIN_COMMIT_POW_BITS {
-        bail!("Insufficient Commit PoW: need {} leading zero bits", MIN_COMMIT_POW_BITS);
+pub fn commit_pow_hash(commitment: &[u8; 32], nonce: u64, target_height: u64) -> [u8; 32] {
+    if target_height < crate::core::types::RECENT_POW_ACTIVATION_HEIGHT {
+        super::types::hash_concat(commitment, &nonce.to_le_bytes())
+    } else {
+        let mut data = Vec::with_capacity(48);
+        data.extend_from_slice(&target_height.to_le_bytes());
+        data.extend_from_slice(commitment);
+        data.extend_from_slice(&nonce.to_le_bytes());
+        super::types::hash(&data)
     }
+}
+
+pub fn evaluate_commit_pow(commitment: &[u8; 32], nonce: u64, current_height: u64) -> Result<u32> {
+    if current_height < crate::core::types::RECENT_POW_ACTIVATION_HEIGHT {
+        let h = commit_pow_hash(commitment, nonce, current_height);
+        let zeros = crate::core::types::count_leading_zeros(&h);
+        if zeros < MIN_COMMIT_POW_BITS {
+            bail!("Insufficient Commit PoW: need {} leading zero bits", MIN_COMMIT_POW_BITS);
+        }
+        return Ok(zeros);
+    }
+
+    let start = current_height.saturating_sub(crate::core::types::COMMIT_POW_WINDOW);
+    let mut best_zeros = 0;
+    
+    // The "Wiggle Room": If the PoW is valid for ANY height in the last 1000 blocks, accept it.
+    for h in start..=current_height {
+        let hash = commit_pow_hash(commitment, nonce, h);
+        let zeros = crate::core::types::count_leading_zeros(&hash);
+        if zeros > best_zeros {
+            best_zeros = zeros;
+        }
+    }
+
+    if best_zeros < MIN_COMMIT_POW_BITS {
+        bail!("Insufficient Commit PoW or expired: need {} leading zero bits", MIN_COMMIT_POW_BITS);
+    }
+    Ok(best_zeros)
+}
+
+fn validate_commit_pow(commitment: &[u8; 32], nonce: u64, current_height: u64) -> Result<()> {
+    evaluate_commit_pow(commitment, nonce, current_height)?;
     Ok(())
 }
 
@@ -79,8 +116,13 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
                     if !seen.insert(input.coin_id()) {
                         bail!("Duplicate input coin");
                     }
-                    if input.commitment.is_some() && state.height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
-                        bail!("State Threads are disabled before activation height.");
+                    if input.commitment.is_some() {
+                        if state.height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
+                            bail!("State Threads are disabled before activation height.");
+                        }
+                        if input.value != 0 {
+                            bail!("State Thread inputs must have a value of exactly 0");
+                        }
                     }
                 }
             }
@@ -174,7 +216,7 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
 pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
     match tx {
         Transaction::Commit { commitment, spam_nonce } => {
-            validate_commit_pow(commitment, *spam_nonce)?;
+            validate_commit_pow(commitment, *spam_nonce, state.height)?;
             if !state.commitments.insert(*commitment) {
                 bail!("Duplicate commitment");
             }
@@ -213,8 +255,13 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                     if !seen.insert(input.coin_id()) {
                         bail!("Duplicate input coin");
                     }
-                    if input.commitment.is_some() && state.height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
-                        bail!("State Threads are disabled before activation height.");
+                    if input.commitment.is_some() {
+                        if state.height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
+                            bail!("State Threads are disabled before activation height.");
+                        }
+                        if input.value != 0 {
+                            bail!("State Thread inputs must have a value of exactly 0");
+                        }
                     }
                 }
             }
@@ -343,7 +390,7 @@ fn verify_predicate(
 pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
     match tx {
         Transaction::Commit { commitment, spam_nonce } => {
-            validate_commit_pow(commitment, *spam_nonce)?;
+             validate_commit_pow(commitment, *spam_nonce, state.height)?;
             if state.commitments.contains(commitment) {
                 bail!("Duplicate commitment");
             }
@@ -380,8 +427,13 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                     if !seen.insert(input.coin_id()) {
                         bail!("Duplicate input coin");
                     }
-                    if input.commitment.is_some() && state.height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
-                        bail!("State Threads are disabled before activation height.");
+                    if input.commitment.is_some() {
+                        if state.height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
+                            bail!("State Threads are disabled before activation height.");
+                        }
+                        if input.value != 0 {
+                            bail!("State Thread inputs must have a value of exactly 0");
+                        }
                     }
                 }
             }

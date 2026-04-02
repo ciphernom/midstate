@@ -1367,10 +1367,10 @@ let (commitment, _salt) = wallet.prepare_commit(
     Ok(())
 }
 
-fn mine_pow(commitment: &[u8; 32], required_pow: u32) -> u64 {
+fn mine_pow(commitment: &[u8; 32], required_pow: u32, current_height: u64) -> u64 {
     let mut n = 0u64;
     loop {
-        let h = midstate::core::hash_concat(commitment, &n.to_le_bytes());
+        let h = midstate::core::transaction::commit_pow_hash(commitment, n, current_height);
         if midstate::core::types::count_leading_zeros(&h) >= required_pow {
             return n;
         }
@@ -1378,11 +1378,11 @@ fn mine_pow(commitment: &[u8; 32], required_pow: u32) -> u64 {
     }
 }
 
-async fn fetch_required_pow(client: &reqwest::Client, rpc_port: u16, rpc_host: &str) -> Result<u32> {
+async fn fetch_state_info(client: &reqwest::Client, rpc_port: u16, rpc_host: &str) -> Result<(u32, u64)> {
     let url = format!("http://{}:{}/state", rpc_host, rpc_port);
     let resp = client.get(&url).send().await?;
     let state: rpc::GetStateResponse = resp.json().await?;
-    Ok(state.required_pow)
+    Ok((state.required_pow, state.height))
 }
 
 async fn submit_commit(
@@ -1391,9 +1391,9 @@ async fn submit_commit(
     rpc_host: &str,
     commitment: &[u8; 32],
 ) -> Result<()> {
-    let required_pow = fetch_required_pow(client, rpc_port, rpc_host).await?;
-    println!("Mining PoW locally (difficulty: {} leading zeros)...", required_pow);
-    let spam_nonce = mine_pow(commitment, required_pow);
+    let (required_pow, current_height) = fetch_state_info(client, rpc_port, rpc_host).await?;
+    println!("Mining PoW locally (difficulty: {} leading zeros, height: {})...", required_pow, current_height);
+    let spam_nonce = mine_pow(commitment, required_pow, current_height);
     println!("✓ PoW found (nonce: {})", spam_nonce);
 
     let commit_req = rpc::CommitRequest {
@@ -1624,7 +1624,10 @@ async fn wallet_mix(
     
     // --- Sign the mix_id to prove ownership ---
     let parsed_mix_id = parse_hex32(&mix_id_hex)?;
-    let join_sig = wallet.sign_mix_input(&mix_coin_id, &parsed_mix_id)?;
+    
+    // Do NOT sign the mix_id! Sending a WOTS signature here reuses the key
+    // and instantly compromises the user's funds. The node ignores this field anyway.
+    let join_sig = vec![]; 
     // -----------------------------------------------
 
     let register_req = rpc::MixRegisterRequest {
