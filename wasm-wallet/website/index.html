@@ -1234,7 +1234,7 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
     <h2>Virtual Machine</h2>
     <p>Every UTXO in Midstate is locked by a compiled bytecode script. The VM executes witness inputs pushed onto the <code>SmallVec</code> stack, then evaluates the locking script. Execution succeeds if and only if the final top-of-stack item is exactly <code>[1]</code>.</p>
 
-    <p>The stack machine in Midstate is Turing-incomplete by design — no loops, no unbounded recursion, no on-chain state mutation. What it <em>does</em> have is <strong>output introspection</strong> via <code>OP_SUM_TO_ADDR</code>, a capability Bitcoin still lacks natively. This single opcode unlocks covenants, streaming payments, DAOs, and inheritance contracts without any smart contract risk surface.</p>
+    <p>The stack machine in Midstate is Turing-incomplete by design — no loops, no unbounded recursion, no on-chain state mutation. However, it features <strong>output introspection</strong> via <code>OP_SUM_TO_ADDR</code> and <strong>State Threads</strong> via <code>OP_READ_INPUT_STATE</code>. These capabilities unlock Covenants, AMMs, native tokens, and DAOs without any of the security risks associated with EVM smart contracts.</p>
 
     <div class="stat-grid">
         <div class="stat-card">
@@ -1254,6 +1254,7 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
     <div class="tabs">
 <div class="tab-nav">
             <button class="tab-btn active" data-tab="vm-midscript">Midscript (High-Level)</button>
+            <button class="tab-btn" data-tab="vm-state">State Threads (eUTXO)</button>
             <button class="tab-btn" data-tab="vm-p2pk">P2PK</button>
             <button class="tab-btn" data-tab="vm-multisig">Multi-Sig</button>
             <button class="tab-btn" data-tab="vm-htlc">Atomic Swap (HTLC)</button>
@@ -1421,6 +1422,101 @@ verify_gte(2);
 true;</code></pre>
 
         </div>
+        
+        <!-- ── STATE THREADS ─────────────────────────────────────────────── -->
+        <div class="tab-content" id="vm-state">
+            <h3>State Threads (Extended UTXO)</h3>
+            <p>At Block 65,000, Midstate activates the <strong>State Threads</strong> soft-fork, officially upgrading the network from stateless scripting to a full Cardano-style Extended UTXO (eUTXO) smart contract platform.</p>
+
+            <div class="callout stark">
+                <h4>What is a State Thread?</h4>
+                <p>A State Thread is a special UTXO with a value of exactly <code>0</code>. Because it has no monetary value, anyone can attach one to a transaction for free. Instead of holding coins, it carries a mutable <strong>32-byte State Variable</strong>. When you spend a State Thread, the locking script can read the old state, execute logic, and enforce what the <em>next</em> 32-byte state must be.</p>
+            </div>
+
+            <h4>The Two Magic Opcodes</h4>
+            <p>State Threads are driven by two new opcodes (available in Midscript as functions):</p>
+            <ul>
+                <li><code>read_input_state()</code>: Pushes the 32-byte state of the currently executing input onto the stack.</li>
+                <li><code>read_output_state(index)</code>: Pushes the 32-byte state of the newly created output at the specified index.</li>
+            </ul>
+
+            <h4>Example: A Decentralized DEX Limit Order</h4>
+            <p>Stateless blockchains can't do limit orders natively because they can't "remember" partial fills. State Threads solve this instantly. A Maker locks 10,000 coins in a contract, and sets a State Thread tracking <code>[Coins_Remaining, Price]</code>.</p>
+            <pre><code>// 1. Read the old state (Coins_Remaining)
+read_input_state();
+
+// 2. Subtract the amount the Taker is buying
+PUSH_INT &lt;taker_buy_amount&gt;; // Passed via witness stack
+sub();
+
+// 3. Read the NEW state the Taker is creating at Output 0
+PUSH_INT 0;
+read_output_state();
+
+// 4. Verify the Taker correctly updated the Coins_Remaining state!
+EQUALVERIFY;
+
+// 5. Enforce that the Taker actually paid the Maker for the coins taken
+require_transfer(MAKER_ADDR, &lt;taker_buy_amount&gt; * PRICE);
+true;</code></pre>
+
+            <p>This simple script creates a fully on-chain, decentralized AMM/Orderbook without any centralized sequencers, gas fees, or re-entrancy vulnerabilities.</p>
+            
+            
+            <h4>Example: Bonding Curve AMM (Algorithmic Pricing)</h4>
+            <p>Stateless blockchains cannot execute Automated Market Makers (AMMs) because they cannot track reserve balances or adjust prices. State Threads solve this instantly. Here is a fully decentralized <strong>Linear Bonding Curve AMM</strong>, where the 32-byte State tracks the <code>Current_Token_Supply</code>.</p>
+            <pre><code>// The AMM algorithmic rule: The Price of the next token is equal to Current_Supply.
+
+// 1. Read Current Supply (This acts as our dynamic Price)
+read_input_state(); 
+
+// 2. Verify Payment: Did the user send exactly 'Price' to the Treasury?
+dup();
+sum_to_addr(TREASURY_ADDR);
+EQUALVERIFY;
+
+// 3. Calculate New State: Supply + 1
+PUSH_INT 1;
+add();
+
+// 4. Verify the AMM State was properly updated in Output 0
+PUSH_INT 0;
+read_output_state();
+EQUALVERIFY;
+
+true;</code></pre>
+
+            <p>This 15-line contract demonstrates a fully autonomous, on-chain Automated Market Maker. The price of the token scales automatically based purely on supply and demand—without any central sequencers, external price oracles, gas fees, or re-entrancy vulnerabilities.</p>
+            
+            
+            
+            
+            
+            
+            
+<h4>Example: Constant Product AMM (Uniswap X * Y = K)</h4>
+            <p>Stateless blockchains cannot execute Automated Market Makers (AMMs) because they cannot track reserve balances or calculate slippage. State Threads solve this instantly. Here is a fully decentralized <strong>Constant Product AMM</strong>, where the 32-byte State tracks the token reserves: <code>[Reserve_X, Reserve_Y]</code>.</p>
+            <pre><code>// 1. Calculate Old K = Old_X * Old_Y
+read_input_state();
+dup(); PUSH_INT 0; PUSH_INT 8; slice(); // Extract Old_X
+swap(); PUSH_INT 8; PUSH_INT 8; slice(); // Extract Old_Y
+mul(); // Old_K
+
+// 2. Calculate New K = New_X * New_Y
+PUSH_INT 0; read_output_state();
+dup(); PUSH_INT 0; PUSH_INT 8; slice(); // Extract New_X
+swap(); PUSH_INT 8; PUSH_INT 8; slice(); // Extract New_Y
+mul(); // New_K
+
+// 3. Enforce X * Y = K (New_K >= Old_K ensures no value is lost)
+swap(); // Stack is now [New_K, Old_K]
+GREATER_OR_EQUAL;
+VERIFY;</code></pre>
+
+            <p>This 12-line contract demonstrates a fully autonomous, on-chain Automated Market Maker. Because Midstate natively supports integer multiplication and slicing, the contract perfectly calculates the <code>X * Y = K</code> invariant curve. The price scales automatically based purely on supply and demand—without any central sequencers, external price oracles, gas fees, or re-entrancy vulnerabilities.</p>
+        </div>
+        
+        
         <!-- ── P2PK ──────────────────────────────────────────────────────── -->
         <div class="tab-content" id="vm-p2pk">
             <h3>Pay-to-Public-Key (P2PK)</h3>
@@ -1856,6 +1952,8 @@ Script:
                 <tbody>
                     <tr><td><code>CHECKTIMEVERIFY</code></td><td>height →</td><td>Fail if chain height &lt; height. Pop height.</td></tr>
                     <tr><td><code>SUM_TO_ADDR</code></td><td>addr → amount</td><td>Sum all output values in this tx sent to addr. Push total.</td></tr>
+                    <tr><td><code>READ_INPUT_STATE</code></td><td>→ state</td><td>Push the 32-byte state of the current input (v3).</td></tr>
+                    <tr><td><code>READ_OUTPUT_STATE</code></td><td>index → state</td><td>Push the 32-byte state of the output at 'index' (v3).</td></tr>
                 </tbody>
             </table>
 

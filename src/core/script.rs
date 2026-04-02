@@ -39,11 +39,18 @@ pub const OP_ENDIF: u8            = 0x42;
 
 pub const OP_SUM_TO_ADDR: u8      = 0x50;
 
+pub const OP_READ_INPUT_STATE: u8 = 0x51;
+pub const OP_READ_OUTPUT_STATE: u8= 0x52;
+
 ///v3 opcodes
 pub const VM_UPGRADE_ACTIVATION_HEIGHT: u64 = 60_000;
 pub const OP_OVER: u8             = 0x13;
 pub const OP_ROT: u8              = 0x14;
+pub const OP_SLICE: u8            = 0x15;
+pub const OP_CONCAT: u8           = 0x16;
 pub const OP_SUB: u8              = 0x25;
+pub const OP_MUL: u8              = 0x26;
+pub const OP_DIV: u8              = 0x27;
 
 
 // ── Consensus limits ───────────────────────────────────────────────────────
@@ -75,6 +82,8 @@ pub enum ScriptError {
     ScriptMustFinishTrue,
     EmptyStack,
     CleanStackRuleFailed,
+    InvalidStateRead,
+    DivisionByZero,
 }
 
 impl std::fmt::Display for ScriptError {
@@ -93,6 +102,8 @@ impl std::fmt::Display for ScriptError {
             Self::ScriptMustFinishTrue => write!(f, "script did not finish with [1] on top"),
             Self::EmptyStack => write!(f, "stack empty at end of execution"),
             Self::CleanStackRuleFailed => write!(f, "script execution finished with extra items on the stack (Clean Stack Rule)"),
+            Self::InvalidStateRead => write!(f, "invalid state read (no state present or index out of bounds)"),
+            Self::DivisionByZero => write!(f, "division by zero"),
         }
     }
 }
@@ -107,6 +118,7 @@ pub struct ExecContext<'a> {
     pub height: u64,
     pub outputs: &'a [OutputData],
     pub input_value: u64,
+    pub input_state: Option<[u8; 32]>,
 }
 
 // ── AOT validation ─────────────────────────────────────────────────────────
@@ -152,8 +164,13 @@ pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<(), ScriptErro
             OP_ADD | OP_GREATER_OR_EQUAL |
             OP_HASH | OP_CHECKSIG | OP_CHECKSIGVERIFY | OP_CHECKTIMEVERIFY |
             OP_SUM_TO_ADDR => {}
-            OP_OVER | OP_ROT | OP_SUB => {
+            OP_OVER | OP_ROT | OP_SLICE | OP_CONCAT | OP_SUB | OP_MUL | OP_DIV => {
                 if height < VM_UPGRADE_ACTIVATION_HEIGHT {
+                    return Err(ScriptError::InvalidOpcode(op));
+                }
+            }
+            OP_READ_INPUT_STATE | OP_READ_OUTPUT_STATE => {
+                if height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
                     return Err(ScriptError::InvalidOpcode(op));
                 }
             }
@@ -340,6 +357,36 @@ pub fn execute_script(
                 let item = stack.remove(len - 3);
                 stack.push(item);
             }
+            OP_SLICE => {
+                if ctx.height < VM_UPGRADE_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
+                let len_u64 = to_u64(&stack_pop(&mut stack)?)?;
+                let offset_u64 = to_u64(&stack_pop(&mut stack)?)?;
+                let data = stack_pop(&mut stack)?;
+                
+                // 1. Safe addition using u64 to prevent wrap-around
+                let end_u64 = offset_u64.checked_add(len_u64).ok_or(ScriptError::MathOverflow)?;
+                
+                // 2. Validate against data bounds before casting to usize
+                if end_u64 > data.len() as u64 {
+                    return Err(ScriptError::VerifyFailed);
+                }
+                
+                // 3. Safe to cast because data.len() is constrained by MAX_ITEM_SIZE (1536)
+                let offset = offset_u64 as usize;
+                let end = end_u64 as usize;
+                
+                stack_push(&mut stack, SmallVec::from_slice(&data[offset..end]))?;
+            }
+            OP_CONCAT => {
+                if ctx.height < VM_UPGRADE_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
+                let b = stack_pop(&mut stack)?;
+                let mut a = stack_pop(&mut stack)?;
+                if a.len() + b.len() > MAX_ITEM_SIZE {
+                    return Err(ScriptError::ItemTooLarge);
+                }
+                a.extend_from_slice(&b);
+                stack_push(&mut stack, a)?;
+            }
             OP_EQUAL => {
                 let b = stack_pop(&mut stack)?;
                 let a = stack_pop(&mut stack)?;
@@ -367,6 +414,21 @@ pub fn execute_script(
                 let a = stack_pop(&mut stack)?;
                 let diff = to_u64(&a)?.checked_sub(to_u64(&b)?).ok_or(ScriptError::MathOverflow)?;
                 stack_push(&mut stack, from_u64(diff))?;
+            }
+            OP_MUL => {
+                if ctx.height < VM_UPGRADE_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
+                let b = stack_pop(&mut stack)?;
+                let a = stack_pop(&mut stack)?;
+                let prod = to_u64(&a)?.checked_mul(to_u64(&b)?).ok_or(ScriptError::MathOverflow)?;
+                stack_push(&mut stack, from_u64(prod))?;
+            }
+            OP_DIV => {
+                if ctx.height < VM_UPGRADE_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
+                let b_val = to_u64(&stack_pop(&mut stack)?)?;
+                if b_val == 0 { return Err(ScriptError::DivisionByZero); }
+                let a_val = to_u64(&stack_pop(&mut stack)?)?;
+                let quot = a_val / b_val; // Integer division truncates (floors) natively
+                stack_push(&mut stack, from_u64(quot))?;
             }
             OP_GREATER_OR_EQUAL => {
                 let b = stack_pop(&mut stack)?;
@@ -415,7 +477,32 @@ pub fn execute_script(
                 }
                 stack_push(&mut stack, from_u64(sum))?;
             }
-           
+            OP_READ_INPUT_STATE => {
+                if ctx.height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
+                if let Some(state_bytes) = ctx.input_state {
+                    stack_push(&mut stack, SmallVec::from_slice(&state_bytes))?;
+                } else {
+                    return Err(ScriptError::InvalidStateRead);
+                }
+            }
+            OP_READ_OUTPUT_STATE => {
+                if ctx.height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
+                let idx_item = stack_pop(&mut stack)?;
+                let idx_u64 = to_u64(&idx_item)?;
+                
+                // Check bounds strictly using u64 before casting
+                if idx_u64 >= ctx.outputs.len() as u64 {
+                    return Err(ScriptError::InvalidStateRead);
+                }
+                
+                let idx = idx_u64 as usize; // Now guaranteed to fit in 32-bit and 64-bit alike
+                
+                if let Some(state_bytes) = ctx.outputs[idx].commitment() {
+                    stack_push(&mut stack, SmallVec::from_slice(&state_bytes))?;
+                } else {
+                    return Err(ScriptError::InvalidStateRead);
+                }
+            }
 
             _ => return Err(ScriptError::InvalidOpcode(op)),
         }
@@ -488,7 +575,7 @@ pub fn compile_multisig_2of3(
     bc.push(OP_CHECKSIG);
     bc.push(OP_ADD);
     push_int(&mut bc, 2);
-    bc.push(OP_EQUAL);
+    bc.push(OP_GREATER_OR_EQUAL);
     bc
 }
 
@@ -548,11 +635,15 @@ pub fn assemble(source: &str) -> Result<Vec<u8>, String> {
             "SWAP"              => bc.push(OP_SWAP),
             "OVER"              => bc.push(OP_OVER),
             "ROT"               => bc.push(OP_ROT),
+            "SLICE"             => bc.push(OP_SLICE),
+            "CONCAT"            => bc.push(OP_CONCAT),
             "EQUAL"             => bc.push(OP_EQUAL),
             "VERIFY"            => bc.push(OP_VERIFY),
             "EQUALVERIFY"       => bc.push(OP_EQUALVERIFY),
             "ADD"               => bc.push(OP_ADD),
             "SUB"               => bc.push(OP_SUB),
+            "MUL"               => bc.push(OP_MUL),
+            "DIV"               => bc.push(OP_DIV),
             "GREATER_OR_EQUAL"  => bc.push(OP_GREATER_OR_EQUAL),
             "HASH"              => bc.push(OP_HASH),
             "CHECKSIG"          => bc.push(OP_CHECKSIG),
@@ -562,6 +653,8 @@ pub fn assemble(source: &str) -> Result<Vec<u8>, String> {
             "ELSE"              => bc.push(OP_ELSE),
             "ENDIF"             => bc.push(OP_ENDIF),
             "SUM_TO_ADDR"       => bc.push(OP_SUM_TO_ADDR),
+            "READ_INPUT_STATE"  => bc.push(OP_READ_INPUT_STATE),
+            "READ_OUTPUT_STATE" => bc.push(OP_READ_OUTPUT_STATE),
             other => return Err(format!("unknown mnemonic '{}'", other)),
         }
         i += 1;
@@ -975,6 +1068,22 @@ mod tests {
         assert_eq!(execute_script(&[OP_ROT], &[vec![1u8], vec![2u8], vec![3u8]], &ctx), Err(ScriptError::InvalidOpcode(OP_ROT)));
         assert_eq!(execute_script(&[OP_SUB], &[vec![5u8], vec![3u8]], &ctx), Err(ScriptError::InvalidOpcode(OP_SUB)));
     }
- 
+ #[test]
+fn multisig_2of3_all_three_valid() {
+    let seed1 = hash(b"key1");
+    let seed2 = hash(b"key2");
+    let seed3 = hash(b"key3");
+    let pk1 = wots::keygen(&seed1);
+    let pk2 = wots::keygen(&seed2);
+    let pk3 = wots::keygen(&seed3);
+    let commitment = hash(b"multisig commitment");
+    let bytecode = compile_multisig_2of3(&pk1, &pk2, &pk3);
+    let sig1 = wots::sig_to_bytes(&wots::sign(&seed1, &commitment));
+    let sig2 = wots::sig_to_bytes(&wots::sign(&seed2, &commitment));
+    let sig3 = wots::sig_to_bytes(&wots::sign(&seed3, &commitment));
+    let witness = vec![sig1, sig2, sig3];
+    let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[], input_value: 0 };
+    assert!(execute_script(&bytecode, &witness, &ctx).is_ok());
+}
     
 }

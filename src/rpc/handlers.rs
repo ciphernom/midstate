@@ -120,14 +120,14 @@ pub async fn send_transaction(
         });
     }
 
-let inputs: Vec<InputReveal> = req.inputs.iter().map(|i| {
+    let inputs: Vec<InputReveal> = req.inputs.iter().map(|i| {
         Ok(InputReveal {
             predicate: Predicate::Script { 
                 bytecode: hex::decode(&i.bytecode).map_err(|e| ErrorResponse { error: format!("Invalid bytecode hex: {}", e) })? 
             },
             value: i.value,
             salt: parse_hex32(&i.salt, "input_salt")?,
-            commitment: None,
+            commitment: i.commitment.as_ref().map(|c| parse_hex32(c, "input_commitment")).transpose()?,
         })
     }).collect::<Result<_, ErrorResponse>>()?;
 
@@ -147,6 +147,13 @@ let inputs: Vec<InputReveal> = req.inputs.iter().map(|i| {
                 Ok(OutputData::Standard {
                     address: parse_hex32(address, "address")?,
                     value: *value,
+                    salt: parse_hex32(salt, "output_salt")?,
+                })
+            }
+            OutputDataJson::Confidential { address, commitment, salt } => {
+                Ok(OutputData::Confidential {
+                    address: parse_hex32(address, "address")?,
+                    commitment: parse_hex32(commitment, "commitment")?,
                     salt: parse_hex32(salt, "output_salt")?,
                 })
             }
@@ -319,24 +326,29 @@ pub async fn mix_register(
 ) -> Result<Json<serde_json::Value>, ErrorResponse> {
     let mix_id = parse_hex32(&req.mix_id, "mix_id")?;
 
-let input = InputReveal {
+    let input = InputReveal {
         predicate: Predicate::Script { 
             bytecode: hex::decode(&req.input.bytecode).map_err(|e| ErrorResponse { error: format!("Invalid bytecode hex: {}", e) })? 
         },
         value: req.input.value,
         salt: parse_hex32(&req.input.salt, "input_salt")?,
-        commitment: None,
+        commitment: req.input.commitment.as_ref().map(|c| parse_hex32(c, "input_commitment")).transpose()?,
     };
+    
     let output = match req.output {
         OutputDataJson::Standard { address, value, salt } => OutputData::Standard {
             address: parse_hex32(&address, "address")?,
             value,
             salt: parse_hex32(&salt, "output_salt")?,
         },
+        OutputDataJson::Confidential { address, commitment, salt } => OutputData::Confidential {
+            address: parse_hex32(&address, "address")?,
+            commitment: parse_hex32(&commitment, "commitment")?,
+            salt: parse_hex32(&salt, "output_salt")?,
+        },
         OutputDataJson::DataBurn { .. } => {
             return Err(ErrorResponse { error: "DataBurn payloads are not allowed in CoinJoin mixes".into() })
         }
-
     };
 
     // --- Validate coin exists in UTXO set before touching MixManager ---
@@ -369,14 +381,15 @@ pub async fn mix_fee(
 ) -> Result<Json<serde_json::Value>, ErrorResponse> {
     let mix_id = parse_hex32(&req.mix_id, "mix_id")?;
 
-let input = InputReveal {
+    let input = InputReveal {
         predicate: Predicate::Script { 
             bytecode: hex::decode(&req.input.bytecode).map_err(|e| ErrorResponse { error: format!("Invalid bytecode hex: {}", e) })? 
         },
         value: req.input.value,
         salt: parse_hex32(&req.input.salt, "input_salt")?,
-        commitment: None,
+        commitment: req.input.commitment.as_ref().map(|c| parse_hex32(c, "input_commitment")).transpose()?,
     };
+    
     // --- Validate fee coin exists in UTXO set before touching MixManager ---
     {
         let coin_id = input.coin_id();
@@ -1095,7 +1108,10 @@ pub fn parse_reveal_json(value: serde_json::Value) -> Result<Transaction, String
                 let b = hex::decode(&i.salt).map_err(|e| format!("Invalid salt hex: {}", e))?;
                 <[u8; 32]>::try_from(b).map_err(|_| "salt must be 32 bytes".to_string())?
             },
-            commitment: None,
+            commitment: i.commitment.as_ref().map(|c| {
+                let b = hex::decode(c).map_err(|e| format!("Invalid commitment hex: {}", e))?;
+                <[u8; 32]>::try_from(b).map_err(|_| "commitment must be 32 bytes".to_string())
+            }).transpose()?,
         })
     }).collect::<Result<_, String>>()?;
 
@@ -1117,6 +1133,16 @@ pub fn parse_reveal_json(value: serde_json::Value) -> Result<Transaction, String
                 Ok(OutputData::Standard {
                     address: <[u8; 32]>::try_from(a).map_err(|_| "address must be 32 bytes")?,
                     value: *value,
+                    salt: <[u8; 32]>::try_from(s).map_err(|_| "salt must be 32 bytes")?,
+                })
+            }
+            OutputDataJson::Confidential { address, commitment, salt } => {
+                let a = hex::decode(address).map_err(|e| format!("Invalid address hex: {}", e))?;
+                let c = hex::decode(commitment).map_err(|e| format!("Invalid commitment hex: {}", e))?;
+                let s = hex::decode(salt).map_err(|e| format!("Invalid salt hex: {}", e))?;
+                Ok(OutputData::Confidential {
+                    address: <[u8; 32]>::try_from(a).map_err(|_| "address must be 32 bytes")?,
+                    commitment: <[u8; 32]>::try_from(c).map_err(|_| "commitment must be 32 bytes")?,
                     salt: <[u8; 32]>::try_from(s).map_err(|_| "salt must be 32 bytes")?,
                 })
             }

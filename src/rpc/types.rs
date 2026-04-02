@@ -19,6 +19,8 @@ pub struct InputRevealJson {
     pub bytecode: String,
     pub value: u64,
     pub salt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commitment: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -27,6 +29,11 @@ pub enum OutputDataJson {
     Standard {
         address: String, 
         value: u64,
+        salt: String,
+    },
+    Confidential {
+        address: String,
+        commitment: String,
         salt: String,
     },
     DataBurn {

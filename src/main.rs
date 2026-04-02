@@ -255,11 +255,13 @@ enum WalletAction {
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
         #[arg(long)]
-        coin: String,
+        coin: Vec<String>,             // <--- NOW AN ARRAY
         #[arg(long)]
         bytecode: String,
         #[arg(long)]
-        inputs: String,
+        inputs: Vec<String>,           // <--- NOW AN ARRAY
+        #[arg(long)]
+        input_state: Vec<String>,      // <--- NOW AN ARRAY
         #[arg(long)]
         burn_data: Option<String>,
         #[arg(long)]
@@ -369,22 +371,35 @@ fn parse_hex32(s: &str) -> Result<[u8; 32]> {
     Ok(<[u8; 32]>::try_from(bytes).unwrap())
 }
 
-fn parse_output_spec(s: &str) -> Result<([u8; 32], u64)> {
-    let parts: Vec<&str> = s.splitn(2, ':').collect();
-    if parts.len() != 2 {
-        anyhow::bail!("expected format <address>:<value>, got: {}", s);
+enum ParsedOutput {
+    Standard([u8; 32], u64),
+    Stateful([u8; 32], [u8; 32]),
+}
+
+fn parse_output_spec(s: &str) -> Result<ParsedOutput> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        anyhow::bail!("expected format <address>:<value>[:<state_hex>]");
     }
     
-    // Use the new flexible parser to validate the checksum
-    let pk = midstate::core::types::parse_address_flexible(parts[0])
+    let addr = midstate::core::types::parse_address_flexible(parts[0])
         .map_err(|e| anyhow::anyhow!(e))?;
         
     let value: u64 = parts[1].parse()
         .map_err(|_| anyhow::anyhow!("invalid value: {}", parts[1]))?;
-    if value == 0 {
-        anyhow::bail!("value must be > 0");
+        
+    if parts.len() == 3 {
+        if value != 0 {
+            anyhow::bail!("State threads (Confidential outputs) must have value exactly 0. To send value AND state, create two outputs.");
+        }
+        let state = parse_hex32(parts[2]).map_err(|_| anyhow::anyhow!("invalid state hex: {}", parts[2]))?;
+        Ok(ParsedOutput::Stateful(addr, state))
+    } else {
+        if value == 0 {
+            anyhow::bail!("Standard outputs must have value > 0");
+        }
+        Ok(ParsedOutput::Standard(addr, value))
     }
-    Ok((pk, value))
 }
 
 fn format_age(secs: u64) -> String {
@@ -629,57 +644,75 @@ async fn wallet_spend_script(
     path: &PathBuf,
     rpc_port: u16,
     rpc_host: String,
-    coin_ref: String,
+    coin_refs: Vec<String>,
     bytecode_hex: String,
-    inputs_arg: String,
+    inputs_args: Vec<String>,
+    input_states: Vec<String>,
     burn_data: Option<String>,
     to_args: Vec<String>,
     timeout_secs: u64,
 ) -> Result<()> {
+    if coin_refs.is_empty() { anyhow::bail!("Must specify at least one --coin"); }
+    
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
 
-    let target_coin_id = wallet.resolve_coin(&coin_ref)?;
-    let target_coin = wallet.find_coin(&target_coin_id).cloned()
-        .ok_or_else(|| anyhow::anyhow!("Coin not found in local wallet"))?;
+    let mut spending_coins = Vec::new();
+    for cref in &coin_refs {
+        let cid = wallet.resolve_coin(cref)?;
+        let coin = wallet.find_coin(&cid).cloned()
+            .ok_or_else(|| anyhow::anyhow!("Coin {} not found", cref))?;
+        spending_coins.push(coin);
+    }
 
     let bytecode = hex::decode(&bytecode_hex).context("Invalid bytecode hex")?;
     let script_address = midstate::core::types::hash(&bytecode);
-    if script_address != target_coin.address {
-        anyhow::bail!("Bytecode hash does not match coin address");
+
+    // Verify all spending coins match the bytecode address
+    for coin in &spending_coins {
+        if script_address != coin.address {
+            anyhow::bail!("Bytecode hash does not match coin address for {}", hex::encode(coin.coin_id));
+        }
+    }
+
+    // Because eUTXO allows manual input selection, we must ensure the user 
+    // didn't accidentally leave a sibling UTXO behind, which would lead to WOTS key reuse.
+    let input_set: std::collections::HashSet<[u8; 32]> = spending_coins.iter().map(|c| c.coin_id).collect();
+    for coin in &spending_coins {
+        // Only standard WOTS coins have siblings (MSS handles reuse safely)
+        let siblings = wallet.wots_siblings(&coin.coin_id);
+        for sib_id in siblings {
+            if !input_set.contains(&sib_id) {
+                anyhow::bail!(
+                    "WOTS co-spend violation! You are trying to spend coin {}, but its sibling {} at the same address is missing from your inputs.\n\
+                     To prevent catastrophic WOTS private key reuse, you must include ALL siblings in the transaction.\n\
+                     Fix: Add `--coin {}` to your command.",
+                    hex::encode(coin.coin_id), hex::encode(sib_id), hex::encode(sib_id)
+                );
+            }
+        }
     }
 
     if to_args.is_empty() && burn_data.is_none() { 
         anyhow::bail!("Must specify at least one output via --to or --burn-data"); 
     }
 
-    // --- 1. SMART CO-SPEND: Gather all sibling coins ---
-    let is_mss = wallet.data.mss_keys.iter().any(|k| midstate::core::compute_address(&k.master_pk) == target_coin.address);
-    let mut spending_coins = vec![target_coin.clone()];
-    
-    if !is_mss {
-        for c in wallet.data.coins.iter() {
-            if c.address == target_coin.address && c.coin_id != target_coin_id {
-                spending_coins.push(c.clone());
-            }
-        }
-        if spending_coins.len() > 1 {
-            println!("Auto-merging {} sibling coin(s) to protect WOTS key...", spending_coins.len() - 1);
-        }
-    }
-
     let in_sum: u64 = spending_coins.iter().map(|c| c.value).sum();
-    // ----------------------------------------------------
-
     let mut outputs = Vec::new();
     let mut out_sum = 0u64;
     
     for arg in &to_args {
-        let (addr, val) = parse_output_spec(arg)?;
         let salt: [u8; 32] = rand::random();
-        outputs.push(OutputData::Standard { address: addr, value: val, salt });
-        out_sum += val;
+        match parse_output_spec(arg)? {
+            ParsedOutput::Standard(addr, val) => {
+                outputs.push(midstate::core::OutputData::Standard { address: addr, value: val, salt });
+                out_sum += val;
+            }
+            ParsedOutput::Stateful(addr, state) => {
+                outputs.push(midstate::core::OutputData::Confidential { address: addr, commitment: state, salt });
+            }
+        }
     }
 
     if let Some(burn_str) = burn_data {
@@ -687,7 +720,7 @@ async fn wallet_spend_script(
         if parts.len() != 2 { anyhow::bail!("Format: <hex_payload>:<value>"); }
         let payload = hex::decode(parts[0]).context("Invalid burn payload hex")?;
         let val: u64 = parts[1].parse().context("Invalid burn value")?;
-        outputs.push(OutputData::DataBurn { payload, value_burned: val });
+        outputs.push(midstate::core::OutputData::DataBurn { payload, value_burned: val });
         out_sum += val;
     }
 
@@ -695,31 +728,25 @@ async fn wallet_spend_script(
         anyhow::bail!("Total input value ({}) must exceed output value ({}) to pay fee", in_sum, out_sum);
     }
 
-    // --- 2. AUTO-CHANGE GENERATION ---
-    // If the inputs (including siblings) vastly exceed the requested outputs,
-    // we generate change to prevent paying a massive fee. We assume a base 100-unit fee.
+    // Auto-change generation
     let base_fee = 100;
     let mut change_seeds = Vec::new();
-    
     if in_sum > out_sum + base_fee {
         let change_val = in_sum - out_sum - base_fee;
-        let change_denoms = midstate::core::decompose_value(change_val);
-        for denom in change_denoms {
+        for denom in midstate::core::decompose_value(change_val) {
             let seed = wallet.next_wots_seed();
             let pk = midstate::core::wots::keygen(&seed);
             let addr = midstate::core::compute_address(&pk);
             let salt: [u8; 32] = rand::random();
             let idx = outputs.len();
-            outputs.push(OutputData::Standard { address: addr, value: denom, salt });
+            outputs.push(midstate::core::OutputData::Standard { address: addr, value: denom, salt });
             change_seeds.push((idx, seed));
         }
-        println!("Auto-generated {} change output(s) totaling {}", change_seeds.len(), change_val);
+        println!("Auto-generated {} change output(s)", change_seeds.len());
     }
-    // ---------------------------------
 
     let input_coin_ids: Vec<[u8; 32]> = spending_coins.iter().map(|c| c.coin_id).collect();
     let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
-    
     let tx_salt: [u8; 32] = rand::random();
     let commitment = midstate::core::compute_commitment(&input_coin_ids, &output_commit_hashes, &tx_salt);
 
@@ -731,49 +758,57 @@ async fn wallet_spend_script(
     }
     println!("✓ Commit mined!");
 
-    // Generate the witness stack (only needs to be solved once!)
-    let mut stack_items = Vec::new();
-    for token in inputs_arg.split(',').filter(|s| !s.is_empty()) {
-        if token.starts_with("AUTO:") {
-            let pk_hex = token.strip_prefix("AUTO:").unwrap();
-            let pk = parse_hex32(pk_hex)?;
-            println!("Auto-solving signature for {}...", hex::encode(&pk));
-            stack_items.push(wallet.auto_sign(&pk, &commitment)?);
-        } else {
-            stack_items.push(hex::decode(token).context("Invalid hex in --inputs")?);
-        }
-    }
-    let witness_string = stack_items.iter().map(hex::encode).collect::<Vec<_>>().join(",");
-
-    // --- 3. DUPLICATE WITNESS FOR SIBLINGS ---
     let mut rpc_inputs = Vec::new();
     let mut rpc_signatures = Vec::new();
 
-    for coin in &spending_coins {
+    // Map each coin to its corresponding witness and state stack
+    for (i, coin) in spending_coins.iter().enumerate() {
+        let wit_arg = inputs_args.get(i).map(|s| s.as_str()).unwrap_or("");
+        
+        let mut stack_items = Vec::new();
+        for token in wit_arg.split(',').filter(|s| !s.is_empty()) {
+            if token.trim().starts_with("AUTO:") {
+                let pk_hex = token.trim().strip_prefix("AUTO:").unwrap();
+                let pk = parse_hex32(pk_hex)?;
+                stack_items.push(wallet.auto_sign(&pk, &commitment)?);
+            } else {
+                stack_items.push(hex::decode(token.trim()).context("Invalid hex in --inputs")?);
+            }
+        }
+        rpc_signatures.push(stack_items.iter().map(hex::encode).collect::<Vec<_>>().join(","));
+
+        // Match input states to the respective coins
+        let state_hex = input_states.get(i)
+            .filter(|s| !s.is_empty() && *s != "none")
+            .cloned()
+            .or_else(|| coin.commitment.map(hex::encode));
+
         rpc_inputs.push(rpc::InputRevealJson {
             bytecode: bytecode_hex.clone(),
             value: coin.value,
             salt: hex::encode(coin.salt),
+            commitment: state_hex,
         });
-        // The exact same witness string satisfies all sibling coins
-        rpc_signatures.push(witness_string.clone());
     }
-    // -----------------------------------------
 
     let reveal_req = rpc::SendTransactionRequest {
         inputs: rpc_inputs,
         signatures: rpc_signatures,
         outputs: outputs.iter().map(|o| match o {
-            OutputData::Standard { address, value, salt } => rpc::OutputDataJson::Standard {
+            midstate::core::OutputData::Standard { address, value, salt } => rpc::OutputDataJson::Standard {
                 address: hex::encode(address),
                 value: *value,
                 salt: hex::encode(salt),
             },
-            OutputData::DataBurn { payload, value_burned } => rpc::OutputDataJson::DataBurn {
+            midstate::core::OutputData::Confidential { address, commitment, salt } => rpc::OutputDataJson::Confidential {
+                address: hex::encode(address),
+                commitment: hex::encode(commitment),
+                salt: hex::encode(salt),
+            },
+            midstate::core::OutputData::DataBurn { payload, value_burned } => rpc::OutputDataJson::DataBurn {
                 payload: hex::encode(payload),
                 value_burned: *value_burned,
             },
-            OutputData::Confidential { .. } => unreachable!("Confidential outputs disabled"),
         }).collect(),
         salt: hex::encode(tx_salt),
     };
@@ -786,36 +821,24 @@ async fn wallet_spend_script(
         anyhow::bail!("Reveal failed: {}", err.error);
     }
 
-    // --- 4. CLEANUP WALLET STATE ---
-    // Remove all spent coins
     wallet.data.coins.retain(|c| !input_coin_ids.contains(&c.coin_id));
     
-    // Save new change coins
     for (idx, seed) in change_seeds {
-        let out = &outputs[idx];
-        if let OutputData::Standard { address, value, salt } = out {
+        if let midstate::core::OutputData::Standard { address, value, salt } = &outputs[idx] {
             let owner_pk = midstate::core::wots::keygen(&seed);
             wallet.data.coins.push(midstate::wallet::WalletCoin {
-                seed,
-                owner_pk,
-                address: *address,
-                value: *value,
-                salt: *salt,
-                coin_id: out.coin_id().unwrap(),
+                seed, owner_pk, address: *address, value: *value, salt: *salt,
+                coin_id: outputs[idx].coin_id().unwrap(),
                 label: Some(format!("change ({})", value)),
-                wots_signed: false,
-                commitment: None,
+                wots_signed: false, commitment: None,
             });
         }
     }
     wallet.save()?;
-    // -------------------------------
 
     println!("✓ Custom script spent successfully!");
     Ok(())
 }
-
-
 
 async fn handle_wallet(action: WalletAction) -> Result<()> {
     match action {
@@ -830,8 +853,8 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         WalletAction::Send { path, rpc_port, rpc_host, coin, to, timeout, private } => {
             wallet_send(&path, rpc_port, rpc_host, coin, to, timeout, private).await
         }
-        WalletAction::SpendScript { path, rpc_port, rpc_host, coin, bytecode, inputs, burn_data, to, timeout } => {
-            wallet_spend_script(&path, rpc_port, rpc_host, coin, bytecode, inputs, burn_data, to, timeout).await
+        WalletAction::SpendScript { path, rpc_port, rpc_host, coin, bytecode, inputs, input_state, burn_data, to, timeout } => {
+            wallet_spend_script(&path, rpc_port, rpc_host, coin, bytecode, inputs, input_state, burn_data, to, timeout).await
         }
         WalletAction::Import { path, seed, value, salt, label } => {
             wallet_import(&path, &seed, value, &salt, label)
@@ -1135,11 +1158,14 @@ async fn wallet_send(
     }
 
 
-    let recipient_specs: Vec<([u8; 32], u64)> = to_args.iter()
+    let recipient_specs: Vec<ParsedOutput> = to_args.iter()
         .map(|s| parse_output_spec(s))
         .collect::<Result<Vec<_>>>()?;
 
-    let total_send: u64 = recipient_specs.iter().map(|(_, v)| v).sum();
+    let total_send: u64 = recipient_specs.iter().map(|o| match o {
+        ParsedOutput::Standard(_, v) => *v,
+        ParsedOutput::Stateful(_, _) => 0,
+    }).sum();
 
     let mut live_coins = Vec::new();
     for wc in wallet.coins() {
@@ -1149,8 +1175,17 @@ async fn wallet_send(
     }
 
     if private {
-        let denoms: Vec<u64> = recipient_specs.iter().map(|(_, v)| *v).collect();
-        let recipient_address = recipient_specs[0].0;
+        // Find standard outputs for private send logic
+        let denoms: Vec<u64> = recipient_specs.iter().filter_map(|o| match o {
+            ParsedOutput::Standard(_, v) => Some(*v),
+            ParsedOutput::Stateful(_, _) => None,
+        }).collect();
+        
+        let recipient_address = match &recipient_specs[0] {
+            ParsedOutput::Standard(a, _) => *a,
+            ParsedOutput::Stateful(a, _) => *a,
+        };
+        
         let pairs = wallet.plan_private_send(&live_coins, &recipient_address, &denoms)?;
         println!("Private send: {} independent transaction(s)\n", pairs.len());
 
@@ -1220,8 +1255,11 @@ async fn wallet_send(
             // Estimate the number of outputs that will be created
             let change = current_in_sum.saturating_sub(total_send + target_fee);
             let mut num_outputs = 0;
-            for (_, value) in &recipient_specs {
-                num_outputs += decompose_value(*value).len();
+            for spec in &recipient_specs {
+                match spec {
+                    ParsedOutput::Standard(_, value) => num_outputs += decompose_value(*value).len(),
+                    ParsedOutput::Stateful(_, _) => num_outputs += 1,
+                }
             }
             num_outputs += decompose_value(change).len();
             
@@ -1244,22 +1282,30 @@ async fn wallet_send(
                 change_seeds = Vec::new();
 
                 // 1. Build recipient outputs
-                for (address, value) in &recipient_specs {
-                    for denom in decompose_value(*value) {
-                        let salt: [u8; 32] = rand::random();
-                        all_outputs.push(OutputData::Standard { address: *address, value: denom, salt });
+                for spec in &recipient_specs {
+                    match spec {
+                        ParsedOutput::Standard(address, value) => {
+                            for denom in midstate::core::decompose_value(*value) {
+                                let salt: [u8; 32] = rand::random();
+                                all_outputs.push(midstate::core::OutputData::Standard { address: *address, value: denom, salt });
+                            }
+                        }
+                        ParsedOutput::Stateful(address, state) => {
+                            let salt: [u8; 32] = rand::random();
+                            all_outputs.push(midstate::core::OutputData::Confidential { address: *address, commitment: *state, salt });
+                        }
                     }
                 }
 
                 // 2. Build exact change outputs
                 if final_change > 0 {
-                    for denom in decompose_value(final_change) {
+                    for denom in midstate::core::decompose_value(final_change) {
                         let seed = wallet.next_wots_seed();
-                        let pk = wots::keygen(&seed);
-                        let addr = compute_address(&pk);
+                        let pk = midstate::core::wots::keygen(&seed);
+                        let addr = midstate::core::compute_address(&pk);
                         let salt: [u8; 32] = rand::random();
                         let idx = all_outputs.len();
-                        all_outputs.push(OutputData::Standard { address: addr, value: denom, salt });
+                        all_outputs.push(midstate::core::OutputData::Standard { address: addr, value: denom, salt });
                         change_seeds.push((idx, seed));
                     }
                 }
@@ -1269,7 +1315,7 @@ async fn wallet_send(
                     use rand::seq::SliceRandom;
                     let mut indices: Vec<usize> = (0..all_outputs.len()).collect();
                     indices.shuffle(&mut rand::thread_rng());
-                    let shuffled: Vec<OutputData> = indices.iter().map(|&i| all_outputs[i].clone()).collect();
+                    let shuffled: Vec<midstate::core::OutputData> = indices.iter().map(|&i| all_outputs[i].clone()).collect();
                     let mut rev = vec![0usize; indices.len()];
                     for (new_i, &old_i) in indices.iter().enumerate() { rev[old_i] = new_i; }
                     change_seeds = change_seeds.into_iter()
@@ -1420,6 +1466,7 @@ async fn do_reveal(
             bytecode: match &ir.predicate { midstate::core::types::Predicate::Script { bytecode } => hex::encode(bytecode) },
             value: ir.value,
             salt: hex::encode(ir.salt),
+            commitment: ir.commitment.map(hex::encode),
         }).collect(),
         signatures: signatures.iter().map(|s| match s {
             midstate::core::types::Witness::ScriptInputs(inputs) => {
@@ -1427,16 +1474,20 @@ async fn do_reveal(
             }
         }).collect(),
         outputs: pending.outputs.iter().map(|o| match o {
-            OutputData::Standard { address, value, salt } => rpc::OutputDataJson::Standard {
+            midstate::core::OutputData::Standard { address, value, salt } => rpc::OutputDataJson::Standard {
                 address: hex::encode(address),
                 value: *value,
                 salt: hex::encode(salt),
             },
-            OutputData::DataBurn { payload, value_burned } => rpc::OutputDataJson::DataBurn {
+            midstate::core::OutputData::Confidential { address, commitment, salt } => rpc::OutputDataJson::Confidential {
+                address: hex::encode(address),
+                commitment: hex::encode(commitment),
+                salt: hex::encode(salt),
+            },
+            midstate::core::OutputData::DataBurn { payload, value_burned } => rpc::OutputDataJson::DataBurn {
                 payload: hex::encode(payload),
                 value_burned: *value_burned,
             },
-            OutputData::Confidential { .. } => unreachable!("Confidential outputs disabled"),
         }).collect(),
         salt: hex::encode(pending.salt),
     };
@@ -1583,11 +1634,23 @@ async fn wallet_mix(
             bytecode: match &input.predicate { midstate::core::types::Predicate::Script { bytecode } => hex::encode(bytecode) },
             value: input.value,
             salt: hex::encode(input.salt),
+            commitment: input.commitment.map(hex::encode),
         },
-        output: rpc::OutputDataJson::Standard {
-            address: hex::encode(output.address()),
-            value: output.value(),
-            salt: hex::encode(output.salt()),
+        output: match &output {
+            midstate::core::OutputData::Standard { address, value, salt } => rpc::OutputDataJson::Standard {
+                address: hex::encode(address),
+                value: *value,
+                salt: hex::encode(salt),
+            },
+            midstate::core::OutputData::Confidential { address, commitment, salt } => rpc::OutputDataJson::Confidential {
+                address: hex::encode(address),
+                commitment: hex::encode(commitment),
+                salt: hex::encode(salt),
+            },
+            midstate::core::OutputData::DataBurn { payload, value_burned } => rpc::OutputDataJson::DataBurn {
+                payload: hex::encode(payload),
+                value_burned: *value_burned,
+            },
         },
         signature: hex::encode(join_sig),
     };
@@ -1611,6 +1674,7 @@ async fn wallet_mix(
                         bytecode: match &fee_input.predicate { midstate::core::types::Predicate::Script { bytecode } => hex::encode(bytecode) },
                         value: fee_input.value,
                         salt: hex::encode(fee_input.salt),
+                        commitment: fee_input.commitment.map(hex::encode),
                     },
                 };
                 let resp = client.post(format!("{}/mix/fee", base_url))
@@ -1874,6 +1938,7 @@ let (input_reveals, signatures) = match wallet.sign_reveal(&pending) {
                 bytecode: match &ir.predicate { midstate::core::types::Predicate::Script { bytecode } => hex::encode(bytecode) },
                 value: ir.value,
                 salt: hex::encode(ir.salt),
+                commitment: ir.commitment.map(hex::encode),
             }).collect(),
             signatures: signatures.iter().map(|s| match s {
                 midstate::core::types::Witness::ScriptInputs(inputs) => {
@@ -1886,11 +1951,15 @@ let (input_reveals, signatures) = match wallet.sign_reveal(&pending) {
                 value: *value,
                 salt: hex::encode(salt),
             },
+            midstate::core::OutputData::Confidential { address, commitment, salt } => rpc::OutputDataJson::Confidential {
+                address: hex::encode(address),
+                commitment: hex::encode(commitment),
+                salt: hex::encode(salt),
+            },
             midstate::core::OutputData::DataBurn { payload, value_burned } => rpc::OutputDataJson::DataBurn {
                 payload: hex::encode(payload),
                 value_burned: *value_burned,
             },
-            midstate::core::OutputData::Confidential { .. } => unreachable!("Confidential outputs disabled"),
         }).collect(),
             salt: hex::encode(pending.salt),
         };
