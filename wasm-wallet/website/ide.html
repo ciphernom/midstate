@@ -122,7 +122,7 @@ select.tb-sel option{background:#071522;color:var(--text);}
 
 /* LOG */
 .log-scroll{flex:1;overflow-y:auto;padding:7px 12px;font-family:'JetBrains Mono',monospace;font-size:11px;}
-.log-line{margin-bottom:3px;line-height:1.5;border-bottom:1px solid rgba(255,255,255,.03);padding-bottom:3px;}
+.log-line{margin-bottom:3px;line-height:1.5;border-bottom:1px solid rgba(255,255,255,.03);padding-bottom:3px;word-break:break-all;}
 .lt{color:#1e3a5f;margin-right:8px;font-size:10px;}
 .li{color:#5a8ab0;}.ls{color:var(--ok);}.le{color:var(--fail);font-weight:700;}.lw{color:var(--warn);}
 
@@ -197,6 +197,7 @@ select.tb-sel option{background:#071522;color:var(--text);}
   <h1>MIDSTATE</h1>
   <div class="tb-sep"></div>
   <button class="tb-btn" onclick="compileCode()" title="Ctrl+Enter">▶ Compile</button>
+  <button class="tb-btn" onclick="runTests()" title="Ctrl+T" style="border-color: #aa00ff; color: #d488ff;">🧪 Run Tests</button>
   <button class="tb-btn" id="btnStep" onclick="vmStep()" disabled title="F10">⬇ Step</button>
   <button class="tb-btn ok-btn" id="btnRun" onclick="vmRun()" disabled>⚡ Run</button>
 <div class="tb-sep"></div>
@@ -206,12 +207,26 @@ select.tb-sel option{background:#071522;color:var(--text);}
   <button class="tb-btn" onclick="saveProject()">💾 Save</button>
   <button class="tb-btn" onclick="newProject()">＋ New</button>
   <div class="tb-sep"></div>
-  <select class="tb-sel" id="templateSelect" onchange="loadTemplate()">
+<select class="tb-sel" id="templateSelect" onchange="loadTemplate()">
+    <option value="maker_vault">Maker Vault (Stablecoin CDP)</option>
+    <option value="stream">Sovereign Stream (Pay Channel)</option>
+    <option value="amm_uniswap">Constant Product AMM (X*Y=K)</option>
+    <option value="tokens">Custom Tokens (Coloured Coins)</option>
+    <option value="stateful">Bonding Curve AMM (Linear)</option>
     <option value="deadman">Dead Man's Switch</option>
     <option value="htlc">Atomic Swap (HTLC)</option>
     <option value="multisig">2-of-3 Multisig</option>
     <option value="math">Math &amp; Logic</option>
-    <option value="escrow">Trustless Escrow (Let/Macro)</option>
+<option value="escrow">Trustless Escrow (Let/Macro)</option>
+    <option disabled>──────────</option>
+    <option value="options_amm">Options Market: 1. AMM</option>
+    <option value="options_vault">Options Market: 2. Vault</option>
+    <option value="options_token">Options Market: 3. Token</option>
+    <option value="options_stream">Options Market: 4. Stream</option>
+<option disabled>──────────</option>
+  <option value="advanced_staking_gov">Advanced Staking Governance</option>
+  <option value="merkle_ledger">Merkle Ledger</option>
+  <option value="merkle_whitelist">Merkle Whitelist</option>
   </select>
   <div class="tb-sep"></div>
   <div class="tb-stat">Size&nbsp;<b id="statSize">—</b></div>
@@ -297,12 +312,17 @@ select.tb-sel option{background:#071522;color:var(--text);}
         <div class="ctx-row">
           <div>
             <label class="ctx-lbl">Block Height</label>
-            <input class="ctx-inp" type="number" id="ctxHeight" value="500001">
+            <input class="ctx-inp" type="number" id="ctxHeight" value="65001">
+            
           </div>
           <div>
-            <label class="ctx-lbl">Tx Outputs (addr:value)</label>
-            <input class="ctx-inp" id="ctxOutputs" value="" placeholder="CC:1000000, DD:5000">
+            <label class="ctx-lbl">Input State (32-byte hex)</label>
+            <input class="ctx-inp" id="ctxInputState" value="" placeholder="e.g. 000000000000...">
           </div>
+        </div>
+        <div style="margin-top:10px;">
+          <label class="ctx-lbl">Tx Outputs (addr:value:state)</label>
+          <input class="ctx-inp" id="ctxOutputs" value="" placeholder="CC:1000000, DD:0:000000000000...">
         </div>
       </div>
     </div>
@@ -399,6 +419,53 @@ select.tb-sel option{background:#071522;color:var(--text);}
 </script>
 
 <script>
+    const STD_LIB = `
+// ═════════════════════════════════════════════════════════════════════
+// MIDSTATE STANDARD LIBRARY (Auto-injected)
+// ═════════════════════════════════════════════════════════════════════
+
+// ── MATH ──
+macro min(x, y) { if (x < y) { x; } else { y; } }
+macro max(x, y) { if (x > y) { x; } else { y; } }
+
+// ── SECURITY PRIMITIVES ──
+macro require_signed_by(pk) {
+    pk; CHECKSIGVERIFY;
+}
+
+macro require_timelock(blocks) {
+    blocks; CHECKTIMEVERIFY;
+}
+
+macro require_funds_transferred(amount, address) {
+    assert(sum_to_addr(address) >= amount);
+}
+
+// ── CRYPTO: MERKLE TREES ──
+// Standard step for verifying a static Merkle Proof
+// Expected Stack: [..., Sibling, Dir, Current]
+macro merkle_step() {
+    swap();
+    if (pop_int() == 1) { } else { swap(); }
+    concat();
+    hash();
+}
+
+// Advanced step for SIMULTANEOUSLY verifying an old root and calculating a new root.
+// Expected Stack: [..., Sibling, Dir, Old_Acc, New_Acc] (New_Acc is on top)
+macro merkle_update_step() {
+    swap(); 
+    rot();
+    if (pop_int() == 1) { 
+        rot(); dup(); rot(); concat(); hash(); 
+        rot(); rot(); swap(); concat(); hash();
+    } else { 
+        rot(); dup(); rot(); swap(); concat(); hash(); 
+        rot(); rot(); concat(); hash();
+    }
+}
+// ═════════════════════════════════════════════════════════════════════
+`;
 // ═══════════════════════════════════════════
 // WINDOW MANAGER
 // ═══════════════════════════════════════════
@@ -541,14 +608,21 @@ function validateMidscript() {
     const annotations = [];
 
     try {
-        const tokens = new Lexer(code).tokenize();
-        new Parser(tokens).parse();
+        // Parse STD_LIB and user code independently
+        const stdAst = new Parser(new Lexer(STD_LIB).tokenize()).parse();
+        const userAst = new Parser(new Lexer(code).tokenize()).parse();
+        const ast = [...stdAst, ...userAst];
+        
+        // Run CodeGen to catch Semantic Errors (Type Mismatches, Stack Depth, etc)
+        const gen = new CodeGen();
+        gen.generate(ast);
+
     } catch (e) {
         let row = 0;
         let column = 0;
         let text = e.toString();
 
-        // Extract line and col from your parser's error strings (e.g., "Syntax Error at 7:9: ...")
+        // This regex now catches both "Syntax Error at L:C" and "Semantic Error at L:C"
         const match = text.match(/at (\d+):(\d+)/);
         if (match) {
             row = parseInt(match[1], 10) - 1;    // Ace rows are 0-indexed
@@ -559,8 +633,9 @@ function validateMidscript() {
             row: row,
             column: column,
             text: text,
-            type: "error" // Creates the red "x"
+            type: "error" // Creates the red "x" in the gutter
         });
+        editor.session.addMarker(new ace.Range(row, column, row, column + 10), "ace_error-marker", "text");
     }
 
     editor.session.setAnnotations(annotations);
@@ -583,171 +658,633 @@ window.loadTemplate = function() {
 // TEMPLATES
 // ═══════════════════════════════════════════
 const TEMPLATES = {
+
+  maker_vault: {
+    code:`// =====================================================================
+// THE MAKER VAULT (Decentralized Stablecoin CDP)
+// =====================================================================
+
+let OWNER_PK   = "0202020202020202020202020202020202020202020202020202020202020202";
+let VAULT_ADDR = "aa000000000000000000000000000000000000000000000000000000000000aa";
+let PRICE = 2000;
+let MIN_RATIO = 150;
+
+// The compiler natively maps these to the exact bytes in the Input State!
+state Vault {
+  col: 8,
+  debt: 8,
+  padding: 16
+}
+
+macro get_new_col()  { read_output_state(0); 0; 8; slice(); 0; add(); }
+macro get_new_debt() { read_output_state(0); 8; 8; slice(); 0; add(); }
+
+route {
+  case 0: { // PATH 0: OWNER ADJUST
+    require_sig(OWNER_PK);
+
+    var newCol = get_new_col();
+    var newDebt = get_new_debt();
+
+    // Solvency Check
+    assert((newCol * PRICE * 100) >= (newDebt * MIN_RATIO));
+    
+    // Physical Covenant Check (Evaluates variable first to stay within safe stack depth!)
+    assert(newCol == sum_to_addr(VAULT_ADDR));
+  }
+  case 1: { // PATH 1: PUBLIC LIQUIDATION
+    // Vulnerability Check using direct dot-notation
+    assert((Vault.debt * MIN_RATIO) >= (Vault.col * PRICE * 100) + 1);
+    
+    // Ensure debt and collateral are wiped
+    assert(get_new_debt() == 0);
+    assert(get_new_col() == 0);
+    
+    // Ensure physical coins were taken from the vault
+    assert(sum_to_addr(VAULT_ADDR) == 0);
+  }
+  case 2: { // PATH 2: VALUE UTXO DELEGATION
+    // Silently passes
+  }
+  default: { fail(); }
+}
+
+true;`,
+    witness: '01', 
+    inputState: '0a00000000000000b03600000000000000000000000000000000000000000000',
+    outputs: 'aa000000000000000000000000000000000000000000000000000000000000aa:0:0000000000000000000000000000000000000000000000000000000000000000, dd000000000000000000000000000000000000000000000000000000000000dd:10',
+    height: '65100'
+  },
+
+  stream: {
+    code:`// =====================================================================
+// THE SOVEREIGN STREAM (Continuous Payment Channel)
+// =====================================================================
+
+let SENDER_PK     = "0202020202020202020202020202020202020202020202020202020202020202";
+let RECEIVER_PK   = "0303030303030303030303030303030303030303030303030303030303030303";
+let RECEIVER_ADDR = "dd000000000000000000000000000000000000000000000000000000000000dd";
+
+state Stream {
+  startHeight: 8,
+  rate: 8,
+  withdrawn: 8,
+  padding: 8
+}
+
+macro get_new_start()    { read_output_state(0); 0; 8; slice(); 0; add(); }
+macro get_new_rate()     { read_output_state(0); 8; 8; slice(); 0; add(); }
+macro get_new_withdrawn(){ read_output_state(0); 16; 8; slice(); 0; add(); }
+
+route {
+  case 0: { // WITHDRAWAL
+    // 1. Consume the signature FIRST to get it off the physical stack
+    require_sig(RECEIVER_PK);
+    
+    // 2. Now the height is exposed. Grab it!
+    var currentHeight = pop_int();
+    
+    require_time(currentHeight); 
+
+    // Calculate Accrued Balance
+    var elapsed = currentHeight - Stream.startHeight;
+    var maxAllowed = elapsed * Stream.rate;
+    var available = maxAllowed - Stream.withdrawn;
+
+    // State Immutability Check
+    assert(Stream.startHeight == get_new_start());
+    assert(Stream.rate == get_new_rate());
+
+    // Calculate and Verify Withdrawal
+    var justWithdrawn = get_new_withdrawn() - Stream.withdrawn;
+    
+    assert(available >= justWithdrawn);
+    
+    // Proof of Physical Payment
+    assert(sum_to_addr(RECEIVER_ADDR) >= justWithdrawn);
+  }
+  case 1: { // SENDER CANCEL
+    require_sig(SENDER_PK);
+  }
+  case 2: { // DELEGATION
+    // Managed by co-spent state
+  }
+  default: { fail(); }
+}
+true;`,
+    witness: 'ffff, 0303030303030303030303030303030303030303030303030303030303030303, 00',
+    inputState: '28fd0000000000000a00000000000000f4010000000000000000000000000000',
+    outputs: 'aa000000000000000000000000000000000000000000000000000000000000aa:1000000:28fd0000000000000a00000000000000bc020000000000000000000000000000, dd000000000000000000000000000000000000000000000000000000000000dd:200',
+    height: '65535'
+  },
+
+  amm_uniswap: {
+    code:`// Constant Product AMM (Uniswap X * Y = K)
+// -----------------------------------------------------------------
+let CONTRACT_ADDR = "aa000000000000000000000000000000000000000000000000000000000000aa";
+
+state AMM {
+  reserveX: 8,
+  reserveY: 8,
+  padding: 16
+}
+
+macro get_new_x() { read_output_state(0); 0; 8; slice(); 0; add(); }
+macro get_new_y() { read_output_state(0); 8; 8; slice(); 0; add(); }
+
+// 1. Enforce X * Y = K (New K >= Old K prevents rounding drain)
+assert(get_new_x() * get_new_y() >= AMM.reserveX * AMM.reserveY);
+
+// 2. Verify Physical Native Coins (X) match the State
+assert(sum_to_addr(CONTRACT_ADDR) == get_new_x());
+
+true;`,
+    witness: '', 
+    inputState: '0a00000000000000640000000000000000000000000000000000000000000000',
+    outputs: 'aa000000000000000000000000000000000000000000000000000000000000aa:20:1400000000000000320000000000000000000000000000000000000000000000'
+  },
+
+  tokens: {
+    code:`// Native Custom Token / Coloured Coin (eUTXO)
+// -----------------------------------------------------------------
+state Token {
+  balance: 8,
+  assetID: 24
+}
+
+macro get_out0_id() { read_output_state(0); 8; 24; slice(); }
+macro get_out1_id() { read_output_state(1); 8; 24; slice(); }
+
+macro get_out0_bal() { read_output_state(0); 0; 8; slice(); 0; add(); }
+macro get_out1_bal() { read_output_state(1); 0; 8; slice(); 0; add(); }
+
+// 1. PREVENT FORGERY (Verify Asset IDs map cleanly to the outputs)
+assert(Token.assetID == get_out0_id());
+assert(Token.assetID == get_out1_id());
+
+// 2. CONSERVATION OF MASS (Verify Balances)
+assert(Token.balance == get_out0_bal() + get_out1_bal());
+
+// 3. AUTHORIZATION
+require_sig("a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1");
+true;`,
+    witness: 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1', 
+    inputState: '14000000000000004d79476f6c64546f6b656e00000000000000000000000000',
+    outputs: 'bb000000000000000000000000000000000000000000000000000000000000bb:0:0f000000000000004d79476f6c64546f6b656e00000000000000000000000000, cc000000000000000000000000000000000000000000000000000000000000cc:0:05000000000000004d79476f6c64546f6b656e00000000000000000000000000'
+  },
+
+  stateful: {
+    code:`// Linear Bonding Curve AMM (Automated Market Maker)
+// -----------------------------------------------------------------
+let TREASURY_ADDR = "aa000000000000000000000000000000000000000000000000000000000000aa";
+
+state Curve { supply: 8, padding: 24 }
+
+macro get_new_supply() { read_output_state(0); 0; 8; slice(); 0; add(); }
+
+// 1. Verify Payment: Did the user send exactly 'Price' to the Treasury?
+// (In a linear curve, Price == Current Supply)
+assert(sum_to_addr(TREASURY_ADDR) == Curve.supply);
+
+// 2. Verify the AMM State was properly updated to Supply + 1
+assert(get_new_supply() == Curve.supply + 1);
+
+true;`,
+    witness: '', 
+    inputState: '0a00000000000000000000000000000000000000000000000000000000000000',
+    outputs: 'bb000000000000000000000000000000000000000000000000000000000000bb:0:0b00000000000000000000000000000000000000000000000000000000000000, aa000000000000000000000000000000000000000000000000000000000000aa:10'
+  },
+
   deadman:{
     code:`// The Trust-Fund Contract
 // Witness stack expected: [Signature, Path]
 
-if (peek() == 0) {
-    // Path 0: Owner Spend
-    drop();
+route {
+  case 0: { // Path 0: Owner Spend
     require_sig("AA");
-
-} else if (peek() == 1) {
-    // Path 1: Dead Man's Switch
-    drop();
+  }
+  case 1: { // Path 1: Dead Man's Switch
     require_time(500000);
     require_sig("BB");
-    require_transfer("CC", 1000000);
-
-} else if (peek() == 2) {
-    // Path 2: Oracle Release
-    drop();
+    assert(sum_to_addr("cc00000000000000000000000000000000000000000000000000000000000000") == 1000000);
+  }
+  case 2: { // Path 2: Oracle Release
     require_sig("DD");
-    require_transfer("CC", 1000000);
-
-} else {
-    drop();
-    drop();
-    fail();
+    assert(sum_to_addr("cc00000000000000000000000000000000000000000000000000000000000000") == 1000000);
+  }
+  default: { fail(); }
 }
 
 true;`,
-    witness:'BB, 01', outputs:'CC:1000000, DD:5000'
+    witness:'BB, 01', outputs:'cc00000000000000000000000000000000000000000000000000000000000000:1000000, dd00000000000000000000000000000000000000000000000000000000000000:5000'
   },
+
   htlc:{
     code:`// Hash Time-Locked Contract (Atomic Swaps)
 // Alice claim: [Alice_Sig, Secret_Preimage, 01]
-// Bob refund:  [Bob_Sig, 00, 00]
+// Bob refund:  [Bob_Sig, 00]
 
-if (peek() == 1) {
-    drop();
+route {
+  case 1: {
+    // Top of stack is now Secret_Preimage, then Alice_Sig
     require_preimage("5fbf08af2b116ab8f7f3c14b8ec01a46ce23d290e2ebc7a752d0982d54c054f2");
-    require_sig("ALICE_PUBKEY");
-} else {
-    drop();
-    drop();
+    require_sig("a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1");
+  }
+  case 0: {
     require_time(600000);
-    require_sig("BOB_PUBKEY");
+    require_sig("b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0");
+  }
+  default: { fail(); }
 }
 
 true;`,
-    witness:'ALICE_PUBKEY, 736563726574, 01', outputs:'ALICE_DEST:50000'
+    witness:'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, 736563726574, 01', outputs:'c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0:50000'
   },
+
   multisig:{
     code:`// 2-of-3 Multi-Signature Wallet
 // Witness expected: [Sig_C, Sig_B, Sig_A]
 
-check_sig("PUBKEY_A");
+check_sig("a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1");
 
 swap();
-check_sig("PUBKEY_B");
+check_sig("b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0");
 add();
 
 swap();
-check_sig("PUBKEY_C");
+check_sig("c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0");
 add();
 
-verify_gte(2);
+assert(pop_int() >= 2);
 
 true;`,
-    witness:'00, PUBKEY_B, PUBKEY_A', outputs:'DEST:50000'
+    witness:'00, b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0, a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1', outputs:'DEST:50000'
   },
-math:{
+
+  math:{
     code:`// Math & Logic Test
 // Witness: [Number_A, Number_B]
 
-swap();
-if (peek() >= 10) {
-    add();
-    if (peek() == 50) {
-        drop();
-        true;
-    } else {
-        drop();
-        fail();
-    }
-} else {
-    drop();
-    drop();
-    fail();
-}`,
+{
+    var b = pop_int();
+    var a = pop_int();
+
+    assert(a >= 10);
+    assert(b + a == 50); 
+}
+
+true;`,
     witness:'28, 0a', outputs:''
   },
-escrow:{
+
+  escrow:{
     code:`// Trustless Escrow with Arbiter & Timeout
 // -----------------------------------------------------------------
-// Path 0 (Coop):    [Sig_Buyer, Sig_Seller, 00]
-// Path 1 (Dispute): [Sig_Arbiter, Sig_Winner, 01]
-// Path 2 (Timeout): [Sig_Buyer, 02]
-
 let BUYER_PK    = "02aaaa1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
 let SELLER_PK   = "03bbbb1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
 let ARBITER_PK  = "04cccc1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
 let REFUND_TIME = 2000000;
 
-if (peek() == 0) {
-    drop(); // Consume routing int
+route {
+  case 0: { // Cooperative Path: [Buyer_Sig, Seller_Sig, 00]
+    // Because stack is LIFO, Seller is top, Buyer is under it.
+    require_sig(SELLER_PK);
+    require_sig(BUYER_PK);
+  }
+  case 1: { // Dispute Path: [Arbiter_Sig, Winner_Sig, 01]
+    var winnerSig = pop_hex(); // Save the winner's signature to a local variable
+    require_sig(ARBITER_PK); // Consumes the Arbiter's signature
     
-    // Cooperative Path: Requires both Buyer and Seller
-    swap();
-    check_sig(BUYER_PK);
-    swap();
-    check_sig(SELLER_PK);
-    add();
+    // We check the saved signature against both parties.
+    // Notice how simply typing the variable name pushes it back to the stack!
+    winnerSig; check_sig(BUYER_PK);
+    winnerSig; check_sig(SELLER_PK);
     
-    if (peek() == 2) {
-        drop(); // Drop the sum
-        true;
-    } else {
-        drop(); // Drop the sum
-        fail();
-    }
-
-} else if (peek() == 1) {
-    drop(); // Consume routing int
-    
-    // Dispute Path: Arbiter + (Buyer OR Seller)
-    swap();
-    check_sig(ARBITER_PK);
-    
-    if (peek() == 1) {
-        drop(); // Drop arbiter success bool
-        
-        // Check remaining sig against both parties
-        dup();
-        check_sig(BUYER_PK);
-        swap();
-        check_sig(SELLER_PK);
-        add();
-        
-        if (peek() == 1) {
-            drop(); // Drop the sum
-            true;
-        } else {
-            drop(); // Drop the sum
-            fail();
-        }
-    } else {
-        drop(); // Drop arbiter failure bool
-        drop(); // Drop winner sig
-        fail();
-    }
-
-} else if (peek() == 2) {
-    drop(); // Consume routing int
-    
-    // Timeout Path: Buyer gets refund if escrow stalls
+    // Ensure exactly 1 party matched the signature
+    assert(pop_int() + pop_int() == 1);
+  }
+  case 2: { // Timeout Path: [Buyer_Sig, 02]
     require_time(REFUND_TIME);
     require_sig(BUYER_PK);
-    true;
-
-} else {
-    drop();
-    fail();
-}`,
+  }
+  default: { fail(); }
+}
+true;`,
     witness:'02aaaa1234567890abcdef1234567890abcdef1234567890abcdef1234567890, 03bbbb1234567890abcdef1234567890abcdef1234567890abcdef1234567890, 00', 
     outputs:''
+  },
+
+  options_amm: {
+    code:`// =====================================================================
+// DECENTRALIZED OPTIONS MARKET: 1. AMM Contract
+// =====================================================================
+let AMM_ADDR = "aa00000000000000000000000000000000000000000000000000000000000004";
+
+state AMM { reserve_x: 8, reserve_y: 8, pad: 16 }
+
+macro new_x() { read_output_state(3); 0; 8; slice(); 0; add(); }
+macro new_y() { read_output_state(3); 8; 8; slice(); 0; add(); }
+
+assert(new_x() * new_y() >= AMM.reserve_x * AMM.reserve_y);
+assert(sum_to_addr(AMM_ADDR) == new_x());
+
+true;`,
+    witness: '',
+    height: '65100',
+    inputState: '0a00000000000000780000000000000000000000000000000000000000000000',
+    outputs: '00:0, 00:0, 00:0, aa00000000000000000000000000000000000000000000000000000000000004:15:0f00000000000000500000000000000000000000000000000000000000000000'
+  },
+
+  options_vault: {
+    code:`// =====================================================================
+// DECENTRALIZED OPTIONS MARKET: 2. Vault Contract
+// =====================================================================
+let VAULT_ADDR        = "aa00000000000000000000000000000000000000000000000000000000000001";
+let OPTION_TOKEN_ADDR = "aa00000000000000000000000000000000000000000000000000000000000002";
+let WRITER_PK         = "0202020202020202020202020202020202020202020202020202020202020202";
+let HOLDER_DELIVERY   = "dd00000000000000000000000000000000000000000000000000000000000000";
+let WRITER_RECLAIM    = "ee00000000000000000000000000000000000000000000000000000000000000";
+let STRIKE_PRICE      = 2000; 
+
+macro amm_reserve_x() { read_output_state(3); 0; 8; slice(); 0; add(); }
+macro amm_reserve_y() { read_output_state(3); 8; 8; slice(); 0; add(); }
+
+state Vault { locked: 8, pad: 8, expiry: 8, pad2: 8 }
+
+macro option_token_burned() { sum_to_addr(OPTION_TOKEN_ADDR) == 0; }
+macro vault_emptied()       { sum_to_addr(VAULT_ADDR) == 0; }
+
+route {
+  case 0: { // EXERCISE
+    // Is Oracle price (Res_Y/Res_X) >= Strike Price? Multiply out fractions.
+    assert(amm_reserve_y() * 1000 >= amm_reserve_x() * STRIKE_PRICE);
+    assert(option_token_burned());
+    assert(sum_to_addr(HOLDER_DELIVERY) >= Vault.locked);
+    assert(vault_emptied());
   }
+  case 1: { // EXPIRY
+    require_time(Vault.expiry);
+    assert(option_token_burned());
+    assert(sum_to_addr(WRITER_RECLAIM) >= Vault.locked);
+    assert(vault_emptied());
+    require_sig(WRITER_PK);
+  }
+  default: { fail(); }
+}
+true;`,
+    witness: '00',
+    height: '65100',
+    inputState: '0a00000000000000000000000000000010110100000000000000000000000000',
+    outputs: 'aa00000000000000000000000000000000000000000000000000000000000001:0, aa00000000000000000000000000000000000000000000000000000000000002:0, 00:0, aa00000000000000000000000000000000000000000000000000000000000004:15:0f00000000000000500000000000000000000000000000000000000000000000, dd00000000000000000000000000000000000000000000000000000000000000:10'
+  },
+
+  options_token: {
+    code:`// =====================================================================
+// DECENTRALIZED OPTIONS MARKET: 3. Token Contract (P2PKH)
+// =====================================================================
+let OPTION_TOKEN_ADDR = "aa00000000000000000000000000000000000000000000000000000000000002";
+let VAULT_ADDR        = "aa00000000000000000000000000000000000000000000000000000000000001";
+
+state Bearer { option_id: 8, holder_hash: 24 }
+
+macro out_option_id()   { read_output_state(1); 0; 8; slice(); }
+macro token_burned()    { sum_to_addr(OPTION_TOKEN_ADDR) == 0; }
+macro vault_emptied()   { sum_to_addr(VAULT_ADDR) == 0; }
+
+macro verify_owner() {
+    dup(); hash(); 0; 24; slice(); Bearer.holder_hash; EQUALVERIFY;
+    CHECKSIGVERIFY;
+}
+
+route {
+  case 0: { // TRANSFER
+    assert(Bearer.option_id == out_option_id());
+    assert(sum_to_addr(OPTION_TOKEN_ADDR) > 0);
+    verify_owner(); 
+  }
+  case 1: { // EXERCISE
+    assert(vault_emptied());
+    assert(token_burned());
+    verify_owner();
+  }
+  case 2: { // EXPIRY BURN
+    // Relies on Vault enforcing timelock
+    assert(token_burned());
+    assert(vault_emptied());
+  }
+  default: { fail(); }
+}
+true;`,
+    witness: '0303030303030303030303030303030303030303030303030303030303030303, 0303030303030303030303030303030303030303030303030303030303030303, 01',
+    height: '65100',
+    inputState: '01000000000000001fb5fbf7762cd146e8d15a1c322c338f2a69bee4fc2398b1',
+    outputs: 'aa00000000000000000000000000000000000000000000000000000000000001:0, aa00000000000000000000000000000000000000000000000000000000000002:0'
+  },
+
+  options_stream: {
+    code:`// =====================================================================
+// DECENTRALIZED OPTIONS MARKET: 4. Premium Stream
+// =====================================================================
+let STREAM_ADDR = "aa00000000000000000000000000000000000000000000000000000000000003";
+let WRITER_ADDR = "ee00000000000000000000000000000000000000000000000000000000000000";
+let WRITER_PK   = "0202020202020202020202020202020202020202020202020202020202020202";
+let HOLDER_PK   = "0303030303030303030303030303030303030303030303030303030303030303";
+
+state Stream { start: 8, rate: 8, withdrawn: 8, limit: 8 }
+
+route {
+  case 1: { // EXERCISE
+    var owed = Stream.limit - Stream.withdrawn;
+    assert(sum_to_addr(WRITER_ADDR) >= owed);
+    assert(sum_to_addr(STREAM_ADDR) == 0);
+  }
+  case 2: { // EXPIRY (Same logic as exercise)
+    var owed = Stream.limit - Stream.withdrawn;
+    assert(sum_to_addr(WRITER_ADDR) >= owed);
+    assert(sum_to_addr(STREAM_ADDR) == 0);
+  }
+  case 3: { // MUTUAL CANCEL
+    require_sig(WRITER_PK);
+    require_sig(HOLDER_PK);
+  }
+  default: { fail(); }
+}
+true;`,
+    witness: '01',
+    height: '65100',
+    inputState: '100000000000000001000000000000000a000000000000006400000000000000',
+    outputs: 'aa00000000000000000000000000000000000000000000000000000000000003:0, ee00000000000000000000000000000000000000000000000000000000000000:90'
+  },
+  
+  advanced_staking_gov: {
+    code:`// =====================================================================
+// ADVANCED STAKING + GOVERNANCE CONTRACT (Complex Showcase)
+// =====================================================================
+
+state Pool { totalStaked: 8, totalRewards: 8, governanceVotes: 8, lastRewardBlock: 8 }
+struct User { stake: 8, lastClaimBlock: 8, votes: 8, padding: 8 }
+
+let OWNER_PK = "0202020202020202020202020202020202020202020202020202020202020202";
+let REWARD_RATE = 100;
+let MIN_STAKE = 1000;
+
+macro current_height() { READ_INPUT_STATE; 0; 8; slice(); 0; add(); }
+
+route {
+  case 0: { // PATH 0: STAKE 
+    require_sig(OWNER_PK);
+    
+    var newStake = User.stake + sum_to_addr("aa000000000000000000000000000000000000000000000000000000000000aa");
+    var currentHeight = current_height();
+    
+    assert(newStake >= MIN_STAKE);
+    assert(newStake + Pool.totalStaked == User.stake + Pool.totalStaked);
+  }
+  case 1: { // PATH 1: UNSTAKE
+    require_sig(OWNER_PK);
+    
+    var elapsed = current_height() - User.lastClaimBlock;
+    var pendingReward = (User.stake * REWARD_RATE * elapsed) / 1000000;
+    
+    assert(Pool.totalRewards >= pendingReward);
+  }
+  case 2: { // PATH 2: CLAIM REWARDS
+    require_sig(OWNER_PK);
+    
+    var claimElapsed = current_height() - User.lastClaimBlock;
+    assert(claimElapsed > 0);
+    
+    var reward = (User.stake * REWARD_RATE * claimElapsed) / 1000000;
+    assert(Pool.totalRewards >= reward);
+  }
+  case 3: { // PATH 3: GOVERNANCE VOTE
+    require_sig(OWNER_PK);
+    
+    route { 
+      case 0: { var newVotes = Pool.governanceVotes + User.stake; }
+      case 1: { /* No state change */ }
+      default: { fail(); }
+    }
+  }
+  default: { fail(); }
+}
+true;`,
+    witness: '0202020202020202020202020202020202020202020202020202020202020202, 00',
+    inputState: 'e803000000000000000000000000000000000000000000000000000000000000',
+    outputs: 'aa000000000000000000000000000000000000000000000000000000000000aa:0:0a00000000000000140000000000000000000000000000000000000000000000, bb000000000000000000000000000000000000000000000000000000000000bb:0:0500000000000000000000000000000000000000000000000000000000000000',
+    height: '65100'
+  },
+  merkle_ledger: {
+    code:`// =====================================================================
+// DYNAMIC MERKLE LEDGER (Rollup / Bank)
+// =====================================================================
+// Witness (bottom→top):
+//   [sib_2, dir_2, sib_1, dir_1, sib_0, dir_0, old_leaf, new_leaf, route_int]
+state Ledger { root: 32 }
+
+route {
+  case 0: { // PATH 0: UPDATE STATE
+    repeat(3) {
+        merkle_update_step();
+    }
+
+    // The stack naturally aligns as [Old_Acc, New_Acc]
+    // Asserting directly against pop() consumes the stack physically 
+    // without confusing the compiler's local variable tracker.
+    assert(pop_hex() == read_output_state(0));
+    assert(pop_hex() == Ledger.root);
+  }
+  default: { fail(); }
+}
+true;`,
+    witness: '00, 00, 00, 00, 00, 00, OLD_LEAF_HEX, NEW_LEAF_HEX, 00',
+    inputState: 'c0767d5f0bbcd5481f5b045531d138ab4616fa0364b92f5e00a7f75fdf4f2708',
+    outputs: 'aa000000000000000000000000000000000000000000000000000000000000aa:0:ee2b70acf3ea5d29748cd26d782b3ba708b9ba30337be287fd3c8f29ffd24d99',
+    height: '65100'
+  },
+  
+  merkle_whitelist: {
+    code:`// =====================================================================
+// MERKLE ACCESS CONTROL (MAST / Whitelist)
+// =====================================================================
+// This contract secures funds using a Merkle Root of authorized Public Keys.
+// The state is only 32 bytes, but it can authorize millions of users.
+//
+// To spend, the user provides:
+// 1. Their Public Key
+// 2. Their Signature
+// 3. A Merkle Proof (Sibling hashes + Left/Right direction flags)
+
+state Registry { root: 32 }
+
+// ── MERKLE PROOF UNROLLER ──
+// Expects the physical stack to be: [..., Sibling_Hash, Direction_Flag, Current_Hash]
+macro merkle_step() {
+    swap(); // Brings Direction_Flag to the top
+    
+    // 1 = Sibling is on the Left, 0 = Sibling is on the Right
+    if (pop_int() == 1) {
+        // Sibling is on the Left. 
+        // CONCAT joins (Bottom || Top). Stack is currently [Sibling, Current].
+        // This naturally yields (Sibling || Current). We do nothing!
+    } else {
+        // Sibling is on the Right.
+        // Swap stack to [Current, Sibling] so CONCAT yields (Current || Sibling).
+        swap(); 
+    }
+    
+    concat();
+    hash();
+}
+
+route {
+  case 0: { // PATH 0: AUTHORIZED SPEND
+    // 1. Consume the signature first to expose the PubKey underneath
+    var my_pk = pop_hex();
+    require_sig(my_pk); 
+    
+    // 2. Push PK back to stack and hash it to create the starting Leaf
+    my_pk;
+    hash();
+
+    // 3. Unroll the Merkle Proof! (Assuming a tree depth of 3 for this example)
+    // The compiler will flatten this into 3 back-to-back merkle_step() sequences.
+    repeat(3) {
+        merkle_step();
+    }
+
+    // 4. Verify the computed root matches the on-chain State thread!
+    assert(pop_hex() == Registry.root);
+  }
+  default: { fail(); }
+}
+
+// ── TEST SUITE ──
+// This proves the stack mechanics work without bloating the on-chain bytecode.
+test "Validates a Left-Sibling Merkle Step" {
+    // Setup Mock Stack: [Sibling(AA), Direction(Left=1), Current(BB)]
+    push_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    push_int(1); 
+    push_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    
+    merkle_step();
+    
+    // Because sibling was left (1), the concat order should have been AA || BB.
+    push_hex("7e244b7fa716d86fb5a0f274291c984caebef9df451e0ff0d48cb96d66e74b3e"); 
+    
+    assert(pop_hex() == pop_hex()); 
+}
+
+true;`,
+    // WITNESS STACK ORDER:
+    // [Sibling_3, Dir_3, Sibling_2, Dir_2, Sibling_1, Dir_1, Signature, PubKey, Routing_Int]
+    witness: '00, 00, 00, 00, 00, 00, 00, 00, 00', 
+    inputState: '4382613d62545604613ce55fcaf7748a3eb9281d83827824773842c49d28cd9b',
+    outputs: '',
+    height: '65100'
+  },
+  
+  
 };
 
 window.loadTemplate = function() {
@@ -756,6 +1293,8 @@ window.loadTemplate = function() {
   editor.setValue(t.code, -1);
   document.getElementById('ctxWitness').value = t.witness;
   document.getElementById('ctxOutputs').value = t.outputs;
+  document.getElementById('ctxInputState').value = t.inputState || '0500000000000000000000000000000000000000000000000000000000000000';
+  if (t.height) document.getElementById('ctxHeight').value = t.height; 
   document.getElementById('bytecodeOutput').textContent = 'Click Compile to generate bytecode...';
   document.getElementById('asmOutput').innerHTML = "<div style='color:#1e3a5f;padding:12px;font-size:11px;'>Awaiting compilation...</div>";
   setVmStatus('Ready.','neu');
@@ -763,6 +1302,9 @@ window.loadTemplate = function() {
   document.getElementById('btnStep').disabled = true;
   document.getElementById('btnRun').disabled = true;
   log('Template loaded: '+key,'i');
+    if (key.startsWith('options_')) {
+    log('⚠ Multi-contract system: Deploy AMM first, then paste its P2SH address into the Vault code before compiling.', 'w');
+  }
 };
 
 // ═══════════════════════════════════════════
@@ -777,6 +1319,8 @@ function intToHexLE(n){
 }
 function hexLEToInt(h){
   if(!h) return 0n;
+  // Enforce Rust VM's strict 8-byte limit on math opcodes to prevent crashes
+  if(h.length > 16) throw 'InvalidOpcode (Math operations require inputs of 8 bytes or less)';
   return BigInt('0x' + h.match(/.{2}/g).reverse().join(''));
 }
 function isTrue(h){if(!h)return false;return h.match(/.{2}/g).some(b=>parseInt(b,16)!==0);}
@@ -816,7 +1360,7 @@ function setVmStatus(msg,cls='neu') {
 // ═══════════════════════════════════════════
 // ASSEMBLER
 // ═══════════════════════════════════════════
-const OPS={PUSH_DATA:0x01,DROP:0x10,DUP:0x11,SWAP:0x12,OVER:0x13,ROT:0x14,EQUAL:0x20,VERIFY:0x21,EQUALVERIFY:0x22,ADD:0x23,GREATER_OR_EQUAL:0x24,SUB:0x25,HASH:0x30,CHECKSIG:0x31,CHECKSIGVERIFY:0x32,CHECKTIMEVERIFY:0x33,IF:0x40,ELSE:0x41,ENDIF:0x42,SUM_TO_ADDR:0x50};
+const OPS={PUSH_DATA:0x01,DROP:0x10,DUP:0x11,SWAP:0x12,OVER:0x13,ROT:0x14,SLICE:0x15,CONCAT:0x16,EQUAL:0x20,VERIFY:0x21,EQUALVERIFY:0x22,ADD:0x23,GREATER_OR_EQUAL:0x24,SUB:0x25,MUL:0x26,DIV:0x27,HASH:0x30,CHECKSIG:0x31,CHECKSIGVERIFY:0x32,CHECKTIMEVERIFY:0x33,IF:0x40,ELSE:0x41,ENDIF:0x42,SUM_TO_ADDR:0x50,READ_INPUT_STATE:0x51,READ_OUTPUT_STATE:0x52};
 
 function assembleBytecode(asm) {
   let bc=[];
@@ -825,6 +1369,8 @@ function assembleBytecode(asm) {
     if(op==='PUSH_HEX'||op==='PUSH_INT'){
       bc.push(OPS.PUSH_DATA);
       let hex=op==='PUSH_INT'?intToHexLE(BigInt(rest[0])):rest[0].toLowerCase();
+      if (hex.length % 2 !== 0) throw `Syntax Error: Hex string must have an even number of characters ('${hex}')`;
+      if (!/^[0-9a-f]*$/.test(hex)) throw `Syntax Error: Invalid hex characters in '${hex}'`;
       let len=hex.length/2, lh=len.toString(16).padStart(4,'0');
       bc.push(parseInt(lh.slice(2,4),16),parseInt(lh.slice(0,2),16));
       for(let i=0;i<hex.length;i+=2)bc.push(parseInt(hex.slice(i,i+2),16));
@@ -845,10 +1391,11 @@ class Lexer {
     this.pos=0;this.line=1;this.col=1;
   }
   adv(){let c=this.src[this.pos++];if(c==='\n'){this.line++;this.col=1;}else this.col++;return c;}
-    tokenize(){
+  tokenize(){
     const toks=[];
-    const AOPS=['PUSH_INT','PUSH_HEX','DUP','DROP','SWAP','OVER','ROT','EQUAL','EQUALVERIFY','CHECKSIG','CHECKSIGVERIFY','ADD','SUB','GREATER_OR_EQUAL','HASH','CHECKTIMEVERIFY','VERIFY','SUM_TO_ADDR'];
-    const KWS=['if','else','repeat','true','false','macro','let'];
+    // ONLY true raw opcodes that never take (args) in high-level code
+    const RAW_OPS=['PUSH_INT','PUSH_HEX','DUP','DROP','SWAP','OVER','ROT','SLICE','CONCAT','EQUAL','EQUALVERIFY','CHECKSIG','CHECKSIGVERIFY','ADD','SUB','MUL','DIV','GREATER_OR_EQUAL','HASH','CHECKTIMEVERIFY','VERIFY'];
+    const KWS=['if','else','repeat','true','false','macro','let','var','state','struct','switch','case','default','assert','route','test'];
     while(this.pos<this.src.length){
       let c=this.src[this.pos];
       if(/\s/.test(c)){this.adv();continue;}
@@ -859,9 +1406,17 @@ class Lexer {
       if(c==='>'&&this.src[this.pos+1]==='='){toks.push({t:'OP',v:'>=',l:sl,c:sc});this.adv();this.adv();continue;}
       if(c==='&'&&this.src[this.pos+1]==='&'){toks.push({t:'OP',v:'&&',l:sl,c:sc});this.adv();this.adv();continue;}
       if(c==='|'&&this.src[this.pos+1]==='|'){toks.push({t:'OP',v:'||',l:sl,c:sc});this.adv();this.adv();continue;}
-      if(['+','-','{','}','(',')','.',';',','].includes(c)){toks.push({t:'P',v:c,l:sl,c:sc});this.adv();continue;}
+      // FIXED: Added ':' to punctuation list (required for "field: size" in state/struct)
+      if(['+','-','*','/','{','}','(',')','.',';',',',':'].includes(c)){
+        if(c==='.') toks.push({t:'DOT',v:'.',l:sl,c:sc});
+        else toks.push({t:'P',v:c,l:sl,c:sc});
+        this.adv();continue;
+      }
       if(c==='='||c==='>'||c==='<'){let op=this.adv();if(this.src[this.pos]==='=')op+=this.adv();toks.push({t:'ROP',v:op,l:sl,c:sc});continue;}
-      if(/[a-zA-Z_]/.test(c)){let id='';while(this.pos<this.src.length&&/[a-zA-Z0-9_]/.test(this.src[this.pos]))id+=this.adv();if(AOPS.includes(id.toUpperCase()))toks.push({t:'ASM',v:id.toUpperCase(),l:sl,c:sc});else if(KWS.includes(id))toks.push({t:'KW',v:id,l:sl,c:sc});else toks.push({t:'ID',v:id,l:sl,c:sc});continue;}
+      if(/[a-zA-Z_]/.test(c)){let id='';while(this.pos<this.src.length&&/[a-zA-Z0-9_]/.test(this.src[this.pos]))id+=this.adv();
+        if(RAW_OPS.includes(id))toks.push({t:'ASM',v:id,l:sl,c:sc});
+        else if(KWS.includes(id))toks.push({t:'KW',v:id,l:sl,c:sc});
+        else toks.push({t:'ID',v:id,l:sl,c:sc});continue;}
       throw`Unknown char '${c}' at ${this.line}:${this.col}`;
     }
     return toks;
@@ -871,34 +1426,111 @@ class Lexer {
 // ═══════════════════════════════════════════
 // PARSER
 // ═══════════════════════════════════════════
+
 class Parser {
   constructor(toks){this.toks=toks;this.pos=0;}
   pk(){return this.toks[this.pos];}
   consume(et,ev){let t=this.toks[this.pos];if(!t)throw'Unexpected EOF';if(et&&t.t!==et)throw`Syntax Error at ${t.l}:${t.c}: Expected ${et}, got '${t.v}'`;if(ev&&t.v!==ev)throw`Syntax Error at ${t.l}:${t.c}: Expected '${ev}', got '${t.v}'`;return this.toks[this.pos++];}
   match(v){if(this.pk()&&this.pk().v===v){this.pos++;return true;}return false;}
   parse(){let s=[];while(this.pos<this.toks.length){let st=this.parseStmt();if(st)s.push(st);}return s;}
-parseStmt(){
+
+  parseStmt(){
     let t=this.pk();if(!t)return null;
+
     if(t.t==='KW'&&t.v==='let'){
-      this.consume(); 
-      let id=this.consume('ID').v; 
-      this.consume('ROP','='); 
-      let expr=this.parseExpr(); 
+      this.consume();
+      let id=this.consume('ID').v;
+      this.consume('ROP','=');
+      let expr=this.parseExpr();
       this.match(';');
       return {type:'LetStmt', id, expr};
     }
-    if(t.t==='KW'&&t.v==='macro'){
-      this.consume(); 
-      let name=this.consume('ID').v; 
-      this.consume('P','('); 
-      this.consume('P',')'); 
-      let body=this.parseBlock();
-      return {type:'MacroDefStmt', name, body};
+
+    if(t.t==='KW'&&t.v==='var'){
+      this.consume();
+      let id=this.consume('ID').v;
+      this.consume('ROP','=');
+      let expr=this.parseExpr();
+      this.match(';');
+      return {type:'VarDecl', id, expr};
     }
+// Check for bare assignment: identifier = expr
+if (t.t === 'ID' && this.toks[this.pos + 1]?.v === '=') {
+    const id = this.consume('ID').v;
+    this.consume('ROP', '=');
+    const expr = this.parseExpr();
+    this.match(';');
+    return { type: 'AssignStmt', id, expr, l: t.l, c: t.c }; 
+}
+    if(t.t==='KW'&&t.v==='macro'){
+      this.consume();
+      let name=this.consume('ID').v;
+      this.consume('P','(');
+      let params = [];
+      while(this.pk() && this.pk().v !== ')') {
+          params.push(this.consume('ID').v);
+          if (this.match(',')) continue;
+      }
+      this.consume('P',')');
+      let body=this.parseBlock();
+      return {type:'MacroDefStmt', name, params, body};
+    }
+
+    if(t.t==='KW'&&t.v==='state'){
+      this.consume();
+      let name=this.consume('ID').v;
+      this.consume('P','{');
+      let fields={}; let offset=0;
+      while(this.pk()&&this.pk().v!=='}'){
+        let fname=this.consume('ID').v;
+        this.consume('P',':');
+        let size=this.consume('NUM').v;
+        fields[fname]={offset, size};
+        offset += size;
+        this.match(',');
+      }
+      this.consume('P','}');
+      return {type:'StateDef', name, fields};
+    }
+
+    if(t.t==='KW'&&t.v==='struct'){
+      this.consume();
+      let name=this.consume('ID').v;
+      this.consume('P','{');
+      let fields={}; let offset=0;
+      while(this.pk()&&this.pk().v!=='}'){
+        let fname=this.consume('ID').v;
+        this.consume('P',':');
+        let size=this.consume('NUM').v;
+        fields[fname]={offset, size};
+        offset += size;
+        this.match(',');
+      }
+      this.consume('P','}');
+      return {type:'StructDef', name, fields};
+    }
+
     if(t.t==='KW'&&t.v==='if')return this.parseIf();
     if(t.t==='KW'&&t.v==='repeat')return this.parseRepeat();
+    if(t.t==='KW'&&t.v==='switch')return this.parseSwitch();
+    if(t.t==='KW'&&t.v==='route')return this.parseRoute();
+    if(t.t==='KW'&&t.v==='test') {
+      this.consume();
+      let name = this.consume('HEX').v; // Reusing your string tokenizer for the description
+      let body = this.parseBlock();
+      return {type: 'TestDef', name, body};
+    }
+if(t.t==='KW'&&t.v==='assert'){
+      this.consume();
+      this.consume('P','(');
+      let expr=this.parseExpr();
+      this.consume('P',')');
+      this.match(';');
+      return {type:'AssertStmt', expr, l: t.l, c: t.c}; 
+    }
     if(t.t==='P'&&t.v==='{')return this.parseBlock();
     if(t.t==='P'&&t.v===';'){this.consume();return null;}
+
     if(t.t==='ASM'){
       this.consume();
       if(t.v==='PUSH_HEX'||t.v==='PUSH_INT'){
@@ -911,25 +1543,119 @@ parseStmt(){
     if(t.t==='P'&&t.v==='+'){this.consume();this.match(';');return{type:'RawASM',op:'ADD'};}
     if(t.t==='ROP'&&t.v==='=='){this.consume();this.match(';');return{type:'RawASM',op:'EQUAL'};}
     if(t.t==='ROP'&&t.v==='>='){this.consume();this.match(';');return{type:'RawASM',op:'GREATER_OR_EQUAL'};}
+
     let expr=this.parseExpr();this.match(';');return{type:'ExprStmt',expr};
   }
+
+  parseSwitch(){
+    let t = this.consume('KW','switch');
+    if(!this.match('('))throw`Expected '(' after 'switch'`;
+    let expr=this.parseExpr();
+    if(!this.match(')'))throw`Expected ')'`;
+    if(!this.match('{'))throw`Expected '{' after switch`;
+    let cases=[];
+    while(this.pk()&&this.pk().v!=='}'){
+      if(this.match('case')){
+        let val=this.parseExpr();
+        this.consume('P',':');
+        let body=this.parseBlock()||this.parseStmt();
+        cases.push({val,body});
+      } else if(this.match('default')){
+        this.consume('P',':');
+        let body=this.parseBlock()||this.parseStmt();
+        cases.push({isDefault:true,body});
+      } else break;
+    }
+    if(!this.match('}'))throw`Missing '}' for switch`;
+    return {type:'SwitchStmt',expr,cases, l: t.l, c: t.c}; 
+  }
+  parseRoute(){
+    let t = this.consume('KW','route'); // <-- Capture token t here
+    if(!this.match('{'))throw `Expected '{' after route`;
+    let cases=[];
+    while(this.pk()&&this.pk().v!=='}'){
+      if(this.match('case')){
+        let val=this.parseExpr();
+        this.consume('P',':');
+        let body=this.parseBlock()||this.parseStmt();
+        cases.push({val,body});
+      } else if(this.match('default')){
+        this.consume('P',':');
+        let body=this.parseBlock()||this.parseStmt();
+        cases.push({isDefault:true,body});
+      } else break;
+    }
+    this.consume('P','}');
+    
+    return {type:'SwitchStmt', expr: {type:'ImplicitTop'}, cases, l: t.l, c: t.c}; 
+  }
+
   parseBlock(){let s=this.consume('P','{');let stmts=[];while(this.pos<this.toks.length&&(!this.pk()||this.pk().v!=='}')){let st=this.parseStmt();if(st)stmts.push(st);}if(!this.match('}'))throw`Missing '}' for block at ${s.l}`;return{type:'BlockStmt',stmts};}
   parseIf(){let t=this.consume('KW','if');if(!this.match('('))throw`Expected '(' after 'if'`;let cond=this.parseExpr();if(!this.match(')'))throw`Expected ')' after if condition`;let thenB=this.parseBlock(),elseB=null;if(this.match('else')){if(this.pk()&&this.pk().v==='if')elseB=this.parseIf();else elseB=this.parseBlock();}return{type:'IfStmt',cond,thenB,elseB};}
   parseRepeat(){let t=this.consume('KW','repeat');if(!this.match('('))throw`Expected '(' after 'repeat'`;let n=this.consume('NUM');if(!this.match(')'))throw`Expected ')'`;return{type:'RepeatStmt',count:n.v,body:this.parseBlock()};}
   parseExpr(){return this.parseLOr();}
   parseLOr(){let e=this.parseLAnd();while(this.match('||'))e={type:'Bin',l:e,op:'||',r:this.parseLAnd()};return e;}
   parseLAnd(){let e=this.parseEq();while(this.match('&&'))e={type:'Bin',l:e,op:'&&',r:this.parseEq()};return e;}
-  parseEq(){let e=this.parseAdd();while(this.match('==')||this.match('>=')){let op=this.toks[this.pos-1].v;e={type:'Bin',l:e,op,r:this.parseAdd()};}return e;}
-  parseAdd(){let e=this.parsePrim();while(this.match('+')||this.match('-')){let op=this.toks[this.pos-1].v;e={type:'Bin',l:e,op,r:this.parsePrim()};}return e;}
-  parsePrim(){
+  parseEq(){
+    let e=this.parseAdd();
+    while(this.match('==')||this.match('>=')||this.match('>')||this.match('<=')||this.match('<')){   
+      let op=this.toks[this.pos-1].v;
+      e={type:'Bin',l:e,op,r:this.parseAdd()};
+    }
+    return e;
+  }
+  parseAdd(){
+    let e=this.parseMul();
+    while(this.match('+')||this.match('-')){
+      let op=this.toks[this.pos-1].v;
+      let r=this.parseMul();
+      // Fold constants if both sides are static integers
+      if(e.type==='Lit' && r.type==='Lit' && e.k==='int' && r.k==='int') {
+          e = {type:'Lit', v: op==='+' ? e.v+r.v : e.v-r.v, k:'int'};
+      } else {
+          e={type:'Bin',l:e,op,r};
+      }
+    }
+    return e;
+  }
+  
+  parseMul(){
+    let e=this.parsePrim();
+    while(this.match('*')||this.match('/')){
+      let op=this.toks[this.pos-1].v;
+      let r=this.parsePrim();
+      // Fold constants if both sides are static integers
+      if(e.type==='Lit' && r.type==='Lit' && e.k==='int' && r.k==='int') {
+          e = {type:'Lit', v: op==='*' ? e.v*r.v : Math.floor(e.v/r.v), k:'int'};
+      } else {
+          e={type:'Bin',l:e,op,r};
+      }
+    }
+    return e;
+  }
+parsePrim(){
     let t=this.pk();if(!t)throw'Unexpected EOF in expression';
     if(this.match('(')){let e=this.parseExpr();if(!this.match(')'))throw`Missing ')' at ${t.l}:${t.c}`;return e;}
     t=this.consume();
-    if(t.t==='NUM')return{type:'Lit',v:t.v,k:'int'};
-    if(t.t==='HEX')return{type:'Lit',v:t.v,k:'hex'};
-    if(t.t==='KW'&&t.v==='true')return{type:'Lit',v:1,k:'int'};
-    if(t.t==='KW'&&t.v==='false')return{type:'Lit',v:0,k:'int'};
-    if(t.t==='ID'){if(this.match('(')){let args=[];while(this.pk()&&this.pk().v!==')'){args.push(this.parseExpr());this.match(',');}if(!this.match(')'))throw`Missing ')' for '${t.v}'`;return{type:'Call',name:t.v,args};}return{type:'Lit',v:t.v,k:'hex'};}
+    if(t.t==='NUM')return{type:'Lit',v:t.v,k:'int',l:t.l,c:t.c};
+    if(t.t==='HEX')return{type:'Lit',v:t.v,k:'hex',l:t.l,c:t.c};
+    if(t.t==='KW'&&t.v==='true')return{type:'Lit',v:1,k:'int',l:t.l,c:t.c};
+    if(t.t==='KW'&&t.v==='false')return{type:'Lit',v:0,k:'int',l:t.l,c:t.c};
+    if(t.t==='ID'){
+      if(this.match('.')){
+        let field=this.consume('ID').v;
+        return {type:'FieldAccess', base:t.v, field, l:t.l, c:t.c};
+      }
+      if(this.match('(')){
+          let args=[];
+          while(this.pk()&&this.pk().v!==')'){
+              args.push(this.parseExpr());this.match(',');
+          }
+          if(!this.match(')'))throw`Missing ')' for '${t.v}'`;
+          return{type:'Call',name:t.v,args,l:t.l,c:t.c};
+      }
+      return{type:'Lit',v:t.v,k:'hex',l:t.l,c:t.c};
+    }
     throw`Syntax Error at ${t.l}:${t.c}: Unexpected token '${t.v}'`;
   }
 }
@@ -938,72 +1664,470 @@ parseStmt(){
 // CODE GEN
 // ═══════════════════════════════════════════
 class CodeGen {
-  constructor(){this.asm=[]; this.macros={}; this.constants={};}
-  emit(op){this.asm.push(op);}
-  generate(ast){for(let n of ast)if(n)this.genStmt(n);return this.asm;}
-  
-  genStmt(s){
-    if(s.type==='MacroDefStmt'){this.macros[s.name]=s.body;}
-    else if(s.type==='LetStmt'){this.constants[s.id]=s.expr;}
-    else if(s.type==='BlockStmt')for(let c of s.stmts)this.genStmt(c);
-    else if(s.type==='ExprStmt')this.genExpr(s.expr);
-    else if(s.type==='RawASM')this.emit(s.arg!==undefined?`${s.op} ${s.arg}`:s.op);
-    else if(s.type==='IfStmt'){this.genExpr(s.cond);this.emit('IF');this.genStmt(s.thenB);if(s.elseB){this.emit('ELSE');this.genStmt(s.elseB);}this.emit('ENDIF');}
-    else if(s.type==='RepeatStmt'){for(let i=0;i<s.count;i++)this.genStmt(s.body);}
+  constructor(){
+    this.asm = [];
+    this.sourceMap = [];
+    this.macros = {};
+    this.constants = {};
+    this.structs = {};
+    this.locals = [];           // list of active var names (stack order)
+    this.stateDefs = {};
+    this.stackDepthOffset = 0;
+    this.simulatedStackDepth = 0;
+  }
+  emit(op, line){
+    this.asm.push(op);
+    this.sourceMap.push(line || 0);
+    
+    // Calculate stack effect of this operation
+    let baseOp = op.split(' ')[0];
+    
+    if (baseOp.startsWith('PUSH_') || baseOp === 'DUP' || baseOp === 'READ_INPUT_STATE') {
+        this.simulatedStackDepth += 1;
+    } else if (baseOp === 'DROP' || baseOp === 'ADD' || baseOp === 'SUB' || baseOp === 'MUL' || baseOp === 'DIV' || baseOp === 'EQUAL' || baseOp === 'EQUALVERIFY' || baseOp === 'GREATER_OR_EQUAL' || baseOp === 'CONCAT' || baseOp === 'CHECKSIG' || baseOp === 'CHECKSIGVERIFY' || baseOp === 'CHECKTIMEVERIFY' || baseOp === 'VERIFY') {
+        this.simulatedStackDepth -= 1;
+    } else if (baseOp === 'SLICE') {
+        this.simulatedStackDepth -= 2; // Pops 3, Pushes 1 = net -2
+    }
+    // SWAP, OVER, ROT, HASH, SUM_TO_ADDR, READ_OUTPUT_STATE have a net 0 effect.
+
+    if (this.simulatedStackDepth > 64) {
+        throw `Fatal Compiler Error: Maximum stack depth of 64 exceeded at line ${line || 'unknown'}. (Current depth: ${this.simulatedStackDepth})`;
+    }
   }
   
-genExpr(e){
+  generate(ast) {
+    for(let n of ast) if(n) this.genStmt(n);
+    return this.optimize(this.asm);
+  }
+
+  optimize(asm) {
+    let opt = [];
+    for(let i=0; i<asm.length; i++) {
+      let curr = asm[i];
+      let next = asm[i+1];
+      
+      // Strip ONLY pure stack redundancies, leave math alone (used for type-casting)
+      if (curr === 'SWAP' && next === 'SWAP') { i++; continue; }
+      if (curr === 'DUP' && next === 'DROP') { i++; continue; }
+      
+      opt.push(curr);
+    }
+    return opt;
+  }
+
+  genStmt(s){
+    if(s.type==='TestDef') {
+      this.tests = this.tests || {};
+      this.tests[s.name] = s.body;
+      return; 
+    }
+    if(s.type==='MacroDefStmt'){this.macros[s.name]={params: s.params, body: s.body};}
+    else if(s.type==='LetStmt'){this.constants[s.id]=s.expr;}
+    else if(s.type==='VarDecl'){
+      // Prevent Shadowing
+      const existing = this.locals.find(l => l.id === s.id);
+      if (existing) {
+          throw `Semantic Error at ${s.l}:${s.c}: Cannot redeclare variable '${s.id}'. Shadowing is forbidden in Midscript.`;
+      }
+
+      let tType = this.genExpr(s.expr); 
+      this.locals.push({id: s.id, type: tType});
+    }
+    else if(s.type==='StateDef' || s.type==='StructDef'){
+      this.structs[s.name]=s.fields;
+      if(s.type==='StateDef') this.stateDefs[s.name]=s.fields;
+    }
+    else if(s.type==='BlockStmt') {
+      let initialLocals = this.locals.length; 
+      for(let c of s.stmts) this.genStmt(c);
+      let toDrop = this.locals.length - initialLocals;
+      for(let i=0; i<toDrop; i++) {
+        this.emit('DROP', s.l); // Pass line
+        this.locals.pop(); 
+      }
+    }
+    else if (s.type === 'AssignStmt') {
+        const idx = this.locals.findIndex(l => l.id === s.id);
+        if (idx === -1) throw `Semantic Error at ${s.l}:${s.c}: Assignment to undeclared variable '${s.id}'`;
+        const depth = this.locals.length - 1 - idx;
+        let newType = 'unknown';
+        if (depth === 0) {
+            this.emit('DROP', s.l);
+            newType = this.genExpr(s.expr);
+        } else if (depth === 1) {
+            this.emit('SWAP', s.l);
+            this.emit('DROP', s.l);
+            newType = this.genExpr(s.expr);
+            this.emit('SWAP', s.l);
+        } else {
+            throw `Semantic Error at ${s.l}:${s.c}: Cannot reassign '${s.id}' — too deep on stack.`;
+        }
+        this.locals[idx].type = newType;
+    }
+    else if(s.type==='AssertStmt'){
+      this.genExpr(s.expr);
+      this.emit('VERIFY', s.l); // VERIFY is usually where runtime errors happen!
+    }
+    else if(s.type==='ExprStmt')this.genExpr(s.expr);
+    else if(s.type==='RawASM')this.emit(s.arg!==undefined?`${s.op} ${s.arg}`:s.op, s.l);
+    else if(s.type==='IfStmt'){
+      this.genExpr(s.cond);
+      this.emit('IF', s.l);
+      this.genStmt(s.thenB);
+      if(s.elseB){this.emit('ELSE', s.l); this.genStmt(s.elseB);}
+      this.emit('ENDIF', s.l);
+    }
+    else if(s.type==='RepeatStmt'){for(let i=0;i<s.count;i++)this.genStmt(s.body);}
+    else if(s.type==='SwitchStmt'){this.genSwitch(s);}
+  } 
+
+genSwitch(sw) {
+  this.genExpr(sw.expr); // Push routing value
+  let cases = sw.cases.filter(c => !c.isDefault);
+  let def = sw.cases.find(c => c.isDefault);
+  
+  for(let i=0; i<cases.length; i++) {
+    this.emit('DUP', sw.l); 
+    this.genExpr(cases[i].val);
+    this.emit('EQUAL', sw.l); 
+    this.emit('IF', sw.l); 
+    this.emit('DROP', sw.l); 
+    this.genStmt(cases[i].body);
+    this.emit('ELSE', sw.l); 
+  }
+  
+  this.emit('DROP', sw.l); 
+  if (def) this.genStmt(def.body);
+  
+  for(let i=0; i<cases.length; i++) {
+    this.emit('ENDIF', sw.l); 
+  }
+}
+
+  genExpr(e){
+    if(e.type==='ImplicitTop') return 'unknown'; 
+    
     if(e.type==='Lit'){
+      const idx = this.locals.findIndex(l => l.id === e.v);
+      if (idx !== -1) {
+          const depth = this.locals.length - 1 - idx + this.stackDepthOffset;
+          const varType = this.locals[idx].type;
+          
+          if (depth === 0) {
+              this.emit('DUP', e.l);
+          } else if (depth === 1) {
+              this.emit('OVER', e.l);
+          } else if (depth === 2) {
+              if (this.stackDepthOffset > 0) {
+                  throw `Semantic Error at ${e.l}:${e.c}: Cannot fetch depth 2 variable '${e.v}' mid-expression. Evaluate it first.`;
+              }
+              this.emit('ROT', e.l);
+              this.locals.splice(idx, 1); 
+          } else {
+              throw `Semantic Error at ${e.l}:${e.c}: Variable '${e.v}' is too deep (depth ${depth}). Max fetch depth is 2.`;
+          }
+          return varType;
+      }
+      
+      if (e.v === 'READ_INPUT_STATE') { this.emit('READ_INPUT_STATE', e.l); return 'hex'; }
+      if (e.v === 'READ_OUTPUT_STATE') { this.emit('READ_OUTPUT_STATE', e.l); return 'hex'; }
+
       if(this.constants[e.v]) {
-          this.genExpr(this.constants[e.v]); // Expand alias
+        return this.genExpr(this.constants[e.v]);
       } else {
-          this.emit(e.k==='int'?`PUSH_INT ${e.v}`:`PUSH_HEX ${e.v}`);
+        if (e.k === 'hex' && !/^[0-9a-fA-F]*$/.test(e.v)) {
+          throw `Semantic Error at ${e.l}:${e.c}: Undeclared identifier or invalid hex '${e.v}'`;
+        }
+        this.emit(e.k==='int'?`PUSH_INT ${e.v}`:`PUSH_HEX ${e.v}`, e.l);
+        return e.k;
       }
     }
     else if(e.type==='Bin'){
-      this.genExpr(e.l);this.genExpr(e.r);
-      if(e.op==='==')this.emit('EQUAL');
-      if(e.op==='>=')this.emit('GREATER_OR_EQUAL');
-      if(e.op==='+')this.emit('ADD');
-      if(e.op==='-')this.emit('SUB');
-        if(e.op==='&&'){this.emit('ADD');this.emit('PUSH_INT 2');this.emit('EQUAL');}
-      if(e.op==='||'){this.emit('ADD');this.emit('PUSH_INT 1');this.emit('GREATER_OR_EQUAL');}
-    } else if(e.type==='Call'){
+      let lType = this.genExpr(e.l);
+      this.stackDepthOffset++; 
+      let rType = this.genExpr(e.r);
+      this.stackDepthOffset--; 
+
+      const isMath = ['+', '-', '*', '/'].includes(e.op);
+      const isComparison = ['==', '>=', '>', '<=', '<'].includes(e.op);
+      const isLogical = ['&&', '||'].includes(e.op);
+      
+      const line = e.l.l || 'unknown';
+      const col = e.l.c || 'unknown';
+
+      if (isMath && ((lType !== 'int' && lType !== 'unknown') || (rType !== 'int' && rType !== 'unknown'))) {
+          throw `Semantic Error at ${line}:${col}: Type Mismatch. Math ('${e.op}') requires both sides to be integers.`;
+      }
+      
+      if (isComparison && lType !== rType && lType !== 'unknown' && rType !== 'unknown') {
+          throw `Semantic Error at ${line}:${col}: Type Mismatch. Cannot compare an '${lType}' with an '${rType}'.`;
+      }
+
+      if (isLogical && (lType === 'hex' || rType === 'hex')) {
+          throw `Semantic Error at ${line}:${col}: Type Mismatch. Logical operators ('${e.op}') require evaluated boolean/int expressions, not raw hex.`;
+      }
+      
+      if(e.op==='==')this.emit('EQUAL', e.l);
+      if(e.op==='>=')this.emit('GREATER_OR_EQUAL', e.l);
+      if(e.op==='>'){
+        this.emit('PUSH_INT 1', e.l); 
+        this.emit('ADD', e.l); 
+        this.emit('GREATER_OR_EQUAL', e.l);
+      }
+      if(e.op==='<='){
+        this.emit('SWAP', e.l); 
+        this.emit('GREATER_OR_EQUAL', e.l);
+      }
+      if(e.op==='<'){
+        this.emit('SWAP', e.l); 
+        this.emit('PUSH_INT 1', e.l); 
+        this.emit('ADD', e.l); 
+        this.emit('GREATER_OR_EQUAL', e.l);
+      }
+      
+      
+      if(e.op==='+')this.emit('ADD', e.l);
+      if(e.op==='-')this.emit('SUB', e.l);
+      if(e.op==='*')this.emit('MUL', e.l);
+      if(e.op==='/')this.emit('DIV', e.l);
+      if(e.op==='&&'){this.emit('ADD', e.l); this.emit('PUSH_INT 2', e.l); this.emit('EQUAL', e.l);}
+      if(e.op==='||'){this.emit('ADD', e.l); this.emit('PUSH_INT 1', e.l); this.emit('GREATER_OR_EQUAL', e.l);}
+      
+      return 'int';
+    }
+    else if(e.type==='Call'){
       const fn=e.name;
       if(this.macros[fn]){
-          this.genStmt(this.macros[fn]); // Inline macro block
+        const mac = this.macros[fn];
+        if (e.args.length !== mac.params.length) throw `Semantic Error at ${e.l}:${e.c}: Macro '${fn}' expects ${mac.params.length} arguments.`;
+
+        let macroLocalsSnapshot = this.locals.length; 
+        
+        for (let i = 0; i < e.args.length; i++) {
+            let argType = this.genExpr(e.args[i]);
+            this.locals.push({id: mac.params[i], type: argType});
+        }
+        
+        this.genStmt(mac.body);
+        
+        let toDrop = this.locals.length - macroLocalsSnapshot;
+        for(let i=0; i<toDrop; i++) {
+            this.emit('DROP', e.l);
+            this.locals.pop();
+        }
+        return 'unknown';
       }
-      else if(fn==='peek')this.emit('DUP');
-      else if(fn==='drop')this.emit('DROP');
-      else if(fn==='swap')this.emit('SWAP');
-      else if(fn==='over')this.emit('OVER');
-      else if(fn==='rot')this.emit('ROT');
-      else if(fn==='add')this.emit('ADD');
-      else if(fn==='sub')this.emit('SUB');
-      else if(fn==='hash')this.emit('HASH');
-      else if(fn==='fail')this.emit('PUSH_INT 0');
-      else if(fn==='verify_gte'){this.genExpr(e.args[0]);this.emit('GREATER_OR_EQUAL');this.emit('VERIFY');}
-      else if(fn==='require_preimage'){this.emit('HASH');this.genExpr(e.args[0]);this.emit('EQUALVERIFY');}
-      else if(fn==='require_time'){this.genExpr(e.args[0]);this.emit('CHECKTIMEVERIFY');}
-      else if(fn==='require_sig'){this.genExpr(e.args[0]);this.emit('CHECKSIGVERIFY');}
-      else if(fn==='check_sig'){this.genExpr(e.args[0]);this.emit('CHECKSIG');}
-      else if(fn==='require_transfer'){this.genExpr(e.args[0]);this.emit('SUM_TO_ADDR');this.genExpr(e.args[1]);this.emit('EQUALVERIFY');}
-      else if(fn==='sum_to_addr'){this.genExpr(e.args[0]);this.emit('SUM_TO_ADDR');}
-      else throw `Unknown function or macro '${fn}'`;
+      else if(fn==='pop') {
+          throw `Semantic Error at ${e.l}:${e.c}: Use 'pop_int()' or 'pop_hex()' to ensure type safety. Generic 'pop()' is unsafe.`;
+      }
+      else if(fn==='pop_int') {
+          return 'int';
+      }
+      else if(fn==='pop_hex') {
+          return 'hex';
+      }
+      else if(fn==='peek') { this.emit('DUP', e.l); return 'unknown'; }
+      else if(fn==='dup') { this.emit('DUP', e.l); return 'unknown'; }
+      else if(fn==='drop') { this.emit('DROP', e.l); return 'unknown'; }
+      else if(fn==='swap') { this.emit('SWAP', e.l); return 'unknown'; }
+      else if(fn==='over') { this.emit('OVER', e.l); return 'unknown'; }
+      else if(fn==='rot') { this.emit('ROT', e.l); return 'unknown'; }
+      else if(fn==='slice') { 
+          // Slice usually pops: [value, offset, length]
+          // We need to generate expressions for arguments if they exist
+          if(e.args.length === 3) {
+             this.genExpr(e.args[0]); this.stackDepthOffset++;
+             this.genExpr(e.args[1]); this.stackDepthOffset++;
+             this.genExpr(e.args[2]); this.stackDepthOffset -= 2;
+          }
+          this.emit('SLICE', e.l); return 'hex'; 
+      }
+      else if(fn==='concat') {
+          if (e.args && e.args.length === 2) {
+              this.genExpr(e.args[0]);
+              this.stackDepthOffset++;
+              this.genExpr(e.args[1]);
+              this.stackDepthOffset--;
+          }
+          this.emit('CONCAT', e.l); return 'hex';
+      }
+      else if(fn==='add') { this.emit('ADD', e.l); return 'int'; }
+      else if(fn==='sub') { this.emit('SUB', e.l); return 'int'; }
+      else if(fn==='mul') { this.emit('MUL', e.l); return 'int'; }
+      else if(fn==='div') { this.emit('DIV', e.l); return 'int'; }
+      else if(fn==='hash') {
+          if (e.args && e.args.length > 0) this.genExpr(e.args[0]);
+          this.emit('HASH', e.l); return 'hex';
+      }
+      else if(fn==='fail'){
+          this.emit('PUSH_INT 0', e.l);
+          this.emit('VERIFY', e.l);   
+          return 'unknown';
+      }
+      else if(fn==='verify_gte'){
+          this.genExpr(e.args[0]);
+          this.emit('GREATER_OR_EQUAL', e.l);
+          this.emit('VERIFY', e.l); 
+          return 'unknown';
+      }
+      else if(fn==='require_preimage'){
+          this.emit('HASH', e.l);
+          this.genExpr(e.args[0]);
+          this.emit('EQUALVERIFY', e.l); 
+          return 'unknown';
+      }
+      else if(fn==='require_time'){
+          this.genExpr(e.args[0]);
+          this.emit('CHECKTIMEVERIFY', e.l); 
+          return 'unknown';
+      }
+      else if(fn==='require_sig'){
+          this.genExpr(e.args[0]);
+          this.emit('CHECKSIGVERIFY', e.l); 
+          return 'unknown';
+      }
+      else if(fn==='check_sig'){
+          this.genExpr(e.args[0]);
+          this.emit('CHECKSIG', e.l); 
+          return 'int';
+      }
+      else if(fn==='require_transfer'){
+        this.genExpr(e.args[0]);
+        this.emit('SUM_TO_ADDR', e.l); 
+        this.stackDepthOffset++;
+        this.genExpr(e.args[1]);
+        this.stackDepthOffset--;
+        this.emit('EQUALVERIFY', e.l);
+        return 'unknown';
+      }
+      else if(fn==='sum_to_addr'){this.genExpr(e.args[0]); this.emit('SUM_TO_ADDR', e.l); return 'int';}
+      else if(fn==='read_input_state'){this.emit('READ_INPUT_STATE', e.l); return 'hex';}
+      else if(fn==='read_output_state'){this.genExpr(e.args[0]); this.emit('READ_OUTPUT_STATE', e.l); return 'hex';}
+      else throw `Semantic Error at ${e.l}:${e.c}: Unknown function or macro '${fn}'`;
+    }
+    else if(e.type==='FieldAccess'){
+      let def = this.structs[e.base] || this.stateDefs[e.base];
+      if(!def || !def[e.field]) throw `Semantic Error at ${e.l}:${e.c}: Unknown field '${e.field}' on '${e.base}'`;
+      let f = def[e.field];
+      this.emit('READ_INPUT_STATE', e.l);
+      this.emit(`PUSH_INT ${f.offset}`, e.l);
+      this.emit(`PUSH_INT ${f.size}`, e.l);
+      this.emit('SLICE', e.l);
+      
+      if (f.size <= 8) {
+          this.emit('PUSH_INT 0', e.l);
+          this.emit('ADD', e.l);
+          return 'int';
+      }
+      return 'hex';
     }
   }
 }
+    
+
 
 // ═══════════════════════════════════════════
 // COMPILE
 // ═══════════════════════════════════════════
 let compiledTokens=[], stack=[], execStack=[], pc=0, isHalted=false;
 
+async function runTests() {
+  if(!window.wasmLoaded) return;
+  log('--- Running Test Suite ---', 'i');
+  
+  try {
+    const ast = new Parser(new Lexer(editor.getValue()).tokenize()).parse();
+    const mainGen = new CodeGen();
+    mainGen.generate(ast); // Collects macros, structs, and tests
+    
+    if (!mainGen.tests || Object.keys(mainGen.tests).length === 0) {
+        log('No tests found. Use: test "Description" { ... }', 'w');
+        return;
+    }
+    
+    let passed = 0, failed = 0;
+    
+    for (let [name, body] of Object.entries(mainGen.tests)) {
+        let testGen = new CodeGen();
+        // Inherit global context so tests can use macros/structs defined outside
+        testGen.macros = mainGen.macros;
+        testGen.constants = mainGen.constants;
+        testGen.structs = mainGen.structs;
+        testGen.stateDefs = mainGen.stateDefs;
+        
+        let testAsm = testGen.generate([body]);
+        
+        let testTokens = testAsm.map(inst => {
+            let p = inst.split(' ');
+            return p.length > 1 ? {op: p[0], arg: p[1]} : {op: p[0]};
+        });
+        
+        // Push a silent success code to the end. If the test doesn't fail early, it passes.
+        testTokens.push({op: 'PUSH_INT', arg: '1'});
+        
+        // Prepare a clean, headless VM state
+        stack = []; execStack = []; pc = 0; isHalted = false; window.runtimeSigops = 0;
+        
+        let testError = null;
+        while(!isHalted && pc < testTokens.length) {
+            try {
+                let tok = testTokens[pc];
+                let exec = execStack.every(e => e === true);
+                
+                if(tok.op==='IF'){ if(exec){ execStack.push(isTrue(stack.pop())); } else execStack.push(false); }
+                else if(tok.op==='ELSE'){ let pe = execStack.length<=1 || execStack.slice(0,-1).every(e=>e===true); if(pe) execStack[execStack.length-1] = !execStack[execStack.length-1]; }
+                else if(tok.op==='ENDIF'){ execStack.pop(); }
+                else if(exec) {
+                    if (tok.op === 'CHECKSIG' || tok.op === 'CHECKSIGVERIFY') {
+                        window.runtimeSigops++;
+                        if (window.runtimeSigops > 3) throw 'VerifyFailed: MAX_SIGOPS_PER_SCRIPT exceeded';
+                    }
+                    await execOp(tok);
+                }
+                pc++;
+            } catch(e) {
+                testError = e;
+                break;
+            }
+        }
+        
+        if (!testError && stack.length === 1 && stack[0] === '01') {
+            log(`✓ PASS: ${name}`, 's'); 
+            passed++;
+        } else {
+            let reason = testError || `Clean Stack Rule failed: [${stack.join(', ')}]`;
+            log(`✗ FAIL: ${name} -> ${reason}`, 'e'); 
+            failed++;
+        }
+    }
+    
+    log(`Results: ${passed} passed, ${failed} failed.`, failed > 0 ? 'e' : 's');
+    
+    // Restore the IDE to normal compilation mode when done
+    compileCode(); 
+    
+  } catch(e) {
+    log(`Test compilation failed: ${e}`, 'e');
+  }
+}
+
 async function compileCode() {
   if(!window.wasmLoaded){showToast('WASM not ready','error');return;}
   log('Starting compilation...','i');
   try {
-    const asm = new CodeGen().generate(new Parser(new Lexer(editor.getValue()).tokenize()).parse());
+const rawCode = editor.getValue();
+
+    // 1. Tokenize and parse the Standard Library and User Code independently.
+    // This ensures the Lexer starts at Line 1 for the user's code.
+    const stdAst = new Parser(new Lexer(STD_LIB).tokenize()).parse();
+    const userAst = new Parser(new Lexer(rawCode).tokenize()).parse();
+
+    // 2. Merge the syntax trees sequentially
+    const ast = [...stdAst, ...userAst];
+    const mainGen = new CodeGen();
+    const asm = mainGen.generate(ast);
+    window._sourceMap = mainGen.sourceMap;
     const hex = assembleBytecode(asm);
     document.getElementById('bytecodeOutput').textContent = hex;
     
@@ -1027,8 +2151,8 @@ if (!document.getElementById('btnCopyBc')) {
     document.getElementById('statSize').textContent=`${size} B`;
     document.getElementById('statSigops').textContent=sigops;
     if(size>1024)throw`MAX_SCRIPT_SIZE exceeded (${size} B)`;
-    document.getElementById('cliFund').textContent=`midstate wallet send --to ${addr}:<amount>`;
-    document.getElementById('cliSpend').textContent=`midstate wallet spend-script --coin <ID> --bytecode ${hex} --inputs "${document.getElementById('ctxWitness').value}" --to <dest>:<amt>`;
+    updateCliInstructions(addr);
+
     compiledTokens=[];
     let html='';
     asm.forEach((inst,i)=>{
@@ -1054,6 +2178,7 @@ if (!document.getElementById('btnCopyBc')) {
 }
 
 function resetVM() {
+    editor.session.clearAnnotations();
   window.runtimeSigops = 0;
   stack=[];execStack=[];pc=0;isHalted=false;
   const ws=document.getElementById('ctxWitness').value;
@@ -1100,26 +2225,55 @@ try {
 }
 
 async function execOp(tok) {
-  const pop=()=>{if(!stack.length)throw'Stack underflow';return stack.pop();};
-  const push=v=>stack.push(v);
+  const pop = () => { if(!stack.length) throw 'Stack underflow'; return stack.pop(); };
+  
+  // FIX 1 & 2: Enforce Stack Depth and Item Size limits on every push
+  const push = v => {
+      if (stack.length >= 64) throw 'Stack overflow (depth exceeds 64)';
+      // v.length is hex string length, so divide by 2 for bytes
+      if (v.length / 2 > 1536) throw 'Item too large (exceeds 1536 bytes)'; 
+      stack.push(v);
+  };
+
+  // Helper to enforce v3 opcode activation rules
+  const requireV3 = () => {
+      const cur = BigInt(document.getElementById('ctxHeight').value);
+      if (cur < 60000n) throw `InvalidOpcode: ${tok.op} activates at height 60,000`;
+  };
+
   switch(tok.op){
     case 'PUSH_HEX':push(tok.arg.toLowerCase());break;
-    case 'PUSH_INT':push(intToHexLE(parseInt(tok.arg)));break;
+    case 'PUSH_INT':push(intToHexLE(BigInt(tok.arg)));break;
     case 'DROP':{let a=pop();log(`  → dropped: ${a}`,'i');break;}
     case 'DUP':{let a=pop();push(a);push(a);break;}
     case 'SWAP':{let a=pop(),b=pop();push(a);push(b);break;}
-    case 'OVER':{if(stack.length<2)throw'Stack underflow';push(stack[stack.length-2]);break;}
-    case 'ROT':{if(stack.length<3)throw'Stack underflow';push(stack.splice(stack.length-3,1)[0]);break;}
+    
+    // FIX 3: Apply activation height checks to v3 opcodes
+    case 'OVER':{requireV3(); if(stack.length<2)throw'Stack underflow';push(stack[stack.length-2]);break;}
+    case 'ROT':{requireV3(); if(stack.length<3)throw'Stack underflow';push(stack.splice(stack.length-3,1)[0]);break;}
+    case 'SLICE':{
+      requireV3();
+      let len=Number(hexLEToInt(pop())), off=Number(hexLEToInt(pop())), a=pop();
+      if(off*2 + len*2 > a.length) throw 'SLICE out of bounds';
+      push(a.slice(off*2, off*2 + len*2)); 
+      break;
+    }
+    case 'CONCAT':{requireV3(); let b=pop(), a=pop(); push(a+b); break;}
+    
     case 'EQUAL':{let b=pop(),a=pop();push(a===b?'01':'00');break;}
     case 'VERIFY':{if(!isTrue(pop()))throw'VERIFY failed';break;}
     case 'EQUALVERIFY':{let b=pop(),a=pop();if(a!==b)throw`EQUALVERIFY failed (${a} ≠ ${b})`;break;}
-case 'ADD':{let b=pop(),a=pop();push(intToHexLE(hexLEToInt(a)+hexLEToInt(b)));break;}
-    case 'SUB':{let b=pop(),a=pop();let d=hexLEToInt(a)-hexLEToInt(b);if(d<0n)throw'Math overflow';push(intToHexLE(d));break;}
+    case 'ADD':{let b=pop(),a=pop();push(intToHexLE(hexLEToInt(a)+hexLEToInt(b)));break;}
     case 'GREATER_OR_EQUAL':{let b=pop(),a=pop();push(hexLEToInt(a)>=hexLEToInt(b)?'01':'00');break;}
+    
+    // FIX 3: Apply activation height checks to v3 math
+    case 'SUB':{requireV3(); let b=pop(),a=pop();let d=hexLEToInt(a)-hexLEToInt(b);if(d<0n)throw'Math overflow';push(intToHexLE(d));break;}
+    case 'MUL':{requireV3(); let b=pop(),a=pop();push(intToHexLE(hexLEToInt(a)*hexLEToInt(b)));break;}
+    case 'DIV':{requireV3(); let b=pop(),a=pop();let bv=hexLEToInt(b);if(bv===0n)throw'Division by zero';push(intToHexLE(hexLEToInt(a)/bv));break;}
     case 'HASH':{
       let a=pop(),hex=a;
       if(!/^[0-9A-Fa-f]+$/.test(a)||a.length%2!==0)hex=Array.from(new TextEncoder().encode(a)).map(b=>b.toString(16).padStart(2,'0')).join('');
-      let h=window.blake3_hash_hex(hex);push(h);log(`  → hash: ${h.slice(0,16)}…`,'i');break;
+      let h=window.blake3_hash_hex(hex);push(h);log(`  → hash: ${h}`,'i');break;
     }
     case 'CHECKSIG':{
       let pk=pop(),sig=pop();
@@ -1136,8 +2290,34 @@ case 'ADD':{let b=pop(),a=pop();push(intToHexLE(hexLEToInt(a)+hexLEToInt(b)));br
     case 'CHECKTIMEVERIFY':{let r=hexLEToInt(pop()),cur=BigInt(document.getElementById('ctxHeight').value);if(cur<r)throw`CHECKTIMEVERIFY failed (height ${cur} < ${r})`;break;}
     case 'SUM_TO_ADDR':{
       let addr=pop(),sum=0n;
-      document.getElementById('ctxOutputs').value.split(',').forEach(o=>{let p=o.split(':');if(p.length===2&&p[0].trim().toLowerCase()===addr.toLowerCase())sum+=BigInt(p[1]);});
+        if (addr.length !== 64) throw 'VerifyFailed (SUM_TO_ADDR requires a 32-byte / 64-hex-char address)';
+
+      document.getElementById('ctxOutputs').value.split(',').forEach(o=>{let p=o.split(':');if(p.length>=2&&p[0].trim().toLowerCase()===addr.toLowerCase())sum+=BigInt(p[1]);});
       push(intToHexLE(sum));log(`  → sum for ${addr.slice(0,8)}: ${sum}`,'i');break;
+    }
+    case 'READ_INPUT_STATE':{
+      let cur=BigInt(document.getElementById('ctxHeight').value);
+      if(cur < 65000n) throw 'InvalidOpcode (State Threads activate at height 65,000)';
+      let s = document.getElementById('ctxInputState').value.trim();
+      if(!s) throw 'InvalidStateRead (no input state provided in context)';
+      if(s.length !== 64) throw 'InvalidStateRead (state must be exactly 32 bytes / 64 hex chars)';
+      push(s.toLowerCase());
+      log(`  → read input state: ${s}`,'i');
+      break;
+    }
+    case 'READ_OUTPUT_STATE':{
+      let cur=BigInt(document.getElementById('ctxHeight').value);
+      if(cur < 65000n) throw 'InvalidOpcode (State Threads activate at height 65,000)';
+      let idx = Number(hexLEToInt(pop()));
+      let outs = document.getElementById('ctxOutputs').value.split(',');
+      if (idx >= outs.length) throw 'InvalidStateRead (output index out of bounds)';
+      let parts = outs[idx].split(':');
+      if (parts.length < 3 || !parts[2].trim()) throw 'InvalidStateRead (output has no state defined)';
+      let s = parts[2].trim();
+      if(s.length !== 64) throw 'InvalidStateRead (output state must be 32 bytes / 64 hex chars)';
+      push(s.toLowerCase());
+      log(`  → read output ${idx} state: ${s}`,'i');
+      break;
     }
     default:throw`Unknown opcode: ${tok.op}`;
   }
@@ -1350,6 +2530,23 @@ function haltVM(msg,cls='err'){
   document.getElementById('btnStep').disabled=true;
   document.getElementById('btnRun').disabled=true;
   setVmStatus(msg,cls);
+
+  // Debugging: Show the line in Ace Editor
+  if (window._sourceMap && window._sourceMap[pc]) {
+      const lineNum = window._sourceMap[pc] - 1; // 0-indexed for Ace
+      const annotations = editor.session.getAnnotations();
+      
+      annotations.push({
+          row: lineNum,
+          column: 0,
+          text: "Runtime Error: " + msg,
+          type: "error"
+      });
+      
+      editor.session.setAnnotations(annotations);
+      editor.gotoLine(lineNum + 1); // Move cursor to the bad line
+      showToast("VM Crash on line " + (lineNum + 1), "error");
+  }
 }
 
 // ═══════════════════════════════════════════
@@ -1419,12 +2616,56 @@ document.addEventListener('keydown', e=>{
   if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();compileCode();}
 });
 
-// Auto-update CLI on witness change
-document.getElementById('ctxWitness').addEventListener('input', e=>{
-  const bc=document.getElementById('bytecodeOutput').textContent;
-  if(bc&&bc!=='Click Compile to generate bytecode...')
-    document.getElementById('cliSpend').textContent=`midstate wallet spend-script --coin <ID> --bytecode ${bc} --inputs "${e.target.value}" --to <dest>:<amt>`;
-});
+// Auto-update CLI instructions on context change
+document.getElementById('ctxWitness').addEventListener('input', () => updateCliInstructions());
+document.getElementById('ctxInputState').addEventListener('input', () => updateCliInstructions());
+document.getElementById('ctxOutputs').addEventListener('input', () => updateCliInstructions());
+
+function updateCliInstructions(address) {
+  const bc = document.getElementById('bytecodeOutput').textContent;
+  if (!bc || bc.startsWith('Click')) return;
+  
+  const addr = address || window._lastAddr || '<P2SH>';
+  const wit = document.getElementById('ctxWitness').value.trim();
+  const inState = document.getElementById('ctxInputState').value.trim();
+  const outs = document.getElementById('ctxOutputs').value.split(',').map(s=>s.trim()).filter(s=>s);
+
+  // 1. Funding Instruction (Split state and value into two UTXOs)
+  let fundCmd = `midstate wallet send \\\n  --to ${addr}:<amount>`;
+  if (inState && inState.length === 64) {
+      fundCmd += ` \\\n  --to ${addr}:0:${inState}`;
+  }
+  document.getElementById('cliFund').textContent = fundCmd;
+
+  // 2. Spending Instruction (Supporting multiple inputs)
+  let spendCmd = `midstate wallet spend-script \\\n  --bytecode ${bc}`;
+  
+  // Notice we now pass --coin, --inputs, and --input-state multiple times!
+  if (inState && inState.length === 64) {
+      spendCmd += ` \\\n  --coin <STATE_COIN_ID> \\\n  --inputs "${wit}" \\\n  --input-state ${inState}`;
+      spendCmd += ` \\\n  --coin <VALUE_COIN_ID> \\\n  --inputs "02" \\\n  --input-state none`; 
+  } else {
+      spendCmd += ` \\\n  --coin <ID> \\\n  --inputs "${wit}"`;
+  }
+
+  if (outs.length > 0) {
+      outs.forEach(o => {
+          let parts = o.split(':');
+          if (parts.length === 3 && parts[1] !== "0") {
+              // Automatically split invalid 3-part outputs into valid Value & State UTXOs
+              spendCmd += ` \\\n  --to ${parts[0]}:${parts[1]}`;
+              spendCmd += ` \\\n  --to ${parts[0]}:0:${parts[2]}`;
+          } else {
+              spendCmd += ` \\\n  --to ${o}`; 
+          }
+      });
+  } else {
+      spendCmd += ` \\\n  --to <dest>:<amt>`;
+  }
+  
+  document.getElementById('cliSpend').textContent = spendCmd;
+}
+
 </script>
 
 <!-- CUSTOM PROMPT MODAL -->

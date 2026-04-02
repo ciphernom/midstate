@@ -381,7 +381,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
 
     /// Find all coin IDs sharing a WOTS address with the given coin.
     /// Returns an empty vec for MSS-backed coins (MSS handles reuse safely).
-    fn wots_siblings(&self, coin_id: &[u8; 32]) -> Vec<[u8; 32]> {
+    pub fn wots_siblings(&self, coin_id: &[u8; 32]) -> Vec<[u8; 32]> {
         let coin = match self.find_coin(coin_id) {
             Some(c) => c,
             None => return vec![],

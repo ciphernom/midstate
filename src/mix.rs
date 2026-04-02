@@ -310,7 +310,8 @@ pub fn register(
                     commitment: &proposal.commitment,
                     height: current_height,
                     outputs: &proposal.outputs,
-                    input_value: input.value, // <-- NEW
+                    input_value: input.value,
+                    input_state: input.commitment, // <-- ADDED: Pass the State Thread variable
                 };
                 crate::core::script::execute_script(bytecode, &[signature.clone()], &ctx).is_ok()
             }

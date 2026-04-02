@@ -706,6 +706,9 @@ pub const MSS_REUSE_ACTIVATION_HEIGHT: u64 = 25_000;
 /// After this height, state_root must be non-zero and match the expected value.
 pub const STATE_ROOT_ACTIVATION_HEIGHT: u64 = 30_000;
 
+/// Block height at which ZK remnants are repurposed into Zero-Value State Threads.
+pub const STATE_THREAD_ACTIVATION_HEIGHT: u64 = 65_000;
+
 // ── Economics ───────────────────────────────────────────────────────────────
 
 /// Blocks per year at TARGET_BLOCK_TIME seconds per block.

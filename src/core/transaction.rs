@@ -39,7 +39,7 @@ pub fn verify_transaction_sigs(tx: &Transaction, height: u64, commitments: &Utxo
         }
 
         for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
-            if !verify_predicate(&input.predicate, witness, &commitment, height, outputs, input.value) {
+            if !verify_predicate(&input.predicate, witness, &commitment, height, outputs, input.value, input.commitment) {
                 bail!("Predicate execution failed for input {}", i);
             }
         }
@@ -79,15 +79,20 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
                     if !seen.insert(input.coin_id()) {
                         bail!("Duplicate input coin");
                     }
-                    if input.commitment.is_some() {
-                        bail!("Confidential UTXOs are deprecated and disabled at the consensus level.");
+                    if input.commitment.is_some() && state.height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
+                        bail!("State Threads are disabled before activation height.");
                     }
                 }
             }
 
             for (i, out) in outputs.iter().enumerate() {
-                if out.value() == 0 { bail!("Zero-value output {}", i); }
-                if !out.value().is_power_of_two() {
+                if out.value() == 0 {
+                    if out.is_confidential() && state.height >= crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
+                        // Allowed: 0-value State Thread
+                    } else {
+                        bail!("Zero-value output {}", i);
+                    }
+                } else if !out.value().is_power_of_two() {
                     bail!("Invalid denomination: output {} value {} is not a power of 2", i, out.value());
                 }
                 if let OutputData::DataBurn { payload, .. } = out {
@@ -208,17 +213,20 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                     if !seen.insert(input.coin_id()) {
                         bail!("Duplicate input coin");
                     }
-                    if input.commitment.is_some() {
-                        bail!("Confidential UTXOs are deprecated and disabled at the consensus level.");
+                    if input.commitment.is_some() && state.height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
+                        bail!("State Threads are disabled before activation height.");
                     }
                 }
             }
             // 1. Validate all output values are power of 2 and nonzero
             for (i, out) in outputs.iter().enumerate() {
                 if out.value() == 0 {
-                    bail!("Zero-value output {}", i);
-                }
-                if !out.value().is_power_of_two() {
+                    if out.is_confidential() && state.height >= crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
+                        // Allowed: 0-value State Thread
+                    } else {
+                        bail!("Zero-value output {}", i);
+                    }
+                } else if !out.value().is_power_of_two() {
                     bail!("Invalid denomination: output {} value {} is not a power of 2", i, out.value());
                 }
                 if let OutputData::DataBurn { payload, .. } = out {
@@ -269,7 +277,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 }
                 
                 // Script Execution Engine
-                if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs, input.value) {
+                if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs, input.value, input.commitment) {
                     bail!("Predicate execution failed for input {}", i);
                 }
             }
@@ -315,6 +323,7 @@ fn verify_predicate(
     current_height: u64,
     outputs: &[OutputData],
     input_value: u64,
+    input_state: Option<[u8; 32]>,
 ) -> bool {
     match (predicate, witness) {
         (Predicate::Script { bytecode }, Witness::ScriptInputs(inputs)) => {
@@ -323,6 +332,7 @@ fn verify_predicate(
                 height: current_height,
                 outputs,
                 input_value,
+                input_state,
             };
             script::execute_script(bytecode, inputs, &ctx).is_ok()
         }
@@ -370,16 +380,19 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                     if !seen.insert(input.coin_id()) {
                         bail!("Duplicate input coin");
                     }
-                    if input.commitment.is_some() {
-                        bail!("Confidential UTXOs are deprecated and disabled at the consensus level.");
+                    if input.commitment.is_some() && state.height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
+                        bail!("State Threads are disabled before activation height.");
                     }
                 }
             }
                 for (i, out) in outputs.iter().enumerate() {
                 if out.value() == 0 {
-                    bail!("Zero-value output {}", i);
-                }
-                if !out.value().is_power_of_two() {
+                    if out.is_confidential() && state.height >= crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
+                        // Allowed: 0-value State Thread
+                    } else {
+                        bail!("Zero-value output {}", i);
+                    }
+                } else if !out.value().is_power_of_two() {
                     bail!("Invalid denomination: output {} value {} is not a power of 2", i, out.value());
                 }
                 if let OutputData::DataBurn { payload, .. } = out {
@@ -415,7 +428,7 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                 if !state.coins.contains(&coin_id) {
                     bail!("Coin {} not found", hex::encode(coin_id));
                 }
-                if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs, input.value) {
+                if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs, input.value, input.commitment) {
                     bail!("Predicate execution failed for input {}", i);
                 }
             }
