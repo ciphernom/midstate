@@ -1622,8 +1622,8 @@ async fn wallet_mix(
     // Step 2: Register our input/output
     let (input, output, output_seed) = wallet.prepare_mix_registration(&mix_coin_id)?;
     
-    // --- Sign the mix_id to prove ownership ---
-    let parsed_mix_id = parse_hex32(&mix_id_hex)?;
+    // --- Validate the mix_id formatting ---
+    let _parsed_mix_id = parse_hex32(&mix_id_hex)?;
     
     // Do NOT sign the mix_id! Sending a WOTS signature here reuses the key
     // and instantly compromises the user's funds. The node ignores this field anyway.
@@ -2393,10 +2393,21 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
             }
         };
         if batches.is_empty() { anyhow::bail!("Peer sent empty batches at {}", dl_cursor); }
+        // <--- FIX: Accumulate spent addresses across the sync loop
+        let mut wots_oracle = std::collections::HashMap::new();
+
         for batch in &batches {
             recent_headers.push(state.timestamp);
             if recent_headers.len() > MEDIAN_TIME_PAST_WINDOW { recent_headers.remove(0); }
-            apply_batch(&mut state, batch, &recent_headers, &std::collections::HashMap::new())?;
+            
+            // Extend the oracle if activation height is met
+            if state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                let db_oracle = storage.query_spent_addresses(batch).unwrap_or_default();
+                wots_oracle.extend(db_oracle);
+            }
+
+            // Pass the mutable oracle
+            apply_batch(&mut state, batch, &recent_headers, &mut wots_oracle)?;
             storage.save_batch(dl_cursor, batch)?;
             dl_cursor += 1;
         }

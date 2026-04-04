@@ -1,5 +1,5 @@
 use super::types::*;
-use crate::core::{compute_coin_id, compute_address, hash_concat, wots,
+use crate::core::{compute_coin_id, compute_address, wots,
                   block_reward, Transaction, InputReveal, OutputData, Predicate, Witness};
 use crate::node::NodeHandle;
 use axum::{
