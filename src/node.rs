@@ -646,14 +646,14 @@ pub async fn new(
                         state_root, // NEW
                     };
                     storage.save_batch(0, &genesis_batch)?;
-                    apply_batch(&mut state, &genesis_batch, &[], &std::collections::HashMap::new())?;
+                    apply_batch(&mut state, &genesis_batch, &[], &mut std::collections::HashMap::new())?;
                     state.target = adjust_difficulty(&state);
                     storage.save_state(&state)?;
                     tracing::info!("Genesis batch applied, height now {}", state.height);
                 }
                 Some(batch) => {
                     if state.height == 0 {
-                        apply_batch(&mut state, &batch, &[], &std::collections::HashMap::new())?;
+                        apply_batch(&mut state, &batch, &[], &mut std::collections::HashMap::new())?;
                         state.target = adjust_difficulty(&state);
                         storage.save_state(&state)?;
                     }
@@ -2267,7 +2267,10 @@ if !is_valid {
             recent_ts.push_back(candidate_state.timestamp);
         }
 
-// Apply each batch, verifying against the already-validated headers
+// <--- FIX: Accumulate spent addresses across the sync loop to prevent cross-block reuse bypass
+        let mut wots_oracle = std::collections::HashMap::new();
+
+        // Apply each batch, verifying against the already-validated headers
         for batch in &batches {
             let height = *cursor;
             
@@ -2289,47 +2292,49 @@ if !is_valid {
             let header = &headers[hdr_idx];
 
             // Integrity: batch PoW must match the already-verified header
-if batch.extension.final_hash != header.extension.final_hash {
-    tracing::warn!("Batch at height {} does not match verified header PoW — peer has corrupt data, trying different peer", height);
-    // Save cursor so we restart from here, not from height 10
-    self.last_sync_cursor = Some(height.saturating_sub(1));
-    self.abort_sync_session("peer sent corrupt batch");
-    return Ok(());
-}
+            if batch.extension.final_hash != header.extension.final_hash {
+                tracing::warn!("Batch at height {} does not match verified header PoW — peer has corrupt data, trying different peer", height);
+                // Save cursor so we restart from here, not from height 10
+                self.last_sync_cursor = Some(height.saturating_sub(1));
+                self.abort_sync_session("peer sent corrupt batch");
+                return Ok(());
+            }
             let calc = batch.header();
-if calc.post_tx_midstate != header.post_tx_midstate {
-    // Legacy blocks mined before state_root was added have state_root = [0;32].
-    // Re-check with zeroed state_root to allow syncing pre-migration blocks.
-    let mut legacy_batch = batch.clone();
-    legacy_batch.state_root = [0u8; 32];
-    let legacy_calc = legacy_batch.header();
-    if legacy_calc.post_tx_midstate != header.post_tx_midstate {
-        tracing::warn!("Batch at height {} tx commitment does not match header", height);
-        self.last_sync_cursor = Some(height.saturating_sub(1));
-        self.abort_sync_session("peer sent corrupt batch");
-        return Ok(());
-    }
-    // Legacy block accepted — continue with the actual batch (state_root already zeroed on disk)
-}
+            if calc.post_tx_midstate != header.post_tx_midstate {
+                // Legacy blocks mined before state_root was added have state_root = [0;32].
+                // Re-check with zeroed state_root to allow syncing pre-migration blocks.
+                let mut legacy_batch = batch.clone();
+                legacy_batch.state_root = [0u8; 32];
+                let legacy_calc = legacy_batch.header();
+                if legacy_calc.post_tx_midstate != header.post_tx_midstate {
+                    tracing::warn!("Batch at height {} tx commitment does not match header", height);
+                    self.last_sync_cursor = Some(height.saturating_sub(1));
+                    self.abort_sync_session("peer sent corrupt batch");
+                    return Ok(());
+                }
+                // Legacy block accepted — continue with the actual batch (state_root already zeroed on disk)
+            }
 
             // Apply to candidate state (do NOT save to disk yet — if sync
             // aborts before the reorg is committed, premature writes would
             // leave a Frankenstein chain on disk: some heights from the peer,
             // some from our old chain.  Batches are persisted atomically in
             // perform_reorg only after we decide to adopt.)
-            let wots_oracle = if candidate_state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
-                self.storage.query_spent_addresses(batch).unwrap_or_default()
-            } else {
-                std::collections::HashMap::new()
-            };
-            apply_batch(candidate_state, batch, recent_ts.make_contiguous(), &wots_oracle)?;
             
+            // <--- FIX: Extract DB records and EXTEND the running memory oracle, 
+            if candidate_state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                let db_oracle = self.storage.query_spent_addresses(batch).unwrap_or_default();
+                wots_oracle.extend(db_oracle);
+            }
+            
+            apply_batch(candidate_state, batch, recent_ts.make_contiguous(), &mut wots_oracle)?;
+
             recent_ts.push_back(batch.timestamp);
             if recent_ts.len() > window_size {
                 recent_ts.pop_front();
             }
             
-            candidate_state.target = adjust_difficulty(candidate_state);
+            candidate_state.target = adjust_difficulty(&candidate_state);
             new_history.push((height, candidate_state.midstate, batch.clone()));
             *cursor += 1;
             tokio::task::yield_now().await;
@@ -2419,7 +2424,7 @@ if calc.post_tx_midstate != header.post_tx_midstate {
             }
         }
 
-let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+        let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
             self.storage.query_spent_addresses_for_tx(&tx).unwrap_or_default()
         } else {
             std::collections::HashMap::new()
@@ -2700,7 +2705,10 @@ let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVAT
             }
         }
 
-for (i, batch) in alternative_batches.iter().enumerate() {
+
+         let mut wots_oracle = std::collections::HashMap::new();
+         
+         for (i, batch) in alternative_batches.iter().enumerate() {
 
             if batch.prev_midstate != candidate_state.midstate {
                 tracing::warn!(
@@ -2711,12 +2719,12 @@ for (i, batch) in alternative_batches.iter().enumerate() {
             }
 
             match {
-                let wots_oracle = if candidate_state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
-                    self.storage.query_spent_addresses(batch).unwrap_or_default()
-                } else {
-                    std::collections::HashMap::new()
-                };
-                apply_batch(&mut candidate_state, batch, recent_headers.make_contiguous(), &wots_oracle)
+                // <--- FIX: Extend the oracle
+                if candidate_state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                    let db_oracle = self.storage.query_spent_addresses(batch).unwrap_or_default();
+                    wots_oracle.extend(db_oracle);
+                }
+                apply_batch(&mut candidate_state, batch, recent_headers.make_contiguous(), &mut wots_oracle)
             } {
 
                 Ok(_) => {
@@ -2905,13 +2913,22 @@ fn perform_reorg(
             tokio::task::spawn_blocking(move || -> Result<State> {
                 let mut state = start_state;
                 let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+                
+                let mut wots_oracle = std::collections::HashMap::new();
+                
                 for h in start_h..target_height {
                     if let Some(batch) = storage.load_batch(h)? {
                         recent_headers.push_back(state.timestamp);
                         if recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
                             recent_headers.pop_front();
                         }
-                        apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &std::collections::HashMap::new())?;
+                        if state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                            let db_oracle = storage.query_spent_addresses(&batch).unwrap_or_default();
+                            wots_oracle.extend(db_oracle);
+                        }
+
+                        // <--- MODIFY THIS LINE to pass &mut wots_oracle --->
+                        apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &mut wots_oracle)?;
                         state.target = adjust_difficulty(&state);
                     } else {
                         anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
@@ -2949,13 +2966,20 @@ fn perform_reorg(
                 });
 
                 let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+                let mut wots_oracle = std::collections::HashMap::new(); 
                 for h in replay_from..target_height {
                     if let Some(batch) = storage.load_batch(h)? {
                         recent_headers.push_back(state.timestamp);
                         if recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
                             recent_headers.pop_front();
                         }
-                        apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &std::collections::HashMap::new())?;
+                        if state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                            let db_oracle = storage.query_spent_addresses(&batch).unwrap_or_default();
+                            wots_oracle.extend(db_oracle);
+                        }
+
+                        // <--- MODIFY THIS LINE to pass &mut wots_oracle --->
+                        apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &mut wots_oracle)?;
                         state.target = adjust_difficulty(&state);
                     } else {
                         anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
@@ -3122,7 +3146,7 @@ fn perform_reorg(
             }
             // -----------------------------------------------------
 
-            // CRITICAL FIX: Prevent infinite vector growth on a single midstate
+            // Prevent infinite vector growth on a single midstate
             if list.len() < 4 {
                 list.push(batch); // batch is moved here
                 if list.len() == 1 { // Only push to order queue on first entry
@@ -3160,12 +3184,12 @@ fn perform_reorg(
 
         // Checks passed — now clone state and apply fully.
         let mut candidate_state = self.state.clone();
-        let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+        let mut wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
             self.storage.query_spent_addresses(&batch).unwrap_or_default()
         } else {
             std::collections::HashMap::new()
         };
-        match apply_batch(&mut candidate_state, &batch, self.recent_headers.make_contiguous(), &wots_oracle) {
+        match apply_batch(&mut candidate_state, &batch, self.recent_headers.make_contiguous(), &mut wots_oracle) {
             Ok(_) => {
                 let best = choose_best_state(&self.state, &candidate_state);
                 let is_reorg = best.height == self.state.height &&
@@ -3254,26 +3278,30 @@ fn perform_reorg(
         // Cheap midstate check before expensive state clone.
         if batches[0].prev_midstate == self.state.midstate {
             let mut test_state = self.state.clone();
-            let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+            // Change to let mut
+            let mut wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
                 self.storage.query_spent_addresses(&batches[0]).unwrap_or_default()
             } else {
                 std::collections::HashMap::new()
             };
-            if apply_batch(&mut test_state, &batches[0], self.recent_headers.make_contiguous(), &wots_oracle).is_ok() {
+            // Change to &mut
+            if apply_batch(&mut test_state, &batches[0], self.recent_headers.make_contiguous(), &mut wots_oracle).is_ok() {
                 return self.process_linear_extension(batches, from).await;
             }
         }
 
-        // Try 2: Do any of them extend our chain? (we might already have some)
+        // Try 2
         for (i, batch) in batches.iter().enumerate() {
             if batch.prev_midstate != self.state.midstate { continue; }
             let mut candidate = self.state.clone();
-            let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+            // Change to let mut
+            let mut wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
                 self.storage.query_spent_addresses(batch).unwrap_or_default()
             } else {
                 std::collections::HashMap::new()
             };
-            if apply_batch(&mut candidate, batch, self.recent_headers.make_contiguous(), &wots_oracle).is_ok() {
+            // Change to &mut
+            if apply_batch(&mut candidate, batch, self.recent_headers.make_contiguous(), &mut wots_oracle).is_ok() {
                 tracing::info!("Found linear extension at batch index {}", i);
                 return self.process_linear_extension(batches[i..].to_vec(), from).await;
             }
@@ -3315,16 +3343,18 @@ fn perform_reorg(
 async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) -> Result<()> {
             self.cancel_mining();
         let mut applied = 0;
+        let mut wots_oracle = std::collections::HashMap::new(); // <--- FIX
+        
         for batch in batches {
-            // Cheap check before expensive clone
             if batch.prev_midstate != self.state.midstate { break; }
             let mut candidate = self.state.clone();
-            let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
-                self.storage.query_spent_addresses(&batch).unwrap_or_default()
-            } else {
-                std::collections::HashMap::new()
-            };
-            if apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous(), &wots_oracle).is_ok() {
+            
+            // <--- FIX: Extend the oracle
+            if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                let db_oracle = self.storage.query_spent_addresses(&batch).unwrap_or_default();
+                wots_oracle.extend(db_oracle);
+            }
+            if apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous(), &mut wots_oracle).is_ok() {
                 self.recent_headers.push_back(batch.timestamp);
                 if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
                     self.recent_headers.pop_front();
@@ -3398,12 +3428,14 @@ async fn try_apply_orphans(&mut self) {
             let mut matched = false;
             for batch in batches.drain(..) {
                 let mut candidate = self.state.clone();
-                let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                // Change to let mut
+                let mut wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
                     self.storage.query_spent_addresses(&batch).unwrap_or_default()
                 } else {
                     std::collections::HashMap::new()
                 };
-                if apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous(), &wots_oracle).is_ok() {
+                // Change to &mut
+                if apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous(), &mut wots_oracle).is_ok() {
                     self.cancel_mining();
                     self.recent_headers.push_back(batch.timestamp);
                     if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
@@ -3716,12 +3748,13 @@ async fn try_apply_orphans(&mut self) {
 
         let pre_mine_height = self.state.height;
 
-        let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+        let mut wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
             self.storage.query_spent_addresses(&batch).unwrap_or_default()
         } else {
             std::collections::HashMap::new()
         };
-        match apply_batch(&mut self.state, &batch, self.recent_headers.make_contiguous(), &wots_oracle) {
+        // Change to &mut
+        match apply_batch(&mut self.state, &batch, self.recent_headers.make_contiguous(), &mut wots_oracle) {
             Ok(_) => {
                 self.recent_headers.push_back(batch.timestamp);
                 if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
@@ -4383,19 +4416,19 @@ mod complex_tests {
         // REASONING: We cannot simply use State::genesis() because we need to load 
         // the *exact* genesis batch saved by the node to ensure midstates align.
         let genesis_batch = node.storage.load_batch(0).unwrap().unwrap();
-apply_batch(&mut state_at_2, &genesis_batch, &[], &std::collections::HashMap::new()).unwrap(); // H=1
+        apply_batch(&mut state_at_2, &genesis_batch, &[], &mut std::collections::HashMap::new()).unwrap();// H=1
         state_at_2.target = adjust_difficulty(&state_at_2);
         
         // Apply B1 (shared history)
        let ts_at_1 = vec![state_at_2.timestamp];
-        apply_batch(&mut state_at_2, &b1, &ts_at_1, &std::collections::HashMap::new()).unwrap(); // H = 2
+        apply_batch(&mut state_at_2, &b1, &ts_at_1, &mut std::collections::HashMap::new()).unwrap(); // H = 2
         state_at_2.target = adjust_difficulty(&state_at_2);
 
         // B2' (Alternative block at H=3). Empty, does NOT have the transaction.
         let b2_prime = make_valid_batch(&state_at_2, 20, vec![]); 
         let mut state_at_3_prime = state_at_2.clone();
         let ts_at_2 = vec![state_at_2.timestamp];
-        apply_batch(&mut state_at_3_prime, &b2_prime, &ts_at_2, &std::collections::HashMap::new()).unwrap();
+        apply_batch(&mut state_at_3_prime, &b2_prime, &ts_at_2, &mut std::collections::HashMap::new()).unwrap();
         state_at_3_prime.target = adjust_difficulty(&state_at_3_prime);
         
         // B3' (extends B2', making Chain B longer)
@@ -4447,7 +4480,7 @@ apply_batch(&mut state_at_2, &genesis_batch, &[], &std::collections::HashMap::ne
         let window_size = DIFFICULTY_LOOKBACK as usize;
         for _ in 0..50 {
             let b = make_valid_batch(&node.state, 10, vec![]);
-            apply_batch(&mut node.state, &b, &recent_headers, &std::collections::HashMap::new()).unwrap();
+            apply_batch(&mut node.state, &b, &recent_headers, &mut std::collections::HashMap::new()).unwrap();
             recent_headers.push(node.state.timestamp);
             if recent_headers.len() > window_size { recent_headers.remove(0); }
             node.state.target = adjust_difficulty(&node.state);
@@ -4792,7 +4825,7 @@ apply_batch(&mut state_at_2, &genesis_batch, &[], &std::collections::HashMap::ne
 
         for i in 0..3 {
             let b = make_valid_batch(&chain_b_state, 10 + i, vec![]);
-            apply_batch(&mut chain_b_state, &b, &recent_headers, &std::collections::HashMap::new()).unwrap();
+            apply_batch(&mut chain_b_state, &b, &recent_headers, &mut std::collections::HashMap::new()).unwrap();
             recent_headers.push(chain_b_state.timestamp);
             if recent_headers.len() > 11 { recent_headers.remove(0); }
             chain_b_state.target = adjust_difficulty(&chain_b_state);
@@ -4830,7 +4863,7 @@ fn build_divergent_chain(
             hdr.height = state.height; 
             headers.push(hdr);
 
-            crate::core::state::apply_batch(&mut state, &batch, &recent_ts, &std::collections::HashMap::new()).unwrap();
+            crate::core::state::apply_batch(&mut state, &batch, &recent_ts, &mut std::collections::HashMap::new()).unwrap();
             
             // FIX 2: Push the CURRENT block's timestamp into the history window 
             // after validating it

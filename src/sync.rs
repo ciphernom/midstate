@@ -140,7 +140,8 @@ impl Syncer {
                 .load_batch(h)?
                 .ok_or_else(|| anyhow::anyhow!("Missing batch at height {} during rebuild", h))?;
             
-            apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &std::collections::HashMap::new())?;
+            apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &mut std::collections::HashMap::new())?;
+
             
             recent_headers.push_back(batch.timestamp);
             if recent_headers.len() > window_size { recent_headers.pop_front(); }

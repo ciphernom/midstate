@@ -697,6 +697,10 @@ pub const PRUNE_DEPTH: u64 = 1000;
 /// Blocks below this height are grandfathered (network was live before this rule).
 pub const WOTS_REUSE_ACTIVATION_HEIGHT: u64 = 18_000;
 
+/// Block height at which STRICT intra-block and inter-block WOTS/MSS reuse is enforced.
+/// Prevents multiple spends from the same address within the same block or sync chunk.
+pub const STRICT_WOTS_REUSE_ACTIVATION_HEIGHT: u64 = 85_000; 
+
 /// Block height at which MSS leaf reuse is enforced at consensus level.
 /// Uses the leaf's WOTS public key as a nullifier in the spent oracle.
 pub const MSS_REUSE_ACTIVATION_HEIGHT: u64 = 25_000; 

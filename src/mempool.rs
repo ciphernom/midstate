@@ -711,6 +711,10 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
     /// against `state` (e.g. inputs spent by a newly confirmed block, or
     /// commitments that have already been revealed).
     ///
+    /// FIX: Replaced heavy `validate_transaction` (which performs WOTS/MSS crypto)
+    /// with O(1) pure state checks. Prevents CPU starvation and event-loop blocking
+    /// during reorgs and bulk sync.
+    ///
     /// All associated index entries and `seen_inputs` records are cleaned up.
     ///
     /// # Examples
@@ -721,12 +725,21 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
     /// # let state = State::genesis().0;
     /// mempool.prune_invalid(&state);
     /// ```
-    pub fn prune_invalid(&mut self, state: &State) {
+        pub fn prune_invalid(&mut self, state: &State) {
         // --- Prune commits ---
+        // Validate PoW requirements which may have shifted due to height changes.
+        // `evaluate_commit_pow` is very fast (max 1000 hashes), safe for main thread.
         let commits_to_remove: Vec<[u8; 32]> = self
             .commits
             .iter()
-            .filter(|(_, arc_tx)| validate_transaction(state, arc_tx).is_err())
+            .filter(|(_, arc_tx)| {
+                match &***arc_tx {
+                    Transaction::Commit { commitment, spam_nonce } => {
+                        crate::core::transaction::evaluate_commit_pow(commitment, *spam_nonce, state.height).is_err()
+                    }
+                    _ => false,
+                }
+            })
             .map(|(comm, _)| *comm)
             .collect();
 
@@ -737,15 +750,46 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
         }
 
         // --- Prune reveals ---
+        // ONLY perform fast O(1) state checks. Signatures were verified on admission.
         let reveals_to_remove: Vec<[u8; 32]> = self
             .reveals
             .iter()
-            .filter(|(_, mempool_tx)| validate_transaction(state, &mempool_tx.tx).is_err())
+            .filter(|(_, mempool_tx)| {
+                if let Transaction::Reveal { inputs, outputs, salt, .. } = &*mempool_tx.tx {
+                    // 1. Ensure all inputs still exist in the UTXO set
+                    for input in inputs {
+                        if !state.coins.contains(&input.coin_id()) {
+                            return true; // Invalid, spent or reorged out
+                        }
+                    }
+
+                    // 2. Ensure commitment exists and is not expired
+                    let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+                    let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+                    let expected = crate::core::types::compute_commitment(&input_ids, &output_hashes, salt);
+
+                    if !state.commitments.contains(&expected) {
+                        return true; // Invalid, no matching commitment
+                    }
+
+                    if let Some(&commit_height) = state.commitment_heights.get(&expected) {
+                        if state.height.saturating_sub(commit_height) > crate::core::COMMITMENT_TTL {
+                            return true; // Expired, remove
+                        }
+                    } else {
+                        return true; // Missing height data
+                    }
+
+                    false // Valid, keep in mempool
+                } else {
+                    true // Should never have a Commit in the reveals map
+                }
+            })
             .map(|(id, _)| *id)
             .collect();
 
         for id in reveals_to_remove {
-            self.remove_reveal(&id); // CLEANUP: Reuse helper instead of duplicating logic
+            self.remove_reveal(&id);
         }
     }
 }
