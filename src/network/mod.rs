@@ -291,7 +291,7 @@ pub enum NetworkEvent {
         /// task in next_event() will write it back to the browser.
         respond: tokio::sync::oneshot::Sender<LightResponse>,
     },
-    PeerConnected(PeerId),
+    PeerConnected(PeerId, String),
     PeerDisconnected(PeerId),
     OutgoingConnectionFailed(String),
 }
@@ -1024,7 +1024,12 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                         self.connected.len(),
                         self.light_peers.len()
                     );
-                    return NetworkEvent::PeerConnected(peer_id);
+                    
+                    // --- BAYESIAN ECLIPSE DEFENSE ---
+                    // Construct the full PEX address string to pass to the node
+                    let full_addr = remote_addr.clone().with(libp2p::multiaddr::Protocol::P2p(peer_id)).to_string();
+                    
+                    return NetworkEvent::PeerConnected(peer_id, full_addr);
                 }
                 SwarmEvent::ConnectionClosed {
                     peer_id,
