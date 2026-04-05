@@ -12,7 +12,6 @@ use crate::storage::Storage;
 use crate::wallet::{coinbase_seed, coinbase_salt};
 use crate::core::mss;
 use crate::core::wots;
-use crate::sync::Syncer;
 
 use anyhow::{bail, Result};
 use libp2p::{request_response::ResponseChannel, PeerId, Multiaddr, identity::Keypair};
@@ -64,7 +63,7 @@ const HEADER_REQ_WINDOW_SECS: u64 = 60;
 
 /// GetBatches requests are expensive (up to 8 MB each). Limit them separately.
 /// 500 per 60 seconds allows fast sync while still bounding worst-case CPU/disk load.
-const MAX_BATCH_REQS_PER_PEER: u32 = 200;
+const MAX_BATCH_REQS_PER_PEER: u32 = 1000;
 const BATCH_REQ_WINDOW_SECS: u64 = 60;
 
 /// Non-blocking sync session driven by the main event loop.
@@ -127,7 +126,6 @@ pub struct Node {
     mempool: Mempool,
     storage: Storage,
     network: MidstateNetwork,
-    syncer: Syncer,
     metrics: Metrics,
     mining_threads: Option<usize>,
     recent_headers: VecDeque<u64>,
@@ -212,7 +210,7 @@ pub enum NodeCommand {
     SendMixFee { coordinator: PeerId, mix_id: [u8; 32], input: InputReveal, join_nonce: u64 },
     SendMixSign { coordinator: PeerId, mix_id: [u8; 32], input_index: usize, signature: Vec<u8> },
     BroadcastMixProposal { mix_id: [u8; 32], proposal: crate::wallet::coinjoin::MixProposal, peers: Vec<PeerId> },
-    FinishSyncHeaders { peer: PeerId, headers: Vec<BatchHeader>, is_valid: bool, snapshot: Option<Box<State>> },
+    FinishSyncHeaders { peer: PeerId, headers: Vec<BatchHeader>, is_valid: bool, snapshot: Option<Box<State>>, fork_height: u64, candidate_state: Option<Box<State>>, is_fast_forward: bool },
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -714,7 +712,6 @@ pub async fn new(
             state,
             mempool: Mempool::new(),
             storage: storage.clone(),
-            syncer: Syncer::new(storage),
             network,
             metrics: Metrics::new(),
             mining_threads,
@@ -1324,8 +1321,8 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                                 tracing::error!("Failed to process pool-submitted block: {}", e);
                             }
                         }
-                        NodeCommand::FinishSyncHeaders { peer, headers, is_valid, snapshot } => {
-                            if let Err(e) = self.process_verified_headers(peer, headers, is_valid, snapshot).await {
+                        NodeCommand::FinishSyncHeaders { peer, headers, is_valid, snapshot, fork_height, candidate_state, is_fast_forward } => {
+                            if let Err(e) = self.process_verified_headers(peer, headers, is_valid, snapshot, fork_height, candidate_state, is_fast_forward).await {
                                 tracing::warn!("Failed to process verified headers: {}", e);
                             }
                         }
@@ -1542,8 +1539,11 @@ async fn handle_message(
                         "Peer {} at equal/lower depth (h={}, d={}) with different chain, resuming mining",
                         from, height, depth
                     );
-                    self.sync_in_progress = false;
-                    self.trigger_mining();
+                    // ONLY resume mining if we aren't actively syncing from someone else!
+                    if self.sync_session.is_none() {
+                        self.sync_in_progress = false;
+                        self.trigger_mining();
+                    }
                 }
             }
             
@@ -2005,6 +2005,12 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
         tracing::info!("Downloaded {} headers, offloading PoW verification...", total_headers);
 
         let tx = self.cmd_tx.as_ref().unwrap().clone();
+        let storage = self.storage.clone();
+        let current_height = self.state.height;
+        let safe_depth = self.cached_safe_depth;
+        let state_cache = self.state_cache.clone(); 
+        let current_state = self.state.clone(); 
+
         tokio::spawn(async move {
             let mut is_valid = true;
 
@@ -2016,23 +2022,15 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
                 tracing::warn!("Root header timestamp too far in future");
                 is_valid = false;
             }
-            // ------------------------------
 
             // 1. Fast sequential check: linkage + difficulty target validation
             if is_valid {
                 for i in 1..all_headers.len() {
-                    
-                    // --- CORRECTED: Time Warp & CPU Exhaustion Defense ---
-                    // We ONLY check the future time limit. Nakamoto consensus 
-                    // allows slight backward drift, so we do NOT enforce 
-                    // header.timestamp > prev.timestamp.
                     if all_headers[i].timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
                         tracing::warn!("Header timestamp too far in future at index {}", i);
                         is_valid = false;
                         break;
                     }
-                    // -----------------------------------------------------
-
                     if all_headers[i].prev_midstate != all_headers[i - 1].extension.final_hash {
                         tracing::warn!("Header linkage broken at index {}", i);
                         is_valid = false;
@@ -2052,15 +2050,12 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
 
             // 2. Heavy PoW check in chunks, yielding to prevent CPU starvation
             if is_valid {
-                let mut processed = 0; // <--- Track progress
-                
+                let mut processed = 0; 
                 for chunk in all_headers.chunks(100) {
                     let chunk_owned = chunk.to_vec();
-                    
                     let chunk_valid = tokio::task::spawn_blocking(move || {
                         use rayon::prelude::*;
                         use crate::core::extension::verify_extension;
-                        
                         chunk_owned.par_iter().all(|header| {
                             verify_extension(
                                 header.post_tx_midstate,
@@ -2076,18 +2071,76 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
                     }
 
                     processed += chunk.len();
-
-                    // --- Progress Logging ---
-                    // Log progress every 1,000 headers, or when we hit 100%
                     if processed % 1000 == 0 || processed == total_headers {
                         let pct = (processed as f64 / total_headers as f64) * 100.0;
                         tracing::info!("Initial Headers Verification Progress: Verified {}/{} headers ({:.1}%)", processed, total_headers, pct);
                     }
-                    // -----------------------------
-
-                    // Suspend this task for exactly one cycle of the Tokio executor,
-                    // letting it answer network pings before Rayon locks the CPUs again.
                     tokio::task::yield_now().await;
+                }
+            }
+
+            let mut fork_height = 0;
+            let mut candidate_state = None;
+            let mut is_fast_forward = false;
+
+            // 3. BACKGROUND FORK POINT & STATE REBUILD
+            if is_valid {
+                if let Some(snap) = &snapshot {
+                    if all_headers.is_empty() || all_headers[0].prev_midstate != snap.midstate {
+                        tracing::warn!("Snapshot midstate mismatch! Peer sent fraudulent snapshot. Aborting sync.");
+                        is_valid = false;
+                    } else if all_headers.len() < crate::core::PRUNE_DEPTH as usize {
+                        tracing::warn!("Fast-forward rejected: only {} headers on top of snapshot", all_headers.len());
+                        is_valid = false;
+                    } else {
+                        fork_height = snap.height;
+                        candidate_state = Some(snap.clone());
+                        is_fast_forward = true;
+                    }
+                } else {
+                    let syncer = crate::sync::Syncer::new(storage.clone());
+                    let headers_start_height = all_headers.first().map(|h| h.height).unwrap_or(0);
+                    
+                    match syncer.find_fork_point(&all_headers, headers_start_height, current_height) {
+                        Ok(fh) => {
+                            let max_reorg_depth = current_height.saturating_sub(safe_depth);
+                            if fh < max_reorg_depth {
+                                tracing::warn!("Sync fork at {} exceeds safe depth {}, aborting", fh, max_reorg_depth);
+                                is_valid = false;
+                            } else if fh == headers_start_height && headers_start_height > 0 {
+                                // Deep Fork Guard: Handled safely in main loop
+                                fork_height = fh;
+                            } else {
+                                fork_height = fh;
+                                if fh == 0 {
+                                    candidate_state = Some(Box::new(State::genesis().0));
+                                } else if fh <= current_height {
+                                    if let Some(s) = state_cache.iter().find(|(h, _)| *h == fh).map(|(_, s)| s.clone()) {
+                                        candidate_state = Some(Box::new(s));
+                                    } else {
+                                        tracing::info!("Cache miss at height {}, starting background state rebuild...", fh);
+                                        let cache_start = state_cache.iter()
+                                            .filter(|(h, _)| *h <= fh)
+                                            .max_by_key(|(h, _)| *h)
+                                            .map(|(h, s)| (*h, s.clone()));
+                                        match rebuild_state_from_disk(storage.clone(), fh, cache_start).await {
+                                            Ok(s) => candidate_state = Some(Box::new(s)),
+                                            Err(e) => {
+                                                tracing::error!("Background state rebuild failed: {}", e);
+                                                is_valid = false;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    candidate_state = Some(Box::new(current_state));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to find fork point: {}", e);
+                            is_valid = false;
+                        }
+                    }
                 }
             }
 
@@ -2096,6 +2149,9 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
                 headers: all_headers,
                 is_valid,
                 snapshot,
+                fork_height,
+                candidate_state,
+                is_fast_forward,
             });
         });
 
@@ -2117,6 +2173,9 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
         all_headers: Vec<BatchHeader>,
         is_valid: bool,
         snapshot: Option<Box<State>>,
+        fork_height: u64,
+        candidate_state_opt: Option<Box<State>>,
+        is_fast_forward: bool,
     ) -> Result<()> {
         let session = match self.sync_session.take() {
             Some(s) if s.peer == peer && matches!(s.phase, SyncPhase::VerifyingHeaders) => s,
@@ -2126,81 +2185,36 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
             }
         };
 
-if !is_valid {
-            tracing::warn!("Peer header chain invalid (PoW or linkage failed)");
+        if !is_valid {
+            tracing::warn!("Peer header chain invalid (PoW, linkage, or state rebuild failed)");
             self.sync_in_progress = false;
-            self.ban_peer(peer, "invalid header chain (PoW or linkage failed)");
+            self.ban_peer(peer, "invalid header chain");
             return Ok(());
         }
 
-        // --- Fast-Forward Validation Logic ---
-        let (fork_height, candidate_state, is_fast_forward) = if let Some(snap) = snapshot {
-            tracing::info!("Headers verified. Cryptographically validating snapshot at height {}...", snap.height);
-            
-            // THE CRITICAL CHECK: The downloaded headers represent thousands of valid blocks of PoW. 
-            // If the first header builds exactly on top of the snapshot's midstate, the snapshot is authentic.
-            if all_headers.is_empty() || all_headers[0].prev_midstate != snap.midstate {
-                tracing::warn!("Snapshot midstate mismatch! Peer sent fraudulent snapshot. Aborting sync.");
+        let headers_start_height = all_headers.first().map(|h| h.height).unwrap_or(0);
+        if fork_height == headers_start_height && headers_start_height > 0 && !is_fast_forward {
+            tracing::warn!("Fork is deeper than the 100-block lookback window. Restarting sync from genesis.");
+            self.start_sync_session(peer, session.peer_height, session.peer_depth, Some(0));
+            return Ok(());
+        }
+
+        let candidate_state = match candidate_state_opt {
+            Some(s) => *s,
+            None => {
+                tracing::warn!("Missing candidate state");
                 self.sync_in_progress = false;
                 return Ok(());
             }
-
-            // SECURITY: Require a minimum number of post-snapshot headers before
-            // trusting a snapshot. Without this, an attacker with modest hash power
-            // could forge a snapshot for a fresh node by mining only a handful of
-            // valid blocks on top of a fabricated state. PRUNE_DEPTH headers
-            // (1,000 blocks × 1M iterations each = 1 billion sequential hashes)
-            // makes this prohibitively expensive.
-            let min_headers = PRUNE_DEPTH as usize;
-            if all_headers.len() < min_headers {
-                tracing::warn!(
-                    "Fast-forward rejected: only {} headers on top of snapshot (need >= {}). \
-                     Peer may be attempting state injection.",
-                    all_headers.len(), min_headers
-                );
-                self.sync_in_progress = false;
-                return Ok(());
-            }
-            
-            // Save the trusted snapshot to disk so we can use it for rebuilds later!
-            if let Err(e) = self.storage.save_state_snapshot(snap.height, &snap) {
-                tracing::warn!("Failed to save fast-forward snapshot to disk: {}", e);
-            }
-
-            // Trust the snapshot!
-            (snap.height, *snap, true)
-            } else {
-            // Standard sync path
-            let headers_start_height = all_headers.first().map(|h| h.height).unwrap_or(0);
-            let fh = self.syncer.find_fork_point(&all_headers, headers_start_height, self.state.height)?;
-            
-            // --- NEW: Enforce Safe Depth During Sync ---
-            let safe_depth = self.finality.calculate_safe_depth(1e-6);
-            let max_reorg_depth = self.state.height.saturating_sub(safe_depth);
-            if fh < max_reorg_depth {
-                tracing::warn!("Sync fork at {} exceeds safe depth {}, aborting", fh, max_reorg_depth);
-                self.abort_sync_session("Fork point exceeds safe finality depth");
-            }
-            
-            // NEW: Deep Fork Guard. 
-            // If the fork point equals the start of our 100-block window, it means the 
-            // chains actually diverged even further back in time.
-            if fh == headers_start_height && headers_start_height > 0 {
-                tracing::warn!("Fork is deeper than the 100-block lookback window. Restarting sync from genesis.");
-                // Fall back to a full sync from 0
-                self.start_sync_session(peer, session.peer_height, session.peer_depth, Some(0));
-                return Ok(());
-            }
-
-            let cand = if fh == 0 {
-                State::genesis().0
-            } else if fh <= self.state.height {
-                self.rebuild_state_at_height(fh).await?
-            } else {
-                self.state.clone()
-            };
-            (fh, cand, false)
         };
+
+        if is_fast_forward {
+            if let Some(snap) = snapshot {
+                if let Err(e) = self.storage.save_state_snapshot(snap.height, &snap) {
+                    tracing::warn!("Failed to save fast-forward snapshot to disk: {}", e);
+                }
+            }
+        }
 
         tracing::info!(
             "Fork point/Snapshot at height {}. Will download batches {}..{}",
@@ -2711,7 +2725,11 @@ if !is_valid {
             }
 
             // It's a genuine reorg (fork_height < self.state.height). We MUST rebuild the state.
-            self.rebuild_state_at_height(fork_height).await?
+            let cache_start = self.state_cache.iter()
+                .filter(|(h, _)| *h <= fork_height)
+                .max_by_key(|(h, _)| *h)
+                .map(|(h, s)| (*h, s.clone()));
+            rebuild_state_from_disk(self.storage.clone(), fork_height, cache_start).await?
         };
 
         let mut candidate_state = fork_state;
@@ -2910,113 +2928,7 @@ fn perform_reorg(
         Ok(())
     }
 
-    async fn rebuild_state_at_height(&self, target_height: u64) -> Result<State> {
-        // Fast path: check in-memory cache (covers recent reorgs instantly)
-        if let Some(state) = self.cached_state_at(target_height) {
-            tracing::info!("rebuild_state_at_height: cache hit at height {}", target_height);
-            return Ok(state);
-        }
-
-        tracing::info!(
-            "rebuild_state_at_height: cache miss at height {} (cache covers {}..{}), falling back to disk",
-            target_height,
-            self.state_cache.front().map(|(h, _)| *h).unwrap_or(0),
-            self.state_cache.back().map(|(h, _)| *h).unwrap_or(0),
-        );
-
-        // Slow path: load nearest snapshot from disk and replay forward.
-        // Check if the cache has ANY state we can use as a closer starting point.
-        let cache_start = self.state_cache.iter()
-            .filter(|(h, _)| *h <= target_height)
-            .max_by_key(|(h, _)| *h)
-            .map(|(h, s)| (*h, s.clone()));
-
-        let storage = self.storage.clone();
-
-        if let Some((start_h, start_state)) = cache_start {
-            // We have a cached state below the target — replay from there
-            tokio::task::spawn_blocking(move || -> Result<State> {
-                let mut state = start_state;
-                let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
-                
-                let mut wots_oracle = std::collections::HashMap::new();
-                
-                for h in start_h..target_height {
-                    if let Some(batch) = storage.load_batch(h)? {
-                        recent_headers.push_back(state.timestamp);
-                        if recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
-                            recent_headers.pop_front();
-                        }
-                        if state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
-                            let db_oracle = storage.query_spent_addresses(&batch).unwrap_or_default();
-                            wots_oracle.extend(db_oracle);
-                        }
-
-                        // <--- MODIFY THIS LINE to pass &mut wots_oracle --->
-                        apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &mut wots_oracle)?;
-                        state.target = adjust_difficulty(&state);
-                    } else {
-                        anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
-                    }
-                }
-                Ok(state)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("State rebuild task panicked: {}", e))?
-        } else {
-            // No cache — full disk path
-            tokio::task::spawn_blocking(move || -> Result<State> {
-                let mut snap_height = (target_height / SNAPSHOT_INTERVAL) * SNAPSHOT_INTERVAL;
-                let mut best_snap = None;
-
-                while snap_height > 0 {
-                    match storage.load_state_snapshot(snap_height) {
-                        Ok(Some(snap)) => {
-                            tracing::debug!(
-                                "rebuild_state_at_height: using snapshot at {} (target {})",
-                                snap_height, target_height
-                            );
-                            best_snap = Some((snap, snap_height));
-                            break;
-                        }
-                        _ => {
-                            snap_height = snap_height.saturating_sub(SNAPSHOT_INTERVAL);
-                        }
-                    }
-                }
-
-                let (mut state, replay_from) = best_snap.unwrap_or_else(|| {
-                    tracing::debug!("rebuild_state_at_height: no snapshots found, replaying from genesis");
-                    (State::genesis().0, 0)
-                });
-
-                let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
-                let mut wots_oracle = std::collections::HashMap::new(); 
-                for h in replay_from..target_height {
-                    if let Some(batch) = storage.load_batch(h)? {
-                        recent_headers.push_back(state.timestamp);
-                        if recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
-                            recent_headers.pop_front();
-                        }
-                        if state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
-                            let db_oracle = storage.query_spent_addresses(&batch).unwrap_or_default();
-                            wots_oracle.extend(db_oracle);
-                        }
-
-                        // <--- MODIFY THIS LINE to pass &mut wots_oracle --->
-                        apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &mut wots_oracle)?;
-                        state.target = adjust_difficulty(&state);
-                    } else {
-                        anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
-                    }
-                }
-
-                Ok(state)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("State rebuild task panicked: {}", e))?
-        }
-    }
+    
 
     /// Push the current state into the ring buffer cache.
     /// Called after every successful state advancement.
@@ -3029,13 +2941,6 @@ fn perform_reorg(
         if self.state_cache.len() > STATE_CACHE_SIZE {
             self.state_cache.pop_front();
         }
-    }
-
-    /// Look up a cached state at exactly the given height.
-    fn cached_state_at(&self, height: u64) -> Option<State> {
-        self.state_cache.iter()
-            .find(|(h, _)| *h == height)
-            .map(|(_, s)| s.clone())
     }
 
     /// Trim the cache: discard all entries at or above `fork_height`.
@@ -3877,6 +3782,78 @@ async fn try_apply_orphans(&mut self) {
             }
         }
         Ok(())
+    }
+}
+
+/// Heavy background task to safely rebuild state from disk.
+async fn rebuild_state_from_disk(storage: crate::storage::Storage, target_height: u64, cache_start: Option<(u64, State)>) -> Result<State> {
+    if let Some((start_h, start_state)) = cache_start {
+        tokio::task::spawn_blocking(move || -> Result<State> {
+            let mut state = start_state;
+            let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+            let mut wots_oracle = std::collections::HashMap::new();
+            
+            for h in start_h..target_height {
+                if let Some(batch) = storage.load_batch(h)? {
+                    recent_headers.push_back(state.timestamp);
+                    if recent_headers.len() > crate::core::DIFFICULTY_LOOKBACK as usize {
+                        recent_headers.pop_front();
+                    }
+                    if state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                        let db_oracle = storage.query_spent_addresses(&batch).unwrap_or_default();
+                        wots_oracle.extend(db_oracle);
+                    }
+                    crate::core::state::apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &mut wots_oracle)?;
+                    state.target = crate::core::state::adjust_difficulty(&state);
+                } else {
+                    anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
+                }
+            }
+            Ok(state)
+        }).await.map_err(|e| anyhow::anyhow!("State rebuild task panicked: {}", e))?
+    } else {
+        tokio::task::spawn_blocking(move || -> Result<State> {
+            let mut snap_height = (target_height / 100) * 100;
+            let mut best_snap = None;
+
+            while snap_height > 0 {
+                match storage.load_state_snapshot(snap_height) {
+                    Ok(Some(snap)) => {
+                        tracing::debug!("rebuild_state_from_disk: using snapshot at {} (target {})", snap_height, target_height);
+                        best_snap = Some((snap, snap_height));
+                        break;
+                    }
+                    _ => {
+                        snap_height = snap_height.saturating_sub(100);
+                    }
+                }
+            }
+
+            let (mut state, replay_from) = best_snap.unwrap_or_else(|| {
+                tracing::debug!("rebuild_state_from_disk: no snapshots found, replaying from genesis");
+                (State::genesis().0, 0)
+            });
+
+            let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+            let mut wots_oracle = std::collections::HashMap::new(); 
+            for h in replay_from..target_height {
+                if let Some(batch) = storage.load_batch(h)? {
+                    recent_headers.push_back(state.timestamp);
+                    if recent_headers.len() > crate::core::DIFFICULTY_LOOKBACK as usize {
+                        recent_headers.pop_front();
+                    }
+                    if state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                        let db_oracle = storage.query_spent_addresses(&batch).unwrap_or_default();
+                        wots_oracle.extend(db_oracle);
+                    }
+                    crate::core::state::apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &mut wots_oracle)?;
+                    state.target = crate::core::state::adjust_difficulty(&state);
+                } else {
+                    anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
+                }
+            }
+            Ok(state)
+        }).await.map_err(|e| anyhow::anyhow!("State rebuild task panicked: {}", e))?
     }
 }
 

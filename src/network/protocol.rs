@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use async_trait::async_trait;
 
-pub const MAX_GETBATCHES_COUNT: u64 = 1000;  // heavy, OOM risk
+pub const MAX_GETBATCHES_COUNT: u64 = 250;  // heavy, OOM risk
 pub const MAX_GETHEADERS_COUNT: u64 = 8000; // lightweight, ~1.6MB max
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -92,10 +92,11 @@ impl Message {
     }
 
 pub fn deserialize_bin(bytes: &[u8]) -> anyhow::Result<Self> {
-        use bincode::Options;
-        let msg: Message = bincode::DefaultOptions::new()
-            .with_limit(MAX_MSG_SIZE as u64)
-            .deserialize(bytes)?;
+    use bincode::Options;
+    let msg: Message = bincode::DefaultOptions::new()
+        .with_limit(MAX_MSG_SIZE as u64)
+        .reject_trailing_bytes()
+        .deserialize(bytes)?;
 
         // Post-deserialization bounds check: reject messages with
         // unreasonably large collections that survived bincode's byte limit.
