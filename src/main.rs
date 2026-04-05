@@ -2322,8 +2322,8 @@ async fn keygen(rpc_port: Option<u16>, rpc_host: String) -> Result<()> {
 }
 
 async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> Result<()> {
-    let storage = storage::Storage::open(data_dir.join("db"))?;
-    let syncer = sync::Syncer::new(storage.clone());
+    let storage = midstate::storage::Storage::open(data_dir.join("db"))?;
+    let syncer = midstate::sync::Syncer::new(storage.clone());
 
     let listen_addr: libp2p::Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", port).parse()?;
     let peer_multiaddr: libp2p::Multiaddr = peer_addr.parse()
@@ -2332,10 +2332,12 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
     let keypair = libp2p::identity::Keypair::generate_ed25519();
     let mut network = MidstateNetwork::new(keypair, listen_addr, vec![peer_multiaddr]).await?;
 
-    // Wait for connection
+    println!("Dialing peer...");
+    
+    // Wait for connection (Updated for the Bayesian routing signature)
     let peer_id = loop {
         match network.next_event().await {
-            NetworkEvent::PeerConnected(id) => break id,
+            NetworkEvent::PeerConnected(id, _) => break id,
             _ => continue,
         }
     };
@@ -2372,14 +2374,24 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
     }
 
     // 3. Verify
-    sync::Syncer::verify_header_chain(&headers, &[])?;
-    let our_state = storage.load_state()?.unwrap_or_else(|| State::genesis().0);
-    // from genesis here...
+    // (Note: standalone sync command assumes syncing from genesis, so prior_timestamps is &[])
+    midstate::sync::Syncer::verify_header_chain(&headers, &[])?;
+    let our_state = storage.load_state()?.unwrap_or_else(|| midstate::core::State::genesis().0);
+    
     let fork_height = syncer.find_fork_point(&headers, 0, our_state.height)?;
 
     // 4. Download and apply batches
     let mut state = syncer.rebuild_state_to(fork_height)?;
+    
+    // Seed the Median-Time-Past window from local storage so validation doesn't fail
     let mut recent_headers: Vec<u64> = Vec::new();
+    let window_start = fork_height.saturating_sub(midstate::core::DIFFICULTY_LOOKBACK as u64);
+    for h in window_start..fork_height {
+        if let Some(batch) = storage.load_batch(h)? {
+            recent_headers.push(batch.timestamp);
+        }
+    }
+    
     let mut dl_cursor = fork_height;
     while dl_cursor < peer_height {
         let chunk = 10.min(peer_height - dl_cursor);
@@ -2393,23 +2405,32 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
             }
         };
         if batches.is_empty() { anyhow::bail!("Peer sent empty batches at {}", dl_cursor); }
-        // <--- FIX: Accumulate spent addresses across the sync loop
+        
         let mut wots_oracle = std::collections::HashMap::new();
 
         for batch in &batches {
-            recent_headers.push(state.timestamp);
-            if recent_headers.len() > MEDIAN_TIME_PAST_WINDOW { recent_headers.remove(0); }
-            
-            // Extend the oracle if activation height is met
-            if state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+            if state.height >= midstate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
                 let db_oracle = storage.query_spent_addresses(batch).unwrap_or_default();
                 wots_oracle.extend(db_oracle);
             }
 
-            // Pass the mutable oracle
             apply_batch(&mut state, batch, &recent_headers, &mut wots_oracle)?;
+            
+            // FIX: MUST adjust difficulty so the target matches for the next block
+            state.target = midstate::core::state::adjust_difficulty(&state);
+
+            // Maintain MTP window
+            recent_headers.push(state.timestamp);
+            if recent_headers.len() > midstate::core::MEDIAN_TIME_PAST_WINDOW { 
+                recent_headers.remove(0); 
+            }
+
             storage.save_batch(dl_cursor, batch)?;
             dl_cursor += 1;
+            
+            if dl_cursor % 100 == 0 {
+                println!("Synced up to block {}/{}", dl_cursor, peer_height);
+            }
         }
     }
     storage.save_state(&state)?;

@@ -179,6 +179,9 @@ pub struct Node {
     /// Keyed by height: state_cache[i] = (height, State) where the State
     /// is the result of applying all blocks through height-1.
     state_cache: VecDeque<(u64, State)>,
+    
+    /// Fallback peers to dial if we suffer a total network eclipse
+    bootstrap_peers: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -694,6 +697,9 @@ pub async fn new(
             kp
         };
 
+        // Convert Multiaddrs to Strings BEFORE we move them into the network
+        let bootstrap_strings: Vec<String> = bootstrap_peers.iter().map(|a| a.to_string()).collect();
+
         let network = MidstateNetwork::new(keypair, listen_addr, bootstrap_peers).await?;
 
         let mut recent_headers = VecDeque::new();
@@ -706,6 +712,7 @@ pub async fn new(
             }
         }
 
+        // Convert Multiaddrs to Strings to store for the fallback dialer
         let (mined_batch_tx, mined_batch_rx) = tokio::sync::mpsc::unbounded_channel();
 
         Ok(Self {
@@ -724,7 +731,6 @@ pub async fn new(
             mining_seed,
             data_dir,
             chain_history: VecDeque::new(),
-            //lets assume a hostile environment where 80% of new connections are malicious. 
             finality: crate::core::finality::FinalityEstimator::new(2, 8),
             cached_safe_depth: crate::core::finality::FinalityEstimator::new(2, 8).calculate_safe_depth(1e-6),
             last_sync_cursor: None,
@@ -745,6 +751,7 @@ pub async fn new(
             banned_subnets: HashMap::new(),
             tarpitted_peers: HashSet::new(),
             state_cache: VecDeque::with_capacity(STATE_CACHE_SIZE + 1),
+            bootstrap_peers: bootstrap_strings, // <-- Uses the variable we created above
         })
     }
 
@@ -1247,10 +1254,9 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                     if current_outbound < TARGET_OUTBOUND_PEERS {
                         let needed = TARGET_OUTBOUND_PEERS - current_outbound;
                         
-                        // Pick random addresses from our known pool
                         use rand::seq::IteratorRandom;
                         let mut rng = rand::thread_rng();
-// Bayesian Weighted Routing: Prefer peers with high honest probability
+
                         let mut candidates: Vec<_> = self.known_pex_addrs.iter().collect();
                         candidates.sort_by(|a, b| {
                             let p_a = a.1.0 as f32 / (a.1.0 + a.1.1) as f32;
@@ -1259,15 +1265,27 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                         });
                         
                         let to_dial: Vec<String> = candidates.into_iter()
-                            .take(needed.max(10)) // Only pull from the highest-probability tier
+                            .take(needed.max(10)) 
                             .choose_multiple(&mut rng, needed)
                             .into_iter()
                             .map(|(k, _)| k.clone())
                             .collect();
 
+                        let mut dialed = 0;
                         for addr in to_dial {
-                            //tracing::info!("Maintenance: Dialing {} to maintain outbound ratio", addr); //spams output
                             self.network.dial_addr(&addr);
+                            dialed += 1;
+                        }
+
+                        // --- ANTI-ECLIPSE BOOTSTRAP FALLBACK ---
+                        // If the PEX pool is completely poisoned/empty and we failed to dial 
+                        // any good peers, OR if we have 0 outbound connections (total eclipse), 
+                        // fall back to the hardcoded bootstrap peers.
+                        if current_outbound == 0 || dialed == 0 {
+                            tracing::warn!("Eclipse Defense: Outbound connections critically low. Dialing bootstrap peers.");
+                            for addr in &self.bootstrap_peers {
+                                self.network.dial_addr(addr);
+                            }
                         }
                     }
                 }                
@@ -1333,9 +1351,16 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                             let resp = self.handle_light_request(peer, request).await;
                             let _ = respond.send(resp);
                         }
-                        NetworkEvent::PeerConnected(peer) => {
+                        NetworkEvent::PeerConnected(peer, full_addr) => {
+                            // --- BAYESIAN ECLIPSE DEFENSE (REWARD) ---
+                            // Successfully connecting proves this is a routable, honest peer.
+                            // We reward them heavily to ensure they stay at the top of the PEX pool.
+                            let stats = self.known_pex_addrs.entry(full_addr).or_insert((1, 1));
+                            stats.0 = stats.0.saturating_add(10); // +10 to Alpha
+                            // -----------------------------------------
+
                             // --- BANNED SUBNET DEFENSE ---
-if let Some(subnet) = self.network.peer_subnet(&peer) {
+                            if let Some(subnet) = self.network.peer_subnet(&peer) {
                                 if let Some(&ban_time) = self.banned_subnets.get(&subnet) {
                                     // Bans expire after 1 hour
                                     if ban_time.elapsed().as_secs() < 3600 {
@@ -1717,9 +1742,9 @@ Message::Headers { start_height: _, headers } => {
                     return Ok(());
                 }
 
-// BAYESIAN SYBIL DEFENSE: Trust score dictates PoW requirement
-                let prob = self.network.peer_honesty_probability(&from).await;
-                let required_pow = if prob > 0.80 { 16 } else if prob > 0.20 { crate::mix::MIX_JOIN_POW_BITS } else { 28 };
+                // Client always mines MIX_JOIN_POW_BITS. The Bayesian system handles dropping 
+                // bad peers independently, so we don't need a hidden PoW trap here.
+                let required_pow = crate::mix::MIX_JOIN_POW_BITS;
 
                 if !crate::mix::verify_mix_join_pow(&mix_id, &coin_id, &from.to_bytes(), join_nonce, required_pow) {
                     tracing::debug!("MixJoin rejected from peer {}: insufficient join PoW (needed {})", from, required_pow);
@@ -1761,9 +1786,7 @@ Message::Headers { start_height: _, headers } => {
                     return Ok(());
                 }
 
-// BAYESIAN SYBIL DEFENSE: Trust score dictates PoW requirement
-                let prob = self.network.peer_honesty_probability(&from).await;
-                let required_pow = if prob > 0.80 { 16 } else if prob > 0.20 { crate::mix::MIX_JOIN_POW_BITS } else { 28 };
+                let required_pow = crate::mix::MIX_JOIN_POW_BITS;
 
                 if !crate::mix::verify_mix_join_pow(&mix_id, &coin_id, &from.to_bytes(), join_nonce, required_pow) {
                     tracing::debug!("MixFee rejected from peer {}: insufficient join PoW (needed {})", from, required_pow);

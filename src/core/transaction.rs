@@ -43,6 +43,12 @@ pub fn evaluate_commit_pow(commitment: &[u8; 32], nonce: u64, current_height: u6
         let zeros = crate::core::types::count_leading_zeros(&hash);
         if zeros > best_zeros {
             best_zeros = zeros;
+            
+            // Short-circuit: we only need to prove it meets the minimum threshold
+            // against ANY recent block. No need to hash the remaining heights.
+            if best_zeros >= MIN_COMMIT_POW_BITS {
+                break;
+            }
         }
     }
 
