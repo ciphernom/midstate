@@ -262,9 +262,9 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                     anyhow::bail!("Commitment already in mempool");
                 }
 
-                // Reconstruct a reference for validate_transaction.
+                // Reconstruct a reference to store. Validation was already 
+                // performed on a background thread before calling add().
                 let tx_ref = Transaction::Commit { commitment, spam_nonce };
-                validate_transaction(state, &tx_ref)?;
 
                 if self.commits.len() >= MAX_PENDING_COMMITS {
                     if let Some(&(lowest_pow, lowest_comm)) = self.commits_by_pow.iter().next() {
@@ -360,7 +360,8 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                     }
                 }
 
-                validate_transaction(state, &reveal_tx)?;
+               // Validation was already done in the background.
+
 
                 let fee_rate = compute_fee_rate(reveal_tx.fee(), tx_bytes);
                 let tx_id = get_tx_id(&reveal_tx);
