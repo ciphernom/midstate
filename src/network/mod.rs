@@ -960,14 +960,23 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                 SwarmEvent::Behaviour(_) => {}
 
                 // ── Connection lifecycle ─────────────────────────────
-                SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                     // --- Ignore closures of self-connections ---
                     if peer_id == *self.swarm.local_peer_id() {
                         tracing::debug!("Ignoring self-connection");
                         let _ = self.swarm.disconnect_peer_id(peer_id);
                         continue;
                     }
-                    // ------------------------------------------------------------------
+
+                    // --- DEDUPLICATION GATE ---
+                    // If we already have 1 or more connections to this PeerID, 
+                    // ignore this event. This prevents "flapping" when a peer 
+                    // connects via multiple protocols (QUIC + TCP + WebRTC).
+                    if num_established.get() > 1 {
+                        tracing::debug!("Redundant connection established from {}; ignoring event.", peer_id);
+                        continue;
+                    }
+                    // --------------------------
 
                     let remote_addr = endpoint.get_remote_address();
                     let is_webrtc = remote_addr.to_string().contains("webrtc-direct");
