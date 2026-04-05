@@ -110,8 +110,6 @@ enum Command {
         listen: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long)]
-        isbootstrap: bool,
     },
     Wallet {
         #[command(subcommand)]
@@ -429,8 +427,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Node { data_dir, port, rpc_port, rpc_bind, peer, mine, threads, verify_threads, listen, config, isbootstrap } => {
-            run_node(data_dir, port, rpc_port, rpc_bind, peer, mine, threads, verify_threads, listen, config, isbootstrap).await
+        Command::Node { data_dir, port, rpc_port, rpc_bind, peer, mine, threads, verify_threads, listen, config } => {
+            run_node(data_dir, port, rpc_port, rpc_bind, peer, mine, threads, verify_threads, listen, config).await
         }
         Command::Wallet { action } => handle_wallet(action).await,
         Command::Commit { rpc_port, rpc_host, coin, dest } => {
@@ -2114,7 +2112,7 @@ async fn check_coin_rpc(client: &reqwest::Client, rpc_port: u16, rpc_host: &str,
 
 // ── Original commands ───────────────────────────────────────────────────────
 
-async fn run_node(
+pub async fn run_node(
     data_dir: PathBuf, 
     port: u16, 
     rpc_port: u16, 
@@ -2125,7 +2123,6 @@ async fn run_node(
     verify_threads: Option<usize>,
     listen: Option<String>, 
     config_path: Option<PathBuf>,
-    is_bootstrap: bool,
 ) -> Result<()> {
 
     // --- Configure Rayon Global Thread Pool for Verification ---
@@ -2175,9 +2172,9 @@ let bootstrap: Vec<libp2p::Multiaddr> = all_peers.iter()
         None
     };
 
-    let node = node::Node::new(data_dir.clone(), mining_threads, listen_addr, bootstrap, is_bootstrap).await?;
+    let node = node::Node::new(data_dir.clone(), mining_threads, listen_addr, bootstrap).await?;
     
-    if is_bootstrap {
+   
         let peer_id_str = node.local_peer_id().to_string();
         if config.peer_id.as_deref() != Some(&peer_id_str) {
             let contents = std::fs::read_to_string(&config_file).unwrap_or_default();
@@ -2191,7 +2188,7 @@ let bootstrap: Vec<libp2p::Multiaddr> = all_peers.iter()
                 writeln!(file, "\npeer_id = \"{}\"", peer_id_str)?;
             }
             tracing::info!("Saved bootstrap peer ID to config file: {}", peer_id_str);
-        }
+        
     }
 
     let (handle, cmd_rx) = node.create_handle();
