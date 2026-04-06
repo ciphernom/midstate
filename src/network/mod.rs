@@ -373,9 +373,9 @@ impl MidstateNetwork {
             .with_behaviour(|key: &libp2p::identity::Keypair, relay_client| {
                 let local_peer = key.public().to_peer_id();
 
-            // --- Increase timeout from 10s to 60s ---
+            // --- Increase timeout from 60s to 120s to give weaker boards a chance ---
                 let rr_config = RequestResponseConfig::default()
-                    .with_request_timeout(Duration::from_secs(60));
+                    .with_request_timeout(Duration::from_secs(120));
 
                 let rr = request_response::Behaviour::new(
                     [(MIDSTATE_PROTOCOL, ProtocolSupport::Full)],

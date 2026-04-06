@@ -80,7 +80,8 @@ fn deserialize_state_with_migration(bytes: &[u8]) -> Result<(State, bool)> {
 /// Same as above but with size-limited deserialization (for untrusted snapshots)
 fn deserialize_state_with_migration_limited(bytes: &[u8]) -> Result<(State, bool)> {
     use bincode::Options;
-    let opts = bincode::DefaultOptions::new().with_limit(500_000_000);
+    let opts = bincode::DefaultOptions::new().with_limit(50_000_000); // 50MB is plenty for a state
+
     // Try current format: first with DefaultOptions (matching old load path),
     // then standard bincode (matching save path)
     if let Ok(state) = opts.deserialize::<State>(bytes) {
