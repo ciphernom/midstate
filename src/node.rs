@@ -587,7 +587,6 @@ pub async fn new(
         mining_threads: Option<usize>,
         listen_addr: Multiaddr,
         bootstrap_peers: Vec<Multiaddr>,
-        is_bootstrap: bool,
     ) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
         let storage = Storage::open(data_dir.join("db"))?;
@@ -678,23 +677,19 @@ pub async fn new(
         };
 
         // Load or generate libp2p keypair
-        let keypair = if is_bootstrap {
-            match load_keypair(&data_dir) {
-                Some(kp) => {
-                    tracing::info!("Loaded peer keypair");
-                    kp
-                }
-                None => {
-                    let kp = Keypair::generate_ed25519();
-                    save_keypair(&data_dir, &kp);
-                    tracing::info!("Generated new peer keypair");
-                    kp
-                }
+        // We now persist the identity for ALL nodes using a data directory.
+        // This allows nodes to have a "Static ID" that survives restarts.
+        let keypair = match load_keypair(&data_dir) {
+            Some(kp) => {
+                tracing::info!("Loaded persistent peer identity: {}", kp.public().to_peer_id());
+                kp
             }
-        } else {
-            let kp = Keypair::generate_ed25519();
-            tracing::info!("Generated ephemeral peer keypair");
-            kp
+            None => {
+                let kp = Keypair::generate_ed25519();
+                save_keypair(&data_dir, &kp);
+                tracing::info!("Generated new persistent peer identity: {}", kp.public().to_peer_id());
+                kp
+            }
         };
 
         // Convert Multiaddrs to Strings BEFORE we move them into the network
@@ -1080,13 +1075,20 @@ if coinbase_total != expected_total {
 
     /// Evaluates if the node is ready to mine, and spawns the task if so.
     fn trigger_mining(&mut self) {
-        if self.mining_threads.is_some() && !self.sync_in_progress && self.mining_cancel.is_none() {
+        // Only mine if:
+        // 1. Mining is enabled
+        // 2. We aren't currently syncing
+        // 3. We don't have a background task already
+        // 4. We haven't heard of a better height/depth from peers recently (SyncRequestedUpTo)
+        let is_behind = self.sync_requested_up_to > self.state.height;
+        
+        if self.mining_threads.is_some() && !self.sync_in_progress && !is_behind && self.mining_cancel.is_none() {
             if let Err(e) = self.spawn_mining_task() {
                 tracing::error!("Failed to trigger mining task: {}", e);
             }
         }
     }
-
+    
 pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver<NodeCommand>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = NodeHandle {
@@ -1250,44 +1252,44 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                 }
                 
                 _ = connection_maintenance.tick() => {
-                    let current_outbound = self.network.outbound_peer_count();
-                    if current_outbound < TARGET_OUTBOUND_PEERS {
-                        let needed = TARGET_OUTBOUND_PEERS - current_outbound;
-                        
-                        use rand::seq::IteratorRandom;
-                        let mut rng = rand::thread_rng();
+                        let current_outbound = self.network.outbound_peer_count();
+                        if current_outbound < TARGET_OUTBOUND_PEERS {
+                            let needed = TARGET_OUTBOUND_PEERS - current_outbound;
+                            
+                            use rand::seq::IteratorRandom;
+                            let mut rng = rand::thread_rng();
 
-                        let mut candidates: Vec<_> = self.known_pex_addrs.iter().collect();
-                        candidates.sort_by(|a, b| {
-                            let p_a = a.1.0 as f32 / (a.1.0 + a.1.1) as f32;
-                            let p_b = b.1.0 as f32 / (b.1.0 + b.1.1) as f32;
-                            p_b.partial_cmp(&p_a).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        
-                        let to_dial: Vec<String> = candidates.into_iter()
-                            .take(needed.max(10)) 
-                            .choose_multiple(&mut rng, needed)
-                            .into_iter()
-                            .map(|(k, _)| k.clone())
-                            .collect();
+                            let mut candidates: Vec<_> = self.known_pex_addrs.iter().collect();
+                            candidates.sort_by(|a, b| {
+                                let p_a = a.1.0 as f32 / (a.1.0 + a.1.1) as f32;
+                                let p_b = b.1.0 as f32 / (b.1.0 + b.1.1) as f32;
+                                p_b.partial_cmp(&p_a).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            
+                            let to_dial: Vec<String> = candidates.into_iter()
+                                .take(needed.max(10)) 
+                                .choose_multiple(&mut rng, needed)
+                                .into_iter()
+                                .map(|(k, _)| k.clone())
+                                .collect();
 
-                        let mut dialed = 0;
-                        for addr in to_dial {
-                            self.network.dial_addr(&addr);
-                            dialed += 1;
-                        }
-
-                        // --- ANTI-ECLIPSE BOOTSTRAP FALLBACK ---
-                        // If the PEX pool is completely poisoned/empty and we failed to dial 
-                        // any good peers, OR if we have 0 outbound connections (total eclipse), 
-                        // fall back to the hardcoded bootstrap peers.
-                        if current_outbound == 0 || dialed == 0 {
-                            tracing::warn!("Eclipse Defense: Outbound connections critically low. Dialing bootstrap peers.");
-                            for addr in &self.bootstrap_peers {
-                                self.network.dial_addr(addr);
+                            let mut dialed = 0;
+                            for addr in to_dial {
+                                self.network.dial_addr(&addr);
+                                dialed += 1;
                             }
-                        }
-                    }
+
+                            // --- ANTI-ECLIPSE BOOTSTRAP FALLBACK ---
+                            // If the PEX pool is completely poisoned/empty and we failed to dial 
+                            // any good peers, OR if we have 0 outbound connections (total eclipse), 
+                            // fall back to the hardcoded bootstrap peers.
+                            if current_outbound == 0 || dialed == 0 {
+                                tracing::warn!("Eclipse Defense: Outbound connections critically low. Dialing bootstrap peers.");
+                                for addr in &self.bootstrap_peers {
+                                    self.network.dial_addr(addr);
+                                }
+                            }
+                        }                    
                 }                
                 
                 
