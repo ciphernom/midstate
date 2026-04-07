@@ -3,7 +3,7 @@ use crate::core::types::compute_address;
 use crate::core::types::{CoinbaseOutput, BatchHeader};
 use crate::core::state::{apply_batch, choose_best_state};
 use crate::core::extension::{mine_extension, create_extension};
-use crate::core::transaction::{apply_transaction, validate_transaction};
+use crate::core::transaction::{apply_transaction, apply_transaction_no_sig_check, validate_transaction};
 use crate::mempool::Mempool;
 use crate::metrics::Metrics;
 use crate::mix::{MixManager, MixPhase, MixStatusSnapshot};
@@ -97,6 +97,13 @@ enum SyncPhase {
         new_history: Vec<(u64, [u8; 32], Batch)>,
         is_fast_forward: bool,
     },
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SyncStateBackup {
+    pub cursor: u64,
+    pub peer_height: u64,
+    pub accumulated_headers: Vec<BatchHeader>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1189,9 +1196,16 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                     }
                 }
                 _ = save_interval.tick() => {
-                    if let Err(e) = self.storage.save_state(&self.state) {
-                        tracing::error!("Failed to save state: {}", e);
-                    }
+                    // Clone the Arc to the DB and the persistent `im` state (O(1) RAM cost)
+                    let storage_clone = self.storage.clone();
+                    let state_clone = self.state.clone(); 
+                    
+                    // Offload the heavy serialization to a background thread
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = storage_clone.save_state(&state_clone) {
+                            tracing::error!("Failed to save state in background: {}", e);
+                        }
+                    });
                 }
                 _ = ui_interval.tick() => {
                     // safe_depth is already computed inline after each observe_honest()
@@ -1857,25 +1871,42 @@ Message::Headers { start_height: _, headers } => {
 
 fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u128, force_start: Option<u64>) {
         self.cancel_mining();
-        
-        // Prefer: explicit override > last known cursor > 360-block lookback.
-        // The last_sync_cursor lets us resume a timed-out header download from
-        // where we left off rather than restarting from scratch every time.
-let start_height = force_start.unwrap_or_else(|| {
-            let base_start = self.last_sync_cursor
-                .filter(|&c| c > self.state.height.saturating_sub(360)
-                             && c <= self.state.height) // FIX: Do not allow cursor to be ahead of tip
-                .unwrap_or_else(|| {
-                    if self.state.height <= 360 {
-                        self.state.height
-                    } else {
-                        self.state.height.saturating_sub(360)
-                    }
-                });
 
-            // SAFETY CAP: Always ensure we overlap with our current tip.
-            // If the calculated start is ahead of us, force it back to our tip.
-            base_start.min(self.state.height)
+        // --- NEW: CRASH RECOVERY RESTORE ---
+        let sync_file_path = self.data_dir.join("sync_state.bin");
+        let mut recovered_headers = Vec::new();
+        let mut recovered_cursor = None;
+
+        if let Ok(bytes) = std::fs::read(&sync_file_path) {
+            if let Ok(backup) = bincode::deserialize::<SyncStateBackup>(&bytes) {
+                // Only resume if the peer we are connecting to has a chain at least as long
+                if peer_height >= backup.peer_height {
+                    tracing::info!("Recovered interrupted sync session. Resuming from height {}", backup.cursor);
+                    recovered_headers = backup.accumulated_headers;
+                    recovered_cursor = Some(backup.cursor);
+                } else {
+                    tracing::info!("Discarding recovered sync session (new peer has shorter chain).");
+                    let _ = std::fs::remove_file(&sync_file_path);
+                }
+            }
+        }
+        // -----------------------------------
+        
+        // Prefer: explicit override > recovered_cursor > last known cursor > 360-block lookback.
+        let start_height = force_start.unwrap_or_else(|| {
+            recovered_cursor.unwrap_or_else(|| {
+                let base_start = self.last_sync_cursor
+                    .filter(|&c| c > self.state.height.saturating_sub(360)
+                                 && c <= self.state.height)
+                    .unwrap_or_else(|| {
+                        if self.state.height <= 360 {
+                            self.state.height
+                        } else {
+                            self.state.height.saturating_sub(360)
+                        }
+                    });
+                base_start.min(self.state.height)
+            })
         });
         
         
@@ -1899,7 +1930,7 @@ let start_height = force_start.unwrap_or_else(|| {
             peer_height,
             peer_depth,
             phase: SyncPhase::Headers {
-                accumulated: Vec::new(),
+                accumulated: recovered_headers,
                 cursor: start_height,
                 snapshot: None, 
             },
@@ -1957,8 +1988,37 @@ self.network.send(peer, Message::GetHeaders { start_height, count });
             return Ok(());
         }
 
+        let chunk_size = headers.len();
+        let start_h = cursor;
+        let end_h = cursor + chunk_size as u64 - 1;
+        tracing::info!("Received headers {}..{} ({} total). Verifying Proof-of-Work...", start_h, end_h, chunk_size);
+
+        // --- NEW: PIPELINED VERIFICATION ---
+        // Verify the PoW of this specific chunk immediately as it arrives,
+        let chunk_owned = headers.clone();
+        let chunk_valid = tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            use crate::core::extension::verify_extension;
+            chunk_owned.par_iter().all(|header| {
+                verify_extension(
+                    header.post_tx_midstate,
+                    &header.extension,
+                    &header.target,
+                ).is_ok()
+            })
+        }).await.expect("Header verification task panicked");
+
+        if !chunk_valid {
+            self.abort_sync_session("peer sent headers with invalid Proof-of-Work");
+            self.ban_peer(from, "invalid header PoW");
+            return Ok(());
+        }
+        // -----------------------------------
+
         // Accumulate headers
         let new_cursor = cursor + headers.len() as u64;
+        let pct = (new_cursor as f64 / peer_height as f64) * 100.0;
+        tracing::info!("✓ Verified and saved chunk. Sync progress: {}/{} ({:.1}%)", new_cursor, peer_height, pct);
         match &mut self.sync_session {
             Some(s) => {
                 if let SyncPhase::Headers { accumulated, cursor: c, snapshot: snap_ref } = &mut s.phase {
@@ -1970,6 +2030,22 @@ self.network.send(peer, Message::GetHeaders { start_height, count });
                     }
                     accumulated.extend(headers);
                     *c = new_cursor;
+                    
+                    // --- NEW: CRASH RECOVERY PERSISTENCE ---
+                    let sync_file_path = self.data_dir.join("sync_state.bin");
+                    let backup = SyncStateBackup {
+                        cursor: new_cursor,
+                        peer_height,
+                        accumulated_headers: accumulated.clone(),
+                    };
+                    // Run in background to avoid stalling the network reactor
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(bytes) = bincode::serialize(&backup) {
+                            let _ = std::fs::write(&sync_file_path, bytes);
+                        }
+                    });
+                    // ---------------------------------------
+                    
                     if snapshot.is_some() {
                         *snap_ref = snapshot; // Put the snapshot back for the next iteration
                     }
@@ -2048,36 +2124,7 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
                 }
             }
 
-            // 2. Heavy PoW check in chunks, yielding to prevent CPU starvation
-            if is_valid {
-                let mut processed = 0; 
-                for chunk in all_headers.chunks(100) {
-                    let chunk_owned = chunk.to_vec();
-                    let chunk_valid = tokio::task::spawn_blocking(move || {
-                        use rayon::prelude::*;
-                        use crate::core::extension::verify_extension;
-                        chunk_owned.par_iter().all(|header| {
-                            verify_extension(
-                                header.post_tx_midstate,
-                                &header.extension,
-                                &header.target,
-                            ).is_ok()
-                        })
-                    }).await.expect("Header verification task panicked");
 
-                    if !chunk_valid {
-                        is_valid = false;
-                        break;
-                    }
-
-                    processed += chunk.len();
-                    if processed % 1000 == 0 || processed == total_headers {
-                        let pct = (processed as f64 / total_headers as f64) * 100.0;
-                        tracing::info!("Initial Headers Verification Progress: Verified {}/{} headers ({:.1}%)", processed, total_headers, pct);
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }
 
             let mut fork_height = 0;
             let mut candidate_state = None;
@@ -2191,6 +2238,11 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
             self.ban_peer(peer, "invalid header chain");
             return Ok(());
         }
+
+        // --- NEW: CLEANUP CRASH RECOVERY FILE ---
+        let sync_file_path = self.data_dir.join("sync_state.bin");
+        let _ = std::fs::remove_file(&sync_file_path);
+        // ----------------------------------------
 
         let headers_start_height = all_headers.first().map(|h| h.height).unwrap_or(0);
         if fork_height == headers_start_height && headers_start_height > 0 && !is_fast_forward {
@@ -2563,6 +2615,17 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
             return Err(e);
         }
         self.metrics.inc_transactions_processed();
+
+
+/**** for future, when more nodes, we should change the behavior below to the following:
+ * // If the stem pool is at capacity, DROP the transaction to preserve privacy.
+        // Broadcasting it publicly (fluffing) under a Sybil flood attack would
+        // allow an attacker to instantly deanonymize the sender's IP address.
+        if self.stem_pool.len() >= MAX_STEM_POOL_SIZE {
+            tracing::warn!("Stem pool full ({} entries). Dropping incoming stem tx to preserve Dandelion++ privacy.", MAX_STEM_POOL_SIZE);
+            return Ok(());
+        } else {
+*/
 
         // If the stem pool is at capacity, skip the privacy phase entirely
         // and insert directly into the public mempool. Node survival takes
@@ -3589,7 +3652,7 @@ async fn try_apply_orphans(&mut self) {
                 }
             }
 
-            match apply_transaction(&mut candidate_state, &tx) {
+            match apply_transaction_no_sig_check(&mut candidate_state, &tx) {  // sigs already verified at mempool admission
                 Ok(_) => {
                     if let Transaction::Reveal { inputs, outputs, .. } = &tx {
                         current_inputs += inputs.len();
