@@ -760,6 +760,30 @@ document.getElementById('cmd-input').addEventListener('keydown', function(e) {
 log('Explorer ready. Type a height, hash, or "mempool".', 'var(--accent-dim)');
 poll();
 setInterval(poll, 4000);
+
+// --- NEW: Deep Linking / URL Parameter Parsing ---
+// Supports:
+// 1. /?q=123
+// 2. /?query=a1b2c3d4...
+// 3. /?123  (Cleanest format)
+const params = new URLSearchParams(window.location.search);
+let initQuery = params.get('q') || params.get('query');
+
+// If they didn't use 'q=' but just put a value after the '?', grab that instead
+if (!initQuery && window.location.search.length > 1 && !window.location.search.includes('=')) {
+    initQuery = window.location.search.substring(1);
+}
+
+if (initQuery) {
+    // Decode in case the browser encoded it, and strip any trailing slashes
+    const cleanQuery = decodeURIComponent(initQuery).replace(/\/$/, '');
+    
+    // Wait 100ms to allow the initial poll() to fetch the chain tip and set up the UI
+    setTimeout(() => {
+        document.getElementById('cmd-input').value = cleanQuery;
+        execCmd(cleanQuery);
+    }, 100);
+}
 </script>
 </body>
 </html>
