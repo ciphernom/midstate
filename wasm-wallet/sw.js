@@ -1,4 +1,4 @@
-const CACHE_NAME = 'midstate-wallet-v7';
+const CACHE_NAME = 'midstate-wallet-v8';
 
 const ASSETS = [
   'index.html',

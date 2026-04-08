@@ -890,77 +890,94 @@ async fn handle_light_request(
             }
 
             LightRequest::GetBlock { height } => {
-                match self.storage.load_batch(height) {
-                    Ok(Some(batch)) => {
-                        match serde_json::to_value(&batch) {
-                            Ok(val) => LightResponse::success(val),
-                            Err(e) => LightResponse::error(format!("Serialization error: {}", e)),
+                let store_path = self.data_dir.join("db").join("batches");
+                
+                let result = tokio::task::spawn_blocking(move || {
+                    let store = match crate::storage::BatchStore::new(&store_path) {
+                        Ok(s) => s,
+                        Err(e) => return LightResponse::error(format!("Storage error: {}", e)),
+                    };
+                    
+                    match store.load(height) {
+                        Ok(Some(batch)) => {
+                            match serde_json::to_value(&batch) {
+                                Ok(val) => LightResponse::success(val),
+                                Err(e) => LightResponse::error(format!("Serialization error: {}", e)),
+                            }
                         }
+                        Ok(None) => LightResponse::error("Block not found"),
+                        Err(e) => LightResponse::error(format!("Storage error: {}", e)),
                     }
-                    Ok(None) => LightResponse::error("Block not found"),
-                    Err(e) => LightResponse::error(format!("Storage error: {}", e)),
-                }
+                }).await.unwrap_or_else(|_| LightResponse::error("Internal task panicked"));
+
+                result
             }
 
-LightRequest::GetFilters { start_height, end_height } => {
+            LightRequest::GetFilters { start_height, end_height } => {
                 let end = end_height
                     .min(self.state.height)
                     .min(start_height.saturating_add(1000));
-                let store = crate::storage::BatchStore::new(
-                    &self.data_dir.join("db").join("batches")
-                );
-                match store {
-                    Ok(store) => {
-                        let mut filters = Vec::new();
-                        let mut element_counts = Vec::new();
-                        let mut block_hashes = Vec::new();
-                        for h in start_height..end {
-                            match (store.load(h), store.load_filter(h)) {
-                                (Ok(Some(batch)), Ok(Some(filter_data))) => {
-                                    // Count elements the same way the RPC handler does
-                                    let mut items = std::collections::HashSet::new();
-                                    for tx in &batch.transactions {
-                                        match tx {
-                                            crate::core::Transaction::Commit { commitment, .. } => {
-                                                items.insert(*commitment);
+                
+                let store_path = self.data_dir.join("db").join("batches");
+                
+                // Spawn blocking thread to prevent freezing the network reactor!
+                let result = tokio::task::spawn_blocking(move || {
+                    let store = match crate::storage::BatchStore::new(&store_path) {
+                        Ok(s) => s,
+                        Err(e) => return LightResponse::error(format!("Storage error: {}", e)),
+                    };
+
+                    let mut filters = Vec::new();
+                    let mut element_counts = Vec::new();
+                    let mut block_hashes = Vec::new();
+
+                    for h in start_height..end {
+                        match (store.load(h), store.load_filter(h)) {
+                            (Ok(Some(batch)), Ok(Some(filter_data))) => {
+                                // Count elements the same way the RPC handler does
+                                let mut items = std::collections::HashSet::new();
+                                for tx in &batch.transactions {
+                                    match tx {
+                                        crate::core::Transaction::Commit { commitment, .. } => {
+                                            items.insert(*commitment);
+                                        }
+                                        crate::core::Transaction::Reveal { inputs, outputs, .. } => {
+                                            for input in inputs {
+                                                items.insert(input.coin_id());
+                                                items.insert(input.predicate.address());
                                             }
-                                            crate::core::Transaction::Reveal { inputs, outputs, .. } => {
-                                                for input in inputs {
-                                                    items.insert(input.coin_id());
-                                                    items.insert(input.predicate.address());
-                                                }
-                                                for output in outputs {
-                                                    if let Some(cid) = output.coin_id() { items.insert(cid); }
-                                                    items.insert(output.address());
-                                                }
+                                            for output in outputs {
+                                                if let Some(cid) = output.coin_id() { items.insert(cid); }
+                                                items.insert(output.address());
                                             }
                                         }
                                     }
-                                    for cb in &batch.coinbase {
-                                        items.insert(cb.coin_id());
-                                        items.insert(cb.address);
-                                    }
-                                    filters.push(hex::encode(filter_data));
-                                    block_hashes.push(hex::encode(batch.extension.final_hash));
-                                    element_counts.push(items.len() as u64);
                                 }
-                                (Ok(Some(batch)), _) => {
-                                    filters.push(String::new());
-                                    block_hashes.push(hex::encode(batch.extension.final_hash));
-                                    element_counts.push(0);
+                                for cb in &batch.coinbase {
+                                    items.insert(cb.coin_id());
+                                    items.insert(cb.address);
                                 }
-                                _ => break,
+                                filters.push(hex::encode(filter_data));
+                                block_hashes.push(hex::encode(batch.extension.final_hash));
+                                element_counts.push(items.len() as u64);
                             }
+                            (Ok(Some(batch)), _) => {
+                                filters.push(String::new());
+                                block_hashes.push(hex::encode(batch.extension.final_hash));
+                                element_counts.push(0);
+                            }
+                            _ => break,
                         }
-                        LightResponse::success(serde_json::json!({
-                            "start_height": start_height,
-                            "filters": filters,
-                            "element_counts": element_counts,
-                            "block_hashes": block_hashes,
-                        }))
                     }
-                    Err(e) => LightResponse::error(format!("Storage error: {}", e)),
-                }
+                    LightResponse::success(serde_json::json!({
+                        "start_height": start_height,
+                        "filters": filters,
+                        "element_counts": element_counts,
+                        "block_hashes": block_hashes,
+                    }))
+                }).await.unwrap_or_else(|_| LightResponse::error("Internal task panicked"));
+
+                result
             }
 
             LightRequest::GetMempool => {

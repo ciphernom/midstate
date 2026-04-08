@@ -48,6 +48,16 @@ const MSS_BINARY_HEADER_SIZE: usize = 80;
 /// Matches the consensus limit (MAX_TX_INPUTS = 256), with a safety margin.
 const MAX_SELECTED_INPUTS: usize = 250;
 
+const SALT_DOMAIN: &[u8] = b"midstate/salt/v1";
+
+fn derive_deterministic_salt(master_seed: &[u8; 32], index: u64) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(SALT_DOMAIN);
+    hasher.update(master_seed);
+    hasher.update(&index.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 // ─── Global Wasm Helpers ────────────────────────────────────────────────────
 
 /// Generate a new BIP39 24-word mnemonic phrase.
@@ -394,8 +404,8 @@ impl WebWallet {
             let pk = wots::keygen(&seed);
             let address = compute_address(&pk);
 
-            let mut salt = [0u8; 32];
-            getrandom_02::getrandom(&mut salt).ok()?;
+            // Deterministic salt derived from the master seed and index!
+            let salt = derive_deterministic_salt(&self.master_seed, wots_idx as u64);
 
             coinbase_json.push(serde_json::json!({
                 "address": hex::encode(address),
@@ -691,11 +701,27 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
     /// - `"Insufficient funds."` — UTXO values don't cover amount + fee.
     /// - `"MSS signing key not loaded."` — an MSS-backed UTXO's tree is missing.
     ///   The user should run a Network Sync to trigger cache loading.
-    pub fn prepare_spend(&mut self, available_utxos_json: &str, to_address_hex: &str, send_amount: u64, next_wots_index: u32) -> Result<String, JsValue> {
+    /// Selects coins and builds a transaction for a specified send amount.
+    ///
+    /// This is a complex state-machine loop that balances three competing goals:
+    /// 1. Security: Strictly enforcing the "One-Time Signature" (WOTS) co-spend rule.
+    /// 2. Efficiency: Consolidating fragmented UTXOs into larger denominations (Snowball Merge).
+    /// 3. Restorability: Ensuring all change coins are discoverable from the seed phrase.
+    pub fn prepare_spend(
+        &mut self, 
+        available_utxos_json: &str, 
+        to_address_hex: &str, 
+        send_amount: u64, 
+        next_wots_index: u32
+    ) -> Result<String, JsValue> {
+        // Parse the UTXO set provided by the JavaScript wallet state.
         let mut available: Vec<WasmUtxo> = serde_json::from_str(available_utxos_json)
             .map_err(|e| JsValue::from_str(&format!("Failed to parse UTXOs: {}", e)))?;
 
-        // All MSS trees must be pre-loaded from IndexedDB. Never regenerate here.
+        // CRITICAL UX CHECK:
+        // Because generating height-10 Merkle trees is expensive, the JS layer must 
+        // pre-load them from IndexedDB into WASM memory. If a tree is missing, 
+        // we abort here rather than causing a 2-minute freeze during the spend.
         for utxo in &available {
             if utxo.is_mss && !self.mss_cache.contains_key(&utxo.address) {
                 return Err(JsValue::from_str(
@@ -704,18 +730,18 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
             }
         }
 
-        // Validate checksum (if 72-char) and normalize to 64-char hex.
-        // This ensures the node always receives a raw 32-byte address,
-        // even if the user entered a checksummed 72-char address.
+        // Validate and normalize the recipient address. 
+        // This handles both raw 64-char hex and checksummed 72-char hex formats.
         let recipient_addr = parse_address_wasm(to_address_hex)?;
         let recipient_hex = hex::encode(recipient_addr);
 
+        // Sort UTXOs by value descending. This greedy approach minimizes the 
+        // number of inputs needed, keeping transaction size and fees low.
         available.sort_by(|a, b| b.value.cmp(&a.value));
 
+        // Initial fee guess (100 units). The loop will increase this if the 
+        // transaction size (input count) requires a higher fee.
         let mut target_fee = 100u64;
-        let final_selected: Vec<WasmUtxo>;
-        let mut final_outputs = Vec::new();
-        let final_fee;
 
         loop {
             let needed = send_amount + target_fee;
@@ -723,7 +749,8 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
             let mut selected_set = HashSet::new();
             let mut total = 0u64;
 
-            // Step 1: Greedy selection (largest first)
+            // STEP 1: Greedy Selection.
+            // Pick the largest coins first until we cover the amount + current fee guess.
             for coin in &available {
                 if total >= needed { break; }
                 selected_set.insert(coin.coin_id.clone());
@@ -733,7 +760,13 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
 
             if total < needed { return Err(JsValue::from_str("Insufficient funds.")); }
 
-            // Step 2: WOTS co-spend grouping (first pass)
+            // STEP 2: WOTS Co-Spend Enforcement (Safety Requirement).
+            // Midstate uses Winternitz One-Time Signatures. If you spend one coin at a 
+            // WOTS address but leave others behind, a future spend of those coins 
+            // would reveal a second signature for the same key, allowing an attacker 
+            // to derive your private key. 
+            // FIX: We scan for any sibling coins sharing the same address and force 
+            // them into this transaction.
             let mut grouped_addresses = HashSet::new();
             for c in &selected {
                 if !c.is_mss { grouped_addresses.insert(c.address.clone()); }
@@ -746,12 +779,16 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
                 }
             }
 
-            // Step 3: Snowball merge (UTXO consolidation)
+            // STEP 3: Snowball Merge (UTXO Defragmentation).
+            // Midstate requires all coins to be powers of 2. This can lead to 
+            // "dust" fragmentation. We use a greedy snowball algorithm: if our 
+            // current change denominations match any coins still in our wallet, 
+            // we pull those coins in too to "roll them up" into higher powers of 2.
             let mut added_new = true;
             while added_new {
                 added_new = false;
-                let change = total.saturating_sub(send_amount).saturating_sub(target_fee);
-                let change_denoms = decompose_value(change);
+                let current_change = total.saturating_sub(send_amount).saturating_sub(target_fee);
+                let change_denoms = decompose_value(current_change);
 
                 for denom in change_denoms {
                     if let Some(pos) = available.iter().position(|c| c.value == denom && !selected_set.contains(&c.coin_id)) {
@@ -763,10 +800,13 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
                         break;
                     }
                 }
+                // Consensus hard-cap: 256 inputs. We stop at 250 for safety.
                 if selected.len() >= MAX_SELECTED_INPUTS { break; }
             }
 
-            // Step 4: Final WOTS co-spend sweep (catch siblings pulled in by snowball)
+            // STEP 4: Final Co-Spend Sweep.
+            // The snowball merge might have pulled in coins that have siblings. 
+            // We run the co-spend check one last time to ensure absolute WOTS safety.
             let mut final_addresses = HashSet::new();
             for c in &selected {
                 if !c.is_mss { final_addresses.insert(c.address.clone()); }
@@ -779,97 +819,105 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
                 }
             }
 
-            // Step 5: Fee estimation
+            // STEP 5: Precise Fee Estimation.
+            // A Midstate Reveal tx is roughly 1.6KB per input (due to WOTS sigs).
+            // We calculate the exact required fee based on the mempool's price-per-KB.
             let mut num_outputs = decompose_value(send_amount).len();
-            let final_change = total.saturating_sub(send_amount).saturating_sub(target_fee);
-            num_outputs += decompose_value(final_change).len();
+            let final_change_val = total.saturating_sub(send_amount).saturating_sub(target_fee);
+            num_outputs += decompose_value(final_change_val).len();
 
             let estimated_bytes = 100 + (selected.len() as u64 * 1636) + (num_outputs as u64 * 100);
             let required_fee = (estimated_bytes * 10) / 1024 + 10;
 
             if total >= send_amount + required_fee {
-                final_fee = required_fee;
+                // SELECTION SUCCESSFUL.
+                let final_fee = required_fee;
                 let actual_change = total - send_amount - final_fee;
+                let mut final_outputs = Vec::new();
 
-                // Build recipient outputs
+                // 1. Build recipient outputs. 
+                // We use random salts for the recipient to maximize their privacy.
                 for denom in decompose_value(send_amount) {
                     let mut salt = [0u8; 32];
                     getrandom_02::getrandom(&mut salt).unwrap();
-                    final_outputs.push(JsOutput { address: recipient_hex.clone(), value: denom, salt: hex::encode(salt) });
+                    final_outputs.push(JsOutput { 
+                        address: recipient_hex.clone(), 
+                        value: denom, 
+                        salt: hex::encode(salt) 
+                    });
                 }
 
-                // Build change outputs (sent back to the first selected address)
-                let change_address = selected.first()
-                    .map(|c| c.address.clone())
-                    .unwrap_or_else(|| recipient_hex.clone());
-
-
+                // 2. Build change outputs with DETERMINISTIC addresses and salts.
+                // This is vital: if change went back to the input address, it would 
+                // break WOTS security. If change used random salts, it couldn't 
+                // be recovered from a seed phrase.
+                let mut current_wots_idx = next_wots_index;
                 for denom in decompose_value(actual_change) {
-                    let mut salt = [0u8; 32];
-                    getrandom_02::getrandom(&mut salt).unwrap();
+                    // Derive a unique, fresh address for every change coin.
+                    let change_seed = derive_wots_seed(&self.master_seed, current_wots_idx as u64);
+                    let change_addr = compute_address(&wots::keygen(&change_seed));
+                    
+                    // Derive a salt tied to the seed phrase index.
+                    let salt = derive_deterministic_salt(&self.master_seed, current_wots_idx as u64);
+
                     final_outputs.push(JsOutput {
-                        address: change_address.clone(),
+                        address: hex::encode(change_addr),
                         value: denom,
                         salt: hex::encode(salt)
                     });
+                    current_wots_idx += 1;
                 }
-                final_selected = selected;
-                break;
+
+                // SHUFFLE: Randomize output order so an observer cannot tell 
+                // which output is the payment and which is the change.
+                use rand::seq::SliceRandom;
+                final_outputs.shuffle(&mut rand::thread_rng());
+
+                // Construct the commitment payload.
+                let mut input_coin_ids = Vec::new();
+                for inp in &selected {
+                    let mut buf = [0u8; 32];
+                    hex::decode_to_slice(&inp.coin_id, &mut buf).unwrap();
+                    input_coin_ids.push(buf);
+                }
+
+                let mut output_hashes = Vec::new();
+                for out in &final_outputs {
+                    let addr_bytes = parse_address_wasm(&out.address)?;
+                    let mut salt_bytes = [0u8; 32];
+                    hex::decode_to_slice(&out.salt, &mut salt_bytes).unwrap();
+                    output_hashes.push(compute_coin_id(&addr_bytes, out.value, &salt_bytes));
+                }
+
+                // Generate a random transaction salt to prevent rainbow-table 
+                // attacks on the mempool commitment.
+                let mut tx_salt = [0u8; 32];
+                getrandom_02::getrandom(&mut tx_salt).unwrap();
+                
+                // The commitment blinds the transaction until the PoW is mined.
+                let commitment = compute_commitment(&input_coin_ids, &output_hashes, &tx_salt);
+
+                // Package the context for return to the worker.
+                let ctx = SpendContext {
+                    selected_inputs: selected,
+                    outputs: final_outputs,
+                    commit_payload: serde_json::json!({
+                        "coins": input_coin_ids.iter().map(hex::encode).collect::<Vec<_>>(),
+                        "destinations": output_hashes.iter().map(hex::encode).collect::<Vec<_>>()
+                    }),
+                    tx_salt: hex::encode(tx_salt),
+                    commitment: hex::encode(commitment),
+                    fee: final_fee,
+                    next_wots_index: current_wots_idx, // Bumped counter for next derivation
+                };
+
+                return Ok(serde_json::to_string(&ctx).unwrap());
             } else {
-                // Fee was underestimated — increase and retry selection
+                // If the selected coins didn't cover the amount + the new, larger 
+                // fee estimate, update the target and re-run the selection.
                 target_fee = required_fee;
             }
         }
-
-        // Shuffle outputs for privacy (prevents position-based fingerprinting)
-        use rand::seq::SliceRandom;
-        let mut rng = rand::thread_rng();
-        final_outputs.shuffle(&mut rng);
-
-        // Compute commitment hash
-        let mut input_coin_ids = Vec::new();
-        for inp in &final_selected {
-            let mut buf = [0u8; 32];
-            if let Ok(decoded) = hex::decode(&inp.coin_id) {
-                if decoded.len() >= 32 { buf.copy_from_slice(&decoded[0..32]); }
-            }
-            input_coin_ids.push(buf);
-        }
-
-        let mut output_hashes = Vec::new();
-        for out in &final_outputs {
-            // Safely parse the address, verifying the checksum if it's 72 chars
-            let addr_bytes = parse_address_wasm(&out.address)?;
-
-            let mut salt_bytes = [0u8; 32];
-            hex::decode_to_slice(&out.salt, &mut salt_bytes)
-                .map_err(|_| JsValue::from_str("Invalid salt hex format."))?;
-                
-            output_hashes.push(compute_coin_id(&addr_bytes, out.value, &salt_bytes));
-        }
-
-        let mut tx_salt = [0u8; 32];
-        getrandom_02::getrandom(&mut tx_salt).unwrap();
-
-        let commitment = compute_commitment(&input_coin_ids, &output_hashes, &tx_salt);
-        let dest_hashes: Vec<String> = output_hashes.iter().map(hex::encode).collect();
-
-        let commit_payload = serde_json::json!({
-            "coins": final_selected.iter().map(|i| i.coin_id.clone()).collect::<Vec<_>>(),
-            "destinations": dest_hashes
-        });
-
-        let ctx = SpendContext {
-            selected_inputs: final_selected,
-            outputs: final_outputs,
-            commit_payload,
-            tx_salt: hex::encode(tx_salt),
-            commitment: hex::encode(commitment),
-            fee: final_fee,
-            next_wots_index,
-        };
-
-        Ok(serde_json::to_string(&ctx).unwrap())
     }
 
     /// Build the reveal payload (inputs + signatures + outputs) for a committed transaction.

@@ -444,6 +444,12 @@ export class WebWallet {
      * - `"Insufficient funds."` — UTXO values don't cover amount + fee.
      * - `"MSS signing key not loaded."` — an MSS-backed UTXO's tree is missing.
      *   The user should run a Network Sync to trigger cache loading.
+     * Selects coins and builds a transaction for a specified send amount.
+     *
+     * This is a complex state-machine loop that balances three competing goals:
+     * 1. Security: Strictly enforcing the "One-Time Signature" (WOTS) co-spend rule.
+     * 2. Efficiency: Consolidating fragmented UTXOs into larger denominations (Snowball Merge).
+     * 3. Restorability: Ensuring all change coins are discoverable from the seed phrase.
      * @param {string} available_utxos_json
      * @param {string} to_address_hex
      * @param {bigint} send_amount

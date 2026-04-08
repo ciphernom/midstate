@@ -101,8 +101,10 @@ impl LightPeerState {
 
     fn current_expensive_limit(&self) -> u32 {
         let probability_honest = self.alpha as f32 / (self.alpha + self.beta) as f32;
-        if probability_honest < 0.2 { return 1; }
-        (2.0 + (20.0 * probability_honest)) as u32
+        if probability_honest < 0.2 { return 5; }
+        // Base 20, max 200. A new peer (0.5 prob) gets 120 requests per minute.
+        // 120 requests * 1000 blocks = 120,000 blocks synced per minute over WebRTC.
+        (20.0 + (200.0 * probability_honest)) as u32
     }
 
     /// Reset counters if the window has elapsed.
@@ -627,14 +629,24 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
             .filter_map(|a| {
                 // Only include webrtc-direct addresses
                 if !a.to_string().contains("webrtc-direct") { return None; }
-                // If we know our external IP, substitute it in
+                
+                let a_str = a.to_string();
                 if let Some(ip) = external_ip {
                     let replaced = replace_ip(a, ip);
-                    Some(replaced.with(p2p_suffix.clone()).to_string())
+                    let rep_str = replaced.to_string();
+                    if rep_str.contains("/p2p/") {
+                        Some(rep_str)
+                    } else {
+                        Some(replaced.with(p2p_suffix.clone()).to_string())
+                    }
                 } else {
                     // Fall back to non-localhost listen addrs
                     if is_localhost(a) { return None; }
-                    Some(a.clone().with(p2p_suffix.clone()).to_string())
+                    if a_str.contains("/p2p/") {
+                        Some(a_str)
+                    } else {
+                        Some(a.clone().with(p2p_suffix.clone()).to_string())
+                    }
                 }
             })
             .collect();
@@ -657,9 +669,13 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     if is_localhost(addr) {
                         continue;
                     }
-                    let full = addr.clone()
-                        .with(libp2p::multiaddr::Protocol::P2p(*peer));
-                    addrs.push(full.to_string());
+                    let a_str = addr.to_string();
+                    if a_str.contains("/p2p/") {
+                        addrs.push(a_str);
+                    } else {
+                        let full = addr.clone().with(libp2p::multiaddr::Protocol::P2p(*peer));
+                        addrs.push(full.to_string());
+                    }
                 }
             }
         }
@@ -1036,7 +1052,12 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     
                     // --- BAYESIAN ECLIPSE DEFENSE ---
                     // Construct the full PEX address string to pass to the node
-                    let full_addr = remote_addr.clone().with(libp2p::multiaddr::Protocol::P2p(peer_id)).to_string();
+                    let remote_str = remote_addr.to_string();
+                    let full_addr = if remote_str.contains("/p2p/") {
+                        remote_str
+                    } else {
+                        remote_addr.clone().with(libp2p::multiaddr::Protocol::P2p(peer_id)).to_string()
+                    };
                     
                     return NetworkEvent::PeerConnected(peer_id, full_addr);
                 }
