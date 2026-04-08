@@ -1215,13 +1215,13 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                     *handle.mempool_txs.write().await = self.mempool.transactions_cloned();
                     *handle.peer_addrs.write().await = self.network.peer_addrs();
                     
-                    // --- NEW: WebRTC Load Shedding ---
+                    // --- WebRTC Load Shedding ---
                     let mut webrtc_list = self.network.advertisable_addrs();
-                    let community_addrs = self.network.pex_addrs(); // Gets up to 50 known peers
+                    let community_addrs = self.network.pex_addrs(); 
                     
                     for addr in community_addrs {
-                        // Only share WebRTC addresses with the light client
-                        if addr.contains("webrtc-direct") && !webrtc_list.contains(&addr) {
+                        // CRITICAL: Must contain certhash or the browser multiaddr parser will crash!
+                        if addr.contains("webrtc-direct") && addr.contains("certhash") && !webrtc_list.contains(&addr) {
                             webrtc_list.push(addr);
                         }
                     }

@@ -185,7 +185,8 @@ export class LightClient {
     async connectTo(addrStr) {
         try {
             const ma = multiaddr(addrStr);
-            const conn = await this.node.dial(ma);
+            // FIX: Add a 5-second timeout so it doesn't hang on firewalled community peers
+            const conn = await this.node.dial(ma, { signal: AbortSignal.timeout(5000) });
             console.log('[light] Dialed:', addrStr);
             return conn;
         } catch (e) {
