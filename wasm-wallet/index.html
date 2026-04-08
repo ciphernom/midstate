@@ -1757,10 +1757,15 @@ async function connectWebRTC(bootstrapAddr) {
                 // ─── Mining Messages ─────────────────────────────
                 case 'TEMPLATE_READY':
                     if (payload && isMiningActive) {
-                        currentTemplate = payload;
-                        if (payload.chainHeight !== lastTemplateHeight) {
-                            lastTemplateHeight = payload.chainHeight;
-                            log(`Template received (height ${payload.chainHeight}). Broadcasting to ${miners.length} miners...`);
+                        // FIX: Check if the midstate changed (captures new blocks AND new mempool txs).
+                        // Only update currentTemplate if we are actually broadcasting it to the miners!
+                        if (payload.mining_midstate !== currentTemplate?.mining_midstate) {
+                            currentTemplate = payload;
+                            lastTemplateHeight = payload.chainHeight; // Keep for UI tracking
+                            
+                            const txCount = payload.batch_template.transactions?.length || 0;
+                            log(`Template updated (height ${payload.chainHeight}, ${txCount} txs). Broadcasting to ${miners.length} miners...`);
+                            
                             broadcastToMiners(payload.mining_midstate, payload.target);
                         }
                     } else if (!payload && isMiningActive) {
