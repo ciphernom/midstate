@@ -18,10 +18,10 @@ const MIX_SESSION_TIMEOUT: u64 = 300;
 /// Maximum concurrent mix sessions per node.
 const MAX_MIX_SESSIONS: usize = 16;
 
-/// 24 bits ≈ 16M BLAKE3 hashes ≈ 5-10s on modern hardware.
+/// 30 bits ≈ 1 Billion BLAKE3 hashes ≈ 1 to 3 seconds on modern hardware.
 /// Combined with PeerId binding, prevents costless Sybil flooding
-/// of CoinJoin sessions with rotating PeerIds.
-pub const MIX_JOIN_POW_BITS: u32 = 24;
+/// of CoinJoin sessions with rotating PeerIds. 
+pub const MIX_JOIN_POW_BITS: u32 = 30;
 
 /// Verify the PoW accompanying a MixJoin or MixFee message.
 /// The challenge is: hash(mix_id || coin_id || peer_id || nonce_le)

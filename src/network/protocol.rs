@@ -6,7 +6,7 @@ use std::io;
 use async_trait::async_trait;
 
 pub const MAX_GETBATCHES_COUNT: u64 = 250;  // heavy, OOM risk
-pub const MAX_GETHEADERS_COUNT: u64 = 8000; // lightweight, ~1.6MB max
+pub const MAX_GETHEADERS_COUNT: u64 = 500; // lightweight, ~1.6MB max
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Message {
