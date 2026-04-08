@@ -1316,35 +1316,43 @@ if ('serviceWorker' in navigator) {
 async function connectWebRTC(bootstrapAddr) {
             updateWebRTCStatus('connecting');
             try {
-                // --- NEW: Fetch the dynamic WebRTC address from the node ---
                 let actualWebrtcAddr = bootstrapAddr;
                 
                 try {
-                    // Extract the IP from the multiaddr (e.g., "/ip4/134.199.148.215/...")
                     const parts = bootstrapAddr.split('/');
                     if (parts[1] === 'ip4' || parts[1] === 'ip6') {
                         const ip = parts[2];
                         const rpcPort = 8545; // Default Midstate RPC port
                         
-                        log(`[light] Fetching dynamic WebRTC certhash from http://${ip}:${rpcPort}/state...`);
+                        log(`[light] Fetching dynamic WebRTC peers from http://${ip}:${rpcPort}/state...`);
                         
-                        // Fetch the state (with a 3-second timeout so it doesn't hang forever)
                         const resp = await fetch(`http://${ip}:${rpcPort}/state`, { 
                             signal: AbortSignal.timeout(3000) 
                         });
                         const state = await resp.json();
                         
-                        // Find the address containing 'webrtc-direct'
-                        const webrtcAddr = state.webrtc_addrs.find(a => a.includes('webrtc-direct'));
-                        if (webrtcAddr) {
-                            actualWebrtcAddr = webrtcAddr;
-                            log(`[light] Found active WebRTC address: ${actualWebrtcAddr}`);
+                        // Filter for valid WebRTC addresses
+                        const webrtcAddrs = state.webrtc_addrs.filter(a => a.includes('webrtc-direct') && a.includes('certhash'));
+                        
+                        if (webrtcAddrs.length > 0) {
+                            actualWebrtcAddr = webrtcAddrs[0];
+                            
+                            // FIX: If the node advertises 0.0.0.0, replace it with the real IP we just connected to
+                            if (actualWebrtcAddr.includes('/ip4/0.0.0.0/') || actualWebrtcAddr.includes('/ip4/127.0.0.1/')) {
+                                actualWebrtcAddr = actualWebrtcAddr.replace(/\/ip4\/[^\/]+/, `/ip4/${ip}`);
+                            }
+                            
+                            // Add community peers as failovers
+                            if (lightClient) {
+                                for (let i = 1; i < webrtcAddrs.length; i++) {
+                                    lightClient.knownMultiaddrs.add(webrtcAddrs[i]);
+                                }
+                            }
                         }
                     }
                 } catch (fetchErr) {
-                    log(`[light] Could not fetch dynamic WebRTC address: ${fetchErr.message}. Trying original address...`, 'var(--yellow)');
+                    log(`[light] Could not fetch peer list: ${fetchErr.message}. Trying original address...`, 'var(--yellow)');
                 }
-                // -----------------------------------------------------------
 
                 if (lightClient) { await lightClient.stop(); lightClient = null; }
                 lightClient = await createLightClient();
@@ -1359,7 +1367,6 @@ async function connectWebRTC(bootstrapAddr) {
                     }
                 });
                 
-                // Use the dynamically fetched address instead of the hardcoded one!
                 await lightClient.start(actualWebrtcAddr);
                 
             } catch (e) {
