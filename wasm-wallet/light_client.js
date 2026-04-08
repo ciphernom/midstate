@@ -142,10 +142,10 @@ export class LightClient {
         this._onStatusChange = null;       // callback: (status) => void
     }
 
-    /// Start the libp2p node and connect to a bootstrap peer.
+    /// Start the libp2p node and connect to a bootstrap peer list.
     ///
-    /// bootstrapAddr: string like "/ip4/203.0.113.10/udp/9335/webrtc-direct/certhash/uEi..."
-    async start(bootstrapAddr) {
+    /// addrs: Array of multiaddr strings
+    async start(addrs) {
         this.node = await createLibp2p({
             transports: [webRTCDirect()],
             connectionEncrypters: [noise()],
@@ -174,25 +174,36 @@ export class LightClient {
             }
         });
 
-        // Connect to bootstrap
-        if (bootstrapAddr) {
-            this.knownMultiaddrs.add(bootstrapAddr);
-            await this.connectTo(bootstrapAddr);
+        // Try connecting to the provided addresses in order
+        if (addrs && addrs.length > 0) {
+            for (const addr of addrs) {
+                this.knownMultiaddrs.add(addr);
+            }
+            
+            let connected = false;
+            for (const addr of addrs) {
+                try {
+                    await this.connectTo(addr);
+                    connected = true;
+                    break; // Stop at the first successful connection
+                } catch (e) {
+                    console.warn('[light] Skipping unreachable peer:', addr);
+                }
+            }
+            
+            if (!connected) {
+                throw new Error("Could not connect to any WebRTC peers");
+            }
         }
     }
 
-    /// Connect to a specific multiaddr.
+    /// Connect to a specific multiaddr with a 5-second timeout.
     async connectTo(addrStr) {
-        try {
-            const ma = multiaddr(addrStr);
-            // FIX: Add a 5-second timeout so it doesn't hang on firewalled community peers
-            const conn = await this.node.dial(ma, { signal: AbortSignal.timeout(5000) });
-            console.log('[light] Dialed:', addrStr);
-            return conn;
-        } catch (e) {
-            console.warn('[light] Failed to dial', addrStr, e.message);
-            throw e;
-        }
+        const ma = multiaddr(addrStr);
+        // AbortSignal.timeout ensures we don't hang forever on firewalled peers
+        const conn = await this.node.dial(ma, { signal: AbortSignal.timeout(5000) });
+        console.log('[light] Dialed:', addrStr);
+        return conn;
     }
 
     /// Send a JSON request over the light protocol and return the parsed response.

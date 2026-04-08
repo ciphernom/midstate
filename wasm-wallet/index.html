@@ -1316,7 +1316,8 @@ if ('serviceWorker' in navigator) {
 async function connectWebRTC(bootstrapAddr) {
             updateWebRTCStatus('connecting');
             try {
-                let actualWebrtcAddr = bootstrapAddr;
+                // Default to just the VPS if the fetch fails
+                let dialList = [bootstrapAddr]; 
                 
                 try {
                     const parts = bootstrapAddr.split('/');
@@ -1331,27 +1332,31 @@ async function connectWebRTC(bootstrapAddr) {
                         });
                         const state = await resp.json();
                         
-                        // Filter for valid WebRTC addresses
-                        const webrtcAddrs = state.webrtc_addrs.filter(a => a.includes('webrtc-direct') && a.includes('certhash'));
+                        // Filter for valid WebRTC addresses with certhashes
+                        const webrtcAddrs = (state.webrtc_addrs || []).filter(a => a.includes('webrtc-direct') && a.includes('certhash'));
                         
                         if (webrtcAddrs.length > 0) {
-                            actualWebrtcAddr = webrtcAddrs[0];
+                            // The first address returned by the node is its own (your VPS)
+                            let vpsAddr = webrtcAddrs[0];
                             
-                            // FIX: If the node advertises 0.0.0.0, replace it with the real IP we just connected to
-                            if (actualWebrtcAddr.includes('/ip4/0.0.0.0/') || actualWebrtcAddr.includes('/ip4/127.0.0.1/')) {
-                                actualWebrtcAddr = actualWebrtcAddr.replace(/\/ip4\/[^\/]+/, `/ip4/${ip}`);
+                            // Fix the 0.0.0.0 issue by swapping in the real IP
+                            if (vpsAddr.includes('/ip4/0.0.0.0/') || vpsAddr.includes('/ip4/127.0.0.1/')) {
+                                vpsAddr = vpsAddr.replace(/\/ip4\/[^\/]+/, `/ip4/${ip}`);
                             }
                             
-                            // Add community peers as failovers
-                            if (lightClient) {
-                                for (let i = 1; i < webrtcAddrs.length; i++) {
-                                    lightClient.knownMultiaddrs.add(webrtcAddrs[i]);
-                                }
-                            }
+                            // The remaining addresses belong to the community
+                            let communityAddrs = webrtcAddrs.slice(1);
+                            
+                            // Shuffle the community peers so users don't all hammer the same node
+                            communityAddrs.sort(() => Math.random() - 0.5);
+                            
+                            // Build the prioritized dialing list: 
+                            // 1. Random Community Peers -> 2. VPS -> 3. HTTPS (implied if all fail)
+                            dialList = [...communityAddrs, vpsAddr];
                         }
                     }
                 } catch (fetchErr) {
-                    log(`[light] Could not fetch peer list: ${fetchErr.message}. Trying original address...`, 'var(--yellow)');
+                    log(`[light] Could not fetch peer list: ${fetchErr.message}. Trying VPS directly...`, 'var(--yellow)');
                 }
 
                 if (lightClient) { await lightClient.stop(); lightClient = null; }
@@ -1367,7 +1372,8 @@ async function connectWebRTC(bootstrapAddr) {
                     }
                 });
                 
-                await lightClient.start(actualWebrtcAddr);
+                // Pass the prioritized array to the light client
+                await lightClient.start(dialList);
                 
             } catch (e) {
                 log(`[light] WebRTC connect error: ${e.message}`, 'var(--red)');
