@@ -1208,16 +1208,25 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                     });
                 }
                 _ = ui_interval.tick() => {
-                    // safe_depth is already computed inline after each observe_honest()
-                    // call and stored in self.cached_safe_depth. We just push it to the
-                    // handle here so both state and safe_depth are always coherent.
                     let current_safe_depth = self.cached_safe_depth;
                     *handle.state.write().await = self.state.clone();
                     *handle.safe_depth.write().await = current_safe_depth;
                     *handle.mempool_size.write().await = self.mempool.len();
                     *handle.mempool_txs.write().await = self.mempool.transactions_cloned();
                     *handle.peer_addrs.write().await = self.network.peer_addrs();
-                    *handle.webrtc_addrs.write().await = self.network.advertisable_addrs();  
+                    
+                    // --- NEW: WebRTC Load Shedding ---
+                    let mut webrtc_list = self.network.advertisable_addrs();
+                    let community_addrs = self.network.pex_addrs(); // Gets up to 50 known peers
+                    
+                    for addr in community_addrs {
+                        // Only share WebRTC addresses with the light client
+                        if addr.contains("webrtc-direct") && !webrtc_list.contains(&addr) {
+                            webrtc_list.push(addr);
+                        }
+                    }
+                    *handle.webrtc_addrs.write().await = webrtc_list;  
+                    // ---------------------------------
                 }
                 _ = metrics_interval.tick() => {
                     self.metrics.report();
