@@ -97,6 +97,7 @@ enum SyncPhase {
         new_history: Vec<(u64, [u8; 32], Batch)>,
         is_fast_forward: bool,
     },
+    VerifyingBatches,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -218,6 +219,20 @@ pub enum NodeCommand {
     SendMixSign { coordinator: PeerId, mix_id: [u8; 32], input_index: usize, signature: Vec<u8> },
     BroadcastMixProposal { mix_id: [u8; 32], proposal: crate::wallet::coinjoin::MixProposal, peers: Vec<PeerId> },
     FinishSyncHeaders { peer: PeerId, headers: Vec<BatchHeader>, is_valid: bool, snapshot: Option<Box<State>>, fork_height: u64, candidate_state: Option<Box<State>>, is_fast_forward: bool },
+    FinishSyncBatchesChunk {
+        peer: PeerId,
+        headers: Vec<BatchHeader>,
+        fork_height: u64,
+        candidate_state: Box<State>,
+        cursor: u64,
+        new_history: Vec<(u64, [u8; 32], Batch)>,
+        is_fast_forward: bool,
+        is_valid: bool,
+        error_msg: String,
+        session_started_at: std::time::Instant,
+        peer_height: u64,
+        peer_depth: u128,
+    },
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -754,6 +769,100 @@ pub async fn new(
         })
     }
 
+async fn process_verified_batches_chunk(
+        &mut self,
+        from: PeerId,
+        headers: Vec<BatchHeader>,
+        fork_height: u64,
+        candidate_state: Box<State>,
+        current_cursor: u64,
+        mut new_history: Vec<(u64, [u8; 32], Batch)>,
+        is_fast_forward: bool,
+        is_valid: bool,
+        error_msg: String,
+        session_started_at: std::time::Instant,
+        peer_height: u64,
+        peer_depth: u128,
+    ) -> Result<()> {
+        // Remove the VerifyingBatches placeholder the spawn set.
+        self.sync_session.take();
+
+        if !is_valid {
+            tracing::warn!("Batch at height {} does not match verified header PoW — peer has corrupt data, trying different peer", current_cursor);
+            tracing::warn!("{}", error_msg);
+            // Save cursor so we restart from here, not from height - 360
+            self.last_sync_cursor = Some(current_cursor.saturating_sub(1));
+            self.abort_sync_session("peer sent corrupt batch");
+            return Ok(());
+        }
+
+        tracing::info!("Applied sync batches up to height {}/{}", current_cursor, peer_height);
+
+        // FAT FORK DEFENSE: If we are doing a fast-forward sync, we don't need to 
+        // hold the entire chain in RAM waiting for a reorg conflict to resolve. 
+        // We can commit the chunk immediately to clear RAM.
+        if is_fast_forward && new_history.len() >= 500 {
+            tracing::info!("Flushing 500 synced batches to disk to free RAM...");
+            let history_to_flush = std::mem::take(&mut new_history);
+            self.perform_reorg(*candidate_state.clone(), history_to_flush, true)?;
+        }
+
+        if current_cursor < peer_height {
+            // Need more batches — request next chunk
+            let count = (peer_height - current_cursor).min(MAX_GETBATCHES_COUNT);
+            self.network.send(from, Message::GetBatches { start_height: current_cursor, count });
+            
+            // Re-arm the session back into the Batches phase
+            self.sync_session = Some(SyncSession {
+                peer: from,
+                peer_height,
+                peer_depth,
+                phase: SyncPhase::Batches {
+                    headers,
+                    fork_height,
+                    candidate_state: *candidate_state,
+                    cursor: current_cursor,
+                    new_history,
+                    is_fast_forward,
+                },
+                started_at: session_started_at,
+                last_progress_at: std::time::Instant::now(),
+            });
+            return Ok(());
+        }
+
+        // All batches applied — check if we should adopt this chain
+        if candidate_state.depth > self.state.depth
+            || (candidate_state.depth == self.state.depth && candidate_state.midstate < self.state.midstate)
+        {
+            tracing::info!(
+                "✓ Sync complete! Adopting chain: height {} -> {}, depth {} -> {}",
+                self.state.height, candidate_state.height,
+                self.state.depth, candidate_state.depth
+            );
+            self.perform_reorg(*candidate_state, new_history, is_fast_forward)?;
+            self.try_apply_orphans().await;
+        } else {
+            tracing::info!(
+                "Sync complete but peer chain has less work (depth {} <= {}), keeping ours",
+                candidate_state.depth, self.state.depth
+            );
+        }
+
+        self.sync_in_progress = false;
+        // Sync complete — next attempt starts fresh
+        self.last_sync_cursor = None;
+
+        // Immediately check if the peer has mined more blocks while we were
+        // syncing.  Without this, we'd have to wait for the next broadcast
+        // (which will fail because we missed intermediate blocks) before
+        // discovering we're still behind — creating a catch-up death spiral
+        // where each cycle takes ~5 s and the miner advances by ~1 block.
+        self.network.send(from, Message::GetState);
+
+        Ok(())
+    }
+
 
     /// Handle a request from a browser light client over WebRTC.
     ///
@@ -1248,7 +1357,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                 _ = sync_timeout_interval.tick() => {
                     if let Some(session) = &self.sync_session {
                         // FIX: Do not timeout if the delay is caused by our own CPU verifying headers.
-                        if !matches!(session.phase, SyncPhase::VerifyingHeaders) {
+                        if !matches!(session.phase, SyncPhase::VerifyingHeaders | SyncPhase::VerifyingBatches) {
                             // Use a longer timeout if we haven't received any data yet
                             // (initial relay handshake, NAT traversal, etc.)
                             let idle_secs = session.last_progress_at.elapsed().as_secs();
@@ -1347,6 +1456,11 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                         NodeCommand::FinishSyncHeaders { peer, headers, is_valid, snapshot, fork_height, candidate_state, is_fast_forward } => {
                             if let Err(e) = self.process_verified_headers(peer, headers, is_valid, snapshot, fork_height, candidate_state, is_fast_forward).await {
                                 tracing::warn!("Failed to process verified headers: {}", e);
+                            }
+                        }
+                        NodeCommand::FinishSyncBatchesChunk { peer, headers, fork_height, candidate_state, cursor, new_history, is_fast_forward, is_valid, error_msg, session_started_at, peer_height, peer_depth } => {
+                            if let Err(e) = self.process_verified_batches_chunk(peer, headers, fork_height, candidate_state, cursor, new_history, is_fast_forward, is_valid, error_msg, session_started_at, peer_height, peer_depth).await {
+                                tracing::warn!("Error processing verified batches chunk: {}", e);
                             }
                         }
                         NodeCommand::BroadcastMixProposal { mix_id, proposal, peers } => {
@@ -2318,7 +2432,7 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
         }
 
         // Take the session to work with it
-        let mut session = match self.sync_session.take() {
+        let session = match self.sync_session.take() {
             Some(s) if s.peer == from => s,
             other => {
                 self.sync_session = other; // put it back
@@ -2326,28 +2440,35 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
             }
         };
 
-        let (headers, _fork_height, candidate_state, cursor, new_history, _is_fast_forward) = match &mut session.phase {
+        // Bind Copy fields before destructuring session, so they can be
+        // captured independently by the spawn_blocking closure.
+        let session_peer_height = session.peer_height;
+        let session_peer_depth = session.peer_depth;
+        let session_started_at = session.started_at;
+
+        let (headers, fork_height, candidate_state, cursor, new_history, is_fast_forward) = match session.phase {
             SyncPhase::Batches { headers, fork_height, candidate_state, cursor, new_history, is_fast_forward } => {
-                (headers, *fork_height, candidate_state, cursor, new_history, *is_fast_forward)
+                (headers, fork_height, candidate_state, cursor, new_history, is_fast_forward)
             }
             _ => {
-                self.sync_session = Some(session); // wrong phase, put it back
+                // Wrong phase — put it back untouched
+                self.sync_session = Some(session);
                 return Ok(());
             }
         };
 
         // Build a bounded sliding window of recent timestamps (mirrors
-        // evaluate_alternative_chain).  Both validate_timestamp and
+        // evaluate_alternative_chain). Both validate_timestamp and
         // adjust_difficulty uses ASERT anchored to genesis,
         // entries, so there is no need to collect every timestamp from genesis.
-        let window_size = DIFFICULTY_LOOKBACK as usize;
         let mut recent_ts: VecDeque<u64> = VecDeque::new();
-
+        let window_size = DIFFICULTY_LOOKBACK as usize;
+        
         // FIX: Unify start height mapping
         let header_start_height = headers.first().map(|h| h.height).unwrap_or(0);
         let start_height = cursor.saturating_sub(window_size as u64);
 
-        for h in start_height..*cursor {
+        for h in start_height..cursor {
             // 1. If we have the header in our downloaded array, use it
             if h >= header_start_height {
                 let idx = (h - header_start_height) as usize;
@@ -2367,143 +2488,115 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
             recent_ts.push_back(candidate_state.timestamp);
         }
 
-// <--- FIX: Accumulate spent addresses across the sync loop to prevent cross-block reuse bypass
-        let mut wots_oracle = std::collections::HashMap::new();
+        let tx = self.cmd_tx.as_ref().unwrap().clone();
+        let storage = self.storage.clone();
 
-        // Apply each batch, verifying against the already-validated headers
-        for batch in &batches {
-            let height = *cursor;
+        tokio::task::spawn_blocking(move || {
+            let mut candidate_state = candidate_state;
+            let mut new_history = new_history;
+            let mut cursor = cursor;
+            let mut recent_ts = recent_ts;
             
-            if height < header_start_height {
-                tracing::error!("Fatal sync error: batch height {} is below header_start_height {}. Aborting to prevent underflow.", height, header_start_height);
-                self.abort_sync_session("Batch height below header start");
-                return Ok(());
-            }
-            
-            // Map absolute height to relative array index
-            let hdr_idx = (height - header_start_height) as usize;
+            // <--- FIX: Accumulate spent addresses across the sync loop to prevent cross-block reuse bypass
+            let mut wots_oracle = std::collections::HashMap::new();
+            let mut is_valid = true;
+            let mut error_msg = String::new();
 
-            if hdr_idx >= headers.len() {
-                tracing::warn!("Batch height {} exceeds header count {}", height, headers.len());
-                self.sync_in_progress = false;
-                return Ok(());
-            }
+            // Apply each batch, verifying against the already-validated headers
+            for batch in &batches {
+                let height = cursor;
 
-            let header = &headers[hdr_idx];
-
-            // Integrity: batch PoW must match the already-verified header
-            if batch.extension.final_hash != header.extension.final_hash {
-                tracing::warn!("Batch at height {} does not match verified header PoW — peer has corrupt data, trying different peer", height);
-                // Save cursor so we restart from here, not from height 10
-                self.last_sync_cursor = Some(height.saturating_sub(1));
-                self.abort_sync_session("peer sent corrupt batch");
-                return Ok(());
-            }
-            let calc = batch.header();
-            if calc.post_tx_midstate != header.post_tx_midstate {
-                // Legacy blocks mined before state_root was added have state_root = [0;32].
-                // Re-check with zeroed state_root to allow syncing pre-migration blocks.
-                let mut legacy_batch = batch.clone();
-                legacy_batch.state_root = [0u8; 32];
-                let legacy_calc = legacy_batch.header();
-                if legacy_calc.post_tx_midstate != header.post_tx_midstate {
-                    tracing::warn!("Batch at height {} tx commitment does not match header", height);
-                    self.last_sync_cursor = Some(height.saturating_sub(1));
-                    self.abort_sync_session("peer sent corrupt batch");
-                    return Ok(());
+                if height < header_start_height {
+                    error_msg = format!("Fatal sync error: batch height {} is below header_start_height {}. Aborting to prevent underflow.", height, header_start_height);
+                    is_valid = false;
+                    break;
                 }
-                // Legacy block accepted — continue with the actual batch (state_root already zeroed on disk)
+
+                // Map absolute height to relative array index
+                let hdr_idx = (height - header_start_height) as usize;
+
+                if hdr_idx >= headers.len() {
+                    error_msg = format!("Batch height {} exceeds header count {}", height, headers.len());
+                    is_valid = false;
+                    break;
+                }
+
+                let header = &headers[hdr_idx];
+
+                // Integrity: batch PoW must match the already-verified header
+                if batch.extension.final_hash != header.extension.final_hash {
+                    // Legacy blocks mined before state_root was added have state_root = [0;32].
+                    // Re-check with zeroed state_root to allow syncing pre-migration blocks.
+                    let mut legacy_batch = batch.clone();
+                    legacy_batch.state_root = [0u8; 32];
+                    let legacy_calc = legacy_batch.header();
+                    if legacy_calc.post_tx_midstate != header.post_tx_midstate {
+                        error_msg = format!("Batch at height {} tx commitment does not match header", height);
+                        is_valid = false;
+                        break;
+                    }
+                    // Legacy block accepted — continue with the actual batch (state_root already zeroed on disk)
+                }
+
+                // <--- FIX: Extract DB records and EXTEND the running memory oracle
+                if candidate_state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                    if let Ok(db_oracle) = storage.query_spent_addresses(batch) {
+                        wots_oracle.extend(db_oracle);
+                    }
+                }
+
+                // Apply to candidate state (do NOT save to disk yet — if sync
+                // aborts before the reorg is committed, premature writes would
+                // leave a Frankenstein chain on disk: some heights from the peer,
+                // some from our old chain.  Batches are persisted atomically in
+                // perform_reorg only after we decide to adopt.)
+                if let Err(e) = crate::core::state::apply_batch(
+                    &mut candidate_state,
+                    batch,
+                    recent_ts.make_contiguous(),
+                    &mut wots_oracle,
+                ) {
+                    error_msg = format!("Failed to apply batch {}: {}", height, e);
+                    is_valid = false;
+                    break;
+                }
+
+                recent_ts.push_back(batch.timestamp);
+                if recent_ts.len() > window_size {
+                    recent_ts.pop_front();
+                }
+
+                candidate_state.target = crate::core::state::adjust_difficulty(&candidate_state);
+                new_history.push((height, candidate_state.midstate, batch.clone()));
+                cursor += 1;
             }
 
-            // Apply to candidate state (do NOT save to disk yet — if sync
-            // aborts before the reorg is committed, premature writes would
-            // leave a Frankenstein chain on disk: some heights from the peer,
-            // some from our old chain.  Batches are persisted atomically in
-            // perform_reorg only after we decide to adopt.)
-            
-            // <--- FIX: Extract DB records and EXTEND the running memory oracle, 
-            if candidate_state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
-                let db_oracle = self.storage.query_spent_addresses(batch).unwrap_or_default();
-                wots_oracle.extend(db_oracle);
-            }
-            
-            apply_batch(candidate_state, batch, recent_ts.make_contiguous(), &mut wots_oracle)?;
+            let _ = tx.send(NodeCommand::FinishSyncBatchesChunk {
+                peer: from,
+                headers,
+                fork_height,
+                candidate_state: Box::new(candidate_state),
+                cursor,
+                new_history,
+                is_fast_forward,
+                is_valid,
+                error_msg,
+                session_started_at,
+                peer_height: session_peer_height,
+                peer_depth: session_peer_depth,
+            });
+        });
 
-            recent_ts.push_back(batch.timestamp);
-            if recent_ts.len() > window_size {
-                recent_ts.pop_front();
-            }
-            
-            candidate_state.target = adjust_difficulty(&candidate_state);
-            new_history.push((height, candidate_state.midstate, batch.clone()));
-            *cursor += 1;
-            tokio::task::yield_now().await;
-        }
-
-        let current_cursor = *cursor;
-        let peer_height = session.peer_height;
-
-        tracing::info!("Applied sync batches up to height {}/{}", current_cursor, peer_height);
-
-// FAT FORK DEFENSE: If we are doing a fast-forward sync, we don't need to 
-        // hold the entire chain in RAM waiting for a reorg conflict to resolve. 
-        // We can commit the chunk immediately to clear RAM.
-        let mut session_phase = session.phase;
-        if let SyncPhase::Batches { is_fast_forward: true, new_history, candidate_state, .. } = &mut session_phase {
-            if new_history.len() >= 500 {
-                tracing::info!("Flushing 500 synced batches to disk to free RAM...");
-                let history_to_flush = std::mem::take(new_history);
-                self.perform_reorg(candidate_state.clone(), history_to_flush, true)?;
-            }
-        }
-
-        if current_cursor < peer_height {
-            // Need more batches — request next chunk
-            let count = (peer_height - current_cursor).min(MAX_GETBATCHES_COUNT);
-            self.network.send(from, Message::GetBatches { start_height: current_cursor, count });
-            session.last_progress_at = std::time::Instant::now();
-            session.phase = session_phase;
-            self.sync_session = Some(session); 
-            return Ok(());
-        }
-        
-        // Restore phase for the final block
-        session.phase = session_phase;
-
-        // All batches applied — check if we should adopt this chain
-        let (final_state, final_history, is_ff) = match session.phase {
-            SyncPhase::Batches { candidate_state, new_history, is_fast_forward, .. } => {
-                (candidate_state, new_history, is_fast_forward)
-            }
-            _ => unreachable!(),
-        };
-
-        if final_state.depth > self.state.depth
-            || (final_state.depth == self.state.depth && final_state.midstate < self.state.midstate)
-        {
-            tracing::info!(
-                "✓ Sync complete! Adopting chain: height {} -> {}, depth {} -> {}",
-                self.state.height, final_state.height,
-                self.state.depth, final_state.depth
-            );
-            self.perform_reorg(final_state, final_history, is_ff)?;
-            self.try_apply_orphans().await;
-        } else {
-            tracing::info!(
-                "Sync complete but peer chain has less work (depth {} <= {}), keeping ours",
-                final_state.depth, self.state.depth
-            );
-        }
-
-        self.sync_in_progress = false;
-        self.last_sync_cursor = None; // Sync complete — next attempt starts fresh
-
-        // Immediately check if the peer has mined more blocks while we were
-        // syncing.  Without this, we'd have to wait for the next broadcast
-        // (which will fail because we missed intermediate blocks) before
-        // discovering we're still behind — creating a catch-up death spiral
-        // where each cycle takes ~5 s and the miner advances by ~1 block.
-        self.network.send(from, Message::GetState);
+        // Set a placeholder phase so the timeout guard knows work is in flight
+        // and the event loop stays alive processing other messages.
+        self.sync_session = Some(SyncSession {
+            peer: from,
+            peer_height: session_peer_height,
+            peer_depth: session_peer_depth,
+            phase: SyncPhase::VerifyingBatches,
+            started_at: session_started_at,
+            last_progress_at: std::time::Instant::now(),
+        });
 
         Ok(())
     }

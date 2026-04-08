@@ -1408,8 +1408,8 @@ async function connectWebRTC(bootstrapAddr) {
                         log('[light] WebRTC auto-connect failed. Using HTTPS.');
                     }
                 });
-                await lightClient.start(addrs[0]);
-                for (const addr of addrs.slice(1)) lightClient.knownMultiaddrs.add(addr);
+                await lightClient.start(addrs);
+
             } catch (e) {
                 log(`[light] WebRTC auto-connect error: ${e.message}`);
             }
