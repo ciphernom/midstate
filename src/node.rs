@@ -798,13 +798,14 @@ async fn process_verified_batches_chunk(
 
         tracing::info!("Applied sync batches up to height {}/{}", current_cursor, peer_height);
 
-        // FAT FORK DEFENSE: If we are doing a fast-forward sync, we don't need to 
-        // hold the entire chain in RAM waiting for a reorg conflict to resolve. 
-        // We can commit the chunk immediately to clear RAM.
-        if is_fast_forward && new_history.len() >= 500 {
-            tracing::info!("Flushing 500 synced batches to disk to free RAM...");
+        // RAM FLUSH & CHECKPOINT: We cannot hold 60,000 blocks in RAM on a Raspberry Pi.
+        // Once we have a chunk of blocks, AND the candidate chain has definitively 
+        // overtaken our local chain's work (depth), we can safely commit the progress 
+        // to disk immediately. This frees RAM (preventing OOM kills) and saves our spot.
+        if new_history.len() >= 500 && candidate_state.depth > self.state.depth {
+            tracing::info!("Checkpointing sync: Flushing {} batches to disk to free RAM...", new_history.len());
             let history_to_flush = std::mem::take(&mut new_history);
-            self.perform_reorg(*candidate_state.clone(), history_to_flush, true)?;
+            self.perform_reorg(*candidate_state.clone(), history_to_flush, is_fast_forward)?;
         }
 
         if current_cursor < peer_height {
@@ -2223,7 +2224,6 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
         let tx = self.cmd_tx.as_ref().unwrap().clone();
         let storage = self.storage.clone();
         let current_height = self.state.height;
-        let safe_depth = self.cached_safe_depth;
         let state_cache = self.state_cache.clone(); 
         let current_state = self.state.clone(); 
 
@@ -2290,12 +2290,9 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
                     
                     match syncer.find_fork_point(&all_headers, headers_start_height, current_height) {
                         Ok(fh) => {
-                            let max_reorg_depth = current_height.saturating_sub(safe_depth);
-                            if fh < max_reorg_depth {
-                                tracing::warn!("Sync fork at {} exceeds safe depth {}, aborting", fh, max_reorg_depth);
-                                is_valid = false;
-                            } else if fh == headers_start_height && headers_start_height > 0 {
-                                // Deep Fork Guard: Handled safely in main loop
+                            // Nakamoto Consensus dictates the heaviest chain always wins.
+                            // We do not bound reorgs by safe_depth, otherwise we cause permanent network splits.
+                            if fh == headers_start_height && headers_start_height > 0 {
                                 fork_height = fh;
                             } else {
                                 fork_height = fh;
@@ -2883,10 +2880,8 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
             self.state.clone()
         } else if fork_height == 0 {
             State::genesis().0
-        } else if fork_height <= self.state.height.saturating_sub(self.finality.calculate_safe_depth(1e-6)) {
-            tracing::warn!("Fork at {} exceeds statistical safe depth, rejecting", fork_height);
-            return Ok(None);
         } else {
+            // Pre-check: can the alternative chain's work possibly beat ours?
             // Pre-check: can the alternative chain's work possibly beat ours?
             // Compare the work in our chain from fork_height..tip against the
             // alternative's theoretical maximum. This is O(N) integer math on
