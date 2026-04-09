@@ -219,6 +219,7 @@ pub enum NodeCommand {
     SendMixSign { coordinator: PeerId, mix_id: [u8; 32], input_index: usize, signature: Vec<u8> },
     BroadcastMixProposal { mix_id: [u8; 32], proposal: crate::wallet::coinjoin::MixProposal, peers: Vec<PeerId> },
     FinishSyncHeaders { peer: PeerId, headers: Vec<BatchHeader>, is_valid: bool, snapshot: Option<Box<State>>, fork_height: u64, candidate_state: Option<Box<State>>, is_fast_forward: bool },
+    FinishSyncHeadersChunk { peer: PeerId, headers: Vec<BatchHeader>, is_valid: bool },
     FinishSyncBatchesChunk {
         peer: PeerId,
         headers: Vec<BatchHeader>,
@@ -1431,7 +1432,11 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                             // any good peers, OR if we have 0 outbound connections (total eclipse), 
                             // fall back to the hardcoded bootstrap peers.
                             if current_outbound == 0 || dialed == 0 {
-                                tracing::warn!("Eclipse Defense: Outbound connections critically low. Dialing bootstrap peers.");
+                                if self.network.peer_count() == 0 {
+                                    tracing::warn!("Eclipse Defense: Outbound connections critically low. Dialing bootstrap peers.");
+                                } else {
+                                    tracing::debug!("Outbound connections low ({} inbound). Dialing bootstrap peers.", self.network.peer_count());
+                                }
                                 for addr in &self.bootstrap_peers {
                                     self.network.dial_addr(addr);
                                 }
@@ -1474,6 +1479,11 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                         NodeCommand::FinishSyncHeaders { peer, headers, is_valid, snapshot, fork_height, candidate_state, is_fast_forward } => {
                             if let Err(e) = self.process_verified_headers(peer, headers, is_valid, snapshot, fork_height, candidate_state, is_fast_forward).await {
                                 tracing::warn!("Failed to process verified headers: {}", e);
+                            }
+                        }
+                        NodeCommand::FinishSyncHeadersChunk { peer, headers, is_valid } => {
+                            if let Err(e) = self.process_verified_headers_chunk(peer, headers, is_valid).await {
+                                tracing::warn!("Failed to process headers chunk: {}", e);
                             }
                         }
                         NodeCommand::FinishSyncBatchesChunk { peer, headers, fork_height, candidate_state, cursor, new_history, is_fast_forward, is_valid, error_msg, session_started_at, peer_height, peer_depth } => {
@@ -2114,7 +2124,7 @@ self.network.send(peer, Message::GetHeaders { start_height, count });
 
  pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHeader>) -> Result<()> {
         // Extract state from the session — only accept headers from the sync peer
-        let (peer_height, cursor, snapshot) = match &mut self.sync_session {
+        let (_peer_height, cursor, snapshot) = match &mut self.sync_session {
             Some(s) if s.peer == from => {
                 match &mut s.phase {
                     SyncPhase::Headers { cursor, snapshot, .. } => (s.peer_height, *cursor, snapshot.take()),
@@ -2129,42 +2139,75 @@ self.network.send(peer, Message::GetHeaders { start_height, count });
             return Ok(());
         }
 
+        // Put the snapshot back for the next iteration
+        if let Some(s) = &mut self.sync_session {
+            if let SyncPhase::Headers { snapshot: snap_ref, .. } = &mut s.phase {
+                *snap_ref = snapshot;
+            }
+        }
+
         let chunk_size = headers.len();
         let start_h = cursor;
         let end_h = cursor + chunk_size as u64 - 1;
         tracing::info!("Received headers {}..{} ({} total). Verifying Proof-of-Work...", start_h, end_h, chunk_size);
 
-        // --- NEW: PIPELINED VERIFICATION ---
-        // Verify the PoW of this specific chunk immediately as it arrives,
+        // --- NEW: NON-BLOCKING PIPELINED VERIFICATION ---
+        // Verify the PoW of this specific chunk immediately as it arrives on a background thread.
         let chunk_owned = headers.clone();
-        let chunk_valid = tokio::task::spawn_blocking(move || {
-            use rayon::prelude::*;
-            use crate::core::extension::verify_extension;
-            chunk_owned.par_iter().all(|header| {
-                verify_extension(
-                    header.post_tx_midstate,
-                    &header.extension,
-                    &header.target,
-                ).is_ok()
-            })
-        }).await.expect("Header verification task panicked");
+        let tx = self.cmd_tx.as_ref().unwrap().clone();
+        
+        tokio::spawn(async move {
+            let chunk_valid = tokio::task::spawn_blocking(move || {
+                use rayon::prelude::*;
+                use crate::core::extension::verify_extension;
+                chunk_owned.par_iter().all(|header| {
+                    verify_extension(
+                        header.post_tx_midstate,
+                        &header.extension,
+                        &header.target,
+                    ).is_ok()
+                })
+            }).await.expect("Header verification task panicked");
 
-        if !chunk_valid {
+            let _ = tx.send(NodeCommand::FinishSyncHeadersChunk {
+                peer: from,
+                headers,
+                is_valid: chunk_valid,
+            });
+        });
+        
+        if let Some(s) = &mut self.sync_session {
+            s.last_progress_at = std::time::Instant::now();
+        }
+
+        Ok(())
+    }
+
+    async fn process_verified_headers_chunk(&mut self, from: PeerId, headers: Vec<BatchHeader>, is_valid: bool) -> Result<()> {
+        let (peer_height, cursor) = match &mut self.sync_session {
+            Some(s) if s.peer == from => {
+                match &mut s.phase {
+                    SyncPhase::Headers { cursor, .. } => (s.peer_height, *cursor),
+                    _ => return Ok(()),
+                }
+            }
+            _ => return Ok(()),
+        };
+
+        if !is_valid {
             self.abort_sync_session("peer sent headers with invalid Proof-of-Work");
             self.ban_peer(from, "invalid header PoW");
             return Ok(());
         }
-        // -----------------------------------
 
-        // Accumulate headers
         let new_cursor = cursor + headers.len() as u64;
         let pct = (new_cursor as f64 / peer_height as f64) * 100.0;
         tracing::info!("✓ Verified and saved chunk. Sync progress: {}/{} ({:.1}%)", new_cursor, peer_height, pct);
+
         match &mut self.sync_session {
             Some(s) => {
-                if let SyncPhase::Headers { accumulated, cursor: c, snapshot: snap_ref } = &mut s.phase {
+                if let SyncPhase::Headers { accumulated, cursor: c, .. } = &mut s.phase {
                     
-                    // --- OOM Defense ---
                     if accumulated.len() + headers.len() > 100_000 {
                         self.abort_sync_session("Peer attempted OOM DoS with too many headers");
                         return Ok(());
@@ -2172,24 +2215,17 @@ self.network.send(peer, Message::GetHeaders { start_height, count });
                     accumulated.extend(headers);
                     *c = new_cursor;
                     
-                    // --- NEW: CRASH RECOVERY PERSISTENCE ---
                     let sync_file_path = self.data_dir.join("sync_state.bin");
                     let backup = SyncStateBackup {
                         cursor: new_cursor,
                         peer_height,
                         accumulated_headers: accumulated.clone(),
                     };
-                    // Run in background to avoid stalling the network reactor
                     tokio::task::spawn_blocking(move || {
                         if let Ok(bytes) = bincode::serialize(&backup) {
                             let _ = std::fs::write(&sync_file_path, bytes);
                         }
                     });
-                    // ---------------------------------------
-                    
-                    if snapshot.is_some() {
-                        *snap_ref = snapshot; // Put the snapshot back for the next iteration
-                    }
                 }
             }
             _ => unreachable!(),
@@ -2197,19 +2233,16 @@ self.network.send(peer, Message::GetHeaders { start_height, count });
 
         if new_cursor < peer_height {
             // Need more headers — request next chunk
-let count = MAX_GETHEADERS_COUNT.min(peer_height - new_cursor);
-self.network.send(from, Message::GetHeaders { start_height: new_cursor, count });
+            let count = MAX_GETHEADERS_COUNT.min(peer_height - new_cursor);
+            self.network.send(from, Message::GetHeaders { start_height: new_cursor, count });
 
-            //  Reset idle timeout because we are making progress
             if let Some(s) = &mut self.sync_session {
                 s.last_progress_at = std::time::Instant::now();
             }
-            // Save cursor so a timeout can resume from here rather than height-360
             self.last_sync_cursor = Some(new_cursor);
 
             return Ok(());
         }
-
 
         // All headers received — take ownership of the session data
         let session = self.sync_session.take().unwrap();
@@ -2219,7 +2252,7 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
         };
 
         let total_headers = all_headers.len(); 
-        tracing::info!("Downloaded {} headers, offloading PoW verification...", total_headers);
+        tracing::info!("Downloaded {} headers, offloading final verification...", total_headers);
 
         let tx = self.cmd_tx.as_ref().unwrap().clone();
         let storage = self.storage.clone();
@@ -2263,8 +2296,6 @@ self.network.send(from, Message::GetHeaders { start_height: new_cursor, count })
                     }
                 }
             }
-
-
 
             let mut fork_height = 0;
             let mut candidate_state = None;
