@@ -134,8 +134,7 @@ pub fn compute_coin_id(address: &[u8; 32], value: u64, salt: &[u8; 32]) -> [u8; 
      *hasher.finalize().as_bytes()
 }
 
-/// Create a confidential value commitment: Blake3(value_le || blinding_factor).
-/// The blinding_factor must be 32 bytes of cryptographic randomness.
+/// Create a state thread commitment by hashing a value or data chunk with a salt.
 pub fn compute_value_commitment(value: u64, blinding: &[u8; 32]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&value.to_le_bytes());
@@ -382,10 +381,9 @@ pub enum OutputData {
         value: u64,
         salt: [u8; 32],
     },
-    /// A confidential output whose value is hidden behind a Blake3 commitment.
-    /// Balance correctness is proven via OP_VERIFY_STARK with the
-    /// `confidential_transfer` program. The node does not perform arithmetic
-    /// balance checking — the STARK proof covers it.
+    /// A zero-value stateful output (State Thread) carrying a 32-byte data commitment.
+    /// Used to provide "memory" to scripts across transactions. Scripts can read
+    /// this value via OP_READ_INPUT_STATE.
     Confidential {
         address: [u8; 32],
         commitment: [u8; 32],
@@ -476,8 +474,8 @@ impl OutputData {
         }
     }
 
-    /// Returns the visible value. Confidential outputs return 0 —
-    /// their real value is proven via STARK, not visible on-chain.
+    /// Returns the visible value. State Thread (Confidential) outputs always 
+    /// return 0 as they are used for logic continuity rather than value transfer.
     pub fn value(&self) -> u64 {
         match self {
             OutputData::Standard { value, .. } => *value,
@@ -523,8 +521,8 @@ pub struct InputReveal {
     pub predicate: Predicate,
     pub value: u64,
     pub salt: [u8; 32],
-    /// FIX 2: For spending a Confidential UTXO, the spender must provide the
-    /// commitment hash so the node can reconstruct the correct coin_id.
+    /// For spending a State Thread (Confidential UTXO), the spender must provide 
+    /// the existing state commitment so the node can reconstruct the coin_id
     #[serde(default)]
     pub commitment: Option<[u8; 32]>,
 }
