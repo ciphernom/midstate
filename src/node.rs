@@ -1573,6 +1573,11 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                                 }
                             }
                         }
+                        NetworkEvent::RequestFailed(peer) => {
+                            if self.sync_session.as_ref().map_or(false, |s| s.peer == peer) {
+                                self.abort_sync_session("Outbound request failed (timeout or disconnected)");
+                            }
+                        }
                     }
                 }
             }
@@ -1871,6 +1876,8 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                     }
                     Err(e) => {
                         tracing::warn!("Failed to load headers: {}", e);
+                        // Send empty response to unblock requester
+                        self.send_response(channel, Message::Headers { start_height, headers: vec![] });
                     }
                 }
             }
@@ -2023,7 +2030,6 @@ Message::Headers { start_height: _, headers } => {
 fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u128, force_start: Option<u64>) {
         self.cancel_mining();
 
-        // --- NEW: CRASH RECOVERY RESTORE ---
         let sync_file_path = self.data_dir.join("sync_state.bin");
         let mut recovered_headers = Vec::new();
         let mut recovered_cursor = None;
@@ -2041,27 +2047,33 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
                 }
             }
         }
-        // -----------------------------------
+        
+        // <--- Prevent mixing old recovered headers with a fresh start
+        if force_start.is_some() {
+            recovered_headers.clear();
+            recovered_cursor = None;
+            let _ = std::fs::remove_file(&sync_file_path);
+        }
+        // --------------------------------------------------------------------
+
+        // <--- Clamp sync window to peer_height for lower-height forks
+        let effective_height = self.state.height.min(peer_height);
         
         // Prefer: explicit override > recovered_cursor > last known cursor > 360-block lookback.
         let start_height = force_start.unwrap_or_else(|| {
             recovered_cursor.unwrap_or_else(|| {
                 let base_start = self.last_sync_cursor
-                    .filter(|&c| c > self.state.height.saturating_sub(360)
-                                 && c <= self.state.height)
+                    .filter(|&c| c > effective_height.saturating_sub(360)
+                                 && c <= effective_height)
                     .unwrap_or_else(|| {
-                        if self.state.height <= 360 {
-                            self.state.height
-                        } else {
-                            self.state.height.saturating_sub(360)
-                        }
+                        effective_height.saturating_sub(360)
                     });
-                base_start.min(self.state.height)
+                base_start.min(effective_height)
             })
         });
+        // --------------------------------------------------------------------
         
-        
-        // --- FIX 3: Prevent zero-header sync traps ---
+        // Prevent zero-header sync traps
         if peer_height <= start_height {
             tracing::debug!("Peer height {} is <= our sync cursor {}, ignoring.", peer_height, start_height);
             self.sync_in_progress = false;

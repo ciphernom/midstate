@@ -296,6 +296,7 @@ pub enum NetworkEvent {
     PeerConnected(PeerId, String),
     PeerDisconnected(PeerId),
     OutgoingConnectionFailed(String),
+    RequestFailed(PeerId),
 }
 
 // ── Network API ─────────────────────────────────────────────────────────────
@@ -875,6 +876,7 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                 )) => {
                     self.pending_requests.remove(&request_id);
                     tracing::warn!("Outbound request to {} failed: {}", peer, error);
+                    return NetworkEvent::RequestFailed(peer); 
                 }
                 SwarmEvent::Behaviour(MidstateBehaviourEvent::Rr(
                     request_response::Event::InboundFailure { peer, error, .. },
