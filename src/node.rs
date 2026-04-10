@@ -1766,7 +1766,7 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                 entry.0 += 1;
                 if entry.0 > MAX_BATCH_REQS_PER_PEER {
                     tracing::debug!("Rate-limiting batch requests from peer {}", from);
-                    self.ack(channel);
+                    self.send_response(channel, Message::Batches { start_height, batches: vec![] });
                     return Ok(());
                 }
 
@@ -1851,14 +1851,14 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                 entry.0 += 1;
                 if entry.0 > MAX_HEADER_REQS_PER_PEER {
                     tracing::debug!("Rate-limiting header requests from peer {}", from);
-                    self.ack(channel);
+                    self.send_response(channel, Message::Headers { start_height, headers: vec![] });
                     return Ok(());
                 }
 
                 let count = count.min(MAX_GETHEADERS_COUNT);
                 let end = start_height.saturating_add(count).min(self.state.height + 1);
                 if end <= start_height {
-                    self.ack(channel);
+                    self.send_response(channel, Message::Headers { start_height, headers: vec![] });
                     return Ok(());
                 }
                 
@@ -2031,7 +2031,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
         if let Ok(bytes) = std::fs::read(&sync_file_path) {
             if let Ok(backup) = bincode::deserialize::<SyncStateBackup>(&bytes) {
                 // Only resume if the peer we are connecting to has a chain at least as long
-                if peer_height >= backup.peer_height {
+                if peer_height > backup.cursor {
                     tracing::info!("Recovered interrupted sync session. Resuming from height {}", backup.cursor);
                     recovered_headers = backup.accumulated_headers;
                     recovered_cursor = Some(backup.cursor);
@@ -4081,6 +4081,14 @@ fn save_keypair(data_dir: &PathBuf, keypair: &Keypair) {
     }
 }
 
+impl Drop for Node {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.mining_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+            tracing::debug!("Node shutting down: cancelled background mining tasks.");
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

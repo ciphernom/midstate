@@ -753,7 +753,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
 
         for coin_id in &pending.input_coin_ids {
             if let Some(wc) = self.find_coin(coin_id).cloned() {
-                // FIX 2: Check for confidential transfers where the value is hidden
+                // Check for state threads where value is 0 but data is present
                 let is_confidential = wc.value == 0;
                 input_reveals.push(InputReveal {
                     predicate: Predicate::p2pk(&wc.owner_pk),
