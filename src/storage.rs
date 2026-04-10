@@ -56,6 +56,8 @@ impl LegacyState {
     }
 }
 
+
+
 /// Try deserializing as current State, fall back to LegacyState (u64 depth)
 /// and convert. Returns the deserialized state and whether migration occurred.
 fn deserialize_state_with_migration(bytes: &[u8]) -> Result<(State, bool)> {
@@ -133,6 +135,12 @@ impl Storage {
                 }
             }
         }
+        Ok(())
+    }
+    
+    pub fn truncate_chain(&self, new_tip_height: u64) -> Result<()> {
+        self.batches.truncate(new_tip_height)?;
+        self.delete_snapshots_above(new_tip_height)?;
         Ok(())
     }
     

@@ -2426,8 +2426,17 @@ self.network.send(peer, Message::GetHeaders { start_height, count });
 
         let headers_start_height = all_headers.first().map(|h| h.height).unwrap_or(0);
         if fork_height == headers_start_height && headers_start_height > 0 && !is_fast_forward {
-            tracing::warn!("Fork is deeper than the 100-block lookback window. Restarting sync from genesis.");
-            self.start_sync_session(peer, session.peer_height, session.peer_depth, Some(0));
+            
+            // Step back exactly the maximum allowed header count to ensure contiguous coverage
+            let step_back = crate::network::MAX_GETHEADERS_COUNT;
+            let new_start = headers_start_height.saturating_sub(step_back);
+            
+            tracing::warn!(
+                "Fork is deeper than downloaded headers ({}). Stepping back to {} to find the exact fork point.", 
+                headers_start_height, new_start
+            );
+            
+            self.start_sync_session(peer, session.peer_height, session.peer_depth, Some(new_start));
             return Ok(());
         }
 
