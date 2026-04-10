@@ -147,6 +147,29 @@ impl BatchStore {
         Ok(Self { base_path })
     }
 
+    /// Deletes all batch, header, and filter files at or above the given height,
+    /// and updates the highest_height marker.
+    pub fn truncate(&self, new_tip_height: u64) -> Result<()> {
+        let highest = self.highest().unwrap_or(0);
+        if new_tip_height >= highest { return Ok(()); }
+        
+        for h in new_tip_height..=highest {
+            let folder = h / 1000;
+            let folder_path = self.base_path.join(format!("{:06}", folder));
+            
+            let _ = fs::remove_file(folder_path.join(format!("batch_{}.bin", h)));
+            let _ = fs::remove_file(folder_path.join(format!("header_{}.bin", h)));
+            let _ = fs::remove_file(folder_path.join(format!("filter_{}.bin", h)));
+            let _ = fs::remove_file(folder_path.join(format!("batch_{}.tmp", h)));
+            let _ = fs::remove_file(folder_path.join(format!("header_{}.tmp", h)));
+        }
+        
+        // Update the marker so highest() is O(1) again
+        let marker = self.base_path.join("highest_height");
+        let _ = fs::write(marker, new_tip_height.saturating_sub(1).to_string());
+        Ok(())
+    }
+
     /// State-aware WAL recovery. Must be called after loading state from redb.
     ///
     /// - If a `.tmp` file's height <= committed_height, the DB committed but
