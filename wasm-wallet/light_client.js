@@ -356,6 +356,12 @@ async request(req, _retries = 2) {
         return resp.data;
     }
 
+    async checkCommitment(commitmentHex) {
+        const resp = await this.request({ method: 'check_commitment', params: { commitment: commitmentHex } });
+        if (!resp.ok) throw new Error(resp.error);
+        return resp.data;
+    }
+
     async mssState(masterPkHex) {
         const resp = await this.request({ method: 'mss_state', params: { master_pk: masterPkHex } });
         if (!resp.ok) throw new Error(resp.error);

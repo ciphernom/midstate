@@ -63,6 +63,10 @@ pub enum LightRequest {
     #[serde(rename = "check")]
     CheckCoin { coin: String },
 
+    /// GET /check_commitment equivalent
+    #[serde(rename = "check_commitment")]
+    CheckCommitment { commitment: String },
+
     /// POST /mss_state equivalent
     #[serde(rename = "mss_state")]
     MssState { master_pk: String },
@@ -277,6 +281,7 @@ mod tests {
             r#"{"method":"check","params":{"coin":"aabbccdd"}}"#,
             r#"{"method":"mss_state","params":{"master_pk":"0011223344"}}"#,
             r#"{"method":"commit","params":{"commitment":"abcd","spam_nonce":42}}"#,
+            r#"{"method":"check_commitment","params":{"commitment":"aabbccdd"}}"#,
         ];
         for json in cases {
             let parsed: Result<LightRequest, _> = serde_json::from_str(json);
