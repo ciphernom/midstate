@@ -319,7 +319,8 @@ const rpc = {
     commit:         (c, n)       => rpcCall('commit', { commitmentHex: c, spamNonce: n }),
     send:           (reveal)     => rpcCall('send', { revealPayload: reveal }),
     checkCommitment: (commitment) => rpcCall('checkCommitment', { commitmentHex: commitment }),
-
+    checkCoin:      (coin)       => rpcCall('checkCoin', { coinHex: coin }),
+    
     /**
      * Get a block template for solo mining.
      * @param {Array<Object>} coinbase - Coinbase output specifications.
