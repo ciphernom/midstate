@@ -1281,8 +1281,12 @@ async function performSend(toAddress, amount) {
     for (let attempts = 0; attempts < 500; attempts++) {
         if (attempts > 0 && attempts % 10 === 0) self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Still waiting for commit block (${attempts * 3}s)...` } });
 
-        const checkResp = await rpc.checkCommitment(ctx.commitment);
-        if (checkResp && checkResp.exists) { commitMined = true; break; }
+        try {
+            const checkResp = await rpc.checkCommitment(ctx.commitment);
+            if (checkResp && checkResp.exists) { commitMined = true; break; }
+        } catch (e) {
+            console.warn(`[light] checkCommitment poll failed (will retry): ${e.message}`);
+        }
         await new Promise(r => setTimeout(r, 3000));
     }
 
@@ -1306,8 +1310,13 @@ async function performSend(toAddress, amount) {
     for (let attempts = 0; attempts < 150; attempts++) {
         if (attempts > 0 && attempts % 15 === 0) self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Waiting for reveal to be mined (${attempts * 2}s)...` } });
 
-        const checkResp = await rpc.checkCoin(inputCoinToCheck);
-        if (checkResp && !checkResp.exists) { revealMined = true; break; }
+        try {
+            const checkResp = await rpc.checkCoin(inputCoinToCheck);
+            // If the input coin no longer exists in the UTXO set, the reveal was mined
+            if (checkResp && !checkResp.exists) { revealMined = true; break; }
+        } catch (e) {
+            console.warn(`[light] checkCoin poll failed (will retry): ${e.message}`);
+        }
         await new Promise(r => setTimeout(r, 2000));
     }
 
