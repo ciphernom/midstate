@@ -1164,8 +1164,11 @@ if coinbase_total != expected_total {
                                 }
                             }
                             Err(e) => {
-                                self.network.observe_adversarial_light_peer(from).await; // SMART GUARD PENALTY
-                                LightResponse::error(format!("{}", e))
+                                let err_str = format!("{}", e);
+                                if !err_str.contains("No matching commitment found") {
+                                    self.network.observe_adversarial_light_peer(from).await; // SMART GUARD PENALTY
+                                }
+                                LightResponse::error(err_str)
                             }
                         }
                     }
@@ -1181,7 +1184,14 @@ if coinbase_total != expected_total {
                 let exists = self.state.coins.contains(&coin_bytes);
                 LightResponse::success(serde_json::json!({ "exists": exists }))
             }
-
+            LightRequest::CheckCommitment { commitment } => {
+                let mut commitment_bytes = [0u8; 32];
+                if hex::decode_to_slice(&commitment, &mut commitment_bytes).is_err() {
+                    return LightResponse::error("Invalid commitment hex");
+                }
+                let exists = self.state.commitments.contains(&commitment_bytes);
+                LightResponse::success(serde_json::json!({ "exists": exists }))
+            }
             LightRequest::MssState { master_pk } => {
                 let mut pk_bytes = [0u8; 32];
                 if hex::decode_to_slice(&master_pk, &mut pk_bytes).is_err() {

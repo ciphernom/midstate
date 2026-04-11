@@ -1532,6 +1532,10 @@ async function connectWebRTC(bootstrapAddr) {
                     if (lc) { result = await lc.checkCoin(params.coinHex); }
                     else { const r = await fetch(`${url}/check`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ coin: params.coinHex }) }); result = r.ok ? await r.json() : null; }
 
+                } else if (method === 'checkCommitment') {
+                    if (lc) { result = await lc.checkCommitment(params.commitmentHex); }
+                    else { const r = await fetch(`${url}/check_commitment`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ commitment: params.commitmentHex }) }); result = r.ok ? await r.json() : null; }
+
                 } else {
                     throw new Error(`Unknown RPC method: ${method}`);
                 }

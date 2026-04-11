@@ -318,7 +318,7 @@ const rpc = {
     submitBatch:    (batch)      => rpcCall('submitBatch', { batch }),
     commit:         (c, n)       => rpcCall('commit', { commitmentHex: c, spamNonce: n }),
     send:           (reveal)     => rpcCall('send', { revealPayload: reveal }),
-    checkCoin:      (coin)       => rpcCall('checkCoin', { coinHex: coin }),
+    checkCommitment: (commitment) => rpcCall('checkCommitment', { commitmentHex: commitment }),
 
     /**
      * Get a block template for solo mining.
@@ -1271,28 +1271,32 @@ async function performSend(toAddress, amount) {
         throw new Error(`Commit rejected by network:\n${errText}\n\nWhat to do: The network might be congested, or your UTXOs might be out of sync. Your funds have not moved. Run a Network Sync and try again.`);
     }
 
-    // Wait for commit to be mined, then submit reveal
+    // Wait for commit to be mined, then submit reveal.
+    // Poll CheckCommitment (read-only, no SMART GUARD penalty) instead of
+    // speculatively submitting the Reveal, which would trigger an instant ban.
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commitment accepted. Waiting for block confirmation..." } });
     const revealPayloadStr = wallet.build_reveal(spendContextStr, ctx.commitment, ctx.tx_salt);
 
-    let mempoolAccepted = false;
-    for (let attempts = 0; attempts < 1500; attempts++) {
-        if (attempts > 0 && attempts % 15 === 0) self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Still waiting for commit block (${attempts * 2}s)...` } });
+    let commitMined = false;
+    for (let attempts = 0; attempts < 500; attempts++) {
+        if (attempts > 0 && attempts % 10 === 0) self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Still waiting for commit block (${attempts * 3}s)...` } });
 
-        const revealReq = await rpc.send(revealPayloadStr);
-        if (revealReq.ok) { mempoolAccepted = true; break; }
-
-        let errText = revealReq.body || 'rejected';
-
-        try { errText = JSON.parse(errText).error || errText; } catch(e) {}
-        if (errText.includes("No matching commitment found")) {
-            await new Promise(r => setTimeout(r, 3000));
-        } else {
-            throw new Error(`Reveal rejected by network:\n${errText}\n\nWhat to do: A cryptographic error or double-spend occurred. Your funds are safe. Run a Network Sync and try again.`);
-        }
+        const checkResp = await rpc.checkCommitment(ctx.commitment);
+        if (checkResp && checkResp.exists) { commitMined = true; break; }
+        await new Promise(r => setTimeout(r, 3000));
     }
 
-    if (!mempoolAccepted) throw new Error("Timed out waiting for Commit to be mined.\n\nWhat to do: Your funds are perfectly safe. The network dropped the transaction due to high traffic. Please try sending again in a few minutes.");
+    if (!commitMined) throw new Error("Timed out waiting for Commit to be mined.\n\nWhat to do: Your funds are perfectly safe. The network dropped the transaction due to high traffic. Please try sending again in a few minutes.");
+
+    // Commit is confirmed — submit the reveal exactly once.
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commit confirmed! Submitting reveal..." } });
+    const revealReq = await rpc.send(revealPayloadStr);
+    let mempoolAccepted = revealReq.ok;
+    if (!mempoolAccepted) {
+        let errText = revealReq.body || 'rejected';
+        try { errText = JSON.parse(errText).error || errText; } catch(e) {}
+        throw new Error(`Reveal rejected by network:\n${errText}\n\nWhat to do: A cryptographic error or double-spend occurred. Your funds are safe. Run a Network Sync and try again.`);
+    }
 
     // Wait for reveal to be mined
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commit confirmed! Broadcasting reveal..." } });
