@@ -1339,8 +1339,11 @@ async function connectWebRTC(bootstrapAddr) {
                             // The first address returned by the node is its own (your VPS)
                             let vpsAddr = webrtcAddrs[0];
                             
-                            // Fix the 0.0.0.0 issue by swapping in the real IP
-                            if (vpsAddr.includes('/ip4/0.0.0.0/') || vpsAddr.includes('/ip4/127.0.0.1/')) {
+                            // Robustly replace ANY private/unspecified IP with the IP we actually used to hit the RPC
+                            if (vpsAddr.includes('/ip4/0.0.0.0/') || 
+                                vpsAddr.includes('/ip4/127.0.0.1/') || 
+                                vpsAddr.includes('/ip4/192.168.') || 
+                                vpsAddr.includes('/ip4/10.')) {
                                 vpsAddr = vpsAddr.replace(/\/ip4\/[^\/]+/, `/ip4/${ip}`);
                             }
                             

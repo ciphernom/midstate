@@ -189,6 +189,7 @@ async function idbDelete(key) {
  * Guards against redundant loading and ensures caches are ready before signing.
  */
 let mssCachesReady = false;
+let mssCachesLoading = null;
 
 /**
  * Load all MSS trees from IndexedDB into the WASM wallet's in-memory cache.
@@ -205,54 +206,55 @@ let mssCachesReady = false;
  */
 async function loadMssCaches() {
     if (!wallet || mssCachesReady) return;
-
-    const entries = Object.entries(wState.mssAddrs);
-    if (entries.length === 0) { mssCachesReady = true; return; }
-
-    self.postMessage({ type: 'LOG', payload: `Loading ${entries.length} MSS tree(s) from storage...` });
-
-    for (const [addrHex, mss] of entries) {
-        try {
-            // Already in WASM memory (e.g., just generated during CREATE)
-            if (wallet.has_mss_cache(addrHex)) {
-                wallet.set_mss_leaf_index(addrHex, mss.next_leaf);
-                continue;
-            }
-
-            // Try IndexedDB — instant load (~1ms for 64 KB)
-            const treeBytes = await idbGet(`mss_${addrHex}`);
-            if (treeBytes) {
-                wallet.import_mss_bytes(addrHex, new Uint8Array(treeBytes));
-                wallet.set_mss_leaf_index(addrHex, mss.next_leaf);
-                self.postMessage({ type: 'LOG', payload: `MSS tree ${addrHex.substring(0,12)}… loaded from IndexedDB.` });
-                continue;
-            }
-
-            // Not in IndexedDB — regenerate from seed (one-time migration cost)
-            self.postMessage({ type: 'LOG', payload: `MSS tree ${addrHex.substring(0,12)}… not cached. Generating (one-time)...` });
-            self.postMessage({ type: 'MSS_PROGRESS', payload: { current: 0, total: 100, label: "Regenerating MSS tree (one-time)..." } });
-
-            const addr = wallet.get_mss_address(mss.index, mss.height, (current, total) => {
-                const now = Date.now();
-                if (now - lastMssUpdate > 66 || current === total) {
-                    lastMssUpdate = now;
-                    self.postMessage({ type: 'MSS_PROGRESS', payload: { current, total, label: `Regenerating MSS tree (${current}/${total})...` } });
-                }
-            });
-
-            // Persist to IndexedDB so next load is instant
-            const exportedBytes = wallet.export_mss_bytes(addr);
-            await idbPut(`mss_${addr}`, exportedBytes);
-
-            wallet.set_mss_leaf_index(addrHex, mss.next_leaf);
-            self.postMessage({ type: 'LOG', payload: `MSS tree ${addrHex.substring(0,12)}… generated and cached.` });
-        } catch (e) {
-            console.warn("MSS load failed for", addrHex, e);
-            self.postMessage({ type: 'LOG', payload: `Warning: MSS load failed for ${addrHex.substring(0,12)}…: ${e}` });
-        }
+    
+    // Prevent race conditions if Sync and Send are clicked simultaneously
+    if (mssCachesLoading) {
+        await mssCachesLoading;
+        return;
     }
 
-    mssCachesReady = true;
+    mssCachesLoading = (async () => {
+        const entries = Object.entries(wState.mssAddrs);
+        if (entries.length === 0) { mssCachesReady = true; return; }
+
+        self.postMessage({ type: 'LOG', payload: `Loading ${entries.length} MSS tree(s) from storage...` });
+
+        for (const [addrHex, mss] of entries) {
+            try {
+                if (wallet.has_mss_cache(addrHex)) {
+                    wallet.set_mss_leaf_index(addrHex, mss.next_leaf);
+                    continue;
+                }
+
+                const treeBytes = await idbGet(`mss_${addrHex}`);
+                if (treeBytes) {
+                    wallet.import_mss_bytes(addrHex, new Uint8Array(treeBytes));
+                    wallet.set_mss_leaf_index(addrHex, mss.next_leaf);
+                    continue;
+                }
+
+                // Regenerate fallback
+                self.postMessage({ type: 'MSS_PROGRESS', payload: { current: 0, total: 100, label: "Regenerating MSS tree (one-time)..." } });
+                const addr = wallet.get_mss_address(mss.index, mss.height, (current, total) => {
+                    const now = Date.now();
+                    if (now - lastMssUpdate > 66 || current === total) {
+                        lastMssUpdate = now;
+                        self.postMessage({ type: 'MSS_PROGRESS', payload: { current, total, label: `Regenerating MSS tree (${current}/${total})...` } });
+                    }
+                });
+
+                const exportedBytes = wallet.export_mss_bytes(addr);
+                await idbPut(`mss_${addr}`, exportedBytes);
+                wallet.set_mss_leaf_index(addrHex, mss.next_leaf);
+            } catch (e) {
+                self.postMessage({ type: 'LOG', payload: `Warning: MSS load failed for ${addrHex.substring(0,12)}…: ${e}` });
+            }
+        }
+        mssCachesReady = true;
+    })();
+
+    await mssCachesLoading;
+    mssCachesLoading = null;
     self.postMessage({ type: 'LOG', payload: "All MSS trees loaded." });
 }
 
@@ -1043,7 +1045,8 @@ while (currentHeight < chainHeight) {
  */
 async function processFullBlock(height) {
     const block = await rpc.getBlock(height);
-    if (!block) return false;
+    // Throw error instead of returning false so the scanner halts safely
+    if (!block) throw new Error(`Network failed to fetch block at height ${height}. Sync paused to prevent missed transactions.`);
 
     let matchFound = false;
     const ourSalts = new Map();
@@ -1307,14 +1310,25 @@ async function performSend(toAddress, amount) {
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commit confirmed! Broadcasting reveal..." } });
 
     const inputCoinToCheck = ctx.selected_inputs[0].coin_id;
+    // We check the OUTPUT coin to guarantee the transaction succeeded. 
+    // Checking the input coin is dangerous because a reorg could drop the input entirely.
+    const outputCoinToCheck = ctx.outputs.length > 0 
+        ? compute_coin_id_hex(ctx.outputs[0].address, BigInt(ctx.outputs[0].value), ctx.outputs[0].salt) 
+        : null;
+
     let revealMined = false;
     for (let attempts = 0; attempts < 150; attempts++) {
         if (attempts > 0 && attempts % 15 === 0) self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Waiting for reveal to be mined (${attempts * 2}s)...` } });
 
         try {
-            const checkResp = await rpc.checkCoin(inputCoinToCheck);
-            // If the input coin no longer exists in the UTXO set, the reveal was mined
-            if (checkResp && !checkResp.exists) { revealMined = true; break; }
+            if (outputCoinToCheck) {
+                const checkOut = await rpc.checkCoin(outputCoinToCheck);
+                if (checkOut && checkOut.exists) { revealMined = true; break; }
+            } else {
+                // Fallback for DataBurns
+                const checkInp = await rpc.checkCoin(inputCoinToCheck);
+                if (checkInp && !checkInp.exists) { revealMined = true; break; }
+            }
         } catch (e) {
             console.warn(`[light] checkCoin poll failed (will retry): ${e.message}`);
         }
