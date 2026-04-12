@@ -20,7 +20,7 @@ import { yamux } from '@chainsafe/libp2p-yamux';
 import { multiaddr } from '@multiformats/multiaddr';
 
 const LIGHT_PROTOCOL = '/midstate/light/1.0.0';
-const REQUEST_TIMEOUT_MS = 30_000;
+const REQUEST_TIMEOUT_MS = 60_000;
 const RECONNECT_DELAY_MS = 3_000;
 const MAX_RECONNECT_ATTEMPTS = 5;
 

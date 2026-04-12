@@ -901,7 +901,14 @@ async fn handle_light_request(
                     };
                     
                     match store.load(height) {
-                        Ok(Some(batch)) => {
+                        Ok(Some(mut batch)) => {
+                            // Strip witness data to prevent WebRTC SCTP congestion and save bandwidth
+                            for tx in &mut batch.transactions {
+                                if let crate::core::Transaction::Reveal { witnesses, .. } = tx {
+                                    *witnesses = vec![];
+                                }
+                            }
+                            
                             match serde_json::to_value(&batch) {
                                 Ok(val) => LightResponse::success(val),
                                 Err(e) => LightResponse::error(format!("Serialization error: {}", e)),
@@ -3938,14 +3945,20 @@ async fn try_apply_orphans(&mut self) {
                 // 2. Cache for instant reorg rollback
                 self.cache_current_state();
                 
-                // 3. NOW SAVE STATE
-                self.storage.save_state(&self.state)?;
-
-                // 4. BURN WOTS ADDRESSES (immediate, post-activation only)
-                if let Err(e) = self.storage.burn_batch_addresses(&batch, pre_mine_height) {
-                    tracing::warn!("burn_batch_addresses failed at height {}: {}", pre_mine_height, e);
-                }
+                // 3. NOW SAVE STATE and BURN ADDRESSES (Offloaded to prevent event loop stalls)
+                let storage_clone = self.storage.clone();
+                let state_clone = self.state.clone();
+                let batch_clone = batch.clone();
                 
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = storage_clone.save_state(&state_clone) {
+                        tracing::error!("Failed to save state: {}", e);
+                    }
+                    if let Err(e) = storage_clone.burn_batch_addresses(&batch_clone, pre_mine_height) {
+                        tracing::warn!("burn_batch_addresses failed at height {}: {}", pre_mine_height, e);
+                    }
+                });
+
                 // 5. NOW SAVE SNAPSHOT (every SNAPSHOT_INTERVAL blocks)
                 if self.state.height > 0 && self.state.height % SNAPSHOT_INTERVAL == 0 {
                     if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
