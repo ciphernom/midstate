@@ -735,7 +735,7 @@ self.onmessage = async (e) => {
         else if (type === 'DEFI_ACTION') {
             if (!wallet) throw new Error("Wallet not initialized");
             
-            showActivity(payload.action === 'deploy' ? "Deploying Vault Contract..." : "Minting Stablecoin...");
+            self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: payload.action === 'deploy' ? "Deploying Vault Contract..." : "Minting Stablecoin..." } });
             
             const utxoArray = Object.values(wState.utxos).map(u => {
                 if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
@@ -747,8 +747,6 @@ self.onmessage = async (e) => {
 
             if (payload.action === 'deploy') {
                 // Genesis State: Supply starts at 0.
-                // NOTE: The WASM builder automatically generates the State Thread output, 
-                // so we leave extraOutputs empty here.
                 newSupply = 0;
             } 
             else if (payload.action === 'mint') {
@@ -795,7 +793,7 @@ self.onmessage = async (e) => {
                 const txData = JSON.parse(txDataStr);
                 wState.nextWotsIndex = txData.next_wots_index;
                 
-                showActivity("Mining Proof of Work...");
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining Proof of Work..." } });
                 const stateData = await rpc.getState();
                 
                 // Mine PoW locally in JS to satisfy the mempool
@@ -816,11 +814,11 @@ self.onmessage = async (e) => {
                     spamNonce++;
                 }
                 
-                showActivity("Submitting Commit...");
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Submitting Commit..." } });
                 const commitResp = await rpc.commit(txData.commitment, spamNonce);
                 if (!commitResp.ok) throw new Error(commitResp.body || commitResp.error);
 
-                showActivity("Waiting for Block Confirmation...");
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for Block Confirmation..." } });
                 let mined = false;
                 for (let i = 0; i < 30; i++) {
                     await new Promise(r => setTimeout(r, 2000));
@@ -829,19 +827,19 @@ self.onmessage = async (e) => {
                 }
                 if (!mined) throw new Error("Timed out waiting for block confirmation");
 
-                showActivity("Executing Smart Contract...");
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Executing Smart Contract..." } });
                 const revealResp = await rpc.send(txData.reveal);
                 if (!revealResp.ok) throw new Error(revealResp.body || revealResp.error);
 
-                hideActivity();
-                self.postMessage({ type: 'ERROR', payload: payload.action === 'deploy' ? "Contract Deployed Successfully!" : "MUSD Minted Successfully!" }); 
                 await saveState();
                 
                 // Rescan to pick up the updated AMM state and newly minted Token!
                 await performScan();
+                
+                // Sends the green Toast and clears the banner automatically!
+                self.postMessage({ type: 'SEND_COMPLETE', payload: buildDashboardPayload() });
 
             } catch (e) {
-                hideActivity();
                 self.postMessage({ type: 'ERROR', payload: e.message || "Failed to execute contract" });
             }
         }
