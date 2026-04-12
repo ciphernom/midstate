@@ -483,6 +483,7 @@ async function loadState(pwd, bundleStr) {
         mssCachesReady = false;
         await loadMssCaches();
 
+        self.postMessage({ type: 'DEFI_UPDATE', payload: vaultUtxo });
         self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
     } catch(e) {
         throw new Error("Incorrect password or corrupted wallet file");
@@ -709,6 +710,7 @@ self.onmessage = async (e) => {
             mssCachesReady = true;
 
             await saveState();
+            self.postMessage({ type: 'DEFI_UPDATE', payload: vaultUtxo });
             self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
             self.postMessage({ type: 'AUTO_CONNECT_WEBRTC' });
         }
@@ -1149,8 +1151,9 @@ while (currentHeight < chainHeight) {
         wallet.set_mss_leaf_index(addr, mss.next_leaf);
     }
 
-    wState.lastScannedHeight = chainHeight;
+   wState.lastScannedHeight = chainHeight;
     await saveState();
+    self.postMessage({ type: 'DEFI_UPDATE', payload: vaultUtxo });
     self.postMessage({ type: 'SCAN_COMPLETE', payload: buildDashboardPayload() });
 }
 
