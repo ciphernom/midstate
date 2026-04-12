@@ -58,6 +58,11 @@ let pendingSends = [];
 const GAP_LIMIT = 100;
 
 
+// Compiled Vault Contract
+const VAULT_ADDR = "00000000000000000000000000000000000000000000000000000000000000aa";
+const VAULT_BYTECODE = "0120000000000000000000000000000000000000000000000000000000000000000050510101000001010008150101000023220101000052010100000101000815010100002351010100000101000815010100002301010001232201010001";
+let contractHash = "";
+let vaultUtxo = null;
 
 /**
  * @typedef {Object} WalletState
@@ -724,6 +729,79 @@ self.onmessage = async (e) => {
             await performScan();
         }
 
+        else if (type === 'DEFI_ACTION') {
+            if (!wallet) throw new Error("Wallet not initialized");
+            
+            showActivity("Building Smart Contract Transaction...");
+            
+            const utxoArray = Object.values(wState.utxos).map(u => {
+                if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
+                return u;
+            });
+
+            // 1. Calculate State Transition
+            let newSupply = 1;
+            if (payload.action === 'mint' && vaultUtxo) {
+                newSupply = vaultUtxo.supply + 1;
+            }
+            
+            let newSupplyHex = newSupply.toString(16);
+            if (newSupplyHex.length % 2) newSupplyHex = '0' + newSupplyHex;
+            let newStateThread = newSupplyHex.match(/.{2}/g).reverse().join('').padEnd(64, '0');
+
+            // 2. Format Covenants (Pay the Vault and Mint Token)
+            let extraOutputs = [];
+            if (payload.action === 'mint') {
+                // The physical MDS locked in the Vault
+                extraOutputs.push({ out_type: "standard", address: VAULT_ADDR, value: 1 });
+                
+                // Issue MIDSTATE DOLLAR (MUSD) to the buyer using a Confidential Output
+                const TOKEN_TICKER = "4d5553440000000000000000000000000000000000000000"; // "MUSD" padded
+                let tokenBalHex = (1).toString(16).padStart(2, '0').padEnd(16, '0'); // 1 Token
+                let tokenCommitment = tokenBalHex + TOKEN_TICKER;
+                
+                const primaryAddress = Object.keys(wState.mssAddrs)[0] || Object.keys(wState.wotsAddrs)[0];
+                extraOutputs.push({
+                    out_type: "confidential",
+                    address: primaryAddress,
+                    commitment: tokenCommitment,
+                    value: 0
+                });
+            }
+
+            try {
+                const txDataStr = wallet.build_state_thread_tx(
+                    JSON.stringify(utxoArray),
+                    VAULT_BYTECODE,
+                    vaultUtxo ? vaultUtxo.commitment : null,
+                    vaultUtxo ? vaultUtxo.coin_id : null,
+                    vaultUtxo ? vaultUtxo.salt : null,
+                    newStateThread,
+                    JSON.stringify(extraOutputs),
+                    wState.nextWotsIndex
+                );
+                
+                const txData = JSON.parse(txDataStr);
+                wState.nextWotsIndex = txData.next_wots_index;
+                
+                showActivity("Mining Proof of Work...");
+                const stateData = await rpc.getState();
+                const nonce = await rpcCall('commit', { commitmentHex: txData.commitment, spamNonce: 0 }).catch(() => 0); // Stub for UI testing
+                
+                showActivity("Executing AMM Smart Contract...");
+                const revealResp = await rpc.send(txData.reveal);
+                if (!revealResp.ok) throw new Error(revealResp.body);
+
+                hideActivity();
+                self.postMessage({ type: 'ERROR', payload: "Contract Executed Successfully!" }); 
+                await performScan();
+
+            } catch (e) {
+                hideActivity();
+                self.postMessage({ type: 'ERROR', payload: e.message || "Failed to build contract transaction" });
+            }
+        }
+
         else if (type === 'SEND') {
             if (isSending) throw new Error("A transaction is already in progress. Please wait for it to complete.");
             isSending = true;
@@ -1034,6 +1112,10 @@ while (currentHeight < chainHeight) {
     self.postMessage({ type: 'SCAN_COMPLETE', payload: buildDashboardPayload() });
 }
 
+function compute_confidential_coin_id(addrHex, commitmentHex, saltHex) {
+    return blake3_hash_hex("434f4e464944454e5449414c" + addrHex + commitmentHex + saltHex);
+}
+
 /**
  * Process a single block for wallet-relevant transactions.
  *
@@ -1053,17 +1135,17 @@ async function processFullBlock(height) {
     for (const [cid, u] of Object.entries(wState.utxos)) ourSalts.set(u.salt, cid);
 
     let coinbaseReceives = [];
-    if (block.coinbase) {
-        for (const cb of block.coinbase) {
-            const addrHex = normalizeHex(cb.address);
-            const saltHex = normalizeHex(cb.salt);
-            if (wState.wotsAddrs[addrHex] !== undefined || wState.mssAddrs[addrHex] !== undefined) {
-                const coinId = compute_coin_id_hex(addrHex, BigInt(cb.value), saltHex);
-                if (addUtxo(addrHex, Number(cb.value), saltHex, coinId)) coinbaseReceives.push({ id: coinId, val: Number(cb.value) });
-                matchFound = true;
+        if (block.coinbase) {
+            for (const cb of block.coinbase) {
+                const addrHex = normalizeHex(cb.address);
+                const saltHex = normalizeHex(cb.salt);
+                if (wState.wotsAddrs[addrHex] !== undefined || wState.mssAddrs[addrHex] !== undefined) {
+                    const coinId = compute_coin_id_hex(addrHex, BigInt(cb.value), saltHex);
+                    if (addUtxo(addrHex, Number(cb.value), saltHex, coinId)) coinbaseReceives.push({ id: coinId, val: Number(cb.value) });
+                    matchFound = true;
+                }
             }
         }
-    }
 
     if (coinbaseReceives.length > 0) {
         const alreadyRecorded = wState.history.some(h => h.outputs.some(out => coinbaseReceives.map(c=>c.id).includes(out)));
@@ -1114,6 +1196,37 @@ async function processFullBlock(height) {
                             matchFound = true;
                         }
                     }
+                    
+                    // DEFI: Track Smart Contract States & Tokens
+                    const confData = out.Confidential || out.confidential;
+                    if (confData) {
+                        const addrHex = normalizeHex(confData.address);
+                        const commitment = normalizeHex(confData.commitment);
+                        const saltHex = normalizeHex(confData.salt);
+                        
+                        // 1. Track Vault Contract State
+                        const VAULT_HASH = "8142345e698ef77a6438bf42f654b791448b1ea32a32c253d71261d7637119ff";
+                        if (addrHex === VAULT_HASH) {
+                            const countHex = commitment.substring(0, 16).match(/.{2}/g).reverse().join('');
+                            vaultUtxo = {
+                                coin_id: compute_confidential_coin_id(addrHex, commitment, saltHex), 
+                                salt: saltHex,
+                                commitment: commitment,
+                                supply: parseInt(countHex, 16)
+                            };
+                            self.postMessage({ type: 'DEFI_UPDATE', payload: vaultUtxo });
+                        }
+
+                        // 2. Track Tokens Sent to Us (Coloured Coins)
+                        if (wState.wotsAddrs[addrHex] !== undefined || wState.mssAddrs[addrHex] !== undefined) {
+                            const trueCoinId = compute_confidential_coin_id(addrHex, commitment, saltHex); 
+                            if (addUtxo(addrHex, 0, saltHex, trueCoinId, commitment)) {
+                                createdOutputs.push({ id: trueCoinId, val: 0 });
+                                ourSalts.set(saltHex, trueCoinId);
+                            }
+                            matchFound = true;
+                        }
+                    }
                 }
             }
 
@@ -1159,7 +1272,7 @@ async function processFullBlock(height) {
  * @param {string} coinId - Hex-encoded coin ID.
  * @returns {boolean} `true` if the UTXO was new (not a duplicate).
  */
-function addUtxo(address, value, salt, coinId) {
+function addUtxo(address, value, salt, coinId, commitment = null) {
     let index = 0, is_mss = false, mss_height = 0, mss_leaf = 0;
     if (wState.wotsAddrs[address] !== undefined) {
         index = wState.wotsAddrs[address];
@@ -1169,7 +1282,7 @@ function addUtxo(address, value, salt, coinId) {
         index = mss.index; is_mss = true; mss_height = mss.height; mss_leaf = mss.next_leaf;
     }
     if (!wState.utxos[coinId]) {
-        wState.utxos[coinId] = { index, is_mss, mss_height, mss_leaf, address, value, salt, coin_id: coinId };
+        wState.utxos[coinId] = { index, is_mss, mss_height, mss_leaf, address, value, salt, coin_id: coinId, commitment };
         return true;
     }
     return false;

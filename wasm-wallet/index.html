@@ -325,6 +325,7 @@
             <div style="text-align: center; margin: 1rem 0 2.5rem 0;">
                 <div style="color: #666; text-transform: uppercase; font-size: 11px; letter-spacing: 1px; margin-bottom: 8px;">Total Balance</div>
                 <div class="stat-val" id="lblBalance" style="color: var(--accent); font-size: 42px;">0</div>
+                <div id="tokenContainer" style="display: flex; justify-content: center; gap: 10px; margin-top: 15px; flex-wrap: wrap;"></div>
             </div>
 
             <!-- Compact mining widget -->
@@ -491,22 +492,46 @@
                 </div>
             </div>
         </main>
+<!-- DEFI LAUNCHPAD -->
+        <main id="view-defi" class="page">
+            <h2>Stablecoin Vault</h2>
+            <p style="font-size: 11px; color: #666; margin-bottom: 15px;">Decentralized CDP Smart Contract</p>
+            
+            <div class="panel" style="text-align: center; padding: 30px 15px;">
+                <h3 style="margin-bottom: 10px; color: var(--text-max);">MIDSTATE DOLLAR (MUSD)</h3>
+                <p style="font-size: 11px; color: #888; margin-bottom: 25px;">Lock 1 MDS as collateral to mint 1 MUSD stablecoin to your wallet.</p>
+                
+                <div style="display: flex; justify-content: space-around; background: #000; border: 1px solid var(--border); padding: 20px; border-radius: 8px; margin-bottom: 25px;">
+                    <div>
+                        <div style="font-size: 10px; color: #666; text-transform: uppercase;">Total MUSD Minted</div>
+                        <div id="curveSupply" style="font-size: 28px; font-weight: bold; color: var(--text-max);">?</div>
+                    </div>
+                    <div>
+                        <div style="font-size: 10px; color: #666; text-transform: uppercase;">Collateral Ratio</div>
+                        <div id="curvePrice" style="font-size: 28px; font-weight: bold; color: var(--accent);">?</div>
+                    </div>
+                </div>
 
+                <button id="btnDefiDeploy" class="hidden" style="background: transparent; color: var(--accent); border: 1px dashed var(--accent);">Deploy Vault Contract</button>
+                <button id="btnDefiBuy" class="hidden" style="background: var(--accent); color: #000; font-size: 16px; padding: 15px 30px; font-weight: bold;">Lock 1 MDS & Mint 1 MUSD</button>
+                <div id="defiStatus" style="font-size: 11px; color: var(--warn); margin-top: 15px;">Checking Network State...</div>
+            </div>
+        </main>
         <!-- SETTINGS -->
         <main id="view-settings" class="page">
             <h2>Settings</h2>
-<!-- AFTER -->
-<div class="panel">
-    <label style="font-size: 11px; color: #666; text-transform: uppercase;">HTTPS Fallback RPC URL</label>
-    <input type="text" id="rpcUrl" value="https://rpc.cypherpunk.gold" style="margin-bottom: 8px;">
-    <label style="font-size: 11px; color: #666; text-transform: uppercase;">WebRTC Node Multiaddr</label>
-    <input type="text" id="bootstrapAddr" placeholder="/ip4/…/udp/9335/webrtc-direct/certhash/uEi…" style="margin-bottom: 8px;">
-    <div style="display: flex; gap: 8px;">
-        <button id="btnConnectWebRTC" style="flex:1; background: var(--accent); color: #000; margin: 0;">Connect</button>
-        <button id="btnDisconnectWebRTC" style="flex:1; background: transparent; color: var(--red); border-color: var(--red); margin: 0;">Disconnect</button>
-    </div>
-    <div id="webrtcStatus" style="font-size: 11px; color: #666; margin-top: 8px; text-align: center;">WebRTC: not connected</div>
-</div>
+            <!-- AFTER -->
+            <div class="panel">
+                <label style="font-size: 11px; color: #666; text-transform: uppercase;">HTTPS Fallback RPC URL</label>
+                <input type="text" id="rpcUrl" value="https://rpc.cypherpunk.gold" style="margin-bottom: 8px;">
+                <label style="font-size: 11px; color: #666; text-transform: uppercase;">WebRTC Node Multiaddr</label>
+                <input type="text" id="bootstrapAddr" placeholder="/ip4/…/udp/9335/webrtc-direct/certhash/uEi…" style="margin-bottom: 8px;">
+                <div style="display: flex; gap: 8px;">
+                    <button id="btnConnectWebRTC" style="flex:1; background: var(--accent); color: #000; margin: 0;">Connect</button>
+                    <button id="btnDisconnectWebRTC" style="flex:1; background: transparent; color: var(--red); border-color: var(--red); margin: 0;">Disconnect</button>
+                </div>
+                <div id="webrtcStatus" style="font-size: 11px; color: #666; margin-top: 8px; text-align: center;">WebRTC: not connected</div>
+            </div>
             <div class="panel">
                 <h3 style="font-size: 14px;">Security & Backup</h3>
                 <button id="btnExport" style="background: var(--bg-panel);">Export Encrypted Backup</button>
@@ -522,14 +547,19 @@
                 <div class="term-log" id="term-log"></div>
             </details>
         </main>
+        
 
-        <!-- NAV (5 tabs) -->
+        
+
+        <!-- NAV (6 tabs) -->
         <nav id="bottom-nav" class="hidden">
             <button class="nav-btn active" data-target="view-home"><span class="nav-icon">🏠</span><span>Home</span></button>
+            <button class="nav-btn" data-target="view-defi"><span class="nav-icon">🏦</span><span>Vault</span></button>
             <button class="nav-btn" data-target="view-mine"><span class="nav-icon">⛏️</span><span>Mine</span></button>
             <button class="nav-btn" data-target="view-send"><span class="nav-icon">💸</span><span>Send</span></button>
             <button class="nav-btn" data-target="view-receive"><span class="nav-icon">⬇️</span><span>Receive</span></button>
             <button class="nav-btn" data-target="view-settings"><span class="nav-icon">⚙️</span><span>Settings</span></button>
+            
         </nav>
     </div>
 
@@ -1627,7 +1657,7 @@ async function connectWebRTC(bootstrapAddr) {
                 if (!payload) return;
 
                 const primaryAddress = payload.primaryAddress || "None";
-                document.getElementById('lblBalance').innerText = payload.balance !== undefined ? payload.balance : "0";
+                document.getElementById('lblBalance').innerHTML = `${payload.balance !== undefined ? payload.balance : "0"} <span style="font-size:14px;color:#666;">MDS</span>`;
                 document.getElementById('lblAddress').innerText = primaryAddress;
 
                 const qrContainer = document.getElementById('qrCodeContainer');
@@ -1642,6 +1672,49 @@ async function connectWebRTC(bootstrapAddr) {
                     qrContainer.innerHTML = "<span>[ No Address ]</span>";
                 }
 
+                // Handle Native MDS vs Token UTXOs
+                let nativeUtxos = [];
+                let tokenBalances = {};
+
+                if (payload.utxos) {
+                    payload.utxos.forEach(u => {
+                        if (u.commitment) {
+                            // Extract 8-byte balance from Token State Thread (first 16 hex chars)
+                            const balHex = u.commitment.substring(0, 16);
+                            let hexReversed = balHex.match(/.{2}/g).reverse().join('');
+                            const balance = parseInt(hexReversed, 16);
+                            
+                            // Extract ASCII Ticker from the rest of the commitment
+                            const assetHex = u.commitment.substring(16);
+                            let assetStr = '';
+                            for(let i=0; i<assetHex.length; i+=2) {
+                                let char = parseInt(assetHex.substr(i,2), 16);
+                                if(char > 0) assetStr += String.fromCharCode(char);
+                            }
+                            
+                            if (!tokenBalances[assetStr]) tokenBalances[assetStr] = 0;
+                            tokenBalances[assetStr] += balance;
+                        } else {
+                            nativeUtxos.push(u);
+                        }
+                    });
+                }
+
+                // Render Tokens on Home Page
+                const tokenContainer = document.getElementById('tokenContainer');
+                if (Object.keys(tokenBalances).length === 0) {
+                    tokenContainer.innerHTML = '';
+                } else {
+                    let tokensHtml = '';
+                    for (const [asset, bal] of Object.entries(tokenBalances)) {
+                        tokensHtml += `<div style="background: rgba(212, 255, 0, 0.05); border: 1px solid var(--accent-dim); padding: 8px 16px; border-radius: 8px; display: inline-flex; align-items: baseline; gap: 6px;">
+                            <span style="font-size: 18px; font-weight: bold; color: var(--text-max);">${bal}</span>
+                            <span style="font-size: 11px; color: var(--accent); font-weight: bold;">${asset}</span>
+                        </div>`;
+                    }
+                    tokenContainer.innerHTML = tokensHtml;
+                }
+
                 const uList = document.getElementById('utxoList');
                 if (!payload.utxos || payload.utxos.length === 0) {
                     uList.innerHTML = '<div class="list-item" style="text-align: center; color: #555;">No UTXOs synced.</div>';
@@ -1649,7 +1722,7 @@ async function connectWebRTC(bootstrapAddr) {
                     uList.innerHTML = payload.utxos.map(u => `
                         <div class="list-item">
                             <div class="flex-row">
-                                <span style="font-weight: bold; color: var(--text-max);">${u.value}</span>
+                                <span style="font-weight: bold; color: var(--text-max);">${u.value} MDS</span>
                                 <span style="font-size: 10px; color: ${u.is_mss ? 'var(--accent)' : '#888'}; border: 1px solid ${u.is_mss ? 'var(--accent-dim)' : '#333'}; padding: 2px 6px; border-radius: 4px;">${u.is_mss ? 'MSS' : 'WOTS'}</span>
                             </div>
                             <div style="font-size: 10px; color: #666; margin-top: 4px; word-break: break-all;">ID: ${u.coin_id.substring(0, 16)}...</div>
@@ -1757,6 +1830,25 @@ async function connectWebRTC(bootstrapAddr) {
                     break;
                 }
 
+                case 'DEFI_UPDATE':
+                    const btnDep = document.getElementById('btnDefiDeploy');
+                    const btnBuy = document.getElementById('btnDefiBuy');
+                    
+                    if (payload) {
+                        document.getElementById('curveSupply').innerText = payload.supply + " MUSD";
+                        document.getElementById('curvePrice').innerText = "100%";
+                        document.getElementById('defiStatus').innerText = "Live on-chain";
+                        document.getElementById('defiStatus').style.color = "var(--ok)";
+                        btnDep.classList.add('hidden');
+                        btnBuy.classList.remove('hidden');
+                    } else {
+                        document.getElementById('curveSupply').innerText = "0 MUSD";
+                        document.getElementById('curvePrice').innerText = "0%";
+                        document.getElementById('defiStatus').innerText = "Not deployed yet";
+                        btnDep.classList.remove('hidden');
+                        btnBuy.classList.add('hidden');
+                    }
+                    break;
 
                 case 'PHRASE_GENERATED':
                     document.getElementById('seedPhrase').value = payload;
@@ -2013,8 +2105,11 @@ async function connectWebRTC(bootstrapAddr) {
             );
         };
 
-        document.getElementById('btnExport').onclick = () => {
-            worker.postMessage({ type: 'EXPORT_BACKUP' });
+        document.getElementById('btnDefiDeploy').onclick = () => {
+            worker.postMessage({ type: 'DEFI_ACTION', payload: { action: 'deploy' } });
+        };
+        document.getElementById('btnDefiBuy').onclick = () => {
+            worker.postMessage({ type: 'DEFI_ACTION', payload: { action: 'mint' } });
         };
 
         document.getElementById('btnImportTrigger').onclick = () => {
@@ -2063,6 +2158,7 @@ async function connectWebRTC(bootstrapAddr) {
                 reader.readAsText(file);
             }
         });
+        
     </script>
 </body>
 </html>

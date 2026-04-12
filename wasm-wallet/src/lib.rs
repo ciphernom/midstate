@@ -374,6 +374,272 @@ impl WebWallet {
         })
     }
 
+
+    /// Universal DeFi Transaction Builder
+    /// Constructs a transaction that transitions a State Thread while securely attaching 
+    /// physical UTXOs to satisfy covenants (like paying a Treasury).
+    /// Uses dynamic fee calculation and greedy UTXO defragmentation.
+    #[wasm_bindgen]
+    pub fn build_state_thread_tx(
+        &mut self,
+        available_utxos_json: &str,
+        contract_bytecode_hex: &str,
+        current_state_hex: Option<String>,
+        current_coin_id_hex: Option<String>,
+        current_salt_hex: Option<String>,
+        new_state_hex: &str,
+        extra_outputs_json: &str,
+        next_wots_index: u32,
+    ) -> Result<String, JsValue> {
+        let available: Vec<WasmUtxo> = serde_json::from_str(available_utxos_json)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            
+        #[derive(serde::Deserialize)]
+        struct ExtraOut { 
+            out_type: String, 
+            address: String, 
+            #[serde(default)] value: u64,
+            #[serde(default)] commitment: Option<String>
+        }
+        let extra_outs: Vec<ExtraOut> = serde_json::from_str(extra_outputs_json).unwrap_or_default();
+        
+        let extra_value: u64 = extra_outs.iter().map(|o| o.value).sum();
+        
+        let mut avail_sorted = available.clone();
+        avail_sorted.sort_by(|a, b| b.value.cmp(&a.value));
+
+        // 1. Dynamic Fee Estimation & Coin Selection Loop
+        let mut target_fee = 100u64;
+        let mut selected = Vec::new();
+        let mut total = 0u64;
+        let final_fee;
+        
+        loop {
+            let needed = extra_value + target_fee;
+            selected.clear();
+            let mut selected_set = HashSet::new();
+            total = 0;
+
+            // Greedy Selection
+            for coin in &avail_sorted {
+                if total >= needed { break; }
+                selected_set.insert(coin.coin_id.clone());
+                selected.push(coin.clone());
+                total += coin.value;
+            }
+
+            if total < needed { return Err(JsValue::from_str("Insufficient funds for contract requirements and fees")); }
+
+            // WOTS Co-Spend Enforcement
+            let mut grouped_addresses = HashSet::new();
+            for c in &selected {
+                if !c.is_mss { grouped_addresses.insert(c.address.clone()); }
+            }
+            for coin in &available {
+                if grouped_addresses.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
+                    selected_set.insert(coin.coin_id.clone());
+                    selected.push(coin.clone());
+                    total += coin.value;
+                }
+            }
+
+            // Snowball Merge (Defragmentation)
+            let mut added_new = true;
+            while added_new {
+                added_new = false;
+                let current_change = total.saturating_sub(extra_value).saturating_sub(target_fee);
+                let change_denoms = decompose_value(current_change);
+                for denom in change_denoms {
+                    if let Some(pos) = available.iter().position(|c| c.value == denom && !selected_set.contains(&c.coin_id)) {
+                        let coin_to_add = available[pos].clone();
+                        selected_set.insert(coin_to_add.coin_id.clone());
+                        selected.push(coin_to_add);
+                        total += denom;
+                        added_new = true;
+                        break;
+                    }
+                }
+                if selected.len() >= MAX_SELECTED_INPUTS { break; }
+            }
+
+            // Final Co-Spend Sweep
+            let mut final_addresses = HashSet::new();
+            for c in &selected {
+                if !c.is_mss { final_addresses.insert(c.address.clone()); }
+            }
+            for coin in &available {
+                if final_addresses.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
+                    selected_set.insert(coin.coin_id.clone());
+                    selected.push(coin.clone());
+                    total += coin.value;
+                }
+            }
+
+            // Calculate precise byte size of the transaction
+            let mut num_outputs = extra_outs.len() + 1; // +1 for the State Thread output
+            let final_change_val = total.saturating_sub(extra_value).saturating_sub(target_fee);
+            num_outputs += decompose_value(final_change_val).len();
+
+            // Bytes: Base Tx (100) + Wallet Inputs (~1636 each) + State Thread Input (~100) + Outputs (~100 each)
+            let estimated_bytes = 100 
+                + (selected.len() as u64 * 1636) 
+                + (if current_state_hex.is_some() { 100 } else { 0 }) 
+                + (num_outputs as u64 * 100);
+                
+            let required_fee = (estimated_bytes * 10) / 1024 + 10;
+
+            if total >= extra_value + required_fee {
+                final_fee = required_fee;
+                break;
+            } else {
+                target_fee = required_fee;
+            }
+        }
+
+        // 2. Build the Transaction
+        let contract_bytes = hex::decode(contract_bytecode_hex).unwrap();
+        let contract_addr = midstate::core::types::hash(&contract_bytes);
+
+        let mut input_coin_ids = Vec::new();
+        let mut input_reveals = Vec::new();
+        let mut signatures = Vec::new();
+
+        // -> Consume Contract Input (Old State)
+        if let (Some(state), Some(cid), Some(salt)) = (&current_state_hex, &current_coin_id_hex, &current_salt_hex) {
+            let mut cid_b = [0u8; 32]; hex::decode_to_slice(cid, &mut cid_b).unwrap();
+            input_coin_ids.push(cid_b);
+            input_reveals.push(serde_json::json!({
+                "bytecode": contract_bytecode_hex,
+                "value": 0,
+                "salt": salt,
+                "commitment": state
+            }));
+            signatures.push("00".to_string()); // Dummy witness for the contract
+        }
+
+        // -> Consume Wallet Inputs
+        for inp in &selected {
+            let mut cid_b = [0u8; 32]; hex::decode_to_slice(&inp.coin_id, &mut cid_b).unwrap();
+            input_coin_ids.push(cid_b);
+            
+            let pk = if inp.is_mss {
+                self.mss_cache.get(&inp.address).unwrap().master_pk
+            } else {
+                let seed = derive_wots_seed(&self.master_seed, inp.index as u64);
+                wots::keygen(&seed)
+            };
+            let bytecode = midstate::core::script::compile_p2pk(&pk);
+            input_reveals.push(serde_json::json!({
+                "bytecode": hex::encode(&bytecode),
+                "value": inp.value,
+                "salt": inp.salt
+            }));
+        }
+
+        let mut outputs_json = Vec::new();
+        let mut output_hashes = Vec::new();
+
+        // -> Create Contract Output (New State)
+        let mut new_state_b = [0u8; 32]; hex::decode_to_slice(new_state_hex, &mut new_state_b).unwrap();
+        let mut contract_out_salt = [0u8; 32]; getrandom_02::getrandom(&mut contract_out_salt).unwrap();
+        
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"CONFIDENTIAL");
+        hasher.update(&contract_addr);
+        hasher.update(&new_state_b);
+        hasher.update(&contract_out_salt);
+        output_hashes.push(*hasher.finalize().as_bytes());
+
+        outputs_json.push(serde_json::json!({
+            "type": "confidential",
+            "address": hex::encode(contract_addr),
+            "commitment": new_state_hex,
+            "salt": hex::encode(contract_out_salt)
+        }));
+
+        // -> Create Extra Outputs (Treasury Payment & Token Minting)
+        for ext in extra_outs {
+            let mut addr_b = [0u8; 32]; hex::decode_to_slice(&ext.address, &mut addr_b).unwrap();
+            let mut salt_b = [0u8; 32]; getrandom_02::getrandom(&mut salt_b).unwrap();
+            
+            if ext.out_type == "confidential" {
+                let comm_hex = ext.commitment.unwrap_or_default();
+                let mut comm_b = [0u8; 32]; hex::decode_to_slice(&comm_hex, &mut comm_b).unwrap();
+                
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"CONFIDENTIAL");
+                hasher.update(&addr_b);
+                hasher.update(&comm_b);
+                hasher.update(&salt_b);
+                output_hashes.push(*hasher.finalize().as_bytes());
+
+                outputs_json.push(serde_json::json!({
+                    "type": "confidential",
+                    "address": ext.address,
+                    "commitment": comm_hex,
+                    "salt": hex::encode(salt_b)
+                }));
+            } else {
+                output_hashes.push(compute_coin_id(&addr_b, ext.value, &salt_b));
+                outputs_json.push(serde_json::json!({
+                    "type": "standard",
+                    "address": ext.address,
+                    "value": ext.value,
+                    "salt": hex::encode(salt_b)
+                }));
+            }
+        }
+
+        // -> Create Change Output
+        let change = total - extra_value - final_fee;
+        let mut current_idx = next_wots_index;
+        if change > 0 {
+            for denom in decompose_value(change) {
+                let change_seed = derive_wots_seed(&self.master_seed, current_idx as u64);
+                let change_addr = compute_address(&wots::keygen(&change_seed));
+                let change_salt = derive_deterministic_salt(&self.master_seed, current_idx as u64);
+                
+                output_hashes.push(compute_coin_id(&change_addr, denom, &change_salt));
+                outputs_json.push(serde_json::json!({
+                    "type": "standard",
+                    "address": hex::encode(change_addr),
+                    "value": denom,
+                    "salt": hex::encode(change_salt)
+                }));
+                current_idx += 1;
+            }
+        }
+
+        let mut tx_salt = [0u8; 32]; getrandom_02::getrandom(&mut tx_salt).unwrap();
+        let commitment = compute_commitment(&input_coin_ids, &output_hashes, &tx_salt);
+
+        // 3. Securely Sign Wallet Inputs
+        for inp in &selected {
+            if inp.is_mss {
+                let kp = self.mss_cache.get_mut(&inp.address).unwrap();
+                kp.next_leaf = inp.mss_leaf as u64;
+                let sig = kp.sign(&commitment).unwrap();
+                signatures.push(hex::encode(sig.to_bytes()));
+            } else {
+                let seed = derive_wots_seed(&self.master_seed, inp.index as u64);
+                let sig = wots::sign(&seed, &commitment);
+                signatures.push(hex::encode(wots::sig_to_bytes(&sig)));
+            }
+        }
+
+        Ok(serde_json::json!({
+            "commitment": hex::encode(commitment),
+            "reveal": {
+                "inputs": input_reveals,
+                "signatures": signatures,
+                "outputs": outputs_json,
+                "salt": hex::encode(tx_salt)
+            },
+            "next_wots_index": current_idx,
+            "fee": final_fee
+        }).to_string())
+    }
+
     /// Build coinbase outputs for solo mining.
     ///
     /// Decomposes `total_value` (block reward + fees) into power-of-2
