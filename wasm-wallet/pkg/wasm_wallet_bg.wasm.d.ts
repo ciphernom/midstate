@@ -11,6 +11,7 @@ export const search_nonces: (a: number, b: number, c: number, d: number, e: numb
 export const webwallet_build_coinbase: (a: number, b: number, c: bigint, d: number) => void;
 export const webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const webwallet_build_solo_extension: (a: number, b: number, c: number, d: number, e: bigint) => void;
+export const webwallet_build_state_thread_tx: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number) => void;
 export const webwallet_check_filter: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
 export const webwallet_export_mss_bytes: (a: number, b: number, c: number, d: number) => void;
 export const webwallet_from_seed_hex: (a: number, b: number, c: number) => void;

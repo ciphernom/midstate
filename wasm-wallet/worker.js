@@ -669,6 +669,7 @@ self.onmessage = async (e) => {
     try {
         if (type === 'INIT') {
             await init();
+            VAULT_ADDR = blake3_hash_hex(VAULT_BYTECODE);
             self.postMessage({ type: 'INIT_DONE' });
         }
 
@@ -732,30 +733,32 @@ self.onmessage = async (e) => {
         else if (type === 'DEFI_ACTION') {
             if (!wallet) throw new Error("Wallet not initialized");
             
-            showActivity("Building Smart Contract Transaction...");
+            showActivity(payload.action === 'deploy' ? "Deploying Vault Contract..." : "Minting Stablecoin...");
             
             const utxoArray = Object.values(wState.utxos).map(u => {
                 if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
                 return u;
             });
 
-            // 1. Calculate State Transition
-            let newSupply = 1;
-            if (payload.action === 'mint' && vaultUtxo) {
-                newSupply = vaultUtxo.supply + 1;
-            }
-            
-            let newSupplyHex = newSupply.toString(16);
-            if (newSupplyHex.length % 2) newSupplyHex = '0' + newSupplyHex;
-            let newStateThread = newSupplyHex.match(/.{2}/g).reverse().join('').padEnd(64, '0');
-
-            // 2. Format Covenants (Pay the Vault and Mint Token)
+            let newSupply = 0;
             let extraOutputs = [];
-            if (payload.action === 'mint') {
-                // The physical MDS locked in the Vault
+
+            if (payload.action === 'deploy') {
+                // Genesis State: Supply starts at 0.
+                // NOTE: The WASM builder automatically generates the State Thread output, 
+                // so we leave extraOutputs empty here.
+                newSupply = 0;
+            } 
+            else if (payload.action === 'mint') {
+                if (!vaultUtxo) throw new Error("Vault not deployed yet! Please deploy first.");
+                
+                // Increment Supply
+                newSupply = vaultUtxo.supply + 1;
+                
+                // 1. Pay the physical MDS locked in the Vault
                 extraOutputs.push({ out_type: "standard", address: VAULT_ADDR, value: 1 });
                 
-                // Issue MIDSTATE DOLLAR (MUSD) to the buyer using a Confidential Output
+                // 2. Issue MIDSTATE DOLLAR (MUSD) to the buyer using a Confidential Output
                 const TOKEN_TICKER = "4d5553440000000000000000000000000000000000000000"; // "MUSD" padded
                 let tokenBalHex = (1).toString(16).padStart(2, '0').padEnd(16, '0'); // 1 Token
                 let tokenCommitment = tokenBalHex + TOKEN_TICKER;
@@ -769,13 +772,19 @@ self.onmessage = async (e) => {
                 });
             }
 
+            // Convert integer to Little-Endian hex string padded to 32 bytes (64 chars)
+            let newSupplyHex = newSupply.toString(16);
+            if (newSupplyHex.length % 2) newSupplyHex = '0' + newSupplyHex;
+            let newStateThread = newSupplyHex.match(/.{2}/g).reverse().join('').padEnd(64, '0');
+
             try {
+                // Call the universal WASM Builder
                 const txDataStr = wallet.build_state_thread_tx(
                     JSON.stringify(utxoArray),
                     VAULT_BYTECODE,
-                    vaultUtxo ? vaultUtxo.commitment : null,
-                    vaultUtxo ? vaultUtxo.coin_id : null,
-                    vaultUtxo ? vaultUtxo.salt : null,
+                    payload.action === 'deploy' ? null : vaultUtxo.commitment,
+                    payload.action === 'deploy' ? null : vaultUtxo.coin_id,
+                    payload.action === 'deploy' ? null : vaultUtxo.salt,
                     newStateThread,
                     JSON.stringify(extraOutputs),
                     wState.nextWotsIndex
@@ -786,19 +795,52 @@ self.onmessage = async (e) => {
                 
                 showActivity("Mining Proof of Work...");
                 const stateData = await rpc.getState();
-                const nonce = await rpcCall('commit', { commitmentHex: txData.commitment, spamNonce: 0 }).catch(() => 0); // Stub for UI testing
                 
-                showActivity("Executing AMM Smart Contract...");
+                // Mine PoW locally in JS to satisfy the mempool
+                let spamNonce = 0;
+                while (true) {
+                    const hashExt = blake3_hash_hex(txData.commitment + spamNonce.toString(16).padStart(16, '0').match(/.{2}/g).reverse().join(''));
+                    // Check leading zeros against difficulty
+                    let zeros = 0;
+                    for (let i = 0; i < 64; i++) {
+                        if (hashExt[i] === '0') zeros += 4;
+                        else {
+                            let bin = parseInt(hashExt[i], 16).toString(2).padStart(4, '0');
+                            for (let b of bin) { if (b === '0') zeros++; else break; }
+                            break;
+                        }
+                    }
+                    if (zeros >= (stateData.required_pow || 24)) break;
+                    spamNonce++;
+                }
+                
+                showActivity("Submitting Commit...");
+                const commitResp = await rpc.commit(txData.commitment, spamNonce);
+                if (!commitResp.ok) throw new Error(commitResp.body || commitResp.error);
+
+                showActivity("Waiting for Block Confirmation...");
+                let mined = false;
+                for (let i = 0; i < 30; i++) {
+                    await new Promise(r => setTimeout(r, 2000));
+                    const check = await rpc.checkCommitment(txData.commitment);
+                    if (check && check.exists) { mined = true; break; }
+                }
+                if (!mined) throw new Error("Timed out waiting for block confirmation");
+
+                showActivity("Executing Smart Contract...");
                 const revealResp = await rpc.send(txData.reveal);
-                if (!revealResp.ok) throw new Error(revealResp.body);
+                if (!revealResp.ok) throw new Error(revealResp.body || revealResp.error);
 
                 hideActivity();
-                self.postMessage({ type: 'ERROR', payload: "Contract Executed Successfully!" }); 
+                self.postMessage({ type: 'ERROR', payload: payload.action === 'deploy' ? "Contract Deployed Successfully!" : "MUSD Minted Successfully!" }); 
+                await saveState();
+                
+                // Rescan to pick up the updated AMM state and newly minted Token!
                 await performScan();
 
             } catch (e) {
                 hideActivity();
-                self.postMessage({ type: 'ERROR', payload: e.message || "Failed to build contract transaction" });
+                self.postMessage({ type: 'ERROR', payload: e.message || "Failed to execute contract" });
             }
         }
 
@@ -1205,8 +1247,7 @@ async function processFullBlock(height) {
                         const saltHex = normalizeHex(confData.salt);
                         
                         // 1. Track Vault Contract State
-                        const VAULT_HASH = "8142345e698ef77a6438bf42f654b791448b1ea32a32c253d71261d7637119ff";
-                        if (addrHex === VAULT_HASH) {
+                        if (addrHex === VAULT_ADDR) {
                             const countHex = commitment.substring(0, 16).match(/.{2}/g).reverse().join('');
                             vaultUtxo = {
                                 coin_id: compute_confidential_coin_id(addrHex, commitment, saltHex), 

@@ -156,6 +156,59 @@ export class WebWallet {
         }
     }
     /**
+     * Universal DeFi Transaction Builder
+     * Constructs a transaction that transitions a State Thread while securely attaching
+     * physical UTXOs to satisfy covenants (like paying a Treasury).
+     * Uses dynamic fee calculation and greedy UTXO defragmentation.
+     * @param {string} available_utxos_json
+     * @param {string} contract_bytecode_hex
+     * @param {string | null | undefined} current_state_hex
+     * @param {string | null | undefined} current_coin_id_hex
+     * @param {string | null | undefined} current_salt_hex
+     * @param {string} new_state_hex
+     * @param {string} extra_outputs_json
+     * @param {number} next_wots_index
+     * @returns {string}
+     */
+    build_state_thread_tx(available_utxos_json, contract_bytecode_hex, current_state_hex, current_coin_id_hex, current_salt_hex, new_state_hex, extra_outputs_json, next_wots_index) {
+        let deferred9_0;
+        let deferred9_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(available_utxos_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(contract_bytecode_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            var ptr2 = isLikeNone(current_state_hex) ? 0 : passStringToWasm0(current_state_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            var len2 = WASM_VECTOR_LEN;
+            var ptr3 = isLikeNone(current_coin_id_hex) ? 0 : passStringToWasm0(current_coin_id_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            var len3 = WASM_VECTOR_LEN;
+            var ptr4 = isLikeNone(current_salt_hex) ? 0 : passStringToWasm0(current_salt_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            var len4 = WASM_VECTOR_LEN;
+            const ptr5 = passStringToWasm0(new_state_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len5 = WASM_VECTOR_LEN;
+            const ptr6 = passStringToWasm0(extra_outputs_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len6 = WASM_VECTOR_LEN;
+            wasm.webwallet_build_state_thread_tx(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, ptr6, len6, next_wots_index);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr8 = r0;
+            var len8 = r1;
+            if (r3) {
+                ptr8 = 0; len8 = 0;
+                throw takeObject(r2);
+            }
+            deferred9_0 = ptr8;
+            deferred9_1 = len8;
+            return getStringFromWasm0(ptr8, len8);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred9_0, deferred9_1, 1);
+        }
+    }
+    /**
      * Test a Golomb-coded compact block filter for wallet relevance.
      *
      * Returns `true` if any address in the watchlist matches the filter,

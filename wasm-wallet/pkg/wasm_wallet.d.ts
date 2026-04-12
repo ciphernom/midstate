@@ -71,6 +71,13 @@ export class WebWallet {
      */
     build_solo_extension(midstate_hex: string, nonce: bigint): string | undefined;
     /**
+     * Universal DeFi Transaction Builder
+     * Constructs a transaction that transitions a State Thread while securely attaching
+     * physical UTXOs to satisfy covenants (like paying a Treasury).
+     * Uses dynamic fee calculation and greedy UTXO defragmentation.
+     */
+    build_state_thread_tx(available_utxos_json: string, contract_bytecode_hex: string, current_state_hex: string | null | undefined, current_coin_id_hex: string | null | undefined, current_salt_hex: string | null | undefined, new_state_hex: string, extra_outputs_json: string, next_wots_index: number): string;
+    /**
      * Test a Golomb-coded compact block filter for wallet relevance.
      *
      * Returns `true` if any address in the watchlist matches the filter,
@@ -371,6 +378,7 @@ export interface InitOutput {
     readonly webwallet_build_coinbase: (a: number, b: number, c: bigint, d: number) => void;
     readonly webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly webwallet_build_solo_extension: (a: number, b: number, c: number, d: number, e: bigint) => void;
+    readonly webwallet_build_state_thread_tx: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number) => void;
     readonly webwallet_check_filter: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
     readonly webwallet_export_mss_bytes: (a: number, b: number, c: number, d: number) => void;
     readonly webwallet_from_seed_hex: (a: number, b: number, c: number) => void;
