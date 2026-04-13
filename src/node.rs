@@ -26,6 +26,8 @@ const STATE_CACHE_SIZE: usize = 200;
 /// nearby snapshot to replay from instead of rewinding to genesis.
 const SNAPSHOT_INTERVAL: u64 = 100;
 
+
+
 use std::path::PathBuf;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -36,6 +38,13 @@ use tokio::time;
 use rayon::prelude::*;
 
 const MAX_ORPHAN_BATCHES: usize = 32;
+/// How many batch chunks to have in-flight simultaneously across peers.
+/// Each chunk is up to 8 MB, so 3 = up to ~24 MB of in-flight data.
+const BATCH_LOOKAHEAD: usize = 3;
+
+const MAX_PREFETCH_BUFFER: usize = 32;
+const MAX_PREFETCH_DISTANCE: u64 = 10_000;
+
 const SYNC_TIMEOUT_SECS: u64 = 900;
 /// Extra grace period for the first chunk (relay handshake, NAT traversal, etc.)
 const SYNC_INITIAL_TIMEOUT_SECS: u64 = 1200;
@@ -96,8 +105,26 @@ enum SyncPhase {
         cursor: u64,
         new_history: Vec<(u64, [u8; 32], Batch)>,
         is_fast_forward: bool,
+        /// Chunks requested from secondary peers that haven't been applied yet.
+       /// (start_height, peer_id)
+        in_flight: std::collections::BTreeMap<u64, PeerId>,
+        /// Out-of-order chunks that arrived before we were ready for them.
+        /// Keyed by start_height.
+        prefetch_buffer: std::collections::BTreeMap<u64, Vec<Batch>>,
     },
-    VerifyingBatches,
+    VerifyingBatches {
+        in_flight: std::collections::BTreeMap<u64, PeerId>,
+        prefetch_buffer: std::collections::BTreeMap<u64, Vec<Batch>>,
+    },
+    /// Fork point found, GetBatches already sent, but state rebuild is still
+    /// running in the background. Batches arriving from the peer are buffered here.
+    PipelinedRebuild {
+        headers: Vec<BatchHeader>,
+        fork_height: u64,
+        is_fast_forward: bool,
+        buffered_batches: Vec<Batch>,
+        in_flight: std::collections::BTreeMap<u64, PeerId>,
+    },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -142,6 +169,8 @@ pub struct Node {
     sync_in_progress: bool,
     sync_requested_up_to: u64,
     sync_session: Option<SyncSession>,
+    sync_retry_count: u32,
+    sync_backoff_until: Option<std::time::Instant>,
     mining_seed: [u8; 32],
     data_dir: PathBuf,
     chain_history: VecDeque<(u64, [u8; 32])>,
@@ -218,7 +247,6 @@ pub enum NodeCommand {
     SendMixFee { coordinator: PeerId, mix_id: [u8; 32], input: InputReveal, join_nonce: u64 },
     SendMixSign { coordinator: PeerId, mix_id: [u8; 32], input_index: usize, signature: Vec<u8> },
     BroadcastMixProposal { mix_id: [u8; 32], proposal: crate::wallet::coinjoin::MixProposal, peers: Vec<PeerId> },
-    FinishSyncHeaders { peer: PeerId, headers: Vec<BatchHeader>, is_valid: bool, snapshot: Option<Box<State>>, fork_height: u64, candidate_state: Option<Box<State>>, is_fast_forward: bool },
     FinishSyncHeadersChunk { peer: PeerId, headers: Vec<BatchHeader>, is_valid: bool },
     FinishSyncBatchesChunk {
         peer: PeerId,
@@ -233,6 +261,14 @@ pub enum NodeCommand {
         session_started_at: std::time::Instant,
         peer_height: u64,
         peer_depth: u128,
+    },
+    FinishStateRebuild {
+        peer: PeerId,
+        fork_height: u64,
+        candidate_state: Option<Box<State>>,
+        headers: Vec<BatchHeader>,
+        is_fast_forward: bool,
+        is_valid: bool,
     },
 }
 
@@ -750,6 +786,8 @@ pub async fn new(
             cached_safe_depth: crate::core::finality::FinalityEstimator::new(2, 8).calculate_safe_depth(1e-6),
             last_sync_cursor: None,
             sync_session: None,
+            sync_retry_count: 0,
+            sync_backoff_until: None,
             known_pex_addrs: HashMap::new(),
             connected_peers: HashSet::new(),
             mining_cancel: None,
@@ -770,6 +808,151 @@ pub async fn new(
         })
     }
 
+async fn process_state_rebuild(
+    &mut self,
+    peer: PeerId,
+    fork_height: u64,
+    candidate_state: Option<Box<State>>,
+    headers: Vec<BatchHeader>,
+    is_fast_forward: bool,
+    is_valid: bool,
+) -> Result<()> {
+    if !is_valid {
+        tracing::warn!("State rebuild or header validation failed, banning peer");
+        self.sync_in_progress = false;
+        self.ban_peer(peer, "invalid header chain or rebuild failed");
+        return Ok(());
+    }
+
+    let headers_start_height = headers.first().map(|h| h.height).unwrap_or(0);
+    if fork_height == headers_start_height && headers_start_height > 0 && !is_fast_forward {
+        let session = match self.sync_session.take() {
+            Some(s) if s.peer == peer => s,
+            other => { self.sync_session = other; return Ok(()); }
+        };
+        let step_back = crate::network::MAX_GETHEADERS_COUNT;
+        let new_start = headers_start_height.saturating_sub(step_back);
+        tracing::warn!(
+            "Fork is deeper than downloaded headers ({}). Stepping back to {} to find the exact fork point.", 
+            headers_start_height, new_start
+        );
+        self.start_sync_session(peer, session.peer_height, session.peer_depth, Some(new_start));
+        return Ok(());
+    }
+
+    match candidate_state {
+        None => {
+            // First message: fork point found, state rebuild still in progress.
+            let session = match self.sync_session.take() {
+                Some(s) if s.peer == peer && matches!(
+                    s.phase,
+                    SyncPhase::VerifyingHeaders | SyncPhase::PipelinedRebuild { .. }
+                ) => s,
+                other => {
+                    tracing::warn!(
+                        "FinishStateRebuild (None branch) arrived but session phase mismatch \
+                         for peer {}, ignoring. Session will timeout.", peer
+                    );
+                    self.sync_session = other;
+                    return Ok(());
+                }
+            };
+            let existing_buffer = match &session.phase {
+                SyncPhase::PipelinedRebuild { buffered_batches, .. } => buffered_batches.clone(),
+                _ => Vec::new(),
+            };
+            tracing::info!(
+                "Pipeline: fork point at {}. Sending GetBatches while state rebuilds...",
+                fork_height
+            );
+
+            let count = (session.peer_height - fork_height).min(MAX_GETBATCHES_COUNT);
+            self.network.send(peer, Message::GetBatches { start_height: fork_height, count });
+
+            let mut in_flight = match &session.phase {
+                SyncPhase::PipelinedRebuild { in_flight, .. } => in_flight.clone(),
+                _ => std::collections::BTreeMap::new(),
+            };
+            in_flight.insert(fork_height, peer);
+
+            self.sync_session = Some(SyncSession {
+                peer,
+                peer_height: session.peer_height,
+                peer_depth: session.peer_depth,
+                phase: SyncPhase::PipelinedRebuild {
+                    headers,
+                    fork_height,
+                    is_fast_forward,
+                    buffered_batches: existing_buffer,
+                    in_flight,
+                },
+                started_at: session.started_at,
+                last_progress_at: std::time::Instant::now(),
+            });
+        }
+
+        Some(state) => {
+            // Second message: state is ready. Drain buffer into Batches phase.
+            let session = match self.sync_session.take() {
+                Some(s) if s.peer == peer => s,
+                other => { self.sync_session = other; return Ok(()); }
+            };
+
+            let mut is_instant = false;
+            let (buffered, stored_headers, stored_fork_height, stored_is_fast_forward, in_flight, peer_height, peer_depth, started_at) = match session.phase {
+                SyncPhase::PipelinedRebuild { 
+                    buffered_batches, headers: ph_headers, fork_height: ph_fh, is_fast_forward: ph_ff, in_flight
+                } => {
+                    (buffered_batches, ph_headers, ph_fh, ph_ff, in_flight, session.peer_height, session.peer_depth, session.started_at)
+                }
+                SyncPhase::VerifyingHeaders => {
+                    is_instant = true;
+                    (Vec::new(), headers, fork_height, is_fast_forward, std::collections::BTreeMap::new(), session.peer_height, session.peer_depth, session.started_at)
+                }
+                _ => return Ok(()),
+            };
+
+            tracing::info!("Pipeline: state ready at height {}. {} buffered batch(es).", stored_fork_height, buffered.len());
+
+            self.sync_session = Some(SyncSession {
+                peer,
+                peer_height,
+                peer_depth,
+                phase: SyncPhase::Batches {
+                    headers: stored_headers,
+                    fork_height: stored_fork_height,
+                    candidate_state: *state,
+                    cursor: stored_fork_height,
+                    new_history: Vec::new(),
+                    is_fast_forward: stored_is_fast_forward,
+                    in_flight,
+                    prefetch_buffer: std::collections::BTreeMap::new(),
+                },
+                started_at,
+                last_progress_at: std::time::Instant::now(),
+            });
+
+            if is_instant {
+                let count = (peer_height - stored_fork_height).min(MAX_GETBATCHES_COUNT);
+                self.network.send(peer, Message::GetBatches { start_height: stored_fork_height, count });
+                if let Some(s) = &mut self.sync_session {
+                    if let SyncPhase::Batches { in_flight, .. } = &mut s.phase { in_flight.insert(stored_fork_height, peer); }
+                }
+            } else if !buffered.is_empty() {
+                if let Err(e) = self.handle_sync_batches(peer, buffered).await {
+                    tracing::warn!("Error applying buffered batches: {}", e);
+                    self.abort_sync_session("buffered batch apply failed"); 
+                    return Ok(()); 
+                }
+            }
+            self.fire_batch_lookahead();
+            self.drain_prefetch_buffer().await;
+        }
+    }
+    Ok(())
+}
+
+
 async fn process_verified_batches_chunk(
         &mut self,
         from: PeerId,
@@ -785,8 +968,14 @@ async fn process_verified_batches_chunk(
         peer_height: u64,
         peer_depth: u128,
     ) -> Result<()> {
-        // Remove the VerifyingBatches placeholder the spawn set.
-        self.sync_session.take();
+        // Remove the VerifyingBatches placeholder the spawn set and extract lookahead state.
+        let (mut in_flight, prefetch_buffer) = match self.sync_session.take() {
+            Some(s) => match s.phase {
+                SyncPhase::VerifyingBatches { in_flight, prefetch_buffer } => (in_flight, prefetch_buffer),
+                _ => (std::collections::BTreeMap::new(), std::collections::BTreeMap::new()),
+            },
+            None => (std::collections::BTreeMap::new(), std::collections::BTreeMap::new()),
+        };
 
         if !is_valid {
             tracing::warn!("Batch at height {} does not match verified header PoW — peer has corrupt data, trying different peer", current_cursor);
@@ -809,10 +998,17 @@ async fn process_verified_batches_chunk(
             self.perform_reorg(*candidate_state.clone(), history_to_flush, is_fast_forward)?;
         }
 
-        if current_cursor < peer_height {
-            // Need more batches — request next chunk
-            let count = (peer_height - current_cursor).min(MAX_GETBATCHES_COUNT);
-            self.network.send(from, Message::GetBatches { start_height: current_cursor, count });
+        // Restore sync state because perform_reorg clears it ---
+        self.sync_in_progress = true;
+        self.cancel_mining();
+        
+       if current_cursor < peer_height {
+            let has_next = prefetch_buffer.contains_key(&current_cursor);
+            if !has_next {
+                let count = (peer_height - current_cursor).min(MAX_GETBATCHES_COUNT);
+                self.network.send(from, Message::GetBatches { start_height: current_cursor, count });
+                in_flight.insert(current_cursor, from);
+            }
             
             // Re-arm the session back into the Batches phase
             self.sync_session = Some(SyncSession {
@@ -826,10 +1022,17 @@ async fn process_verified_batches_chunk(
                     cursor: current_cursor,
                     new_history,
                     is_fast_forward,
+                    in_flight,
+                    prefetch_buffer,
                 },
                 started_at: session_started_at,
                 last_progress_at: std::time::Instant::now(),
             });
+            
+            // Now that we are back in the Batches phase and cursor is advanced:
+            self.fire_batch_lookahead();
+            self.drain_prefetch_buffer().await;
+            
             return Ok(());
         }
 
@@ -854,7 +1057,9 @@ async fn process_verified_batches_chunk(
         self.sync_in_progress = false;
         // Sync complete — next attempt starts fresh
         self.last_sync_cursor = None;
-
+        // Reset backoff: successful sync proves the peer and path are healthy
+        self.sync_retry_count = 0;
+        self.sync_backoff_until = None;
         // Immediately check if the peer has mined more blocks while we were
         // syncing.  Without this, we'd have to wait for the next broadcast
         // (which will fail because we missed intermediate blocks) before
@@ -1284,7 +1489,8 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
         let mut ui_interval = time::interval(Duration::from_secs(1));
         ui_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut metrics_interval = time::interval(Duration::from_secs(30));
-        let mut sync_poll_interval = time::interval(Duration::from_secs(30));
+        let mut sync_poll_interval = time::interval(Duration::from_secs(5));
+        sync_poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut mempool_prune_interval = time::interval(Duration::from_secs(60));
         let mut sync_timeout_interval = time::interval(Duration::from_secs(5));
         let mut pex_interval = time::interval(Duration::from_secs(120));
@@ -1386,25 +1592,60 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                     self.flush_stem_pool();
                 }
                 _ = sync_poll_interval.tick() => {
-                    if let Some(peer) = self.network.random_peer() {
-                        self.network.send(peer, Message::GetState);
+                    // Respect exponential backoff: don't poll until the window expires
+                    if let Some(until) = self.sync_backoff_until {
+                        if std::time::Instant::now() < until {
+                            continue;
+                        }
+                        self.sync_backoff_until = None;
+                    }
+
+                    // Don't interrupt an active session
+                    if self.sync_session.is_some() || self.sync_in_progress {
+                        continue;
+                    }
+
+                    // Poll ALL connected peers, not just one random one.
+                    // On a small network (2-6 peers) polling one random peer means
+                    // a 50-80% chance each tick of missing the peer with the best chain.
+                    let peers: Vec<_> = self.network.connected_peers()
+                        .into_iter()
+                        .filter(|p| !self.network.is_light_peer(p))
+                        .collect();
+
+                    if peers.is_empty() {
+                        tracing::debug!("Sync poll: no peers connected, skipping");
+                    } else {
+                        tracing::debug!("Sync poll: querying {} peer(s) for chain state", peers.len());
+                        for peer in peers {
+                            self.network.send(peer, Message::GetState);
+                        }
                     }
                 }
+                
                 _ = sync_timeout_interval.tick() => {
                     if let Some(session) = &self.sync_session {
-                        // FIX: Do not timeout if the delay is caused by our own CPU verifying headers.
-                        if !matches!(session.phase, SyncPhase::VerifyingHeaders | SyncPhase::VerifyingBatches) {
-                            // Use a longer timeout if we haven't received any data yet
-                            // (initial relay handshake, NAT traversal, etc.)
+                        if !matches!(session.phase, SyncPhase::VerifyingHeaders | SyncPhase::VerifyingBatches { .. } | SyncPhase::PipelinedRebuild { .. }) {
                             let idle_secs = session.last_progress_at.elapsed().as_secs();
                             let has_made_progress = session.last_progress_at != session.started_at;
-                            let timeout = if has_made_progress {
-                                SYNC_TIMEOUT_SECS
-                            } else {
-                                SYNC_INITIAL_TIMEOUT_SECS
+                            let timeout = if has_made_progress { SYNC_TIMEOUT_SECS } else { SYNC_INITIAL_TIMEOUT_SECS };
+                            let peer = session.peer;
+                            let phase_name = match &session.phase {
+                                SyncPhase::Headers { cursor, .. } => format!("Headers(cursor={})", cursor),
+                                SyncPhase::Batches { cursor, .. } => format!("Batches(cursor={})", cursor),
+                                _ => "Verifying".into(),
                             };
                             if idle_secs > timeout {
-                                self.abort_sync_session("timed out");
+                                self.abort_sync_session(&format!(
+                                    "timed out after {}s in phase {} with peer {}",
+                                    idle_secs, phase_name, peer
+                                ));
+                            } else if idle_secs > timeout / 2 && idle_secs % 30 < 5 {
+                                // Log roughly every 30s in the danger zone, not every 5s
+                                tracing::warn!(
+                                    "Sync stall warning: {}s idle in {} (timeout={}s, peer={})",
+                                    idle_secs, phase_name, timeout, peer
+                                );
                             }
                         }
                     }
@@ -1493,11 +1734,6 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                                 tracing::error!("Failed to process pool-submitted block: {}", e);
                             }
                         }
-                        NodeCommand::FinishSyncHeaders { peer, headers, is_valid, snapshot, fork_height, candidate_state, is_fast_forward } => {
-                            if let Err(e) = self.process_verified_headers(peer, headers, is_valid, snapshot, fork_height, candidate_state, is_fast_forward).await {
-                                tracing::warn!("Failed to process verified headers: {}", e);
-                            }
-                        }
                         NodeCommand::FinishSyncHeadersChunk { peer, headers, is_valid } => {
                             if let Err(e) = self.process_verified_headers_chunk(peer, headers, is_valid).await {
                                 tracing::warn!("Failed to process headers chunk: {}", e);
@@ -1506,6 +1742,11 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                         NodeCommand::FinishSyncBatchesChunk { peer, headers, fork_height, candidate_state, cursor, new_history, is_fast_forward, is_valid, error_msg, session_started_at, peer_height, peer_depth } => {
                             if let Err(e) = self.process_verified_batches_chunk(peer, headers, fork_height, candidate_state, cursor, new_history, is_fast_forward, is_valid, error_msg, session_started_at, peer_height, peer_depth).await {
                                 tracing::warn!("Error processing verified batches chunk: {}", e);
+                            }
+                        }
+                        NodeCommand::FinishStateRebuild { peer, fork_height, candidate_state, headers, is_fast_forward, is_valid } => {
+                            if let Err(e) = self.process_state_rebuild(peer, fork_height, candidate_state, headers, is_fast_forward, is_valid).await {
+                                tracing::warn!("Failed to process state rebuild: {}", e);
                             }
                         }
                         NodeCommand::BroadcastMixProposal { mix_id, proposal, peers } => {
@@ -1572,8 +1813,28 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                             self.peer_tx_counts.remove(&peer); 
                             tracing::info!("Peer disconnected: {}", peer);
                             self.tarpitted_peers.remove(&peer);
+
+                            // If this peer had in-flight lookahead requests, drop them from
+                            // tracking so fire_batch_lookahead re-requests from another peer
+                            if let Some(s) = &mut self.sync_session {
+                                match &mut s.phase {
+                                    SyncPhase::Batches { in_flight, .. } |
+                                    SyncPhase::VerifyingBatches { in_flight, .. } |
+                                    SyncPhase::PipelinedRebuild { in_flight, .. } => {
+                                        let lost = in_flight.values().filter(|&p| p == &peer).count();
+                                        if lost > 0 {
+                                            tracing::warn!("Peer {} disconnected with {} in-flight chunk(s), will re-request", peer, lost);
+                                            in_flight.retain(|_, p| &*p != &peer);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+
                             if self.sync_session.as_ref().map_or(false, |s| s.peer == peer) {
                                 self.abort_sync_session("sync peer disconnected");
+                            } else {
+                                self.fire_batch_lookahead();
                             }
                             
                             // Fail any mixes relying on this peer
@@ -1845,19 +2106,85 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
             Message::Batches { start_height: batch_start, batches } => {
                 self.ack(channel);
                 if !batches.is_empty() {
-                    // If we have an active sync session in the Batches phase from this
-                    // peer, route through the sync state machine instead of the normal
-                    // batch handler.
-                    let is_sync_batches = self.sync_session.as_ref().map_or(false, |s| {
-                        s.peer == from && matches!(s.phase, SyncPhase::Batches { .. })
-                    });
-                    if is_sync_batches {
-                        if let Err(e) = self.handle_sync_batches(from, batches).await {
-                            tracing::warn!("Error processing sync batches: {}", e);
-                            self.abort_sync_session("batch processing error");
+                    let session_role = self.sync_session.as_ref().and_then(|s| {
+                        match &s.phase {
+                            SyncPhase::Batches { in_flight, .. } => {
+                                if s.peer == from || in_flight.iter().any(|(_, p)| *p == from) {
+                                    Some("batches")
+                                } else { None }
+                            }
+                            SyncPhase::VerifyingBatches { in_flight, .. } => {
+                                if s.peer == from || in_flight.iter().any(|(_, p)| *p == from) {
+                                    Some("verifying")
+                                } else { None }
+                            }
+                            SyncPhase::PipelinedRebuild { .. } if s.peer == from => Some("pipeline"),
+                            _ => None,
                         }
-                    } else {
-                        self.handle_batches_response(batch_start, batches, from).await?;
+                    });
+
+                    match session_role {
+                        Some("batches") | Some("verifying") => {
+                            let cursor = match &self.sync_session {
+                                Some(s) => match &s.phase {
+                                    SyncPhase::Batches { cursor, .. } => *cursor,
+                                    // If we are currently verifying, the effective cursor for INCOMING
+                                    // data is still the old cursor. We buffer everything that arrives.
+                                    SyncPhase::VerifyingBatches { .. } => u64::MAX, // Force buffer
+                                    _ => 0,
+                                },
+                                None => 0,
+                            };
+
+                            if batch_start == cursor && session_role == Some("batches") {
+                                if let Some(s) = &mut self.sync_session {
+                                    if let SyncPhase::Batches { in_flight, .. } = &mut s.phase {
+                                        in_flight.remove(&batch_start);
+                                    }
+                                }
+                                if let Err(e) = self.handle_sync_batches(from, batches).await {
+                                    tracing::warn!("Error processing sync batches: {}", e);
+                                    self.abort_sync_session("batch processing error");
+                                }
+                            } else {
+                                tracing::debug!("Prefetch: buffering chunk at {} (role={:?})", batch_start, session_role);
+                                if let Some(s) = &mut self.sync_session {
+                                    match &mut s.phase {
+                                        SyncPhase::Batches { cursor, prefetch_buffer, in_flight, .. } => {
+                                            let current_cursor = *cursor;
+                                            if batch_start > current_cursor && batch_start <= current_cursor + MAX_PREFETCH_DISTANCE && prefetch_buffer.len() < MAX_PREFETCH_BUFFER {
+                                                prefetch_buffer.insert(batch_start, batches);
+                                            }
+                                            in_flight.remove(&batch_start);
+                                        }
+                                        SyncPhase::VerifyingBatches { prefetch_buffer, in_flight } => {
+                                            if prefetch_buffer.len() < MAX_PREFETCH_BUFFER {
+                                                prefetch_buffer.insert(batch_start, batches);
+                                            }
+                                            in_flight.remove(&batch_start);
+                                        }
+                                        _ => {}
+                                    }
+                                    s.last_progress_at = std::time::Instant::now();
+                                }
+                            }
+                        }
+                        Some("pipeline") => {
+                            if let Some(s) = &mut self.sync_session {
+                                if let SyncPhase::PipelinedRebuild { buffered_batches, .. } = &mut s.phase {
+                                    if buffered_batches.len() < 50 {
+                                        buffered_batches.extend(batches);
+                                        s.last_progress_at = std::time::Instant::now();
+                                    } else {
+                                        tracing::warn!("Pipeline buffer overflow. Aborting sync.");
+                                        self.abort_sync_session("pipeline buffer overflow");
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            self.handle_batches_response(batch_start, batches, from).await?;
+                        }
                     }
                 }
             }
@@ -1898,7 +2225,7 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                     }
                 }
             }
-Message::Headers { start_height: _, headers } => {
+            Message::Headers { start_height: _, headers } => {
                 self.ack(channel);
                 if let Err(e) = self.handle_sync_headers(from, headers).await {
                     tracing::warn!("Error processing sync headers from {}: {}", from, e);
@@ -2124,9 +2451,119 @@ self.network.send(peer, Message::GetHeaders { start_height, count });
 
 
 
+fn fire_batch_lookahead(&mut self) {
+        let (cursor, peer_height, in_flight_len, primary_peer) = match &self.sync_session {
+            Some(s) => match &s.phase {
+                SyncPhase::Batches { cursor, in_flight, .. } => {
+                    (*cursor, s.peer_height, in_flight.len(), s.peer)
+                }
+                _ => return,
+            },
+            None => return,
+        };
+
+        let slots_available = BATCH_LOOKAHEAD.saturating_sub(in_flight_len);
+        if slots_available == 0 { return; }
+
+        let furthest_in_flight = match &self.sync_session {
+            Some(s) => match &s.phase {
+                SyncPhase::Batches { in_flight, .. } => in_flight.keys().cloned().max(),
+                _ => None,
+            },
+            None => None,
+        };
+        
+        let furthest_prefetched = match &self.sync_session {
+            Some(s) => match &s.phase {
+                SyncPhase::Batches { prefetch_buffer, .. } => prefetch_buffer.keys().cloned().max(),
+                _ => None,
+            },
+            None => None,
+        };
+
+        let furthest_requested = furthest_in_flight.max(furthest_prefetched).unwrap_or(cursor);
+
+        let busy_peers: HashSet<PeerId> = match &self.sync_session {
+            Some(s) => match &s.phase {
+                SyncPhase::Batches { in_flight, .. } => in_flight.values().cloned().collect(),
+                _ => return,
+            },
+            None => return,
+        };
+
+        let mut available_peers: Vec<PeerId> = self.network.connected_peers()
+            .into_iter()
+            .filter(|p| !self.network.is_light_peer(p) && !busy_peers.contains(p))
+            .collect();
+        if available_peers.is_empty() {
+            available_peers.push(primary_peer);
+        }
+
+        let mut next_start = furthest_requested + MAX_GETBATCHES_COUNT;
+        let mut peer_idx = 0;
+
+        for _ in 0..slots_available {
+            if next_start >= peer_height { break; }
+
+            let target_peer = available_peers[peer_idx % available_peers.len()];
+            peer_idx += 1;
+
+            let count = (peer_height - next_start).min(MAX_GETBATCHES_COUNT);
+            tracing::debug!("Lookahead: requesting batches {}..{} from {}", next_start, next_start + count, target_peer);
+            self.network.send(target_peer, Message::GetBatches { start_height: next_start, count });
+
+            if let Some(s) = &mut self.sync_session {
+                if let SyncPhase::Batches { in_flight, .. } = &mut s.phase {
+                    in_flight.insert(next_start, target_peer);
+                }
+            }
+
+            next_start += MAX_GETBATCHES_COUNT;
+        }
+    }
+
+
+
+    async fn drain_prefetch_buffer(&mut self) {
+        let cursor = match &self.sync_session {
+            Some(s) => match &s.phase {
+                SyncPhase::Batches { cursor, .. } => *cursor,
+                _ => return,
+            },
+            None => return,
+        };
+
+        let next_batches = match &mut self.sync_session {
+            Some(s) => match &mut s.phase {
+                SyncPhase::Batches { prefetch_buffer, .. } => prefetch_buffer.remove(&cursor),
+                _ => None,
+            },
+            None => None,
+        };
+
+        if let Some(batches) = next_batches {
+            tracing::debug!("Draining prefetch buffer at height {}", cursor);
+            let peer = self.sync_session.as_ref().unwrap().peer;
+            if let Err(e) = self.handle_sync_batches(peer, batches).await {
+                tracing::warn!("Error applying prefetched batches: {}", e);
+                self.abort_sync_session("prefetch batch apply failed");
+            }
+        }
+    }
+
     fn abort_sync_session(&mut self, reason: &str) {
         if self.sync_session.is_some() {
-            tracing::warn!("Aborting sync session: {}", reason);
+            self.sync_retry_count += 1;
+            // Exponential backoff: 2^n seconds, capped at 5 minutes.
+            // Sequence: 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 300s, 300s...
+            let backoff_secs = 2u64.saturating_pow(self.sync_retry_count).min(300);
+            self.sync_backoff_until = Some(
+                std::time::Instant::now() + Duration::from_secs(backoff_secs)
+            );
+            tracing::warn!(
+                "Aborting sync session (attempt {}): {}. Retrying in {}s.",
+                self.sync_retry_count, reason, backoff_secs
+            );
         }
         self.sync_session = None;
         self.sync_in_progress = false;
@@ -2363,6 +2800,17 @@ self.network.send(peer, Message::GetHeaders { start_height, count });
                                         candidate_state = Some(Box::new(s));
                                     } else {
                                         tracing::info!("Cache miss at height {}, starting background state rebuild...", fh);
+                                        
+                                        // Pipelined Rebuild Start Command
+                                        let _ = tx.send(NodeCommand::FinishStateRebuild {
+                                            peer: from,
+                                            fork_height: fh,
+                                            candidate_state: None,
+                                            headers: all_headers.clone(),
+                                            is_fast_forward: false,
+                                            is_valid: true,
+                                        });
+
                                         let cache_start = state_cache.iter()
                                             .filter(|(h, _)| *h <= fh)
                                             .max_by_key(|(h, _)| *h)
@@ -2388,14 +2836,13 @@ self.network.send(peer, Message::GetHeaders { start_height, count });
                 }
             }
 
-            let _ = tx.send(NodeCommand::FinishSyncHeaders {
+            let _ = tx.send(NodeCommand::FinishStateRebuild {
                 peer: from,
-                headers: all_headers,
-                is_valid,
-                snapshot,
                 fork_height,
                 candidate_state,
+                headers: all_headers,
                 is_fast_forward,
+                is_valid,
             });
         });
 
@@ -2411,102 +2858,7 @@ self.network.send(peer, Message::GetHeaders { start_height, count });
         Ok(())
     }
 
-    async fn process_verified_headers(
-        &mut self,
-        peer: PeerId,
-        all_headers: Vec<BatchHeader>,
-        is_valid: bool,
-        snapshot: Option<Box<State>>,
-        fork_height: u64,
-        candidate_state_opt: Option<Box<State>>,
-        is_fast_forward: bool,
-    ) -> Result<()> {
-        let session = match self.sync_session.take() {
-            Some(s) if s.peer == peer && matches!(s.phase, SyncPhase::VerifyingHeaders) => s,
-            other => {
-                self.sync_session = other; 
-                return Ok(());
-            }
-        };
-
-        if !is_valid {
-            tracing::warn!("Peer header chain invalid (PoW, linkage, or state rebuild failed)");
-            self.sync_in_progress = false;
-            self.ban_peer(peer, "invalid header chain");
-            return Ok(());
-        }
-
-        // --- NEW: CLEANUP CRASH RECOVERY FILE ---
-        let sync_file_path = self.data_dir.join("sync_state.bin");
-        let _ = std::fs::remove_file(&sync_file_path);
-        // ----------------------------------------
-
-        let headers_start_height = all_headers.first().map(|h| h.height).unwrap_or(0);
-        if fork_height == headers_start_height && headers_start_height > 0 && !is_fast_forward {
-            
-            // Step back exactly the maximum allowed header count to ensure contiguous coverage
-            let step_back = crate::network::MAX_GETHEADERS_COUNT;
-            let new_start = headers_start_height.saturating_sub(step_back);
-            
-            tracing::warn!(
-                "Fork is deeper than downloaded headers ({}). Stepping back to {} to find the exact fork point.", 
-                headers_start_height, new_start
-            );
-            
-            self.start_sync_session(peer, session.peer_height, session.peer_depth, Some(new_start));
-            return Ok(());
-        }
-
-        let candidate_state = match candidate_state_opt {
-            Some(s) => *s,
-            None => {
-                tracing::warn!("Missing candidate state");
-                self.sync_in_progress = false;
-                return Ok(());
-            }
-        };
-
-        if is_fast_forward {
-            if let Some(snap) = snapshot {
-                if let Err(e) = self.storage.save_state_snapshot(snap.height, &snap) {
-                    tracing::warn!("Failed to save fast-forward snapshot to disk: {}", e);
-                }
-            }
-        }
-
-        tracing::info!(
-            "Fork point/Snapshot at height {}. Will download batches {}..{}",
-            fork_height, fork_height, session.peer_height
-        );
-
-        if fork_height >= session.peer_height {
-            tracing::info!("Already in sync with peer");
-            self.sync_in_progress = false;
-            return Ok(());
-        }
-
-        let now = std::time::Instant::now();
-        self.sync_session = Some(SyncSession {
-            peer,
-            peer_height: session.peer_height,
-            peer_depth: session.peer_depth,
-            phase: SyncPhase::Batches {
-                headers: all_headers,
-                fork_height,
-                candidate_state,
-                cursor: fork_height,
-                new_history: Vec::new(),
-                is_fast_forward,
-            },
-            started_at: now,
-            last_progress_at: now,
-        });
-
-        let count = (session.peer_height - fork_height).min(MAX_GETBATCHES_COUNT);
-        self.network.send(peer, Message::GetBatches { start_height: fork_height, count });
-
-        Ok(())
-    }
+    
 
     async fn handle_sync_batches(&mut self, from: PeerId, batches: Vec<Batch>) -> Result<()> {
         if batches.is_empty() {
@@ -2529,9 +2881,9 @@ self.network.send(peer, Message::GetHeaders { start_height, count });
         let session_peer_depth = session.peer_depth;
         let session_started_at = session.started_at;
 
-        let (headers, fork_height, candidate_state, cursor, new_history, is_fast_forward) = match session.phase {
-            SyncPhase::Batches { headers, fork_height, candidate_state, cursor, new_history, is_fast_forward } => {
-                (headers, fork_height, candidate_state, cursor, new_history, is_fast_forward)
+        let (headers, fork_height, candidate_state, cursor, new_history, is_fast_forward, in_flight, prefetch_buffer) = match session.phase {
+            SyncPhase::Batches { headers, fork_height, candidate_state, cursor, new_history, is_fast_forward, in_flight, prefetch_buffer } => {
+                (headers, fork_height, candidate_state, cursor, new_history, is_fast_forward, in_flight, prefetch_buffer)
             }
             _ => {
                 // Wrong phase — put it back untouched
@@ -2676,7 +3028,10 @@ self.network.send(peer, Message::GetHeaders { start_height, count });
             peer: from,
             peer_height: session_peer_height,
             peer_depth: session_peer_depth,
-            phase: SyncPhase::VerifyingBatches,
+            phase: SyncPhase::VerifyingBatches {
+                in_flight,
+                prefetch_buffer,
+            },
             started_at: session_started_at,
             last_progress_at: std::time::Instant::now(),
         });
@@ -3300,12 +3655,20 @@ fn perform_reorg(
             }
 
             // 2. Asymmetry check: ensure the target isn't artificially easy.
-            // Since ASERT smooths difficulty, a valid orphan shouldn't be significantly 
-            // easier than our current tip. We reject if it's >4x easier (shifted by 2 bits).
+            // We use a 16x (4-bit shift) window instead of 4x (2-bit), because ASERT is
+            // anchored to wall-clock time: two nodes that diverged for even a few
+            // minutes will legitimately have different targets. The 4x window was
+            // causing valid miner batches to be silently dropped, forking them off
+            // permanently. The PoW verification above is the real spam gate.
             let current_target = primitive_types::U256::from_big_endian(&self.state.target);
             let batch_target = primitive_types::U256::from_big_endian(&batch.target);
-            if batch_target > (current_target << 2) {
-                tracing::debug!("Rejected invalid orphan block (Target too easy, possible spam)");
+            if batch_target > (current_target << 4) {
+                tracing::warn!(
+                    "Rejected orphan block from {:?}: target {:?} is >16x easier than ours ({:?}). Likely spam.",
+                    from,
+                    hex::encode(batch.target),
+                    hex::encode(self.state.target)
+                );
                 return Ok(());
             }
             // --------------------------------------
@@ -4046,6 +4409,9 @@ async fn rebuild_state_from_disk(storage: crate::storage::Storage, target_height
             let mut wots_oracle = std::collections::HashMap::new();
             
             for h in start_h..target_height {
+                if h % 500 == 0 && h > 0 {
+                    tracing::info!("[REBUILD] Rebuilding state: {}/{}", h, target_height);
+                }
                 if let Some(batch) = storage.load_batch(h)? {
                     recent_headers.push_back(state.timestamp);
                     if recent_headers.len() > crate::core::DIFFICULTY_LOOKBACK as usize {
@@ -4089,6 +4455,9 @@ async fn rebuild_state_from_disk(storage: crate::storage::Storage, target_height
             let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
             let mut wots_oracle = std::collections::HashMap::new(); 
             for h in replay_from..target_height {
+                if h % 500 == 0 && h > 0 {
+                    tracing::info!("[REPLAY] Rebuilding state: {}/{}", h, target_height);
+                }
                 if let Some(batch) = storage.load_batch(h)? {
                     recent_headers.push_back(state.timestamp);
                     if recent_headers.len() > crate::core::DIFFICULTY_LOOKBACK as usize {

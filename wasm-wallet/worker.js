@@ -793,7 +793,7 @@ self.onmessage = async (e) => {
                 const txData = JSON.parse(txDataStr);
                 wState.nextWotsIndex = txData.next_wots_index;
                 
-                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining Proof of Work..." } });
+                showActivity("Mining Proof of Work...");
                 const stateData = await rpc.getState();
                 
                 // Mine PoW locally in JS to satisfy the mempool
@@ -814,32 +814,44 @@ self.onmessage = async (e) => {
                     spamNonce++;
                 }
                 
-                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Submitting Commit..." } });
+                showActivity("Submitting Commit...");
                 const commitResp = await rpc.commit(txData.commitment, spamNonce);
                 if (!commitResp.ok) throw new Error(commitResp.body || commitResp.error);
 
-                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for Block Confirmation..." } });
+                // Wait up to 5 minutes for the Commit to be mined
+                showActivity("Waiting for Block Confirmation (Phase 1)...");
                 let mined = false;
-                for (let i = 0; i < 30; i++) {
+                for (let i = 0; i < 150; i++) {
                     await new Promise(r => setTimeout(r, 2000));
                     const check = await rpc.checkCommitment(txData.commitment);
                     if (check && check.exists) { mined = true; break; }
                 }
-                if (!mined) throw new Error("Timed out waiting for block confirmation");
+                if (!mined) throw new Error("Timed out waiting for block. Ensure your Miner is running!");
 
-                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Executing Smart Contract..." } });
+                showActivity("Executing Smart Contract...");
                 const revealResp = await rpc.send(txData.reveal);
                 if (!revealResp.ok) throw new Error(revealResp.body || revealResp.error);
 
+                // When a Reveal is mined, its Commitment is deleted from the blockchain state.
+                // We check if it disappeared to know Phase 2 is complete!
+                showActivity("Finalizing Mint (Phase 2)...");
+                let revealMined = false;
+                for (let i = 0; i < 150; i++) {
+                    await new Promise(r => setTimeout(r, 2000));
+                    const check = await rpc.checkCommitment(txData.commitment);
+                    if (check && !check.exists) { revealMined = true; break; }
+                }
+                if (!revealMined) throw new Error("Timed out waiting for final execution. Ensure your Miner is running!");
+
+                hideActivity();
+                self.postMessage({ type: 'ERROR', payload: payload.action === 'deploy' ? "Contract Deployed Successfully!" : "MUSD Minted Successfully!" }); 
                 await saveState();
                 
-                // Rescan to pick up the updated AMM state and newly minted Token!
+                // Scan to instantly pick up the updated AMM state and newly minted Token!
                 await performScan();
-                
-                // Sends the green Toast and clears the banner automatically!
-                self.postMessage({ type: 'SEND_COMPLETE', payload: buildDashboardPayload() });
 
             } catch (e) {
+                hideActivity();
                 self.postMessage({ type: 'ERROR', payload: e.message || "Failed to execute contract" });
             }
         }
