@@ -2465,24 +2465,6 @@ fn fire_batch_lookahead(&mut self) {
         let slots_available = BATCH_LOOKAHEAD.saturating_sub(in_flight_len);
         if slots_available == 0 { return; }
 
-        let furthest_in_flight = match &self.sync_session {
-            Some(s) => match &s.phase {
-                SyncPhase::Batches { in_flight, .. } => in_flight.keys().cloned().max(),
-                _ => None,
-            },
-            None => None,
-        };
-        
-        let furthest_prefetched = match &self.sync_session {
-            Some(s) => match &s.phase {
-                SyncPhase::Batches { prefetch_buffer, .. } => prefetch_buffer.keys().cloned().max(),
-                _ => None,
-            },
-            None => None,
-        };
-
-        let furthest_requested = furthest_in_flight.max(furthest_prefetched).unwrap_or(cursor);
-
         let busy_peers: HashSet<PeerId> = match &self.sync_session {
             Some(s) => match &s.phase {
                 SyncPhase::Batches { in_flight, .. } => in_flight.values().cloned().collect(),
@@ -2499,23 +2481,41 @@ fn fire_batch_lookahead(&mut self) {
             available_peers.push(primary_peer);
         }
 
-        let mut next_start = furthest_requested + MAX_GETBATCHES_COUNT;
+        let mut next_start = cursor;
         let mut peer_idx = 0;
+        let mut reqs_sent = 0;
 
-        for _ in 0..slots_available {
-            if next_start >= peer_height { break; }
+        while reqs_sent < slots_available && next_start < peer_height {
+            let is_in_flight = match &self.sync_session {
+                Some(s) => match &s.phase {
+                    SyncPhase::Batches { in_flight, .. } => in_flight.contains_key(&next_start),
+                    _ => false,
+                },
+                None => false,
+            };
 
-            let target_peer = available_peers[peer_idx % available_peers.len()];
-            peer_idx += 1;
+            let is_prefetched = match &self.sync_session {
+                Some(s) => match &s.phase {
+                    SyncPhase::Batches { prefetch_buffer, .. } => prefetch_buffer.contains_key(&next_start),
+                    _ => false,
+                },
+                None => false,
+            };
 
-            let count = (peer_height - next_start).min(MAX_GETBATCHES_COUNT);
-            tracing::debug!("Lookahead: requesting batches {}..{} from {}", next_start, next_start + count, target_peer);
-            self.network.send(target_peer, Message::GetBatches { start_height: next_start, count });
+            if !is_in_flight && !is_prefetched {
+                let target_peer = available_peers[peer_idx % available_peers.len()];
+                peer_idx += 1;
 
-            if let Some(s) = &mut self.sync_session {
-                if let SyncPhase::Batches { in_flight, .. } = &mut s.phase {
-                    in_flight.insert(next_start, target_peer);
+                let count = (peer_height - next_start).min(MAX_GETBATCHES_COUNT);
+                tracing::debug!("Lookahead: requesting batches {}..{} from {}", next_start, next_start + count, target_peer);
+                self.network.send(target_peer, Message::GetBatches { start_height: next_start, count });
+
+                if let Some(s) = &mut self.sync_session {
+                    if let SyncPhase::Batches { in_flight, .. } = &mut s.phase {
+                        in_flight.insert(next_start, target_peer);
+                    }
                 }
+                reqs_sent += 1;
             }
 
             next_start += MAX_GETBATCHES_COUNT;
@@ -2725,11 +2725,19 @@ fn fire_batch_lookahead(&mut self) {
         let current_height = self.state.height;
         let state_cache = self.state_cache.clone(); 
         let current_state = self.state.clone(); 
+        
+        // Grab recent timestamps to pass to the background thread for MTP validation
+        let recent_headers_vec: Vec<u64> = self.recent_headers.iter().copied().collect();
 
         tokio::spawn(async move {
             let mut is_valid = true;
 
-            // --- Time Warp Defense (Constants) ---
+            // --- Time Warp Defense (MTP & Full PoW Validation) ---
+            if let Err(e) = crate::sync::Syncer::verify_header_chain(&all_headers, &recent_headers_vec) {
+                tracing::warn!("Accumulated header chain failed consensus (MTP/PoW/Linkage): {}", e);
+                is_valid = false;
+            }
+
             let current_time = crate::core::state::current_timestamp();
             const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
 
@@ -3157,30 +3165,12 @@ fn fire_batch_lookahead(&mut self) {
         self.metrics.inc_transactions_processed();
 
 
-/**** for future, when more nodes, we should change the behavior below to the following:
- * // If the stem pool is at capacity, DROP the transaction to preserve privacy.
-        // Broadcasting it publicly (fluffing) under a Sybil flood attack would
-        // allow an attacker to instantly deanonymize the sender's IP address.
+        // If the stem pool is at capacity, DROP the incoming P2P stem transaction.
+        // If we broadcasted it, an attacker could spam us with stem txs to force us
+        // to fluff our own txs, instantly deanonymizing our IP address.
         if self.stem_pool.len() >= MAX_STEM_POOL_SIZE {
-            tracing::warn!("Stem pool full ({} entries). Dropping incoming stem tx to preserve Dandelion++ privacy.", MAX_STEM_POOL_SIZE);
+            tracing::warn!("Stem pool full ({} entries). Dropping incoming P2P stem tx to preserve privacy and prevent broadcast storms.", MAX_STEM_POOL_SIZE);
             return Ok(());
-        } else {
-*/
-
-        // If the stem pool is at capacity, skip the privacy phase entirely
-        // and insert directly into the public mempool. Node survival takes
-        // priority over Dandelion++ anonymity under active spam.
-        if self.stem_pool.len() >= MAX_STEM_POOL_SIZE {
-            tracing::warn!("Stem pool full ({} entries), bypassing Dandelion++ for tx", MAX_STEM_POOL_SIZE);
-            let wots_oracle = if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
-                self.storage.query_spent_addresses_for_tx(&tx).unwrap_or_default()
-            } else {
-                std::collections::HashMap::new()
-            };
-            let _ = self.mempool.add(tx.clone(), &self.state, &wots_oracle);
-            self.network.broadcast(Message::Transaction(tx));
-            self.cancel_mining();
-            self.trigger_mining();
         } else {
 // ADAPTIVE DANDELION++: Dynamic fluff probability based on network size.
             let outbound_count = self.network.outbound_peer_count().max(1) as u32;
