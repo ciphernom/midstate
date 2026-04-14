@@ -732,6 +732,10 @@ pub const MAX_SIGNATURE_SIZE: usize = 1_536;
 /// 1,024 total inputs keeps verification under ~600M hashes (~0.5s).
 pub const MAX_BATCH_INPUTS: usize = 1_024;
 
+/// Block height at which strict Median-Time-Past (MTP) and monotonicity 
+/// timestamps are enforced. Grandfathers early blocks mined during the sync bug.
+pub const STRICT_MTP_ACTIVATION_HEIGHT: u64 = 70_000;
+
 /// Cap on total outputs per batch to strictly bound worst-case block size 
 /// and prevent exceeding the 10MB P2P message limit.
 pub const MAX_BATCH_OUTPUTS: usize = 10_000;

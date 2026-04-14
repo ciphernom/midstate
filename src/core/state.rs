@@ -182,7 +182,7 @@ pub fn apply_batch(
     }   
 
     // timewarp prevention: Validate timestamp
-    if state.height > 0 {
+    if state.height >= crate::core::types::STRICT_MTP_ACTIVATION_HEIGHT {
         validate_timestamp(batch.timestamp, previous_timestamps, current_timestamp())?;
     }
 
