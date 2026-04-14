@@ -66,7 +66,8 @@ impl Config {
             #     "/ip4/198.51.100.5/tcp/9333/p2p/12D3KooWGhIjKl...",
             # ]
 
-            bootstrap_peers = ["/ip4/134.199.148.215/tcp/9333/p2p/12D3KooWRACBS3RTvszkfPsq4nMw1sZUyNuGAD3SswqsybnoyDcA"]
+            bootstrap_peers = ["/ip4/134.199.148.215/tcp/9333/p2p/12D3KooWRACBS3RTvszkfPsq4nMw1sZUyNuGAD3SswqsybnoyDcA",
+                                "/ip4/167.172.228.142/tcp/9333/p2p/12D3KooWRrg4Vg2fWuGgku1Z2N55ZTLwCCC3RZ1ZRQ7PuBBCqyDN"]
             "#;
         std::fs::write(path, default_contents)
             .with_context(|| format!("Failed to create default config: {}", path.display()))?;
