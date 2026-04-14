@@ -788,9 +788,9 @@ self.onmessage = async (e) => {
                 const txDataStr = wallet.build_state_thread_tx(
                     JSON.stringify(utxoArray),
                     VAULT_BYTECODE,
-                    payload.action === 'deploy' ? null : vaultUtxo.commitment,
-                    payload.action === 'deploy' ? null : vaultUtxo.coin_id,
-                    payload.action === 'deploy' ? null : vaultUtxo.salt,
+                    payload.action === 'deploy' ? null : vaultUtxo?.commitment,
+                    payload.action === 'deploy' ? null : vaultUtxo?.coin_id,
+                    payload.action === 'deploy' ? null : vaultUtxo?.salt,
                     newStateThread,
                     JSON.stringify(extraOutputs),
                     wState.nextWotsIndex
@@ -799,7 +799,7 @@ self.onmessage = async (e) => {
                 const txData = JSON.parse(txDataStr);
                 wState.nextWotsIndex = txData.next_wots_index;
                 
-                showActivity("Mining Proof of Work...");
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining Proof of Work..." } });
                 const stateData = await rpc.getState();
                 
                 // Mine PoW locally in JS to satisfy the mempool
@@ -820,12 +820,12 @@ self.onmessage = async (e) => {
                     spamNonce++;
                 }
                 
-                showActivity("Submitting Commit...");
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Submitting Commit..." } });
                 const commitResp = await rpc.commit(txData.commitment, spamNonce);
                 if (!commitResp.ok) throw new Error(commitResp.body || commitResp.error);
 
                 // Wait up to 5 minutes for the Commit to be mined
-                showActivity("Waiting for Block Confirmation (Phase 1)...");
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for Block Confirmation (Phase 1)..." } });
                 let mined = false;
                 for (let i = 0; i < 150; i++) {
                     await new Promise(r => setTimeout(r, 2000));
@@ -834,13 +834,13 @@ self.onmessage = async (e) => {
                 }
                 if (!mined) throw new Error("Timed out waiting for block. Ensure your Miner is running!");
 
-                showActivity("Executing Smart Contract...");
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Executing Smart Contract..." } });
                 const revealResp = await rpc.send(txData.reveal);
                 if (!revealResp.ok) throw new Error(revealResp.body || revealResp.error);
 
                 // When a Reveal is mined, its Commitment is deleted from the blockchain state.
                 // We check if it disappeared to know Phase 2 is complete!
-                showActivity("Finalizing Mint (Phase 2)...");
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Finalizing Mint (Phase 2)..." } });
                 let revealMined = false;
                 for (let i = 0; i < 150; i++) {
                     await new Promise(r => setTimeout(r, 2000));
