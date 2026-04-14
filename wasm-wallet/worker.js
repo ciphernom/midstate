@@ -849,15 +849,21 @@ self.onmessage = async (e) => {
                 }
                 if (!revealMined) throw new Error("Timed out waiting for final execution. Ensure your Miner is running!");
 
-                hideActivity();
-                self.postMessage({ type: 'ERROR', payload: payload.action === 'deploy' ? "Contract Deployed Successfully!" : "MUSD Minted Successfully!" }); 
+                // Save the spent UTXOs
                 await saveState();
                 
                 // Scan to instantly pick up the updated AMM state and newly minted Token!
                 await performScan();
 
+                // Tell the main thread we succeeded. This automatically hides the 
+                // activity spinner and shows a green success toast!
+                self.postMessage({ 
+                    type: 'SEND_COMPLETE', 
+                    payload: buildDashboardPayload() 
+                });
+
             } catch (e) {
-                hideActivity();
+                // Let the main thread handle the error UI
                 self.postMessage({ type: 'ERROR', payload: e.message || "Failed to execute contract" });
             }
         }

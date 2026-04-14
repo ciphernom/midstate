@@ -1852,14 +1852,14 @@ async function connectWebRTC(bootstrapAddr) {
                     
                     if (payload) {
                         document.getElementById('curveSupply').innerText = payload.supply + " MUSD";
-                        document.getElementById('curvePrice').innerText = "200%";
+                        document.getElementById('curvePrice').innerText = "549B MDS";
                         document.getElementById('defiStatus').innerText = "Live on-chain";
                         document.getElementById('defiStatus').style.color = "var(--ok)";
                         if (btnDep) btnDep.classList.add('hidden');
                         if (btnBuy) btnBuy.classList.remove('hidden');
                     } else {
                         document.getElementById('curveSupply').innerText = "0 MUSD";
-                        document.getElementById('curvePrice').innerText = "200%";
+                        document.getElementById('curvePrice').innerText = "549B MDS";
                         document.getElementById('defiStatus').innerText = "Not deployed yet";
                         document.getElementById('defiStatus').style.color = "var(--warn)";
                         if (btnDep) btnDep.classList.remove('hidden');
