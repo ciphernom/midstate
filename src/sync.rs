@@ -32,20 +32,18 @@ impl Syncer {
         let current_time = crate::core::state::current_timestamp();
         let window_size = crate::core::MEDIAN_TIME_PAST_WINDOW;
 
-        // Validate header[0] against prior chain history only (no in-batch predecessors yet).
-        crate::core::state::validate_timestamp(headers[0].timestamp, prior_timestamps, current_time)
-            .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index 0: {}", e))?;
+        // Validate header[0] against prior chain history only (Skip Genesis)
+        if headers[0].height > 0 {
+            crate::core::state::validate_timestamp(headers[0].timestamp, prior_timestamps, current_time)
+                .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index 0: {}", e))?;
+        }
 
         // 1. Fast sequential check: Ensure chain linkage is intact AND validate targets
         for i in 1..headers.len() {
             let header = &headers[i];
             let prev = &headers[i - 1];
 
-            // Build the exact previous_timestamps window that apply_batch would pass to
-            // validate_timestamp: prior chain history followed by in-batch predecessors,
-            // trimmed to the MTP window size. This guarantees verify_header_chain and
-            // apply_batch accept and reject identical chains, including the early-chain
-            // fallback where validate_timestamp uses strict monotonicity instead of MTP.
+            // Build the exact previous_timestamps window that apply_batch would pass
             let combined: Vec<u64> = prior_timestamps.iter()
                 .chain(headers[..i].iter().map(|h| &h.timestamp))
                 .copied()
@@ -53,8 +51,11 @@ impl Syncer {
             let window_start = combined.len().saturating_sub(window_size);
             let previous_timestamps = &combined[window_start..];
 
-            crate::core::state::validate_timestamp(header.timestamp, previous_timestamps, current_time)
-                .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index {}: {}", i, e))?;
+            // Skip genesis if it somehow appears 
+            if header.height > 0 {
+                crate::core::state::validate_timestamp(header.timestamp, previous_timestamps, current_time)
+                    .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index {}: {}", i, e))?;
+            }
 
             if header.prev_midstate != prev.extension.final_hash {
                 bail!("Header linkage broken at index {}: prev_midstate mismatch", i);
