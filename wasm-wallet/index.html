@@ -499,7 +499,8 @@
             
             <div class="panel" style="text-align: center; padding: 30px 15px;">
                 <h3 style="margin-bottom: 10px; color: var(--text-max);">MIDSTATE DOLLAR (MUSD)</h3>
-                <p style="font-size: 11px; color: #888; margin-bottom: 25px;">Lock 549755813888 MDS as collateral to mint 1 MUSD stablecoin to your wallet (1:549755813888 Ratio).</p>
+                <p style="font-size: 11px; color: #888; margin-bottom: 25px;">Lock 549,755,813,888 MDS as collateral to mint 1 MUSD stablecoin to your wallet.</p>
+                
                 <div style="display: flex; justify-content: space-around; background: #000; border: 1px solid var(--border); padding: 20px; border-radius: 8px; margin-bottom: 25px;">
                     <div>
                         <div style="font-size: 10px; color: #666; text-transform: uppercase;">Total MUSD Minted</div>
@@ -512,7 +513,7 @@
                 </div>
 
                 <button id="btnDefiDeploy" class="hidden" style="background: transparent; color: var(--accent); border: 1px dashed var(--accent);">Deploy Vault Contract</button>
-                <button id="btnDefiBuy" class="hidden" style="background: var(--accent); color: #000; font-size: 16px; padding: 15px 30px; font-weight: bold;">Lock 549755813888 MDS & Mint 1 MUSD</button>
+                <button id="btnDefiBuy" class="hidden" style="background: var(--accent); color: #000; font-size: 16px; padding: 15px 30px; font-weight: bold;">Lock 549B MDS & Mint 1 MUSD</button>
                 <div id="defiStatus" style="font-size: 11px; color: var(--warn); margin-top: 15px;">Checking Network State...</div>
             </div>
         </main>
@@ -1845,26 +1846,28 @@ async function connectWebRTC(bootstrapAddr) {
                     break;
                 }
 
-                case 'DEFI_UPDATE':
+                case 'DEFI_UPDATE': {
                     const btnDep = document.getElementById('btnDefiDeploy');
                     const btnBuy = document.getElementById('btnDefiBuy');
                     
                     if (payload) {
                         document.getElementById('curveSupply').innerText = payload.supply + " MUSD";
-                        document.getElementById('curvePrice').innerText = "100%";
+                        document.getElementById('curvePrice').innerText = "200%";
                         document.getElementById('defiStatus').innerText = "Live on-chain";
                         document.getElementById('defiStatus').style.color = "var(--ok)";
-                        btnDep.classList.add('hidden');
-                        btnBuy.classList.remove('hidden');
+                        if (btnDep) btnDep.classList.add('hidden');
+                        if (btnBuy) btnBuy.classList.remove('hidden');
                     } else {
                         document.getElementById('curveSupply').innerText = "0 MUSD";
-                        document.getElementById('curvePrice').innerText = "0%";
+                        document.getElementById('curvePrice').innerText = "200%";
                         document.getElementById('defiStatus').innerText = "Not deployed yet";
-                        btnDep.classList.remove('hidden');
-                        btnBuy.classList.add('hidden');
+                        document.getElementById('defiStatus').style.color = "var(--warn)";
+                        if (btnDep) btnDep.classList.remove('hidden');
+                        if (btnBuy) btnBuy.classList.add('hidden');
                     }
                     break;
-
+                }
+                
                 case 'PHRASE_GENERATED':
                     document.getElementById('seedPhrase').value = payload;
                     break;

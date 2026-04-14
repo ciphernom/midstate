@@ -683,16 +683,18 @@ macro get_burned_token_ticker() { read_input_state(1); 8; 24; slice(); }
 
 route {
     case 0: { // ── PATH 0: MINT MUSD ──
+        // 1. Pop vault address and immediately check how much MDS was deposited!
+        // This keeps the stack incredibly shallow and efficient.
+        var deposited_mds = sum_to_addr(pop_hex());
+        
+        // 2. Calculate the minted amount
         var minted_musd = get_new_supply() - Vault.supply;
         assert(minted_musd > 0);
 
-        // Pop the vault address from the witness stack 
-        var vault_addr = pop_hex();
-        
-        // 1. Verify the physical collateral was deposited into THIS contract
-        assert(minted_musd * COLLATERAL_RATIO <= sum_to_addr(vault_addr));
+        // 3. Verify the physical collateral deposited covers the minted amount
+        assert(deposited_mds >= minted_musd * COLLATERAL_RATIO);
 
-        // 2. Verify the minted token is MUSD and matches the State Thread update
+        // 4. Verify the minted token is MUSD and matches the State Thread update
         assert(get_minted_token_ticker() == TOKEN_TICKER);
         assert(minted_musd == get_minted_token_bal());
     }
