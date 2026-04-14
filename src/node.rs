@@ -1962,14 +1962,7 @@ async fn handle_message(
                 } else if depth > self.state.depth || height > self.state.height
                     || (depth == self.state.depth && midstate < self.state.midstate)
                 {
-                    // --- FIX 2: Sanity Check Depth Claims ---
-                    // Do not trust a massive depth claim if the height is impossibly low
-                    let safe_depth = self.cached_safe_depth;
-                    if depth > self.state.depth && height < self.state.height.saturating_sub(safe_depth * 2) {
-                        tracing::warn!("Peer {} claims impossible depth ({}) for low height ({}). Ignoring.", from, depth, height);
-                        return Ok(());
-                    }
-                    // ----------------------------------------
+
                 
                 
                     // FIX: also guard on sync_in_progress, which stays true even when
