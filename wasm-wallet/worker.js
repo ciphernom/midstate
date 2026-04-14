@@ -59,7 +59,8 @@ const GAP_LIMIT = 100;
 
 
 // Compiled Vault Contract
-const VAULT_BYTECODE = "010100005201010000010100081501010000235101010000010100081501010000230101000123202101010001";
+const VAULT_BYTECODE = "1101010000204010010100005201010000010100081501010000235101010000010100081501010000232511010100000101000123242113010500000000008026135012242101010002520101000801010018150118004d555344000000000000000000000000000000000000000020211301010002520101000001010008150101000023202110104111010100012040105101010000010100081501010000230101000052010100000101000815010100002325110101000001010001232421510101000801010018150118004d555344000000000000000000000000000000000000000020211151010100000101000815010100002320211041100101000021424201010001";
+
 let VAULT_ADDR = ""; // Calculated on WASM init
 let contractHash = "";
 let vaultUtxo = null;
@@ -749,18 +750,23 @@ self.onmessage = async (e) => {
                 // Genesis State: Supply starts at 0.
                 newSupply = 0;
             } 
-            else if (payload.action === 'mint') {
+            if (payload.action === 'mint') {
                 if (!vaultUtxo) throw new Error("Vault not deployed yet! Please deploy first.");
                 
-                // Increment Supply
-                newSupply = vaultUtxo.supply + 1;
+                const MINT_AMOUNT = 1;
+                const COLLATERAL_AMOUNT = 549755813888; // Exactly 2^39 MDS
+
+                // Increment Global Supply
+                newSupply = vaultUtxo.supply + MINT_AMOUNT;
                 
-                // 1. Pay the physical MDS locked in the Vault
-                extraOutputs.push({ out_type: "standard", address: VAULT_ADDR, value: 1 });
+                // 1. Pay the physical MDS to the Smart Contract (VAULT_ADDR) so it can be redeemed later!
+                extraOutputs.push({ out_type: "standard", address: VAULT_ADDR, value: COLLATERAL_AMOUNT });
                 
                 // 2. Issue MIDSTATE DOLLAR (MUSD) to the buyer using a Confidential Output
                 const TOKEN_TICKER = "4d5553440000000000000000000000000000000000000000"; // "MUSD" padded
-                let tokenBalHex = (1).toString(16).padStart(2, '0').padEnd(16, '0'); // 1 Token
+                
+                // FIX: Convert to base-16 hex (toString(16)) and pad correctly to exactly 8 bytes (16 chars) LE
+                let tokenBalHex = (MINT_AMOUNT).toString(16).padStart(2, '0').padEnd(16, '0'); 
                 let tokenCommitment = tokenBalHex + TOKEN_TICKER;
                 
                 const primaryAddress = Object.keys(wState.mssAddrs)[0] || Object.keys(wState.wotsAddrs)[0];

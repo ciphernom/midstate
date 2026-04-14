@@ -499,8 +499,7 @@
             
             <div class="panel" style="text-align: center; padding: 30px 15px;">
                 <h3 style="margin-bottom: 10px; color: var(--text-max);">MIDSTATE DOLLAR (MUSD)</h3>
-                <p style="font-size: 11px; color: #888; margin-bottom: 25px;">Lock 1 MDS as collateral to mint 1 MUSD stablecoin to your wallet.</p>
-                
+                <p style="font-size: 11px; color: #888; margin-bottom: 25px;">Lock 549755813888 MDS as collateral to mint 1 MUSD stablecoin to your wallet (1:549755813888 Ratio).</p>
                 <div style="display: flex; justify-content: space-around; background: #000; border: 1px solid var(--border); padding: 20px; border-radius: 8px; margin-bottom: 25px;">
                     <div>
                         <div style="font-size: 10px; color: #666; text-transform: uppercase;">Total MUSD Minted</div>
@@ -513,7 +512,7 @@
                 </div>
 
                 <button id="btnDefiDeploy" class="hidden" style="background: transparent; color: var(--accent); border: 1px dashed var(--accent);">Deploy Vault Contract</button>
-                <button id="btnDefiBuy" class="hidden" style="background: var(--accent); color: #000; font-size: 16px; padding: 15px 30px; font-weight: bold;">Lock 1 MDS & Mint 1 MUSD</button>
+                <button id="btnDefiBuy" class="hidden" style="background: var(--accent); color: #000; font-size: 16px; padding: 15px 30px; font-weight: bold;">Lock 549755813888 MDS & Mint 1 MUSD</button>
                 <div id="defiStatus" style="font-size: 11px; color: var(--warn); margin-top: 15px;">Checking Network State...</div>
             </div>
         </main>
@@ -1719,15 +1718,30 @@ async function connectWebRTC(bootstrapAddr) {
                 if (!payload.utxos || payload.utxos.length === 0) {
                     uList.innerHTML = '<div class="list-item" style="text-align: center; color: #555;">No UTXOs synced.</div>';
                 } else {
-                    uList.innerHTML = payload.utxos.map(u => `
+                    uList.innerHTML = payload.utxos.map(u => {
+                        // Formatter: Detect Token vs Native UTXO
+                        let displayVal = `${u.value} MDS`;
+                        if (u.commitment) {
+                            const balHex = u.commitment.substring(0, 16);
+                            const balance = parseInt(balHex.match(/.{2}/g).reverse().join(''), 16);
+                            let assetStr = '';
+                            for(let i=16; i<u.commitment.length; i+=2) {
+                                let char = parseInt(u.commitment.substr(i,2), 16);
+                                if(char > 0) assetStr += String.fromCharCode(char);
+                            }
+                            displayVal = `<span style="color:var(--accent); font-weight:bold;">${balance} ${assetStr}</span>`;
+                        }
+
+                        return `
                         <div class="list-item">
                             <div class="flex-row">
-                                <span style="font-weight: bold; color: var(--text-max);">${u.value} MDS</span>
+                                <span style="font-weight: bold; color: var(--text-max);">${displayVal}</span>
                                 <span style="font-size: 10px; color: ${u.is_mss ? 'var(--accent)' : '#888'}; border: 1px solid ${u.is_mss ? 'var(--accent-dim)' : '#333'}; padding: 2px 6px; border-radius: 4px;">${u.is_mss ? 'MSS' : 'WOTS'}</span>
                             </div>
                             <div style="font-size: 10px; color: #666; margin-top: 4px; word-break: break-all;">ID: ${u.coin_id.substring(0, 16)}...</div>
                         </div>
-                    `).join('');
+                        `;
+                    }).join('');
                 }
 
                 const hList = document.getElementById('historyList');
