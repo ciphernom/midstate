@@ -32,8 +32,8 @@ impl Syncer {
         let current_time = crate::core::state::current_timestamp();
         let window_size = crate::core::MEDIAN_TIME_PAST_WINDOW;
 
-        // Validate header[0] against prior chain history only (Skip Genesis)
-        if headers[0].height > 0 {
+        // Validate header[0] against prior chain history only (no in-batch predecessors yet).
+        if headers[0].height >= crate::core::types::STRICT_MTP_ACTIVATION_HEIGHT {
             crate::core::state::validate_timestamp(headers[0].timestamp, prior_timestamps, current_time)
                 .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index 0: {}", e))?;
         }
@@ -51,8 +51,7 @@ impl Syncer {
             let window_start = combined.len().saturating_sub(window_size);
             let previous_timestamps = &combined[window_start..];
 
-            // Skip genesis if it somehow appears 
-            if header.height > 0 {
+            if header.height >= crate::core::types::STRICT_MTP_ACTIVATION_HEIGHT {
                 crate::core::state::validate_timestamp(header.timestamp, previous_timestamps, current_time)
                     .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index {}: {}", i, e))?;
             }
