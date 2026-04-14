@@ -516,7 +516,8 @@ impl WebWallet {
             }));
             // Dynamically inject the contract's own address into the witness stack 
             // before the routing integer (00), solving the circular hashing problem!
-            signatures.push(format!("{}, 00", hex::encode(contract_addr)));
+            signatures.push(format!("{},00", hex::encode(contract_addr)));
+
         }
 
         // -> Consume Wallet Inputs

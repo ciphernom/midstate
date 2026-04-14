@@ -63,7 +63,6 @@ const VAULT_BYTECODE = "11010100002040105001010000520101000001010008150101000023
 
 let VAULT_ADDR = ""; // Calculated on WASM init
 let contractHash = "";
-let vaultUtxo = null;
 
 /**
  * @typedef {Object} WalletState
@@ -93,7 +92,8 @@ let wState = {
     mssAddrs: {},
     utxos: {},
     history: [],
-    lastScannedHeight: 0
+    lastScannedHeight: 0,
+    vaultUtxo: null
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -484,7 +484,7 @@ async function loadState(pwd, bundleStr) {
         mssCachesReady = false;
         await loadMssCaches();
 
-        self.postMessage({ type: 'DEFI_UPDATE', payload: vaultUtxo });
+        self.postMessage({ type: 'DEFI_UPDATE', payload: wState.vaultUtxo });
         self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
     } catch(e) {
         throw new Error("Incorrect password or corrupted wallet file");
@@ -711,7 +711,7 @@ self.onmessage = async (e) => {
             mssCachesReady = true;
 
             await saveState();
-            self.postMessage({ type: 'DEFI_UPDATE', payload: vaultUtxo });
+            self.postMessage({ type: 'DEFI_UPDATE', payload: wState.vaultUtxo });
             self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
             self.postMessage({ type: 'AUTO_CONNECT_WEBRTC' });
         }
@@ -751,13 +751,13 @@ self.onmessage = async (e) => {
                 newSupply = 0;
             } 
             if (payload.action === 'mint') {
-                if (!vaultUtxo) throw new Error("Vault not deployed yet! Please deploy first.");
+                if (!wState.vaultUtxo) throw new Error("Vault not deployed yet! Please deploy first.");
                 
                 const MINT_AMOUNT = 1;
                 const COLLATERAL_AMOUNT = 549755813888; // Exactly 2^39 MDS
 
                 // Increment Global Supply
-                newSupply = vaultUtxo.supply + MINT_AMOUNT;
+                newSupply = wState.vaultUtxo.supply + MINT_AMOUNT;
                 
                 // 1. Pay the physical MDS to the Smart Contract (VAULT_ADDR) so it can be redeemed later!
                 extraOutputs.push({ out_type: "standard", address: VAULT_ADDR, value: COLLATERAL_AMOUNT });
@@ -765,8 +765,10 @@ self.onmessage = async (e) => {
                 // 2. Issue MIDSTATE DOLLAR (MUSD) to the buyer using a Confidential Output
                 const TOKEN_TICKER = "4d5553440000000000000000000000000000000000000000"; // "MUSD" padded
                 
-                // FIX: Convert to base-16 hex (toString(16)) and pad correctly to exactly 8 bytes (16 chars) LE
-                let tokenBalHex = (MINT_AMOUNT).toString(16).padStart(2, '0').padEnd(16, '0'); 
+                // Convert to base-16 hex (toString(16)) and pad correctly to exactly 8 bytes (16 chars) LE
+                let tokenHex = MINT_AMOUNT.toString(16);
+                if (tokenHex.length % 2) tokenHex = '0' + tokenHex;
+                let tokenBalHex = tokenHex.match(/.{2}/g).reverse().join('').padEnd(16, '0');
                 let tokenCommitment = tokenBalHex + TOKEN_TICKER;
                 
                 const primaryAddress = Object.keys(wState.mssAddrs)[0] || Object.keys(wState.wotsAddrs)[0];
@@ -788,9 +790,9 @@ self.onmessage = async (e) => {
                 const txDataStr = wallet.build_state_thread_tx(
                     JSON.stringify(utxoArray),
                     VAULT_BYTECODE,
-                    payload.action === 'deploy' ? null : vaultUtxo?.commitment,
-                    payload.action === 'deploy' ? null : vaultUtxo?.coin_id,
-                    payload.action === 'deploy' ? null : vaultUtxo?.salt,
+                    payload.action === 'deploy' ? null : wState.vaultUtxo?.commitment,
+                    payload.action === 'deploy' ? null : wState.vaultUtxo?.coin_id,
+                    payload.action === 'deploy' ? null : wState.vaultUtxo?.salt,
                     newStateThread,
                     JSON.stringify(extraOutputs),
                     wState.nextWotsIndex
@@ -1185,7 +1187,7 @@ while (currentHeight < chainHeight) {
 
    wState.lastScannedHeight = chainHeight;
     await saveState();
-    self.postMessage({ type: 'DEFI_UPDATE', payload: vaultUtxo });
+    self.postMessage({ type: 'DEFI_UPDATE', payload: wState.vaultUtxo });
     self.postMessage({ type: 'SCAN_COMPLETE', payload: buildDashboardPayload() });
 }
 
@@ -1284,13 +1286,13 @@ async function processFullBlock(height) {
                         // 1. Track Vault Contract State
                         if (addrHex === VAULT_ADDR) {
                             const countHex = commitment.substring(0, 16).match(/.{2}/g).reverse().join('');
-                            vaultUtxo = {
+                            wState.vaultUtxo = {
                                 coin_id: compute_confidential_coin_id(addrHex, commitment, saltHex), 
                                 salt: saltHex,
                                 commitment: commitment,
                                 supply: parseInt(countHex, 16)
                             };
-                            self.postMessage({ type: 'DEFI_UPDATE', payload: vaultUtxo });
+                            self.postMessage({ type: 'DEFI_UPDATE', payload: wState.vaultUtxo });
                         }
 
                         // 2. Track Tokens Sent to Us (Coloured Coins)
