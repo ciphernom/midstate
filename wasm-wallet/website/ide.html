@@ -661,58 +661,60 @@ const TEMPLATES = {
 
   maker_vault: {
     code:`// =====================================================================
-// THE MAKER VAULT (Decentralized Stablecoin CDP)
+// MIDSTATE DOLLAR (MUSD) - Two-Way CDP Vault
 // =====================================================================
 
-let OWNER_PK   = "0202020202020202020202020202020202020202020202020202020202020202";
-let VAULT_ADDR = "aa000000000000000000000000000000000000000000000000000000000000aa";
-let PRICE = 2000;
-let MIN_RATIO = 150;
+let TOKEN_TICKER  = "4d5553440000000000000000000000000000000000000000"; // "MUSD"
+let COLLATERAL_RATIO = 549755813888; // 2^39 MDS per 1 MUSD
 
-// The compiler natively maps these to the exact bytes in the Input State!
-state Vault {
-  col: 8,
-  debt: 8,
-  padding: 16
+// The Global Ledger: Tracks total MUSD minted
+state Vault { 
+    supply: 8, 
+    padding: 24 
 }
 
-macro get_new_col()  { read_output_state(0); 0; 8; slice(); 0; add(); }
-macro get_new_debt() { read_output_state(0); 8; 8; slice(); 0; add(); }
+macro get_new_supply()          { read_output_state(0); 0; 8; slice(); 0; add(); }
+macro get_minted_token_bal()    { read_output_state(2); 0; 8; slice(); 0; add(); }
+macro get_minted_token_ticker() { read_output_state(2); 8; 24; slice(); }
+
+// For Redemption: Reads the MUSD token being burned in Input 1
+macro get_burned_token_bal()    { read_input_state(1); 0; 8; slice(); 0; add(); }
+macro get_burned_token_ticker() { read_input_state(1); 8; 24; slice(); }
 
 route {
-  case 0: { // PATH 0: OWNER ADJUST
-    require_sig(OWNER_PK);
+    case 0: { // ── PATH 0: MINT MUSD ──
+        var minted_musd = get_new_supply() - Vault.supply;
+        assert(minted_musd > 0);
 
-    var newCol = get_new_col();
-    var newDebt = get_new_debt();
+        // Pop the vault address from the witness stack 
+        var vault_addr = pop_hex();
+        
+        // 1. Verify the physical collateral was deposited into THIS contract
+        assert(minted_musd * COLLATERAL_RATIO <= sum_to_addr(vault_addr));
 
-    // Solvency Check
-    assert((newCol * PRICE * 100) >= (newDebt * MIN_RATIO));
-    
-    // Physical Covenant Check (Evaluates variable first to stay within safe stack depth!)
-    assert(newCol == sum_to_addr(VAULT_ADDR));
-  }
-  case 1: { // PATH 1: PUBLIC LIQUIDATION
-    // Vulnerability Check using direct dot-notation
-    assert((Vault.debt * MIN_RATIO) >= (Vault.col * PRICE * 100) + 1);
-    
-    // Ensure debt and collateral are wiped
-    assert(get_new_debt() == 0);
-    assert(get_new_col() == 0);
-    
-    // Ensure physical coins were taken from the vault
-    assert(sum_to_addr(VAULT_ADDR) == 0);
-  }
-  case 2: { // PATH 2: VALUE UTXO DELEGATION
-    // Silently passes
-  }
-  default: { fail(); }
+        // 2. Verify the minted token is MUSD and matches the State Thread update
+        assert(get_minted_token_ticker() == TOKEN_TICKER);
+        assert(minted_musd == get_minted_token_bal());
+    }
+    case 1: { // ── PATH 1: REDEEM MUSD ──
+        var burned_musd = Vault.supply - get_new_supply();
+        assert(burned_musd > 0);
+
+        // 1. Verify the user actually burned the MUSD token
+        assert(get_burned_token_ticker() == TOKEN_TICKER);
+        assert(burned_musd == get_burned_token_bal());
+        
+        // Because Midstate's VM enforces Inputs >= Outputs at the consensus level,
+        // successfully burning the MUSD allows the user to safely extract their 
+        // underlying MDS collateral from the Vault UTXO in the same transaction!
+    }
+    default: { fail(); }
 }
 
 true;`,
-    witness: '01', 
-    inputState: '0a00000000000000b03600000000000000000000000000000000000000000000',
-    outputs: 'aa000000000000000000000000000000000000000000000000000000000000aa:0:0000000000000000000000000000000000000000000000000000000000000000, dd000000000000000000000000000000000000000000000000000000000000dd:10',
+    witness: '56e67563e12c43b55fcee4bec3b079dc618a875c3d1fc611607472e2f9666dba, 00', 
+    inputState: '0a00000000000000000000000000000000000000000000000000000000000000',
+    outputs: '56e67563e12c43b55fcee4bec3b079dc618a875c3d1fc611607472e2f9666dba:0:0b00000000000000000000000000000000000000000000000000000000000000, 56e67563e12c43b55fcee4bec3b079dc618a875c3d1fc611607472e2f9666dba:549755813888, bb000000000000000000000000000000000000000000000000000000000000bb:0:01000000000000004d5553440000000000000000000000000000000000000000',
     height: '65100'
   },
 
