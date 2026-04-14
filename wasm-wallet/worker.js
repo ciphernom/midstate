@@ -805,7 +805,17 @@ self.onmessage = async (e) => {
                 // Mine PoW locally in JS to satisfy the mempool
                 let spamNonce = 0;
                 while (true) {
-                    const hashExt = blake3_hash_hex(txData.commitment + spamNonce.toString(16).padStart(16, '0').match(/.{2}/g).reverse().join(''));
+                    // Ensure we use the post-80k PoW algorithm which includes the target height
+                    let heightHex = BigInt(stateData.height).toString(16).padStart(16, '0').match(/.{2}/g).reverse().join('');
+                    let nonceHex = spamNonce.toString(16).padStart(16, '0').match(/.{2}/g).reverse().join('');
+                    
+                    let payloadToHash = txData.commitment + nonceHex;
+                    if (stateData.height >= 80000) { // RECENT_POW_ACTIVATION_HEIGHT
+                        payloadToHash = heightHex + txData.commitment + nonceHex;
+                    }
+                    
+                    const hashExt = blake3_hash_hex(payloadToHash);
+                    
                     // Check leading zeros against difficulty
                     let zeros = 0;
                     for (let i = 0; i < 64; i++) {
