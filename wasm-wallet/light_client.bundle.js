@@ -30452,9 +30452,13 @@ async request(req, _retries = 2) {
         const resp = await this.request({ method: 'block_template', params: { coinbase } });
         return {
             ok: resp.ok,
-            status: resp.ok ? 200 : 500,
+            // If the node provided expected_total during an error (409 Conflict), map it correctly
+            status: resp.ok ? 200 : (resp.data && resp.data.expected_total ? 409 : 500),
             json: () => Promise.resolve(resp.data),
-            text: () => Promise.resolve(resp.ok ? JSON.stringify(resp.data) : (resp.error || 'error')),
+            // Always stringify the data payload if it exists, even on failure
+            text: () => Promise.resolve(
+                resp.data ? JSON.stringify(resp.data) : (resp.error || 'error')
+            ),
         };
     }
     async commit(commitmentHex, spamNonce) {
