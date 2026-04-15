@@ -1831,6 +1831,7 @@ async function connectWebRTC(bootstrapAddr) {
                     break;
 
                 case 'BACKUP_READY': {
+                    hideActivity();
                     const blob = new Blob([payload], { type: "application/json" });
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a');
@@ -2137,7 +2138,10 @@ async function connectWebRTC(bootstrapAddr) {
             }
             document.getElementById('importFile').click();
         };
-
+document.getElementById('btnExport').onclick = () => {
+            showActivity("Preparing encrypted backup...");
+            worker.postMessage({ type: 'EXPORT_BACKUP' });
+        };
         document.getElementById('importFile').addEventListener('change', function(e) {
             const file = e.target.files[0];
             if (!file) return;
