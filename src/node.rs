@@ -892,6 +892,7 @@ async fn process_state_rebuild(
         }
 
         Some(state) => {
+            let _ = self.storage.save_state_snapshot(fork_height, &state);
             // Second message: state is ready. Drain buffer into Batches phase.
             let session = match self.sync_session.take() {
                 Some(s) if s.peer == peer => s,
@@ -2595,6 +2596,7 @@ fn fire_batch_lookahead(&mut self) {
 
         if headers.is_empty() {
             self.abort_sync_session("peer sent empty headers");
+            let _ = std::fs::remove_file(self.data_dir.join("sync_state.bin"));
             return Ok(());
         }
 
@@ -4420,6 +4422,10 @@ async fn rebuild_state_from_disk(storage: crate::storage::Storage, target_height
                     }
                     crate::core::state::apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &mut wots_oracle)?;
                     state.target = crate::core::state::adjust_difficulty(&state);
+
+                    if h > 0 && h % 500 == 0 {
+                        let _ = storage.save_state_snapshot(h, &state);
+                    }
                 } else {
                     anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
                 }
