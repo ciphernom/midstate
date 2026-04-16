@@ -44,6 +44,34 @@ let isSubmitting = false;
 /** @type {boolean} Guard against concurrent template requests to prevent WebRTC stream exhaustion. */
 let isFetchingTemplate = false;
 
+/** @type {number} The current network height fetched from the node. */
+let networkHeight = 0;
+
+/** @type {number} The current mempool size fetched from the node. */
+let mempoolSize = 0;
+
+/** @type {Array<Function>} Resolvers awaiting the next block push event. */
+let nextBlockResolvers = [];
+
+/**
+ * Suspend execution until the next block arrives via WebRTC push, 
+ * or fallback to resolving after a maximum timeout.
+ * @param {number} timeoutMs - Maximum wait time before continuing anyway
+ * @returns {Promise<boolean>} True if resolved by block, False if timeout.
+ */
+function waitForNextBlock(timeoutMs = 15000) {
+    return new Promise(resolve => {
+        let timer = setTimeout(() => {
+            nextBlockResolvers = nextBlockResolvers.filter(r => r !== resolve);
+            resolve(false);
+        }, timeoutMs);
+        nextBlockResolvers.push(() => {
+            clearTimeout(timer);
+            resolve(true);
+        });
+    });
+}
+
 /**
  * @type {Array<Object>} Pending send transactions displayed in the UI.
  * Cleared when the send completes or fails.
@@ -526,6 +554,10 @@ async function handleGetTemplate() {
             mempoolFees = (mempool.transactions || []).reduce((s, tx) => s + (tx.fee || 0), 0);
         } catch (e) {}
 
+        networkHeight = stateObj.height;
+        mempoolSize = mempoolTxs;
+        self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+
         if (stateObj.height > wState.lastScannedHeight) {
             self.postMessage({ type: 'LOG', payload: "Chain advanced! Auto-syncing..." });
             await performScan();
@@ -687,7 +719,14 @@ self.onmessage = async (e) => {
             const notif = payload.NewBlockTip;
             if (!notif) return;
             
+            networkHeight = notif.height;
+            self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
             self.postMessage({ type: 'LOG', payload: `⚡ Network Push: New block found at height ${notif.height}!` });
+            
+            // Awake any pending transaction operations instantly!
+            const resolvers = nextBlockResolvers;
+            nextBlockResolvers = [];
+            resolvers.forEach(r => r());
             
             // 1. Instant Miner Update: Stop wasting hashes, get the new template!
             if (isMiningActive) {
@@ -864,15 +903,12 @@ self.onmessage = async (e) => {
                 const commitResp = await rpc.commit(txData.commitment, spamNonce);
                 if (!commitResp.ok) throw new Error(commitResp.body || commitResp.error);
 
-                // Wait up to 5 minutes for the Commit to be mined
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for Block Confirmation (Phase 1)..." } });
-                let mined = false;
-                for (let i = 0; i < 150; i++) {
-                    await new Promise(r => setTimeout(r, 2000));
-                    const check = await rpc.checkCommitment(txData.commitment);
-                    if (check && check.exists) { mined = true; break; }
+                while (true) {
+                    const check = await rpc.checkCommitment(txData.commitment).catch(()=>null);
+                    if (check && check.exists) break;
+                    await waitForNextBlock(15000);
                 }
-                if (!mined) throw new Error("Timed out waiting for block. Ensure your Miner is running!");
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Executing Smart Contract..." } });
                 const revealResp = await rpc.send(txData.reveal);
@@ -881,13 +917,11 @@ self.onmessage = async (e) => {
                 // When a Reveal is mined, its Commitment is deleted from the blockchain state.
                 // We check if it disappeared to know Phase 2 is complete!
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Finalizing Mint (Phase 2)..." } });
-                let revealMined = false;
-                for (let i = 0; i < 150; i++) {
-                    await new Promise(r => setTimeout(r, 2000));
-                    const check = await rpc.checkCommitment(txData.commitment);
-                    if (check && !check.exists) { revealMined = true; break; }
+                while (true) {
+                    const check = await rpc.checkCommitment(txData.commitment).catch(()=>null);
+                    if (check && !check.exists) break;
+                    await waitForNextBlock(15000);
                 }
-                if (!revealMined) throw new Error("Timed out waiting for final execution. Ensure your Miner is running!");
 
                 // Save the spent UTXOs
                 await saveState();
@@ -1118,9 +1152,25 @@ function buildDashboardPayload() {
         primaryAddress: mssList.length > 0 ? mssList[mssList.length - 1] : "None",
         balance: safeBalance,
         utxos:   utxoArray,
-        history: sortedHistory
+        history: sortedHistory,
+        lastScannedHeight: wState.lastScannedHeight || 0,
+        networkHeight: networkHeight || 0,
+        mempoolSize: mempoolSize || 0
     };
 }
+
+async function refreshNetworkStats() {
+    if (!wallet) return;
+    try {
+        const state = await rpc.getState();
+        networkHeight = state.height;
+        const mempool = await rpc.getMempool();
+        mempoolSize = mempool.size || 0;
+        self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+    } catch(e) {}
+}
+
+setInterval(refreshNetworkStats, 20000);
 
 /**
  * Update the WASM-side watchlist from current wallet state.
@@ -1154,6 +1204,8 @@ async function performScan() {
     self.postMessage({ type: 'LOG', payload: "Fetching chain state..." });
     const state       = await rpc.getState();
     const chainHeight = state.height;
+    networkHeight     = chainHeight;
+    self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
 
     if (chainHeight <= wState.lastScannedHeight) {
         // Sync leaf indices even when chain hasn't advanced
@@ -1494,26 +1546,18 @@ async function performSend(toAddress, amount) {
         throw new Error(`Commit rejected by network:\n${errText}\n\nWhat to do: The network might be congested, or your UTXOs might be out of sync. Your funds have not moved. Run a Network Sync and try again.`);
     }
 
-    // Wait for commit to be mined, then submit reveal.
-    // Poll CheckCommitment (read-only, no SMART GUARD penalty) instead of
-    // speculatively submitting the Reveal, which would trigger an instant ban.
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commitment accepted. Waiting for block confirmation..." } });
     const revealPayloadStr = wallet.build_reveal(spendContextStr, ctx.commitment, ctx.tx_salt);
 
-    let commitMined = false;
-    for (let attempts = 0; attempts < 500; attempts++) {
-        if (attempts > 0 && attempts % 10 === 0) self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Still waiting for commit block (${attempts * 3}s)...` } });
-
+    while (true) {
         try {
             const checkResp = await rpc.checkCommitment(ctx.commitment);
-            if (checkResp && checkResp.exists) { commitMined = true; break; }
+            if (checkResp && checkResp.exists) break;
         } catch (e) {
             console.warn(`[light] checkCommitment poll failed (will retry): ${e.message}`);
         }
-        await new Promise(r => setTimeout(r, 3000));
+        await waitForNextBlock(15000);
     }
-
-    if (!commitMined) throw new Error("Timed out waiting for Commit to be mined.\n\nWhat to do: Your funds are perfectly safe. The network dropped the transaction due to high traffic. Please try sending again in a few minutes.");
 
     // Commit is confirmed — submit the reveal exactly once.
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commit confirmed! Submitting reveal..." } });
@@ -1525,36 +1569,29 @@ async function performSend(toAddress, amount) {
         throw new Error(`Reveal rejected by network:\n${errText}\n\nWhat to do: A cryptographic error or double-spend occurred. Your funds are safe. Run a Network Sync and try again.`);
     }
 
-    // Wait for reveal to be mined
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commit confirmed! Broadcasting reveal..." } });
 
     const inputCoinToCheck = ctx.selected_inputs[0].coin_id;
     // We check the OUTPUT coin to guarantee the transaction succeeded. 
-    // Checking the input coin is dangerous because a reorg could drop the input entirely.
     const outputCoinToCheck = ctx.outputs.length > 0 
         ? compute_coin_id_hex(ctx.outputs[0].address, BigInt(ctx.outputs[0].value), ctx.outputs[0].salt) 
         : null;
 
-    let revealMined = false;
-    for (let attempts = 0; attempts < 150; attempts++) {
-        if (attempts > 0 && attempts % 15 === 0) self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Waiting for reveal to be mined (${attempts * 2}s)...` } });
-
+    while (true) {
         try {
             if (outputCoinToCheck) {
                 const checkOut = await rpc.checkCoin(outputCoinToCheck);
-                if (checkOut && checkOut.exists) { revealMined = true; break; }
+                if (checkOut && checkOut.exists) break;
             } else {
                 // Fallback for DataBurns
                 const checkInp = await rpc.checkCoin(inputCoinToCheck);
-                if (checkInp && !checkInp.exists) { revealMined = true; break; }
+                if (checkInp && !checkInp.exists) break;
             }
         } catch (e) {
             console.warn(`[light] checkCoin poll failed (will retry): ${e.message}`);
         }
-        await new Promise(r => setTimeout(r, 2000));
+        await waitForNextBlock(15000);
     }
-
-    if (!revealMined) throw new Error("Timed out waiting for Reveal to be mined. Your transaction is likely stuck in the mempool.");
 
     // Update local state
     pendingSends = [];

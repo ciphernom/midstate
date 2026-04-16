@@ -3704,6 +3704,9 @@ fn perform_reorg(
             let header = batch.header();
             if crate::core::extension::verify_extension(header.post_tx_midstate, &batch.extension, &batch.target).is_err() {
                 tracing::debug!("Rejected invalid orphan block (PoW failed)");
+                if let Some(peer) = from {
+                    self.ban_peer(peer, "invalid orphan block (PoW failed)");
+                }
                 return Ok(());
             }
 
@@ -3722,6 +3725,9 @@ fn perform_reorg(
                     hex::encode(batch.target),
                     hex::encode(self.state.target)
                 );
+                if let Some(peer) = from {
+                    self.ban_peer(peer, "absurdly easy difficulty target (orphan spam)");
+                }
                 return Ok(());
             }
             // --------------------------------------
@@ -3771,6 +3777,9 @@ fn perform_reorg(
 
         if batch.target != self.state.target {
             tracing::debug!("Batch target mismatch, ignoring");
+            if let Some(peer) = from {
+                self.ban_peer(peer, "batch target mismatch for current height");
+            }
             return Ok(());
         }
 
