@@ -30259,6 +30259,10 @@ class LightClient {
         this._onStatusChange = null;       // callback: (status) => void
     }
 
+onPushEvent(cb) {
+        this._onPushEvent = cb;
+    }
+
     /// Start the libp2p node and connect to a bootstrap peer list.
     ///
     /// addrs: Array of multiaddr strings
@@ -30267,6 +30271,29 @@ class LightClient {
             transports: [webRTCDirect()],
             connectionEncrypters: [noise()],
             streamMuxers: [yamux()],
+        });
+
+        // --- LISTEN FOR SERVER PUSHES ---
+        this.node.handle('/midstate/light-push/1.0.0', async ({ stream }) => {
+            try {
+                const chunks = [];
+                let total = 0;
+                for await (const chunk of stream.source) {
+                    const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.subarray());
+                    chunks.push(bytes);
+                    total += bytes.length;
+                }
+                const rawBuf = new Uint8Array(total);
+                let offset = 0;
+                for (const c of chunks) { rawBuf.set(c, offset); offset += c.length; }
+                
+                if (rawBuf.length >= 4) {
+                    const len = new DataView(rawBuf.buffer, rawBuf.byteOffset).getUint32(0, true);
+                    const jsonStr = new TextDecoder().decode(rawBuf.slice(4, 4 + len));
+                    const notif = JSON.parse(jsonStr);
+                    if (this._onPushEvent) this._onPushEvent(notif);
+                }
+            } catch (e) { console.warn("[light] Push handle error", e); }
         });
 
         await this.node.start();
@@ -30346,43 +30373,23 @@ async request(req, _retries = 2) {
         stream.sendCloseWrite();
 
         // Collect raw protobuf-framed bytes from incomingData.
-        // The iterator never terminates on stream close — we must detect
-        // FIN/RESET flags in the protobuf framing and break manually.
-        let rawBuf = new Uint8Array(0);
+        const chunks = [];
+        let totalLen = 0;
         let gotReset = false;
+        
         const readAll = async () => {
             try {
                 for await (const chunk of stream.incomingData) {
                     const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-                    const merged = new Uint8Array(rawBuf.length + bytes.length);
-                    merged.set(rawBuf);
-                    merged.set(bytes, rawBuf.length);
-                    rawBuf = merged;
+                    chunks.push(bytes);
+                    totalLen += bytes.length;
 
                     // Check for RESET first — server killed the stream
                     if (chunkContainsReset(bytes)) {
                         gotReset = true;
                         break;
                     }
-
-                    // PRIMARY EXIT: Check if we have the complete response
-                    // by decoding the protobuf framing and reading the
-                    // application-layer length prefix. This is reliable
-                    // regardless of whether FIN arrives.
-                    try {
-                        const appData = decodeWebRTCStreamData(rawBuf);
-                        if (appData.length >= 4) {
-                            const respLen = new DataView(appData.buffer, appData.byteOffset).getUint32(0, true);
-                            if (appData.length >= 4 + respLen) {
-                                break; // Full response received
-                            }
-                        }
-                    } catch (_) {
-                        // Partial data — keep reading
-                    }
-
-                    // FALLBACK: FIN detection (still useful for error
-                    // responses that might not have a valid length prefix)
+                    // FIN detection works reliably for js-libp2p streams
                     if (chunkContainsFin(bytes)) {
                         break;
                     }
@@ -30395,6 +30402,16 @@ async request(req, _retries = 2) {
         const timeoutPromise = new Promise((_, reject) =>
             setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS)
         );
+
+        await Promise.race([readAll(), timeoutPromise]);
+
+        // Flatten the chunks ONCE (O(N) instead of O(N^2))
+        const rawBuf = new Uint8Array(totalLen);
+        let offset = 0;
+        for (const c of chunks) {
+            rawBuf.set(c, offset);
+            offset += c.length;
+        };       
 
         await Promise.race([readAll(), timeoutPromise]);
 
