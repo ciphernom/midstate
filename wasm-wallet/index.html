@@ -44,6 +44,19 @@
         }
         header h1 { margin: 0; font-size: 16px; font-weight: 700; letter-spacing: 2px; }
 
+        #global-network-stats {
+            display: flex; justify-content: center; gap: 20px; padding: 8px 1.5rem;
+            background: rgba(10,10,10,0.95); border-bottom: 1px solid var(--border);
+            font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: #888;
+            z-index: 9;
+        }
+        #global-network-stats .stat { display: flex; align-items: center; gap: 6px; }
+        #global-network-stats .val { color: var(--text-max); font-weight: bold; font-variant-numeric: tabular-nums; }
+        .pulse-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+        .pulse-dot.wallet { background: #00e5ff; box-shadow: 0 0 5px #00e5ff; }
+        .pulse-dot.network { background: var(--accent); box-shadow: 0 0 5px var(--accent); }
+        .pulse-dot.mempool { background: #ffa500; box-shadow: 0 0 5px #ffa500; }
+
         .page {
             flex: 1; overflow-y: auto; padding: 1.5rem;
             padding-bottom: calc(env(safe-area-inset-bottom, 1rem) + 80px);
@@ -274,10 +287,16 @@
     </style>
 </head>
 <body>
-    <div id="app-container">
+        <div id="app-container">
         <header>
             <h1>MIDSTATE<span style="color:var(--accent);">.</span>WALLET</h1>
         </header>
+        
+        <div id="global-network-stats">
+            <div class="stat" title="Blocks scanned by your wallet"><span class="pulse-dot wallet"></span>Wallet <span id="uiWalletHeight" class="val">0</span></div>
+            <div class="stat" title="Highest block on the network"><span class="pulse-dot network"></span>Network <span id="uiNetworkHeight" class="val">0</span></div>
+            <div class="stat" title="Pending transactions waiting to be mined"><span class="pulse-dot mempool"></span>Mempool <span id="uiMempoolSize" class="val">0</span></div>
+        </div>
 
         <div id="activity-banner">
             <div class="spinner"></div>
@@ -1650,6 +1669,10 @@ if ('serviceWorker' in navigator) {
         function updateDashboard(payload) {
             try {
                 if (!payload) return;
+
+                if (payload.lastScannedHeight !== undefined) document.getElementById('uiWalletHeight').innerText = payload.lastScannedHeight;
+                if (payload.networkHeight !== undefined) document.getElementById('uiNetworkHeight').innerText = payload.networkHeight;
+                if (payload.mempoolSize !== undefined) document.getElementById('uiMempoolSize').innerText = payload.mempoolSize;
 
                 const primaryAddress = payload.primaryAddress || "None";
                 document.getElementById('lblBalance').innerHTML = `${payload.balance !== undefined ? payload.balance : "0"} <span style="font-size:14px;color:#666;">MDS</span>`;

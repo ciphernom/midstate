@@ -156,7 +156,7 @@ onPushEvent(cb) {
             streamMuxers: [yamux()],
         });
 
-        // --- LISTEN FOR SERVER PUSHES ---
+                // --- LISTEN FOR SERVER PUSHES ---
         this.node.handle('/midstate/light-push/1.0.0', async ({ stream }) => {
             try {
                 const chunks = [];
@@ -170,9 +170,12 @@ onPushEvent(cb) {
                 let offset = 0;
                 for (const c of chunks) { rawBuf.set(c, offset); offset += c.length; }
                 
-                if (rawBuf.length >= 4) {
-                    const len = new DataView(rawBuf.buffer, rawBuf.byteOffset).getUint32(0, true);
-                    const jsonStr = new TextDecoder().decode(rawBuf.slice(4, 4 + len));
+                // Strip the WebRTC Protobuf framing before parsing
+                const appData = decodeWebRTCStreamData(rawBuf);
+                
+                if (appData.length >= 4) {
+                    const len = new DataView(appData.buffer, appData.byteOffset).getUint32(0, true);
+                    const jsonStr = new TextDecoder().decode(appData.slice(4, 4 + len));
                     const notif = JSON.parse(jsonStr);
                     if (this._onPushEvent) this._onPushEvent(notif);
                 }
