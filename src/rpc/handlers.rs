@@ -464,8 +464,7 @@ pub async fn get_filters(
     let count = (req.end_height.saturating_sub(req.start_height)).min(1000);
     let end = req.start_height + count;
 
-    let store = crate::storage::BatchStore::new(&node.batches_path)
-        .map_err(|e| ErrorResponse { error: format!("Storage error: {}", e) })?;
+    let store = &node.storage.batches;
 
     let mut filters = Vec::new();
     let mut block_hashes = Vec::new();
@@ -547,8 +546,7 @@ pub async fn get_batch(
     State(node): State<AppState>,
     axum::extract::Path(height): axum::extract::Path<u64>,
 ) -> Result<Json<serde_json::Value>, ErrorResponse> {
-    let store = crate::storage::BatchStore::new(&node.batches_path)
-        .map_err(|e| ErrorResponse { error: format!("Storage error: {}", e) })?;
+    let store = &node.storage.batches;
 
     let batch = store.load(height)
         .map_err(|e| ErrorResponse { error: e.to_string() })?
@@ -585,8 +583,7 @@ pub async fn search(
 ) -> Result<Json<SearchResponse>, ErrorResponse> {
     let query = parse_hex32(&req.query, "query")?;
 
-    let store = crate::storage::BatchStore::new(&node.batches_path)
-        .map_err(|e| ErrorResponse { error: format!("Storage error: {}", e) })?;
+    let store = &node.storage.batches; 
 
     let tip = store.highest()
         .map_err(|e| ErrorResponse { error: e.to_string() })?;
@@ -756,8 +753,7 @@ pub async fn get_block_raw(
     State(node): State<AppState>,
     axum::extract::Path(height): axum::extract::Path<u64>,
 ) -> Result<Json<crate::core::Batch>, ErrorResponse> {
-    let store = crate::storage::BatchStore::new(&node.batches_path)
-        .map_err(|e| ErrorResponse { error: format!("Storage error: {}", e) })?;
+    let store = &node.storage.batches; 
 
     let mut batch = store.load(height)
         .map_err(|e| ErrorResponse { error: e.to_string() })?
@@ -1006,7 +1002,7 @@ pub async fn axe_apply_overclock(
 }
 
 pub async fn axe_download_rewards(
-    State(node): State<AppState>,
+    State(_node): State<AppState>,
 ) -> Result<Response, ErrorResponse> {
     // --- HARDWARE + AUTH GATE ---
     if !is_axe_device() {
@@ -1015,9 +1011,7 @@ pub async fn axe_download_rewards(
         });
     }
 
-    // Navigate from data_dir/db/batches back up to data_dir
-    let data_dir = node.batches_path.parent().unwrap().parent().unwrap();
-    let log_path = data_dir.join("coinbase_seeds.jsonl");
+    let log_path = "data/coinbase_seeds.jsonl";
 
     let contents = std::fs::read_to_string(&log_path).unwrap_or_else(|_| {
         tracing::warn!("No coinbase_seeds.jsonl found (no blocks mined yet?)");
@@ -1064,11 +1058,8 @@ pub async fn get_tx_by_input(
         }
     }
 
-    // 2. Check Chain History (Fallback - Disk I/O)
-    // Scan the last 100 blocks to catch txs mined between polling intervals.
-    // Capped to prevent disk I/O exhaustion from repeated requests.
-    let store = crate::storage::BatchStore::new(&node.batches_path)
-        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+    // 2. Check Chain History 
+    let store = &node.storage.batches; 
     
     let current_height = node.get_state().await.height;
     let start = current_height.saturating_sub(100);
