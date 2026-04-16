@@ -45,9 +45,9 @@ const BATCH_LOOKAHEAD: usize = 3;
 const MAX_PREFETCH_BUFFER: usize = 32;
 const MAX_PREFETCH_DISTANCE: u64 = 10_000;
 
-const SYNC_TIMEOUT_SECS: u64 = 900;
+const SYNC_TIMEOUT_SECS: u64 = 120;
 /// Extra grace period for the first chunk (relay handshake, NAT traversal, etc.)
-const SYNC_INITIAL_TIMEOUT_SECS: u64 = 1200;
+const SYNC_INITIAL_TIMEOUT_SECS: u64 = 180;
 
 /// Max transactions accepted from a single peer per rate-limit window.
 const MAX_TX_PER_PEER_PER_WINDOW: u32 = 50;
@@ -836,7 +836,21 @@ async fn process_state_rebuild(
             "Fork is deeper than downloaded headers ({}). Stepping back to {} to find the exact fork point.", 
             headers_start_height, new_start
         );
-        self.start_sync_session(peer, session.peer_height, session.peer_depth, Some(new_start));
+        self.sync_session = Some(SyncSession {
+            peer,
+            peer_height: session.peer_height,
+            peer_depth: session.peer_depth,
+            phase: SyncPhase::Headers {
+                accumulated: headers, // <--- KEEP previously downloaded headers
+                cursor: new_start,    // <--- Step cursor backward
+                snapshot: None,
+            },
+            started_at: session.started_at,
+            last_progress_at: std::time::Instant::now(),
+        });
+
+        let count = headers_start_height.saturating_sub(new_start).min(crate::network::MAX_GETHEADERS_COUNT);
+        self.network.send(peer, Message::GetHeaders { start_height: new_start, count });
         return Ok(());
     }
 
@@ -1958,35 +1972,39 @@ async fn handle_message(
                 self.ack(channel);
                 tracing::debug!("Peer {} state: height={} depth={}", from, height, depth);
 
-                if midstate == self.state.midstate && height == self.state.height {
-                    self.sync_in_progress = false;
-                    self.sync_session = None;
-                    self.trigger_mining();
-                } else if depth > self.state.depth || height > self.state.height
-                    || (depth == self.state.depth && midstate < self.state.midstate)
-                {
+                let is_syncing = self.sync_in_progress || self.sync_session.is_some();
+                let is_sync_peer = self.sync_session.as_ref().map_or(false, |s| s.peer == from);
 
-                
-                
-                    // FIX: also guard on sync_in_progress, which stays true even when
-                    // sync_session is temporarily None during background PoW verification
-                    if self.sync_session.is_some() || self.sync_in_progress {
-                        tracing::debug!("Sync session already active. Ignoring StateInfo from {} to prevent thrashing.", from);
+                if is_syncing {
+                    // We are actively busy syncing. 
+                    if is_sync_peer {
+                        // The peer we are syncing with just sent us an update.
+                        if midstate == self.state.midstate && height == self.state.height {
+                            tracing::info!("Caught up to sync peer {}", from);
+                            self.sync_in_progress = false;
+                            self.sync_session = None;
+                            self.trigger_mining();
+                        } else if depth > self.state.depth || height > self.state.height {
+                            tracing::debug!("Sync peer {} advanced to height {}", from, height);
+                            // Do nothing, let the active sync session continue fetching
+                        }
                     } else {
-                        // --- FIX: Disable insecure Fast-Forward Sync ---
-                        // We must always anchor syncs to our locally verified chain history.
-                        self.start_sync_session(from, height, depth, None);
-                        // -----------------------------------------------
+                        // A random peer sent us their state while we are busy. 
+                        // IGNORE IT completely so it doesn't sabotage the active sync.
+                        tracing::debug!("Ignoring StateInfo from {} because we are actively syncing with another peer.", from);
                     }
                 } else {
-                    tracing::debug!(
-                        "Peer {} at equal/lower depth (h={}, d={}) with different chain, resuming mining",
-                        from, height, depth
-                    );
-                    // ONLY resume mining if we aren't actively syncing from someone else!
-                    if self.sync_session.is_none() {
-                        self.sync_in_progress = false;
-                        self.trigger_mining();
+                    // We are NOT syncing. Evaluate normally.
+                    if depth > self.state.depth || height > self.state.height
+                        || (depth == self.state.depth && midstate < self.state.midstate)
+                    {
+                        tracing::info!("Peer {} is ahead (h={}, d={}). Starting sync.", from, height, depth);
+                        self.start_sync_session(from, height, depth, None);
+                    } else {
+                        tracing::debug!("Peer {} is at equal/lower depth, ignoring.", from);
+                        if midstate == self.state.midstate && height == self.state.height {
+                            self.trigger_mining();
+                        }
                     }
                 }
             }
@@ -2168,7 +2186,7 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                         Some("pipeline") => {
                             if let Some(s) = &mut self.sync_session {
                                 if let SyncPhase::PipelinedRebuild { buffered_batches, .. } = &mut s.phase {
-                                    if buffered_batches.len() < 50 {
+                                    if buffered_batches.len() < 1000 {
                                         buffered_batches.extend(batches);
                                         s.last_progress_at = std::time::Instant::now();
                                     } else {
@@ -2651,6 +2669,7 @@ fn fire_batch_lookahead(&mut self) {
             s.last_progress_at = std::time::Instant::now();
         }
 
+        
         Ok(())
     }
 
@@ -2671,7 +2690,7 @@ fn fire_batch_lookahead(&mut self) {
             return Ok(());
         }
 
-        let new_cursor = cursor + headers.len() as u64;
+        let mut new_cursor = cursor + headers.len() as u64; 
         let pct = (new_cursor as f64 / peer_height as f64) * 100.0;
         tracing::info!("✓ Verified and saved chunk. Sync progress: {}/{} ({:.1}%)", new_cursor, peer_height, pct);
 
@@ -2683,8 +2702,26 @@ fn fire_batch_lookahead(&mut self) {
                         self.abort_sync_session("Peer attempted OOM DoS with too many headers");
                         return Ok(());
                     }
-                    accumulated.extend(headers);
-                    *c = new_cursor;
+                    
+                    // Prepend backward chunks for deep forks ---
+                    // If the incoming headers are OLDER than our accumulated ones, we are resolving a deep fork.
+                    if !accumulated.is_empty() && headers.last().map(|h| h.height) < accumulated.first().map(|h| h.height) {
+                        tracing::info!("Prepended deep fork headers {}..{}", headers.first().unwrap().height, headers.last().unwrap().height);
+                        
+                        let mut new_acc = headers.clone();
+                        new_acc.append(accumulated); // Moves all elements from accumulated to new_acc
+                        *accumulated = new_acc;
+                        
+                        // The backward gap is now filled, and the array reaches the tip again.
+                        // Forcing new_cursor = peer_height tells the outer state machine to immediately
+                        // move to the final verification phase with the fully re-assembled chain.
+                        new_cursor = peer_height;
+                        *c = new_cursor;
+                    } else {
+                        // Normal forward sync
+                        accumulated.extend(headers);
+                        *c = new_cursor;
+                    }
                     
                     let sync_file_path = self.data_dir.join("sync_state.bin");
                     let backup = SyncStateBackup {
@@ -2812,9 +2849,16 @@ fn fire_batch_lookahead(&mut self) {
                     let syncer = crate::sync::Syncer::new(storage.clone());
                     let headers_start_height = all_headers.first().map(|h| h.height).unwrap_or(0);
                     
-                    match syncer.find_fork_point(&all_headers, headers_start_height, current_height) {
+                    // Offload disk I/O to a background thread
+                    // This prevents the Tokio network layer from freezing while searching the disk!
+                    let all_headers_clone = all_headers.clone();
+                    let fork_res = tokio::task::spawn_blocking(move || {
+                        syncer.find_fork_point(&all_headers_clone, headers_start_height, current_height)
+                    }).await.unwrap();
+
+                    match fork_res {
                         Ok(fh) => {
-                            // Nakamoto Consensus dictates the heaviest chain always wins.
+                            // Nakamoto Consensus dictates the heaviest chain always wins
                             // We do not bound reorgs by safe_depth, otherwise we cause permanent network splits.
                             if fh == headers_start_height && headers_start_height > 0 {
                                 fork_height = fh;
@@ -4427,6 +4471,7 @@ async fn rebuild_state_from_disk(storage: crate::storage::Storage, target_height
                         recent_headers.pop_front();
                     }
                     if state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                        wots_oracle.clear(); //we dont need to hold the oracle in ram since the whole truth is kept in SPENT_ADDRESSES_TABLE anyway - we just need to ensure the current batch is good. 
                         let db_oracle = storage.query_spent_addresses(&batch).unwrap_or_default();
                         wots_oracle.extend(db_oracle);
                     }
@@ -4477,6 +4522,7 @@ async fn rebuild_state_from_disk(storage: crate::storage::Storage, target_height
                         recent_headers.pop_front();
                     }
                     if state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
+                        wots_oracle.clear(); //we dont need to hold the oracle in ram since the whole truth is kept in SPENT_ADDRESSES_TABLE anyway - we just need to ensure the current batch is good. 
                         let db_oracle = storage.query_spent_addresses(&batch).unwrap_or_default();
                         wots_oracle.extend(db_oracle);
                     }
