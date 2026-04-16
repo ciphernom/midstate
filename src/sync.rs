@@ -25,6 +25,14 @@ impl Syncer {
     /// `previous_timestamps` window that `apply_batch` / `validate_timestamp`
     /// would see, keeping the two code paths in exact consensus.
     pub fn verify_header_chain(headers: &[BatchHeader], prior_timestamps: &[u64]) -> Result<()> {
+        Self::verify_header_chain_internal(headers, prior_timestamps, true)
+    }
+
+    pub fn verify_header_chain_no_pow(headers: &[BatchHeader], prior_timestamps: &[u64]) -> Result<()> {
+        Self::verify_header_chain_internal(headers, prior_timestamps, false)
+    }
+
+    fn verify_header_chain_internal(headers: &[BatchHeader], prior_timestamps: &[u64], check_pow: bool) -> Result<()> {
         if headers.is_empty() {
             return Ok(());
         }
@@ -32,7 +40,6 @@ impl Syncer {
         let current_time = crate::core::state::current_timestamp();
         let window_size = crate::core::MEDIAN_TIME_PAST_WINDOW;
 
-        // Validate header[0] against prior chain history only (no in-batch predecessors yet).
         if headers[0].height >= crate::core::types::STRICT_MTP_ACTIVATION_HEIGHT {
             crate::core::state::validate_timestamp(headers[0].timestamp, prior_timestamps, current_time)
                 .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index 0: {}", e))?;
@@ -43,7 +50,6 @@ impl Syncer {
             let header = &headers[i];
             let prev = &headers[i - 1];
 
-            // Build the exact previous_timestamps window that apply_batch would pass
             let combined: Vec<u64> = prior_timestamps.iter()
                 .chain(headers[..i].iter().map(|h| &h.timestamp))
                 .copied()
@@ -67,24 +73,25 @@ impl Syncer {
             }
         }
 
-        // 2. Heavy parallel check: Verify Proof of Work for all headers across all CPU cores
-        let results: Vec<Result<(), String>> = headers
-                .par_iter()
-                .enumerate()
-                .map(|(i, header)| {
-                    verify_extension(
-                        header.post_tx_midstate,
-                        &header.extension,
-                        &header.target,
-                    ).map_err(|e| format!("Invalid PoW at header index {}: {}", i, e))
-                })
-                .collect();
+        // 2. Heavy parallel check: ONLY run if check_pow is true
+        if check_pow {
+            let results: Vec<Result<(), String>> = headers
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, header)| {
+                        verify_extension(
+                            header.post_tx_midstate,
+                            &header.extension,
+                            &header.target,
+                        ).map_err(|e| format!("Invalid PoW at header index {}: {}", i, e))
+                    })
+                    .collect();
 
-        // 3. Report first error if any failed
-        for res in results {
-                if let Err(e) = res {
-                    bail!("{}", e);
-                }
+            for res in results {
+                    if let Err(e) = res {
+                        bail!("{}", e);
+                    }
+            }
         }
 
         Ok(())
