@@ -1343,54 +1343,60 @@ if ('serviceWorker' in navigator) {
             if (status === 'failed')    showToast('WebRTC failed. Using HTTPS fallback.', 'info');
         }
 
-async function connectWebRTC(bootstrapAddr) {
+        async function findHeaviestNetworkState(rpcUrls) {
+            log(`[light] Quorum check: Querying ${rpcUrls.length} nodes to find the heaviest chain...`);
+            const promises = rpcUrls.map(async (url) => {
+                try {
+                    const cleanUrl = url.trim().replace(/\/+$/, '');
+                    const resp = await fetch(`${cleanUrl}/state`, { signal: AbortSignal.timeout(3000) });
+                    if (!resp.ok) return null;
+                    const state = await resp.json();
+                    return { url: cleanUrl, state };
+                } catch(e) { return null; }
+            });
+            
+            const results = (await Promise.all(promises)).filter(r => r !== null);
+            if (results.length === 0) throw new Error("Could not reach any nodes for quorum check.");
+            
+            // Sort descending by depth (using BigInt because depth is u128)
+            results.sort((a, b) => {
+                const dA = BigInt(a.state.depth);
+                const dB = BigInt(b.state.depth);
+                return dA < dB ? 1 : (dA > dB ? -1 : 0);
+            });
+            
+            const bestNode = results[0];
+            log(`[light] Consensus reached. Highest depth is ${bestNode.state.height} blocks on ${bestNode.url}.`);
+            return bestNode;
+        }
+
+        async function connectWebRTC(customAddr) {
             updateWebRTCStatus('connecting');
             try {
-                // Default to just the VPS if the fetch fails
-                let dialList = [bootstrapAddr]; 
+                // 1. Establish trusted bootstrap quorum
+                const bootstrapUrls = [
+                    "https://rpc.cypherpunk.gold",
+                    "http://134.199.148.215:8545",
+                    "http://167.172.228.142:8545"
+                ];
+
+                const bestNode = await findHeaviestNetworkState(bootstrapUrls);
                 
-                try {
-                    const parts = bootstrapAddr.split('/');
-                    if (parts[1] === 'ip4' || parts[1] === 'ip6') {
-                        const ip = parts[2];
-                        const rpcPort = 8545; // Default Midstate RPC port
-                        
-                        log(`[light] Fetching dynamic WebRTC peers from http://${ip}:${rpcPort}/state...`);
-                        
-                        const resp = await fetch(`http://${ip}:${rpcPort}/state`, { 
-                            signal: AbortSignal.timeout(3000) 
-                        });
-                        const state = await resp.json();
-                        
-                        // Filter for valid WebRTC addresses with certhashes
-                        const webrtcAddrs = (state.webrtc_addrs || []).filter(a => a.includes('webrtc-direct') && a.includes('certhash'));
-                        
-                        if (webrtcAddrs.length > 0) {
-                            // The first address returned by the node is its own (your VPS)
-                            let vpsAddr = webrtcAddrs[0];
-                            
-                            // Robustly replace ANY private/unspecified IP with the IP we actually used to hit the RPC
-                            if (vpsAddr.includes('/ip4/0.0.0.0/') || 
-                                vpsAddr.includes('/ip4/127.0.0.1/') || 
-                                vpsAddr.includes('/ip4/192.168.') || 
-                                vpsAddr.includes('/ip4/10.')) {
-                                vpsAddr = vpsAddr.replace(/\/ip4\/[^\/]+/, `/ip4/${ip}`);
-                            }
-                            
-                            // The remaining addresses belong to the community
-                            let communityAddrs = webrtcAddrs.slice(1);
-                            
-                            // Shuffle the community peers so users don't all hammer the same node
-                            communityAddrs.sort(() => Math.random() - 0.5);
-                            
-                            // Build the prioritized dialing list: 
-                            // 1. Random Community Peers -> 2. VPS -> 3. HTTPS (implied if all fail)
-                            dialList = [...communityAddrs, vpsAddr];
-                        }
-                    }
-                } catch (fetchErr) {
-                    log(`[light] Could not fetch peer list: ${fetchErr.message}. Trying VPS directly...`, 'var(--yellow)');
+                let dialList = [];
+                // If user provided a raw P2P multiaddr, try it first
+                if (customAddr && customAddr.includes("/p2p/")) {
+                    dialList.push(customAddr);
                 }
+
+                // Extract verified WebRTC addresses from the honest node
+                const webrtcAddrs = (bestNode.state.webrtc_addrs || []).filter(a => a.includes('webrtc-direct') && a.includes('certhash'));
+                if (webrtcAddrs.length > 0) {
+                    // Randomize community peers to distribute load
+                    const communityPeers = webrtcAddrs.slice(1).sort(() => Math.random() - 0.5);
+                    dialList.push(...communityPeers, webrtcAddrs[0]); // Put primary VPS last as fallback
+                }
+
+                if (dialList.length === 0) throw new Error("The heaviest node is not advertising any WebRTC addresses.");
 
                 if (lightClient) { await lightClient.stop(); lightClient = null; }
                 lightClient = await createLightClient();
@@ -1398,55 +1404,44 @@ async function connectWebRTC(bootstrapAddr) {
                 lightClient.onStatusChange((status) => {
                     updateWebRTCStatus(status);
                     if (status === 'connected') {
-                        log('[light] WebRTC connected to full node.');
-                        lightClient.discoverPeers().catch(() => {});
+                        log('[light] WebRTC connected securely.');
+                        lightClient.discoverPeers().catch(()=>{});
                     } else if (status === 'failed') {
                         log('[light] WebRTC failed. Falling back to HTTPS.');
                     }
                 });
-                
-                // Pass the prioritized array to the light client
+
+                // Attach Push Listener
+                lightClient.onPushEvent((payload) => {
+                    worker.postMessage({ type: 'PUSH_NEW_BLOCK', payload });
+                });
+
                 await lightClient.start(dialList);
                 
+                // Lock RPC URL to the trusted node to prevent spoofed blocks
+                _rpcUrl = bestNode.url; 
+                
             } catch (e) {
-                log(`[light] WebRTC connect error: ${e.message}`, 'var(--red)');
+                log(`[light] Connect error: ${e.message}`, 'var(--red)');
                 updateWebRTCStatus('failed');
                 lightClient = null;
             }
         }
 
+        async function autoConnectWebRTC() {
+            try {
+                await connectWebRTC(null);
+            } catch (e) {
+                log(`[light] Auto-connect error: ${e.message}`);
+            }
+        }
+        
         async function disconnectWebRTC() {
             if (lightClient) { await lightClient.stop(); lightClient = null; }
             updateWebRTCStatus('disconnected');
         }
 
-        async function autoConnectWebRTC() {
-            try {
-                _rpcUrl = document.getElementById('rpcUrl')?.value?.trim() || _rpcUrl;
-                const url = _rpcUrl.replace(/\/+$/, '');
-                const state = await fetch(`${url}/state`, { cache: 'no-store' }).then(r => r.json());
-                const addrs = state.webrtc_addrs;
-                if (!addrs || addrs.length === 0) {
-                    log('[light] Node advertises no WebRTC addrs — staying on HTTPS.');
-                    return;
-                }
-                if (lightClient) { await lightClient.stop(); lightClient = null; }
-                lightClient = await createLightClient();
-                lightClient.onStatusChange((status) => {
-                    updateWebRTCStatus(status);
-                    if (status === 'connected') {
-                        log('[light] WebRTC auto-connected.');
-                        lightClient.discoverPeers().catch(() => {});
-                    } else if (status === 'failed') {
-                        log('[light] WebRTC auto-connect failed. Using HTTPS.');
-                    }
-                });
-                await lightClient.start(addrs);
-
-            } catch (e) {
-                log(`[light] WebRTC auto-connect error: ${e.message}`);
-            }
-        }
+        
 
         // ── RPC Bridge ──────────────────────────────────────────────────────────
         // Handles RPC_REQUEST messages from worker.js. Executes the network call

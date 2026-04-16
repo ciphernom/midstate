@@ -1352,7 +1352,11 @@ function log(msg,type='i') {
   const d=document.createElement('div');
   d.className='log-line';
   const ts=new Date().toLocaleTimeString([],{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit',fractionalSecondDigits:2});
-  d.innerHTML=`<span class="lt">[${ts}]</span><span class="l${type}">${msg}</span>`;
+  
+  // Securely build DOM elements to prevent XSS from script errors
+  d.innerHTML=`<span class="lt">[${ts}]</span><span class="l${type}"></span>`;
+  d.lastChild.textContent = msg; 
+  
   c.appendChild(d);
   c.scrollTop=c.scrollHeight;
 }
