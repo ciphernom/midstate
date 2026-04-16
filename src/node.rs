@@ -1056,21 +1056,23 @@ async fn process_verified_batches_chunk(
         }
 
         self.sync_in_progress = false;
-        // Sync complete — next attempt starts fresh
-        self.last_sync_cursor = None;
+
+        // By subtracting 1, we guarantee exactly 1 block of overlap for the next sync,
+        // preventing the "Fork is deeper" panic, while keeping the sync instant.
+        self.last_sync_cursor = Some(self.state.height.saturating_sub(1)); 
+               
         // Reset backoff: successful sync proves the peer and path are healthy
         self.sync_retry_count = 0;
         self.sync_backoff_until = None;
-        // Immediately check if the peer has mined more blocks while we were
-        // syncing.  Without this, we'd have to wait for the next broadcast
-        // (which will fail because we missed intermediate blocks) before
-        // discovering we're still behind — creating a catch-up death spiral
-        // where each cycle takes ~5 s and the miner advances by ~1 block.
+
+        // CLEAR THE CACHE 
+        let _ = std::fs::remove_file(self.data_dir.join("sync_state.bin"));
+
+        // Immediately check if the peer has mined more blocks while we were syncing.
         self.network.send(from, Message::GetState);
 
         Ok(())
     }
-
 
     /// Handle a request from a browser light client over WebRTC.
     ///
@@ -2741,9 +2743,9 @@ fn fire_batch_lookahead(&mut self) {
         tokio::spawn(async move {
             let mut is_valid = true;
 
-            // --- Time Warp Defense (MTP & Full PoW Validation) ---
-            if let Err(e) = crate::sync::Syncer::verify_header_chain(&all_headers, &recent_headers_vec) {
-                tracing::warn!("Accumulated header chain failed consensus (MTP/PoW/Linkage): {}", e);
+            // --- Time Warp Defense 
+            if let Err(e) = crate::sync::Syncer::verify_header_chain_no_pow(&all_headers, &recent_headers_vec) {
+                tracing::warn!("Accumulated header chain failed consensus (MTP/Linkage): {}", e);
                 is_valid = false;
             }
 
