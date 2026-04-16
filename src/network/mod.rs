@@ -1,6 +1,6 @@
 pub mod protocol;
 pub mod light_protocol;
-use light_protocol::{LightRequest, LightResponse, LIGHT_PROTOCOL};
+use light_protocol::{LightRequest, LightResponse, LIGHT_PROTOCOL, LIGHT_PUSH_PROTOCOL, LightNotification};
 
 pub use protocol::{Message, MidstateCodec, MIDSTATE_PROTOCOL, MAX_GETBATCHES_COUNT, MAX_GETHEADERS_COUNT};
 
@@ -517,6 +517,38 @@ let autonat = autonat::Behaviour::new(
 
         Ok(net)
     }
+
+    pub fn has_light_peers(&self) -> bool {
+        !self.light_peers.is_empty()
+    }
+
+    pub fn broadcast_light_push(&mut self, notification: &LightNotification) {
+        if self.light_peers.is_empty() { return; }
+        
+        let bytes = serde_json::to_vec(notification).unwrap_or_default();
+        let mut payload = (bytes.len() as u32).to_le_bytes().to_vec();
+        payload.extend_from_slice(&bytes);
+        
+        let control = self.swarm.behaviour_mut().light.new_control();
+        
+        for &peer in &self.light_peers {
+            let mut ctrl = control.clone();
+            let data = payload.clone();
+            
+            tokio::spawn(async move {
+                // Strict 5-second timeout prevents Reverse-Slowloris task leaks
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+                    if let Ok(mut stream) = ctrl.open_stream(peer, LIGHT_PUSH_PROTOCOL).await {
+                        use futures::AsyncWriteExt;
+                        let _ = stream.write_all(&data).await;
+                        let _ = stream.close().await;
+                    }
+                }).await;
+            });
+        }
+    }
+
+
 
     // ── Public API ──────────────────────────────────────────────────────
 
