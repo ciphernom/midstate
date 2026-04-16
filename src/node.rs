@@ -2182,6 +2182,14 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                             self.handle_batches_response(batch_start, batches, from).await?;
                         }
                     }
+               } else {
+                    // If the peer sends an empty list, and we are actively waiting 
+                    // for blocks from them, abort immediately instead of stalling for 15 mins.
+                    let is_waiting = self.sync_session.as_ref().map_or(false, |s| s.peer == from);
+                    if is_waiting {
+                        tracing::warn!("Peer {} sent an empty block list. Aborting sync.", from);
+                        self.abort_sync_session("peer sent empty batches response");
+                    }
                 }
             }
             Message::GetHeaders { start_height, count } => {
@@ -4474,6 +4482,12 @@ async fn rebuild_state_from_disk(storage: crate::storage::Storage, target_height
                     }
                     crate::core::state::apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &mut wots_oracle)?;
                     state.target = crate::core::state::adjust_difficulty(&state);
+                    
+                    // save our work in case there is a node crash or restart mid replay
+                    if h > 0 && h % 500 == 0 {
+                        let _ = storage.save_state_snapshot(h, &state);
+                    }
+                    
                 } else {
                     anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
                 }
