@@ -666,13 +666,6 @@ async function buildMiningTemplate(stateObj) {
             return tmpl;
         }
 
-        if (resp.ok) {
-            const tmpl = await resp.json();
-            tmpl.mining_addrs    = cbData.mining_addrs;
-            tmpl.next_wots_index = cbData.next_wots_index;
-            return tmpl;
-        }
-
         // Handle fee mismatch — retry with corrected total
         try {
             let err = await resp.json();

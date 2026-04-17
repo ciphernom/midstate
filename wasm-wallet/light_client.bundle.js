@@ -29420,10 +29420,11 @@ async request(req, _retries = 2) {
 
             // 1. WRITE and READ in one clean pipeline.
             // pipe(source, duplex_stream, sink_function)
-            const streamPipeline = pipe(
-                [msg],
-                stream,
-                async (source) => {
+            async function* _msgSource() { yield msg; }
+                const streamPipeline = pipe(
+                    _msgSource(),
+                    stream,
+                    async (source) => {
                     for await (const chunk of source) {
                         const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.subarray ? chunk.subarray() : chunk);
                         chunks.push(bytes);
