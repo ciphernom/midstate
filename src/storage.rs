@@ -22,6 +22,11 @@ const SPENT_ADDRESSES_TABLE: TableDefinition<&[u8; 32], &[u8; 32]> =
 const MSS_LEAF_INDEX_TABLE: TableDefinition<&[u8; 32], u64> =
     TableDefinition::new("mss_leaf_index");
 
+/// Block storage tables
+pub const BATCHES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("batches");
+pub const HEADERS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("headers");
+pub const FILTERS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("filters");
+
 /// V1 state layout (depth: u64). Used only for one-time migration from
 /// pre-u128 databases. Identical field order to the old `State` so that
 /// bincode positional decoding works.
@@ -148,9 +153,6 @@ impl Storage {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
 
-        // redb acquires an exclusive file lock.  If a previous node process
-        // is still shutting down (race between kill and restart), the lock
-        // may not yet be released.  Retry with back-off before giving up.
         let db_path = path.join("state.redb");
         let mut last_err = None;
         for attempt in 0..10 {
@@ -161,28 +163,24 @@ impl Storage {
                     }
                     // Initialize tables
                     let write_txn = db.begin_write()?;
-{
+                    {
                         let _ = write_txn.open_table(STATE_TABLE)?;
                         let _ = write_txn.open_table(MINING_SEED_TABLE)?;
                         let _ = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
                         let _ = write_txn.open_table(MSS_LEAF_INDEX_TABLE)?;
+                        let _ = write_txn.open_table(BATCHES_TABLE)?;
+                        let _ = write_txn.open_table(HEADERS_TABLE)?;
+                        let _ = write_txn.open_table(FILTERS_TABLE)?;
                     }
                     write_txn.commit()?;
 
-                    let batches = BatchStore::new(path.join("batches"))?;
+                    let db_arc = Arc::new(db);
+                    let batches = BatchStore::new(db_arc.clone(), path.join("batches"))?;
 
-                    let storage = Self {
-                        db: Arc::new(db),
+                    return Ok(Self {
+                        db: db_arc,
                         batches,
-                    };
-
-                    // State-aware WAL recovery: load the committed height from
-                    // redb BEFORE recovering .tmp files so we know which belong
-                    // to a committed reorg (promote) vs an aborted one (delete).
-                    let committed_height = storage.load_committed_height()?;
-                    storage.batches.recover_wal(committed_height)?;
-
-                    return Ok(storage);
+                    });
                 }
                 Err(e) => {
                     last_err = Some(e);
@@ -285,19 +283,7 @@ impl Storage {
         }
     }
 
-    /// Load only the committed state height from redb (no tree rebuilds).
-    /// Used by WAL recovery to determine which .tmp files to promote vs delete.
-    fn load_committed_height(&self) -> Result<u64> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(STATE_TABLE)?;
-        match table.get("current")? {
-            Some(bytes) => {
-                let (state, _) = deserialize_state_with_migration(bytes.value())?;
-                Ok(state.height)
-            }
-            None => Ok(0),
-        }
-    }
+
 
     pub fn save_mining_seed(&self, seed: &[u8; 32]) -> Result<()> {
         // Save to flat file for concurrent CLI access

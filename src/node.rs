@@ -206,9 +206,7 @@ pub struct Node {
     peer_header_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     hash_counter: Arc<AtomicU64>,
     banned_subnets: HashMap<IpAddr, std::time::Instant>,
-    /// Tarpitted peers: kept connected but fed garbage responses.
-    /// They don't know they're banned, so they don't reconnect from new IPs.
-    tarpitted_peers: HashSet<PeerId>,
+
     
     /// Ring buffer of recent states for instant reorg rollback.
     /// Keyed by height: state_cache[i] = (height, State) where the State
@@ -228,7 +226,7 @@ pub struct NodeHandle {
     peer_addrs: Arc<RwLock<Vec<String>>>,
     webrtc_addrs: Arc<RwLock<Vec<String>>>, 
     tx_sender: tokio::sync::mpsc::UnboundedSender<NodeCommand>,
-    pub batches_path: PathBuf,
+    pub storage: crate::storage::Storage,
     pub mix_manager: Arc<RwLock<MixManager>>,
     pub commit_limiter: Arc<tokio::sync::Semaphore>, 
     pub hash_counter: Arc<AtomicU64>,
@@ -453,7 +451,7 @@ impl NodeHandle {
         Ok(())
     }
     pub fn scan_addresses(&self, addresses: &[[u8; 32]], start: u64, end: u64) -> Result<Vec<ScannedCoin>> {
-        let store = crate::storage::BatchStore::new(&self.batches_path)?;
+        let store = &self.storage.batches; 
         let mut found = Vec::new();
         for height in start..end {
             if let Some(batch) = store.load(height)? {
@@ -490,7 +488,7 @@ impl NodeHandle {
         Ok(found)
     }
 pub fn scan_mss_index(&self, master_pk: &[u8; 32], start: u64, end: u64) -> Result<u64> {
-        let store = crate::storage::BatchStore::new(&self.batches_path)?;
+        let store = &self.storage.batches;
         let mut max_idx: u64 = 0;
         for h in start..end {
             if let Some(batch) = store.load(h)? {
@@ -803,7 +801,6 @@ pub async fn new(
             peer_header_req_counts: HashMap::new(),
             hash_counter: Arc::new(AtomicU64::new(0)),
             banned_subnets: HashMap::new(),
-            tarpitted_peers: HashSet::new(),
             state_cache: VecDeque::with_capacity(STATE_CACHE_SIZE + 1),
             bootstrap_peers: bootstrap_strings, // <-- Uses the variable we created above
         })
@@ -1115,13 +1112,9 @@ async fn handle_light_request(
             }
 
             LightRequest::GetBlock { height } => {
-                let store_path = self.data_dir.join("db").join("batches");
+                 let store = self.storage.batches.clone();
                 
                 let result = tokio::task::spawn_blocking(move || {
-                    let store = match crate::storage::BatchStore::new(&store_path) {
-                        Ok(s) => s,
-                        Err(e) => return LightResponse::error(format!("Storage error: {}", e)),
-                    };
                     
                     match store.load(height) {
                         Ok(Some(mut batch)) => {
@@ -1150,14 +1143,11 @@ async fn handle_light_request(
                     .min(self.state.height)
                     .min(start_height.saturating_add(1000));
                 
-                let store_path = self.data_dir.join("db").join("batches");
+                let store = self.storage.batches.clone(); 
                 
                 // Spawn blocking thread to prevent freezing the network reactor!
                 let result = tokio::task::spawn_blocking(move || {
-                    let store = match crate::storage::BatchStore::new(&store_path) {
-                        Ok(s) => s,
-                        Err(e) => return LightResponse::error(format!("Storage error: {}", e)),
-                    };
+                    
 
                     let mut filters = Vec::new();
                     let mut element_counts = Vec::new();
@@ -1471,7 +1461,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
             peer_addrs: Arc::new(RwLock::new(Vec::new())),
             webrtc_addrs: Arc::new(RwLock::new(Vec::new())),
             tx_sender: tx,
-            batches_path: self.data_dir.join("db").join("batches"),
+            storage: self.storage.clone(),
             mix_manager: Arc::clone(&self.mix_manager),
             commit_limiter: Arc::new(tokio::sync::Semaphore::new(4)), // <--  (Max 4 concurrent PoW tasks)
             hash_counter: Arc::clone(&self.hash_counter),
@@ -1833,7 +1823,6 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                             self.connected_peers.remove(&peer);
                             self.peer_tx_counts.remove(&peer); 
                             tracing::info!("Peer disconnected: {}", peer);
-                            self.tarpitted_peers.remove(&peer);
 
                             // If this peer had in-flight lookahead requests, drop them from
                             // tracking so fire_batch_lookahead re-requests from another peer
@@ -1899,56 +1888,7 @@ async fn handle_message(
         msg: Message,
         channel: Option<ResponseChannel<Message>>,
     ) -> Result<()> {
-// ── Tarpit: feed garbage to known-malicious peers ───────────
-        if self.tarpitted_peers.contains(&from) {
-            // Randomly disconnect 1% of tarpitted peers every message 
-            // to cycle file descriptors while still being annoying.
-            if rand::random::<u8>() < 2 {
-                self.network.disconnect_peer(from);
-                return Ok(());
-            }
-
-            // STOCHASTIC TARPITTING: Exponential distribution delay
-            // We mathematically paralyze the attacker's async event loop
-            // Delay = -ln(1 - U) * mean_delay
-            let u: f32 = rand::random::<f32>().max(0.0001); // Prevent ln(0)
-            let mean_delay = 10.0; // 10 seconds average
-            let delay_secs = (-u.ln() * mean_delay).min(60.0); // Cap at 60s
-            tokio::time::sleep(std::time::Duration::from_secs_f32(delay_secs)).await;
-
-            match &msg {
-                Message::GetState => {
-                    // Claim to be at height 0 with impossibly high depth —
-                    // they'll try to sync from us and get nothing useful.
-                    self.send_response(channel, Message::StateInfo {
-                        height: 0,
-                        depth: u128::MAX,
-                        midstate: [0xFF; 32],
-                    });
-                }
-                Message::GetHeaders { .. } | Message::GetBatches { .. } => {
-                    // Send empty responses — they burn time waiting
-                    self.ack(channel);
-                }
-                Message::GetAddr => {
-                    // Feed them fake addresses pointing to themselves
-                    self.send_response(channel, Message::Addr(vec![
-                        "/ip4/127.0.0.1/tcp/1/p2p/12D3KooWDEADBEEF00000000000000000000000000000000000".into(),
-                    ]));
-                }
-                Message::Ping { nonce } => {
-                    // Keep the connection alive — respond normally so they
-                    // don't detect the tarpit from a broken keepalive
-                    self.send_response(channel, Message::Pong { nonce: *nonce });
-                }
-                _ => {
-                    // Silently consume everything else
-                    self.ack(channel);
-                }
-            }
-            return Ok(());
-        }
-        // ── End tarpit ──────────────────────────────────────────────
+        
 
         match msg {
             Message::Transaction(tx) => {
@@ -2596,21 +2536,44 @@ fn fire_batch_lookahead(&mut self) {
         // Don't clear last_sync_cursor here — keep it so the next attempt resumes
     }
 
-/// Tarpit a malicious peer: keep them connected but feed them garbage.
-    /// They waste CPU on fake PoW requirements and never realize they're banned,
-    /// so they don't reconnect from a different IP.
+    /// Instantly drop a malicious peer and penalize their Bayesian reputation.
+    /// We do not waste CPU or RAM holding the connection open.
     ///
-    /// Also bans their subnet so new connections from the same range are rejected.
+    /// Also bans their subnet so new connections from the same IP range are rejected
+    /// instantly at the network layer, and purges them from the PEX routing table
+    /// so we stop gossiping their address to honest nodes.
     fn ban_peer(&mut self, peer: PeerId, reason: &str) {
-        tracing::error!(
-            "TARPITTING peer {} — {}", peer, reason
-        );
-        self.tarpitted_peers.insert(peer);
+        tracing::error!("BANNING peer {} — {}", peer, reason);
+        
+        // 1. Immediately sever the TCP connection (Frees RAM/FDs)
+        self.network.disconnect_peer(peer);
 
-        // Also ban the subnet for new connection attempts
+        // 2. Ban the subnet so they can't spam reconnects
         if let Some(subnet) = self.network.peer_subnet(&peer) {
             self.banned_subnets.insert(subnet, std::time::Instant::now());
-            tracing::warn!("Banned subnet {} — peer {} tarpitted", subnet, peer);
+            tracing::debug!("Banned subnet {} due to malicious peer", subnet);
+        }
+
+        // 3. Bayesian Penalty: Heavily penalize them in the routing table
+        // We find their IP string from the PEX pool to apply the penalty.
+        let peer_str = peer.to_string();
+        let mut to_purge = None;
+        
+        for (addr_str, stats) in self.known_pex_addrs.iter_mut() {
+            if addr_str.contains(&peer_str) {
+                stats.1 = stats.1.saturating_add(50); // Massive penalty to Beta (Adversarial)
+                
+                let prob = stats.0 as f32 / (stats.0 + stats.1) as f32;
+                if prob < 0.1 {
+                    to_purge = Some(addr_str.clone());
+                }
+            }
+        }
+
+        // If they are irredeemably bad, purge them from PEX entirely
+        if let Some(purge_addr) = to_purge {
+            self.known_pex_addrs.remove(&purge_addr);
+            tracing::info!("Purged malicious peer from PEX routing table: {}", purge_addr);
         }
     }
 
@@ -3545,33 +3508,19 @@ fn perform_reorg(
         // Cache the new tip for future reorgs
         self.cache_current_state();
 
-        // 1. PREPARE: Write the batch files to .tmp FIRST.
-        // If we crash here, the DB hasn't advanced, and recover_wal() will
-        // delete these .tmp files on next boot (height > committed_height).
+        // 1. WRITE BATCHES (Atomic via Redb)
         for (height, _, batch) in &new_history {
-            if let Err(e) = self.storage.batches.save_tmp(*height, batch) {
-                tracing::error!("Failed to save temp reorg batch at {}: {}", height, e);
-                return Err(e.into());
-            }
+            self.storage.save_batch(*height, batch)?;
         }
 
-        // 2. COMMIT: Atomically update the state pointer in the database.
-        // This is the point of no return. 
+        // 2. COMMIT STATE 
         self.storage.save_state(&self.state)?;
 
-        // Burn WOTS addresses for all newly adopted blocks.
-        // Idempotent: reorg replays of the same batch write the same commitment value.
+        // 3. BURN ADDRESSES
         for (height, _, batch) in &new_history {
             if let Err(e) = self.storage.burn_batch_addresses(batch, *height) {
                 tracing::warn!("burn_batch_addresses failed at height {}: {}", height, e);
             }
-        }
-
-        // 3. APPLY: Rename .tmp files to .bin.
-        // If we crash during this loop, recover_wal() will finish the renames
-        // on the next boot (height <= committed_height).
-        for (height, _, _) in &new_history {
-            let _ = self.storage.batches.commit_tmp(*height);
         }
 
         self.mempool.re_add(abandoned_txs, &self.state);
