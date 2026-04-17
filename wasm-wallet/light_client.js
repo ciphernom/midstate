@@ -243,7 +243,6 @@ async request(req, _retries = 2) {
             throw new Error('Not connected to any peer');
         }
 
-        // Handle version differences in js-libp2p (returns raw stream vs { stream })
         const dialResult = await this.node.dialProtocol(this.connectedPeer, LIGHT_PROTOCOL);
         const stream = dialResult.stream || dialResult;
 
@@ -255,19 +254,17 @@ async request(req, _retries = 2) {
             msg.set(lenBuf, 0);
             msg.set(jsonBytes, 4);
 
-            // 1. WRITE to the stream using the bulletproof pipe utility
-            await pipe([msg], stream);
-
-            // Collect raw protobuf-framed bytes
             const chunks = [];
             let totalLen = 0;
             let gotReset = false;
-            
-            // 2. READ from the stream using the standard .source iterable
-            const readAll = async () => {
-                try {
-                    for await (const chunk of stream.source) {
-                        // Handle BufferList/Uint8Array differences across versions
+
+            // 1. WRITE and READ in one clean pipeline.
+            // pipe(source, duplex_stream, sink_function)
+            const streamPipeline = pipe(
+                [msg],
+                stream,
+                async (source) => {
+                    for await (const chunk of source) {
                         const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.subarray ? chunk.subarray() : chunk);
                         chunks.push(bytes);
                         totalLen += bytes.length;
@@ -280,18 +277,16 @@ async request(req, _retries = 2) {
                             break;
                         }
                     }
-                } catch (_) {
-                    // Stream close may throw an abort error, which is fine
                 }
-            };
+            );
 
             const timeoutPromise = new Promise((_, reject) =>
                 setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS)
             );
 
-            await Promise.race([readAll(), timeoutPromise]);
+            // 2. Await the pipeline with a timeout safety net
+            await Promise.race([streamPipeline, timeoutPromise]);
 
-            // Flatten the chunks
             const rawBuf = new Uint8Array(totalLen);
             let offset = 0;
             for (const c of chunks) {
@@ -305,7 +300,6 @@ async request(req, _retries = 2) {
                 return this.request(req, _retries - 1);
             }
 
-            // Decode protobuf framing to extract application data
             const appData = decodeWebRTCStreamData(rawBuf);
 
             if (appData.length < 4) throw new Error('Response too short');
