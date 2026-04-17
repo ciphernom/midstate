@@ -15,8 +15,7 @@
 
 import { createLibp2p } from 'libp2p';
 import { webRTCDirect } from '@libp2p/webrtc';
-import { noise } from '@chainsafe/libp2p-noise';
-import { yamux } from '@chainsafe/libp2p-yamux';
+import { pipe } from 'it-pipe';
 import { multiaddr } from '@multiformats/multiaddr';
 
 const LIGHT_PROTOCOL = '/midstate/light/1.0.0';
@@ -240,86 +239,85 @@ onPushEvent(cb) {
     /// req: { method: 'get_state' } or { method: 'get_block', params: { height: 42 } }
     /// Returns: parsed LightResponse { ok, data?, error? }
 async request(req, _retries = 2) {
-    if (!this.isConnected || !this.connectedPeer) {
-        throw new Error('Not connected to any peer');
-    }
-
-    const stream = await this.node.dialProtocol(this.connectedPeer, LIGHT_PROTOCOL);
-
-    try {
-        const jsonBytes = new TextEncoder().encode(JSON.stringify(req));
-        const lenBuf = new Uint8Array(4);
-        new DataView(lenBuf.buffer).setUint32(0, jsonBytes.length, true);
-        const msg = new Uint8Array(4 + jsonBytes.length);
-        msg.set(lenBuf, 0);
-        msg.set(jsonBytes, 4);
-
-        await stream.sink((async function* () {
-            yield msg;
-        })());
-
-        // Collect raw protobuf-framed bytes from incomingData.
-        const chunks = [];
-        let totalLen = 0;
-        let gotReset = false;
-        
-        const readAll = async () => {
-            try {
-                for await (const chunk of stream.incomingData) {
-                    const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-                    chunks.push(bytes);
-                    totalLen += bytes.length;
-
-                    // Check for RESET first — server killed the stream
-                    if (chunkContainsReset(bytes)) {
-                        gotReset = true;
-                        break;
-                    }
-                    // FIN detection works reliably for js-libp2p streams
-                    if (chunkContainsFin(bytes)) {
-                        break;
-                    }
-                }
-            } catch (_) {
-                // Stream close may throw AggregateError as background rejection
-            }
-        };
-
-        const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS)
-        );
-
-        await Promise.race([readAll(), timeoutPromise]);
-
-        // Flatten the chunks ONCE (O(N) instead of O(N^2))
-        const rawBuf = new Uint8Array(totalLen);
-        let offset = 0;
-        for (const c of chunks) {
-            rawBuf.set(c, offset);
-            offset += c.length;
-        };       
-
-        await Promise.race([readAll(), timeoutPromise]);
-
-        // If we got RESET, retry (server's initial binary protocol probe
-        // can kill the first light stream after a new connection)
-        if (gotReset && _retries > 0) {
-            try { stream.abort(new Error('reset')); } catch (_) {}
-            return this.request(req, _retries - 1);
+        if (!this.isConnected || !this.connectedPeer) {
+            throw new Error('Not connected to any peer');
         }
 
-        // Decode protobuf framing to extract application data
-        const appData = decodeWebRTCStreamData(rawBuf);
+        // Handle version differences in js-libp2p (returns raw stream vs { stream })
+        const dialResult = await this.node.dialProtocol(this.connectedPeer, LIGHT_PROTOCOL);
+        const stream = dialResult.stream || dialResult;
 
-        if (appData.length < 4) throw new Error('Response too short');
-        const respLen = new DataView(appData.buffer, appData.byteOffset).getUint32(0, true);
-        const respJson = new TextDecoder().decode(appData.slice(4, 4 + respLen));
-        return JSON.parse(respJson);
-    } finally {
-        try { stream.abort(new Error('done')); } catch (_) {}
-        try { stream.close(); } catch (_) {}
+        try {
+            const jsonBytes = new TextEncoder().encode(JSON.stringify(req));
+            const lenBuf = new Uint8Array(4);
+            new DataView(lenBuf.buffer).setUint32(0, jsonBytes.length, true);
+            const msg = new Uint8Array(4 + jsonBytes.length);
+            msg.set(lenBuf, 0);
+            msg.set(jsonBytes, 4);
+
+            // 1. WRITE to the stream using the bulletproof pipe utility
+            await pipe([msg], stream);
+
+            // Collect raw protobuf-framed bytes
+            const chunks = [];
+            let totalLen = 0;
+            let gotReset = false;
+            
+            // 2. READ from the stream using the standard .source iterable
+            const readAll = async () => {
+                try {
+                    for await (const chunk of stream.source) {
+                        // Handle BufferList/Uint8Array differences across versions
+                        const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.subarray ? chunk.subarray() : chunk);
+                        chunks.push(bytes);
+                        totalLen += bytes.length;
+
+                        if (chunkContainsReset(bytes)) {
+                            gotReset = true;
+                            break;
+                        }
+                        if (chunkContainsFin(bytes)) {
+                            break;
+                        }
+                    }
+                } catch (_) {
+                    // Stream close may throw an abort error, which is fine
+                }
+            };
+
+            const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS)
+            );
+
+            await Promise.race([readAll(), timeoutPromise]);
+
+            // Flatten the chunks
+            const rawBuf = new Uint8Array(totalLen);
+            let offset = 0;
+            for (const c of chunks) {
+                rawBuf.set(c, offset);
+                offset += c.length;
+            };       
+
+            // If the node reset the stream (happens occasionally on first connect), retry
+            if (gotReset && _retries > 0) {
+                try { stream.abort(new Error('reset')); } catch (_) {}
+                return this.request(req, _retries - 1);
+            }
+
+            // Decode protobuf framing to extract application data
+            const appData = decodeWebRTCStreamData(rawBuf);
+
+            if (appData.length < 4) throw new Error('Response too short');
+            const respLen = new DataView(appData.buffer, appData.byteOffset).getUint32(0, true);
+            const respJson = new TextDecoder().decode(appData.slice(4, 4 + respLen));
+            return JSON.parse(respJson);
+            
+        } finally {
+            try { stream.abort(new Error('done')); } catch (_) {}
+            try { stream.close(); } catch (_) {}
+        }
     }
-}
 
     // ── Convenience Methods (match the RPC endpoints the wallet uses) ────────
 

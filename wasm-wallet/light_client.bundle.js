@@ -14043,7 +14043,7 @@ function queuelessPushable() {
  * console.info(arr) // 0, 1, 5, 6, 2, 3, 4, 7, 8, 9  <- nb. order is not guaranteed
  * ```
  */
-function isAsyncIterable$6(thing) {
+function isAsyncIterable$7(thing) {
     return thing[Symbol.asyncIterator] != null;
 }
 async function addAllToPushable(sources, output, signal) {
@@ -14087,7 +14087,7 @@ function* mergeSyncSources(syncSources) {
 function merge(...sources) {
     const syncSources = [];
     for (const source of sources) {
-        if (!isAsyncIterable$6(source)) {
+        if (!isAsyncIterable$7(source)) {
             syncSources.push(source);
         }
     }
@@ -14097,6 +14097,91 @@ function merge(...sources) {
     }
     return mergeSources(sources);
 }
+
+function pipe(first, ...rest) {
+    if (first == null) {
+        throw new Error('Empty pipeline');
+    }
+    // Duplex at start: wrap in function and return duplex source
+    if (isDuplex(first)) {
+        const duplex = first;
+        first = () => duplex.source;
+        // Iterable at start: wrap in function
+    }
+    else if (isIterable(first) || isAsyncIterable$6(first)) {
+        const source = first;
+        first = () => source;
+    }
+    const fns = [first, ...rest];
+    if (fns.length > 1) {
+        // Duplex at end: use duplex sink
+        if (isDuplex(fns[fns.length - 1])) {
+            fns[fns.length - 1] = fns[fns.length - 1].sink;
+        }
+    }
+    if (fns.length > 2) {
+        // Duplex in the middle, consume source with duplex sink and return duplex source
+        for (let i = 1; i < fns.length - 1; i++) {
+            if (isDuplex(fns[i])) {
+                fns[i] = duplexPipelineFn(fns[i]);
+            }
+        }
+    }
+    return rawPipe(...fns);
+}
+const rawPipe = (...fns) => {
+    let res;
+    while (fns.length > 0) {
+        res = fns.shift()(res);
+    }
+    return res;
+};
+const isAsyncIterable$6 = (obj) => {
+    return obj?.[Symbol.asyncIterator] != null;
+};
+const isIterable = (obj) => {
+    return obj?.[Symbol.iterator] != null;
+};
+const isDuplex = (obj) => {
+    if (obj == null) {
+        return false;
+    }
+    return obj.sink != null && obj.source != null;
+};
+const duplexPipelineFn = (duplex) => {
+    return (source) => {
+        const p = duplex.sink(source);
+        if (p?.then != null) {
+            const stream = pushable({
+                objectMode: true
+            });
+            p.then(() => {
+                stream.end();
+            }, (err) => {
+                stream.end(err);
+            });
+            let sourceWrap;
+            const source = duplex.source;
+            if (isAsyncIterable$6(source)) {
+                sourceWrap = async function* () {
+                    yield* source;
+                    stream.end();
+                };
+            }
+            else if (isIterable(source)) {
+                sourceWrap = function* () {
+                    yield* source;
+                    stream.end();
+                };
+            }
+            else {
+                throw new Error('Unknown duplex source type - must be Iterable or AsyncIterable');
+            }
+            return merge(stream, sourceWrap());
+        }
+        return duplex.source;
+    };
+};
 
 const DEFAULT_MAX_BUFFER_SIZE$1 = 4_194_304;
 class UnwrappedError extends Error {
@@ -29077,46 +29162,6 @@ function webRTCDirect(init) {
     return (components) => new WebRTCDirectTransport(components, init);
 }
 
-var FrameType;
-(function (FrameType) {
-    /** Used to transmit data. May transmit zero length payloads depending on the flags. */
-    FrameType[FrameType["Data"] = 0] = "Data";
-    /** Used to updated the senders receive window size. This is used to implement per-session flow control. */
-    FrameType[FrameType["WindowUpdate"] = 1] = "WindowUpdate";
-    /** Used to measure RTT. It can also be used to heart-beat and do keep-alive over TCP. */
-    FrameType[FrameType["Ping"] = 2] = "Ping";
-    /** Used to close a session. */
-    FrameType[FrameType["GoAway"] = 3] = "GoAway";
-})(FrameType || (FrameType = {}));
-var Flag;
-(function (Flag) {
-    /** Signals the start of a new stream. May be sent with a data or window update message. Also sent with a ping to indicate outbound. */
-    Flag[Flag["SYN"] = 1] = "SYN";
-    /** Acknowledges the start of a new stream. May be sent with a data or window update message. Also sent with a ping to indicate response. */
-    Flag[Flag["ACK"] = 2] = "ACK";
-    /** Performs a half-close of a stream. May be sent with a data message or window update. */
-    Flag[Flag["FIN"] = 4] = "FIN";
-    /** Reset a stream immediately. May be sent with a data or window update message. */
-    Flag[Flag["RST"] = 8] = "RST";
-})(Flag || (Flag = {}));
-Object.values(Flag).filter((x) => typeof x !== 'string');
-var GoAwayCode;
-(function (GoAwayCode) {
-    GoAwayCode[GoAwayCode["NormalTermination"] = 0] = "NormalTermination";
-    GoAwayCode[GoAwayCode["ProtocolError"] = 1] = "ProtocolError";
-    GoAwayCode[GoAwayCode["InternalError"] = 2] = "InternalError";
-})(GoAwayCode || (GoAwayCode = {}));
-
-var StreamState;
-(function (StreamState) {
-    StreamState[StreamState["Init"] = 0] = "Init";
-    StreamState[StreamState["SYNSent"] = 1] = "SYNSent";
-    StreamState[StreamState["SYNReceived"] = 2] = "SYNReceived";
-    StreamState[StreamState["Established"] = 3] = "Established";
-    StreamState[StreamState["Finished"] = 4] = "Finished";
-    StreamState[StreamState["Paused"] = 5] = "Paused";
-})(StreamState || (StreamState = {}));
-
 // light_client.js — Browser-side libp2p light client for Midstate wallet
 //
 // Connects to full nodes over WebRTC direct (no HTTPS, no domain, no cert authority).
@@ -29354,86 +29399,85 @@ onPushEvent(cb) {
     /// req: { method: 'get_state' } or { method: 'get_block', params: { height: 42 } }
     /// Returns: parsed LightResponse { ok, data?, error? }
 async request(req, _retries = 2) {
-    if (!this.isConnected || !this.connectedPeer) {
-        throw new Error('Not connected to any peer');
-    }
-
-    const stream = await this.node.dialProtocol(this.connectedPeer, LIGHT_PROTOCOL);
-
-    try {
-        const jsonBytes = new TextEncoder().encode(JSON.stringify(req));
-        const lenBuf = new Uint8Array(4);
-        new DataView(lenBuf.buffer).setUint32(0, jsonBytes.length, true);
-        const msg = new Uint8Array(4 + jsonBytes.length);
-        msg.set(lenBuf, 0);
-        msg.set(jsonBytes, 4);
-
-        await stream.sink((async function* () {
-            yield msg;
-        })());
-
-        // Collect raw protobuf-framed bytes from incomingData.
-        const chunks = [];
-        let totalLen = 0;
-        let gotReset = false;
-        
-        const readAll = async () => {
-            try {
-                for await (const chunk of stream.incomingData) {
-                    const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-                    chunks.push(bytes);
-                    totalLen += bytes.length;
-
-                    // Check for RESET first — server killed the stream
-                    if (chunkContainsReset(bytes)) {
-                        gotReset = true;
-                        break;
-                    }
-                    // FIN detection works reliably for js-libp2p streams
-                    if (chunkContainsFin(bytes)) {
-                        break;
-                    }
-                }
-            } catch (_) {
-                // Stream close may throw AggregateError as background rejection
-            }
-        };
-
-        const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS)
-        );
-
-        await Promise.race([readAll(), timeoutPromise]);
-
-        // Flatten the chunks ONCE (O(N) instead of O(N^2))
-        const rawBuf = new Uint8Array(totalLen);
-        let offset = 0;
-        for (const c of chunks) {
-            rawBuf.set(c, offset);
-            offset += c.length;
-        };       
-
-        await Promise.race([readAll(), timeoutPromise]);
-
-        // If we got RESET, retry (server's initial binary protocol probe
-        // can kill the first light stream after a new connection)
-        if (gotReset && _retries > 0) {
-            try { stream.abort(new Error('reset')); } catch (_) {}
-            return this.request(req, _retries - 1);
+        if (!this.isConnected || !this.connectedPeer) {
+            throw new Error('Not connected to any peer');
         }
 
-        // Decode protobuf framing to extract application data
-        const appData = decodeWebRTCStreamData(rawBuf);
+        // Handle version differences in js-libp2p (returns raw stream vs { stream })
+        const dialResult = await this.node.dialProtocol(this.connectedPeer, LIGHT_PROTOCOL);
+        const stream = dialResult.stream || dialResult;
 
-        if (appData.length < 4) throw new Error('Response too short');
-        const respLen = new DataView(appData.buffer, appData.byteOffset).getUint32(0, true);
-        const respJson = new TextDecoder().decode(appData.slice(4, 4 + respLen));
-        return JSON.parse(respJson);
-    } finally {
-        try { stream.abort(new Error('done')); } catch (_) {}
-        try { stream.close(); } catch (_) {}
+        try {
+            const jsonBytes = new TextEncoder().encode(JSON.stringify(req));
+            const lenBuf = new Uint8Array(4);
+            new DataView(lenBuf.buffer).setUint32(0, jsonBytes.length, true);
+            const msg = new Uint8Array(4 + jsonBytes.length);
+            msg.set(lenBuf, 0);
+            msg.set(jsonBytes, 4);
+
+            // 1. WRITE to the stream using the bulletproof pipe utility
+            await pipe([msg], stream);
+
+            // Collect raw protobuf-framed bytes
+            const chunks = [];
+            let totalLen = 0;
+            let gotReset = false;
+            
+            // 2. READ from the stream using the standard .source iterable
+            const readAll = async () => {
+                try {
+                    for await (const chunk of stream.source) {
+                        // Handle BufferList/Uint8Array differences across versions
+                        const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.subarray ? chunk.subarray() : chunk);
+                        chunks.push(bytes);
+                        totalLen += bytes.length;
+
+                        if (chunkContainsReset(bytes)) {
+                            gotReset = true;
+                            break;
+                        }
+                        if (chunkContainsFin(bytes)) {
+                            break;
+                        }
+                    }
+                } catch (_) {
+                    // Stream close may throw an abort error, which is fine
+                }
+            };
+
+            const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS)
+            );
+
+            await Promise.race([readAll(), timeoutPromise]);
+
+            // Flatten the chunks
+            const rawBuf = new Uint8Array(totalLen);
+            let offset = 0;
+            for (const c of chunks) {
+                rawBuf.set(c, offset);
+                offset += c.length;
+            };       
+
+            // If the node reset the stream (happens occasionally on first connect), retry
+            if (gotReset && _retries > 0) {
+                try { stream.abort(new Error('reset')); } catch (_) {}
+                return this.request(req, _retries - 1);
+            }
+
+            // Decode protobuf framing to extract application data
+            const appData = decodeWebRTCStreamData(rawBuf);
+
+            if (appData.length < 4) throw new Error('Response too short');
+            const respLen = new DataView(appData.buffer, appData.byteOffset).getUint32(0, true);
+            const respJson = new TextDecoder().decode(appData.slice(4, 4 + respLen));
+            return JSON.parse(respJson);
+            
+        } finally {
+            try { stream.abort(new Error('done')); } catch (_) {}
+            try { stream.close(); } catch (_) {}
+        }
     }
-}
 
     // ── Convenience Methods (match the RPC endpoints the wallet uses) ────────
 
