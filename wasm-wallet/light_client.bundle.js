@@ -29318,10 +29318,12 @@ async request(req, _retries = 2) {
         throw new Error('Not connected to any peer');
     }
 
-    const dialResult = await this.node.dialProtocol(this.connectedPeer, LIGHT_PROTOCOL);
-    const stream = dialResult.stream || dialResult;
+    const conns = this.node.getConnections(this.connectedPeer);
+    if (!conns || conns.length === 0) throw new Error('No active connection to peer');
+    const stream = await conns[0].newStream([LIGHT_PROTOCOL]);
 
     try {
+        // Build the length-prefixed message
         const jsonBytes = new TextEncoder().encode(JSON.stringify(req));
         const lenBuf = new Uint8Array(4);
         new DataView(lenBuf.buffer).setUint32(0, jsonBytes.length, true);
@@ -29329,23 +29331,22 @@ async request(req, _retries = 2) {
         msg.set(lenBuf, 0);
         msg.set(jsonBytes, 4);
 
-        // Write: feed msg into stream.sink directly, then close the write side
-        async function* _msgSource() { yield msg; }
-        await stream.sink(_msgSource());
+        // Write: sendData sends a Uint8Array, then close the write side
+        stream.sendData(msg);
+        stream.sendCloseWrite();
 
-        // Read: consume stream.source directly, no pipe involved
+        // Read: incomingData is an async iterator
         const chunks = [];
         let totalLen = 0;
         let gotReset = false;
 
         const readWithTimeout = async () => {
-            for await (const chunk of stream.source) {
+            for await (const chunk of stream.incomingData) {
                 const bytes = chunk instanceof Uint8Array
                     ? chunk
-                    : new Uint8Array(chunk.subarray ? chunk.subarray() : chunk);
+                    : new Uint8Array(chunk.buffer ?? chunk);
                 chunks.push(bytes);
                 totalLen += bytes.length;
-
                 if (chunkContainsReset(bytes)) { gotReset = true; break; }
                 if (chunkContainsFin(bytes)) { break; }
             }
@@ -29375,7 +29376,6 @@ async request(req, _retries = 2) {
 
     } finally {
         try { stream.abort(new Error('done')); } catch (_) {}
-        try { stream.close(); } catch (_) {}
     }
 }
 
