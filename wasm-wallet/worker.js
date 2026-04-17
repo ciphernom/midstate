@@ -682,7 +682,35 @@ self.onmessage = async (e) => {
         else if (type === 'GENERATE') {
             self.postMessage({ type: 'PHRASE_GENERATED', payload: generate_phrase() });
         }
-
+        
+        else if (type === 'PUSH_NEW_BLOCK') {
+            const notif = payload.NewBlockTip;
+            if (!notif) return;
+            
+            self.postMessage({ type: 'LOG', payload: `⚡ Network Push: New block found at height ${notif.height}!` });
+            
+            // 1. Instant Miner Update: Stop wasting hashes, get the new template!
+            if (isMiningActive) {
+                handleGetTemplate().then(tmpl => {
+                    if (tmpl) self.postMessage({ type: 'TEMPLATE_READY', payload: tmpl });
+                }).catch(()=>{});
+            }
+            
+            // 2. Instant Sync: Check the block's filter for incoming funds!
+            if (notif.filter_hex && notif.block_hash && notif.element_count > 0) {
+                const matched = wallet.check_filter(notif.filter_hex, notif.block_hash, notif.element_count);
+                if (matched) {
+                    self.postMessage({ type: 'LOG', payload: `Incoming funds detected! Auto-scanning...` });
+                    performScan().catch(()=>{});
+                } else if (notif.height > wState.lastScannedHeight) {
+                    // Safe to advance local height marker without a full scan
+                    wState.lastScannedHeight = notif.height;
+                    saveState();
+                    self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+                }
+            }
+        }
+        
         else if (type === 'CREATE') {
             if (wallet) wallet.free();
             password = payload.password;

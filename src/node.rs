@@ -270,6 +270,7 @@ pub enum NodeCommand {
         is_fast_forward: bool,
         is_valid: bool,
     },
+    BroadcastLightPush(crate::network::light_protocol::LightNotification),
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -1765,6 +1766,9 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                             if let Err(e) = self.process_state_rebuild(peer, fork_height, candidate_state, headers, is_fast_forward, is_valid).await {
                                 tracing::warn!("Failed to process state rebuild: {}", e);
                             }
+                        }
+                        NodeCommand::BroadcastLightPush(notif) => {
+                            self.network.broadcast_light_push(&notif);
                         }
                         NodeCommand::BroadcastMixProposal { mix_id, proposal, peers } => {
                             for peer in peers {
@@ -3579,6 +3583,53 @@ fn perform_reorg(
 
         self.sync_in_progress = false;
         self.trigger_mining();
+        
+        // --- Hardware-Safe Background Push Generation ---
+        // Push the new chain tip to light clients so they recognize the reorg instantly
+        if let Some((_, _, last_batch)) = new_history.last() {
+            let last_batch_clone = last_batch.clone();
+            let state_clone = self.state.clone();
+            let cmd_tx = self.cmd_tx.as_ref().unwrap().clone();
+            let has_light_peers = self.network.has_light_peers();
+
+            if has_light_peers {
+                tokio::task::spawn_blocking(move || {
+                    let filter = crate::core::filter::CompactFilter::build(&last_batch_clone);
+                    
+                    let mut items = std::collections::HashSet::new();
+                    for tx in &last_batch_clone.transactions {
+                        match tx {
+                            crate::core::Transaction::Commit { commitment, .. } => { items.insert(*commitment); }
+                            crate::core::Transaction::Reveal { inputs, outputs, .. } => {
+                                for input in inputs {
+                                    items.insert(input.coin_id());
+                                    items.insert(input.predicate.address());
+                                }
+                                for output in outputs {
+                                    if let Some(cid) = output.coin_id() { items.insert(cid); }
+                                    items.insert(output.address());
+                                }
+                            }
+                        }
+                    }
+                    for cb in &last_batch_clone.coinbase {
+                        items.insert(cb.coin_id());
+                        items.insert(cb.address);
+                    }
+
+                    let notif = crate::network::light_protocol::LightNotification::NewBlockTip {
+                        height: state_clone.height,
+                        target: hex::encode(state_clone.target),
+                        filter_hex: hex::encode(filter.data),
+                        block_hash: hex::encode(last_batch_clone.extension.final_hash),
+                        element_count: items.len() as u64,
+                    };
+                    
+                    let _ = cmd_tx.send(NodeCommand::BroadcastLightPush(notif));
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -3933,15 +3984,17 @@ fn perform_reorg(
 
     // ── Added sync_in_progress clear at end ──────────────
 async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) -> Result<()> {
-            self.cancel_mining();
+        self.cancel_mining();
         let mut applied = 0;
-        let mut wots_oracle = std::collections::HashMap::new(); // <--- FIX
+        let mut wots_oracle = std::collections::HashMap::new();
+        
+        // --- NEW: Track the last applied batch for light client notifications ---
+        let mut last_applied_batch = None;
         
         for batch in batches {
             if batch.prev_midstate != self.state.midstate { break; }
             let mut candidate = self.state.clone();
             
-            // <--- FIX: Extend the oracle
             if self.state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
                 let db_oracle = self.storage.query_spent_addresses(&batch).unwrap_or_default();
                 wots_oracle.extend(db_oracle);
@@ -3953,15 +4006,10 @@ async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) 
                 }
                 self.state = candidate;
                 
-                // ADJUST TARGET FIRST
                 self.state.target = adjust_difficulty(&self.state);
-
-                // Cache for instant reorg rollback
                 self.cache_current_state();
-
                 self.storage.save_batch(self.state.height - 1, &batch)?;
                 
-                // Periodic snapshot saving
                 if self.state.height > 0 && self.state.height % SNAPSHOT_INTERVAL == 0 {
                     if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
                         tracing::warn!("Failed to save state snapshot: {}", e);
@@ -3981,6 +4029,7 @@ async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) 
                 }
 
                 applied += 1;
+                last_applied_batch = Some(batch); // Keep a copy of the block we just processed
             } else {
                 break;
             }
@@ -3988,7 +4037,6 @@ async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) 
 
         if applied > 0 {
             tracing::info!("Synced {} batch(es), now at height {}", applied, self.state.height);
-            // During bulk sync, a single O(N) sweep at the end is fine
             self.mempool.prune_invalid(&self.state);
             self.try_apply_orphans().await;
             self.check_pending_mix_reveals().await;
@@ -3996,13 +4044,59 @@ async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) 
             if self.state.height >= self.sync_requested_up_to {
                 self.sync_in_progress = false;
             } else {
-                // Still behind — request more batches from same peer
                 let start = self.state.height;
                 let count = (self.sync_requested_up_to.saturating_sub(start) + 1).min(MAX_GETBATCHES_COUNT);
                 tracing::info!("Continuing sync from peer {} (requesting {} batches from {})", from, count, start);
                 self.network.send(from, Message::GetBatches { start_height: start, count });
             }
+            
             self.trigger_mining();
+            
+            // --- Hardware-Safe Background Push Generation ---
+            // Only push the VERY LAST block applied in this chunk to avoid spamming the clients
+            if let Some(batch_clone) = last_applied_batch {
+                let state_clone = self.state.clone();
+                let cmd_tx = self.cmd_tx.as_ref().unwrap().clone();
+                let has_light_peers = self.network.has_light_peers();
+
+                if has_light_peers {
+                    tokio::task::spawn_blocking(move || {
+                        let filter = crate::core::filter::CompactFilter::build(&batch_clone);
+                        
+                        let mut items = std::collections::HashSet::new();
+                        for tx in &batch_clone.transactions {
+                            match tx {
+                                crate::core::Transaction::Commit { commitment, .. } => { items.insert(*commitment); }
+                                crate::core::Transaction::Reveal { inputs, outputs, .. } => {
+                                    for input in inputs {
+                                        items.insert(input.coin_id());
+                                        items.insert(input.predicate.address());
+                                    }
+                                    for output in outputs {
+                                        if let Some(cid) = output.coin_id() { items.insert(cid); }
+                                        items.insert(output.address());
+                                    }
+                                }
+                            }
+                        }
+                        for cb in &batch_clone.coinbase {
+                            items.insert(cb.coin_id());
+                            items.insert(cb.address);
+                        }
+
+                        let notif = crate::network::light_protocol::LightNotification::NewBlockTip {
+                            height: state_clone.height,
+                            target: hex::encode(state_clone.target),
+                            filter_hex: hex::encode(filter.data),
+                            block_hash: hex::encode(batch_clone.extension.final_hash),
+                            element_count: items.len() as u64,
+                        };
+                        
+                        let _ = cmd_tx.send(NodeCommand::BroadcastLightPush(notif));
+                    });
+                }
+            }
+
         } else {
             self.sync_in_progress = false;
         }
@@ -4365,13 +4459,52 @@ async fn try_apply_orphans(&mut self) {
                 let storage_clone = self.storage.clone();
                 let state_clone = self.state.clone();
                 let batch_clone = batch.clone();
-                
+                let cmd_tx = self.cmd_tx.as_ref().unwrap().clone(); // Pass the channel
+                let has_light_peers = self.network.has_light_peers(); // Check if we even need to bother
+
                 tokio::task::spawn_blocking(move || {
                     if let Err(e) = storage_clone.save_state(&state_clone) {
                         tracing::error!("Failed to save state: {}", e);
                     }
                     if let Err(e) = storage_clone.burn_batch_addresses(&batch_clone, pre_mine_height) {
                         tracing::warn!("burn_batch_addresses failed at height {}: {}", pre_mine_height, e);
+                    }
+
+                    // --- PUSH GENERATION ---
+                    // We build the filter and count elements in the background, entirely avoiding main-thread CPU/Disk stalls.
+                    if has_light_peers {
+                        let filter = crate::core::filter::CompactFilter::build(&batch_clone);
+                        
+                        let mut items = std::collections::HashSet::new();
+                        for tx in &batch_clone.transactions {
+                            match tx {
+                                crate::core::Transaction::Commit { commitment, .. } => { items.insert(*commitment); }
+                                crate::core::Transaction::Reveal { inputs, outputs, .. } => {
+                                    for input in inputs {
+                                        items.insert(input.coin_id());
+                                        items.insert(input.predicate.address());
+                                    }
+                                    for output in outputs {
+                                        if let Some(cid) = output.coin_id() { items.insert(cid); }
+                                        items.insert(output.address());
+                                    }
+                                }
+                            }
+                        }
+                        for cb in &batch_clone.coinbase {
+                            items.insert(cb.coin_id());
+                            items.insert(cb.address);
+                        }
+
+                        let notif = crate::network::light_protocol::LightNotification::NewBlockTip {
+                            height: state_clone.height,
+                            target: hex::encode(state_clone.target),
+                            filter_hex: hex::encode(filter.data),
+                            block_hash: hex::encode(batch_clone.extension.final_hash),
+                            element_count: items.len() as u64,
+                        };
+                        
+                        let _ = cmd_tx.send(NodeCommand::BroadcastLightPush(notif));
                     }
                 });
 
@@ -4451,6 +4584,9 @@ async fn try_apply_orphans(&mut self) {
         }
         Ok(())
     }
+    
+       
+    
 }
 
 /// Heavy background task to safely rebuild state from disk.

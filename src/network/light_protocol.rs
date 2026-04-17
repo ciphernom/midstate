@@ -16,6 +16,19 @@ use serde::{Deserialize, Serialize};
 use std::io;
 
 pub const LIGHT_PROTOCOL: StreamProtocol = StreamProtocol::new("/midstate/light/1.0.0");
+pub const LIGHT_PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/midstate/light-push/1.0.0");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum LightNotification {
+    NewBlockTip {
+        height: u64,
+        target: String,
+        filter_hex: String,
+        block_hash: String,
+        element_count: u64,
+    }
+}
 
 /// Maximum message size for light client requests/responses.
 /// Light clients don't transfer full batch payloads, so 2 MB is generous.
