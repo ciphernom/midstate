@@ -267,6 +267,7 @@ pub enum NodeCommand {
         headers: Vec<BatchHeader>,
         is_fast_forward: bool,
         is_valid: bool,
+        is_local_corruption: bool,
     },
     BroadcastLightPush(crate::network::light_protocol::LightNotification),
 }
@@ -1752,8 +1753,12 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                                 tracing::warn!("Error processing verified batches chunk: {}", e);
                             }
                         }
-                        NodeCommand::FinishStateRebuild { peer, fork_height, candidate_state, headers, is_fast_forward, is_valid } => {
-                            if let Err(e) = self.process_state_rebuild(peer, fork_height, candidate_state, headers, is_fast_forward, is_valid).await {
+                        NodeCommand::FinishStateRebuild { peer, fork_height, candidate_state, headers, is_fast_forward, is_valid, is_local_corruption } => {
+                            if is_local_corruption {
+                                tracing::error!("Local database corruption detected during state rebuild. Initiating self-healing rollback...");
+                                self.self_heal_rollback(fork_height).await;
+                                self.abort_sync_session("local corruption, rolled back");
+                            } else if let Err(e) = self.process_state_rebuild(peer, fork_height, candidate_state, headers, is_fast_forward, is_valid).await {
                                 tracing::warn!("Failed to process state rebuild: {}", e);
                             }
                         }
@@ -2797,6 +2802,7 @@ fn fire_batch_lookahead(&mut self) {
             let mut fork_height = 0;
             let mut candidate_state = None;
             let mut is_fast_forward = false;
+            let mut is_local_corruption = false;
 
             // 3. BACKGROUND FORK POINT & STATE REBUILD
             if is_valid {
@@ -2847,6 +2853,7 @@ fn fire_batch_lookahead(&mut self) {
                                             headers: all_headers.clone(),
                                             is_fast_forward: false,
                                             is_valid: true,
+                                            is_local_corruption: false,
                                         });
 
                                         let cache_start = state_cache.iter()
@@ -2857,7 +2864,7 @@ fn fire_batch_lookahead(&mut self) {
                                             Ok(s) => candidate_state = Some(Box::new(s)),
                                             Err(e) => {
                                                 tracing::error!("Background state rebuild failed: {}", e);
-                                                is_valid = false;
+                                                is_local_corruption = true;
                                             }
                                         }
                                     }
@@ -2868,7 +2875,7 @@ fn fire_batch_lookahead(&mut self) {
                         }
                         Err(e) => {
                             tracing::error!("Failed to find fork point: {}", e);
-                            is_valid = false;
+                            is_local_corruption = true;
                         }
                     }
                 }
@@ -2881,9 +2888,10 @@ fn fire_batch_lookahead(&mut self) {
                 headers: all_headers,
                 is_fast_forward,
                 is_valid,
+                is_local_corruption,
             });
         });
-
+        
         self.sync_session = Some(SyncSession {
             peer: session.peer,
             peer_height: session.peer_height,
@@ -3604,7 +3612,42 @@ fn perform_reorg(
         }
     }
 
+    async fn self_heal_rollback(&mut self, fork_height: u64) {
+        // Start the rollback from strictly BELOW the corrupted fork point
+        let mut snap_height = (fork_height / 100) * 100;
+        if snap_height == fork_height {
+            snap_height = snap_height.saturating_sub(100);
+        }
 
+        while snap_height > 0 {
+            if let Ok(Some(snap)) = self.storage.load_state_snapshot(snap_height) {
+                tracing::info!("Self-healing: Rolling back state to snapshot at {}", snap_height);
+                self.state = snap;
+                self.state.target = adjust_difficulty(&self.state);
+                self.cache_current_state();
+                let _ = self.storage.save_state(&self.state);
+                let _ = self.storage.truncate_chain(snap_height);
+                
+                self.chain_history.clear();
+                self.recent_headers.clear();
+                self.last_sync_cursor = Some(snap_height);
+                
+                // Repopulate recent headers
+                let window = crate::core::DIFFICULTY_LOOKBACK as u64;
+                let start = self.state.height.saturating_sub(window);
+                for h in start..self.state.height {
+                    if let Ok(Some(batch)) = self.storage.load_batch(h) {
+                        self.recent_headers.push_back(batch.timestamp);
+                    }
+                }
+                
+                return;
+            }
+            snap_height = snap_height.saturating_sub(100);
+        }
+        
+        tracing::error!("Self-healing failed: no valid snapshots found. Node may require a resync from genesis.");
+    }
 
     /// Handle a completed CoinJoin mix: submit Commit, queue Reveal.
     async fn handle_mix_transaction(&mut self, mix_id: [u8; 32], reveal_tx: Transaction) -> Result<()> {
