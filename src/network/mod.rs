@@ -1045,11 +1045,15 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                         continue;
                     }
 
-                    // --- Subnet Limit Defense ---
+                   // --- Subnet Limit Defense ---
                     if let Some(subnet) = extract_subnet(remote_addr) {
                         let peers = self.subnet_peers.entry(subnet).or_default();
                         if !peers.contains(&peer_id) {
-                            if peers.len() >= 4 { // Max 4 distinct peers per subnet
+                            // Give WebRTC connections a much higher limit to handle 
+                            // coffee shops, NATs, and developers refreshing the webpage.
+                            let limit = if is_webrtc { 50 } else { 4 }; 
+                            
+                            if peers.len() >= limit { 
                                 tracing::warn!("Eclipse Defense: Rejecting {}, subnet {} limit reached", peer_id, subnet);
                                 let _ = self.swarm.disconnect_peer_id(peer_id);
                                 continue;
