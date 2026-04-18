@@ -239,80 +239,70 @@ onPushEvent(cb) {
     /// req: { method: 'get_state' } or { method: 'get_block', params: { height: 42 } }
     /// Returns: parsed LightResponse { ok, data?, error? }
 async request(req, _retries = 2) {
-        if (!this.isConnected || !this.connectedPeer) {
-            throw new Error('Not connected to any peer');
-        }
-
-        const dialResult = await this.node.dialProtocol(this.connectedPeer, LIGHT_PROTOCOL);
-        const stream = dialResult.stream || dialResult;
-
-        try {
-            const jsonBytes = new TextEncoder().encode(JSON.stringify(req));
-            const lenBuf = new Uint8Array(4);
-            new DataView(lenBuf.buffer).setUint32(0, jsonBytes.length, true);
-            const msg = new Uint8Array(4 + jsonBytes.length);
-            msg.set(lenBuf, 0);
-            msg.set(jsonBytes, 4);
-
-            const chunks = [];
-            let totalLen = 0;
-            let gotReset = false;
-
-            // 1. WRITE and READ in one clean pipeline.
-            // pipe(source, duplex_stream, sink_function)
-            async function* _msgSource() { yield msg; }
-                const streamPipeline = pipe(
-                    _msgSource(),
-                    stream,
-                    async (source) => {
-                    for await (const chunk of source) {
-                        const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.subarray ? chunk.subarray() : chunk);
-                        chunks.push(bytes);
-                        totalLen += bytes.length;
-
-                        if (chunkContainsReset(bytes)) {
-                            gotReset = true;
-                            break;
-                        }
-                        if (chunkContainsFin(bytes)) {
-                            break;
-                        }
-                    }
-                }
-            );
-
-            const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS)
-            );
-
-            // 2. Await the pipeline with a timeout safety net
-            await Promise.race([streamPipeline, timeoutPromise]);
-
-            const rawBuf = new Uint8Array(totalLen);
-            let offset = 0;
-            for (const c of chunks) {
-                rawBuf.set(c, offset);
-                offset += c.length;
-            };       
-
-            // If the node reset the stream (happens occasionally on first connect), retry
-            if (gotReset && _retries > 0) {
-                try { stream.abort(new Error('reset')); } catch (_) {}
-                return this.request(req, _retries - 1);
-            }
-
-            const appData = decodeWebRTCStreamData(rawBuf);
-
-            if (appData.length < 4) throw new Error('Response too short');
-            const respLen = new DataView(appData.buffer, appData.byteOffset).getUint32(0, true);
-            const respJson = new TextDecoder().decode(appData.slice(4, 4 + respLen));
-            return JSON.parse(respJson);
-            
-        } finally {
-            try { stream.abort(new Error('done')); } catch (_) {}
-            try { stream.close(); } catch (_) {}
-        }
+    if (!this.isConnected || !this.connectedPeer) {
+        throw new Error('Not connected to any peer');
     }
+
+    const dialResult = await this.node.dialProtocol(this.connectedPeer, LIGHT_PROTOCOL);
+    const stream = dialResult.stream || dialResult;
+
+    try {
+        const jsonBytes = new TextEncoder().encode(JSON.stringify(req));
+        const lenBuf = new Uint8Array(4);
+        new DataView(lenBuf.buffer).setUint32(0, jsonBytes.length, true);
+        const msg = new Uint8Array(4 + jsonBytes.length);
+        msg.set(lenBuf, 0);
+        msg.set(jsonBytes, 4);
+
+        // Write: feed msg into stream.sink directly, then close the write side
+        async function* _msgSource() { yield msg; }
+        await stream.sink(_msgSource());
+
+        // Read: consume stream.source directly, no pipe involved
+        const chunks = [];
+        let totalLen = 0;
+        let gotReset = false;
+
+        const readWithTimeout = async () => {
+            for await (const chunk of stream.source) {
+                const bytes = chunk instanceof Uint8Array
+                    ? chunk
+                    : new Uint8Array(chunk.subarray ? chunk.subarray() : chunk);
+                chunks.push(bytes);
+                totalLen += bytes.length;
+
+                if (chunkContainsReset(bytes)) { gotReset = true; break; }
+                if (chunkContainsFin(bytes)) { break; }
+            }
+        };
+
+        await Promise.race([
+            readWithTimeout(),
+            new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS)
+            )
+        ]);
+
+        if (gotReset && _retries > 0) {
+            try { stream.abort(new Error('reset')); } catch (_) {}
+            return this.request(req, _retries - 1);
+        }
+
+        const rawBuf = new Uint8Array(totalLen);
+        let offset = 0;
+        for (const c of chunks) { rawBuf.set(c, offset); offset += c.length; }
+
+        const appData = decodeWebRTCStreamData(rawBuf);
+        if (appData.length < 4) throw new Error('Response too short');
+        const respLen = new DataView(appData.buffer, appData.byteOffset).getUint32(0, true);
+        const respJson = new TextDecoder().decode(appData.slice(4, 4 + respLen));
+        return JSON.parse(respJson);
+
+    } finally {
+        try { stream.abort(new Error('done')); } catch (_) {}
+        try { stream.close(); } catch (_) {}
+    }
+}
 
     // ── Convenience Methods (match the RPC endpoints the wallet uses) ────────
 
