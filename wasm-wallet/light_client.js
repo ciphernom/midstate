@@ -152,8 +152,7 @@ onPushEvent(cb) {
     async start(addrs) {
         this.node = await createLibp2p({
             transports: [webRTCDirect()],
-            connectionEncrypters: [noise()],
-            streamMuxers: [yamux()],
+            // WebRTC handles DTLS/SCTP automatically.
         });
 
                 // --- LISTEN FOR SERVER PUSHES ---
@@ -255,8 +254,9 @@ async request(req, _retries = 2) {
         msg.set(lenBuf, 0);
         msg.set(jsonBytes, 4);
 
-        await stream.sendData(msg);
-        stream.sendCloseWrite();
+        await stream.sink((async function* () {
+            yield msg;
+        })());
 
         // Collect raw protobuf-framed bytes from incomingData.
         const chunks = [];
