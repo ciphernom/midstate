@@ -58,8 +58,10 @@ pub fn calculate_target(height: u64, timestamp: u64) -> [u8; 32] {
     }
 
     // 5. Clamp: never zero, never above the absolute ceiling
-    if target > ceiling || target.is_zero() {
+    if target > ceiling {
         target = ceiling;
+    } else if target.is_zero() {
+        target = U256::one();
     }
 
     target.to_big_endian()
@@ -83,7 +85,7 @@ pub fn validate_timestamp(
     previous_timestamps: &[u64],
     current_time: u64,
 ) -> Result<()> {
-    const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
+    const MAX_FUTURE_BLOCK_TIME: u64 = 10 * 60 * 60;
 
     if new_timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
         bail!(

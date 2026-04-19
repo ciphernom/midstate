@@ -2729,7 +2729,8 @@ fn fire_batch_lookahead(&mut self) {
             Some(s) => {
                 if let SyncPhase::Headers { accumulated, cursor: c, .. } = &mut s.phase {
                     
-                    if accumulated.len() + headers.len() > 100_000 {
+                    // Allow up to 10 million headers in RAM during initial sync (~19 years of blocks)
+                    if accumulated.len() + headers.len() > 10_000_000 {
                         self.abort_sync_session("Peer attempted OOM DoS with too many headers");
                         return Ok(());
                     }
@@ -3840,7 +3841,8 @@ fn fire_batch_lookahead(&mut self) {
             // permanently. The PoW verification above is the real spam gate.
             let current_target = primitive_types::U256::from_big_endian(&self.state.target);
             let batch_target = primitive_types::U256::from_big_endian(&batch.target);
-            if batch_target > (current_target << 4) {
+            let (max_allowed, overflow) = current_target.overflowing_mul(primitive_types::U256::from(16u64));
+            if !overflow && batch_target > max_allowed {
                 tracing::warn!(
                     "Rejected orphan block from {:?}: target {:?} is >16x easier than ours ({:?}). Likely spam.",
                     from,
