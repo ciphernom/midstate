@@ -184,8 +184,8 @@ pub struct Node {
     connected_peers: HashSet<PeerId>,
     // Background mining concurrency
     mining_cancel: Option<Arc<AtomicBool>>,
-    mined_batch_rx: tokio::sync::mpsc::UnboundedReceiver<MinedResult>,
-    mined_batch_tx: tokio::sync::mpsc::UnboundedSender<MinedResult>,
+    mined_batch_rx: tokio::sync::mpsc::Receiver<MinedResult>,
+    mined_batch_tx: tokio::sync::mpsc::Sender<MinedResult>,
     // CoinJoin mix coordinator
     mix_manager: Arc<RwLock<MixManager>>,
     /// Reveals waiting for their Commit to be mined.
@@ -194,7 +194,8 @@ pub struct Node {
     /// Per-peer transaction rate limiter: maps peer -> (count, window_start).
     /// Resets every TX_RATE_WINDOW_SECS seconds.
     peer_tx_counts: HashMap<PeerId, (u32, std::time::Instant)>,
-    cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<NodeCommand>>,
+    cmd_tx: Option<tokio::sync::mpsc::Sender<NodeCommand>>,
+
     /// Dandelion++ stem pool: txs in stem phase waiting to be fluffed.
     /// Key: commitment or tx hash, Value: (transaction, received_at).
     /// After STEM_TIMEOUT_SECS without being fluffed, we fluff them ourselves.
@@ -225,7 +226,7 @@ pub struct NodeHandle {
     mempool_txs: Arc<RwLock<Vec<Transaction>>>,
     peer_addrs: Arc<RwLock<Vec<String>>>,
     webrtc_addrs: Arc<RwLock<Vec<String>>>, 
-    tx_sender: tokio::sync::mpsc::UnboundedSender<NodeCommand>,
+    tx_sender: tokio::sync::mpsc::Sender<NodeCommand>,
     pub storage: crate::storage::Storage,
     pub mix_manager: Arc<RwLock<MixManager>>,
     pub commit_limiter: Arc<tokio::sync::Semaphore>, 
@@ -444,11 +445,13 @@ impl NodeHandle {
         let state_guard = self.state.read().await;
         validate_transaction(&state_guard, &tx)?;
         drop(state_guard);
-        self.tx_sender.send(NodeCommand::SendTransaction(tx))?;
+        self.tx_sender.try_send(NodeCommand::SendTransaction(tx))
+            .map_err(|e| anyhow::anyhow!("Node is currently overloaded: {}", e))?;
         Ok(())
     }
     pub fn submit_mined_block(&self, batch: crate::core::Batch) -> anyhow::Result<()> {
-        self.tx_sender.send(NodeCommand::SubmitMinedBlock(batch))?;
+        self.tx_sender.try_send(NodeCommand::SubmitMinedBlock(batch))
+            .map_err(|e| anyhow::anyhow!("Node is currently overloaded: {}", e))?;
         Ok(())
     }
     pub fn scan_addresses(&self, addresses: &[[u8; 32]], start: u64, end: u64) -> Result<Vec<ScannedCoin>> {
@@ -507,7 +510,8 @@ pub fn scan_mss_index(&self, master_pk: &[u8; 32], start: u64, end: u64) -> Resu
         drop(mgr); // Drop lock before sending over channel
         
         // Broadcast the announcement to the network
-        self.tx_sender.send(NodeCommand::BroadcastMixAnnounce { mix_id, denomination })?;
+        self.tx_sender.try_send(NodeCommand::BroadcastMixAnnounce { mix_id, denomination })
+            .map_err(|e| anyhow::anyhow!("Node is overloaded: {}", e))?;
         Ok(mix_id)
     }
 
@@ -533,16 +537,17 @@ pub fn scan_mss_index(&self, master_pk: &[u8; 32], start: u64, end: u64) -> Resu
 
                 }).await.map_err(|e| anyhow::anyhow!("PoW task failed: {}", e))?;
 
-                self.tx_sender.send(NodeCommand::SendMixJoin { 
+                self.tx_sender.try_send(NodeCommand::SendMixJoin { 
                     coordinator: peer, mix_id, input, output, signature, join_nonce 
-                })?;
+                }).map_err(|e| anyhow::anyhow!("Node is overloaded: {}", e))?;
             }
         } else {
             // We are the coordinator. Re-acquire lock to check if ready.
             let mut mgr_coord = self.mix_manager.write().await;
             if let Ok(Some(proposal)) = mgr_coord.try_finalize(&mix_id) {
                 let peers = mgr_coord.remote_participants(&mix_id);
-                self.tx_sender.send(NodeCommand::BroadcastMixProposal { mix_id, proposal, peers })?;
+                self.tx_sender.try_send(NodeCommand::BroadcastMixProposal { mix_id, proposal, peers })
+                    .map_err(|e| anyhow::anyhow!("Node is overloaded: {}", e))?;
             }
         }
         Ok(())
@@ -567,14 +572,16 @@ pub fn scan_mss_index(&self, master_pk: &[u8; 32], start: u64, end: u64) -> Resu
                     crate::mix::mine_mix_join_pow(&mix_id, &coin_id, &peer_id_bytes, crate::mix::MIX_JOIN_POW_BITS)
                 }).await.map_err(|e| anyhow::anyhow!("PoW task failed: {}", e))?;
 
-                self.tx_sender.send(NodeCommand::SendMixFee { coordinator: peer, mix_id, input, join_nonce })?;
+                self.tx_sender.try_send(NodeCommand::SendMixFee { coordinator: peer, mix_id, input, join_nonce })
+                    .map_err(|e| anyhow::anyhow!("Node is overloaded: {}", e))?;
             }
         } else {
             // We are the coordinator. Re-acquire lock to check if ready.
             let mut mgr_coord = self.mix_manager.write().await;
             if let Ok(Some(proposal)) = mgr_coord.try_finalize(&mix_id) {
                 let peers = mgr_coord.remote_participants(&mix_id);
-                self.tx_sender.send(NodeCommand::BroadcastMixProposal { mix_id, proposal, peers })?;
+                self.tx_sender.try_send(NodeCommand::BroadcastMixProposal { mix_id, proposal, peers })
+                    .map_err(|e| anyhow::anyhow!("Node is overloaded: {}", e))?;
             }
         }
         Ok(())
@@ -589,11 +596,13 @@ pub fn scan_mss_index(&self, master_pk: &[u8; 32], start: u64, end: u64) -> Resu
 
         if !is_coord {
             if let Some(peer) = coord_peer {
-                self.tx_sender.send(NodeCommand::SendMixSign { coordinator: peer, mix_id, input_index, signature })?;
+                self.tx_sender.try_send(NodeCommand::SendMixSign { coordinator: peer, mix_id, input_index, signature })
+                    .map_err(|e| anyhow::anyhow!("Node is overloaded: {}", e))?;
             }
         } else if let Some(tx) = mgr.try_build_transaction(&mix_id)? {
             mgr.set_phase(&mix_id, MixPhase::CommitSubmitted);
-            self.tx_sender.send(NodeCommand::SubmitMixTransaction { mix_id, tx })?;
+            self.tx_sender.try_send(NodeCommand::SubmitMixTransaction { mix_id, tx })
+                .map_err(|e| anyhow::anyhow!("Node is overloaded: {}", e))?;
         }
         Ok(())
     }
@@ -765,7 +774,7 @@ pub async fn new(
         }
 
         // Convert Multiaddrs to Strings to store for the fallback dialer
-        let (mined_batch_tx, mined_batch_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mined_batch_tx, mined_batch_rx) = tokio::sync::mpsc::channel(100);
 
         Ok(Self {
             state,
@@ -1009,7 +1018,7 @@ async fn process_verified_batches_chunk(
         if new_history.len() >= 500 && candidate_state.depth > self.state.depth {
             tracing::info!("Checkpointing sync: Flushing {} batches to disk to free RAM...", new_history.len());
             let history_to_flush = std::mem::take(&mut new_history);
-            self.perform_reorg(*candidate_state.clone(), history_to_flush, is_fast_forward)?;
+            self.perform_reorg(*candidate_state.clone(), history_to_flush, is_fast_forward).await?; 
         }
 
         // Restore sync state because perform_reorg clears it ---
@@ -1059,7 +1068,7 @@ async fn process_verified_batches_chunk(
                 self.state.height, candidate_state.height,
                 self.state.depth, candidate_state.depth
             );
-            self.perform_reorg(*candidate_state, new_history, is_fast_forward)?;
+            self.perform_reorg(*candidate_state, new_history, is_fast_forward).await?; 
             self.try_apply_orphans().await;
         } else {
             tracing::info!(
@@ -1329,9 +1338,9 @@ if coinbase_total != expected_total {
                     Ok(batch) => {
                         // Submit via the command channel
                         if let Some(tx) = &self.cmd_tx {
-                            match tx.send(NodeCommand::SubmitMinedBlock(batch)) {
+                            match tx.try_send(NodeCommand::SubmitMinedBlock(batch)) {
                                 Ok(_) => LightResponse::success(serde_json::json!({ "accepted": true })),
-                                Err(e) => LightResponse::error(format!("Submit failed: {}", e)),
+                                Err(_) => LightResponse::error("Node is currently overloaded, please try again"),
                             }
                         } else {
                             LightResponse::error("Node command channel unavailable")
@@ -1356,7 +1365,7 @@ if coinbase_total != expected_total {
                     Ok(_) => {
                         self.network.observe_honest_light_peer(from).await; // SMART GUARD REWARD
                         if let Some(cmd_tx) = &self.cmd_tx {
-                            let _ = cmd_tx.send(NodeCommand::SendTransaction(tx));
+                            let _ = cmd_tx.try_send(NodeCommand::SendTransaction(tx));
                             LightResponse::success(serde_json::json!({ "accepted": true }))
                         } else {
                             LightResponse::error("Node command channel unavailable")
@@ -1378,7 +1387,7 @@ if coinbase_total != expected_total {
                             Ok(_) => {
                                 self.network.observe_honest_light_peer(from).await; // SMART GUARD REWARD
                                 if let Some(cmd_tx) = &self.cmd_tx {
-                                    let _ = cmd_tx.send(NodeCommand::SendTransaction(tx));
+                                    let _ = cmd_tx.try_send(NodeCommand::SendTransaction(tx));
                                     LightResponse::success(serde_json::json!({ "accepted": true }))
                                 } else {
                                     LightResponse::error("Node command channel unavailable")
@@ -1451,10 +1460,10 @@ if coinbase_total != expected_total {
             }
         }
     }
-    
-pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver<NodeCommand>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let handle = NodeHandle {
+
+pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeCommand>) {
+            let (tx, rx) = tokio::sync::mpsc::channel(10_000); 
+            let handle = NodeHandle {
             state: Arc::new(RwLock::new(self.state.clone())),
             safe_depth: Arc::new(RwLock::new(self.finality.calculate_safe_depth(1e-6))),
             mempool_size: Arc::new(RwLock::new(self.mempool.len())),
@@ -1485,7 +1494,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
     pub async fn run(
         mut self,
         handle: NodeHandle,
-        mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<NodeCommand>,
+        mut cmd_rx: tokio::sync::mpsc::Receiver<NodeCommand>,
     ) -> Result<()> {
         self.cmd_tx = Some(handle.tx_sender.clone());
 
@@ -1506,6 +1515,8 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
         let mut connection_maintenance = time::interval(Duration::from_secs(15));
         let mut stem_flush_interval = time::interval(Duration::from_secs(5));
         const TARGET_OUTBOUND_PEERS: usize = 8;
+        let mut health_check_interval = time::interval(Duration::from_secs(600)); // Every 10 mins
+        health_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         
         // Initial sync: ask all peers for their height
         if self.network.peer_count() > 0 {
@@ -1517,7 +1528,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        // FIX: Start mining immediately if we aren't waiting on a sync!
+        // Start mining immediately if we aren't waiting on a sync!
         self.trigger_mining();
         loop {
             tokio::select! {
@@ -1567,6 +1578,27 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::UnboundedReceiver
                         }
                     });
                 }
+                
+                _ = health_check_interval.tick() => {
+                    // Periodic O(1) health check to ensure we aren't desynced/corrupted
+                    if !self.sync_in_progress && self.state.height > 0 {
+                        match self.perform_health_check().await {
+                            Ok(true) => {
+                                tracing::debug!("Periodic state health check passed.");
+                            }
+                            Ok(false) => {
+                                tracing::error!("CRITICAL: Node state is sick/corrupted. Initiating self-healing sequence...");
+                                self.cancel_mining();
+                                self.self_heal_rollback(self.state.height).await;
+                                self.trigger_mining();
+                            }
+                            Err(e) => {
+                                tracing::error!("Health check execution failed: {}", e);
+                            }
+                        }
+                    }
+                }
+                
                 _ = ui_interval.tick() => {
                     let current_safe_depth = self.cached_safe_depth;
                     *handle.state.write().await = self.state.clone();
@@ -2630,7 +2662,7 @@ fn fire_batch_lookahead(&mut self) {
                 })
             }).await.expect("Header verification task panicked");
 
-            let _ = tx.send(NodeCommand::FinishSyncHeadersChunk {
+            let _ = tx.try_send(NodeCommand::FinishSyncHeadersChunk {
                 peer: from,
                 headers,
                 is_valid: chunk_valid,
@@ -2676,21 +2708,38 @@ fn fire_batch_lookahead(&mut self) {
                     }
                     
                     // Prepend backward chunks for deep forks ---
-                    // If the incoming headers are OLDER than our accumulated ones, we are resolving a deep fork.
                     if !accumulated.is_empty() && headers.last().map(|h| h.height) < accumulated.first().map(|h| h.height) {
                         tracing::info!("Prepended deep fork headers {}..{}", headers.first().unwrap().height, headers.last().unwrap().height);
                         
+                        if let (Some(last_new), Some(first_acc)) = (headers.last(), accumulated.first()) {
+                            if first_acc.prev_midstate != last_new.extension.final_hash {
+                                tracing::warn!("Incoming deep-fork headers do not link to recovered sync state. Discarding sync_state.bin and restarting.");
+                                let _ = std::fs::remove_file(self.data_dir.join("sync_state.bin"));
+                                self.last_sync_cursor = None;
+                                self.abort_sync_session("sync_state.bin deep-fork mismatch");
+                                return Ok(());
+                            }
+                        }
+
                         let mut new_acc = headers.clone();
                         new_acc.append(accumulated); // Moves all elements from accumulated to new_acc
                         *accumulated = new_acc;
                         
                         // The backward gap is now filled, and the array reaches the tip again.
-                        // Forcing new_cursor = peer_height tells the outer state machine to immediately
-                        // move to the final verification phase with the fully re-assembled chain.
                         new_cursor = peer_height;
                         *c = new_cursor;
                     } else {
                         // Normal forward sync
+                        if let (Some(last_acc), Some(first_new)) = (accumulated.last(), headers.first()) {
+                            if first_new.prev_midstate != last_acc.extension.final_hash {
+                                tracing::warn!("Incoming headers do not link to recovered sync state (heights: acc={}, new={}). Discarding sync_state.bin and restarting.", last_acc.height, first_new.height);
+                                let _ = std::fs::remove_file(self.data_dir.join("sync_state.bin"));
+                                self.last_sync_cursor = None;
+                                self.abort_sync_session("sync_state.bin fork mismatch");
+                                return Ok(());
+                            }
+                        }
+
                         accumulated.extend(headers);
                         *c = new_cursor;
                     }
@@ -2846,7 +2895,7 @@ fn fire_batch_lookahead(&mut self) {
                                         tracing::info!("Cache miss at height {}, starting background state rebuild...", fh);
                                         
                                         // Pipelined Rebuild Start Command
-                                        let _ = tx.send(NodeCommand::FinishStateRebuild {
+                                        let _ = tx.try_send(NodeCommand::FinishStateRebuild {
                                             peer: from,
                                             fork_height: fh,
                                             candidate_state: None,
@@ -2881,7 +2930,7 @@ fn fire_batch_lookahead(&mut self) {
                 }
             }
 
-            let _ = tx.send(NodeCommand::FinishStateRebuild {
+            let _ = tx.try_send(NodeCommand::FinishStateRebuild {
                 peer: from,
                 fork_height,
                 candidate_state,
@@ -3052,7 +3101,7 @@ fn fire_batch_lookahead(&mut self) {
                 cursor += 1;
             }
 
-            let _ = tx.send(NodeCommand::FinishSyncBatchesChunk {
+            let _ = tx.try_send(NodeCommand::FinishSyncBatchesChunk {
                 peer: from,
                 headers,
                 fork_height,
@@ -3438,12 +3487,12 @@ fn fire_batch_lookahead(&mut self) {
     }
 
     // ── Added sync_in_progress = false at end ────────────
-fn perform_reorg(
-        &mut self,
-        new_state: State,
-        new_history: Vec<(u64, [u8; 32], Batch)>,
-        is_fast_forward: bool,
-    ) -> Result<()> {
+    async fn perform_reorg(
+            &mut self,
+            new_state: State,
+            new_history: Vec<(u64, [u8; 32], Batch)>,
+            is_fast_forward: bool,
+        ) -> Result<()> {
         self.cancel_mining();
 
         let fork_height = new_history.first().map(|(h, _, _)| *h).unwrap_or(0);
@@ -3516,20 +3565,26 @@ fn perform_reorg(
         // Cache the new tip for future reorgs
         self.cache_current_state();
 
-        // 1. WRITE BATCHES (Atomic via Redb)
-        for (height, _, batch) in &new_history {
-            self.storage.save_batch(*height, batch)?;
-        }
-
-        // 2. COMMIT STATE 
-        self.storage.save_state(&self.state)?;
-
-        // 3. BURN ADDRESSES
-        for (height, _, batch) in &new_history {
-            if let Err(e) = self.storage.burn_batch_addresses(batch, *height) {
-                tracing::warn!("burn_batch_addresses failed at height {}: {}", height, e);
+        // OFFLOAD HEAVY REORG DISK I/O TO THREADPOOL ---
+        let storage_clone = self.storage.clone();
+        let state_clone = self.state.clone();
+        let history_clone = new_history.clone();
+        
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            // 1. WRITE BATCHES
+            for (height, _, batch) in &history_clone {
+                storage_clone.save_batch(*height, batch)?;
             }
-        }
+            // 2. COMMIT STATE 
+            storage_clone.save_state(&state_clone)?;
+            // 3. BURN ADDRESSES
+            for (height, _, batch) in &history_clone {
+                if let Err(e) = storage_clone.burn_batch_addresses(batch, *height) {
+                    tracing::warn!("burn_batch_addresses failed at height {}: {}", height, e);
+                }
+            }
+            Ok(())
+        }).await.expect("Reorg DB task panicked")?;
 
         self.mempool.re_add(abandoned_txs, &self.state);
 
@@ -3582,7 +3637,7 @@ fn perform_reorg(
                         element_count: items.len() as u64,
                     };
                     
-                    let _ = cmd_tx.send(NodeCommand::BroadcastLightPush(notif));
+                    let _ = cmd_tx.try_send(NodeCommand::BroadcastLightPush(notif));
                 });
             }
         }
@@ -3610,6 +3665,58 @@ fn perform_reorg(
         while self.state_cache.back().map_or(false, |(h, _)| *h >= fork_height) {
             self.state_cache.pop_back();
         }
+    }
+
+    /// Performs an ultra-fast O(log N) health check on the node's internal state.
+    /// Verifies that the in-memory UTXO set, midstate, and disk records are perfectly aligned.
+    async fn perform_health_check(&mut self) -> Result<bool> {
+        if self.state.height == 0 {
+            return Ok(true);
+        }
+
+        // 1. Check if Disk is fundamentally out of sync with Memory State (O(log N))
+        let disk_highest = self.storage.highest_batch().unwrap_or(0);
+        if disk_highest + 1 != self.state.height {
+            tracing::error!("Health Check Failed: Disk tip is {} but Memory State is at {}", disk_highest, self.state.height);
+            return Ok(false);
+        }
+
+        // 2. Load the tip block from disk (O(log N))
+        let tip_batch = match self.storage.load_batch(self.state.height - 1)? {
+            Some(b) => b,
+            None => {
+                tracing::error!("Health Check Failed: Missing tip block {} on disk!", self.state.height - 1);
+                return Ok(false);
+            }
+        };
+
+        // 3. Verify Midstate matches perfectly (O(1))
+        if self.state.midstate != tip_batch.extension.final_hash {
+            tracing::error!("Health Check Failed: Memory midstate diverges from disk tip!");
+            return Ok(false);
+        }
+
+        // 4. Verify State Root & UTXO SMT Integrity (O(1))
+        // Because the accumulator caches the top 16 levels and we just cloned it, 
+        // `root()` evaluates instantly in nanoseconds.
+        if self.state.height >= crate::core::types::STATE_ROOT_ACTIVATION_HEIGHT {
+            let mut coins_clone = self.state.coins.clone();
+            let mut comms_clone = self.state.commitments.clone();
+            let smt_root = crate::core::types::hash_concat(&coins_clone.root(), &comms_clone.root());
+            let local_state_root = crate::core::types::hash_concat(&smt_root, &self.state.chain_mmr.root());
+
+            // Legacy blocks prior to the state root migration have a 0 state_root, ignore those
+            if tip_batch.state_root != [0u8; 32] && local_state_root != tip_batch.state_root {
+                tracing::error!(
+                    "Health Check Failed: UTXO State Root corruption detected! Local: {}, Disk: {}", 
+                    hex::encode(local_state_root), 
+                    hex::encode(tip_batch.state_root)
+                );
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 
     async fn self_heal_rollback(&mut self, fork_height: u64) {
@@ -3960,7 +4067,7 @@ fn perform_reorg(
 
                 match self.evaluate_alternative_chain(fork_height, relevant, from).await {
                     Ok(Some((new_state, new_history))) => {
-                        self.perform_reorg(new_state, new_history, false)?;
+                        self.perform_reorg(new_state, new_history, false).await?; 
                         self.try_apply_orphans().await;
                         // Check if peer has even more blocks
                         self.network.send(from, Message::GetState);
@@ -3984,12 +4091,12 @@ fn perform_reorg(
     }
 
     // ── Added sync_in_progress clear at end ──────────────
-async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) -> Result<()> {
+    async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) -> Result<()> {
         self.cancel_mining();
         let mut applied = 0;
         let mut wots_oracle = std::collections::HashMap::new();
         
-        // --- NEW: Track the last applied batch for light client notifications ---
+        // --- Track the last applied batch for light client notifications ---
         let mut last_applied_batch = None;
         
         for batch in batches {
@@ -4042,6 +4149,15 @@ async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) 
             self.try_apply_orphans().await;
             self.check_pending_mix_reveals().await;
 
+            // --- 1000 Block Milestone Check ---
+            if self.state.height > 0 && self.state.height % 1000 == 0 {
+                if let Ok(false) = self.perform_health_check().await {
+                     tracing::error!("CRITICAL: Node state is sick/corrupted at milestone. Initiating self-healing sequence...");
+                     self.cancel_mining();
+                     self.self_heal_rollback(self.state.height).await;
+                }
+            }
+
             if self.state.height >= self.sync_requested_up_to {
                 self.sync_in_progress = false;
             } else {
@@ -4093,7 +4209,8 @@ async fn process_linear_extension(&mut self, batches: Vec<Batch>, from: PeerId) 
                             element_count: items.len() as u64,
                         };
                         
-                        let _ = cmd_tx.send(NodeCommand::BroadcastLightPush(notif));
+                        let _ = cmd_tx.try_send(NodeCommand::BroadcastLightPush(notif));
+
                     });
                 }
             }
@@ -4403,12 +4520,12 @@ async fn try_apply_orphans(&mut self) {
                 match mining_result {
                     MiningResult::Block(extension) => {
                         template.extension = extension;
-                        let _ = tx.send(MinedResult::Block(template));
+                        let _ = tx.try_send(MinedResult::Block(template)); 
                     }
                     MiningResult::Share(extension) => {
                         template.extension = extension;
                         if let (Some(url), Some(addr)) = (pool_url, payout_address) {
-                            let _ = tx.send(MinedResult::Share {
+                            let _ = tx.try_send(MinedResult::Share { 
                                 batch: template,
                                 pool_url: url,
                                 payout_address: addr,
@@ -4505,7 +4622,8 @@ async fn try_apply_orphans(&mut self) {
                             element_count: items.len() as u64,
                         };
                         
-                        let _ = cmd_tx.send(NodeCommand::BroadcastLightPush(notif));
+                        let _ = cmd_tx.try_send(NodeCommand::BroadcastLightPush(notif));
+
                     }
                 });
 
@@ -4518,6 +4636,15 @@ async fn try_apply_orphans(&mut self) {
                     }
                 }
                 
+                // 1000 Block Milestone Check ---
+                if self.state.height > 0 && self.state.height % 1000 == 0 {
+                    if let Ok(false) = self.perform_health_check().await {
+                         tracing::error!("CRITICAL: Node state is sick/corrupted at milestone. Initiating self-healing sequence...");
+                         self.cancel_mining();
+                         self.self_heal_rollback(self.state.height).await;
+                         return Ok(()); // abort further processing
+                    }
+                }
 
                 self.metrics.inc_batches_mined();
                 self.network.broadcast(Message::Batch(batch.clone()));

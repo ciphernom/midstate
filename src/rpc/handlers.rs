@@ -44,7 +44,15 @@ pub async fn get_state(State(node): State<AppState>) -> Json<GetStateResponse> {
     let state = node.get_state().await;
     let safe_depth = node.get_safe_depth().await;
     let required_pow = crate::mempool::Mempool::calculate_required_pow(state.commitments.len());
-     let webrtc_addrs = node.get_webrtc_addrs().await; 
+     let webrtc_addrs = node.get_webrtc_addrs().await
+    .into_iter()
+    .filter(|addr| {
+        // Keep only addresses with public routable IPs
+        addr.parse::<libp2p::Multiaddr>().ok()
+            .map(|ma| crate::network::is_routable(&ma))
+            .unwrap_or(false)
+    })
+    .collect::<Vec<_>>();
 
     Json(GetStateResponse {
         height: state.height,
