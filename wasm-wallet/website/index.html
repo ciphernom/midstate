@@ -504,28 +504,28 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
 
 <div class="callout">
                 <h4>Why the name "Midstate"?</h4>
-                <p>In traditional blockchains, blocks are distinct data structures linked by their header hashes. Midstate abandons this design. Instead, the entire blockchain is mathematically modeled as a single, continuous <strong>BLAKE3 hash function</strong>.</p>
+                <p>In traditional blockchains, blocks are distinct data structures linked by their header hashes. Midstate elevates this by maintaining a continuous, mathematically chained <strong>BLAKE3 Midstate</strong> for transactions, while binding it to the chain using sequential header hashing.</p>
                 
                 <div class="mermaid" style="text-align: center; margin: 20px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px;">
                 graph LR
-                    M0([Midstate N-1]) --> Combine1{+ State Root<br>+ Nonce}
+                    H0([Header Hash N-1]) --> Combine1{+ Midstate<br>+ State Root<br>+ Nonce}
                     Combine1 --> HashLoop1[BLAKE3<br>x 1,000,000]
-                    HashLoop1 --> M1([Midstate N])
+                    HashLoop1 --> H1([Header Hash N])
                     
-                    M1 --> Combine2{+ State Root<br>+ Nonce}
+                    H1 --> Combine2{+ Midstate<br>+ State Root<br>+ Nonce}
                     Combine2 --> HashLoop2[BLAKE3<br>x 1,000,000]
-                    HashLoop2 --> M2([Midstate N+1])
+                    HashLoop2 --> H2([Header Hash N+1])
                     
-                    M2 -.-> Combine3{...}
+                    H2 -.-> Combine3{...}
 
-                    style M0 fill:#431407,stroke:#ea580c,stroke-width:2px
-                    style M1 fill:#431407,stroke:#ea580c,stroke-width:2px
-                    style M2 fill:#431407,stroke:#ea580c,stroke-width:2px
+                    style H0 fill:#431407,stroke:#ea580c,stroke-width:2px
+                    style H1 fill:#431407,stroke:#ea580c,stroke-width:2px
+                    style H2 fill:#431407,stroke:#ea580c,stroke-width:2px
                     style HashLoop1 fill:#064e3b,stroke:#10b981,stroke-width:2px
                     style HashLoop2 fill:#064e3b,stroke:#10b981,stroke-width:2px
                 </div>
 
-                <p>The <code>midstate</code> is the 32-byte internal state of this global hash function. When a miner processes a block, they aren't hashing a static header—they are taking the current network <code>midstate</code>, injecting the new transactions, and advancing it by exactly 1,000,000 sequential BLAKE3 compression cycles. Every transaction permanently mutates this singular, ongoing mathematical state.</p>
+                <p>The <code>midstate</code> tracks the continuous mathematical state of the UTXO set. When a miner processes a block, they construct a <strong>Block Header</strong> (containing the new midstate, the state root, and the previous header hash), and subject it to exactly 1,000,000 sequential BLAKE3 compression cycles. Every transaction permanently mutates this internal state, securely anchoring the ledger to a sequential proof of time.</p>
             </div>
 
             <h3>How is Midstate Different?</h3>
@@ -652,7 +652,7 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
 
                         subgraph Sequential [Midstate: Sequential PoW - CPU Friendly]
                             direction LR
-                            S1([State + Nonce]) --> S2[BLAKE3] --> S3[BLAKE3] --> S4[... x 1,000,000] --> S5[Final Hash] --> C4{Check}
+                            S1([Header + Nonce]) --> S2[BLAKE3] --> S3[BLAKE3] --> S4[... x 1,000,000] --> S5[Final Hash] --> C4{Check}
                         end
 
                         style Parallel fill:#1f2937,stroke:#4b5563,stroke-width:2px,color:#d1d5db
@@ -1036,7 +1036,7 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
         subgraph PeerA ["Peer A (PeerID: QmXa...)"]
             direction TB
             P1["Receive Announce"] --> P2["Compute PoW Nonce"]
-            P2 -->|"BLAKE3(mix_id || coin_id || peer_id || nonce) ≥ 24 leading zeros"| P3{"Sufficient?"}
+            P2 -->|"BLAKE3(mix_id || coin_id || peer_id || nonce) ≥ 30 leading zeros"| P3{"Sufficient?"}
             P3 --Yes--> P4["Send MixJoin"]
             P3 --No--> P2
         end
@@ -1047,8 +1047,7 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
         style P2 fill:#1f2937,stroke:#8b5cf6,color:#fff,stroke-dasharray: 5 5
         style P3 fill:#064e3b,stroke:#10b981,color:#fff
     </div>
-    <p class="callout" style="margin-top:-12px;">The coordinator broadcasts the session. Peers prove they control a real coin (and are not Sybils) by solving a <code>BLAKE3</code> PoW challenge bound to their <code>PeerId</code> and <code>coin_id</code>. This anti-Sybil mechanism is exactly the same 24-bit target used for commit spam protection.</p>
-
+    <p class="callout" style="margin-top:-12px;">The coordinator broadcasts the session. Peers prove they control a real coin (and are not Sybils) by solving a <code>BLAKE3</code> PoW challenge bound to their <code>PeerId</code> and <code>coin_id</code>. This anti-Sybil mechanism requires 30 leading zero bits (approx. 1 billion hashes), heavily punishing Sybil attackers.</p>
     <!-- Diagram 2: Registration & Canonical Proposal -->
     <div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
     graph LR
@@ -1102,7 +1101,7 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
 
     <ul>
         <li><strong>Uniformity Constraints:</strong> Enforced in <code>MixSession::register</code> and <code>set_fee_input</code>. DataBurn outputs are explicitly forbidden.</li>
-        <li><strong>Anti-Sybil Proof-of-Work:</strong> <code>BLAKE3(mix_id || coin_id || peer_id || nonce) ≥ 24 leading zeros</code> — exactly the same constant used for mempool spam protection (<code>MIX_JOIN_POW_BITS</code>).</li>
+        <li><strong>Anti-Sybil Proof-of-Work:</strong> <code>BLAKE3(mix_id || coin_id || peer_id || nonce) ≥ 30 leading zeros</code> — enforced via <code>MIX_JOIN_POW_BITS</code>.</li>
         <li><strong>Trustless Proposal Assembly:</strong> Lexicographical sort by <code>coin_id</code> (see <code>proposal()</code>). Participants sign only the final commitment hash after local verification.</li>
         <li><strong>On-Chain Detection:</strong> Any observer can call <code>is_uniform_mix(tx)</code> — it simply counts inputs/outputs of identical power-of-2 value plus at most one fee coin. The transaction remains fully valid even if the heuristic is unknown.</li>
     </ul>

@@ -2739,7 +2739,7 @@ fn fire_batch_lookahead(&mut self) {
                         tracing::info!("Prepended deep fork headers {}..{}", headers.first().unwrap().height, headers.last().unwrap().height);
                         
                         if let (Some(last_new), Some(first_acc)) = (headers.last(), accumulated.first()) {
-                            if first_acc.prev_midstate != last_new.extension.final_hash {
+                            if first_acc.prev_header_hash != last_new.extension.final_hash || first_acc.prev_midstate != last_new.post_tx_midstate {
                                 tracing::warn!("Incoming deep-fork headers do not link to recovered sync state. Discarding sync_state.bin and restarting.");
                                 let _ = std::fs::remove_file(self.data_dir.join("sync_state.bin"));
                                 self.last_sync_cursor = None;
@@ -2758,7 +2758,7 @@ fn fire_batch_lookahead(&mut self) {
                     } else {
                         // Normal forward sync
                         if let (Some(last_acc), Some(first_new)) = (accumulated.last(), headers.first()) {
-                            if first_new.prev_midstate != last_acc.extension.final_hash {
+                            if first_new.prev_header_hash != last_acc.extension.final_hash || first_new.prev_midstate != last_acc.post_tx_midstate {
                                 tracing::warn!("Incoming headers do not link to recovered sync state (heights: acc={}, new={}). Discarding sync_state.bin and restarting.", last_acc.height, first_new.height);
                                 let _ = std::fs::remove_file(self.data_dir.join("sync_state.bin"));
                                 self.last_sync_cursor = None;
@@ -2850,31 +2850,6 @@ fn fire_batch_lookahead(&mut self) {
                 is_valid = false;
             }
 
-            // 1. Fast sequential check: linkage + difficulty target validation
-            if is_valid {
-                for i in 1..all_headers.len() {
-                    if all_headers[i].timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
-                        tracing::warn!("Header timestamp too far in future at index {}", i);
-                        is_valid = false;
-                        break;
-                    }
-                    if all_headers[i].prev_midstate != all_headers[i - 1].extension.final_hash {
-                        tracing::warn!("Header linkage broken at index {}", i);
-                        is_valid = false;
-                        break;
-                    }
-                    let expected_target = crate::core::state::calculate_target(
-                        all_headers[i - 1].height + 1,
-                        all_headers[i - 1].timestamp,
-                    );
-                    if all_headers[i].target != expected_target {
-                        tracing::warn!("Invalid difficulty target at header index {}", i);
-                        is_valid = false;
-                        break;
-                    }
-                }
-            }
-
             let mut fork_height = 0;
             let mut candidate_state = None;
             let mut is_fast_forward = false;
@@ -2883,7 +2858,7 @@ fn fire_batch_lookahead(&mut self) {
             // 3. BACKGROUND FORK POINT & STATE REBUILD
             if is_valid {
                 if let Some(snap) = &snapshot {
-                    if all_headers.is_empty() || all_headers[0].prev_midstate != snap.midstate {
+                    if all_headers.is_empty() || all_headers[0].prev_midstate != snap.midstate || all_headers[0].prev_header_hash != snap.header_hash {
                         tracing::warn!("Snapshot midstate mismatch! Peer sent fraudulent snapshot. Aborting sync.");
                         is_valid = false;
                     } else if all_headers.len() < crate::core::PRUNE_DEPTH as usize {
