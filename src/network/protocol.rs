@@ -124,7 +124,7 @@ pub fn deserialize_bin(bytes: &[u8]) -> anyhow::Result<Self> {
 }
 
 // ── libp2p request-response codec ───────────────────────────────────────────
-pub const MIDSTATE_PROTOCOL: StreamProtocol = StreamProtocol::new("/midstate/1.1.0");
+pub const MIDSTATE_PROTOCOL: StreamProtocol = StreamProtocol::new("/midstate/2.0.0");
 const MAX_MSG_SIZE: usize = 10_000_000;
 
 #[derive(Debug, Clone, Default)]

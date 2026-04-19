@@ -338,7 +338,7 @@ export function generate_phrase(): string;
  *
  * Panics if `commitment_hex` is not exactly 64 valid hex characters.
  */
-export function mine_commitment_pow(commitment_hex: string, required_pow: number): bigint;
+export function mine_commitment_pow(commitment_hex: string, required_pow: number, target_height: bigint): bigint;
 
 /**
  * Search a range of nonces for a valid block extension hash.
@@ -373,7 +373,7 @@ export interface InitOutput {
     readonly compute_coin_id_hex: (a: number, b: number, c: number, d: bigint, e: number, f: number) => void;
     readonly decrypt_cli_wallet: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly generate_phrase: (a: number) => void;
-    readonly mine_commitment_pow: (a: number, b: number, c: number) => bigint;
+    readonly mine_commitment_pow: (a: number, b: number, c: number, d: bigint) => bigint;
     readonly search_nonces: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => void;
     readonly webwallet_build_coinbase: (a: number, b: number, c: bigint, d: number) => void;
     readonly webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;

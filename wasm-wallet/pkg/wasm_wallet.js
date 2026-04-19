@@ -745,12 +745,13 @@ export function generate_phrase() {
  * Panics if `commitment_hex` is not exactly 64 valid hex characters.
  * @param {string} commitment_hex
  * @param {number} required_pow
+ * @param {bigint} target_height
  * @returns {bigint}
  */
-export function mine_commitment_pow(commitment_hex, required_pow) {
+export function mine_commitment_pow(commitment_hex, required_pow, target_height) {
     const ptr0 = passStringToWasm0(commitment_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
     const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.mine_commitment_pow(ptr0, len0, required_pow);
+    const ret = wasm.mine_commitment_pow(ptr0, len0, required_pow, target_height);
     return BigInt.asUintN(64, ret);
 }
 

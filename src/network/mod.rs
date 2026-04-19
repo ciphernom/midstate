@@ -393,7 +393,7 @@ impl MidstateNetwork {
 
                 let identify = identify::Behaviour::new(
                     identify::Config::new(
-                        "/midstate/id/1.0.0".to_string(),
+                        "/midstate/id/2.0.0".to_string(),
                         key.public(),
                     )
                     .with_push_listen_addr_updates(true)

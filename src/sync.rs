@@ -40,10 +40,8 @@ impl Syncer {
         let current_time = crate::core::state::current_timestamp();
         let window_size = crate::core::MEDIAN_TIME_PAST_WINDOW;
 
-        if headers[0].height >= crate::core::types::STRICT_MTP_ACTIVATION_HEIGHT {
-            crate::core::state::validate_timestamp(headers[0].timestamp, prior_timestamps, current_time)
-                .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index 0: {}", e))?;
-        }
+        crate::core::state::validate_timestamp(headers[0].timestamp, prior_timestamps, current_time)
+            .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index 0: {}", e))?;
 
         // 1. Fast sequential check: Ensure chain linkage is intact AND validate targets
         for i in 1..headers.len() {
@@ -51,8 +49,11 @@ impl Syncer {
             let prev = &headers[i - 1];
 
             // CHECK LINKAGE FIRST!
-            if header.prev_midstate != prev.extension.final_hash {
-                bail!("Header linkage broken at index {}: prev_midstate mismatch", i);
+            if header.prev_header_hash != prev.extension.final_hash {
+                bail!("Header chain linkage broken at index {}: prev_header_hash mismatch", i);
+            }
+            if header.prev_midstate != prev.post_tx_midstate {
+                bail!("Header chain linkage broken at index {}: prev_midstate mismatch", i);
             }
 
             let combined: Vec<u64> = prior_timestamps.iter()
@@ -63,10 +64,8 @@ impl Syncer {
             let previous_timestamps = &combined[window_start..];
 
             // THEN CHECK MTP
-            if header.height >= crate::core::types::STRICT_MTP_ACTIVATION_HEIGHT {
-                crate::core::state::validate_timestamp(header.timestamp, previous_timestamps, current_time)
-                    .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index {}: {}", i, e))?;
-            }
+            crate::core::state::validate_timestamp(header.timestamp, previous_timestamps, current_time)
+                .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index {}: {}", i, e))?;
             
             let expected_target = crate::core::state::calculate_target(prev.height + 1, prev.timestamp);
             if header.target != expected_target {
@@ -81,8 +80,9 @@ impl Syncer {
                     .par_iter()
                     .enumerate()
                     .map(|(i, header)| {
+                        let mining_target = crate::core::types::compute_header_hash(header);
                         verify_extension(
-                            header.post_tx_midstate,
+                            mining_target,
                             &header.extension,
                             &header.target,
                         ).map_err(|e| format!("Invalid PoW at header index {}: {}", i, e))

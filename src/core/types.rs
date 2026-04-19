@@ -237,6 +237,7 @@ pub struct State {
     /// Append-only log of historical block hashes for light client proofs
     #[serde(default)]
     pub chain_mmr: crate::core::mmr::MerkleMountainRange,
+    pub header_hash: [u8; 32],
 }
 
 impl State {
@@ -302,11 +303,12 @@ impl State {
             timestamp: BITCOIN_BLOCK_TIME,
             commitment_heights: im::HashMap::new(),
             chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
+            header_hash: initial_midstate, 
         };
         (state, genesis_coinbase)
     }
+    
 pub fn header(&self) -> BatchHeader {
-        // Clone coins because root() requires &mut self
         let mut coins_clone = self.coins.clone();
         let mut commitments_clone = self.commitments.clone();
         let smt_root = hash_concat(&coins_clone.root(), &commitments_clone.root());
@@ -318,11 +320,12 @@ pub fn header(&self) -> BatchHeader {
             post_tx_midstate: self.midstate,
             extension: Extension {
                 nonce: 0,
-                final_hash: self.midstate,
+                final_hash: self.header_hash, // Note: final_hash holds header_hash here
             },
             timestamp: self.timestamp,
             target: self.target,
             state_root, 
+            prev_header_hash: [0u8; 32], 
         }
     }
 }
@@ -360,6 +363,7 @@ impl Batch {
 
         BatchHeader {
             height: 0, // Caller assigns this
+            prev_header_hash: self.prev_header_hash,
             prev_midstate: self.prev_midstate,
             post_tx_midstate: midstate,
             extension: self.extension.clone(),
@@ -639,6 +643,7 @@ pub struct Batch {
     /// Explicitly commit to the state
     #[serde(default)]
     pub state_root: [u8; 32],
+    pub prev_header_hash: [u8; 32], 
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -649,10 +654,19 @@ pub struct BatchHeader {
     pub extension: Extension,
     pub timestamp: u64,
     pub target: [u8; 32],
-    #[serde(default)]
     pub state_root: [u8; 32],
+    pub prev_header_hash: [u8; 32], 
 }
 
+pub fn compute_header_hash(header: &BatchHeader) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&header.prev_header_hash);
+    hasher.update(&header.post_tx_midstate);
+    hasher.update(&header.state_root);
+    hasher.update(&header.timestamp.to_le_bytes());
+    hasher.update(&header.target);
+    *hasher.finalize().as_bytes()
+}
 
 
 // ── Protocol constants ──────────────────────────────────────────────────────
@@ -691,27 +705,7 @@ pub const COMMITMENT_TTL: u64 = 1000;
 /// remain fully verifiable via full-chain recomputation in verify_extension.
 pub const PRUNE_DEPTH: u64 = 1000;
 
-/// Block height at which WOTS address-reuse is enforced at consensus level.
-/// Blocks below this height are grandfathered (network was live before this rule).
-pub const WOTS_REUSE_ACTIVATION_HEIGHT: u64 = 18_000;
 
-/// Block height at which STRICT intra-block and inter-block WOTS/MSS reuse is enforced.
-/// Prevents multiple spends from the same address within the same block or sync chunk.
-pub const STRICT_WOTS_REUSE_ACTIVATION_HEIGHT: u64 = 85_000; 
-
-/// Block height at which MSS leaf reuse is enforced at consensus level.
-/// Uses the leaf's WOTS public key as a nullifier in the spent oracle.
-pub const MSS_REUSE_ACTIVATION_HEIGHT: u64 = 25_000; 
-
-/// Block height at which state_root in batches becomes mandatory.
-/// Before this height, blocks may omit the state root (legacy blocks).
-/// After this height, state_root must be non-zero and match the expected value.
-pub const STATE_ROOT_ACTIVATION_HEIGHT: u64 = 30_000;
-
-/// Block height at which ZK remnants are repurposed into Zero-Value State Threads.
-pub const STATE_THREAD_ACTIVATION_HEIGHT: u64 = 65_000;
-
-pub const RECENT_POW_ACTIVATION_HEIGHT: u64 = 80_000;
 pub const COMMIT_POW_WINDOW: u64 = 1000;
 
 // ── Economics ───────────────────────────────────────────────────────────────
@@ -731,10 +725,6 @@ pub const MAX_SIGNATURE_SIZE: usize = 1_536;
 /// 100 txs × 256 inputs = 25,600 WOTS verifications ≈ 15B hashes — too much.
 /// 1,024 total inputs keeps verification under ~600M hashes (~0.5s).
 pub const MAX_BATCH_INPUTS: usize = 1_024;
-
-/// Block height at which strict Median-Time-Past (MTP) and monotonicity 
-/// timestamps are enforced. Grandfathers early blocks mined during the sync bug.
-pub const STRICT_MTP_ACTIVATION_HEIGHT: u64 = 70_000;
 
 /// Cap on total outputs per batch to strictly bound worst-case block size 
 /// and prevent exceeding the 10MB P2P message limit.

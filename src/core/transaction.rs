@@ -13,39 +13,23 @@ pub const MIN_COMMIT_POW_BITS: u32 = 24;
 pub const MIN_COMMIT_POW_BITS: u32 = 16;
 
 pub fn commit_pow_hash(commitment: &[u8; 32], nonce: u64, target_height: u64) -> [u8; 32] {
-    if target_height < crate::core::types::RECENT_POW_ACTIVATION_HEIGHT {
-        super::types::hash_concat(commitment, &nonce.to_le_bytes())
-    } else {
-        let mut data = Vec::with_capacity(48);
-        data.extend_from_slice(&target_height.to_le_bytes());
-        data.extend_from_slice(commitment);
-        data.extend_from_slice(&nonce.to_le_bytes());
-        super::types::hash(&data)
-    }
+    let mut data = Vec::with_capacity(48);
+    data.extend_from_slice(&target_height.to_le_bytes());
+    data.extend_from_slice(commitment);
+    data.extend_from_slice(&nonce.to_le_bytes());
+    super::types::hash(&data)
 }
 
-pub fn evaluate_commit_pow(commitment: &[u8; 32], nonce: u64, current_height: u64) -> Result<u32> {
-    if current_height < crate::core::types::RECENT_POW_ACTIVATION_HEIGHT {
-        let h = commit_pow_hash(commitment, nonce, current_height);
-        let zeros = crate::core::types::count_leading_zeros(&h);
-        if zeros < MIN_COMMIT_POW_BITS {
-            bail!("Insufficient Commit PoW: need {} leading zero bits", MIN_COMMIT_POW_BITS);
-        }
-        return Ok(zeros);
-    }
 
+pub fn evaluate_commit_pow(commitment: &[u8; 32], nonce: u64, current_height: u64) -> Result<u32> {
     let start = current_height.saturating_sub(crate::core::types::COMMIT_POW_WINDOW);
     let mut best_zeros = 0;
     
-    // The "Wiggle Room": If the PoW is valid for ANY height in the last 1000 blocks, accept it.
     for h in start..=current_height {
         let hash = commit_pow_hash(commitment, nonce, h);
         let zeros = crate::core::types::count_leading_zeros(&hash);
         if zeros > best_zeros {
             best_zeros = zeros;
-            
-            // Short-circuit: we only need to prove it meets the minimum threshold
-            // against ANY recent block. No need to hash the remaining heights.
             if best_zeros >= MIN_COMMIT_POW_BITS {
                 break;
             }
@@ -123,9 +107,6 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
                         bail!("Duplicate input coin");
                     }
                     if input.commitment.is_some() {
-                        if state.height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
-                            bail!("State Threads are disabled before activation height.");
-                        }
                         if input.value != 0 {
                             bail!("State Thread inputs must have a value of exactly 0");
                         }
@@ -135,7 +116,7 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
 
             for (i, out) in outputs.iter().enumerate() {
                 if out.value() == 0 {
-                    if out.is_confidential() && state.height >= crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
+                    if out.is_confidential() {
                         // Allowed: 0-value State Thread
                     } else {
                         bail!("Zero-value output {}", i);
@@ -262,9 +243,6 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                         bail!("Duplicate input coin");
                     }
                     if input.commitment.is_some() {
-                        if state.height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
-                            bail!("State Threads are disabled before activation height.");
-                        }
                         if input.value != 0 {
                             bail!("State Thread inputs must have a value of exactly 0");
                         }
@@ -274,7 +252,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             // 1. Validate all output values are power of 2 and nonzero
             for (i, out) in outputs.iter().enumerate() {
                 if out.value() == 0 {
-                    if out.is_confidential() && state.height >= crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
+                    if out.is_confidential()  {
                         // Allowed: 0-value State Thread
                     } else {
                         bail!("Zero-value output {}", i);
@@ -434,9 +412,6 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                         bail!("Duplicate input coin");
                     }
                     if input.commitment.is_some() {
-                        if state.height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
-                            bail!("State Threads are disabled before activation height.");
-                        }
                         if input.value != 0 {
                             bail!("State Thread inputs must have a value of exactly 0");
                         }
@@ -445,7 +420,7 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
             }
                 for (i, out) in outputs.iter().enumerate() {
                 if out.value() == 0 {
-                    if out.is_confidential() && state.height >= crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
+                    if out.is_confidential() {
                         // Allowed: 0-value State Thread
                     } else {
                         bail!("Zero-value output {}", i);

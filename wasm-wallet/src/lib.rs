@@ -139,13 +139,14 @@ pub fn compute_coin_id_hex(address_hex: &str, value: u64, salt_hex: &str) -> Str
 ///
 /// Panics if `commitment_hex` is not exactly 64 valid hex characters.
 #[wasm_bindgen]
-pub fn mine_commitment_pow(commitment_hex: &str, required_pow: u32) -> u64 {
+pub fn mine_commitment_pow(commitment_hex: &str, required_pow: u32, target_height: u64) -> u64 {
     let mut commitment = [0u8; 32];
     hex::decode_to_slice(commitment_hex, &mut commitment).unwrap();
 
     let mut nonce = 0u64;
     loop {
-        let h = midstate::core::hash_concat(&commitment, &nonce.to_le_bytes());
+        // Use the official V2 hashing algorithm from the core library
+        let h = midstate::core::transaction::commit_pow_hash(&commitment, nonce, target_height);
         if midstate::core::count_leading_zeros(&h) >= required_pow {
             return nonce;
         }

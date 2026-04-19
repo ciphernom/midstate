@@ -293,9 +293,7 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
             reveal_tx @ Transaction::Reveal { .. } => {
                 // WOTS address-reuse pre-flight check.
                 // Gives immediate RPC feedback instead of silent miner rejection.
-                if state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT
-                    && !spent_oracle.is_empty()
-                {
+                if !spent_oracle.is_empty() {
                     if let Transaction::Reveal { inputs, witnesses, outputs, salt } = &reveal_tx {
                         let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
                         let output_hashes: Vec<[u8; 32]> = outputs.iter()
@@ -306,38 +304,35 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                         );
                         for (input, witness) in inputs.iter().zip(witnesses.iter()) {
                             let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
-                                if let Some(sig) = wit_inputs.first() {
-                                    if sig.len() == crate::core::wots::SIG_SIZE {
-                                        // Standard WOTS: check the predicate address
-                                        let addr = input.predicate.address();
-                                        if let Some(&prior_commitment) = spent_oracle.get(&addr) {
-                                            if prior_commitment != this_commitment {
-                                                anyhow::bail!(
-                                                    "Mempool rejected: WOTS address {} already \
-                                                     spent with a different commitment",
-                                                    hex::encode(addr)
-                                                );
-                                            }
+                            if let Some(sig) = wit_inputs.first() {
+                                if sig.len() == crate::core::wots::SIG_SIZE {
+                                    // Standard WOTS: check the predicate address
+                                    let addr = input.predicate.address();
+                                    if let Some(&prior_commitment) = spent_oracle.get(&addr) {
+                                        if prior_commitment != this_commitment {
+                                            anyhow::bail!(
+                                                "Mempool rejected: WOTS address {} already \
+                                                 spent with a different commitment",
+                                                hex::encode(addr)
+                                            );
                                         }
-                                    } else if state.height >= crate::core::types::MSS_REUSE_ACTIVATION_HEIGHT {
-                                        // MSS: check the specific leaf's WOTS public key
-                                        if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                                            if let Some(&prior_commitment) = spent_oracle.get(&mss_sig.wots_pk) {
-                                                if prior_commitment != this_commitment {
-                                                    anyhow::bail!(
-                                                        "Mempool rejected: MSS leaf {} (index {}) already \
-                                                         spent with a different commitment",
-                                                        hex::encode(mss_sig.wots_pk),
-                                                        mss_sig.leaf_index
-                                                    );
-                                                }
-                                            }
+                                    }
+                                } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                                    // MSS: check the specific leaf's WOTS public key
+                                    if let Some(&prior_commitment) = spent_oracle.get(&mss_sig.wots_pk) {
+                                        if prior_commitment != this_commitment {
+                                            anyhow::bail!(
+                                                "Mempool rejected: MSS leaf {} (index {}) already \
+                                                 spent with a different commitment",
+                                                hex::encode(mss_sig.wots_pk),
+                                                mss_sig.leaf_index
+                                            );
                                         }
                                     }
                                 }
                             }
                         }
-                    
+                    }
                 }
 
                 // Admission fee check and stored ordering key use the same
