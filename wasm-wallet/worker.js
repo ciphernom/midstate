@@ -1160,6 +1160,11 @@ async function refreshNetworkStats() {
         const mempool = await rpc.getMempool();
         mempoolSize = mempool.size || 0;
         self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+
+        // Auto-sync if we're behind
+        if (networkHeight > wState.lastScannedHeight + 1) {
+            performScan().catch(() => {});
+        }
     } catch(e) {}
 }
 

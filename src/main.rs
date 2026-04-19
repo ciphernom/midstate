@@ -2128,8 +2128,6 @@ pub async fn run_node(
 
     // --- Configure Rayon Global Thread Pool for Verification ---
     if let Some(vt) = verify_threads {
-        // If vt is 0, Rayon defaults to the number of logical cores.
-        // If vt is 1, verification becomes strictly sequential.
         rayon::ThreadPoolBuilder::new()
             .num_threads(vt)
             .build_global()
@@ -2137,7 +2135,6 @@ pub async fn run_node(
             
         tracing::info!("Verification restricted to {} thread(s)", vt);
     }
-    // -----------------------------------------------------------
 
     // Load config: explicit --config path, or <data_dir>/config.toml
     let config_file = config_path.unwrap_or_else(|| data_dir.join("config.toml"));
@@ -2161,7 +2158,7 @@ pub async fn run_node(
         None => format!("/ip4/0.0.0.0/tcp/{}", port).parse()?,
     };
 
-let bootstrap: Vec<libp2p::Multiaddr> = all_peers.iter()
+    let bootstrap: Vec<libp2p::Multiaddr> = all_peers.iter()
         .map(|a| a.parse())
         .collect::<Result<Vec<_>, _>>()
         .context("Invalid peer multiaddr")?;
@@ -2175,34 +2172,27 @@ let bootstrap: Vec<libp2p::Multiaddr> = all_peers.iter()
 
     let node = node::Node::new(data_dir.clone(), mining_threads, listen_addr, bootstrap).await?;
     
-   
-        let peer_id_str = node.local_peer_id().to_string();
-        if config.peer_id.as_deref() != Some(&peer_id_str) {
-            let contents = std::fs::read_to_string(&config_file).unwrap_or_default();
-            if contents.contains("peer_id") {
-                let mut new_config = config.clone();
-                new_config.peer_id = Some(peer_id_str.clone());
-                std::fs::write(&config_file, toml::to_string(&new_config)?)?;
-            } else {
-                use std::io::Write;
-                let mut file = std::fs::OpenOptions::new().append(true).open(&config_file)?;
-                writeln!(file, "\npeer_id = \"{}\"", peer_id_str)?;
-            }
-            tracing::info!("Saved bootstrap peer ID to config file: {}", peer_id_str);
-        
+    let peer_id_str = node.local_peer_id().to_string();
+    if config.peer_id.as_deref() != Some(&peer_id_str) {
+        let contents = std::fs::read_to_string(&config_file).unwrap_or_default();
+        if contents.contains("peer_id") {
+            let mut new_config = config.clone();
+            new_config.peer_id = Some(peer_id_str.clone());
+            std::fs::write(&config_file, toml::to_string(&new_config)?)?;
+        } else {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&config_file)?;
+            writeln!(file, "\npeer_id = \"{}\"", peer_id_str)?;
+        }
+        tracing::info!("Saved bootstrap peer ID to config file: {}", peer_id_str);
     }
 
     let (handle, cmd_rx) = node.create_handle();
 
     let rpc_server = rpc::RpcServer::new(&rpc_bind, rpc_port)?;
     let handle_clone = handle.clone();
-    tokio::spawn(async move {
-        if let Err(e) = rpc_server.run(handle_clone).await {
-            tracing::error!("RPC server error: {}", e);
-        }
-    });
     
-    // Update the logging print
+    // --- Update the logging print 
     tracing::info!("Node started (mining: {}, threads: {}, rpc: {})", 
         mine, threads.unwrap_or(0), rpc_port);
 
@@ -2210,8 +2200,31 @@ let bootstrap: Vec<libp2p::Multiaddr> = all_peers.iter()
         let simd = midstate::core::simd_mining::detected_level();
         tracing::info!("Mining SIMD: {} ({} nonces/batch)", simd.name(), simd.lanes());
     }
-        
-    node.run(handle, cmd_rx).await
+
+    // Spawn the RPC server in a background task
+    tokio::spawn(async move {
+        if let Err(e) = rpc_server.run(handle_clone).await {
+            tracing::error!("RPC server error: {}", e);
+        }
+    });
+
+    // --- GRACEFUL SHUTDOWN TRAP ---
+    // We run the node directly inline. tokio::select! will poll both the 
+    // node and the Ctrl+C signal concurrently on the main thread!
+    tokio::select! {
+        res = node.run(handle, cmd_rx) => {
+            if let Err(e) = res {
+                tracing::error!("Node failed: {}", e);
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Received Ctrl+C / SIGTERM. Shutting down gracefully...");
+            // Because the select! block exits here, `node` is dropped.
+            // Your `Drop` trait cancels mining, and Tokio gracefully flushes DB writes.
+        }
+    }
+    
+    Ok(())
 }
 
 async fn commit_transaction(rpc_port: u16, rpc_host: String, coins: Vec<String>, destinations: Vec<String>) -> Result<()> {

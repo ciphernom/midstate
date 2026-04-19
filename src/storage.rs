@@ -157,10 +157,18 @@ impl Storage {
         let mut last_err = None;
         for attempt in 0..10 {
             match Database::create(&db_path) {
-                Ok(db) => {
+                Ok(mut db) => {
                     if attempt > 0 {
                         tracing::info!("Database lock acquired after {} retries", attempt);
                     }
+                    
+                    tracing::info!("Compacting database to free dead pages...");
+                    if let Err(e) = db.compact() {
+                        tracing::warn!("Database compaction failed (non-fatal): {}", e);
+                    } else {
+                        tracing::info!("Database compaction complete.");
+                    }
+                    
                     // Initialize tables
                     let write_txn = db.begin_write()?;
                     {

@@ -50,6 +50,11 @@ impl Syncer {
             let header = &headers[i];
             let prev = &headers[i - 1];
 
+            // CHECK LINKAGE FIRST!
+            if header.prev_midstate != prev.extension.final_hash {
+                bail!("Header linkage broken at index {}: prev_midstate mismatch", i);
+            }
+
             let combined: Vec<u64> = prior_timestamps.iter()
                 .chain(headers[..i].iter().map(|h| &h.timestamp))
                 .copied()
@@ -57,13 +62,10 @@ impl Syncer {
             let window_start = combined.len().saturating_sub(window_size);
             let previous_timestamps = &combined[window_start..];
 
+            // THEN CHECK MTP
             if header.height >= crate::core::types::STRICT_MTP_ACTIVATION_HEIGHT {
                 crate::core::state::validate_timestamp(header.timestamp, previous_timestamps, current_time)
                     .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index {}: {}", i, e))?;
-            }
-
-            if header.prev_midstate != prev.extension.final_hash {
-                bail!("Header linkage broken at index {}: prev_midstate mismatch", i);
             }
             
             let expected_target = crate::core::state::calculate_target(prev.height + 1, prev.timestamp);

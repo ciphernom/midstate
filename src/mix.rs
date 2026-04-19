@@ -458,6 +458,11 @@ pub fn register(
         let now_time = now();
         let mut peers_to_ban = Vec::new();
 
+        // Clear all bans randomly every ~12 hours to prevent infinite HashSet growth
+        if rand::random::<u16>() % 720 == 0 {
+            self.banned_peers.clear();
+        }
+        
         self.sessions.retain(|id, ns| {
             // Griefer detection: 60 seconds in Signing phase without finishing
             if ns.phase == MixPhase::Signing && now_time.saturating_sub(ns.phase_started_at) > 60 {
