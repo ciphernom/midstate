@@ -29080,7 +29080,7 @@ function webRTCDirect(init) {
 // light_client.js — Browser-side libp2p light client for Midstate wallet
 //
 // Connects to full nodes over WebRTC direct (no HTTPS, no domain, no cert authority).
-// Speaks the /midstate/light/1.0.0 JSON protocol over libp2p streams.
+// Speaks the /midstate/light/2.0.0 JSON protocol over libp2p streams.
 //
 // Usage in worker.js:
 //   import { LightClient } from './light_client.js';
@@ -29093,7 +29093,7 @@ function webRTCDirect(init) {
 //   npm install it-length-prefixed uint8arrays it-pipe
 
 
-const LIGHT_PROTOCOL = '/midstate/light/1.0.0';
+const LIGHT_PROTOCOL = '/midstate/light/2.0.0';
 const REQUEST_TIMEOUT_MS = 60_000;
 const RECONNECT_DELAY_MS = 3_000;
 const MAX_RECONNECT_ATTEMPTS = 5;
@@ -29230,7 +29230,7 @@ onPushEvent(cb) {
         });
 
                 // --- LISTEN FOR SERVER PUSHES ---
-        this.node.handle('/midstate/light-push/1.0.0', async ({ stream }) => {
+        this.node.handle('/midstate/light-push/2.0.0', async ({ stream }) => {
             try {
                 const chunks = [];
                 let total = 0;

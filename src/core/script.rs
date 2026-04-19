@@ -43,7 +43,6 @@ pub const OP_READ_INPUT_STATE: u8 = 0x51;
 pub const OP_READ_OUTPUT_STATE: u8= 0x52;
 
 ///v3 opcodes
-pub const VM_UPGRADE_ACTIVATION_HEIGHT: u64 = 60_000;
 pub const OP_OVER: u8             = 0x13;
 pub const OP_ROT: u8              = 0x14;
 pub const OP_SLICE: u8            = 0x15;
@@ -124,7 +123,8 @@ pub struct ExecContext<'a> {
 // ── AOT validation ─────────────────────────────────────────────────────────
 
 /// Ahead-of-time structural validation. O(N) single pass.
-pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<(), ScriptError> {
+pub fn validate_structure(bytecode: &[u8], _height: u64) -> Result<(), ScriptError> {
+
     if bytecode.len() > MAX_SCRIPT_SIZE {
         return Err(ScriptError::ScriptTooLarge);
     }
@@ -164,16 +164,8 @@ pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<(), ScriptErro
             OP_ADD | OP_GREATER_OR_EQUAL |
             OP_HASH | OP_CHECKSIG | OP_CHECKSIGVERIFY | OP_CHECKTIMEVERIFY |
             OP_SUM_TO_ADDR => {}
-            OP_OVER | OP_ROT | OP_SLICE | OP_CONCAT | OP_SUB | OP_MUL | OP_DIV => {
-                if height < VM_UPGRADE_ACTIVATION_HEIGHT {
-                    return Err(ScriptError::InvalidOpcode(op));
-                }
-            }
-            OP_READ_INPUT_STATE | OP_READ_OUTPUT_STATE => {
-                if height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT {
-                    return Err(ScriptError::InvalidOpcode(op));
-                }
-            }
+            OP_OVER | OP_ROT | OP_SLICE | OP_CONCAT | OP_SUB | OP_MUL | OP_DIV => {}
+            OP_READ_INPUT_STATE | OP_READ_OUTPUT_STATE => {}
             _ => return Err(ScriptError::InvalidOpcode(op)),
         }
     }
@@ -344,21 +336,18 @@ pub fn execute_script(
                 stack.swap(len - 1, len - 2);
             }
             OP_OVER => {
-                if ctx.height < VM_UPGRADE_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
                 let len = stack.len();
                 if len < 2 { return Err(ScriptError::StackUnderflow); }
                 let over_item = stack[len - 2].clone();
                 stack_push(&mut stack, over_item)?;
             }
             OP_ROT => {
-                if ctx.height < VM_UPGRADE_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
                 let len = stack.len();
                 if len < 3 { return Err(ScriptError::StackUnderflow); }
                 let item = stack.remove(len - 3);
                 stack.push(item);
             }
             OP_SLICE => {
-                if ctx.height < VM_UPGRADE_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
                 let len_u64 = to_u64(&stack_pop(&mut stack)?)?;
                 let offset_u64 = to_u64(&stack_pop(&mut stack)?)?;
                 let data = stack_pop(&mut stack)?;
@@ -378,7 +367,6 @@ pub fn execute_script(
                 stack_push(&mut stack, SmallVec::from_slice(&data[offset..end]))?;
             }
             OP_CONCAT => {
-                if ctx.height < VM_UPGRADE_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
                 let b = stack_pop(&mut stack)?;
                 let mut a = stack_pop(&mut stack)?;
                 if a.len() + b.len() > MAX_ITEM_SIZE {
@@ -409,21 +397,18 @@ pub fn execute_script(
                 stack_push(&mut stack, from_u64(sum))?;
             }
             OP_SUB => {
-                if ctx.height < VM_UPGRADE_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
                 let b = stack_pop(&mut stack)?;
                 let a = stack_pop(&mut stack)?;
                 let diff = to_u64(&a)?.checked_sub(to_u64(&b)?).ok_or(ScriptError::MathOverflow)?;
                 stack_push(&mut stack, from_u64(diff))?;
             }
             OP_MUL => {
-                if ctx.height < VM_UPGRADE_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
                 let b = stack_pop(&mut stack)?;
                 let a = stack_pop(&mut stack)?;
                 let prod = to_u64(&a)?.checked_mul(to_u64(&b)?).ok_or(ScriptError::MathOverflow)?;
                 stack_push(&mut stack, from_u64(prod))?;
             }
             OP_DIV => {
-                if ctx.height < VM_UPGRADE_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
                 let b_val = to_u64(&stack_pop(&mut stack)?)?;
                 if b_val == 0 { return Err(ScriptError::DivisionByZero); }
                 let a_val = to_u64(&stack_pop(&mut stack)?)?;
@@ -478,7 +463,6 @@ pub fn execute_script(
                 stack_push(&mut stack, from_u64(sum))?;
             }
             OP_READ_INPUT_STATE => {
-                if ctx.height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
                 if let Some(state_bytes) = ctx.input_state {
                     stack_push(&mut stack, SmallVec::from_slice(&state_bytes))?;
                 } else {
@@ -486,7 +470,6 @@ pub fn execute_script(
                 }
             }
             OP_READ_OUTPUT_STATE => {
-                if ctx.height < crate::core::types::STATE_THREAD_ACTIVATION_HEIGHT { return Err(ScriptError::InvalidOpcode(op)); }
                 let idx_item = stack_pop(&mut stack)?;
                 let idx_u64 = to_u64(&idx_item)?;
                 
@@ -1059,15 +1042,7 @@ mod tests {
         assert_eq!(execute_script(&bc, &witness, &ctx), Err(ScriptError::MathOverflow));
     }
 
-    #[test]
-    fn opcodes_fail_before_activation() {
-        let mut ctx = empty_ctx();
-        ctx.height = VM_UPGRADE_ACTIVATION_HEIGHT - 1;
-
-        assert_eq!(execute_script(&[OP_OVER], &[vec![1u8], vec![2u8]], &ctx), Err(ScriptError::InvalidOpcode(OP_OVER)));
-        assert_eq!(execute_script(&[OP_ROT], &[vec![1u8], vec![2u8], vec![3u8]], &ctx), Err(ScriptError::InvalidOpcode(OP_ROT)));
-        assert_eq!(execute_script(&[OP_SUB], &[vec![5u8], vec![3u8]], &ctx), Err(ScriptError::InvalidOpcode(OP_SUB)));
-    }
+    
  #[test]
 fn multisig_2of3_all_three_valid() {
     let seed1 = hash(b"key1");

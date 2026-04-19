@@ -146,22 +146,20 @@ pub fn apply_batch(
     state: &mut State,
     batch: &Batch,
     previous_timestamps: &[u64],
-    // Pre-flight oracle: WOTS address or MSS leaf PK -> commitment that previously spent it.
-    // Built by the caller from storage. Pass an empty map pre-activation or
-    // in tests — the check is skipped entirely when the map is empty.
-    spent_oracle: &mut std::collections::HashMap<[u8; 32], [u8; 32]>, // <--- CHANGED: Now &mut
+    spent_oracle: &mut std::collections::HashMap<[u8; 32], [u8; 32]>, 
 ) -> Result<()> {
     // 1. Check parent linkage
     if batch.prev_midstate != state.midstate {
         bail!("Block parent mismatch: expected {}, got {}",
-              hex::encode(state.midstate),
-              hex::encode(batch.prev_midstate));
+              hex::encode(state.midstate), hex::encode(batch.prev_midstate));
     }
-
+    if batch.prev_header_hash != state.header_hash { // <-- NEW
+        bail!("Block header hash mismatch: expected {}, got {}",
+              hex::encode(state.header_hash), hex::encode(batch.prev_header_hash));
+    }
     if batch.target != state.target {
         bail!("Batch target mismatch: expected {}, got {}",
-              hex::encode(state.target),
-              hex::encode(batch.target));
+              hex::encode(state.target), hex::encode(batch.target));
     }
 
     // Reject oversized batches at consensus level using decoupled limits
@@ -182,74 +180,39 @@ pub fn apply_batch(
     }   
 
     // timewarp prevention: Validate timestamp
-    if state.height >= crate::core::types::STRICT_MTP_ACTIVATION_HEIGHT {
-        validate_timestamp(batch.timestamp, previous_timestamps, current_timestamp())?;
-    }
+     validate_timestamp(batch.timestamp, previous_timestamps, current_timestamp())?;
+    
 
-    // WOTS & MSS address/leaf-reuse consensus check (post-activation).
+    // WOTS & MSS address/leaf-reuse consensus check 
     // Uses the pre-built oracle so state.rs stays pure (no storage I/O here).
     // A key is being reused if it is in the oracle AND the commitment
     // for this transaction differs from the one that originally spent it.
     // Same commitment = safe reorg replay of the identical transaction.
-    let wots_active = state.height >= crate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT;
-    let mss_active = state.height >= crate::core::types::MSS_REUSE_ACTIVATION_HEIGHT;
-    let strict_reuse_active = state.height >= crate::core::types::STRICT_WOTS_REUSE_ACTIVATION_HEIGHT; // <--- ADDED
-
-    // <--- FIX: Ensure we check if either standard WOTS reuse is active (with a populated oracle),
-    // OR if strict reuse is active (which populates the oracle dynamically).
-    if (wots_active && !spent_oracle.is_empty()) || strict_reuse_active {
-        for tx in &batch.transactions {
-            if let Transaction::Reveal { inputs, witnesses, outputs, salt } = tx {
-                let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
-                let output_hashes: Vec<[u8; 32]> = outputs.iter()
-                    .map(|o| o.hash_for_commitment())
-                    .collect();
-                let this_commitment = crate::core::types::compute_commitment(
-                    &input_ids, &output_hashes, salt,
-                );
-                for (input, witness) in inputs.iter().zip(witnesses.iter()) {
-                    let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
-                    if let Some(sig) = wit_inputs.first() {
-                        if sig.len() == crate::core::wots::SIG_SIZE {
-                            // Standard WOTS: Check the predicate address
-                            let addr = input.predicate.address();
-                            if let Some(&prior_commitment) = spent_oracle.get(&addr) {
-                                if prior_commitment != this_commitment {
-                                    bail!(
-                                        "Consensus violation: WOTS address {} reused \
-                                         with different commitment (prior: {}, this: {})",
-                                        hex::encode(addr),
-                                        hex::encode(prior_commitment),
-                                        hex::encode(this_commitment),
-                                    );
-                                }
-                            }
-                            // FIX: Insert into oracle to prevent intra-block and inter-block reuse
-                            if strict_reuse_active {
-                                spent_oracle.insert(addr, this_commitment);
-                            }
-                        } else if mss_active {
-                            // MSS: Check the specific leaf's WOTS public key
-                            if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                                let leaf_pk = mss_sig.wots_pk;
-                                if let Some(&prior_commitment) = spent_oracle.get(&leaf_pk) {
-                                    if prior_commitment != this_commitment {
-                                        bail!(
-                                            "Consensus violation: MSS leaf {} (Index {}) reused \
-                                             with different commitment (prior: {}, this: {})",
-                                            hex::encode(leaf_pk),
-                                            mss_sig.leaf_index,
-                                            hex::encode(prior_commitment),
-                                            hex::encode(this_commitment),
-                                        );
-                                    }
-                                }
-                                // FIX: Insert into oracle to prevent intra-block and inter-block reuse
-                                if strict_reuse_active {
-                                    spent_oracle.insert(leaf_pk, this_commitment);
-                                }
+    for tx in &batch.transactions {
+        if let Transaction::Reveal { inputs, witnesses, outputs, salt } = tx {
+            let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+            let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+            let this_commitment = crate::core::types::compute_commitment(&input_ids, &output_hashes, salt);
+            
+            for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                if let Some(sig) = wit_inputs.first() {
+                    if sig.len() == crate::core::wots::SIG_SIZE {
+                        let addr = input.predicate.address();
+                        if let Some(&prior_commitment) = spent_oracle.get(&addr) {
+                            if prior_commitment != this_commitment {
+                                bail!("Consensus violation: WOTS address {} reused with different commitment", hex::encode(addr));
                             }
                         }
+                        spent_oracle.insert(addr, this_commitment);
+                    } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                        let leaf_pk = mss_sig.wots_pk;
+                        if let Some(&prior_commitment) = spent_oracle.get(&leaf_pk) {
+                            if prior_commitment != this_commitment {
+                                bail!("Consensus violation: MSS leaf {} (Index {}) reused", hex::encode(leaf_pk), mss_sig.leaf_index);
+                            }
+                        }
+                        spent_oracle.insert(leaf_pk, this_commitment);
                     }
                 }
             }
@@ -329,35 +292,36 @@ pub fn apply_batch(
     }
 
     // --- State Root Validation ---
-    // After activation, state_root is mandatory. Before activation, [0; 32] bypasses.
-    if state.height >= crate::core::types::STATE_ROOT_ACTIVATION_HEIGHT
-        && batch.state_root == [0u8; 32]
-    {
-        bail!(
-            "state_root is mandatory after height {} (got all-zeros)",
-            crate::core::types::STATE_ROOT_ACTIVATION_HEIGHT
-        );
+    let mut temp_state_coins = state.coins.clone();
+    for coin_id in &coinbase_ids {
+        temp_state_coins.insert(*coin_id);
     }
-    if batch.state_root != [0u8; 32] { // Bypass for legacy blocks
-        // Simulate adding coinbase coins to calculate the exact state root
-        let mut temp_state_coins = state.coins.clone();
-        for coin_id in &coinbase_ids {
-            temp_state_coins.insert(*coin_id);
-        }
-        let smt_root = hash_concat(&temp_state_coins.root(), &state.commitments.root());
-        let expected_state_root = hash_concat(&smt_root, &state.chain_mmr.root());
-        
-        if batch.state_root != expected_state_root {
-            bail!("State root mismatch: expected {}, got {}", hex::encode(expected_state_root), hex::encode(batch.state_root));
-        }
-        
-        // Hash the state root into the midstate BEFORE verifying the PoW!
-        future_midstate = hash_concat(&future_midstate, &batch.state_root);
+    let smt_root = hash_concat(&temp_state_coins.root(), &state.commitments.root());
+    let expected_state_root = hash_concat(&smt_root, &state.chain_mmr.root());
+    
+    if batch.state_root != expected_state_root {
+        bail!("State root mismatch: expected {}, got {}", hex::encode(expected_state_root), hex::encode(batch.state_root));
     }
+    
+    future_midstate = hash_concat(&future_midstate, &batch.state_root);
+    
     // -----------------------------------
 
-    // 5. Verify extension against future midstate
-    verify_extension(future_midstate, &batch.extension, &batch.target)?;
+    // 5. Verify extension against the NEW HEADER HASH
+    let candidate_header = BatchHeader {
+        height: state.height,
+        prev_header_hash: state.header_hash,
+        prev_midstate: state.midstate,
+        post_tx_midstate: future_midstate,
+        extension: batch.extension.clone(),
+        timestamp: batch.timestamp,
+        target: batch.target,
+        state_root: batch.state_root,
+    };
+    
+    let mining_target = crate::core::types::compute_header_hash(&candidate_header);
+    verify_extension(mining_target, &batch.extension, &batch.target)?;
+
     // 6. Add coinbase coins to state
     for coin_id in &coinbase_ids {
         if !state.coins.insert(*coin_id) {
@@ -366,7 +330,8 @@ pub fn apply_batch(
     }
 
     // 7. Finalize
-    state.midstate = batch.extension.final_hash;
+    state.midstate = future_midstate; // <-- NEW: State transitions to post_tx_midstate
+    state.header_hash = batch.extension.final_hash; // <-- NEW: Header hash becomes PoW result
     state.chain_mmr.append(&batch.extension.final_hash);
     state.depth += calculate_work(&batch.target);
     state.height += 1;
@@ -441,16 +406,30 @@ let state_root = hash_concat(&smt_root, &state.chain_mmr.root());
         mining_midstate = hash_concat(&mining_midstate, &state_root);
 
         // Search for a nonce that meets the target
+        let candidate_header = BatchHeader {
+            height: state.height,
+            prev_header_hash: state.header_hash,
+            prev_midstate: state.midstate,
+            post_tx_midstate: mining_midstate,
+            extension: Extension { nonce: 0, final_hash: [0u8; 32] },
+            timestamp,
+            target: state.target,
+            state_root,
+        };
+        let mining_target = crate::core::types::compute_header_hash(&candidate_header);
+
         let mut nonce = 0u64;
         let extension = loop {
-            let ext = create_extension(mining_midstate, nonce);
+            let ext = create_extension(mining_target, nonce);
             if ext.final_hash < state.target {
                 break ext;
             }
             nonce += 1;
         };
+        
         Batch {
             prev_midstate: state.midstate,
+            prev_header_hash: state.header_hash,
             transactions: vec![],
             extension,
             coinbase,

@@ -605,7 +605,7 @@ async function handleSubmitMinedBlock(template, nonce) {
         if (!extStr) throw new Error("Failed to recompute extension hash.");
 
         const batch = JSON.parse(JSON.stringify(template.batch_template));
-        batch.timestamp = Math.floor(Date.now() / 1000);
+        // Timestamp is mathematically locked into the template by the node. Do not touch it!
         batch.extension = JSON.parse(extStr);
 
         for (const entry of template.mining_addrs) wState.wotsAddrs[entry.address] = entry.index;
@@ -867,15 +867,11 @@ self.onmessage = async (e) => {
                 // Mine PoW locally in JS to satisfy the mempool
                 let spamNonce = 0;
                 while (true) {
-                    // Ensure we use the post-80k PoW algorithm which includes the target height
+                    // V2 PoW algorithm mathematically binds the target height
                     let heightHex = BigInt(stateData.height).toString(16).padStart(16, '0').match(/.{2}/g).reverse().join('');
                     let nonceHex = spamNonce.toString(16).padStart(16, '0').match(/.{2}/g).reverse().join('');
                     
-                    let payloadToHash = txData.commitment + nonceHex;
-                    if (stateData.height >= 80000) { // RECENT_POW_ACTIVATION_HEIGHT
-                        payloadToHash = heightHex + txData.commitment + nonceHex;
-                    }
-                    
+                    let payloadToHash = heightHex + txData.commitment + nonceHex;
                     const hashExt = blake3_hash_hex(payloadToHash);
                     
                     // Check leading zeros against difficulty
@@ -1531,7 +1527,8 @@ async function performSend(toAddress, amount) {
 
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Mining Proof-of-Work (difficulty: ${requiredPow})...` } });
     await new Promise(r => setTimeout(r, 50));
-    const spamNonce = Number(mine_commitment_pow(ctx.commitment, requiredPow));
+    // Pass the height to the V2 WASM miner
+    const spamNonce = Number(mine_commitment_pow(ctx.commitment, requiredPow, BigInt(stateData.height)));
 
     // Submit commit
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "PoW complete. Submitting commitment..." } });

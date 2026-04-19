@@ -18,125 +18,7 @@ use anyhow::Result;
 use redb::{Database, ReadableTable};
 use std::path::PathBuf;
 use std::sync::Arc;
-use crate::core::types::{Predicate, Witness, OutputData}; 
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  LEGACY BINCODE MIGRATIONS
-// ═══════════════════════════════════════════════════════════════════════════
-// Bincode relies on strict structural positioning. When the protocol is upgraded 
-// (e.g., adding `state_root` to blocks, or `commitment` to InputReveals for State Threads),
-// older blocks saved on disk will fail to deserialize.
-// We maintain these legacy structs to catch deserialization failures, read the old bytes 
-// perfectly, and dynamically map them into the current active protocol structs.
-
-#[derive(Clone, Debug, serde::Deserialize)]
-struct LegacyInputReveal {
-    pub predicate: Predicate,
-    pub value: u64,
-    pub salt: [u8; 32],
-}
-
-impl LegacyInputReveal {
-    fn into_current(self) -> crate::core::InputReveal {
-        crate::core::InputReveal {
-            predicate: self.predicate,
-            value: self.value,
-            salt: self.salt,
-            commitment: None, // Sentinel value for pre-State Thread inputs
-        }
-    }
-}
-
-#[derive(Clone, Debug, serde::Deserialize)]
-enum LegacyTransaction {
-    Commit { commitment: [u8; 32], spam_nonce: u64 },
-    Reveal { inputs: Vec<LegacyInputReveal>, witnesses: Vec<Witness>, outputs: Vec<OutputData>, salt: [u8; 32] },
-}
-
-impl LegacyTransaction {
-    fn into_current(self) -> crate::core::Transaction {
-        match self {
-            Self::Commit { commitment, spam_nonce } => crate::core::Transaction::Commit { commitment, spam_nonce },
-            Self::Reveal { inputs, witnesses, outputs, salt } => crate::core::Transaction::Reveal {
-                inputs: inputs.into_iter().map(|i| i.into_current()).collect(),
-                witnesses, outputs, salt,
-            },
-        }
-    }
-}
-
-#[derive(Clone, Debug, serde::Deserialize)]
-struct LegacyBatch {
-    pub prev_midstate: [u8; 32],
-    pub transactions: Vec<LegacyTransaction>,
-    pub extension: crate::core::Extension,
-    #[serde(default)]
-    pub coinbase: Vec<crate::core::CoinbaseOutput>,
-    pub timestamp: u64,
-    pub target: [u8; 32],
-}
-
-impl LegacyBatch {
-    fn into_current(self) -> crate::core::Batch {
-        crate::core::Batch {
-            prev_midstate: self.prev_midstate,
-            transactions: self.transactions.into_iter().map(|t| t.into_current()).collect(),
-            extension: self.extension,
-            coinbase: self.coinbase,
-            timestamp: self.timestamp,
-            target: self.target,
-            state_root: [0u8; 32], // Sentinel for blocks mined before state_root activation
-        }
-    }
-}
-
-#[derive(Clone, Debug, serde::Deserialize)]
-struct LegacyBatchHeader {
-    pub height: u64,
-    pub prev_midstate: [u8; 32],
-    pub post_tx_midstate: [u8; 32],
-    pub extension: crate::core::Extension,
-    pub timestamp: u64,
-    pub target: [u8; 32],
-}
-
-impl LegacyBatchHeader {
-    fn into_current(self) -> crate::core::BatchHeader {
-        crate::core::BatchHeader {
-            height: self.height,
-            prev_midstate: self.prev_midstate,
-            post_tx_midstate: self.post_tx_midstate,
-            extension: self.extension,
-            timestamp: self.timestamp,
-            target: self.target,
-            state_root: [0u8; 32], 
-        }
-    }
-}
-
-/// Attempts to deserialize a Batch. If the current schema fails, falls back to the legacy schema.
-fn deserialize_batch_with_migration(bytes: &[u8], height: u64) -> Result<crate::core::Batch> {
-    match bincode::deserialize::<crate::core::Batch>(bytes) {
-        Ok(batch) => Ok(batch),
-        Err(_) => {
-            let legacy: LegacyBatch = bincode::deserialize(bytes)
-                .map_err(|e| anyhow::anyhow!("Failed to deserialize batch {}: {}", height, e))?;
-            Ok(legacy.into_current())
-        }
-    }
-}
-
-/// Attempts to deserialize a Header. If the current schema fails, falls back to the legacy schema.
-fn deserialize_header_with_migration(bytes: &[u8], height: u64) -> Result<crate::core::BatchHeader> {
-    match bincode::deserialize::<crate::core::BatchHeader>(bytes) {
-        Ok(hdr) => Ok(hdr),
-        Err(_) => {
-            let legacy: LegacyBatchHeader = bincode::deserialize(bytes)
-                .map_err(|e| anyhow::anyhow!("Failed to deserialize header {}: {}", height, e))?;
-            Ok(legacy.into_current())
-        }
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  BATCH STORE IMPLEMENTATION
@@ -151,110 +33,13 @@ pub struct BatchStore {
 }
 
 impl BatchStore {
-    /// Initializes the store and automatically triggers a seamless migration 
-    /// from the old filesystem structure to the single-file database.
     pub fn new(db: Arc<Database>, legacy_fs_path: PathBuf) -> Result<Self> {
         let store = Self { db, legacy_fs_path };
-        store.migrate_from_fs()?;
         Ok(store)
     }
 
-    /// Safely scans for the highest legacy block if the `highest_height` marker file is missing.
-    /// Guarantees no blocks are lost during migration from very old nodes.
-    fn legacy_highest(&self) -> u64 {
-        let marker = self.legacy_fs_path.join("highest_height");
-        if marker.exists() {
-            if let Ok(s) = std::fs::read_to_string(&marker) {
-                if let Ok(v) = s.trim().parse::<u64>() {
-                    return v;
-                }
-            }
-        }
+    
 
-        // Fallback: Manually scan directories (O(N) operation, only runs once ever)
-        let mut max = 0u64;
-        if let Ok(entries) = std::fs::read_dir(&self.legacy_fs_path) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    if let Ok(files) = std::fs::read_dir(entry.path()) {
-                        for file in files.flatten() {
-                            let name = file.file_name();
-                            let name_str = name.to_string_lossy();
-                            if let Some(h_str) = name_str.strip_prefix("batch_").and_then(|s| s.strip_suffix(".bin")) {
-                                if let Ok(h) = h_str.parse::<u64>() {
-                                    max = max.max(h);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        max
-    }
-
-    /// The one-time migration engine. Reads all flat files and imports them into Redb.
-    ///
-    /// Memory Safety: We process the migration in 500-block transactions.
-    /// Redb holds dirty pages in memory before `commit()` is called. At 100KB per block, 
-    /// 500 blocks consumes ~50 MB of RAM, which is completely safe for a 512 MB Raspberry Pi.
-    ///
-    /// Atomic Deletion: The old flat files are ONLY deleted if the entire loop finishes 
-    /// flawlessly. If power is lost mid-migration, the node simply resumes writing over 
-    /// the DB from the flat files on next boot.
-    fn migrate_from_fs(&self) -> Result<()> {
-        if !self.legacy_fs_path.exists() { return Ok(()); }
-
-        let highest = self.legacy_highest();
-
-        // Edge case: If the directory exists but is completely empty, just clean it up.
-        let folder0 = self.legacy_fs_path.join("000000");
-        if highest == 0 && !folder0.join("batch_0.bin").exists() {
-            let _ = std::fs::remove_dir_all(&self.legacy_fs_path);
-            return Ok(());
-        }
-
-        tracing::info!("Migrating {} blocks to Database. Please wait...", highest + 1);
-
-        let mut write_txn = self.db.begin_write()?;
-        let mut batches_table = write_txn.open_table(super::BATCHES_TABLE)?;
-        let mut headers_table = write_txn.open_table(super::HEADERS_TABLE)?;
-        let mut filters_table = write_txn.open_table(super::FILTERS_TABLE)?;
-
-        for h in 0..=highest {
-            let folder = h / 1000;
-            let folder_path = self.legacy_fs_path.join(format!("{:06}", folder));
-            
-            let b_path = folder_path.join(format!("batch_{}.bin", h));
-            if b_path.exists() { batches_table.insert(h, std::fs::read(&b_path)?.as_slice())?; }
-            
-            let h_path = folder_path.join(format!("header_{}.bin", h));
-            if h_path.exists() { headers_table.insert(h, std::fs::read(&h_path)?.as_slice())?; }
-            
-            let f_path = folder_path.join(format!("filter_{}.bin", h));
-            if f_path.exists() { filters_table.insert(h, std::fs::read(&f_path)?.as_slice())?; }
-
-            // 500-block boundary commit to prevent OOM kills on constrained hardware
-            if h > 0 && h % 500 == 0 {
-                drop(batches_table); drop(headers_table); drop(filters_table);
-                write_txn.commit()?;
-                
-                write_txn = self.db.begin_write()?;
-                batches_table = write_txn.open_table(super::BATCHES_TABLE)?;
-                headers_table = write_txn.open_table(super::HEADERS_TABLE)?;
-                filters_table = write_txn.open_table(super::FILTERS_TABLE)?;
-                tracing::info!("Migrated {} / {} blocks...", h, highest);
-            }
-        }
-        
-        drop(batches_table); drop(headers_table); drop(filters_table);
-        write_txn.commit()?;
-
-        // ONLY delete the old file mess if the entire database migration succeeded perfectly.
-        let _ = std::fs::remove_dir_all(&self.legacy_fs_path);
-        tracing::info!("Migration to Database complete! Node is fully optimized.");
-        Ok(())
-    }
 
     /// Returns the legacy root path. Preserved so `node.rs` can resolve sibling directories 
     /// like `snapshots/`.
@@ -322,7 +107,7 @@ impl BatchStore {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(super::BATCHES_TABLE)?;
         if let Some(guard) = table.get(height)? {
-            let batch = deserialize_batch_with_migration(guard.value(), height)?;
+            let batch: Batch = bincode::deserialize(guard.value())?;
             Ok(Some(batch))
         } else {
             Ok(None)
@@ -335,7 +120,7 @@ impl BatchStore {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(super::HEADERS_TABLE)?;
         if let Some(guard) = table.get(height)? {
-            let header = deserialize_header_with_migration(guard.value(), height)?;
+            let header: BatchHeader = bincode::deserialize(guard.value())?;
             Ok(Some(header))
         } else {
             // Fallback for pre-header migration blocks
@@ -352,25 +137,45 @@ impl BatchStore {
     /// Loads a sequential array of headers. Stops early if a gap is encountered.
     pub fn load_headers(&self, start: u64, end: u64) -> Result<Vec<BatchHeader>> {
         if end <= start { return Ok(Vec::new()); }
+        
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::HEADERS_TABLE)?;
+        
         let mut headers = Vec::with_capacity((end - start) as usize);
         for h in start..end {
-            if let Some(header) = self.load_header(h)? {
+            if let Some(guard) = table.get(h)? {
+                let header: BatchHeader = bincode::deserialize(guard.value())?;
                 headers.push(header);
             } else {
+                // Fallback for extremely old pre-migration blocks
+                drop(table);
+                drop(read_txn);
+                for fh in h..end {
+                    if let Some(header) = self.load_header(fh)? {
+                        headers.push(header);
+                    } else {
+                        break;
+                    }
+                }
                 break;
             }
         }
         Ok(headers)
     }
 
-    /// Loads a sequential array of full batches. 
     pub fn load_range(&self, start: u64, end: u64) -> Result<Vec<(u64, Batch)>> {
+        if end <= start { return Ok(Vec::new()); }
+        
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::BATCHES_TABLE)?;
+        
         let mut batches = Vec::new();
         for height in start..end {
-            match self.load(height) {
-                Ok(Some(batch)) => batches.push((height, batch)),
-                Ok(None) => break,
-                Err(_) => break,
+            if let Some(guard) = table.get(height)? {
+                let batch: Batch = bincode::deserialize(guard.value())?;
+                batches.push((height, batch));
+            } else {
+                break;
             }
         }
         Ok(batches)
@@ -403,10 +208,23 @@ mod tests {
     fn dummy_batch(nonce: u64) -> Batch {
         let ms = crate::core::types::hash(&nonce.to_le_bytes());
         let state_root = [0u8; 32];
-        let mining_ms = crate::core::types::hash_concat(&ms, &state_root);
-        let ext = crate::core::extension::create_extension(mining_ms, nonce);
+        
+        let candidate_header = BatchHeader {
+            height: 0,
+            prev_header_hash: [0u8; 32],
+            prev_midstate: ms,
+            post_tx_midstate: ms, // dummy
+            extension: crate::core::Extension { nonce: 0, final_hash: [0u8; 32] },
+            timestamp: 1000 + nonce,
+            target: [0xff; 32],
+            state_root,
+        };
+        let mining_hash = crate::core::types::compute_header_hash(&candidate_header);
+        let ext = crate::core::extension::create_extension(mining_hash, nonce);
+        
         Batch {
             prev_midstate: ms,
+            prev_header_hash: [0u8; 32],
             transactions: vec![],
             extension: ext,
             coinbase: vec![],

@@ -2,7 +2,6 @@ mod batch_store;
 pub use batch_store::BatchStore;
 
 use crate::core::State;
-use crate::core::mmr::{MerkleMountainRange, UtxoAccumulator};
 use anyhow::Result;
 use redb::{Database, ReadableTable, TableDefinition};
 use std::path::Path;
@@ -27,87 +26,15 @@ pub const BATCHES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("bat
 pub const HEADERS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("headers");
 pub const FILTERS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("filters");
 
-/// V1 state layout (depth: u64). Used only for one-time migration from
-/// pre-u128 databases. Identical field order to the old `State` so that
-/// bincode positional decoding works.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct LegacyState {
-    pub midstate: [u8; 32],
-    pub coins: UtxoAccumulator,
-    pub commitments: UtxoAccumulator,
-    pub depth: u64,
-    pub target: [u8; 32],
-    pub height: u64,
-    pub timestamp: u64,
-    #[serde(default)]
-    pub commitment_heights: im::HashMap<[u8; 32], u64>,
-    #[serde(default)]
-    pub chain_mmr: MerkleMountainRange,
+
+fn deserialize_state(bytes: &[u8]) -> Result<State> {
+    bincode::deserialize::<State>(bytes).map_err(|e| anyhow::anyhow!("State deserialization failed: {}", e))
 }
 
-impl LegacyState {
-    fn into_current(self) -> State {
-        State {
-            midstate: self.midstate,
-            coins: self.coins,
-            commitments: self.commitments,
-            depth: self.depth as u128,
-            target: self.target,
-            height: self.height,
-            timestamp: self.timestamp,
-            commitment_heights: self.commitment_heights,
-            chain_mmr: self.chain_mmr,
-        }
-    }
-}
-
-
-
-/// Try deserializing as current State, fall back to LegacyState (u64 depth)
-/// and convert. Returns the deserialized state and whether migration occurred.
-fn deserialize_state_with_migration(bytes: &[u8]) -> Result<(State, bool)> {
-    // Try current format first
-    match bincode::deserialize::<State>(bytes) {
-        Ok(state) => Ok((state, false)),
-        Err(_) => {
-            // Fall back to legacy format
-            let legacy: LegacyState = bincode::deserialize(bytes)
-                .map_err(|e| anyhow::anyhow!(
-                    "State deserialization failed for both current and legacy formats: {}", e
-                ))?;
-            tracing::info!(
-                "Migrating state from v1 (depth u64={}) to v2 (depth u128={})",
-                legacy.depth, legacy.depth as u128
-            );
-            Ok((legacy.into_current(), true))
-        }
-    }
-}
-
-/// Same as above but with size-limited deserialization (for untrusted snapshots)
-fn deserialize_state_with_migration_limited(bytes: &[u8]) -> Result<(State, bool)> {
+fn deserialize_state_limited(bytes: &[u8]) -> Result<State> {
     use bincode::Options;
-    let opts = bincode::DefaultOptions::new().with_limit(50_000_000); // 50MB is plenty for a state
-
-    // Try current format: first with DefaultOptions (matching old load path),
-    // then standard bincode (matching save path)
-    if let Ok(state) = opts.deserialize::<State>(bytes) {
-        return Ok((state, false));
-    }
-    if let Ok(state) = bincode::deserialize::<State>(bytes) {
-        return Ok((state, false));
-    }
-    // Fall back to legacy formats
-    if let Ok(legacy) = opts.deserialize::<LegacyState>(bytes) {
-        tracing::info!("Migrating snapshot from v1 to v2 (depth {})", legacy.depth);
-        return Ok((legacy.into_current(), true));
-    }
-    let legacy: LegacyState = bincode::deserialize(bytes)
-        .map_err(|e| anyhow::anyhow!(
-            "Snapshot deserialization failed for all format combinations: {}", e
-        ))?;
-    tracing::info!("Migrating snapshot from v1 to v2 (depth {})", legacy.depth);
-    Ok((legacy.into_current(), true))
+    let opts = bincode::DefaultOptions::new().with_limit(50_000_000); 
+    opts.deserialize::<State>(bytes).map_err(|e| anyhow::anyhow!("Snapshot deserialization failed: {}", e))
 }
 
 #[derive(Debug, Clone)]
@@ -243,15 +170,9 @@ impl Storage {
         
         if path.exists() {
             let bytes = std::fs::read(&path)?;
-            let (mut state, migrated) = deserialize_state_with_migration_limited(&bytes)?;
+            let mut state = deserialize_state_limited(&bytes)?;
             state.coins.rebuild_tree();
             state.commitments.rebuild_tree();
-            // Re-save migrated snapshots so they load faster next time
-            if migrated {
-                let new_bytes = bincode::serialize(&state)?;
-                std::fs::write(&path, new_bytes)?;
-                tracing::info!("Re-saved snapshot at height {} in v2 format", height);
-            }
             Ok(Some(state))
         } else {
             Ok(None)
@@ -274,17 +195,9 @@ impl Storage {
         let table = read_txn.open_table(STATE_TABLE)?;
         match table.get("current")? {
             Some(bytes) => {
-                let (mut state, migrated) = deserialize_state_with_migration(bytes.value())?;
+                let mut state = deserialize_state(bytes.value())?;
                 state.coins.rebuild_tree();
                 state.commitments.rebuild_tree();
-                // If we migrated from legacy format, write back in new format
-                // so subsequent loads don't need migration.
-                drop(table);
-                drop(read_txn);
-                if migrated {
-                    tracing::info!("Re-saving state in v2 format after migration");
-                    self.save_state(&state)?;
-                }
                 Ok(Some(state))
             }
             None => Ok(None),
@@ -367,14 +280,7 @@ impl Storage {
     /// - For standard WOTS: burns the address hash.
     /// - For MSS (post-activation): burns the specific leaf's WOTS public key.
     /// - Idempotent: reorg replays of the same batch write the same value.
-pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, block_height: u64) -> Result<()> {
-        use crate::core::types::{WOTS_REUSE_ACTIVATION_HEIGHT, MSS_REUSE_ACTIVATION_HEIGHT, Witness, compute_commitment};
-        use crate::core::wots::SIG_SIZE;
-
-        if block_height < WOTS_REUSE_ACTIVATION_HEIGHT {
-            return Ok(());
-        }
-
+pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, _block_height: u64) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut spent_table = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
@@ -386,25 +292,23 @@ pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, block_height: u64
                     let output_hashes: Vec<[u8; 32]> = outputs.iter()
                         .map(|o| o.hash_for_commitment())
                         .collect();
-                    let commitment = compute_commitment(&input_ids, &output_hashes, salt);
+                    let commitment = crate::core::compute_commitment(&input_ids, &output_hashes, salt);
 
                     for (input, witness) in inputs.iter().zip(witnesses.iter()) {
-                        let Witness::ScriptInputs(wit_inputs) = witness;
+                        let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
                         if let Some(sig) = wit_inputs.first() {
-                            if sig.len() == SIG_SIZE {
+                            if sig.len() == crate::core::wots::SIG_SIZE {
                                 let addr = input.predicate.address();
                                 spent_table.insert(&addr, &commitment)?;
-                            } else if block_height >= MSS_REUSE_ACTIVATION_HEIGHT {
-                                if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                                    spent_table.insert(&mss_sig.wots_pk, &commitment)?;
-
-                                    // O(1) MSS leaf index tracker
-                                    if let Some(master_pk) = input.predicate.owner_pk() {
-                                        let next = mss_sig.leaf_index + 1;
-                                        let current = mss_idx_table.get(&master_pk)?.map(|v: redb::AccessGuard<'_, u64>| v.value()).unwrap_or(0);
-                                        if next > current {
-                                            mss_idx_table.insert(&master_pk, next)?;
-                                        }
+                            } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                                spent_table.insert(&mss_sig.wots_pk, &commitment)?;
+                                
+                                // O(1) MSS leaf index tracker
+                                if let Some(master_pk) = input.predicate.owner_pk() {
+                                    let next = mss_sig.leaf_index + 1;
+                                    let current = mss_idx_table.get(&master_pk)?.map(|v: redb::AccessGuard<'_, u64>| v.value()).unwrap_or(0);
+                                    if next > current {
+                                        mss_idx_table.insert(&master_pk, next)?;
                                     }
                                 }
                             }
@@ -416,7 +320,6 @@ pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, block_height: u64
         write_txn.commit()?;
         Ok(())
     }
-
     /// Build a pre-flight oracle for a batch: returns a map of
     /// `nullifier -> prior_commitment` for every WOTS address or MSS leaf in the batch
     /// that already exists in the spent-address table.

@@ -4,7 +4,7 @@
 //
 // Uses JSON framing (4-byte LE length + JSON body) so browsers don't need
 // a bincode implementation. Runs as a separate request_response::Behaviour
-// on the same swarm alongside the full /midstate/1.1.0 binary protocol.
+// on the same swarm alongside the full /midstate/2.0.0 binary protocol.
 //
 // The protocol ID includes "light" so full nodes can rate-limit/prioritize
 // light client traffic independently from peer-to-peer sync traffic.
@@ -15,8 +15,8 @@ use libp2p::StreamProtocol;
 use serde::{Deserialize, Serialize};
 use std::io;
 
-pub const LIGHT_PROTOCOL: StreamProtocol = StreamProtocol::new("/midstate/light/1.0.0");
-pub const LIGHT_PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/midstate/light-push/1.0.0");
+pub const LIGHT_PROTOCOL: StreamProtocol = StreamProtocol::new("/midstate/light/2.0.0");
+pub const LIGHT_PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/midstate/light-push/2.0.0");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]

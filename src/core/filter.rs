@@ -259,6 +259,7 @@ mod tests {
     fn dummy_batch() -> Batch {
         Batch {
             prev_midstate: [0; 32],
+            prev_header_hash: [0; 32], 
             transactions: vec![],
             extension: Extension { nonce: 0, final_hash: [1; 32]},
             coinbase: vec![],

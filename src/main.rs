@@ -66,8 +66,7 @@ impl Config {
             #     "/ip4/198.51.100.5/tcp/9333/p2p/12D3KooWGhIjKl...",
             # ]
 
-            bootstrap_peers = ["/ip4/134.199.148.215/tcp/9333/p2p/12D3KooWRACBS3RTvszkfPsq4nMw1sZUyNuGAD3SswqsybnoyDcA",
-                                "/ip4/167.172.228.142/tcp/9333/p2p/12D3KooWRrg4Vg2fWuGgku1Z2N55ZTLwCCC3RZ1ZRQ7PuBBCqyDN"]
+            bootstrap_peers = ["/ip4/134.199.148.215/tcp/9333/p2p/12D3KooWPbR63SQg1UBLpAMiNngqrRHGM4LaMP8ieAJUxhfw7dxv"]
             "#;
         std::fs::write(path, default_contents)
             .with_context(|| format!("Failed to create default config: {}", path.display()))?;
@@ -2420,10 +2419,9 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
         let mut wots_oracle = std::collections::HashMap::new();
 
         for batch in &batches {
-            if state.height >= midstate::core::types::WOTS_REUSE_ACTIVATION_HEIGHT {
                 let db_oracle = storage.query_spent_addresses(batch).unwrap_or_default();
                 wots_oracle.extend(db_oracle);
-            }
+            
 
             apply_batch(&mut state, batch, &recent_headers, &mut wots_oracle)?;
             
