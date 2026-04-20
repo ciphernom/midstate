@@ -3843,15 +3843,13 @@ fn fire_batch_lookahead(&mut self) {
             let batch_target = primitive_types::U256::from_big_endian(&batch.target);
             let (max_allowed, overflow) = current_target.overflowing_mul(primitive_types::U256::from(16u64));
             if !overflow && batch_target > max_allowed {
-                tracing::warn!(
-                    "Rejected orphan block from {:?}: target {:?} is >16x easier than ours ({:?}). Likely spam.",
-                    from,
-                    hex::encode(batch.target),
-                    hex::encode(self.state.target)
+                tracing::debug!(
+                    "Dropped orphan block from {:?}: target is >16x easier than ours. Ignoring until synced.",
+                    from
                 );
-                if let Some(peer) = from {
-                    self.ban_peer(peer, "absurdly easy difficulty target (orphan spam)");
-                }
+                // DO NOT BAN THE PEER. If we are syncing from genesis, the network's tip 
+                // might legitimately be >16x easier than our local genesis target. 
+                // Just drop the orphan; the sync process will fetch it properly later.
                 return Ok(());
             }
             // --------------------------------------
