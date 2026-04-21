@@ -4689,6 +4689,16 @@ async fn rebuild_state_from_disk(storage: crate::storage::Storage, target_height
         tokio::task::spawn_blocking(move || -> Result<State> {
             let mut state = start_state;
             let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+            
+            // Pre-populate recent_headers from disk
+            let window_size = crate::core::DIFFICULTY_LOOKBACK as usize;
+            let lookback_start = start_h.saturating_sub(window_size as u64);
+            for h in lookback_start..start_h {
+                if let Ok(Some(batch)) = storage.load_batch(h) {
+                    recent_headers.push_back(batch.timestamp);
+                }
+            }
+
             let mut wots_oracle = std::collections::HashMap::new();
             
             for h in start_h..target_height {
@@ -4696,16 +4706,18 @@ async fn rebuild_state_from_disk(storage: crate::storage::Storage, target_height
                     tracing::info!("[REBUILD] Rebuilding state: {}/{}", h, target_height);
                 }
                 if let Some(batch) = storage.load_batch(h)? {
-                    recent_headers.push_back(state.timestamp);
-                    if recent_headers.len() > crate::core::DIFFICULTY_LOOKBACK as usize {
-                        recent_headers.pop_front();
-                    }
-                        wots_oracle.clear(); //we dont need to hold the oracle in ram since the whole truth is kept in SPENT_ADDRESSES_TABLE anyway - we just need to ensure the current batch is good. 
-                        let db_oracle = storage.query_spent_addresses(&batch).unwrap_or_default();
-                        wots_oracle.extend(db_oracle);
+                    wots_oracle.clear(); 
+                    let db_oracle = storage.query_spent_addresses(&batch).unwrap_or_default();
+                    wots_oracle.extend(db_oracle);
                     
                     crate::core::state::apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &mut wots_oracle)?;
                     state.target = crate::core::state::adjust_difficulty(&state);
+
+                    // Push timestamp AFTER applying the batch
+                    recent_headers.push_back(batch.timestamp);
+                    if recent_headers.len() > window_size {
+                        recent_headers.pop_front();
+                    }
 
                     if h > 0 && h % 500 == 0 {
                         let _ = storage.save_state_snapshot(h, &state);
@@ -4740,28 +4752,38 @@ async fn rebuild_state_from_disk(storage: crate::storage::Storage, target_height
             });
 
             let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+            
+            // Pre-populate recent_headers from disk
+            let window_size = crate::core::DIFFICULTY_LOOKBACK as usize;
+            let lookback_start = replay_from.saturating_sub(window_size as u64);
+            for h in lookback_start..replay_from {
+                if let Ok(Some(batch)) = storage.load_batch(h) {
+                    recent_headers.push_back(batch.timestamp);
+                }
+            }
+
             let mut wots_oracle = std::collections::HashMap::new(); 
             for h in replay_from..target_height {
                 if h % 500 == 0 && h > 0 {
                     tracing::info!("[REPLAY] Rebuilding state: {}/{}", h, target_height);
                 }
                 if let Some(batch) = storage.load_batch(h)? {
-                    recent_headers.push_back(state.timestamp);
-                    if recent_headers.len() > crate::core::DIFFICULTY_LOOKBACK as usize {
-                        recent_headers.pop_front();
-                    }
-                        wots_oracle.clear(); //we dont need to hold the oracle in ram since the whole truth is kept in SPENT_ADDRESSES_TABLE anyway - we just need to ensure the current batch is good. 
-                        let db_oracle = storage.query_spent_addresses(&batch).unwrap_or_default();
-                        wots_oracle.extend(db_oracle);
+                    wots_oracle.clear(); 
+                    let db_oracle = storage.query_spent_addresses(&batch).unwrap_or_default();
+                    wots_oracle.extend(db_oracle);
                     
                     crate::core::state::apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &mut wots_oracle)?;
                     state.target = crate::core::state::adjust_difficulty(&state);
                     
-                    // save our work in case there is a node crash or restart mid replay
+                    // Push timestamp AFTER applying the batch
+                    recent_headers.push_back(batch.timestamp);
+                    if recent_headers.len() > window_size {
+                        recent_headers.pop_front();
+                    }
+
                     if h > 0 && h % 500 == 0 {
                         let _ = storage.save_state_snapshot(h, &state);
                     }
-                    
                 } else {
                     anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
                 }
