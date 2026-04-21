@@ -1554,7 +1554,6 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
         // Initial sync: ask all peers for their height
         if self.network.peer_count() > 0 {
             tracing::info!("Requesting chain state from {} peer(s)...", self.network.peer_count());
-            self.sync_in_progress = true;
             for peer in self.network.connected_peers() {
                 if self.network.is_light_peer(&peer) { continue; }
                 self.network.send(peer, Message::GetState);
@@ -1926,7 +1925,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
 // Bayesian Eclipse Defense 
                         NetworkEvent::OutgoingConnectionFailed(addr_str) => {
                             if let Some(stats) = self.known_pex_addrs.get_mut(&addr_str) {
-                                stats.1 = stats.1.saturating_add(5); // Heavy penalty for failing to connect
+                                stats.1 = stats.1.saturating_add(1); // penalty for failing to connect
                                 let prob = stats.0 as f32 / (stats.0 + stats.1) as f32;
                                 if prob < 0.1 {
                                     self.known_pex_addrs.remove(&addr_str);
@@ -2117,7 +2116,8 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                                 Message::Batches { start_height, batches: vec![] }
                             }
                         };
-                        let _ = tx.try_send(NodeCommand::SendResponse { channel: ch, msg: response });
+                        let _ = tx.blocking_send(NodeCommand::SendResponse { channel: ch, msg: response });
+
                     });
                 }
                 // Return immediately, the spawned task will send the response
@@ -2248,7 +2248,8 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                                 Message::Headers { start_height, headers: vec![] }
                             }
                         };
-                        let _ = tx.try_send(NodeCommand::SendResponse { channel: ch, msg: response });
+                        let _ = tx.blocking_send(NodeCommand::SendResponse { channel: ch, msg: response });
+
                     });
                 }
                 return Ok(());
@@ -2689,11 +2690,11 @@ fn fire_batch_lookahead(&mut self) {
                 })
             }).await.expect("Header verification task panicked");
 
-            let _ = tx.try_send(NodeCommand::FinishSyncHeadersChunk {
+           let _ = tx.send(NodeCommand::FinishSyncHeadersChunk {
                 peer: from,
                 headers,
                 is_valid: chunk_valid,
-            });
+            }).await;
         });
         
         if let Some(s) = &mut self.sync_session {
@@ -2898,7 +2899,7 @@ fn fire_batch_lookahead(&mut self) {
                                         tracing::info!("Cache miss at height {}, starting background state rebuild...", fh);
                                         
                                         // Pipelined Rebuild Start Command
-                                        let _ = tx.try_send(NodeCommand::FinishStateRebuild {
+                                        let _ = tx.send(NodeCommand::FinishStateRebuild {
                                             peer: from,
                                             fork_height: fh,
                                             candidate_state: None,
@@ -2906,7 +2907,7 @@ fn fire_batch_lookahead(&mut self) {
                                             is_fast_forward: false,
                                             is_valid: true,
                                             is_local_corruption: false,
-                                        });
+                                        }).await; // <--- Changed to send().await
 
                                         let cache_start = state_cache.iter()
                                             .filter(|(h, _)| *h <= fh)
@@ -2933,7 +2934,7 @@ fn fire_batch_lookahead(&mut self) {
                 }
             }
 
-            let _ = tx.try_send(NodeCommand::FinishStateRebuild {
+            let _ = tx.send(NodeCommand::FinishStateRebuild {
                 peer: from,
                 fork_height,
                 candidate_state,
@@ -2941,7 +2942,7 @@ fn fire_batch_lookahead(&mut self) {
                 is_fast_forward,
                 is_valid,
                 is_local_corruption,
-            });
+            }).await;
         });
         
         self.sync_session = Some(SyncSession {
@@ -3104,7 +3105,7 @@ fn fire_batch_lookahead(&mut self) {
                 cursor += 1;
             }
 
-            let _ = tx.try_send(NodeCommand::FinishSyncBatchesChunk {
+           let _ = tx.blocking_send(NodeCommand::FinishSyncBatchesChunk {
                 peer: from,
                 headers,
                 fork_height,
@@ -3629,7 +3630,8 @@ fn fire_batch_lookahead(&mut self) {
                         element_count: items.len() as u64,
                     };
                     
-                    let _ = cmd_tx.try_send(NodeCommand::BroadcastLightPush(notif));
+                    let _ = cmd_tx.blocking_send(NodeCommand::BroadcastLightPush(notif));
+
                 });
             }
         }
@@ -3888,7 +3890,6 @@ fn fire_batch_lookahead(&mut self) {
 
             if !self.sync_in_progress {
                 if let Some(peer) = from {
-                    self.sync_in_progress = true;
                     self.network.send(peer, Message::GetState);
                 }
             }
@@ -4168,7 +4169,8 @@ fn fire_batch_lookahead(&mut self) {
                             element_count: items.len() as u64,
                         };
                         
-                        let _ = cmd_tx.try_send(NodeCommand::BroadcastLightPush(notif));
+                        let _ = cmd_tx.blocking_send(NodeCommand::BroadcastLightPush(notif));
+
 
                     });
                 }
@@ -4487,12 +4489,12 @@ async fn try_apply_orphans(&mut self) {
                 match mining_result {
                     MiningResult::Block(extension) => {
                         template.extension = extension;
-                        let _ = tx.try_send(MinedResult::Block(template)); 
+                        let _ = tx.blocking_send(MinedResult::Block(template)); 
                     }
                     MiningResult::Share(extension) => {
                         template.extension = extension;
                         if let (Some(url), Some(addr)) = (pool_url, payout_address) {
-                            let _ = tx.try_send(MinedResult::Share { 
+                            let _ = tx.blocking_send(MinedResult::Share {
                                 batch: template,
                                 pool_url: url,
                                 payout_address: addr,
@@ -4585,7 +4587,8 @@ async fn try_apply_orphans(&mut self) {
                             element_count: items.len() as u64,
                         };
                         
-                        let _ = cmd_tx.try_send(NodeCommand::BroadcastLightPush(notif));
+                        let _ = cmd_tx.blocking_send(NodeCommand::BroadcastLightPush(notif));
+
 
                     }
                 });
