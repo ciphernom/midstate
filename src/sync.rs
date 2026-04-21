@@ -43,12 +43,19 @@ impl Syncer {
         crate::core::state::validate_timestamp(headers[0].timestamp, prior_timestamps, current_time)
             .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index 0: {}", e))?;
 
+        // Pre-allocate a sliding window to prevent O(N^2) memory exhaustion
+        let mut recent_ts: std::collections::VecDeque<u64> = prior_timestamps.iter().copied().collect();
+        recent_ts.push_back(headers[0].timestamp);
+        if recent_ts.len() > window_size {
+            let overflow = recent_ts.len() - window_size;
+            drop(recent_ts.drain(0..overflow));
+        }
+
         // 1. Fast sequential check: Ensure chain linkage is intact AND validate targets
         for i in 1..headers.len() {
             let header = &headers[i];
             let prev = &headers[i - 1];
 
-            // CHECK LINKAGE FIRST!
             if header.prev_header_hash != prev.extension.final_hash {
                 bail!("Header chain linkage broken at index {}: prev_header_hash mismatch", i);
             }
@@ -56,21 +63,19 @@ impl Syncer {
                 bail!("Header chain linkage broken at index {}: prev_midstate mismatch", i);
             }
 
-            let combined: Vec<u64> = prior_timestamps.iter()
-                .chain(headers[..i].iter().map(|h| &h.timestamp))
-                .copied()
-                .collect();
-            let window_start = combined.len().saturating_sub(window_size);
-            let previous_timestamps = &combined[window_start..];
-
-            // THEN CHECK MTP
-            crate::core::state::validate_timestamp(header.timestamp, previous_timestamps, current_time)
+            // O(1) Sliding Window MTP Check
+            crate::core::state::validate_timestamp(header.timestamp, recent_ts.make_contiguous(), current_time)
                 .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index {}: {}", i, e))?;
             
             let expected_target = crate::core::state::calculate_target(prev.height + 1, prev.timestamp);
             if header.target != expected_target {
                 bail!("Invalid difficulty target at height {} (expected {}, got {})", 
                     header.height, hex::encode(expected_target), hex::encode(header.target));
+            }
+
+            recent_ts.push_back(header.timestamp);
+            if recent_ts.len() > window_size {
+                recent_ts.pop_front();
             }
         }
 

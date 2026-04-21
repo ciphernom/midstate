@@ -660,10 +660,8 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
 
         let mut addrs: Vec<String> = self.listen_addrs.iter()
             .filter_map(|a| {
-                // Only include webrtc-direct addresses
-                if !a.to_string().contains("webrtc-direct") { return None; }
-                
                 let a_str = a.to_string();
+                
                 if let Some(ip) = external_ip {
                     let replaced = replace_ip(a, ip);
                     let rep_str = replaced.to_string();
@@ -673,8 +671,11 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                         Some(replaced.with(p2p_suffix.clone()).to_string())
                     }
                 } else {
-                    // Fall back to non-localhost listen addrs
-                    if is_localhost(a) { return None; }
+                    // Fall back to local listen addrs. 
+                    // Do not gossip 0.0.0.0 or localhost as peers cannot dial them.
+                    if is_localhost(a) || a_str.contains("0.0.0.0") { 
+                        return None; 
+                    }
                     if a_str.contains("/p2p/") {
                         Some(a_str)
                     } else {

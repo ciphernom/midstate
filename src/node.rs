@@ -1640,11 +1640,15 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                     *handle.peer_addrs.write().await = self.network.peer_addrs();
                     
                     // --- WebRTC Load Shedding ---
-                    let mut webrtc_list = self.network.advertisable_addrs();
+                    // Filter for WebRTC addresses here at the UI level
+                    let mut webrtc_list: Vec<String> = self.network.advertisable_addrs()
+                        .into_iter()
+                        .filter(|a| a.contains("webrtc-direct") && a.contains("certhash"))
+                        .collect();
+                        
                     let community_addrs = self.network.pex_addrs(); 
                     
                     for addr in community_addrs {
-                        // CRITICAL: Must contain certhash or the browser multiaddr parser will crash!
                         if addr.contains("webrtc-direct") && addr.contains("certhash") && !webrtc_list.contains(&addr) {
                             webrtc_list.push(addr);
                         }
