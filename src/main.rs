@@ -2208,18 +2208,48 @@ pub async fn run_node(
     });
 
     // --- GRACEFUL SHUTDOWN TRAP ---
-    // We run the node directly inline. tokio::select! will poll both the 
-    // node and the Ctrl+C signal concurrently on the main thread!
+    // We run the node directly inline. tokio::select! polls both the node
+    // and the shutdown signals concurrently on the main thread.
+    //
+    // On Unix, `tokio::signal::ctrl_c()` only catches SIGINT — it does NOT
+    // catch SIGTERM, which is what `kill`, `systemctl stop`, `docker stop`,
+    // and Kubernetes pod termination all send by default. We install a
+    // separate SIGTERM listener so container and service managers get the
+    // same graceful-shutdown path as an interactive Ctrl+C.
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Failed to install SIGTERM handler: {}. Falling back to SIGINT only.", e);
+                    let _ = tokio::signal::ctrl_c().await;
+                    return "SIGINT";
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT (Ctrl+C)",
+                _ = sigterm.recv() => "SIGTERM",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            "Ctrl+C"
+        }
+    };
+
     tokio::select! {
         res = node.run(handle, cmd_rx) => {
             if let Err(e) = res {
                 tracing::error!("Node failed: {}", e);
             }
         }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Received Ctrl+C / SIGTERM. Shutting down gracefully...");
+        sig = shutdown => {
+            tracing::info!("Received {}. Shutting down gracefully...", sig);
             // Because the select! block exits here, `node` is dropped.
-            // Your `Drop` trait cancels mining, and Tokio gracefully flushes DB writes.
+            // Its Drop impl cancels mining, and Tokio flushes blocking DB writes.
         }
     }
     
