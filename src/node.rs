@@ -2,7 +2,7 @@ use crate::core::*;
 use crate::core::types::compute_address;
 use crate::core::types::{CoinbaseOutput, BatchHeader};
 use crate::core::state::{apply_batch, choose_best_state};
-use crate::core::extension::{mine_extension, create_extension};
+use crate::core::extension::create_extension;
 use crate::core::transaction::{apply_transaction, apply_transaction_no_sig_check, validate_transaction};
 use crate::mempool::Mempool;
 use crate::metrics::Metrics;
@@ -45,9 +45,9 @@ const BATCH_LOOKAHEAD: usize = 3;
 const MAX_PREFETCH_BUFFER: usize = 32;
 const MAX_PREFETCH_DISTANCE: u64 = 10_000;
 
-const SYNC_TIMEOUT_SECS: u64 = 120;
+const SYNC_TIMEOUT_SECS: u64 = 30;
 /// Extra grace period for the first chunk (relay handshake, NAT traversal, etc.)
-const SYNC_INITIAL_TIMEOUT_SECS: u64 = 180;
+const SYNC_INITIAL_TIMEOUT_SECS: u64 = 45;
 
 /// Max transactions accepted from a single peer per rate-limit window.
 const MAX_TX_PER_PEER_PER_WINDOW: u32 = 50;
@@ -1724,12 +1724,11 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                                 _ => "Verifying".into(),
                             };
                             if idle_secs > timeout {
-                                self.abort_sync_session(&format!(
-                                    "timed out after {}s in phase {} with peer {}",
-                                    idle_secs, phase_name, peer
-                                ));
+                                let msg = format!("timed out after {}s in phase {}", idle_secs, phase_name);
+                                self.abort_sync_session(&msg);
+                                // FIX: Punish the black-hole peer so we don't pick them again!
+                                self.ban_peer(peer, "sync stall timeout");
                             } else if idle_secs > timeout / 2 && idle_secs % 30 < 5 {
-                                // Log roughly every 30s in the danger zone, not every 5s
                                 tracing::warn!(
                                     "Sync stall warning: {}s idle in {} (timeout={}s, peer={})",
                                     idle_secs, phase_name, timeout, peer
@@ -1951,6 +1950,26 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                         NetworkEvent::RequestFailed(peer) => {
                             if self.sync_session.as_ref().map_or(false, |s| s.peer == peer) {
                                 self.abort_sync_session("Outbound request failed (timeout or disconnected)");
+                            } else {
+                                // If a secondary peer failed, we must clear their in-flight chunks so they can be re-requested
+                                if let Some(s) = &mut self.sync_session {
+                                    match &mut s.phase {
+                                        SyncPhase::Batches { in_flight, .. } |
+                                        SyncPhase::VerifyingBatches { in_flight, .. } |
+                                        SyncPhase::PipelinedRebuild { in_flight, .. } => {
+                                            let lost_chunks: Vec<u64> = in_flight.iter()
+                                                .filter(|(_, p)| **p == peer)
+                                                .map(|(h, _)| *h)
+                                                .collect();
+                                            
+                                            for h in lost_chunks {
+                                                in_flight.remove(&h);
+                                                tracing::warn!("Lookahead request to secondary peer {} failed. Re-queueing chunk at {}.", peer, h);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
                             }
                         }
                     }
@@ -2190,13 +2209,36 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                                             if batch_start > current_cursor && batch_start <= current_cursor + MAX_PREFETCH_DISTANCE && prefetch_buffer.len() < MAX_PREFETCH_BUFFER {
                                                 prefetch_buffer.insert(batch_start, batches);
                                             }
-                                            in_flight.remove(&batch_start);
+                                            
+                                            // Remove the entry based on what we requested, not what arrived.
+                                            // Find the closest requested height in flight that matches this arrival.
+                                            let mut to_remove = None;
+                                            for (&req_h, _) in in_flight.iter() {
+                                                if batch_start >= req_h && batch_start < req_h + MAX_GETBATCHES_COUNT {
+                                                    to_remove = Some(req_h);
+                                                    break;
+                                                }
+                                            }
+                                            if let Some(h) = to_remove {
+                                                in_flight.remove(&h);
+                                            }
                                         }
                                         SyncPhase::VerifyingBatches { prefetch_buffer, in_flight } => {
                                             if prefetch_buffer.len() < MAX_PREFETCH_BUFFER {
                                                 prefetch_buffer.insert(batch_start, batches);
                                             }
-                                            in_flight.remove(&batch_start);
+                                            
+                                            // Apply the same safe removal logic here
+                                            let mut to_remove = None;
+                                            for (&req_h, _) in in_flight.iter() {
+                                                if batch_start >= req_h && batch_start < req_h + MAX_GETBATCHES_COUNT {
+                                                    to_remove = Some(req_h);
+                                                    break;
+                                                }
+                                            }
+                                            if let Some(h) = to_remove {
+                                                in_flight.remove(&h);
+                                            }
                                         }
                                         _ => {}
                                     }
@@ -4508,11 +4550,15 @@ async fn try_apply_orphans(&mut self) {
         let tx = self.mined_batch_tx.clone();
         let hash_counter = Arc::clone(&self.hash_counter);
         
-        tokio::task::spawn_blocking(move || {
+        // The mining task is a pure CPU-bound infinite loop. 
+        // It should never be placed on Tokio's spawn_blocking pool, 
+        // which is designed for synchronous I/O (like DB reads). 
+        std::thread::spawn(move || {
             use crate::core::extension::MiningResult;
             // Mine against the secure header hash!
-            if let Some(mining_result) = mine_extension(mining_hash, target, pool_target, threads, cancel, hash_counter) {
-                // Do NOT mutate the timestamp here anymore.
+            if let Some(mining_result) = crate::core::extension::mine_extension(
+                mining_hash, target, pool_target, threads, cancel, hash_counter
+            ) {
                 match mining_result {
                     MiningResult::Block(extension) => {
                         template.extension = extension;
