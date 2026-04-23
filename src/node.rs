@@ -91,10 +91,14 @@ struct SyncSession {
 
 enum SyncPhase {
     /// Downloading headers. If fast-forwarding, it holds the snapshot to verify against.
+    /// `verifying` is true while a per-chunk PoW verification task is in flight;
+    /// the stall monitor ignores the session in that case so queueing delays in
+    /// the rayon pool don't trip a false timeout.
     Headers {
         accumulated: Vec<BatchHeader>,
         cursor: u64,
         snapshot: Option<Box<State>>,
+        verifying: bool,
     },
     VerifyingHeaders,
     /// Headers verified, now downloading batches from fork_height forward.
@@ -880,9 +884,10 @@ async fn process_state_rebuild(
             peer_height: session.peer_height,
             peer_depth: session.peer_depth,
             phase: SyncPhase::Headers {
-                accumulated: headers, // <--- KEEP previously downloaded headers
-                cursor: new_start,    // <--- Step cursor backward
+                accumulated: headers,
+                cursor: new_start,
                 snapshot: None,
+                verifying: false,
             },
             started_at: session.started_at,
             last_progress_at: std::time::Instant::now(),
@@ -1702,7 +1707,13 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                 
                 _ = sync_timeout_interval.tick() => {
                     if let Some(session) = &self.sync_session {
-                        if !matches!(session.phase, SyncPhase::VerifyingHeaders | SyncPhase::VerifyingBatches { .. } | SyncPhase::PipelinedRebuild { .. }) {
+                        if !matches!(
+                            session.phase,
+                            SyncPhase::VerifyingHeaders
+                            | SyncPhase::VerifyingBatches { .. }
+                            | SyncPhase::PipelinedRebuild { .. }
+                            | SyncPhase::Headers { verifying: true, .. }
+                        ) {
                             let idle_secs = session.last_progress_at.elapsed().as_secs();
                             let has_made_progress = session.last_progress_at != session.started_at;
                             let timeout = if has_made_progress { SYNC_TIMEOUT_SECS } else { SYNC_INITIAL_TIMEOUT_SECS };
@@ -2472,7 +2483,8 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
             phase: SyncPhase::Headers {
                 accumulated: recovered_headers,
                 cursor: start_height,
-                snapshot: None, 
+                snapshot: None,
+                verifying: false,
             },
             started_at: now,
             last_progress_at: now,
@@ -2700,12 +2712,18 @@ fn fire_batch_lookahead(&mut self) {
                 is_valid: chunk_valid,
             }).await;
         });
-        
+
+        // Mark the session as "verify in flight" so the stall monitor ignores
+        // the time spent queued in / running on the rayon pool. `last_progress_at`
+        // is deliberately NOT reset here — the stall monitor will skip the session
+        // while `verifying: true`, and `process_verified_headers_chunk` resets the
+        // timer when the next GetHeaders actually goes out to the peer.
         if let Some(s) = &mut self.sync_session {
-            s.last_progress_at = std::time::Instant::now();
+            if let SyncPhase::Headers { verifying, .. } = &mut s.phase {
+                *verifying = true;
+            }
         }
 
-        
         Ok(())
     }
 
@@ -2713,7 +2731,12 @@ fn fire_batch_lookahead(&mut self) {
         let (peer_height, cursor) = match &mut self.sync_session {
             Some(s) if s.peer == from => {
                 match &mut s.phase {
-                    SyncPhase::Headers { cursor, .. } => (s.peer_height, *cursor),
+                    SyncPhase::Headers { cursor, verifying, .. } => {
+                        // Clear the in-flight flag: the rayon task has returned.
+                        // From here on the stall monitor watches this session again.
+                        *verifying = false;
+                        (s.peer_height, *cursor)
+                    }
                     _ => return Ok(()),
                 }
             }
