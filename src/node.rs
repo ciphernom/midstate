@@ -3126,6 +3126,8 @@ fn fire_batch_lookahead(&mut self) {
 
                 let header = &headers[hdr_idx];
 
+                let mut expected_mining_hash = crate::core::types::compute_header_hash(header);
+
                 // Integrity: batch PoW must match the already-verified header
                 if batch.extension.final_hash != header.extension.final_hash {
                     // Legacy blocks mined before state_root was added have state_root = [0;32].
@@ -3138,25 +3140,26 @@ fn fire_batch_lookahead(&mut self) {
                         is_valid = false;
                         break;
                     }
-                    // Legacy block accepted — continue with the actual batch (state_root already zeroed on disk)
+                    // Legacy block accepted. 
+                    // `candidate_header` inside `apply_batch_skip_pow` will compute its hash using `batch.state_root` ([0; 32]).
+                    // So we update `expected_mining_hash` to match what it will naturally compute.
+                    let mut legacy_header = header.clone();
+                    legacy_header.state_root = [0u8; 32];
+                    expected_mining_hash = crate::core::types::compute_header_hash(&legacy_header);
                 }
 
-                // <--- FIX: Extract DB records and EXTEND the running memory oracle
-                    if let Ok(db_oracle) = storage.query_spent_addresses(batch) {
-                        wots_oracle.extend(db_oracle);
-                    }
-                
+                // Extract DB records and EXTEND the running memory oracle
+                if let Ok(db_oracle) = storage.query_spent_addresses(batch) {
+                    wots_oracle.extend(db_oracle);
+                }
 
-                // Apply to candidate state (do NOT save to disk yet — if sync
-                // aborts before the reorg is committed, premature writes would
-                // leave a Frankenstein chain on disk: some heights from the peer,
-                // some from our old chain.  Batches are persisted atomically in
-                // perform_reorg only after we decide to adopt.)
-                if let Err(e) = crate::core::state::apply_batch(
+                // Apply to candidate state with explicitly bound hash parameter
+                if let Err(e) = crate::core::state::apply_batch_skip_pow(
                     &mut candidate_state,
                     batch,
                     recent_ts.make_contiguous(),
                     &mut wots_oracle,
+                    expected_mining_hash, 
                 ) {
                     error_msg = format!("Failed to apply batch {}: {}", height, e);
                     is_valid = false;
