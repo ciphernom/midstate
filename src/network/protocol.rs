@@ -184,36 +184,33 @@ impl libp2p::request_response::Codec for MidstateCodec {
 }
 
 async fn read_message<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<Message> {
-    let mut len_bytes = [0u8; 4];
-    io.read_exact(&mut len_bytes).await?;
-    let len = u32::from_le_bytes(len_bytes) as usize;
-    if len > MAX_MSG_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
-    }
-    
-    // FIX: Prevent Slowloris OOM by starting with a small capacity (max 64KB)
-    // and only growing the vector as bytes actually arrive.
-    let initial_alloc = std::cmp::min(len, 65_536);
-    let mut buf = Vec::with_capacity(initial_alloc);
-    
-    // Take exactly `len` bytes from the stream to prevent over-reading
-    let mut handle = io.take(len as u64);
-    handle.read_to_end(&mut buf).await?;
-    
-    if buf.len() != len {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete message"));
-    }
-    
-// Catch panics from malicious bincode payloads (e.g., crafted Vec length
-    // fields that cause capacity overflow during allocation, before the
-    // byte-count limit can kick in).
-    match std::panic::catch_unwind(|| Message::deserialize_bin(&buf)) {
-        Ok(result) => result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "malformed message caused allocation panic (possible exploit attempt)",
-        )),
-    }
+    let read_future = async {
+        let mut len_bytes = [0u8; 4];
+        io.read_exact(&mut len_bytes).await?;
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        if len > MAX_MSG_SIZE {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
+        }
+        
+        let initial_alloc = std::cmp::min(len, 65_536);
+        let mut buf = Vec::with_capacity(initial_alloc);
+        let mut handle = io.take(len as u64);
+        handle.read_to_end(&mut buf).await?;
+        
+        if buf.len() != len {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete message"));
+        }
+        
+        match std::panic::catch_unwind(|| Message::deserialize_bin(&buf)) {
+            Ok(result) => result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+            Err(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "malformed message caused allocation panic")),
+        }
+    };
+
+    // Enforce a hard 30-second deadline to read the payload
+    tokio::time::timeout(std::time::Duration::from_secs(30), read_future)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Stream read timed out"))?
 }
 
 async fn write_message<T: AsyncWrite + Unpin + Send>(io: &mut T, msg: &Message) -> io::Result<()> {
