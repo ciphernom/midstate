@@ -150,6 +150,32 @@ pub fn apply_batch(
     previous_timestamps: &[u64],
     spent_oracle: &mut std::collections::HashMap<[u8; 32], [u8; 32]>, 
 ) -> Result<()> {
+    apply_batch_internal(state, batch, previous_timestamps, spent_oracle, None)
+}
+
+/// # Safety
+///
+/// Caller MUST provide the exact `verified_mining_hash` that was successfully 
+/// checked against `verify_extension` (usually via Rayon). This function guarantees 
+/// that the applied transactions mathematically reduce to that pre-verified hash.
+/// Calling this with an arbitrary hash allows forged blocks to corrupt the state.
+pub fn apply_batch_skip_pow(
+    state: &mut State,
+    batch: &Batch,
+    previous_timestamps: &[u64],
+    spent_oracle: &mut std::collections::HashMap<[u8; 32], [u8; 32]>, 
+    verified_mining_hash: [u8; 32],
+) -> Result<()> {
+    apply_batch_internal(state, batch, previous_timestamps, spent_oracle, Some(verified_mining_hash))
+}
+
+fn apply_batch_internal(
+    state: &mut State,
+    batch: &Batch,
+    previous_timestamps: &[u64],
+    spent_oracle: &mut std::collections::HashMap<[u8; 32], [u8; 32]>,
+    preverified_hash: Option<[u8; 32]>,
+) -> Result<()> {
     // 1. Check parent linkage
     if batch.prev_midstate != state.midstate {
         bail!("Block parent mismatch: expected {}, got {}",
@@ -322,7 +348,24 @@ pub fn apply_batch(
     };
     
     let mining_target = crate::core::types::compute_header_hash(&candidate_header);
-    verify_extension(mining_target, &batch.extension, &batch.target)?;
+
+    match preverified_hash {
+        None => {
+            // Standard path: verify the 1,000,000 hashes right now
+            verify_extension(mining_target, &batch.extension, &batch.target)?;
+        }
+        Some(expected_hash) => {
+            // Fast path: Explicit invariant check. Guarantee the applied 
+            // transactions actually form the header that Rayon verified.
+            if mining_target != expected_hash {
+                bail!(
+                    "CRITICAL: Batch integrity failure! Computed header hash {} does not match pre-verified PoW hash {}", 
+                    hex::encode(mining_target), 
+                    hex::encode(expected_hash)
+                );
+            }
+        }
+    }
 
     // 6. Add coinbase coins to state
     for coin_id in &coinbase_ids {
