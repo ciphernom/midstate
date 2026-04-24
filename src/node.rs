@@ -4759,53 +4759,84 @@ async fn try_apply_orphans(&mut self) {
     
 }
 
+/// Helper to replay a sequence of blocks from disk into a state object.
+///
+/// # Preconditions
+/// - `start` must exactly match `state.height`.
+fn replay_blocks_into_state(
+    storage: &crate::storage::Storage,
+    state: &mut State,
+    start: u64,
+    end: u64,
+    log_tag: &str,
+) -> Result<()> {
+    debug_assert_eq!(state.height, start, "replay_blocks_into_state: state.height must equal start");
+    let window_size = crate::core::DIFFICULTY_LOOKBACK as usize;
+    let mut recent_headers = std::collections::VecDeque::new();
+    
+    // Pre-populate recent_headers from disk for MTP validation
+    let lookback_start = start.saturating_sub(window_size as u64);
+    for h in lookback_start..start {
+        if let Ok(Some(batch)) = storage.load_batch(h) {
+            recent_headers.push_back(batch.timestamp);
+        }
+    }
+
+    let mut wots_oracle = std::collections::HashMap::new();
+
+    for h in start..end {
+        if h % 500 == 0 && h > 0 {
+            tracing::info!("[{}] Rebuilding state: {}/{}", log_tag, h, end);
+        }
+        if let Some(batch) = storage.load_batch(h)? {
+            wots_oracle.clear(); 
+            let db_oracle = storage.query_spent_addresses(&batch).unwrap_or_default();
+            wots_oracle.extend(db_oracle);
+            
+            let mut header = batch.header();
+            
+            // Batch doesn't store height (header() hardcodes 0). We must assign it.
+            debug_assert_eq!(
+                header.height, 0, 
+                "If Batch ever starts storing height, this overwrite needs to become a consistency check!"
+            );
+            header.height = h;
+
+            // Trust the batch's stored linkage (prev_header_hash, prev_midstate).
+            let expected_mining_hash = crate::core::types::compute_header_hash(&header);
+
+            crate::core::state::apply_batch_skip_pow(
+                state, 
+                &batch, 
+                recent_headers.make_contiguous(), 
+                &mut wots_oracle, 
+                expected_mining_hash
+            )?;
+            
+            state.target = crate::core::state::adjust_difficulty(state);
+
+            recent_headers.push_back(batch.timestamp);
+            if recent_headers.len() > window_size {
+                recent_headers.pop_front();
+            }
+
+            if h > 0 && h % 500 == 0 {
+                let _ = storage.save_state_snapshot(h, state);
+            }
+        } else {
+            anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
+        }
+    }
+    Ok(())
+}
+
 /// Heavy background task to safely rebuild state from disk.
 async fn rebuild_state_from_disk(storage: crate::storage::Storage, target_height: u64, cache_start: Option<(u64, State)>) -> Result<State> {
-    if let Some((start_h, start_state)) = cache_start {
-        tokio::task::spawn_blocking(move || -> Result<State> {
-            let mut state = start_state;
-            let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
-            
-            // Pre-populate recent_headers from disk
-            let window_size = crate::core::DIFFICULTY_LOOKBACK as usize;
-            let lookback_start = start_h.saturating_sub(window_size as u64);
-            for h in lookback_start..start_h {
-                if let Ok(Some(batch)) = storage.load_batch(h) {
-                    recent_headers.push_back(batch.timestamp);
-                }
-            }
-
-            let mut wots_oracle = std::collections::HashMap::new();
-            
-            for h in start_h..target_height {
-                if h % 500 == 0 && h > 0 {
-                    tracing::info!("[REBUILD] Rebuilding state: {}/{}", h, target_height);
-                }
-                if let Some(batch) = storage.load_batch(h)? {
-                    wots_oracle.clear(); 
-                    let db_oracle = storage.query_spent_addresses(&batch).unwrap_or_default();
-                    wots_oracle.extend(db_oracle);
-                    
-                    crate::core::state::apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &mut wots_oracle)?;
-                    state.target = crate::core::state::adjust_difficulty(&state);
-
-                    // Push timestamp AFTER applying the batch
-                    recent_headers.push_back(batch.timestamp);
-                    if recent_headers.len() > window_size {
-                        recent_headers.pop_front();
-                    }
-
-                    if h > 0 && h % 500 == 0 {
-                        let _ = storage.save_state_snapshot(h, &state);
-                    }
-                } else {
-                    anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
-                }
-            }
-            Ok(state)
-        }).await.map_err(|e| anyhow::anyhow!("State rebuild task panicked: {}", e))?
-    } else {
-        tokio::task::spawn_blocking(move || -> Result<State> {
+    tokio::task::spawn_blocking(move || -> Result<State> {
+        let (mut state, replay_from, log_tag) = if let Some((start_h, start_state)) = cache_start {
+            (start_state, start_h, "REBUILD")
+        } else {
+            // Find best snapshot to replay from
             let mut snap_height = (target_height / 100) * 100;
             let mut best_snap = None;
 
@@ -4822,51 +4853,23 @@ async fn rebuild_state_from_disk(storage: crate::storage::Storage, target_height
                 }
             }
 
-            let (mut state, replay_from) = best_snap.unwrap_or_else(|| {
+            let (s, h) = best_snap.unwrap_or_else(|| {
                 tracing::debug!("rebuild_state_from_disk: no snapshots found, replaying from genesis");
                 (State::genesis().0, 0)
             });
+            (s, h, "REPLAY")
+        };
 
-            let mut recent_headers: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
-            
-            // Pre-populate recent_headers from disk
-            let window_size = crate::core::DIFFICULTY_LOOKBACK as usize;
-            let lookback_start = replay_from.saturating_sub(window_size as u64);
-            for h in lookback_start..replay_from {
-                if let Ok(Some(batch)) = storage.load_batch(h) {
-                    recent_headers.push_back(batch.timestamp);
-                }
-            }
+        replay_blocks_into_state(
+            &storage,
+            &mut state,
+            replay_from,
+            target_height,
+            log_tag
+        )?;
 
-            let mut wots_oracle = std::collections::HashMap::new(); 
-            for h in replay_from..target_height {
-                if h % 500 == 0 && h > 0 {
-                    tracing::info!("[REPLAY] Rebuilding state: {}/{}", h, target_height);
-                }
-                if let Some(batch) = storage.load_batch(h)? {
-                    wots_oracle.clear(); 
-                    let db_oracle = storage.query_spent_addresses(&batch).unwrap_or_default();
-                    wots_oracle.extend(db_oracle);
-                    
-                    crate::core::state::apply_batch(&mut state, &batch, recent_headers.make_contiguous(), &mut wots_oracle)?;
-                    state.target = crate::core::state::adjust_difficulty(&state);
-                    
-                    // Push timestamp AFTER applying the batch
-                    recent_headers.push_back(batch.timestamp);
-                    if recent_headers.len() > window_size {
-                        recent_headers.pop_front();
-                    }
-
-                    if h > 0 && h % 500 == 0 {
-                        let _ = storage.save_state_snapshot(h, &state);
-                    }
-                } else {
-                    anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
-                }
-            }
-            Ok(state)
-        }).await.map_err(|e| anyhow::anyhow!("State rebuild task panicked: {}", e))?
-    }
+        Ok(state)
+    }).await.map_err(|e| anyhow::anyhow!("State rebuild task panicked: {}", e))?
 }
 
 // ── Keypair persistence ─────────────────────────────────────────────────────
