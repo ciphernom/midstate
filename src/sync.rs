@@ -115,17 +115,32 @@ impl Syncer {
         headers_start_height: u64, 
         our_height: u64,
     ) -> Result<u64> {
-        // If the peer's headers start way ahead of our local tip, 
-        // force the fork point to the start of their headers to trigger the deep fork guard.
         if our_height <= headers_start_height {
             return Ok(headers_start_height);
         }
         let compare_end = our_height.min(headers_start_height + peer_headers.len() as u64);
 
+        // Track expected parent to detect internal DB corruption
+        let mut expected_parent = None;
+        if headers_start_height > 0 {
+            if let Ok(Some(prev)) = self.storage.load_batch(headers_start_height - 1) {
+                expected_parent = Some(prev.extension.final_hash);
+            }
+        }
+
         for h in headers_start_height..compare_end {
             let idx = (h - headers_start_height) as usize;
             match self.storage.load_batch(h)? {
                 Some(our_batch) => {
+                    // FIX: Detect Frankenstein local database
+                    if let Some(parent) = expected_parent {
+                        if our_batch.prev_header_hash != parent {
+                            tracing::warn!("Local database corruption (Frankenstein chain) detected at height {}. Forcing fork point here.", h);
+                            return Ok(h);
+                        }
+                    }
+                    expected_parent = Some(our_batch.extension.final_hash);
+
                     let peer_hdr = &peer_headers[idx];
                     if our_batch.extension.final_hash != peer_hdr.extension.final_hash {
                         tracing::info!("Fork detected at height {}", h);

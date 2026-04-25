@@ -3774,27 +3774,40 @@ fn fire_batch_lookahead(&mut self) {
 
         while snap_height > 0 {
             if let Ok(Some(snap)) = self.storage.load_state_snapshot(snap_height) {
-                tracing::info!("Self-healing: Rolling back state to snapshot at {}", snap_height);
-                self.state = snap;
-                self.state.target = adjust_difficulty(&self.state);
-                self.cache_current_state();
-                let _ = self.storage.save_state(&self.state);
-                let _ = self.storage.truncate_chain(snap_height);
                 
-                self.chain_history.clear();
-                self.recent_headers.clear();
-                self.last_sync_cursor = Some(snap_height);
-                
-                // Repopulate recent headers
-                let window = crate::core::DIFFICULTY_LOOKBACK as u64;
-                let start = self.state.height.saturating_sub(window);
-                for h in start..self.state.height {
-                    if let Ok(Some(batch)) = self.storage.load_batch(h) {
-                        self.recent_headers.push_back(batch.timestamp);
+                // Verify snapshot matches disk before trusting it
+                let mut is_valid = true;
+                if let Ok(Some(prev)) = self.storage.load_batch(snap_height - 1) {
+                    if snap.header_hash != prev.extension.final_hash {
+                        is_valid = false;
                     }
+                } else {
+                    is_valid = false;
                 }
-                
-                return;
+
+                if is_valid {
+                    tracing::info!("Self-healing: Rolling back state to valid snapshot at {}", snap_height);
+                    self.state = snap;
+                    self.state.target = adjust_difficulty(&self.state);
+                    self.cache_current_state();
+                    let _ = self.storage.save_state(&self.state);
+                    let _ = self.storage.truncate_chain(snap_height);
+                    
+                    self.chain_history.clear();
+                    self.recent_headers.clear();
+                    self.last_sync_cursor = Some(snap_height);
+                    
+                    // Repopulate recent headers
+                    let window = crate::core::DIFFICULTY_LOOKBACK as u64;
+                    let start = self.state.height.saturating_sub(window);
+                    for h in start..self.state.height {
+                        if let Ok(Some(batch)) = self.storage.load_batch(h) {
+                            self.recent_headers.push_back(batch.timestamp);
+                        }
+                    }
+                    
+                    return;
+                }
             }
             snap_height = snap_height.saturating_sub(100);
         }
@@ -4820,9 +4833,7 @@ fn replay_blocks_into_state(
                 recent_headers.pop_front();
             }
 
-            if h > 0 && h % 500 == 0 {
-                let _ = storage.save_state_snapshot(h, state);
-            }
+
         } else {
             anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
         }
@@ -4843,14 +4854,26 @@ async fn rebuild_state_from_disk(storage: crate::storage::Storage, target_height
             while snap_height > 0 {
                 match storage.load_state_snapshot(snap_height) {
                     Ok(Some(snap)) => {
-                        tracing::debug!("rebuild_state_from_disk: using snapshot at {} (target {})", snap_height, target_height);
-                        best_snap = Some((snap, snap_height));
-                        break;
+                        // Verify snapshot integrity against the batches on disk
+                        let mut is_valid = true;
+                        if let Ok(Some(prev)) = storage.load_batch(snap_height - 1) {
+                            if snap.header_hash != prev.extension.final_hash {
+                                tracing::warn!("Discarding snapshot at {} (does not match disk batches)", snap_height);
+                                is_valid = false;
+                            }
+                        } else {
+                            is_valid = false;
+                        }
+
+                        if is_valid {
+                            tracing::debug!("rebuild_state_from_disk: using snapshot at {} (target {})", snap_height, target_height);
+                            best_snap = Some((snap, snap_height));
+                            break;
+                        }
                     }
-                    _ => {
-                        snap_height = snap_height.saturating_sub(100);
-                    }
+                    _ => {}
                 }
+                snap_height = snap_height.saturating_sub(100);
             }
 
             let (s, h) = best_snap.unwrap_or_else(|| {
