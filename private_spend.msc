@@ -1,5 +1,0 @@
-VERIFY_STARK
-PUSH_HEX <alice_owner_pk_hex>
-CHECKSIGVERIFY
-PUSH_INT 1
-

@@ -194,7 +194,14 @@ let fee = {
         in_sum.saturating_sub(out_sum)
     };
 
-    let tx = Transaction::Reveal { inputs, witnesses, outputs, salt };
+    let tx = if req.is_consolidate {
+        if witnesses.len() != 1 {
+            return Err(ErrorResponse { error: "Consolidate transactions must have exactly 1 signature".into() });
+        }
+        Transaction::Consolidate { inputs, witness: witnesses.into_iter().next().unwrap(), outputs, salt }
+    } else {
+        Transaction::Reveal { inputs, witnesses, outputs, salt }
+    };
 
     node.send_transaction(tx)
         .await
@@ -247,6 +254,12 @@ pub async fn get_mempool(State(node): State<AppState>) -> Json<GetMempoolRespons
                 fee: None,
             },
             Transaction::Reveal { inputs, outputs, .. } => TransactionInfo {
+                commitment: None,
+                input_coins: Some(inputs.iter().map(|i| hex::encode(i.coin_id())).collect()),
+                output_coins: Some(outputs.iter().filter_map(|o| o.coin_id().map(hex::encode)).collect()),                
+                fee: Some(tx.fee()),
+            },
+            Transaction::Consolidate { inputs, outputs, .. } => TransactionInfo {
                 commitment: None,
                 input_coins: Some(inputs.iter().map(|i| hex::encode(i.coin_id())).collect()),
                 output_coins: Some(outputs.iter().filter_map(|o| o.coin_id().map(hex::encode)).collect()),                
@@ -498,7 +511,7 @@ pub async fn get_filters(
                 crate::core::Transaction::Commit { commitment, .. } => {
                     items.insert(*commitment);
                 }
-                crate::core::Transaction::Reveal { inputs, outputs, .. } => {
+                crate::core::Transaction::Reveal { inputs, outputs, .. } | crate::core::Transaction::Consolidate { inputs, outputs, .. } => {
                     for input in inputs {
                         items.insert(input.coin_id());
                         items.insert(input.predicate.address());
@@ -569,9 +582,12 @@ pub async fn get_batch(
         for tx in txs {
             if let Some(reveal) = tx.get_mut("Reveal") {
                 if let Some(witnesses) = reveal.get_mut("witnesses") {
-                    // Replace with just the count so the UI knows how many inputs
                     let count = witnesses.as_array().map(|a| a.len()).unwrap_or(0);
                     *witnesses = serde_json::json!(format!("{} witness(es) stripped", count));
+                }
+            } else if let Some(consolidate) = tx.get_mut("Consolidate") {
+                if let Some(witness) = consolidate.get_mut("witness") {
+                    *witness = serde_json::json!("1 witness stripped");
                 }
             }
         }
@@ -664,7 +680,7 @@ pub async fn search(
                         });
                     }
                 }
-                Transaction::Reveal { inputs, outputs, salt, .. } => {
+               Transaction::Reveal { inputs, outputs, salt, .. } | Transaction::Consolidate { inputs, outputs, salt, .. } => {
                     if *salt == query {
                         results.push(SearchResult {
                             result_type: "reveal_salt".into(),
@@ -1058,7 +1074,7 @@ pub async fn get_tx_by_input(
     // 1. Check Mempool (Fast Path - O(N) over a small array)
     let (_, txs) = node.get_mempool_info().await;
     for tx in txs {
-        if let Transaction::Reveal { inputs, .. } = &tx {
+        if let Transaction::Reveal { inputs, .. } | Transaction::Consolidate { inputs, .. } = &tx {
             if inputs.iter().any(|i| i.coin_id() == target_coin) {
                 // Return the raw, unstripped transaction containing the witnesses
                 return Ok(Json(tx));
@@ -1075,7 +1091,7 @@ pub async fn get_tx_by_input(
     for h in (start..current_height).rev() {
         if let Ok(Some(batch)) = store.load(h) {
             for tx in batch.transactions {
-                if let Transaction::Reveal { inputs, .. } = &tx {
+                if let Transaction::Reveal { inputs, .. } | Transaction::Consolidate { inputs, .. } = &tx {
                     if inputs.iter().any(|i| i.coin_id() == target_coin) {
                         // Return the raw, unstripped transaction containing the witnesses
                         return Ok(Json(tx));
@@ -1162,7 +1178,14 @@ pub fn parse_reveal_json(value: serde_json::Value) -> Result<Transaction, String
     let salt_bytes = hex::decode(&req.salt).map_err(|e| format!("Invalid salt hex: {}", e))?;
     let salt = <[u8; 32]>::try_from(salt_bytes).map_err(|_| "salt must be 32 bytes".to_string())?;
 
-    Ok(Transaction::Reveal { inputs, witnesses, outputs, salt })
+    if req.is_consolidate {
+        if witnesses.len() != 1 {
+            return Err("Consolidate transactions must have exactly 1 signature".into());
+        }
+        Ok(Transaction::Consolidate { inputs, witness: witnesses.into_iter().next().unwrap(), outputs, salt })
+    } else {
+        Ok(Transaction::Reveal { inputs, witnesses, outputs, salt })
+    }
 }
 
 /// Build a block template for an external miner (web wallet).

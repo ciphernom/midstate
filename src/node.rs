@@ -29,7 +29,6 @@ const SNAPSHOT_INTERVAL: u64 = 100;
 
 
 use std::path::PathBuf;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -210,7 +209,6 @@ pub struct Node {
     /// Rate-limit counter for GetHeaders (cheap normally, expensive on fallback path).
     peer_header_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     hash_counter: Arc<AtomicU64>,
-    banned_subnets: HashMap<IpAddr, std::time::Instant>,
 
     
     /// Ring buffer of recent states for instant reorg rollback.
@@ -353,32 +351,57 @@ impl NodeHandle {
         let mut transactions = Vec::new();
         let mut current_inputs = 0;
         let mut current_outputs = 0;
+        let mut consolidated_addresses = std::collections::HashSet::new();
 
-        for tx in &mempool_txs {
+        // Enforce the Canonical Block Ordering rules by selecting from split mempool structure
+        let mut pending_commits = Vec::new();
+        let mut pending_reveals = Vec::new();
+        
+        for tx in mempool_txs {
             match tx {
-                Transaction::Commit { .. } => {
-                    if transactions.iter().filter(|t| matches!(t, Transaction::Commit { .. })).count()
-                        >= MAX_BATCH_COMMITS { continue; }
-                    match apply_transaction(&mut candidate, tx) {
-                        Ok(_) => { total_fees += tx.fee(); transactions.push(tx.clone()); }
-                        Err(_) => {}
-                    }
-                }
+                Transaction::Commit { .. } => pending_commits.push(tx),
+                Transaction::Reveal { .. } | Transaction::Consolidate { .. } => pending_reveals.push(tx),
+            }
+        }
+
+        for tx in pending_commits.into_iter().take(crate::core::MAX_BATCH_COMMITS) {
+            if let Ok(_) = apply_transaction(&mut candidate, &tx) {
+                total_fees += tx.fee(); 
+                transactions.push(tx);
+            }
+        }
+
+        for tx in pending_reveals.into_iter().take(crate::core::MAX_BATCH_REVEALS) {
+
+            match &tx {
                 Transaction::Reveal { inputs, outputs, .. } => {
-                    if transactions.iter().filter(|t| matches!(t, Transaction::Reveal { .. })).count()
-                        >= MAX_BATCH_REVEALS { continue; }
-                    if current_inputs + inputs.len() > MAX_BATCH_INPUTS { continue; }
-                    if current_outputs + outputs.len() > MAX_BATCH_OUTPUTS { continue; }
-                    match apply_transaction(&mut candidate, tx) {
-                        Ok(_) => {
-                            current_inputs += inputs.len();
-                            current_outputs += outputs.len();
-                            total_fees += tx.fee();
-                            transactions.push(tx.clone());
-                        }
-                        Err(_) => {}
-                    }
+                    if current_inputs + inputs.len() > crate::core::MAX_BATCH_INPUTS { continue; }
+                    if current_outputs + outputs.len() > crate::core::MAX_BATCH_OUTPUTS { continue; }
                 }
+                Transaction::Consolidate { inputs, outputs, .. } => {
+                    let addr = inputs[0].predicate.address();
+                    if consolidated_addresses.contains(&addr) { continue; }
+                    if current_inputs + 1 > crate::core::MAX_BATCH_INPUTS { continue; }
+                    if current_outputs + outputs.len() > crate::core::MAX_BATCH_OUTPUTS { continue; }
+                }
+                _ => continue,
+            }
+            
+            if let Ok(_) = apply_transaction(&mut candidate, &tx) {
+                match &tx {
+                    Transaction::Reveal { inputs, outputs, .. } => {
+                        current_inputs += inputs.len();
+                        current_outputs += outputs.len();
+                    }
+                    Transaction::Consolidate { inputs, outputs, .. } => {
+                        consolidated_addresses.insert(inputs[0].predicate.address());
+                        current_inputs += 1;
+                        current_outputs += outputs.len();
+                    }
+                    _ => {}
+                }
+                total_fees += tx.fee();
+                transactions.push(tx);
             }
         }
 
@@ -483,7 +506,7 @@ impl NodeHandle {
         for height in start..end {
             if let Some(batch) = store.load(height)? {
                 for tx in &batch.transactions {
-                    if let Transaction::Reveal { outputs, .. } = tx {
+                    if let Transaction::Reveal { outputs, .. } | Transaction::Consolidate { outputs, .. } = tx {
                         for out in outputs {
                             if addresses.contains(&out.address()) {
                                 if let Some(c_id) = out.coin_id() {
@@ -650,11 +673,12 @@ pub fn scan_mss_index(&self, master_pk: &[u8; 32], start: u64, end: u64) -> Resu
 pub fn scan_txs_for_mss_index(txs: &[Transaction], master_pk: &[u8; 32]) -> u64 {
     let mut max_idx: u64 = 0;
     for tx in txs {
-        if let Transaction::Reveal { inputs, witnesses, .. } = tx {
-            for (input, witness) in inputs.iter().zip(witnesses.iter()) {
-                if let Some(owner_pk) = input.predicate.owner_pk() {
-                    if &owner_pk == master_pk {
-                        let Witness::ScriptInputs(wit_inputs) = witness; 
+        match tx {
+            Transaction::Reveal { inputs, witnesses, .. } => {
+                for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                    if let Some(owner_pk) = input.predicate.owner_pk() {
+                        if &owner_pk == master_pk {
+                            let Witness::ScriptInputs(wit_inputs) = witness; 
                             if let Some(sig_bytes) = wit_inputs.first() {
                                 if sig_bytes.len() > wots::SIG_SIZE {
                                     if let Ok(mss_sig) = mss::MssSignature::from_bytes(sig_bytes) {
@@ -662,9 +686,26 @@ pub fn scan_txs_for_mss_index(txs: &[Transaction], master_pk: &[u8; 32]) -> u64 
                                     }
                                 }
                             }                        
+                        }
                     }
                 }
             }
+            Transaction::Consolidate { inputs, witness, .. } => {
+                if inputs.is_empty() { continue; }
+                if let Some(owner_pk) = inputs[0].predicate.owner_pk() {
+                    if &owner_pk == master_pk {
+                        let Witness::ScriptInputs(wit_inputs) = witness; 
+                        if let Some(sig_bytes) = wit_inputs.first() {
+                            if sig_bytes.len() > wots::SIG_SIZE {
+                                if let Ok(mss_sig) = mss::MssSignature::from_bytes(sig_bytes) {
+                                    max_idx = max_idx.max(mss_sig.leaf_index.saturating_add(1));
+                                }
+                            }
+                        }                        
+                    }
+                }
+            }
+            _ => {}
         }
     }
     max_idx
@@ -845,7 +886,6 @@ pub async fn new(
             peer_batch_req_counts: HashMap::new(),
             peer_header_req_counts: HashMap::new(),
             hash_counter: Arc::new(AtomicU64::new(0)),
-            banned_subnets: HashMap::new(),
             state_cache: VecDeque::with_capacity(STATE_CACHE_SIZE + 1),
             bootstrap_peers: bootstrap_strings, // <-- Uses the variable we created above
         })
@@ -1166,8 +1206,14 @@ async fn handle_light_request(
                         Ok(Some(mut batch)) => {
                             // Strip witness data to prevent WebRTC SCTP congestion and save bandwidth
                             for tx in &mut batch.transactions {
-                                if let crate::core::Transaction::Reveal { witnesses, .. } = tx {
-                                    *witnesses = vec![];
+                                match tx {
+                                    crate::core::Transaction::Reveal { witnesses, .. } => {
+                                        *witnesses = vec![];
+                                    }
+                                    crate::core::Transaction::Consolidate { witness, .. } => {
+                                        *witness = crate::core::types::Witness::ScriptInputs(vec![]);
+                                    }
+                                    _ => {}
                                 }
                             }
                             
@@ -1209,7 +1255,7 @@ async fn handle_light_request(
                                         crate::core::Transaction::Commit { commitment, .. } => {
                                             items.insert(*commitment);
                                         }
-                                        crate::core::Transaction::Reveal { inputs, outputs, .. } => {
+                                        crate::core::Transaction::Reveal { inputs, outputs, .. } | crate::core::Transaction::Consolidate { inputs, outputs, .. } => {
                                             for input in inputs {
                                                 items.insert(input.coin_id());
                                                 items.insert(input.predicate.address());
@@ -1290,7 +1336,7 @@ async fn handle_light_request(
                                 transactions.push(tx.clone());
                             }
                         }
-                        Transaction::Reveal { inputs, outputs, .. } => {
+                        Transaction::Reveal { inputs, outputs, .. } | Transaction::Consolidate { inputs, outputs, .. } => {
                             if transactions.iter().filter(|t| matches!(t, Transaction::Reveal { .. })).count()
                                 >= MAX_BATCH_REVEALS { continue; }
                             if current_inputs + inputs.len() > MAX_BATCH_INPUTS { continue; }
@@ -1880,14 +1926,14 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
 
                             // --- BANNED SUBNET DEFENSE ---
                             if let Some(subnet) = self.network.peer_subnet(&peer) {
-                                if let Some(&ban_time) = self.banned_subnets.get(&subnet) {
+                                if let Some(&ban_time) = self.network.banned_subnets.get(&subnet) {
                                     // Bans expire after 1 hour
                                     if ban_time.elapsed().as_secs() < 3600 {
                                         tracing::debug!("Rejected connection from banned subnet: {}", subnet);
                                         self.network.disconnect_peer(peer);
                                         continue;
                                     } else {
-                                        self.banned_subnets.remove(&subnet);
+                                        self.network.banned_subnets.remove(&subnet);
                                     }
                                 }
                             }
@@ -2671,7 +2717,7 @@ fn fire_batch_lookahead(&mut self) {
 
         // 2. Ban the subnet so they can't spam reconnects
         if let Some(subnet) = self.network.peer_subnet(&peer) {
-            self.banned_subnets.insert(subnet, std::time::Instant::now());
+            self.network.banned_subnets.insert(subnet, std::time::Instant::now());
             tracing::debug!("Banned subnet {} due to malicious peer", subnet);
         }
 
@@ -3230,7 +3276,7 @@ fn fire_batch_lookahead(&mut self) {
 
         // EVENT LOOP DEFENSE: Validate cryptography on a background thread.
         // We clone the state (O(1) cost due to immutable data structures) and the tx,
-        // so the heavy STARK/WOTS math doesn't stall the Tokio networking reactor.
+        // so the heavy WOTS math doesn't stall the Tokio networking reactor.
         let state_clone = self.state.clone();
         let tx_clone = tx.clone();
         let is_valid = tokio::task::spawn_blocking(move || {
@@ -3677,7 +3723,7 @@ fn fire_batch_lookahead(&mut self) {
                     for tx in &last_batch_clone.transactions {
                         match tx {
                             crate::core::Transaction::Commit { commitment, .. } => { items.insert(*commitment); }
-                            crate::core::Transaction::Reveal { inputs, outputs, .. } => {
+                            crate::core::Transaction::Reveal { inputs, outputs, .. } | crate::core::Transaction::Consolidate { inputs, outputs, .. } => {
                                 for input in inputs {
                                     items.insert(input.coin_id());
                                     items.insert(input.predicate.address());
@@ -3819,7 +3865,7 @@ fn fire_batch_lookahead(&mut self) {
     async fn handle_mix_transaction(&mut self, mix_id: [u8; 32], reveal_tx: Transaction) -> Result<()> {
         // Extract the commitment from the reveal tx
         let (input_ids, output_ids, salt) = match &reveal_tx {
-            Transaction::Reveal { inputs, outputs, salt, .. } => {
+            Transaction::Reveal { inputs, outputs, salt, .. } | Transaction::Consolidate { inputs, outputs, salt, .. } => {
                 let ins: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
                 let outs: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
                 (ins, outs, *salt)
@@ -4037,7 +4083,7 @@ fn fire_batch_lookahead(&mut self) {
                     for tx in &batch.transactions {
                         match tx {
                             Transaction::Commit { commitment, .. } => mined_commits.push(*commitment),
-                            Transaction::Reveal { inputs, .. } => {
+                            Transaction::Reveal { inputs, .. } | Transaction::Consolidate { inputs, .. } => {
                                 for input in inputs { spent_inputs.push(input.coin_id()); }
                             }
                         }
@@ -4217,11 +4263,11 @@ fn fire_batch_lookahead(&mut self) {
             // --- Hardware-Safe Background Push Generation ---
             // Only push the VERY LAST block applied in this chunk to avoid spamming the clients
             if let Some(batch_clone) = last_applied_batch {
-                let state_clone = self.state.clone();
-                let cmd_tx = self.cmd_tx.as_ref().unwrap().clone();
                 let has_light_peers = self.network.has_light_peers();
 
                 if has_light_peers {
+                    let state_clone = self.state.clone();
+                    let cmd_tx = self.cmd_tx.as_ref().unwrap().clone();
                     tokio::task::spawn_blocking(move || {
                         let filter = crate::core::filter::CompactFilter::build(&batch_clone);
                         
@@ -4229,7 +4275,7 @@ fn fire_batch_lookahead(&mut self) {
                         for tx in &batch_clone.transactions {
                             match tx {
                                 crate::core::Transaction::Commit { commitment, .. } => { items.insert(*commitment); }
-                                crate::core::Transaction::Reveal { inputs, outputs, .. } => {
+                                crate::core::Transaction::Reveal { inputs, outputs, .. } | crate::core::Transaction::Consolidate { inputs, outputs, .. } => {
                                     for input in inputs {
                                         items.insert(input.coin_id());
                                         items.insert(input.predicate.address());
@@ -4304,7 +4350,7 @@ async fn try_apply_orphans(&mut self) {
                     for tx in &batch.transactions {
                         match tx {
                             Transaction::Commit { commitment, .. } => mined_commits.push(*commitment),
-                            Transaction::Reveal { inputs, .. } => {
+                            Transaction::Reveal { inputs, .. } | Transaction::Consolidate { inputs, .. } => {
                                 for input in inputs { spent_inputs.push(input.coin_id()); }
                             }
                         }
@@ -4481,40 +4527,48 @@ async fn try_apply_orphans(&mut self) {
         let mut current_inputs = 0;
         let mut current_outputs = 0;
 
+        let mut consolidated_addresses = std::collections::HashSet::new();
+
         for arc_tx in pending_commits.into_iter().take(max_commits) {
             let tx = Arc::unwrap_or_clone(arc_tx);
-            match apply_transaction(&mut candidate_state, &tx) {
-                Ok(_) => {
-                    total_fees = total_fees.saturating_add(tx.fee());
-                    transactions.push(tx);
-                }
-                Err(e) => tracing::debug!("Skipping stale commit during mining: {}", e),
+            if let Ok(_) = apply_transaction(&mut candidate_state, &tx) {
+                total_fees = total_fees.saturating_add(tx.fee());
+                transactions.push(tx);
             }
         }
 
         for arc_tx in pending_reveals.into_iter().take(max_reveals) {
             let tx = Arc::unwrap_or_clone(arc_tx);
 
-            // Pre-check: Will adding this transaction exceed our global batch limits?
-            if let Transaction::Reveal { inputs, outputs, .. } = &tx {
-                if current_inputs + inputs.len() > crate::core::MAX_BATCH_INPUTS {
-                    continue; // Skip this tx, try the next one
+            match &tx {
+                Transaction::Reveal { inputs, outputs, .. } => {
+                    if current_inputs + inputs.len() > crate::core::MAX_BATCH_INPUTS { continue; }
+                    if current_outputs + outputs.len() > crate::core::MAX_BATCH_OUTPUTS { continue; }
                 }
-                if current_outputs + outputs.len() > crate::core::MAX_BATCH_OUTPUTS {
-                    continue; // Skip this tx, try the next one
+                Transaction::Consolidate { inputs, outputs, .. } => {
+                    let addr = inputs[0].predicate.address();
+                    if consolidated_addresses.contains(&addr) { continue; }
+                    if current_inputs + 1 > crate::core::MAX_BATCH_INPUTS { continue; }
+                    if current_outputs + outputs.len() > crate::core::MAX_BATCH_OUTPUTS { continue; }
                 }
+                _ => continue,
             }
 
-            match apply_transaction_no_sig_check(&mut candidate_state, &tx) {  // sigs already verified at mempool admission
-                Ok(_) => {
-                    if let Transaction::Reveal { inputs, outputs, .. } = &tx {
+            if let Ok(_) = apply_transaction_no_sig_check(&mut candidate_state, &tx) { 
+                match &tx {
+                    Transaction::Reveal { inputs, outputs, .. } => {
                         current_inputs += inputs.len();
                         current_outputs += outputs.len();
                     }
-                    total_fees = total_fees.saturating_add(tx.fee());
-                    transactions.push(tx);
+                    Transaction::Consolidate { inputs, outputs, .. } => {
+                        consolidated_addresses.insert(inputs[0].predicate.address());
+                        current_inputs += 1;
+                        current_outputs += outputs.len();
+                    }
+                    _ => {}
                 }
-                Err(e) => tracing::warn!("Skipping stale reveal during mining: {}", e),
+                total_fees = total_fees.saturating_add(tx.fee());
+                transactions.push(tx);
             }
         }
 
@@ -4651,7 +4705,7 @@ async fn try_apply_orphans(&mut self) {
                         for tx in &batch_clone.transactions {
                             match tx {
                                 crate::core::Transaction::Commit { commitment, .. } => { items.insert(*commitment); }
-                                crate::core::Transaction::Reveal { inputs, outputs, .. } => {
+                                crate::core::Transaction::Reveal { inputs, outputs, .. } | crate::core::Transaction::Consolidate { inputs, outputs, .. } => {
                                     for input in inputs {
                                         items.insert(input.coin_id());
                                         items.insert(input.predicate.address());
@@ -4721,7 +4775,7 @@ async fn try_apply_orphans(&mut self) {
                 for tx in &batch.transactions {
                     match tx {
                         Transaction::Commit { commitment, .. } => mined_commits.push(*commitment),
-                        Transaction::Reveal { inputs, .. } => {
+                        Transaction::Reveal { inputs, .. } | Transaction::Consolidate { inputs, .. } => {
                             for input in inputs { spent_inputs.push(input.coin_id()); }
                         }
                     }
@@ -5821,7 +5875,7 @@ mod complex_tests {
         let out_sum: u64 = outputs.iter().map(|o| o.value()).sum();
         assert!(in_value > out_sum, "fee must be positive");
 
-        let (commitment, _salt) = wallet.prepare_commit(&selected, &outputs, change_seeds, false).unwrap();
+        let (commitment, _salt) = wallet.prepare_commit(&selected, &outputs, change_seeds, false, false).unwrap();
 
         let mut spam_nonce = 0u64;
         loop {

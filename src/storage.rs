@@ -287,33 +287,51 @@ pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, _block_height: u6
             let mut mss_idx_table = write_txn.open_table(MSS_LEAF_INDEX_TABLE)?;
 
             for tx in &batch.transactions {
-                if let crate::core::Transaction::Reveal { inputs, witnesses, outputs, salt } = tx {
-                    let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
-                    let output_hashes: Vec<[u8; 32]> = outputs.iter()
-                        .map(|o| o.hash_for_commitment())
-                        .collect();
-                    let commitment = crate::core::compute_commitment(&input_ids, &output_hashes, salt);
+                match tx {
+                    crate::core::Transaction::Reveal { inputs, witnesses, outputs, salt } => {
+                        let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+                        let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+                        let commitment = crate::core::compute_commitment(&input_ids, &output_hashes, salt);
 
-                    for (input, witness) in inputs.iter().zip(witnesses.iter()) {
-                        let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
-                        if let Some(sig) = wit_inputs.first() {
-                            if sig.len() == crate::core::wots::SIG_SIZE {
-                                let addr = input.predicate.address();
-                                spent_table.insert(&addr, &commitment)?;
-                            } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                                spent_table.insert(&mss_sig.wots_pk, &commitment)?;
-                                
-                                // O(1) MSS leaf index tracker
-                                if let Some(master_pk) = input.predicate.owner_pk() {
-                                    let next = mss_sig.leaf_index + 1;
-                                    let current = mss_idx_table.get(&master_pk)?.map(|v: redb::AccessGuard<'_, u64>| v.value()).unwrap_or(0);
-                                    if next > current {
-                                        mss_idx_table.insert(&master_pk, next)?;
+                        for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                            let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                            if let Some(sig) = wit_inputs.first() {
+                                if sig.len() == crate::core::wots::SIG_SIZE {
+                                    let addr = input.predicate.address();
+                                    spent_table.insert(&addr, &commitment)?;
+                                } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                                    spent_table.insert(&mss_sig.wots_pk, &commitment)?;
+                                    if let Some(master_pk) = input.predicate.owner_pk() {
+                                        let next = mss_sig.leaf_index + 1;
+                                        let current = mss_idx_table.get(&master_pk)?.map(|v: redb::AccessGuard<'_, u64>| v.value()).unwrap_or(0);
+                                        if next > current { mss_idx_table.insert(&master_pk, next)?; }
                                     }
                                 }
                             }
                         }
                     }
+                    crate::core::Transaction::Consolidate { inputs, witness, outputs, salt } => {
+                        if inputs.is_empty() { continue; }
+                        let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+                        let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+                        let commitment = crate::core::compute_commitment(&input_ids, &output_hashes, salt);
+                        
+                        let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                        if let Some(sig) = wit_inputs.first() {
+                            if sig.len() == crate::core::wots::SIG_SIZE {
+                                let addr = inputs[0].predicate.address();
+                                spent_table.insert(&addr, &commitment)?;
+                            } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                                spent_table.insert(&mss_sig.wots_pk, &commitment)?;
+                                if let Some(master_pk) = inputs[0].predicate.owner_pk() {
+                                    let next = mss_sig.leaf_index + 1;
+                                    let current = mss_idx_table.get(&master_pk)?.map(|v: redb::AccessGuard<'_, u64>| v.value()).unwrap_or(0);
+                                    if next > current { mss_idx_table.insert(&master_pk, next)?; }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -335,24 +353,33 @@ pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, _block_height: u6
         let table = read_txn.open_table(SPENT_ADDRESSES_TABLE)?;
 
         for tx in &batch.transactions {
-            if let crate::core::Transaction::Reveal { inputs, witnesses, .. } = tx {
-                for (input, witness) in inputs.iter().zip(witnesses.iter()) {
-                    let Witness::ScriptInputs(wit_inputs) = witness;
-                    if let Some(sig) = wit_inputs.first() {
-                        if sig.len() == SIG_SIZE {
-                            // Standard WOTS query
-                            let addr = input.predicate.address();
-                            if let Some(existing) = table.get(&addr)? {
-                                result.insert(addr, *existing.value());
-                            }
-                        } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                            // NEW: MSS leaf query
-                            if let Some(existing) = table.get(&mss_sig.wots_pk)? {
-                                result.insert(mss_sig.wots_pk, *existing.value());
+            match tx {
+                crate::core::Transaction::Reveal { inputs, witnesses, .. } => {
+                    for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                        let Witness::ScriptInputs(wit_inputs) = witness;
+                        if let Some(sig) = wit_inputs.first() {
+                            if sig.len() == SIG_SIZE {
+                                let addr = input.predicate.address();
+                                if let Some(existing) = table.get(&addr)? { result.insert(addr, *existing.value()); }
+                            } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                                if let Some(existing) = table.get(&mss_sig.wots_pk)? { result.insert(mss_sig.wots_pk, *existing.value()); }
                             }
                         }
                     }
                 }
+                crate::core::Transaction::Consolidate { inputs, witness, .. } => {
+                    if inputs.is_empty() { continue; }
+                    let Witness::ScriptInputs(wit_inputs) = witness;
+                    if let Some(sig) = wit_inputs.first() {
+                        if sig.len() == SIG_SIZE {
+                            let addr = inputs[0].predicate.address();
+                            if let Some(existing) = table.get(&addr)? { result.insert(addr, *existing.value()); }
+                        } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                            if let Some(existing) = table.get(&mss_sig.wots_pk)? { result.insert(mss_sig.wots_pk, *existing.value()); }
+                        }
+                    }
+                }
+                _ => {}
             }
         }    
         Ok(result)
@@ -371,24 +398,33 @@ pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, _block_height: u6
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(SPENT_ADDRESSES_TABLE)?;
 
-        if let crate::core::Transaction::Reveal { inputs, witnesses, .. } = tx {
-            for (input, witness) in inputs.iter().zip(witnesses.iter()) {
-                let Witness::ScriptInputs(wit_inputs) = witness;
-                if let Some(sig) = wit_inputs.first() {
-                    if sig.len() == SIG_SIZE {
-                        // Standard WOTS query
-                        let addr = input.predicate.address();
-                        if let Some(existing) = table.get(&addr)? {
-                            result.insert(addr, *existing.value());
-                        }
-                    } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                        // NEW: MSS leaf query
-                        if let Some(existing) = table.get(&mss_sig.wots_pk)? {
-                            result.insert(mss_sig.wots_pk, *existing.value());
+        match tx {
+            crate::core::Transaction::Reveal { inputs, witnesses, .. } => {
+                for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                    let Witness::ScriptInputs(wit_inputs) = witness;
+                    if let Some(sig) = wit_inputs.first() {
+                        if sig.len() == SIG_SIZE {
+                            let addr = input.predicate.address();
+                            if let Some(existing) = table.get(&addr)? { result.insert(addr, *existing.value()); }
+                        } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                            if let Some(existing) = table.get(&mss_sig.wots_pk)? { result.insert(mss_sig.wots_pk, *existing.value()); }
                         }
                     }
                 }
             }
+            crate::core::Transaction::Consolidate { inputs, witness, .. } => {
+                if inputs.is_empty() { return Ok(result); }
+                let Witness::ScriptInputs(wit_inputs) = witness;
+                if let Some(sig) = wit_inputs.first() {
+                    if sig.len() == SIG_SIZE {
+                        let addr = inputs[0].predicate.address();
+                        if let Some(existing) = table.get(&addr)? { result.insert(addr, *existing.value()); }
+                    } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                        if let Some(existing) = table.get(&mss_sig.wots_pk)? { result.insert(mss_sig.wots_pk, *existing.value()); }
+                    }
+                }
+            }
+            _ => {}
         }
         
         Ok(result)
