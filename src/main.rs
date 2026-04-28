@@ -1162,8 +1162,8 @@ async fn wallet_consolidate(
     // Create a fresh MSS tree to hold the consolidated funds safely
     let new_mss_pk = wallet.generate_mss(10, Some("Consolidated Sweeper".into()))?;
     
-    // Fee logic: Consolidate uses 1 signature regardless of input count, so fee is extremely cheap
-    let estimated_bytes = 100 + 1636 + 100; // Base overhead + 1 WOTS Sig + 1 Output
+    // ~85 bytes per InputReveal (predicate + value + salt + overhead)
+    let estimated_bytes = 100 + 1636 + 100 + (live_coins.len() as u64 * 85);
     let fee = (estimated_bytes * 10) / 1024 + 10;
     
     if total_val <= fee {

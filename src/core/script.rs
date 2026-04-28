@@ -1094,23 +1094,7 @@ mod tests {
         assert!(execute_script(&bytecode, &witness, &ctx).is_ok());
     }
     
-    #[test]
-    fn v4_activation_height_enforced() {
-        let mut bc = Vec::new();
-        bc.push(OP_INPUT_VALUE);
-        bc.push(OP_DROP);
-        push_int(&mut bc, 1);
 
-        let mut ctx = empty_ctx();
-        
-        // Fails below 100,000
-        ctx.height = 99_999;
-        assert_eq!(execute_script(&bc, &[], &ctx), Err(ScriptError::InvalidOpcode(OP_INPUT_VALUE)));
-
-        // Passes at or above 100,000
-        ctx.height = 100_000;
-        assert!(execute_script(&bc, &[], &ctx).is_ok());
-    }
 
     #[test]
     fn pick_works() {

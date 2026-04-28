@@ -352,6 +352,11 @@ impl NodeHandle {
         let mut current_inputs = 0;
         let mut current_outputs = 0;
         let mut consolidated_addresses = std::collections::HashSet::new();
+        
+        // --- BYTE TRACKING ---
+        let mut current_bytes = 0u64;
+        const MAX_BLOCK_BYTES: u64 = 8_000_000; // 8 MB safety limit (leaves 2MB for P2P overhead)
+        // -------------------------
 
         // Enforce the Canonical Block Ordering rules by selecting from split mempool structure
         let mut pending_commits = Vec::new();
@@ -365,13 +370,21 @@ impl NodeHandle {
         }
 
         for tx in pending_commits.into_iter().take(crate::core::MAX_BATCH_COMMITS) {
+            // Check size before applying
+            let tx_bytes = bincode::serialized_size(&tx).unwrap_or(0) as u64;
+            if current_bytes + tx_bytes > MAX_BLOCK_BYTES { continue; }
+
             if let Ok(_) = apply_transaction(&mut candidate, &tx) {
                 total_fees += tx.fee(); 
+                current_bytes += tx_bytes; // Track size
                 transactions.push(tx);
             }
         }
 
         for tx in pending_reveals.into_iter().take(crate::core::MAX_BATCH_REVEALS) {
+            // Check size before applying
+            let tx_bytes = bincode::serialized_size(&tx).unwrap_or(0) as u64;
+            if current_bytes + tx_bytes > MAX_BLOCK_BYTES { continue; }
 
             match &tx {
                 Transaction::Reveal { inputs, outputs, .. } => {
@@ -401,6 +414,7 @@ impl NodeHandle {
                     _ => {}
                 }
                 total_fees += tx.fee();
+                current_bytes += tx_bytes; // Track size
                 transactions.push(tx);
             }
         }
@@ -4526,19 +4540,31 @@ async fn try_apply_orphans(&mut self) {
 
         let mut current_inputs = 0;
         let mut current_outputs = 0;
-
         let mut consolidated_addresses = std::collections::HashSet::new();
+
+        // ---  BYTE TRACKING ---
+        let mut current_bytes = 0u64;
+        const MAX_BLOCK_BYTES: u64 = 8_000_000; 
+        // -------------------------
 
         for arc_tx in pending_commits.into_iter().take(max_commits) {
             let tx = Arc::unwrap_or_clone(arc_tx);
+            
+            let tx_bytes = bincode::serialized_size(&tx).unwrap_or(0) as u64;
+            if current_bytes + tx_bytes > MAX_BLOCK_BYTES { continue; }
+
             if let Ok(_) = apply_transaction(&mut candidate_state, &tx) {
                 total_fees = total_fees.saturating_add(tx.fee());
+                current_bytes += tx_bytes;
                 transactions.push(tx);
             }
         }
 
         for arc_tx in pending_reveals.into_iter().take(max_reveals) {
             let tx = Arc::unwrap_or_clone(arc_tx);
+
+            let tx_bytes = bincode::serialized_size(&tx).unwrap_or(0) as u64;
+            if current_bytes + tx_bytes > MAX_BLOCK_BYTES { continue; }
 
             match &tx {
                 Transaction::Reveal { inputs, outputs, .. } => {
@@ -4568,6 +4594,7 @@ async fn try_apply_orphans(&mut self) {
                     _ => {}
                 }
                 total_fees = total_fees.saturating_add(tx.fee());
+                current_bytes += tx_bytes;
                 transactions.push(tx);
             }
         }
