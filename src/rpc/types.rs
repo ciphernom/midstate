@@ -49,6 +49,9 @@ pub struct SendTransactionRequest {
     pub outputs: Vec<OutputDataJson>,
     /// Commitment salt (hex)
     pub salt: String,
+    /// Flag to indicate this is a dust-sweeping Consolidate transaction
+    #[serde(default)]
+    pub is_consolidate: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

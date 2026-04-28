@@ -31,7 +31,7 @@ const FEE_RATE_SCALE: u128 = 1_024;
 fn get_tx_id(tx: &Transaction) -> [u8; 32] {
     match tx {
         Transaction::Commit { commitment, .. } => *commitment,
-        Transaction::Reveal { inputs, outputs, salt, .. } => {
+        Transaction::Reveal { inputs, outputs, salt, .. } | Transaction::Consolidate { inputs, outputs, salt, .. } => {
             let mut hasher = blake3::Hasher::new();
             for i in inputs { hasher.update(&i.coin_id()); }
             for o in outputs { hasher.update(&o.hash_for_commitment()); }
@@ -244,7 +244,7 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                     Err(e) => anyhow::bail!(e),
                 }
             }
-            Transaction::Reveal { .. } => (None, None),
+            Transaction::Reveal { .. } | Transaction::Consolidate { .. } => (None, None),
         };
 
         match tx {
@@ -290,48 +290,60 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                 self.commits_by_pow.insert((actual_zeros, commitment));
             }
 
-            reveal_tx @ Transaction::Reveal { .. } => {
+            reveal_tx @ Transaction::Reveal { .. } | reveal_tx @ Transaction::Consolidate { .. } => {
                 // WOTS address-reuse pre-flight check.
                 // Gives immediate RPC feedback instead of silent miner rejection.
                 if !spent_oracle.is_empty() {
-                    if let Transaction::Reveal { inputs, witnesses, outputs, salt } = &reveal_tx {
-                        let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
-                        let output_hashes: Vec<[u8; 32]> = outputs.iter()
-                            .map(|o| o.hash_for_commitment())
-                            .collect();
-                        let this_commitment = crate::core::types::compute_commitment(
-                            &input_ids, &output_hashes, salt,
-                        );
-                        for (input, witness) in inputs.iter().zip(witnesses.iter()) {
-                            let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
-                            if let Some(sig) = wit_inputs.first() {
-                                if sig.len() == crate::core::wots::SIG_SIZE {
-                                    // Standard WOTS: check the predicate address
-                                    let addr = input.predicate.address();
-                                    if let Some(&prior_commitment) = spent_oracle.get(&addr) {
-                                        if prior_commitment != this_commitment {
-                                            anyhow::bail!(
-                                                "Mempool rejected: WOTS address {} already \
-                                                 spent with a different commitment",
-                                                hex::encode(addr)
-                                            );
+                    match &reveal_tx {
+                        Transaction::Reveal { inputs, witnesses, outputs, salt } => {
+                            let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+                            let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+                            let this_commitment = crate::core::types::compute_commitment(&input_ids, &output_hashes, salt);
+                            
+                            for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                                let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                                if let Some(sig) = wit_inputs.first() {
+                                    if sig.len() == crate::core::wots::SIG_SIZE {
+                                        let addr = input.predicate.address();
+                                        if let Some(&prior_commitment) = spent_oracle.get(&addr) {
+                                            if prior_commitment != this_commitment {
+                                                anyhow::bail!("Mempool rejected: WOTS address {} already spent with a different commitment", hex::encode(addr));
+                                            }
                                         }
-                                    }
-                                } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                                    // MSS: check the specific leaf's WOTS public key
-                                    if let Some(&prior_commitment) = spent_oracle.get(&mss_sig.wots_pk) {
-                                        if prior_commitment != this_commitment {
-                                            anyhow::bail!(
-                                                "Mempool rejected: MSS leaf {} (index {}) already \
-                                                 spent with a different commitment",
-                                                hex::encode(mss_sig.wots_pk),
-                                                mss_sig.leaf_index
-                                            );
+                                    } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                                        if let Some(&prior_commitment) = spent_oracle.get(&mss_sig.wots_pk) {
+                                            if prior_commitment != this_commitment {
+                                                anyhow::bail!("Mempool rejected: MSS leaf {} already spent", hex::encode(mss_sig.wots_pk));
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
+                        Transaction::Consolidate { inputs, witness, outputs, salt } => {
+                            let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+                            let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+                            let this_commitment = crate::core::types::compute_commitment(&input_ids, &output_hashes, salt);
+                            
+                            let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                            if let Some(sig) = wit_inputs.first() {
+                                if sig.len() == crate::core::wots::SIG_SIZE {
+                                    let addr = inputs[0].predicate.address();
+                                    if let Some(&prior_commitment) = spent_oracle.get(&addr) {
+                                        if prior_commitment != this_commitment {
+                                            anyhow::bail!("Mempool rejected: WOTS address {} already spent with a different commitment", hex::encode(addr));
+                                        }
+                                    }
+                                } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                                    if let Some(&prior_commitment) = spent_oracle.get(&mss_sig.wots_pk) {
+                                        if prior_commitment != this_commitment {
+                                            anyhow::bail!("Mempool rejected: MSS leaf {} already spent", hex::encode(mss_sig.wots_pk));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
 
@@ -488,7 +500,7 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                 Transaction::Commit { commitment, .. } => {
                     self.commits.contains_key(commitment)
                 }
-                Transaction::Reveal { .. } => {
+                Transaction::Reveal { .. } | Transaction::Consolidate { .. } => {
                     tx.input_coin_ids().iter().any(|i| self.seen_inputs.contains(i))
                 }
             };
@@ -507,7 +519,7 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                         self.commits_by_pow.insert((zeros, commitment));
                     }
                 }
-                reveal_tx @ Transaction::Reveal { .. } => {
+                reveal_tx @ Transaction::Reveal { .. } | reveal_tx @ Transaction::Consolidate { .. } => {
                     let tx_bytes =
                         bincode::serialized_size(&reveal_tx).unwrap_or(0) as u64;
                     let fee_rate = compute_fee_rate(reveal_tx.fee(), tx_bytes);
@@ -751,34 +763,26 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
             .reveals
             .iter()
             .filter(|(_, mempool_tx)| {
-                if let Transaction::Reveal { inputs, outputs, salt, .. } = &*mempool_tx.tx {
-                    // 1. Ensure all inputs still exist in the UTXO set
-                    for input in inputs {
-                        if !state.coins.contains(&input.coin_id()) {
-                            return true; // Invalid, spent or reorged out
+                match &*mempool_tx.tx {
+                    Transaction::Reveal { inputs, outputs, salt, .. } | Transaction::Consolidate { inputs, outputs, salt, .. } => {
+                        for input in inputs {
+                            if !state.coins.contains(&input.coin_id()) { return true; }
                         }
-                    }
+                        let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+                        let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+                        let expected = crate::core::types::compute_commitment(&input_ids, &output_hashes, salt);
 
-                    // 2. Ensure commitment exists and is not expired
-                    let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
-                    let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
-                    let expected = crate::core::types::compute_commitment(&input_ids, &output_hashes, salt);
-
-                    if !state.commitments.contains(&expected) {
-                        return true; // Invalid, no matching commitment
-                    }
-
-                    if let Some(&commit_height) = state.commitment_heights.get(&expected) {
-                        if state.height.saturating_sub(commit_height) > crate::core::COMMITMENT_TTL {
-                            return true; // Expired, remove
+                        if !state.commitments.contains(&expected) { return true; }
+                        if let Some(&commit_height) = state.commitment_heights.get(&expected) {
+                            if state.height.saturating_sub(commit_height) > crate::core::COMMITMENT_TTL {
+                                return true;
+                            }
+                        } else {
+                            return true;
                         }
-                    } else {
-                        return true; // Missing height data
+                        false
                     }
-
-                    false // Valid, keep in mempool
-                } else {
-                    true // Should never have a Commit in the reveals map
+                    _ => true,
                 }
             })
             .map(|(id, _)| *id)

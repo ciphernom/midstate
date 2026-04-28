@@ -190,13 +190,36 @@ fn apply_batch_internal(
               hex::encode(state.target), hex::encode(batch.target));
     }
 
-    // Reject oversized batches at consensus level using decoupled limits
+    // 1. O(N) Topological Ordering & Pre-pass Extraction
+    let mut seen_non_commit = false;
+    let mut in_block_commits = std::collections::HashSet::new();
     let mut commit_count = 0;
     let mut reveal_count = 0;
+    let mut consolidated_addresses = std::collections::HashSet::new();
+
     for tx in &batch.transactions {
         match tx {
-            Transaction::Commit { .. } => commit_count += 1,
-            Transaction::Reveal { .. } => reveal_count += 1,
+            Transaction::Commit { commitment, .. } => {
+                if seen_non_commit {
+                    bail!("Block ordering violation: Commit appears after a Reveal or Consolidate");
+                }
+                in_block_commits.insert(*commitment);
+                commit_count += 1;
+            }
+            Transaction::Reveal { .. } => {
+                seen_non_commit = true;
+                reveal_count += 1;
+            }
+            Transaction::Consolidate { inputs, .. } => {
+                seen_non_commit = true;
+                reveal_count += 1;
+                if !inputs.is_empty() {
+                    let addr = inputs[0].predicate.address();
+                    if !consolidated_addresses.insert(addr) {
+                        bail!("Batch contains multiple Consolidate transactions for the same address");
+                    }
+                }
+            }
         }
     }
 
@@ -208,42 +231,67 @@ fn apply_batch_internal(
     }   
 
     // timewarp prevention: Validate timestamp
-     validate_timestamp(batch.timestamp, previous_timestamps, current_timestamp())?;
+    validate_timestamp(batch.timestamp, previous_timestamps, current_timestamp())?;
     
 
     // WOTS & MSS address/leaf-reuse consensus check 
     // Uses the pre-built oracle so state.rs stays pure (no storage I/O here).
-    // A key is being reused if it is in the oracle AND the commitment
-    // for this transaction differs from the one that originally spent it.
-    // Same commitment = safe reorg replay of the identical transaction.
     for tx in &batch.transactions {
-        if let Transaction::Reveal { inputs, witnesses, outputs, salt } = tx {
-            let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
-            let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
-            let this_commitment = crate::core::types::compute_commitment(&input_ids, &output_hashes, salt);
-            
-            for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+        match tx {
+            Transaction::Reveal { inputs, witnesses, outputs, salt } => {
+                let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+                let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+                let this_commitment = crate::core::types::compute_commitment(&input_ids, &output_hashes, salt);
+                
+                for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                    let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                    if let Some(sig) = wit_inputs.first() {
+                        if sig.len() == crate::core::wots::SIG_SIZE {
+                            let addr = input.predicate.address();
+                            if let Some(&prior_commitment) = spent_oracle.get(&addr) {
+                                if prior_commitment != this_commitment {
+                                    bail!("Consensus violation: WOTS address {} reused", hex::encode(addr));
+                                }
+                            }
+                            spent_oracle.insert(addr, this_commitment);
+                        } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                            if let Some(&prior_commitment) = spent_oracle.get(&mss_sig.wots_pk) {
+                                if prior_commitment != this_commitment {
+                                    bail!("Consensus violation: MSS leaf {} reused", hex::encode(mss_sig.wots_pk));
+                                }
+                            }
+                            spent_oracle.insert(mss_sig.wots_pk, this_commitment);
+                        }
+                    }
+                }
+            }
+            Transaction::Consolidate { inputs, witness, outputs, salt } => {
+                if inputs.is_empty() { continue; }
+                let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+                let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+                let this_commitment = crate::core::types::compute_commitment(&input_ids, &output_hashes, salt);
+                
                 let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
                 if let Some(sig) = wit_inputs.first() {
                     if sig.len() == crate::core::wots::SIG_SIZE {
-                        let addr = input.predicate.address();
+                        let addr = inputs[0].predicate.address();
                         if let Some(&prior_commitment) = spent_oracle.get(&addr) {
                             if prior_commitment != this_commitment {
-                                bail!("Consensus violation: WOTS address {} reused with different commitment", hex::encode(addr));
+                                bail!("Consensus violation: WOTS address {} reused", hex::encode(addr));
                             }
                         }
                         spent_oracle.insert(addr, this_commitment);
                     } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                        let leaf_pk = mss_sig.wots_pk;
-                        if let Some(&prior_commitment) = spent_oracle.get(&leaf_pk) {
+                        if let Some(&prior_commitment) = spent_oracle.get(&mss_sig.wots_pk) {
                             if prior_commitment != this_commitment {
-                                bail!("Consensus violation: MSS leaf {} (Index {}) reused", hex::encode(leaf_pk), mss_sig.leaf_index);
+                                bail!("Consensus violation: MSS leaf {} reused", hex::encode(mss_sig.wots_pk));
                             }
                         }
-                        spent_oracle.insert(leaf_pk, this_commitment);
+                        spent_oracle.insert(mss_sig.wots_pk, this_commitment);
                     }
                 }
             }
+            _ => {}
         }
     }
 
@@ -253,9 +301,16 @@ fn apply_batch_internal(
     let mut total_outputs = 0;
 
     for tx in &batch.transactions {
-        if let Transaction::Reveal { inputs, outputs, .. } = tx {
-            total_inputs += inputs.len();
-            total_outputs += outputs.len();
+        match tx {
+            Transaction::Reveal { inputs, outputs, .. } => {
+                total_inputs += inputs.len();
+                total_outputs += outputs.len();
+            }
+            Transaction::Consolidate { outputs, .. } => {
+                total_inputs += 1; // Structurally bounds validation to 1 signature
+                total_outputs += outputs.len();
+            }
+            _ => {}
         }
     }
 
@@ -271,7 +326,7 @@ fn apply_batch_internal(
     // 3. Apply transactions and tally fees
     // Phase 1: verify all signatures in parallel (pure, no state mutation)
     batch.transactions.par_iter().try_for_each(|tx| {
-        verify_transaction_sigs(tx, state.height, &state.commitments)
+        verify_transaction_sigs(tx, state.height, &state.commitments, &in_block_commits)
     })?;
 
     // Phase 2: apply sequentially (state mutation, sigs already verified)

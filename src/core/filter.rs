@@ -20,7 +20,7 @@ impl CompactFilter {
                 Transaction::Commit { commitment, .. } => {
                     items.push(*commitment);
                 }
-                Transaction::Reveal { inputs, outputs, .. } => {
+                Transaction::Reveal { inputs, outputs, .. } | Transaction::Consolidate { inputs, outputs, .. } => {
                     for input in inputs {
                         items.push(input.coin_id());
                         items.push(input.predicate.address());

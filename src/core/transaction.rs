@@ -51,28 +51,52 @@ fn validate_commit_pow(commitment: &[u8; 32], nonce: u64, current_height: u64) -
 /// Called in parallel across all transactions in a batch before sequential apply.
 /// Performs an O(1) read-only check against the commitment set to prevent 
 /// CPU exhaustion from stateless signature spam.
-pub fn verify_transaction_sigs(tx: &Transaction, height: u64, commitments: &UtxoAccumulator) -> Result<()> {
-    if let Transaction::Reveal { inputs, witnesses, outputs, salt, .. } = tx {
-        let input_coin_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
-        let output_commit_hashes: Vec<[u8; 32]> = outputs.iter()
-            .map(|o| o.hash_for_commitment())
-            .collect();
-        let commitment = compute_commitment(&input_coin_ids, &output_commit_hashes, salt);
-        
-        // Reject immediately if the commitment isn't in the state.
-        // This drops fake/un-mined Reveal spam before doing any heavy math.
-        if !commitments.contains(&commitment) {
-            bail!("Phase 1 validation failed: Reveal transaction references an unknown or expired commitment");
-        }
-
-        for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
-            if !verify_predicate(&input.predicate, witness, &commitment, height, outputs, input.value, input.commitment) {
-                bail!("Predicate execution failed for input {}", i);
+pub fn verify_transaction_sigs(tx: &Transaction, height: u64, commitments: &UtxoAccumulator, in_block_commits: &std::collections::HashSet<[u8; 32]>) -> Result<()> {
+    match tx {
+        Transaction::Commit { .. } => Ok(()),
+        Transaction::Reveal { inputs, witnesses, outputs, salt, .. } => {
+            let input_coin_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+            let output_commit_hashes: Vec<[u8; 32]> = outputs.iter()
+                .map(|o| o.hash_for_commitment())
+                .collect();
+            let commitment = compute_commitment(&input_coin_ids, &output_commit_hashes, salt);
+            
+            if !commitments.contains(&commitment) && !in_block_commits.contains(&commitment) {
+                bail!("Phase 1 validation failed: Reveal transaction references an unknown commitment");
             }
+
+            for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
+                if !verify_predicate(&input.predicate, witness, &commitment, height, outputs, input.value, input.commitment) {
+                    bail!("Predicate execution failed for input {}", i);
+                }
+            }
+            Ok(())
+        }
+        Transaction::Consolidate { inputs, witness, outputs, salt, .. } => {
+            if inputs.is_empty() { bail!("Phase 1 validation failed: Empty inputs"); }
+            let input_coin_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+            let output_commit_hashes: Vec<[u8; 32]> = outputs.iter()
+                .map(|o| o.hash_for_commitment())
+                .collect();
+            let commitment = compute_commitment(&input_coin_ids, &output_commit_hashes, salt);
+            
+            if !commitments.contains(&commitment) && !in_block_commits.contains(&commitment) {
+                bail!("Phase 1 validation failed: Consolidate transaction references an unknown commitment");
+            }
+            
+            let first_addr = inputs[0].predicate.address();
+            for input in inputs.iter().skip(1) {
+                if input.predicate.address() != first_addr {
+                    bail!("Phase 1 validation failed: All inputs in a Consolidate transaction must share the same predicate address");
+                }
+            }
+
+            if !verify_predicate(&inputs[0].predicate, witness, &commitment, height, outputs, inputs[0].value, inputs[0].commitment) {
+                bail!("Predicate execution failed for Consolidate witness");
+            }
+            Ok(())
         }
     }
-    // Commits have no signature to verify
-    Ok(())
 }
 
 /// Apply a transaction that has already passed signature verification.
@@ -192,6 +216,89 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
                 hasher.update(salt);
                 let tx_hash = *hasher.finalize().as_bytes();
                 state.midstate = hash_concat(&state.midstate, &tx_hash);
+            }
+
+            Ok(())
+        }
+        Transaction::Consolidate { inputs, witness: _, outputs, salt, .. } => {
+            if inputs.is_empty() { bail!("Transaction must spend at least one coin"); }
+            if outputs.is_empty() { bail!("Transaction must create at least one new coin"); }
+            if inputs.len() > crate::core::types::MAX_CONSOLIDATE_INPUTS { bail!("Too many inputs (max {})", crate::core::types::MAX_CONSOLIDATE_INPUTS); }
+            if outputs.len() > MAX_TX_OUTPUTS { bail!("Too many outputs (max {})", MAX_TX_OUTPUTS); }
+
+            let first_addr = inputs[0].predicate.address();
+            {
+                let mut seen = std::collections::HashSet::new();
+                for input in inputs {
+                    if input.predicate.address() != first_addr {
+                        bail!("Consolidate inputs must share the same address");
+                    }
+                    if !seen.insert(input.coin_id()) {
+                        bail!("Duplicate input coin");
+                    }
+                    if input.commitment.is_some() {
+                        if input.value != 0 {
+                            bail!("State Thread inputs must have a value of exactly 0");
+                        }
+                    }
+                }
+            }
+
+            for (i, out) in outputs.iter().enumerate() {
+                if out.value() == 0 && !out.is_confidential() {
+                    bail!("Zero-value output {}", i);
+                } else if out.value() != 0 && !out.value().is_power_of_two() {
+                    bail!("Invalid denomination: output {} value {} is not a power of 2", i, out.value());
+                }
+                if let OutputData::DataBurn { payload, .. } = out {
+                    if payload.len() > crate::core::types::MAX_BURN_DATA_SIZE {
+                        bail!("DataBurn payload exceeds max size");
+                    }
+                }
+            }
+
+            let in_sum = inputs.iter().try_fold(0u64, |acc, i| acc.checked_add(i.value)).ok_or_else(|| anyhow::anyhow!("Input value overflow"))?;
+            let out_sum = outputs.iter().try_fold(0u64, |acc, o| acc.checked_add(o.value())).ok_or_else(|| anyhow::anyhow!("Output value overflow"))?;
+            if in_sum <= out_sum {
+                bail!("Input value ({}) must exceed output value ({}) to pay fee", in_sum, out_sum);
+            }
+
+            let input_coin_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+            let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+            let expected = compute_commitment(&input_coin_ids, &output_commit_hashes, salt);
+
+            if !state.commitments.contains(&expected) {
+                bail!("No matching commitment found (expected {})", hex::encode(expected));
+            }
+            if let Some(&commit_height) = state.commitment_heights.get(&expected) {
+                if state.height.saturating_sub(commit_height) > crate::core::COMMITMENT_TTL {
+                    bail!("Commitment expired at consensus");
+                }
+            }
+            state.commitments.remove(&expected);
+            state.commitment_heights.remove(&expected);
+
+            for input in inputs.iter() {
+                if !state.coins.contains(&input.coin_id()) {
+                    bail!("Coin {} not found or already spent", hex::encode(input.coin_id()));
+                }
+            }
+            for coin_id in &input_coin_ids {
+                state.coins.remove(coin_id);
+            }
+            for out in outputs {
+                if let Some(coin_id) = out.coin_id() {
+                    if !state.coins.insert(coin_id) {
+                        bail!("Duplicate coin created");
+                    }
+                }
+            }
+            {
+                let mut hasher = blake3::Hasher::new();
+                for coin_id in &input_coin_ids { hasher.update(coin_id); }
+                for hash in &output_commit_hashes { hasher.update(hash); }
+                hasher.update(salt);
+                state.midstate = hash_concat(&state.midstate, hasher.finalize().as_bytes());
             }
 
             Ok(())
@@ -343,6 +450,89 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
 
             Ok(())
         }
+        Transaction::Consolidate { inputs, witness, outputs, salt, .. } => {
+            if inputs.is_empty() { bail!("Transaction must spend at least one coin"); }
+            if outputs.is_empty() { bail!("Transaction must create at least one new coin"); }
+            if inputs.len() > crate::core::types::MAX_CONSOLIDATE_INPUTS { bail!("Too many inputs (max {})", crate::core::types::MAX_CONSOLIDATE_INPUTS); }
+            if outputs.len() > MAX_TX_OUTPUTS { bail!("Too many outputs (max {})", MAX_TX_OUTPUTS); }
+
+            let first_addr = inputs[0].predicate.address();
+            {
+                let mut seen = std::collections::HashSet::new();
+                for input in inputs {
+                    if input.predicate.address() != first_addr {
+                        bail!("Consolidate inputs must share the same address");
+                    }
+                    if !seen.insert(input.coin_id()) {
+                        bail!("Duplicate input coin");
+                    }
+                    if input.commitment.is_some() && input.value != 0 {
+                        bail!("State Thread inputs must have a value of exactly 0");
+                    }
+                }
+            }
+
+            for (i, out) in outputs.iter().enumerate() {
+                if out.value() == 0 && !out.is_confidential() {
+                    bail!("Zero-value output {}", i);
+                } else if out.value() != 0 && !out.value().is_power_of_two() {
+                    bail!("Invalid denomination: output {} value {} is not a power of 2", i, out.value());
+                }
+                if let OutputData::DataBurn { payload, .. } = out {
+                    if payload.len() > crate::core::types::MAX_BURN_DATA_SIZE {
+                        bail!("DataBurn payload exceeds max size");
+                    }
+                }
+            }
+
+            let in_sum = inputs.iter().try_fold(0u64, |acc, i| acc.checked_add(i.value)).ok_or_else(|| anyhow::anyhow!("Input value overflow"))?;
+            let out_sum = outputs.iter().try_fold(0u64, |acc, o| acc.checked_add(o.value())).ok_or_else(|| anyhow::anyhow!("Output value overflow"))?;
+            if in_sum <= out_sum {
+                bail!("Input value ({}) must exceed output value ({}) to pay fee", in_sum, out_sum);
+            }
+
+            let input_coin_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+            let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+            let expected = compute_commitment(&input_coin_ids, &output_commit_hashes, salt);
+
+            if !state.commitments.contains(&expected) {
+                bail!("No matching commitment found (expected {})", hex::encode(expected));
+            }
+            if let Some(&commit_height) = state.commitment_heights.get(&expected) {
+                if state.height.saturating_sub(commit_height) > COMMITMENT_TTL {
+                    bail!("Commitment expired at consensus");
+                }
+            }
+            state.commitments.remove(&expected);
+            state.commitment_heights.remove(&expected);
+
+            for input in inputs.iter() {
+                let coin_id = input.coin_id();
+                if !state.coins.contains(&coin_id) {
+                    bail!("Coin {} not found or already spent", hex::encode(coin_id));
+                }
+            }
+
+            if !verify_predicate(&inputs[0].predicate, witness, &expected, state.height, outputs, inputs[0].value, inputs[0].commitment) {
+                bail!("Predicate execution failed for Consolidate witness");
+            }
+
+            for coin_id in &input_coin_ids { state.coins.remove(coin_id); }
+            for out in outputs {
+                if let Some(coin_id) = out.coin_id() {
+                    if !state.coins.insert(coin_id) { bail!("Duplicate coin created"); }
+                }
+            }
+            {
+                let mut hasher = blake3::Hasher::new();
+                for coin_id in &input_coin_ids { hasher.update(coin_id); }
+                for hash in &output_commit_hashes { hasher.update(hash); }
+                hasher.update(salt);
+                state.midstate = hash_concat(&state.midstate, hasher.finalize().as_bytes());
+            }
+
+            Ok(())
+        }
     }
 }
 
@@ -455,7 +645,7 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                     bail!("Commitment expired (committed at height {}, current {})", commit_height, state.height);
                 }
             }
-            // 5. Verify each Witness executes cleanly against its Predicate
+             // 5. Verify each Witness executes cleanly against its Predicate
             for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
                 let coin_id = input.coin_id();
                 if !state.coins.contains(&coin_id) {
@@ -466,6 +656,56 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                 }
             }
 
+            Ok(())
+        }
+        Transaction::Consolidate { inputs, witness, outputs, salt, .. } => {
+            if inputs.is_empty() { bail!("Must spend at least one coin"); }
+            if outputs.is_empty() { bail!("Must create at least one coin"); }
+            if inputs.len() > crate::core::types::MAX_CONSOLIDATE_INPUTS { bail!("Too many inputs (max {})", crate::core::types::MAX_CONSOLIDATE_INPUTS); }
+            if outputs.len() > MAX_TX_OUTPUTS { bail!("Too many outputs (max {})", MAX_TX_OUTPUTS); }
+
+            let first_addr = inputs[0].predicate.address();
+            {
+                let mut seen = std::collections::HashSet::new();
+                for input in inputs {
+                    if input.predicate.address() != first_addr { bail!("Consolidate inputs must share the same address"); }
+                    if !seen.insert(input.coin_id()) { bail!("Duplicate input coin"); }
+                    if input.commitment.is_some() && input.value != 0 { bail!("State Thread inputs must have a value of exactly 0"); }
+                }
+            }
+            for (i, out) in outputs.iter().enumerate() {
+                if out.value() == 0 && !out.is_confidential() {
+                    bail!("Zero-value output {}", i);
+                } else if out.value() != 0 && !out.value().is_power_of_two() {
+                    bail!("Invalid denomination: output {} value {} is not a power of 2", i, out.value());
+                }
+                if let OutputData::DataBurn { payload, .. } = out {
+                    if payload.len() > crate::core::types::MAX_BURN_DATA_SIZE { bail!("DataBurn payload exceeds max size"); }
+                }
+            }
+
+            let in_sum = inputs.iter().try_fold(0u64, |acc, i| acc.checked_add(i.value)).ok_or_else(|| anyhow::anyhow!("Input value overflow"))?;
+            let out_sum = outputs.iter().try_fold(0u64, |acc, o| acc.checked_add(o.value())).ok_or_else(|| anyhow::anyhow!("Output value overflow"))?;
+            if in_sum <= out_sum { bail!("Input value must exceed output value"); }
+
+            let input_coin_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+            let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+            let expected = compute_commitment(&input_coin_ids, &output_commit_hashes, salt);
+
+            if !state.commitments.contains(&expected) { bail!("No matching commitment found"); }
+            if let Some(&commit_height) = state.commitment_heights.get(&expected) {
+                if state.height.saturating_sub(commit_height) > COMMITMENT_TTL {
+                    bail!("Commitment expired (committed at height {}, current {})", commit_height, state.height);
+                }
+            }
+
+            for input in inputs.iter() {
+                let coin_id = input.coin_id();
+                if !state.coins.contains(&coin_id) { bail!("Coin {} not found", hex::encode(coin_id)); }
+            }
+            if !verify_predicate(&inputs[0].predicate, witness, &expected, state.height, outputs, inputs[0].value, inputs[0].commitment) {
+                bail!("Predicate execution failed for Consolidate witness");
+            }
             Ok(())
         }
     }

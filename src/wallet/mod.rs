@@ -59,6 +59,9 @@ pub struct PendingCommit {
     pub created_at: u64,
     #[serde(default)]
     pub reveal_not_before: u64,
+    /// Identifies if this commit belongs to a dust-sweeping Consolidate transaction
+    #[serde(default)]
+    pub is_consolidate: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -497,7 +500,10 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             bail!("insufficient funds: have {}, need {}", total, needed);
         }
 
-        // 1.5. WOTS Co-Spend Grouping
+        if selected.len() > crate::core::MAX_TX_INPUTS {
+            bail!("Too many siblings to spend in a normal transaction ({} > {}). Please use the 'midstate wallet consolidate' command to compress them into a new UTXO first.", selected.len(), crate::core::MAX_TX_INPUTS);
+        }
+
         // If we selected a coin from a WOTS address that has siblings, we MUST
         // pull them all in. Spending them in the same tx produces an identical
         // commitment hash → identical WOTS signature → zero key leakage.
@@ -671,6 +677,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         outputs: &[OutputData],
         change_seeds: Vec<(usize, [u8; 32])>,
         privacy_delay: bool,
+        is_consolidate: bool,
     ) -> Result<([u8; 32], [u8; 32])> {
         // Verify we own all inputs
         for coin_id in input_coin_ids {
@@ -734,6 +741,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             change_seeds,
             created_at: now,
             reveal_not_before,
+            is_consolidate,
         });
         self.save()?;
 
@@ -799,6 +807,49 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         }
         self.save()?;
         Ok((input_reveals, witnesses))
+    }
+
+    /// Sign a Consolidate commitment. Generates EXACTLY one signature that covers
+    /// every input in the transaction. This eliminates the O(N) signature bandwidth overhead.
+    pub fn sign_consolidate(&mut self, pending: &PendingCommit) -> Result<(Vec<InputReveal>, Witness)> {
+        let output_commit_hashes: Vec<[u8; 32]> = pending.outputs.iter().map(|o| o.hash_for_commitment()).collect();
+        let commitment = compute_commitment(&pending.input_coin_ids, &output_commit_hashes, &pending.salt);
+
+        let mut input_reveals = Vec::new();
+        for coin_id in &pending.input_coin_ids {
+            if let Some(wc) = self.find_coin(coin_id).cloned() {
+                input_reveals.push(InputReveal {
+                    predicate: Predicate::p2pk(&wc.owner_pk),
+                    value: wc.value,
+                    salt: wc.salt,
+                    commitment: None,
+                });
+            } else {
+                bail!("coin not found");
+            }
+        }
+        
+        let first_coin = self.find_coin(&pending.input_coin_ids[0]).unwrap().clone();
+        let is_mss = self.data.mss_keys.iter().any(|k| k.master_pk == first_coin.owner_pk);
+        let witness = if is_mss {
+            let pos = self.data.mss_keys.iter().position(|k| k.master_pk == first_coin.owner_pk).unwrap();
+            let keypair = &mut self.data.mss_keys[pos];
+            if keypair.remaining() == 0 { bail!("MSS key exhausted"); }
+            let sig = keypair.sign(&commitment)?;
+            Witness::sig(sig.to_bytes())
+        } else {
+            let addr = first_coin.address;
+            for c in self.data.coins.iter_mut() {
+                if c.address == addr {
+                    c.wots_signed = true;
+                }
+            }
+            let sig = wots::sign(&first_coin.seed, &commitment);
+            Witness::sig(wots::sig_to_bytes(&sig))
+        };
+        
+        self.save()?;
+        Ok((input_reveals, witness))
     }
 
     pub fn find_pending(&self, commitment: &[u8; 32]) -> Option<&PendingCommit> {
@@ -2013,7 +2064,7 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
             value: 3,
             salt: [0xBB; 32],
         }];
-        let result = w.prepare_commit(&[c1], &outputs, vec![], false);
+        let result = w.prepare_commit(&[c1], &outputs, vec![], false, false);
         assert!(result.is_err(), "must reject when sibling is missing");
         let err = result.unwrap_err().to_string();
         assert!(err.contains("co-spend"), "error should mention co-spend: {}", err);
@@ -2036,7 +2087,7 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
             value: 4,
             salt: [0xBB; 32],
         }];
-        let result = w.prepare_commit(&[c1, c2], &outputs, vec![], false);
+        let result = w.prepare_commit(&[c1, c2], &outputs, vec![], false, false);
         assert!(result.is_ok(), "should accept when all siblings included");
     }
 
@@ -2056,7 +2107,7 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
             value: 4,
             salt: [0xBB; 32],
         }];
-        let (commitment, _salt) = w.prepare_commit(&[c1, c2], &outputs, vec![], false).unwrap();
+        let (commitment, _salt) = w.prepare_commit(&[c1, c2], &outputs, vec![], false, false).unwrap();
         let pending = w.find_pending(&commitment).unwrap().clone();
         w.sign_reveal(&pending).unwrap();
 
@@ -2098,7 +2149,7 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
             value: 3,
             salt: [0xBB; 32],
         }];
-        let result = w.prepare_commit(&[c1], &outputs, vec![], false);
+        let result = w.prepare_commit(&[c1], &outputs, vec![], false, false);
         assert!(result.is_ok());
     }
 }

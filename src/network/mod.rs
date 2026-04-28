@@ -344,6 +344,7 @@ pub struct MidstateNetwork {
     listen_addrs: Vec<Multiaddr>,
     external_addrs: Vec<Multiaddr>,
     subnet_peers: HashMap<IpAddr, HashSet<PeerId>>,
+    pub banned_subnets: HashMap<IpAddr, std::time::Instant>,
 }
 
 impl MidstateNetwork {
@@ -432,7 +433,7 @@ let autonat = autonat::Behaviour::new(
                 // In libp2p v0.52+, ConnectionLimits is a Behaviour, not a Swarm Config.
                 let limits = libp2p::connection_limits::ConnectionLimits::default()
                     .with_max_established_per_peer(Some(2)) // Prevent buggy peers from spamming parallel connections
-                    .with_max_pending_incoming(Some(50))
+                    .with_max_pending_incoming(Some(200))
                     .with_max_established_incoming(Some(200)); // Hard cap to prevent OS error 24
                 let connection_limits = libp2p::connection_limits::Behaviour::new(limits);
                 // -------------------------------------------------------------------
@@ -475,6 +476,7 @@ let autonat = autonat::Behaviour::new(
             listen_addrs: Vec::new(),
             external_addrs: Vec::new(),
             subnet_peers: HashMap::new(),
+            banned_subnets: HashMap::new(),
         };
 
         net.swarm.listen_on(listen_addr.clone())?;
@@ -1099,6 +1101,26 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     };
                     
                     return NetworkEvent::PeerConnected(peer_id, full_addr);
+                }
+                
+                SwarmEvent::IncomingConnectionError { local_addr: _, send_back_addr, error, connection_id: _ } => {
+                    // This event fires when a connection fails BEFORE Step 4 (Identify).
+                    // This catches the DTLS Slowloris and bad cryptography.
+                    if let Some(subnet) = crate::network::extract_subnet(&send_back_addr) {
+                        tracing::debug!("Incoming transport error from subnet {}: {:?}", subnet, error);
+                        
+                        // We use the subnet_peers map as a temporary strike counter for unauthenticated IPs
+                        let strikes = self.subnet_peers.entry(subnet).or_default();
+                        
+                        // We push dummy PeerIds just to increment the length of the HashSet
+                        strikes.insert(PeerId::random()); 
+                        
+                        if strikes.len() >= 5 { // 5 failed transport handshakes = Ban
+                            tracing::warn!("Eclipse/Flood Defense: Banning subnet {} due to repeated transport handshake failures.", subnet);
+                            self.banned_subnets.insert(subnet, std::time::Instant::now());
+                            self.subnet_peers.remove(&subnet); // cleanup
+                        }
+                    }
                 }
                 SwarmEvent::ConnectionClosed {
                     peer_id,

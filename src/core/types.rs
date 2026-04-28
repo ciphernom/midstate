@@ -340,7 +340,7 @@ impl Batch {
                 Transaction::Commit { commitment, .. } => {
                     midstate = hash_concat(&midstate, commitment);
                 }
-                Transaction::Reveal { inputs, outputs, salt, .. } => {
+                Transaction::Reveal { inputs, outputs, salt, .. } | Transaction::Consolidate { inputs, outputs, salt, .. } => {
                     let mut hasher = blake3::Hasher::new();
                     for i in inputs { hasher.update(&i.coin_id()); }
                     for o in outputs { hasher.update(&o.hash_for_commitment()); }
@@ -512,7 +512,6 @@ impl OutputData {
         }
     }
 
-    /// True if this output hides its value behind a STARK-verified commitment.
     pub fn is_confidential(&self) -> bool {
         matches!(self, OutputData::Confidential { .. })
     }
@@ -583,6 +582,18 @@ pub enum Transaction {
         /// Salt used when computing the commitment.
         salt: [u8; 32],
     },
+    
+    /// Dust-sweep: Compress thousands of siblings into a single output using 1 signature.
+    Consolidate {
+        /// Up to MAX_CONSOLIDATE_INPUTS preimages all sharing the SAME address
+        inputs: Vec<InputReveal>,
+        /// A single signature authenticating the commitment for all inputs
+        witness: Witness,
+        /// New coins to create (usually a single MSS output)
+        outputs: Vec<OutputData>,
+        /// Salt used when computing the commitment.
+        salt: [u8; 32],
+    },
 }
 
 impl Transaction {
@@ -590,7 +601,9 @@ impl Transaction {
     pub fn input_coin_ids(&self) -> Vec<[u8; 32]> {
         match self {
             Transaction::Commit { .. } => vec![],
-            Transaction::Reveal { inputs, .. } => inputs.iter().map(|i| i.coin_id()).collect(),
+            Transaction::Reveal { inputs, .. } | Transaction::Consolidate { inputs, .. } => {
+                inputs.iter().map(|i| i.coin_id()).collect()
+            }
         }
     }
 
@@ -598,7 +611,9 @@ impl Transaction {
     pub fn output_coin_ids(&self) -> Vec<[u8; 32]> {
         match self {
             Transaction::Commit { .. } => vec![],
-            Transaction::Reveal { outputs, .. } => outputs.iter().filter_map(|o| o.coin_id()).collect(),
+            Transaction::Reveal { outputs, .. } | Transaction::Consolidate { outputs, .. } => {
+                outputs.iter().filter_map(|o| o.coin_id()).collect()
+            }
         }
     }
 
@@ -606,7 +621,7 @@ impl Transaction {
     pub fn fee(&self) -> u64 {
         match self {
             Transaction::Commit { .. } => 0,
-            Transaction::Reveal { inputs, outputs, .. } => {
+            Transaction::Reveal { inputs, outputs, .. } | Transaction::Consolidate { inputs, outputs, .. } => {
                 let in_sum = inputs.iter()
                     .try_fold(0u64, |acc, i| acc.checked_add(i.value))
                     .unwrap_or(u64::MAX);
@@ -679,6 +694,10 @@ pub const EXTENSION_ITERATIONS: u64 = 100;
 
 /// Maximum number of Reveals (actual value transfers) per batch
 pub const MAX_BATCH_REVEALS: usize = 500;
+
+/// Maximum inputs for a consolidate tx
+pub const MAX_CONSOLIDATE_INPUTS: usize = 8192;
+
 /// Maximum number of Commits per batch. High limit to prevent bottlenecks.
 pub const MAX_BATCH_COMMITS: usize = 2_000;
 

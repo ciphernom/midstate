@@ -47,10 +47,16 @@ pub const OP_OVER: u8             = 0x13;
 pub const OP_ROT: u8              = 0x14;
 pub const OP_SLICE: u8            = 0x15;
 pub const OP_CONCAT: u8           = 0x16;
+
 pub const OP_SUB: u8              = 0x25;
 pub const OP_MUL: u8              = 0x26;
 pub const OP_DIV: u8              = 0x27;
 
+///v4 opcodes
+pub const OP_PICK: u8             = 0x17;
+pub const OP_MOD: u8              = 0x28;
+pub const OP_SIZE: u8             = 0x29;
+pub const OP_INPUT_VALUE: u8      = 0x53;
 
 // ── Consensus limits ───────────────────────────────────────────────────────
 
@@ -166,6 +172,7 @@ pub fn validate_structure(bytecode: &[u8], _height: u64) -> Result<(), ScriptErr
             OP_SUM_TO_ADDR => {}
             OP_OVER | OP_ROT | OP_SLICE | OP_CONCAT | OP_SUB | OP_MUL | OP_DIV => {}
             OP_READ_INPUT_STATE | OP_READ_OUTPUT_STATE => {}
+            OP_PICK | OP_SIZE | OP_MOD | OP_INPUT_VALUE => {}
             _ => return Err(ScriptError::InvalidOpcode(op)),
         }
     }
@@ -486,7 +493,29 @@ pub fn execute_script(
                     return Err(ScriptError::InvalidStateRead);
                 }
             }
-
+            OP_PICK => {
+                let depth_item = to_u64(&stack_pop(&mut stack)?)? as usize;
+                let len = stack.len();
+                if depth_item >= len { return Err(ScriptError::StackUnderflow); }
+                let picked = stack[len - 1 - depth_item].clone();
+                stack_push(&mut stack, picked)?;
+            }
+            OP_SIZE => {
+                // Read the top item without popping it (just like DUP)
+                let top = stack.last().ok_or(ScriptError::StackUnderflow)?;
+                let len = top.len() as u64;
+                stack_push(&mut stack, from_u64(len))?;
+            }
+            OP_MOD => {
+                let b_val = to_u64(&stack_pop(&mut stack)?)?;
+                if b_val == 0 { return Err(ScriptError::DivisionByZero); }
+                let a_val = to_u64(&stack_pop(&mut stack)?)?;
+                let rem = a_val % b_val; 
+                stack_push(&mut stack, from_u64(rem))?;
+            }
+            OP_INPUT_VALUE => {
+                stack_push(&mut stack, from_u64(ctx.input_value))?;
+            }
             _ => return Err(ScriptError::InvalidOpcode(op)),
         }
     }
@@ -618,6 +647,8 @@ pub fn assemble(source: &str) -> Result<Vec<u8>, String> {
             "SWAP"              => bc.push(OP_SWAP),
             "OVER"              => bc.push(OP_OVER),
             "ROT"               => bc.push(OP_ROT),
+            "PICK"              => bc.push(OP_PICK),
+            "SIZE"              => bc.push(OP_SIZE),
             "SLICE"             => bc.push(OP_SLICE),
             "CONCAT"            => bc.push(OP_CONCAT),
             "EQUAL"             => bc.push(OP_EQUAL),
@@ -627,6 +658,7 @@ pub fn assemble(source: &str) -> Result<Vec<u8>, String> {
             "SUB"               => bc.push(OP_SUB),
             "MUL"               => bc.push(OP_MUL),
             "DIV"               => bc.push(OP_DIV),
+            "MOD"               => bc.push(OP_MOD),
             "GREATER_OR_EQUAL"  => bc.push(OP_GREATER_OR_EQUAL),
             "HASH"              => bc.push(OP_HASH),
             "CHECKSIG"          => bc.push(OP_CHECKSIG),
@@ -638,6 +670,7 @@ pub fn assemble(source: &str) -> Result<Vec<u8>, String> {
             "SUM_TO_ADDR"       => bc.push(OP_SUM_TO_ADDR),
             "READ_INPUT_STATE"  => bc.push(OP_READ_INPUT_STATE),
             "READ_OUTPUT_STATE" => bc.push(OP_READ_OUTPUT_STATE),
+            "INPUT_VALUE"       => bc.push(OP_INPUT_VALUE),
             other => return Err(format!("unknown mnemonic '{}'", other)),
         }
         i += 1;
@@ -986,7 +1019,7 @@ mod tests {
         assert!(execute_script(&bytecode, &witness, &ctx).is_err());
     }
 
- #[test]
+    #[test]
     fn over_works() {
         let mut bc = Vec::new();
         bc.push(OP_OVER);
@@ -1043,22 +1076,96 @@ mod tests {
     }
 
     
- #[test]
-fn multisig_2of3_all_three_valid() {
-    let seed1 = hash(b"key1");
-    let seed2 = hash(b"key2");
-    let seed3 = hash(b"key3");
-    let pk1 = wots::keygen(&seed1);
-    let pk2 = wots::keygen(&seed2);
-    let pk3 = wots::keygen(&seed3);
-    let commitment = hash(b"multisig commitment");
-    let bytecode = compile_multisig_2of3(&pk1, &pk2, &pk3);
-    let sig1 = wots::sig_to_bytes(&wots::sign(&seed1, &commitment));
-    let sig2 = wots::sig_to_bytes(&wots::sign(&seed2, &commitment));
-    let sig3 = wots::sig_to_bytes(&wots::sign(&seed3, &commitment));
-    let witness = vec![sig1, sig2, sig3];
-    let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[], input_value: 0 };
-    assert!(execute_script(&bytecode, &witness, &ctx).is_ok());
-}
+     #[test]
+    fn multisig_2of3_all_three_valid() {
+        let seed1 = hash(b"key1");
+        let seed2 = hash(b"key2");
+        let seed3 = hash(b"key3");
+        let pk1 = wots::keygen(&seed1);
+        let pk2 = wots::keygen(&seed2);
+        let pk3 = wots::keygen(&seed3);
+        let commitment = hash(b"multisig commitment");
+        let bytecode = compile_multisig_2of3(&pk1, &pk2, &pk3);
+        let sig1 = wots::sig_to_bytes(&wots::sign(&seed1, &commitment));
+        let sig2 = wots::sig_to_bytes(&wots::sign(&seed2, &commitment));
+        let sig3 = wots::sig_to_bytes(&wots::sign(&seed3, &commitment));
+        let witness = vec![sig1, sig2, sig3];
+        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[], input_value: 0 };
+        assert!(execute_script(&bytecode, &witness, &ctx).is_ok());
+    }
+    
+    #[test]
+    fn v4_activation_height_enforced() {
+        let mut bc = Vec::new();
+        bc.push(OP_INPUT_VALUE);
+        bc.push(OP_DROP);
+        push_int(&mut bc, 1);
+
+        let mut ctx = empty_ctx();
+        
+        // Fails below 100,000
+        ctx.height = 99_999;
+        assert_eq!(execute_script(&bc, &[], &ctx), Err(ScriptError::InvalidOpcode(OP_INPUT_VALUE)));
+
+        // Passes at or above 100,000
+        ctx.height = 100_000;
+        assert!(execute_script(&bc, &[], &ctx).is_ok());
+    }
+
+    #[test]
+    fn pick_works() {
+        let mut bc = Vec::new();
+        push_int(&mut bc, 2); // The depth we want to pick (0-indexed)
+        bc.push(OP_PICK);
+        push_int(&mut bc, 10);
+        bc.push(OP_EQUAL);
+
+        // Stack: Bottom [10, 20, 30] Top
+        let witness = vec![vec![10u8], vec![20u8], vec![30u8]];
+        let mut ctx = empty_ctx();
+        ctx.height = 100_000;
+        assert!(execute_script(&bc, &witness, &ctx).is_ok());
+    }
+
+    #[test]
+    fn size_works() {
+        let mut bc = Vec::new();
+        bc.push(OP_SIZE);
+        push_int(&mut bc, 4); // Expect size to be 4 bytes
+        bc.push(OP_EQUALVERIFY);
+        bc.push(OP_DROP); // Drop the original data
+        push_int(&mut bc, 1);
+
+        let witness = vec![vec![0xAA, 0xBB, 0xCC, 0xDD]];
+        let mut ctx = empty_ctx();
+        ctx.height = 100_000;
+        assert!(execute_script(&bc, &witness, &ctx).is_ok());
+    }
+
+    #[test]
+    fn input_value_works() {
+        let mut bc = Vec::new();
+        bc.push(OP_INPUT_VALUE);
+        push_int(&mut bc, 5000);
+        bc.push(OP_EQUAL);
+
+        let mut ctx = empty_ctx();
+        ctx.height = 100_000;
+        ctx.input_value = 5000; // Inject exactly 5000 into the VM context
+        assert!(execute_script(&bc, &[], &ctx).is_ok());
+    }
+
+    #[test]
+    fn mod_works() {
+        let mut bc = Vec::new();
+        bc.push(OP_MOD);
+        push_int(&mut bc, 2); // 17 % 5 = 2
+        bc.push(OP_EQUAL);
+
+        let witness = vec![vec![17u8], vec![5u8]];
+        let mut ctx = empty_ctx();
+        ctx.height = 100_000;
+        assert!(execute_script(&bc, &witness, &ctx).is_ok());
+    }
     
 }

@@ -289,6 +289,16 @@ enum WalletAction {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
     },
+    Consolidate {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
+        #[arg(long)]
+        address: String,
+    },
     Reveal {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
@@ -339,6 +349,18 @@ enum WalletAction {
         #[arg(long)]
         pay_fee: bool,
         #[arg(long, default_value = "300")]
+        timeout: u64,
+    },
+    AutoMix {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
+        #[arg(long)]
+        coin: String,
+        #[arg(long, default_value = "1200")]
         timeout: u64,
     },
 }
@@ -809,6 +831,7 @@ async fn wallet_spend_script(
             },
         }).collect(),
         salt: hex::encode(tx_salt),
+        is_consolidate: false,
     };
     
     println!("Submitting Phase 2 Reveal...");
@@ -859,6 +882,9 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         }
         WalletAction::Export { path, coin } => wallet_export(&path, &coin),
         WalletAction::Pending { path } => wallet_pending(&path),
+        WalletAction::Consolidate { path, rpc_port, rpc_host, address } => {
+            wallet_consolidate(&path, rpc_port, rpc_host, address).await
+        }
         WalletAction::Reveal { path, rpc_port, rpc_host, commitment } => {
             wallet_reveal(&path, rpc_port, rpc_host, commitment).await
         }
@@ -870,7 +896,10 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
             wallet_generate_mss(&path, height, label)
         }
         WalletAction::Mix { path, rpc_port, rpc_host, denomination, coin, join, pay_fee, timeout } => {
-            wallet_mix(&path, rpc_port, rpc_host, denomination, coin, join, pay_fee, timeout).await
+            wallet_mix(&path, rpc_port, rpc_host, denomination, coin, join, pay_fee, timeout, None).await
+        }
+        WalletAction::AutoMix { path, rpc_port, rpc_host, coin, timeout } => {
+            wallet_automix(&path, rpc_port, rpc_host, coin, timeout).await
         }
     }
 }
@@ -1095,6 +1124,114 @@ async fn wallet_balance(path: &PathBuf, rpc_port: u16, rpc_host: String) -> Resu
     Ok(())
 }
 
+async fn wallet_consolidate(
+    path: &PathBuf,
+    rpc_port: u16,
+    rpc_host: String,
+    address_str: String,
+) -> Result<()> {
+    let password = read_password("Password: ")?;
+    let mut wallet = Wallet::open(path, &password)?;
+    let client = reqwest::Client::new();
+
+    let target_addr = midstate::core::types::parse_address_flexible(&address_str)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Find all live coins at this address
+    let mut live_coins = Vec::new();
+    let mut total_val = 0u64;
+    for wc in wallet.coins() {
+        if wc.address == target_addr {
+            if let Ok(true) = check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
+                live_coins.push(wc.coin_id);
+                total_val += wc.value;
+            }
+        }
+    }
+
+    if live_coins.len() < 2 {
+        anyhow::bail!("Address only has {} live UTXOs. Consolidation is only for grouped sibling UTXOs.", live_coins.len());
+    }
+    
+    if live_coins.len() > midstate::core::MAX_CONSOLIDATE_INPUTS {
+        anyhow::bail!("Too many UTXOs to consolidate in one transaction ({} > {}). Wait for next update for multi-pass.", live_coins.len(), midstate::core::MAX_CONSOLIDATE_INPUTS);
+    }
+
+    println!("Found {} live UTXOs at this address totaling {} value.", live_coins.len(), total_val);
+
+    // Create a fresh MSS tree to hold the consolidated funds safely
+    let new_mss_pk = wallet.generate_mss(10, Some("Consolidated Sweeper".into()))?;
+    
+    // Fee logic: Consolidate uses 1 signature regardless of input count, so fee is extremely cheap
+    let estimated_bytes = 100 + 1636 + 100; // Base overhead + 1 WOTS Sig + 1 Output
+    let fee = (estimated_bytes * 10) / 1024 + 10;
+    
+    if total_val <= fee {
+        anyhow::bail!("Total value {} is too low to pay the network fee of {}", total_val, fee);
+    }
+
+    let out_val = total_val - fee;
+    let mut outputs = Vec::new();
+    let change_seeds = Vec::new();
+    
+    // Break the output value into power-of-2 denominations
+    for denom in midstate::core::decompose_value(out_val) {
+        let salt: [u8; 32] = rand::random();
+        outputs.push(midstate::core::OutputData::Standard { address: new_mss_pk, value: denom, salt });
+    }
+
+    // Pass `true` as the final parameter to prepare_commit to indicate this is a Consolidate tx
+    let (commitment, _salt) = wallet.prepare_commit(&live_coins, &outputs, change_seeds, false, true)?;
+
+    println!("Submitting Phase 1: Consolidate Commit...");
+    submit_commit(&client, rpc_port, &rpc_host, &commitment).await?;
+
+    if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &hex::encode(commitment), 120).await {
+        anyhow::bail!("Timed out waiting for Commit to be mined.");
+    }
+    println!("✓ Commit mined!");
+
+    let pending = wallet.find_pending(&commitment).unwrap().clone();
+    let (input_reveals, witness) = wallet.sign_consolidate(&pending)?;
+    
+    let mut witnesses = Vec::new();
+    let midstate::core::types::Witness::ScriptInputs(inputs) = witness;
+    witnesses.push(inputs.iter().map(hex::encode).collect::<Vec<_>>().join(","));
+
+    let reveal_req = rpc::SendTransactionRequest {
+        inputs: input_reveals.iter().map(|ir| rpc::InputRevealJson {
+            bytecode: match &ir.predicate { midstate::core::types::Predicate::Script { bytecode } => hex::encode(bytecode) },
+            value: ir.value,
+            salt: hex::encode(ir.salt),
+            commitment: None,
+        }).collect(),
+        signatures: witnesses,
+        outputs: outputs.iter().map(|o| match o {
+            midstate::core::OutputData::Standard { address, value, salt } => rpc::OutputDataJson::Standard {
+                address: hex::encode(address),
+                value: *value,
+                salt: hex::encode(salt),
+            },
+            _ => unreachable!(),
+        }).collect(),
+        salt: hex::encode(pending.salt),
+        is_consolidate: true, // Tell the RPC server to construct a Consolidate tx
+    };
+    
+    println!("Submitting Phase 2: Sweep Reveal...");
+    let reveal_url = format!("http://{}:{}/send", rpc_host, rpc_port);
+    let resp = client.post(&reveal_url).json(&reveal_req).send().await?;
+    if !resp.status().is_success() {
+        let err: rpc::ErrorResponse = resp.json().await?;
+        anyhow::bail!("Reveal failed: {}", err.error);
+    }
+    
+    wallet.complete_reveal(&commitment)?;
+    println!("✓ Dust swept successfully into {} new UTXOs!", outputs.len());
+    
+    Ok(())
+}
+
 async fn wallet_send(
     path: &PathBuf,
     rpc_port: u16,
@@ -1197,7 +1334,7 @@ async fn wallet_send(
                 pair_idx, inputs.len(), in_val, outputs.len(), out_val, in_val - out_val);
 
             let (commitment, _salt) = wallet.prepare_commit(
-                inputs, outputs, change_seeds.clone(), true
+                inputs, outputs, change_seeds.clone(), true, false
             )?;
 
             if let Err(e) = submit_commit(&client, rpc_port, &rpc_host, &commitment).await {
@@ -1344,7 +1481,7 @@ async fn wallet_send(
         );
 
 let (commitment, _salt) = wallet.prepare_commit(
-            &input_coin_ids, &all_outputs, change_seeds.clone(), false
+            &input_coin_ids, &all_outputs, change_seeds.clone(), false, false
         )?;
 
         submit_commit(&client, rpc_port, &rpc_host, &commitment).await?;
@@ -1488,6 +1625,7 @@ async fn do_reveal(
             },
         }).collect(),
         salt: hex::encode(pending.salt),
+        is_consolidate: pending.is_consolidate,
     };
 
     let response = client.post(&reveal_url).json(&reveal_req).send().await?;
@@ -1547,12 +1685,17 @@ async fn wallet_mix(
     join_mix_id: Option<String>,
     pay_fee: bool,
     timeout_secs: u64,
+    password_override: Option<Vec<u8>>,
 ) -> Result<()> {
     if !denomination.is_power_of_two() || denomination == 0 {
         anyhow::bail!("denomination must be a non-zero power of 2");
     }
 
-    let password = read_password("Password: ")?;
+    let password = match password_override {
+        Some(pw) => pw,
+        None => read_password("Password: ")?,
+    };
+    
     let mut wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
     let base_url = format!("http://{}:{}", rpc_host, rpc_port);
@@ -1810,6 +1953,187 @@ async fn wallet_mix(
     Ok(())
 }
 
+// ── Auto-Shatter & Drip Mixing ──────────────────────────────────────────────
+
+async fn wallet_automix(
+    path: &PathBuf,
+    rpc_port: u16,
+    rpc_host: String,
+    coin_ref: String,
+    timeout_secs: u64,
+) -> Result<()> {
+    let password = read_password("Password: ")?;
+    
+    let mut wallet = Wallet::open(path, &password)?;
+    let client = reqwest::Client::new();
+    let base_url = format!("http://{}:{}", rpc_host, rpc_port);
+
+    // 1. Resolve initial coin
+    let base_coin_id = wallet.resolve_coin(&coin_ref)?;
+    
+    // Auto-consolidate any WOTS siblings to prevent co-spend consensus errors
+    let mut selected_coins = vec![base_coin_id];
+    let siblings = wallet.wots_siblings(&base_coin_id);
+    for sib in siblings {
+        selected_coins.push(sib);
+    }
+    
+    let mut coin_val = 0u64;
+    for cid in &selected_coins {
+        let val = wallet.find_coin(cid)
+            .ok_or_else(|| anyhow::anyhow!("Coin not found in wallet"))?.value;
+        coin_val += val;
+    }
+
+    println!("🔍 Sniffing network for active CoinJoin liquidity...");
+    let list_resp: midstate::rpc::MixListResponse = client.get(format!("{}/mix/list", base_url))
+        .send().await?.json().await?;
+
+    let mut target_mixes = Vec::new();
+    let mut required_value = 0u64;
+    let mut outputs = Vec::new();
+    let mut change_seeds = Vec::new();
+
+    // 2. Discover Liquidity and Provision Outputs
+    for session in list_resp.sessions {
+        if session.phase == "collecting" {
+            let cost = session.denomination + 1; // +1 for the fee provision coin
+            
+            // Can we afford to fill this pool? (+1 overall for the shatter transaction's own fee)
+            if required_value + cost + 1 <= coin_val {
+                target_mixes.push((session.mix_id, session.denomination));
+                required_value += cost;
+                
+                // Provision the target mix denomination output
+                let seed1 = wallet.next_wots_seed();
+                let pk1 = midstate::core::wots::keygen(&seed1);
+                let addr1 = midstate::core::compute_address(&pk1);
+                let salt1: [u8; 32] = rand::random();
+                let idx1 = outputs.len();
+                outputs.push(midstate::core::OutputData::Standard { address: addr1, value: session.denomination, salt: salt1 });
+                change_seeds.push((idx1, seed1));
+
+                // Provision the exact fee output (denom 1) needed for this specific pool
+                let seed2 = wallet.next_wots_seed();
+                let pk2 = midstate::core::wots::keygen(&seed2);
+                let addr2 = midstate::core::compute_address(&pk2);
+                let salt2: [u8; 32] = rand::random();
+                let idx2 = outputs.len();
+                outputs.push(midstate::core::OutputData::Standard { address: addr2, value: 1, salt: salt2 });
+                change_seeds.push((idx2, seed2));
+            }
+        }
+    }
+
+    if target_mixes.is_empty() {
+        println!("No affordable active pools found. Try standard mix creation.");
+        return Ok(());
+    }
+
+    println!("🎯 Found {} active pools. Shattering coin to match required liquidity...", target_mixes.len());
+
+    // Calculate normal change
+    let change_value = coin_val.saturating_sub(required_value).saturating_sub(1); // -1 for shatter tx fee
+    if change_value > 0 {
+        let change_denoms = midstate::core::decompose_value(change_value);
+        for denom in change_denoms {
+            let seed = wallet.next_wots_seed();
+            let pk = midstate::core::wots::keygen(&seed);
+            let addr = midstate::core::compute_address(&pk);
+            let salt: [u8; 32] = rand::random();
+            let idx = outputs.len();
+            outputs.push(midstate::core::OutputData::Standard { address: addr, value: denom, salt });
+            change_seeds.push((idx, seed));
+        }
+    }
+
+    // Shuffle outputs to prevent sequential linkage on-chain
+    {
+        use rand::seq::SliceRandom;
+        let mut indices: Vec<usize> = (0..outputs.len()).collect();
+        indices.shuffle(&mut rand::thread_rng());
+        let shuffled_outputs: Vec<midstate::core::OutputData> = indices.iter().map(|&i| outputs[i].clone()).collect();
+        let mut reverse_map = vec![0usize; indices.len()];
+        for (new_i, &old_i) in indices.iter().enumerate() { reverse_map[old_i] = new_i; }
+        change_seeds = change_seeds.into_iter().map(|(old_idx, s)| (reverse_map[old_idx], s)).collect();
+        outputs = shuffled_outputs;
+    }
+
+    // 3. Execute Shatter Transaction
+    let (commitment, _salt) = wallet.prepare_commit(&selected_coins, &outputs, change_seeds, false, false)?;
+    submit_commit(&client, rpc_port, &rpc_host, &commitment).await?;
+    println!("  Shatter Commit submitted ({}). Waiting for inclusion...", hex::encode(&commitment));
+    
+    if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &hex::encode(commitment), timeout_secs).await {
+        anyhow::bail!("Timed out waiting for shatter commit to be mined");
+    }
+
+    do_reveal(&client, &mut wallet, rpc_port, &rpc_host, &commitment, timeout_secs).await?;
+    println!("✅ Shatter transaction complete. Coins are now perfectly sized.");
+
+    // EXTREMELY IMPORTANT: Drop the wallet instance so `wallet_mix` can safely acquire 
+    // the file lock on `wallet.dat` when it runs recursively.
+    drop(wallet);
+
+    // Track coins we've already assigned to a pool to prevent duplicate usage
+    let mut used_coins = std::collections::HashSet::new();
+
+    // 4. The Drip Phase
+    for (i, (target_mix_id, denom)) in target_mixes.into_iter().enumerate() {
+        
+        // Stochastic delay (5 to 25 seconds) to de-correlate mix timing from the shatter block
+        let delay = 5 + (rand::random::<u64>() % 20);
+        println!("\n⏳ [Drip {}] Waiting {} seconds to de-correlate timing...", i+1, delay);
+        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+
+        println!("💧 [Drip {}] Joining Mix Pool {} for denomination {}...", i+1, &target_mix_id[..16], denom);
+
+        // Open wallet temporarily to find the exact unspent UTXO we just shattered
+        let coin_to_mix = {
+            let temp_wallet = Wallet::open(path, &password)?;
+            let mut found = None;
+            for wc in temp_wallet.coins() {
+                if wc.value == denom && !wc.wots_signed && !used_coins.contains(&wc.coin_id) {
+                    // Double check it's fully confirmed on-chain
+                    if check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await.unwrap_or(false) {
+                        found = Some(hex::encode(wc.coin_id));
+                        used_coins.insert(wc.coin_id);
+                        break;
+                    }
+                }
+            }
+            found
+        };
+
+        let coin_to_mix = match coin_to_mix {
+            Some(c) => c,
+            None => {
+                println!("⚠️ Could not find the shattered coin of denom {} for mix. Skipping.", denom);
+                continue;
+            }
+        };
+
+        // Forward to the standard mix handler, passing the password securely in memory
+        match wallet_mix(
+            path,
+            rpc_port,
+            rpc_host.clone(),
+            denom,
+            Some(coin_to_mix),
+            Some(target_mix_id.clone()),
+            true, // We provisioned exactly one 'denom 1' coin for this pool, so auto-pay the fee!
+            timeout_secs,
+            Some(password.clone()), // SECURE MEMORY PASSING
+        ).await {
+            Ok(_) => println!("🎉 Successfully joined and mixed pool {}", &target_mix_id[..8]),
+            Err(e) => println!("⚠️ Mix {} failed: {}", &target_mix_id[..8], e),
+        }
+    }
+    
+    println!("\n✅ Auto-Shatter & Drip complete!");
+    Ok(())
+}
+
 fn wallet_import(path: &PathBuf, seed_hex: &str, value: u64, salt_hex: &str, label: Option<String>) -> Result<()> {
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
@@ -1963,6 +2287,7 @@ let (input_reveals, signatures) = match wallet.sign_reveal(&pending) {
             },
         }).collect(),
             salt: hex::encode(pending.salt),
+            is_consolidate: pending.is_consolidate,
         };
 
         let response = client.post(&url).json(&req).send().await?;
