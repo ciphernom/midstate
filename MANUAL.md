@@ -4,16 +4,16 @@ This document details the operational mechanics, configuration, disaster recover
 
 ## 1. Directory Structure and Configuration
 
-Midstate separates node data from wallet data.
+Midstate separates node data from wallet data to ensure that running a public node does not expose private keys.
 
 ### Node Directory (`./data` by default)
 
-* `db/`: The Redb database containing the state accumulator (`state.redb`) and the `batches/` directory for historical block storage.
-* `config.toml`: Node P2P configuration file.
+* `db/`: The Redb database containing the state accumulator (`state.redb`), historical blocks (`batches/`), and the `snapshots/` directory used for instant deep-reorg recovery.
+* `config.toml`: Node P2P configuration file (contains bootstrap peers and your persistent `peer_id`).
 * `miner.toml`: Mining configuration file (Solo/Pool mode, pool URLs, payout addresses).
-* `peer_key`: The libp2p identity key. This determines the node's `PeerId`.
+* `peer_key`: The libp2p identity key. This ensures your node maintains a static `PeerId` across restarts for Bayesian routing reputation.
 * `coinbase_seeds.jsonl`: Append-only log of mined solo block rewards.
-* `mining_seed`: The persistent seed used to generate deterministic solo coinbase outputs.
+* `mining_seed.key`: The persistent master seed used to generate deterministic solo coinbase outputs.
 
 ### Wallet Directory (`~/.midstate/` by default)
 
@@ -30,42 +30,53 @@ By default, wallets are Hierarchical Deterministic (HD). The 24-word phrase gene
 To restore an HD wallet to a new machine:
 ```bash
 midstate wallet restore --path wallet.dat
-
 ```
 
 *Note: Because MSS keys are stateful, restoring a wallet requires scanning the blockchain. The node will automatically query the chain to fast-forward your MSS `leaf_index` to prevent cryptographic key reuse.*
 
+### Mining Reward Recovery
+
+If you solo-mine blocks, the rewards are tied to the node's `mining_seed.key`, *not* your wallet's HD seed. To sweep mined block rewards into your wallet, run:
+```bash
+midstate wallet import-rewards --coinbase-file ./data/coinbase_seeds.jsonl --data-dir ./data
+```
+
 ### Legacy/Advanced: Raw Data Extraction
 
 If dealing with a legacy (non-HD) wallet or for specific offline backups, extract the raw coin data:
-
 ```bash
 midstate wallet export --path wallet.dat --coin <COIN_ID_HEX>
-
 ```
 
 To rebuild a single coin from raw data:
-
 ```bash
 midstate wallet import --path wallet.dat --seed <SEED_HEX> --value <INTEGER> --salt <SALT_HEX>
-
 ```
 
 ## 3. Node Maintenance and Troubleshooting
 
 ### Thread Management
 
-By default, the solo miner utilizes all available CPU cores. This can starve the asynchronous network executor (Tokio) on low-power devices.
-Use the `--threads` flag to restrict the miner and reserve CPU time for network keep-alives (e.g., on a 4-core Raspberry Pi, use 3 threads).
+By default, the solo miner utilizes all available CPU cores. This can starve the asynchronous network executor (Tokio) on low-power devices, causing peer disconnects. Use the `--threads` flag to restrict the miner and reserve CPU time for network keep-alives (e.g., on a 4-core Raspberry Pi, use 3 threads). You can also restrict verification threads to prevent CPU spikes during heavy chain syncs.
 
 ```bash
-midstate node --mine --threads 3
-
+midstate node --mine --threads 3 --verify-threads 2
 ```
 
-### Unrecoverable Coins (Address Reuse)
+### WOTS Address Reuse & Co-spending (Consolidation)
 
-WOTS addresses are strictly single-use. If a sender transmits funds to a WOTS address that has already been spent from, the wallet will ignore the incoming transaction to protect the key. The second coin becomes "burnt".
+WOTS addresses are strictly single-use. The protocol enforces this at the consensus level. 
+
+* **Siblings:** If you receive multiple payments to the same WOTS address *before* spending from it, the wallet creates "Sibling" UTXOs. To prevent key reuse, the wallet enforces a **Co-spend Rule**: you must spend all siblings in the exact same transaction. 
+* **Dust Sweeping:** If you accumulate too many siblings (exceeding the `MAX_TX_INPUTS` limit of 256), you must sweep them into a reusable MSS address using the consolidate command:
+  ```bash
+  midstate wallet consolidate --address <WOTS_ADDRESS>
+  ```
+* **Quarantine:** If a sender transmits funds to a WOTS address that has *already* been spent from, the wallet will quarantine the incoming transaction to protect your private key. The second coin is mathematically unspendable (burnt).
+
+### Database Corruption & Self-Healing
+
+Midstate employs an ultra-fast $O(\log N)$ periodic health check. If the node loses power abruptly and the `Redb` state accumulator falls out of sync with the block headers, the node will log a `CRITICAL` error and initiate a **Self-Healing Rollback**. It will automatically rewind the chain state to the last safe `snapshot` (taken every 100 blocks) and replay the blocks to repair the database without requiring a full resync from Genesis.
 
 ## 4. Privacy Mechanics
 
@@ -79,12 +90,19 @@ The standard `send` command aggregates inputs. The `--private` flag splits the t
 
 ```bash
 midstate wallet send --to <ADDRESS>:15 --private
+```
 
+### Auto-Shatter & Drip Mixing (`automix`)
+
+For maximum anonymity, Midstate includes an automated dark-pool routing command. `automix` takes a large UTXO, shatters it into standard power-of-2 denominations, and stochastically "drips" them into active P2P CoinJoin pools over time with random delays, breaking temporal heuristics.
+
+```bash
+midstate wallet automix --coin <COIN_ID>
 ```
 
 ### CoinJoin P2P Timeouts
 
-CoinJoin (`wallet mix`) operates in phases: `Collecting`, `Signing`, and `CommitSubmitted`. If a peer disconnects or fails to provide a signature, they are banned from the pool, and the session halts. Because the final `Reveal` transaction is never broadcast, your inputs remain unspent and safe.
+CoinJoin (`wallet mix`) operates in phases: `Collecting`, `Signing`, and `CommitSubmitted`. If a peer disconnects or fails to provide a signature within 60 seconds, they are penalized via the node's Bayesian routing system and temporarily banned from the pool, halting the session. Because the final `Reveal` transaction is never broadcast, your inputs remain unspent and cryptographically safe.
 
 ## 5. Midstate Axe & Hardware Operations
 
@@ -97,4 +115,4 @@ From the dashboard, you can:
 
 1. Reconfigure network Wi-Fi settings (Captive Portal).
 2. Toggle between Solo Mining and Decentralized Pool Mining.
-3. Apply hardware-level overclocks. **Warning: Do not apply the 'Force Turbo' overclock without a physical copper/aluminum heatsink attached to the SoC, or thermal throttling will severely degrade node performance.**
+3. Apply hardware-level overclocks. **Warning: Do not apply the 'Force Turbo' overclock without a physical copper/aluminum heatsink attached to the SoC, or thermal throttling will severely degrade node performance and potentially damage the board.**
