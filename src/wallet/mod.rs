@@ -476,6 +476,13 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
 
     /// Select coins whose total value >= needed, aggressively pulling in extra
     /// dust coins to merge change into higher powers of 2.
+    /// Select coins whose total value >= needed, aggressively pulling in extra
+    /// dust coins to merge change into higher powers of 2.
+    ///
+    /// # Formal Logic & Complexity
+    /// Pre-computes O(N) hash maps mapping `denomination -> Vec<CoinID>` and 
+    /// `address -> Vec<CoinID>`. This reduces the greedy snowball merge and 
+    /// sibling co-spend grouping from O(N^2) to an amortized O(N) linear pass.
     pub fn select_coins(&self, needed: u64, live_coins: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
         let mut selected = Vec::new();
         let mut selected_set = std::collections::HashSet::new();
@@ -483,12 +490,24 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         
         let live_set: std::collections::HashSet<[u8; 32]> = live_coins.iter().copied().collect();
 
-        // 1. Initial Selection: Sort by value descending to minimize baseline inputs
+        // 1. Build O(1) Lookup Indexes in O(N) time
         let mut available: Vec<&WalletCoin> = self.data.coins.iter()
             .filter(|c| live_set.contains(&c.coin_id))
             .collect();
         available.sort_by(|a, b| b.value.cmp(&a.value));
 
+        let mut by_denom: std::collections::HashMap<u64, Vec<[u8; 32]>> = std::collections::HashMap::new();
+        let mut by_addr: std::collections::HashMap<[u8; 32], Vec<[u8; 32]>> = std::collections::HashMap::new();
+        
+        for coin in &available {
+            by_denom.entry(coin.value).or_default().push(coin.coin_id);
+            // Only group WOTS addresses (MSS handles its own reuse safety)
+            if !self.data.mss_keys.iter().any(|k| compute_address(&k.master_pk) == coin.address) {
+                by_addr.entry(coin.address).or_default().push(coin.coin_id);
+            }
+        }
+
+        // 2. Initial Selection: Sort by value descending to minimize baseline inputs
         for coin in &available {
             if total >= needed { break; }
             selected.push(coin.coin_id);
@@ -504,76 +523,69 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             bail!("Too many siblings to spend in a normal transaction ({} > {}). Please use the 'midstate wallet consolidate' command to compress them into a new UTXO first.", selected.len(), crate::core::MAX_TX_INPUTS);
         }
 
-        // If we selected a coin from a WOTS address that has siblings, we MUST
-        // pull them all in. Spending them in the same tx produces an identical
-        // commitment hash → identical WOTS signature → zero key leakage.
-        let mut grouped_addresses = std::collections::HashSet::new();
-        for id in &selected {
-            if let Some(c) = self.find_coin(id) {
-                grouped_addresses.insert(c.address);
-            }
-        }
-        for coin in &available {
-            if grouped_addresses.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
-                let is_mss = self.data.mss_keys.iter().any(|k| compute_address(&k.master_pk) == coin.address);
-                if !is_mss {
-                    selected.push(coin.coin_id);
-                    selected_set.insert(coin.coin_id);
-                    total += coin.value;
-                    tracing::info!(
-                        "Co-spend grouping: pulled in sibling coin {} (value {}) to prevent WOTS key reuse",
-                        hex::encode(&coin.coin_id), coin.value
-                    );
+        // 3. O(1) Sibling Sweep: If we picked a WOTS coin, grab all siblings instantly
+        let initial_selected = selected.clone();
+        for id in initial_selected {
+            if let Some(c) = self.find_coin(&id) {
+                if let Some(siblings) = by_addr.get(&c.address) {
+                    for sib_id in siblings {
+                        if selected_set.insert(*sib_id) {
+                            selected.push(*sib_id);
+                            if let Some(sib_coin) = self.find_coin(sib_id) {
+                                total += sib_coin.value;
+                                tracing::info!(
+                                    "Co-spend grouping: pulled in sibling coin {} (value {}) to prevent WOTS key reuse",
+                                    hex::encode(sib_id), sib_coin.value
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // 2. The Greedy "Snowball" Merge
-        // If our resulting change includes a denomination we already have in our wallet,
-        // pull that wallet coin into the transaction! This effectively adds it to 
-        // the change, merging the two identical denominations into the next power of 2.
+        // 4. The Greedy "Snowball" Merge in O(1) loop lookups
         let mut added_new = true;
         while added_new {
             added_new = false;
             let change = total - needed;
             let mut change_denoms = decompose_value(change);
             use rand::seq::SliceRandom;
-            change_denoms.shuffle(&mut rand::thread_rng()); //gotta shuffle the change
+            change_denoms.shuffle(&mut rand::thread_rng()); 
             
             for denom in change_denoms {
-                // Try to find an unselected live coin of this exact denomination
-                if let Some(pos) = available.iter().position(|c| c.value == denom && !selected_set.contains(&c.coin_id)) {
-                    selected.push(available[pos].coin_id);
-                    selected_set.insert(available[pos].coin_id);
-                    total += denom;
-                    added_new = true;
-                    
-                    tracing::info!("Greedy Merge: Pulled in an extra coin of value {} to consolidate change", denom);
-                    break; // Break inner loop to re-evaluate the new, larger change
+                if let Some(candidates) = by_denom.get(&denom) {
+                    for cand_id in candidates {
+                        if selected_set.insert(*cand_id) {
+                            selected.push(*cand_id);
+                            total += denom;
+                            added_new = true;
+                            
+                            // Must also pull in siblings of the greedy coin
+                            if let Some(cand_coin) = self.find_coin(cand_id) {
+                                if let Some(siblings) = by_addr.get(&cand_coin.address) {
+                                    for sib_id in siblings {
+                                        if selected_set.insert(*sib_id) {
+                                            selected.push(*sib_id);
+                                            if let Some(sib_coin) = self.find_coin(sib_id) {
+                                                total += sib_coin.value;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            tracing::info!("Greedy Merge: Pulled in an extra coin of value {} to consolidate change", denom);
+                            break; 
+                        }
+                    }
                 }
+                if added_new { break; }
             }
             
-            // Consensus safety valve: MAX_TX_INPUTS is 256. Stop at 250 to be safe.
             if selected.len() >= 250 {
                 tracing::warn!("Greedy merge stopped early to avoid exceeding MAX_TX_INPUTS");
                 break;
-            }
-        }
-
-        // 3. Final co-spend sweep: the snowball merge may have pulled in
-        //    coins that have WOTS siblings not yet in the selection.
-        let mut final_addresses = std::collections::HashSet::new();
-        for id in &selected {
-            if let Some(c) = self.find_coin(id) {
-                if !self.data.mss_keys.iter().any(|k| compute_address(&k.master_pk) == c.address) {
-                    final_addresses.insert(c.address);
-                }
-            }
-        }
-        for coin in &available {
-            if final_addresses.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
-                selected.push(coin.coin_id);
-                selected_set.insert(coin.coin_id);
             }
         }
 

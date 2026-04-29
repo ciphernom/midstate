@@ -1105,21 +1105,11 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                 
                 SwarmEvent::IncomingConnectionError { local_addr: _, send_back_addr, error, connection_id: _ } => {
                     // This event fires when a connection fails BEFORE Step 4 (Identify).
-                    // This catches the DTLS Slowloris and bad cryptography.
+                    // Just log it. Do NOT insert PeerId::random() into self.subnet_peers, 
+                    // as that permanently consumes valid connection slots and leads to 
+                    // accidental network-wide bans for innocent QUIC packet drops.
                     if let Some(subnet) = crate::network::extract_subnet(&send_back_addr) {
-                        tracing::debug!("Incoming transport error from subnet {}: {:?}", subnet, error);
-                        
-                        // We use the subnet_peers map as a temporary strike counter for unauthenticated IPs
-                        let strikes = self.subnet_peers.entry(subnet).or_default();
-                        
-                        // We push dummy PeerIds just to increment the length of the HashSet
-                        strikes.insert(PeerId::random()); 
-                        
-                        if strikes.len() >= 5 { // 5 failed transport handshakes = Ban
-                            tracing::warn!("Eclipse/Flood Defense: Banning subnet {} due to repeated transport handshake failures.", subnet);
-                            self.banned_subnets.insert(subnet, std::time::Instant::now());
-                            self.subnet_peers.remove(&subnet); // cleanup
-                        }
+                        tracing::trace!("Incoming transport error from subnet {}: {:?}", subnet, error);
                     }
                 }
                 SwarmEvent::ConnectionClosed {
