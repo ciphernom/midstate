@@ -2949,17 +2949,32 @@ fn fire_batch_lookahead(&mut self) {
         
         // Grab recent timestamps BEFORE the start of this header chunk for MTP validation
         let mut recent_headers_vec: Vec<u64> = Vec::new();
+        let mut links_to_local = false;
+
         if let Some(first_hdr) = all_headers.first() {
             let start_h = first_hdr.height;
-            let window_size = crate::core::DIFFICULTY_LOOKBACK as u64;
-            let lookback_start = start_h.saturating_sub(window_size);
             
-            for h in lookback_start..start_h {
-                if let Ok(Some(batch)) = storage.load_batch(h) {
-                    recent_headers_vec.push(batch.timestamp);
-                } else if let Some(snap) = &snapshot {
-                    // Fallback for fast-forward sync gaps
-                    recent_headers_vec.push(snap.timestamp);
+            if start_h > 0 {
+                if let Ok(Some(prev_batch)) = storage.load_batch(start_h - 1) {
+                    if prev_batch.extension.final_hash == first_hdr.prev_header_hash {
+                        links_to_local = true;
+                    }
+                }
+            } else {
+                links_to_local = true; // Genesis always links
+            }
+
+            if links_to_local {
+                let window_size = crate::core::DIFFICULTY_LOOKBACK as u64;
+                let lookback_start = start_h.saturating_sub(window_size);
+                
+                for h in lookback_start..start_h {
+                    if let Ok(Some(batch)) = storage.load_batch(h) {
+                        recent_headers_vec.push(batch.timestamp);
+                    } else if let Some(snap) = &snapshot {
+                        // Fallback for fast-forward sync gaps
+                        recent_headers_vec.push(snap.timestamp);
+                    }
                 }
             }
         }
