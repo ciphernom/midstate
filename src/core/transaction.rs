@@ -12,32 +12,69 @@ pub const MIN_COMMIT_POW_BITS: u32 = 24;
 #[cfg(feature = "fast-mining")]
 pub const MIN_COMMIT_POW_BITS: u32 = 16;
 
-pub fn commit_pow_hash(commitment: &[u8; 32], nonce: u64, target_height: u64) -> [u8; 32] {
-    let mut data = Vec::with_capacity(48);
+pub fn commit_pow_hash(commitment: &[u8; 32], actual_nonce: u32, target_height: u32) -> [u8; 32] {
+    let mut data = Vec::with_capacity(40);
     data.extend_from_slice(&target_height.to_le_bytes());
     data.extend_from_slice(commitment);
-    data.extend_from_slice(&nonce.to_le_bytes());
+    data.extend_from_slice(&actual_nonce.to_le_bytes());
     super::types::hash(&data)
 }
 
+pub fn pack_spam_nonce(actual_nonce: u32, target_height: u32) -> u64 {
+    ((target_height as u64) << 32) | (actual_nonce as u64)
+}
 
-pub fn evaluate_commit_pow(commitment: &[u8; 32], nonce: u64, current_height: u64) -> Result<u32> {
+pub fn unpack_spam_nonce(spam_nonce: u64) -> (u32, u32) {
+    let target_height = (spam_nonce >> 32) as u32;
+    let actual_nonce = (spam_nonce & 0xFFFFFFFF) as u32;
+    (target_height, actual_nonce)
+}
+
+/// Evaluate the Commit-PoW associated with a commitment under either V1
+/// (legacy brute-force) or V2 (single-hash with explicit target height) rules.
+pub fn evaluate_commit_pow(commitment: &[u8; 32], spam_nonce: u64, current_height: u64) -> Result<u32> {
+    let (target_height, actual_nonce) = unpack_spam_nonce(spam_nonce);
+
+    if current_height >= crate::core::types::V2_ACTIVATION_HEIGHT {
+        if target_height == 0 {
+            bail!("Legacy V1 Commits are deprecated. Upgrade your node/wallet.");
+        }
+        if current_height.saturating_sub(target_height as u64) > crate::core::types::COMMIT_POW_WINDOW {
+            bail!("Commit PoW expired. Mined for height {}, current is {}", target_height, current_height);
+        }
+        if (target_height as u64) > current_height + 1 {
+            bail!("Commit PoW target height too far in the future");
+        }
+
+        // V2 path: O(1) validation — exactly ONE hash.
+        let hash = commit_pow_hash(commitment, actual_nonce, target_height);
+        let zeros = crate::core::types::count_leading_zeros(&hash);
+        if zeros < MIN_COMMIT_POW_BITS {
+            bail!("Insufficient Commit PoW");
+        }
+        return Ok(zeros);
+    }
+
+    // V1 legacy path: O(W) brute-force search backward
     let start = current_height.saturating_sub(crate::core::types::COMMIT_POW_WINDOW);
     let mut best_zeros = 0;
-    
     for h in start..=current_height {
-        let hash = commit_pow_hash(commitment, nonce, h);
+        // Reconstruct legacy layout (target_height as u64 || commitment || spam_nonce as u64)
+        let mut data = Vec::with_capacity(48);
+        data.extend_from_slice(&h.to_le_bytes());
+        data.extend_from_slice(commitment);
+        data.extend_from_slice(&spam_nonce.to_le_bytes());
+        let hash = super::types::hash(&data);
+
         let zeros = crate::core::types::count_leading_zeros(&hash);
         if zeros > best_zeros {
             best_zeros = zeros;
-            if best_zeros >= MIN_COMMIT_POW_BITS {
-                break;
-            }
+            if best_zeros >= MIN_COMMIT_POW_BITS { break; }
         }
     }
 
     if best_zeros < MIN_COMMIT_POW_BITS {
-        bail!("Insufficient Commit PoW or expired: need {} leading zero bits", MIN_COMMIT_POW_BITS);
+        bail!("Insufficient Commit PoW or expired");
     }
     Ok(best_zeros)
 }
@@ -49,9 +86,14 @@ fn validate_commit_pow(commitment: &[u8; 32], nonce: u64, current_height: u64) -
 
 /// Pure signature verification only — no state reads or mutations.
 /// Called in parallel across all transactions in a batch before sequential apply.
-/// Performs an O(1) read-only check against the commitment set to prevent 
+/// Performs an O(1) read-only check against the commitment set to prevent
 /// CPU exhaustion from stateless signature spam.
-pub fn verify_transaction_sigs(tx: &Transaction, height: u64, commitments: &UtxoAccumulator, in_block_commits: &std::collections::HashSet<[u8; 32]>) -> Result<()> {
+pub fn verify_transaction_sigs(
+    tx: &Transaction,
+    height: u64,
+    commitments: &UtxoAccumulator,
+    in_block_commits: &std::collections::HashSet<[u8; 32]>,
+) -> Result<()> {
     match tx {
         Transaction::Commit { .. } => Ok(()),
         Transaction::Reveal { inputs, witnesses, outputs, salt, .. } => {
@@ -60,7 +102,7 @@ pub fn verify_transaction_sigs(tx: &Transaction, height: u64, commitments: &Utxo
                 .map(|o| o.hash_for_commitment())
                 .collect();
             let commitment = compute_commitment(&input_coin_ids, &output_commit_hashes, salt);
-            
+
             if !commitments.contains(&commitment) && !in_block_commits.contains(&commitment) {
                 bail!("Phase 1 validation failed: Reveal transaction references an unknown commitment");
             }
@@ -79,11 +121,11 @@ pub fn verify_transaction_sigs(tx: &Transaction, height: u64, commitments: &Utxo
                 .map(|o| o.hash_for_commitment())
                 .collect();
             let commitment = compute_commitment(&input_coin_ids, &output_commit_hashes, salt);
-            
+
             if !commitments.contains(&commitment) && !in_block_commits.contains(&commitment) {
                 bail!("Phase 1 validation failed: Consolidate transaction references an unknown commitment");
             }
-            
+
             let first_addr = inputs[0].predicate.address();
             for input in inputs.iter().skip(1) {
                 if input.predicate.address() != first_addr {
@@ -101,7 +143,13 @@ pub fn verify_transaction_sigs(tx: &Transaction, height: u64, commitments: &Utxo
 
 /// Apply a transaction that has already passed signature verification.
 /// Skips the verify_predicate call — all other validation still runs.
+///
+/// All accumulator mutations use `is_v2 = is_v2_at(state.height)` (captured
+/// once at function entry) so that within a single block every UTXO/SMT
+/// update lives in the same hashing universe.
 pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Result<()> {
+    let v2 = crate::core::types::is_v2_at(state.height);
+
     match tx {
         Transaction::Commit { .. } => {
             // Commits are cheap — just delegate to the normal path
@@ -113,16 +161,14 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
             if outputs.is_empty() { bail!("Transaction must create at least one new coin"); }
             if inputs.len() > MAX_TX_INPUTS { bail!("Too many inputs (max {})", MAX_TX_INPUTS); }
             if outputs.len() > MAX_TX_OUTPUTS { bail!("Too many outputs (max {})", MAX_TX_OUTPUTS); }
-            if witnesses.len() != inputs.len() { 
-                bail!("Witness count must match input count"); 
+            if witnesses.len() != inputs.len() {
+                bail!("Witness count must match input count");
             }
 
             let max_witness_size = MAX_SIGNATURE_SIZE * MAX_TX_INPUTS;
             if bincode::serialized_size(&witnesses).unwrap_or(u64::MAX) > max_witness_size as u64 {
                 bail!("Witnesses payload exceeds maximum allowed size");
             }
-            
-
 
             {
                 let mut seen = std::collections::HashSet::new();
@@ -180,7 +226,7 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
                     );
                 }
             }
-            state.commitments.remove(&expected);
+            state.commitments.remove(&expected, v2);
             state.commitment_heights.remove(&expected);
 
             // Coin existence check still needed — sig verification doesn't touch state
@@ -194,12 +240,12 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
             // NOTE: verify_predicate intentionally skipped here — already done in parallel
 
             for coin_id in &input_coin_ids {
-                state.coins.remove(coin_id);
+                state.coins.remove(coin_id, v2);
             }
 
             for out in outputs {
                 if let Some(coin_id) = out.coin_id() {
-                    if !state.coins.insert(coin_id) {
+                    if !state.coins.insert(coin_id, v2) {
                         bail!("Duplicate coin created");
                     }
                 }
@@ -275,7 +321,7 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
                     bail!("Commitment expired at consensus");
                 }
             }
-            state.commitments.remove(&expected);
+            state.commitments.remove(&expected, v2);
             state.commitment_heights.remove(&expected);
 
             for input in inputs.iter() {
@@ -284,11 +330,11 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
                 }
             }
             for coin_id in &input_coin_ids {
-                state.coins.remove(coin_id);
+                state.coins.remove(coin_id, v2);
             }
             for out in outputs {
                 if let Some(coin_id) = out.coin_id() {
-                    if !state.coins.insert(coin_id) {
+                    if !state.coins.insert(coin_id, v2) {
                         bail!("Duplicate coin created");
                     }
                 }
@@ -306,15 +352,27 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
     }
 }
 
-/// Apply a transaction to the state
+/// Apply a transaction to the state, including signature verification.
+///
+/// All accumulator mutations use `is_v2 = is_v2_at(state.height)` (captured
+/// once at function entry) so that within a single block every UTXO/SMT
+/// update lives in the same hashing universe.
 pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
+    let v2 = crate::core::types::is_v2_at(state.height);
+
     match tx {
         Transaction::Commit { commitment, spam_nonce } => {
             validate_commit_pow(commitment, *spam_nonce, state.height)?;
-            if !state.commitments.insert(*commitment) {
+            if !state.commitments.insert(*commitment, v2) {
                 bail!("Duplicate commitment");
             }
             state.commitment_heights.insert(*commitment, state.height);
+
+            // O(log H) expiration tracking
+            let mut list = state.expirations.get(&state.height).cloned().unwrap_or_default();
+            list.push(*commitment);
+            state.expirations.insert(state.height, list);
+
             state.midstate = hash_concat(&state.midstate, commitment);
             Ok(())
         }
@@ -326,22 +384,21 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             if outputs.is_empty() {
                 bail!("Transaction must create at least one new coin");
             }
-            if inputs.len() > MAX_TX_INPUTS { 
-                bail!("Too many inputs (max {})", MAX_TX_INPUTS); 
-                }
-            if outputs.len() > MAX_TX_OUTPUTS { 
-                bail!("Too many outputs (max {})", MAX_TX_OUTPUTS); 
+            if inputs.len() > MAX_TX_INPUTS {
+                bail!("Too many inputs (max {})", MAX_TX_INPUTS);
             }
-            
-            if witnesses.len() != inputs.len() { 
-                bail!("Witness count must match input count"); 
+            if outputs.len() > MAX_TX_OUTPUTS {
+                bail!("Too many outputs (max {})", MAX_TX_OUTPUTS);
+            }
+
+            if witnesses.len() != inputs.len() {
+                bail!("Witness count must match input count");
             }
 
             let max_witness_size = MAX_SIGNATURE_SIZE * MAX_TX_INPUTS;
             if bincode::serialized_size(&witnesses).unwrap_or(u64::MAX) > max_witness_size as u64 {
                 bail!("Witnesses payload exceeds maximum allowed size");
             }
-            
 
             {
                 let mut seen = std::collections::HashSet::new();
@@ -404,7 +461,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                     );
                 }
             }
-            state.commitments.remove(&expected);
+            state.commitments.remove(&expected, v2);
             state.commitment_heights.remove(&expected);
 
             // 5. Verify each input coin exists and executes cleanly against its Predicate
@@ -413,7 +470,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 if !state.coins.contains(&coin_id) {
                     bail!("Coin {} not found or already spent", hex::encode(coin_id));
                 }
-                
+
                 // Script Execution Engine
                 if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs, input.value, input.commitment) {
                     bail!("Predicate execution failed for input {}", i);
@@ -422,13 +479,13 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
 
             // 6. Remove spent coins
             for coin_id in &input_coin_ids {
-                state.coins.remove(coin_id);
+                state.coins.remove(coin_id, v2);
             }
 
             // 7. Add new coins (Ignore DataBurns, protecting the SMT!)
             for out in outputs {
                 if let Some(coin_id) = out.coin_id() {
-                    if !state.coins.insert(coin_id) {
+                    if !state.coins.insert(coin_id, v2) {
                         bail!("Duplicate coin created");
                     }
                 }
@@ -503,7 +560,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                     bail!("Commitment expired at consensus");
                 }
             }
-            state.commitments.remove(&expected);
+            state.commitments.remove(&expected, v2);
             state.commitment_heights.remove(&expected);
 
             for input in inputs.iter() {
@@ -517,10 +574,10 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 bail!("Predicate execution failed for Consolidate witness");
             }
 
-            for coin_id in &input_coin_ids { state.coins.remove(coin_id); }
+            for coin_id in &input_coin_ids { state.coins.remove(coin_id, v2); }
             for out in outputs {
                 if let Some(coin_id) = out.coin_id() {
-                    if !state.coins.insert(coin_id) { bail!("Duplicate coin created"); }
+                    if !state.coins.insert(coin_id, v2) { bail!("Duplicate coin created"); }
                 }
             }
             {
@@ -560,11 +617,11 @@ fn verify_predicate(
     }
 }
 
-/// Validate a transaction without applying it
+/// Validate a transaction without applying it (read-only consensus check).
 pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
     match tx {
         Transaction::Commit { commitment, spam_nonce } => {
-             validate_commit_pow(commitment, *spam_nonce, state.height)?;
+            validate_commit_pow(commitment, *spam_nonce, state.height)?;
             if state.commitments.contains(commitment) {
                 bail!("Duplicate commitment");
             }
@@ -578,22 +635,21 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
             if outputs.is_empty() {
                 bail!("Must create at least one coin");
             }
-            if inputs.len() > MAX_TX_INPUTS { 
-                bail!("Too many inputs (max {})", MAX_TX_INPUTS); 
-                }
-            if outputs.len() > MAX_TX_OUTPUTS { 
-                bail!("Too many outputs (max {})", MAX_TX_OUTPUTS); 
+            if inputs.len() > MAX_TX_INPUTS {
+                bail!("Too many inputs (max {})", MAX_TX_INPUTS);
             }
-            
-            if witnesses.len() != inputs.len() { 
-                bail!("Witness count must match input count"); 
+            if outputs.len() > MAX_TX_OUTPUTS {
+                bail!("Too many outputs (max {})", MAX_TX_OUTPUTS);
+            }
+
+            if witnesses.len() != inputs.len() {
+                bail!("Witness count must match input count");
             }
 
             let max_witness_size = MAX_SIGNATURE_SIZE * MAX_TX_INPUTS;
             if bincode::serialized_size(&witnesses).unwrap_or(u64::MAX) > max_witness_size as u64 {
                 bail!("Witnesses payload exceeds maximum allowed size");
             }
-                        
 
             {
                 let mut seen = std::collections::HashSet::new();
@@ -608,7 +664,7 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                     }
                 }
             }
-                for (i, out) in outputs.iter().enumerate() {
+            for (i, out) in outputs.iter().enumerate() {
                 if out.value() == 0 {
                     if out.is_confidential() {
                         // Allowed: 0-value State Thread
@@ -645,7 +701,7 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                     bail!("Commitment expired (committed at height {}, current {})", commit_height, state.height);
                 }
             }
-             // 5. Verify each Witness executes cleanly against its Predicate
+            // 5. Verify each Witness executes cleanly against its Predicate
             for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
                 let coin_id = input.coin_id();
                 if !state.coins.contains(&coin_id) {
@@ -711,7 +767,7 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
     }
 }
 
-#[cfg(test)] 
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::mmr::UtxoAccumulator;
@@ -727,7 +783,9 @@ mod tests {
             height: 1,
             timestamp: 1000,
             commitment_heights: im::HashMap::new(),
+            expirations: im::OrdMap::new(),
             chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
+            header_hash: [0u8; 32],
         }
     }
 
@@ -746,7 +804,8 @@ mod tests {
     fn commit_pow_valid_nonce_passes() {
         let commitment = hash(b"test commitment");
         let nonce = mine_commit_nonce(&commitment);
-        assert!(validate_commit_pow(&commitment, nonce).is_ok());
+        // Tests use V1 path (height 0), where target_height in nonce is unused.
+        assert!(validate_commit_pow(&commitment, nonce, 0).is_ok());
     }
 
     #[test]
@@ -761,7 +820,7 @@ mod tests {
             }
             bad_nonce += 1;
         }
-        assert!(validate_commit_pow(&commitment, bad_nonce).is_err());
+        assert!(validate_commit_pow(&commitment, bad_nonce, 0).is_err());
     }
 
     #[test]
@@ -771,11 +830,8 @@ mod tests {
         let start = std::time::Instant::now();
         let nonce = mine_commit_nonce(&commitment);
         let elapsed = start.elapsed();
-        // Verify it's actually valid
-        assert!(validate_commit_pow(&commitment, nonce).is_ok());
-        // Log timing (visible with `cargo test -- --nocapture`)
+        assert!(validate_commit_pow(&commitment, nonce, 0).is_ok());
         eprintln!("Commit PoW mining took {:?} (nonce: {})", elapsed, nonce);
-        // Soft assert: should complete within 5 seconds even on slow hardware
         assert!(elapsed.as_secs() < 5, "PoW took too long: {:?}", elapsed);
     }
 
@@ -810,12 +866,13 @@ mod tests {
     /// Helper: create a state with a spendable coin, returning (state, seed, coin_id, salt).
     fn state_with_coin(value: u64) -> (State, [u8; 32], [u8; 32], [u8; 32]) {
         let mut state = empty_state();
+        let v2 = crate::core::types::is_v2_at(state.height);
         let seed: [u8; 32] = [0x42; 32];
         let owner_pk = wots::keygen(&seed);
         let address = compute_address(&owner_pk);
         let salt = hash(b"test salt");
         let coin_id = compute_coin_id(&address, value, &salt);
-        state.coins.insert(coin_id);
+        state.coins.insert(coin_id, v2);
         (state, seed, coin_id, salt)
     }
 
@@ -850,9 +907,9 @@ mod tests {
         let owner_pk = wots::keygen(&seed);
         let sig = wots::sign(&seed, &commitment);
         let tx = Transaction::Reveal {
-            inputs: vec![InputReveal { 
-                predicate: Predicate::p2pk(&owner_pk), 
-                value: 16, 
+            inputs: vec![InputReveal {
+                predicate: Predicate::p2pk(&owner_pk),
+                value: 16,
                 salt: input_salt,
                 commitment: None,
             }],
@@ -868,7 +925,7 @@ mod tests {
         assert!(state.coins.contains(&output_coin_id.unwrap()));
     }
 
-#[test]
+    #[test]
     fn reveal_rejects_without_commit() {
         let (mut state, seed, _coin_id, input_salt) = state_with_coin(16);
         let owner_pk = wots::keygen(&seed);
@@ -892,7 +949,7 @@ mod tests {
         let output = OutputData::Standard { address: hash(b"r"), value: 8, salt: [0; 32] };
         let commit_salt: [u8; 32] = [0x33; 32];
         let commitment = do_commit(&mut state, &[coin_id], &[output.coin_id().unwrap()], &commit_salt);
-        
+
         // Sign with wrong key
         let wrong_seed: [u8; 32] = [0xFF; 32];
         let bad_sig = wots::sign(&wrong_seed, &commitment);
@@ -1082,6 +1139,7 @@ mod tests {
         use crate::core::mss;
 
         let mut state = empty_state();
+        let v2 = crate::core::types::is_v2_at(state.height);
         let mss_seed = hash(b"mss test seed");
         let mut keypair = mss::keygen(&mss_seed, 4).unwrap();
         let master_pk = keypair.public_key(); // this is the owner_pk
@@ -1091,7 +1149,7 @@ mod tests {
         let input_salt = hash(b"mss coin salt");
         let value = 16u64;
         let coin_id = compute_coin_id(&address, value, &input_salt);
-        state.coins.insert(coin_id);
+        state.coins.insert(coin_id, v2);
 
         let output = OutputData::Standard { address: hash(b"dest"), value: 8, salt: [0; 32] };
         let commit_salt = [0xCC; 32];

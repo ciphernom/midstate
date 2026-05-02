@@ -214,11 +214,12 @@ fn from_u64(v: u64) -> StackItem {
     if v == 0 {
         return SmallVec::from_slice(&[0]);
     }
-    let mut bytes = v.to_le_bytes().to_vec();
-    while bytes.len() > 1 && bytes.last() == Some(&0) {
-        bytes.pop();
+    let bytes = v.to_le_bytes();
+    let mut len = 8;
+    while len > 1 && bytes[len - 1] == 0 {
+        len -= 1;
     }
-    SmallVec::from_vec(bytes)
+    SmallVec::from_slice(&bytes[..len])
 }
 
 fn is_true(item: &[u8]) -> bool {

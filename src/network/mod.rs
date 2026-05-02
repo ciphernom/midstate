@@ -377,9 +377,9 @@ impl MidstateNetwork {
             .with_behaviour(|key: &libp2p::identity::Keypair, relay_client| {
                 let local_peer = key.public().to_peer_id();
 
-            // --- decrease to 15s to stop wasting time
+            // --- decrease to 60s to PREVENT SYNC TIMEOUTS
                 let rr_config = RequestResponseConfig::default()
-                    .with_request_timeout(Duration::from_secs(15));
+                    .with_request_timeout(Duration::from_secs(60));
 
                 let rr = request_response::Behaviour::new(
                     [(MIDSTATE_PROTOCOL, ProtocolSupport::Full)],
@@ -405,10 +405,10 @@ impl MidstateNetwork {
                 // We provide just enough bandwidth for light clients to submit
                 // transactions, but cut off heavy data streaming.
                 let mut relay_config = relay::Config::default();
-                relay_config.max_circuits = 16;                 // Max 16 total relayed connections
-                relay_config.max_circuits_per_peer = 2;         // Prevent 1 peer taking all 16 slots
-                relay_config.max_circuit_duration = std::time::Duration::from_secs(2 * 60); // 2 min max
-                relay_config.max_circuit_bytes = 1_048_576;     // 1 MB data limit per circuit
+                relay_config.max_circuits = 32;                 // Max 16 total relayed connections
+                relay_config.max_circuits_per_peer = 4;         // Prevent 1 peer taking all 16 slots
+                relay_config.max_circuit_duration = std::time::Duration::from_secs(10 * 60); // 10 min max
+                relay_config.max_circuit_bytes = 33_554_432;     // 32 MB data limit per circuit
 
                 let relay_server = relay::Behaviour::new(
                     local_peer,
@@ -432,7 +432,7 @@ let autonat = autonat::Behaviour::new(
                 // --- EFFICIENCY FIX: Prevent File Descriptor / Socket Exhaustion ---
                 // In libp2p v0.52+, ConnectionLimits is a Behaviour, not a Swarm Config.
                 let limits = libp2p::connection_limits::ConnectionLimits::default()
-                    .with_max_established_per_peer(Some(2)) // Prevent buggy peers from spamming parallel connections
+                    .with_max_established_per_peer(Some(4)) // Prevent buggy peers from spamming parallel connections
                     .with_max_pending_incoming(Some(200))
                     .with_max_established_incoming(Some(200)); // Hard cap to prevent OS error 24
                 let connection_limits = libp2p::connection_limits::Behaviour::new(limits);
@@ -1068,8 +1068,8 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     // Eclipse Protection: Enforce inbound limit manually
                     if endpoint.is_listener() {
                         let inbound_count = self.connected.values().filter(|e| e.is_listener()).count();
-                        if inbound_count >= 40 {
-                            tracing::warn!("Max inbound peers (40) reached, dropping {}", peer_id);
+                        if inbound_count >= 200 {
+                            tracing::warn!("Max inbound peers (200) reached, dropping {}", peer_id);
                             let _ = self.swarm.disconnect_peer_id(peer_id);
                             continue; 
                         }

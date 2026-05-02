@@ -143,14 +143,17 @@ pub fn mine_commitment_pow(commitment_hex: &str, required_pow: u32, target_heigh
     let mut commitment = [0u8; 32];
     hex::decode_to_slice(commitment_hex, &mut commitment).unwrap();
 
-    let mut nonce = 0u64;
+    let target_height_u32 = target_height as u32;
+    let mut actual_nonce = 0u32;
+    
     loop {
         // Use the official V2 hashing algorithm from the core library
-        let h = midstate::core::transaction::commit_pow_hash(&commitment, nonce, target_height);
-        if midstate::core::count_leading_zeros(&h) >= required_pow {
-            return nonce;
+        let h = midstate::core::transaction::commit_pow_hash(&commitment, actual_nonce, target_height_u32);
+        if midstate::core::types::count_leading_zeros(&h) >= required_pow {
+            // Pack the 32-bit target height and 32-bit nonce into the 64-bit spam_nonce
+            return midstate::core::transaction::pack_spam_nonce(actual_nonce, target_height_u32);
         }
-        nonce += 1;
+        actual_nonce += 1;
     }
 }
 

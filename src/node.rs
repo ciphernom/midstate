@@ -337,6 +337,7 @@ impl NodeHandle {
 
                 let state = self.state.read().await;
         let mut candidate = state.clone();
+        let v2 = crate::core::types::is_v2_at(candidate.height);
         let height = state.height;
         let target = state.target;
         let prev_midstate = state.midstate;
@@ -453,11 +454,11 @@ impl NodeHandle {
         // Compute mining midstate
         for cb in &coinbase {
             candidate.midstate = hash_concat(&candidate.midstate, &cb.coin_id());
-            candidate.coins.insert(cb.coin_id());
+            candidate.coins.insert(cb.coin_id(), v2);
         }
 
-        let smt_root = hash_concat(&candidate.coins.root(), &candidate.commitments.root());
-        let state_root = hash_concat(&smt_root, &candidate.chain_mmr.root());
+        let smt_root = hash_concat(&candidate.coins.root(v2), &candidate.commitments.root(v2));
+        let state_root = hash_concat(&smt_root, &candidate.chain_mmr.root(v2));
         candidate.midstate = hash_concat(&candidate.midstate, &state_root);
 
         let min_timestamp = state_timestamp + 1; // <-- Use extracted variable
@@ -750,17 +751,18 @@ pub async fn new(
                     tracing::info!("Creating genesis batch (batch_0)");
                     let genesis_coinbase = State::genesis().1;
 
+                    let v2 = crate::core::types::is_v2_at(state.height);
                     let mut mining_midstate = state.midstate;
                     let mut temp_coins = state.coins.clone();
                     for cb in &genesis_coinbase {
                         let coin_id = cb.coin_id();
                         mining_midstate = hash_concat(&mining_midstate, &coin_id);
-                        temp_coins.insert(coin_id);
+                        temp_coins.insert(coin_id, v2);
                     }
 
                     // --- Calculate Genesis State Root ---
-                    let smt_root = hash_concat(&temp_coins.root(), &state.commitments.root());
-                    let state_root = hash_concat(&smt_root, &state.chain_mmr.root());
+                    let smt_root = hash_concat(&temp_coins.root(v2), &state.commitments.root(v2));
+                    let state_root = hash_concat(&smt_root, &state.chain_mmr.root(v2));
                     mining_midstate = hash_concat(&mining_midstate, &state_root);
                     // -----------------------------------------
 
@@ -1329,6 +1331,7 @@ async fn handle_light_request(
                 };
 
                 let mut candidate = self.state.clone();
+                let v2 = crate::core::types::is_v2_at(candidate.height);
                 let height = self.state.height;
                 let target = self.state.target;
                 let prev_midstate = self.state.midstate;
@@ -1398,11 +1401,11 @@ if coinbase_total != expected_total {
 
                 for cb in &coinbase_out {
                     candidate.midstate = hash_concat(&candidate.midstate, &cb.coin_id());
-                    candidate.coins.insert(cb.coin_id());
+                    candidate.coins.insert(cb.coin_id(), v2);
                 }
 
-                let smt_root = hash_concat(&candidate.coins.root(), &candidate.commitments.root());
-                let state_root = hash_concat(&smt_root, &candidate.chain_mmr.root());
+                let smt_root = hash_concat(&candidate.coins.root(v2), &candidate.commitments.root(v2));
+                let state_root = hash_concat(&smt_root, &candidate.chain_mmr.root(v2));
                 candidate.midstate = hash_concat(&candidate.midstate, &state_root);
                 let min_timestamp = candidate.timestamp + 1;
                 let actual_timestamp = crate::core::state::current_timestamp().max(min_timestamp);
@@ -1786,8 +1789,8 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                             if idle_secs > timeout {
                                 let msg = format!("timed out after {}s in phase {}", idle_secs, phase_name);
                                 self.abort_sync_session(&msg);
-                                // FIX: Punish the black-hole peer so we don't pick them again!
-                                self.ban_peer(peer, "sync stall timeout");
+                                // Do NOT ban the peer for latency/load. Just disconnect them.
+                                self.network.disconnect_peer(peer); 
                             } else if idle_secs > timeout / 2 && idle_secs % 30 < 5 {
                                 tracing::warn!(
                                     "Sync stall warning: {}s idle in {} (timeout={}s, peer={})",
@@ -3812,6 +3815,7 @@ fn fire_batch_lookahead(&mut self) {
     /// Verifies that the in-memory UTXO set, midstate, and disk records are perfectly aligned.
     async fn perform_health_check(&mut self) -> Result<bool> {
         if self.state.height == 0 { return Ok(true); }
+        let v2 = crate::core::types::is_v2_at(self.state.height);
 
         let disk_highest = self.storage.highest_batch().unwrap_or(0);
         if disk_highest + 1 != self.state.height {
@@ -3833,9 +3837,9 @@ fn fire_batch_lookahead(&mut self) {
         }
 
         // Just ensure SMT math works without crashing
-        let mut coins_clone = self.state.coins.clone();
-        let mut comms_clone = self.state.commitments.clone();
-        let _smt_root = crate::core::types::hash_concat(&coins_clone.root(), &comms_clone.root());
+        let coins_clone = self.state.coins.clone();
+        let comms_clone = self.state.commitments.clone();
+        let _smt_root = crate::core::types::hash_concat(&coins_clone.root(v2), &comms_clone.root(v2));
 
         Ok(true)
     }
@@ -3906,13 +3910,13 @@ fn fire_batch_lookahead(&mut self) {
 
         // Mine spam nonce for the Commit (respecting dynamic mempool difficulty)
         let required_pow = self.mempool.required_commit_pow();
-        let current_height = self.state.height;
+        let current_height_u32 = self.state.height as u32;
         let spam_nonce = tokio::task::spawn_blocking(move || {
-            let mut n = 0u64;
+            let mut n = 0u32;
             loop {
-                let h = crate::core::transaction::commit_pow_hash(&commitment, n, current_height);
+                let h = crate::core::transaction::commit_pow_hash(&commitment, n, current_height_u32);
                 if crate::core::types::count_leading_zeros(&h) >= required_pow {
-                    return n;
+                    return crate::core::transaction::pack_spam_nonce(n, current_height_u32);
                 }
                 n += 1;
             }
@@ -4058,9 +4062,9 @@ fn fire_batch_lookahead(&mut self) {
 
         if batch.target != self.state.target {
             tracing::debug!("Batch target mismatch, ignoring");
-            if let Some(peer) = from {
-                self.ban_peer(peer, "batch target mismatch for current height");
-            }
+            //if let Some(peer) = from {
+            //    self.ban_peer(peer, "batch target mismatch for current height");
+           // }
             return Ok(());
         }
 
@@ -4544,6 +4548,7 @@ async fn try_apply_orphans(&mut self) {
         let pre_mine_height = self.state.height;
         let pre_mine_midstate = self.state.midstate;
         let mut candidate_state = self.state.clone();
+        let v2 = crate::core::types::is_v2_at(candidate_state.height);
         
         let mut total_fees: u64 = 0;
         let mut transactions = Vec::new();
@@ -4617,13 +4622,13 @@ async fn try_apply_orphans(&mut self) {
         let coinbase = self.generate_coinbase(pre_mine_height, total_fees, pool_address_bytes);
         for cb in &coinbase {
             let coin_id = cb.coin_id();
-            candidate_state.coins.insert(coin_id);
+            candidate_state.coins.insert(coin_id, v2);
             candidate_state.midstate = hash_concat(&candidate_state.midstate, &coin_id);
         }
 
         // --- Calculate state root ---
-        let smt_root = hash_concat(&candidate_state.coins.root(), &candidate_state.commitments.root());
-        let state_root = hash_concat(&smt_root, &candidate_state.chain_mmr.root());
+        let smt_root = hash_concat(&candidate_state.coins.root(v2), &candidate_state.commitments.root(v2));
+        let state_root = hash_concat(&smt_root, &candidate_state.chain_mmr.root(v2));
         candidate_state.midstate = hash_concat(&candidate_state.midstate, &state_root);
         // ---------------------------------
 
@@ -4914,7 +4919,7 @@ fn replay_blocks_into_state(
             // Trust the batch's stored linkage (prev_header_hash, prev_midstate).
             let expected_mining_hash = crate::core::types::compute_header_hash(&header);
 
-            crate::core::state::apply_batch_skip_pow(
+            crate::core::state::apply_batch_trusted(
                 state, 
                 &batch, 
                 recent_headers.make_contiguous(), 
@@ -5375,14 +5380,15 @@ mod tests {
 
         let (mut state, genesis_coinbase) = State::genesis();
         let mut mining_midstate = state.midstate;
+        let v2 = false; // genesis is V1
         let mut temp_coins = state.coins.clone();
         for cb in &genesis_coinbase {
             let coin_id = cb.coin_id();
             mining_midstate = hash_concat(&mining_midstate, &coin_id);
-            temp_coins.insert(coin_id);
+            temp_coins.insert(coin_id, v2);
         }
-        let smt_root = hash_concat(&temp_coins.root(), &state.commitments.root());
-        let state_root = hash_concat(&smt_root, &state.chain_mmr.root());
+        let smt_root = hash_concat(&temp_coins.root(v2), &state.commitments.root(v2));
+        let state_root = hash_concat(&smt_root, &state.chain_mmr.root(v2));
         mining_midstate = hash_concat(&mining_midstate, &state_root);
 
         for nonce in 0u64.. {
@@ -5427,6 +5433,7 @@ mod complex_tests {
     /// 3. Finds a valid Proof-of-Work nonce for the *real* target of the previous state.
     fn make_valid_batch(prev_state: &State, timestamp_offset: u64, transactions: Vec<Transaction>) -> Batch {
         let timestamp = prev_state.timestamp + timestamp_offset;
+        let v2 = crate::core::types::is_v2_at(prev_state.height);
         let mut candidate_state = prev_state.clone();
         
         // 1. Apply txs to candidate state
@@ -5452,13 +5459,13 @@ mod complex_tests {
 
         for cb in &coinbase {
             let coin_id = cb.coin_id();
-            candidate_state.coins.insert(coin_id);
+            candidate_state.coins.insert(coin_id, v2);
             candidate_state.midstate = hash_concat(&candidate_state.midstate, &coin_id);
         }
 
         // 3. Compute State Root
-        let smt_root = hash_concat(&candidate_state.coins.root(), &candidate_state.commitments.root());
-        let state_root = hash_concat(&smt_root, &candidate_state.chain_mmr.root());
+        let smt_root = hash_concat(&candidate_state.coins.root(v2), &candidate_state.commitments.root(v2));
+        let state_root = hash_concat(&smt_root, &candidate_state.chain_mmr.root(v2));
         candidate_state.midstate = hash_concat(&candidate_state.midstate, &state_root);
 
         let target = prev_state.target;

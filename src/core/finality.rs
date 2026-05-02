@@ -92,28 +92,36 @@ impl FinalityEstimator {
             total_weight += w;
         }
 
-        // 3. Find the lowest depth `z` that satisfies the target risk
-        let mut z = 1;
-        loop {
+        // 3. Binary search to find the lowest `z` satisfying the target risk in O(log Z)
+        let mut low = 1;
+        let mut high = 10_000;
+        let mut ans = 10_000;
+
+        while low <= high {
+            let mid = low + (high - low) / 2;
             let mut expected_risk = 0.0;
+            
             for i in 1..STEPS {
                 let p = i as f64 / STEPS as f64;
                 let w = weights[i] / total_weight;
                 
                 let catchup_prob = if p > 0.5 {
-                    ((1.0 - p) / p).powi(z as i32)
+                    ((1.0 - p) / p).powi(mid as i32)
                 } else {
-                    1.0 // If attacker has > 50%, catchup is guaranteed
+                    1.0
                 };
                 
                 expected_risk += catchup_prob * w;
             }
 
-            if expected_risk <= target_risk || z >= 10_000 {
-                return z;
+            if expected_risk <= target_risk {
+                ans = mid;
+                high = mid - 1; // Try to find a tighter/smaller safe depth
+            } else {
+                low = mid + 1;  // Not safe enough, increase depth
             }
-            z += 1;
         }
+        ans
     }
 }
 #[cfg(test)]

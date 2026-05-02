@@ -1,7 +1,25 @@
+//! # Flat Mempool with Replace-By-Fee (RBF)
+//!
+//! This module implements a highly efficient, priority-sorted memory pool for pending transactions.
+//! Because Midstate uses a two-phase Commit/Reveal protocol, unconfirmed transaction chaining
+//! (CPFP) is structurally impossible. Therefore, the mempool is implemented as a flat,
+//! zero-dependency list optimized purely for Replace-By-Fee (RBF) and PoW-based spam resistance.
+//!
+//! ## Architecture
+//! The mempool is split into two independent, capacity-bounded pools:
+//!
+//! 1. **Commits** (up to `MAX_PENDING_COMMITS`): Sorted by Proof-of-Work difficulty.
+//!    The weakest commit is evicted first.
+//! 2. **Reveals** (up to `MAX_MEMPOOL_REVEALS` / `MAX_MEMPOOL_BYTES`): Sorted by Fee Rate.
+//!    The cheapest reveal is evicted first.
+//!
+//! Both pools use a `HashMap` for O(1) lookup by key and a `BTreeSet` as a priority index,
+//! giving O(log N) insertion, eviction, and minimum-finding.
+
 use crate::core::{State, Transaction};
 use crate::core::transaction::validate_transaction;
 use anyhow::Result;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 const MAX_MEMPOOL_REVEALS: usize = 9_000;
@@ -18,21 +36,25 @@ const MIN_FEE_PER_KB: u64 = 10;
 /// while staying in integer arithmetic. fee_rate = fee * FEE_RATE_SCALE / bytes.
 const FEE_RATE_SCALE: u128 = 1_024;
 
-/// Computes a stable, content-derived transaction ID by hashing the bincode
-/// serialization of the transaction. Used as the key in the reveals map and
-/// the secondary sort key in `reveals_by_fee`.
-// OLD: Allocates ~1.3KB on the heap per call
-// fn get_tx_id(tx: &Transaction) -> [u8; 32] {
-//     let bytes = bincode::serialize(tx).unwrap_or_default();
-//     crate::core::types::hash(&bytes)
-// }
-
-// NEW: 100% stack-allocated, ignores massive witness payloads
+/// Computes a stable, content-derived transaction ID. Used as the key in the
+/// reveals map and the secondary sort key in `reveals_by_fee`.
+///
+/// Uses a discriminant byte to prevent collision between Reveals and Consolidates
+/// that happen to share the exact same inputs/outputs/salt.
 fn get_tx_id(tx: &Transaction) -> [u8; 32] {
     match tx {
         Transaction::Commit { commitment, .. } => *commitment,
-        Transaction::Reveal { inputs, outputs, salt, .. } | Transaction::Consolidate { inputs, outputs, salt, .. } => {
+        Transaction::Reveal { inputs, outputs, salt, .. } => {
             let mut hasher = blake3::Hasher::new();
+            hasher.update(&[0x01]); // Discriminant for Reveal
+            for i in inputs { hasher.update(&i.coin_id()); }
+            for o in outputs { hasher.update(&o.hash_for_commitment()); }
+            hasher.update(salt);
+            *hasher.finalize().as_bytes()
+        }
+        Transaction::Consolidate { inputs, outputs, salt, .. } => {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&[0x02]); // Discriminant for Consolidate
             for i in inputs { hasher.update(&i.coin_id()); }
             for o in outputs { hasher.update(&o.hash_for_commitment()); }
             hasher.update(salt);
@@ -59,7 +81,7 @@ fn compute_fee_rate(fee: u64, tx_bytes: u64) -> u64 {
 
 /// A stored Reveal transaction with its byte size pre-computed at admission time.
 /// Eliminates repeated `bincode::serialized_size` traversals of 40 KB witness
-/// vectors during RBF checks, eviction loops, drain, and remove_reveal.
+/// vectors during RBF checks, eviction loops, drain, and remove_reveal_internal.
 struct MempoolTx {
     tx: Arc<Transaction>,
     /// Byte size of `tx` as computed by `bincode::serialized_size` at insertion.
@@ -103,45 +125,33 @@ pub struct Mempool {
     /// The entry with the *lowest* fee rate is at the front (eviction candidate).
     reveals_by_fee: BTreeSet<(u64, [u8; 32])>,
 
-    /// Set of input coin IDs currently consumed by mempool Reveals.
-    /// Used for O(1) double-spend detection.
-    seen_inputs: HashSet<[u8; 32]>,
-    
     /// Maps an Input Coin ID to the Mempool Transaction ID that is trying to spend it.
-    /// Used for O(1) mempool eviction when a block is mined.
+    /// Used for O(1) double-spend detection and RBF conflict resolution.
     txs_by_input: HashMap<[u8; 32], [u8; 32]>,
-    
-    /// Tracks the total byte size of all active Reveals
+
+    /// Tracks the total byte size of all active Reveals to prevent OOM.
     current_reveal_bytes: u64,
 }
 
 impl Mempool {
     /// Creates a new, empty Mempool.
-    ///
-    /// # Examples
-    /// ```
-    /// use midstate::mempool::Mempool;
-    /// let mempool = Mempool::new();
-    /// assert_eq!(mempool.len(), 0);
-    /// ```
     pub fn new() -> Self {
         Self {
             commits: HashMap::new(),
             commits_by_pow: BTreeSet::new(),
             reveals: HashMap::new(),
             reveals_by_fee: BTreeSet::new(),
-            seen_inputs: HashSet::new(),
             txs_by_input: HashMap::new(),
             current_reveal_bytes: 0,
         }
     }
 
-/// Calculates the required Proof-of-Work (number of leading zero bits)
+    /// Calculates the required Proof-of-Work (number of leading zero bits)
     /// based on the provided number of pending commits.
     ///
-    /// Uses a continuous logistic function (Sigmoid curve) to scale difficulty 
+    /// Uses a continuous logistic function (Sigmoid curve) to scale difficulty
     /// smoothly as the mempool congests, preventing exploitable difficulty "cliffs".
-    /// 
+    ///
     /// Formula: `Base_PoW + round(6.0 / (1.0 + e^(-0.015 * (commits - 750))))`
     ///
     /// | Pending commits | Added PoW | Total zeros (normal) | Total zeros (fast) |
@@ -150,17 +160,7 @@ impl Mempool {
     /// | 750 (midpoint)  | +3 bits   | 27                   | 19                 |
     /// | 900             | +5 bits   | 29                   | 21                 |
     /// | >= 1000 (max)   | +6 bits   | 30                   | 22                 |
-    ///
-    /// # Examples
-    /// ```
-    /// use midstate::mempool::Mempool;
-    /// // Base threshold varies by build profile
-    /// let pow = Mempool::calculate_required_pow(100);
-    /// assert!(pow >= 16);
-    /// ```
-pub fn calculate_required_pow(commits: usize) -> u32 {
-        // Continuous Sigmoid Probability Curve
-        // Maps mempool congestion to a smooth difficulty increase
+    pub fn calculate_required_pow(commits: usize) -> u32 {
         let x = commits as f64;
         let x0 = 750.0;   // Midpoint of congestion
         let k = 0.015;    // Steepness of the curve
@@ -178,16 +178,21 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
 
     /// Convenience method to get the required Proof-of-Work based on the
     /// *current* size of the mempool's commit pool.
-    ///
-    /// # Examples
-    /// ```
-    /// use midstate::mempool::Mempool;
-    /// let mempool = Mempool::new();
-    /// let pow = mempool.required_commit_pow();
-    /// assert!(pow >= 16);
-    /// ```
     pub fn required_commit_pow(&self) -> u32 {
         Self::calculate_required_pow(self.commits.len())
+    }
+
+    /// Internal helper to safely remove a Reveal and all its tracking indices
+    /// (`reveals_by_fee`, `txs_by_input`, byte counter).
+    fn remove_reveal_internal(&mut self, id: &[u8; 32]) {
+        if let Some(mempool_tx) = self.reveals.remove(id) {
+            self.current_reveal_bytes = self.current_reveal_bytes.saturating_sub(mempool_tx.size);
+            let fee_rate = compute_fee_rate(mempool_tx.tx.fee(), mempool_tx.size);
+            self.reveals_by_fee.remove(&(fee_rate, *id));
+            for input in mempool_tx.tx.input_coin_ids() {
+                self.txs_by_input.remove(&input);
+            }
+        }
     }
 
     /// Adds a transaction to the mempool after validating it against the
@@ -196,8 +201,7 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
     /// ## Commit admission
     /// 1. PoW must meet or exceed [`required_commit_pow`](Self::required_commit_pow).
     /// 2. The commitment must not already be pending.
-    /// 3. The transaction must pass [`validate_transaction`].
-    /// 4. If the commit pool is at capacity ([`MAX_PENDING_COMMITS`]), the
+    /// 3. If the commit pool is at capacity ([`MAX_PENDING_COMMITS`]), the
     ///    incoming commit must have *strictly higher* PoW than the weakest
     ///    existing commit in order to evict it.
     ///
@@ -205,38 +209,35 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
     /// 1. Fee rate must be ≥ [`MIN_FEE_PER_KB`] (checked with integer-only
     ///    arithmetic using [`FEE_RATE_SCALE`] to stay consistent with the
     ///    stored ordering key).
-    /// 2. No input may already be consumed by a pending reveal.
-    /// 3. The transaction must pass [`validate_transaction`].
-    /// 4. If the reveal pool is at capacity ([`MAX_MEMPOOL_REVEALS`]), the
-    ///    incoming reveal must have a *strictly higher* fee rate than the
-    ///    cheapest existing reveal to evict it.
+    /// 2. No input may already be consumed by a pending reveal, unless the
+    ///    incoming transaction qualifies under Replace-By-Fee.
+    /// 3. If the reveal pool is at capacity ([`MAX_MEMPOOL_REVEALS`] /
+    ///    [`MAX_MEMPOOL_BYTES`]), the incoming reveal must have a *strictly
+    ///    higher* fee rate than the cheapest existing reveal to evict it.
+    ///
+    /// ## Replace-By-Fee (RBF) Rules
+    /// 1. The incoming transaction must have a strictly higher fee rate than
+    ///    every transaction it is evicting.
+    /// 2. The incoming transaction must pay a strictly higher *absolute* fee
+    ///    than the sum of the fees of all transactions it is evicting
+    ///    (BIP-125 Rule 3).
+    ///
+    /// ## Pre-flight oracle
+    /// `spent_oracle` maps WOTS addresses (or MSS leaves) to the commitment
+    /// that previously spent them. Used to give immediate RPC feedback for
+    /// address-reuse violations instead of silent miner rejection. Pass an
+    /// empty map pre-activation.
     ///
     /// # Errors
     /// Returns an error if the transaction fails any of the checks above.
-    ///
-    /// # Examples
-    /// ```no_run
-    /// # use midstate::mempool::Mempool;
-    /// # use midstate::core::{State, Transaction};
-    /// # let mut mempool = Mempool::new();
-    /// # let state = State::genesis().0;
-    /// # let tx = Transaction::Commit { commitment: [0; 32], spam_nonce: 0 };
-    /// // 'tx' must carry valid PoW for this to succeed.
-    /// mempool.add(tx, &state, &std::collections::HashMap::new()).unwrap();
-    /// ```
     pub fn add(
         &mut self,
         tx: Transaction,
         state: &State,
-        // Pre-flight oracle: WOTS address -> commitment that previously spent it.
-        // Built by the caller from storage. Pass an empty map pre-activation.
         spent_oracle: &std::collections::HashMap<[u8; 32], [u8; 32]>,
     ) -> Result<()> {
         let tx_bytes = bincode::serialized_size(&tx).unwrap_or(0) as u64;
 
-        // Extract the values we need from borrowed fields *before* any
-        // potential move of `tx`. This satisfies the borrow checker: all
-        // references into `tx` are gone by the time we call `Arc::new(tx)`.
         let (actual_zeros, _commitment_key) = match &tx {
             Transaction::Commit { commitment, spam_nonce } => {
                 match crate::core::transaction::evaluate_commit_pow(commitment, *spam_nonce, state.height) {
@@ -262,8 +263,6 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                     anyhow::bail!("Commitment already in mempool");
                 }
 
-                // Reconstruct a reference to store. Validation was already 
-                // performed on a background thread before calling add().
                 let tx_ref = Transaction::Commit { commitment, spam_nonce };
 
                 if self.commits.len() >= MAX_PENDING_COMMITS {
@@ -271,10 +270,6 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                         if actual_zeros > lowest_pow {
                             self.commits_by_pow.remove(&(lowest_pow, lowest_comm));
                             self.commits.remove(&lowest_comm);
-                            tracing::info!(
-                                "Evicted low-PoW commit ({} bits) for higher-PoW commit ({} bits)",
-                                lowest_pow, actual_zeros
-                            );
                         } else {
                             anyhow::bail!(
                                 "Mempool full of Commits: incoming PoW ({} bits) must exceed \
@@ -299,7 +294,7 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                             let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
                             let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
                             let this_commitment = crate::core::types::compute_commitment(&input_ids, &output_hashes, salt);
-                            
+
                             for (input, witness) in inputs.iter().zip(witnesses.iter()) {
                                 let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
                                 if let Some(sig) = wit_inputs.first() {
@@ -307,7 +302,7 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                                         let addr = input.predicate.address();
                                         if let Some(&prior_commitment) = spent_oracle.get(&addr) {
                                             if prior_commitment != this_commitment {
-                                                anyhow::bail!("Mempool rejected: WOTS address {} already spent with a different commitment", hex::encode(addr));
+                                                anyhow::bail!("Mempool rejected: WOTS address {} already spent", hex::encode(addr));
                                             }
                                         }
                                     } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
@@ -324,14 +319,14 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                             let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
                             let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
                             let this_commitment = crate::core::types::compute_commitment(&input_ids, &output_hashes, salt);
-                            
+
                             let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
                             if let Some(sig) = wit_inputs.first() {
                                 if sig.len() == crate::core::wots::SIG_SIZE {
                                     let addr = inputs[0].predicate.address();
                                     if let Some(&prior_commitment) = spent_oracle.get(&addr) {
                                         if prior_commitment != this_commitment {
-                                            anyhow::bail!("Mempool rejected: WOTS address {} already spent with a different commitment", hex::encode(addr));
+                                            anyhow::bail!("Mempool rejected: WOTS address {} already spent", hex::encode(addr));
                                         }
                                     }
                                 } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
@@ -347,17 +342,16 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                     }
                 }
 
-                // Admission fee check and stored ordering key use the same
-                // FEE_RATE_SCALE so they are numerically consistent.
-                if (reveal_tx.fee() as u128) * FEE_RATE_SCALE
-                    < (MIN_FEE_PER_KB as u128) * (tx_bytes as u128)
-                {
+                // Admission fee check uses the same FEE_RATE_SCALE as the
+                // stored ordering key so they are numerically consistent.
+                if (reveal_tx.fee() as u128) * FEE_RATE_SCALE < (MIN_FEE_PER_KB as u128) * (tx_bytes as u128) {
                     anyhow::bail!(
                         "Fee rate too low. Required: {} per KB. Provided: {} for {} bytes",
                         MIN_FEE_PER_KB, reveal_tx.fee(), tx_bytes
                     );
                 }
-                
+
+                // Identify RBF Conflicts
                 let mut conflicting_txs: Vec<[u8; 32]> = Vec::new();
                 for input in reveal_tx.input_coin_ids() {
                     if let Some(&existing_id) = self.txs_by_input.get(&input) {
@@ -367,13 +361,10 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                     }
                 }
 
-               // Validation was already done in the background.
-
-
                 let fee_rate = compute_fee_rate(reveal_tx.fee(), tx_bytes);
                 let tx_id = get_tx_id(&reveal_tx);
 
-                // --- FIX: Setup simulation tracking BEFORE mutating the mempool ---
+                // Simulation tracking ensures we don't drop valid txs if a late check fails.
                 let mut to_evict = conflicting_txs.clone();
                 let mut simulated_bytes = self.current_reveal_bytes;
                 let mut simulated_len = self.reveals.len();
@@ -381,11 +372,11 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                 if !conflicting_txs.is_empty() {
                     let mut total_evicted_fee = 0u64;
 
-                    // Must outbid every conflicting transaction's fee RATE
                     for &cid in &conflicting_txs {
                         if let Some(existing) = self.reveals.get(&cid) {
                             let existing_rate = compute_fee_rate(existing.tx.fee(), existing.size);
-                            
+
+                            // BIP-125 Rule: Must outbid the fee RATE of all conflicting txs
                             if fee_rate <= existing_rate {
                                 anyhow::bail!(
                                     "RBF rejected: new fee rate {} must exceed conflicting tx rate {}",
@@ -393,8 +384,7 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                                 );
                             }
                             total_evicted_fee = total_evicted_fee.saturating_add(existing.tx.fee());
-                            
-                            // Track simulated removal
+
                             simulated_bytes = simulated_bytes.saturating_sub(existing.size);
                             simulated_len = simulated_len.saturating_sub(1);
                         }
@@ -409,17 +399,14 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                     }
                 }
 
-                // --- Byte-Bounded & Count-Bounded Eviction Loop ---
-                // We use our simulated metrics so we don't accidentally drop valid transactions
-                // if this loop ultimately fails to free up enough space.
+                // Byte-Bounded & Count-Bounded Eviction Loop.
+                // Uses simulated metrics so we don't accidentally drop valid
+                // transactions if this loop ultimately fails to free up enough space.
                 let mut fee_iter = self.reveals_by_fee.iter();
                 while simulated_len + 1 > MAX_MEMPOOL_REVEALS || simulated_bytes + tx_bytes > MAX_MEMPOOL_BYTES {
                     if let Some(&(lowest_rate, lowest_id)) = fee_iter.next() {
-                        
                         // Skip if we already marked this for RBF eviction
-                        if to_evict.contains(&lowest_id) {
-                            continue; 
-                        }
+                        if to_evict.contains(&lowest_id) { continue; }
 
                         if fee_rate > lowest_rate {
                             if let Some(existing) = self.reveals.get(&lowest_id) {
@@ -440,11 +427,10 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
 
                 // --- ALL CHECKS PASSED, BEGIN REAL MUTATION ---
                 for cid in to_evict {
-                    self.remove_reveal(&cid);
+                    self.remove_reveal_internal(&cid);
                 }
 
                 for input in reveal_tx.input_coin_ids() {
-                    self.seen_inputs.insert(input);
                     self.txs_by_input.insert(input, tx_id);
                 }
 
@@ -454,11 +440,6 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                 self.current_reveal_bytes += tx_bytes;
             }
         }
-
-        tracing::debug!(
-            "Added transaction to mempool (commits: {}, reveals: {})",
-            self.commits.len(), self.reveals.len()
-        );
         Ok(())
     }
 
@@ -473,44 +454,23 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
     ///   (coins and commitments must still exist).
     /// - Duplicate detection (commitment or input already pending).
     ///
-    /// Capacity limits are also relaxed: the pools may temporarily exceed their
-    /// soft caps. The next call to [`add`] or [`prune_invalid`] will bring them
-    /// back into range.
-    ///
-    /// # Examples
-    /// ```no_run
-    /// # use midstate::mempool::Mempool;
-    /// # use midstate::core::{State, Transaction};
-    /// # let mut mempool = Mempool::new();
-    /// # let state = State::genesis().0;
-    /// # let abandoned_txs: Vec<Transaction> = vec![];
-    /// mempool.re_add(abandoned_txs, &state);
-    /// ```
+    /// Capacity limits are also relaxed: the pools may temporarily exceed
+    /// their soft caps. The trailing call to [`prune_invalid`](Self::prune_invalid)
+    /// brings them back into range.
     pub fn re_add(&mut self, txs: Vec<Transaction>, state: &State) {
         let mut restored = 0usize;
 
         for tx in txs {
-            // Hard gate 1: must still be valid against the current state.
-            if validate_transaction(state, &tx).is_err() {
-                continue;
-            }
+            if validate_transaction(state, &tx).is_err() { continue; }
 
-            // Hard gate 2: no duplicates.
             let already_present = match &tx {
-                Transaction::Commit { commitment, .. } => {
-                    self.commits.contains_key(commitment)
-                }
+                Transaction::Commit { commitment, .. } => self.commits.contains_key(commitment),
                 Transaction::Reveal { .. } | Transaction::Consolidate { .. } => {
-                    tx.input_coin_ids().iter().any(|i| self.seen_inputs.contains(i))
+                    tx.input_coin_ids().iter().any(|i| self.txs_by_input.contains_key(i))
                 }
             };
-            if already_present {
-                continue;
-            }
+            if already_present { continue; }
 
-            // Insert directly, bypassing PoW / fee-rate / capacity checks.
-            // Match by value so we can move `tx` into `Arc::new` without a
-            // borrow-after-move error.
             match tx {
                 Transaction::Commit { commitment, spam_nonce } => {
                     if let Ok(zeros) = crate::core::transaction::evaluate_commit_pow(&commitment, spam_nonce, state.height) {
@@ -520,27 +480,25 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                     }
                 }
                 reveal_tx @ Transaction::Reveal { .. } | reveal_tx @ Transaction::Consolidate { .. } => {
-                    let tx_bytes =
-                        bincode::serialized_size(&reveal_tx).unwrap_or(0) as u64;
+                    let tx_bytes = bincode::serialized_size(&reveal_tx).unwrap_or(0) as u64;
                     let fee_rate = compute_fee_rate(reveal_tx.fee(), tx_bytes);
                     let tx_id = get_tx_id(&reveal_tx);
+
                     for input in reveal_tx.input_coin_ids() {
-                        self.seen_inputs.insert(input);
                         self.txs_by_input.insert(input, tx_id);
                     }
+
                     let arc_tx = Arc::new(reveal_tx);
                     self.reveals.insert(tx_id, MempoolTx::new(arc_tx, tx_bytes));
                     self.reveals_by_fee.insert((fee_rate, tx_id));
                     self.current_reveal_bytes += tx_bytes;
                 }
             }
-
             restored += 1;
         }
 
         if restored > 0 {
-            tracing::info!("Restored {} transactions to mempool after reorg", restored);
-            // Enforce capacity after bulk restore to prevent unbounded growth
+            // Enforce capacity after bulk restore to prevent unbounded growth.
             self.prune_invalid(state);
         }
     }
@@ -552,16 +510,7 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
     /// 1. Reveals ordered by descending fee rate (most profitable first).
     /// 2. Commits ordered by descending PoW (strongest work first).
     ///
-    /// All associated index entries and `seen_inputs` records are cleaned up
-    /// as transactions are removed.
-    ///
-    /// # Examples
-    /// ```
-    /// use midstate::mempool::Mempool;
-    /// let mut mempool = Mempool::new();
-    /// let batch = mempool.drain(100);
-    /// assert_eq!(batch.len(), 0);
-    /// ```
+    /// All associated index entries are cleaned up as transactions are removed.
     pub fn drain(&mut self, max: usize) -> Vec<Transaction> {
         let mut drained = Vec::with_capacity(max.min(self.len()));
 
@@ -570,11 +519,9 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
             if let Some(&(rate, id)) = self.reveals_by_fee.iter().next_back() {
                 self.reveals_by_fee.remove(&(rate, id));
                 let mempool_tx = self.reveals.remove(&id).unwrap();
-                
+
                 self.current_reveal_bytes = self.current_reveal_bytes.saturating_sub(mempool_tx.size);
-                
                 for input in mempool_tx.tx.input_coin_ids() {
-                    self.seen_inputs.remove(&input);
                     self.txs_by_input.remove(&input);
                 }
                 drained.push(Arc::unwrap_or_clone(mempool_tx.tx));
@@ -593,26 +540,14 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                 break;
             }
         }
-
         drained
     }
 
     /// Returns the total number of transactions (Commits + Reveals) in the mempool.
-    ///
-    /// # Examples
-    /// ```
-    /// use midstate::mempool::Mempool;
-    /// let mempool = Mempool::new();
-    /// assert_eq!(mempool.len(), 0);
-    /// ```
-    pub fn len(&self) -> usize {
-        self.commits.len() + self.reveals.len()
-    }
+    pub fn len(&self) -> usize { self.commits.len() + self.reveals.len() }
 
     /// Returns `true` if the mempool contains no transactions.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
 
     /// Returns a priority-sorted snapshot of all transactions currently in
     /// the mempool without removing them.
@@ -621,8 +556,7 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
     /// followed by highest PoW Commits.
     ///
     /// Each element is an `Arc`-wrapped transaction. If you need owned
-    /// `Transaction` values (e.g. to store in a `Vec<Transaction>`), use
-    /// [`transactions_cloned`](Self::transactions_cloned) instead.
+    /// `Transaction` values, use [`transactions_cloned`](Self::transactions_cloned).
     pub fn transactions(&self) -> Vec<Arc<Transaction>> {
         let mut all = Vec::with_capacity(self.len());
         for &(_, id) in self.reveals_by_fee.iter().rev() {
@@ -654,37 +588,29 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
 
     /// Returns a priority-sorted snapshot as owned `Transaction` values.
     ///
-    /// This is a convenience wrapper around [`transactions`](Self::transactions)
-    /// that clones each `Arc` into an owned value. Use this when the caller
-    /// needs a `Vec<Transaction>` (e.g. for [`NodeHandle`] or RPC serialisation)
-    /// rather than shared references.
+    /// Convenience wrapper around [`transactions`](Self::transactions) that
+    /// clones each `Arc` into an owned value. Use this when the caller needs
+    /// a `Vec<Transaction>` (e.g. for RPC serialisation) rather than shared references.
     pub fn transactions_cloned(&self) -> Vec<Transaction> {
-        self.transactions()
-            .into_iter()
-            .map(|arc| (*arc).clone())
-            .collect()
-    }
-
-    /// Helper to cleanly remove a Reveal and its secondary indexes
-    fn remove_reveal(&mut self, id: &[u8; 32]) {
-        if let Some(mempool_tx) = self.reveals.remove(id) {
-            self.current_reveal_bytes = self.current_reveal_bytes.saturating_sub(mempool_tx.size);
-            let fee_rate = compute_fee_rate(mempool_tx.tx.fee(), mempool_tx.size);
-            self.reveals_by_fee.remove(&(fee_rate, *id));
-            for input in mempool_tx.tx.input_coin_ids() {
-                self.seen_inputs.remove(&input);
-                self.txs_by_input.remove(&input);
-            }
-        }
+        self.transactions().into_iter().map(|arc| (*arc).clone()).collect()
     }
 
     /// Event-driven, O(K) pruning executed immediately when a block is mined/received.
-    /// Completely avoids hashing or signature verification.
+    ///
+    /// Performs three passes:
+    /// 1. Prune Reveals whose inputs were spent by the new block.
+    /// 2. Prune Commits that were mined into the new block.
+    /// 3. Prune Reveals whose underlying commitment has exceeded
+    ///    [`COMMITMENT_TTL`](crate::core::COMMITMENT_TTL) or has been
+    ///    expired entirely from state.
+    ///
+    /// Completely avoids hashing or signature verification — safe to call
+    /// on the main event loop.
     pub fn prune_on_new_block(&mut self, state: &State, newly_spent_inputs: &[[u8; 32]], newly_mined_commits: &[[u8; 32]]) {
         // 1. O(K) Prune Reveals based on spent inputs
         for coin in newly_spent_inputs {
             if let Some(tx_id) = self.txs_by_input.remove(coin) {
-                self.remove_reveal(&tx_id);
+                self.remove_reveal_internal(&tx_id);
             }
         }
 
@@ -695,52 +621,44 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
             }
         }
 
-        // 3. O(R) TTL Prune (Instant, no signatures verified)
+        // 3. O(R) TTL Prune (Instant, no signatures verified).
+        // Handles both Reveal and Consolidate — both reference an underlying
+        // commitment via the same inputs/outputs/salt construction.
         let expired: Vec<_> = self.reveals.iter().filter(|(_, mempool_tx)| {
-            if let Transaction::Reveal { inputs, outputs, salt, .. } = &*mempool_tx.tx { 
-                let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
-                let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
-                let commit_hash = crate::core::compute_commitment(&input_ids, &output_hashes, &salt); 
-                if let Some(&height) = state.commitment_heights.get(&commit_hash) {
-                    return state.height.saturating_sub(height) > crate::core::COMMITMENT_TTL;
-                } else {
-                    // If the commit is missing from the state entirely (expired or reorged out),
-                    // the reveal is definitively dead. Evict it.
-                    return true;
-                }
+            let (inputs, outputs, salt) = match &*mempool_tx.tx {
+                Transaction::Reveal { inputs, outputs, salt, .. }
+                | Transaction::Consolidate { inputs, outputs, salt, .. } => (inputs, outputs, salt),
+                _ => return false,
+            };
+            let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+            let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+            let commit_hash = crate::core::compute_commitment(&input_ids, &output_hashes, salt);
+            if let Some(&height) = state.commitment_heights.get(&commit_hash) {
+                state.height.saturating_sub(height) > crate::core::COMMITMENT_TTL
+            } else {
+                // If the commit is missing from state entirely (expired or reorged out),
+                // the reveal is definitively dead. Evict it.
+                true
             }
-            false
         }).map(|(&id, _)| id).collect();
 
-        for id in expired { self.remove_reveal(&id); }
+        for id in expired { self.remove_reveal_internal(&id); }
     }
 
     /// Scans the mempool and removes any transactions that are no longer valid
     /// against `state` (e.g. inputs spent by a newly confirmed block, or
-    /// commitments that have already been revealed).
+    /// commitments that have already been revealed or aged out).
     ///
-    /// FIX: Replaced heavy `validate_transaction` (which performs WOTS/MSS crypto)
-    /// with O(1) pure state checks. Prevents CPU starvation and event-loop blocking
-    /// during reorgs and bulk sync.
-    ///
-    /// All associated index entries and `seen_inputs` records are cleaned up.
-    ///
-    /// # Examples
-    /// ```no_run
-    /// # use midstate::mempool::Mempool;
-    /// # use midstate::core::State;
-    /// # let mut mempool = Mempool::new();
-    /// # let state = State::genesis().0;
-    /// mempool.prune_invalid(&state);
-    /// ```
-        pub fn prune_invalid(&mut self, state: &State) {
+    /// **Performance note:** Uses O(1) pure state checks rather than the heavy
+    /// `validate_transaction` (which performs WOTS/MSS crypto). Signatures
+    /// were verified on admission and don't need re-verification here.
+    /// Calling `validate_transaction` from this hot path would cause CPU
+    /// starvation and event-loop blocking during reorgs and bulk sync.
+    pub fn prune_invalid(&mut self, state: &State) {
         // --- Prune commits ---
         // Validate PoW requirements which may have shifted due to height changes.
         // `evaluate_commit_pow` is very fast (max 1000 hashes), safe for main thread.
-        let commits_to_remove: Vec<[u8; 32]> = self
-            .commits
-            .iter()
-            .filter(|(_, arc_tx)| {
+        let commits_to_remove: Vec<[u8; 32]> = self.commits.iter().filter(|(_, arc_tx)| {
                 match &***arc_tx {
                     Transaction::Commit { commitment, spam_nonce } => {
                         crate::core::transaction::evaluate_commit_pow(commitment, *spam_nonce, state.height).is_err()
@@ -748,8 +666,7 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                     _ => false,
                 }
             })
-            .map(|(comm, _)| *comm)
-            .collect();
+            .map(|(comm, _)| *comm).collect();
 
         for comm in commits_to_remove {
             if self.commits.remove(&comm).is_some() {
@@ -759,15 +676,13 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
 
         // --- Prune reveals ---
         // ONLY perform fast O(1) state checks. Signatures were verified on admission.
-        let reveals_to_remove: Vec<[u8; 32]> = self
-            .reveals
-            .iter()
-            .filter(|(_, mempool_tx)| {
+        let reveals_to_remove: Vec<[u8; 32]> = self.reveals.iter().filter(|(_, mempool_tx)| {
                 match &*mempool_tx.tx {
                     Transaction::Reveal { inputs, outputs, salt, .. } | Transaction::Consolidate { inputs, outputs, salt, .. } => {
-                        for input in inputs {
-                            if !state.coins.contains(&input.coin_id()) { return true; }
+                        if inputs.iter().any(|i| !state.coins.contains(&i.coin_id())) {
+                            return true;
                         }
+
                         let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
                         let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
                         let expected = crate::core::types::compute_commitment(&input_ids, &output_hashes, salt);
@@ -785,11 +700,10 @@ pub fn calculate_required_pow(commits: usize) -> u32 {
                     _ => true,
                 }
             })
-            .map(|(id, _)| *id)
-            .collect();
+            .map(|(id, _)| *id).collect();
 
         for id in reveals_to_remove {
-            self.remove_reveal(&id);
+            self.remove_reveal_internal(&id);
         }
     }
 }
@@ -813,7 +727,7 @@ impl Mempool {
         let tx_bytes = bincode::serialized_size(&tx).unwrap_or(0) as u64;
         let fee_rate = compute_fee_rate(tx.fee(), tx_bytes);
         for input in tx.input_coin_ids() {
-            self.seen_inputs.insert(input);
+            self.txs_by_input.insert(input, tx_id);
         }
         let arc_tx = Arc::new(tx);
         self.reveals.insert(tx_id, MempoolTx::new(arc_tx, tx_bytes));
@@ -948,9 +862,7 @@ mod tests {
         let mut bad = 0u64;
         loop {
             let h = hash_concat(&commitment, &bad.to_le_bytes());
-            if crate::core::types::count_leading_zeros(&h) < 24 {
-                break;
-            }
+            if crate::core::types::count_leading_zeros(&h) < 24 { break; }
             bad += 1;
         }
         let tx = Transaction::Commit { commitment, spam_nonce: bad };
@@ -994,14 +906,20 @@ mod tests {
         }
         assert_eq!(mp.commits.len(), MAX_PENDING_COMMITS);
 
-        // Pool is full; required PoW is now 30 bits.
+        // NOTE ON SIGMOID MATH:
+        // With MAX_PENDING_COMMITS = 1000, the sigmoid evaluates to:
+        // Base_Pow (24) + round(6.0 / (1.0 + e^(-0.015 * (1000 - 750))))
+        // = 24 + round(6.0 / (1.0 + e^(-3.75)))
+        // = 24 + round(6.0 / 1.0235)
+        // = 24 + round(5.86)
+        // = 24 + 6 = 30 bits.
+        // This is extremely close to the rounding boundary. If `max_add` or `k`
+        // changes, this test will need an updated target bits threshold.
         let extra = hash(b"commit overflow");
         let mut n = 0u64;
         loop {
             let h = hash_concat(&extra, &n.to_le_bytes());
-            if crate::core::types::count_leading_zeros(&h) >= 30 {
-                break;
-            }
+            if crate::core::types::count_leading_zeros(&h) >= 30 { break; }
             n += 1;
         }
 
@@ -1020,7 +938,7 @@ mod tests {
     /// When the commit pool is full and the incoming commit's PoW is not
     /// strictly better than the current worst, it must be rejected rather than
     /// silently dropped.
-#[test]
+    #[test]
     fn max_pending_commits_rejects_equal_pow() {
         let state = empty_state();
         let mut mp = Mempool::new();
@@ -1035,7 +953,7 @@ mod tests {
         // 2. Try to add one more with a bad nonce
         let commitment = crate::core::types::hash(b"equal pow");
         let tx = Transaction::Commit { commitment, spam_nonce: 0 };
-        
+
         let err = mp.add(tx, &state, &std::collections::HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("Mempool is busy") || err.to_string().contains("Mempool full of Commits"));
     }
@@ -1142,8 +1060,8 @@ mod tests {
         // The new input must now be tracked.
         let new_input = tx.input_coin_ids()[0];
         assert!(
-            mp.seen_inputs.contains(&new_input),
-            "New reveal's input must be in seen_inputs"
+            mp.txs_by_input.contains_key(&new_input),
+            "New reveal's input must be in txs_by_input"
         );
     }
 
@@ -1182,7 +1100,7 @@ mod tests {
 
     /// A Commit must be rejected when both pools are at capacity, not silently
     /// accepted or panicked.
-#[test]
+    #[test]
     fn mempool_full_rejects_commit() {
         let state = empty_state();
         let mut mp = Mempool::new();
@@ -1198,7 +1116,7 @@ mod tests {
         // 2. Try to add one more with a bad nonce
         let extra = crate::core::types::hash(b"one more");
         let tx = Transaction::Commit { commitment: extra, spam_nonce: 0 };
-        
+
         let err = mp.add(tx, &state, &std::collections::HashMap::new()).unwrap_err();
         assert!(
             err.to_string().contains("Mempool is busy")
@@ -1297,7 +1215,7 @@ mod tests {
         mp.prune_invalid(&empty_state());
 
         assert_eq!(mp.len(), 0);
-        assert!(mp.seen_inputs.is_empty(), "seen_inputs must be cleared");
+        assert!(mp.txs_by_input.is_empty(), "txs_by_input must be cleared");
         assert!(mp.reveals_by_fee.is_empty(), "BTreeSet must be cleared too");
     }
 

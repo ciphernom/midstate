@@ -26,15 +26,235 @@ pub const BATCHES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("bat
 pub const HEADERS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("headers");
 pub const FILTERS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("filters");
 
-
+/// Deserialize a `State` from bincode bytes and rebuild every cache that was
+/// `#[serde(skip)]`'d on the wire.
+///
+/// # Formal specification
+///
+/// ```text
+///   pre:   bytes encodes a valid State under either the CURRENT wire format
+///          OR the LEGACY (v2.1.x pre-domain-separation) wire format
+///   post:  result.coins, result.commitments, result.expirations are all
+///          internally consistent caches over the deserialized canonical
+///          fields, under is_v2 = is_v2_at(state.height)
+/// ```
+///
+/// Two derived structures are reconstructed here:
+///
+/// 1. The `UtxoAccumulator` SMT caches (`nodes`, `buckets`) inside both
+///    `state.coins` and `state.commitments` — empty after deserialisation
+///    because they're `#[serde(skip)]`. Without this rebuild, calls to
+///    `coins.root(...)` would silently return the empty-tree hash even
+///    though the canonical coin set is populated.
+///
+/// 2. The `expirations` index, also `#[serde(skip)]`. Reconstructed from
+///    `commitment_heights`. The per-height `Vec` is sorted lexicographically
+///    so two processes loading the same on-disk state arrive at the same
+///    in-memory layout regardless of `HashMap` iteration order.
+///
+/// `expirations` is not consensus-critical — only `commitment_heights`,
+/// `coins`, `commitments`, and `chain_mmr` feed any hash — so the sort
+/// choice is purely an in-memory hygiene call.
+///
+/// # Legacy migration
+///
+/// Pre-domain-separation builds (≤ v2.1.4) saved `State` with three
+/// extra interspersed `is_v2: bool` bytes (one per accumulator and one
+/// for the MMR) plus a fully-serialised `expirations` map between
+/// `commitment_heights` and `chain_mmr`. The current code's `State`
+/// has none of those: `is_v2` was removed entirely from the structs
+/// (now passed as a parameter), and `expirations` is `#[serde(default,
+/// skip)]`. So a strict bincode read of legacy bytes fails — usually
+/// with `"Slice had bytes remaining"`, sometimes with a mid-stream
+/// varint error if the misaligned bytes happen to hit an invalid
+/// extension point.
+///
+/// On *any* strict-parse failure we fall back to a private
+/// [`legacy::LegacyState`] shape that mirrors the pre-V2 wire layout
+/// exactly. If THAT parse also fails, the file is genuinely corrupt or
+/// follows an unknown third format, and we bubble up the original
+/// (strict-new) error so the user sees the most relevant diagnostic.
+///
+/// The discarded `is_v2` bytes are *intentionally* dropped — the new
+/// code derives the hashing mode from `state.height` via
+/// [`is_v2_at`](crate::core::types::is_v2_at), which is the single
+/// source of truth.
+///
+/// The first `save_state` after a successful legacy load writes the
+/// state back in the current format, so the migration self-disables on
+/// every running node.
 fn deserialize_state(bytes: &[u8]) -> Result<State> {
-    bincode::deserialize::<State>(bytes).map_err(|e| anyhow::anyhow!("State deserialization failed: {}", e))
+    use bincode::Options;
+
+    // FIX: Match bincode::serialize()'s implicit Fixint encoding!
+    let strict = bincode::DefaultOptions::new()
+        .with_limit(100_000_000)
+        .with_fixint_encoding(); // <--- ADD THIS LINE
+
+    let mut state = match strict.deserialize::<State>(bytes) {
+        Ok(s) => s,
+        Err(strict_err) => match legacy::deserialize_legacy_state(bytes) {
+            Ok(migrated) => {
+                tracing::warn!(
+                    "State on disk is in the pre-domain-separation wire format \
+                     (strict parse failed: {}). Migrated successfully; the next \
+                     save_state will write canonical form.",
+                    strict_err
+                );
+                migrated
+            }
+            Err(legacy_err) => {
+                // Both parses failed. The strict-new error is usually the
+                // more informative one (e.g. "Slice had bytes remaining"
+                // immediately tells the operator what's going on); the
+                // legacy error is logged for diagnostics in case the file
+                // turns out to be a third unknown format.
+                tracing::error!(
+                    "Legacy migration also failed: {}",
+                    legacy_err
+                );
+                return Err(anyhow::anyhow!(
+                    "State deserialization failed: {}",
+                    strict_err
+                ));
+            }
+        },
+    };
+
+    // Rebuild the SMT caches under the chain-height-implied hashing mode.
+    // Note: when arriving via the legacy path, `legacy::deserialize_legacy_state`
+    // already rebuilt the caches (because it constructs the new accumulators
+    // via from_canonical_coins / from_raw_parts). The double-rebuild is harmless
+    // and keeps the function's postcondition independent of the path taken.
+    let v2 = crate::core::types::is_v2_at(state.height);
+    state.coins.rebuild_tree(v2);
+    state.commitments.rebuild_tree(v2);
+
+    // Rebuild the expirations B-tree from commitment_heights.
+    use std::collections::BTreeMap;
+    let mut staging: BTreeMap<u64, Vec<[u8; 32]>> = BTreeMap::new();
+    for (commitment, height) in &state.commitment_heights {
+        staging.entry(*height).or_default().push(*commitment);
+    }
+    for list in staging.values_mut() {
+        list.sort_unstable();
+    }
+    state.expirations = staging.into_iter().collect();
+
+    Ok(state)
 }
 
-fn deserialize_state_limited(bytes: &[u8]) -> Result<State> {
+/// Pre-domain-separation wire format support. Module-private — no part of
+/// this is intended to outlive the migration window.
+mod legacy {
+    use super::State;
+    use anyhow::Result;
     use bincode::Options;
-    let opts = bincode::DefaultOptions::new().with_limit(50_000_000); 
-    opts.deserialize::<State>(bytes).map_err(|e| anyhow::anyhow!("Snapshot deserialization failed: {}", e))
+    use serde::Deserialize;
+
+    /// Old `UtxoAccumulator` wire shape: canonical coin set followed by an
+    /// `is_v2` byte. The `nodes` and `buckets` caches were `#[serde(skip)]`
+    /// in the old code too, so they don't appear here.
+    #[derive(Deserialize)]
+    pub(super) struct LegacyUtxoAccumulator {
+        pub coins: im::OrdSet<[u8; 32]>,
+        #[serde(default)]
+        pub _is_v2: bool,
+    }
+
+    /// Old `MerkleMountainRange` wire shape: post-order node array, leaf
+    /// count, then an `is_v2` byte.
+    #[derive(Deserialize, Default)]
+    pub(super) struct LegacyMmr {
+        pub nodes: im::Vector<[u8; 32]>,
+        pub leaf_count: u64,
+        #[serde(default)]
+        pub _is_v2: bool,
+    }
+
+    /// Old `State` wire shape. Field order MUST match the pre-domain-
+    /// separation `State` declaration order exactly — bincode is positional
+    /// and does not record field names.
+    #[derive(Deserialize)]
+    pub(super) struct LegacyState {
+        pub midstate: [u8; 32],
+        pub coins: LegacyUtxoAccumulator,
+        pub commitments: LegacyUtxoAccumulator,
+        pub depth: u128,
+        pub target: [u8; 32],
+        pub height: u64,
+        pub timestamp: u64,
+        #[serde(default)]
+        pub commitment_heights: im::HashMap<[u8; 32], u64>,
+        /// Was a normal serialized field in the old code; in the new code
+        /// it is `#[serde(default, skip)]` and rebuilt on load.
+        #[allow(dead_code)]
+        #[serde(default)]
+        pub expirations: im::OrdMap<u64, Vec<[u8; 32]>>,
+        #[serde(default)]
+        pub chain_mmr: LegacyMmr,
+        pub header_hash: [u8; 32],
+    }
+
+    /// Parse the legacy wire format and synthesise a current-shape `State`.
+    ///
+    /// # Formal specification
+    /// ```text
+    ///   pre:   bytes encodes a valid State under the LEGACY wire format
+    ///   post:  result.* canonical fields = legacy.* canonical fields
+    ///          result.coins, result.commitments, result.chain_mmr are
+    ///                  reconstructed under is_v2 = is_v2_at(legacy.height)
+    ///          legacy is_v2 bytes are discarded (the new code derives mode
+    ///                  from height via is_v2_at, not from a stored field)
+    /// ```
+    ///
+    /// Strict parse: legacy bytes must be consumed in full. If trailing
+    /// bytes remain even under the legacy schema, we fail loudly rather
+    /// than swallow them — at that point the file is genuinely corrupt
+    /// or follows a third unknown format and forging ahead would silently
+    /// produce a malformed in-memory state.
+    pub(super) fn deserialize_legacy_state(bytes: &[u8]) -> Result<State> {
+        let strict = bincode::DefaultOptions::new()
+            .with_limit(100_000_000)
+            .with_fixint_encoding();
+            
+        let legacy: LegacyState = strict
+            .deserialize(bytes)
+            .map_err(|e| anyhow::anyhow!("Legacy state parse failed: {}", e))?;
+
+        let v2 = crate::core::types::is_v2_at(legacy.height);
+
+        let coins = crate::core::mmr::UtxoAccumulator::from_canonical_coins(
+            legacy.coins.coins,
+            v2,
+        );
+        let commitments = crate::core::mmr::UtxoAccumulator::from_canonical_coins(
+            legacy.commitments.coins,
+            v2,
+        );
+        let chain_mmr = crate::core::mmr::MerkleMountainRange::from_raw_parts(
+            legacy.chain_mmr.nodes,
+            legacy.chain_mmr.leaf_count,
+        );
+
+        // expirations is rebuilt by the caller; we drop legacy.expirations on
+        // purpose, since the canonical source-of-truth in the new code is
+        // commitment_heights.
+
+        Ok(State {
+            midstate: legacy.midstate,
+            coins,
+            commitments,
+            depth: legacy.depth,
+            target: legacy.target,
+            height: legacy.height,
+            timestamp: legacy.timestamp,
+            commitment_heights: legacy.commitment_heights,
+            expirations: im::OrdMap::new(),
+            chain_mmr,
+            header_hash: legacy.header_hash,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -44,14 +264,14 @@ pub struct Storage {
 }
 
 impl Storage {
-    
+
     /// Deletes any state snapshots at or above the given fork height.
-    /// Called during a reorg to prevent stale snapshots from a dead chain 
+    /// Called during a reorg to prevent stale snapshots from a dead chain
     /// from corrupting future state rebuilds.
     pub fn delete_snapshots_above(&self, fork_height: u64) -> Result<()> {
         let snapshot_dir = self.batches.base_path().parent().unwrap().join("snapshots");
         if !snapshot_dir.exists() { return Ok(()); }
-        
+
         for entry in std::fs::read_dir(&snapshot_dir)? {
             if let Ok(entry) = entry {
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -69,13 +289,13 @@ impl Storage {
         }
         Ok(())
     }
-    
+
     pub fn truncate_chain(&self, new_tip_height: u64) -> Result<()> {
         self.batches.truncate(new_tip_height)?;
         self.delete_snapshots_above(new_tip_height)?;
         Ok(())
     }
-    
+
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
@@ -88,14 +308,14 @@ impl Storage {
                     if attempt > 0 {
                         tracing::info!("Database lock acquired after {} retries", attempt);
                     }
-                    
+
                     tracing::info!("Compacting database to free dead pages...");
                     if let Err(e) = db.compact() {
                         tracing::warn!("Database compaction failed (non-fatal): {}", e);
                     } else {
                         tracing::info!("Database compaction complete.");
                     }
-                    
+
                     // Initialize tables
                     let write_txn = db.begin_write()?;
                     {
@@ -136,7 +356,7 @@ impl Storage {
     pub fn save_state_snapshot(&self, height: u64, state: &State) -> Result<()> {
         let snapshot_dir = self.batches.base_path().parent().unwrap().join("snapshots");
         std::fs::create_dir_all(&snapshot_dir)?;
-        
+
         let path = snapshot_dir.join(format!("state_{}.bin", height));
         let bytes = bincode::serialize(state)?;
         std::fs::write(path, bytes)?;
@@ -164,15 +384,16 @@ impl Storage {
     }
 
     /// Loads a historical snapshot to serve to a peer.
+    ///
+    /// Routes through the canonical [`deserialize_state`], which rebuilds
+    /// the SMT caches and the `expirations` index automatically.
     pub fn load_state_snapshot(&self, height: u64) -> Result<Option<State>> {
         let snapshot_dir = self.batches.base_path().parent().unwrap().join("snapshots");
         let path = snapshot_dir.join(format!("state_{}.bin", height));
-        
+
         if path.exists() {
             let bytes = std::fs::read(&path)?;
-            let mut state = deserialize_state_limited(&bytes)?;
-            state.coins.rebuild_tree();
-            state.commitments.rebuild_tree();
+            let state = deserialize_state(&bytes)?;
             Ok(Some(state))
         } else {
             Ok(None)
@@ -190,27 +411,27 @@ impl Storage {
         Ok(())
     }
 
+    /// Loads the persisted current state from the redb-backed STATE_TABLE.
+    ///
+    /// Routes through the canonical [`deserialize_state`], which rebuilds
+    /// the SMT caches and the `expirations` index automatically.
     pub fn load_state(&self) -> Result<Option<State>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(STATE_TABLE)?;
         match table.get("current")? {
             Some(bytes) => {
-                let mut state = deserialize_state(bytes.value())?;
-                state.coins.rebuild_tree();
-                state.commitments.rebuild_tree();
+                let state = deserialize_state(bytes.value())?;
                 Ok(Some(state))
             }
             None => Ok(None),
         }
     }
 
-
-
     pub fn save_mining_seed(&self, seed: &[u8; 32]) -> Result<()> {
         // Save to flat file for concurrent CLI access
         let seed_path = self.batches.base_path().parent().unwrap().join("mining_seed.key");
         std::fs::write(&seed_path, seed)?;
-        
+
         // Restrict permissions to owner-only on Unix systems
         #[cfg(unix)]
         {
@@ -280,7 +501,7 @@ impl Storage {
     /// - For standard WOTS: burns the address hash.
     /// - For MSS (post-activation): burns the specific leaf's WOTS public key.
     /// - Idempotent: reorg replays of the same batch write the same value.
-pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, _block_height: u64) -> Result<()> {
+    pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, _block_height: u64) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut spent_table = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
@@ -315,7 +536,7 @@ pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, _block_height: u6
                         let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
                         let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
                         let commitment = crate::core::compute_commitment(&input_ids, &output_hashes, salt);
-                        
+
                         let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
                         if let Some(sig) = wit_inputs.first() {
                             if sig.len() == crate::core::wots::SIG_SIZE {
@@ -338,6 +559,7 @@ pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, _block_height: u6
         write_txn.commit()?;
         Ok(())
     }
+
     /// Build a pre-flight oracle for a batch: returns a map of
     /// `nullifier -> prior_commitment` for every WOTS address or MSS leaf in the batch
     /// that already exists in the spent-address table.
@@ -381,7 +603,7 @@ pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, _block_height: u6
                 }
                 _ => {}
             }
-        }    
+        }
         Ok(result)
     }
 
@@ -426,9 +648,10 @@ pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, _block_height: u6
             }
             _ => {}
         }
-        
+
         Ok(result)
     }
+
     /// O(1) lookup of the highest MSS leaf index used on-chain for a given master_pk.
     /// Returns 0 if the master_pk has never been seen (or pre-activation blocks only).
     pub fn query_mss_leaf_index(&self, master_pk: &[u8; 32]) -> Result<u64> {

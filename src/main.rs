@@ -1503,11 +1503,12 @@ let (commitment, _salt) = wallet.prepare_commit(
 }
 
 fn mine_pow(commitment: &[u8; 32], required_pow: u32, current_height: u64) -> u64 {
-    let mut n = 0u64;
+    let mut n = 0u32;
+    let target_height = current_height as u32;
     loop {
-        let h = midstate::core::transaction::commit_pow_hash(commitment, n, current_height);
+        let h = midstate::core::transaction::commit_pow_hash(commitment, n, target_height);
         if midstate::core::types::count_leading_zeros(&h) >= required_pow {
-            return n;
+            return midstate::core::transaction::pack_spam_nonce(n, target_height);
         }
         n += 1;
     }

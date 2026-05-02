@@ -207,8 +207,8 @@ async fn read_message<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<Mes
         }
     };
 
-    // Enforce a hard 30-second deadline to read the payload
-    tokio::time::timeout(std::time::Duration::from_secs(30), read_future)
+    // Enforce a hard 60-second deadline to read the payload
+    tokio::time::timeout(std::time::Duration::from_secs(60), read_future)
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Stream read timed out"))?
 }

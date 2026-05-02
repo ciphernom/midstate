@@ -72,14 +72,7 @@ pub struct MssSignature {
     /// The WOTS signature 
     pub wots_sig: [[u8; 32]; wots::CHAINS],
     /// Auth path: H sibling hashes from leaf to root.
-    pub auth_path: Vec<AuthNode>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AuthNode {
-    pub hash: [u8; 32],
-    /// true → sibling is on the right (we are the left child).
-    pub is_right: bool,
+    pub auth_path: Vec<[u8; 32]>,
 }
 
 // ── Key generation ──────────────────────────────────────────────────────────
@@ -233,18 +226,18 @@ impl MssKeypair {
     }
 
     /// Merkle auth path for leaf `leaf_idx`.
-    fn auth_path(&self, leaf_idx: u64) -> Vec<AuthNode> {
+    fn auth_path(&self, leaf_idx: u64) -> Vec<[u8; 32]> {
         let num_leaves = 1u64 << self.height;
         let mut path = Vec::with_capacity(self.height as usize);
-        let mut node = (num_leaves + leaf_idx) as usize; // 1-indexed
+        let mut node = (num_leaves + leaf_idx) as usize; 
 
         for _ in 0..self.height {
-            let (sibling_hash, is_right) = if node % 2 == 0 {
-                (self.tree[node + 1], true) // we're left, sibling right
+            let sibling_hash = if node % 2 == 0 {
+                self.tree[node + 1]
             } else {
-                (self.tree[node - 1], false) // we're right, sibling left
+                self.tree[node - 1]
             };
-            path.push(AuthNode { hash: sibling_hash, is_right });
+            path.push(sibling_hash);
             node /= 2;
         }
         path
@@ -274,21 +267,14 @@ pub fn verify(sig: &MssSignature, message: &[u8; 32], master_pk: &MasterPublicKe
     let mut current = sig.wots_pk;
     let mut current_idx = sig.leaf_index;
 
-    for node in &sig.auth_path {
-        // If current_idx is even, we are the left child, so sibling is on the right.
-        let expected_is_right = current_idx % 2 == 0;
-        
-        // Prevent forged paths and leaf_index poisoning
-        if node.is_right != expected_is_right {
-            return false;
-        }
-
-        current = if node.is_right {
-            hash_concat(&current, &node.hash)
+    for node_hash in &sig.auth_path {
+        // Implicit spatial position enforcement prevents path malleability
+        let is_right = current_idx % 2 == 0;
+        current = if is_right {
+            hash_concat(&current, node_hash)
         } else {
-            hash_concat(&node.hash, &current)
+            hash_concat(node_hash, &current)
         };
-        
         current_idx /= 2;
     }
     current == *master_pk
@@ -302,15 +288,14 @@ impl MssSignature {
     pub fn to_bytes(&self) -> Vec<u8> {
         let wots_bytes = wots::sig_to_bytes(&self.wots_sig);
         let auth_len = self.auth_path.len();
-        let mut buf = Vec::with_capacity(8 + 32 + wots_bytes.len() + 4 + auth_len * 33);
+        let mut buf = Vec::with_capacity(8 + 32 + wots_bytes.len() + 4 + auth_len * 32);
 
         buf.extend_from_slice(&self.leaf_index.to_le_bytes());
         buf.extend_from_slice(&self.wots_pk);
         buf.extend_from_slice(&wots_bytes);
         buf.extend_from_slice(&(auth_len as u32).to_le_bytes());
-        for node in &self.auth_path {
-            buf.extend_from_slice(&node.hash);
-            buf.push(if node.is_right { 1 } else { 0 });
+        for hash in &self.auth_path {
+            buf.extend_from_slice(hash);
         }
         buf
     }
@@ -329,22 +314,32 @@ impl MssSignature {
         if auth_len > MAX_HEIGHT as usize {
             bail!("MSS auth path too long: {} > {}", auth_len, MAX_HEIGHT);
         }
+        
         let ps = ao + 4;
-        if data.len() < ps + auth_len * 33 { bail!("MSS signature truncated"); }
+        let remaining = data.len() - ps;
+        
+        // Auto-detect V1 (33 bytes) vs V2 (32 bytes)
+        let node_size = if auth_len > 0 && remaining % 33 == 0 && remaining / 33 == auth_len {
+            33
+        } else if auth_len > 0 && remaining % 32 == 0 && remaining / 32 == auth_len {
+            32
+        } else if auth_len == 0 {
+            32
+        } else {
+            bail!("MSS signature truncated or invalid format");
+        };
 
-        let auth_path = (0..auth_len).map(|i| {
-            let o = ps + i * 33;
-            AuthNode {
-                hash: data[o..o + 32].try_into().unwrap(),
-                is_right: data[o + 32] != 0,
-            }
-        }).collect();
+        let mut auth_path = Vec::with_capacity(auth_len);
+        for i in 0..auth_len {
+            let o = ps + i * node_size;
+            auth_path.push(data[o..o+32].try_into().unwrap());
+        }
 
         Ok(Self { leaf_index, wots_pk, wots_sig, auth_path })
     }
 
     pub fn size(&self) -> usize {
-        8 + 32 + wots::SIG_SIZE + 4 + self.auth_path.len() * 33
+        8 + 32 + wots::SIG_SIZE + 4 + self.auth_path.len() * 32
     }
 }
 

@@ -234,6 +234,11 @@ pub struct State {
     pub timestamp: u64,
     #[serde(default)]
     pub commitment_heights: im::HashMap<[u8; 32], u64>,
+    // CHANGED: skip + default — the index is rebuilt from `commitment_heights`
+    // at load time (see storage.rs::deserialize_state). Not part of the wire
+    // format, not part of any consensus hash.
+    #[serde(default, skip)]
+    pub expirations: im::OrdMap<u64, Vec<[u8; 32]>>,
     /// Append-only log of historical block hashes for light client proofs
     #[serde(default)]
     pub chain_mmr: crate::core::mmr::MerkleMountainRange,
@@ -302,6 +307,7 @@ impl State {
             height: 0,
             timestamp: BITCOIN_BLOCK_TIME,
             commitment_heights: im::HashMap::new(),
+            expirations: im::OrdMap::new(),
             chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
             header_hash: initial_midstate, 
         };
@@ -309,21 +315,22 @@ impl State {
     }
     
 pub fn header(&self) -> BatchHeader {
-        let mut coins_clone = self.coins.clone();
-        let mut commitments_clone = self.commitments.clone();
-        let smt_root = hash_concat(&coins_clone.root(), &commitments_clone.root());
-        let state_root = hash_concat(&smt_root, &self.chain_mmr.root());
+    let v2 = is_v2_at(self.height);
+    let coins_clone = self.coins.clone();
+    let commitments_clone = self.commitments.clone();
+    let smt_root = hash_concat(&coins_clone.root(v2), &commitments_clone.root(v2));
+    let state_root = hash_concat(&smt_root, &self.chain_mmr.root(v2));
 
-        BatchHeader {
-            height: self.height,
-            prev_midstate: [0u8; 32],
-            post_tx_midstate: self.midstate,
-            extension: Extension {
-                nonce: 0,
-                final_hash: self.header_hash, // Note: final_hash holds header_hash here
-            },
-            timestamp: self.timestamp,
-            target: self.target,
+    BatchHeader {
+        height: self.height,
+        prev_midstate: [0u8; 32],
+        post_tx_midstate: self.midstate,
+        extension: Extension {
+            nonce: 0,
+            final_hash: self.header_hash,
+        },
+        timestamp: self.timestamp,
+        target: self.target,
             state_root, 
             prev_header_hash: [0u8; 32], 
         }
@@ -687,6 +694,16 @@ pub fn compute_header_hash(header: &BatchHeader) -> [u8; 32] {
 // ── Protocol constants ──────────────────────────────────────────────────────
 pub const MAX_BURN_DATA_SIZE: usize = 80; //OP_RETURN analog
 pub const NETWORK_MAGIC: &[u8] = b"MIDSTATE_MAINNET_V1";
+
+pub const V2_ACTIVATION_HEIGHT: u64 = 100_000; 
+
+/// True iff a state at the given height should hash with V2 rules.
+/// Single source of truth for V2 activation across the codebase.
+#[inline]
+pub fn is_v2_at(height: u64) -> bool {
+    height >= V2_ACTIVATION_HEIGHT
+}
+
 #[cfg(not(feature = "fast-mining"))]
 pub const EXTENSION_ITERATIONS: u64 = 1_000_000;
 #[cfg(feature = "fast-mining")]

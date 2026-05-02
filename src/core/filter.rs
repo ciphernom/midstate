@@ -179,6 +179,8 @@ fn decode_golomb(reader: &mut BitReader) -> Option<u64> {
 }
 
 /// Decode an entire filter into the sorted list of hash values.
+// only every called by unit tests. 
+#[allow(dead_code)]
 fn decode_filter(data: &[u8], n: u64) -> Vec<u64> {
     if data.is_empty() || n == 0 {
         return vec![];
@@ -230,20 +232,27 @@ pub fn match_any(filter_data: &[u8], block_hash: &[u8; 32], n: u64, items: &[[u8
         let raw = u64::from_le_bytes(h[..8].try_into().unwrap());
         raw % modulus
     }).collect();
-    query_hashes.sort();
+    query_hashes.sort_unstable();
     query_hashes.dedup();
 
-    // Decode the filter
-    let filter_values = decode_filter(filter_data, n);
-
-    // Sorted set intersection (both lists are sorted)
-    let mut fi = 0;
+    // Zero-allocation intersection: Decode and compare on the fly
+    let mut reader = BitReader::new(filter_data);
+    let mut cumulative = 0u64;
     let mut qi = 0;
-    while fi < filter_values.len() && qi < query_hashes.len() {
-        match filter_values[fi].cmp(&query_hashes[qi]) {
-            std::cmp::Ordering::Equal => return true,
-            std::cmp::Ordering::Less => fi += 1,
-            std::cmp::Ordering::Greater => qi += 1,
+
+    for _ in 0..n {
+        if qi >= query_hashes.len() { break; }
+        match decode_golomb(&mut reader) {
+            Some(delta) => {
+                cumulative += delta;
+                while qi < query_hashes.len() && query_hashes[qi] < cumulative {
+                    qi += 1;
+                }
+                if qi < query_hashes.len() && query_hashes[qi] == cumulative {
+                    return true;
+                }
+            }
+            None => break,
         }
     }
     false

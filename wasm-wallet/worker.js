@@ -864,12 +864,13 @@ self.onmessage = async (e) => {
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining Proof of Work..." } });
                 const stateData = await rpc.getState();
                 
-                // Mine PoW locally in JS to satisfy the mempool
-                let spamNonce = 0;
+                // --- V2 UPGRADE FIX ---
+                let actualNonce = 0;
+                const targetHeight = Number(stateData.height);
                 while (true) {
-                    // V2 PoW algorithm mathematically binds the target height
-                    let heightHex = BigInt(stateData.height).toString(16).padStart(16, '0').match(/.{2}/g).reverse().join('');
-                    let nonceHex = spamNonce.toString(16).padStart(16, '0').match(/.{2}/g).reverse().join('');
+                    // V2 PoW algorithm mathematically binds the target height (4 bytes = 8 hex chars)
+                    let heightHex = targetHeight.toString(16).padStart(8, '0').match(/.{2}/g).reverse().join('');
+                    let nonceHex = actualNonce.toString(16).padStart(8, '0').match(/.{2}/g).reverse().join('');
                     
                     let payloadToHash = heightHex + txData.commitment + nonceHex;
                     const hashExt = blake3_hash_hex(payloadToHash);
@@ -885,11 +886,15 @@ self.onmessage = async (e) => {
                         }
                     }
                     if (zeros >= (stateData.required_pow || 24)) break;
-                    spamNonce++;
+                    actualNonce++;
                 }
                 
+                // Pack the nonce: ((targetHeight << 32) | actualNonce)
+                // Since JS bitwise operators truncate to 32-bit, we must use BigInt
+                const packedSpamNonce = Number((BigInt(targetHeight) << 32n) | BigInt(actualNonce));
+                
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Submitting Commit..." } });
-                const commitResp = await rpc.commit(txData.commitment, spamNonce);
+                const commitResp = await rpc.commit(txData.commitment, packedSpamNonce);
                 if (!commitResp.ok) throw new Error(commitResp.body || commitResp.error);
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for Block Confirmation (Phase 1)..." } });
