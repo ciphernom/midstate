@@ -58,6 +58,10 @@ pub const OP_MOD: u8              = 0x28;
 pub const OP_SIZE: u8             = 0x29;
 pub const OP_INPUT_VALUE: u8      = 0x53;
 
+///v5 opcodes — covenant primitives
+pub const OP_OUTPUT_ADDRESS: u8   = 0x54;
+pub const OP_THIS_ADDRESS: u8     = 0x55;
+
 // ── Consensus limits ───────────────────────────────────────────────────────
 
 pub const MAX_SCRIPT_SIZE: usize  = 1_024;
@@ -124,6 +128,9 @@ pub struct ExecContext<'a> {
     pub outputs: &'a [OutputData],
     pub input_value: u64,
     pub input_state: Option<[u8; 32]>,
+    /// Address of the predicate currently executing.
+    /// Equals `Predicate::Script { bytecode }.address()` for the input being verified.
+    pub this_address: [u8; 32],
 }
 
 // ── AOT validation ─────────────────────────────────────────────────────────
@@ -173,6 +180,7 @@ pub fn validate_structure(bytecode: &[u8], _height: u64) -> Result<(), ScriptErr
             OP_OVER | OP_ROT | OP_SLICE | OP_CONCAT | OP_SUB | OP_MUL | OP_DIV => {}
             OP_READ_INPUT_STATE | OP_READ_OUTPUT_STATE => {}
             OP_PICK | OP_SIZE | OP_MOD | OP_INPUT_VALUE => {}
+            OP_OUTPUT_ADDRESS | OP_THIS_ADDRESS => {}
             _ => return Err(ScriptError::InvalidOpcode(op)),
         }
     }
@@ -517,6 +525,17 @@ pub fn execute_script(
             OP_INPUT_VALUE => {
                 stack_push(&mut stack, from_u64(ctx.input_value))?;
             }
+            OP_OUTPUT_ADDRESS => {
+                let idx_u64 = to_u64(&stack_pop(&mut stack)?)?;
+                if idx_u64 >= ctx.outputs.len() as u64 {
+                    return Err(ScriptError::InvalidStateRead);
+                }
+                let addr = ctx.outputs[idx_u64 as usize].address();
+                stack_push(&mut stack, SmallVec::from_slice(&addr))?;
+            }
+            OP_THIS_ADDRESS => {
+                stack_push(&mut stack, SmallVec::from_slice(&ctx.this_address))?;
+            }
             _ => return Err(ScriptError::InvalidOpcode(op)),
         }
     }
@@ -672,6 +691,8 @@ pub fn assemble(source: &str) -> Result<Vec<u8>, String> {
             "READ_INPUT_STATE"  => bc.push(OP_READ_INPUT_STATE),
             "READ_OUTPUT_STATE" => bc.push(OP_READ_OUTPUT_STATE),
             "INPUT_VALUE"       => bc.push(OP_INPUT_VALUE),
+            "OUTPUT_ADDRESS"    => bc.push(OP_OUTPUT_ADDRESS),
+            "THIS_ADDRESS"      => bc.push(OP_THIS_ADDRESS),
             other => return Err(format!("unknown mnemonic '{}'", other)),
         }
         i += 1;
@@ -697,6 +718,8 @@ mod tests {
             height: 100,
             outputs: &OUTPUTS,
             input_value: 0,
+            input_state: None,
+            this_address: [0u8; 32],
         }
     }
 
@@ -830,7 +853,7 @@ mod tests {
         let sig = wots::sign(&seed, &commitment);
         let sig_bytes = wots::sig_to_bytes(&sig);
         let bytecode = compile_p2pk(&pk);
-        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[] , input_value: 0 };
+        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
         assert!(execute_script(&bytecode, &[sig_bytes], &ctx).is_ok());
     }
 
@@ -841,7 +864,7 @@ mod tests {
         let commitment = hash(b"test commitment");
         let wrong_sig = vec![0u8; wots::SIG_SIZE];
         let bytecode = compile_p2pk(&pk);
-        let ctx = ExecContext { commitment: &commitment, height: 31000, outputs: &[] , input_value: 0 };
+        let ctx = ExecContext { commitment: &commitment, height: 31000, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
         assert!(execute_script(&bytecode, &[wrong_sig], &ctx).is_err());
     }
 
@@ -897,7 +920,7 @@ mod tests {
         let sig = wots::sign(&receiver_seed, &commitment);
         let sig_bytes = wots::sig_to_bytes(&sig);
         let witness = vec![sig_bytes, secret.to_vec(), vec![1u8]];
-        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[] , input_value: 0 };
+        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
         assert!(execute_script(&bytecode, &witness, &ctx).is_ok());
     }
 
@@ -912,7 +935,7 @@ mod tests {
         let sig = wots::sign(&refund_seed, &commitment);
         let sig_bytes = wots::sig_to_bytes(&sig);
         let witness = vec![sig_bytes, vec![0u8; 32], vec![0u8]];
-        let ctx = ExecContext { commitment: &commitment, height: 31000, outputs: &[] , input_value: 0 };
+        let ctx = ExecContext { commitment: &commitment, height: 31000, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
         assert!(execute_script(&bytecode, &witness, &ctx).is_ok());
     }
 
@@ -927,7 +950,7 @@ mod tests {
         let sig = wots::sign(&refund_seed, &commitment);
         let sig_bytes = wots::sig_to_bytes(&sig);
         let witness = vec![sig_bytes, vec![0u8; 32], vec![0u8]];
-        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[] , input_value: 0 };
+        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
         assert!(execute_script(&bytecode, &witness, &ctx).is_err());
     }
 
@@ -947,7 +970,7 @@ mod tests {
         bc.push(OP_GREATER_OR_EQUAL);
         bc.push(OP_VERIFY);
         push_int(&mut bc, 1);
-        let ctx = ExecContext { commitment: &[0; 32], height: 0, outputs: &outputs , input_value: 0 };
+        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
         assert!(execute_script(&bc, &[], &ctx).is_ok());
     }
 
@@ -962,7 +985,7 @@ mod tests {
         bc.push(OP_GREATER_OR_EQUAL);
         bc.push(OP_VERIFY);
         push_int(&mut bc, 1);
-        let ctx = ExecContext { commitment: &[0; 32], height: 0, outputs: &outputs , input_value: 0 };
+        let ctx = ExecContext { commitment: &[0; 32], height: 0, outputs: &outputs, input_value: 0, input_state: None, this_address: [0u8; 32] };
         assert!(execute_script(&bc, &[], &ctx).is_err());
     }
 
@@ -1000,7 +1023,7 @@ mod tests {
         let sig1 = wots::sig_to_bytes(&wots::sign(&seed1, &commitment));
         let sig2 = wots::sig_to_bytes(&wots::sign(&seed2, &commitment));
         let witness = vec![sig1, sig2, vec![0u8]];
-        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[] , input_value: 0 };
+        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
         assert!(execute_script(&bytecode, &witness, &ctx).is_ok());
     }
 
@@ -1016,7 +1039,7 @@ mod tests {
         let bytecode = compile_multisig_2of3(&pk1, &pk2, &pk3);
         let sig1 = wots::sig_to_bytes(&wots::sign(&seed1, &commitment));
         let witness = vec![sig1, vec![0u8], vec![0u8]];
-        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[] , input_value: 0 };
+        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
         assert!(execute_script(&bytecode, &witness, &ctx).is_err());
     }
 
@@ -1091,7 +1114,7 @@ mod tests {
         let sig2 = wots::sig_to_bytes(&wots::sign(&seed2, &commitment));
         let sig3 = wots::sig_to_bytes(&wots::sign(&seed3, &commitment));
         let witness = vec![sig1, sig2, sig3];
-        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[], input_value: 0 };
+        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
         assert!(execute_script(&bytecode, &witness, &ctx).is_ok());
     }
     
@@ -1152,5 +1175,70 @@ mod tests {
         ctx.height = 100_000;
         assert!(execute_script(&bc, &witness, &ctx).is_ok());
     }
-    
+    #[test]
+    fn this_address_returns_predicate_address() {
+        let expected = [0xAB; 32];
+        let mut bc = Vec::new();
+        bc.push(OP_THIS_ADDRESS);
+        push_data(&mut bc, &expected);
+        bc.push(OP_EQUALVERIFY);
+        push_int(&mut bc, 1);
+
+        let mut ctx = empty_ctx();
+        ctx.this_address = expected;
+        assert!(execute_script(&bc, &[], &ctx).is_ok());
+    }
+
+    #[test]
+    fn output_address_returns_correct_address() {
+        let alice = [0xAA; 32];
+        let bob = [0xBB; 32];
+        let outputs = vec![
+            OutputData::Standard { address: alice, value: 1, salt: [0; 32] },
+            OutputData::Standard { address: bob,   value: 2, salt: [0; 32] },
+        ];
+        let mut bc = Vec::new();
+        push_int(&mut bc, 1);
+        bc.push(OP_OUTPUT_ADDRESS);
+        push_data(&mut bc, &bob);
+        bc.push(OP_EQUALVERIFY);
+        push_int(&mut bc, 1);
+
+        let ctx = ExecContext {
+            commitment: &[0u8; 32], height: 0, outputs: &outputs,
+            input_value: 0, input_state: None, this_address: [0u8; 32],
+        };
+        assert!(execute_script(&bc, &[], &ctx).is_ok());
+    }
+
+    #[test]
+    fn output_address_index_oob_fails() {
+        let outputs: Vec<OutputData> = vec![];
+        let mut bc = Vec::new();
+        push_int(&mut bc, 0);
+        bc.push(OP_OUTPUT_ADDRESS);
+        let ctx = ExecContext {
+            commitment: &[0u8; 32], height: 0, outputs: &outputs,
+            input_value: 0, input_state: None, this_address: [0u8; 32],
+        };
+        assert_eq!(execute_script(&bc, &[], &ctx), Err(ScriptError::InvalidStateRead));
+    }
+
+    #[test]
+    fn output_address_of_databurn_is_zero() {
+        let outputs = vec![
+            OutputData::DataBurn { payload: vec![1, 2, 3], value_burned: 0 },
+        ];
+        let mut bc = Vec::new();
+        push_int(&mut bc, 0);
+        bc.push(OP_OUTPUT_ADDRESS);
+        push_data(&mut bc, &[0u8; 32]);
+        bc.push(OP_EQUALVERIFY);
+        push_int(&mut bc, 1);
+        let ctx = ExecContext {
+            commitment: &[0u8; 32], height: 0, outputs: &outputs,
+            input_value: 0, input_state: None, this_address: [0u8; 32],
+        };
+        assert!(execute_script(&bc, &[], &ctx).is_ok());
+    }
 }

@@ -605,12 +605,14 @@ fn verify_predicate(
 ) -> bool {
     match (predicate, witness) {
         (Predicate::Script { bytecode }, Witness::ScriptInputs(inputs)) => {
+            let this_address = predicate.address();
             let ctx = script::ExecContext {
                 commitment,
                 height: current_height,
                 outputs,
                 input_value,
                 input_state,
+                this_address,
             };
             script::execute_script(bytecode, inputs, &ctx).is_ok()
         }

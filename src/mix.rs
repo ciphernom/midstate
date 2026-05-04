@@ -306,12 +306,14 @@ pub fn register(
         let input = &proposal.inputs[input_index];
         let is_valid = match &input.predicate {
             crate::core::types::Predicate::Script { bytecode } => {
+                let this_address = input.predicate.address();
                 let ctx = crate::core::script::ExecContext {
                     commitment: &proposal.commitment,
                     height: current_height,
                     outputs: &proposal.outputs,
                     input_value: input.value,
-                    input_state: input.commitment, // <-- ADDED: Pass the State Thread variable
+                    input_state: input.commitment,
+                    this_address,
                 };
                 crate::core::script::execute_script(bytecode, &[signature.clone()], &ctx).is_ok()
             }
