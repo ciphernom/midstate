@@ -998,7 +998,7 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
             }
         }
 
-        // Support empty address for L2-only actions (no L1 transfer)
+        // Support empty address 
         let recipient_addr = if to_address_hex.is_empty() {
             [0u8; 32]
         } else {

@@ -512,41 +512,7 @@
             </div>
         </main>
         
-<!-- DEFI LAUNCHPAD & DEX -
-        <main id="view-defi" class="page">
-            <h2>L2 Native DEX</h2>
-            <p style="font-size: 11px; color: #666; margin-bottom: 15px;">Serverless P2P Rollup</p>
-            
-            <div class="panel">
-                <h3 style="margin-bottom: 10px; color: var(--text-max); font-size: 14px;">Launch a Token</h3>
-                <div class="flex-row" style="gap: 10px;">
-                    <input type="text" id="deployTicker" placeholder="TICKER (Max 8)" maxlength="8" style="flex: 1; margin: 0; text-transform: uppercase;">
-                    <input type="number" id="deployBurnAmount" placeholder="MDS to Burn" style="flex: 2; margin: 0;">
-                </div>
-                <button id="btnL2Mint" style="background: var(--accent); color: #000; margin-top: 10px;">Launch & Buy (Curve)</button>
-            </div>
 
-            <div class="panel">
-                <h3 style="margin-bottom: 10px; color: var(--text-max); font-size: 14px;">List Sell Order</h3>
-                <div class="flex-row" style="gap: 10px; margin-bottom: 10px;">
-                    <input type="text" id="listTicker" placeholder="TICKER" maxlength="8" style="flex: 1; margin: 0; text-transform: uppercase;">
-                    <input type="number" id="listAmount" placeholder="Amount to Sell" style="flex: 2; margin: 0;">
-                </div>
-                <input type="number" id="listPrice" placeholder="Total Price (MDS)" style="width: 100%; margin-bottom: 10px;">
-                <button id="btnL2List" style="background: transparent; color: var(--accent); border: 1px dashed var(--accent);">Create Sell Order</button>
-            </div>
-
-            <h3 style="font-size: 12px; color: #666; text-transform: uppercase; margin-bottom: 8px;">Global Orderbook</h3>
-            <div id="l2Orderbook" class="list-container" style="margin-bottom: 20px;">
-                <div class="list-item" style="text-align: center; color: #555; font-size: 11px;">No active orders.</div>
-            </div>
-
-            <h3 style="font-size: 12px; color: #666; text-transform: uppercase; margin-bottom: 8px;">My L2 Balances</h3>
-            <div id="l2MyBalances" class="list-container">
-                <div class="list-item" style="text-align: center; color: #555; font-size: 11px;">No L2 tokens found.</div>
-            </div>
-        </main>
-        -->
         <!-- SETTINGS -->
         <main id="view-settings" class="page">
             <h2>Settings</h2>
@@ -1873,48 +1839,7 @@ if ('serviceWorker' in navigator) {
                     break;
                 }
 
-                case 'DEFI_UPDATE': {
-                    const l2 = payload;
-                    if (!l2) break;
-
-                    const primaryAddress = Object.keys(wState.mssAddrs)[0] || Object.keys(wState.wotsAddrs)[0];
-                    
-                    // Render My Balances
-                    const balContainer = document.getElementById('l2MyBalances');
-                    const myBals = l2.balances[primaryAddress];
-
-                    if (!myBals || Object.keys(myBals).length === 0) {
-                        balContainer.innerHTML = '<div class="list-item" style="text-align: center; color: #555; font-size: 11px;">No L2 tokens found.</div>';
-                    } else {
-                        balContainer.innerHTML = Object.entries(myBals).map(([ticker, amt]) => `
-                            <div class="list-item flex-row">
-                                <span style="font-weight: bold; color: var(--text-max);">${amt.toLocaleString()} <span style="color:var(--accent);">${ticker}</span></span>
-                                <span style="font-size: 10px; color: #666;">Global Supply: ${(l2.tokens[ticker]?.supply || 0).toLocaleString()}</span>
-                            </div>
-                        `).join('');
-                    }
-
-                    // Render Orderbook
-                    const obContainer = document.getElementById('l2Orderbook');
-                    if (!l2.orders || Object.keys(l2.orders).length === 0) {
-                        obContainer.innerHTML = '<div class="list-item" style="text-align: center; color: #555; font-size: 11px;">No active orders.</div>';
-                    } else {
-                        obContainer.innerHTML = Object.entries(l2.orders).map(([orderId, o]) => `
-                            <div class="list-item flex-row">
-                                <div>
-                                    <div style="font-weight: bold; color: var(--text-max);">${o.amount.toLocaleString()} <span style="color:var(--accent);">${o.ticker}</span></div>
-                                    <div style="font-size: 10px; color: #888;">for ${o.price} MDS</div>
-                                </div>
-                                ${o.maker === primaryAddress 
-                                    ? `<span style="font-size: 10px; color: #666; padding: 6px 12px;">YOUR ORDER</span>` 
-                                    : `<button onclick="fillOrder('${orderId}', '${o.maker}', ${o.price})" style="width: auto; margin: 0; padding: 6px 16px; min-height: 0; font-size: 11px; background: var(--text-max); color: #000;">Buy</button>`
-                                }
-                            </div>
-                        `).join('');
-                    }
-                    break;
-                }
-                
+                                
                 case 'PHRASE_GENERATED':
                     document.getElementById('seedPhrase').value = payload;
                     break;
@@ -2170,38 +2095,11 @@ if ('serviceWorker' in navigator) {
             );
         };
 
-        document.getElementById('btnL2Mint').onclick = () => {
-            const ticker = document.getElementById('deployTicker').value.toUpperCase().trim();
-            const burnAmt = parseInt(document.getElementById('deployBurnAmount').value);
-            if (!ticker || !burnAmt) return showToast("Enter ticker and burn amount.", "error");
-            
-            showConfirm(
-                "Launch Token",
-                `This will permanently burn <strong style="color:var(--text-max)">${burnAmt} MDS</strong> to mint <strong>$${ticker}</strong> on the bonding curve. Continue?`,
-                () => { worker.postMessage({ type: 'L2_ACTION', payload: { action: 'mint', ticker, burnAmount: burnAmt } }); }
-            );
-        };
+        
 
-        document.getElementById('btnL2List').onclick = () => {
-            const ticker = document.getElementById('listTicker').value.toUpperCase().trim();
-            const amount = parseInt(document.getElementById('listAmount').value);
-            const price = parseInt(document.getElementById('listPrice').value);
-            if (!ticker || !amount || !price) return showToast("Fill out all fields.", "error");
+        
 
-            showConfirm(
-                "List Sell Order",
-                `List ${amount} $${ticker} for ${price} MDS?`,
-                () => { worker.postMessage({ type: 'L2_ACTION', payload: { action: 'list', ticker, amount, price } }); }
-            );
-        };
-
-        window.fillOrder = function(orderId, maker, price) {
-            showConfirm(
-                "Buy Token",
-                `Send ${price} MDS to fill this order?`,
-                () => { worker.postMessage({ type: 'L2_ACTION', payload: { action: 'fill', orderId, maker, price } }); }
-            );
-        };
+        
 
         document.getElementById('btnImportTrigger').onclick = () => {
             if (walletExists) {

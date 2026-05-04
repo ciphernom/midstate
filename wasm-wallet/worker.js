@@ -85,18 +85,7 @@ let pendingSends = [];
  */
 const GAP_LIMIT = 100;
 
-// --- L2 Based Rollup State Engine ---
-let l2State = {
-    tokens: {},   // { "TICKER": { supply: 10000 } }
-    balances: {}, // { "AddressHex": { "TICKER": 500 } }
-    orders: {}    // { "TxIdHex": { maker, ticker, amount, price } }
-};
 
-async function saveL2State() { await idbPut('l2_state', new TextEncoder().encode(JSON.stringify(l2State))); }
-async function loadL2State() {
-    const data = await idbGet('l2_state');
-    if (data) l2State = JSON.parse(new TextDecoder().decode(data));
-}
 
 
 /**
@@ -518,9 +507,7 @@ async function loadState(pwd, bundleStr) {
         // Load MSS trees from IndexedDB into WASM (instant if previously cached or just restored)
         mssCachesReady = false;
         await loadMssCaches();
-        await loadL2State(); 
-         
-         self.postMessage({ type: 'DEFI_UPDATE', payload: l2State });
+
         self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
     } catch(e) {
         throw new Error("Incorrect password or corrupted wallet file");
@@ -778,7 +765,6 @@ self.onmessage = async (e) => {
             mssCachesReady = true;
 
             await saveState();
-            self.postMessage({ type: 'DEFI_UPDATE', payload: wState.vaultUtxo });
             self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
             self.postMessage({ type: 'AUTO_CONNECT_WEBRTC' });
         }
@@ -800,34 +786,7 @@ self.onmessage = async (e) => {
             await performScan();
         }
 
-        else if (type === 'L2_ACTION') {
-            if (!wallet) throw new Error("Wallet not initialized");
-            self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Preparing L2 Rollup Transaction..." } });
-            
-            try {
-                if (payload.action === 'mint') {
-                    if (payload.burnAmount <= 0) throw new Error("Burn amount must be > 0");
-                    let tickerHex = payload.ticker.split('').map(c => c.charCodeAt(0).toString(16).padStart(2,'0')).join('').padEnd(16, '0');
-                    let payloadHex = "424201" + tickerHex;
-                    await performSend("", 0, payloadHex, payload.burnAmount);
-                } 
-                else if (payload.action === 'list') {
-                    if (payload.amount <= 0 || payload.price <= 0) throw new Error("Amount and price must be > 0");
-                    let tickerHex = payload.ticker.split('').map(c => c.charCodeAt(0).toString(16).padStart(2,'0')).join('').padEnd(16, '0');
-                    let amtHex = payload.amount.toString(16).padStart(16, '0');
-                    let priceHex = payload.price.toString(16).padStart(16, '0');
-                    let payloadHex = "424202" + tickerHex + amtHex + priceHex;
-                    await performSend("", 0, payloadHex, 1); // Burn 1 dust to anchor the order
-                }
-                else if (payload.action === 'fill') {
-                    let targetOrderBase = payload.orderId.substring(0, 58);
-                    let payloadHex = "424203" + targetOrderBase;
-                    await performSend(payload.maker, payload.price, payloadHex, 1);
-                }
-            } catch (e) {
-                self.postMessage({ type: 'ERROR', payload: e.message || "Failed to execute L2 action" });
-            }
-        }
+        
 
         else if (type === 'SEND') {
             if (isSending) throw new Error("A transaction is already in progress. Please wait for it to complete.");
@@ -1159,7 +1118,6 @@ while (currentHeight < chainHeight) {
 
    wState.lastScannedHeight = chainHeight;
     await saveState();
-    self.postMessage({ type: 'DEFI_UPDATE', payload: wState.vaultUtxo });
     self.postMessage({ type: 'SCAN_COMPLETE', payload: buildDashboardPayload() });
 }
 
@@ -1215,7 +1173,7 @@ async function processFullBlock(height) {
 
             let spentIds = [], spentValue = 0, createdOutputs = [];
             
-            // Extract Sender Identity for L2 Actions
+            // Extract Sender Identity 
             let senderAddrHex = "";
             let txId = "";
             if (reveal.inputs && reveal.inputs.length > 0) {
@@ -1257,9 +1215,7 @@ async function processFullBlock(height) {
                     const burnData = out.DataBurn || out.data_burn;
                     if (burnData) {
                         const payloadHex = normalizeHex(burnData.payload);
-                        if (payloadHex.startsWith("4242")) {
-                            processL2Action(senderAddrHex, txId, payloadHex, Number(burnData.value_burned), reveal.outputs);
-                        }
+                        //could do something with the burn data here i guess
                     }
                 }
             }
@@ -1290,67 +1246,6 @@ async function processFullBlock(height) {
         }
     }
     return matchFound;
-}
-
-function processL2Action(sender, txId, payloadHex, valueBurned, allOutputs) {
-    if (!sender || !txId) return;
-    const action = payloadHex.substring(4, 6);
-    
-    // Parse Ticker (Next 16 hex chars = 8 bytes)
-    const tickerHex = payloadHex.substring(6, 22);
-    let ticker = '';
-    for(let i=0; i<16; i+=2) {
-        let char = parseInt(tickerHex.substr(i,2), 16);
-        if (char > 0) ticker += String.fromCharCode(char);
-    }
-
-    if (action === '01') { // MINT (Bonding Curve)
-        const minted = Math.floor(Math.sqrt(valueBurned) * 100); 
-        if (minted <= 0) return;
-        if (!l2State.tokens[ticker]) l2State.tokens[ticker] = { supply: 0 };
-        l2State.tokens[ticker].supply += minted;
-        if (!l2State.balances[sender]) l2State.balances[sender] = {};
-        l2State.balances[sender][ticker] = (l2State.balances[sender][ticker] || 0) + minted;
-    } 
-    else if (action === '02') { // LIST ORDER
-        const amountHex = payloadHex.substring(22, 38);
-        const priceHex = payloadHex.substring(38, 54);
-        const amount = parseInt(amountHex, 16);
-        const price = parseInt(priceHex, 16);
-        
-        if (!l2State.balances[sender] || (l2State.balances[sender][ticker] || 0) < amount) return;
-        
-        // Escrow the tokens
-        l2State.balances[sender][ticker] -= amount;
-        l2State.orders[txId] = { maker: sender, ticker, amount, price };
-    }
-    else if (action === '03') { // FILL ORDER
-        const targetOrderBase = payloadHex.substring(6, 64);
-        let orderId = null;
-        let order = null;
-        for (const [oid, o] of Object.entries(l2State.orders)) {
-            if (oid.startsWith(targetOrderBase)) { orderId = oid; order = o; break; }
-        }
-        if (!order) return;
-
-        // Verify Maker was paid on L1
-        let paid = 0;
-        for (const out of allOutputs) {
-            const std = out.Standard || out.standard;
-            if (std && normalizeHex(std.address) === order.maker) {
-                paid += Number(std.value);
-            }
-        }
-
-        if (paid >= order.price) {
-            // Fill successful: Taker gets tokens
-            if (!l2State.balances[sender]) l2State.balances[sender] = {};
-            l2State.balances[sender][order.ticker] = (l2State.balances[sender][order.ticker] || 0) + order.amount;
-            delete l2State.orders[orderId];
-        }
-    }
-    saveL2State().catch(()=>{});
-    self.postMessage({ type: 'DEFI_UPDATE', payload: l2State });
 }
 
 /**
