@@ -85,12 +85,19 @@ let pendingSends = [];
  */
 const GAP_LIMIT = 100;
 
+// --- L2 Based Rollup State Engine ---
+let l2State = {
+    tokens: {},   // { "TICKER": { supply: 10000 } }
+    balances: {}, // { "AddressHex": { "TICKER": 500 } }
+    orders: {}    // { "TxIdHex": { maker, ticker, amount, price } }
+};
 
-// Compiled Vault Contract
-const VAULT_BYTECODE = "11010100002040105001010000520101000001010008150101000023510101000001010008150101000023251101010000010100012324211313010500000000008026242101010002520101000801010018150118004d555344000000000000000000000000000000000000000020211101010002520101000001010008150101000023202110104111010100012040105101010000010100081501010000230101000052010100000101000815010100002325110101000001010001232421510101000801010018150118004d555344000000000000000000000000000000000000000020211151010100000101000815010100002320211041100101000021424201010001";
+async function saveL2State() { await idbPut('l2_state', new TextEncoder().encode(JSON.stringify(l2State))); }
+async function loadL2State() {
+    const data = await idbGet('l2_state');
+    if (data) l2State = JSON.parse(new TextDecoder().decode(data));
+}
 
-let VAULT_ADDR = ""; // Calculated on WASM init
-let contractHash = "";
 
 /**
  * @typedef {Object} WalletState
@@ -511,8 +518,9 @@ async function loadState(pwd, bundleStr) {
         // Load MSS trees from IndexedDB into WASM (instant if previously cached or just restored)
         mssCachesReady = false;
         await loadMssCaches();
-
-        self.postMessage({ type: 'DEFI_UPDATE', payload: wState.vaultUtxo });
+        await loadL2State(); 
+         
+         self.postMessage({ type: 'DEFI_UPDATE', payload: l2State });
         self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
     } catch(e) {
         throw new Error("Incorrect password or corrupted wallet file");
@@ -696,7 +704,6 @@ self.onmessage = async (e) => {
     try {
         if (type === 'INIT') {
             await init();
-            VAULT_ADDR = blake3_hash_hex(VAULT_BYTECODE);
             self.postMessage({ type: 'INIT_DONE' });
         }
 
@@ -793,146 +800,32 @@ self.onmessage = async (e) => {
             await performScan();
         }
 
-        else if (type === 'DEFI_ACTION') {
+        else if (type === 'L2_ACTION') {
             if (!wallet) throw new Error("Wallet not initialized");
+            self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Preparing L2 Rollup Transaction..." } });
             
-            self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: payload.action === 'deploy' ? "Deploying Vault Contract..." : "Minting Stablecoin..." } });
-            
-            const utxoArray = Object.values(wState.utxos).map(u => {
-                if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
-                return u;
-            });
-
-            let newSupply = 0;
-            let extraOutputs = [];
-
-            if (payload.action === 'deploy') {
-                // Genesis State: Supply starts at 0.
-                newSupply = 0;
-            } 
-            if (payload.action === 'mint') {
-                if (!wState.vaultUtxo) throw new Error("Vault not deployed yet! Please deploy first.");
-                
-                const MINT_AMOUNT = 1;
-                const COLLATERAL_AMOUNT = 549755813888; // Exactly 2^39 MDS
-
-                // Increment Global Supply
-                newSupply = wState.vaultUtxo.supply + MINT_AMOUNT;
-                
-                // 1. Pay the physical MDS to the Smart Contract (VAULT_ADDR) so it can be redeemed later!
-                extraOutputs.push({ out_type: "standard", address: VAULT_ADDR, value: COLLATERAL_AMOUNT });
-                
-                // 2. Issue MIDSTATE DOLLAR (MUSD) to the buyer using a Confidential Output
-                const TOKEN_TICKER = "4d5553440000000000000000000000000000000000000000"; // "MUSD" padded
-                
-                // Convert to base-16 hex (toString(16)) and pad correctly to exactly 8 bytes (16 chars) LE
-                let tokenHex = MINT_AMOUNT.toString(16);
-                if (tokenHex.length % 2) tokenHex = '0' + tokenHex;
-                let tokenBalHex = tokenHex.match(/.{2}/g).reverse().join('').padEnd(16, '0');
-                let tokenCommitment = tokenBalHex + TOKEN_TICKER;
-                
-                const primaryAddress = Object.keys(wState.mssAddrs)[0] || Object.keys(wState.wotsAddrs)[0];
-                extraOutputs.push({
-                    out_type: "confidential",
-                    address: primaryAddress,
-                    commitment: tokenCommitment,
-                    value: 0
-                });
-            }
-
-            // Convert integer to Little-Endian hex string padded to 32 bytes (64 chars)
-            let newSupplyHex = newSupply.toString(16);
-            if (newSupplyHex.length % 2) newSupplyHex = '0' + newSupplyHex;
-            let newStateThread = newSupplyHex.match(/.{2}/g).reverse().join('').padEnd(64, '0');
-
             try {
-                // Call the universal WASM Builder
-                const txDataStr = wallet.build_state_thread_tx(
-                    JSON.stringify(utxoArray),
-                    VAULT_BYTECODE,
-                    payload.action === 'deploy' ? null : wState.vaultUtxo?.commitment,
-                    payload.action === 'deploy' ? null : wState.vaultUtxo?.coin_id,
-                    payload.action === 'deploy' ? null : wState.vaultUtxo?.salt,
-                    newStateThread,
-                    JSON.stringify(extraOutputs),
-                    wState.nextWotsIndex
-                );
-                
-                const txData = JSON.parse(txDataStr);
-                wState.nextWotsIndex = txData.next_wots_index;
-                
-                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining Proof of Work..." } });
-                const stateData = await rpc.getState();
-                
-                // --- V2 UPGRADE FIX ---
-                let actualNonce = 0;
-                const targetHeight = Number(stateData.height);
-                while (true) {
-                    // V2 PoW algorithm mathematically binds the target height (4 bytes = 8 hex chars)
-                    let heightHex = targetHeight.toString(16).padStart(8, '0').match(/.{2}/g).reverse().join('');
-                    let nonceHex = actualNonce.toString(16).padStart(8, '0').match(/.{2}/g).reverse().join('');
-                    
-                    let payloadToHash = heightHex + txData.commitment + nonceHex;
-                    const hashExt = blake3_hash_hex(payloadToHash);
-                    
-                    // Check leading zeros against difficulty
-                    let zeros = 0;
-                    for (let i = 0; i < 64; i++) {
-                        if (hashExt[i] === '0') zeros += 4;
-                        else {
-                            let bin = parseInt(hashExt[i], 16).toString(2).padStart(4, '0');
-                            for (let b of bin) { if (b === '0') zeros++; else break; }
-                            break;
-                        }
-                    }
-                    if (zeros >= (stateData.required_pow || 24)) break;
-                    actualNonce++;
+                if (payload.action === 'mint') {
+                    if (payload.burnAmount <= 0) throw new Error("Burn amount must be > 0");
+                    let tickerHex = payload.ticker.split('').map(c => c.charCodeAt(0).toString(16).padStart(2,'0')).join('').padEnd(16, '0');
+                    let payloadHex = "424201" + tickerHex;
+                    await performSend("", 0, payloadHex, payload.burnAmount);
+                } 
+                else if (payload.action === 'list') {
+                    if (payload.amount <= 0 || payload.price <= 0) throw new Error("Amount and price must be > 0");
+                    let tickerHex = payload.ticker.split('').map(c => c.charCodeAt(0).toString(16).padStart(2,'0')).join('').padEnd(16, '0');
+                    let amtHex = payload.amount.toString(16).padStart(16, '0');
+                    let priceHex = payload.price.toString(16).padStart(16, '0');
+                    let payloadHex = "424202" + tickerHex + amtHex + priceHex;
+                    await performSend("", 0, payloadHex, 1); // Burn 1 dust to anchor the order
                 }
-                
-                // Pack the nonce: ((targetHeight << 32) | actualNonce)
-                // Since JS bitwise operators truncate to 32-bit, we must use BigInt
-                const packedSpamNonce = Number((BigInt(targetHeight) << 32n) | BigInt(actualNonce));
-                
-                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Submitting Commit..." } });
-                const commitResp = await rpc.commit(txData.commitment, packedSpamNonce);
-                if (!commitResp.ok) throw new Error(commitResp.body || commitResp.error);
-
-                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for Block Confirmation (Phase 1)..." } });
-                while (true) {
-                    const check = await rpc.checkCommitment(txData.commitment).catch(()=>null);
-                    if (check && check.exists) break;
-                    await waitForNextBlock(15000);
+                else if (payload.action === 'fill') {
+                    let targetOrderBase = payload.orderId.substring(0, 58);
+                    let payloadHex = "424203" + targetOrderBase;
+                    await performSend(payload.maker, payload.price, payloadHex, 1);
                 }
-
-                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Executing Smart Contract..." } });
-                const revealResp = await rpc.send(txData.reveal);
-                if (!revealResp.ok) throw new Error(revealResp.body || revealResp.error);
-
-                // When a Reveal is mined, its Commitment is deleted from the blockchain state.
-                // We check if it disappeared to know Phase 2 is complete!
-                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Finalizing Mint (Phase 2)..." } });
-                while (true) {
-                    const check = await rpc.checkCommitment(txData.commitment).catch(()=>null);
-                    if (check && !check.exists) break;
-                    await waitForNextBlock(15000);
-                }
-
-                // Save the spent UTXOs
-                await saveState();
-                
-                // Scan to instantly pick up the updated AMM state and newly minted Token!
-                await performScan();
-
-                // Tell the main thread we succeeded. This automatically hides the 
-                // activity spinner and shows a green success toast!
-                self.postMessage({ 
-                    type: 'SEND_COMPLETE', 
-                    payload: buildDashboardPayload() 
-                });
-
             } catch (e) {
-                // Let the main thread handle the error UI
-                self.postMessage({ type: 'ERROR', payload: e.message || "Failed to execute contract" });
+                self.postMessage({ type: 'ERROR', payload: e.message || "Failed to execute L2 action" });
             }
         }
 
@@ -1285,35 +1178,32 @@ function compute_confidential_coin_id(addrHex, commitmentHex, saltHex) {
  */
 async function processFullBlock(height) {
     const block = await rpc.getBlock(height);
-    // Throw error instead of returning false so the scanner halts safely
-    if (!block) throw new Error(`Network failed to fetch block at height ${height}. Sync paused to prevent missed transactions.`);
+    if (!block) throw new Error(`Network failed to fetch block at height ${height}.`);
 
     let matchFound = false;
     const ourSalts = new Map();
     for (const [cid, u] of Object.entries(wState.utxos)) ourSalts.set(u.salt, cid);
 
     let coinbaseReceives = [];
-        if (block.coinbase) {
-            for (const cb of block.coinbase) {
-                const addrHex = normalizeHex(cb.address);
-                const saltHex = normalizeHex(cb.salt);
-                if (wState.wotsAddrs[addrHex] !== undefined || wState.mssAddrs[addrHex] !== undefined) {
-                    const coinId = compute_coin_id_hex(addrHex, BigInt(cb.value), saltHex);
-                    if (addUtxo(addrHex, Number(cb.value), saltHex, coinId)) coinbaseReceives.push({ id: coinId, val: Number(cb.value) });
-                    matchFound = true;
-                }
+    if (block.coinbase) {
+        for (const cb of block.coinbase) {
+            const addrHex = normalizeHex(cb.address);
+            const saltHex = normalizeHex(cb.salt);
+            if (wState.wotsAddrs[addrHex] !== undefined || wState.mssAddrs[addrHex] !== undefined) {
+                const coinId = compute_coin_id_hex(addrHex, BigInt(cb.value), saltHex);
+                if (addUtxo(addrHex, Number(cb.value), saltHex, coinId)) coinbaseReceives.push({ id: coinId, val: Number(cb.value) });
+                matchFound = true;
             }
         }
+    }
 
     if (coinbaseReceives.length > 0) {
         const alreadyRecorded = wState.history.some(h => h.outputs.some(out => coinbaseReceives.map(c=>c.id).includes(out)));
         if (!alreadyRecorded) {
             wState.history.push({
-                kind: 'coinbase',
-                timestamp: block.timestamp || Math.floor(Date.now() / 1000),
-                fee: 0, inputs: [],
-                outputs: coinbaseReceives.map(c => c.id),
-                value:   coinbaseReceives.reduce((s, c) => s + c.val, 0)
+                kind: 'coinbase', timestamp: block.timestamp || Math.floor(Date.now() / 1000),
+                fee: 0, inputs: [], outputs: coinbaseReceives.map(c => c.id),
+                value: coinbaseReceives.reduce((s, c) => s + c.val, 0)
             });
         }
     }
@@ -1324,6 +1214,16 @@ async function processFullBlock(height) {
             if (!reveal) continue;
 
             let spentIds = [], spentValue = 0, createdOutputs = [];
+            
+            // Extract Sender Identity for L2 Actions
+            let senderAddrHex = "";
+            let txId = "";
+            if (reveal.inputs && reveal.inputs.length > 0) {
+                const bytecode = reveal.inputs[0].predicate?.Script?.bytecode || reveal.inputs[0].bytecode;
+                if (bytecode) senderAddrHex = blake3_hash_hex(normalizeHex(bytecode));
+                const saltHex = normalizeHex(reveal.inputs[0].salt);
+                txId = compute_coin_id_hex(senderAddrHex, BigInt(reveal.inputs[0].value), saltHex);
+            }
 
             if (reveal.inputs) {
                 for (const inp of reveal.inputs) {
@@ -1354,43 +1254,18 @@ async function processFullBlock(height) {
                             matchFound = true;
                         }
                     }
-                    
-                    // DEFI: Track Smart Contract States & Tokens
-                    const confData = out.Confidential || out.confidential;
-                    if (confData) {
-                        const addrHex = normalizeHex(confData.address);
-                        const commitment = normalizeHex(confData.commitment);
-                        const saltHex = normalizeHex(confData.salt);
-                        
-                        // 1. Track Vault Contract State
-                        if (addrHex === VAULT_ADDR) {
-                            const countHex = commitment.substring(0, 16).match(/.{2}/g).reverse().join('');
-                            wState.vaultUtxo = {
-                                coin_id: compute_confidential_coin_id(addrHex, commitment, saltHex), 
-                                salt: saltHex,
-                                commitment: commitment,
-                                supply: parseInt(countHex, 16)
-                            };
-                            self.postMessage({ type: 'DEFI_UPDATE', payload: wState.vaultUtxo });
-                        }
-
-                        // 2. Track Tokens Sent to Us (Coloured Coins)
-                        if (wState.wotsAddrs[addrHex] !== undefined || wState.mssAddrs[addrHex] !== undefined) {
-                            const trueCoinId = compute_confidential_coin_id(addrHex, commitment, saltHex); 
-                            if (addUtxo(addrHex, 0, saltHex, trueCoinId, commitment)) {
-                                createdOutputs.push({ id: trueCoinId, val: 0 });
-                                ourSalts.set(saltHex, trueCoinId);
-                            }
-                            matchFound = true;
+                    const burnData = out.DataBurn || out.data_burn;
+                    if (burnData) {
+                        const payloadHex = normalizeHex(burnData.payload);
+                        if (payloadHex.startsWith("4242")) {
+                            processL2Action(senderAddrHex, txId, payloadHex, Number(burnData.value_burned), reveal.outputs);
                         }
                     }
                 }
             }
 
             if (spentIds.length > 0) {
-                const alreadyRecorded = wState.history.some(h =>
-                    (h.kind === 'sent' || h.kind === 'mixed') && h.inputs.some(inp => spentIds.includes(inp))
-                );
+                const alreadyRecorded = wState.history.some(h => (h.kind === 'sent' || h.kind === 'mixed') && h.inputs.some(inp => spentIds.includes(inp)));
                 if (!alreadyRecorded) {
                     let totalTxIn = 0, totalTxOut = 0;
                     if (reveal.inputs)  reveal.inputs.forEach(i  => totalTxIn  += Number(i.value));
@@ -1415,6 +1290,67 @@ async function processFullBlock(height) {
         }
     }
     return matchFound;
+}
+
+function processL2Action(sender, txId, payloadHex, valueBurned, allOutputs) {
+    if (!sender || !txId) return;
+    const action = payloadHex.substring(4, 6);
+    
+    // Parse Ticker (Next 16 hex chars = 8 bytes)
+    const tickerHex = payloadHex.substring(6, 22);
+    let ticker = '';
+    for(let i=0; i<16; i+=2) {
+        let char = parseInt(tickerHex.substr(i,2), 16);
+        if (char > 0) ticker += String.fromCharCode(char);
+    }
+
+    if (action === '01') { // MINT (Bonding Curve)
+        const minted = Math.floor(Math.sqrt(valueBurned) * 100); 
+        if (minted <= 0) return;
+        if (!l2State.tokens[ticker]) l2State.tokens[ticker] = { supply: 0 };
+        l2State.tokens[ticker].supply += minted;
+        if (!l2State.balances[sender]) l2State.balances[sender] = {};
+        l2State.balances[sender][ticker] = (l2State.balances[sender][ticker] || 0) + minted;
+    } 
+    else if (action === '02') { // LIST ORDER
+        const amountHex = payloadHex.substring(22, 38);
+        const priceHex = payloadHex.substring(38, 54);
+        const amount = parseInt(amountHex, 16);
+        const price = parseInt(priceHex, 16);
+        
+        if (!l2State.balances[sender] || (l2State.balances[sender][ticker] || 0) < amount) return;
+        
+        // Escrow the tokens
+        l2State.balances[sender][ticker] -= amount;
+        l2State.orders[txId] = { maker: sender, ticker, amount, price };
+    }
+    else if (action === '03') { // FILL ORDER
+        const targetOrderBase = payloadHex.substring(6, 64);
+        let orderId = null;
+        let order = null;
+        for (const [oid, o] of Object.entries(l2State.orders)) {
+            if (oid.startsWith(targetOrderBase)) { orderId = oid; order = o; break; }
+        }
+        if (!order) return;
+
+        // Verify Maker was paid on L1
+        let paid = 0;
+        for (const out of allOutputs) {
+            const std = out.Standard || out.standard;
+            if (std && normalizeHex(std.address) === order.maker) {
+                paid += Number(std.value);
+            }
+        }
+
+        if (paid >= order.price) {
+            // Fill successful: Taker gets tokens
+            if (!l2State.balances[sender]) l2State.balances[sender] = {};
+            l2State.balances[sender][order.ticker] = (l2State.balances[sender][order.ticker] || 0) + order.amount;
+            delete l2State.orders[orderId];
+        }
+    }
+    saveL2State().catch(()=>{});
+    self.postMessage({ type: 'DEFI_UPDATE', payload: l2State });
 }
 
 /**
@@ -1464,34 +1400,23 @@ function addUtxo(address, value, salt, coinId, commitment = null) {
  * @returns {Promise<void>}
  * @throws {Error} On any failure (insufficient funds, network errors, timeouts).
  */
-async function performSend(toAddress, amount) {
+async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0) {
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Selecting coins and building transaction..." } });
     await new Promise(r => setTimeout(r, 10));
 
-    // Ensure MSS caches are loaded
     if (!mssCachesReady) await loadMssCaches();
 
-    // -----------------------------------------------------------------------
-    // Verify MSS safety indices with the node before signing
-    // -----------------------------------------------------------------------
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Verifying MSS safety indices..." } });
     for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
         try {
             const mssState = await rpc.getMssState(addr);
-            // If the node has seen more signatures than we have locally, FAST FORWARD.
             if (mssState && mssState.next_index > mss.next_leaf) {
-                const SAFETY_MARGIN = 20;
-                mss.next_leaf = mssState.next_index + SAFETY_MARGIN;
-                self.postMessage({ type: 'LOG', payload: `⚠️ Fast-forwarded MSS index for ${addr.substring(0,8)} to ${mss.next_leaf} for safety.` });
+                mss.next_leaf = mssState.next_index + 20;
+                self.postMessage({ type: 'LOG', payload: `⚠️ Fast-forwarded MSS index for safety.` });
             }
         } catch (e) {
-            throw new Error(`Safety Check Failed: Could not verify MSS state for ${addr.substring(0,8)}. Aborting to prevent key reuse. Run a Network Sync.`);
+            throw new Error(`Safety Check Failed. Aborting to prevent key reuse.`);
         }
-    }
-    // -----------------------------------------------------------------------
-
-    // Sync leaf indices before spend
-    for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
         wallet.set_mss_leaf_index(addr, mss.next_leaf);
     }
 
@@ -1502,113 +1427,75 @@ async function performSend(toAddress, amount) {
 
     let spendContextStr;
     try {
-        spendContextStr = wallet.prepare_spend(JSON.stringify(utxoArray), toAddress, BigInt(amount), wState.nextWotsIndex);
+        spendContextStr = wallet.prepare_spend(
+            JSON.stringify(utxoArray), 
+            toAddress, 
+            BigInt(amount), 
+            wState.nextWotsIndex,
+            burnDataHex,
+            burnDataHex ? BigInt(burnValue) : null
+        );
     } catch (e) {
-        throw new Error(`Failed to prepare transaction: ${e.toString()}.\n\nWhat to do: Ensure you have enough funds to cover the amount plus the network fee. Try running a Network Sync first.`);
+        throw new Error(`Failed to prepare transaction: ${e.toString()}`);
     }
 
     const ctx = JSON.parse(spendContextStr);
 
-    // Show pending in UI immediately
     pendingSends.push({ kind: 'pending', timestamp: Math.floor(Date.now() / 1000), fee: ctx.fee, inputs: ctx.selected_inputs.map(i => i.coin_id), outputs: [], value: Number(amount) });
     self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
 
-    // Advance WOTS counter for any change addresses derived during prepare_spend
     while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
-
-    // Advance MSS leaf counters for used addresses
     const usedMssAddrs = new Set();
     for (const inp of ctx.selected_inputs) if (inp.is_mss) usedMssAddrs.add(inp.address);
     for (const addr of usedMssAddrs) wState.mssAddrs[addr].next_leaf++;
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Encrypting and saving wallet state..." } });
-    await new Promise(r => setTimeout(r, 10));
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Saving wallet state..." } });
     await saveState();
 
-    // Mine spam-proof PoW
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Fetching network difficulty..." } });
     const stateData   = await rpc.getState();
     const requiredPow = stateData.required_pow || 24;
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Mining Proof-of-Work (difficulty: ${requiredPow})...` } });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Mining PoW...` } });
     await new Promise(r => setTimeout(r, 50));
-    // Pass the height to the V2 WASM miner
     const spamNonce = Number(mine_commitment_pow(ctx.commitment, requiredPow, BigInt(stateData.height)));
 
-    // Submit commit
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "PoW complete. Submitting commitment..." } });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Submitting commit..." } });
     const commitReq = await rpc.commit(ctx.commitment, spamNonce);
+    if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
 
-    if (!commitReq.ok) {
-        let errText = commitReq.body || 'rejected';
-
-        try { errText = JSON.parse(errText).error || errText; } catch(e) {}
-        throw new Error(`Commit rejected by network:\n${errText}\n\nWhat to do: The network might be congested, or your UTXOs might be out of sync. Your funds have not moved. Run a Network Sync and try again.`);
-    }
-
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commitment accepted. Waiting for block confirmation..." } });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for Block Confirmation (Phase 1)..." } });
     const revealPayloadStr = wallet.build_reveal(spendContextStr, ctx.commitment, ctx.tx_salt);
 
     while (true) {
         try {
             const checkResp = await rpc.checkCommitment(ctx.commitment);
             if (checkResp && checkResp.exists) break;
-        } catch (e) {
-            console.warn(`[light] checkCommitment poll failed (will retry): ${e.message}`);
-        }
+        } catch (e) {}
         await waitForNextBlock(15000);
     }
 
-    // Commit is confirmed — submit the reveal exactly once.
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commit confirmed! Submitting reveal..." } });
     const revealReq = await rpc.send(revealPayloadStr);
-    let mempoolAccepted = revealReq.ok;
-    if (!mempoolAccepted) {
-        let errText = revealReq.body || 'rejected';
-        try { errText = JSON.parse(errText).error || errText; } catch(e) {}
-        throw new Error(`Reveal rejected by network:\n${errText}\n\nWhat to do: A cryptographic error or double-spend occurred. Your funds are safe. Run a Network Sync and try again.`);
-    }
+    if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commit confirmed! Broadcasting reveal..." } });
-
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting reveal..." } });
     const inputCoinToCheck = ctx.selected_inputs[0].coin_id;
-    // We check the OUTPUT coin to guarantee the transaction succeeded. 
-    const outputCoinToCheck = ctx.outputs.length > 0 
-        ? compute_coin_id_hex(ctx.outputs[0].address, BigInt(ctx.outputs[0].value), ctx.outputs[0].salt) 
-        : null;
 
     while (true) {
         try {
-            if (outputCoinToCheck) {
-                const checkOut = await rpc.checkCoin(outputCoinToCheck);
-                if (checkOut && checkOut.exists) break;
-            } else {
-                // Fallback for DataBurns
-                const checkInp = await rpc.checkCoin(inputCoinToCheck);
-                if (checkInp && !checkInp.exists) break;
-            }
-        } catch (e) {
-            console.warn(`[light] checkCoin poll failed (will retry): ${e.message}`);
-        }
+            const checkInp = await rpc.checkCoin(inputCoinToCheck);
+            if (checkInp && !checkInp.exists) break;
+        } catch (e) {}
         await waitForNextBlock(15000);
     }
 
-    // Update local state
     pendingSends = [];
     for (const inp of ctx.selected_inputs) delete wState.utxos[inp.coin_id];
+    
+    // Scan locally rather than blindly accepting outputs to prevent mismatches
+    await performScan();
 
-    let outIds = [];
-    for (const out of ctx.outputs) {
-        const addrHex = normalizeHex(out.address);
-        if (wState.wotsAddrs[addrHex] !== undefined || wState.mssAddrs[addrHex] !== undefined) {
-            const saltHex = normalizeHex(out.salt);
-            const coinId  = compute_coin_id_hex(addrHex, BigInt(out.value), saltHex);
-            if (addUtxo(addrHex, Number(out.value), saltHex, coinId)) outIds.push(coinId);
-        }
-    }
-
-    wState.history.push({ kind: 'sent', timestamp: Math.floor(Date.now() / 1000), fee: ctx.fee, inputs: ctx.selected_inputs.map(i => i.coin_id), outputs: outIds, value: Number(amount) });
-    await saveState();
     self.postMessage({ type: 'SEND_COMPLETE', payload: buildDashboardPayload() });
 }
 

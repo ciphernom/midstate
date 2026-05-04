@@ -1619,6 +1619,9 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
         let mut health_check_interval = time::interval(Duration::from_secs(600)); // Every 10 mins
         health_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         
+        // Create a single shared HTTP client
+        let http_client = reqwest::Client::new();
+        
         // Initial sync: ask all peers for their height
         if self.network.peer_count() > 0 {
             tracing::info!("Requesting chain state from {} peer(s)...", self.network.peer_count());
@@ -1642,7 +1645,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                         }
                         MinedResult::Share { batch, pool_url, payout_address } => {
                             tracing::info!("Found pool share! Submitting to {}", pool_url);
-                            let client = reqwest::Client::new();
+                            let client = http_client.clone(); 
                             tokio::spawn(async move {
                                 let payload = serde_json::json!({
                                     "batch": batch,

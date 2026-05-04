@@ -6,6 +6,7 @@ pub use protocol::{Message, MidstateCodec, MIDSTATE_PROTOCOL, MAX_GETBATCHES_COU
 
 use anyhow::Result;
 use futures::StreamExt;
+use libp2p_core::muxing::StreamMuxerBox;
 use libp2p::{
     autonat,
     dcutr,
@@ -21,7 +22,7 @@ use libp2p::{
     identity::Keypair,
     Multiaddr, PeerId, Swarm,
     core::ConnectedPoint,
-    Transport,
+    Transport    
 };
 
 use std::collections::{HashMap, HashSet};
@@ -370,7 +371,7 @@ impl MidstateNetwork {
                     
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
                     libp2p_webrtc::tokio::Transport::new(keypair.clone(), certificate)
-                        .map(|(peer_id, conn), _| (peer_id, libp2p::core::muxing::StreamMuxerBox::new(conn)))
+                        .map(|(peer_id, conn), _| (peer_id, StreamMuxerBox::new(conn)))
                 )
             })?
             .with_relay_client(noise::Config::new, yamux::Config::default)?
@@ -733,6 +734,14 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
 
     /// Try to dial a multiaddr string. Ignores bad parses or dial failures.
     pub fn dial_addr(&mut self, addr_str: &str) {
+        // SERVER-TO-SERVER WEBRTC LEAK FIX:
+        // webrtc-rs has a known bug where outbound ICE agents leak mDNS sockets (UDP 5353)
+        // on connection failure. Nodes do not speak to each other over WebRTC anyway 
+        // (they use TCP/QUIC). WebRTC addresses are collected via PEX *only* to be 
+        // served to the browser UI. Ignore them for actual daemon dialing.
+        if addr_str.contains("webrtc-direct") {
+            return;
+        }
         match addr_str.parse::<Multiaddr>() {
             Ok(addr) => {
             // NEW: Add the is_routable check here
@@ -879,7 +888,7 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                 event = self.swarm.select_next_some() => match event {
                 // ── Request-Response ────────────────────────────────
                 SwarmEvent::Behaviour(MidstateBehaviourEvent::Rr(
-                    request_response::Event::Message { peer, message },
+                    request_response::Event::Message { peer, message , ..},
                 )) => match message {
                     request_response::Message::Request {
                         request, channel, ..
@@ -907,6 +916,7 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                         peer,
                         request_id,
                         error,
+                        ..
                     },
                 )) => {
                     self.pending_requests.remove(&request_id);
@@ -927,6 +937,12 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     identify::Event::Received { peer_id, info, .. },
                 )) => {
                     for addr in &info.listen_addrs {
+                        // SERVER-TO-SERVER WEBRTC LEAK FIX:
+                        // Prevent Kademlia from learning and autonomously dialing WebRTC addresses.
+                        if addr.to_string().contains("webrtc-direct") {
+                            continue;
+                        }
+                        
                         self.swarm
                             .behaviour_mut()
                             .kademlia
@@ -1103,7 +1119,7 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     return NetworkEvent::PeerConnected(peer_id, full_addr);
                 }
                 
-                SwarmEvent::IncomingConnectionError { local_addr: _, send_back_addr, error, connection_id: _ } => {
+                SwarmEvent::IncomingConnectionError { local_addr: _, send_back_addr, error, connection_id: _, ..} => {
                     // This event fires when a connection fails BEFORE Step 4 (Identify).
                     // Just log it. Do NOT insert PeerId::random() into self.subnet_peers, 
                     // as that permanently consumes valid connection slots and leads to 
@@ -1163,9 +1179,9 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                         if let Some((multiaddr, _)) = failed_addrs.first() {
                             return NetworkEvent::OutgoingConnectionFailed(multiaddr.to_string());
                         }
-                    } else if let libp2p::swarm::DialError::WrongPeerId { endpoint, .. } = error {
+                    } else if let libp2p::swarm::DialError::WrongPeerId { address, .. } = error {
                         // The peer answered, but lied about its PeerId (malicious/misconfigured)
-                        return NetworkEvent::OutgoingConnectionFailed(endpoint.get_remote_address().to_string());
+                        return NetworkEvent::OutgoingConnectionFailed(address.to_string());
                     }
                 }
                 SwarmEvent::ExternalAddrConfirmed { address } => {

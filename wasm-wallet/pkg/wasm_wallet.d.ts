@@ -235,7 +235,7 @@ export class WebWallet {
      * 2. Efficiency: Consolidating fragmented UTXOs into larger denominations (Snowball Merge).
      * 3. Restorability: Ensuring all change coins are discoverable from the seed phrase.
      */
-    prepare_spend(available_utxos_json: string, to_address_hex: string, send_amount: bigint, next_wots_index: number): string;
+    prepare_spend(available_utxos_json: string, to_address_hex: string, send_amount: bigint, next_wots_index: number, databurn_hex?: string | null, databurn_value?: bigint | null): string;
     /**
      * Update the next-leaf counter for an MSS tree.
      *
@@ -387,7 +387,7 @@ export interface InitOutput {
     readonly webwallet_has_mss_cache: (a: number, b: number, c: number) => number;
     readonly webwallet_import_mss_bytes: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly webwallet_new: (a: number, b: number, c: number) => void;
-    readonly webwallet_prepare_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number) => void;
+    readonly webwallet_prepare_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number, k: number, l: bigint) => void;
     readonly webwallet_set_mss_leaf_index: (a: number, b: number, c: number, d: number) => void;
     readonly webwallet_set_watchlist: (a: number, b: number, c: number) => void;
     readonly decompose_amount: (a: bigint) => number;
