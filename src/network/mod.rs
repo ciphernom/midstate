@@ -435,7 +435,8 @@ let autonat = autonat::Behaviour::new(
                 let limits = libp2p::connection_limits::ConnectionLimits::default()
                     .with_max_established_per_peer(Some(4)) // Prevent buggy peers from spamming parallel connections
                     .with_max_pending_incoming(Some(200))
-                    .with_max_established_incoming(Some(200)); // Hard cap to prevent OS error 24
+                    .with_max_established_incoming(Some(200))  // Hard cap to prevent OS error 24
+                    .with_max_established_outgoing(Some(200));
                 let connection_limits = libp2p::connection_limits::Behaviour::new(limits);
                 // -------------------------------------------------------------------
 

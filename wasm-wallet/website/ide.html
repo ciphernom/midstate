@@ -145,6 +145,10 @@
           </div>
         </div>
         <div style="margin-top:10px;">
+            <label class="ctx-lbl">This Address (32-byte hex — for OP_THIS_ADDRESS)</label>
+            <input class="ctx-inp" id="ctxThisAddress" value="aa000000000000000000000000000000000000000000000000000000000000aa" placeholder="64 hex chars">
+        </div>
+        <div style="margin-top:10px;">
             <label class="ctx-lbl">Input State (32-byte hex)</label>
             <input class="ctx-inp" id="ctxInputState" value="" placeholder="e.g. 000000000000...">
         </div>
@@ -1250,8 +1254,7 @@ function setVmStatus(msg,cls='neu') {
 // ═══════════════════════════════════════════
 // ASSEMBLER
 // ═══════════════════════════════════════════
-const OPS={PUSH_DATA:0x01,DROP:0x10,DUP:0x11,SWAP:0x12,OVER:0x13,ROT:0x14,SLICE:0x15,CONCAT:0x16,PICK:0x17,EQUAL:0x20,VERIFY:0x21,EQUALVERIFY:0x22,ADD:0x23,GREATER_OR_EQUAL:0x24,SUB:0x25,MUL:0x26,DIV:0x27,MOD:0x28,SIZE:0x29,HASH:0x30,CHECKSIG:0x31,CHECKSIGVERIFY:0x32,CHECKTIMEVERIFY:0x33,IF:0x40,ELSE:0x41,ENDIF:0x42,SUM_TO_ADDR:0x50,READ_INPUT_STATE:0x51,READ_OUTPUT_STATE:0x52,INPUT_VALUE:0x53};
-
+const OPS={PUSH_DATA:0x01,DROP:0x10,DUP:0x11,SWAP:0x12,OVER:0x13,ROT:0x14,SLICE:0x15,CONCAT:0x16,PICK:0x17,EQUAL:0x20,VERIFY:0x21,EQUALVERIFY:0x22,ADD:0x23,GREATER_OR_EQUAL:0x24,SUB:0x25,MUL:0x26,DIV:0x27,MOD:0x28,SIZE:0x29,HASH:0x30,CHECKSIG:0x31,CHECKSIGVERIFY:0x32,CHECKTIMEVERIFY:0x33,IF:0x40,ELSE:0x41,ENDIF:0x42,SUM_TO_ADDR:0x50,READ_INPUT_STATE:0x51,READ_OUTPUT_STATE:0x52,INPUT_VALUE:0x53,OUTPUT_ADDRESS:0x54,THIS_ADDRESS:0x55};
 function assembleBytecode(asm) {
   let bc=[];
   for(let inst of asm){
@@ -1284,7 +1287,7 @@ class Lexer {
   tokenize(){
     const toks=[];
     // ONLY true raw opcodes that never take (args) in high-level code
-    const RAW_OPS=['PUSH_INT','PUSH_HEX','DUP','DROP','SWAP','OVER','ROT','PICK','SLICE','CONCAT','EQUAL','EQUALVERIFY','CHECKSIG','CHECKSIGVERIFY','ADD','SUB','MUL','DIV','MOD','SIZE','GREATER_OR_EQUAL','HASH','CHECKTIMEVERIFY','VERIFY','INPUT_VALUE'];
+    const RAW_OPS=['PUSH_INT','PUSH_HEX','DUP','DROP','SWAP','OVER','ROT','PICK','SLICE','CONCAT','EQUAL','EQUALVERIFY','CHECKSIG','CHECKSIGVERIFY','ADD','SUB','MUL','DIV','MOD','SIZE','GREATER_OR_EQUAL','HASH','CHECKTIMEVERIFY','VERIFY','INPUT_VALUE','OUTPUT_ADDRESS','THIS_ADDRESS'];
     const KWS=['if','else','repeat','true','false','macro','let','var','state','struct','switch','case','default','assert','route','test'];
     while(this.pos<this.src.length){
       let c=this.src[this.pos];
@@ -1576,14 +1579,15 @@ class CodeGen {
     // Calculate stack effect of this operation
     let baseOp = op.split(' ')[0];
     
-    if (baseOp.startsWith('PUSH_') || baseOp === 'DUP' || baseOp === 'READ_INPUT_STATE' || baseOp === 'SIZE' || baseOp === 'INPUT_VALUE') {
+    if (baseOp.startsWith('PUSH_') || baseOp === 'DUP' || baseOp === 'READ_INPUT_STATE' || baseOp === 'SIZE' || baseOp === 'INPUT_VALUE' || baseOp === 'THIS_ADDRESS') {
         this.simulatedStackDepth += 1;
     } else if (baseOp === 'DROP' || baseOp === 'ADD' || baseOp === 'SUB' || baseOp === 'MUL' || baseOp === 'DIV' || baseOp === 'MOD' || baseOp === 'EQUAL' || baseOp === 'EQUALVERIFY' || baseOp === 'GREATER_OR_EQUAL' || baseOp === 'CONCAT' || baseOp === 'CHECKSIG' || baseOp === 'CHECKSIGVERIFY' || baseOp === 'CHECKTIMEVERIFY' || baseOp === 'VERIFY') {
         this.simulatedStackDepth -= 1;
     } else if (baseOp === 'SLICE') {
         this.simulatedStackDepth -= 2; 
     }
-    // SWAP, OVER, ROT, PICK, HASH, SUM_TO_ADDR, READ_OUTPUT_STATE have a net 0 effect.
+    // SWAP, OVER, ROT, PICK, HASH, SUM_TO_ADDR, READ_OUTPUT_STATE, OUTPUT_ADDRESS have a net 0 effect.
+    // (OUTPUT_ADDRESS pops index, pushes address — net 0.)
 
     if (this.simulatedStackDepth > 64) {
         throw `Fatal Compiler Error: Maximum stack depth of 64 exceeded at line ${line || 'unknown'}. (Current depth: ${this.simulatedStackDepth})`;
@@ -1921,6 +1925,8 @@ genSwitch(sw) {
       else if(fn==='sum_to_addr'){this.genExpr(e.args[0]); this.emit('SUM_TO_ADDR', e.l); return 'int';}
       else if(fn==='read_input_state'){this.emit('READ_INPUT_STATE', e.l); return 'hex';}
       else if(fn==='read_output_state'){this.genExpr(e.args[0]); this.emit('READ_OUTPUT_STATE', e.l); return 'hex';}
+      else if(fn==='output_address'){this.genExpr(e.args[0]); this.emit('OUTPUT_ADDRESS', e.l); return 'hex';}
+      else if(fn==='this_address'){this.emit('THIS_ADDRESS', e.l); return 'hex';}
       else throw `Semantic Error at ${e.l}:${e.c}: Unknown function or macro '${fn}'`;
     }
     else if(e.type==='FieldAccess'){
@@ -2185,6 +2191,26 @@ async function execOp(tok) {
       requireV3();
       let val = BigInt(document.getElementById('ctxInputValue').value || 0);
       push(intToHexLE(val));
+      break;
+    }
+    case 'OUTPUT_ADDRESS':{
+      requireV3();
+      let idx = Number(hexLEToInt(pop()));
+      let outs = document.getElementById('ctxOutputs').value.split(',');
+      if (idx >= outs.length) throw 'InvalidStateRead (OUTPUT_ADDRESS index out of bounds)';
+      let parts = outs[idx].split(':');
+      let addr = parts[0].trim().toLowerCase();
+      if (addr.length !== 64) throw 'InvalidStateRead (output address must be 32 bytes / 64 hex chars)';
+      push(addr);
+      log(`  → output ${idx} address: ${addr.slice(0,8)}...`,'i');
+      break;
+    }
+    case 'THIS_ADDRESS':{
+      requireV3();
+      let addr = document.getElementById('ctxThisAddress').value.trim().toLowerCase();
+      if (addr.length !== 64) throw 'InvalidStateRead (this_address must be 32 bytes / 64 hex chars)';
+      push(addr);
+      log(`  → this_address: ${addr.slice(0,8)}...`,'i');
       break;
     }
     case 'SLICE':{

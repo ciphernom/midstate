@@ -41,6 +41,21 @@ let isSending = false;
 /** @type {boolean} Guard against concurrent block submissions. */
 let isSubmitting = false;
 
+/** @type {boolean} Guard against concurrent chain scans. */
+let isScanning = false;
+
+/** @type {boolean} Set when a scan is requested while one is already running.
+ *  The wrapper loops once more when the current iteration finishes. */
+let scanRequested = false;
+
+/** @type {number} Bumped to cancel an in-flight scan. The inner loop checks
+ *  this and exits without committing partial state. */
+let scanGeneration = 0;
+
+/** @type {boolean} When true, the next scan iteration wipes wallet state
+ *  before scanning. Set by RESCAN; consumed atomically inside the wrapper. */
+let scanResetPending = false;
+
 /** @type {boolean} Guard against concurrent template requests to prevent WebRTC stream exhaustion. */
 let isFetchingTemplate = false;
 
@@ -728,16 +743,27 @@ self.onmessage = async (e) => {
                 if (matched) {
                     self.postMessage({ type: 'LOG', payload: `Incoming funds detected! Auto-scanning...` });
                     performScan().catch(()=>{});
-                } else if (notif.height > wState.lastScannedHeight) {
-                    // Safe to advance local height marker without a full scan
+                } else if (
+                    !isScanning &&
+                    notif.height === wState.lastScannedHeight + 1
+                ) {
+                    // Caught up and the new block is exactly the next one — safe fast-path.
                     wState.lastScannedHeight = notif.height;
                     saveState();
                     self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+                } else if (notif.height > wState.lastScannedHeight + 1) {
+                    // We're behind by more than one block — there's actual history to
+                    // scan. Don't fast-forward the marker; let performScan handle it.
+                    performScan().catch(()=>{});
                 }
             }
         }
         
         else if (type === 'CREATE') {
+            scanGeneration++;
+            while (isScanning) {
+                await new Promise(r => setTimeout(r, 50));
+            }
             if (wallet) wallet.free();
             password = payload.password;
             wState = {
@@ -779,14 +805,13 @@ self.onmessage = async (e) => {
         }
 
         else if (type === 'RESCAN') {
-            wState.lastScannedHeight = 0;
-            wState.utxos = {};
-            wState.history = [];
-            await saveState();
+            // Cancel any in-flight scan (its generation check will bail without
+            // committing partial state) and ask the wrapper to do an atomic
+            // wipe-then-scan in its next iteration.
+            scanGeneration++;
+            scanResetPending = true;
             await performScan();
         }
-
-        
 
         else if (type === 'SEND') {
             if (isSending) throw new Error("A transaction is already in progress. Please wait for it to complete.");
@@ -863,6 +888,10 @@ self.onmessage = async (e) => {
 
         else if (type === 'IMPORT_CLI') {
             try {
+                scanGeneration++;
+                while (isScanning) {
+                    await new Promise(r => setTimeout(r, 50));
+                }
                 const cliJsonStr = decrypt_cli_wallet(payload.fileBytes, payload.password);
                 const cliData    = JSON.parse(cliJsonStr);
                 if (!cliData.master_seed) throw new Error("Legacy (non-HD) wallets not supported in Web.");
@@ -1041,16 +1070,74 @@ function updateWasmWatchlist() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Scan the blockchain for wallet-relevant transactions.
+ * Public entry point for chain scanning.
  *
- * Uses compact block filters (Golomb-coded sets) to efficiently skip
- * irrelevant blocks. Only fetches full block data when a filter matches.
- *
- * @returns {Promise<void>}
+ * Guarantees:
+ *  • At most one scan iteration runs at a time (mutex on isScanning).
+ *  • A scan request that arrives mid-flight is coalesced into a single trailing
+ *    pass after the current one finishes.
+ *  • RESCAN-style state resets happen atomically just before the scan that
+ *    consumes them, so a queued in-flight scan can't run with mixed state.
+ *  • Any thrown error inside the scan body is reported and the UI is unstuck;
+ *    the wrapper does NOT loop on a thrown error to avoid hot-loop crashes.
+ *  • A bumped scanGeneration cancels the in-flight scan; partial state from
+ *    the cancelled scan is never committed (lastScannedHeight + saveState are
+ *    only written when the generation still matches at the end of the loop).
  */
 async function performScan() {
-    // Ensure MSS caches are loaded before scanning (handles login edge cases)
+    if (isScanning) {
+        // Coalesce: ask the running wrapper to do another pass, then wait for
+        // both the current and the queued pass to complete before returning.
+        scanRequested = true;
+        while (isScanning) {
+            await new Promise(r => setTimeout(r, 50));
+        }
+        return;
+    }
+
+    isScanning = true;
+    try {
+        do {
+            // Apply any pending state reset atomically before scanning.
+            // (RESCAN sets scanResetPending; doing the wipe here closes the
+            // race where the 20s timer could otherwise fire between the
+            // wipe and the rescan call.)
+            if (scanResetPending) {
+                scanResetPending = false;
+                wState.lastScannedHeight = 0;
+                wState.utxos = {};
+                wState.history = [];
+                await saveState();
+            }
+
+            scanRequested = false;
+            const myGen = scanGeneration;
+            try {
+                await _performScanInner(myGen);
+            } catch (err) {
+                self.postMessage({
+                    type: 'ERROR',
+                    payload: `Scan failed: ${err && err.message ? err.message : err}`
+                });
+                break; // don't hot-loop on a persistent error
+            }
+        } while (scanRequested);
+    } finally {
+        isScanning = false;
+    }
+}
+
+/**
+ * Inner scan body. Must be called only from performScan() so the mutex,
+ * coalescing, generation, and reset semantics above are honoured.
+ *
+ * @param {number} myGen - Generation token at the start of this iteration.
+ *   If scanGeneration moves past this value, the inner exits without
+ *   committing lastScannedHeight or sending SCAN_COMPLETE.
+ */
+async function _performScanInner(myGen) {
     if (!mssCachesReady) await loadMssCaches();
+    if (myGen !== scanGeneration) return;
 
     self.postMessage({ type: 'LOG', payload: "Fetching chain state..." });
     const state       = await rpc.getState();
@@ -1058,8 +1145,9 @@ async function performScan() {
     networkHeight     = chainHeight;
     self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
 
+    if (myGen !== scanGeneration) return;
+
     if (chainHeight <= wState.lastScannedHeight) {
-        // Sync leaf indices even when chain hasn't advanced
         for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
             wallet.set_mss_leaf_index(addr, mss.next_leaf);
         }
@@ -1067,23 +1155,30 @@ async function performScan() {
         return;
     }
 
-    self.postMessage({ type: 'LOG', payload: `Scanning blocks ${wState.lastScannedHeight} to ${chainHeight}...` });
+    self.postMessage({
+        type: 'LOG',
+        payload: `Scanning blocks ${wState.lastScannedHeight} to ${chainHeight}...`
+    });
 
     let currentHeight = wState.lastScannedHeight;
     updateWasmWatchlist();
 
-while (currentHeight < chainHeight) {
-        // Increase chunk size to 1000 to drastically reduce the number of network requests
+    while (currentHeight < chainHeight) {
+        if (myGen !== scanGeneration) return; // cancelled — drop partial work
+
         const end        = Math.min(currentHeight + 1000, chainHeight);
         const filterData = await rpc.getFilters(currentHeight, end);
         const numFilters = filterData.filters ? filterData.filters.length : 0;
-        
-        // Add a tiny delay to appease Nginx/Cloudflare rate limiters
+
         await new Promise(r => setTimeout(r, 15));
 
         for (let i = 0; i < numFilters; i++) {
+            if (myGen !== scanGeneration) return;
+
             const height = filterData.start_height + i;
-            if (height % 100 === 0) self.postMessage({ type: 'SCAN_PROGRESS', payload: { height, max: chainHeight } });
+            if (height % 100 === 0) {
+                self.postMessage({ type: 'SCAN_PROGRESS', payload: { height, max: chainHeight } });
+            }
 
             const n         = filterData.element_counts ? filterData.element_counts[i] : 0;
             if (n === 0) continue;
@@ -1103,20 +1198,26 @@ while (currentHeight < chainHeight) {
         currentHeight += numFilters;
         if (currentHeight < end) {
             while (currentHeight < end) {
+                if (myGen !== scanGeneration) return;
                 const mutated = await processFullBlock(currentHeight);
                 if (mutated) updateWasmWatchlist();
                 currentHeight++;
-                if (currentHeight % 100 === 0) self.postMessage({ type: 'SCAN_PROGRESS', payload: { height: currentHeight, max: chainHeight } });
+                if (currentHeight % 100 === 0) {
+                    self.postMessage({ type: 'SCAN_PROGRESS', payload: { height: currentHeight, max: chainHeight } });
+                }
             }
         }
     }
 
-    // Sync leaf indices from wState into WASM cache
+    // Final commit guarded by the generation: a cancelled scan never writes
+    // a stale lastScannedHeight or stale UTXO state to disk.
+    if (myGen !== scanGeneration) return;
+
     for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
         wallet.set_mss_leaf_index(addr, mss.next_leaf);
     }
 
-   wState.lastScannedHeight = chainHeight;
+    wState.lastScannedHeight = chainHeight;
     await saveState();
     self.postMessage({ type: 'SCAN_COMPLETE', payload: buildDashboardPayload() });
 }
