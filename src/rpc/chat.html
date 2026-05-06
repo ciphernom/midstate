@@ -378,6 +378,15 @@
     const inputField = document.getElementById('chat-input');
     const messageMap = new Map();
 
+    function escapeHtml(unsafe) {
+        return String(unsafe ?? "")
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
+
     function getNick(peerId) {
         return localStorage.getItem('nick_' + peerId) || peerId.substring(0, 16) + '...';
     }
@@ -401,7 +410,7 @@
         // Parse the safe string back into a JS number
         replyingToNonce = Number(nonceStr); 
         const nick = getNick(sender);
-        document.getElementById('reply-text').innerHTML = `Replying to <span style="color:var(--link-color)">${nick}</span>`;
+        document.getElementById('reply-text').innerHTML = `Replying to <span style="color:var(--link-color)">${escapeHtml(nick)}</span>`;
         document.getElementById('active-reply').style.display = 'flex';
         inputField.focus();
     }
@@ -480,36 +489,60 @@
 
     function renderMessages(newMessages) {
         const box = document.getElementById('chat-box');
-        
+
         newMessages.forEach(msg => {
             const date = new Date(msg.timestamp * 1000);
-            const timeStr = date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'});
+            const timeStr = date.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
             const nick = getNick(msg.sender);
             const wordsText = msg.words.map(w => dictionary[w] || "???").join(" ");
-            
+
             const div = document.createElement('div');
             div.className = 'msg';
             if (msg.reply_to) div.classList.add('is-reply');
 
-            let replyContextHtml = "";
+            // Reply context — textContent escapes automatically.
             if (msg.reply_to) {
                 const parentMsg = messageMap.get(msg.reply_to);
                 if (parentMsg) {
                     const parentNick = getNick(parentMsg.sender);
-                    replyContextHtml = `<div class="reply-context">↳ Replying to ${parentNick}</div>`;
+                    const ctx = document.createElement('div');
+                    ctx.className = 'reply-context';
+                    ctx.textContent = `↳ Replying to ${parentNick}`;
+                    div.appendChild(ctx);
                 }
             }
 
-            div.innerHTML = `
-                ${replyContextHtml}
-                <div class="msg-header">
-                    <span class="sender" onclick="setNick('${msg.sender}')" title="${msg.sender}">${nick}</span>
-                    <span class="time">${timeStr}</span> 
-                </div>
-                <div class="words">${wordsText}</div>
-                <!-- Wrapped nonce in quotes so JS doesn't break large u64 numbers -->
-                <button class="reply-btn" onclick="startReply('${msg.nonce}', '${msg.sender}')">Reply</button>
-            `;
+            // Header.
+            const header = document.createElement('div');
+            header.className = 'msg-header';
+
+            const senderSpan = document.createElement('span');
+            senderSpan.className = 'sender';
+            senderSpan.textContent = nick;          // safe: textContent
+            senderSpan.title = msg.sender;          // safe: attribute setter escapes
+            senderSpan.addEventListener('click', () => setNick(msg.sender));  // safe: no string interpolation
+            header.appendChild(senderSpan);
+
+            const timeSpan = document.createElement('span');
+            timeSpan.className = 'time';
+            timeSpan.textContent = timeStr;
+            header.appendChild(timeSpan);
+
+            div.appendChild(header);
+
+            // Words.
+            const wordsDiv = document.createElement('div');
+            wordsDiv.className = 'words';
+            wordsDiv.textContent = wordsText;
+            div.appendChild(wordsDiv);
+
+            // Reply button — pass nonce as a real value, no string conversion.
+            const replyBtn = document.createElement('button');
+            replyBtn.className = 'reply-btn';
+            replyBtn.textContent = 'Reply';
+            replyBtn.addEventListener('click', () => startReply(msg.nonce, msg.sender));
+            div.appendChild(replyBtn);
+
             box.appendChild(div);
         });
         box.scrollTop = box.scrollHeight;
