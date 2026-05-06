@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Midstate | Global P2P Chat</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+        :root {
+            --bg: #0e0e0e;
+            --bg-alt: #161616;
+            --border: #2c2c2c;
+            --text-main: #ededed;
+            --text-muted: #a1a1aa;
+            --code-bg: #1a1a1a;
+            --accent: #ffffff;
+            --highlight: #1e1e1e;
+            --stark-accent: #a78bfa;
+            --warn-accent: #fb923c;
+            --link-color: #60a5fa;
+            --msg-bg: #131313;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            background-color: var(--bg);
+            color: var(--text-main);
+            font-family: 'Inter', -apple-system, sans-serif;
+            font-size: 15px;
+            line-height: 1.6;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        .mono { font-family: 'JetBrains Mono', monospace; }
+
+        /* ── Top Navigation ─────────────────────────────────────────────────────── */
+        .topbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 32px;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg);
+            flex-shrink: 0;
+        }
+
+        .brand {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 16px;
+            letter-spacing: 1px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-weight: 600;
+        }
+
+        .brand-indicator {
+            width: 8px;
+            height: 8px;
+            background-color: var(--stark-accent);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(167, 139, 250, 0.4); }
+            70% { box-shadow: 0 0 0 6px rgba(167, 139, 250, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(167, 139, 250, 0); }
+        }
+
+        .btn {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-main);
+            font-family: 'Inter', sans-serif;
+            font-size: 13px;
+            font-weight: 500;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.15s;
+            text-decoration: none;
+        }
+        .btn:hover:not(:disabled) { background: var(--bg-alt); border-color: var(--text-muted); }
+        .btn:disabled { color: var(--text-muted); cursor: not-allowed; opacity: 0.5; }
+        .btn-primary { background: var(--text-main); color: var(--bg); border-color: var(--text-main); font-weight: 600; }
+        .btn-primary:hover:not(:disabled) { background: #d4d4d8; border-color: #d4d4d8; }
+
+        /* ── Main Workspace ────────────────────────────────────────────────────── */
+        .workspace {
+            display: flex;
+            flex: 1;
+            max-width: 1200px;
+            margin: 0 auto;
+            width: 100%;
+            padding: 24px 20px;
+            gap: 32px;
+            overflow: hidden; /* Prevent body scroll, handle inside components */
+        }
+
+        /* ── Left Column (Chat) ────────────────────────────────────────────────── */
+        .chat-column {
+            flex: 2;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            min-width: 0;
+            height: 100%;
+        }
+
+        .header-desc {
+            color: var(--text-muted);
+            font-size: 14px;
+        }
+
+        #chat-box {
+            flex: 1;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--bg-alt);
+            padding: 16px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .msg {
+            background: var(--msg-bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 12px 16px;
+            position: relative;
+            transition: border-color 0.2s;
+        }
+        .msg:hover { border-color: #444; }
+        .msg.is-reply { margin-left: 24px; border-left: 3px solid var(--border); }
+        .msg.pinged { border-left: 3px solid var(--stark-accent); background: #1a1525; }
+
+        .msg-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 6px;
+            font-size: 12px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        
+        .sender {
+            color: var(--link-color);
+            cursor: pointer;
+            text-decoration: underline;
+            text-decoration-color: transparent;
+            transition: all 0.2s;
+            font-weight: 500;
+        }
+        .sender:hover { text-decoration-color: currentColor; }
+        .time { color: var(--text-muted); }
+
+        .words {
+            font-size: 15px;
+            color: var(--text-main);
+            letter-spacing: 0.2px;
+        }
+
+        .reply-context {
+            display: block;
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .reply-btn {
+            position: absolute;
+            right: 16px;
+            top: 10px;
+            opacity: 0;
+            background: var(--bg-alt);
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .msg:hover .reply-btn { opacity: 1; }
+        .reply-btn:hover { background: var(--highlight); color: var(--text-main); }
+
+        /* ── Input Area ────────────────────────────────────────────────────────── */
+        .composer {
+            background: var(--bg-alt);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        #active-reply {
+            display: none;
+            background: var(--highlight);
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-left: 3px solid var(--stark-accent);
+            border-radius: 6px;
+            font-size: 13px;
+            color: var(--text-main);
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .draft-container {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+            min-height: 38px;
+            padding: 8px 12px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+        }
+        
+        .draft-word {
+            background: var(--highlight);
+            border: 1px solid var(--border);
+            padding: 4px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            color: var(--text-main);
+            transition: all 0.15s;
+        }
+        .draft-word:hover { background: var(--warn-bg); color: var(--warn-accent); border-color: var(--warn-accent); text-decoration: line-through; }
+        
+        #chat-input {
+            background: transparent;
+            border: none;
+            color: var(--text-main);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 14px;
+            outline: none;
+            flex-grow: 1;
+            min-width: 150px;
+            padding: 4px;
+        }
+        #chat-input::placeholder { color: var(--text-muted); }
+
+        .composer-controls {
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+        }
+
+        /* ── Right Column (Dictionary) ─────────────────────────────────────────── */
+        .dict-column {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            overflow-y: auto;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--bg-alt);
+        }
+
+        .dict-header {
+            padding: 16px;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg);
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+
+        .dict-header h3 {
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        #dictionary-box {
+            padding: 16px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-content: flex-start;
+        }
+
+        .dict-btn {
+            background: var(--bg);
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+            padding: 6px 10px;
+            cursor: pointer;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            border-radius: 4px;
+            transition: all 0.15s;
+        }
+        .dict-btn:hover:not(:disabled) { background: var(--highlight); color: var(--text-main); border-color: var(--text-muted); }
+        .dict-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+        @media (max-width: 900px) {
+            .workspace { flex-direction: column; overflow: visible; height: auto; }
+            .dict-column { flex: none; max-height: 400px; }
+            #chat-box { height: 500px; flex: none; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="topbar">
+    <div class="brand"><div class="brand-indicator"></div> MIDSTATE CHAT</div>
+    <div class="nav-actions">
+        <a href="/" class="btn">Explorer</a>
+    </div>
+</div>
+
+<div class="workspace">
+    <!-- Chat Area -->
+    <div class="chat-column">
+        <div>
+            <div class="header-desc">Decentralized P2P message bus. Max 10 words. Click a PeerId to set a local nickname.</div>
+        </div>
+
+        <div id="chat-box"></div>
+
+        <div class="composer">
+            <div id="active-reply">
+                <span id="reply-text" class="mono">Replying to...</span>
+                <button class="btn" style="padding: 2px 8px; font-size: 11px;" onclick="cancelReply()">Cancel</button>
+            </div>
+
+            <div class="draft-container">
+                <div id="draft-words" style="display: flex; gap: 6px; flex-wrap: wrap;"></div>
+                <input type="text" id="chat-input" list="dict-list" placeholder="Type a word..." autocomplete="off">
+            </div>
+            <datalist id="dict-list"></datalist>
+
+            <div class="composer-controls">
+                <button class="btn" onclick="clearDraft()">Clear</button>
+                <button class="btn btn-primary" onclick="sendChat()" id="send-btn" disabled>Broadcast Message</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Dictionary Area -->
+    <div class="dict-column">
+        <div class="dict-header">
+            <h3>Protocol Dictionary</h3>
+        </div>
+        <div id="dictionary-box"></div>
+    </div>
+</div>
+
+<script>
+    let dictionary = [];
+    let draft = [];
+    let knownMessages = 0;
+    let replyingToNonce = null;
+    let myPeerId = null;
+
+    const inputField = document.getElementById('chat-input');
+    const messageMap = new Map();
+
+    function getNick(peerId) {
+        return localStorage.getItem('nick_' + peerId) || peerId.substring(0, 16) + '...';
+    }
+
+    function setNick(peerId) {
+        const current = localStorage.getItem('nick_' + peerId) || peerId;
+        const nick = prompt(`Set a local nickname for this peer:\n\n${peerId}`, current === peerId ? "" : current);
+        if (nick !== null) {
+            if (nick.trim() === "") {
+                localStorage.removeItem('nick_' + peerId);
+            } else {
+                localStorage.setItem('nick_' + peerId, nick.trim());
+            }
+            knownMessages = 0;
+            document.getElementById('chat-box').innerHTML = '';
+            fetchChat();
+        }
+    }
+
+    function startReply(nonceStr, sender) {
+        // Parse the safe string back into a JS number
+        replyingToNonce = Number(nonceStr); 
+        const nick = getNick(sender);
+        document.getElementById('reply-text').innerHTML = `Replying to <span style="color:var(--link-color)">${nick}</span>`;
+        document.getElementById('active-reply').style.display = 'flex';
+        inputField.focus();
+    }
+
+    function cancelReply() {
+        replyingToNonce = null;
+        document.getElementById('active-reply').style.display = 'none';
+    }
+
+    inputField.addEventListener('keydown', function(e) {
+        if (e.key === ' ' || e.key === 'Enter') {
+            e.preventDefault();
+            const val = this.value.trim().toLowerCase();
+            if (!val && e.key === 'Enter' && draft.length > 0) {
+                sendChat();
+                return;
+            }
+            if (!val) return;
+
+            const idx = dictionary.findIndex(w => w.toLowerCase() === val);
+            if (idx !== -1) {
+                addWord(idx);
+                this.value = '';
+            } else {
+                this.style.color = 'var(--warn-accent)';
+                setTimeout(() => this.style.color = 'var(--text-main)', 300);
+            }
+        } else if (e.key === 'Backspace' && this.value === '') {
+            e.preventDefault();
+            if (draft.length > 0) {
+                draft.pop();
+                renderDraft();
+            }
+        }
+    });
+
+    async function fetchChat() {
+        try {
+            const res = await fetch('/api/chat');
+            const data = await res.json();
+            
+            if (dictionary.length === 0 && data.dictionary) {
+                dictionary = data.dictionary;
+                renderDictionary();
+            }
+
+            if (data.messages && data.messages.length > knownMessages) {
+                data.messages.forEach(m => messageMap.set(m.nonce, m));
+                renderMessages(data.messages.slice(knownMessages));
+                knownMessages = data.messages.length;
+            }
+        } catch (err) {
+            console.error("Failed to fetch chat", err);
+        }
+    }
+
+    function renderDictionary() {
+        const box = document.getElementById('dictionary-box');
+        const datalist = document.getElementById('dict-list');
+        box.innerHTML = '';
+        datalist.innerHTML = '';
+
+        dictionary.forEach((word, index) => {
+            const btn = document.createElement('button');
+            btn.className = 'dict-btn';
+            btn.textContent = word;
+            btn.onclick = () => addWord(index);
+            box.appendChild(btn);
+
+            const opt = document.createElement('option');
+            opt.value = word;
+            datalist.appendChild(opt);
+        });
+        updateButtons();
+    }
+
+    function renderMessages(newMessages) {
+        const box = document.getElementById('chat-box');
+        
+        newMessages.forEach(msg => {
+            const date = new Date(msg.timestamp * 1000);
+            const timeStr = date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'});
+            const nick = getNick(msg.sender);
+            const wordsText = msg.words.map(w => dictionary[w] || "???").join(" ");
+            
+            const div = document.createElement('div');
+            div.className = 'msg';
+            if (msg.reply_to) div.classList.add('is-reply');
+
+            let replyContextHtml = "";
+            if (msg.reply_to) {
+                const parentMsg = messageMap.get(msg.reply_to);
+                if (parentMsg) {
+                    const parentNick = getNick(parentMsg.sender);
+                    replyContextHtml = `<div class="reply-context">↳ Replying to ${parentNick}</div>`;
+                }
+            }
+
+            div.innerHTML = `
+                ${replyContextHtml}
+                <div class="msg-header">
+                    <span class="sender" onclick="setNick('${msg.sender}')" title="${msg.sender}">${nick}</span>
+                    <span class="time">${timeStr}</span> 
+                </div>
+                <div class="words">${wordsText}</div>
+                <!-- Wrapped nonce in quotes so JS doesn't break large u64 numbers -->
+                <button class="reply-btn" onclick="startReply('${msg.nonce}', '${msg.sender}')">Reply</button>
+            `;
+            box.appendChild(div);
+        });
+        box.scrollTop = box.scrollHeight;
+    }
+
+    function addWord(index) {
+        if (draft.length >= 10) return;
+        draft.push(index);
+        inputField.value = '';
+        renderDraft();
+        inputField.focus();
+    }
+
+    function clearDraft() {
+        draft = [];
+        inputField.value = '';
+        renderDraft();
+        inputField.focus();
+    }
+
+    function renderDraft() {
+        const box = document.getElementById('draft-words');
+        box.innerHTML = '';
+        draft.forEach((wordIndex, arrayIndex) => {
+            const span = document.createElement('div');
+            span.className = 'draft-word';
+            span.textContent = dictionary[wordIndex];
+            span.onclick = () => {
+                draft.splice(arrayIndex, 1);
+                renderDraft();
+                inputField.focus();
+            };
+            box.appendChild(span);
+        });
+        updateButtons();
+    }
+
+    function updateButtons() {
+        const isFull = draft.length >= 10;
+        const isEmpty = draft.length === 0;
+        
+        document.getElementById('send-btn').disabled = isEmpty;
+        inputField.disabled = isFull;
+        
+        const dictButtons = document.getElementById('dictionary-box').querySelectorAll('.dict-btn');
+        dictButtons.forEach(btn => btn.disabled = isFull);
+    }
+
+    async function sendChat() {
+        if (draft.length === 0 || draft.length > 10) return;
+        
+        const payload = {
+            words: draft,
+            reply_to: replyingToNonce
+        };
+
+        const sendBtn = document.getElementById('send-btn');
+        sendBtn.disabled = true;
+        sendBtn.textContent = "Sending...";
+
+        try {
+            const res = await fetch('/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            // Safe Error Handling: Read as text first!
+            if (res.ok) {
+                clearDraft();
+                cancelReply();
+                fetchChat();
+            } else {
+                const errText = await res.text();
+                if (res.status === 403) {
+                    alert("Blocked by Node Firewall: You can only send messages from the local network.");
+                } else {
+                    try {
+                        const errJson = JSON.parse(errText);
+                        alert("Error: " + (errJson.error || "Unknown error"));
+                    } catch(e) {
+                        alert("Backend Error: " + errText);
+                    }
+                }
+            }
+        } catch (err) {
+            console.error("Failed to send chat", err);
+            alert("Network request failed. Is the node running?");
+        } finally {
+            sendBtn.textContent = "Broadcast Message";
+            updateButtons();
+        }
+    }
+
+    fetchChat();
+    setInterval(fetchChat, 2000);
+</script>
+</body>
+</html>

@@ -381,3 +381,15 @@ pub struct BlockTemplateMismatchError {
     pub block_reward: u64,
     pub total_fees: u64,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SendChatRequest {
+    pub reply_to: Option<u64>, 
+    pub words: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetChatResponse {
+    pub messages: Vec<crate::node::ChatMessage>,
+    pub dictionary: Vec<String>,
+}

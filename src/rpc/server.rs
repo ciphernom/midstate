@@ -85,6 +85,8 @@ impl RpcServer {
 
         let app = Router::new()
             .route("/", get(explorer_ui))
+            .route("/chat", get(chat_ui))
+            .route("/api/chat", get(get_chat).post(send_chat))         
             .route("/batch/:height", get(get_batch))
             .route("/search", post(search))
             .route("/coin/:coin_id", get(check_coin_get))
@@ -119,6 +121,7 @@ impl RpcServer {
             .with_state(node_handle);
 
         tracing::info!("RPC server listening on {}", self.addr);
+        tracing::info!("💬 Midstate Chat available at: http://{}/chat", self.addr);
 
         let listener = tokio::net::TcpListener::bind(self.addr).await?;
         

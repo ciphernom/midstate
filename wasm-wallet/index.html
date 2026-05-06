@@ -257,6 +257,76 @@
         .home-mine-indicator.on { background: var(--accent); box-shadow: 0 0 8px var(--accent-dim); animation: indicatorPulse 1.5s ease-in-out infinite; }
         @keyframes indicatorPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
 
+
+#chat-box { 
+            border: 1px solid var(--border); 
+            height: 350px; 
+            overflow-y: scroll; 
+            padding: 10px; 
+            margin-bottom: 20px; 
+            background: var(--bg-panel); 
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            border-radius: 8px;
+        }
+        .chat-msg { 
+            line-height: 1.4; 
+            padding: 8px;
+            border-radius: 6px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            position: relative;
+        }
+        .chat-msg:hover .reply-btn { display: inline-block; }
+        .chat-msg.is-reply { margin-left: 20px; border-left: 2px solid var(--border-bright); }
+        .chat-msg.pinged { background: rgba(212, 255, 0, 0.05); border-left: 2px solid var(--accent); }
+        
+        .chat-time { color: #666; font-size: 0.85em; }
+        .chat-sender { color: var(--accent); font-weight: bold; cursor: pointer; font-size: 0.9em; margin: 0 4px; }
+        .chat-words { color: var(--text-max); font-size: 1.05em; font-weight: 500; }
+        
+        .reply-context { font-size: 0.8em; color: #888; margin-bottom: 4px; display: block; }
+        .reply-btn {
+            display: none; position: absolute; right: 10px; top: 6px;
+            background: transparent; color: #888; border: 1px solid var(--border-bright);
+            padding: 2px 8px; font-size: 10px; cursor: pointer; border-radius: 4px; width: auto; min-height: 0; margin: 0;
+        }
+        .reply-btn:hover { background: var(--border); color: #fff; }
+
+        #active-reply {
+            display: none; background: rgba(212, 255, 0, 0.05); padding: 8px 12px;
+            border: 1px solid var(--accent-dim); border-radius: 6px; margin-bottom: 10px;
+            color: var(--accent); justify-content: space-between; align-items: center; font-size: 12px;
+        }
+
+        #draft-box { 
+            border: 1px solid var(--border); padding: 10px; margin-bottom: 10px; 
+            min-height: 44px; background: var(--bg-panel); display: flex; 
+            align-items: center; gap: 10px; flex-wrap: wrap; border-radius: 8px;
+        }
+        .draft-word { 
+            background: var(--border-bright); padding: 4px 8px; border-radius: 4px; 
+            cursor: pointer; color: var(--text-max); font-size: 13px; font-weight: 500;
+        }
+        .draft-word:hover { background: var(--red); color: #fff; text-decoration: line-through; }
+        
+        #chat-input {
+            background: transparent; border: none; color: var(--accent); font-family: monospace;
+            font-size: 14px; outline: none; flex-grow: 1; min-width: 150px; padding: 0; margin: 0;
+        }
+        #chat-input::placeholder { color: #555; }
+
+        #dictionary-box { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 20px; max-height: 150px; overflow-y: auto; padding: 5px; }
+        .dict-btn { 
+            background: var(--bg-panel); color: var(--text-bright); border: 1px solid var(--border); 
+            padding: 6px 10px; cursor: pointer; border-radius: 4px; width: auto; min-height: 0; margin: 0; font-size: 12px;
+        }
+        .dict-btn:hover:not(:disabled) { background: var(--border); color: var(--text-max); }
+        .dict-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+        
+        .chat-controls { display: flex; gap: 10px; }
+
         /* Desktop */
         @media (min-width: 768px) {
             body, html { display: flex; align-items: center; justify-content: center; background: #050505; }
@@ -512,6 +582,36 @@
             </div>
         </main>
         
+        <main id="view-chat" class="page">
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+                <h2>Global Node Chat</h2>
+                <span style="font-size: 11px; color: var(--accent); cursor: pointer;" onclick="fetchChatHistory()">↻ Refresh</span>
+            </div>
+            <p style="color: #666; font-size: 11px; margin-top: -10px; margin-bottom: 15px;">Encrypted P2P comms. Type to search dictionary. Max 10 words.</p>
+            
+            <div id="chat-box">
+                <div style="text-align: center; color: #555; margin-top: 20px;">Connecting to swarm...</div>
+            </div>
+            
+            <div id="active-reply">
+                <span id="reply-text">Replying to...</span>
+                <button onclick="cancelReply()" style="padding: 4px 8px; font-size: 10px; border-color: var(--red); color: var(--red); width: auto; min-height: 0; margin: 0; background: transparent;">Cancel</button>
+            </div>
+
+            <div id="draft-box">
+                <div id="draft-words" style="display: flex; gap: 5px;"></div>
+                <input type="text" id="chat-input" list="dict-list" placeholder="Type here..." autocomplete="off">
+            </div>
+            <datalist id="dict-list"></datalist>
+
+            <div class="chat-controls">
+                <button onclick="submitChat()" id="send-chat-btn" disabled style="background: var(--text-max); color: #000; flex: 2;">Send</button>
+                <button onclick="clearChatDraft()" style="background: transparent; color: var(--red); border-color: var(--red); flex: 1;">Clear</button>
+            </div>
+
+            <h3 style="margin-top: 20px; font-size: 12px; color: #666; text-transform: uppercase;">Dictionary</h3>
+            <div id="dictionary-box"></div>
+        </main>
 
         <!-- SETTINGS -->
         <main id="view-settings" class="page">
@@ -547,15 +647,15 @@
 
         
 
-        <!-- NAV (6 tabs) -->
+        <!-- NAV (7 tabs now) -->
         <nav id="bottom-nav" class="hidden">
             <button class="nav-btn active" data-target="view-home"><span class="nav-icon">🏠</span><span>Home</span></button>
             <button class="nav-btn" data-target="view-defi"><span class="nav-icon">📈</span><span>DEX</span></button>
             <button class="nav-btn" data-target="view-mine"><span class="nav-icon">⛏️</span><span>Mine</span></button>
             <button class="nav-btn" data-target="view-send"><span class="nav-icon">💸</span><span>Send</span></button>
             <button class="nav-btn" data-target="view-receive"><span class="nav-icon">⬇️</span><span>Receive</span></button>
+            <button class="nav-btn" data-target="view-chat"><span class="nav-icon">💬</span><span>Chat</span></button>
             <button class="nav-btn" data-target="view-settings"><span class="nav-icon">⚙️</span><span>Settings</span></button>
-            
         </nav>
     </div>
 
@@ -1557,7 +1657,17 @@ if ('serviceWorker' in navigator) {
                 } else if (method === 'checkCommitment') {
                     if (lc) { result = await lc.checkCommitment(params.commitmentHex); }
                     else { const r = await fetch(`${url}/check_commitment`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ commitment: params.commitmentHex }) }); result = r.ok ? await r.json() : null; }
-
+                } else if (method === 'sendChat') {
+                    if (lc) {
+                        const resp = await lc.sendChat(params.words, params.replyTo);
+                        result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
+                    } else {
+                        const r = await fetch(`${url}/api/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ words: params.words, reply_to: params.replyTo }) });
+                        result = { ok: r.ok, body: r.ok ? null : await r.text() };
+                    }
+                } else if (method === 'getChat') {
+                    const r = await fetch(`${url}/api/chat`, { cache: 'no-store' });
+                    result = r.ok ? await r.json() : { messages: [], dictionary: [] };
                 } else {
                     throw new Error(`Unknown RPC method: ${method}`);
                 }
@@ -1903,6 +2013,29 @@ if ('serviceWorker' in navigator) {
                     break;
 
                 // ─── Other Messages ──────────────────────────────
+                
+                case 'CHAT_HISTORY':
+                    if (chatDictionary.length === 0 && payload.dictionary) {
+                        chatDictionary = payload.dictionary;
+                        renderChatDictionary();
+                    }
+                    if (payload.messages) {
+                        payload.messages.forEach(m => chatMessageMap.set(m.nonce, m));
+                        renderChatMessages(payload.messages, true); // true = overwrite
+                    }
+                    break;
+
+                case 'CHAT_MESSAGE':
+                    chatMessageMap.set(payload.nonce, payload);
+                    renderChatMessages([payload], false); // false = append
+                    break;
+
+                case 'CHAT_SENT':
+                    clearChatDraft();
+                    cancelReply();
+                    document.getElementById('send-chat-btn').innerText = "Send";
+                    break;
+                
                 case 'MSS_PROGRESS': {
                     const cp = document.getElementById('createProgress');
                     const mp = document.getElementById('mssProgress');
@@ -2150,6 +2283,196 @@ document.getElementById('btnExport').onclick = () => {
                 reader.readAsText(file);
             }
         });
+        
+        
+        // ═══════════════════════════════════════════════════════════════
+        //  Global Chat Logic
+        // ═══════════════════════════════════════════════════════════════
+
+        let chatDictionary = [];
+        let chatDraft = [];
+        let replyingToNonce = null;
+        const chatMessageMap = new Map();
+        const chatInputField = document.getElementById('chat-input');
+
+        function getChatNick(peerId) {
+            return localStorage.getItem('nick_' + peerId) || (peerId.substring(0, 10) + "...");
+        }
+
+        function setChatNick(peerId) {
+            const current = localStorage.getItem('nick_' + peerId) || peerId;
+            const nick = prompt(`Set a local nickname for this peer:\n\n${peerId}`, current === peerId ? "" : current);
+            if (nick !== null) {
+                if (nick.trim() === "") localStorage.removeItem('nick_' + peerId);
+                else localStorage.setItem('nick_' + peerId, nick.trim());
+                // Re-render
+                renderChatMessages(Array.from(chatMessageMap.values()), true);
+            }
+        }
+
+        function fetchChatHistory() {
+            worker.postMessage({ type: 'GET_CHAT' });
+        }
+
+        // Auto-fetch chat history every 30s just in case WebRTC disconnects,
+        // but rely on push events for instant updates.
+        setInterval(fetchChatHistory, 30000);
+
+        function startReply(nonce, sender) {
+            replyingToNonce = nonce;
+            const nick = getChatNick(sender);
+            document.getElementById('reply-text').textContent = `↳ Replying to ${nick}`;
+            document.getElementById('active-reply').style.display = 'flex';
+            chatInputField.focus();
+        }
+
+        function cancelReply() {
+            replyingToNonce = null;
+            document.getElementById('active-reply').style.display = 'none';
+        }
+
+        chatInputField.addEventListener('keydown', function(e) {
+            if (e.key === ' ' || e.key === 'Enter') {
+                e.preventDefault();
+                const val = this.value.trim().toLowerCase();
+                if (!val) {
+                    if (e.key === 'Enter' && chatDraft.length > 0) submitChat();
+                    return;
+                }
+
+                const idx = chatDictionary.findIndex(w => w.toLowerCase() === val);
+                if (idx !== -1) {
+                    addChatWord(idx);
+                } else {
+                    this.style.color = 'var(--red)';
+                    setTimeout(() => this.style.color = 'var(--accent)', 300);
+                }
+            } else if (e.key === 'Backspace' && this.value === '') {
+                e.preventDefault();
+                if (chatDraft.length > 0) {
+                    chatDraft.pop();
+                    renderChatDraft();
+                }
+            }
+        });
+
+        function renderChatDictionary() {
+            const box = document.getElementById('dictionary-box');
+            const datalist = document.getElementById('dict-list');
+            box.innerHTML = '';
+            datalist.innerHTML = '';
+
+            chatDictionary.forEach((word, index) => {
+                const btn = document.createElement('button');
+                btn.className = 'dict-btn';
+                btn.textContent = word;
+                btn.onclick = () => addChatWord(index);
+                box.appendChild(btn);
+
+                const opt = document.createElement('option');
+                opt.value = word;
+                datalist.appendChild(opt);
+            });
+            updateChatButtons();
+        }
+
+        function renderChatMessages(messages, overwrite) {
+            const box = document.getElementById('chat-box');
+            if (overwrite) box.innerHTML = '';
+            else if (box.innerHTML.includes("Connecting to swarm")) box.innerHTML = '';
+
+            messages.forEach(msg => {
+                // Deduplicate if appending
+                if (!overwrite && document.getElementById(`msg-${msg.nonce}`)) return;
+
+                const date = new Date(msg.timestamp * 1000);
+                const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                
+                const nick = getChatNick(msg.sender);
+                const wordsText = msg.words.map(w => chatDictionary[w] || "???").join(" ");
+                
+                const div = document.createElement('div');
+                div.className = 'chat-msg';
+                div.id = `msg-${msg.nonce}`;
+                if (msg.reply_to) div.classList.add('is-reply');
+
+                let replyHtml = "";
+                if (msg.reply_to) {
+                    const parentMsg = chatMessageMap.get(msg.reply_to);
+                    if (parentMsg) {
+                        const pNick = getChatNick(parentMsg.sender);
+                        replyHtml = `<span class="reply-context">↳ Replying to ${pNick}</span>`;
+                    }
+                }
+
+                div.innerHTML = `
+                    ${replyHtml}
+                    <span class="chat-time">${timeStr}</span> 
+                    <span class="chat-sender" onclick="setChatNick('${msg.sender}')" title="${msg.sender}">${nick}</span> 
+                    <span class="chat-words">${wordsText}</span>
+                    <button class="reply-btn" onclick="startReply(${msg.nonce}, '${msg.sender}')">Reply</button>
+                `;
+                box.appendChild(div);
+            });
+            
+            // Auto-scroll
+            if (box.scrollHeight - box.scrollTop - box.clientHeight < 150 || overwrite) {
+                box.scrollTop = box.scrollHeight;
+            }
+        }
+
+        function addChatWord(index) {
+            if (chatDraft.length >= 10) return;
+            chatDraft.push(index);
+            chatInputField.value = '';
+            renderChatDraft();
+            chatInputField.focus();
+        }
+
+        function clearChatDraft() {
+            chatDraft = [];
+            chatInputField.value = '';
+            renderChatDraft();
+            chatInputField.focus();
+        }
+
+        function renderChatDraft() {
+            const box = document.getElementById('draft-words');
+            box.innerHTML = '';
+            chatDraft.forEach((wordIndex, arrayIndex) => {
+                const span = document.createElement('span');
+                span.className = 'draft-word';
+                span.textContent = chatDictionary[wordIndex];
+                span.onclick = () => {
+                    chatDraft.splice(arrayIndex, 1);
+                    renderChatDraft();
+                    chatInputField.focus();
+                };
+                box.appendChild(span);
+            });
+            updateChatButtons();
+        }
+
+        function updateChatButtons() {
+            const isFull = chatDraft.length >= 10;
+            const isEmpty = chatDraft.length === 0;
+            
+            document.getElementById('send-chat-btn').disabled = isEmpty;
+            chatInputField.disabled = isFull;
+            
+            const dictButtons = document.getElementById('dictionary-box').querySelectorAll('button');
+            dictButtons.forEach(btn => btn.disabled = isFull);
+        }
+
+        function submitChat() {
+            if (chatDraft.length === 0 || chatDraft.length > 10) return;
+            document.getElementById('send-chat-btn').innerText = "Sending...";
+            document.getElementById('send-chat-btn').disabled = true;
+            worker.postMessage({ type: 'SEND_CHAT', payload: { words: chatDraft, replyTo: replyingToNonce } });
+        }
+        
+        // Fetch chat once on load
+        setTimeout(fetchChatHistory, 2000);
         
     </script>
 </body>
