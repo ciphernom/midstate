@@ -1205,3 +1205,84 @@ pub async fn block_template(
         Err(resp) => Err(resp),
     }
 }
+
+pub async fn get_chat(State(node): State<AppState>) -> Json<GetChatResponse> {
+    let hist = node.chat_history.read().await;
+    Json(GetChatResponse {
+        messages: hist.iter().cloned().collect(),
+        dictionary: crate::node::CHAT_DICTIONARY.iter().map(|&s| s.to_string()).collect(),
+    })
+}
+
+pub async fn send_chat(
+    State(node): State<AppState>,
+    headers: axum::http::HeaderMap, //  read Nginx headers
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Json(req): Json<SendChatRequest>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    
+    // --- 1. PROXY-AWARE LAN FIREWALL CHECK ---
+    let check_is_lan = |ip: std::net::IpAddr| -> bool {
+        match ip {
+            std::net::IpAddr::V4(ipv4) => ipv4.is_loopback() || ipv4.is_private() || ipv4.is_link_local(),
+            std::net::IpAddr::V6(ipv6) => ipv6.is_loopback() || (ipv6.segments()[0] & 0xfe00) == 0xfc00 || (ipv6.segments()[0] & 0xffc0) == 0xfe80,
+        }
+    };
+
+    // First check the immediate connection (Is it directly from the internet?)
+    let immediate_ip = addr.ip();
+    if !check_is_lan(immediate_ip) {
+        tracing::warn!("Blocked direct WAN access to chat POST from {}", immediate_ip);
+        return Err(ErrorResponse { error: "Blocked by Node Firewall: You can only send messages from the local network.".into() });
+    }
+
+    // Immediate connection is local (e.g., Nginx or you on localhost). 
+    // Now check if Nginx is telling us it's proxying someone from the public internet.
+    let mut proxied_ip = None;
+    if let Some(forwarded) = headers.get("x-forwarded-for").and_then(|h| h.to_str().ok()) {
+        if let Some(first_ip) = forwarded.split(',').next() {
+            proxied_ip = first_ip.trim().parse::<std::net::IpAddr>().ok();
+        }
+    } else if let Some(real_ip) = headers.get("x-real-ip").and_then(|h| h.to_str().ok()) {
+        proxied_ip = real_ip.trim().parse::<std::net::IpAddr>().ok();
+    }
+
+    if let Some(client_ip) = proxied_ip {
+        if !check_is_lan(client_ip) {
+            tracing::warn!("Blocked Nginx-proxied WAN access to chat POST from {}", client_ip);
+            return Err(ErrorResponse { error: "Blocked by Node Firewall: You can only send messages from the local network.".into() });
+        }
+    }
+    // -----------------------------------------
+
+    if req.words.is_empty() || req.words.len() > 10 {
+        return Err(ErrorResponse { error: "Message must be between 1 and 10 words".into() });
+    }
+    if req.words.iter().any(|&w| (w as usize) >= crate::node::CHAT_DICTIONARY.len()) {
+        return Err(ErrorResponse { error: "Invalid word index".into() });
+    }
+
+    // --- 2. GLOBAL RPC OUTBOX RATE LIMITER ---
+    {
+        let mut limiter = node.outbox_chat_limiter.lock().await;
+        let now = std::time::Instant::now();
+        if now.duration_since(limiter.1).as_secs() >= 10 {
+            *limiter = (0, now);
+        }
+        limiter.0 += 1;
+        if limiter.0 > 5 {
+            return Err(ErrorResponse { error: "Node rate limit exceeded (Max 5 per 10s).".into() });
+        }
+    }
+    // -----------------------------------------
+    
+   
+    node.send_chat(req.words, req.reply_to)
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+    
+    Ok(Json(serde_json::json!({ "status": "sent" })))
+}
+
+pub async fn chat_ui() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("chat.html"))
+}

@@ -80,6 +80,12 @@ pub enum Message {
         input_index: usize,
         signature: Vec<u8>,
     },
+    /// older nodes should ignore this
+    Chat {
+        nonce: u64,
+        reply_to: Option<u64>, 
+        words: Vec<u8>,
+    },
 }
 
 impl Message {
@@ -357,6 +363,11 @@ mod tests {
                 mix_id: [0; 32],
                 input_index: 0,
                 signature: vec![],
+            },
+            Message::Chat {
+                nonce: 12345,
+                reply_to: None,
+                words: vec![1, 5, 20],
             },
         ];
 

@@ -42,6 +42,45 @@ const MAX_ORPHAN_BATCHES: usize = 32;
 const BATCH_LOOKAHEAD: usize = 3;
 
 const MAX_PREFETCH_BUFFER: usize = 32;
+
+//chat dictionary
+pub const CHAT_DICTIONARY: &[&str] = &[
+    // --- Social / Basic ---
+    "Hello", "Goodbye", "Yes", "No", "Thanks", "Please", 
+    "gm", "gn", "lol", "LFG", "WAGMI", "?", "!",
+    
+    // --- Node / Network Nouns ---
+    "Node", "Miner", "Peer", "Network", "Mempool", "Block", 
+    "Fork", "Reorg", "Relay", "NAT", "Port", "Bug", "Update", 
+    "Chain", "Hash", "Target", "Difficulty", "Transactions",
+    
+    // --- Status / Verbs ---
+    "Syncing", "Mined", "Updating", "Restarting", "Waiting", 
+    "Checking", "Found", "Lost", "Need", "Help", "Stop", 
+    "Start", "Connecting", "Disconnected", "Stuck",
+    
+    // --- Adjectives / Qualifiers ---
+    "Good", "Bad", "Fast", "Slow", "Full", "Empty", 
+    "High", "Low", "Urgent", "Fixed", "Ready", "Online", 
+    "Offline", "Here", "There", "My", "Your", "All",
+    
+    // --- Numbers (For Heights, Peers, etc.) ---
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", 
+    "20", "50", "100", "500", "1000", "10000", "50000", "100000",
+    
+    // --- Conjunctions / Prepositions ---
+    "At", "To", "From", "Is", "Are", "And", "Or", "Not", "With"
+];
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ChatMessage {
+    pub sender: String,
+    pub timestamp: u64,
+    pub nonce: u64,             
+    pub reply_to: Option<u64>, 
+    pub words: Vec<u8>,
+}
+
 const MAX_PREFETCH_DISTANCE: u64 = 10_000;
 
 const SYNC_TIMEOUT_SECS: u64 = 30;
@@ -208,6 +247,7 @@ pub struct Node {
     peer_batch_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     /// Rate-limit counter for GetHeaders (cheap normally, expensive on fallback path).
     peer_header_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
+    peer_chat_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     hash_counter: Arc<AtomicU64>,
 
     
@@ -215,6 +255,9 @@ pub struct Node {
     /// Keyed by height: state_cache[i] = (height, State) where the State
     /// is the result of applying all blocks through height-1.
     state_cache: VecDeque<(u64, State)>,
+    
+    chat_history: Arc<RwLock<VecDeque<ChatMessage>>>,
+    seen_chats: HashSet<(PeerId, u64)>,
     
     /// Fallback peers to dial if we suffer a total network eclipse
     bootstrap_peers: Vec<String>,
@@ -236,6 +279,8 @@ pub struct NodeHandle {
     pub metrics: Metrics,
     /// Our local PeerId, needed for PeerId-bound CoinJoin PoW.
     local_peer_id: PeerId,
+    pub chat_history: Arc<RwLock<VecDeque<ChatMessage>>>,
+    pub outbox_chat_limiter: Arc<tokio::sync::Mutex<(u32, std::time::Instant)>>,
 }
 
 pub enum NodeCommand {
@@ -274,6 +319,8 @@ pub enum NodeCommand {
     },
     BroadcastLightPush(crate::network::light_protocol::LightNotification),
     SendResponse { channel: libp2p::request_response::ResponseChannel<crate::network::Message>, msg: crate::network::Message },
+    SendChat { reply_to: Option<u64>, words: Vec<u8> },   
+    BroadcastP2PChat { nonce: u64, reply_to: Option<u64>, words: Vec<u8> },
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -378,6 +425,13 @@ impl NodeHandle {
             .map_err(|e| anyhow::anyhow!("Node is currently overloaded: {}", e))?;
         Ok(())
     }
+    
+    pub fn send_chat(&self, words: Vec<u8>, reply_to: Option<u64>) -> Result<()> {
+        self.tx_sender.try_send(NodeCommand::SendChat { reply_to, words })
+            .map_err(|e| anyhow::anyhow!("Node is overloaded: {}", e))?;
+        Ok(())
+    }
+    
     pub fn scan_addresses(&self, addresses: &[[u8; 32]], start: u64, end: u64) -> Result<Vec<ScannedCoin>> {
         let store = &self.storage.batches; 
         let mut found = Vec::new();
@@ -977,9 +1031,12 @@ pub async fn new(
             stem_pool: HashMap::new(),
             peer_batch_req_counts: HashMap::new(),
             peer_header_req_counts: HashMap::new(),
+            peer_chat_counts: HashMap::new(),
             hash_counter: Arc::new(AtomicU64::new(0)),
             state_cache: VecDeque::with_capacity(STATE_CACHE_SIZE + 1),
             bootstrap_peers: bootstrap_strings, // <-- Uses the variable we created above
+            chat_history: Arc::new(RwLock::new(VecDeque::new())),
+            seen_chats: HashSet::new(),
         })
     }
 
@@ -1529,6 +1586,35 @@ async fn handle_light_request(
 
                 LightResponse::success(serde_json::json!({ "next_index": chain_max.max(mempool_max) }))
             }
+            
+            LightRequest::SendChat { reply_to, words } => { // <-- ADD reply_to
+                if words.is_empty() || words.len() > 10 {
+                    return LightResponse::error("Message must be between 1 and 10 words");
+                }
+                if words.iter().any(|&w| (w as usize) >= crate::node::CHAT_DICTIONARY.len()) {
+                    return LightResponse::error("Invalid word index");
+                }
+
+                let nonce = rand::random();
+                let timestamp = crate::core::state::current_timestamp();
+                let sender = from.to_string();
+
+                let mut hist = self.chat_history.write().await;
+                hist.push_back(ChatMessage { sender: sender.clone(), timestamp, nonce, reply_to, words: words.clone() });
+                if hist.len() > 100 { hist.pop_front(); }
+                drop(hist);
+
+                if let Some(cmd_tx) = &self.cmd_tx {
+                    let _ = cmd_tx.try_send(NodeCommand::BroadcastP2PChat { nonce, reply_to, words: words.clone() });
+                    let notif = crate::network::light_protocol::LightNotification::ChatMessage {
+                        sender, timestamp, nonce, reply_to, words
+                    };
+                    let _ = cmd_tx.try_send(NodeCommand::BroadcastLightPush(notif));
+                }
+
+                LightResponse::success(serde_json::json!({ "status": "sent" }))
+            }
+            
         }
     }
 
@@ -1569,6 +1655,8 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
             hash_counter: Arc::clone(&self.hash_counter),
             metrics: self.metrics.clone(),
             local_peer_id: self.network.local_peer_id(),
+            chat_history: Arc::clone(&self.chat_history),
+            outbox_chat_limiter: Arc::new(tokio::sync::Mutex::new((0, std::time::Instant::now()))),
         };
         (handle, rx)
     }
@@ -1726,6 +1814,9 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                     self.mix_manager.write().await.cleanup();
                     // Light client: GC stale rate-limiter entries
                     self.network.gc_stale_light_peers().await;
+                    if self.seen_chats.len() > 5000 {
+                        self.seen_chats.clear();
+                    }
                 }
                 _ = stem_flush_interval.tick() => {
                     self.flush_stem_pool();
@@ -1938,6 +2029,28 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                         NodeCommand::SendResponse { channel, msg } => {
                             self.network.respond(channel, msg);
                         }
+                        NodeCommand::SendChat { reply_to, words } => {
+                            let nonce = rand::random();
+                            let timestamp = crate::core::state::current_timestamp();
+                            let sender = self.network.local_peer_id().to_string();
+
+                            let mut hist = self.chat_history.write().await;
+                            hist.push_back(ChatMessage { sender: sender.clone(), timestamp, nonce, reply_to, words: words.clone() });
+                            if hist.len() > 100 { hist.pop_front(); }
+                            drop(hist);
+
+                            self.seen_chats.insert((self.network.local_peer_id(), nonce));
+                            self.network.broadcast(Message::Chat { nonce, reply_to, words: words.clone() });
+
+                            let notif = crate::network::light_protocol::LightNotification::ChatMessage {
+                                sender, timestamp, nonce, reply_to, words
+                            };
+                            self.network.broadcast_light_push(&notif);
+                        }
+                        NodeCommand::BroadcastP2PChat { nonce, reply_to, words } => {
+                            self.seen_chats.insert((self.network.local_peer_id(), nonce));
+                            self.network.broadcast(Message::Chat { nonce, reply_to, words });
+                        }
                     }
                 }
                 event = self.network.next_event() => {
@@ -1989,6 +2102,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                         NetworkEvent::PeerDisconnected(peer) => {
                             self.connected_peers.remove(&peer);
                             self.peer_tx_counts.remove(&peer); 
+                            self.peer_chat_counts.remove(&peer);
                             tracing::info!("Peer disconnected: {}", peer);
 
                             // If this peer had in-flight lookahead requests, drop them from
@@ -2532,6 +2646,46 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                     }
                 }
             }
+            Message::Chat { nonce, reply_to, words } => { 
+                self.ack(channel);
+
+                let now = std::time::Instant::now();
+                let entry = self.peer_chat_counts.entry(from).or_insert((0, now));
+                if now.duration_since(entry.1).as_secs() >= 10 { 
+                    *entry = (0, now); 
+                }
+                entry.0 += 1;
+                if entry.0 > 5 { 
+                    tracing::debug!("Chat rate limit exceeded by peer {}", from);
+                    return Ok(()); 
+                }
+
+                if self.seen_chats.insert((from, nonce)) {
+                    if words.len() <= 10 && words.iter().all(|&w| (w as usize) < CHAT_DICTIONARY.len()) {
+                        let timestamp = crate::core::state::current_timestamp();
+                        let sender_str = from.to_string();
+                        
+                        let mut hist = self.chat_history.write().await;
+                        hist.push_back(ChatMessage { sender: sender_str.clone(), timestamp, nonce, reply_to, words: words.clone() });
+                        if hist.len() > 100 { hist.pop_front(); }
+                        drop(hist);
+
+                        self.network.broadcast_except(Some(from), Message::Chat { nonce, reply_to, words: words.clone() });
+
+                        let notif = crate::network::light_protocol::LightNotification::ChatMessage {
+                            sender: sender_str,
+                            timestamp,
+                            nonce,
+                            reply_to,
+                            words,
+                        };
+                        if let Some(tx) = &self.cmd_tx {
+                            let _ = tx.try_send(NodeCommand::BroadcastLightPush(notif));
+                        }
+                    }
+                }
+            }
+            
         }
         Ok(())
     }

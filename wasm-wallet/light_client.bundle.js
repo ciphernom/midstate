@@ -29450,6 +29450,11 @@ async request(req, _retries = 2) {
         return resp.data;
     }
 
+    async sendChat(words, replyTo) {
+        const resp = await this.request({ method: 'send_chat', params: { words, reply_to: replyTo } });
+        return resp;
+    }
+
     // ── Peer Discovery ──────────────────────────────────────────────────────
 
     /// Ask the connected node for its known peers' WebRTC multiaddrs.

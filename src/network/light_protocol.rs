@@ -27,6 +27,13 @@ pub enum LightNotification {
         filter_hex: String,
         block_hash: String,
         element_count: u64,
+    },
+    ChatMessage {
+        sender: String,
+        timestamp: u64,
+        nonce: u64,            
+        reply_to: Option<u64>, 
+        words: Vec<u8>,
     }
 }
 
@@ -83,6 +90,14 @@ pub enum LightRequest {
     /// POST /mss_state equivalent
     #[serde(rename = "mss_state")]
     MssState { master_pk: String },
+    
+    #[serde(rename = "send_chat")]
+    SendChat { 
+        reply_to: Option<u64>, 
+        words: Vec<u8> 
+    },
+    
+
 }
 
 /// Every response sent to a browser light client.

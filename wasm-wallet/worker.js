@@ -367,6 +367,8 @@ const rpc = {
     send:           (reveal)     => rpcCall('send', { revealPayload: reveal }),
     checkCommitment: (commitment) => rpcCall('checkCommitment', { commitmentHex: commitment }),
     checkCoin:      (coin)       => rpcCall('checkCoin', { coinHex: coin }),
+    sendChat:       (words, replyTo) => rpcCall('sendChat', { words, replyTo }),
+    getChat:        ()           => rpcCall('getChat'),
     
     /**
      * Get a block template for solo mining.
@@ -724,6 +726,10 @@ self.onmessage = async (e) => {
         }
         
         else if (type === 'PUSH_NEW_BLOCK') {
+            if (payload.ChatMessage) {
+                self.postMessage({ type: 'CHAT_MESSAGE', payload: payload.ChatMessage });
+                return;
+            }
             const notif = payload.NewBlockTip;
             if (!notif) return;
             
@@ -838,7 +844,26 @@ self.onmessage = async (e) => {
             if (wState.phrase) self.postMessage({ type: 'SEED_REVEALED', payload: wState.phrase });
             else self.postMessage({ type: 'ERROR', payload: "Seed phrase not found in memory." });
         }
-
+        else if (type === 'GET_CHAT') {
+            try {
+                const res = await rpc.getChat();
+                self.postMessage({ type: 'CHAT_HISTORY', payload: res });
+            } catch (e) {
+                self.postMessage({ type: 'ERROR', payload: `Chat sync failed: ${e}` });
+            }
+        }
+        else if (type === 'SEND_CHAT') {
+            try {
+                const res = await rpc.sendChat(payload.words, payload.replyTo);
+                if (res.ok) {
+                    self.postMessage({ type: 'CHAT_SENT' });
+                } else {
+                    self.postMessage({ type: 'ERROR', payload: res.body || "Chat rejected" });
+                }
+            } catch (e) {
+                self.postMessage({ type: 'ERROR', payload: `Send chat failed: ${e}` });
+            }
+        }
         else if (type === 'GET_TEMPLATE') {
             try {
                 const result = await handleGetTemplate();
