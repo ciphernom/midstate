@@ -35,10 +35,11 @@ pub fn unpack_spam_nonce(spam_nonce: u64) -> (u32, u32) {
 ///
 /// # Reasoning
 /// Prior to the V2 activation height, the network must accept both V1 and V2
-/// PoW formats to allow a seamless transition for upgraded wallets. 
-/// The true V1 format was a height-independent 40-byte hash: 
-/// `hash(commitment || spam_nonce_u64)`. The V2 format is a height-bound 
-/// 40-byte hash: `hash(target_height_u32 || commitment || actual_nonce_u32)`.
+/// PoW formats to allow a seamless transition for upgraded wallets. The V1 format 
+/// was a brute-forced 48-byte hash: 
+/// `hash(height_u64 || commitment || spam_nonce_u64)`. The V2 format is a 
+/// height-bound, O(1) validated 40-byte hash: 
+/// `hash(target_height_u32 || commitment || actual_nonce_u32)`.
 ///
 /// # Formal Specification
 /// 
@@ -56,8 +57,8 @@ pub fn unpack_spam_nonce(spam_nonce: u64) -> (u32, u32) {
 ///
 /// Definitions:
 ///   (t, a) ≜ unpack(n?)  where t ∈ ℕ₃₂, a ∈ ℕ₃₂
-///   H_v1   ≜ ℋ(c? ⌢ n?)
-///   H_v2   ≜ ℋ(t ⌢ c? ⌢ a)
+///   H_v1(h) ≜ ℋ(h_u64 ⌢ c? ⌢ n?)
+///   H_v2    ≜ ℋ(t ⌢ c? ⌢ a)
 ///
 /// Preconditions:
 ///   h_cur? < V2_ACTIVATION_HEIGHT
@@ -65,7 +66,7 @@ pub fn unpack_spam_nonce(spam_nonce: u64) -> (u32, u32) {
 /// Postconditions:
 ///   result! = Ok(z) ⇔ 
 ///       ( z = 𝒵(H_v2) ∧ z ≥ MIN_COMMIT_POW_BITS ∧ (h_cur? - t ≤ WINDOW) ∧ (t ≤ h_cur? + 1) )
-///     ∨ ( z = 𝒵(H_v1) ∧ z ≥ MIN_COMMIT_POW_BITS )
+///     ∨ ( ∃ h ∈ [h_cur? - WINDOW, h_cur?] : z = 𝒵(H_v1(h)) ∧ z ≥ MIN_COMMIT_POW_BITS )
 ///   
 ///   result! = Err ⇔ ¬(above)
 /// ```
@@ -106,14 +107,28 @@ pub fn evaluate_commit_pow(commitment: &[u8; 32], spam_nonce: u64, current_heigh
         }
     }
 
-    // 2. Try V1 legacy path (The true V1 format was completely height-independent)
-    let hash_v1 = crate::core::types::hash_concat(commitment, &spam_nonce.to_le_bytes());
-    let zeros_v1 = crate::core::types::count_leading_zeros(&hash_v1);
-    if zeros_v1 >= MIN_COMMIT_POW_BITS {
-        return Ok(zeros_v1);
+    // 2. Try V1 legacy path: O(W) brute-force search backward
+    let start = current_height.saturating_sub(crate::core::types::COMMIT_POW_WINDOW);
+    let mut best_zeros = 0;
+    for h in start..=current_height {
+        // Reconstruct legacy layout (target_height as u64 || commitment || spam_nonce as u64)
+        let mut data = Vec::with_capacity(48);
+        data.extend_from_slice(&h.to_le_bytes());
+        data.extend_from_slice(commitment);
+        data.extend_from_slice(&spam_nonce.to_le_bytes());
+        let hash_v1 = super::types::hash(&data);
+
+        let zeros_v1 = crate::core::types::count_leading_zeros(&hash_v1);
+        if zeros_v1 > best_zeros {
+            best_zeros = zeros_v1;
+            if best_zeros >= MIN_COMMIT_POW_BITS { break; }
+        }
     }
 
-    bail!("Insufficient Commit PoW or expired");
+    if best_zeros < MIN_COMMIT_POW_BITS {
+        bail!("Insufficient Commit PoW or expired");
+    }
+    Ok(best_zeros)
 }
 
 fn validate_commit_pow(commitment: &[u8; 32], nonce: u64, current_height: u64) -> Result<()> {
