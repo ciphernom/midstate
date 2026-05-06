@@ -258,74 +258,78 @@
         @keyframes indicatorPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
 
 
-#chat-box { 
-            border: 1px solid var(--border); 
-            height: 350px; 
-            overflow-y: scroll; 
-            padding: 10px; 
-            margin-bottom: 20px; 
-            background: var(--bg-panel); 
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-            border-radius: 8px;
+#view-chat { display: flex; flex-direction: column; height: 100%; }
+        
+        #chat-box { 
+            flex-grow: 1; border: 1px solid var(--border); 
+            overflow-y: auto; padding: 16px; margin-bottom: 12px; 
+            background: #080808; display: flex; flex-direction: column;
+            gap: 12px; border-radius: 12px;
+            box-shadow: inset 0 2px 10px rgba(0,0,0,0.5);
         }
+        
         .chat-msg { 
-            line-height: 1.4; 
-            padding: 8px;
-            border-radius: 6px;
-            background: var(--bg);
-            border: 1px solid var(--border);
-            position: relative;
+            line-height: 1.4; padding: 12px 16px; border-radius: 12px;
+            background: var(--bg-panel); border: 1px solid var(--border-bright);
+            position: relative; width: fit-content; max-width: 90%;
+            align-self: flex-start; transition: border-color 0.2s;
         }
-        .chat-msg:hover .reply-btn { display: inline-block; }
-        .chat-msg.is-reply { margin-left: 20px; border-left: 2px solid var(--border-bright); }
-        .chat-msg.pinged { background: rgba(212, 255, 0, 0.05); border-left: 2px solid var(--accent); }
+        .chat-msg:hover { border-color: #444; }
+        .chat-msg:hover .reply-btn { opacity: 1; }
         
-        .chat-time { color: #666; font-size: 0.85em; }
-        .chat-sender { color: var(--accent); font-weight: bold; cursor: pointer; font-size: 0.9em; margin: 0 4px; }
-        .chat-words { color: var(--text-max); font-size: 1.05em; font-weight: 500; }
+        .chat-msg.is-reply { margin-left: 24px; border-top-left-radius: 4px; }
+        .chat-msg.pinged { background: rgba(212, 255, 0, 0.08); border-color: var(--accent-dim); }
         
-        .reply-context { font-size: 0.8em; color: #888; margin-bottom: 4px; display: block; }
+        .chat-header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+        .chat-sender { color: var(--accent); font-weight: bold; cursor: pointer; font-size: 13px; text-decoration: underline; text-decoration-color: transparent; transition: all 0.2s; }
+        .chat-sender:hover { text-decoration-color: var(--accent); }
+        .chat-time { color: #666; font-size: 11px; }
+        
+        .chat-words { color: var(--text-max); font-size: 15px; font-weight: 500; display: block; letter-spacing: 0.3px; }
+        
+        .reply-context { font-size: 11px; color: #888; margin-bottom: 6px; display: block; background: rgba(255,255,255,0.05); padding: 4px 8px; border-radius: 4px; border-left: 2px solid var(--border-bright); }
+        
         .reply-btn {
-            display: none; position: absolute; right: 10px; top: 6px;
-            background: transparent; color: #888; border: 1px solid var(--border-bright);
-            padding: 2px 8px; font-size: 10px; cursor: pointer; border-radius: 4px; width: auto; min-height: 0; margin: 0;
+            opacity: 0; position: absolute; right: -40px; top: 50%; transform: translateY(-50%);
+            background: var(--bg-panel); color: #888; border: 1px solid var(--border-bright);
+            padding: 4px 8px; font-size: 11px; cursor: pointer; border-radius: 6px; width: auto; min-height: 0; margin: 0; transition: all 0.2s;
         }
-        .reply-btn:hover { background: var(--border); color: #fff; }
+        .reply-btn:hover { background: var(--text-max); color: #000; }
 
         #active-reply {
-            display: none; background: rgba(212, 255, 0, 0.05); padding: 8px 12px;
-            border: 1px solid var(--accent-dim); border-radius: 6px; margin-bottom: 10px;
+            display: none; background: rgba(212, 255, 0, 0.1); padding: 8px 12px;
+            border: 1px solid var(--accent-dim); border-radius: 8px; margin-bottom: 12px;
             color: var(--accent); justify-content: space-between; align-items: center; font-size: 12px;
         }
 
         #draft-box { 
-            border: 1px solid var(--border); padding: 10px; margin-bottom: 10px; 
-            min-height: 44px; background: var(--bg-panel); display: flex; 
-            align-items: center; gap: 10px; flex-wrap: wrap; border-radius: 8px;
+            border: 1px solid var(--border-bright); padding: 8px 12px; margin-bottom: 12px; 
+            min-height: 50px; background: var(--bg-panel); display: flex; 
+            align-items: center; gap: 8px; flex-wrap: wrap; border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
         }
+        
         .draft-word { 
-            background: var(--border-bright); padding: 4px 8px; border-radius: 4px; 
-            cursor: pointer; color: var(--text-max); font-size: 13px; font-weight: 500;
+            background: var(--accent); color: #000; padding: 4px 10px; border-radius: 16px; 
+            cursor: pointer; font-size: 13px; font-weight: bold; transition: all 0.15s;
         }
         .draft-word:hover { background: var(--red); color: #fff; text-decoration: line-through; }
         
         #chat-input {
-            background: transparent; border: none; color: var(--accent); font-family: monospace;
-            font-size: 14px; outline: none; flex-grow: 1; min-width: 150px; padding: 0; margin: 0;
+            background: transparent; border: none; color: var(--text-max);
+            font-size: 15px; outline: none; flex-grow: 1; min-width: 150px; padding: 4px; margin: 0;
         }
-        #chat-input::placeholder { color: #555; }
+        #chat-input::placeholder { color: #666; font-style: italic; }
 
-        #dictionary-box { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 20px; max-height: 150px; overflow-y: auto; padding: 5px; }
+        #dictionary-box { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; max-height: 120px; overflow-y: auto; padding-right: 5px; }
         .dict-btn { 
-            background: var(--bg-panel); color: var(--text-bright); border: 1px solid var(--border); 
-            padding: 6px 10px; cursor: pointer; border-radius: 4px; width: auto; min-height: 0; margin: 0; font-size: 12px;
+            background: var(--bg); color: var(--text-bright); border: 1px solid var(--border); 
+            padding: 6px 12px; cursor: pointer; border-radius: 6px; width: auto; min-height: 0; margin: 0; font-size: 12px; transition: all 0.1s;
         }
-        .dict-btn:hover:not(:disabled) { background: var(--border); color: var(--text-max); }
+        .dict-btn:hover:not(:disabled) { background: var(--border-bright); color: var(--text-max); border-color: #555; }
         .dict-btn:disabled { opacity: 0.3; cursor: not-allowed; }
         
-        .chat-controls { display: flex; gap: 10px; }
+        .chat-controls { display: flex; gap: 12px; margin-bottom: 16px; }
 
         /* Desktop */
         @media (min-width: 768px) {
@@ -2295,6 +2299,12 @@ document.getElementById('btnExport').onclick = () => {
         const chatMessageMap = new Map();
         const chatInputField = document.getElementById('chat-input');
 
+        function escapeHtml(unsafe) {
+            return String(unsafe ?? "").replace(/[&<>"']/g, m => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+            })[m]);
+        }
+
         function getChatNick(peerId) {
             return localStorage.getItem('nick_' + peerId) || (peerId.substring(0, 10) + "...");
         }
@@ -2319,12 +2329,12 @@ document.getElementById('btnExport').onclick = () => {
         setInterval(fetchChatHistory, 30000);
 
         function startReply(nonce, sender) {
-            replyingToNonce = nonce;  // nonce is now a real number, no string parsing needed
-            const nick = getNick(sender);
+            replyingToNonce = Number(nonce); // Cast to number safely
+            const nick = getChatNick(sender);
             document.getElementById('reply-text').innerHTML =
-                `Replying to <span style="color:var(--link-color)">${escapeHtml(nick)}</span>`;
+                `Replying to <span style="color:var(--accent); font-weight:bold;">${escapeHtml(nick)}</span>`;
             document.getElementById('active-reply').style.display = 'flex';
-            inputField.focus();
+            chatInputField.focus();
         }
 
         function cancelReply() {
@@ -2346,7 +2356,7 @@ document.getElementById('btnExport').onclick = () => {
                     addChatWord(idx);
                 } else {
                     this.style.color = 'var(--red)';
-                    setTimeout(() => this.style.color = 'var(--accent)', 300);
+                    setTimeout(() => this.style.color = 'var(--text-max)', 300);
                 }
             } else if (e.key === 'Backspace' && this.value === '') {
                 e.preventDefault();
@@ -2377,6 +2387,7 @@ document.getElementById('btnExport').onclick = () => {
             updateChatButtons();
         }
 
+        // --- SAFE DOM RENDERER ---
         function renderChatMessages(messages, overwrite) {
             const box = document.getElementById('chat-box');
             if (overwrite) box.innerHTML = '';
@@ -2388,7 +2399,6 @@ document.getElementById('btnExport').onclick = () => {
 
                 const date = new Date(msg.timestamp * 1000);
                 const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                
                 const nick = getChatNick(msg.sender);
                 const wordsText = msg.words.map(w => chatDictionary[w] || "???").join(" ");
                 
@@ -2397,22 +2407,49 @@ document.getElementById('btnExport').onclick = () => {
                 div.id = `msg-${msg.nonce}`;
                 if (msg.reply_to) div.classList.add('is-reply');
 
-                let replyHtml = "";
+                // 1. Reply Context
                 if (msg.reply_to) {
                     const parentMsg = chatMessageMap.get(msg.reply_to);
                     if (parentMsg) {
                         const pNick = getChatNick(parentMsg.sender);
-                        replyHtml = `<span class="reply-context">↳ Replying to ${pNick}</span>`;
+                        const ctx = document.createElement('span');
+                        ctx.className = 'reply-context';
+                        ctx.textContent = `↳ Replying to ${pNick}`;
+                        div.appendChild(ctx);
                     }
                 }
 
-                div.innerHTML = `
-                    ${replyHtml}
-                    <span class="chat-time">${timeStr}</span> 
-                    <span class="chat-sender" onclick="setChatNick('${msg.sender}')" title="${msg.sender}">${nick}</span> 
-                    <span class="chat-words">${wordsText}</span>
-                    <button class="reply-btn" onclick="startReply(${msg.nonce}, '${msg.sender}')">Reply</button>
-                `;
+                // 2. Header (Sender + Time)
+                const header = document.createElement('div');
+                header.className = 'chat-header';
+                
+                const senderSpan = document.createElement('span');
+                senderSpan.className = 'chat-sender';
+                senderSpan.textContent = nick;
+                senderSpan.title = msg.sender;
+                senderSpan.onclick = () => setChatNick(msg.sender);
+                header.appendChild(senderSpan);
+
+                const timeSpan = document.createElement('span');
+                timeSpan.className = 'chat-time';
+                timeSpan.textContent = timeStr;
+                header.appendChild(timeSpan);
+                
+                div.appendChild(header);
+
+                // 3. Message Body
+                const wordsSpan = document.createElement('span');
+                wordsSpan.className = 'chat-words';
+                wordsSpan.textContent = wordsText;
+                div.appendChild(wordsSpan);
+
+                // 4. Reply Button
+                const replyBtn = document.createElement('button');
+                replyBtn.className = 'reply-btn';
+                replyBtn.textContent = 'Reply';
+                replyBtn.onclick = () => startReply(msg.nonce, msg.sender);
+                div.appendChild(replyBtn);
+
                 box.appendChild(div);
             });
             
