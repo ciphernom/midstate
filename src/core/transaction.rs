@@ -31,7 +31,44 @@ pub fn unpack_spam_nonce(spam_nonce: u64) -> (u32, u32) {
 }
 
 /// Evaluate the Commit-PoW associated with a commitment under either V1
-/// (legacy brute-force) or V2 (single-hash with explicit target height) rules.
+/// (legacy) or V2 (single-hash with explicit target height) rules.
+///
+/// # Reasoning
+/// Prior to the V2 activation height, the network must accept both V1 and V2
+/// PoW formats to allow a seamless transition for upgraded wallets. 
+/// The true V1 format was a height-independent 40-byte hash: 
+/// `hash(commitment || spam_nonce_u64)`. The V2 format is a height-bound 
+/// 40-byte hash: `hash(target_height_u32 || commitment || actual_nonce_u32)`.
+///
+/// # Formal Specification
+/// 
+/// ```text
+/// Let ℂ be the 32-byte commitment space.
+/// Let ℕ₆₄ be the 64-bit integer space.
+/// Let ℕ₃₂ be the 32-bit integer space.
+/// Let 𝒵 : ℂ → ℕ be the leading zero counting function.
+/// Let ℋ : seq 𝔹 → ℂ be the BLAKE3 hash function.
+///
+/// Inputs:
+///   c?     ∈ ℂ           (commitment)
+///   n?     ∈ ℕ₆₄         (spam_nonce)
+///   h_cur? ∈ ℕ₆₄         (current_height)
+///
+/// Definitions:
+///   (t, a) ≜ unpack(n?)  where t ∈ ℕ₃₂, a ∈ ℕ₃₂
+///   H_v1   ≜ ℋ(c? ⌢ n?)
+///   H_v2   ≜ ℋ(t ⌢ c? ⌢ a)
+///
+/// Preconditions:
+///   h_cur? < V2_ACTIVATION_HEIGHT
+///
+/// Postconditions:
+///   result! = Ok(z) ⇔ 
+///       ( z = 𝒵(H_v2) ∧ z ≥ MIN_COMMIT_POW_BITS ∧ (h_cur? - t ≤ WINDOW) ∧ (t ≤ h_cur? + 1) )
+///     ∨ ( z = 𝒵(H_v1) ∧ z ≥ MIN_COMMIT_POW_BITS )
+///   
+///   result! = Err ⇔ ¬(above)
+/// ```
 pub fn evaluate_commit_pow(commitment: &[u8; 32], spam_nonce: u64, current_height: u64) -> Result<u32> {
     let (target_height, actual_nonce) = unpack_spam_nonce(spam_nonce);
 
@@ -55,28 +92,28 @@ pub fn evaluate_commit_pow(commitment: &[u8; 32], spam_nonce: u64, current_heigh
         return Ok(zeros);
     }
 
-    // V1 legacy path: O(W) brute-force search backward
-    let start = current_height.saturating_sub(crate::core::types::COMMIT_POW_WINDOW);
-    let mut best_zeros = 0;
-    for h in start..=current_height {
-        // Reconstruct legacy layout (target_height as u64 || commitment || spam_nonce as u64)
-        let mut data = Vec::with_capacity(48);
-        data.extend_from_slice(&h.to_le_bytes());
-        data.extend_from_slice(commitment);
-        data.extend_from_slice(&spam_nonce.to_le_bytes());
-        let hash = super::types::hash(&data);
+    // PRE-ACTIVATION: Accept both true V1 and V2 formats to allow wallets and light
+    // clients to upgrade securely before the hard fork enforces V2 exclusively.
 
-        let zeros = crate::core::types::count_leading_zeros(&hash);
-        if zeros > best_zeros {
-            best_zeros = zeros;
-            if best_zeros >= MIN_COMMIT_POW_BITS { break; }
+    // 1. Try V2 path (for upgraded wallets/light clients)
+    if current_height.saturating_sub(target_height as u64) <= crate::core::types::COMMIT_POW_WINDOW 
+        && (target_height as u64) <= current_height + 1 
+    {
+        let hash_v2 = commit_pow_hash(commitment, actual_nonce, target_height);
+        let zeros_v2 = crate::core::types::count_leading_zeros(&hash_v2);
+        if zeros_v2 >= MIN_COMMIT_POW_BITS {
+            return Ok(zeros_v2);
         }
     }
 
-    if best_zeros < MIN_COMMIT_POW_BITS {
-        bail!("Insufficient Commit PoW or expired");
+    // 2. Try V1 legacy path (The true V1 format was completely height-independent)
+    let hash_v1 = crate::core::types::hash_concat(commitment, &spam_nonce.to_le_bytes());
+    let zeros_v1 = crate::core::types::count_leading_zeros(&hash_v1);
+    if zeros_v1 >= MIN_COMMIT_POW_BITS {
+        return Ok(zeros_v1);
     }
-    Ok(best_zeros)
+
+    bail!("Insufficient Commit PoW or expired");
 }
 
 fn validate_commit_pow(commitment: &[u8; 32], nonce: u64, current_height: u64) -> Result<()> {
