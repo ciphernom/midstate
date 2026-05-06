@@ -82,8 +82,9 @@ pub enum Message {
     },
     /// older nodes should ignore this
     Chat {
+        sender: String,
         nonce: u64,
-        reply_to: Option<u64>, 
+        reply_to: Option<u64>,
         words: Vec<u8>,
     },
 }
@@ -122,6 +123,20 @@ pub fn deserialize_bin(bytes: &[u8]) -> anyhow::Result<Self> {
                     anyhow::bail!("Addr count {} exceeds max 1000", addrs.len());
                 }
             }
+            Message::Chat { sender, words, .. } => {
+                // 1. Length check
+                if sender.len() > 128 {
+                    anyhow::bail!("Chat sender too long: {}", sender.len());
+                }
+                // 2. CRYPTO CHECK: Ensure the string is an actual base58 encoded PeerId
+                if sender.parse::<libp2p::PeerId>().is_err() {
+                    anyhow::bail!("Chat sender must be a valid cryptographic PeerId");
+                }
+                // 3. Word count check
+                if words.len() > 10 {
+                    anyhow::bail!("Chat words count {} exceeds max 10", words.len());
+                }
+            }          
             _ => {}
         }
 

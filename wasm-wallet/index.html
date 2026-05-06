@@ -2319,11 +2319,12 @@ document.getElementById('btnExport').onclick = () => {
         setInterval(fetchChatHistory, 30000);
 
         function startReply(nonce, sender) {
-            replyingToNonce = nonce;
-            const nick = getChatNick(sender);
-            document.getElementById('reply-text').textContent = `↳ Replying to ${nick}`;
+            replyingToNonce = nonce;  // nonce is now a real number, no string parsing needed
+            const nick = getNick(sender);
+            document.getElementById('reply-text').innerHTML =
+                `Replying to <span style="color:var(--link-color)">${escapeHtml(nick)}</span>`;
             document.getElementById('active-reply').style.display = 'flex';
-            chatInputField.focus();
+            inputField.focus();
         }
 
         function cancelReply() {

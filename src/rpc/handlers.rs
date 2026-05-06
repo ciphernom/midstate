@@ -1236,21 +1236,40 @@ pub async fn send_chat(
         return Err(ErrorResponse { error: "Blocked by Node Firewall: You can only send messages from the local network.".into() });
     }
 
-    // Immediate connection is local (e.g., Nginx or you on localhost). 
+    // Immediate connection is local (e.g., Nginx or you on localhost).
     // Now check if Nginx is telling us it's proxying someone from the public internet.
-    let mut proxied_ip = None;
+    //
+    // X-Forwarded-For is a comma-separated chain. Under the standard
+    // `$proxy_add_x_forwarded_for` config, Nginx APPENDS the immediate client
+    // to whatever the client sent — so an attacker can prepend "127.0.0.1"
+    // to spoof a LAN origin. We require EVERY IP in the chain to be LAN;
+    // a single public IP anywhere in the chain proves the request crossed
+    // the WAN at some hop and must be rejected.
     if let Some(forwarded) = headers.get("x-forwarded-for").and_then(|h| h.to_str().ok()) {
-        if let Some(first_ip) = forwarded.split(',').next() {
-            proxied_ip = first_ip.trim().parse::<std::net::IpAddr>().ok();
+        for ip_str in forwarded.split(',') {
+            match ip_str.trim().parse::<std::net::IpAddr>() {
+                Ok(ip) if !check_is_lan(ip) => {
+                    tracing::warn!("Blocked Nginx-proxied WAN access to chat POST: XFF chain contains {}", ip);
+                    return Err(ErrorResponse { error: "Blocked by Node Firewall: You can only send messages from the local network.".into() });
+                }
+                Ok(_) => {} // LAN IP, keep checking the rest
+                Err(_) => {
+                    // Unparseable entry in XFF — fail closed.
+                    tracing::warn!("Blocked chat POST: malformed XFF entry {:?}", ip_str.trim());
+                    return Err(ErrorResponse { error: "Blocked by Node Firewall: malformed forwarding header.".into() });
+                }
+            }
         }
-    } else if let Some(real_ip) = headers.get("x-real-ip").and_then(|h| h.to_str().ok()) {
-        proxied_ip = real_ip.trim().parse::<std::net::IpAddr>().ok();
     }
 
-    if let Some(client_ip) = proxied_ip {
-        if !check_is_lan(client_ip) {
-            tracing::warn!("Blocked Nginx-proxied WAN access to chat POST from {}", client_ip);
-            return Err(ErrorResponse { error: "Blocked by Node Firewall: You can only send messages from the local network.".into() });
+    // X-Real-IP is set by Nginx itself (single value), so check it independently.
+    if let Some(real_ip) = headers.get("x-real-ip").and_then(|h| h.to_str().ok()) {
+        match real_ip.trim().parse::<std::net::IpAddr>() {
+            Ok(ip) if !check_is_lan(ip) => {
+                tracing::warn!("Blocked Nginx-proxied WAN access to chat POST from X-Real-IP {}", ip);
+                return Err(ErrorResponse { error: "Blocked by Node Firewall: You can only send messages from the local network.".into() });
+            }
+            Ok(_) | Err(_) => {} // LAN or unparseable; XFF was the authoritative check above
         }
     }
     // -----------------------------------------

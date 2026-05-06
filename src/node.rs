@@ -43,33 +43,51 @@ const BATCH_LOOKAHEAD: usize = 3;
 
 const MAX_PREFETCH_BUFFER: usize = 32;
 
-//chat dictionary
+// 256-word max capacity chat dictionary (fits exactly in u8 indices 0-255)
 pub const CHAT_DICTIONARY: &[&str] = &[
-    // --- Social / Basic ---
-    "Hello", "Goodbye", "Yes", "No", "Thanks", "Please", 
-    "gm", "gn", "lol", "LFG", "WAGMI", "?", "!",
-    
-    // --- Node / Network Nouns ---
-    "Node", "Miner", "Peer", "Network", "Mempool", "Block", 
-    "Fork", "Reorg", "Relay", "NAT", "Port", "Bug", "Update", 
-    "Chain", "Hash", "Target", "Difficulty", "Transactions",
-    
-    // --- Status / Verbs ---
-    "Syncing", "Mined", "Updating", "Restarting", "Waiting", 
-    "Checking", "Found", "Lost", "Need", "Help", "Stop", 
-    "Start", "Connecting", "Disconnected", "Stuck",
-    
-    // --- Adjectives / Qualifiers ---
-    "Good", "Bad", "Fast", "Slow", "Full", "Empty", 
-    "High", "Low", "Urgent", "Fixed", "Ready", "Online", 
-    "Offline", "Here", "There", "My", "Your", "All",
-    
-    // --- Numbers (For Heights, Peers, etc.) ---
-    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", 
-    "20", "50", "100", "500", "1000", "10000", "50000", "100000",
-    
-    // --- Conjunctions / Prepositions ---
-    "At", "To", "From", "Is", "Are", "And", "Or", "Not", "With"
+    // 0-19: Greetings & Slang
+    "Hello", "Goodbye", "Yes", "No", "Thanks", "Please", "gm", "gn", "lol", "lmao",
+    "LFG", "WAGMI", "NGMI", "ser", "fren", "anon", "mate", "based", "wtf", "omg",
+
+    // 20-39: Pronouns & Questions
+    "I", "You", "We", "They", "He", "She", "It", "This", "That", "Who",
+    "What", "Where", "When", "Why", "How", "Which", "Whose", "My", "Your", "Our",
+
+    // 40-79: Verbs
+    "Is", "Are", "Was", "Were", "Be", "Have", "Has", "Had", "Do", "Does",
+    "Did", "Will", "Can", "Could", "Should", "Would", "Make", "Go", "Stop", "Wait",
+    "See", "Look", "Send", "Receive", "Buy", "Sell", "Build", "Break", "Fix", "Run",
+    "Sync", "Mine", "Hash", "Mix", "Join", "Check", "Update", "Restart", "Connect", "Drop",
+
+    // 80-129: Tech, Crypto & Node Nouns
+    "Node", "Peer", "Network", "Mempool", "Block", "Fork", "Reorg", "Relay", "NAT", "Port",
+    "Bug", "Chain", "Target", "Difficulty", "Transactions", "Midstate", "Axe", "Miner", "WOTS", "MSS",
+    "SMT", "Seed", "Keys", "Wallet", "Price", "Fiat", "Moon", "Pump", "Dump", "Bull",
+    "Bear", "DEX", "CEX", "Code", "Rust", "Server", "Client", "IP", "WebRTC", "UTXO",
+    "Fee", "Hashrate", "Shares", "Pool", "Hardware", "Software", "Linux", "Pi", "Data", "Disk",
+
+    // 130-169: Adjectives & Adverbs
+    "Good", "Bad", "Fast", "Slow", "Full", "Empty", "High", "Low", "Urgent", "Ready",
+    "Online", "Offline", "Hot", "Cold", "Big", "Small", "Hard", "Easy", "Safe", "Risky",
+    "True", "False", "Up", "Down", "Here", "There", "Now", "Later", "Soon", "Early",
+    "Very", "Too", "Much", "Many", "More", "Less", "All", "None", "Some", "Any",
+
+    // 170-189: Prepositions & Conjunctions
+    "At", "To", "From", "And", "Or", "Not", "With", "Without", "In", "Out",
+    "On", "Off", "For", "By", "About", "As", "But", "If", "Then", "Else",
+
+    // 190-209: Time & Measurements
+    "Today", "Tomorrow", "Yesterday", "Second", "Minute", "Hour", "Day", "Week", "Month", "Year",
+    "Time", "Morning", "Night", "Always", "Never", "Sometimes", "Before", "After", "Again", "Done",
+
+    // 210-234: Numbers
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "10", "20", "50", "100", "200", "500", "1000", "5000", "10000", "50000",
+    "100000", "1M", "10M", "100M", "1B",
+
+    // 235-255: Punctuation & Emojis (21 items)
+    "?", "!", ".", ",", "...", ":)", ":(", "ok", "ok.", "no.",
+    "🔥", "🚀", "💀", "💎", "👀", "🤝", "📈", "📉", "⚡", "⚠️", "✅"
 ];
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -257,7 +275,11 @@ pub struct Node {
     state_cache: VecDeque<(u64, State)>,
     
     chat_history: Arc<RwLock<VecDeque<ChatMessage>>>,
-    seen_chats: HashSet<(PeerId, u64)>,
+    seen_chats: HashSet<u64>,
+    seen_chats_queue: VecDeque<u64>,
+    
+    outbox_chat_limiter: Arc<tokio::sync::Mutex<(u32, std::time::Instant)>>,
+    light_chat_limits: Arc<tokio::sync::Mutex<std::collections::HashMap<PeerId, (u32, std::time::Instant)>>>,
     
     /// Fallback peers to dial if we suffer a total network eclipse
     bootstrap_peers: Vec<String>,
@@ -281,6 +303,7 @@ pub struct NodeHandle {
     local_peer_id: PeerId,
     pub chat_history: Arc<RwLock<VecDeque<ChatMessage>>>,
     pub outbox_chat_limiter: Arc<tokio::sync::Mutex<(u32, std::time::Instant)>>,
+    pub light_chat_limits: Arc<tokio::sync::Mutex<std::collections::HashMap<PeerId, (u32, std::time::Instant)>>>,
 }
 
 pub enum NodeCommand {
@@ -320,7 +343,8 @@ pub enum NodeCommand {
     BroadcastLightPush(crate::network::light_protocol::LightNotification),
     SendResponse { channel: libp2p::request_response::ResponseChannel<crate::network::Message>, msg: crate::network::Message },
     SendChat { reply_to: Option<u64>, words: Vec<u8> },   
-    BroadcastP2PChat { nonce: u64, reply_to: Option<u64>, words: Vec<u8> },
+    BroadcastP2PChat { sender: String, nonce: u64, reply_to: Option<u64>, words: Vec<u8> },
+
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -1037,6 +1061,9 @@ pub async fn new(
             bootstrap_peers: bootstrap_strings, // <-- Uses the variable we created above
             chat_history: Arc::new(RwLock::new(VecDeque::new())),
             seen_chats: HashSet::new(),
+            seen_chats_queue: VecDeque::with_capacity(5001),
+            outbox_chat_limiter: Arc::new(tokio::sync::Mutex::new((0, std::time::Instant::now()))),
+            light_chat_limits: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -1587,7 +1614,7 @@ async fn handle_light_request(
                 LightResponse::success(serde_json::json!({ "next_index": chain_max.max(mempool_max) }))
             }
             
-            LightRequest::SendChat { reply_to, words } => { // <-- ADD reply_to
+            LightRequest::SendChat { reply_to, words } => {
                 if words.is_empty() || words.len() > 10 {
                     return LightResponse::error("Message must be between 1 and 10 words");
                 }
@@ -1595,7 +1622,42 @@ async fn handle_light_request(
                     return LightResponse::error("Invalid word index");
                 }
 
-                let nonce = rand::random();
+                // Per-light-client rate limit: 5 chats per 10s per PeerId.
+                {
+                    let mut limits = self.light_chat_limits.lock().await;
+                    let now = std::time::Instant::now();
+
+                    // Bound memory: when the map gets large, drop entries idle for >60s.
+                    if limits.len() > 1000 {
+                        limits.retain(|_, (_, ts)| now.duration_since(*ts).as_secs() < 60);
+                    }
+
+                    let entry = limits.entry(from).or_insert((0, now));
+                    if now.duration_since(entry.1).as_secs() >= 10 {
+                        *entry = (0, now);
+                    }
+                    entry.0 += 1;
+                    if entry.0 > 5 {
+                        return LightResponse::error("Rate limit exceeded (Max 5 per 10s).");
+                    }
+                }
+
+                // Global light-origination cap: prevents a swarm of clients from
+                // using this node to amplify into the network.
+                {
+                    let mut limiter = self.outbox_chat_limiter.lock().await;
+                    let now = std::time::Instant::now();
+                    if now.duration_since(limiter.1).as_secs() >= 10 {
+                        *limiter = (0, now);
+                    }
+                    limiter.0 += 1;
+                    if limiter.0 > 50 {
+                        return LightResponse::error("Node-wide light-client rate limit exceeded.");
+                    }
+                }
+
+                // 53 bits of entropy: perfectly safe for JS Numbers, zero chance of collision.
+                let nonce = rand::random::<u64>() % 9_007_199_254_740_991;
                 let timestamp = crate::core::state::current_timestamp();
                 let sender = from.to_string();
 
@@ -1605,7 +1667,13 @@ async fn handle_light_request(
                 drop(hist);
 
                 if let Some(cmd_tx) = &self.cmd_tx {
-                    let _ = cmd_tx.try_send(NodeCommand::BroadcastP2PChat { nonce, reply_to, words: words.clone() });
+                    // Fix #1: pass sender through so forwarders preserve identity.
+                    let _ = cmd_tx.try_send(NodeCommand::BroadcastP2PChat {
+                        sender: sender.clone(),
+                        nonce,
+                        reply_to,
+                        words: words.clone(),
+                    });
                     let notif = crate::network::light_protocol::LightNotification::ChatMessage {
                         sender, timestamp, nonce, reply_to, words
                     };
@@ -1621,6 +1689,29 @@ async fn handle_light_request(
 
     pub fn local_peer_id(&self) -> PeerId {
         self.network.local_peer_id()
+    }
+
+    /// Mark a chat nonce as seen. Returns `true` if it was novel (caller should
+    /// process and rebroadcast), `false` if it was already in the dedup cache.
+    ///
+    /// Maintains a strict 5000-entry FIFO: when full, the oldest nonce is
+    /// evicted from BOTH the set and the queue. This guarantees that recent
+    /// chats are always recognized as duplicates, preventing the broadcast-storm
+    /// failure mode where a `.clear()` would let still-circulating gossip
+    /// re-enter the network.
+    fn mark_chat_seen(&mut self, nonce: u64) -> bool {
+        const CHAT_DEDUP_CAPACITY: usize = 5000;
+
+        if !self.seen_chats.insert(nonce) {
+            return false;
+        }
+        self.seen_chats_queue.push_back(nonce);
+        if self.seen_chats_queue.len() > CHAT_DEDUP_CAPACITY {
+            if let Some(old) = self.seen_chats_queue.pop_front() {
+                self.seen_chats.remove(&old);
+            }
+        }
+        true
     }
 
     /// Evaluates if the node is ready to mine, and spawns the task if so.
@@ -1656,7 +1747,8 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
             metrics: self.metrics.clone(),
             local_peer_id: self.network.local_peer_id(),
             chat_history: Arc::clone(&self.chat_history),
-            outbox_chat_limiter: Arc::new(tokio::sync::Mutex::new((0, std::time::Instant::now()))),
+            outbox_chat_limiter: Arc::clone(&self.outbox_chat_limiter),
+            light_chat_limits: Arc::clone(&self.light_chat_limits),
         };
         (handle, rx)
     }
@@ -1814,9 +1906,6 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                     self.mix_manager.write().await.cleanup();
                     // Light client: GC stale rate-limiter entries
                     self.network.gc_stale_light_peers().await;
-                    if self.seen_chats.len() > 5000 {
-                        self.seen_chats.clear();
-                    }
                 }
                 _ = stem_flush_interval.tick() => {
                     self.flush_stem_pool();
@@ -2030,7 +2119,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                             self.network.respond(channel, msg);
                         }
                         NodeCommand::SendChat { reply_to, words } => {
-                            let nonce = rand::random();
+                            let nonce = rand::random::<u32>() as u64;  // Fix #2
                             let timestamp = crate::core::state::current_timestamp();
                             let sender = self.network.local_peer_id().to_string();
 
@@ -2039,17 +2128,22 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                             if hist.len() > 100 { hist.pop_front(); }
                             drop(hist);
 
-                            self.seen_chats.insert((self.network.local_peer_id(), nonce));
-                            self.network.broadcast(Message::Chat { nonce, reply_to, words: words.clone() });
+                             self.mark_chat_seen(nonce);
+                            self.network.broadcast(Message::Chat {
+                                sender: sender.clone(),
+                                nonce,
+                                reply_to,
+                                words: words.clone(),
+                            });
 
                             let notif = crate::network::light_protocol::LightNotification::ChatMessage {
                                 sender, timestamp, nonce, reply_to, words
                             };
                             self.network.broadcast_light_push(&notif);
                         }
-                        NodeCommand::BroadcastP2PChat { nonce, reply_to, words } => {
-                            self.seen_chats.insert((self.network.local_peer_id(), nonce));
-                            self.network.broadcast(Message::Chat { nonce, reply_to, words });
+                        NodeCommand::BroadcastP2PChat { sender, nonce, reply_to, words } => {
+                            self.mark_chat_seen(nonce);
+                            self.network.broadcast(Message::Chat { sender, nonce, reply_to, words });
                         }
                     }
                 }
@@ -2646,43 +2740,71 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                     }
                 }
             }
-            Message::Chat { nonce, reply_to, words } => { 
+            Message::Chat { sender, nonce, reply_to, words } => {
                 self.ack(channel);
 
+                // Cheap structural validation first — drop malformed gossip
+                // before it can affect dedup or rate-limit accounting.
+                if words.len() > 10 || words.iter().any(|&w| (w as usize) >= CHAT_DICTIONARY.len()) {
+                    return Ok(());
+                }
+                if sender.len() > 128 {
+                    return Ok(());
+                }
+
+                // Nonce-only dedup with bounded FIFO eviction. Drop duplicate
+                // forwards before they burn rate-limit budget or pollute history.
+                if !self.mark_chat_seen(nonce) {
+                    return Ok(());
+                }
+
+                // Fix #3: per-peer forwarding limit applies only to *novel* messages.
+                // Raised from 5 to 100 because well-connected nodes legitimately
+                // forward gossip on behalf of the whole network.
                 let now = std::time::Instant::now();
                 let entry = self.peer_chat_counts.entry(from).or_insert((0, now));
-                if now.duration_since(entry.1).as_secs() >= 10 { 
-                    *entry = (0, now); 
+                if now.duration_since(entry.1).as_secs() >= 10 {
+                    *entry = (0, now);
                 }
                 entry.0 += 1;
-                if entry.0 > 5 { 
-                    tracing::debug!("Chat rate limit exceeded by peer {}", from);
-                    return Ok(()); 
+                if entry.0 > 100 {
+                    tracing::debug!("Chat forwarding rate limit exceeded by peer {}", from);
+                    // Important: we already inserted into seen_chats above. That's
+                    // fine — dropping the message everywhere is the right outcome
+                    // for a misbehaving peer.
+                    return Ok(());
                 }
 
-                if self.seen_chats.insert((from, nonce)) {
-                    if words.len() <= 10 && words.iter().all(|&w| (w as usize) < CHAT_DICTIONARY.len()) {
-                        let timestamp = crate::core::state::current_timestamp();
-                        let sender_str = from.to_string();
-                        
-                        let mut hist = self.chat_history.write().await;
-                        hist.push_back(ChatMessage { sender: sender_str.clone(), timestamp, nonce, reply_to, words: words.clone() });
-                        if hist.len() > 100 { hist.pop_front(); }
-                        drop(hist);
+                let timestamp = crate::core::state::current_timestamp();
 
-                        self.network.broadcast_except(Some(from), Message::Chat { nonce, reply_to, words: words.clone() });
+                let mut hist = self.chat_history.write().await;
+                hist.push_back(ChatMessage {
+                    sender: sender.clone(),
+                    timestamp,
+                    nonce,
+                    reply_to,
+                    words: words.clone(),
+                });
+                if hist.len() > 100 { hist.pop_front(); }
+                drop(hist);
 
-                        let notif = crate::network::light_protocol::LightNotification::ChatMessage {
-                            sender: sender_str,
-                            timestamp,
-                            nonce,
-                            reply_to,
-                            words,
-                        };
-                        if let Some(tx) = &self.cmd_tx {
-                            let _ = tx.try_send(NodeCommand::BroadcastLightPush(notif));
-                        }
-                    }
+                // Fix #1: preserve original sender on rebroadcast.
+                self.network.broadcast_except(Some(from), Message::Chat {
+                    sender: sender.clone(),
+                    nonce,
+                    reply_to,
+                    words: words.clone(),
+                });
+
+                let notif = crate::network::light_protocol::LightNotification::ChatMessage {
+                    sender,
+                    timestamp,
+                    nonce,
+                    reply_to,
+                    words,
+                };
+                if let Some(tx) = &self.cmd_tx {
+                    let _ = tx.try_send(NodeCommand::BroadcastLightPush(notif));
                 }
             }
             
