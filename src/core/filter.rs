@@ -1,4 +1,5 @@
 use crate::core::types::{Batch, Transaction, hash_concat};
+use std::collections::HashSet;
 
 /// False Positive Rate = 1 / FPR_INVERSE (1 in 1,000,000)
 const FPR_INVERSE: u64 = 1_000_000;
@@ -10,39 +11,48 @@ pub struct CompactFilter {
 }
 
 impl CompactFilter {
-    /// Build a Golomb-Coded Set filter for a given Batch
-    pub fn build(batch: &Batch) -> Self {
-        let mut items = Vec::new();
-
-        // 1. Extract all identifiable elements from the batch
+    
+    /// Returns the canonical set of items that `build` will fold into the
+    /// filter for `batch`. The element count is `items_in(batch).len()`.
+    /// 
+    /// Single source of truth: `build` should call this internally, and any
+    /// caller that needs the count alongside the filter (light client push,
+    /// GetFilters RPC) should call it here. Drift between filter contents
+    /// and reported element count is a consensus break for light clients.
+    pub fn items_in(batch: &Batch) -> HashSet<[u8; 32]> {
+        let mut items = HashSet::new();
         for tx in &batch.transactions {
             match tx {
                 Transaction::Commit { commitment, .. } => {
-                    items.push(*commitment);
+                    items.insert(*commitment);
                 }
-                Transaction::Reveal { inputs, outputs, .. } | Transaction::Consolidate { inputs, outputs, .. } => {
+                Transaction::Reveal { inputs, outputs, .. }
+                | Transaction::Consolidate { inputs, outputs, .. } => {
                     for input in inputs {
-                        items.push(input.coin_id());
-                        items.push(input.predicate.address());
+                        items.insert(input.coin_id());
+                        items.insert(input.predicate.address());
                     }
                     for output in outputs {
                         if let Some(cid) = output.coin_id() {
-                            items.push(cid);
+                            items.insert(cid);
                         }
-                        items.push(output.address());
+                        items.insert(output.address());
                     }
                 }
             }
         }
         for cb in &batch.coinbase {
-            items.push(cb.coin_id());
-            items.push(cb.address);
+            items.insert(cb.coin_id());
+            items.insert(cb.address);
         }
-
-        // Deduplicate
-        items.sort();
-        items.dedup();
-
+        items
+    }
+    
+    /// Build a Golomb-Coded Set filter for a given Batch
+    pub fn build(batch: &Batch) -> Self {
+        // 1. Get the canonical item set. HashSet already deduplicates, so the
+        // explicit sort+dedup the old code did is now subsumed by collection.
+        let items = Self::items_in(batch);
         let n = items.len() as u64;
         if n == 0 {
             return Self { data: vec![] };

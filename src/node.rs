@@ -239,7 +239,7 @@ pub struct NodeHandle {
 }
 
 pub enum NodeCommand {
-    SubmitMinedBlock(Batch),
+    SubmitMinedBlock(Batch, Option<tokio::sync::oneshot::Sender<Result<(), String>>>),
     SendTransaction(Transaction),
     SubmitMixTransaction { mix_id: [u8; 32], tx: Transaction },
     // --- P2P Mix Coordination Commands ---
@@ -327,172 +327,35 @@ impl NodeHandle {
     /// validates the miner's coinbase, computes state_root and mining
     /// midstate, and returns everything the miner needs to search nonces.
     pub async fn build_block_template(
-        &self,
-        req: crate::rpc::types::BlockTemplateRequest,
+    &self,
+    req: crate::rpc::types::BlockTemplateRequest,
     ) -> Result<crate::rpc::types::BlockTemplateResponse, axum::response::Response> {
-        use crate::core::transaction::apply_transaction;
         use axum::http::StatusCode;
         use axum::Json;
         use axum::response::IntoResponse;
 
-                let state = self.state.read().await;
-        let mut candidate = state.clone();
-        let v2 = crate::core::types::is_v2_at(candidate.height);
-        let height = state.height;
-        let target = state.target;
-        let prev_midstate = state.midstate;
-        let prev_header_hash = state.header_hash; // <-- Extract before drop
-        let state_timestamp = state.timestamp;    // <-- Extract before drop
-        drop(state);
-
+        // Take consistent snapshots of state and mempool, then drop the locks
+        // before any work — template construction is pure CPU and we don't want
+        // to hold the state lock across it.
+        let state       = self.state.read().await.clone();
         let mempool_txs = self.mempool_txs.read().await.clone();
 
-        // Select valid mempool transactions
-        let mut total_fees: u64 = 0;
-        let mut transactions = Vec::new();
-        let mut current_inputs = 0;
-        let mut current_outputs = 0;
-        let mut consolidated_addresses = std::collections::HashSet::new();
-        
-        // --- BYTE TRACKING ---
-        let mut current_bytes = 0u64;
-        const MAX_BLOCK_BYTES: u64 = 8_000_000; // 8 MB safety limit (leaves 2MB for P2P overhead)
-        // -------------------------
-
-        // Enforce the Canonical Block Ordering rules by selecting from split mempool structure
-        let mut pending_commits = Vec::new();
-        let mut pending_reveals = Vec::new();
-        
-        for tx in mempool_txs {
-            match tx {
-                Transaction::Commit { .. } => pending_commits.push(tx),
-                Transaction::Reveal { .. } | Transaction::Consolidate { .. } => pending_reveals.push(tx),
+        build_block_template_inner(&state, mempool_txs, &req).map_err(|e| match e {
+            BlockTemplateError::InvalidCoinbase(msg) => {
+                (StatusCode::BAD_REQUEST,
+                 Json(serde_json::json!({ "error": msg })))
+                    .into_response()
             }
-        }
-
-        for tx in pending_commits.into_iter().take(crate::core::MAX_BATCH_COMMITS) {
-            // Check size before applying
-            let tx_bytes = bincode::serialized_size(&tx).unwrap_or(0) as u64;
-            if current_bytes + tx_bytes > MAX_BLOCK_BYTES { continue; }
-
-            if let Ok(_) = apply_transaction(&mut candidate, &tx) {
-                total_fees += tx.fee(); 
-                current_bytes += tx_bytes; // Track size
-                transactions.push(tx);
-            }
-        }
-
-        for tx in pending_reveals.into_iter().take(crate::core::MAX_BATCH_REVEALS) {
-            // Check size before applying
-            let tx_bytes = bincode::serialized_size(&tx).unwrap_or(0) as u64;
-            if current_bytes + tx_bytes > MAX_BLOCK_BYTES { continue; }
-
-            match &tx {
-                Transaction::Reveal { inputs, outputs, .. } => {
-                    if current_inputs + inputs.len() > crate::core::MAX_BATCH_INPUTS { continue; }
-                    if current_outputs + outputs.len() > crate::core::MAX_BATCH_OUTPUTS { continue; }
-                }
-                Transaction::Consolidate { inputs, outputs, .. } => {
-                    let addr = inputs[0].predicate.address();
-                    if consolidated_addresses.contains(&addr) { continue; }
-                    if current_inputs + 1 > crate::core::MAX_BATCH_INPUTS { continue; }
-                    if current_outputs + outputs.len() > crate::core::MAX_BATCH_OUTPUTS { continue; }
-                }
-                _ => continue,
-            }
-            
-            if let Ok(_) = apply_transaction(&mut candidate, &tx) {
-                match &tx {
-                    Transaction::Reveal { inputs, outputs, .. } => {
-                        current_inputs += inputs.len();
-                        current_outputs += outputs.len();
+            BlockTemplateError::CoinbaseTotalMismatch { expected_total, block_reward, total_fees } => {
+                (StatusCode::CONFLICT, Json(
+                    crate::rpc::types::BlockTemplateMismatchError {
+                        error: "Coinbase total mismatch".into(),
+                        expected_total,
+                        block_reward,
+                        total_fees,
                     }
-                    Transaction::Consolidate { inputs, outputs, .. } => {
-                        consolidated_addresses.insert(inputs[0].predicate.address());
-                        current_inputs += 1;
-                        current_outputs += outputs.len();
-                    }
-                    _ => {}
-                }
-                total_fees += tx.fee();
-                current_bytes += tx_bytes; // Track size
-                transactions.push(tx);
+                )).into_response()
             }
-        }
-
-        // Parse and validate coinbase
-        let reward = block_reward(height);
-        let expected_total = reward + total_fees;
-        let mut coinbase = Vec::with_capacity(req.coinbase.len());
-        let mut coinbase_total: u64 = 0;
-
-        for cb in &req.coinbase {
-            let mut address = [0u8; 32];
-            let mut salt = [0u8; 32];
-            if hex::decode_to_slice(&cb.address, &mut address).is_err()
-                || hex::decode_to_slice(&cb.salt, &mut salt).is_err()
-                || cb.value == 0 || !cb.value.is_power_of_two()
-            {
-                return Err((StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "Invalid coinbase output"}))).into_response());
-            }
-            coinbase_total += cb.value;
-            coinbase.push(CoinbaseOutput { address, value: cb.value, salt });
-        }
-
-        if coinbase_total != expected_total {
-            return Err((StatusCode::CONFLICT, Json(
-                crate::rpc::types::BlockTemplateMismatchError {
-                    error: "Coinbase total mismatch".into(),
-                    expected_total,
-                    block_reward: reward,
-                    total_fees,
-                }
-            )).into_response());
-        }
-
-        // Compute mining midstate
-        for cb in &coinbase {
-            candidate.midstate = hash_concat(&candidate.midstate, &cb.coin_id());
-            candidate.coins.insert(cb.coin_id(), v2);
-        }
-
-        let smt_root = hash_concat(&candidate.coins.root(v2), &candidate.commitments.root(v2));
-        let state_root = hash_concat(&smt_root, &candidate.chain_mmr.root(v2));
-        candidate.midstate = hash_concat(&candidate.midstate, &state_root);
-
-        let min_timestamp = state_timestamp + 1; // <-- Use extracted variable
-        let actual_timestamp = crate::core::state::current_timestamp().max(min_timestamp);
-
-        let candidate_header = BatchHeader {
-            height,
-            prev_header_hash, // <-- Use extracted variable
-            prev_midstate,
-            post_tx_midstate: candidate.midstate,
-            extension: Extension { nonce: 0, final_hash: [0u8; 32] },
-            timestamp: actual_timestamp,
-            target,
-            state_root,
-        };
-        let mining_hash = crate::core::types::compute_header_hash(&candidate_header);
-
-        let batch = Batch {
-            prev_midstate,
-            prev_header_hash, // <-- Fixes E0063
-            transactions,
-            extension: Extension { nonce: 0, final_hash: [0u8; 32] },
-            coinbase,
-            timestamp: actual_timestamp,
-            target,
-            state_root,
-        };
-
-        Ok(crate::rpc::types::BlockTemplateResponse {
-            mining_midstate: hex::encode(mining_hash), // Web miner grinds on the HEADER hash now
-            target: hex::encode(target),
-            batch_template: serde_json::to_value(&batch).unwrap(),
-            total_fees,
-            block_reward: reward,
         })
     }
 
@@ -511,7 +374,7 @@ impl NodeHandle {
         Ok(())
     }
     pub fn submit_mined_block(&self, batch: crate::core::Batch) -> anyhow::Result<()> {
-        self.tx_sender.try_send(NodeCommand::SubmitMinedBlock(batch))
+        self.tx_sender.try_send(NodeCommand::SubmitMinedBlock(batch, None))
             .map_err(|e| anyhow::anyhow!("Node is currently overloaded: {}", e))?;
         Ok(())
     }
@@ -726,6 +589,219 @@ pub fn scan_txs_for_mss_index(txs: &[Transaction], master_pk: &[u8; 32]) -> u64 
     max_idx
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+//  Block template assembly — single source of truth
+// ───────────────────────────────────────────────────────────────────────────
+//
+// Both the HTTP RPC (`NodeHandle::build_block_template`) and the WebRTC light
+// protocol (`LightRequest::BlockTemplate`) build mining templates from the
+// same chain state and mempool. They MUST produce byte-identical templates for
+// the same inputs — historically they drifted, and the WebRTC path silently
+// returned `post_tx_midstate` as `mining_midstate` while the HTTP path was
+// upgraded to return `compute_header_hash(&header)`. Every block mined by the
+// web wallet over WebRTC then failed verification on the node side.
+//
+// To prevent that recurring, all template assembly lives in
+// `build_block_template_inner` below. The two callers do their own state
+// acquisition (read-locking vs direct access) and map the typed error to
+// their respective response idioms (axum vs LightResponse).
+
+/// Error variants returned by `build_block_template_inner`. Both call sites
+/// translate these into their own response format.
+#[derive(Debug)]
+pub enum BlockTemplateError {
+    /// A coinbase output was malformed (bad hex, zero value, or non-power-of-two
+    /// denomination). Maps to HTTP 400 / LightResponse error.
+    InvalidCoinbase(&'static str),
+
+    /// The supplied coinbase total didn't equal `block_reward + total_fees`.
+    /// The current totals are returned so the caller can rebuild and retry
+    /// without having to re-read state. Maps to HTTP 409.
+    CoinbaseTotalMismatch {
+        expected_total: u64,
+        block_reward: u64,
+        total_fees: u64,
+    },
+}
+
+/// Build a block template from a state snapshot, a mempool snapshot, and the
+/// miner's coinbase request. Pure function — no I/O, no locking.
+///
+/// The miner must grind nonces against the returned `mining_midstate`, which
+/// is `compute_header_hash(&candidate_header)`. This is the same input the
+/// consensus layer feeds to `verify_extension` (`state.rs ~472`), so a valid
+/// nonce here will validate on receipt.
+pub fn build_block_template_inner(
+    state: &State,
+    mempool_txs: Vec<Transaction>,
+    req: &crate::rpc::types::BlockTemplateRequest,
+) -> Result<crate::rpc::types::BlockTemplateResponse, BlockTemplateError> {
+    let mut candidate = state.clone();
+    let v2 = crate::core::types::is_v2_at(candidate.height);
+    let height = state.height;
+    let target = state.target;
+    let prev_midstate = state.midstate;
+    let prev_header_hash = state.header_hash;
+    let state_timestamp = state.timestamp;
+
+    // ── Mempool selection ────────────────────────────────────────────────
+    //
+    // Canonical block ordering: all Commits first, then Reveals/Consolidates.
+    // Track block size in bytes, per-batch input/output counts, and dedup
+    // Consolidate addresses (one consolidation per address per block).
+
+    let mut total_fees: u64 = 0;
+    let mut transactions = Vec::new();
+    let mut current_inputs = 0usize;
+    let mut current_outputs = 0usize;
+    let mut consolidated_addresses = std::collections::HashSet::new();
+    let mut current_bytes = 0u64;
+    const MAX_BLOCK_BYTES: u64 = 8_000_000; // 8 MB; leaves 2 MB for P2P overhead
+
+    let mut pending_commits = Vec::new();
+    let mut pending_reveals = Vec::new();
+    for tx in mempool_txs {
+        match tx {
+            Transaction::Commit { .. } => pending_commits.push(tx),
+            Transaction::Reveal { .. } | Transaction::Consolidate { .. } => pending_reveals.push(tx),
+        }
+    }
+
+    for tx in pending_commits.into_iter().take(crate::core::MAX_BATCH_COMMITS) {
+        let tx_bytes = bincode::serialized_size(&tx).unwrap_or(0) as u64;
+        if current_bytes + tx_bytes > MAX_BLOCK_BYTES { continue; }
+
+        if apply_transaction(&mut candidate, &tx).is_ok() {
+            total_fees    += tx.fee();
+            current_bytes += tx_bytes;
+            transactions.push(tx);
+        }
+    }
+
+    for tx in pending_reveals.into_iter().take(crate::core::MAX_BATCH_REVEALS) {
+        let tx_bytes = bincode::serialized_size(&tx).unwrap_or(0) as u64;
+        if current_bytes + tx_bytes > MAX_BLOCK_BYTES { continue; }
+
+        match &tx {
+            Transaction::Reveal { inputs, outputs, .. } => {
+                if current_inputs  + inputs.len()  > crate::core::MAX_BATCH_INPUTS  { continue; }
+                if current_outputs + outputs.len() > crate::core::MAX_BATCH_OUTPUTS { continue; }
+            }
+            Transaction::Consolidate { inputs, outputs, .. } => {
+                let addr = inputs[0].predicate.address();
+                if consolidated_addresses.contains(&addr)            { continue; }
+                if current_inputs  + 1            > crate::core::MAX_BATCH_INPUTS  { continue; }
+                if current_outputs + outputs.len() > crate::core::MAX_BATCH_OUTPUTS { continue; }
+            }
+            _ => continue,
+        }
+
+        if apply_transaction(&mut candidate, &tx).is_ok() {
+            match &tx {
+                Transaction::Reveal { inputs, outputs, .. } => {
+                    current_inputs  += inputs.len();
+                    current_outputs += outputs.len();
+                }
+                Transaction::Consolidate { inputs, outputs, .. } => {
+                    consolidated_addresses.insert(inputs[0].predicate.address());
+                    current_inputs  += 1;
+                    current_outputs += outputs.len();
+                }
+                _ => {}
+            }
+            total_fees    += tx.fee();
+            current_bytes += tx_bytes;
+            transactions.push(tx);
+        }
+    }
+
+    // ── Coinbase validation ──────────────────────────────────────────────
+
+    let reward = block_reward(height);
+    let expected_total = reward + total_fees;
+    let mut coinbase = Vec::with_capacity(req.coinbase.len());
+    let mut coinbase_total: u64 = 0;
+
+    for cb in &req.coinbase {
+        let mut address = [0u8; 32];
+        let mut salt    = [0u8; 32];
+        if hex::decode_to_slice(&cb.address, &mut address).is_err()
+            || hex::decode_to_slice(&cb.salt, &mut salt).is_err()
+            || cb.value == 0
+            || !cb.value.is_power_of_two()
+        {
+            return Err(BlockTemplateError::InvalidCoinbase("Invalid coinbase output"));
+        }
+        coinbase_total += cb.value;
+        coinbase.push(CoinbaseOutput { address, value: cb.value, salt });
+    }
+
+    if coinbase_total != expected_total {
+        return Err(BlockTemplateError::CoinbaseTotalMismatch {
+            expected_total,
+            block_reward: reward,
+            total_fees,
+        });
+    }
+
+    // ── Fold coinbase into midstate, then absorb state_root ──────────────
+
+    for cb in &coinbase {
+        candidate.midstate = hash_concat(&candidate.midstate, &cb.coin_id());
+        candidate.coins.insert(cb.coin_id(), v2);
+    }
+
+    let smt_root  = hash_concat(&candidate.coins.root(v2), &candidate.commitments.root(v2));
+    let state_root = hash_concat(&smt_root, &candidate.chain_mmr.root(v2));
+    candidate.midstate = hash_concat(&candidate.midstate, &state_root);
+
+    // Lock the timestamp now: it's a header field, so the miner cannot bump
+    // it post-grind without invalidating the header hash they searched on.
+    let min_timestamp    = state_timestamp + 1;
+    let actual_timestamp = crate::core::state::current_timestamp().max(min_timestamp);
+
+    // ── Build the BatchHeader the consensus layer will reconstruct ───────
+    //
+    // The miner MUST grind on compute_header_hash(&candidate_header) — NOT on
+    // post_tx_midstate. verify_extension recomputes from the header hash on
+    // receipt; if they differ, the hash chain doesn't match and the block is
+    // dropped. This is the bug that silently rejected every block the web
+    // wallet ever mined over WebRTC.
+
+    let candidate_header = BatchHeader {
+        height,
+        prev_header_hash,
+        prev_midstate,
+        post_tx_midstate: candidate.midstate,
+        extension: Extension { nonce: 0, final_hash: [0u8; 32] },
+        timestamp: actual_timestamp,
+        target,
+        state_root,
+    };
+    let mining_hash = crate::core::types::compute_header_hash(&candidate_header);
+
+    let batch = Batch {
+        prev_midstate,
+        prev_header_hash,
+        transactions,
+        extension: Extension { nonce: 0, final_hash: [0u8; 32] },
+        coinbase,
+        timestamp: actual_timestamp,
+        target,
+        state_root,
+    };
+
+    Ok(crate::rpc::types::BlockTemplateResponse {
+        mining_midstate: hex::encode(mining_hash),
+        target:          hex::encode(target),
+        batch_template:  serde_json::to_value(&batch)
+            .expect("Batch is always serde-serializable"),
+        total_fees,
+        block_reward: reward,
+    })
+}
+
+
 impl Node {
 pub async fn new(
         data_dir: PathBuf,
@@ -906,6 +982,48 @@ pub async fn new(
             bootstrap_peers: bootstrap_strings, // <-- Uses the variable we created above
         })
     }
+
+
+/// Validate a user-submitted transaction from a light client, then forward
+/// it to the command channel. Updates the peer's Bayesian reputation based
+/// on the validation outcome.
+///
+/// `suppress_penalty_substr` lets the caller exempt specific error strings
+/// from triggering an adversarial-peer penalty — used by `Send` so that
+/// "commit not yet mined" doesn't get peers marked as malicious.
+async fn submit_light_transaction(
+    &self,
+    from: PeerId,
+    tx: Transaction,
+    suppress_penalty_substr: Option<&str>,
+) -> crate::network::light_protocol::LightResponse {
+    use crate::network::light_protocol::LightResponse;
+
+    match crate::core::transaction::validate_transaction(&self.state, &tx) {
+        Ok(_) => {
+            self.network.observe_honest_light_peer(from).await;
+            match &self.cmd_tx {
+                Some(cmd_tx) => {
+                    let _ = cmd_tx.try_send(NodeCommand::SendTransaction(tx));
+                    LightResponse::success(serde_json::json!({ "accepted": true }))
+                }
+                None => LightResponse::error("Node command channel unavailable"),
+            }
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            let should_penalize = match suppress_penalty_substr {
+                Some(s) => !err_str.contains(s),
+                None    => true,
+            };
+            if should_penalize {
+                self.network.observe_adversarial_light_peer(from).await;
+            }
+            LightResponse::error(err_str)
+        }
+    }
+}
+
 
 async fn process_state_rebuild(
     &mut self,
@@ -1264,29 +1382,7 @@ async fn handle_light_request(
                     for h in start_height..end {
                         match (store.load(h), store.load_filter(h)) {
                             (Ok(Some(batch)), Ok(Some(filter_data))) => {
-                                // Count elements the same way the RPC handler does
-                                let mut items = std::collections::HashSet::new();
-                                for tx in &batch.transactions {
-                                    match tx {
-                                        crate::core::Transaction::Commit { commitment, .. } => {
-                                            items.insert(*commitment);
-                                        }
-                                        crate::core::Transaction::Reveal { inputs, outputs, .. } | crate::core::Transaction::Consolidate { inputs, outputs, .. } => {
-                                            for input in inputs {
-                                                items.insert(input.coin_id());
-                                                items.insert(input.predicate.address());
-                                            }
-                                            for output in outputs {
-                                                if let Some(cid) = output.coin_id() { items.insert(cid); }
-                                                items.insert(output.address());
-                                            }
-                                        }
-                                    }
-                                }
-                                for cb in &batch.coinbase {
-                                    items.insert(cb.coin_id());
-                                    items.insert(cb.address);
-                                }
+                                let items = crate::core::filter::CompactFilter::items_in(&batch);
                                 filters.push(hex::encode(filter_data));
                                 block_hashes.push(hex::encode(batch.extension.final_hash));
                                 element_counts.push(items.len() as u64);
@@ -1326,128 +1422,61 @@ async fn handle_light_request(
                 let req: crate::rpc::types::BlockTemplateRequest = match serde_json::from_value(
                     serde_json::json!({ "coinbase": coinbase })
                 ) {
-                    Ok(r) => r,
+                    Ok(r)  => r,
                     Err(e) => return LightResponse::error(format!("Invalid coinbase: {}", e)),
                 };
 
-                let mut candidate = self.state.clone();
-                let v2 = crate::core::types::is_v2_at(candidate.height);
-                let height = self.state.height;
-                let target = self.state.target;
-                let prev_midstate = self.state.midstate;
-
                 let mempool_txs = self.mempool.transactions_cloned();
 
-                let mut total_fees: u64 = 0;
-                let mut transactions = Vec::new();
-                let mut current_inputs = 0;
-                let mut current_outputs = 0;
-
-                for tx in &mempool_txs {
-                    match tx {
-                        Transaction::Commit { .. } => {
-                            if transactions.iter().filter(|t| matches!(t, Transaction::Commit { .. })).count()
-                                >= MAX_BATCH_COMMITS { continue; }
-                            if let Ok(_) = apply_transaction(&mut candidate, tx) {
-                                total_fees += tx.fee();
-                                transactions.push(tx.clone());
-                            }
-                        }
-                        Transaction::Reveal { inputs, outputs, .. } | Transaction::Consolidate { inputs, outputs, .. } => {
-                            if transactions.iter().filter(|t| matches!(t, Transaction::Reveal { .. })).count()
-                                >= MAX_BATCH_REVEALS { continue; }
-                            if current_inputs + inputs.len() > MAX_BATCH_INPUTS { continue; }
-                            if current_outputs + outputs.len() > MAX_BATCH_OUTPUTS { continue; }
-                            if let Ok(_) = apply_transaction(&mut candidate, tx) {
-                                current_inputs += inputs.len();
-                                current_outputs += outputs.len();
-                                total_fees += tx.fee();
-                                transactions.push(tx.clone());
-                            }
+                match build_block_template_inner(&self.state, mempool_txs, &req) {
+                    Ok(resp) => match serde_json::to_value(&resp) {
+                        Ok(val) => LightResponse::success(val),
+                        Err(e)  => LightResponse::error(format!("Serialization error: {}", e)),
+                    },
+                    Err(BlockTemplateError::InvalidCoinbase(msg)) => LightResponse::error(msg),
+                    Err(BlockTemplateError::CoinbaseTotalMismatch { expected_total, block_reward, total_fees }) => {
+                        // Wire shape preserved so the wallet's existing retry loop in
+                        // worker.js (`buildMiningTemplate`) — which reads `expected_total`
+                        // out of the response body — keeps working unchanged.
+                        LightResponse {
+                            ok: false,
+                            data: Some(serde_json::json!({
+                                "error":          "Coinbase total mismatch",
+                                "expected_total": expected_total,
+                                "block_reward":   block_reward,
+                                "total_fees":     total_fees,
+                            })),
+                            error: None,
                         }
                     }
-                }
-
-                let reward = block_reward(height);
-                let expected_total = reward + total_fees;
-                let mut coinbase_out = Vec::with_capacity(req.coinbase.len());
-                let mut coinbase_total: u64 = 0;
-
-                for cb in &req.coinbase {
-                    let mut address = [0u8; 32];
-                    let mut salt = [0u8; 32];
-                    if hex::decode_to_slice(&cb.address, &mut address).is_err()
-                        || hex::decode_to_slice(&cb.salt, &mut salt).is_err()
-                        || cb.value == 0 || !cb.value.is_power_of_two()
-                    {
-                        return LightResponse::error("Invalid coinbase output");
-                    }
-                    coinbase_total += cb.value;
-                    coinbase_out.push(CoinbaseOutput { address, value: cb.value, salt });
-                }
-
-if coinbase_total != expected_total {
-                    return LightResponse {
-                        ok: false,
-                        data: Some(serde_json::json!({
-                            "error": "Coinbase total mismatch",
-                            "expected_total": expected_total,
-                            "block_reward": reward,
-                            "total_fees": total_fees,
-                        })),
-                        error: None,
-                    };
-                }
-
-                for cb in &coinbase_out {
-                    candidate.midstate = hash_concat(&candidate.midstate, &cb.coin_id());
-                    candidate.coins.insert(cb.coin_id(), v2);
-                }
-
-                let smt_root = hash_concat(&candidate.coins.root(v2), &candidate.commitments.root(v2));
-                let state_root = hash_concat(&smt_root, &candidate.chain_mmr.root(v2));
-                candidate.midstate = hash_concat(&candidate.midstate, &state_root);
-                let min_timestamp = candidate.timestamp + 1;
-                let actual_timestamp = crate::core::state::current_timestamp().max(min_timestamp);
-                let batch = Batch {
-                    prev_midstate,
-                    prev_header_hash: candidate.header_hash, // <-- Fixes E0063
-                    transactions,
-                    extension: Extension { nonce: 0, final_hash: [0u8; 32] },
-                    coinbase: coinbase_out,
-                    timestamp: actual_timestamp,
-                    target,
-                    state_root,
-                };
-
-                let resp = crate::rpc::types::BlockTemplateResponse {
-                    mining_midstate: hex::encode(candidate.midstate),
-                    target: hex::encode(target),
-                    batch_template: serde_json::to_value(&batch).unwrap(),
-                    total_fees,
-                    block_reward: reward,
-                };
-
-                match serde_json::to_value(&resp) {
-                    Ok(val) => LightResponse::success(val),
-                    Err(e) => LightResponse::error(format!("Serialization error: {}", e)),
                 }
             }
 
             LightRequest::SubmitBatch { batch } => {
-                match serde_json::from_value::<crate::core::Batch>(batch) {
-                    Ok(batch) => {
-                        // Submit via the command channel
-                        if let Some(tx) = &self.cmd_tx {
-                            match tx.try_send(NodeCommand::SubmitMinedBlock(batch)) {
-                                Ok(_) => LightResponse::success(serde_json::json!({ "accepted": true })),
-                                Err(_) => LightResponse::error("Node is currently overloaded, please try again"),
-                            }
-                        } else {
-                            LightResponse::error("Node command channel unavailable")
-                        }
-                    }
-                    Err(e) => LightResponse::error(format!("Invalid batch JSON: {}", e)),
+                let batch: crate::core::Batch = match serde_json::from_value(batch) {
+                    Ok(b)  => b,
+                    Err(e) => return LightResponse::error(format!("Invalid batch JSON: {}", e)),
+                };
+
+                let cmd_tx = match &self.cmd_tx {
+                    Some(tx) => tx.clone(),
+                    None     => return LightResponse::error("Node command channel unavailable"),
+                };
+
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+                if cmd_tx.try_send(NodeCommand::SubmitMinedBlock(batch, Some(ack_tx))).is_err() {
+                    return LightResponse::error("Node is currently overloaded, please try again");
+                }
+
+                // Bound the wait so a stuck node loop can never hang a light client.
+                // 5s is generous: handle_new_batch verifies PoW (~1ms), applies
+                // transactions, and writes the batch — all comfortably sub-second.
+                match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
+                    Ok(Ok(Ok(()))) => LightResponse::success(serde_json::json!({ "accepted": true })),
+                    Ok(Ok(Err(e))) => LightResponse::error(format!("Block rejected: {}", e)),
+                    Ok(Err(_))     => LightResponse::error("Node dropped submission ack"),
+                    Err(_)         => LightResponse::error("Block validation timed out"),
                 }
             }
 
@@ -1456,53 +1485,15 @@ if coinbase_total != expected_total {
                 if hex::decode_to_slice(&commitment, &mut commitment_bytes).is_err() {
                     return LightResponse::error("Invalid commitment hex");
                 }
-
-                let tx = crate::core::Transaction::Commit {
-                    commitment: commitment_bytes,
-                    spam_nonce,
-                };
-
-            match crate::core::transaction::validate_transaction(&self.state, &tx) {
-                    Ok(_) => {
-                        self.network.observe_honest_light_peer(from).await; // SMART GUARD REWARD
-                        if let Some(cmd_tx) = &self.cmd_tx {
-                            let _ = cmd_tx.try_send(NodeCommand::SendTransaction(tx));
-                            LightResponse::success(serde_json::json!({ "accepted": true }))
-                        } else {
-                            LightResponse::error("Node command channel unavailable")
-                        }
-                    }
-                    Err(e) => {
-                        self.network.observe_adversarial_light_peer(from).await; // SMART GUARD PENALTY
-                        LightResponse::error(format!("{}", e))
-                    }
-                }
+                let tx = Transaction::Commit { commitment: commitment_bytes, spam_nonce };
+                self.submit_light_transaction(from, tx, None).await
             }
 
             LightRequest::Send { reveal } => {
-                // Parse the reveal JSON into a Transaction::Reveal
-                // The format matches what the web wallet sends to POST /send
-                match crate::rpc::handlers::parse_reveal_json(reveal){
-                    Ok(tx) => {
-                        match crate::core::transaction::validate_transaction(&self.state, &tx) {
-                            Ok(_) => {
-                                self.network.observe_honest_light_peer(from).await; // SMART GUARD REWARD
-                                if let Some(cmd_tx) = &self.cmd_tx {
-                                    let _ = cmd_tx.try_send(NodeCommand::SendTransaction(tx));
-                                    LightResponse::success(serde_json::json!({ "accepted": true }))
-                                } else {
-                                    LightResponse::error("Node command channel unavailable")
-                                }
-                            }
-                            Err(e) => {
-                                let err_str = format!("{}", e);
-                                if !err_str.contains("No matching commitment found") {
-                                    self.network.observe_adversarial_light_peer(from).await; // SMART GUARD PENALTY
-                                }
-                                LightResponse::error(err_str)
-                            }
-                        }
-                    }
+                match crate::rpc::handlers::parse_reveal_json(reveal) {
+                    Ok(tx) => self.submit_light_transaction(
+                        from, tx, Some("No matching commitment found")
+                    ).await,
                     Err(e) => LightResponse::error(format!("Invalid reveal: {}", e)),
                 }
             }
@@ -1882,9 +1873,33 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                         NodeCommand::SendMixSign { coordinator, mix_id, input_index, signature } => {
                             self.network.send(coordinator, Message::MixSign { mix_id, input_index, signature });
                         }
-                        NodeCommand::SubmitMinedBlock(batch) => {
-                            if let Err(e) = self.handle_new_batch(batch, None).await {
-                                tracing::error!("Failed to process pool-submitted block: {}", e);
+                        NodeCommand::SubmitMinedBlock(batch, ack) => {
+                            let height_before = self.state.height;
+                            let submitted_hash = batch.extension.final_hash;
+
+                            let inner = self.handle_new_batch(batch, None).await;
+
+                            // handle_new_batch returns Ok(()) for most rejection paths (duplicate,
+                            // orphan, target mismatch, apply_batch failure). Detect actual landing
+                            // by checking whether our submitted block is now the canonical tip.
+                            let result: Result<(), String> = match inner {
+                                Err(e) => Err(e.to_string()),
+                                Ok(()) => {
+                                    if self.state.header_hash == submitted_hash {
+                                        Ok(())
+                                    } else if self.state.height > height_before {
+                                        Err("Block was not adopted as the canonical tip (lost race)".into())
+                                    } else {
+                                        Err("Block was rejected (orphan, duplicate, target mismatch, or invalid)".into())
+                                    }
+                                }
+                            };
+
+                            if let Err(ref e) = result {
+                                tracing::error!("Pool-submitted block did not land: {}", e);
+                            }
+                            if let Some(ack) = ack {
+                                let _ = ack.send(result);
                             }
                         }
                         NodeCommand::FinishSyncHeadersChunk { peer, headers, is_valid } => {
@@ -3753,27 +3768,7 @@ fn fire_batch_lookahead(&mut self) {
             if has_light_peers {
                 tokio::task::spawn_blocking(move || {
                     let filter = crate::core::filter::CompactFilter::build(&last_batch_clone);
-                    
-                    let mut items = std::collections::HashSet::new();
-                    for tx in &last_batch_clone.transactions {
-                        match tx {
-                            crate::core::Transaction::Commit { commitment, .. } => { items.insert(*commitment); }
-                            crate::core::Transaction::Reveal { inputs, outputs, .. } | crate::core::Transaction::Consolidate { inputs, outputs, .. } => {
-                                for input in inputs {
-                                    items.insert(input.coin_id());
-                                    items.insert(input.predicate.address());
-                                }
-                                for output in outputs {
-                                    if let Some(cid) = output.coin_id() { items.insert(cid); }
-                                    items.insert(output.address());
-                                }
-                            }
-                        }
-                    }
-                    for cb in &last_batch_clone.coinbase {
-                        items.insert(cb.coin_id());
-                        items.insert(cb.address);
-                    }
+                    let items  = crate::core::filter::CompactFilter::items_in(&last_batch_clone);
 
                     let notif = crate::network::light_protocol::LightNotification::NewBlockTip {
                         height: state_clone.height,
@@ -3782,9 +3777,8 @@ fn fire_batch_lookahead(&mut self) {
                         block_hash: hex::encode(last_batch_clone.extension.final_hash),
                         element_count: items.len() as u64,
                     };
-                    
-                    let _ = cmd_tx.blocking_send(NodeCommand::BroadcastLightPush(notif));
 
+                    let _ = cmd_tx.blocking_send(NodeCommand::BroadcastLightPush(notif));
                 });
             }
         }
@@ -4306,27 +4300,7 @@ fn fire_batch_lookahead(&mut self) {
                     let cmd_tx = self.cmd_tx.as_ref().unwrap().clone();
                     tokio::task::spawn_blocking(move || {
                         let filter = crate::core::filter::CompactFilter::build(&batch_clone);
-                        
-                        let mut items = std::collections::HashSet::new();
-                        for tx in &batch_clone.transactions {
-                            match tx {
-                                crate::core::Transaction::Commit { commitment, .. } => { items.insert(*commitment); }
-                                crate::core::Transaction::Reveal { inputs, outputs, .. } | crate::core::Transaction::Consolidate { inputs, outputs, .. } => {
-                                    for input in inputs {
-                                        items.insert(input.coin_id());
-                                        items.insert(input.predicate.address());
-                                    }
-                                    for output in outputs {
-                                        if let Some(cid) = output.coin_id() { items.insert(cid); }
-                                        items.insert(output.address());
-                                    }
-                                }
-                            }
-                        }
-                        for cb in &batch_clone.coinbase {
-                            items.insert(cb.coin_id());
-                            items.insert(cb.address);
-                        }
+                        let items  = crate::core::filter::CompactFilter::items_in(&batch_clone);
 
                         let notif = crate::network::light_protocol::LightNotification::NewBlockTip {
                             height: state_clone.height,
@@ -4335,10 +4309,8 @@ fn fire_batch_lookahead(&mut self) {
                             block_hash: hex::encode(batch_clone.extension.final_hash),
                             element_count: items.len() as u64,
                         };
-                        
+
                         let _ = cmd_tx.blocking_send(NodeCommand::BroadcastLightPush(notif));
-
-
                     });
                 }
             }
@@ -4750,27 +4722,7 @@ async fn try_apply_orphans(&mut self) {
                     // We build the filter and count elements in the background, entirely avoiding main-thread CPU/Disk stalls.
                     if has_light_peers {
                         let filter = crate::core::filter::CompactFilter::build(&batch_clone);
-                        
-                        let mut items = std::collections::HashSet::new();
-                        for tx in &batch_clone.transactions {
-                            match tx {
-                                crate::core::Transaction::Commit { commitment, .. } => { items.insert(*commitment); }
-                                crate::core::Transaction::Reveal { inputs, outputs, .. } | crate::core::Transaction::Consolidate { inputs, outputs, .. } => {
-                                    for input in inputs {
-                                        items.insert(input.coin_id());
-                                        items.insert(input.predicate.address());
-                                    }
-                                    for output in outputs {
-                                        if let Some(cid) = output.coin_id() { items.insert(cid); }
-                                        items.insert(output.address());
-                                    }
-                                }
-                            }
-                        }
-                        for cb in &batch_clone.coinbase {
-                            items.insert(cb.coin_id());
-                            items.insert(cb.address);
-                        }
+                        let items  = crate::core::filter::CompactFilter::items_in(&batch_clone);
 
                         let notif = crate::network::light_protocol::LightNotification::NewBlockTip {
                             height: state_clone.height,
@@ -4779,10 +4731,8 @@ async fn try_apply_orphans(&mut self) {
                             block_hash: hex::encode(batch_clone.extension.final_hash),
                             element_count: items.len() as u64,
                         };
-                        
+
                         let _ = cmd_tx.blocking_send(NodeCommand::BroadcastLightPush(notif));
-
-
                     }
                 });
 
@@ -6346,6 +6296,62 @@ fn build_divergent_chain(
         // Second open should fail after exhausting retries
         let result = Storage::open(&db_path);
         assert!(result.is_err(), "Should fail when lock is permanently held");
+    }
+    
+
+    #[test]
+    fn block_template_mining_hash_matches_consensus() {
+        // The invariant the original bug violated: the mining_midstate handed to
+        // the miner must equal compute_header_hash of the BatchHeader that
+        // verify_extension reconstructs on receipt. If this ever fails, every
+        // block mined against this template will be silently rejected.
+        let state = State::genesis().0;
+        let reward = crate::core::block_reward(state.height);
+        let denoms = crate::core::types::decompose_value(reward);
+
+
+        let req = crate::rpc::types::BlockTemplateRequest {
+            coinbase: denoms.iter().enumerate().map(|(i, &v)| {
+                crate::rpc::types::CoinbaseOutputJson {
+                    address: hex::encode([(i as u8).wrapping_add(1); 32]),
+                    value:   v,
+                    salt:    hex::encode([(i as u8).wrapping_add(0x40); 32]),
+                }
+            }).collect(),
+        };
+
+        let resp = build_block_template_inner(&state, vec![], &req).unwrap();
+        let batch: Batch = serde_json::from_value(resp.batch_template.clone()).unwrap();
+
+        // Replay the coinbase folding to recover post_tx_midstate the same way
+        // build_block_template_inner did.
+        let v2 = crate::core::types::is_v2_at(state.height);
+        let mut post_tx_midstate = state.midstate;
+        let mut temp_coins = state.coins.clone();
+        for cb in &batch.coinbase {
+            let cid = cb.coin_id();
+            post_tx_midstate = hash_concat(&post_tx_midstate, &cid);
+            temp_coins.insert(cid, v2);
+        }
+        let smt_root   = hash_concat(&temp_coins.root(v2), &state.commitments.root(v2));
+        let state_root = hash_concat(&smt_root, &state.chain_mmr.root(v2));
+        post_tx_midstate = hash_concat(&post_tx_midstate, &state_root);
+        assert_eq!(state_root, batch.state_root, "state_root recomputation must match");
+
+        let header = BatchHeader {
+            height:           state.height,
+            prev_header_hash: state.header_hash,
+            prev_midstate:    state.midstate,
+            post_tx_midstate,
+            extension:        Extension { nonce: 0, final_hash: [0u8; 32] },
+            timestamp:        batch.timestamp,
+            target:           batch.target,
+            state_root:       batch.state_root,
+        };
+
+        let consensus_hash = crate::core::types::compute_header_hash(&header);
+        assert_eq!(hex::encode(consensus_hash), resp.mining_midstate,
+            "mining_midstate diverged from compute_header_hash — the original bug is back");
     }
     
 }

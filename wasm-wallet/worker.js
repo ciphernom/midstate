@@ -626,12 +626,18 @@ async function handleSubmitMinedBlock(template, nonce) {
         const rejectReason = accepted ? null : (submitReq.body || 'rejected');
 
         if (accepted) {
+            // Only commit WOTS index advancement when the block actually lands.
+            // Otherwise we burn one-time-use addresses for blocks that never existed.
+            for (const entry of template.mining_addrs) wState.wotsAddrs[entry.address] = entry.index;
+            wState.nextWotsIndex = template.next_wots_index;
+
             self.postMessage({ type: 'LOG', payload: `✅ Block accepted! Height: ${template.chainHeight}` });
             await saveState();
             await performScan();
         } else {
             self.postMessage({ type: 'LOG', payload: `❌ Block rejected: ${rejectReason}` });
-            await saveState();
+            // No state mutation — the coinbase WOTS keys are still unused, so the next
+            // template build will reuse the same indices. No bookkeeping leak.
         }
 
         const finalHashHex = Array.from(batch.extension.final_hash).map(b => b.toString(16).padStart(2, '0')).join('');
