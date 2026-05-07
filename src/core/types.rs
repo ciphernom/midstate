@@ -696,6 +696,7 @@ pub const MAX_BURN_DATA_SIZE: usize = 80; //OP_RETURN analog
 pub const NETWORK_MAGIC: &[u8] = b"MIDSTATE_MAINNET_V1";
 
 pub const V2_ACTIVATION_HEIGHT: u64 = 100_000; 
+pub const COMMIT_WEIGHT_ACTIVATION_HEIGHT: u64 = 101_000; //ties commits pow to block weight, preventing tragedy of commons. 
 
 /// True iff a state at the given height should hash with V2 rules.
 /// Single source of truth for V2 activation across the codebase.

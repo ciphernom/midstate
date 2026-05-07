@@ -500,7 +500,21 @@ fn apply_batch_internal(
     state.midstate = future_midstate;
     state.header_hash = batch.extension.final_hash;
     state.chain_mmr.append(&batch.extension.final_hash, v2);
-    state.depth += calculate_work(&batch.target);
+
+    let mut block_work = calculate_work(&batch.target);
+    
+    // NAKAMOTO CONSENSUS UPGRADE: Incentivize Commit inclusion.
+    // Starting at the activation height, we add the base Proof-of-Work value 
+    // of each Commit to the block's total weight. This solves the Free-Rider 
+    // problem: blocks with more Commits are strictly heavier, ensuring they win 
+    // all tie-breakers and minimizing the miner's orphan rate.
+    if state.height >= crate::core::types::COMMIT_WEIGHT_ACTIVATION_HEIGHT {
+        // 2^24 hashes = 16,777,216 base work per Commit
+        let commit_bonus = (commit_count as u128) * 16_777_216; 
+        block_work = block_work.saturating_add(commit_bonus);
+    }
+
+    state.depth += block_work;
     state.height += 1;
 
     // V2 activation crossing: the SMT caches were populated under V1 hashing
