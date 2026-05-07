@@ -1323,6 +1323,12 @@ async fn process_verified_batches_chunk(
             // Save cursor so we restart from here, not from height - 360
             self.last_sync_cursor = Some(current_cursor.saturating_sub(1));
             self.abort_sync_session("peer sent corrupt batch");
+            
+            // --- FIX: Poison Block Defense ---
+            // The peer proved they have hashpower (valid header), but sent a payload 
+            // that mathematically cannot produce that header. Ban them to break the loop.
+            self.ban_peer(from, "malicious payload: batch does not match verified header");
+            
             return Ok(());
         }
 
@@ -3837,7 +3843,7 @@ fn fire_batch_lookahead(&mut self) {
         &mut self,
         fork_height: u64,
         alternative_batches: &[Batch],
-        _from: PeerId,
+        from: PeerId,
     ) -> Result<Option<(State, Vec<(u64, [u8; 32], Batch)>)>> {
         
         // FIX: Optimize state derivation to prevent unnecessary and impossible rebuilds.
@@ -3849,17 +3855,31 @@ fn fire_batch_lookahead(&mut self) {
             State::genesis().0
         } else {
             // Pre-check: can the alternative chain's work possibly beat ours?
-            // Pre-check: can the alternative chain's work possibly beat ours?
-            // Compare the work in our chain from fork_height..tip against the
-            // alternative's theoretical maximum. This is O(N) integer math on
-            // small headers — avoids the expensive state rebuild + disk I/O.
-            let our_headers = self.storage.batches.load_headers(fork_height, self.state.height)?;
-            let our_work_since_fork: u128 = our_headers.iter()
-                .map(|h| crate::core::state::calculate_work(&h.target))
-                .fold(0u128, |a, b| a.saturating_add(b));
-            let alt_work: u128 = alternative_batches.iter()
-                .map(|b| crate::core::state::calculate_work(&b.target))
-                .fold(0u128, |a, b| a.saturating_add(b));
+            // FIX: Load full batches to count the Commits so we accurately 
+            // calculate the Nakamoto Consensus Commit Bonus.
+            let mut our_work_since_fork = 0u128;
+            for h in fork_height..self.state.height {
+                if let Ok(Some(b)) = self.storage.load_batch(h) {
+                    let mut work = crate::core::state::calculate_work(&b.target);
+                    if h >= crate::core::types::COMMIT_WEIGHT_ACTIVATION_HEIGHT {
+                        let commit_count = b.transactions.iter().filter(|tx| matches!(tx, crate::core::Transaction::Commit { .. })).count();
+                        work = work.saturating_add((commit_count as u128) * 16_777_216);
+                    }
+                    our_work_since_fork = our_work_since_fork.saturating_add(work);
+                }
+            }
+
+            let mut alt_work = 0u128;
+            for (i, b) in alternative_batches.iter().enumerate() {
+                let h = fork_height + i as u64;
+                let mut work = crate::core::state::calculate_work(&b.target);
+                if h >= crate::core::types::COMMIT_WEIGHT_ACTIVATION_HEIGHT {
+                    let commit_count = b.transactions.iter().filter(|tx| matches!(tx, crate::core::Transaction::Commit { .. })).count();
+                    work = work.saturating_add((commit_count as u128) * 16_777_216);
+                }
+                alt_work = alt_work.saturating_add(work);
+            }
+
             if alt_work <= our_work_since_fork {
                 tracing::debug!(
                     "Rejecting fork at {}: alt work {} <= our work since fork {}",
@@ -3902,6 +3922,8 @@ fn fire_batch_lookahead(&mut self) {
                     "Alternative chain broken at batch index {} (height {})",
                     i, fork_height + i as u64
                 );
+                // --- Poison Fork Defense ---
+                self.ban_peer(from, "malicious fork: broken chain linkage");
                 return Ok(None);
             }
 
@@ -3931,6 +3953,7 @@ fn fire_batch_lookahead(&mut self) {
                 }
                 Err(e) => {
                     tracing::warn!("Alternative chain invalid at height {}: {}", fork_height + i as u64, e);
+                    self.ban_peer(from, &format!("malicious fork: invalid batch payload ({})", e));
                     return Ok(None);
                 }
             }
@@ -4454,6 +4477,24 @@ fn fire_batch_lookahead(&mut self) {
                 // The finality estimator models adversarial *hashpower* — only
                 // actual chain reorgs (which require real PoW) should shift the
                 // estimate. See perform_reorg() for the legitimate call site.
+                
+                // --- FIX: PEX Bayesian Penalty ---
+                // Even though we don't shift the consensus Finality Estimator, we SHOULD penalize 
+                // the peer's routing score so we eventually drop connection with spammers.
+                if let Some(peer) = from {
+                    let peer_str = peer.to_string();
+                    if let Some(stats) = self.known_pex_addrs.get_mut(&peer_str) {
+                        stats.1 = stats.1.saturating_add(5); // Moderate penalty (+5 to Beta)
+                        
+                        // Purge if they become completely untrustworthy
+                        let prob = stats.0 as f32 / (stats.0 + stats.1) as f32;
+                        if prob < 0.1 {
+                            self.known_pex_addrs.remove(&peer_str);
+                            self.network.disconnect_peer(peer);
+                        }
+                    }
+                }
+
                 Ok(())
             }
         }
