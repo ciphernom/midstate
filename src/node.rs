@@ -216,6 +216,29 @@ pub enum MinedResult {
     },
 }
 
+/// Requires ~1 million hashes (20 leading zero bits). Takes ~10ms per message.
+pub fn verify_chat_pow(sender: &str, timestamp: u64, reply_to: Option<u64>, words: &[u8], nonce: u64) -> bool {
+    let mut data = Vec::new();
+    data.extend_from_slice(sender.as_bytes());
+    data.extend_from_slice(&timestamp.to_le_bytes());
+    data.extend_from_slice(&reply_to.unwrap_or(0).to_le_bytes());
+    data.extend_from_slice(words);
+    data.extend_from_slice(&nonce.to_le_bytes());
+    
+    let h = crate::core::types::hash(&data);
+    crate::core::types::count_leading_zeros(&h) >= 20
+}
+
+pub fn mine_chat_pow(sender: String, timestamp: u64, reply_to: Option<u64>, words: Vec<u8>) -> u64 {
+    let mut n = 0u64;
+    loop {
+        if verify_chat_pow(&sender, timestamp, reply_to, &words, n) { 
+            return n; 
+        }
+        n += 1;
+    }
+}
+
 pub struct Node {
     state: State,
     mempool: Mempool,
@@ -343,7 +366,7 @@ pub enum NodeCommand {
     BroadcastLightPush(crate::network::light_protocol::LightNotification),
     SendResponse { channel: libp2p::request_response::ResponseChannel<crate::network::Message>, msg: crate::network::Message },
     SendChat { reply_to: Option<u64>, words: Vec<u8> },   
-    BroadcastP2PChat { sender: String, nonce: u64, reply_to: Option<u64>, words: Vec<u8> },
+    BroadcastP2PChat { sender: String, timestamp: u64, nonce: u64, reply_to: Option<u64>, words: Vec<u8> },
 
 }
 
@@ -1670,6 +1693,7 @@ async fn handle_light_request(
                     // Fix #1: pass sender through so forwarders preserve identity.
                     let _ = cmd_tx.try_send(NodeCommand::BroadcastP2PChat {
                         sender: sender.clone(),
+                        timestamp,
                         nonce,
                         reply_to,
                         words: words.clone(),
@@ -2119,31 +2143,37 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                             self.network.respond(channel, msg);
                         }
                         NodeCommand::SendChat { reply_to, words } => {
-                            let nonce = rand::random::<u32>() as u64;  // Fix #2
                             let timestamp = crate::core::state::current_timestamp();
                             let sender = self.network.local_peer_id().to_string();
 
+                            let words_clone = words.clone();
+                            let sender_clone = sender.clone();
+                            let cmd_tx = self.cmd_tx.as_ref().unwrap().clone();
+
+                            // Mine PoW in background
+                            tokio::spawn(async move {
+                                let nonce = tokio::task::spawn_blocking(move || {
+                                    mine_chat_pow(sender_clone, timestamp, reply_to, words_clone)
+                                }).await.unwrap();
+
+                                let _ = cmd_tx.send(NodeCommand::BroadcastP2PChat {
+                                    sender, timestamp, nonce, reply_to, words
+                                }).await;
+                            });
+                        }
+                        NodeCommand::BroadcastP2PChat { sender, timestamp, nonce, reply_to, words } => {
                             let mut hist = self.chat_history.write().await;
                             hist.push_back(ChatMessage { sender: sender.clone(), timestamp, nonce, reply_to, words: words.clone() });
                             if hist.len() > 100 { hist.pop_front(); }
                             drop(hist);
 
-                             self.mark_chat_seen(nonce);
-                            self.network.broadcast(Message::Chat {
-                                sender: sender.clone(),
-                                nonce,
-                                reply_to,
-                                words: words.clone(),
-                            });
+                            self.mark_chat_seen(nonce);
+                            self.network.broadcast(Message::Chat { sender: sender.clone(), timestamp, nonce, reply_to, words: words.clone() });
 
                             let notif = crate::network::light_protocol::LightNotification::ChatMessage {
                                 sender, timestamp, nonce, reply_to, words
                             };
                             self.network.broadcast_light_push(&notif);
-                        }
-                        NodeCommand::BroadcastP2PChat { sender, nonce, reply_to, words } => {
-                            self.mark_chat_seen(nonce);
-                            self.network.broadcast(Message::Chat { sender, nonce, reply_to, words });
                         }
                     }
                 }
@@ -2740,42 +2770,46 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                     }
                 }
             }
-            Message::Chat { sender, nonce, reply_to, words } => {
+            Message::Chat { sender, timestamp, nonce, reply_to, words } => {
                 self.ack(channel);
 
-                // Cheap structural validation first — drop malformed gossip
-                // before it can affect dedup or rate-limit accounting.
-                if words.len() > 10 || words.iter().any(|&w| (w as usize) >= CHAT_DICTIONARY.len()) {
-                    return Ok(());
-                }
-                if sender.len() > 128 {
+                if words.len() > 10 || words.iter().any(|&w| (w as usize) >= CHAT_DICTIONARY.len()) || sender.len() > 128 {
                     return Ok(());
                 }
 
-                // Nonce-only dedup with bounded FIFO eviction. Drop duplicate
-                // forwards before they burn rate-limit budget or pollute history.
+                // Verify PoW
+                if !verify_chat_pow(&sender, timestamp, reply_to, &words, nonce) {
+                    tracing::warn!("Peer {} sent Chat with invalid PoW", from);
+                    
+                    // BAYESIAN PENALTY: Heavily penalize peers sending invalid PoW
+                    let peer_str = from.to_string();
+                    if let Some(stats) = self.known_pex_addrs.get_mut(&peer_str) {
+                        stats.1 = stats.1.saturating_add(20); // +20 to Beta (Adversarial)
+                    }
+                    return Ok(());
+                }
+
                 if !self.mark_chat_seen(nonce) {
                     return Ok(());
                 }
 
-                // Fix #3: per-peer forwarding limit applies only to *novel* messages.
-                // Raised from 5 to 100 because well-connected nodes legitimately
-                // forward gossip on behalf of the whole network.
                 let now = std::time::Instant::now();
                 let entry = self.peer_chat_counts.entry(from).or_insert((0, now));
                 if now.duration_since(entry.1).as_secs() >= 10 {
                     *entry = (0, now);
                 }
                 entry.0 += 1;
+                
                 if entry.0 > 100 {
                     tracing::debug!("Chat forwarding rate limit exceeded by peer {}", from);
-                    // Important: we already inserted into seen_chats above. That's
-                    // fine — dropping the message everywhere is the right outcome
-                    // for a misbehaving peer.
+                    
+                    // BAYESIAN PENALTY: Penalize peers violating the rate limit
+                    let peer_str = from.to_string();
+                    if let Some(stats) = self.known_pex_addrs.get_mut(&peer_str) {
+                        stats.1 = stats.1.saturating_add(10); // +10 to Beta (Adversarial)
+                    }
                     return Ok(());
                 }
-
-                let timestamp = crate::core::state::current_timestamp();
 
                 let mut hist = self.chat_history.write().await;
                 hist.push_back(ChatMessage {
@@ -2788,9 +2822,9 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                 if hist.len() > 100 { hist.pop_front(); }
                 drop(hist);
 
-                // Fix #1: preserve original sender on rebroadcast.
                 self.network.broadcast_except(Some(from), Message::Chat {
                     sender: sender.clone(),
+                    timestamp,
                     nonce,
                     reply_to,
                     words: words.clone(),

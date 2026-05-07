@@ -370,32 +370,23 @@ impl Mempool {
                 let mut simulated_len = self.reveals.len();
 
                 if !conflicting_txs.is_empty() {
-                    let mut total_evicted_fee = 0u64;
-
                     for &cid in &conflicting_txs {
                         if let Some(existing) = self.reveals.get(&cid) {
                             let existing_rate = compute_fee_rate(existing.tx.fee(), existing.size);
 
-                            // BIP-125 Rule: Must outbid the fee RATE of all conflicting txs
+                            // Midstate RBF Rule: Must outbid the fee RATE of all conflicting txs.
+                            // (Absolute fee check is removed since chained transactions don't exist,
+                            //  preventing attackers from 'pinning' funds with artificially massive txs).
                             if fee_rate <= existing_rate {
                                 anyhow::bail!(
                                     "RBF rejected: new fee rate {} must exceed conflicting tx rate {}",
                                     fee_rate, existing_rate
                                 );
                             }
-                            total_evicted_fee = total_evicted_fee.saturating_add(existing.tx.fee());
 
                             simulated_bytes = simulated_bytes.saturating_sub(existing.size);
                             simulated_len = simulated_len.saturating_sub(1);
                         }
-                    }
-
-                    // BIP-125 Rule 3: Must pay a higher ABSOLUTE fee than the sum of all evicted txs
-                    if reveal_tx.fee() <= total_evicted_fee {
-                        anyhow::bail!(
-                            "RBF rejected: new absolute fee {} must exceed total evicted fee {}",
-                            reveal_tx.fee(), total_evicted_fee
-                        );
                     }
                 }
 

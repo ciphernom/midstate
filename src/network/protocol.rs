@@ -83,6 +83,7 @@ pub enum Message {
     /// older nodes should ignore this
     Chat {
         sender: String,
+        timestamp: u64,
         nonce: u64,
         reply_to: Option<u64>,
         words: Vec<u8>,
@@ -380,6 +381,8 @@ mod tests {
                 signature: vec![],
             },
             Message::Chat {
+                sender: "12D3KooWTest".to_string(),
+                timestamp: 0,
                 nonce: 12345,
                 reply_to: None,
                 words: vec![1, 5, 20],

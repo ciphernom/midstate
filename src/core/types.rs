@@ -732,10 +732,9 @@ pub const MEDIAN_TIME_PAST_WINDOW: usize = 11;
 /// Commitment time-to-live in blocks. A commitment must be revealed within
 /// this window or it expires and is garbage-collected from state.
 ///
-/// 1000 blocks ≈ 16.7 hours at 60s target. Long enough to survive transient
-/// censorship or network partitions; short enough to bound state bloat
-/// (max ~20K live commitments at 20 commits/block).
-pub const COMMITMENT_TTL: u64 = 1000; 
+/// 144 blocks ≈ 2.4 hours at 60s target. Defends against the free-option 
+/// state-bloat attack where an attacker mines 0-fee Commits endlessly.
+pub const COMMITMENT_TTL: u64 = 144;
 
 /// Blocks behind tip before checkpoints are pruned from stored batches.
 /// Pruning reclaims ~32 KB per block (~98% of batch storage). Pruned batches

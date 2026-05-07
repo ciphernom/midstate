@@ -229,6 +229,12 @@ enum WalletAction {
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
     },
+    Abandon {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+        #[arg(long)]
+        address: String,
+    },
     Send {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
@@ -861,6 +867,22 @@ async fn wallet_spend_script(
     Ok(())
 }
 
+fn wallet_abandon(path: &PathBuf, address_hex: String) -> Result<()> {
+    let password = read_password("Password: ")?;
+    let mut wallet = Wallet::open(path, &password)?;
+    
+    let addr = midstate::core::types::parse_address_flexible(&address_hex)
+        .map_err(|e| anyhow::anyhow!(e))?;
+        
+    let removed = wallet.abandon_coins_at_address(&addr)?;
+    if removed > 0 {
+        println!("Successfully abandoned {} coin(s) at address {}", removed, address_hex);
+    } else {
+        println!("No coins found at address {}", address_hex);
+    }
+    Ok(())
+}
+
 async fn handle_wallet(action: WalletAction) -> Result<()> {
     match action {
         WalletAction::Create { path, legacy } => wallet_create(&path, legacy),
@@ -887,6 +909,9 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         }
         WalletAction::Reveal { path, rpc_port, rpc_host, commitment } => {
             wallet_reveal(&path, rpc_port, rpc_host, commitment).await
+        }
+        WalletAction::Abandon { path, address } => {
+            wallet_abandon(&path, address)
         }
         WalletAction::History { path, count } => wallet_history(&path, count),
         WalletAction::ImportRewards { path, coinbase_file, data_dir } => {

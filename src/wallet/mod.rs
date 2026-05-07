@@ -1210,6 +1210,20 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         Ok(())
     }
 
+
+    /// Locally abandons (deletes) all coins matching a specific address.
+    /// Used to clear out "dust bombs" so they don't break the co-spend rule.
+    pub fn abandon_coins_at_address(&mut self, address: &[u8; 32]) -> Result<usize> {
+        let initial_count = self.data.coins.len();
+        self.data.coins.retain(|c| c.address != *address);
+        let removed = initial_count - self.data.coins.len();
+        
+        if removed > 0 {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+    
     /// How many WOTS keys have been derived so far (HD wallets only).
     pub fn wots_index(&self) -> u64 {
         self.data.next_wots_index
