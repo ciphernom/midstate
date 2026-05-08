@@ -732,9 +732,9 @@ pub const MEDIAN_TIME_PAST_WINDOW: usize = 11;
 /// Commitment time-to-live in blocks. A commitment must be revealed within
 /// this window or it expires and is garbage-collected from state.
 ///
-/// 144 blocks ≈ 2.4 hours at 60s target. Defends against the free-option 
+/// Defends against the free-option 
 /// state-bloat attack where an attacker mines 0-fee Commits endlessly.
-pub const COMMITMENT_TTL: u64 = 144;
+pub const COMMITMENT_TTL: u64 = 1000;
 
 /// Blocks behind tip before checkpoints are pruned from stored batches.
 /// Pruning reclaims ~32 KB per block (~98% of batch storage). Pruned batches
