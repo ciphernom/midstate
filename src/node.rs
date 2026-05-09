@@ -778,26 +778,69 @@ pub fn build_block_template_inner(
             transactions.push(tx);
         }
     }
+    
+    // Let's not include reused addresses in the block templates either!
+    let mut block_wots_keys = std::collections::HashSet::new();
 
     for tx in pending_reveals.into_iter().take(crate::core::MAX_BATCH_REVEALS) {
         let tx_bytes = bincode::serialized_size(&tx).unwrap_or(0) as u64;
         if current_bytes + tx_bytes > MAX_BLOCK_BYTES { continue; }
 
+        let mut tx_wots_keys = Vec::new(); // Hold keys to insert ONLY if the tx succeeds
+
         match &tx {
-            Transaction::Reveal { inputs, outputs, .. } => {
+            Transaction::Reveal { inputs, witnesses, outputs, .. } => {
+                // 1. Check network limits (This fixes the compiler warnings!)
                 if current_inputs  + inputs.len()  > crate::core::MAX_BATCH_INPUTS  { continue; }
                 if current_outputs + outputs.len() > crate::core::MAX_BATCH_OUTPUTS { continue; }
+                
+                // 2. Check for WOTS key reuse
+                let mut conflict = false;
+                for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                    let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                    if let Some(sig) = wit_inputs.first() {
+                        if sig.len() == crate::core::wots::SIG_SIZE {
+                            let key = input.predicate.address();
+                            if block_wots_keys.contains(&key) { conflict = true; break; }
+                            tx_wots_keys.push(key);
+                        } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                            let key = mss_sig.wots_pk;
+                            if block_wots_keys.contains(&key) { conflict = true; break; }
+                            tx_wots_keys.push(key);
+                        }
+                    }
+                }
+                if conflict { continue; } // Skip this tx if it reuses a key
             }
-            Transaction::Consolidate { inputs, outputs, .. } => {
+            Transaction::Consolidate { inputs, witness, outputs, .. } => {
                 let addr = inputs[0].predicate.address();
+                // 1. Check network limits
                 if consolidated_addresses.contains(&addr)            { continue; }
                 if current_inputs  + 1            > crate::core::MAX_BATCH_INPUTS  { continue; }
                 if current_outputs + outputs.len() > crate::core::MAX_BATCH_OUTPUTS { continue; }
+
+                // 2. Check for WOTS key reuse
+                let mut conflict = false;
+                let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                if let Some(sig) = wit_inputs.first() {
+                    if sig.len() == crate::core::wots::SIG_SIZE {
+                        let key = inputs[0].predicate.address();
+                        if block_wots_keys.contains(&key) { conflict = true; }
+                        tx_wots_keys.push(key);
+                    } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                        let key = mss_sig.wots_pk;
+                        if block_wots_keys.contains(&key) { conflict = true; }
+                        tx_wots_keys.push(key);
+                    }
+                }
+                if conflict { continue; } // Skip this tx if it reuses a key
             }
             _ => continue,
         }
 
+        // 3. Try to apply the transaction
         if apply_transaction(&mut candidate, &tx).is_ok() {
+            // 4. It succeeded! Now update all the tracking variables
             match &tx {
                 Transaction::Reveal { inputs, outputs, .. } => {
                     current_inputs  += inputs.len();
@@ -810,6 +853,12 @@ pub fn build_block_template_inner(
                 }
                 _ => {}
             }
+            
+            // Mark these WOTS/MSS keys as used in this block
+            for key in tx_wots_keys {
+                block_wots_keys.insert(key);
+            }
+
             total_fees    += tx.fee();
             current_bytes += tx_bytes;
             transactions.push(tx);

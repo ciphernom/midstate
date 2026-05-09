@@ -319,7 +319,7 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
             Ok(())
         }
         Transaction::Consolidate { inputs, witness: _, outputs, salt, .. } => {
-            if inputs.is_empty() { bail!("Transaction must spend at least one coin"); }
+            if inputs.len() < 2 { bail!("Consolidate transactions must spend at least two coins"); }
             if outputs.is_empty() { bail!("Transaction must create at least one new coin"); }
             if inputs.len() > crate::core::types::MAX_CONSOLIDATE_INPUTS { bail!("Too many inputs (max {})", crate::core::types::MAX_CONSOLIDATE_INPUTS); }
             if outputs.len() > MAX_TX_OUTPUTS { bail!("Too many outputs (max {})", MAX_TX_OUTPUTS); }
@@ -560,7 +560,8 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             Ok(())
         }
         Transaction::Consolidate { inputs, witness, outputs, salt, .. } => {
-            if inputs.is_empty() { bail!("Transaction must spend at least one coin"); }
+            if inputs.len() < 2 { bail!("Consolidate transactions must spend at least two coins"); }
+
             if outputs.is_empty() { bail!("Transaction must create at least one new coin"); }
             if inputs.len() > crate::core::types::MAX_CONSOLIDATE_INPUTS { bail!("Too many inputs (max {})", crate::core::types::MAX_CONSOLIDATE_INPUTS); }
             if outputs.len() > MAX_TX_OUTPUTS { bail!("Too many outputs (max {})", MAX_TX_OUTPUTS); }
