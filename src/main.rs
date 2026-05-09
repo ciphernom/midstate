@@ -338,6 +338,8 @@ enum WalletAction {
         rpc_port: u16,
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
+        #[arg(long)]
+        from_genesis: bool,
     },
     Mix {
         #[arg(long, default_value_os_t = default_wallet_path())]
@@ -472,7 +474,7 @@ async fn main() -> Result<()> {
 }
 
 // ── Wallet commands ─────────────────────────────────────────────────────────
-async fn wallet_scan(path: &PathBuf, rpc_port: u16, rpc_host: String) -> Result<()> {
+async fn wallet_scan(path: &PathBuf, rpc_port: u16, rpc_host: String, from_genesis: bool) -> Result<()> {
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
@@ -487,9 +489,11 @@ async fn wallet_scan(path: &PathBuf, rpc_port: u16, rpc_host: String) -> Result<
     let state: rpc::GetStateResponse = client.get(format!("{}/state", base_url))
         .send().await?.json().await?;
     let chain_height = state.height;
-    let start = wallet.data.last_scan_height;
 
-    if start >= chain_height {
+    // Use the from_genesis flag here:
+    let start = if from_genesis { 0 } else { wallet.data.last_scan_height };
+
+    if start >= chain_height && !from_genesis {
         println!("Already scanned to height {}. Chain is at {}.", start, chain_height);
         return Ok(());
     }
@@ -892,7 +896,9 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         WalletAction::Generate { path, count, label } => wallet_generate(&path, count, label),
         WalletAction::List { path, rpc_port, rpc_host, full } => wallet_list(&path, rpc_port, rpc_host, full).await,
         WalletAction::Balance { path, rpc_port, rpc_host } => wallet_balance(&path, rpc_port, rpc_host).await,
-        WalletAction::Scan { path, rpc_port, rpc_host } => wallet_scan(&path, rpc_port, rpc_host).await,
+        WalletAction::Scan { path, rpc_port, rpc_host, from_genesis } => {
+            wallet_scan(&path, rpc_port, rpc_host, from_genesis).await
+        }
         WalletAction::Send { path, rpc_port, rpc_host, coin, to, timeout, private } => {
             wallet_send(&path, rpc_port, rpc_host, coin, to, timeout, private).await
         }
