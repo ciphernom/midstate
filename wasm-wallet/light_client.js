@@ -256,8 +256,11 @@ async request(req, _retries = 2) {
         msg.set(lenBuf, 0);
         msg.set(jsonBytes, 4);
 
-        // Write: sendData sends a Uint8Array, then close the write side
-        stream.sendData(msg);
+         // Write in chunks to respect WebRTC SCTP message size limits (16 KB)
+        const CHUNK_SIZE = 16384; 
+        for (let i = 0; i < msg.length; i += CHUNK_SIZE) {
+            stream.sendData(msg.slice(i, i + CHUNK_SIZE));
+        }
         stream.sendCloseWrite();
 
         // Read: incomingData is an async iterator
