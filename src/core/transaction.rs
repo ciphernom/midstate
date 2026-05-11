@@ -30,6 +30,35 @@ pub fn unpack_spam_nonce(spam_nonce: u64) -> (u32, u32) {
     (target_height, actual_nonce)
 }
 
+pub fn mine_pow(commitment: &[u8; 32], required_pow: u32, current_height: u64, header_hash: [u8; 32]) -> u64 {
+    let mut n = 0u32;
+    
+    if current_height >= crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
+        let anchor_height = current_height.saturating_sub(1) as u32;
+        loop {
+            let mut data = Vec::with_capacity(68);
+            data.extend_from_slice(&header_hash);
+            data.extend_from_slice(commitment);
+            data.extend_from_slice(&n.to_le_bytes());
+            let h = crate::core::types::hash(&data);
+            
+            if crate::core::types::count_leading_zeros(&h) >= required_pow {
+                return pack_spam_nonce(n, anchor_height);
+            }
+            n += 1;
+        }
+    } else {
+        let target_height = current_height as u32;
+        loop {
+            let h = commit_pow_hash(commitment, n, target_height);
+            if crate::core::types::count_leading_zeros(&h) >= required_pow {
+                return pack_spam_nonce(n, target_height);
+            }
+            n += 1;
+        }
+    }
+}
+
 /// Evaluate the Commit-PoW associated with a commitment under either V1
 /// (legacy) or V2 (single-hash with explicit target height) rules.
 ///
@@ -70,9 +99,43 @@ pub fn unpack_spam_nonce(spam_nonce: u64) -> (u32, u32) {
 ///   
 ///   result! = Err ⇔ ¬(above)
 /// ```
-pub fn evaluate_commit_pow(commitment: &[u8; 32], spam_nonce: u64, current_height: u64) -> Result<u32> {
+pub fn evaluate_commit_pow(commitment: &[u8; 32], spam_nonce: u64, state: &crate::core::State) -> Result<u32> {
     let (target_height, actual_nonce) = unpack_spam_nonce(spam_nonce);
+    let current_height = state.height;
 
+    // V3 HARD FORK: Fix Time-Travel Hashpower Exploit
+    if current_height >= crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
+        if target_height == 0 {
+            bail!("Legacy V1/V2 Commits are deprecated. Upgrade your node/wallet.");
+        }
+        if current_height.saturating_sub(target_height as u64) > crate::core::types::COMMIT_POW_WINDOW {
+            bail!("Commit PoW expired. Anchored to height {}, current is {}", target_height, current_height);
+        }
+        if (target_height as u64) >= current_height {
+            bail!("Commit PoW anchor height must be a past block");
+        }
+
+        // O(1) Validation: Fetch the unpredictable block hash at `target_height`
+        let mmr_pos = crate::core::mmr::mmr_size(target_height as u64);
+        let anchor_hash = state.chain_mmr.get(mmr_pos).ok_or_else(|| {
+            anyhow::anyhow!("Anchor height {} block hash not found in chain MMR", target_height)
+        })?;
+
+        // V3 Hash: anchor_hash || commitment || actual_nonce
+        let mut data = Vec::with_capacity(68);
+        data.extend_from_slice(anchor_hash);
+        data.extend_from_slice(commitment);
+        data.extend_from_slice(&actual_nonce.to_le_bytes());
+        let hash = crate::core::types::hash(&data);
+
+        let zeros = crate::core::types::count_leading_zeros(&hash);
+        if zeros < MIN_COMMIT_POW_BITS {
+            bail!("Insufficient Commit PoW");
+        }
+        return Ok(zeros);
+    }
+
+    // V2 Path
     if current_height >= crate::core::types::V2_ACTIVATION_HEIGHT {
         if target_height == 0 {
             bail!("Legacy V1 Commits are deprecated. Upgrade your node/wallet.");
@@ -84,7 +147,6 @@ pub fn evaluate_commit_pow(commitment: &[u8; 32], spam_nonce: u64, current_heigh
             bail!("Commit PoW target height too far in the future");
         }
 
-        // V2 path: O(1) validation — exactly ONE hash.
         let hash = commit_pow_hash(commitment, actual_nonce, target_height);
         let zeros = crate::core::types::count_leading_zeros(&hash);
         if zeros < MIN_COMMIT_POW_BITS {
@@ -93,10 +155,7 @@ pub fn evaluate_commit_pow(commitment: &[u8; 32], spam_nonce: u64, current_heigh
         return Ok(zeros);
     }
 
-    // PRE-ACTIVATION: Accept both true V1 and V2 formats to allow wallets and light
-    // clients to upgrade securely before the hard fork enforces V2 exclusively.
-
-    // 1. Try V2 path (for upgraded wallets/light clients)
+    // PRE-ACTIVATION: Accept both true V1 and V2 formats
     if current_height.saturating_sub(target_height as u64) <= crate::core::types::COMMIT_POW_WINDOW 
         && (target_height as u64) <= current_height + 1 
     {
@@ -107,11 +166,9 @@ pub fn evaluate_commit_pow(commitment: &[u8; 32], spam_nonce: u64, current_heigh
         }
     }
 
-    // 2. Try V1 legacy path: O(W) brute-force search backward
     let start = current_height.saturating_sub(crate::core::types::COMMIT_POW_WINDOW);
     let mut best_zeros = 0;
     for h in start..=current_height {
-        // Reconstruct legacy layout (target_height as u64 || commitment || spam_nonce as u64)
         let mut data = Vec::with_capacity(48);
         data.extend_from_slice(&h.to_le_bytes());
         data.extend_from_slice(commitment);
@@ -131,8 +188,8 @@ pub fn evaluate_commit_pow(commitment: &[u8; 32], spam_nonce: u64, current_heigh
     Ok(best_zeros)
 }
 
-fn validate_commit_pow(commitment: &[u8; 32], nonce: u64, current_height: u64) -> Result<()> {
-    evaluate_commit_pow(commitment, nonce, current_height)?;
+fn validate_commit_pow(commitment: &[u8; 32], nonce: u64, state: &crate::core::State) -> Result<()> {
+    evaluate_commit_pow(commitment, nonce, state)?;
     Ok(())
 }
 
@@ -278,8 +335,12 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
                     );
                 }
             }
-            state.commitments.remove(&expected, v2);
-            state.commitment_heights.remove(&expected);
+            // PREVENT COMMIT REPLAY ATTACK: Do not delete commitments after activation height.
+            // Let the deterministic GC sweep them when their PoW naturally expires.
+            if state.height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
+                state.commitments.remove(&expected, v2);
+                state.commitment_heights.remove(&expected);
+            }
 
             // Coin existence check still needed — sig verification doesn't touch state
             for input in inputs.iter() {
@@ -373,9 +434,12 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
                     bail!("Commitment expired at consensus");
                 }
             }
-            state.commitments.remove(&expected, v2);
-            state.commitment_heights.remove(&expected);
-
+            // PREVENT COMMIT REPLAY ATTACK: Do not delete commitments after activation height.
+            // Let the deterministic GC sweep them when their PoW naturally expires.
+            if state.height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
+                state.commitments.remove(&expected, v2);
+                state.commitment_heights.remove(&expected);
+            }
             for input in inputs.iter() {
                 if !state.coins.contains(&input.coin_id()) {
                     bail!("Coin {} not found or already spent", hex::encode(input.coin_id()));
@@ -414,7 +478,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
 
     match tx {
         Transaction::Commit { commitment, spam_nonce } => {
-            validate_commit_pow(commitment, *spam_nonce, state.height)?;
+            validate_commit_pow(commitment, *spam_nonce, state)?;
             if !state.commitments.insert(*commitment, v2) {
                 bail!("Duplicate commitment");
             }
@@ -513,8 +577,12 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                     );
                 }
             }
-            state.commitments.remove(&expected, v2);
-            state.commitment_heights.remove(&expected);
+            // PREVENT COMMIT REPLAY ATTACK: Do not delete commitments after activation height.
+            // Let the deterministic GC sweep them when their PoW naturally expires.
+            if state.height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
+                state.commitments.remove(&expected, v2);
+                state.commitment_heights.remove(&expected);
+            }
 
             // 5. Verify each input coin exists and executes cleanly against its Predicate
             for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
@@ -613,8 +681,12 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                     bail!("Commitment expired at consensus");
                 }
             }
-            state.commitments.remove(&expected, v2);
-            state.commitment_heights.remove(&expected);
+            // PREVENT COMMIT REPLAY ATTACK: Do not delete commitments after activation height.
+            // Let the deterministic GC sweep them when their PoW naturally expires.
+            if state.height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
+                state.commitments.remove(&expected, v2);
+                state.commitment_heights.remove(&expected);
+            }
 
             for input in inputs.iter() {
                 let coin_id = input.coin_id();
@@ -676,7 +748,7 @@ fn verify_predicate(
 pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
     match tx {
         Transaction::Commit { commitment, spam_nonce } => {
-            validate_commit_pow(commitment, *spam_nonce, state.height)?;
+            validate_commit_pow(commitment, *spam_nonce, state)?;
             if state.commitments.contains(commitment) {
                 bail!("Duplicate commitment");
             }

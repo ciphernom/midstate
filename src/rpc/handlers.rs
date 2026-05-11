@@ -65,6 +65,7 @@ pub async fn get_state(State(node): State<AppState>) -> Json<GetStateResponse> {
         block_reward: block_reward(state.height),
         required_pow,
         webrtc_addrs, 
+        header_hash: hex::encode(state.header_hash),
     })
 }
 
@@ -90,7 +91,7 @@ pub async fn commit_transaction(
     let required_pow = crate::mempool::Mempool::calculate_required_pow(pending_commits);
 
     let state = node.get_state().await;
-    let actual_zeros = match crate::core::transaction::evaluate_commit_pow(&commitment, req.spam_nonce, state.height) {
+    let actual_zeros = match crate::core::transaction::evaluate_commit_pow(&commitment, req.spam_nonce, &state) {
         Ok(z) => z,
         Err(e) => return Err(ErrorResponse { error: e.to_string() }),
     };

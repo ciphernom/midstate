@@ -1533,34 +1533,33 @@ let (commitment, _salt) = wallet.prepare_commit(
     Ok(())
 }
 
-fn mine_pow(commitment: &[u8; 32], required_pow: u32, current_height: u64) -> u64 {
-    let mut n = 0u32;
-    let target_height = current_height as u32;
-    loop {
-        let h = midstate::core::transaction::commit_pow_hash(commitment, n, target_height);
-        if midstate::core::types::count_leading_zeros(&h) >= required_pow {
-            return midstate::core::transaction::pack_spam_nonce(n, target_height);
-        }
-        n += 1;
-    }
-}
 
-async fn fetch_state_info(client: &reqwest::Client, rpc_port: u16, rpc_host: &str) -> Result<(u32, u64)> {
+
+async fn fetch_state_info(client: &reqwest::Client, rpc_port: u16, rpc_host: &str) -> Result<(u32, u64, [u8; 32])> {
     let url = format!("http://{}:{}/state", rpc_host, rpc_port);
     let resp = client.get(&url).send().await?;
     let state: rpc::GetStateResponse = resp.json().await?;
-    Ok((state.required_pow, state.height))
+    let mut hh = [0u8; 32];
+    hex::decode_to_slice(&state.header_hash, &mut hh)?;
+    Ok((state.required_pow, state.height, hh))
 }
 
 async fn submit_commit(
-    client: &reqwest::Client,
-    rpc_port: u16,
-    rpc_host: &str,
-    commitment: &[u8; 32],
-) -> Result<()> {
-    let (required_pow, current_height) = fetch_state_info(client, rpc_port, rpc_host).await?;
+    client: &reqwest::Client, 
+    rpc_port: u16, 
+    rpc_host: &str, 
+    commitment: &[u8; 32]) -> 
+    Result<()> {
+    let (required_pow, current_height, header_hash) = fetch_state_info(client, rpc_port, rpc_host).await?;
     println!("Mining PoW locally (difficulty: {} leading zeros, height: {})...", required_pow, current_height);
-    let spam_nonce = mine_pow(commitment, required_pow, current_height);
+    let commitment_owned = *commitment;
+    let spam_nonce = tokio::task::spawn_blocking(move || {
+        midstate::core::transaction::mine_pow(&commitment_owned, required_pow, current_height, header_hash)
+    }).await?;
+    
+
+    
+    
     println!("✓ PoW found (nonce: {})", spam_nonce);
 
     let commit_req = rpc::CommitRequest {

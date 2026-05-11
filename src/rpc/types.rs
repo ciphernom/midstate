@@ -95,6 +95,7 @@ pub struct GetStateResponse {
     pub block_reward: u64,
     pub required_pow: u32,
     pub webrtc_addrs: Vec<String>, 
+    pub header_hash: String, 
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetMssStateRequest {

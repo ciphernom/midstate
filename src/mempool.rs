@@ -240,7 +240,7 @@ impl Mempool {
 
         let (actual_zeros, _commitment_key) = match &tx {
             Transaction::Commit { commitment, spam_nonce } => {
-                match crate::core::transaction::evaluate_commit_pow(commitment, *spam_nonce, state.height) {
+                match crate::core::transaction::evaluate_commit_pow(commitment, *spam_nonce, state) {
                     Ok(zeros) => (Some(zeros), Some(*commitment)),
                     Err(e) => anyhow::bail!(e),
                 }
@@ -464,7 +464,7 @@ impl Mempool {
 
             match tx {
                 Transaction::Commit { commitment, spam_nonce } => {
-                    if let Ok(zeros) = crate::core::transaction::evaluate_commit_pow(&commitment, spam_nonce, state.height) {
+                    if let Ok(zeros) = crate::core::transaction::evaluate_commit_pow(&commitment, spam_nonce, state) {
                         let arc_tx = Arc::new(Transaction::Commit { commitment, spam_nonce });
                         self.commits.insert(commitment, arc_tx);
                         self.commits_by_pow.insert((zeros, commitment));
@@ -652,7 +652,7 @@ impl Mempool {
         let commits_to_remove: Vec<[u8; 32]> = self.commits.iter().filter(|(_, arc_tx)| {
                 match &***arc_tx {
                     Transaction::Commit { commitment, spam_nonce } => {
-                        crate::core::transaction::evaluate_commit_pow(commitment, *spam_nonce, state.height).is_err()
+                        crate::core::transaction::evaluate_commit_pow(commitment, *spam_nonce, state).is_err()
                     }
                     _ => false,
                 }

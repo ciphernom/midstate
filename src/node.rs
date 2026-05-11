@@ -216,6 +216,8 @@ pub enum MinedResult {
     },
 }
 
+
+
 /// Requires ~1 million hashes (20 leading zero bits). Takes ~10ms per message.
 pub fn verify_chat_pow(sender: &str, timestamp: u64, reply_to: Option<u64>, words: &[u8], nonce: u64) -> bool {
     let mut data = Vec::new();
@@ -1490,6 +1492,7 @@ async fn handle_light_request(
                     "block_reward": crate::core::block_reward(state.height),
                     "required_pow": self.mempool.required_commit_pow(),
                     "timestamp": state.timestamp,
+                    "header_hash": hex::encode(state.header_hash),
                 }))
             }
 
@@ -4289,16 +4292,10 @@ fn fire_batch_lookahead(&mut self) {
 
         // Mine spam nonce for the Commit (respecting dynamic mempool difficulty)
         let required_pow = self.mempool.required_commit_pow();
-        let current_height_u32 = self.state.height as u32;
+        let current_height = self.state.height;
+        let header_hash = self.state.header_hash;
         let spam_nonce = tokio::task::spawn_blocking(move || {
-            let mut n = 0u32;
-            loop {
-                let h = crate::core::transaction::commit_pow_hash(&commitment, n, current_height_u32);
-                if crate::core::types::count_leading_zeros(&h) >= required_pow {
-                    return crate::core::transaction::pack_spam_nonce(n, current_height_u32);
-                }
-                n += 1;
-            }
+            crate::core::transaction::mine_pow(&commitment, required_pow, current_height, header_hash)
         }).await?;
 
         let commit_tx = Transaction::Commit { commitment, spam_nonce };
