@@ -139,22 +139,15 @@ pub fn compute_coin_id_hex(address_hex: &str, value: u64, salt_hex: &str) -> Str
 ///
 /// Panics if `commitment_hex` is not exactly 64 valid hex characters.
 #[wasm_bindgen]
-pub fn mine_commitment_pow(commitment_hex: &str, required_pow: u32, target_height: u64) -> u64 {
+pub fn mine_commitment_pow(commitment_hex: &str, required_pow: u32, target_height: u64, header_hash_hex: &str) -> u64 {
     let mut commitment = [0u8; 32];
     hex::decode_to_slice(commitment_hex, &mut commitment).unwrap();
 
-    let target_height_u32 = target_height as u32;
-    let mut actual_nonce = 0u32;
-    
-    loop {
-        // Use the official V2 hashing algorithm from the core library
-        let h = midstate::core::transaction::commit_pow_hash(&commitment, actual_nonce, target_height_u32);
-        if midstate::core::types::count_leading_zeros(&h) >= required_pow {
-            // Pack the 32-bit target height and 32-bit nonce into the 64-bit spam_nonce
-            return midstate::core::transaction::pack_spam_nonce(actual_nonce, target_height_u32);
-        }
-        actual_nonce += 1;
-    }
+    let mut header_hash = [0u8; 32];
+    hex::decode_to_slice(header_hash_hex, &mut header_hash).unwrap();
+
+    // Call the unified V3 PoW function from the core library
+    midstate::core::transaction::mine_pow(&commitment, required_pow, target_height, header_hash)
 }
 
 // ─── Solo Mining: Hot-Loop Nonce Search ─────────────────────────────────────

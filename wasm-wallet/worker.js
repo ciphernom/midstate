@@ -1485,7 +1485,7 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0)
 
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Mining PoW...` } });
     await new Promise(r => setTimeout(r, 50));
-    const spamNonce = Number(mine_commitment_pow(ctx.commitment, requiredPow, BigInt(stateData.height)));
+    const spamNonce = Number(mine_commitment_pow(ctx.commitment, requiredPow, BigInt(stateData.height), stateData.header_hash));
 
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Submitting commit..." } });
     const commitReq = await rpc.commit(ctx.commitment, spamNonce);

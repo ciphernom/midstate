@@ -750,12 +750,15 @@ export function generate_phrase() {
  * @param {string} commitment_hex
  * @param {number} required_pow
  * @param {bigint} target_height
+ * @param {string} header_hash_hex
  * @returns {bigint}
  */
-export function mine_commitment_pow(commitment_hex, required_pow, target_height) {
+export function mine_commitment_pow(commitment_hex, required_pow, target_height, header_hash_hex) {
     const ptr0 = passStringToWasm0(commitment_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
     const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.mine_commitment_pow(ptr0, len0, required_pow, target_height);
+    const ptr1 = passStringToWasm0(header_hash_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.mine_commitment_pow(ptr0, len0, required_pow, target_height, ptr1, len1);
     return BigInt.asUintN(64, ret);
 }
 
