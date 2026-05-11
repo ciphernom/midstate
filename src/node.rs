@@ -1150,25 +1150,28 @@ pub async fn new(
 /// from triggering an adversarial-peer penalty — used by `Send` so that
 /// "commit not yet mined" doesn't get peers marked as malicious.
 async fn submit_light_transaction(
-    &self,
-    from: PeerId,
-    tx: Transaction,
-    suppress_penalty_substr: Option<&str>,
-) -> crate::network::light_protocol::LightResponse {
-    use crate::network::light_protocol::LightResponse;
+        &self,
+        from: PeerId,
+        tx: Transaction,
+        suppress_penalty_substr: Option<&str>,
+    ) -> crate::network::light_protocol::LightResponse {
+        use crate::network::light_protocol::LightResponse;
 
-    match crate::core::transaction::validate_transaction(&self.state, &tx) {
-        Ok(_) => {
-            self.network.observe_honest_light_peer(from).await;
-            match &self.cmd_tx {
-                Some(cmd_tx) => {
-                    let _ = cmd_tx.try_send(NodeCommand::SendTransaction(tx));
-                    LightResponse::success(serde_json::json!({ "accepted": true }))
+        match crate::core::transaction::validate_transaction(&self.state, &tx) {
+            Ok(_) => {
+                self.network.observe_honest_light_peer(from).await;
+                match &self.cmd_tx {
+                    Some(cmd_tx) => {
+                        if cmd_tx.try_send(NodeCommand::SendTransaction(tx)).is_ok() {
+                            LightResponse::success(serde_json::json!({ "accepted": true }))
+                        } else {
+                            LightResponse::error("Node is currently overloaded, please try again")
+                        }
+                    }
+                    None => LightResponse::error("Node command channel unavailable"),
                 }
-                None => LightResponse::error("Node command channel unavailable"),
             }
-        }
-        Err(e) => {
+            Err(e) => {
             let err_str = e.to_string();
             let should_penalize = match suppress_penalty_substr {
                 Some(s) => !err_str.contains(s),

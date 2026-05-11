@@ -40,12 +40,12 @@ pub const MAX_PEX_ADDRS: usize = 50;
 /// Maximum concurrent WebRTC light client connections.
 const MAX_LIGHT_PEERS: usize = 30;
 /// Maximum concurrent streams (requests in flight) per light peer.
-const MAX_LIGHT_STREAMS_PER_PEER: usize = 5;
+const MAX_LIGHT_STREAMS_PER_PEER: usize = 50;
 /// Rate limit window in seconds.
 const LIGHT_RATE_WINDOW_SECS: u64 = 60;
 
 /// Number of rate-limit violations before temporary ban.
-const LIGHT_BAN_THRESHOLD: u32 = 3;
+const LIGHT_BAN_THRESHOLD: u32 = 10;
 /// Duration of a temporary ban in seconds.
 const LIGHT_BAN_DURATION_SECS: u64 = 300;
 /// Timeout waiting for a light client to send its request data.
