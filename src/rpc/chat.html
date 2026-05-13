@@ -1,4 +1,40 @@
 <!DOCTYPE html>
+<!--
+    Midstate Chat — LAN-only browser UI.
+
+    Wire contract (mirrors crate::rpc::types::SendChatRequest):
+
+      POST /api/chat
+      Content-Type: application/json
+      Body:
+        {
+          "reply_to": <u64 | null>,
+          "words":    [<u8>, ...],          // 0..=10 indices into CHAT_DICTIONARY
+          "attachments": [                  // 0..=4 entries
+            { "kind": "address", "value": "<64-char lowercase hex>" }
+          ]
+        }
+      Either `words` or `attachments` must be non-empty.
+
+      GET  /api/chat
+      Returns:
+        {
+          "messages": [
+            { sender, timestamp, nonce, reply_to, words, attachments? }
+            ...
+          ],
+          "dictionary": [<string>; 256]
+        }
+      Each message's `attachments` is omitted by the server when empty.
+
+    Bug-fix notes (server-side):
+      - Pre-v2 light-client chats broadcast with random-nonce PoW; this
+        caused remote peers to apply Bayesian Adversarial penalty to the
+        forwarding node. The handler now mines real v2 PoW. See
+        LightRequest::SendChat handler in src/node.rs.
+      - Pre-v2 light-client chats double-pushed history. Fixed by the
+        same handler change.
+-->
 <html lang="en" data-theme="dark">
 <head>
     <meta charset="UTF-8">
@@ -320,6 +356,35 @@
             .dict-column { flex: none; max-height: 400px; }
             #chat-box { height: 500px; flex: none; }
         }
+        .draft-attachment {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            background: var(--code-bg);
+            border: 1px solid var(--stark-accent);
+            color: var(--stark-accent);
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .draft-attachment::before { content: "📎 "; }
+
+        .msg-attachments {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 6px;
+        }
+        .msg-attachment {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            background: var(--code-bg);
+            border: 1px solid var(--border);
+            color: var(--link-color);
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .msg-attachment:hover { border-color: var(--link-color); }
     </style>
 </head>
 <body>
@@ -352,7 +417,10 @@
             </div>
             <datalist id="dict-list"></datalist>
 
+            <div id="draft-attachments" style="display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px;"></div>
+
             <div class="composer-controls">
+                <button class="btn" onclick="attachAddressPrompt()">+ Address</button>
                 <button class="btn" onclick="clearDraft()">Clear</button>
                 <button class="btn btn-primary" onclick="sendChat()" id="send-btn" disabled>Broadcast Message</button>
             </div>
@@ -369,8 +437,9 @@
 </div>
 
 <script>
-    let dictionary = [];
+   let dictionary = [];
     let draft = [];
+    let draftAttachments = [];  // [{ kind: "address", value: "<64-hex>" }, ...]
     let knownMessages = 0;
     let replyingToNonce = null;
     let myPeerId = null;
@@ -536,6 +605,28 @@
             wordsDiv.textContent = wordsText;
             div.appendChild(wordsDiv);
 
+            if (msg.attachments && msg.attachments.length > 0) {
+                const attBox = document.createElement('div');
+                attBox.className = 'msg-attachments';
+                msg.attachments.forEach(att => {
+                    const chip = document.createElement('div');
+                    chip.className = 'msg-attachment';
+                    if (att.kind === 'address') {
+                        const short = att.value.slice(0, 8) + '…' + att.value.slice(-8);
+                        chip.textContent = `address: ${short}`;
+                        chip.title = "Click to copy • " + att.value;
+                        chip.addEventListener('click', () => {
+                            navigator.clipboard.writeText(att.value);
+                            chip.style.borderColor = 'var(--stark-accent)';
+                            setTimeout(() => { chip.style.borderColor = ''; }, 600);
+                        });
+                    } else {
+                        chip.textContent = `${att.kind}: ${att.value}`;
+                    }
+                    attBox.appendChild(chip);
+                });
+                div.appendChild(attBox);
+            }
             // Reply button — pass nonce as a real value, no string conversion.
             const replyBtn = document.createElement('button');
             replyBtn.className = 'reply-btn';
@@ -558,8 +649,10 @@
 
     function clearDraft() {
         draft = [];
+        draftAttachments = [];
         inputField.value = '';
         renderDraft();
+        renderDraftAttachments();
         inputField.focus();
     }
 
@@ -582,21 +675,61 @@
 
     function updateButtons() {
         const isFull = draft.length >= 10;
-        const isEmpty = draft.length === 0;
-        
+        const isEmpty = draft.length === 0 && draftAttachments.length === 0;
+
         document.getElementById('send-btn').disabled = isEmpty;
         inputField.disabled = isFull;
-        
+
         const dictButtons = document.getElementById('dictionary-box').querySelectorAll('.dict-btn');
         dictButtons.forEach(btn => btn.disabled = isFull);
     }
+    function attachAddressPrompt() {
+        if (draftAttachments.length >= 4) {
+            alert("Maximum 4 attachments per message.");
+            return;
+        }
+        const raw = prompt("Paste a midstate address (64 hex characters):");
+        if (raw === null) return;
+        const hex = raw.trim().toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(hex)) {
+            alert("Invalid address — must be exactly 64 hex characters (0-9, a-f).");
+            return;
+        }
+        if (draftAttachments.some(a => a.kind === "address" && a.value === hex)) {
+            alert("That address is already attached.");
+            return;
+        }
+        draftAttachments.push({ kind: "address", value: hex });
+        renderDraftAttachments();
+        updateButtons();
+    }
 
+    function renderDraftAttachments() {
+        const box = document.getElementById('draft-attachments');
+        box.innerHTML = '';
+        draftAttachments.forEach((att, i) => {
+            const chip = document.createElement('div');
+            chip.className = 'draft-attachment';
+            const short = att.value.slice(0, 8) + '…' + att.value.slice(-8);
+            chip.textContent = `${att.kind}:${short}`;
+            chip.title = "Click to remove • " + att.value;
+            chip.onclick = () => {
+                draftAttachments.splice(i, 1);
+                renderDraftAttachments();
+                updateButtons();
+            };
+            box.appendChild(chip);
+        });
+    }
     async function sendChat() {
-        if (draft.length === 0 || draft.length > 10) return;
-        
+        if (draft.length === 0 && draftAttachments.length === 0) return;
+        if (draft.length > 10) return;
+        if (draftAttachments.length > 4) return;
+
         const payload = {
             words: draft,
-            reply_to: replyingToNonce
+            reply_to: replyingToNonce,
+            attachments: draftAttachments,
         };
 
         const sendBtn = document.getElementById('send-btn');
@@ -609,8 +742,6 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)
             });
-
-            // Safe Error Handling: Read as text first!
             if (res.ok) {
                 clearDraft();
                 cancelReply();
@@ -623,7 +754,7 @@
                     try {
                         const errJson = JSON.parse(errText);
                         alert("Error: " + (errJson.error || "Unknown error"));
-                    } catch(e) {
+                    } catch (e) {
                         alert("Backend Error: " + errText);
                     }
                 }

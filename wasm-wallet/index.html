@@ -295,7 +295,42 @@
         .chat-sender { color: var(--accent); font-weight: bold; cursor: pointer; font-size: 12px; text-decoration: underline; text-decoration-color: transparent; transition: all 0.2s; }
         .chat-sender:hover { text-decoration-color: var(--accent); }
         .chat-time { color: #555; font-size: 10px; margin-left: auto; }
+/* Chat attachments — typed, fixed-width payloads (e.g. addresses). */
+        .draft-attachment {
+            font-family: 'JetBrains Mono', 'Menlo', monospace;
+            font-size: 11px;
+            background: #1a1a1a;
+            border: 1px solid var(--accent);
+            color: var(--accent);
+            padding: 3px 7px;
+            border-radius: 4px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .draft-attachment::before { content: "📎"; font-size: 10px; }
+        .draft-attachment:hover { background: rgba(212, 255, 0, 0.1); }
 
+        .chat-attachments {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+            margin-top: 6px;
+        }
+        .chat-attachment {
+            font-family: 'JetBrains Mono', 'Menlo', monospace;
+            font-size: 11px;
+            background: #161616;
+            border: 1px solid #2c2c2c;
+            color: #888;
+            padding: 3px 7px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .chat-attachment:hover { border-color: var(--accent); color: var(--accent); }
+        .chat-attachment.copied { border-color: var(--accent); color: var(--accent); }
         .chat-words { color: var(--text-max); font-size: 15px; font-weight: 500; display: block; letter-spacing: 0.3px; }
 
         .reply-context { font-size: 11px; color: #888; margin-bottom: 6px; display: block; background: rgba(255,255,255,0.04); padding: 4px 8px; border-radius: 4px; border-left: 2px solid var(--accent-dim); }
@@ -636,7 +671,10 @@
             </div>
             <datalist id="dict-list"></datalist>
 
+            <div id="draft-attachments" style="display: flex; gap: 5px; flex-wrap: wrap; margin-top: 8px;"></div>
+
             <div class="chat-controls">
+                <button onclick="attachChatAddress()" style="background: transparent; color: var(--accent); border-color: var(--accent); flex: 1;">+ Address</button>
                 <button onclick="clearChatDraft()" style="background: transparent; color: var(--red); border-color: var(--red); flex: 1;">Clear</button>
                 <button onclick="submitChat()" id="send-chat-btn" disabled style="background: var(--accent); color: #000; flex: 2;">Send</button>
             </div>
@@ -1687,11 +1725,20 @@ if ('serviceWorker' in navigator) {
                     if (lc) { result = await lc.checkCommitment(params.commitmentHex); }
                     else { const r = await fetch(`${url}/check_commitment`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ commitment: params.commitmentHex }) }); result = r.ok ? await r.json() : null; }
                 } else if (method === 'sendChat') {
+                    const attachments = params.attachments || [];
                     if (lc) {
-                        const resp = await lc.sendChat(params.words, params.replyTo);
+                        const resp = await lc.sendChat(params.words, params.replyTo, attachments);
                         result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
                     } else {
-                        const r = await fetch(`${url}/api/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ words: params.words, reply_to: params.replyTo }) });
+                        const r = await fetch(`${url}/api/chat`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                words: params.words,
+                                reply_to: params.replyTo,
+                                attachments,
+                            }),
+                        });
                         result = { ok: r.ok, body: r.ok ? null : await r.text() };
                     }
                 } else if (method === 'getChat') {
@@ -2322,6 +2369,7 @@ document.getElementById('btnExport').onclick = () => {
         let chatDictionary = [];
         let myChatSender = null;
         let chatDraft = [];
+        let chatDraftAttachments = [];  // [{kind:"address", value:"<64-hex>"}, ...]
         let replyingToNonce = null;
         const chatMessageMap = new Map();
         const chatInputField = document.getElementById('chat-input');
@@ -2471,6 +2519,35 @@ document.getElementById('btnExport').onclick = () => {
                 wordsSpan.textContent = wordsText;
                 div.appendChild(wordsSpan);
 
+                // 3b. Attachments (typed, fixed-width payloads — currently addresses)
+                if (msg.attachments && msg.attachments.length > 0) {
+                    const attBox = document.createElement('div');
+                    attBox.className = 'chat-attachments';
+                    msg.attachments.forEach(att => {
+                        const chip = document.createElement('div');
+                        chip.className = 'chat-attachment';
+                        if (att.kind === 'address') {
+                            const short = att.value.slice(0, 8) + '…' + att.value.slice(-8);
+                            chip.textContent = `📎 address: ${short}`;
+                            chip.title = "Click to copy • " + att.value;
+                            chip.addEventListener('click', () => {
+                                navigator.clipboard.writeText(att.value);
+                                chip.classList.add('copied');
+                                const orig = chip.textContent;
+                                chip.textContent = '✓ copied';
+                                setTimeout(() => {
+                                    chip.classList.remove('copied');
+                                    chip.textContent = orig;
+                                }, 800);
+                            });
+                        } else {
+                            chip.textContent = `${att.kind}: ${att.value}`;
+                        }
+                        attBox.appendChild(chip);
+                    });
+                    div.appendChild(attBox);
+                }
+
                 // 4. Reply Button
                 const replyBtn = document.createElement('button');
                 replyBtn.className = 'reply-btn';
@@ -2494,11 +2571,54 @@ document.getElementById('btnExport').onclick = () => {
             renderChatDraft();
             chatInputField.focus();
         }
+/**
+         * Prompt the user to attach a midstate address (64 hex chars).
+         * Capped at 4 per message (matches `MAX_CHAT_ATTACHMENTS` server-side).
+         */
+        function attachChatAddress() {
+            if (chatDraftAttachments.length >= 4) {
+                alert("Maximum 4 attachments per message.");
+                return;
+            }
+            const raw = prompt("Paste a midstate address (64 hex characters):");
+            if (raw === null) return;
+            const hex = raw.trim().toLowerCase();
+            if (!/^[0-9a-f]{64}$/.test(hex)) {
+                alert("Invalid address — must be exactly 64 hex characters (0-9, a-f).");
+                return;
+            }
+            if (chatDraftAttachments.some(a => a.kind === "address" && a.value === hex)) {
+                alert("That address is already attached.");
+                return;
+            }
+            chatDraftAttachments.push({ kind: "address", value: hex });
+            renderChatDraftAttachments();
+            updateChatButtons();
+        }
 
+        function renderChatDraftAttachments() {
+            const box = document.getElementById('draft-attachments');
+            box.innerHTML = '';
+            chatDraftAttachments.forEach((att, i) => {
+                const chip = document.createElement('div');
+                chip.className = 'draft-attachment';
+                const short = att.value.slice(0, 8) + '…' + att.value.slice(-8);
+                chip.textContent = `${att.kind}:${short}`;
+                chip.title = "Click to remove • " + att.value;
+                chip.onclick = () => {
+                    chatDraftAttachments.splice(i, 1);
+                    renderChatDraftAttachments();
+                    updateChatButtons();
+                };
+                box.appendChild(chip);
+            });
+        }
         function clearChatDraft() {
             chatDraft = [];
+            chatDraftAttachments = [];
             chatInputField.value = '';
             renderChatDraft();
+            renderChatDraftAttachments();
             chatInputField.focus();
         }
 
@@ -2521,25 +2641,35 @@ document.getElementById('btnExport').onclick = () => {
                 counter.textContent = `${chatDraft.length} / 10`;
                 counter.style.color = chatDraft.length >= 10 ? 'var(--accent)' : (chatDraft.length >= 8 ? '#999' : '#444');
             }
+            renderChatDraftAttachments();
             updateChatButtons();
         }
 
         function updateChatButtons() {
             const isFull = chatDraft.length >= 10;
-            const isEmpty = chatDraft.length === 0;
-            
+            const isEmpty = chatDraft.length === 0 && chatDraftAttachments.length === 0;
+
             document.getElementById('send-chat-btn').disabled = isEmpty;
             chatInputField.disabled = isFull;
-            
+
             const dictButtons = document.getElementById('dictionary-box').querySelectorAll('button');
             dictButtons.forEach(btn => btn.disabled = isFull);
         }
 
         function submitChat() {
-            if (chatDraft.length === 0 || chatDraft.length > 10) return;
+            if (chatDraft.length === 0 && chatDraftAttachments.length === 0) return;
+            if (chatDraft.length > 10) return;
+            if (chatDraftAttachments.length > 4) return;
             document.getElementById('send-chat-btn').innerText = "Sending...";
             document.getElementById('send-chat-btn').disabled = true;
-            worker.postMessage({ type: 'SEND_CHAT', payload: { words: chatDraft, replyTo: replyingToNonce } });
+            worker.postMessage({
+                type: 'SEND_CHAT',
+                payload: {
+                    words: chatDraft,
+                    replyTo: replyingToNonce,
+                    attachments: chatDraftAttachments,
+                },
+            });
         }
         
         // Fetch chat once on load

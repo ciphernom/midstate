@@ -383,10 +383,34 @@ pub struct BlockTemplateMismatchError {
     pub total_fees: u64,
 }
 
+/// HTTP request body for `POST /api/chat`.
+///
+/// # Validation (in `crate::rpc::handlers::send_chat`)
+///
+/// ```text
+/// (#words ≥ 1 ∨ #attachments ≥ 1)
+/// #words ≤ 10
+/// ∀ w ∈ ran words • w < #CHAT_DICTIONARY
+/// #attachments ≤ MAX_CHAT_ATTACHMENTS
+/// ```
+///
+/// # JSON shape
+///
+/// ```json
+/// {
+///   "reply_to": null,
+///   "words": [42, 81, 200],
+///   "attachments": [
+///     { "kind": "address", "value": "ab01...64-hex-chars...ff" }
+///   ]
+/// }
+/// ```
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SendChatRequest {
-    pub reply_to: Option<u64>, 
+    pub reply_to: Option<u64>,
     pub words: Vec<u8>,
+    #[serde(default)]
+    pub attachments: Vec<crate::node::ChatAttachment>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

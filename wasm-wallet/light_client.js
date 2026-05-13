@@ -378,8 +378,24 @@ async request(req, _retries = 2) {
         return resp.data;
     }
 
-    async sendChat(words, replyTo) {
-        const resp = await this.request({ method: 'send_chat', params: { words, reply_to: replyTo } });
+    /**
+     * Originate a chat over the WebRTC light protocol.
+     *
+     * Server-side this hits `LightRequest::SendChat` in `src/node.rs`,
+     * which enqueues a `NodeCommand::SendChat` with `sender_override =
+     * Some(<our light-peer-id>)`. The node mines v2 PoW (~10 ms) and
+     * broadcasts as `Message::ChatV2`.
+     *
+     * @param {number[]}                                words      0..=10 indices into CHAT_DICTIONARY
+     * @param {number|null}                             replyTo    Parent message nonce, or null
+     * @param {{kind:"address",value:string}[]} [attachments=[]]   0..=4 typed attachments
+     *                                                             (value: 64-char lowercase hex for address)
+     */
+    async sendChat(words, replyTo, attachments = []) {
+        const resp = await this.request({
+            method: 'send_chat',
+            params: { words, reply_to: replyTo, attachments },
+        });
         return resp;
     }
 

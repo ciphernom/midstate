@@ -8,7 +8,21 @@
 //
 // The protocol ID includes "light" so full nodes can rate-limit/prioritize
 // light client traffic independently from peer-to-peer sync traffic.
-
+//! # Chat additive evolution
+//!
+//! Both [`LightRequest::SendChat`] and [`LightNotification::ChatMessage`]
+//! gained an `attachments: Vec<crate::node::ChatAttachment>` field in
+//! v2. The field uses `#[serde(default)]` so payloads from older
+//! browsers (which omit the field) still parse, defaulting to an empty
+//! vector — equivalent to a v2 chat without attachments.
+//!
+//! `LightNotification::ChatMessage` also marks `attachments` with
+//! `skip_serializing_if = "Vec::is_empty"` to keep the JSON form
+//! bit-identical to v1 when no attachments are present.
+//!
+//! These JSON evolutions are unrelated to the binary
+//! `crate::network::protocol::Message::ChatV2` variant — they exist
+//! purely to keep browser wallets compatible across the upgrade.
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use libp2p::StreamProtocol;
@@ -28,12 +42,20 @@ pub enum LightNotification {
         block_hash: String,
         element_count: u64,
     },
+    /// A chat broadcast pushed to all connected light clients. Mirrors
+    /// the JSON shape of [`crate::node::ChatMessage`].
+    ///
+    /// `attachments` is `#[serde(default)]` for backward-compatible
+    /// JSON ingest and `skip_serializing_if = "Vec::is_empty"` so the
+    /// serialized form for legacy chats is bit-identical to v1.
     ChatMessage {
         sender: String,
         timestamp: u64,
-        nonce: u64,            
-        reply_to: Option<u64>, 
+        nonce: u64,
+        reply_to: Option<u64>,
         words: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::node::ChatAttachment>,
     }
 }
 
@@ -91,10 +113,22 @@ pub enum LightRequest {
     #[serde(rename = "mss_state")]
     MssState { master_pk: String },
     
+    /// Originate a chat from a browser light client. The node mines v2
+    /// PoW on the client's behalf and broadcasts as
+    /// [`crate::network::protocol::Message::ChatV2`].
+    ///
+    /// `attachments` is `#[serde(default)]` so older browsers (which
+    /// do not know about the field) still produce valid requests.
+    ///
+    /// See the `LightRequest::SendChat` handler in `crate::node` for
+    /// the pre-v2 bug history (Bug A: random-nonce PoW; Bug B:
+    /// duplicate history push).
     #[serde(rename = "send_chat")]
-    SendChat { 
-        reply_to: Option<u64>, 
-        words: Vec<u8> 
+    SendChat {
+        reply_to: Option<u64>,
+        words: Vec<u8>,
+        #[serde(default)]
+        attachments: Vec<crate::node::ChatAttachment>,
     },
     
 

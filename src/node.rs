@@ -1,3 +1,33 @@
+//! # Chat subsystem
+//!
+//! Midstate's chat is a dictionary-bound P2P message bus. Every chat token
+//! is a `u8` index into [`CHAT_DICTIONARY`] (256 fixed entries), and every
+//! field that gossips across the network is either a fixed-width byte
+//! payload or a tightly-bounded enumeration the receiver controls. The
+//! design property the subsystem is built around:
+//!
+//! > **NoArbitraryText.** No field in any chat message admits
+//! > user-controllable `String` or variable-length `Vec<u8>` carrying
+//! > textual data. The only `String` is `sender`, which is validated as
+//! > a base58 libp2p `PeerId` in
+//! > [`crate::network::protocol::Message::deserialize_bin`].
+//!
+//! ## Wire variants
+//!
+//! - [`crate::network::protocol::Message::Chat`] — legacy v1. PoW
+//!   ([`verify_chat_pow`]) covers `(sender, ts, reply_to, words, nonce)`.
+//!   Receive-only on new nodes; new nodes never emit it.
+//! - [`crate::network::protocol::Message::ChatV2`] — current. PoW
+//!   ([`verify_chat_pow_v2`]) additionally covers `attachments` and is
+//!   domain-separated from v1 (Lemma 2.3.1 in `verify_chat_pow_v2` docs).
+//!
+//! ## Chat-only frame property
+//!
+//! See [`crate::network::protocol`] module docs for the wire-format
+//! frame proof: `Message::ChatV2` is **appended** to the `Message` enum
+//! and no existing variant is reordered, so every non-chat variant's
+//! bincode encoding is byte-identical before and after the chat-v2
+//! introduction.
 use crate::core::*;
 use crate::core::types::compute_address;
 use crate::core::types::{CoinbaseOutput, BatchHeader};
@@ -43,7 +73,18 @@ const BATCH_LOOKAHEAD: usize = 3;
 
 const MAX_PREFETCH_BUFFER: usize = 32;
 
-// 256-word max capacity chat dictionary (fits exactly in u8 indices 0-255)
+/// Fixed 256-word dictionary indexed by chat message `words` bytes.
+///
+/// Cardinality (256) is load-bearing: a `Vec<u8>` lookup against this
+/// table cannot overflow `u8`, and a single byte selects exactly one
+/// canonical token. Adding or removing entries is a chat-protocol break
+/// because index 42 must mean the same word on every peer.
+///
+/// New tokens may be appended at the end of the list **only if all
+/// participating nodes upgrade simultaneously**, otherwise unmigrated peers
+/// will reject messages containing the new indices via the
+/// `w as usize >= CHAT_DICTIONARY.len()` check in
+/// [`crate::network::protocol::Message::deserialize_bin`].
 pub const CHAT_DICTIONARY: &[&str] = &[
     // 0-19: Greetings & Slang
     "Hello", "Goodbye", "Yes", "No", "Thanks", "Please", "gm", "gn", "lol", "lmao",
@@ -90,13 +131,129 @@ pub const CHAT_DICTIONARY: &[&str] = &[
     "🔥", "🚀", "💀", "💎", "👀", "🤝", "📈", "📉", "⚡", "⚠️", "✅"
 ];
 
+/// A typed, fixed-shape attachment that rides alongside a v2 chat message.
+///
+/// # Invariant: NoArbitraryText
+///
+/// Every variant is structurally a fixed-width byte payload. There is no
+/// field in this enum that admits user-controlled `String` or
+/// variable-length `Vec<u8>` of textual data. The constraint is enforced
+/// at the type level by serde and bincode:
+///
+/// - JSON: the [`hex_array_32`] adapter requires `value` to be a
+///   64-character hex string. Anything else is a deserialization error.
+/// - Bincode: `[u8; 32]` is a fixed-length array — bincode refuses any
+///   encoding that does not supply exactly 32 bytes.
+///
+/// # Encoding
+///
+/// | Form    | Shape                                                            |
+/// |---------|------------------------------------------------------------------|
+/// | JSON    | `{"kind":"address","value":"<64-char lowercase hex>"}`           |
+/// | Bincode | 32 raw bytes (variant tag prefix per bincode enum encoding)      |
+///
+/// # PoW canonical bytes
+///
+/// When mining or verifying via [`verify_chat_pow_v2`], each attachment
+/// is encoded as `tag_u8 ⌢ payload_bytes`:
+///
+/// | Variant   | Tag    | Payload length |
+/// |-----------|--------|----------------|
+/// | `Address` | `0x01` | 32             |
+///
+/// Future variants append new tags; existing tags are immutable.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ChatAttachment {
+    /// A 32-byte midstate address (same `[u8; 32]` shape produced by
+    /// `crate::core::compute_address` and stored in `WalletKey::address`).
+    Address(#[serde(with = "hex_array_32")] [u8; 32]),
+}
+
+/// Hard cap on attachments per chat message.
+///
+/// Enforced at every entry point that constructs or accepts a chat:
+/// - [`crate::network::protocol::Message::deserialize_bin`] (peer-to-peer)
+/// - The `LightRequest::SendChat` handler (light-client origination)
+/// - `crate::rpc::handlers::send_chat` (LAN browser origination)
+pub const MAX_CHAT_ATTACHMENTS: usize = 4;
+
+/// Serde adapter for `[u8; 32]` that branches on
+/// [`is_human_readable`](serde::Serializer::is_human_readable).
+///
+/// - JSON: 64-character lowercase hex string. Length checked on deserialize.
+/// - Bincode: 32 raw bytes via the default `[u8; 32]` codec.
+///
+/// This dual encoding keeps the on-wire bincode form compact (32 bytes,
+/// not a 64-character string) while keeping the JSON form human-readable
+/// for the browser, the chat UI, and HTTP debugging.
+mod hex_array_32 {
+    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            s.serialize_str(&hex::encode(bytes))
+        } else {
+            use serde::Serialize;
+            bytes.serialize(s)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        if d.is_human_readable() {
+            let s = String::deserialize(d)?;
+            let v = hex::decode(&s).map_err(D::Error::custom)?;
+            if v.len() != 32 {
+                return Err(D::Error::custom(
+                    "ChatAttachment::Address must be exactly 32 bytes / 64 hex chars",
+                ));
+            }
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&v);
+            Ok(out)
+        } else {
+            <[u8; 32]>::deserialize(d)
+        }
+    }
+}
+
+/// A chat message as it appears in `Node::chat_history` and in the
+/// JSON returned by `GET /api/chat`.
+///
+/// # Schema
+///
+/// ```text
+/// ┌─ ChatMessage ──────────────────────────
+/// │  sender    : PeerId
+/// │  timestamp : ℕ
+/// │  nonce     : ℕ
+/// │  reply_to  : ℕ ∪ {⊥}
+/// │  words     : seq u8
+/// │  attachs   : seq ChatAttachment
+/// ├────────────────────────────────────────
+/// │  #words      ≤ 10
+/// │  #attachs    ≤ MAX_CHAT_ATTACHMENTS
+/// │  #sender_bytes ≤ 128
+/// │  isValidPeerId(sender)
+/// │  ∀ w ∈ ran words • w < #CHAT_DICTIONARY
+/// └────────────────────────────────────────
+/// ```
+///
+/// # JSON additive evolution
+///
+/// `attachments` is `#[serde(default)]` so payloads without the field
+/// still deserialize (legacy v1 producers); `skip_serializing_if =
+/// "Vec::is_empty"` makes the serialized form for legacy messages
+/// bit-identical to the pre-v2 wire shape.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
     pub sender: String,
     pub timestamp: u64,
-    pub nonce: u64,             
-    pub reply_to: Option<u64>, 
+    pub nonce: u64,
+    pub reply_to: Option<u64>,
     pub words: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ChatAttachment>,
 }
 
 const MAX_PREFETCH_DISTANCE: u64 = 10_000;
@@ -218,7 +375,33 @@ pub enum MinedResult {
 
 
 
-/// Requires ~1 million hashes (20 leading zero bits). Takes ~10ms per message.
+/// Verify PoW for a legacy [`crate::network::protocol::Message::Chat`].
+///
+/// **Status: receive-only after the v2 introduction.** New nodes never
+/// mine v1 PoW. This function is called only when an old peer delivers a
+/// legacy `Message::Chat`. New chats are emitted via [`mine_chat_pow_v2`]
+/// and [`crate::network::protocol::Message::ChatV2`].
+///
+/// # Canonical PoW preimage (v1)
+///
+/// ```text
+/// sender_bytes ⌢ le8(timestamp) ⌢ le8(reply_to.unwrap_or(0))
+///              ⌢ words ⌢ le8(nonce)
+/// ```
+///
+/// # Difficulty
+///
+/// Requires ≥ 20 leading zero bits of `BLAKE3(preimage)`. Mining cost
+/// is ~2²⁰ ≈ 1 M hashes; ~10 ms on commodity hardware.
+///
+/// # Domain separation
+///
+/// **Lemma 2.3.1.** Even for messages with empty attachments,
+/// `encode_pow_v1(m) ≠ encode_pow_v2(m)` because v2 inserts the
+/// 4-byte little-endian zero `0x00000000` between `words` and `nonce`.
+/// Therefore a v1-valid `(m, nonce)` does not validate under v2 (and
+/// vice versa) with overwhelming probability. The receive handler
+/// dispatches v1/v2 by `Message` variant, never cross-validating.
 pub fn verify_chat_pow(sender: &str, timestamp: u64, reply_to: Option<u64>, words: &[u8], nonce: u64) -> bool {
     let mut data = Vec::new();
     data.extend_from_slice(sender.as_bytes());
@@ -231,11 +414,120 @@ pub fn verify_chat_pow(sender: &str, timestamp: u64, reply_to: Option<u64>, word
     crate::core::types::count_leading_zeros(&h) >= 20
 }
 
+/// Search nonces from 0 upward until [`verify_chat_pow`] returns `true`.
+///
+/// **Status: dead code after v2 introduction.** Kept exported in case a
+/// future tool needs to reproduce a v1-valid digest. New chat origination
+/// uses [`mine_chat_pow_v2`].
 pub fn mine_chat_pow(sender: String, timestamp: u64, reply_to: Option<u64>, words: Vec<u8>) -> u64 {
     let mut n = 0u64;
     loop {
         if verify_chat_pow(&sender, timestamp, reply_to, &words, n) { 
             return n; 
+        }
+        n += 1;
+    }
+}
+
+/// Verify PoW for a [`crate::network::protocol::Message::ChatV2`].
+///
+/// # Canonical PoW preimage (v2)
+///
+/// ```text
+/// sender_bytes
+/// ⌢ le8(timestamp)
+/// ⌢ le8(reply_to.unwrap_or(0))
+/// ⌢ words
+/// ⌢ le4(#attachments)                          // 4-byte LE attachment count
+/// ⌢ (⌢/ ⟨tag_u8(att) ⌢ payload_bytes(att) | att ∈ attachments⟩)
+/// ⌢ le8(nonce)
+/// ```
+///
+/// where `tag_u8(ChatAttachment::Address(_)) = 0x01` and
+/// `payload_bytes(ChatAttachment::Address(a)) = a` (32 bytes).
+///
+/// # Lemma 2.3.1 — Domain separation from v1
+///
+/// For any message with `#attachments = 0`, `encode_pow_v1(m)` and
+/// `encode_pow_v2(m)` differ by exactly 4 bytes (the `le4(0)` prefix),
+/// so their BLAKE3 digests differ with overwhelming probability. A v1
+/// preimage cannot accidentally satisfy v2 (or vice versa). Cross-version
+/// verification is therefore impossible, and the receive handler
+/// dispatches by `Message` variant — never trying the other verifier on
+/// a failed check.
+///
+/// # Lemma 2.3.2 — PoW binds attachments
+///
+/// Suppose `(m, nonce)` is v2-valid and `m'` is identical to `m` except
+/// for `attachments`. If `#attachments ≠ #m'.attachments`, then
+/// `encode_pow_v2(m) ≠ encode_pow_v2(m')` (different `le4` prefix). If
+/// counts match but payloads differ, the per-attachment bytes differ.
+/// Either way, the digest changes and v2 verification of `(m', nonce)`
+/// fails. Consequence: a forwarding peer cannot strip, substitute, or
+/// reorder attachments without invalidating PoW.
+///
+/// # Difficulty
+///
+/// 20 leading zero bits of `BLAKE3(preimage)`. Identical to v1.
+pub fn verify_chat_pow_v2(
+    sender: &str,
+    timestamp: u64,
+    reply_to: Option<u64>,
+    words: &[u8],
+    attachments: &[ChatAttachment],
+    nonce: u64,
+) -> bool {
+    let mut data = Vec::with_capacity(
+        sender.len() + 8 + 8 + words.len() + 4 + attachments.len() * (1 + 32) + 8,
+    );
+    data.extend_from_slice(sender.as_bytes());
+    data.extend_from_slice(&timestamp.to_le_bytes());
+    data.extend_from_slice(&reply_to.unwrap_or(0).to_le_bytes());
+    data.extend_from_slice(words);
+
+    data.extend_from_slice(&(attachments.len() as u32).to_le_bytes());
+    for att in attachments {
+        match att {
+            ChatAttachment::Address(addr) => {
+                data.push(0x01); // tag: Address
+                data.extend_from_slice(addr);
+            }
+        }
+    }
+    data.extend_from_slice(&nonce.to_le_bytes());
+
+    let h = crate::core::types::hash(&data);
+    crate::core::types::count_leading_zeros(&h) >= 20
+}
+
+/// Search nonces from 0 upward until [`verify_chat_pow_v2`] returns `true`.
+///
+/// # Postcondition
+///
+/// ```text
+/// ∃ n : ℕ • verify_chat_pow_v2(sender, ts, reply_to, words, atts, n) = ⊤
+///         ∧ ∀ k : ℕ • k < n ⇒ ¬verify_chat_pow_v2(..., k)
+/// ```
+///
+/// (The function returns the *smallest* satisfying nonce.)
+///
+/// # Termination
+///
+/// At 20 PoW bits, the expected number of iterations is 2²⁰ ≈ 1.05 M;
+/// 99% of mines complete within ~5 M iterations. Mining is CPU-bound
+/// (~10 ms on commodity hardware) and must be invoked on a blocking
+/// task — never inside an async request handler.
+pub fn mine_chat_pow_v2(
+    sender: String,
+    timestamp: u64,
+    reply_to: Option<u64>,
+    words: Vec<u8>,
+    attachments: Vec<ChatAttachment>,
+) -> u64 {
+    let mut n = 0u64;
+    loop {
+        if verify_chat_pow_v2(&sender, timestamp, reply_to, &words, &attachments, n) {
+            return n;
         }
         n += 1;
     }
@@ -367,8 +659,41 @@ pub enum NodeCommand {
     },
     BroadcastLightPush(crate::network::light_protocol::LightNotification),
     SendResponse { channel: libp2p::request_response::ResponseChannel<crate::network::Message>, msg: crate::network::Message },
-    SendChat { reply_to: Option<u64>, words: Vec<u8> },   
-    BroadcastP2PChat { sender: String, timestamp: u64, nonce: u64, reply_to: Option<u64>, words: Vec<u8> },
+    /// Originate a chat message. Triggers async v2 PoW mining followed
+    /// by a single [`NodeCommand::BroadcastP2PChat`].
+    ///
+    /// `sender_override`:
+    /// - `None` ⇒ originator is *this node*; sender = `local_peer_id()`.
+    ///   Used by the HTTP `send_chat` handler.
+    /// - `Some(pid)` ⇒ originator is a light client whose libp2p `PeerId`
+    ///   is `pid`. The node mines PoW on the client's behalf; the
+    ///   resulting v2 message attributes `sender = pid`.
+    SendChat {
+        sender_override: Option<String>,
+        reply_to: Option<u64>,
+        words: Vec<u8>,
+        attachments: Vec<ChatAttachment>,
+    },
+    /// Emit a fully-mined chat onto the wire. Fired only by the
+    /// [`NodeCommand::SendChat`] handler after `mine_chat_pow_v2` completes.
+    ///
+    /// Postcondition:
+    /// - `chat_history' = takeRight(chat_history ⌢ ⟨m⟩, MAX_HISTORY)`
+    /// - `seen_chats'   = seen_chats ∪ {nonce}`
+    /// - `network.broadcast(Message::ChatV2 ⟨m⟩)`
+    /// - `network.broadcast_light_push(LightNotification::ChatMessage ⟨m⟩)`
+    ///
+    /// History push is exactly once. (Pre-v2, the light handler also
+    /// pushed directly, causing duplicate entries. That second push has
+    /// been removed.)
+    BroadcastP2PChat {
+        sender: String,
+        timestamp: u64,
+        nonce: u64,
+        reply_to: Option<u64>,
+        words: Vec<u8>,
+        attachments: Vec<ChatAttachment>,
+    },
 
 }
 
@@ -475,8 +800,36 @@ impl NodeHandle {
         Ok(())
     }
     
-    pub fn send_chat(&self, words: Vec<u8>, reply_to: Option<u64>) -> Result<()> {
-        self.tx_sender.try_send(NodeCommand::SendChat { reply_to, words })
+    /// Originate a chat from this node. Returns immediately after
+    /// enqueueing; mining and broadcast happen asynchronously.
+    ///
+    /// # Precondition (caller's responsibility)
+    ///
+    /// ```text
+    /// (#words ≥ 1 ∨ #attachments ≥ 1)
+    /// #words ≤ 10
+    /// ∀ w ∈ ran words • w < #CHAT_DICTIONARY
+    /// #attachments ≤ MAX_CHAT_ATTACHMENTS
+    /// ```
+    ///
+    /// The HTTP `send_chat` handler enforces these before calling.
+    ///
+    /// # Failure
+    ///
+    /// Returns `Err` only if the command channel is full (back-pressure).
+    pub fn send_chat(
+        &self,
+        words: Vec<u8>,
+        reply_to: Option<u64>,
+        attachments: Vec<ChatAttachment>,
+    ) -> Result<()> {
+        self.tx_sender
+            .try_send(NodeCommand::SendChat {
+                sender_override: None,
+                reply_to,
+                words,
+                attachments,
+            })
             .map_err(|e| anyhow::anyhow!("Node is overloaded: {}", e))?;
         Ok(())
     }
@@ -1698,12 +2051,39 @@ async fn handle_light_request(
                 LightResponse::success(serde_json::json!({ "next_index": chain_max.max(mempool_max) }))
             }
             
-            LightRequest::SendChat { reply_to, words } => {
-                if words.is_empty() || words.len() > 10 {
+            LightRequest::SendChat { reply_to, words, attachments } => {
+                // # Bug-fix history
+                //
+                // Pre-v2 this handler had two bugs:
+                //
+                // - **Bug A — invalid PoW broadcast.** A random nonce was stamped
+                //   onto the outbound `Message::Chat` and gossiped to peers.
+                //   Receiving peers ran `verify_chat_pow`, saw it fail, and applied
+                //   a `+20` Bayesian Adversarial penalty to the *forwarding* node
+                //   — this very node. Every light-client chat poisoned our peer
+                //   reputation.
+                //
+                // - **Bug B — duplicate history push.** This handler pushed into
+                //   `chat_history` *and* enqueued `BroadcastP2PChat`, which *also*
+                //   pushed. Light chats appeared twice in `GET /api/chat`.
+                //
+                // The fix: no local history push, no random-nonce construction.
+                // Enqueue `NodeCommand::SendChat` with
+                // `sender_override = Some(light_pid)` and let the unified command
+                // handler mine real v2 PoW and broadcast exactly once. The
+                // originating light client receives its own message back via the
+                // push protocol — UX unchanged beyond a ~10 ms delay.
+                if words.is_empty() && attachments.is_empty() {
+                    return LightResponse::error("Message must contain words or attachments");
+                }
+                if words.len() > 10 {
                     return LightResponse::error("Message must be between 1 and 10 words");
                 }
                 if words.iter().any(|&w| (w as usize) >= crate::node::CHAT_DICTIONARY.len()) {
                     return LightResponse::error("Invalid word index");
+                }
+                if attachments.len() > crate::node::MAX_CHAT_ATTACHMENTS {
+                    return LightResponse::error("Too many attachments (max 4)");
                 }
 
                 // Per-light-client rate limit: 5 chats per 10s per PeerId.
@@ -1726,8 +2106,7 @@ async fn handle_light_request(
                     }
                 }
 
-                // Global light-origination cap: prevents a swarm of clients from
-                // using this node to amplify into the network.
+                // Global light-origination cap.
                 {
                     let mut limiter = self.outbox_chat_limiter.lock().await;
                     let now = std::time::Instant::now();
@@ -1740,32 +2119,16 @@ async fn handle_light_request(
                     }
                 }
 
-                // 53 bits of entropy: perfectly safe for JS Numbers, zero chance of collision.
-                let nonce = rand::random::<u64>() % 9_007_199_254_740_991;
-                let timestamp = crate::core::state::current_timestamp();
-                let sender = from.to_string();
-
-                let mut hist = self.chat_history.write().await;
-                hist.push_back(ChatMessage { sender: sender.clone(), timestamp, nonce, reply_to, words: words.clone() });
-                if hist.len() > 100 { hist.pop_front(); }
-                drop(hist);
-
                 if let Some(cmd_tx) = &self.cmd_tx {
-                    // Fix #1: pass sender through so forwarders preserve identity.
-                    let _ = cmd_tx.try_send(NodeCommand::BroadcastP2PChat {
-                        sender: sender.clone(),
-                        timestamp,
-                        nonce,
+                    let _ = cmd_tx.try_send(NodeCommand::SendChat {
+                        sender_override: Some(from.to_string()),
                         reply_to,
-                        words: words.clone(),
+                        words,
+                        attachments,
                     });
-                    let notif = crate::network::light_protocol::LightNotification::ChatMessage {
-                        sender, timestamp, nonce, reply_to, words
-                    };
-                    let _ = cmd_tx.try_send(NodeCommand::BroadcastLightPush(notif));
                 }
 
-                LightResponse::success(serde_json::json!({ "status": "sent" }))
+                LightResponse::success(serde_json::json!({ "status": "queued" }))
             }
             
         }
@@ -1797,6 +2160,99 @@ async fn handle_light_request(
             }
         }
         true
+    }
+
+/// Shared post-validation ingest path for inbound chats from peers.
+    ///
+    /// Invoked by both the legacy [`crate::network::protocol::Message::Chat`]
+    /// arm (with empty attachments) and the
+    /// [`crate::network::protocol::Message::ChatV2`] arm. The caller
+    /// is responsible for sender-length, words-bounds, and PoW verification.
+    ///
+    /// # Postcondition
+    ///
+    /// ```text
+    /// nonce ∉ seen_chats  ⇒
+    ///   chat_history' = takeRight(chat_history ⌢ ⟨m⟩, MAX_HISTORY)
+    ///   seen_chats'   = seen_chats ∪ {nonce}
+    ///   peer_chat_counts'(from) = bump
+    ///   network.broadcast_except(from, Message::ChatV2 ⟨m⟩)
+    ///   light_push(LightNotification::ChatMessage ⟨m⟩)
+    /// nonce ∈ seen_chats  ⇒  state unchanged   (dedup)
+    /// flood_count(from) > 100  ⇒  state unchanged, Bayesian penalty
+    /// ```
+    ///
+    /// # Re-emission
+    ///
+    /// Always emits as `Message::ChatV2` regardless of the inbound
+    /// variant. Legacy peers can reach each other via legacy gossip;
+    /// new peers reach each other via v2.
+    async fn ingest_chat_inbound(
+        &mut self,
+        from: PeerId,
+        sender: String,
+        timestamp: u64,
+        nonce: u64,
+        reply_to: Option<u64>,
+        words: Vec<u8>,
+        attachments: Vec<ChatAttachment>,
+    ) {
+        if !self.mark_chat_seen(nonce) {
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        let entry = self.peer_chat_counts.entry(from).or_insert((0, now));
+        if now.duration_since(entry.1).as_secs() >= 10 {
+            *entry = (0, now);
+        }
+        entry.0 += 1;
+        if entry.0 > 100 {
+            tracing::debug!("Chat forwarding rate limit exceeded by peer {}", from);
+            let peer_str = from.to_string();
+            if let Some(stats) = self.known_pex_addrs.get_mut(&peer_str) {
+                stats.1 = stats.1.saturating_add(10);
+            }
+            return;
+        }
+
+        let mut hist = self.chat_history.write().await;
+        hist.push_back(ChatMessage {
+            sender: sender.clone(),
+            timestamp,
+            nonce,
+            reply_to,
+            words: words.clone(),
+            attachments: attachments.clone(),
+        });
+        if hist.len() > 100 {
+            hist.pop_front();
+        }
+        drop(hist);
+
+        self.network.broadcast_except(
+            Some(from),
+            crate::network::Message::ChatV2 {
+                sender: sender.clone(),
+                timestamp,
+                nonce,
+                reply_to,
+                words: words.clone(),
+                attachments: attachments.clone(),
+            },
+        );
+
+        let notif = crate::network::light_protocol::LightNotification::ChatMessage {
+            sender,
+            timestamp,
+            nonce,
+            reply_to,
+            words,
+            attachments,
+        };
+        if let Some(tx) = &self.cmd_tx {
+            let _ = tx.try_send(NodeCommand::BroadcastLightPush(notif));
+        }
     }
 
     /// Evaluates if the node is ready to mine, and spawns the task if so.
@@ -2203,36 +2659,68 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                         NodeCommand::SendResponse { channel, msg } => {
                             self.network.respond(channel, msg);
                         }
-                        NodeCommand::SendChat { reply_to, words } => {
+                        NodeCommand::SendChat { sender_override, reply_to, words, attachments } => {
+                            // sender = sender_override.unwrap_or(local_peer_id())
+                            // Mine v2 PoW on a blocking task (~10 ms at 20 bits);
+                            // emit BroadcastP2PChat once mined.
                             let timestamp = crate::core::state::current_timestamp();
-                            let sender = self.network.local_peer_id().to_string();
+                            let sender = sender_override
+                                .unwrap_or_else(|| self.network.local_peer_id().to_string());
 
-                            let words_clone = words.clone();
                             let sender_clone = sender.clone();
+                            let words_clone = words.clone();
+                            let atts_clone = attachments.clone();
                             let cmd_tx = self.cmd_tx.as_ref().unwrap().clone();
 
-                            // Mine PoW in background
                             tokio::spawn(async move {
                                 let nonce = tokio::task::spawn_blocking(move || {
-                                    mine_chat_pow(sender_clone, timestamp, reply_to, words_clone)
-                                }).await.unwrap();
+                                    mine_chat_pow_v2(sender_clone, timestamp, reply_to, words_clone, atts_clone)
+                                })
+                                .await
+                                .unwrap();
 
-                                let _ = cmd_tx.send(NodeCommand::BroadcastP2PChat {
-                                    sender, timestamp, nonce, reply_to, words
-                                }).await;
+                                let _ = cmd_tx
+                                    .send(NodeCommand::BroadcastP2PChat {
+                                        sender, timestamp, nonce, reply_to, words, attachments,
+                                    })
+                                    .await;
                             });
                         }
-                        NodeCommand::BroadcastP2PChat { sender, timestamp, nonce, reply_to, words } => {
+                        NodeCommand::BroadcastP2PChat { sender, timestamp, nonce, reply_to, words, attachments } => {
+                            // Single, atomic history push. (Pre-v2 the light
+                            // handler also pushed here, causing duplicates.
+                            // That direct push has been removed — see
+                            // `LightRequest::SendChat` handler.)
                             let mut hist = self.chat_history.write().await;
-                            hist.push_back(ChatMessage { sender: sender.clone(), timestamp, nonce, reply_to, words: words.clone() });
-                            if hist.len() > 100 { hist.pop_front(); }
+                            hist.push_back(ChatMessage {
+                                sender: sender.clone(),
+                                timestamp,
+                                nonce,
+                                reply_to,
+                                words: words.clone(),
+                                attachments: attachments.clone(),
+                            });
+                            if hist.len() > 100 {
+                                hist.pop_front();
+                            }
                             drop(hist);
 
                             self.mark_chat_seen(nonce);
-                            self.network.broadcast(Message::Chat { sender: sender.clone(), timestamp, nonce, reply_to, words: words.clone() });
+
+                            // V2 only. Legacy peers fail bincode on the unknown
+                            // discriminant and drop. See frame-property proof
+                            // in `crate::network::protocol` module docs.
+                            self.network.broadcast(Message::ChatV2 {
+                                sender: sender.clone(),
+                                timestamp,
+                                nonce,
+                                reply_to,
+                                words: words.clone(),
+                                attachments: attachments.clone(),
+                            });
 
                             let notif = crate::network::light_protocol::LightNotification::ChatMessage {
-                                sender, timestamp, nonce, reply_to, words
+                                sender, timestamp, nonce, reply_to, words, attachments,
                             };
                             self.network.broadcast_light_push(&notif);
                         }
@@ -2832,75 +3320,55 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                 }
             }
             Message::Chat { sender, timestamp, nonce, reply_to, words } => {
+                // Legacy v1 receive. New nodes never emit this; they accept it
+                // from un-upgraded peers and bridge into the v2 ingest path
+                // with empty attachments.
                 self.ack(channel);
 
-                if words.len() > 10 || words.iter().any(|&w| (w as usize) >= CHAT_DICTIONARY.len()) || sender.len() > 128 {
+                if words.len() > 10
+                    || words.iter().any(|&w| (w as usize) >= CHAT_DICTIONARY.len())
+                    || sender.len() > 128
+                {
                     return Ok(());
                 }
-
-                // Verify PoW
                 if !verify_chat_pow(&sender, timestamp, reply_to, &words, nonce) {
-                    tracing::warn!("Peer {} sent Chat with invalid PoW", from);
-                    
-                    // BAYESIAN PENALTY: Heavily penalize peers sending invalid PoW
+                    tracing::warn!("Peer {} sent legacy Chat with invalid PoW", from);
                     let peer_str = from.to_string();
                     if let Some(stats) = self.known_pex_addrs.get_mut(&peer_str) {
-                        stats.1 = stats.1.saturating_add(20); // +20 to Beta (Adversarial)
+                        stats.1 = stats.1.saturating_add(20);
                     }
                     return Ok(());
                 }
 
-                if !self.mark_chat_seen(nonce) {
+                self.ingest_chat_inbound(
+                    from, sender, timestamp, nonce, reply_to, words, Vec::new(),
+                ).await;
+            }
+            Message::ChatV2 { sender, timestamp, nonce, reply_to, words, attachments } => {
+                // V2 receive. Verification uses v2 PoW; cross-validation
+                // against v1 is impossible by Lemma 2.3.1 (see
+                // `verify_chat_pow_v2` docs).
+                self.ack(channel);
+
+                if words.len() > 10
+                    || words.iter().any(|&w| (w as usize) >= CHAT_DICTIONARY.len())
+                    || sender.len() > 128
+                    || attachments.len() > MAX_CHAT_ATTACHMENTS
+                {
                     return Ok(());
                 }
-
-                let now = std::time::Instant::now();
-                let entry = self.peer_chat_counts.entry(from).or_insert((0, now));
-                if now.duration_since(entry.1).as_secs() >= 10 {
-                    *entry = (0, now);
-                }
-                entry.0 += 1;
-                
-                if entry.0 > 100 {
-                    tracing::debug!("Chat forwarding rate limit exceeded by peer {}", from);
-                    
-                    // BAYESIAN PENALTY: Penalize peers violating the rate limit
+                if !verify_chat_pow_v2(&sender, timestamp, reply_to, &words, &attachments, nonce) {
+                    tracing::warn!("Peer {} sent ChatV2 with invalid PoW", from);
                     let peer_str = from.to_string();
                     if let Some(stats) = self.known_pex_addrs.get_mut(&peer_str) {
-                        stats.1 = stats.1.saturating_add(10); // +10 to Beta (Adversarial)
+                        stats.1 = stats.1.saturating_add(20);
                     }
                     return Ok(());
                 }
 
-                let mut hist = self.chat_history.write().await;
-                hist.push_back(ChatMessage {
-                    sender: sender.clone(),
-                    timestamp,
-                    nonce,
-                    reply_to,
-                    words: words.clone(),
-                });
-                if hist.len() > 100 { hist.pop_front(); }
-                drop(hist);
-
-                self.network.broadcast_except(Some(from), Message::Chat {
-                    sender: sender.clone(),
-                    timestamp,
-                    nonce,
-                    reply_to,
-                    words: words.clone(),
-                });
-
-                let notif = crate::network::light_protocol::LightNotification::ChatMessage {
-                    sender,
-                    timestamp,
-                    nonce,
-                    reply_to,
-                    words,
-                };
-                if let Some(tx) = &self.cmd_tx {
-                    let _ = tx.try_send(NodeCommand::BroadcastLightPush(notif));
-                }
+                self.ingest_chat_inbound(
+                    from, sender, timestamp, nonce, reply_to, words, attachments,
+                ).await;
             }
             
         }

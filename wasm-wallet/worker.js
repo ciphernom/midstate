@@ -367,7 +367,7 @@ const rpc = {
     send:           (reveal)     => rpcCall('send', { revealPayload: reveal }),
     checkCommitment: (commitment) => rpcCall('checkCommitment', { commitmentHex: commitment }),
     checkCoin:      (coin)       => rpcCall('checkCoin', { coinHex: coin }),
-    sendChat:       (words, replyTo) => rpcCall('sendChat', { words, replyTo }),
+    sendChat:       (words, replyTo, attachments) => rpcCall('sendChat', { words, replyTo, attachments }),
     getChat:        ()           => rpcCall('getChat'),
     
     /**
@@ -854,7 +854,9 @@ self.onmessage = async (e) => {
         }
         else if (type === 'SEND_CHAT') {
             try {
-                const res = await rpc.sendChat(payload.words, payload.replyTo);
+                // payload.attachments is `[{kind:"address", value:"<64-hex>"}, ...]`
+                // or undefined for backward compat (treated as []).
+                const res = await rpc.sendChat(payload.words, payload.replyTo, payload.attachments || []);
                 if (res.ok) {
                     self.postMessage({ type: 'CHAT_SENT' });
                 } else {

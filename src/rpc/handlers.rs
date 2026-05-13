@@ -1275,11 +1275,20 @@ pub async fn send_chat(
     }
     // -----------------------------------------
 
-    if req.words.is_empty() || req.words.len() > 10 {
-        return Err(ErrorResponse { error: "Message must be between 1 and 10 words".into() });
+    // Allow attachment-only messages; require at least one word OR one attachment.
+    if req.words.is_empty() && req.attachments.is_empty() {
+        return Err(ErrorResponse {
+            error: "Message must contain at least one word or one attachment".into(),
+        });
+    }
+    if req.words.len() > 10 {
+        return Err(ErrorResponse { error: "Message must contain at most 10 words".into() });
     }
     if req.words.iter().any(|&w| (w as usize) >= crate::node::CHAT_DICTIONARY.len()) {
         return Err(ErrorResponse { error: "Invalid word index".into() });
+    }
+    if req.attachments.len() > crate::node::MAX_CHAT_ATTACHMENTS {
+        return Err(ErrorResponse { error: "Too many attachments (max 4)".into() });
     }
 
     // --- 2. GLOBAL RPC OUTBOX RATE LIMITER ---
@@ -1297,7 +1306,7 @@ pub async fn send_chat(
     // -----------------------------------------
     
    
-    node.send_chat(req.words, req.reply_to)
+    node.send_chat(req.words, req.reply_to, req.attachments)
         .map_err(|e| ErrorResponse { error: e.to_string() })?;
     
     Ok(Json(serde_json::json!({ "status": "sent" })))

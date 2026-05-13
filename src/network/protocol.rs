@@ -1,3 +1,57 @@
+//! # Wire-format frame property
+//!
+//! This module defines the [`Message`] enum that is bincode-encoded over
+//! the `/midstate/2.0.0` libp2p stream. The chat-v2 introduction (see
+//! [`crate::node`]) appends one new variant — [`Message::ChatV2`] — to
+//! this enum. The placement is **load-bearing**: every other variant
+//! retains its source-order discriminant, so its bincode encoding is
+//! byte-identical before and after the chat-v2 change.
+//!
+//! ## Discriminant table (frozen)
+//!
+//! | Index | Variant            |
+//! |------:|--------------------|
+//! |   0   | `Transaction`      |
+//! |   1   | `StemTransaction`  |
+//! |   2   | `Batch`            |
+//! |   3   | `GetState`         |
+//! |   4   | `StateInfo`        |
+//! |   5   | `GetAddr`          |
+//! |   6   | `Addr`             |
+//! |   7   | `Ping`             |
+//! |   8   | `Pong`             |
+//! |   9   | `GetBatches`       |
+//! |  10   | `Batches`          |
+//! |  11   | `GetHeaders`       |
+//! |  12   | `Headers`          |
+//! |  13   | `MixAnnounce`      |
+//! |  14   | `MixJoin`          |
+//! |  15   | `MixFee`           |
+//! |  16   | `MixProposal`      |
+//! |  17   | `MixSign`          |
+//! |  18   | `Chat`             |
+//! |  19   | `ChatV2`           |
+//!
+//! ## Theorem (ChatOnly frame)
+//!
+//! For every variant `V ∈ {Transaction … Chat}` and every value `v : V`,
+//! `bincode_encode_after_v2(v) = bincode_encode_before_v2(v)`. Proof:
+//! bincode encodes an enum variant as the varint of its source-order
+//! index followed by each field encoded in declaration order. The first
+//! 19 source-order indices and all corresponding field types are
+//! unchanged; therefore the encoded bytes are unchanged. ∎
+//!
+//! **Do not modify the order of variants in [`Message`].** Append-only.
+//!
+//! ## Cross-version compatibility
+//!
+//! - Old node → new node: every variant decodes identically;
+//!   [`Message::Chat`] continues to be accepted and is bridged to the
+//!   v2 ingest path with empty attachments.
+//! - New node → old node: variants 0..=18 decode identically; the new
+//!   [`Message::ChatV2`] (index 19) causes a bincode `InvalidTagEncoding`
+//!   error, which `deserialize_bin` surfaces as `Err` and the receiver
+//!   drops the message. No panic, no DoS, no state pollution.
 use crate::core::{Batch, BatchHeader, Transaction};
 use futures::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use libp2p::StreamProtocol;
@@ -80,7 +134,16 @@ pub enum Message {
         input_index: usize,
         signature: Vec<u8>,
     },
-    /// older nodes should ignore this
+    /// Legacy chat variant (discriminant 18). **Receive-only on nodes
+    /// that have adopted chat v2.** New nodes never emit this variant;
+    /// they emit [`Message::ChatV2`]. Old nodes still emit and accept
+    /// this variant, so during the upgrade window legacy peers continue
+    /// to chat with each other.
+    ///
+    /// PoW verification uses [`crate::node::verify_chat_pow`] (v1).
+    ///
+    /// On receipt by a new node, the handler bridges into the v2 ingest
+    /// path with empty attachments and re-emits as [`Message::ChatV2`].
     Chat {
         sender: String,
         timestamp: u64,
@@ -88,7 +151,51 @@ pub enum Message {
         reply_to: Option<u64>,
         words: Vec<u8>,
     },
+    /// Chat with optional structured attachments (discriminant 19).
+    ///
+    /// # Why this variant exists at the end of the enum
+    ///
+    /// Appending preserves the bincode discriminant of every prior
+    /// variant. See the module-level "Wire-format frame property"
+    /// section. Reordering or inserting elsewhere would shift
+    /// discriminants and break the entire `/midstate/2.0.0` protocol —
+    /// not just chat.
+    ///
+    /// # Validation
+    ///
+    /// Enforced in [`Message::deserialize_bin`]:
+    ///
+    /// ```text
+    /// #sender_bytes ≤ 128
+    /// isValidPeerId(sender)
+    /// #words ≤ 10
+    /// #attachments ≤ crate::node::MAX_CHAT_ATTACHMENTS  (= 4)
+    /// ```
+    ///
+    /// The 32-byte length of each `ChatAttachment::Address` is enforced
+    /// structurally by bincode: `[u8; 32]` is a fixed-length array.
+    ///
+    /// # PoW
+    ///
+    /// Verified with [`crate::node::verify_chat_pow_v2`]. Domain-separated
+    /// from v1 (Lemma 2.3.1).
+    ///
+    /// # Old-node behavior
+    ///
+    /// Receivers running pre-v2 code fail bincode with `InvalidTagEncoding`
+    /// on the unknown discriminant 19; `deserialize_bin` returns `Err`
+    /// and the message is dropped without side effects.
+    ChatV2 {
+        sender: String,
+        timestamp: u64,
+        nonce: u64,
+        reply_to: Option<u64>,
+        words: Vec<u8>,
+        attachments: Vec<crate::node::ChatAttachment>,
+    },
 }
+
+
 
 impl Message {
     pub fn serialize_bin(&self) -> Vec<u8> {
@@ -136,6 +243,24 @@ pub fn deserialize_bin(bytes: &[u8]) -> anyhow::Result<Self> {
                 // 3. Word count check
                 if words.len() > 10 {
                     anyhow::bail!("Chat words count {} exceeds max 10", words.len());
+                }
+            }
+            Message::ChatV2 { sender, words, attachments, .. } => {
+                if sender.len() > 128 {
+                    anyhow::bail!("ChatV2 sender too long: {}", sender.len());
+                }
+                if sender.parse::<libp2p::PeerId>().is_err() {
+                    anyhow::bail!("ChatV2 sender must be a valid cryptographic PeerId");
+                }
+                if words.len() > 10 {
+                    anyhow::bail!("ChatV2 words count {} exceeds max 10", words.len());
+                }
+                if attachments.len() > crate::node::MAX_CHAT_ATTACHMENTS {
+                    anyhow::bail!(
+                        "ChatV2 attachments count {} exceeds max {}",
+                        attachments.len(),
+                        crate::node::MAX_CHAT_ATTACHMENTS,
+                    );
                 }
             }          
             _ => {}
