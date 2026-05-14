@@ -33,6 +33,9 @@ struct Config {
     bootstrap_peers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     peer_id: Option<String>,
+    /// List of Peer IDs to block from connecting
+    #[serde(default)]
+    banned_peers: Vec<String>,
 }
 
 impl Config {
@@ -67,6 +70,9 @@ impl Config {
             # ]
 
             bootstrap_peers = ["/ip4/134.199.148.215/tcp/9333/p2p/12D3KooWPbR63SQg1UBLpAMiNngqrRHGM4LaMP8ieAJUxhfw7dxv"]
+
+            # List of Peer IDs to block from connecting
+            banned_peers = []
             "#;
         std::fs::write(path, default_contents)
             .with_context(|| format!("Failed to create default config: {}", path.display()))?;
@@ -2525,7 +2531,15 @@ pub async fn run_node(
         None
     };
 
-    let node = node::Node::new(data_dir.clone(), mining_threads, listen_addr, bootstrap).await?;
+    let mut banned_peers = std::collections::HashSet::new();
+    for peer_str in &config.banned_peers {
+        match peer_str.parse::<libp2p::PeerId>() {
+            Ok(p) => { banned_peers.insert(p); },
+            Err(e) => tracing::warn!("Invalid banned peer ID '{}': {}", peer_str, e),
+        }
+    }
+
+    let node = node::Node::new(data_dir.clone(), mining_threads, listen_addr, bootstrap, banned_peers).await?;
     
     let peer_id_str = node.local_peer_id().to_string();
     if config.peer_id.as_deref() != Some(&peer_id_str) {
@@ -2726,7 +2740,7 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
        .context("Invalid peer multiaddr (expected e.g. /ip4/1.2.3.4/tcp/9333/p2p/12D3KooW...)")?;
 
     let keypair = libp2p::identity::Keypair::generate_ed25519();
-    let mut network = MidstateNetwork::new(keypair, listen_addr, vec![peer_multiaddr]).await?;
+    let mut network = MidstateNetwork::new(keypair, listen_addr, vec![peer_multiaddr], std::collections::HashSet::new()).await?;
 
     println!("Dialing peer...");
     

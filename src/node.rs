@@ -1313,6 +1313,7 @@ pub async fn new(
         mining_threads: Option<usize>,
         listen_addr: Multiaddr,
         bootstrap_peers: Vec<Multiaddr>,
+        banned_peers: HashSet<PeerId>,
     ) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
         let storage = Storage::open(data_dir.join("db"))?;
@@ -1434,7 +1435,7 @@ pub async fn new(
         // Convert Multiaddrs to Strings BEFORE we move them into the network
         let bootstrap_strings: Vec<String> = bootstrap_peers.iter().map(|a| a.to_string()).collect();
 
-        let network = MidstateNetwork::new(keypair, listen_addr, bootstrap_peers).await?;
+        let network = MidstateNetwork::new(keypair, listen_addr, bootstrap_peers, banned_peers).await?;
 
         let mut recent_headers = VecDeque::new();
         let window = DIFFICULTY_LOOKBACK as u64;
@@ -5917,7 +5918,7 @@ mod tests {
         // Bind to port 0 to let OS assign a random available port
         let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
         // Initialize node (this will create genesis if needed)
-        Node::new(dir.to_path_buf(), None, listen, vec![], false).await.unwrap()
+        Node::new(dir.to_path_buf(), None, listen, vec![], std::collections::HashSet::new()).await.unwrap()
     }
 
     #[tokio::test]
@@ -6304,7 +6305,7 @@ mod complex_tests {
         let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
         
         // Initialize node (creates Genesis internally)
-        Node::new(dir.to_path_buf(), None, listen, vec![], false).await.unwrap()
+        Node::new(dir.to_path_buf(), None, listen, vec![], std::collections::HashSet::new()).await.unwrap()
     }
 
     /// specific helper to manually construct a valid batch structure.

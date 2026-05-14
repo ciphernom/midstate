@@ -346,6 +346,7 @@ pub struct MidstateNetwork {
     external_addrs: Vec<Multiaddr>,
     subnet_peers: HashMap<IpAddr, HashSet<PeerId>>,
     pub banned_subnets: HashMap<IpAddr, std::time::Instant>,
+    pub static_banned_peers: HashSet<PeerId>,
 }
 
 impl MidstateNetwork {
@@ -353,6 +354,7 @@ impl MidstateNetwork {
         keypair: Keypair,
         listen_addr: Multiaddr,
         bootstrap_peers: Vec<Multiaddr>,
+        static_banned_peers: HashSet<PeerId>,
     ) -> Result<Self> {
         let peer_id = keypair.public().to_peer_id();
         tracing::info!("Local peer id: {}", peer_id);
@@ -479,6 +481,7 @@ let autonat = autonat::Behaviour::new(
             external_addrs: Vec::new(),
             subnet_peers: HashMap::new(),
             banned_subnets: HashMap::new(),
+            static_banned_peers,
         };
 
         net.swarm.listen_on(listen_addr.clone())?;
@@ -752,6 +755,10 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
             }
 
             if let Some(peer) = extract_peer_id(&addr) {
+                    if self.static_banned_peers.contains(&peer) {
+                        tracing::debug!("PEX ignoring statically banned peer: {}", peer);
+                        return;
+                    }
                     if self.connected.contains_key(&peer) || peer == *self.swarm.local_peer_id() {
                         return; 
                     }
@@ -789,6 +796,13 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
             tokio::select! {
                 // ── Incoming raw stream from a browser light client ──────
                 Some((peer, stream)) = self.light_incoming.next() => {
+                    // ── Gate 0: Static Ban ──
+                    if self.static_banned_peers.contains(&peer) {
+                        tracing::debug!("Light stream from statically banned peer {}, dropping", peer);
+                        let _ = self.swarm.disconnect_peer_id(peer);
+                        continue;
+                    }
+
                     // ── Gate 1: Is peer banned? ──
                     if self.light_guard.is_banned(&peer).await {
                         tracing::debug!("Light stream from banned peer {}, dropping", peer);
@@ -1034,6 +1048,13 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     // --- Ignore closures of self-connections ---
                     if peer_id == *self.swarm.local_peer_id() {
                         tracing::debug!("Ignoring self-connection");
+                        let _ = self.swarm.disconnect_peer_id(peer_id);
+                        continue;
+                    }
+
+                    // --- STATIC BANNED PEER DEFENSE ---
+                    if self.static_banned_peers.contains(&peer_id) {
+                        tracing::warn!("Rejected connection from statically banned peer: {}", peer_id);
                         let _ = self.swarm.disconnect_peer_id(peer_id);
                         continue;
                     }
