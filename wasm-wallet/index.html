@@ -295,42 +295,93 @@
         .chat-sender { color: var(--accent); font-weight: bold; cursor: pointer; font-size: 12px; text-decoration: underline; text-decoration-color: transparent; transition: all 0.2s; }
         .chat-sender:hover { text-decoration-color: var(--accent); }
         .chat-time { color: #555; font-size: 10px; margin-left: auto; }
-/* Chat attachments — typed, fixed-width payloads (e.g. addresses). */
+/* Chat attachments — full address visible, monospace, word-break. */
         .draft-attachment {
-            font-family: 'JetBrains Mono', 'Menlo', monospace;
-            font-size: 11px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
             background: #1a1a1a;
             border: 1px solid var(--accent);
-            color: var(--accent);
-            padding: 3px 7px;
+            padding: 7px 9px;
             border-radius: 4px;
-            cursor: pointer;
-            display: inline-flex;
-            align-items: center;
-            gap: 4px;
+            min-width: 0;
+            max-width: 100%;
         }
-        .draft-attachment::before { content: "📎"; font-size: 10px; }
-        .draft-attachment:hover { background: rgba(212, 255, 0, 0.1); }
+        .draft-attachment-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+        .draft-attachment-label {
+            color: var(--accent);
+            font-weight: 600;
+            font-size: 9px;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+        .draft-attachment-remove {
+            background: transparent;
+            border: none;
+            color: #888;
+            cursor: pointer;
+            padding: 0 6px;
+            font-size: 16px;
+            line-height: 1;
+            min-height: 0;
+            margin: 0;
+            width: auto;
+        }
+        .draft-attachment-remove:hover { color: var(--red); }
+        .draft-attachment-value {
+            font-family: 'JetBrains Mono', 'Menlo', monospace;
+            color: var(--text-max, #fff);
+            font-size: 11px;
+            word-break: break-all;
+            user-select: all;
+            line-height: 1.5;
+        }
 
         .chat-attachments {
             display: flex;
-            flex-wrap: wrap;
+            flex-direction: column;
             gap: 5px;
-            margin-top: 6px;
+            margin-top: 8px;
         }
         .chat-attachment {
-            font-family: 'JetBrains Mono', 'Menlo', monospace;
-            font-size: 11px;
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
             background: #161616;
             border: 1px solid #2c2c2c;
-            color: #888;
-            padding: 3px 7px;
+            padding: 7px 9px;
             border-radius: 4px;
             cursor: pointer;
-            transition: all 0.15s;
+            transition: border-color 0.15s, background 0.15s;
+            min-width: 0;
+            max-width: 100%;
         }
-        .chat-attachment:hover { border-color: var(--accent); color: var(--accent); }
-        .chat-attachment.copied { border-color: var(--accent); color: var(--accent); }
+        .chat-attachment:hover { border-color: var(--accent); }
+        .chat-attachment.copied { border-color: var(--accent); background: rgba(212, 255, 0, 0.08); }
+        .chat-attachment-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 9px;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            color: #888;
+        }
+        .chat-attachment-label::before { content: "📎 "; }
+        .chat-attachment-status { color: var(--accent); }
+        .chat-attachment-value {
+            font-family: 'JetBrains Mono', 'Menlo', monospace;
+            color: var(--text-max, #fff);
+            font-size: 11px;
+            word-break: break-all;
+            user-select: all;
+            line-height: 1.5;
+        }
         .chat-words { color: var(--text-max); font-size: 15px; font-weight: 500; display: block; letter-spacing: 0.3px; }
 
         .reply-context { font-size: 11px; color: #888; margin-bottom: 6px; display: block; background: rgba(255,255,255,0.04); padding: 4px 8px; border-radius: 4px; border-left: 2px solid var(--accent-dim); }
@@ -2519,30 +2570,45 @@ document.getElementById('btnExport').onclick = () => {
                 wordsSpan.textContent = wordsText;
                 div.appendChild(wordsSpan);
 
-                // 3b. Attachments (typed, fixed-width payloads — currently addresses)
+                // 3b. Attachments (typed, fixed-width payloads — currently addresses).
+                //     Full hex is always shown — users must verify the value before acting on it.
                 if (msg.attachments && msg.attachments.length > 0) {
                     const attBox = document.createElement('div');
                     attBox.className = 'chat-attachments';
                     msg.attachments.forEach(att => {
                         const chip = document.createElement('div');
                         chip.className = 'chat-attachment';
-                        if (att.kind === 'address') {
-                            const short = att.value.slice(0, 8) + '…' + att.value.slice(-8);
-                            chip.textContent = `📎 address: ${short}`;
-                            chip.title = "Click to copy • " + att.value;
-                            chip.addEventListener('click', () => {
-                                navigator.clipboard.writeText(att.value);
-                                chip.classList.add('copied');
-                                const orig = chip.textContent;
-                                chip.textContent = '✓ copied';
-                                setTimeout(() => {
-                                    chip.classList.remove('copied');
-                                    chip.textContent = orig;
-                                }, 800);
-                            });
-                        } else {
-                            chip.textContent = `${att.kind}: ${att.value}`;
-                        }
+                        chip.title = "Click to copy";
+
+                        const header = document.createElement('div');
+                        header.className = 'chat-attachment-header';
+
+                        const label = document.createElement('span');
+                        label.className = 'chat-attachment-label';
+                        label.textContent = att.kind;
+                        header.appendChild(label);
+
+                        const status = document.createElement('span');
+                        status.className = 'chat-attachment-status';
+                        header.appendChild(status);
+
+                        chip.appendChild(header);
+
+                        const value = document.createElement('div');
+                        value.className = 'chat-attachment-value';
+                        value.textContent = att.value;   // full 64-char address
+                        chip.appendChild(value);
+
+                        chip.addEventListener('click', () => {
+                            navigator.clipboard.writeText(att.value);
+                            chip.classList.add('copied');
+                            status.textContent = '✓ copied';
+                            setTimeout(() => {
+                                chip.classList.remove('copied');
+                                status.textContent = '';
+                            }, 1000);
+                        });
+
                         attBox.appendChild(chip);
                     });
                     div.appendChild(attBox);
@@ -2602,14 +2668,34 @@ document.getElementById('btnExport').onclick = () => {
             chatDraftAttachments.forEach((att, i) => {
                 const chip = document.createElement('div');
                 chip.className = 'draft-attachment';
-                const short = att.value.slice(0, 8) + '…' + att.value.slice(-8);
-                chip.textContent = `${att.kind}:${short}`;
-                chip.title = "Click to remove • " + att.value;
-                chip.onclick = () => {
+
+                const header = document.createElement('div');
+                header.className = 'draft-attachment-header';
+
+                const label = document.createElement('span');
+                label.className = 'draft-attachment-label';
+                label.textContent = `📎 ${att.kind}`;
+                header.appendChild(label);
+
+                const removeBtn = document.createElement('button');
+                removeBtn.className = 'draft-attachment-remove';
+                removeBtn.textContent = '×';
+                removeBtn.title = 'Remove this attachment';
+                removeBtn.onclick = (e) => {
+                    e.stopPropagation();
                     chatDraftAttachments.splice(i, 1);
                     renderChatDraftAttachments();
                     updateChatButtons();
                 };
+                header.appendChild(removeBtn);
+
+                chip.appendChild(header);
+
+                const value = document.createElement('div');
+                value.className = 'draft-attachment-value';
+                value.textContent = att.value;   // full 64-char address
+                chip.appendChild(value);
+
                 box.appendChild(chip);
             });
         }
