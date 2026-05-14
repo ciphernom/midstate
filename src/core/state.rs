@@ -517,6 +517,8 @@ fn apply_batch_internal(
     state.depth += block_work;
     state.height += 1;
 
+    state.timestamp = batch.timestamp;
+
     // V2 activation crossing: the SMT caches were populated under V1 hashing
     // during this block's transactions; rebuild them now under V2 so all
     // subsequent root() calls produce correct V2 roots. The MMR doesn't need

@@ -122,10 +122,7 @@ fn deserialize_state(bytes: &[u8]) -> Result<State> {
     };
 
     // Rebuild the SMT caches under the chain-height-implied hashing mode.
-    // Note: when arriving via the legacy path, `legacy::deserialize_legacy_state`
-    // already rebuilt the caches (because it constructs the new accumulators
-    // via from_canonical_coins / from_raw_parts). The double-rebuild is harmless
-    // and keeps the function's postcondition independent of the path taken.
+
     let v2 = crate::core::types::is_v2_at(state.height);
     state.coins.rebuild_tree(v2);
     state.commitments.rebuild_tree(v2);
@@ -250,7 +247,7 @@ mod legacy {
             height: legacy.height,
             timestamp: legacy.timestamp,
             commitment_heights: legacy.commitment_heights,
-            expirations: im::OrdMap::new(),
+            expirations: im::OrdMap::new(), 
             chain_mmr,
             header_hash: legacy.header_hash,
         })

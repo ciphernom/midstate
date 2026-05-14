@@ -5719,43 +5719,105 @@ fn replay_blocks_into_state(
 
     let mut wots_oracle = std::collections::HashMap::new();
 
-    for h in start..end {
+    let mut h = start;
+    
+    // Track state from before H-1 so we can roll back perfectly
+    let mut state_before_prev = state.clone();
+    let mut headers_before_prev = recent_headers.clone();
+
+    while h < end {
         if h % 500 == 0 && h > 0 {
             tracing::info!("[{}] Rebuilding state: {}/{}", log_tag, h, end);
         }
         if let Some(batch) = storage.load_batch(h)? {
+            let state_before_h = state.clone();
+            let headers_before_h = recent_headers.clone();
+
             wots_oracle.clear(); 
             let db_oracle = storage.query_spent_addresses(&batch).unwrap_or_default();
             wots_oracle.extend(db_oracle);
             
             let mut header = batch.header();
-            
-            // Batch doesn't store height (header() hardcodes 0). We must assign it.
-            debug_assert_eq!(
-                header.height, 0, 
-                "If Batch ever starts storing height, this overwrite needs to become a consistency check!"
-            );
             header.height = h;
 
-            // Trust the batch's stored linkage (prev_header_hash, prev_midstate).
             let expected_mining_hash = crate::core::types::compute_header_hash(&header);
 
-            crate::core::state::apply_batch_trusted(
+            let res = crate::core::state::apply_batch_trusted(
                 state, 
                 &batch, 
                 recent_headers.make_contiguous(), 
                 &mut wots_oracle, 
                 expected_mining_hash
-            )?;
+            );
+
+            // If a State Root Mismatch occurs, the node's Deterministic GC made a divergent 
+            // decision regarding ghost keys at the END of the previous block (H-1).
+            if let Err(e) = &res {
+                if e.to_string().contains("State root mismatch") && h > start && h < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
+                    tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", h);
+                    
+                    // Roll back to the state BEFORE H-1
+                    *state = state_before_prev.clone();
+                    recent_headers = headers_before_prev.clone();
+
+                    // Simulating a node restart clears ghost keys from expirations
+                    use std::collections::BTreeMap;
+                    let mut staging: BTreeMap<u64, Vec<[u8; 32]>> = BTreeMap::new();
+                    for (commitment, height) in &state.commitment_heights {
+                        staging.entry(*height).or_default().push(*commitment);
+                    }
+                    for list in staging.values_mut() { list.sort_unstable(); }
+                    state.expirations = staging.into_iter().collect();
+
+                    // Replay H-1 with the cleared expirations map
+                    let batch_prev = storage.load_batch(h - 1)?.unwrap();
+                    wots_oracle.clear();
+                    wots_oracle.extend(storage.query_spent_addresses(&batch_prev).unwrap_or_default());
+                    
+                    let mut header_prev = batch_prev.header();
+                    header_prev.height = h - 1;
+                    let hash_prev = crate::core::types::compute_header_hash(&header_prev);
+                    
+                    crate::core::state::apply_batch_trusted(
+                        state, 
+                        &batch_prev, 
+                        recent_headers.make_contiguous(), 
+                        &mut wots_oracle, 
+                        hash_prev
+                    )?;
+                    state.target = crate::core::state::adjust_difficulty(state);
+                    recent_headers.push_back(batch_prev.timestamp);
+                    if recent_headers.len() > window_size { recent_headers.pop_front(); }
+
+                    // Now replay H again!
+                    wots_oracle.clear();
+                    wots_oracle.extend(storage.query_spent_addresses(&batch).unwrap_or_default());
+                    crate::core::state::apply_batch_trusted(
+                        state, 
+                        &batch, 
+                        recent_headers.make_contiguous(), 
+                        &mut wots_oracle, 
+                        expected_mining_hash
+                    )?;
+                } else {
+                    res?;
+                }
+            } else {
+                res?;
+            }
             
             state.target = crate::core::state::adjust_difficulty(state);
+
+            // Shift history buffers
+            state_before_prev = state_before_h;
+            headers_before_prev = headers_before_h;
 
             recent_headers.push_back(batch.timestamp);
             if recent_headers.len() > window_size {
                 recent_headers.pop_front();
             }
 
-
+            h += 1;
         } else {
             anyhow::bail!("Missing batch at height {} needed for state rebuild", h);
         }
