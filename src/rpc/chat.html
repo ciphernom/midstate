@@ -476,7 +476,16 @@
             <div id="draft-attachments" style="display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px;"></div>
 
             <div class="composer-controls">
-                <button class="btn" onclick="attachAddressPrompt()">+ Address</button>
+                <select id="attachment-type" class="btn" style="padding: 4px 8px; outline: none;">
+                    <option value="address">Address</option>
+                    <option value="coin_id">Coin ID</option>
+                    <option value="mix_id">Mix ID</option>
+                    <option value="commitment">Commitment</option>
+                    <option value="block_hash">Block Hash</option>
+                    <option value="midstate">Midstate</option>
+                    <option value="data_hash">Data Hash</option>
+                </select>
+                <button class="btn" onclick="attachItemPrompt()">+ Attach</button>
                 <button class="btn" onclick="clearDraft()">Clear</button>
                 <button class="btn btn-primary" onclick="sendChat()" id="send-btn" disabled>Broadcast Message</button>
             </div>
@@ -685,7 +694,7 @@
 
                     const value = document.createElement('div');
                     value.className = 'msg-attachment-value';
-                    value.textContent = att.value;   // full 64-char address
+                    value.textContent = att.value;
                     chip.appendChild(value);
 
                     chip.addEventListener('click', () => {
@@ -758,23 +767,41 @@
         const dictButtons = document.getElementById('dictionary-box').querySelectorAll('.dict-btn');
         dictButtons.forEach(btn => btn.disabled = isFull);
     }
-    function attachAddressPrompt() {
+    function attachItemPrompt() {
         if (draftAttachments.length >= 4) {
             alert("Maximum 4 attachments per message.");
             return;
         }
-        const raw = prompt("Paste a midstate address (64 hex characters):");
+        
+        const kind = document.getElementById('attachment-type').value;
+        const raw = prompt(`Paste a ${kind} (hex):`);
         if (raw === null) return;
         const hex = raw.trim().toLowerCase();
-        if (!/^[0-9a-f]{64}$/.test(hex)) {
-            alert("Invalid address — must be exactly 64 hex characters (0-9, a-f).");
+        
+        // Addresses can be 64 (legacy) or 72 (checksummed) hex characters.
+        // All other 32-byte hashes are exactly 64 hex characters.
+        let isValid = false;
+        if (kind === "address") {
+            isValid = /^([0-9a-f]{64}|[0-9a-f]{72})$/i.test(hex);
+        } else {
+            isValid = /^[0-9a-f]{64}$/i.test(hex);
+        }
+
+        if (!isValid) {
+            if (kind === "address") {
+                alert("Invalid address — must be exactly 64 or 72 hex characters.");
+            } else {
+                alert(`Invalid ${kind} — must be exactly 64 hex characters.`);
+            }
             return;
         }
-        if (draftAttachments.some(a => a.kind === "address" && a.value === hex)) {
-            alert("That address is already attached.");
+        
+        if (draftAttachments.some(a => a.kind === kind && a.value === hex)) {
+            alert("That item is already attached.");
             return;
         }
-        draftAttachments.push({ kind: "address", value: hex });
+        
+        draftAttachments.push({ kind: kind, value: hex });
         renderDraftAttachments();
         updateButtons();
     }
@@ -810,7 +837,7 @@
 
             const value = document.createElement('div');
             value.className = 'draft-attachment-value';
-            value.textContent = att.value;   // full 64-char address
+            value.textContent = att.value;
             chip.appendChild(value);
 
             box.appendChild(chip);

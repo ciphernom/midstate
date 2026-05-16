@@ -146,13 +146,7 @@ pub const CHAT_DICTIONARY: &[&str] = &[
 /// Every variant is structurally a fixed-width byte payload. There is no
 /// field in this enum that admits user-controlled `String` or
 /// variable-length `Vec<u8>` of textual data. The constraint is enforced
-/// at the type level by serde and bincode:
-///
-/// - JSON: custom serialization maps to `{"kind":"address","value":"<72-char lowercase hex w/ checksum>"}`
-///   and requires valid deserialization including checksum.
-/// - Bincode: custom serialization maps to a standard external enum representation 
-///   with a variant index (0) and 32 raw bytes payload. Bincode refuses any
-///   encoding that does not supply exactly 32 bytes.
+/// at the type level by serde and bincode.
 ///
 /// # Encoding
 ///
@@ -173,31 +167,67 @@ pub const CHAT_DICTIONARY: &[&str] = &[
 /// Future variants append new tags; existing tags are immutable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatAttachment {
-    /// A 32-byte midstate address (same `[u8; 32]` shape produced by
-    /// `crate::core::compute_address` and stored in `WalletKey::address`).
+    /// A 32-byte midstate address (with UI checksum support).
     Address([u8; 32]),
+    /// A 32-byte Coin ID (UTXO). Useful for proving airdrops or payments.
+    CoinId([u8; 32]),
+    /// A 32-byte Mix ID. Useful for coordinating CoinJoin sessions.
+    MixId([u8; 32]),
+    /// A 32-byte Transaction Commitment.
+    Commitment([u8; 32]),
+    /// A 32-byte Block Hash. Useful for referencing specific blocks.
+    BlockHash([u8; 32]),
+    /// A 32-byte Chain Midstate. Useful for node operators debugging consensus forks.
+    Midstate([u8; 32]),
+    /// A generic 32-byte hash (e.g. SHA256/BLAKE3) for external data/binaries.
+    DataHash([u8; 32]),
 }
 
 impl serde::Serialize for ChatAttachment {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         if serializer.is_human_readable() {
-            use serde::ser::SerializeStruct;
-            match self {
-                ChatAttachment::Address(addr) => {
-                    let mut state = serializer.serialize_struct("ChatAttachment", 2)?;
-                    state.serialize_field("kind", "address")?;
-                    state.serialize_field("value", &crate::core::types::encode_address_with_checksum(addr))?;
-                    state.end()
-                }
+            #[derive(serde::Serialize)]
+            #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+            enum JsonHelper {
+                Address(String),
+                CoinId(String),
+                MixId(String),
+                Commitment(String),
+                BlockHash(String),
+                Midstate(String),
+                DataHash(String),
             }
+
+            let helper = match self {
+                ChatAttachment::Address(a) => JsonHelper::Address(crate::core::types::encode_address_with_checksum(a)),
+                ChatAttachment::CoinId(id) => JsonHelper::CoinId(hex::encode(id)),
+                ChatAttachment::MixId(id) => JsonHelper::MixId(hex::encode(id)),
+                ChatAttachment::Commitment(id) => JsonHelper::Commitment(hex::encode(id)),
+                ChatAttachment::BlockHash(id) => JsonHelper::BlockHash(hex::encode(id)),
+                ChatAttachment::Midstate(id) => JsonHelper::Midstate(hex::encode(id)),
+                ChatAttachment::DataHash(id) => JsonHelper::DataHash(hex::encode(id)),
+            };
+            helper.serialize(serializer)
         } else {
             // For bincode: serialize as an external enum
             #[derive(serde::Serialize)]
             enum BincodeHelper<'a> {
                 Address(&'a [u8; 32]),
+                CoinId(&'a [u8; 32]),
+                MixId(&'a [u8; 32]),
+                Commitment(&'a [u8; 32]),
+                BlockHash(&'a [u8; 32]),
+                Midstate(&'a [u8; 32]),
+                DataHash(&'a [u8; 32]),
             }
             let helper = match self {
                 ChatAttachment::Address(addr) => BincodeHelper::Address(addr),
+                ChatAttachment::CoinId(id) => BincodeHelper::CoinId(id),
+                ChatAttachment::MixId(id) => BincodeHelper::MixId(id),
+                ChatAttachment::Commitment(id) => BincodeHelper::Commitment(id),
+                ChatAttachment::BlockHash(id) => BincodeHelper::BlockHash(id),
+                ChatAttachment::Midstate(id) => BincodeHelper::Midstate(id),
+                ChatAttachment::DataHash(id) => BincodeHelper::DataHash(id),
             };
             helper.serialize(serializer)
         }
@@ -208,27 +238,59 @@ impl<'de> serde::Deserialize<'de> for ChatAttachment {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if deserializer.is_human_readable() {
             #[derive(serde::Deserialize)]
-            struct Helper {
-                kind: String,
-                value: String,
+            #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+            enum JsonHelper {
+                Address(String),
+                CoinId(String),
+                MixId(String),
+                Commitment(String),
+                BlockHash(String),
+                Midstate(String),
+                DataHash(String),
             }
-            let helper = Helper::deserialize(deserializer)?;
-            if helper.kind == "address" {
-                let addr = crate::core::types::parse_address_flexible(&helper.value)
-                    .map_err(serde::de::Error::custom)?;
-                Ok(ChatAttachment::Address(addr))
-            } else {
-                Err(serde::de::Error::custom("Unknown attachment kind"))
-            }
+
+            let helper = JsonHelper::deserialize(deserializer)?;
+            
+            let parse_32 = |s: &str| -> Result<[u8; 32], D::Error> {
+                let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
+                bytes.try_into().map_err(|_| serde::de::Error::custom("Must be exactly 32 bytes"))
+            };
+
+            match helper {
+                JsonHelper::Address(s) => {
+                    let addr = crate::core::types::parse_address_flexible(&s)
+                        .map_err(serde::de::Error::custom)?;
+                    Ok(ChatAttachment::Address(addr))
+                }
+                JsonHelper::CoinId(s) => Ok(ChatAttachment::CoinId(parse_32(&s)?)),
+                JsonHelper::MixId(s) => Ok(ChatAttachment::MixId(parse_32(&s)?)),
+                JsonHelper::Commitment(s) => Ok(ChatAttachment::Commitment(parse_32(&s)?)),
+                JsonHelper::BlockHash(s) => Ok(ChatAttachment::BlockHash(parse_32(&s)?)),
+                JsonHelper::Midstate(s) => Ok(ChatAttachment::Midstate(parse_32(&s)?)),
+                JsonHelper::DataHash(s) => Ok(ChatAttachment::DataHash(parse_32(&s)?)),
+           }
+    
         } else {
             // For bincode: deserialize as an external enum
             #[derive(serde::Deserialize)]
             enum BincodeHelper {
                 Address([u8; 32]),
+                CoinId([u8; 32]),
+                MixId([u8; 32]),
+                Commitment([u8; 32]),
+                BlockHash([u8; 32]),
+                Midstate([u8; 32]),
+                DataHash([u8; 32]),
             }
             let helper = BincodeHelper::deserialize(deserializer)?;
             match helper {
                 BincodeHelper::Address(addr) => Ok(ChatAttachment::Address(addr)),
+                BincodeHelper::CoinId(id) => Ok(ChatAttachment::CoinId(id)),
+                BincodeHelper::MixId(id) => Ok(ChatAttachment::MixId(id)),
+                BincodeHelper::Commitment(id) => Ok(ChatAttachment::Commitment(id)),
+                BincodeHelper::BlockHash(id) => Ok(ChatAttachment::BlockHash(id)),
+                BincodeHelper::Midstate(id) => Ok(ChatAttachment::Midstate(id)),
+                BincodeHelper::DataHash(id) => Ok(ChatAttachment::DataHash(id)),
             }
         }
     }
@@ -552,9 +614,33 @@ pub fn verify_chat_pow_v2(
     data.extend_from_slice(&(attachments.len() as u32).to_le_bytes());
     for att in attachments {
         match att {
-            ChatAttachment::Address(addr) => {
+            ChatAttachment::Address(id) => {
                 data.push(0x01); // tag: Address
-                data.extend_from_slice(addr);
+                data.extend_from_slice(id);
+            }
+            ChatAttachment::CoinId(id) => {
+                data.push(0x02); // tag: CoinId
+                data.extend_from_slice(id);
+            }
+            ChatAttachment::MixId(id) => {
+                data.push(0x03); // tag: MixId
+                data.extend_from_slice(id);
+            }
+            ChatAttachment::Commitment(id) => {
+                data.push(0x04); // tag: Commitment
+                data.extend_from_slice(id);
+            }
+            ChatAttachment::BlockHash(id) => {
+                data.push(0x05); // tag: BlockHash
+                data.extend_from_slice(id);
+            }
+            ChatAttachment::Midstate(id) => {
+                data.push(0x06); // tag: Midstate
+                data.extend_from_slice(id);
+            }
+            ChatAttachment::DataHash(id) => {
+                data.push(0x07); // tag: DataHash
+                data.extend_from_slice(id);
             }
         }
     }
