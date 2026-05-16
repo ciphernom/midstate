@@ -86,49 +86,57 @@ const MAX_PREFETCH_BUFFER: usize = 32;
 /// `w as usize >= CHAT_DICTIONARY.len()` check in
 /// [`crate::network::protocol::Message::deserialize_bin`].
 pub const CHAT_DICTIONARY: &[&str] = &[
-    // 0-19: Greetings & Slang
-    "Hello", "Goodbye", "Yes", "No", "Thanks", "Please", "gm", "gn", "lol", "lmao",
-    "LFG", "WAGMI", "NGMI", "ser", "fren", "anon", "mate", "based", "wtf", "omg",
+    // 0-19: Core Crypto & Network
+    "midstate", "network", "node", "peer", "block", "blocks", "tx", "transaction", "mempool", "hash",
+    "pow", "mine", "mining", "miner", "sync", "wallet", "address", "key", "seed", "utxo",
 
-    // 20-39: Pronouns & Questions
-    "I", "You", "We", "They", "He", "She", "It", "This", "That", "Who",
-    "What", "Where", "When", "Why", "How", "Which", "Whose", "My", "Your", "Our",
+    // 20-39: Airdrops, Trading & Finance
+    "airdrop", "incoming", "post", "claim", "free", "giveaway", "reward", "bounty", "pool", "liquidity",
+    "buy", "sell", "trade", "swap", "market", "price", "fiat", "dex", "cex", "value",
 
-    // 40-79: Verbs
-    "Is", "Are", "Was", "Were", "Be", "Have", "Has", "Had", "Do", "Does",
-    "Did", "Will", "Can", "Could", "Should", "Would", "Make", "Go", "Stop", "Wait",
-    "See", "Look", "Send", "Receive", "Buy", "Sell", "Build", "Break", "Fix", "Run",
-    "Sync", "Mine", "Hash", "Mix", "Join", "Check", "Update", "Restart", "Connect", "Drop",
+    // 40-59: Verbs (Action)
+    "send", "receive", "give", "take", "make", "do", "get", "need", "want", "have",
+    "check", "verify", "update", "upgrade", "restart", "connect", "drop", "build", "fix", "run",
 
-    // 80-129: Tech, Crypto & Node Nouns
-    "Node", "Peer", "Network", "Mempool", "Block", "Fork", "Reorg", "Relay", "NAT", "Port",
-    "Bug", "Chain", "Target", "Difficulty", "Transactions", "Midstate", "Axe", "Miner", "WOTS", "MSS",
-    "SMT", "Seed", "Keys", "Wallet", "Price", "Fiat", "Moon", "Pump", "Dump", "Bull",
-    "Bear", "DEX", "CEX", "Code", "Rust", "Server", "Client", "IP", "WebRTC", "UTXO",
-    "Fee", "Hashrate", "Shares", "Pool", "Hardware", "Software", "Linux", "Pi", "Data", "Disk",
+    // 60-79: Verbs (State & Aux)
+    "is", "are", "was", "were", "be", "been", "has", "had", "will", "can",
+    "could", "should", "would", "might", "must", "stop", "wait", "see", "look", "know",
 
-    // 130-169: Adjectives & Adverbs
-    "Good", "Bad", "Fast", "Slow", "Full", "Empty", "High", "Low", "Urgent", "Ready",
-    "Online", "Offline", "Hot", "Cold", "Big", "Small", "Hard", "Easy", "Safe", "Risky",
-    "True", "False", "Up", "Down", "Here", "There", "Now", "Later", "Soon", "Early",
-    "Very", "Too", "Much", "Many", "More", "Less", "All", "None", "Some", "Any",
+    // 80-99: Pronouns
+    "I", "you", "we", "they", "he", "she", "it", "this", "that", "these",
+    "those", "who", "what", "where", "when", "why", "how", "which", "my", "your",
 
-    // 170-189: Prepositions & Conjunctions
-    "At", "To", "From", "And", "Or", "Not", "With", "Without", "In", "Out",
-    "On", "Off", "For", "By", "About", "As", "But", "If", "Then", "Else",
+    // 100-119: Prepositions & Conjunctions
+    "at", "to", "from", "in", "out", "on", "off", "for", "by", "about",
+    "as", "but", "if", "then", "else", "and", "or", "not", "with", "without",
 
-    // 190-209: Time & Measurements
-    "Today", "Tomorrow", "Yesterday", "Second", "Minute", "Hour", "Day", "Week", "Month", "Year",
-    "Time", "Morning", "Night", "Always", "Never", "Sometimes", "Before", "After", "Again", "Done",
+    // 120-139: Adjectives & Adverbs
+    "good", "bad", "fast", "slow", "full", "empty", "high", "low", "urgent", "ready",
+    "online", "offline", "hot", "cold", "big", "small", "hard", "easy", "safe", "new",
 
-    // 210-234: Numbers
+    // 140-159: Quantifiers & Time
+    "all", "none", "some", "any", "many", "much", "more", "less", "every", "only",
+    "now", "later", "soon", "early", "today", "tomorrow", "yesterday", "time", "always", "never",
+
+    // 160-179: Slang & Community
+    "gm", "gn", "lol", "lfg", "wagmi", "ngmi", "ser", "anon", "mate", "based",
+    "wtf", "omg", "moon", "pump", "dump", "bull", "bear", "scam", "rug", "fren",
+
+    // 180-199: Numbers
     "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
-    "10", "20", "50", "100", "200", "500", "1000", "5000", "10000", "50000",
-    "100000", "1M", "10M", "100M", "1B",
+    "10", "20", "50", "100", "200", "500", "1k", "10k", "100k", "1m",
 
-    // 235-255: Punctuation & Emojis (21 items)
-    "?", "!", ".", ",", "...", ":)", ":(", "ok", "ok.", "no.",
-    "🔥", "🚀", "💀", "💎", "👀", "🤝", "📈", "📉", "⚡", "⚠️", "✅"
+    // 200-219: Tech / Concepts
+    "wots", "mss", "smt", "sig", "data", "disk", "linux", "pi", "hardware", "software",
+    "code", "rust", "server", "client", "ip", "webrtc", "error", "bug", "issue", "help",
+
+    // 220-239: Misc useful words
+    "please", "thanks", "ok", "yes", "no", "maybe", "here", "there", "again", "done",
+    "first", "last", "old", "true", "false", "up", "down", "left", "right", "back",
+
+    // 240-255: Punctuation & Emojis (16 items)
+    "?", "!", ".", ",", "...", ":)", ":(", "🔥", "🚀", "💀",
+    "💎", "👀", "🤝", "📈", "📉", "⚡"
 ];
 
 /// A typed, fixed-shape attachment that rides alongside a v2 chat message.
@@ -140,16 +148,17 @@ pub const CHAT_DICTIONARY: &[&str] = &[
 /// variable-length `Vec<u8>` of textual data. The constraint is enforced
 /// at the type level by serde and bincode:
 ///
-/// - JSON: the [`hex_array_32`] adapter requires `value` to be a
-///   64-character hex string. Anything else is a deserialization error.
-/// - Bincode: `[u8; 32]` is a fixed-length array — bincode refuses any
+/// - JSON: custom serialization maps to `{"kind":"address","value":"<72-char lowercase hex w/ checksum>"}`
+///   and requires valid deserialization including checksum.
+/// - Bincode: custom serialization maps to a standard external enum representation 
+///   with a variant index (0) and 32 raw bytes payload. Bincode refuses any
 ///   encoding that does not supply exactly 32 bytes.
 ///
 /// # Encoding
 ///
 /// | Form    | Shape                                                            |
 /// |---------|------------------------------------------------------------------|
-/// | JSON    | `{"kind":"address","value":"<64-char lowercase hex>"}`           |
+/// | JSON    | `{"kind":"address","value":"<72-char lowercase hex w/ checksum>"}` |
 /// | Bincode | 32 raw bytes (variant tag prefix per bincode enum encoding)      |
 ///
 /// # PoW canonical bytes
@@ -162,12 +171,67 @@ pub const CHAT_DICTIONARY: &[&str] = &[
 /// | `Address` | `0x01` | 32             |
 ///
 /// Future variants append new tags; existing tags are immutable.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatAttachment {
     /// A 32-byte midstate address (same `[u8; 32]` shape produced by
     /// `crate::core::compute_address` and stored in `WalletKey::address`).
-    Address(#[serde(with = "hex_array_32")] [u8; 32]),
+    Address([u8; 32]),
+}
+
+impl serde::Serialize for ChatAttachment {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            use serde::ser::SerializeStruct;
+            match self {
+                ChatAttachment::Address(addr) => {
+                    let mut state = serializer.serialize_struct("ChatAttachment", 2)?;
+                    state.serialize_field("kind", "address")?;
+                    state.serialize_field("value", &crate::core::types::encode_address_with_checksum(addr))?;
+                    state.end()
+                }
+            }
+        } else {
+            // For bincode: serialize as an external enum
+            #[derive(serde::Serialize)]
+            enum BincodeHelper<'a> {
+                Address(&'a [u8; 32]),
+            }
+            let helper = match self {
+                ChatAttachment::Address(addr) => BincodeHelper::Address(addr),
+            };
+            helper.serialize(serializer)
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ChatAttachment {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            #[derive(serde::Deserialize)]
+            struct Helper {
+                kind: String,
+                value: String,
+            }
+            let helper = Helper::deserialize(deserializer)?;
+            if helper.kind == "address" {
+                let addr = crate::core::types::parse_address_flexible(&helper.value)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(ChatAttachment::Address(addr))
+            } else {
+                Err(serde::de::Error::custom("Unknown attachment kind"))
+            }
+        } else {
+            // For bincode: deserialize as an external enum
+            #[derive(serde::Deserialize)]
+            enum BincodeHelper {
+                Address([u8; 32]),
+            }
+            let helper = BincodeHelper::deserialize(deserializer)?;
+            match helper {
+                BincodeHelper::Address(addr) => Ok(ChatAttachment::Address(addr)),
+            }
+        }
+    }
 }
 
 /// Hard cap on attachments per chat message.
