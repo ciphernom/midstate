@@ -262,6 +262,9 @@ pub fn deserialize_bin(bytes: &[u8]) -> anyhow::Result<Self> {
                         crate::node::MAX_CHAT_ATTACHMENTS,
                     );
                 }
+                if attachments.iter().any(|att| att.is_graffiti()) {
+                    anyhow::bail!("ChatV2 attachments contain invalid data (possible text graffiti)");
+                }
             }          
             _ => {}
         }

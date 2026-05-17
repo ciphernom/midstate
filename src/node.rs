@@ -183,6 +183,26 @@ pub enum ChatAttachment {
     DataHash([u8; 32]),
 }
 
+impl ChatAttachment {
+    /// Returns true if the 32-byte payload is valid UTF-8, which indicates
+    /// a high probability of text-injection graffiti rather than a random hash.
+    pub fn is_graffiti(&self) -> bool {
+        let bytes = match self {
+            ChatAttachment::Address(b) => b,
+            ChatAttachment::CoinId(b) => b,
+            ChatAttachment::MixId(b) => b,
+            ChatAttachment::Commitment(b) => b,
+            ChatAttachment::BlockHash(b) => b,
+            ChatAttachment::Midstate(b) => b,
+            ChatAttachment::DataHash(b) => b,
+        };
+        
+        // A random 32-byte cryptographic hash has an astronomically low chance 
+        // of accidentally being perfectly valid UTF-8. If it is, it's human text.
+        std::str::from_utf8(bytes).is_ok()
+    }
+}
+
 impl serde::Serialize for ChatAttachment {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         if serializer.is_human_readable() {
@@ -2236,7 +2256,9 @@ async fn handle_light_request(
                 if attachments.len() > crate::node::MAX_CHAT_ATTACHMENTS {
                     return LightResponse::error("Too many attachments (max 4)");
                 }
-
+                if attachments.iter().any(|att| att.is_graffiti()) {
+                    return LightResponse::error("Attachment payload rejected: must be a valid cryptographic hash, not text.");
+                }
                 // Per-light-client rate limit: 5 chats per 10s per PeerId.
                 {
                     let mut limits = self.light_chat_limits.lock().await;
@@ -3623,24 +3645,7 @@ fn fire_batch_lookahead(&mut self) {
         let slots_available = BATCH_LOOKAHEAD.saturating_sub(in_flight_len);
         if slots_available == 0 { return; }
 
-        let busy_peers: HashSet<PeerId> = match &self.sync_session {
-            Some(s) => match &s.phase {
-                SyncPhase::Batches { in_flight, .. } => in_flight.values().cloned().collect(),
-                _ => return,
-            },
-            None => return,
-        };
-
-        let mut available_peers: Vec<PeerId> = self.network.connected_peers()
-            .into_iter()
-            .filter(|p| !self.network.is_light_peer(p) && !busy_peers.contains(p))
-            .collect();
-        if available_peers.is_empty() {
-            available_peers.push(primary_peer);
-        }
-
         let mut next_start = cursor;
-        let mut peer_idx = 0;
         let mut reqs_sent = 0;
 
         while reqs_sent < slots_available && next_start < peer_height {
@@ -3661,11 +3666,10 @@ fn fire_batch_lookahead(&mut self) {
             };
 
             if !is_in_flight && !is_prefetched {
-                let target_peer = available_peers[peer_idx % available_peers.len()];
-                peer_idx += 1;
+                let target_peer = primary_peer; // ALWAYS use primary peer to avoid cross-fork corruption
 
                 let count = (peer_height - next_start).min(MAX_GETBATCHES_COUNT);
-                tracing::debug!("Lookahead: requesting batches {}..{} from {}", next_start, next_start + count, target_peer);
+                tracing::debug!("Lookahead: pipelining batches {}..{} from primary peer {}", next_start, next_start + count, target_peer);
                 self.network.send(target_peer, Message::GetBatches { start_height: next_start, count });
 
                 if let Some(s) = &mut self.sync_session {

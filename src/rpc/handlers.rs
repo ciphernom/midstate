@@ -1290,7 +1290,11 @@ pub async fn send_chat(
     if req.attachments.len() > crate::node::MAX_CHAT_ATTACHMENTS {
         return Err(ErrorResponse { error: "Too many attachments (max 4)".into() });
     }
-
+    if req.attachments.iter().any(|att| att.is_graffiti()) {
+        return Err(ErrorResponse { 
+            error: "Attachment payload rejected: must be a valid cryptographic hash, not text.".into() 
+        });
+    }
     // --- 2. GLOBAL RPC OUTBOX RATE LIMITER ---
     {
         let mut limiter = node.outbox_chat_limiter.lock().await;
