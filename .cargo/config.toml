@@ -1,6 +1,6 @@
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
-rustflags = ["-C", "target-cpu=cortex-a53", "-C", "link-arg=-lgcc"]
+rustflags = ["-C", "target-cpu=cortex-a76", "-C", "link-arg=-lgcc"]
 
 [build]
 # Optimise for size + speed on the Pi
