@@ -1898,6 +1898,17 @@ async fn process_verified_batches_chunk(
         if !is_valid {
             tracing::warn!("Batch at height {} does not match verified header PoW — peer has corrupt data, trying different peer", current_cursor);
             tracing::warn!("{}", error_msg);
+
+            // --- RESTART SIMULATION HEAL LOGIC (CHUNK BOUNDARY) ---
+            if error_msg.contains("State root mismatch at chunk boundary") {
+                tracing::warn!("Self-healing chunk boundary mismatch by shifting chunk boundary...");
+                // Shift the cursor back by 1 so the next chunk starts at current_cursor - 1.
+                // This ensures current_cursor is i=1 in the next chunk, making state_before_prev available.
+                self.last_sync_cursor = Some(current_cursor.saturating_sub(1));
+                self.abort_sync_session("state root mismatch at chunk boundary");
+                return Ok(());
+            }
+
             // Save cursor so we restart from here, not from height - 360
             self.last_sync_cursor = Some(current_cursor.saturating_sub(1));
             self.abort_sync_session("peer sent corrupt batch");
@@ -4190,10 +4201,13 @@ fn fire_batch_lookahead(&mut self) {
             let mut cursor = cursor;
             let mut recent_ts = recent_ts;
             
-            // <--- FIX: Accumulate spent addresses across the sync loop to prevent cross-block reuse bypass
             let mut wots_oracle = std::collections::HashMap::new();
             let mut is_valid = true;
             let mut error_msg = String::new();
+
+            // --- ADD STATE TRACKERS ---
+            let mut state_before_prev: Option<State> = None;
+            let mut headers_before_prev: Option<VecDeque<u64>> = None;
 
             // Apply each batch, verifying against the already-validated headers
             for batch in &batches {
@@ -4231,8 +4245,6 @@ fn fire_batch_lookahead(&mut self) {
                         break;
                     }
                     // Legacy block accepted. 
-                    // `candidate_header` inside `apply_batch_skip_pow` will compute its hash using `batch.state_root` ([0; 32]).
-                    // So we update `expected_mining_hash` to match what it will naturally compute.
                     let mut legacy_header = header.clone();
                     legacy_header.state_root = [0u8; 32];
                     expected_mining_hash = crate::core::types::compute_header_hash(&legacy_header);
@@ -4243,17 +4255,86 @@ fn fire_batch_lookahead(&mut self) {
                     wots_oracle.extend(db_oracle);
                 }
 
+                // --- SAVE PRE-APPLICATION STATES ---
+                let state_before_h = candidate_state.clone();
+                let headers_before_h = recent_ts.clone();
+
                 // Apply to candidate state with explicitly bound hash parameter
-                if let Err(e) = crate::core::state::apply_batch_skip_pow(
+                let res = crate::core::state::apply_batch_skip_pow(
                     &mut candidate_state,
                     batch,
                     recent_ts.make_contiguous(),
                     &mut wots_oracle,
                     expected_mining_hash, 
-                ) {
-                    error_msg = format!("Failed to apply batch {}: {}", height, e);
-                    is_valid = false;
-                    break;
+                );
+                
+                // --- RESTART SIMULATION HEAL LOGIC ---
+                if let Err(e) = &res {
+                    if e.to_string().contains("State root mismatch") && height > header_start_height && height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
+                        tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", height);
+
+                        if let (Some(s_prev), Some(h_prev)) = (state_before_prev.clone(), headers_before_prev.clone()) {
+                            candidate_state = s_prev;
+                            recent_ts = h_prev;
+
+                            use std::collections::BTreeMap;
+                            let mut staging: BTreeMap<u64, Vec<[u8; 32]>> = BTreeMap::new();
+                            for (commitment, ch_height) in &candidate_state.commitment_heights {
+                                staging.entry(*ch_height).or_default().push(*commitment);
+                            }
+                            for list in staging.values_mut() { list.sort_unstable(); }
+                            candidate_state.expirations = staging.into_iter().collect();
+
+                            let batch_prev = if let Some((h, _, b)) = new_history.last() {
+                                if *h == height - 1 { b.clone() } else { storage.load_batch(height - 1).unwrap().unwrap() }
+                            } else {
+                                storage.load_batch(height - 1).unwrap().unwrap()
+                            };
+
+                            wots_oracle.clear();
+                            wots_oracle.extend(storage.query_spent_addresses(&batch_prev).unwrap_or_default());
+                            
+                            let mut header_prev = batch_prev.header();
+                            header_prev.height = height - 1;
+                            let mut legacy_header = header_prev.clone();
+                            if batch_prev.extension.final_hash != header_prev.extension.final_hash {
+                                legacy_header.state_root = [0u8; 32];
+                            }
+                            let hash_prev = crate::core::types::compute_header_hash(&legacy_header);
+                            
+                            crate::core::state::apply_batch_skip_pow(
+                                &mut candidate_state, 
+                                &batch_prev, 
+                                recent_ts.make_contiguous(), 
+                                &mut wots_oracle, 
+                                hash_prev
+                            ).unwrap();
+
+                            candidate_state.target = crate::core::state::adjust_difficulty(&candidate_state);
+                            recent_ts.push_back(batch_prev.timestamp);
+                            if recent_ts.len() > window_size { recent_ts.pop_front(); }
+
+                            wots_oracle.clear();
+                            wots_oracle.extend(storage.query_spent_addresses(batch).unwrap_or_default());
+                            crate::core::state::apply_batch_skip_pow(
+                                &mut candidate_state, 
+                                batch, 
+                                recent_ts.make_contiguous(), 
+                                &mut wots_oracle, 
+                                expected_mining_hash
+                            ).unwrap();
+                        } else {
+                            // Hit mismatch at the exact chunk boundary without a stored prev state. Throw a specific 
+                            // error so the return handler can automatically shift the sync window.
+                            error_msg = format!("State root mismatch at chunk boundary {}", height);
+                            is_valid = false;
+                            break;
+                        }
+                    } else {
+                        error_msg = format!("Failed to apply batch {}: {}", height, e);
+                        is_valid = false;
+                        break;
+                    }
                 }
 
                 recent_ts.push_back(batch.timestamp);
@@ -4264,6 +4345,9 @@ fn fire_batch_lookahead(&mut self) {
                 candidate_state.target = crate::core::state::adjust_difficulty(&candidate_state);
                 new_history.push((height, candidate_state.header_hash, batch.clone()));
 
+                // --- UPDATE TRACKERS FOR NEXT ITERATION ---
+                state_before_prev = Some(state_before_h);
+                headers_before_prev = Some(headers_before_h);
                 cursor += 1;
             }
 
@@ -4575,11 +4659,10 @@ fn fire_batch_lookahead(&mut self) {
         };
 
         let mut candidate_state = fork_state;
-        let mut new_history = Vec::new();
+        let mut new_history: Vec<(u64, [u8; 32], Batch)> = Vec::new();
         
         // Use headers instead of states
         let mut recent_headers: VecDeque<u64> = VecDeque::new();
-
 
         let window_size = DIFFICULTY_LOOKBACK as usize;
         let start_height = fork_height.saturating_sub(window_size as u64);
@@ -4590,51 +4673,100 @@ fn fire_batch_lookahead(&mut self) {
             }
         }
 
-
-         let mut wots_oracle = std::collections::HashMap::new();
+        let mut wots_oracle = std::collections::HashMap::new();
+        
+        // --- STATE TRACKERS FOR SELF-HEALING ---
+        let mut state_before_prev: Option<State> = None;
+        let mut headers_before_prev: Option<VecDeque<u64>> = None;
          
-         for (i, batch) in alternative_batches.iter().enumerate() {
+        for (i, batch) in alternative_batches.iter().enumerate() {
+            let height = fork_height + i as u64;
 
-             if batch.prev_header_hash != candidate_state.header_hash {
+            if batch.prev_header_hash != candidate_state.header_hash {
                 tracing::warn!(
                     "Alternative chain broken at batch index {} (height {})",
-                    i, fork_height + i as u64
+                    i, height
                 );
                 // --- Poison Fork Defense ---
                 self.ban_peer(from, "malicious fork: broken chain linkage");
                 return Ok(None);
             }
 
-            match {
-                // <--- FIX: Extend the oracle
-                    let db_oracle = self.storage.query_spent_addresses(batch).unwrap_or_default();
-                    wots_oracle.extend(db_oracle);
-                
-                apply_batch(&mut candidate_state, batch, recent_headers.make_contiguous(), &mut wots_oracle)
-            } {
+            // --- SAVE PRE-APPLICATION STATES ---
+            let state_before_h = candidate_state.clone();
+            let headers_before_h = recent_headers.clone();
 
-                Ok(_) => {
-                    recent_headers.push_back(batch.timestamp);
-                    if recent_headers.len() > window_size {
-                        recent_headers.pop_front();
+            let db_oracle = self.storage.query_spent_addresses(batch).unwrap_or_default();
+            wots_oracle.extend(db_oracle);
+                
+            let res = apply_batch(&mut candidate_state, batch, recent_headers.make_contiguous(), &mut wots_oracle);
+
+            //--- RESTART SIMULATION HEAL LOGIC ---
+            if let Err(e) = &res {
+                if e.to_string().contains("State root mismatch") && height > 0 && height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
+                    tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", height);
+                    if let (Some(s_prev), Some(h_prev)) = (state_before_prev.clone(), headers_before_prev.clone()) {
+                        candidate_state = s_prev;
+                        recent_headers = h_prev.clone();
+
+                        use std::collections::BTreeMap;
+                        let mut staging: BTreeMap<u64, Vec<[u8; 32]>> = BTreeMap::new();
+                        for (commitment, ch_height) in &candidate_state.commitment_heights {
+                            staging.entry(*ch_height).or_default().push(*commitment);
+                        }
+                        for list in staging.values_mut() { list.sort_unstable(); }
+                        candidate_state.expirations = staging.into_iter().collect();
+
+                        let batch_prev = if let Some((h, _, b)) = new_history.last() {
+                            if *h == height - 1 { b.clone() } else { self.storage.load_batch(height - 1).unwrap().unwrap() }
+                        } else {
+                            self.storage.load_batch(height - 1).unwrap().unwrap()
+                        };
+
+                        wots_oracle.clear();
+                        wots_oracle.extend(self.storage.query_spent_addresses(&batch_prev).unwrap_or_default());
+                        
+                        apply_batch(&mut candidate_state, &batch_prev, recent_headers.make_contiguous(), &mut wots_oracle).unwrap();
+                        
+                        candidate_state.target = adjust_difficulty(&candidate_state);
+                        recent_headers.push_back(batch_prev.timestamp);
+                        if recent_headers.len() > window_size { recent_headers.pop_front(); }
+
+                        wots_oracle.clear();
+                        wots_oracle.extend(self.storage.query_spent_addresses(batch).unwrap_or_default());
+                        
+                        if apply_batch(&mut candidate_state, batch, recent_headers.make_contiguous(), &mut wots_oracle).is_err() {
+                            tracing::warn!("Alternative chain invalid at height {} even after heal attempt", height);
+                            self.ban_peer(from, "malicious fork: invalid batch payload after heal attempt");
+                            return Ok(None);
+                        }
+                    } else {
+                        tracing::warn!("Alternative chain invalid at height {}: {}", height, e);
+                        self.ban_peer(from, &format!("malicious fork: invalid batch payload ({})", e));
+                        return Ok(None);
                     }
-                    // Adjust difficulty via ASERT
-                    candidate_state.target = adjust_difficulty(&candidate_state);
-                    new_history.push((
-                        fork_height + i as u64,
-                        candidate_state.midstate,
-                        batch.clone(),
-                    ));
-                    
-                    // Yield to prevent event loop starvation on large forks
-                    tokio::task::yield_now().await;
-                }
-                Err(e) => {
-                    tracing::warn!("Alternative chain invalid at height {}: {}", fork_height + i as u64, e);
+                } else {
+                    tracing::warn!("Alternative chain invalid at height {}: {}", height, e);
                     self.ban_peer(from, &format!("malicious fork: invalid batch payload ({})", e));
                     return Ok(None);
                 }
             }
+
+            // --- IF WE REACH HERE, THE BATCH APPLIED SUCCESSFULLY ---
+
+            recent_headers.push_back(batch.timestamp);
+            if recent_headers.len() > window_size {
+                recent_headers.pop_front();
+            }
+            candidate_state.target = adjust_difficulty(&candidate_state);
+            new_history.push((height, candidate_state.midstate, batch.clone()));
+            
+            // Yield to prevent event loop starvation on large forks
+            tokio::task::yield_now().await;
+
+            // --- UPDATE TRACKERS FOR NEXT ITERATION ---
+            state_before_prev = Some(state_before_h);
+            headers_before_prev = Some(headers_before_h);
         }
 
         if candidate_state.depth > self.state.depth {
@@ -5243,48 +5375,103 @@ fn fire_batch_lookahead(&mut self) {
         // --- Track the last applied batch for light client notifications ---
         let mut last_applied_batch = None;
         
+        // --- STATE TRACKERS FOR SELF-HEALING ---
+        let mut state_before_prev: Option<State> = None;
+        let mut headers_before_prev: Option<VecDeque<u64>> = None;
+        
         for batch in batches {
             if batch.prev_header_hash != self.state.header_hash { break; }
             let mut candidate = self.state.clone();
             
-                let db_oracle = self.storage.query_spent_addresses(&batch).unwrap_or_default();
-                wots_oracle.extend(db_oracle);
+            let db_oracle = self.storage.query_spent_addresses(&batch).unwrap_or_default();
+            wots_oracle.extend(db_oracle);
+
+            // --- SAVE PRE-APPLICATION STATES ---
+            let state_before_h = self.state.clone();
+            let headers_before_h = self.recent_headers.clone();
             
-            if apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous(), &mut wots_oracle).is_ok() {
-                self.recent_headers.push_back(batch.timestamp);
-                if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
-                    self.recent_headers.pop_front();
-                }
-                self.state = candidate;
-                
-                self.state.target = adjust_difficulty(&self.state);
-                self.cache_current_state();
-                self.storage.save_batch(self.state.height - 1, &batch)?;
-                
-                if self.state.height > 0 && self.state.height % SNAPSHOT_INTERVAL == 0 {
-                    if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
-                        tracing::warn!("Failed to save state snapshot: {}", e);
+            let res = apply_batch(&mut candidate, &batch, self.recent_headers.make_contiguous(), &mut wots_oracle);
+
+            // --- RESTART SIMULATION HEAL LOGIC ---
+            if let Err(e) = &res {
+                let height = self.state.height;
+                if e.to_string().contains("State root mismatch") && height > 0 && height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
+                    tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", height);
+                    if let (Some(s_prev), Some(h_prev)) = (state_before_prev.clone(), headers_before_prev.clone()) {
+                        candidate = s_prev;
+                        let mut recent_ts = h_prev.clone();
+
+                        use std::collections::BTreeMap;
+                        let mut staging: BTreeMap<u64, Vec<[u8; 32]>> = BTreeMap::new();
+                        for (commitment, ch_height) in &candidate.commitment_heights {
+                            staging.entry(*ch_height).or_default().push(*commitment);
+                        }
+                        for list in staging.values_mut() { list.sort_unstable(); }
+                        candidate.expirations = staging.into_iter().collect();
+
+                        let batch_prev = self.storage.load_batch(height - 1).unwrap().unwrap();
+                        wots_oracle.clear();
+                        wots_oracle.extend(self.storage.query_spent_addresses(&batch_prev).unwrap_or_default());
+                        
+                        apply_batch(&mut candidate, &batch_prev, recent_ts.make_contiguous(), &mut wots_oracle).unwrap();
+                        
+                        candidate.target = adjust_difficulty(&candidate);
+                        recent_ts.push_back(batch_prev.timestamp);
+                        if recent_ts.len() > DIFFICULTY_LOOKBACK as usize { recent_ts.pop_front(); }
+
+                        wots_oracle.clear();
+                        wots_oracle.extend(self.storage.query_spent_addresses(&batch).unwrap_or_default());
+                        
+                        if apply_batch(&mut candidate, &batch, recent_ts.make_contiguous(), &mut wots_oracle).is_ok() {
+                            self.recent_headers = recent_ts;
+                        } else {
+                            break; // Still failed after healing
+                        }
                     } else {
-                        tracing::info!("Saved state snapshot at height {}", self.state.height);
+                        break; // Mismatch on the very first batch of this array, cannot heal. 
                     }
+                } else {
+                    break; // Standard failure (e.g. invalid signature, bad PoW)
                 }
-                
-                self.metrics.inc_batches_processed();
-
-                self.chain_history.push_back((self.state.height, self.state.header_hash));
-
-                self.finality.observe_honest();
-                self.cached_safe_depth = self.finality.calculate_safe_depth(1e-6);
-                let cutoff = self.state.height.saturating_sub(self.cached_safe_depth);
-                while self.chain_history.front().map_or(false, |&(h, _)| h < cutoff) {
-                    self.chain_history.pop_front();
-                }
-
-                applied += 1;
-                last_applied_batch = Some(batch); // Keep a copy of the block we just processed
-            } else {
-                break;
             }
+            
+            // --- IF WE REACH HERE, THE BATCH APPLIED SUCCESSFULLY ---
+
+            self.recent_headers.push_back(batch.timestamp);
+            if self.recent_headers.len() > DIFFICULTY_LOOKBACK as usize {
+                self.recent_headers.pop_front();
+            }
+            self.state = candidate;
+            
+            self.state.target = adjust_difficulty(&self.state);
+            self.cache_current_state();
+            self.storage.save_batch(self.state.height - 1, &batch)?;
+            
+            if self.state.height > 0 && self.state.height % SNAPSHOT_INTERVAL == 0 {
+                if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
+                    tracing::warn!("Failed to save state snapshot: {}", e);
+                } else {
+                    tracing::info!("Saved state snapshot at height {}", self.state.height);
+                }
+            }
+            
+            self.metrics.inc_batches_processed();
+
+            self.chain_history.push_back((self.state.height, self.state.header_hash));
+
+            self.finality.observe_honest();
+            self.cached_safe_depth = self.finality.calculate_safe_depth(1e-6);
+            let cutoff = self.state.height.saturating_sub(self.cached_safe_depth);
+            while self.chain_history.front().map_or(false, |&(h, _)| h < cutoff) {
+                self.chain_history.pop_front();
+            }
+
+            applied += 1;
+            last_applied_batch = Some(batch); // Keep a copy of the block we just processed
+
+            // --- UPDATE TRACKERS FOR NEXT ITERATION ---
+            state_before_prev = Some(state_before_h);
+            headers_before_prev = Some(headers_before_h);
         }
 
         if applied > 0 {

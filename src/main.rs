@@ -2803,6 +2803,9 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
     }
     
     let mut dl_cursor = fork_height;
+    let mut state_before_prev: Option<midstate::core::State> = None;
+    let mut headers_before_prev: Option<Vec<u64>> = None;
+    
     while dl_cursor < peer_height {
         let chunk = 10.min(peer_height - dl_cursor);
         network.send(peer_id, Message::GetBatches { start_height: dl_cursor, count: chunk });
@@ -2819,11 +2822,53 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
         let mut wots_oracle = std::collections::HashMap::new();
 
         for batch in &batches {
-                let db_oracle = storage.query_spent_addresses(batch).unwrap_or_default();
-                wots_oracle.extend(db_oracle);
+            let height = dl_cursor;
             
+            // --- SAVE PRE-APPLICATION STATES ---
+            let state_before_h = state.clone();
+            let headers_before_h = recent_headers.clone();
 
-            apply_batch(&mut state, batch, &recent_headers, &mut wots_oracle)?;
+            let db_oracle = storage.query_spent_addresses(batch).unwrap_or_default();
+            wots_oracle.extend(db_oracle);
+            
+            let res = apply_batch(&mut state, batch, &recent_headers, &mut wots_oracle);
+
+            // --- RESTART SIMULATION HEAL LOGIC ---
+            if let Err(e) = &res {
+                if e.to_string().contains("State root mismatch") && height > 0 && height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
+                    tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", height);
+                    if let (Some(s_prev), Some(h_prev)) = (state_before_prev.clone(), headers_before_prev.clone()) {
+                        state = s_prev;
+                        recent_headers = h_prev;
+
+                        use std::collections::BTreeMap;
+                        let mut staging: BTreeMap<u64, Vec<[u8; 32]>> = BTreeMap::new();
+                        for (commitment, ch_height) in &state.commitment_heights {
+                            staging.entry(*ch_height).or_default().push(*commitment);
+                        }
+                        for list in staging.values_mut() { list.sort_unstable(); }
+                        state.expirations = staging.into_iter().collect();
+
+                        let batch_prev = storage.load_batch(height - 1).unwrap().unwrap();
+                        wots_oracle.clear();
+                        wots_oracle.extend(storage.query_spent_addresses(&batch_prev).unwrap_or_default());
+                        
+                        apply_batch(&mut state, &batch_prev, &recent_headers, &mut wots_oracle)?;
+                        
+                        state.target = midstate::core::state::adjust_difficulty(&state);
+                        recent_headers.push(batch_prev.timestamp);
+                        if recent_headers.len() > midstate::core::MEDIAN_TIME_PAST_WINDOW { recent_headers.remove(0); }
+
+                        wots_oracle.clear();
+                        wots_oracle.extend(storage.query_spent_addresses(batch).unwrap_or_default());
+                        apply_batch(&mut state, batch, &recent_headers, &mut wots_oracle)?;
+                    } else {
+                        res?;
+                    }
+                } else {
+                    res?;
+                }
+            }
             
             // FIX: MUST adjust difficulty so the target matches for the next block
             state.target = midstate::core::state::adjust_difficulty(&state);
@@ -2835,6 +2880,11 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
             }
 
             storage.save_batch(dl_cursor, batch)?;
+            
+            // --- UPDATE TRACKERS FOR NEXT ITERATION ---
+            state_before_prev = Some(state_before_h);
+            headers_before_prev = Some(headers_before_h);
+
             dl_cursor += 1;
             
             if dl_cursor % 100 == 0 {
