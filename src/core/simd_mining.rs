@@ -1419,4 +1419,56 @@ mod tests {
             assert_eq!(*fh, expected, "Identical lane {} mismatch", i);
         }
     }
+    
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore]
+    fn bench_neon_paths() {
+        use std::time::Instant;
+
+        let midstate = hash(b"benchmark midstate");
+        let n4: [u64; 4] = [1, 2, 3, 4];
+        let n8: [u64; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+
+        // Warmup
+        for _ in 0..2 {
+            let _ = unsafe { neon::create_extensions_4way_neon(midstate, n4) };
+            let _ = unsafe { neon::create_extensions_8way_neon(midstate, n8) };
+        }
+
+        const ITERS: u32 = 10;
+
+        let t4 = {
+            let start = Instant::now();
+            for _ in 0..ITERS {
+                let r = unsafe { neon::create_extensions_4way_neon(midstate, n4) };
+                std::hint::black_box(r);
+            }
+            start.elapsed()
+        };
+
+        let t8 = {
+            let start = Instant::now();
+            for _ in 0..ITERS {
+                let r = unsafe { neon::create_extensions_8way_neon(midstate, n8) };
+                std::hint::black_box(r);
+            }
+            start.elapsed()
+        };
+
+        let ns_per_hash_4 = t4.as_nanos() / (ITERS as u128 * 4);
+        let ns_per_hash_8 = t8.as_nanos() / (ITERS as u128 * 8);
+        let speedup = ns_per_hash_4 as f64 / ns_per_hash_8 as f64;
+
+        println!();
+        println!("4-way: {:>8} ms total, {:>6} ns/hash/lane",
+                 t4.as_millis(), ns_per_hash_4);
+        println!("8-way: {:>8} ms total, {:>6} ns/hash/lane",
+                 t8.as_millis(), ns_per_hash_8);
+        println!("Per-hash speedup: {:.2}x", speedup);
+        println!();
+    }
+    
 }
+
+
