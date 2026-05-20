@@ -970,7 +970,8 @@ mod tests {
         bc.push(OP_GREATER_OR_EQUAL);
         bc.push(OP_VERIFY);
         push_int(&mut bc, 1);
-        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
+        let commitment = [0u8; 32];
+        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &outputs, input_value: 0, input_state: None, this_address: [0u8; 32] };
         assert!(execute_script(&bc, &[], &ctx).is_ok());
     }
 
@@ -985,7 +986,8 @@ mod tests {
         bc.push(OP_GREATER_OR_EQUAL);
         bc.push(OP_VERIFY);
         push_int(&mut bc, 1);
-        let ctx = ExecContext { commitment: &[0; 32], height: 0, outputs: &outputs, input_value: 0, input_state: None, this_address: [0u8; 32] };
+        let commitment = [0u8; 32];
+        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &outputs, input_value: 0, input_state: None, this_address: [0u8; 32] };
         assert!(execute_script(&bc, &[], &ctx).is_err());
     }
 
@@ -1054,7 +1056,7 @@ mod tests {
 
         let witness = vec![vec![1u8], vec![2u8]];
         let mut ctx = empty_ctx();
-        ctx.height = VM_UPGRADE_ACTIVATION_HEIGHT;
+        ctx.height = 100_000;
         assert!(execute_script(&bc, &witness, &ctx).is_ok());
     }
 
@@ -1071,7 +1073,7 @@ mod tests {
 
         let witness = vec![vec![1u8], vec![2u8], vec![3u8]];
         let mut ctx = empty_ctx();
-        ctx.height = VM_UPGRADE_ACTIVATION_HEIGHT;
+        ctx.height = 100_000;
         assert!(execute_script(&bc, &witness, &ctx).is_ok());
     }
 
@@ -1084,7 +1086,7 @@ mod tests {
 
         let witness = vec![vec![5u8], vec![3u8]];
         let mut ctx = empty_ctx();
-        ctx.height = VM_UPGRADE_ACTIVATION_HEIGHT;
+        ctx.height = 100_000;
         assert!(execute_script(&bc, &witness, &ctx).is_ok());
     }
 
@@ -1095,7 +1097,7 @@ mod tests {
 
         let witness = vec![vec![3u8], vec![5u8]];
         let mut ctx = empty_ctx();
-        ctx.height = VM_UPGRADE_ACTIVATION_HEIGHT;
+        ctx.height = 100_000;
         assert_eq!(execute_script(&bc, &witness, &ctx), Err(ScriptError::MathOverflow));
     }
 

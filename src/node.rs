@@ -324,44 +324,6 @@ impl<'de> serde::Deserialize<'de> for ChatAttachment {
 /// - `crate::rpc::handlers::send_chat` (LAN browser origination)
 pub const MAX_CHAT_ATTACHMENTS: usize = 4;
 
-/// Serde adapter for `[u8; 32]` that branches on
-/// [`is_human_readable`](serde::Serializer::is_human_readable).
-///
-/// - JSON: 64-character lowercase hex string. Length checked on deserialize.
-/// - Bincode: 32 raw bytes via the default `[u8; 32]` codec.
-///
-/// This dual encoding keeps the on-wire bincode form compact (32 bytes,
-/// not a 64-character string) while keeping the JSON form human-readable
-/// for the browser, the chat UI, and HTTP debugging.
-mod hex_array_32 {
-    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
-        if s.is_human_readable() {
-            s.serialize_str(&hex::encode(bytes))
-        } else {
-            use serde::Serialize;
-            bytes.serialize(s)
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
-        if d.is_human_readable() {
-            let s = String::deserialize(d)?;
-            let v = hex::decode(&s).map_err(D::Error::custom)?;
-            if v.len() != 32 {
-                return Err(D::Error::custom(
-                    "ChatAttachment::Address must be exactly 32 bytes / 64 hex chars",
-                ));
-            }
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&v);
-            Ok(out)
-        } else {
-            <[u8; 32]>::deserialize(d)
-        }
-    }
-}
 
 /// A chat message as it appears in `Node::chat_history` and in the
 /// JSON returned by `GET /api/chat`.
@@ -6278,6 +6240,7 @@ mod tests {
         let midstate_1 = ext1.final_hash;
         let batch1 = Batch {
             prev_midstate: midstate_0,
+            prev_header_hash: node.state.header_hash,
             transactions: vec![],
             extension: ext1,
             coinbase: vec![],
@@ -6292,6 +6255,7 @@ mod tests {
         let midstate_2 = ext2.final_hash;
         let batch2 = Batch {
             prev_midstate: midstate_1,
+            prev_header_hash: batch1.extension.final_hash,
             transactions: vec![],
             extension: ext2,
             coinbase: vec![],
@@ -6312,6 +6276,7 @@ mod tests {
         let ext3 = create_extension(midstate_2, 300);
         let batch3 = Batch {
             prev_midstate: midstate_2,
+            prev_header_hash: batch2.extension.final_hash,
             transactions: vec![],
             extension: ext3,
             coinbase: vec![],
@@ -6334,6 +6299,7 @@ mod tests {
         let ext2_prime = create_extension(midstate_1, 999); // Different nonce -> different hash
         let batch2_prime = Batch {
             prev_midstate: midstate_1,
+            prev_header_hash: batch1.extension.final_hash,
             transactions: vec![],
             extension: ext2_prime,
             coinbase: vec![],
@@ -6355,6 +6321,7 @@ mod tests {
         let ext1_prime = create_extension(midstate_0, 555);
         let batch1_prime = Batch {
             prev_midstate: midstate_0,
+            prev_header_hash: node.state.header_hash,
             transactions: vec![],
             extension: ext1_prime,
             coinbase: vec![],
@@ -6603,7 +6570,7 @@ mod tests {
         use crate::core::types::*;
         use crate::core::extension::create_extension;
 
-        let (mut state, genesis_coinbase) = State::genesis();
+        let (state, genesis_coinbase) = State::genesis();
         let mut mining_midstate = state.midstate;
         let v2 = false; // genesis is V1
         let mut temp_coins = state.coins.clone();
@@ -6633,6 +6600,7 @@ mod complex_tests {
     use super::*;
     use tempfile::tempdir;
     use crate::core::types::hash;
+    use crate::sync::Syncer;
 
     // --- Test Helpers ---
 
@@ -7288,7 +7256,7 @@ fn build_divergent_chain(
 
         // 2. Build a divergent chain that forks at height 5
         //    (longer than ours so the node would want to adopt it)
-        let fork_state = node.rebuild_state_at_height(5).await.unwrap();
+        let fork_state = rebuild_state_from_disk(node.storage.clone(), 5, None).await.unwrap();
         let (alt_batches, alt_headers) = build_divergent_chain(&fork_state, 15);
 
         // We need the full header chain from genesis for the sync session.
@@ -7311,6 +7279,8 @@ fn build_divergent_chain(
                 cursor: 5,
                 new_history: Vec::new(),
                 is_fast_forward: false,
+                in_flight: std::collections::BTreeMap::new(),
+                prefetch_buffer: std::collections::BTreeMap::new(),
             },
             started_at: std::time::Instant::now(),
             last_progress_at: std::time::Instant::now(),
@@ -7363,7 +7333,7 @@ fn build_divergent_chain(
         let original_height = node.state.height; // 9
 
         // Build alt chain forking at height 3, longer than ours
-        let fork_state = node.rebuild_state_at_height(3).await.unwrap();
+        let fork_state = rebuild_state_from_disk(node.storage.clone(), 3, None).await.unwrap();
         let (alt_batches, alt_headers) = build_divergent_chain(&fork_state, 12);
 
         let mut full_headers = node.storage.batches.load_headers(0, 3).unwrap();
@@ -7383,6 +7353,8 @@ fn build_divergent_chain(
                 cursor: 3,
                 new_history: Vec::new(),
                 is_fast_forward: false,
+                in_flight: std::collections::BTreeMap::new(),
+                prefetch_buffer: std::collections::BTreeMap::new(),
             },
             started_at: std::time::Instant::now(),
             last_progress_at: std::time::Instant::now(),
@@ -7421,7 +7393,7 @@ fn build_divergent_chain(
         assert_eq!(node.state.height, 6);
 
         // Build alt chain forking at genesis (height 1), longer than ours
-        let fork_state = node.rebuild_state_at_height(1).await.unwrap();
+        let fork_state = rebuild_state_from_disk(node.storage.clone(), 1, None).await.unwrap();
         let (alt_batches, alt_headers) = build_divergent_chain(&fork_state, 10);
 
         let mut full_headers = node.storage.batches.load_headers(0, 1).unwrap();
@@ -7441,6 +7413,8 @@ fn build_divergent_chain(
                 cursor: 1,
                 new_history: Vec::new(),
                 is_fast_forward: false,
+                in_flight: std::collections::BTreeMap::new(),
+                prefetch_buffer: std::collections::BTreeMap::new(),
             },
             started_at: std::time::Instant::now(),
             last_progress_at: std::time::Instant::now(),
@@ -7480,7 +7454,7 @@ fn build_divergent_chain(
         let original_state = node.state.clone();
 
         // Build two different alt chains forking at different points
-        let fork_a_state = node.rebuild_state_at_height(3).await.unwrap();
+         let fork_a_state = rebuild_state_from_disk(node.storage.clone(), 3, None).await.unwrap();
         let (alt_a_batches, alt_a_headers) = build_divergent_chain(&fork_a_state, 10);
 
         let mut full_headers_a = node.storage.batches.load_headers(0, 3).unwrap();
@@ -7500,6 +7474,8 @@ fn build_divergent_chain(
                 cursor: 3,
                 new_history: Vec::new(),
                 is_fast_forward: false,
+                in_flight: std::collections::BTreeMap::new(),
+                prefetch_buffer: std::collections::BTreeMap::new(),
             },
             started_at: std::time::Instant::now(),
             last_progress_at: std::time::Instant::now(),

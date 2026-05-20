@@ -764,6 +764,8 @@ mod tests {
             height: 1,
             timestamp: 1000,
             commitment_heights: im::HashMap::new(),
+            expirations: im::OrdMap::new(),
+            header_hash: [0u8; 32],
             chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
         }
     }
@@ -792,7 +794,7 @@ mod tests {
         let address = compute_address(&owner_pk);
         let input_salt = hash(b"test salt");
         let coin_id = compute_coin_id(&address, 20, &input_salt);
-        state.coins.insert(coin_id);
+        state.coins.insert(coin_id, false);
 
         let output = OutputData::Standard {
             address: hash(b"recipient"),
@@ -981,7 +983,7 @@ mod tests {
         let address = compute_address(&owner_pk);
         let input_salt = [0u8; 32];
         let coin_id = compute_coin_id(&address, 1, &input_salt);
-        state.coins.insert(coin_id);
+        state.coins.insert(coin_id, false);
 
         let output = OutputData::Standard { address: hash(b"r"), value: 1, salt: [0; 32] };
         let commit_salt = [1u8; 32];

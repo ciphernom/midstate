@@ -747,6 +747,8 @@ mod tests {
             height: 1,
             timestamp: 1000,
             commitment_heights: im::HashMap::new(),
+            expirations: im::OrdMap::new(),
+            header_hash: [0u8; 32],
             chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
         };
 
@@ -762,9 +764,10 @@ mod tests {
         let in_b_id = in_b.coin_id();
         let fee_id = fee.coin_id();
 
-        state.coins.insert(in_a_id);
-        state.coins.insert(in_b_id);
-        state.coins.insert(fee_id);
+        let v2 = crate::core::types::is_v2_at(state.height);
+        state.coins.insert(in_a_id, v2);
+        state.coins.insert(in_b_id, v2);
+        state.coins.insert(fee_id, v2);
 
         // Build the CoinJoin
         let mut session = MixSession::with_salt(8, 2, [0x42; 32]).unwrap();

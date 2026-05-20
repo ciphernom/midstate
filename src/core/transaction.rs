@@ -931,13 +931,15 @@ mod tests {
     fn commit_pow_valid_nonce_passes() {
         let commitment = hash(b"test commitment");
         let nonce = mine_commit_nonce(&commitment);
+        let state = empty_state();
         // Tests use V1 path (height 0), where target_height in nonce is unused.
-        assert!(validate_commit_pow(&commitment, nonce, 0).is_ok());
+        assert!(validate_commit_pow(&commitment, nonce, &state).is_ok());
     }
 
     #[test]
     fn commit_pow_invalid_nonce_fails() {
         let commitment = hash(b"test commitment");
+        let state = empty_state();
         // Find a nonce that does NOT meet the PoW threshold
         let mut bad_nonce = 0u64;
         loop {
@@ -947,7 +949,7 @@ mod tests {
             }
             bad_nonce += 1;
         }
-        assert!(validate_commit_pow(&commitment, bad_nonce, 0).is_err());
+        assert!(validate_commit_pow(&commitment, bad_nonce, &state).is_err());
     }
 
     #[test]
@@ -957,7 +959,8 @@ mod tests {
         let start = std::time::Instant::now();
         let nonce = mine_commit_nonce(&commitment);
         let elapsed = start.elapsed();
-        assert!(validate_commit_pow(&commitment, nonce, 0).is_ok());
+        let state = empty_state();
+        assert!(validate_commit_pow(&commitment, nonce, &state).is_ok());
         eprintln!("Commit PoW mining took {:?} (nonce: {})", elapsed, nonce);
         assert!(elapsed.as_secs() < 5, "PoW took too long: {:?}", elapsed);
     }
