@@ -4159,6 +4159,7 @@ fn fire_batch_lookahead(&mut self) {
 
         let tx = self.cmd_tx.as_ref().unwrap().clone();
         let storage = self.storage.clone();
+        let current_state_height = self.state.height; // Capture height before thread
 
         tokio::task::spawn_blocking(move || {
             let mut candidate_state = candidate_state;
@@ -4167,6 +4168,20 @@ fn fire_batch_lookahead(&mut self) {
             let mut recent_ts = recent_ts;
             
             let mut wots_oracle = std::collections::HashMap::new();
+
+            // --- FIX: Ignore DB oracle entries from the abandoned local chain ---
+            let mut ignored_db_addresses = std::collections::HashSet::new();
+            if cursor < current_state_height {
+                for h in cursor..current_state_height {
+                    if let Ok(Some(local_batch)) = storage.load_batch(h) {
+                        for addr in extract_spent_addresses(&local_batch) {
+                            ignored_db_addresses.insert(addr);
+                        }
+                    }
+                }
+            }
+            // --------------------------------------------------------------------
+
             let mut is_valid = true;
             let mut error_msg = String::new();
 
@@ -4216,7 +4231,9 @@ fn fire_batch_lookahead(&mut self) {
                 }
 
                 // Extract DB records and EXTEND the running memory oracle
-                if let Ok(db_oracle) = storage.query_spent_addresses(batch) {
+                if let Ok(mut db_oracle) = storage.query_spent_addresses(batch) {
+                    // Filter out future false-positives
+                    db_oracle.retain(|addr, _| !ignored_db_addresses.contains(addr));
                     wots_oracle.extend(db_oracle);
                 }
 
@@ -4639,6 +4656,17 @@ fn fire_batch_lookahead(&mut self) {
         }
 
         let mut wots_oracle = std::collections::HashMap::new();
+
+        // --- FIX: Ignore DB oracle entries from the abandoned local chain ---
+        let mut ignored_db_addresses = std::collections::HashSet::new();
+        for h in fork_height..self.state.height {
+            if let Ok(Some(local_batch)) = self.storage.load_batch(h) {
+                for addr in extract_spent_addresses(&local_batch) {
+                    ignored_db_addresses.insert(addr);
+                }
+            }
+        }
+        // --------------------------------------------------------------------
         
         // --- STATE TRACKERS FOR SELF-HEALING ---
         let mut state_before_prev: Option<State> = None;
@@ -4648,12 +4676,8 @@ fn fire_batch_lookahead(&mut self) {
             let height = fork_height + i as u64;
 
             if batch.prev_header_hash != candidate_state.header_hash {
-                tracing::warn!(
-                    "Alternative chain broken at batch index {} (height {})",
-                    i, height
-                );
-                // Do not ban: peer could have reorganized while reading from disk.
-                self.network.disconnect_peer(from);
+                tracing::warn!("Alternative chain broken at batch index {} (height {})", i, height);
+                self.ban_peer(from, "malicious fork: broken chain linkage");
                 return Ok(None);
             }
 
@@ -4661,7 +4685,8 @@ fn fire_batch_lookahead(&mut self) {
             let state_before_h = candidate_state.clone();
             let headers_before_h = recent_headers.clone();
 
-            let db_oracle = self.storage.query_spent_addresses(batch).unwrap_or_default();
+            let mut db_oracle = self.storage.query_spent_addresses(batch).unwrap_or_default();
+            db_oracle.retain(|addr, _| !ignored_db_addresses.contains(addr));
             wots_oracle.extend(db_oracle);
                 
             let res = apply_batch(&mut candidate_state, batch, recent_headers.make_contiguous(), &mut wots_oracle);
@@ -6209,6 +6234,40 @@ impl Drop for Node {
             tracing::debug!("Node shutting down: cancelled background mining tasks.");
         }
     }
+}
+
+
+pub(crate) fn extract_spent_addresses(batch: &crate::core::Batch) -> Vec<[u8; 32]> {
+    let mut addrs = Vec::new();
+    for tx in &batch.transactions {
+        match tx {
+            crate::core::Transaction::Reveal { inputs, witnesses, .. } => {
+                for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                    let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                    if let Some(sig) = wit_inputs.first() {
+                        if sig.len() == crate::core::wots::SIG_SIZE {
+                            addrs.push(input.predicate.address());
+                        } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                            addrs.push(mss_sig.wots_pk);
+                        }
+                    }
+                }
+            }
+            crate::core::Transaction::Consolidate { inputs, witness, .. } => {
+                if inputs.is_empty() { continue; }
+                let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                if let Some(sig) = wit_inputs.first() {
+                    if sig.len() == crate::core::wots::SIG_SIZE {
+                        addrs.push(inputs[0].predicate.address());
+                    } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                        addrs.push(mss_sig.wots_pk);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    addrs
 }
 
 #[cfg(test)]
