@@ -1875,10 +1875,13 @@ async fn process_verified_batches_chunk(
             self.last_sync_cursor = Some(current_cursor.saturating_sub(1));
             self.abort_sync_session("peer sent corrupt batch");
             
-            // --- FIX: Poison Block Defense ---
-            // The peer proved they have hashpower (valid header), but sent a payload 
-            // that mathematically cannot produce that header. Ban them to break the loop.
-            self.ban_peer(from, "malicious payload: batch does not match verified header");
+            // --- FIX: Reorg-Proof Sync ---
+            // The peer sent a batch that does not match the header they sent earlier.
+            // This happens frequently when the peer reorganizes their chain while we are syncing from them.
+            // We MUST NOT ban them. Reset backoff so we retry immediately.
+            self.sync_retry_count = 0; 
+            self.abort_sync_session("peer reorganized during sync (batch/header mismatch)");
+            self.network.disconnect_peer(from);
             
             return Ok(());
         }
@@ -3330,7 +3333,7 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                 if let Err(e) = self.handle_sync_headers(from, headers).await {
                     tracing::warn!("Error processing sync headers from {}: {}", from, e);
                     self.abort_sync_session("header processing error");
-                    self.ban_peer(from, &format!("malicious headers: {}", e));
+                    self.network.disconnect_peer(from);
                 }
             }
 
@@ -3835,7 +3838,7 @@ fn fire_batch_lookahead(&mut self) {
 
         if !is_valid {
             self.abort_sync_session("peer sent headers with invalid Proof-of-Work");
-            self.ban_peer(from, "invalid header PoW");
+            self.network.disconnect_peer(from);
             return Ok(());
         }
 
@@ -4649,8 +4652,8 @@ fn fire_batch_lookahead(&mut self) {
                     "Alternative chain broken at batch index {} (height {})",
                     i, height
                 );
-                // --- Poison Fork Defense ---
-                self.ban_peer(from, "malicious fork: broken chain linkage");
+                // Do not ban: peer could have reorganized while reading from disk.
+                self.network.disconnect_peer(from);
                 return Ok(None);
             }
 
@@ -4704,12 +4707,12 @@ fn fire_batch_lookahead(&mut self) {
                         }
                     } else {
                         tracing::warn!("Alternative chain invalid at height {}: {}", height, e);
-                        self.ban_peer(from, &format!("malicious fork: invalid batch payload ({})", e));
+                        self.network.disconnect_peer(from);
                         return Ok(None);
                     }
                 } else {
                     tracing::warn!("Alternative chain invalid at height {}: {}", height, e);
-                    self.ban_peer(from, &format!("malicious fork: invalid batch payload ({})", e));
+                    self.network.disconnect_peer(from);
                     return Ok(None);
                 }
             }
@@ -5090,7 +5093,7 @@ fn fire_batch_lookahead(&mut self) {
             if crate::core::extension::verify_extension(mining_hash, &batch.extension, &batch.target).is_err() {
                 tracing::debug!("Rejected invalid orphan block (PoW failed)");
                 if let Some(peer) = from {
-                    self.ban_peer(peer, "invalid orphan block (PoW failed)");
+                    self.network.disconnect_peer(peer);
                 }
                 return Ok(());
             }

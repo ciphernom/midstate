@@ -70,4 +70,9 @@ panic = "abort"
 strip = true
 
 
-
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+rustflags = [
+    "-C", "target-cpu=cortex-a76",
+    "-C", "link-arg=-lgcc",
+]
