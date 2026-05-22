@@ -4839,10 +4839,12 @@ fn fire_batch_lookahead(&mut self) {
 
         // Load abandoned batches from disk BEFORE overwriting them
         let mut abandoned_txs = Vec::new();
+        let mut abandoned_batches = Vec::new(); 
         if is_actual_reorg {
             for (h, _) in self.chain_history.iter().filter(|(h, _)| *h >= fork_height) {
                 if let Ok(Some(batch)) = self.storage.load_batch(*h) {
-                    abandoned_txs.extend(batch.transactions);
+                    abandoned_txs.extend(batch.transactions.clone()); 
+                    abandoned_batches.push(batch);                   
                 }
             }
         }
@@ -4892,6 +4894,13 @@ fn fire_batch_lookahead(&mut self) {
         let history_clone = new_history.clone();
         
         tokio::task::spawn_blocking(move || -> Result<()> {
+            // 0. UNBURN ABANDONED ADDRESSES (Fix for the Ghost DB entry bug)
+            for batch in &abandoned_batches {
+                if let Err(e) = storage_clone.unburn_batch_addresses(batch) {
+                    tracing::warn!("Failed to unburn abandoned batch addresses: {}", e);
+                }
+            }
+
             // 1. WRITE BATCHES
             for (height, _, batch) in &history_clone {
                 storage_clone.save_batch(*height, batch)?;

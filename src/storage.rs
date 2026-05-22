@@ -500,6 +500,51 @@ pub fn delete_spent_address(&self, address: &[u8; 32]) -> Result<()> {
         self.batches.highest()
     }
 
+    /// Reverts the burning of WOTS addresses from an abandoned chain segment.
+    /// Called during a reorg to prevent "ghost" database entries.
+    pub fn unburn_batch_addresses(&self, batch: &crate::core::Batch) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut spent_table = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
+            // Note: We deliberately do not roll back the MSS_LEAF_INDEX_TABLE here.
+            // That table only tracks the highest seen index for the `/mss_state` RPC endpoint.
+            // Leaving it slightly high just skips a reusable index, which is perfectly safe.
+
+            for tx in &batch.transactions {
+                match tx {
+                    crate::core::Transaction::Reveal { inputs, witnesses, .. } => {
+                        for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                            let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                            if let Some(sig) = wit_inputs.first() {
+                                if sig.len() == crate::core::wots::SIG_SIZE {
+                                    let addr = input.predicate.address();
+                                    spent_table.remove(&addr)?;
+                                } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                                    spent_table.remove(&mss_sig.wots_pk)?;
+                                }
+                            }
+                        }
+                    }
+                    crate::core::Transaction::Consolidate { inputs, witness, .. } => {
+                        if inputs.is_empty() { continue; }
+                        let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                        if let Some(sig) = wit_inputs.first() {
+                            if sig.len() == crate::core::wots::SIG_SIZE {
+                                let addr = inputs[0].predicate.address();
+                                spent_table.remove(&addr)?;
+                            } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                                spent_table.remove(&mss_sig.wots_pk)?;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     /// Burn every WOTS input address from a committed batch, mapping each to the
     /// commitment hash that authorised the spend.
     ///
