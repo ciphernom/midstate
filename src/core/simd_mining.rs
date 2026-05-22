@@ -16,29 +16,6 @@
 //! path is bit-identical to two consecutive 4-way calls — only the
 //! instruction schedule differs.
 //!
-//! # Performance: fully-unrolled iterated compression (aarch64)
-//!
-//! The iterated hashing hot loop runs `EXTENSION_ITERATIONS` (= 1,000,000)
-//! compressions of a 32-byte block whose layout is fixed:
-//!
-//! ```text
-//!   msg[0..8]  = previous_hash  (the only varying part)
-//!   msg[8..16] = 0              (constant zero)
-//!   block_len  = 32             (constant)
-//!   flags      = HASH_FLAGS     (constant)
-//! ```
-//!
-//! On aarch64 we exploit this with **full manual unrolling of all 7 rounds**
-//! using the precomputed `MSG_SCHEDULE`. Each G call has its message indices
-//! hardcoded at the source level (not looked up at runtime), so the compiler
-//! sees concretely which of `m0..m7` (or constant zero) each G call needs.
-//!
-//! Earlier attempts used closures that returned `m[i]` or `zero` based on a
-//! runtime-supplied schedule index. Despite all inputs being statically known
-//! the compiler did not constant-fold those lookups, retaining branches or
-//! lookup tables in the hot loop. The fully-unrolled macros below force the
-//! compiler to see the message source as a compile-time fact at every G call.
-//!
 //! # Formal specification (Z notation)
 //!
 //! Let `M : seq BYTE` with `#M = 32` denote the midstate, `N : NONCE` a nonce
@@ -50,8 +27,10 @@
 //! Scalar(M, N) = blake3^k(blake3(M ‖ N_le8))
 //! ```
 //!
-//! where `k = EXTENSION_ITERATIONS`. Every SIMD path `Φ_w` (for lane width
-//! `w ∈ {4, 8}`) satisfies the **consensus invariant**:
+//! where `k = EXTENSION_ITERATIONS`, `N_le8` is `N` encoded little-endian to
+//! 8 bytes, and `blake3^k` denotes `k`-fold iteration of the 32-byte BLAKE3
+//! compression. Every SIMD path `Φ_w` (for lane width `w ∈ {4, 8}`) satisfies
+//! the **consensus invariant**:
 //!
 //! ```text
 //! ∀ M ∈ BYTE^32 . ∀ N ∈ NONCE^w . ∀ i ∈ 0..w-1 .
@@ -71,13 +50,13 @@ const IV: [u32; 8] = [
 ];
 
 /// Combined chunk flags: `CHUNK_START | CHUNK_END | ROOT`.
+///
+/// Each mining hash step operates on exactly one chunk that is simultaneously
+/// the first chunk, last chunk, and root of its tree, so all three flags are
+/// set together on every compression call.
 const HASH_FLAGS: u32 = 1 | 2 | 8;
 
 /// BLAKE3 message word permutation schedule, one row per round (7 rounds total).
-///
-/// This is duplicated as compile-time literal indices in the unrolled NEON
-/// path below — that path needs each index baked into source code, not
-/// looked up from this array at runtime.
 const MSG_SCHEDULE: [[usize; 16]; 7] = [
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
     [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
@@ -98,6 +77,9 @@ const MSG_SCHEDULE: [[usize; 16]; 7] = [
 ///     bytes_to_words(b)(i) =
 ///         b(4i) + 2^8 · b(4i+1) + 2^16 · b(4i+2) + 2^24 · b(4i+3)
 /// ```
+///
+/// **Pre:** `b : BYTE^32` (enforced by type).
+/// **Post:** result is the little-endian word decomposition of `b`.
 #[inline(always)]
 fn bytes_to_words(b: &[u8; 32]) -> [u32; 8] {
     let mut w = [0u32; 8];
@@ -112,6 +94,9 @@ fn bytes_to_words(b: &[u8; 32]) -> [u32; 8] {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// The SIMD capability level detected on this CPU/target.
+///
+/// Each variant corresponds to a hardware backend. The [`lanes()`](SimdLevel::lanes)
+/// method returns how many nonces are processed simultaneously under that backend.
 ///
 /// # Formal specification
 ///
@@ -132,25 +117,48 @@ pub enum SimdLevel {
     /// No usable SIMD — batch of 4, processed serially.
     Scalar,
     /// WebAssembly 128-bit SIMD — 4 lanes.
+    ///
+    /// Only available when compiled with `target_arch = "wasm32"` and the
+    /// `simd128` target feature enabled (e.g. `-C target-feature=+simd128`).
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     Wasm128_4,
-    /// ARM NEON: 128-bit registers, 4 lanes × 32-bit, fully unrolled.
+    /// ARM NEON: 128-bit registers, 4 lanes × 32-bit.
     ///
     /// Used on in-order / single-issue NEON cores (A53, A55) when explicitly
-    /// selected via `MINER_NEON_FORCE=4`.
+    /// selected via `MINER_NEON_FORCE=4`. On dual-issue cores the [`Neon8`]
+    /// path is faster and is the default.
+    ///
+    /// [`Neon8`]: SimdLevel::Neon8
     #[cfg(target_arch = "aarch64")]
     Neon4,
-    /// ARM NEON dual-issue: two interleaved 4-way streams, 8 lanes total,
-    /// fully unrolled. Default on aarch64.
+    /// ARM NEON dual-issue: two interleaved 4-way streams, 8 lanes total.
+    ///
+    /// Default on aarch64. Targets cores with two 128-bit ASIMD pipelines
+    /// (A75+, X-series, Neoverse N1+, Apple M-series, Pi 5's A76). On
+    /// single-pipe cores (A53/A55) it still works correctly but loses
+    /// ~10–15% to [`Neon4`]; set `MINER_NEON_FORCE=4` to opt out.
+    ///
+    /// [`Neon4`]: SimdLevel::Neon4
     #[cfg(target_arch = "aarch64")]
     Neon8,
     /// x86 AVX2: 256-bit registers, 8 lanes × 32-bit.
+    ///
+    /// Detected at runtime via `std::is_x86_feature_detected!("avx2")`.
     #[cfg(target_arch = "x86_64")]
     Avx2_8,
 }
 
 impl SimdLevel {
     /// How many nonces are processed per batch call.
+    ///
+    /// # Formal specification
+    ///
+    /// ```text
+    /// lanes : SimdLevel → ℕ
+    /// lanes(self) ∈ {4, 8}
+    /// ```
+    ///
+    /// **Post:** `result ∈ {4, 8}`.
     pub fn lanes(self) -> usize {
         match self {
             SimdLevel::Scalar => 4,
@@ -166,15 +174,24 @@ impl SimdLevel {
     }
 
     /// Human-readable name for logging and diagnostics.
+    ///
+    /// # Formal specification
+    ///
+    /// ```text
+    /// name : SimdLevel → STRING
+    /// ∀ ℓ₁, ℓ₂ ∈ SimdLevel . ℓ₁ ≠ ℓ₂ ⇒ name(ℓ₁) ≠ name(ℓ₂)
+    /// ```
+    ///
+    /// **Post:** the returned string is injective on `SimdLevel`.
     pub fn name(self) -> &'static str {
         match self {
             SimdLevel::Scalar => "scalar",
             #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
             SimdLevel::Wasm128_4 => "WASM SIMD128 4-way",
             #[cfg(target_arch = "aarch64")]
-            SimdLevel::Neon4 => "NEON 4-way (unrolled)",
+            SimdLevel::Neon4 => "NEON 4-way",
             #[cfg(target_arch = "aarch64")]
-            SimdLevel::Neon8 => "NEON 8-way (unrolled, dual-issue)",
+            SimdLevel::Neon8 => "NEON 8-way (dual-issue)",
             #[cfg(target_arch = "x86_64")]
             SimdLevel::Avx2_8 => "AVX2 8-way",
         }
@@ -189,7 +206,23 @@ impl std::fmt::Display for SimdLevel {
 
 /// Detects the best available SIMD level for the current CPU/target.
 ///
+/// On x86_64, AVX2 support is checked at runtime. On aarch64, defaults to the
+/// 8-way dual-issue path, which is faster on every out-of-order aarch64 core
+/// (A75+, Apple M-series, Neoverse, Pi 5's A76). On single-issue cores like
+/// A53/A55 (Pi 3, Pi Zero 2 W), set `MINER_NEON_FORCE=4` to opt into the
+/// 4-way path.
+///
+/// On WASM SIMD128 targets, the level is determined at compile time since
+/// those features are either mandatory or statically enabled.
+///
+/// The result is cached via [`detected_level`] so this detection cost is
+/// paid at most once per process.
+///
 /// # Formal specification
+///
+/// Let `CPU ∈ {x86_64_avx2, x86_64_noavx2, aarch64, wasm32_simd128, other}`
+/// denote the host's effective execution environment, and let `env` denote
+/// the process environment map. Then:
 ///
 /// ```text
 /// detect : ⊥ → SimdLevel
@@ -201,6 +234,11 @@ impl std::fmt::Display for SimdLevel {
 ///   CPU = wasm32_simd128                               ⇒ result = Wasm128_4
 ///   CPU = other                                        ⇒ result = Scalar
 /// ```
+///
+/// **Pre:** none.
+/// **Post:** `result ∈ SimdLevel ∧ lanes(result) ∈ {4, 8}`.
+/// **Side effects:** reads `MINER_NEON_FORCE` from process environment on
+/// aarch64; pure on other targets.
 pub fn detect() -> SimdLevel {
     #[cfg(target_arch = "x86_64")]
     {
@@ -226,12 +264,33 @@ pub fn detect() -> SimdLevel {
 }
 
 /// Returns the cached SIMD level, detecting it on the first call.
+///
+/// Subsequent calls return the cached result with no overhead.
+///
+/// # Formal specification
+///
+/// Let `cache : OnceLock⟨SimdLevel⟩` be a process-global cell. Then:
+///
+/// ```text
+/// detected_level : ⊥ → SimdLevel
+///
+///   cache = ∅  ⇒  cache' = {detect()}  ∧  result = detect()
+///   cache ≠ ∅  ⇒  cache' = cache       ∧  result = the cache
+/// ```
+///
+/// **Pre:** none.
+/// **Post:** `result = detect()` for the first ever call;
+/// for all subsequent calls, `result = first_call_result`
+/// (i.e. value is stable across the lifetime of the process).
+/// **Invariant:** `∀ t₁, t₂ . detected_level()@t₁ = detected_level()@t₂`.
 pub fn detected_level() -> SimdLevel {
     static LEVEL: std::sync::OnceLock<SimdLevel> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(detect)
 }
 
 /// Mine a batch of nonces using the best available SIMD.
+///
+/// Returns `Vec<(nonce, final_hash)>` with `detected_level().lanes()` entries.
 ///
 /// # Formal specification
 ///
@@ -246,6 +305,12 @@ pub fn detected_level() -> SimdLevel {
 ///            result(i).0 = nonces(i)  ∧
 ///            result(i).1 = Scalar(midstate, nonces(i))
 /// ```
+///
+/// where `Scalar` is the canonical scalar miner defined in the module docs.
+///
+/// **Pre:** `nonces.len() >= detected_level().lanes()`.
+/// **Post:** result length equals `detected_level().lanes()`; each entry's
+/// hash equals the scalar reference computation for that nonce.
 ///
 /// # Panics
 ///
@@ -292,6 +357,29 @@ pub fn mine_batch(midstate: [u8; 32], nonces: &[u64]) -> Vec<(u64, [u8; 32])> {
 }
 
 /// Convenience: 4-way entry point (backward compat + tests).
+///
+/// Dispatches to the best available 4-lane backend (NEON, WASM SIMD128, or
+/// scalar fallback). On x86_64, this function always uses the scalar path
+/// since the native width is 8 lanes via AVX2.
+///
+/// This function is **independent** of [`detected_level`]: even when
+/// `detected_level() = Neon8`, this entry point always uses the 4-way NEON
+/// implementation. Callers depending on a strict 4-lane interface are
+/// preserved.
+///
+/// # Formal specification
+///
+/// ```text
+/// create_extensions_4way :
+///     BYTE^32 × NONCE^4 → (NONCE × BYTE^32)^4
+///
+/// post:  ∀ i ∈ 0..3 .
+///            result(i).0 = nonces(i)  ∧
+///            result(i).1 = Scalar(midstate, nonces(i))
+/// ```
+///
+/// **Pre:** none beyond the type signature.
+/// **Post:** each lane's hash equals the scalar reference; nonces are echoed.
 pub fn create_extensions_4way(
     midstate: [u8; 32],
     nonces: [u64; 4],
@@ -316,7 +404,7 @@ pub fn create_extensions_4way(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  WASM 128-bit SIMD (wasm32 + simd128) — unchanged
+//  WASM 128-bit SIMD (wasm32 + simd128)
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -324,13 +412,37 @@ mod wasm_simd {
     use super::*;
     use core::arch::wasm32::*;
 
-    #[inline(always)] unsafe fn vrot16(x: v128) -> v128 { v128_or(u32x4_shr(x, 16), u32x4_shl(x, 16)) }
-    #[inline(always)] unsafe fn vrot12(x: v128) -> v128 { v128_or(u32x4_shr(x, 12), u32x4_shl(x, 20)) }
-    #[inline(always)] unsafe fn vrot8(x: v128)  -> v128 { v128_or(u32x4_shr(x, 8),  u32x4_shl(x, 24)) }
-    #[inline(always)] unsafe fn vrot7(x: v128)  -> v128 { v128_or(u32x4_shr(x, 7),  u32x4_shl(x, 25)) }
-
+    /// Rotates each 32-bit lane right by 16 bits.
     #[inline(always)]
-    unsafe fn g(v: &mut [v128; 16], a: usize, b: usize, c: usize, d: usize, mx: v128, my: v128) {
+    unsafe fn vrot16(x: v128) -> v128 {
+        v128_or(u32x4_shr(x, 16), u32x4_shl(x, 16))
+    }
+
+    /// Rotates each 32-bit lane right by 12 bits.
+    #[inline(always)]
+    unsafe fn vrot12(x: v128) -> v128 {
+        v128_or(u32x4_shr(x, 12), u32x4_shl(x, 20))
+    }
+
+    /// Rotates each 32-bit lane right by 8 bits.
+    #[inline(always)]
+    unsafe fn vrot8(x: v128) -> v128 {
+        v128_or(u32x4_shr(x, 8), u32x4_shl(x, 24))
+    }
+
+    /// Rotates each 32-bit lane right by 7 bits.
+    #[inline(always)]
+    unsafe fn vrot7(x: v128) -> v128 {
+        v128_or(u32x4_shr(x, 7), u32x4_shl(x, 25))
+    }
+
+    /// BLAKE3 `G` mixing function over 4 interleaved WASM SIMD lanes simultaneously.
+    #[inline(always)]
+    unsafe fn g(
+        v: &mut [v128; 16],
+        a: usize, b: usize, c: usize, d: usize,
+        mx: v128, my: v128,
+    ) {
         v[a] = u32x4_add(u32x4_add(v[a], v[b]), mx);
         v[d] = vrot16(v128_xor(v[d], v[a]));
         v[c] = u32x4_add(v[c], v[d]);
@@ -341,6 +453,7 @@ mod wasm_simd {
         v[b] = vrot7(v128_xor(v[b], v[c]));
     }
 
+    /// Applies one full BLAKE3 round (4 column + 4 diagonal `G` calls).
     #[inline(always)]
     unsafe fn round(v: &mut [v128; 16], m: &[v128; 16], s: &[usize; 16]) {
         g(v, 0, 4,  8, 12, m[s[0]],  m[s[1]]);
@@ -353,26 +466,50 @@ mod wasm_simd {
         g(v, 3, 4,  9, 14, m[s[14]], m[s[15]]);
     }
 
+    /// Performs one BLAKE3 compression over 4 independent chains in parallel using WASM SIMD128.
+    ///
+    /// Each element of `cv` holds one chaining-value word from all four chains.
+    /// `msg` is laid out the same way. `block_len` is broadcast across all lanes.
     #[inline(always)]
-    unsafe fn compress_4way(cv: &[v128; 8], msg: &[v128; 16], block_len: u32) -> [v128; 8] {
+    unsafe fn compress_4way(
+        cv: &[v128; 8],
+        msg: &[v128; 16],
+        block_len: u32,
+    ) -> [v128; 8] {
         let zero = u32x4_splat(0);
         let mut v: [v128; 16] = [zero; 16];
+
         v[0] = cv[0]; v[1] = cv[1]; v[2] = cv[2]; v[3] = cv[3];
         v[4] = cv[4]; v[5] = cv[5]; v[6] = cv[6]; v[7] = cv[7];
+
         v[8]  = u32x4_splat(IV[0]); v[9]  = u32x4_splat(IV[1]);
         v[10] = u32x4_splat(IV[2]); v[11] = u32x4_splat(IV[3]);
+
         v[12] = zero; v[13] = zero;
         v[14] = u32x4_splat(block_len);
         v[15] = u32x4_splat(HASH_FLAGS);
-        for r in 0..7 { round(&mut v, msg, &MSG_SCHEDULE[r]); }
+
+        for r in 0..7 {
+            round(&mut v, msg, &MSG_SCHEDULE[r]);
+        }
+
         [
-            v128_xor(v[0], v[8]),  v128_xor(v[1], v[9]),
-            v128_xor(v[2], v[10]), v128_xor(v[3], v[11]),
-            v128_xor(v[4], v[12]), v128_xor(v[5], v[13]),
-            v128_xor(v[6], v[14]), v128_xor(v[7], v[15]),
+            v128_xor(v[0],  v[8]),
+            v128_xor(v[1],  v[9]),
+            v128_xor(v[2],  v[10]),
+            v128_xor(v[3],  v[11]),
+            v128_xor(v[4],  v[12]),
+            v128_xor(v[5],  v[13]),
+            v128_xor(v[6],  v[14]),
+            v128_xor(v[7],  v[15]),
         ]
     }
 
+    /// Extracts the 32-byte hash for a single `lane` (0–3) from the transposed output.
+    ///
+    /// # Safety
+    ///
+    /// `lane` must be in `0..4`. `out` must be a valid completed compression output.
     unsafe fn extract_hash(out: &[v128; 8], lane: usize) -> [u8; 32] {
         let mut result = [0u8; 32];
         for i in 0..8 {
@@ -382,27 +519,54 @@ mod wasm_simd {
         result
     }
 
-    pub unsafe fn create_extensions_4way_wasm(midstate: [u8; 32], nonces: [u64; 4]) -> [(u64, [u8; 32]); 4] {
+    /// Mines 4 independent nonces in parallel using WASM SIMD128.
+    ///
+    /// Performs the initial 40-byte compression (midstate ‖ nonce), then
+    /// `EXTENSION_ITERATIONS` rounds of 32-byte iterated hashing, all in
+    /// 4-wide lockstep.
+    ///
+    /// # Safety
+    ///
+    /// Must only be called when the `simd128` target feature is active, which
+    /// is guaranteed by the enclosing `#[cfg(...)]` gate and the
+    /// [`SimdLevel::Wasm128_4`] dispatch path.
+    pub unsafe fn create_extensions_4way_wasm(
+        midstate: [u8; 32],
+        nonces: [u64; 4],
+    ) -> [(u64, [u8; 32]); 4] {
         let zero = u32x4_splat(0);
+
         let cv: [v128; 8] = [
             u32x4_splat(IV[0]), u32x4_splat(IV[1]),
             u32x4_splat(IV[2]), u32x4_splat(IV[3]),
             u32x4_splat(IV[4]), u32x4_splat(IV[5]),
             u32x4_splat(IV[6]), u32x4_splat(IV[7]),
         ];
+
         let ms_words = bytes_to_words(&midstate);
+
+        // Split each 64-bit nonce into low and high 32-bit halves, packed across lanes.
         let nonce_lo: [u32; 4] = [
-            nonces[0] as u32, nonces[1] as u32, nonces[2] as u32, nonces[3] as u32,
+            nonces[0] as u32, nonces[1] as u32,
+            nonces[2] as u32, nonces[3] as u32,
         ];
         let nonce_hi: [u32; 4] = [
             (nonces[0] >> 32) as u32, (nonces[1] >> 32) as u32,
             (nonces[2] >> 32) as u32, (nonces[3] >> 32) as u32,
         ];
+
+        // Build message: words 0–7 = midstate (broadcast), words 8–9 = nonce, rest zero.
         let mut msg: [v128; 16] = [zero; 16];
-        for i in 0..8 { msg[i] = u32x4_splat(ms_words[i]); }
+        for i in 0..8 {
+            msg[i] = u32x4_splat(ms_words[i]);
+        }
         msg[8] = core::mem::transmute(nonce_lo);
         msg[9] = core::mem::transmute(nonce_hi);
+
+        // Initial compression: 40-byte block (32 midstate + 8 nonce).
         let mut hw = compress_4way(&cv, &msg, 40);
+
+        // Iterated hashing: EXTENSION_ITERATIONS rounds of 32-byte blocks.
         for _ in 0..EXTENSION_ITERATIONS {
             msg[0] = hw[0]; msg[1] = hw[1]; msg[2] = hw[2]; msg[3] = hw[3];
             msg[4] = hw[4]; msg[5] = hw[5]; msg[6] = hw[6]; msg[7] = hw[7];
@@ -410,6 +574,7 @@ mod wasm_simd {
             msg[12] = zero; msg[13] = zero; msg[14] = zero; msg[15] = zero;
             hw = compress_4way(&cv, &msg, 32);
         }
+
         [
             (nonces[0], extract_hash(&hw, 0)),
             (nonces[1], extract_hash(&hw, 1)),
@@ -420,15 +585,13 @@ mod wasm_simd {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  NEON 4-way and 8-way (aarch64) — fully unrolled iterated hashing
+//  NEON 4-way and 8-way (aarch64)
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
     use super::*;
     use core::arch::aarch64::*;
-
-    // ─── Rotates ─────────────────────────────────────────────────────────
 
     /// Rotates each 32-bit lane right by 16 bits using NEON byte-reverse within 32-bit elements.
     #[inline(always)]
@@ -451,7 +614,7 @@ mod neon {
         vorrq_u32(vshrq_n_u32::<7>(x), vshlq_n_u32::<25>(x))
     }
 
-    // ─── Generic 4-way primitives (used for the initial 40-byte block) ───
+    // ─── 4-way primitives ────────────────────────────────────────────────
 
     /// BLAKE3 `G` mixing function over 4 interleaved NEON lanes simultaneously.
     #[inline(always)]
@@ -472,20 +635,17 @@ mod neon {
     /// Applies one full BLAKE3 round (4 column + 4 diagonal `G` calls).
     #[inline(always)]
     unsafe fn round(v: &mut [uint32x4_t; 16], m: &[uint32x4_t; 16], s: &[usize; 16]) {
-        g(v, 0, 4,  8, 12, m[s[0]],  m[s[1]]);
-        g(v, 1, 5,  9, 13, m[s[2]],  m[s[3]]);
-        g(v, 2, 6, 10, 14, m[s[4]],  m[s[5]]);
-        g(v, 3, 7, 11, 15, m[s[6]],  m[s[7]]);
-        g(v, 0, 5, 10, 15, m[s[8]],  m[s[9]]);
+        g(v, 0, 4,  8, 12, m[s[0]], m[s[1]]);
+        g(v, 1, 5,  9, 13, m[s[2]], m[s[3]]);
+        g(v, 2, 6, 10, 14, m[s[4]], m[s[5]]);
+        g(v, 3, 7, 11, 15, m[s[6]], m[s[7]]);
+        g(v, 0, 5, 10, 15, m[s[8]], m[s[9]]);
         g(v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
         g(v, 2, 7,  8, 13, m[s[12]], m[s[13]]);
         g(v, 3, 4,  9, 14, m[s[14]], m[s[15]]);
     }
 
     /// Performs one BLAKE3 compression over 4 independent chains in parallel using NEON.
-    ///
-    /// Used only for the initial 40-byte block. The iterated phase uses the
-    /// fully-unrolled `compress_iter_4way` instead.
     #[inline(always)]
     unsafe fn compress_4way(
         cv: &[uint32x4_t; 8], msg: &[uint32x4_t; 16], block_len: u32,
@@ -518,237 +678,7 @@ mod neon {
         result
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    //  FULLY UNROLLED 4-WAY ITERATED COMPRESSION
-    // ═══════════════════════════════════════════════════════════════════
-    //
-    // # Why this is structured this way
-    //
-    // Earlier attempts used:
-    //   - a `round_fused` function that took the 8 message words as
-    //     parameters and looked up `m[s[i]]` at runtime via a closure
-    //   - a `pick(i)` match that returned m0..m7 or zero
-    //
-    // Despite all inputs being statically known, LLVM did NOT constant-fold
-    // those lookups reliably — the generated code retained branches or
-    // lookup tables in the hot loop. Measured result: 0.92× (slower).
-    //
-    // The fix: write each of the 7 rounds as a separate macro invocation
-    // with the MSG_SCHEDULE indices BAKED INTO THE SOURCE. Every G call
-    // explicitly knows whether each of its two message inputs is one of
-    // m0..m7 (the variable chaining-value words) or is the constant ZERO.
-    //
-    // This gives the compiler concrete static facts:
-    //   - "this G call's mx is m3, my is m7" — bind to registers directly
-    //   - "this G call's mx is zero, my is m4" — the `add` with zero may
-    //     simplify (or stay as cheap add-with-zero-register, which on A76
-    //     is the same cycle as a register-register add minus the dependency)
-
-    /// `mw!(N, m0..m7, zero)` expands at macro-expansion time to either
-    /// `m{N}` (when N ∈ 0..7) or `zero` (when N ∈ 8..15).
-    ///
-    /// # Formal specification
-    ///
-    /// ```text
-    /// mw : INDEX × WORD_4^8 × WORD_4 → WORD_4
-    /// mw(i, ⟨m₀,..,m₇⟩, z) = if i < 8 then m_i else z
-    /// ```
-    ///
-    /// The selection is performed by the macro expander, not by generated
-    /// code — there is no runtime branch.
-    macro_rules! mw {
-        // m0..m7: use the concrete chaining word
-        (0, $m0:ident, $m1:ident, $m2:ident, $m3:ident, $m4:ident, $m5:ident, $m6:ident, $m7:ident, $z:ident) => { $m0 };
-        (1, $m0:ident, $m1:ident, $m2:ident, $m3:ident, $m4:ident, $m5:ident, $m6:ident, $m7:ident, $z:ident) => { $m1 };
-        (2, $m0:ident, $m1:ident, $m2:ident, $m3:ident, $m4:ident, $m5:ident, $m6:ident, $m7:ident, $z:ident) => { $m2 };
-        (3, $m0:ident, $m1:ident, $m2:ident, $m3:ident, $m4:ident, $m5:ident, $m6:ident, $m7:ident, $z:ident) => { $m3 };
-        (4, $m0:ident, $m1:ident, $m2:ident, $m3:ident, $m4:ident, $m5:ident, $m6:ident, $m7:ident, $z:ident) => { $m4 };
-        (5, $m0:ident, $m1:ident, $m2:ident, $m3:ident, $m4:ident, $m5:ident, $m6:ident, $m7:ident, $z:ident) => { $m5 };
-        (6, $m0:ident, $m1:ident, $m2:ident, $m3:ident, $m4:ident, $m5:ident, $m6:ident, $m7:ident, $z:ident) => { $m6 };
-        (7, $m0:ident, $m1:ident, $m2:ident, $m3:ident, $m4:ident, $m5:ident, $m6:ident, $m7:ident, $z:ident) => { $m7 };
-        // m8..m15: always zero in the iterated phase
-        (8,  $m0:ident, $m1:ident, $m2:ident, $m3:ident, $m4:ident, $m5:ident, $m6:ident, $m7:ident, $z:ident) => { $z };
-        (9,  $m0:ident, $m1:ident, $m2:ident, $m3:ident, $m4:ident, $m5:ident, $m6:ident, $m7:ident, $z:ident) => { $z };
-        (10, $m0:ident, $m1:ident, $m2:ident, $m3:ident, $m4:ident, $m5:ident, $m6:ident, $m7:ident, $z:ident) => { $z };
-        (11, $m0:ident, $m1:ident, $m2:ident, $m3:ident, $m4:ident, $m5:ident, $m6:ident, $m7:ident, $z:ident) => { $z };
-        (12, $m0:ident, $m1:ident, $m2:ident, $m3:ident, $m4:ident, $m5:ident, $m6:ident, $m7:ident, $z:ident) => { $z };
-        (13, $m0:ident, $m1:ident, $m2:ident, $m3:ident, $m4:ident, $m5:ident, $m6:ident, $m7:ident, $z:ident) => { $z };
-        (14, $m0:ident, $m1:ident, $m2:ident, $m3:ident, $m4:ident, $m5:ident, $m6:ident, $m7:ident, $z:ident) => { $z };
-        (15, $m0:ident, $m1:ident, $m2:ident, $m3:ident, $m4:ident, $m5:ident, $m6:ident, $m7:ident, $z:ident) => { $z };
-    }
-    pub(crate) use mw;
-
-    /// Emits one fully-unrolled round given the 16 schedule indices as
-    /// literal macro args. Each `g` call receives its message inputs as
-    /// direct identifiers (either `m0..m7` or `zero`) selected by `mw!`.
-    ///
-    /// # Formal specification
-    ///
-    /// For schedule `s : INDEX^16` and chaining words `m₀..m₇ : WORD_4`:
-    ///
-    /// ```text
-    /// round_unrolled(v, m₀..m₇, z, s) ≡
-    ///   G(v, 0, 4,  8, 12, mw(s₀, m, z),  mw(s₁,  m, z));
-    ///   G(v, 1, 5,  9, 13, mw(s₂, m, z),  mw(s₃,  m, z));
-    ///   G(v, 2, 6, 10, 14, mw(s₄, m, z),  mw(s₅,  m, z));
-    ///   G(v, 3, 7, 11, 15, mw(s₆, m, z),  mw(s₇,  m, z));
-    ///   G(v, 0, 5, 10, 15, mw(s₈, m, z),  mw(s₉,  m, z));
-    ///   G(v, 1, 6, 11, 12, mw(s₁₀,m, z),  mw(s₁₁, m, z));
-    ///   G(v, 2, 7,  8, 13, mw(s₁₂,m, z),  mw(s₁₃, m, z));
-    ///   G(v, 3, 4,  9, 14, mw(s₁₄,m, z),  mw(s₁₅, m, z));
-    /// ```
-    macro_rules! round_unrolled {
-        ($v:expr,
-         $m0:ident, $m1:ident, $m2:ident, $m3:ident,
-         $m4:ident, $m5:ident, $m6:ident, $m7:ident,
-         $z:ident,
-         $s0:tt, $s1:tt, $s2:tt, $s3:tt,
-         $s4:tt, $s5:tt, $s6:tt, $s7:tt,
-         $s8:tt, $s9:tt, $s10:tt, $s11:tt,
-         $s12:tt, $s13:tt, $s14:tt, $s15:tt
-        ) => {
-            g($v, 0, 4,  8, 12,
-                mw!($s0,  $m0,$m1,$m2,$m3,$m4,$m5,$m6,$m7,$z),
-                mw!($s1,  $m0,$m1,$m2,$m3,$m4,$m5,$m6,$m7,$z));
-            g($v, 1, 5,  9, 13,
-                mw!($s2,  $m0,$m1,$m2,$m3,$m4,$m5,$m6,$m7,$z),
-                mw!($s3,  $m0,$m1,$m2,$m3,$m4,$m5,$m6,$m7,$z));
-            g($v, 2, 6, 10, 14,
-                mw!($s4,  $m0,$m1,$m2,$m3,$m4,$m5,$m6,$m7,$z),
-                mw!($s5,  $m0,$m1,$m2,$m3,$m4,$m5,$m6,$m7,$z));
-            g($v, 3, 7, 11, 15,
-                mw!($s6,  $m0,$m1,$m2,$m3,$m4,$m5,$m6,$m7,$z),
-                mw!($s7,  $m0,$m1,$m2,$m3,$m4,$m5,$m6,$m7,$z));
-            g($v, 0, 5, 10, 15,
-                mw!($s8,  $m0,$m1,$m2,$m3,$m4,$m5,$m6,$m7,$z),
-                mw!($s9,  $m0,$m1,$m2,$m3,$m4,$m5,$m6,$m7,$z));
-            g($v, 1, 6, 11, 12,
-                mw!($s10, $m0,$m1,$m2,$m3,$m4,$m5,$m6,$m7,$z),
-                mw!($s11, $m0,$m1,$m2,$m3,$m4,$m5,$m6,$m7,$z));
-            g($v, 2, 7,  8, 13,
-                mw!($s12, $m0,$m1,$m2,$m3,$m4,$m5,$m6,$m7,$z),
-                mw!($s13, $m0,$m1,$m2,$m3,$m4,$m5,$m6,$m7,$z));
-            g($v, 3, 4,  9, 14,
-                mw!($s14, $m0,$m1,$m2,$m3,$m4,$m5,$m6,$m7,$z),
-                mw!($s15, $m0,$m1,$m2,$m3,$m4,$m5,$m6,$m7,$z));
-        };
-    }
-    pub(crate) use round_unrolled;
-
-    /// Fully unrolled 7-round compression specialised for the iterated phase.
-    ///
-    /// # Formal specification
-    ///
-    /// ```text
-    /// compress_iter_4way :
-    ///     (cv: WORD_4^8, m₀..m₇: WORD_4) → WORD_4^8
-    ///
-    /// post:  result = BLAKE3_compress(
-    ///            chaining_value = cv,
-    ///            block          = ⟨m₀,m₁,...,m₇, 0,0,...,0⟩,  -- 16 words
-    ///            counter        = 0,
-    ///            block_len      = 32,
-    ///            flags          = CHUNK_START | CHUNK_END | ROOT)
-    /// ```
-    ///
-    /// **Pre:** all inputs are well-formed 4-lane SIMD vectors.
-    /// **Post:** `result` is the lane-parallel BLAKE3 compression of a block
-    /// whose first 8 words are `m₀..m₇` and whose last 8 words are zero.
-    #[inline(always)]
-    unsafe fn compress_iter_4way(
-        cv: &[uint32x4_t; 8],
-        m0: uint32x4_t, m1: uint32x4_t, m2: uint32x4_t, m3: uint32x4_t,
-        m4: uint32x4_t, m5: uint32x4_t, m6: uint32x4_t, m7: uint32x4_t,
-        block_len_const: uint32x4_t,
-        flags_const: uint32x4_t,
-        iv_lo: &[uint32x4_t; 4],
-        zero: uint32x4_t,
-    ) -> [uint32x4_t; 8] {
-        let mut v: [uint32x4_t; 16] = [zero; 16];
-        v[0] = cv[0]; v[1] = cv[1]; v[2] = cv[2]; v[3] = cv[3];
-        v[4] = cv[4]; v[5] = cv[5]; v[6] = cv[6]; v[7] = cv[7];
-        v[8]  = iv_lo[0]; v[9]  = iv_lo[1];
-        v[10] = iv_lo[2]; v[11] = iv_lo[3];
-        v[12] = zero; v[13] = zero;
-        v[14] = block_len_const;
-        v[15] = flags_const;
-
-        // Round 0: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-        round_unrolled!(&mut v, m0, m1, m2, m3, m4, m5, m6, m7, zero,
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-        // Round 1: [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8]
-        round_unrolled!(&mut v, m0, m1, m2, m3, m4, m5, m6, m7, zero,
-            2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
-        // Round 2: [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1]
-        round_unrolled!(&mut v, m0, m1, m2, m3, m4, m5, m6, m7, zero,
-            3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
-        // Round 3: [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6]
-        round_unrolled!(&mut v, m0, m1, m2, m3, m4, m5, m6, m7, zero,
-            10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
-        // Round 4: [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4]
-        round_unrolled!(&mut v, m0, m1, m2, m3, m4, m5, m6, m7, zero,
-            12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
-        // Round 5: [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7]
-        round_unrolled!(&mut v, m0, m1, m2, m3, m4, m5, m6, m7, zero,
-            9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
-        // Round 6: [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13]
-        round_unrolled!(&mut v, m0, m1, m2, m3, m4, m5, m6, m7, zero,
-            11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
-
-        [
-            veorq_u32(v[0], v[8]),  veorq_u32(v[1], v[9]),
-            veorq_u32(v[2], v[10]), veorq_u32(v[3], v[11]),
-            veorq_u32(v[4], v[12]), veorq_u32(v[5], v[13]),
-            veorq_u32(v[6], v[14]), veorq_u32(v[7], v[15]),
-        ]
-    }
-
-    /// Iterated hashing loop, 4-way, fully unrolled.
-    ///
-    /// # Formal specification
-    ///
-    /// ```text
-    /// iterated_4way :
-    ///     (cv: WORD_4^8, h₀: WORD_4^8, k: ℕ) → WORD_4^8
-    ///
-    /// iterated_4way(cv, h₀, 0)     = h₀
-    /// iterated_4way(cv, h₀, k + 1) =
-    ///     compress_iter_4way(cv, iterated_4way(cv, h₀, k))
-    /// ```
-    ///
-    /// **Pre:** `iterations ≥ 0`.
-    /// **Post:** `result = compress_iter_4way^k(cv, h₀)` where `k = iterations`.
-    #[inline(never)]
-    unsafe fn iterated_4way(
-        cv: &[uint32x4_t; 8],
-        initial_hw: [uint32x4_t; 8],
-        iterations: u64,
-    ) -> [uint32x4_t; 8] {
-        let zero = vdupq_n_u32(0);
-        let block_len_const = vdupq_n_u32(32);
-        let flags_const = vdupq_n_u32(HASH_FLAGS);
-        let iv_lo: [uint32x4_t; 4] = [
-            vdupq_n_u32(IV[0]), vdupq_n_u32(IV[1]),
-            vdupq_n_u32(IV[2]), vdupq_n_u32(IV[3]),
-        ];
-
-        let mut h0 = initial_hw[0]; let mut h1 = initial_hw[1];
-        let mut h2 = initial_hw[2]; let mut h3 = initial_hw[3];
-        let mut h4 = initial_hw[4]; let mut h5 = initial_hw[5];
-        let mut h6 = initial_hw[6]; let mut h7 = initial_hw[7];
-
-        for _ in 0..iterations {
-            let out = compress_iter_4way(
-                cv, h0, h1, h2, h3, h4, h5, h6, h7,
-                block_len_const, flags_const, &iv_lo, zero,
-            );
-            h0 = out[0]; h1 = out[1]; h2 = out[2]; h3 = out[3];
-            h4 = out[4]; h5 = out[5]; h6 = out[6]; h7 = out[7];
-        }
-        [h0, h1, h2, h3, h4, h5, h6, h7]
-    }
-
-    /// Mines 4 independent nonces in parallel using ARM NEON (fully unrolled).
+    /// Mines 4 independent nonces in parallel using ARM NEON.
     ///
     /// # Formal specification
     ///
@@ -766,8 +696,8 @@ mod neon {
     ///
     /// # Safety
     ///
-    /// NEON is mandatory on `aarch64`. `unsafe` is required because it calls
-    /// NEON intrinsics.
+    /// NEON is mandatory on `aarch64`, so this is always safe to call on that
+    /// target. The `unsafe` marker is required because it calls NEON intrinsics.
     pub unsafe fn create_extensions_4way_neon(
         midstate: [u8; 32], nonces: [u64; 4],
     ) -> [(u64, [u8; 32]); 4] {
@@ -787,2552 +717,163 @@ mod neon {
             (nonces[0] >> 32) as u32, (nonces[1] >> 32) as u32,
             (nonces[2] >> 32) as u32, (nonces[3] >> 32) as u32,
         ];
-
-        // Initial 40-byte compression: uses the generic compress_4way path
-        // (block_len = 40 here, plus nonce-bearing msg[8..10] are nonzero).
         let mut msg: [uint32x4_t; 16] = [zero; 16];
         for i in 0..8 { msg[i] = vdupq_n_u32(ms_words[i]); }
         msg[8] = vld1q_u32(nonce_lo.as_ptr());
         msg[9] = vld1q_u32(nonce_hi.as_ptr());
-        let initial_hw = compress_4way(&cv, &msg, 40);
-
-        // Iterated hashing: uses the unrolled path.
-        let hw = iterated_4way(&cv, initial_hw, EXTENSION_ITERATIONS as u64);
-
+        let mut hw = compress_4way(&cv, &msg, 40);
+        for _ in 0..EXTENSION_ITERATIONS {
+            msg[0] = hw[0]; msg[1] = hw[1]; msg[2] = hw[2]; msg[3] = hw[3];
+            msg[4] = hw[4]; msg[5] = hw[5]; msg[6] = hw[6]; msg[7] = hw[7];
+            msg[8]  = zero; msg[9]  = zero; msg[10] = zero; msg[11] = zero;
+            msg[12] = zero; msg[13] = zero; msg[14] = zero; msg[15] = zero;
+            hw = compress_4way(&cv, &msg, 32);
+        }
         [
             (nonces[0], extract_hash(&hw, 0)), (nonces[1], extract_hash(&hw, 1)),
             (nonces[2], extract_hash(&hw, 2)), (nonces[3], extract_hash(&hw, 3)),
         ]
     }
 
+    // ─── 8-way dual-issue primitives ─────────────────────────────────────
 
-
-    // ═══════════════════════════════════════════════════════════════════
-    //  HAND-WRITTEN AARCH64 ASSEMBLY 8-WAY ITERATED COMPRESSION
-    // ═══════════════════════════════════════════════════════════════════
-    //
-    // # Why hand-written assembly
-    //
-    // Three previous Rust-based attempts to make the 8-way path faster
-    // than two sequential 4-way calls all failed because LLVM aggressively
-    // re-merges the two streams' instructions even when source code
-    // separates them:
-    //
-    //   - v4 (source-interleaved):   60 ns/hash/lane, ~169 inner-loop spills
-    //   - v5 (alternating streams):  asm same as v4 (LLVM merged), spills slightly reduced
-    //   - v6 (alternating + black_box barrier): spills got WORSE, not better
-    //
-    // The fundamental problem: 32 NEON state vectors + 16 chaining words
-    // = 48 simultaneously-live vectors when LLVM merges the two streams'
-    // bodies. A76 has 32 NEON registers. LLVM has no choice but to spill.
-    //
-    // Solution: hand-write the entire iteration loop in aarch64 assembly,
-    // with explicit register allocation that fits in the register file:
-    //
-    //   v0 - v15  : state v[0..16] during a compression (reused per stream)
-    //   v16 - v23 : stream A chaining words a0..a7 (persistent across iterations)
-    //   v24 - v31 : stream B chaining words b0..b7 (persistent across iterations)
-    //
-    // At any moment during stream A's compression, stream B's chaining
-    // words sit untouched in v24..v31 (no spill). During stream B's
-    // compression, stream A's NEW chaining words (just written) sit
-    // untouched in v16..v23 (no spill).
-    //
-    // Total live during a compression: 16 (state) + 16 (both streams'
-    // chaining words) = 32 = exactly the register file. No spills.
-    //
-    // # Trade-off
-    //
-    // - Constants (block_len, flags, IV[0..3]) are NOT register-resident;
-    //   they're rematerialised via `movi` (one cycle, single uop) or loaded
-    //   from stack per compression. Cost: ~10 cycles per compression vs the
-    //   ~2000 cycles of work. Amortised: < 0.5% overhead.
-    // - `cv[0..7]` is loaded from caller-supplied pointer each compression
-    //   via 4 `ldp` instructions. Cost: ~4 cycles. Same amortisation.
-    // - One scratch vector per G call is used for rotate temporaries. We
-    //   pick the lowest state slot NOT in {a, b, c, d} (12 free slots out
-    //   of 16). This works because the chosen slot is dead during the G
-    //   call body — we overwrite it later in the round when the schedule
-    //   reaches it.
-    //
-    // # Safety contract for iterated_4way_x2_asm
-    //
-    // ABI (custom; not standard AAPCS for the parameter passing):
-    //   x0 = pointer to cv[0..7] (read-only, 128 bytes; loop-invariant)
-    //   x1 = pointer to initial_a[0..7] (read-only, 128 bytes; consumed once)
-    //   x2 = pointer to initial_b[0..7] (read-only, 128 bytes; consumed once)
-    //   x3 = iteration count (u64); must be ≥ 1
-    //   x4 = pointer to out_a[0..7] (write-only, 128 bytes; written once at exit)
-    //   x5 = pointer to out_b[0..7] (write-only, 128 bytes; written once at exit)
-    //
-    // The function preserves AAPCS callee-saved registers (low 64 bits of
-    // v8-v15) by saving them to a 144-byte stack frame on entry.
-    // x16, x17 are caller-saved (IP scratch) and freely used.
-    //
-    // # Formal specification (Z notation)
-    //
-    // ```text
-    // iterated_4way_x2_asm :
-    //     CV* × A* × B* × ℕ × OutA* × OutB* → ⊥
-    //
-    // where
-    //     CV*   = address of WORD_4^8  (initial chaining values)
-    //     A*    = address of WORD_4^8  (stream A initial words)
-    //     B*    = address of WORD_4^8  (stream B initial words)
-    //     OutA* = address of WORD_4^8  (writable, stream A output)
-    //     OutB* = address of WORD_4^8  (writable, stream B output)
-    //
-    // post:  *out_a = iterated_4way(*cv, *initial_a, k)  ∧
-    //        *out_b = iterated_4way(*cv, *initial_b, k)
-    //        where k = iterations.
-    // ```
-    //
-    // The post-condition references the Rust `iterated_4way` function as
-    // the specification — i.e. the asm version is required to produce
-    // bit-identical output to running the unrolled 4-way Rust function
-    // twice. The test `eight_way_neon_matches_two_four_way` verifies.
-
-    // The assembly body is generated by /home/claude/gen_asm.py (see Z spec
-    // above for the input/output contract). It contains exactly:
-    //   - 2 × 7 = 14 rounds of 8 G calls = 112 G calls total
-    //   - 560 ADDs, 464 EORs, 336 each of SHL/USHR/ORR, 112 REV32s
-    //   - 8 EORs per compression × 2 compressions = 16 finalise EORs
-    //   - 1 inner-loop branch
-    // Per iteration: ~1900 instructions, NO inner-loop stack spills.
-    core::arch::global_asm!(r#"
-.global iterated_4way_x2_asm
-    .type iterated_4way_x2_asm, @function
-    iterated_4way_x2_asm:
-    // prologue
-    sub sp, sp, #144
-    stp d8, d9,   [sp, #80]
-    stp d10, d11, [sp, #96]
-    stp d12, d13, [sp, #112]
-    stp d14, d15, [sp, #128]
-    // Load IV[0..3] into scratch regs, broadcast, save to stack
-    mov w16, #0xE667
-    movk w16, #0x6A09, lsl #16
-    dup v0.4s, w16
-    mov w16, #0xAE85
-    movk w16, #0xBB67, lsl #16
-    dup v1.4s, w16
-    stp q0, q1, [sp, #16]
-    mov w16, #0xF372
-    movk w16, #0x3C6E, lsl #16
-    dup v0.4s, w16
-    mov w16, #0xF53A
-    movk w16, #0xA54F, lsl #16
-    dup v1.4s, w16
-    stp q0, q1, [sp, #48]
-    // Load initial chaining words
-    ldp q16, q17, [x1]
-    ldp q18, q19, [x1, #32]
-    ldp q20, q21, [x1, #64]
-    ldp q22, q23, [x1, #96]
-    ldp q24, q25, [x2]
-    ldp q26, q27, [x2, #32]
-    ldp q28, q29, [x2, #64]
-    ldp q30, q31, [x2, #96]
-    // Outer loop: iterate `x3` times
-    .Liter_loop:
-    // Save v24 (b0) for use as scratch during stream A
-    str q24, [sp, #0]
-    // === STREAM A COMPRESSION (scratch=v24) ===
-    // state init: v[0..7] = cv[0..7]
-    ldp q0, q1, [x0]
-    ldp q2, q3, [x0, #32]
-    ldp q4, q5, [x0, #64]
-    ldp q6, q7, [x0, #96]
-    // state init: v[8..11] = IV[0..3]  (loaded from stack)
-    ldp q8, q9, [sp, #16]
-    ldp q10, q11, [sp, #48]
-    // state init: v[12..13] = 0
-    movi v12.4s, #0
-    movi v13.4s, #0
-    // state init: v[14] = 32 (block_len), v[15] = 11 (HASH_FLAGS)
-    movi v14.4s, #32
-    movi v15.4s, #11
-    // --- Round 0 ---
-    // G(0,4,8,12, mx=v16/sched[0]=0, my=v17/sched[1]=1)
-    add v0.4s, v0.4s, v4.4s
-    add v0.4s, v0.4s, v16.4s
-    eor v12.16b, v12.16b, v0.16b
-    rev32 v12.8h, v12.8h
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v24.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v24.16b
-    add v0.4s, v0.4s, v4.4s
-    add v0.4s, v0.4s, v17.4s
-    eor v12.16b, v12.16b, v0.16b
-    shl v24.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v24.16b
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v24.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v24.16b
-    // G(1,5,9,13, mx=v18/sched[2]=2, my=v19/sched[3]=3)
-    add v1.4s, v1.4s, v5.4s
-    add v1.4s, v1.4s, v18.4s
-    eor v13.16b, v13.16b, v1.16b
-    rev32 v13.8h, v13.8h
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v24.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v24.16b
-    add v1.4s, v1.4s, v5.4s
-    add v1.4s, v1.4s, v19.4s
-    eor v13.16b, v13.16b, v1.16b
-    shl v24.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v24.16b
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v24.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v24.16b
-    // G(2,6,10,14, mx=v20/sched[4]=4, my=v21/sched[5]=5)
-    add v2.4s, v2.4s, v6.4s
-    add v2.4s, v2.4s, v20.4s
-    eor v14.16b, v14.16b, v2.16b
-    rev32 v14.8h, v14.8h
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v24.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v24.16b
-    add v2.4s, v2.4s, v6.4s
-    add v2.4s, v2.4s, v21.4s
-    eor v14.16b, v14.16b, v2.16b
-    shl v24.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v24.16b
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v24.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v24.16b
-    // G(3,7,11,15, mx=v22/sched[6]=6, my=v23/sched[7]=7)
-    add v3.4s, v3.4s, v7.4s
-    add v3.4s, v3.4s, v22.4s
-    eor v15.16b, v15.16b, v3.16b
-    rev32 v15.8h, v15.8h
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v24.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v24.16b
-    add v3.4s, v3.4s, v7.4s
-    add v3.4s, v3.4s, v23.4s
-    eor v15.16b, v15.16b, v3.16b
-    shl v24.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v24.16b
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v24.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v24.16b
-    // G(0,5,10,15, mx=ZERO/sched[8]=8, my=ZERO/sched[9]=9)
-    add v0.4s, v0.4s, v5.4s
-    eor v15.16b, v15.16b, v0.16b
-    rev32 v15.8h, v15.8h
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v24.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v24.16b
-    add v0.4s, v0.4s, v5.4s
-    eor v15.16b, v15.16b, v0.16b
-    shl v24.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v24.16b
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v24.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v24.16b
-    // G(1,6,11,12, mx=ZERO/sched[10]=10, my=ZERO/sched[11]=11)
-    add v1.4s, v1.4s, v6.4s
-    eor v12.16b, v12.16b, v1.16b
-    rev32 v12.8h, v12.8h
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v24.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v24.16b
-    add v1.4s, v1.4s, v6.4s
-    eor v12.16b, v12.16b, v1.16b
-    shl v24.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v24.16b
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v24.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v24.16b
-    // G(2,7,8,13, mx=ZERO/sched[12]=12, my=ZERO/sched[13]=13)
-    add v2.4s, v2.4s, v7.4s
-    eor v13.16b, v13.16b, v2.16b
-    rev32 v13.8h, v13.8h
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v24.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v24.16b
-    add v2.4s, v2.4s, v7.4s
-    eor v13.16b, v13.16b, v2.16b
-    shl v24.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v24.16b
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v24.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v24.16b
-    // G(3,4,9,14, mx=ZERO/sched[14]=14, my=ZERO/sched[15]=15)
-    add v3.4s, v3.4s, v4.4s
-    eor v14.16b, v14.16b, v3.16b
-    rev32 v14.8h, v14.8h
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v24.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v24.16b
-    add v3.4s, v3.4s, v4.4s
-    eor v14.16b, v14.16b, v3.16b
-    shl v24.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v24.16b
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v24.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v24.16b
-    // --- Round 1 ---
-    // G(0,4,8,12, mx=v18/sched[0]=2, my=v22/sched[1]=6)
-    add v0.4s, v0.4s, v4.4s
-    add v0.4s, v0.4s, v18.4s
-    eor v12.16b, v12.16b, v0.16b
-    rev32 v12.8h, v12.8h
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v24.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v24.16b
-    add v0.4s, v0.4s, v4.4s
-    add v0.4s, v0.4s, v22.4s
-    eor v12.16b, v12.16b, v0.16b
-    shl v24.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v24.16b
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v24.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v24.16b
-    // G(1,5,9,13, mx=v19/sched[2]=3, my=ZERO/sched[3]=10)
-    add v1.4s, v1.4s, v5.4s
-    add v1.4s, v1.4s, v19.4s
-    eor v13.16b, v13.16b, v1.16b
-    rev32 v13.8h, v13.8h
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v24.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v24.16b
-    add v1.4s, v1.4s, v5.4s
-    eor v13.16b, v13.16b, v1.16b
-    shl v24.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v24.16b
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v24.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v24.16b
-    // G(2,6,10,14, mx=v23/sched[4]=7, my=v16/sched[5]=0)
-    add v2.4s, v2.4s, v6.4s
-    add v2.4s, v2.4s, v23.4s
-    eor v14.16b, v14.16b, v2.16b
-    rev32 v14.8h, v14.8h
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v24.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v24.16b
-    add v2.4s, v2.4s, v6.4s
-    add v2.4s, v2.4s, v16.4s
-    eor v14.16b, v14.16b, v2.16b
-    shl v24.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v24.16b
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v24.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v24.16b
-    // G(3,7,11,15, mx=v20/sched[6]=4, my=ZERO/sched[7]=13)
-    add v3.4s, v3.4s, v7.4s
-    add v3.4s, v3.4s, v20.4s
-    eor v15.16b, v15.16b, v3.16b
-    rev32 v15.8h, v15.8h
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v24.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v24.16b
-    add v3.4s, v3.4s, v7.4s
-    eor v15.16b, v15.16b, v3.16b
-    shl v24.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v24.16b
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v24.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v24.16b
-    // G(0,5,10,15, mx=v17/sched[8]=1, my=ZERO/sched[9]=11)
-    add v0.4s, v0.4s, v5.4s
-    add v0.4s, v0.4s, v17.4s
-    eor v15.16b, v15.16b, v0.16b
-    rev32 v15.8h, v15.8h
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v24.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v24.16b
-    add v0.4s, v0.4s, v5.4s
-    eor v15.16b, v15.16b, v0.16b
-    shl v24.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v24.16b
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v24.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v24.16b
-    // G(1,6,11,12, mx=ZERO/sched[10]=12, my=v21/sched[11]=5)
-    add v1.4s, v1.4s, v6.4s
-    eor v12.16b, v12.16b, v1.16b
-    rev32 v12.8h, v12.8h
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v24.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v24.16b
-    add v1.4s, v1.4s, v6.4s
-    add v1.4s, v1.4s, v21.4s
-    eor v12.16b, v12.16b, v1.16b
-    shl v24.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v24.16b
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v24.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v24.16b
-    // G(2,7,8,13, mx=ZERO/sched[12]=9, my=ZERO/sched[13]=14)
-    add v2.4s, v2.4s, v7.4s
-    eor v13.16b, v13.16b, v2.16b
-    rev32 v13.8h, v13.8h
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v24.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v24.16b
-    add v2.4s, v2.4s, v7.4s
-    eor v13.16b, v13.16b, v2.16b
-    shl v24.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v24.16b
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v24.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v24.16b
-    // G(3,4,9,14, mx=ZERO/sched[14]=15, my=ZERO/sched[15]=8)
-    add v3.4s, v3.4s, v4.4s
-    eor v14.16b, v14.16b, v3.16b
-    rev32 v14.8h, v14.8h
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v24.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v24.16b
-    add v3.4s, v3.4s, v4.4s
-    eor v14.16b, v14.16b, v3.16b
-    shl v24.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v24.16b
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v24.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v24.16b
-    // --- Round 2 ---
-    // G(0,4,8,12, mx=v19/sched[0]=3, my=v20/sched[1]=4)
-    add v0.4s, v0.4s, v4.4s
-    add v0.4s, v0.4s, v19.4s
-    eor v12.16b, v12.16b, v0.16b
-    rev32 v12.8h, v12.8h
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v24.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v24.16b
-    add v0.4s, v0.4s, v4.4s
-    add v0.4s, v0.4s, v20.4s
-    eor v12.16b, v12.16b, v0.16b
-    shl v24.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v24.16b
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v24.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v24.16b
-    // G(1,5,9,13, mx=ZERO/sched[2]=10, my=ZERO/sched[3]=12)
-    add v1.4s, v1.4s, v5.4s
-    eor v13.16b, v13.16b, v1.16b
-    rev32 v13.8h, v13.8h
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v24.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v24.16b
-    add v1.4s, v1.4s, v5.4s
-    eor v13.16b, v13.16b, v1.16b
-    shl v24.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v24.16b
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v24.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v24.16b
-    // G(2,6,10,14, mx=ZERO/sched[4]=13, my=v18/sched[5]=2)
-    add v2.4s, v2.4s, v6.4s
-    eor v14.16b, v14.16b, v2.16b
-    rev32 v14.8h, v14.8h
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v24.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v24.16b
-    add v2.4s, v2.4s, v6.4s
-    add v2.4s, v2.4s, v18.4s
-    eor v14.16b, v14.16b, v2.16b
-    shl v24.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v24.16b
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v24.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v24.16b
-    // G(3,7,11,15, mx=v23/sched[6]=7, my=ZERO/sched[7]=14)
-    add v3.4s, v3.4s, v7.4s
-    add v3.4s, v3.4s, v23.4s
-    eor v15.16b, v15.16b, v3.16b
-    rev32 v15.8h, v15.8h
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v24.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v24.16b
-    add v3.4s, v3.4s, v7.4s
-    eor v15.16b, v15.16b, v3.16b
-    shl v24.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v24.16b
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v24.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v24.16b
-    // G(0,5,10,15, mx=v22/sched[8]=6, my=v21/sched[9]=5)
-    add v0.4s, v0.4s, v5.4s
-    add v0.4s, v0.4s, v22.4s
-    eor v15.16b, v15.16b, v0.16b
-    rev32 v15.8h, v15.8h
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v24.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v24.16b
-    add v0.4s, v0.4s, v5.4s
-    add v0.4s, v0.4s, v21.4s
-    eor v15.16b, v15.16b, v0.16b
-    shl v24.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v24.16b
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v24.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v24.16b
-    // G(1,6,11,12, mx=ZERO/sched[10]=9, my=v16/sched[11]=0)
-    add v1.4s, v1.4s, v6.4s
-    eor v12.16b, v12.16b, v1.16b
-    rev32 v12.8h, v12.8h
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v24.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v24.16b
-    add v1.4s, v1.4s, v6.4s
-    add v1.4s, v1.4s, v16.4s
-    eor v12.16b, v12.16b, v1.16b
-    shl v24.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v24.16b
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v24.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v24.16b
-    // G(2,7,8,13, mx=ZERO/sched[12]=11, my=ZERO/sched[13]=15)
-    add v2.4s, v2.4s, v7.4s
-    eor v13.16b, v13.16b, v2.16b
-    rev32 v13.8h, v13.8h
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v24.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v24.16b
-    add v2.4s, v2.4s, v7.4s
-    eor v13.16b, v13.16b, v2.16b
-    shl v24.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v24.16b
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v24.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v24.16b
-    // G(3,4,9,14, mx=ZERO/sched[14]=8, my=v17/sched[15]=1)
-    add v3.4s, v3.4s, v4.4s
-    eor v14.16b, v14.16b, v3.16b
-    rev32 v14.8h, v14.8h
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v24.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v24.16b
-    add v3.4s, v3.4s, v4.4s
-    add v3.4s, v3.4s, v17.4s
-    eor v14.16b, v14.16b, v3.16b
-    shl v24.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v24.16b
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v24.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v24.16b
-    // --- Round 3 ---
-    // G(0,4,8,12, mx=ZERO/sched[0]=10, my=v23/sched[1]=7)
-    add v0.4s, v0.4s, v4.4s
-    eor v12.16b, v12.16b, v0.16b
-    rev32 v12.8h, v12.8h
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v24.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v24.16b
-    add v0.4s, v0.4s, v4.4s
-    add v0.4s, v0.4s, v23.4s
-    eor v12.16b, v12.16b, v0.16b
-    shl v24.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v24.16b
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v24.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v24.16b
-    // G(1,5,9,13, mx=ZERO/sched[2]=12, my=ZERO/sched[3]=9)
-    add v1.4s, v1.4s, v5.4s
-    eor v13.16b, v13.16b, v1.16b
-    rev32 v13.8h, v13.8h
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v24.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v24.16b
-    add v1.4s, v1.4s, v5.4s
-    eor v13.16b, v13.16b, v1.16b
-    shl v24.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v24.16b
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v24.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v24.16b
-    // G(2,6,10,14, mx=ZERO/sched[4]=14, my=v19/sched[5]=3)
-    add v2.4s, v2.4s, v6.4s
-    eor v14.16b, v14.16b, v2.16b
-    rev32 v14.8h, v14.8h
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v24.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v24.16b
-    add v2.4s, v2.4s, v6.4s
-    add v2.4s, v2.4s, v19.4s
-    eor v14.16b, v14.16b, v2.16b
-    shl v24.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v24.16b
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v24.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v24.16b
-    // G(3,7,11,15, mx=ZERO/sched[6]=13, my=ZERO/sched[7]=15)
-    add v3.4s, v3.4s, v7.4s
-    eor v15.16b, v15.16b, v3.16b
-    rev32 v15.8h, v15.8h
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v24.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v24.16b
-    add v3.4s, v3.4s, v7.4s
-    eor v15.16b, v15.16b, v3.16b
-    shl v24.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v24.16b
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v24.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v24.16b
-    // G(0,5,10,15, mx=v20/sched[8]=4, my=v16/sched[9]=0)
-    add v0.4s, v0.4s, v5.4s
-    add v0.4s, v0.4s, v20.4s
-    eor v15.16b, v15.16b, v0.16b
-    rev32 v15.8h, v15.8h
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v24.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v24.16b
-    add v0.4s, v0.4s, v5.4s
-    add v0.4s, v0.4s, v16.4s
-    eor v15.16b, v15.16b, v0.16b
-    shl v24.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v24.16b
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v24.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v24.16b
-    // G(1,6,11,12, mx=ZERO/sched[10]=11, my=v18/sched[11]=2)
-    add v1.4s, v1.4s, v6.4s
-    eor v12.16b, v12.16b, v1.16b
-    rev32 v12.8h, v12.8h
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v24.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v24.16b
-    add v1.4s, v1.4s, v6.4s
-    add v1.4s, v1.4s, v18.4s
-    eor v12.16b, v12.16b, v1.16b
-    shl v24.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v24.16b
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v24.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v24.16b
-    // G(2,7,8,13, mx=v21/sched[12]=5, my=ZERO/sched[13]=8)
-    add v2.4s, v2.4s, v7.4s
-    add v2.4s, v2.4s, v21.4s
-    eor v13.16b, v13.16b, v2.16b
-    rev32 v13.8h, v13.8h
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v24.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v24.16b
-    add v2.4s, v2.4s, v7.4s
-    eor v13.16b, v13.16b, v2.16b
-    shl v24.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v24.16b
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v24.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v24.16b
-    // G(3,4,9,14, mx=v17/sched[14]=1, my=v22/sched[15]=6)
-    add v3.4s, v3.4s, v4.4s
-    add v3.4s, v3.4s, v17.4s
-    eor v14.16b, v14.16b, v3.16b
-    rev32 v14.8h, v14.8h
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v24.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v24.16b
-    add v3.4s, v3.4s, v4.4s
-    add v3.4s, v3.4s, v22.4s
-    eor v14.16b, v14.16b, v3.16b
-    shl v24.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v24.16b
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v24.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v24.16b
-    // --- Round 4 ---
-    // G(0,4,8,12, mx=ZERO/sched[0]=12, my=ZERO/sched[1]=13)
-    add v0.4s, v0.4s, v4.4s
-    eor v12.16b, v12.16b, v0.16b
-    rev32 v12.8h, v12.8h
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v24.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v24.16b
-    add v0.4s, v0.4s, v4.4s
-    eor v12.16b, v12.16b, v0.16b
-    shl v24.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v24.16b
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v24.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v24.16b
-    // G(1,5,9,13, mx=ZERO/sched[2]=9, my=ZERO/sched[3]=11)
-    add v1.4s, v1.4s, v5.4s
-    eor v13.16b, v13.16b, v1.16b
-    rev32 v13.8h, v13.8h
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v24.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v24.16b
-    add v1.4s, v1.4s, v5.4s
-    eor v13.16b, v13.16b, v1.16b
-    shl v24.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v24.16b
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v24.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v24.16b
-    // G(2,6,10,14, mx=ZERO/sched[4]=15, my=ZERO/sched[5]=10)
-    add v2.4s, v2.4s, v6.4s
-    eor v14.16b, v14.16b, v2.16b
-    rev32 v14.8h, v14.8h
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v24.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v24.16b
-    add v2.4s, v2.4s, v6.4s
-    eor v14.16b, v14.16b, v2.16b
-    shl v24.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v24.16b
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v24.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v24.16b
-    // G(3,7,11,15, mx=ZERO/sched[6]=14, my=ZERO/sched[7]=8)
-    add v3.4s, v3.4s, v7.4s
-    eor v15.16b, v15.16b, v3.16b
-    rev32 v15.8h, v15.8h
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v24.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v24.16b
-    add v3.4s, v3.4s, v7.4s
-    eor v15.16b, v15.16b, v3.16b
-    shl v24.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v24.16b
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v24.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v24.16b
-    // G(0,5,10,15, mx=v23/sched[8]=7, my=v18/sched[9]=2)
-    add v0.4s, v0.4s, v5.4s
-    add v0.4s, v0.4s, v23.4s
-    eor v15.16b, v15.16b, v0.16b
-    rev32 v15.8h, v15.8h
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v24.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v24.16b
-    add v0.4s, v0.4s, v5.4s
-    add v0.4s, v0.4s, v18.4s
-    eor v15.16b, v15.16b, v0.16b
-    shl v24.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v24.16b
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v24.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v24.16b
-    // G(1,6,11,12, mx=v21/sched[10]=5, my=v19/sched[11]=3)
-    add v1.4s, v1.4s, v6.4s
-    add v1.4s, v1.4s, v21.4s
-    eor v12.16b, v12.16b, v1.16b
-    rev32 v12.8h, v12.8h
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v24.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v24.16b
-    add v1.4s, v1.4s, v6.4s
-    add v1.4s, v1.4s, v19.4s
-    eor v12.16b, v12.16b, v1.16b
-    shl v24.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v24.16b
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v24.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v24.16b
-    // G(2,7,8,13, mx=v16/sched[12]=0, my=v17/sched[13]=1)
-    add v2.4s, v2.4s, v7.4s
-    add v2.4s, v2.4s, v16.4s
-    eor v13.16b, v13.16b, v2.16b
-    rev32 v13.8h, v13.8h
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v24.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v24.16b
-    add v2.4s, v2.4s, v7.4s
-    add v2.4s, v2.4s, v17.4s
-    eor v13.16b, v13.16b, v2.16b
-    shl v24.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v24.16b
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v24.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v24.16b
-    // G(3,4,9,14, mx=v22/sched[14]=6, my=v20/sched[15]=4)
-    add v3.4s, v3.4s, v4.4s
-    add v3.4s, v3.4s, v22.4s
-    eor v14.16b, v14.16b, v3.16b
-    rev32 v14.8h, v14.8h
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v24.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v24.16b
-    add v3.4s, v3.4s, v4.4s
-    add v3.4s, v3.4s, v20.4s
-    eor v14.16b, v14.16b, v3.16b
-    shl v24.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v24.16b
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v24.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v24.16b
-    // --- Round 5 ---
-    // G(0,4,8,12, mx=ZERO/sched[0]=9, my=ZERO/sched[1]=14)
-    add v0.4s, v0.4s, v4.4s
-    eor v12.16b, v12.16b, v0.16b
-    rev32 v12.8h, v12.8h
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v24.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v24.16b
-    add v0.4s, v0.4s, v4.4s
-    eor v12.16b, v12.16b, v0.16b
-    shl v24.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v24.16b
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v24.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v24.16b
-    // G(1,5,9,13, mx=ZERO/sched[2]=11, my=v21/sched[3]=5)
-    add v1.4s, v1.4s, v5.4s
-    eor v13.16b, v13.16b, v1.16b
-    rev32 v13.8h, v13.8h
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v24.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v24.16b
-    add v1.4s, v1.4s, v5.4s
-    add v1.4s, v1.4s, v21.4s
-    eor v13.16b, v13.16b, v1.16b
-    shl v24.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v24.16b
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v24.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v24.16b
-    // G(2,6,10,14, mx=ZERO/sched[4]=8, my=ZERO/sched[5]=12)
-    add v2.4s, v2.4s, v6.4s
-    eor v14.16b, v14.16b, v2.16b
-    rev32 v14.8h, v14.8h
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v24.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v24.16b
-    add v2.4s, v2.4s, v6.4s
-    eor v14.16b, v14.16b, v2.16b
-    shl v24.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v24.16b
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v24.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v24.16b
-    // G(3,7,11,15, mx=ZERO/sched[6]=15, my=v17/sched[7]=1)
-    add v3.4s, v3.4s, v7.4s
-    eor v15.16b, v15.16b, v3.16b
-    rev32 v15.8h, v15.8h
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v24.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v24.16b
-    add v3.4s, v3.4s, v7.4s
-    add v3.4s, v3.4s, v17.4s
-    eor v15.16b, v15.16b, v3.16b
-    shl v24.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v24.16b
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v24.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v24.16b
-    // G(0,5,10,15, mx=ZERO/sched[8]=13, my=v19/sched[9]=3)
-    add v0.4s, v0.4s, v5.4s
-    eor v15.16b, v15.16b, v0.16b
-    rev32 v15.8h, v15.8h
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v24.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v24.16b
-    add v0.4s, v0.4s, v5.4s
-    add v0.4s, v0.4s, v19.4s
-    eor v15.16b, v15.16b, v0.16b
-    shl v24.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v24.16b
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v24.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v24.16b
-    // G(1,6,11,12, mx=v16/sched[10]=0, my=ZERO/sched[11]=10)
-    add v1.4s, v1.4s, v6.4s
-    add v1.4s, v1.4s, v16.4s
-    eor v12.16b, v12.16b, v1.16b
-    rev32 v12.8h, v12.8h
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v24.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v24.16b
-    add v1.4s, v1.4s, v6.4s
-    eor v12.16b, v12.16b, v1.16b
-    shl v24.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v24.16b
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v24.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v24.16b
-    // G(2,7,8,13, mx=v18/sched[12]=2, my=v22/sched[13]=6)
-    add v2.4s, v2.4s, v7.4s
-    add v2.4s, v2.4s, v18.4s
-    eor v13.16b, v13.16b, v2.16b
-    rev32 v13.8h, v13.8h
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v24.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v24.16b
-    add v2.4s, v2.4s, v7.4s
-    add v2.4s, v2.4s, v22.4s
-    eor v13.16b, v13.16b, v2.16b
-    shl v24.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v24.16b
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v24.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v24.16b
-    // G(3,4,9,14, mx=v20/sched[14]=4, my=v23/sched[15]=7)
-    add v3.4s, v3.4s, v4.4s
-    add v3.4s, v3.4s, v20.4s
-    eor v14.16b, v14.16b, v3.16b
-    rev32 v14.8h, v14.8h
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v24.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v24.16b
-    add v3.4s, v3.4s, v4.4s
-    add v3.4s, v3.4s, v23.4s
-    eor v14.16b, v14.16b, v3.16b
-    shl v24.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v24.16b
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v24.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v24.16b
-    // --- Round 6 ---
-    // G(0,4,8,12, mx=ZERO/sched[0]=11, my=ZERO/sched[1]=15)
-    add v0.4s, v0.4s, v4.4s
-    eor v12.16b, v12.16b, v0.16b
-    rev32 v12.8h, v12.8h
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v24.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v24.16b
-    add v0.4s, v0.4s, v4.4s
-    eor v12.16b, v12.16b, v0.16b
-    shl v24.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v24.16b
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v24.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v24.16b
-    // G(1,5,9,13, mx=v21/sched[2]=5, my=v16/sched[3]=0)
-    add v1.4s, v1.4s, v5.4s
-    add v1.4s, v1.4s, v21.4s
-    eor v13.16b, v13.16b, v1.16b
-    rev32 v13.8h, v13.8h
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v24.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v24.16b
-    add v1.4s, v1.4s, v5.4s
-    add v1.4s, v1.4s, v16.4s
-    eor v13.16b, v13.16b, v1.16b
-    shl v24.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v24.16b
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v24.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v24.16b
-    // G(2,6,10,14, mx=v17/sched[4]=1, my=ZERO/sched[5]=9)
-    add v2.4s, v2.4s, v6.4s
-    add v2.4s, v2.4s, v17.4s
-    eor v14.16b, v14.16b, v2.16b
-    rev32 v14.8h, v14.8h
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v24.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v24.16b
-    add v2.4s, v2.4s, v6.4s
-    eor v14.16b, v14.16b, v2.16b
-    shl v24.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v24.16b
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v24.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v24.16b
-    // G(3,7,11,15, mx=ZERO/sched[6]=8, my=v22/sched[7]=6)
-    add v3.4s, v3.4s, v7.4s
-    eor v15.16b, v15.16b, v3.16b
-    rev32 v15.8h, v15.8h
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v24.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v24.16b
-    add v3.4s, v3.4s, v7.4s
-    add v3.4s, v3.4s, v22.4s
-    eor v15.16b, v15.16b, v3.16b
-    shl v24.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v24.16b
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v24.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v24.16b
-    // G(0,5,10,15, mx=ZERO/sched[8]=14, my=ZERO/sched[9]=10)
-    add v0.4s, v0.4s, v5.4s
-    eor v15.16b, v15.16b, v0.16b
-    rev32 v15.8h, v15.8h
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v24.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v24.16b
-    add v0.4s, v0.4s, v5.4s
-    eor v15.16b, v15.16b, v0.16b
-    shl v24.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v24.16b
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v24.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v24.16b
-    // G(1,6,11,12, mx=v18/sched[10]=2, my=ZERO/sched[11]=12)
-    add v1.4s, v1.4s, v6.4s
-    add v1.4s, v1.4s, v18.4s
-    eor v12.16b, v12.16b, v1.16b
-    rev32 v12.8h, v12.8h
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v24.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v24.16b
-    add v1.4s, v1.4s, v6.4s
-    eor v12.16b, v12.16b, v1.16b
-    shl v24.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v24.16b
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v24.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v24.16b
-    // G(2,7,8,13, mx=v19/sched[12]=3, my=v20/sched[13]=4)
-    add v2.4s, v2.4s, v7.4s
-    add v2.4s, v2.4s, v19.4s
-    eor v13.16b, v13.16b, v2.16b
-    rev32 v13.8h, v13.8h
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v24.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v24.16b
-    add v2.4s, v2.4s, v7.4s
-    add v2.4s, v2.4s, v20.4s
-    eor v13.16b, v13.16b, v2.16b
-    shl v24.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v24.16b
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v24.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v24.16b
-    // G(3,4,9,14, mx=v23/sched[14]=7, my=ZERO/sched[15]=13)
-    add v3.4s, v3.4s, v4.4s
-    add v3.4s, v3.4s, v23.4s
-    eor v14.16b, v14.16b, v3.16b
-    rev32 v14.8h, v14.8h
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v24.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v24.16b
-    add v3.4s, v3.4s, v4.4s
-    eor v14.16b, v14.16b, v3.16b
-    shl v24.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v24.16b
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v24.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v24.16b
-    // finalise: new chaining words = v[i] ^ v[i+8]
-    eor v16.16b, v0.16b, v8.16b
-    eor v17.16b, v1.16b, v9.16b
-    eor v18.16b, v2.16b, v10.16b
-    eor v19.16b, v3.16b, v11.16b
-    eor v20.16b, v4.16b, v12.16b
-    eor v21.16b, v5.16b, v13.16b
-    eor v22.16b, v6.16b, v14.16b
-    eor v23.16b, v7.16b, v15.16b
-    // Restore v24 (b0) for stream B's compression
-    ldr q24, [sp, #0]
-    // Save v16 (new a0) for use as scratch during stream B
-    str q16, [sp, #0]
-    // === STREAM B COMPRESSION (scratch=v16) ===
-    // state init: v[0..7] = cv[0..7]
-    ldp q0, q1, [x0]
-    ldp q2, q3, [x0, #32]
-    ldp q4, q5, [x0, #64]
-    ldp q6, q7, [x0, #96]
-    // state init: v[8..11] = IV[0..3]  (loaded from stack)
-    ldp q8, q9, [sp, #16]
-    ldp q10, q11, [sp, #48]
-    // state init: v[12..13] = 0
-    movi v12.4s, #0
-    movi v13.4s, #0
-    // state init: v[14] = 32 (block_len), v[15] = 11 (HASH_FLAGS)
-    movi v14.4s, #32
-    movi v15.4s, #11
-    // --- Round 0 ---
-    // G(0,4,8,12, mx=v24/sched[0]=0, my=v25/sched[1]=1)
-    add v0.4s, v0.4s, v4.4s
-    add v0.4s, v0.4s, v24.4s
-    eor v12.16b, v12.16b, v0.16b
-    rev32 v12.8h, v12.8h
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v16.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v16.16b
-    add v0.4s, v0.4s, v4.4s
-    add v0.4s, v0.4s, v25.4s
-    eor v12.16b, v12.16b, v0.16b
-    shl v16.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v16.16b
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v16.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v16.16b
-    // G(1,5,9,13, mx=v26/sched[2]=2, my=v27/sched[3]=3)
-    add v1.4s, v1.4s, v5.4s
-    add v1.4s, v1.4s, v26.4s
-    eor v13.16b, v13.16b, v1.16b
-    rev32 v13.8h, v13.8h
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v16.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v16.16b
-    add v1.4s, v1.4s, v5.4s
-    add v1.4s, v1.4s, v27.4s
-    eor v13.16b, v13.16b, v1.16b
-    shl v16.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v16.16b
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v16.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v16.16b
-    // G(2,6,10,14, mx=v28/sched[4]=4, my=v29/sched[5]=5)
-    add v2.4s, v2.4s, v6.4s
-    add v2.4s, v2.4s, v28.4s
-    eor v14.16b, v14.16b, v2.16b
-    rev32 v14.8h, v14.8h
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v16.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v16.16b
-    add v2.4s, v2.4s, v6.4s
-    add v2.4s, v2.4s, v29.4s
-    eor v14.16b, v14.16b, v2.16b
-    shl v16.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v16.16b
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v16.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v16.16b
-    // G(3,7,11,15, mx=v30/sched[6]=6, my=v31/sched[7]=7)
-    add v3.4s, v3.4s, v7.4s
-    add v3.4s, v3.4s, v30.4s
-    eor v15.16b, v15.16b, v3.16b
-    rev32 v15.8h, v15.8h
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v16.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v16.16b
-    add v3.4s, v3.4s, v7.4s
-    add v3.4s, v3.4s, v31.4s
-    eor v15.16b, v15.16b, v3.16b
-    shl v16.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v16.16b
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v16.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v16.16b
-    // G(0,5,10,15, mx=ZERO/sched[8]=8, my=ZERO/sched[9]=9)
-    add v0.4s, v0.4s, v5.4s
-    eor v15.16b, v15.16b, v0.16b
-    rev32 v15.8h, v15.8h
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v16.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v16.16b
-    add v0.4s, v0.4s, v5.4s
-    eor v15.16b, v15.16b, v0.16b
-    shl v16.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v16.16b
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v16.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v16.16b
-    // G(1,6,11,12, mx=ZERO/sched[10]=10, my=ZERO/sched[11]=11)
-    add v1.4s, v1.4s, v6.4s
-    eor v12.16b, v12.16b, v1.16b
-    rev32 v12.8h, v12.8h
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v16.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v16.16b
-    add v1.4s, v1.4s, v6.4s
-    eor v12.16b, v12.16b, v1.16b
-    shl v16.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v16.16b
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v16.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v16.16b
-    // G(2,7,8,13, mx=ZERO/sched[12]=12, my=ZERO/sched[13]=13)
-    add v2.4s, v2.4s, v7.4s
-    eor v13.16b, v13.16b, v2.16b
-    rev32 v13.8h, v13.8h
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v16.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v16.16b
-    add v2.4s, v2.4s, v7.4s
-    eor v13.16b, v13.16b, v2.16b
-    shl v16.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v16.16b
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v16.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v16.16b
-    // G(3,4,9,14, mx=ZERO/sched[14]=14, my=ZERO/sched[15]=15)
-    add v3.4s, v3.4s, v4.4s
-    eor v14.16b, v14.16b, v3.16b
-    rev32 v14.8h, v14.8h
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v16.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v16.16b
-    add v3.4s, v3.4s, v4.4s
-    eor v14.16b, v14.16b, v3.16b
-    shl v16.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v16.16b
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v16.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v16.16b
-    // --- Round 1 ---
-    // G(0,4,8,12, mx=v26/sched[0]=2, my=v30/sched[1]=6)
-    add v0.4s, v0.4s, v4.4s
-    add v0.4s, v0.4s, v26.4s
-    eor v12.16b, v12.16b, v0.16b
-    rev32 v12.8h, v12.8h
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v16.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v16.16b
-    add v0.4s, v0.4s, v4.4s
-    add v0.4s, v0.4s, v30.4s
-    eor v12.16b, v12.16b, v0.16b
-    shl v16.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v16.16b
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v16.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v16.16b
-    // G(1,5,9,13, mx=v27/sched[2]=3, my=ZERO/sched[3]=10)
-    add v1.4s, v1.4s, v5.4s
-    add v1.4s, v1.4s, v27.4s
-    eor v13.16b, v13.16b, v1.16b
-    rev32 v13.8h, v13.8h
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v16.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v16.16b
-    add v1.4s, v1.4s, v5.4s
-    eor v13.16b, v13.16b, v1.16b
-    shl v16.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v16.16b
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v16.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v16.16b
-    // G(2,6,10,14, mx=v31/sched[4]=7, my=v24/sched[5]=0)
-    add v2.4s, v2.4s, v6.4s
-    add v2.4s, v2.4s, v31.4s
-    eor v14.16b, v14.16b, v2.16b
-    rev32 v14.8h, v14.8h
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v16.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v16.16b
-    add v2.4s, v2.4s, v6.4s
-    add v2.4s, v2.4s, v24.4s
-    eor v14.16b, v14.16b, v2.16b
-    shl v16.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v16.16b
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v16.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v16.16b
-    // G(3,7,11,15, mx=v28/sched[6]=4, my=ZERO/sched[7]=13)
-    add v3.4s, v3.4s, v7.4s
-    add v3.4s, v3.4s, v28.4s
-    eor v15.16b, v15.16b, v3.16b
-    rev32 v15.8h, v15.8h
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v16.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v16.16b
-    add v3.4s, v3.4s, v7.4s
-    eor v15.16b, v15.16b, v3.16b
-    shl v16.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v16.16b
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v16.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v16.16b
-    // G(0,5,10,15, mx=v25/sched[8]=1, my=ZERO/sched[9]=11)
-    add v0.4s, v0.4s, v5.4s
-    add v0.4s, v0.4s, v25.4s
-    eor v15.16b, v15.16b, v0.16b
-    rev32 v15.8h, v15.8h
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v16.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v16.16b
-    add v0.4s, v0.4s, v5.4s
-    eor v15.16b, v15.16b, v0.16b
-    shl v16.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v16.16b
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v16.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v16.16b
-    // G(1,6,11,12, mx=ZERO/sched[10]=12, my=v29/sched[11]=5)
-    add v1.4s, v1.4s, v6.4s
-    eor v12.16b, v12.16b, v1.16b
-    rev32 v12.8h, v12.8h
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v16.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v16.16b
-    add v1.4s, v1.4s, v6.4s
-    add v1.4s, v1.4s, v29.4s
-    eor v12.16b, v12.16b, v1.16b
-    shl v16.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v16.16b
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v16.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v16.16b
-    // G(2,7,8,13, mx=ZERO/sched[12]=9, my=ZERO/sched[13]=14)
-    add v2.4s, v2.4s, v7.4s
-    eor v13.16b, v13.16b, v2.16b
-    rev32 v13.8h, v13.8h
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v16.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v16.16b
-    add v2.4s, v2.4s, v7.4s
-    eor v13.16b, v13.16b, v2.16b
-    shl v16.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v16.16b
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v16.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v16.16b
-    // G(3,4,9,14, mx=ZERO/sched[14]=15, my=ZERO/sched[15]=8)
-    add v3.4s, v3.4s, v4.4s
-    eor v14.16b, v14.16b, v3.16b
-    rev32 v14.8h, v14.8h
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v16.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v16.16b
-    add v3.4s, v3.4s, v4.4s
-    eor v14.16b, v14.16b, v3.16b
-    shl v16.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v16.16b
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v16.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v16.16b
-    // --- Round 2 ---
-    // G(0,4,8,12, mx=v27/sched[0]=3, my=v28/sched[1]=4)
-    add v0.4s, v0.4s, v4.4s
-    add v0.4s, v0.4s, v27.4s
-    eor v12.16b, v12.16b, v0.16b
-    rev32 v12.8h, v12.8h
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v16.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v16.16b
-    add v0.4s, v0.4s, v4.4s
-    add v0.4s, v0.4s, v28.4s
-    eor v12.16b, v12.16b, v0.16b
-    shl v16.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v16.16b
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v16.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v16.16b
-    // G(1,5,9,13, mx=ZERO/sched[2]=10, my=ZERO/sched[3]=12)
-    add v1.4s, v1.4s, v5.4s
-    eor v13.16b, v13.16b, v1.16b
-    rev32 v13.8h, v13.8h
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v16.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v16.16b
-    add v1.4s, v1.4s, v5.4s
-    eor v13.16b, v13.16b, v1.16b
-    shl v16.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v16.16b
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v16.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v16.16b
-    // G(2,6,10,14, mx=ZERO/sched[4]=13, my=v26/sched[5]=2)
-    add v2.4s, v2.4s, v6.4s
-    eor v14.16b, v14.16b, v2.16b
-    rev32 v14.8h, v14.8h
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v16.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v16.16b
-    add v2.4s, v2.4s, v6.4s
-    add v2.4s, v2.4s, v26.4s
-    eor v14.16b, v14.16b, v2.16b
-    shl v16.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v16.16b
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v16.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v16.16b
-    // G(3,7,11,15, mx=v31/sched[6]=7, my=ZERO/sched[7]=14)
-    add v3.4s, v3.4s, v7.4s
-    add v3.4s, v3.4s, v31.4s
-    eor v15.16b, v15.16b, v3.16b
-    rev32 v15.8h, v15.8h
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v16.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v16.16b
-    add v3.4s, v3.4s, v7.4s
-    eor v15.16b, v15.16b, v3.16b
-    shl v16.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v16.16b
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v16.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v16.16b
-    // G(0,5,10,15, mx=v30/sched[8]=6, my=v29/sched[9]=5)
-    add v0.4s, v0.4s, v5.4s
-    add v0.4s, v0.4s, v30.4s
-    eor v15.16b, v15.16b, v0.16b
-    rev32 v15.8h, v15.8h
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v16.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v16.16b
-    add v0.4s, v0.4s, v5.4s
-    add v0.4s, v0.4s, v29.4s
-    eor v15.16b, v15.16b, v0.16b
-    shl v16.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v16.16b
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v16.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v16.16b
-    // G(1,6,11,12, mx=ZERO/sched[10]=9, my=v24/sched[11]=0)
-    add v1.4s, v1.4s, v6.4s
-    eor v12.16b, v12.16b, v1.16b
-    rev32 v12.8h, v12.8h
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v16.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v16.16b
-    add v1.4s, v1.4s, v6.4s
-    add v1.4s, v1.4s, v24.4s
-    eor v12.16b, v12.16b, v1.16b
-    shl v16.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v16.16b
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v16.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v16.16b
-    // G(2,7,8,13, mx=ZERO/sched[12]=11, my=ZERO/sched[13]=15)
-    add v2.4s, v2.4s, v7.4s
-    eor v13.16b, v13.16b, v2.16b
-    rev32 v13.8h, v13.8h
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v16.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v16.16b
-    add v2.4s, v2.4s, v7.4s
-    eor v13.16b, v13.16b, v2.16b
-    shl v16.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v16.16b
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v16.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v16.16b
-    // G(3,4,9,14, mx=ZERO/sched[14]=8, my=v25/sched[15]=1)
-    add v3.4s, v3.4s, v4.4s
-    eor v14.16b, v14.16b, v3.16b
-    rev32 v14.8h, v14.8h
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v16.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v16.16b
-    add v3.4s, v3.4s, v4.4s
-    add v3.4s, v3.4s, v25.4s
-    eor v14.16b, v14.16b, v3.16b
-    shl v16.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v16.16b
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v16.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v16.16b
-    // --- Round 3 ---
-    // G(0,4,8,12, mx=ZERO/sched[0]=10, my=v31/sched[1]=7)
-    add v0.4s, v0.4s, v4.4s
-    eor v12.16b, v12.16b, v0.16b
-    rev32 v12.8h, v12.8h
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v16.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v16.16b
-    add v0.4s, v0.4s, v4.4s
-    add v0.4s, v0.4s, v31.4s
-    eor v12.16b, v12.16b, v0.16b
-    shl v16.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v16.16b
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v16.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v16.16b
-    // G(1,5,9,13, mx=ZERO/sched[2]=12, my=ZERO/sched[3]=9)
-    add v1.4s, v1.4s, v5.4s
-    eor v13.16b, v13.16b, v1.16b
-    rev32 v13.8h, v13.8h
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v16.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v16.16b
-    add v1.4s, v1.4s, v5.4s
-    eor v13.16b, v13.16b, v1.16b
-    shl v16.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v16.16b
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v16.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v16.16b
-    // G(2,6,10,14, mx=ZERO/sched[4]=14, my=v27/sched[5]=3)
-    add v2.4s, v2.4s, v6.4s
-    eor v14.16b, v14.16b, v2.16b
-    rev32 v14.8h, v14.8h
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v16.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v16.16b
-    add v2.4s, v2.4s, v6.4s
-    add v2.4s, v2.4s, v27.4s
-    eor v14.16b, v14.16b, v2.16b
-    shl v16.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v16.16b
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v16.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v16.16b
-    // G(3,7,11,15, mx=ZERO/sched[6]=13, my=ZERO/sched[7]=15)
-    add v3.4s, v3.4s, v7.4s
-    eor v15.16b, v15.16b, v3.16b
-    rev32 v15.8h, v15.8h
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v16.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v16.16b
-    add v3.4s, v3.4s, v7.4s
-    eor v15.16b, v15.16b, v3.16b
-    shl v16.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v16.16b
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v16.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v16.16b
-    // G(0,5,10,15, mx=v28/sched[8]=4, my=v24/sched[9]=0)
-    add v0.4s, v0.4s, v5.4s
-    add v0.4s, v0.4s, v28.4s
-    eor v15.16b, v15.16b, v0.16b
-    rev32 v15.8h, v15.8h
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v16.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v16.16b
-    add v0.4s, v0.4s, v5.4s
-    add v0.4s, v0.4s, v24.4s
-    eor v15.16b, v15.16b, v0.16b
-    shl v16.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v16.16b
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v16.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v16.16b
-    // G(1,6,11,12, mx=ZERO/sched[10]=11, my=v26/sched[11]=2)
-    add v1.4s, v1.4s, v6.4s
-    eor v12.16b, v12.16b, v1.16b
-    rev32 v12.8h, v12.8h
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v16.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v16.16b
-    add v1.4s, v1.4s, v6.4s
-    add v1.4s, v1.4s, v26.4s
-    eor v12.16b, v12.16b, v1.16b
-    shl v16.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v16.16b
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v16.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v16.16b
-    // G(2,7,8,13, mx=v29/sched[12]=5, my=ZERO/sched[13]=8)
-    add v2.4s, v2.4s, v7.4s
-    add v2.4s, v2.4s, v29.4s
-    eor v13.16b, v13.16b, v2.16b
-    rev32 v13.8h, v13.8h
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v16.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v16.16b
-    add v2.4s, v2.4s, v7.4s
-    eor v13.16b, v13.16b, v2.16b
-    shl v16.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v16.16b
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v16.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v16.16b
-    // G(3,4,9,14, mx=v25/sched[14]=1, my=v30/sched[15]=6)
-    add v3.4s, v3.4s, v4.4s
-    add v3.4s, v3.4s, v25.4s
-    eor v14.16b, v14.16b, v3.16b
-    rev32 v14.8h, v14.8h
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v16.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v16.16b
-    add v3.4s, v3.4s, v4.4s
-    add v3.4s, v3.4s, v30.4s
-    eor v14.16b, v14.16b, v3.16b
-    shl v16.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v16.16b
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v16.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v16.16b
-    // --- Round 4 ---
-    // G(0,4,8,12, mx=ZERO/sched[0]=12, my=ZERO/sched[1]=13)
-    add v0.4s, v0.4s, v4.4s
-    eor v12.16b, v12.16b, v0.16b
-    rev32 v12.8h, v12.8h
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v16.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v16.16b
-    add v0.4s, v0.4s, v4.4s
-    eor v12.16b, v12.16b, v0.16b
-    shl v16.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v16.16b
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v16.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v16.16b
-    // G(1,5,9,13, mx=ZERO/sched[2]=9, my=ZERO/sched[3]=11)
-    add v1.4s, v1.4s, v5.4s
-    eor v13.16b, v13.16b, v1.16b
-    rev32 v13.8h, v13.8h
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v16.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v16.16b
-    add v1.4s, v1.4s, v5.4s
-    eor v13.16b, v13.16b, v1.16b
-    shl v16.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v16.16b
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v16.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v16.16b
-    // G(2,6,10,14, mx=ZERO/sched[4]=15, my=ZERO/sched[5]=10)
-    add v2.4s, v2.4s, v6.4s
-    eor v14.16b, v14.16b, v2.16b
-    rev32 v14.8h, v14.8h
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v16.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v16.16b
-    add v2.4s, v2.4s, v6.4s
-    eor v14.16b, v14.16b, v2.16b
-    shl v16.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v16.16b
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v16.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v16.16b
-    // G(3,7,11,15, mx=ZERO/sched[6]=14, my=ZERO/sched[7]=8)
-    add v3.4s, v3.4s, v7.4s
-    eor v15.16b, v15.16b, v3.16b
-    rev32 v15.8h, v15.8h
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v16.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v16.16b
-    add v3.4s, v3.4s, v7.4s
-    eor v15.16b, v15.16b, v3.16b
-    shl v16.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v16.16b
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v16.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v16.16b
-    // G(0,5,10,15, mx=v31/sched[8]=7, my=v26/sched[9]=2)
-    add v0.4s, v0.4s, v5.4s
-    add v0.4s, v0.4s, v31.4s
-    eor v15.16b, v15.16b, v0.16b
-    rev32 v15.8h, v15.8h
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v16.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v16.16b
-    add v0.4s, v0.4s, v5.4s
-    add v0.4s, v0.4s, v26.4s
-    eor v15.16b, v15.16b, v0.16b
-    shl v16.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v16.16b
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v16.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v16.16b
-    // G(1,6,11,12, mx=v29/sched[10]=5, my=v27/sched[11]=3)
-    add v1.4s, v1.4s, v6.4s
-    add v1.4s, v1.4s, v29.4s
-    eor v12.16b, v12.16b, v1.16b
-    rev32 v12.8h, v12.8h
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v16.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v16.16b
-    add v1.4s, v1.4s, v6.4s
-    add v1.4s, v1.4s, v27.4s
-    eor v12.16b, v12.16b, v1.16b
-    shl v16.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v16.16b
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v16.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v16.16b
-    // G(2,7,8,13, mx=v24/sched[12]=0, my=v25/sched[13]=1)
-    add v2.4s, v2.4s, v7.4s
-    add v2.4s, v2.4s, v24.4s
-    eor v13.16b, v13.16b, v2.16b
-    rev32 v13.8h, v13.8h
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v16.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v16.16b
-    add v2.4s, v2.4s, v7.4s
-    add v2.4s, v2.4s, v25.4s
-    eor v13.16b, v13.16b, v2.16b
-    shl v16.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v16.16b
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v16.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v16.16b
-    // G(3,4,9,14, mx=v30/sched[14]=6, my=v28/sched[15]=4)
-    add v3.4s, v3.4s, v4.4s
-    add v3.4s, v3.4s, v30.4s
-    eor v14.16b, v14.16b, v3.16b
-    rev32 v14.8h, v14.8h
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v16.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v16.16b
-    add v3.4s, v3.4s, v4.4s
-    add v3.4s, v3.4s, v28.4s
-    eor v14.16b, v14.16b, v3.16b
-    shl v16.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v16.16b
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v16.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v16.16b
-    // --- Round 5 ---
-    // G(0,4,8,12, mx=ZERO/sched[0]=9, my=ZERO/sched[1]=14)
-    add v0.4s, v0.4s, v4.4s
-    eor v12.16b, v12.16b, v0.16b
-    rev32 v12.8h, v12.8h
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v16.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v16.16b
-    add v0.4s, v0.4s, v4.4s
-    eor v12.16b, v12.16b, v0.16b
-    shl v16.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v16.16b
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v16.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v16.16b
-    // G(1,5,9,13, mx=ZERO/sched[2]=11, my=v29/sched[3]=5)
-    add v1.4s, v1.4s, v5.4s
-    eor v13.16b, v13.16b, v1.16b
-    rev32 v13.8h, v13.8h
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v16.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v16.16b
-    add v1.4s, v1.4s, v5.4s
-    add v1.4s, v1.4s, v29.4s
-    eor v13.16b, v13.16b, v1.16b
-    shl v16.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v16.16b
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v16.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v16.16b
-    // G(2,6,10,14, mx=ZERO/sched[4]=8, my=ZERO/sched[5]=12)
-    add v2.4s, v2.4s, v6.4s
-    eor v14.16b, v14.16b, v2.16b
-    rev32 v14.8h, v14.8h
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v16.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v16.16b
-    add v2.4s, v2.4s, v6.4s
-    eor v14.16b, v14.16b, v2.16b
-    shl v16.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v16.16b
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v16.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v16.16b
-    // G(3,7,11,15, mx=ZERO/sched[6]=15, my=v25/sched[7]=1)
-    add v3.4s, v3.4s, v7.4s
-    eor v15.16b, v15.16b, v3.16b
-    rev32 v15.8h, v15.8h
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v16.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v16.16b
-    add v3.4s, v3.4s, v7.4s
-    add v3.4s, v3.4s, v25.4s
-    eor v15.16b, v15.16b, v3.16b
-    shl v16.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v16.16b
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v16.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v16.16b
-    // G(0,5,10,15, mx=ZERO/sched[8]=13, my=v27/sched[9]=3)
-    add v0.4s, v0.4s, v5.4s
-    eor v15.16b, v15.16b, v0.16b
-    rev32 v15.8h, v15.8h
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v16.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v16.16b
-    add v0.4s, v0.4s, v5.4s
-    add v0.4s, v0.4s, v27.4s
-    eor v15.16b, v15.16b, v0.16b
-    shl v16.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v16.16b
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v16.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v16.16b
-    // G(1,6,11,12, mx=v24/sched[10]=0, my=ZERO/sched[11]=10)
-    add v1.4s, v1.4s, v6.4s
-    add v1.4s, v1.4s, v24.4s
-    eor v12.16b, v12.16b, v1.16b
-    rev32 v12.8h, v12.8h
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v16.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v16.16b
-    add v1.4s, v1.4s, v6.4s
-    eor v12.16b, v12.16b, v1.16b
-    shl v16.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v16.16b
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v16.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v16.16b
-    // G(2,7,8,13, mx=v26/sched[12]=2, my=v30/sched[13]=6)
-    add v2.4s, v2.4s, v7.4s
-    add v2.4s, v2.4s, v26.4s
-    eor v13.16b, v13.16b, v2.16b
-    rev32 v13.8h, v13.8h
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v16.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v16.16b
-    add v2.4s, v2.4s, v7.4s
-    add v2.4s, v2.4s, v30.4s
-    eor v13.16b, v13.16b, v2.16b
-    shl v16.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v16.16b
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v16.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v16.16b
-    // G(3,4,9,14, mx=v28/sched[14]=4, my=v31/sched[15]=7)
-    add v3.4s, v3.4s, v4.4s
-    add v3.4s, v3.4s, v28.4s
-    eor v14.16b, v14.16b, v3.16b
-    rev32 v14.8h, v14.8h
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v16.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v16.16b
-    add v3.4s, v3.4s, v4.4s
-    add v3.4s, v3.4s, v31.4s
-    eor v14.16b, v14.16b, v3.16b
-    shl v16.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v16.16b
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v16.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v16.16b
-    // --- Round 6 ---
-    // G(0,4,8,12, mx=ZERO/sched[0]=11, my=ZERO/sched[1]=15)
-    add v0.4s, v0.4s, v4.4s
-    eor v12.16b, v12.16b, v0.16b
-    rev32 v12.8h, v12.8h
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v16.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v16.16b
-    add v0.4s, v0.4s, v4.4s
-    eor v12.16b, v12.16b, v0.16b
-    shl v16.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v16.16b
-    add v8.4s, v8.4s, v12.4s
-    eor v4.16b, v4.16b, v8.16b
-    shl v16.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v16.16b
-    // G(1,5,9,13, mx=v29/sched[2]=5, my=v24/sched[3]=0)
-    add v1.4s, v1.4s, v5.4s
-    add v1.4s, v1.4s, v29.4s
-    eor v13.16b, v13.16b, v1.16b
-    rev32 v13.8h, v13.8h
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v16.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v16.16b
-    add v1.4s, v1.4s, v5.4s
-    add v1.4s, v1.4s, v24.4s
-    eor v13.16b, v13.16b, v1.16b
-    shl v16.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v16.16b
-    add v9.4s, v9.4s, v13.4s
-    eor v5.16b, v5.16b, v9.16b
-    shl v16.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v16.16b
-    // G(2,6,10,14, mx=v25/sched[4]=1, my=ZERO/sched[5]=9)
-    add v2.4s, v2.4s, v6.4s
-    add v2.4s, v2.4s, v25.4s
-    eor v14.16b, v14.16b, v2.16b
-    rev32 v14.8h, v14.8h
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v16.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v16.16b
-    add v2.4s, v2.4s, v6.4s
-    eor v14.16b, v14.16b, v2.16b
-    shl v16.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v16.16b
-    add v10.4s, v10.4s, v14.4s
-    eor v6.16b, v6.16b, v10.16b
-    shl v16.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v16.16b
-    // G(3,7,11,15, mx=ZERO/sched[6]=8, my=v30/sched[7]=6)
-    add v3.4s, v3.4s, v7.4s
-    eor v15.16b, v15.16b, v3.16b
-    rev32 v15.8h, v15.8h
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v16.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v16.16b
-    add v3.4s, v3.4s, v7.4s
-    add v3.4s, v3.4s, v30.4s
-    eor v15.16b, v15.16b, v3.16b
-    shl v16.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v16.16b
-    add v11.4s, v11.4s, v15.4s
-    eor v7.16b, v7.16b, v11.16b
-    shl v16.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v16.16b
-    // G(0,5,10,15, mx=ZERO/sched[8]=14, my=ZERO/sched[9]=10)
-    add v0.4s, v0.4s, v5.4s
-    eor v15.16b, v15.16b, v0.16b
-    rev32 v15.8h, v15.8h
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v16.4s, v5.4s, #20
-    ushr v5.4s, v5.4s, #12
-    orr v5.16b, v5.16b, v16.16b
-    add v0.4s, v0.4s, v5.4s
-    eor v15.16b, v15.16b, v0.16b
-    shl v16.4s, v15.4s, #24
-    ushr v15.4s, v15.4s, #8
-    orr v15.16b, v15.16b, v16.16b
-    add v10.4s, v10.4s, v15.4s
-    eor v5.16b, v5.16b, v10.16b
-    shl v16.4s, v5.4s, #25
-    ushr v5.4s, v5.4s, #7
-    orr v5.16b, v5.16b, v16.16b
-    // G(1,6,11,12, mx=v26/sched[10]=2, my=ZERO/sched[11]=12)
-    add v1.4s, v1.4s, v6.4s
-    add v1.4s, v1.4s, v26.4s
-    eor v12.16b, v12.16b, v1.16b
-    rev32 v12.8h, v12.8h
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v16.4s, v6.4s, #20
-    ushr v6.4s, v6.4s, #12
-    orr v6.16b, v6.16b, v16.16b
-    add v1.4s, v1.4s, v6.4s
-    eor v12.16b, v12.16b, v1.16b
-    shl v16.4s, v12.4s, #24
-    ushr v12.4s, v12.4s, #8
-    orr v12.16b, v12.16b, v16.16b
-    add v11.4s, v11.4s, v12.4s
-    eor v6.16b, v6.16b, v11.16b
-    shl v16.4s, v6.4s, #25
-    ushr v6.4s, v6.4s, #7
-    orr v6.16b, v6.16b, v16.16b
-    // G(2,7,8,13, mx=v27/sched[12]=3, my=v28/sched[13]=4)
-    add v2.4s, v2.4s, v7.4s
-    add v2.4s, v2.4s, v27.4s
-    eor v13.16b, v13.16b, v2.16b
-    rev32 v13.8h, v13.8h
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v16.4s, v7.4s, #20
-    ushr v7.4s, v7.4s, #12
-    orr v7.16b, v7.16b, v16.16b
-    add v2.4s, v2.4s, v7.4s
-    add v2.4s, v2.4s, v28.4s
-    eor v13.16b, v13.16b, v2.16b
-    shl v16.4s, v13.4s, #24
-    ushr v13.4s, v13.4s, #8
-    orr v13.16b, v13.16b, v16.16b
-    add v8.4s, v8.4s, v13.4s
-    eor v7.16b, v7.16b, v8.16b
-    shl v16.4s, v7.4s, #25
-    ushr v7.4s, v7.4s, #7
-    orr v7.16b, v7.16b, v16.16b
-    // G(3,4,9,14, mx=v31/sched[14]=7, my=ZERO/sched[15]=13)
-    add v3.4s, v3.4s, v4.4s
-    add v3.4s, v3.4s, v31.4s
-    eor v14.16b, v14.16b, v3.16b
-    rev32 v14.8h, v14.8h
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v16.4s, v4.4s, #20
-    ushr v4.4s, v4.4s, #12
-    orr v4.16b, v4.16b, v16.16b
-    add v3.4s, v3.4s, v4.4s
-    eor v14.16b, v14.16b, v3.16b
-    shl v16.4s, v14.4s, #24
-    ushr v14.4s, v14.4s, #8
-    orr v14.16b, v14.16b, v16.16b
-    add v9.4s, v9.4s, v14.4s
-    eor v4.16b, v4.16b, v9.16b
-    shl v16.4s, v4.4s, #25
-    ushr v4.4s, v4.4s, #7
-    orr v4.16b, v4.16b, v16.16b
-    // finalise: new chaining words = v[i] ^ v[i+8]
-    eor v24.16b, v0.16b, v8.16b
-    eor v25.16b, v1.16b, v9.16b
-    eor v26.16b, v2.16b, v10.16b
-    eor v27.16b, v3.16b, v11.16b
-    eor v28.16b, v4.16b, v12.16b
-    eor v29.16b, v5.16b, v13.16b
-    eor v30.16b, v6.16b, v14.16b
-    eor v31.16b, v7.16b, v15.16b
-    // Restore v16 (a0) for next iteration
-    ldr q16, [sp, #0]
-    // Loop close
-    subs x3, x3, #1
-    b.ne .Liter_loop
-    // epilogue: write back final chaining words
-    stp q16, q17, [x4]
-    stp q18, q19, [x4, #32]
-    stp q20, q21, [x4, #64]
-    stp q22, q23, [x4, #96]
-    stp q24, q25, [x5]
-    stp q26, q27, [x5, #32]
-    stp q28, q29, [x5, #64]
-    stp q30, q31, [x5, #96]
-    // Restore callee-saved
-    ldp d8, d9,   [sp, #80]
-    ldp d10, d11, [sp, #96]
-    ldp d12, d13, [sp, #112]
-    ldp d14, d15, [sp, #128]
-    add sp, sp, #144
-    ret
-    .size iterated_4way_x2_asm, .-iterated_4way_x2_asm
-"#);
-
-    extern "C" {
-        /// Generated assembly entry point. See the contract documented above.
-        fn iterated_4way_x2_asm(
-            cv: *const uint32x4_t,
-            initial_a: *const uint32x4_t,
-            initial_b: *const uint32x4_t,
-            iterations: u64,
-            out_a: *mut uint32x4_t,
-            out_b: *mut uint32x4_t,
-        );
+    /// BLAKE3 `G` mixing function over **two interleaved 4-way streams**.
+    ///
+    /// Each pair of NEON ops (`va` line then `vb` line) is data-independent,
+    /// allowing dual-issue cores (A75+, Neoverse, Apple M-series, Pi 5's A76)
+    /// to dispatch them on separate ASIMD pipes in the same cycle.
+    ///
+    /// # Formal specification
+    ///
+    /// Let `G_4way(v, a, b, c, d, mx, my)` denote the single-stream `G`
+    /// function defined above. Then `g_x2` satisfies, for all valid inputs:
+    ///
+    /// ```text
+    /// g_x2(va, vb, a, b, c, d, mxa, mya, mxb, myb) ≡
+    ///     ( G_4way(va, a, b, c, d, mxa, mya)
+    ///     ‖ G_4way(vb, a, b, c, d, mxb, myb) )
+    /// ```
+    ///
+    /// where `‖` denotes independent parallel composition (no inter-stream
+    /// data flow). Streams `va` and `vb` therefore evolve identically to
+    /// two independent calls to `g`.
+    #[inline(always)]
+    unsafe fn g_x2(
+        va: &mut [uint32x4_t; 16], vb: &mut [uint32x4_t; 16],
+        a: usize, b: usize, c: usize, d: usize,
+        mxa: uint32x4_t, mya: uint32x4_t,
+        mxb: uint32x4_t, myb: uint32x4_t,
+    ) {
+        va[a] = vaddq_u32(vaddq_u32(va[a], va[b]), mxa);
+        vb[a] = vaddq_u32(vaddq_u32(vb[a], vb[b]), mxb);
+        va[d] = vrot16(veorq_u32(va[d], va[a]));
+        vb[d] = vrot16(veorq_u32(vb[d], vb[a]));
+        va[c] = vaddq_u32(va[c], va[d]);
+        vb[c] = vaddq_u32(vb[c], vb[d]);
+        va[b] = vrot12(veorq_u32(va[b], va[c]));
+        vb[b] = vrot12(veorq_u32(vb[b], vb[c]));
+        va[a] = vaddq_u32(vaddq_u32(va[a], va[b]), mya);
+        vb[a] = vaddq_u32(vaddq_u32(vb[a], vb[b]), myb);
+        va[d] = vrot8(veorq_u32(va[d], va[a]));
+        vb[d] = vrot8(veorq_u32(vb[d], vb[a]));
+        va[c] = vaddq_u32(va[c], va[d]);
+        vb[c] = vaddq_u32(vb[c], vb[d]);
+        va[b] = vrot7(veorq_u32(va[b], va[c]));
+        vb[b] = vrot7(veorq_u32(vb[b], vb[c]));
     }
 
-    /// Iterated hashing loop, 8-way, hand-written aarch64 assembly.
-    ///
-    /// Thin Rust wrapper around the global_asm! routine. Materialises the
-    /// inputs to stack arrays, calls the asm, materialises outputs.
+    /// One full BLAKE3 round over two interleaved 4-way streams.
     ///
     /// # Formal specification
     ///
     /// ```text
-    /// iterated_4way_x2 :
-    ///     (cv: WORD_4^8, ha₀, hb₀: WORD_4^8, k: ℕ)
-    ///     → (WORD_4^8 × WORD_4^8)
+    /// round_x2(va, vb, ma, mb, s) ≡
+    ///     ( round(va, ma, s) ‖ round(vb, mb, s) )
+    /// ```
+    #[inline(always)]
+    unsafe fn round_x2(
+        va: &mut [uint32x4_t; 16], vb: &mut [uint32x4_t; 16],
+        ma: &[uint32x4_t; 16], mb: &[uint32x4_t; 16],
+        s: &[usize; 16],
+    ) {
+        g_x2(va, vb, 0, 4,  8, 12, ma[s[0]],  ma[s[1]],  mb[s[0]],  mb[s[1]]);
+        g_x2(va, vb, 1, 5,  9, 13, ma[s[2]],  ma[s[3]],  mb[s[2]],  mb[s[3]]);
+        g_x2(va, vb, 2, 6, 10, 14, ma[s[4]],  ma[s[5]],  mb[s[4]],  mb[s[5]]);
+        g_x2(va, vb, 3, 7, 11, 15, ma[s[6]],  ma[s[7]],  mb[s[6]],  mb[s[7]]);
+        g_x2(va, vb, 0, 5, 10, 15, ma[s[8]],  ma[s[9]],  mb[s[8]],  mb[s[9]]);
+        g_x2(va, vb, 1, 6, 11, 12, ma[s[10]], ma[s[11]], mb[s[10]], mb[s[11]]);
+        g_x2(va, vb, 2, 7,  8, 13, ma[s[12]], ma[s[13]], mb[s[12]], mb[s[13]]);
+        g_x2(va, vb, 3, 4,  9, 14, ma[s[14]], ma[s[15]], mb[s[14]], mb[s[15]]);
+    }
+
+    /// Two parallel 4-way BLAKE3 compressions, interleaved for dual-issue.
     ///
-    /// post: let (a, b) = iterated_4way_x2(cv, ha₀, hb₀, k) in
-    ///         a = iterated_4way(cv, ha₀, k)  ∧
-    ///         b = iterated_4way(cv, hb₀, k)
+    /// Register pressure: 32 × `uint32x4_t` exceeds the 32 NEON registers, so
+    /// the compiler will spill. That's expected — spills become L1 loads that
+    /// the OoO core hides behind the dual-issued ALU work. Net throughput on
+    /// A76 is ~1.8–2.0× a single `compress_4way` call.
+    ///
+    /// # Formal specification
+    ///
+    /// ```text
+    /// compress_4way_x2(cv, msg_a, msg_b, block_len) =
+    ///     ( compress_4way(cv, msg_a, block_len)
+    ///     , compress_4way(cv, msg_b, block_len) )
     /// ```
     ///
-    /// # Safety
-    ///
-    /// The four input/output arrays are stack-allocated `[uint32x4_t; 8]`
-    /// which is exactly 128 bytes each, satisfying the asm routine's
-    /// pre-conditions on pointer validity and buffer size.
-    #[inline(never)]
-    unsafe fn iterated_4way_x2(
+    /// **Pre:** all arrays well-formed.
+    /// **Post:** returned tuple `(out_a, out_b)` satisfies
+    /// `out_a = compress_4way(cv, msg_a, block_len)` and
+    /// `out_b = compress_4way(cv, msg_b, block_len)`.
+    #[inline(always)]
+    unsafe fn compress_4way_x2(
         cv: &[uint32x4_t; 8],
-        initial_a: [uint32x4_t; 8],
-        initial_b: [uint32x4_t; 8],
-        iterations: u64,
+        msg_a: &[uint32x4_t; 16], msg_b: &[uint32x4_t; 16],
+        block_len: u32,
     ) -> ([uint32x4_t; 8], [uint32x4_t; 8]) {
-        // If iterations == 0, the asm would loop forever (it uses `subs;b.ne`
-        // and assumes count ≥ 1). Return the initial values unchanged.
-        if iterations == 0 {
-            return (initial_a, initial_b);
+        let zero = vdupq_n_u32(0);
+        let mut va: [uint32x4_t; 16] = [zero; 16];
+        let mut vb: [uint32x4_t; 16] = [zero; 16];
+
+        // Initialise both streams identically from cv + IV + counter + block_len + flags.
+        va[0] = cv[0]; vb[0] = cv[0];
+        va[1] = cv[1]; vb[1] = cv[1];
+        va[2] = cv[2]; vb[2] = cv[2];
+        va[3] = cv[3]; vb[3] = cv[3];
+        va[4] = cv[4]; vb[4] = cv[4];
+        va[5] = cv[5]; vb[5] = cv[5];
+        va[6] = cv[6]; vb[6] = cv[6];
+        va[7] = cv[7]; vb[7] = cv[7];
+
+        va[8]  = vdupq_n_u32(IV[0]); vb[8]  = vdupq_n_u32(IV[0]);
+        va[9]  = vdupq_n_u32(IV[1]); vb[9]  = vdupq_n_u32(IV[1]);
+        va[10] = vdupq_n_u32(IV[2]); vb[10] = vdupq_n_u32(IV[2]);
+        va[11] = vdupq_n_u32(IV[3]); vb[11] = vdupq_n_u32(IV[3]);
+        // va[12], va[13], vb[12], vb[13] already zero from init.
+        va[14] = vdupq_n_u32(block_len); vb[14] = vdupq_n_u32(block_len);
+        va[15] = vdupq_n_u32(HASH_FLAGS); vb[15] = vdupq_n_u32(HASH_FLAGS);
+
+        for r in 0..7 {
+            round_x2(&mut va, &mut vb, msg_a, msg_b, &MSG_SCHEDULE[r]);
         }
 
-        let zero = vdupq_n_u32(0);
-        let mut out_a: [uint32x4_t; 8] = [zero; 8];
-        let mut out_b: [uint32x4_t; 8] = [zero; 8];
-
-        iterated_4way_x2_asm(
-            cv.as_ptr(),
-            initial_a.as_ptr(),
-            initial_b.as_ptr(),
-            iterations,
-            out_a.as_mut_ptr(),
-            out_b.as_mut_ptr(),
-        );
-
+        let out_a = [
+            veorq_u32(va[0], va[8]),  veorq_u32(va[1], va[9]),
+            veorq_u32(va[2], va[10]), veorq_u32(va[3], va[11]),
+            veorq_u32(va[4], va[12]), veorq_u32(va[5], va[13]),
+            veorq_u32(va[6], va[14]), veorq_u32(va[7], va[15]),
+        ];
+        let out_b = [
+            veorq_u32(vb[0], vb[8]),  veorq_u32(vb[1], vb[9]),
+            veorq_u32(vb[2], vb[10]), veorq_u32(vb[3], vb[11]),
+            veorq_u32(vb[4], vb[12]), veorq_u32(vb[5], vb[13]),
+            veorq_u32(vb[6], vb[14]), veorq_u32(vb[7], vb[15]),
+        ];
         (out_a, out_b)
     }
 
     /// Mines 8 independent nonces in parallel via two interleaved 4-way NEON
-    /// streams, fully unrolled, exploiting dual-issue ASIMD on A75+ cores
-    /// (Pi 5's A76).
+    /// streams, exploiting dual-issue ASIMD on A75+ cores (Pi 5 is A76).
     ///
     /// Output is **bit-identical** to running [`create_extensions_4way_neon`]
     /// twice with nonces `[0..4]` and `[4..8]` — only the instruction schedule
@@ -3340,10 +881,13 @@ mod neon {
     ///
     /// # Formal specification
     ///
-    /// ```text
-    /// create_extensions_8way_neon :
-    ///     BYTE^32 × NONCE^8 → (NONCE × BYTE^32)^8
+    /// Let `Φ_4 = create_extensions_4way_neon` and `Φ_8 = create_extensions_8way_neon`.
+    /// Then:
     ///
+    /// ```text
+    /// Φ_8 : BYTE^32 × NONCE^8 → (NONCE × BYTE^32)^8
+    ///
+    /// pre:   true
     /// post:  ∀ i ∈ 0..7 .
     ///            result(i).0 = nonces(i)  ∧
     ///            result(i).1 = Scalar(midstate, nonces(i))
@@ -3353,9 +897,9 @@ mod neon {
     ///
     /// ```text
     /// ∀ M ∈ BYTE^32 . ∀ N ∈ NONCE^8 .
-    ///     let R_lo = create_extensions_4way_neon(M, ⟨N(0..3)⟩) in
-    ///     let R_hi = create_extensions_4way_neon(M, ⟨N(4..7)⟩) in
-    ///     let R_8  = create_extensions_8way_neon(M, N) in
+    ///     let R_lo = Φ_4(M, ⟨N(0), N(1), N(2), N(3)⟩) in
+    ///     let R_hi = Φ_4(M, ⟨N(4), N(5), N(6), N(7)⟩) in
+    ///     let R_8  = Φ_8(M, N) in
     ///         ( ∀ i ∈ 0..3 . R_8(i)     = R_lo(i) )  ∧
     ///         ( ∀ i ∈ 0..3 . R_8(i + 4) = R_hi(i) )
     /// ```
@@ -3366,7 +910,9 @@ mod neon {
     ///
     /// # Safety
     ///
-    /// NEON is mandatory on `aarch64`.
+    /// NEON is mandatory on `aarch64`, so this is always safe to call on that
+    /// target regardless of which microarchitecture is hosting it. The
+    /// `unsafe` marker is required because it calls NEON intrinsics.
     pub unsafe fn create_extensions_8way_neon(
         midstate: [u8; 32], nonces: [u64; 8],
     ) -> [(u64, [u8; 32]); 8] {
@@ -3408,14 +954,20 @@ mod neon {
         msg_b[8] = vld1q_u32(nonce_lo_b.as_ptr());
         msg_b[9] = vld1q_u32(nonce_hi_b.as_ptr());
 
-        // Initial 40-byte compressions, generic path.
-        let initial_a = compress_4way(&cv, &msg_a, 40);
-        let initial_b = compress_4way(&cv, &msg_b, 40);
+        let (mut hw_a, mut hw_b) = compress_4way_x2(&cv, &msg_a, &msg_b, 40);
 
-        // Unrolled interleaved iterated phase.
-        let (hw_a, hw_b) = iterated_4way_x2(
-            &cv, initial_a, initial_b, EXTENSION_ITERATIONS as u64,
-        );
+        for _ in 0..EXTENSION_ITERATIONS {
+            msg_a[0] = hw_a[0]; msg_a[1] = hw_a[1]; msg_a[2] = hw_a[2]; msg_a[3] = hw_a[3];
+            msg_a[4] = hw_a[4]; msg_a[5] = hw_a[5]; msg_a[6] = hw_a[6]; msg_a[7] = hw_a[7];
+            msg_b[0] = hw_b[0]; msg_b[1] = hw_b[1]; msg_b[2] = hw_b[2]; msg_b[3] = hw_b[3];
+            msg_b[4] = hw_b[4]; msg_b[5] = hw_b[5]; msg_b[6] = hw_b[6]; msg_b[7] = hw_b[7];
+            msg_a[8] = zero; msg_a[9] = zero;
+            msg_b[8] = zero; msg_b[9] = zero;
+            // msg_a[10..16] and msg_b[10..16] remain zero from init.
+            let (a, b) = compress_4way_x2(&cv, &msg_a, &msg_b, 32);
+            hw_a = a;
+            hw_b = b;
+        }
 
         [
             (nonces[0], extract_hash(&hw_a, 0)),
@@ -3431,7 +983,7 @@ mod neon {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  AVX2 8-way (x86_64) — unchanged
+//  AVX2 8-way (x86_64)
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(target_arch = "x86_64")]
@@ -3439,6 +991,7 @@ mod avx2 {
     use super::*;
     use core::arch::x86_64::*;
 
+    /// Rotates each 32-bit lane right by 16 bits using a byte-shuffle (faster than shift+or on AVX2).
     #[inline(always)]
     unsafe fn vrot16(x: __m256i) -> __m256i {
         let mask = _mm256_set_epi8(
@@ -3447,10 +1000,12 @@ mod avx2 {
         );
         _mm256_shuffle_epi8(x, mask)
     }
+    /// Rotates each 32-bit lane right by 12 bits.
     #[inline(always)]
     unsafe fn vrot12(x: __m256i) -> __m256i {
         _mm256_or_si256(_mm256_srli_epi32::<12>(x), _mm256_slli_epi32::<20>(x))
     }
+    /// Rotates each 32-bit lane right by 8 bits using a byte-shuffle.
     #[inline(always)]
     unsafe fn vrot8(x: __m256i) -> __m256i {
         let mask = _mm256_set_epi8(
@@ -3459,11 +1014,13 @@ mod avx2 {
         );
         _mm256_shuffle_epi8(x, mask)
     }
+    /// Rotates each 32-bit lane right by 7 bits.
     #[inline(always)]
     unsafe fn vrot7(x: __m256i) -> __m256i {
         _mm256_or_si256(_mm256_srli_epi32::<7>(x), _mm256_slli_epi32::<25>(x))
     }
 
+    /// BLAKE3 `G` mixing function over 8 interleaved AVX2 lanes simultaneously.
     #[inline(always)]
     unsafe fn g(
         v: &mut [__m256i; 16], a: usize, b: usize, c: usize, d: usize,
@@ -3479,6 +1036,7 @@ mod avx2 {
         v[b] = vrot7(_mm256_xor_si256(v[b], v[c]));
     }
 
+    /// Applies one full BLAKE3 round (4 column + 4 diagonal `G` calls).
     #[inline(always)]
     unsafe fn round(v: &mut [__m256i; 16], m: &[__m256i; 16], s: &[usize; 16]) {
         g(v, 0, 4,  8, 12, m[s[0]],  m[s[1]]);
@@ -3491,6 +1049,7 @@ mod avx2 {
         g(v, 3, 4,  9, 14, m[s[14]], m[s[15]]);
     }
 
+    /// Performs one BLAKE3 compression over 8 independent chains in parallel using AVX2.
     #[target_feature(enable = "avx2")]
     unsafe fn compress_8way(
         cv: &[__m256i; 8], msg: &[__m256i; 16], block_len: u32,
@@ -3513,6 +1072,7 @@ mod avx2 {
         ]
     }
 
+    /// Extracts the 32-byte hash for a single `lane` (0–7) from the transposed output.
     unsafe fn extract_hash(out: &[__m256i; 8], lane: usize) -> [u8; 32] {
         let mut result = [0u8; 32];
         let mut buf = [0i32; 8];
@@ -3538,6 +1098,12 @@ mod avx2 {
     ///
     /// **Pre:** AVX2 available on the host CPU.
     /// **Post:** each lane's hash equals the scalar reference.
+    ///
+    /// # Safety
+    ///
+    /// Must only be called when AVX2 is available. The `#[target_feature(enable = "avx2")]`
+    /// attribute enforces this at codegen, and [`mine_batch`] only reaches this
+    /// function after a positive runtime `is_x86_feature_detected!("avx2")` check.
     #[target_feature(enable = "avx2")]
     pub unsafe fn create_extensions_8way_avx2(
         midstate: [u8; 32], nonces: [u64; 8],
@@ -3606,6 +1172,7 @@ mod tests {
 
     // ── Detection ────────────────────────────────────────────────────────
 
+    /// Verifies that detection returns a valid level with at least 4 lanes.
     #[test]
     fn detect_returns_valid_level() {
         let level = detect();
@@ -3613,6 +1180,7 @@ mod tests {
         println!("Detected SIMD level: {} ({} lanes)", level.name(), level.lanes());
     }
 
+    /// Verifies that `detected_level` returns a stable, cached result.
     #[test]
     fn detected_level_is_stable() {
         let a = detected_level();
@@ -3622,6 +1190,7 @@ mod tests {
 
     // ── mine_batch ───────────────────────────────────────────────────────
 
+    /// Core correctness: every lane from `mine_batch` must match the scalar reference.
     #[test]
     fn mine_batch_matches_scalar() {
         let midstate = hash(b"batch test");
@@ -3633,6 +1202,7 @@ mod tests {
         }
     }
 
+    /// Verifies that all lanes produce distinct hashes (different nonces → different results).
     #[test]
     fn mine_batch_all_lanes_differ() {
         let midstate = hash(b"lane uniqueness");
@@ -3646,6 +1216,7 @@ mod tests {
         }
     }
 
+    /// Verifies that `mine_batch` correctly returns the nonces it was given.
     #[test]
     fn mine_batch_preserves_nonces() {
         let midstate = hash(b"nonce echo");
@@ -3657,10 +1228,11 @@ mod tests {
         }
     }
 
+    /// Verifies mine_batch with large nonce values (exercises high 32-bit half of u64 split).
     #[test]
     fn mine_batch_large_nonces() {
         let midstate = hash(b"large nonce test");
-        let base: u64 = (1u64 << 33) + 7;
+        let base: u64 = (1u64 << 33) + 7; // Ensures nonce_hi != 0
         let lanes = detected_level().lanes();
         let nonces: Vec<u64> = (0..lanes as u64).map(|i| base + i).collect();
         let results = mine_batch(midstate, &nonces);
@@ -3672,6 +1244,7 @@ mod tests {
 
     // ── create_extensions_4way ───────────────────────────────────────────
 
+    /// Core 4-way correctness against the scalar reference.
     #[test]
     fn four_way_matches_scalar() {
         let midstate = hash(b"test midstate for simd");
@@ -3683,6 +1256,7 @@ mod tests {
         }
     }
 
+    /// Cross-checks 4-way results against `create_extension` (the canonical scalar path).
     #[test]
     fn four_way_matches_create_extension() {
         use crate::core::extension::create_extension;
@@ -3695,10 +1269,16 @@ mod tests {
         }
     }
 
+    /// Verifies 4-way with nonces that exercise the upper 32-bit half of the u64 split.
     #[test]
     fn four_way_large_nonces() {
         let midstate = hash(b"4way large nonce");
-        let nonces: [u64; 4] = [u64::MAX, u64::MAX - 1, 1u64 << 32, (1u64 << 32) + 1];
+        let nonces: [u64; 4] = [
+            u64::MAX,
+            u64::MAX - 1,
+            1u64 << 32,
+            (1u64 << 32) + 1,
+        ];
         let results = create_extensions_4way(midstate, nonces);
         for (i, &(nonce, ref fh)) in results.iter().enumerate() {
             let expected = scalar_reference(midstate, nonces[i]);
@@ -3706,6 +1286,7 @@ mod tests {
         }
     }
 
+    /// Verifies 4-way when all nonces are identical (degenerate but valid input).
     #[test]
     fn four_way_identical_nonces() {
         let midstate = hash(b"identical nonces");
@@ -3718,6 +1299,7 @@ mod tests {
         }
     }
 
+    /// Verifies 4-way with nonce = 0 in all lanes (zero-value edge case).
     #[test]
     fn four_way_zero_nonces() {
         let midstate = hash(b"zero nonces");
@@ -3730,6 +1312,7 @@ mod tests {
         }
     }
 
+    /// Verifies that different midstates produce different results for the same nonce.
     #[test]
     fn different_midstates_differ() {
         let m1 = hash(b"midstate A");
@@ -3742,6 +1325,7 @@ mod tests {
         }
     }
 
+    /// Verifies the `Display` impl for `SimdLevel` matches `name()`.
     #[test]
     fn simd_level_display_matches_name() {
         let level = detected_level();
@@ -3751,12 +1335,17 @@ mod tests {
     // ── 8-way NEON specific tests ────────────────────────────────────────
 
     /// 8-way NEON matches the scalar reference on every lane.
+    ///
+    /// This is the primary correctness test: it directly checks the post
+    /// condition of `create_extensions_8way_neon` against the canonical
+    /// `Scalar` definition from the module spec.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn eight_way_neon_matches_scalar() {
         let midstate = hash(b"8-way neon vs scalar");
         let nonces: [u64; 8] = [
-            0, 1, 42, 1000, u64::MAX, 1u64 << 32, (1u64 << 33) + 7, 99,
+            0, 1, 42, 1000,
+            u64::MAX, 1u64 << 32, (1u64 << 33) + 7, 99,
         ];
         let results = unsafe { neon::create_extensions_8way_neon(midstate, nonces) };
         for (i, &(nonce, ref fh)) in results.iter().enumerate() {
@@ -3765,7 +1354,12 @@ mod tests {
         }
     }
 
-    /// **Consensus invariant test** — 8-way output is bit-identical to two 4-way calls.
+    /// 8-way NEON output is bit-identical to two consecutive 4-way calls.
+    ///
+    /// This is the **consensus-preservation invariant** in test form: it
+    /// directly checks the schedule-equivalence post condition documented
+    /// in the Z spec of `create_extensions_8way_neon`. If this passes, the
+    /// new path cannot produce a different hash than the old 4-way path.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn eight_way_neon_matches_two_four_way() {
@@ -3784,6 +1378,7 @@ mod tests {
         }
     }
 
+    /// Cross-check 8-way against `create_extension` (the canonical scalar path).
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn eight_way_neon_matches_create_extension() {
@@ -3797,6 +1392,7 @@ mod tests {
         }
     }
 
+    /// 8-way NEON with all-zero nonces (degenerate but valid input).
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn eight_way_neon_zero_nonces() {
@@ -3810,6 +1406,7 @@ mod tests {
         }
     }
 
+    /// 8-way NEON with all-identical nonces (verifies determinism across lanes).
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn eight_way_neon_identical_nonces() {
@@ -3822,21 +1419,18 @@ mod tests {
             assert_eq!(*fh, expected, "Identical lane {} mismatch", i);
         }
     }
-
-    /// Run with: `cargo test --release bench_neon_paths -- --ignored --nocapture`
+    
     #[cfg(target_arch = "aarch64")]
     #[test]
     #[ignore]
     fn bench_neon_paths() {
         use std::time::Instant;
 
-        println!();
-        println!("BUILD MARKER: hand-written-asm v7");
-
         let midstate = hash(b"benchmark midstate");
         let n4: [u64; 4] = [1, 2, 3, 4];
         let n8: [u64; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
+        // Warmup
         for _ in 0..2 {
             let _ = unsafe { neon::create_extensions_4way_neon(midstate, n4) };
             let _ = unsafe { neon::create_extensions_8way_neon(midstate, n8) };
@@ -3866,6 +1460,7 @@ mod tests {
         let ns_per_hash_8 = t8.as_nanos() / (ITERS as u128 * 8);
         let speedup = ns_per_hash_4 as f64 / ns_per_hash_8 as f64;
 
+        println!();
         println!("4-way: {:>8} ms total, {:>6} ns/hash/lane",
                  t4.as_millis(), ns_per_hash_4);
         println!("8-way: {:>8} ms total, {:>6} ns/hash/lane",
@@ -3873,4 +1468,6 @@ mod tests {
         println!("Per-hash speedup: {:.2}x", speedup);
         println!();
     }
+    
 }
+
