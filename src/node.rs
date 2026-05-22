@@ -2469,8 +2469,15 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
         let mut ui_interval = time::interval(Duration::from_secs(1));
         ui_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut metrics_interval = time::interval(Duration::from_secs(30));
-        let mut sync_poll_interval = time::interval(Duration::from_secs(5));
+        
+        // DECREASED: We don't need to ask for state every 5 seconds anymore
+        let mut sync_poll_interval = time::interval(Duration::from_secs(60));
         sync_poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        
+        // NEW: 20-second ping to keep consumer NATs and strict firewalls open
+        let mut keep_alive_interval = time::interval(Duration::from_secs(20));
+        keep_alive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         let mut mempool_prune_interval = time::interval(Duration::from_secs(60));
         let mut sync_timeout_interval = time::interval(Duration::from_secs(5));
         let mut pex_interval = time::interval(Duration::from_secs(120));
@@ -2590,6 +2597,16 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                 }
                 _ = metrics_interval.tick() => {
                     self.metrics.report();
+                }
+                _ = keep_alive_interval.tick() => {
+                    // Send a tiny 10-byte Ping packet to keep the TCP/QUIC connection alive
+                    let peers: Vec<_> = self.network.connected_peers()
+                        .into_iter()
+                        .filter(|p| !self.network.is_light_peer(p))
+                        .collect();
+                    for peer in peers {
+                        self.network.send(peer, Message::Ping { nonce: 0 });
+                    }
                 }
                 _ = mempool_prune_interval.tick() => {
                     // CoinJoin: clean up stale mix sessions
