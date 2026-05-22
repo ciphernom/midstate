@@ -1862,12 +1862,12 @@ async fn process_verified_batches_chunk(
             tracing::warn!("{}", error_msg);
 
             // --- RESTART SIMULATION HEAL LOGIC (CHUNK BOUNDARY) ---
-            if error_msg.contains("State root mismatch at chunk boundary") {
-                tracing::warn!("Self-healing chunk boundary mismatch by shifting chunk boundary...");
+            if error_msg.contains("State root mismatch at chunk boundary") || error_msg.contains("Ghost DB entry") {
+                tracing::warn!("Self-healing triggered. Shifting chunk boundary...");
                 // Shift the cursor back by 1 so the next chunk starts at current_cursor - 1.
                 // This ensures current_cursor is i=1 in the next chunk, making state_before_prev available.
                 self.last_sync_cursor = Some(current_cursor.saturating_sub(1));
-                self.abort_sync_session("state root mismatch at chunk boundary");
+                self.abort_sync_session("Self-healing triggered");
                 return Ok(());
             }
 
@@ -4252,7 +4252,25 @@ fn fire_batch_lookahead(&mut self) {
                 
                 // --- RESTART SIMULATION HEAL LOGIC ---
                 if let Err(e) = &res {
-                    if e.to_string().contains("State root mismatch") && height > header_start_height && height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
+                    // --- GHOST ENTRY HEALING ---
+                    let err_str = e.to_string();
+                    if err_str.contains("reused") && (err_str.contains("WOTS address") || err_str.contains("MSS leaf")) {
+                        let split_key = if err_str.contains("WOTS address") { "WOTS address " } else { "MSS leaf " };
+                        if let Some(addr_hex) = err_str.split(split_key).nth(1).and_then(|s| s.split(" ").next()) {
+                            tracing::error!("Ghost DB entry detected for key {}. Purging and forcing chunk retry...", addr_hex);
+                            if let Ok(addr_bytes) = hex::decode(addr_hex) {
+                                if let Ok(addr_arr) = <[u8; 32]>::try_from(addr_bytes.as_slice()) {
+                                    let _ = storage.delete_spent_address(&addr_arr);
+                                    error_msg = format!("Ghost DB entry {} purged. Retrying chunk boundary...", addr_hex);
+                                    is_valid = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // ---------------------------
+
+                    if err_str.contains("State root mismatch") && height > header_start_height && height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
                         tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", height);
 
                         if let (Some(s_prev), Some(h_prev)) = (state_before_prev.clone(), headers_before_prev.clone()) {
@@ -4693,6 +4711,21 @@ fn fire_batch_lookahead(&mut self) {
 
             //--- RESTART SIMULATION HEAL LOGIC ---
             if let Err(e) = &res {
+                // --- GHOST ENTRY HEALING ---
+                let err_str = e.to_string();
+                if err_str.contains("reused") && (err_str.contains("WOTS address") || err_str.contains("MSS leaf")) {
+                    let split_key = if err_str.contains("WOTS address") { "WOTS address " } else { "MSS leaf " };
+                    if let Some(addr_hex) = err_str.split(split_key).nth(1).and_then(|s| s.split(" ").next()) {
+                        tracing::error!("Ghost DB entry detected for key {}. Purging and aborting evaluation...", addr_hex);
+                        if let Ok(addr_bytes) = hex::decode(addr_hex) {
+                            if let Ok(addr_arr) = <[u8; 32]>::try_from(addr_bytes.as_slice()) {
+                                let _ = self.storage.delete_spent_address(&addr_arr);
+                                return Ok(None); // Ghost purged. It will succeed on the next sync poll.
+                            }
+                        }
+                    }
+                }
+                // ---------------------------
                 if e.to_string().contains("State root mismatch") && height > 0 && height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
                     tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", height);
                     if let (Some(s_prev), Some(h_prev)) = (state_before_prev.clone(), headers_before_prev.clone()) {
