@@ -2688,7 +2688,10 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                     }
                 }
                 
-                _ = connection_maintenance.tick() => {
+               _ = connection_maintenance.tick() => {
+                        // NEW: Ask network to autonomously maintain dynamic relays if we are Private
+                        self.network.maintain_relays();
+
                         let current_outbound = self.network.outbound_peer_count();
                         if current_outbound < TARGET_OUTBOUND_PEERS {
                             let needed = TARGET_OUTBOUND_PEERS - current_outbound;
