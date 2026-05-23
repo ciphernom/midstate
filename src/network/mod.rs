@@ -555,7 +555,38 @@ let autonat = autonat::Behaviour::new(
         }
     }
 
+/// Dynamically seeks out public peers to act as inbound relays if we are stuck behind a NAT.
+    pub fn maintain_relays(&mut self) {
+        // Only seek relays if we are confirmed Private, and have fewer than 2 active relays.
+        if self.nat_status == NatStatus::Private && self.relay_reservations.len() < 2 {
+            
+            // Find peers we dialed successfully (meaning they are public),
+            // who are not light clients, and not already acting as our relay.
+            let mut candidates = Vec::new();
+            for (peer, endpoint) in &self.connected {
+                if !self.light_peers.contains(peer) && !self.relay_reservations.contains(peer) {
+                    if endpoint.is_dialer() {
+                        candidates.push((*peer, endpoint.get_remote_address().clone()));
+                    }
+                }
+            }
 
+            use rand::seq::SliceRandom;
+            if let Some((peer, addr)) = candidates.choose(&mut rand::thread_rng()) {
+                // Construct the proper libp2p circuit relay multiaddr
+                let mut base_addr = addr.clone();
+                if !base_addr.to_string().contains("/p2p/") {
+                    base_addr.push(libp2p::multiaddr::Protocol::P2p(*peer));
+                }
+                let relay_addr = base_addr.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                
+                tracing::info!("Dynamic Relay: Requesting inbound routing from public peer {}", peer);
+                if let Err(e) = self.swarm.listen_on(relay_addr) {
+                    tracing::debug!("Failed to request relay from {}: {}", peer, e);
+                }
+            }
+        }
+    }
 
     // ── Public API ──────────────────────────────────────────────────────
 
@@ -1018,6 +1049,7 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                         self.relay_reservations.len()
                     );
                 }
+                
                 SwarmEvent::Behaviour(MidstateBehaviourEvent::RelayClient(event)) => {
                     tracing::debug!("Relay client event: {:?}", event);
                 }
@@ -1164,7 +1196,8 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     
                     if num_established == 0 {
                         self.connected.remove(&peer_id);
-
+                        self.relay_reservations.remove(&peer_id); 
+                        
                         // --- Light peer cleanup ---
                         if self.light_peers.remove(&peer_id) {
                             self.light_guard.remove_peer(&peer_id).await;
