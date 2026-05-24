@@ -69,7 +69,10 @@ impl Config {
             #     "/ip4/198.51.100.5/tcp/9333/p2p/12D3KooWGhIjKl...",
             # ]
 
-            bootstrap_peers = ["/ip4/134.199.148.215/tcp/9333/p2p/12D3KooWPbR63SQg1UBLpAMiNngqrRHGM4LaMP8ieAJUxhfw7dxv"]
+            bootstrap_peers = [
+                "/ip4/134.199.148.215/tcp/9333/p2p/12D3KooWPbR63SQg1UBLpAMiNngqrRHGM4LaMP8ieAJUxhfw7dxv",
+                "/ip4/74.208.253.44/tcp/9333/p2p/12D3KooWBqph3BWQxc3xsusvCijS88RaAEZagZZwwxAwP2Xs1CTE"
+            ]
 
             # List of Peer IDs to block from connecting
             banned_peers = []
