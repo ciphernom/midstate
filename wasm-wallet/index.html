@@ -1763,31 +1763,63 @@ if ('serviceWorker' in navigator) {
                     }
 
                 } else if (method === 'commit') {
+                    let submitted = false;
                     if (lc) {
-                        const resp = await lc.commit(params.commitmentHex, params.spamNonce);
-                        result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
-                    } else {
+                        try {
+                            const resp = await lc.commit(params.commitmentHex, params.spamNonce);
+                            result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
+                            submitted = true;
+                        } catch (e) {
+                            console.warn('[rpc] commit via WebRTC failed, trying HTTPS:', e.message);
+                        }
+                    }
+                    if (!submitted) {
                         const r = await fetch(`${url}/commit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ commitment: params.commitmentHex, spam_nonce: params.spamNonce }) });
                         result = { ok: r.ok, body: r.ok ? null : await r.text() };
                     }
 
                 } else if (method === 'send') {
+                    let submitted = false;
                     if (lc) {
-                        const parsed = typeof params.revealPayload === 'string' ? JSON.parse(params.revealPayload) : params.revealPayload;
-                        const resp = await lc.send(parsed);
-                        result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
-                    } else {
+                        try {
+                            const parsed = typeof params.revealPayload === 'string' ? JSON.parse(params.revealPayload) : params.revealPayload;
+                            const resp = await lc.send(parsed);
+                            result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
+                            submitted = true;
+                        } catch (e) {
+                            console.warn('[rpc] send via WebRTC failed, trying HTTPS:', e.message);
+                        }
+                    }
+                    if (!submitted) {
                         const r = await fetch(`${url}/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: params.revealPayload });
                         result = { ok: r.ok, body: r.ok ? null : await r.text() };
                     }
 
                 } else if (method === 'checkCoin') {
-                    if (lc) { result = await lc.checkCoin(params.coinHex); }
-                    else { const r = await fetch(`${url}/check`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ coin: params.coinHex }) }); result = r.ok ? await r.json() : null; }
+                    let success = false;
+                    if (lc) {
+                        try {
+                            result = await lc.checkCoin(params.coinHex);
+                            success = true;
+                        } catch (e) { console.warn('[rpc] checkCoin via WebRTC failed:', e.message); }
+                    }
+                    if (!success) { 
+                        const r = await fetch(`${url}/check`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ coin: params.coinHex }) }); 
+                        result = r.ok ? await r.json() : null; 
+                    }
 
                 } else if (method === 'checkCommitment') {
-                    if (lc) { result = await lc.checkCommitment(params.commitmentHex); }
-                    else { const r = await fetch(`${url}/check_commitment`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ commitment: params.commitmentHex }) }); result = r.ok ? await r.json() : null; }
+                    let success = false;
+                    if (lc) {
+                        try {
+                            result = await lc.checkCommitment(params.commitmentHex);
+                            success = true;
+                        } catch (e) { console.warn('[rpc] checkCommitment via WebRTC failed:', e.message); }
+                    }
+                    if (!success) { 
+                        const r = await fetch(`${url}/check_commitment`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ commitment: params.commitmentHex }) }); 
+                        result = r.ok ? await r.json() : null; 
+                    }
                 } else if (method === 'sendChat') {
                     const attachments = params.attachments || [];
                     if (lc) {

@@ -14043,7 +14043,7 @@ function queuelessPushable() {
  * console.info(arr) // 0, 1, 5, 6, 2, 3, 4, 7, 8, 9  <- nb. order is not guaranteed
  * ```
  */
-function isAsyncIterable$6(thing) {
+function isAsyncIterable$7(thing) {
     return thing[Symbol.asyncIterator] != null;
 }
 async function addAllToPushable(sources, output, signal) {
@@ -14087,7 +14087,7 @@ function* mergeSyncSources(syncSources) {
 function merge(...sources) {
     const syncSources = [];
     for (const source of sources) {
-        if (!isAsyncIterable$6(source)) {
+        if (!isAsyncIterable$7(source)) {
             syncSources.push(source);
         }
     }
@@ -14097,6 +14097,91 @@ function merge(...sources) {
     }
     return mergeSources(sources);
 }
+
+function pipe(first, ...rest) {
+    if (first == null) {
+        throw new Error('Empty pipeline');
+    }
+    // Duplex at start: wrap in function and return duplex source
+    if (isDuplex(first)) {
+        const duplex = first;
+        first = () => duplex.source;
+        // Iterable at start: wrap in function
+    }
+    else if (isIterable(first) || isAsyncIterable$6(first)) {
+        const source = first;
+        first = () => source;
+    }
+    const fns = [first, ...rest];
+    if (fns.length > 1) {
+        // Duplex at end: use duplex sink
+        if (isDuplex(fns[fns.length - 1])) {
+            fns[fns.length - 1] = fns[fns.length - 1].sink;
+        }
+    }
+    if (fns.length > 2) {
+        // Duplex in the middle, consume source with duplex sink and return duplex source
+        for (let i = 1; i < fns.length - 1; i++) {
+            if (isDuplex(fns[i])) {
+                fns[i] = duplexPipelineFn(fns[i]);
+            }
+        }
+    }
+    return rawPipe(...fns);
+}
+const rawPipe = (...fns) => {
+    let res;
+    while (fns.length > 0) {
+        res = fns.shift()(res);
+    }
+    return res;
+};
+const isAsyncIterable$6 = (obj) => {
+    return obj?.[Symbol.asyncIterator] != null;
+};
+const isIterable = (obj) => {
+    return obj?.[Symbol.iterator] != null;
+};
+const isDuplex = (obj) => {
+    if (obj == null) {
+        return false;
+    }
+    return obj.sink != null && obj.source != null;
+};
+const duplexPipelineFn = (duplex) => {
+    return (source) => {
+        const p = duplex.sink(source);
+        if (p?.then != null) {
+            const stream = pushable({
+                objectMode: true
+            });
+            p.then(() => {
+                stream.end();
+            }, (err) => {
+                stream.end(err);
+            });
+            let sourceWrap;
+            const source = duplex.source;
+            if (isAsyncIterable$6(source)) {
+                sourceWrap = async function* () {
+                    yield* source;
+                    stream.end();
+                };
+            }
+            else if (isIterable(source)) {
+                sourceWrap = function* () {
+                    yield* source;
+                    stream.end();
+                };
+            }
+            else {
+                throw new Error('Unknown duplex source type - must be Iterable or AsyncIterable');
+            }
+            return merge(stream, sourceWrap());
+        }
+        return duplex.source;
+    };
+};
 
 const DEFAULT_MAX_BUFFER_SIZE$1 = 4_194_304;
 class UnwrappedError extends Error {
@@ -29094,7 +29179,7 @@ function webRTCDirect(init) {
 
 
 const LIGHT_PROTOCOL = '/midstate/light/2.0.0';
-const REQUEST_TIMEOUT_MS = 60_000;
+const REQUEST_TIMEOUT_MS = 15_000;
 const RECONNECT_DELAY_MS = 3_000;
 const MAX_RECONNECT_ATTEMPTS = 5;
 
@@ -29322,64 +29407,60 @@ async request(req, _retries = 2) {
     if (!conns || conns.length === 0) throw new Error('No active connection to peer');
     const stream = await conns[0].newStream([LIGHT_PROTOCOL]);
 
-    try {
-        // Build the length-prefixed message
-        const jsonBytes = new TextEncoder().encode(JSON.stringify(req));
-        const lenBuf = new Uint8Array(4);
-        new DataView(lenBuf.buffer).setUint32(0, jsonBytes.length, true);
-        const msg = new Uint8Array(4 + jsonBytes.length);
-        msg.set(lenBuf, 0);
-        msg.set(jsonBytes, 4);
+   try {
+            // Build the length-prefixed message
+            const jsonBytes = new TextEncoder().encode(JSON.stringify(req));
+            const lenBuf = new Uint8Array(4);
+            new DataView(lenBuf.buffer).setUint32(0, jsonBytes.length, true);
+            const msg = new Uint8Array(4 + jsonBytes.length);
+            msg.set(lenBuf, 0);
+            msg.set(jsonBytes, 4);
 
-         // Write in chunks to respect WebRTC SCTP message size limits (16 KB)
-        const CHUNK_SIZE = 16384; 
-        for (let i = 0; i < msg.length; i += CHUNK_SIZE) {
-            stream.sendData(msg.slice(i, i + CHUNK_SIZE));
-        }
-        stream.sendCloseWrite();
+            // Let standard libp2p pipe handle backpressure and chunking naturally
+            await pipe([msg], stream);
 
-        // Read: incomingData is an async iterator
-        const chunks = [];
-        let totalLen = 0;
-        let gotReset = false;
+            // Read: stream.source is an async iterator
+            const chunks = [];
+            let totalLen = 0;
+            let gotReset = false;
 
-        const readWithTimeout = async () => {
-            for await (const chunk of stream.incomingData) {
-                const bytes = chunk instanceof Uint8Array
-                    ? chunk
-                    : new Uint8Array(chunk.buffer ?? chunk);
-                chunks.push(bytes);
-                totalLen += bytes.length;
-                if (chunkContainsReset(bytes)) { gotReset = true; break; }
-                if (chunkContainsFin(bytes)) { break; }
+            const readWithTimeout = async () => {
+                for await (const chunk of stream.source) {
+                    const bytes = chunk instanceof Uint8Array
+                        ? chunk
+                        : new Uint8Array(chunk.buffer ?? chunk);
+                    chunks.push(bytes);
+                    totalLen += bytes.length;
+                    if (chunkContainsReset(bytes)) { gotReset = true; break; }
+                    if (chunkContainsFin(bytes)) { break; }
+                }
+            };
+
+            await Promise.race([
+                readWithTimeout(),
+                new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS)
+                )
+            ]);
+
+            if (gotReset && _retries > 0) {
+                try { stream.abort(new Error('reset')); } catch (_) {}
+                return this.request(req, _retries - 1);
             }
-        };
 
-        await Promise.race([
-            readWithTimeout(),
-            new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS)
-            )
-        ]);
+            const rawBuf = new Uint8Array(totalLen);
+            let offset = 0;
+            for (const c of chunks) { rawBuf.set(c, offset); offset += c.length; }
 
-        if (gotReset && _retries > 0) {
-            try { stream.abort(new Error('reset')); } catch (_) {}
-            return this.request(req, _retries - 1);
+            const appData = decodeWebRTCStreamData(rawBuf);
+            if (appData.length < 4) throw new Error('Response too short');
+            const respLen = new DataView(appData.buffer, appData.byteOffset).getUint32(0, true);
+            const respJson = new TextDecoder().decode(appData.slice(4, 4 + respLen));
+            return JSON.parse(respJson);
+
+        } finally {
+            try { stream.close(); } catch (_) {}
         }
-
-        const rawBuf = new Uint8Array(totalLen);
-        let offset = 0;
-        for (const c of chunks) { rawBuf.set(c, offset); offset += c.length; }
-
-        const appData = decodeWebRTCStreamData(rawBuf);
-        if (appData.length < 4) throw new Error('Response too short');
-        const respLen = new DataView(appData.buffer, appData.byteOffset).getUint32(0, true);
-        const respJson = new TextDecoder().decode(appData.slice(4, 4 + respLen));
-        return JSON.parse(respJson);
-
-    } finally {
-        try { stream.abort(new Error('done')); } catch (_) {}
-    }
 }
 
     // ── Convenience Methods (match the RPC endpoints the wallet uses) ────────
@@ -29453,8 +29534,24 @@ async request(req, _retries = 2) {
         return resp.data;
     }
 
-    async sendChat(words, replyTo) {
-        const resp = await this.request({ method: 'send_chat', params: { words, reply_to: replyTo } });
+    /**
+     * Originate a chat over the WebRTC light protocol.
+     *
+     * Server-side this hits `LightRequest::SendChat` in `src/node.rs`,
+     * which enqueues a `NodeCommand::SendChat` with `sender_override =
+     * Some(<our light-peer-id>)`. The node mines v2 PoW (~10 ms) and
+     * broadcasts as `Message::ChatV2`.
+     *
+     * @param {number[]}                                words      0..=10 indices into CHAT_DICTIONARY
+     * @param {number|null}                             replyTo    Parent message nonce, or null
+     * @param {{kind:"address",value:string}[]} [attachments=[]]   0..=4 typed attachments
+     *                                                             (value: 64-char lowercase hex for address)
+     */
+    async sendChat(words, replyTo, attachments = []) {
+        const resp = await this.request({
+            method: 'send_chat',
+            params: { words, reply_to: replyTo, attachments },
+        });
         return resp;
     }
 
