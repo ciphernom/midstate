@@ -1587,28 +1587,45 @@ if ('serviceWorker' in navigator) {
         async function connectWebRTC(customAddr) {
             updateWebRTCStatus('connecting');
             try {
-                // 1. Establish trusted bootstrap quorum
+                // 1. Establish trusted bootstrap quorum (HTTPS)
                 const bootstrapUrls = [
-                    "https://rpc.cypherpunk.gold",
+                    "https://rpc.cypherpunk.gold",      // Sydney (Default)
+                    "https://rpc.usa.cypherpunk.gold"   // USA
                 ];
 
-                const bestNode = await findHeaviestNetworkState(bootstrapUrls);
-                
                 let dialList = [];
-                // If user provided a raw P2P multiaddr, try it first
                 if (customAddr && customAddr.includes("/p2p/")) {
                     dialList.push(customAddr);
                 }
 
-                // Extract verified WebRTC addresses from the honest node
-                const webrtcAddrs = (bestNode.state.webrtc_addrs || []).filter(a => a.includes('webrtc-direct') && a.includes('certhash'));
-                if (webrtcAddrs.length > 0) {
-                    // Randomize community peers to distribute load
-                    const communityPeers = webrtcAddrs.slice(1).sort(() => Math.random() - 0.5);
-                    dialList.push(...communityPeers, webrtcAddrs[0]); // Put primary VPS last as fallback
+                let bestNode = null;
+                try {
+                    // Try to connect to HTTPS API first to find the best chain
+                    bestNode = await findHeaviestNetworkState(bootstrapUrls);
+                    
+                    const webrtcAddrs = (bestNode.state.webrtc_addrs || []).filter(a => a.includes('webrtc-direct') && a.includes('certhash'));
+                    if (webrtcAddrs.length > 0) {
+                        const communityPeers = webrtcAddrs.slice(1).sort(() => Math.random() - 0.5);
+                        dialList.push(...communityPeers, webrtcAddrs[0]); 
+                    }
+                    
+                    // Lock RPC URL to the trusted node
+                    _rpcUrl = bestNode.url; 
+                    
+                } catch (httpError) {
+                    log("[light] HTTPS Bootstraps unreachable. Falling back to direct WebRTC...", "var(--accent)");
+                    
+                    // --- HARDCODED WEBRTC FALLBACKS ---
+                    // If ALL HTTPS domains go down, fall back to raw IP addresses via WebRTC
+                    
+                    // US Node
+                    dialList.push("/ip4/74.208.253.44/udp/9335/webrtc-direct/certhash/uEiCTNpt4FH1jR4lzQHWuIDnUTyWSr1N4bMniW5Prhh2K0w");
+                    
+                    // Sydney Node
+                    dialList.push("/ip4/134.199.148.215/udp/9335/webrtc-direct/certhash/uEiDwFtheq3OCKVvl4CWkujRc-e3L_eGxgz0wuQFsLXS4tA");
                 }
 
-                if (dialList.length === 0) throw new Error("The heaviest node is not advertising any WebRTC addresses.");
+                if (dialList.length === 0) throw new Error("No WebRTC addresses available to dial.");
 
                 if (lightClient) { await lightClient.stop(); lightClient = null; }
                 lightClient = await createLightClient();
@@ -1623,15 +1640,11 @@ if ('serviceWorker' in navigator) {
                     }
                 });
 
-                // Attach Push Listener
                 lightClient.onPushEvent((payload) => {
                     worker.postMessage({ type: 'PUSH_NEW_BLOCK', payload });
                 });
 
                 await lightClient.start(dialList);
-                
-                // Lock RPC URL to the trusted node to prevent spoofed blocks
-                _rpcUrl = bestNode.url; 
                 
             } catch (e) {
                 log(`[light] Connect error: ${e.message}`, 'var(--red)');
