@@ -256,24 +256,23 @@ async request(req, _retries = 2) {
             msg.set(lenBuf, 0);
             msg.set(jsonBytes, 4);
 
-            // 1. NATIVE BACKPRESSURE: Use an async generator to feed stream.sink.
-            // libp2p will automatically pause the 'yield' if the WebRTC buffer is full,
-            // completely preventing packet drops without arbitrary timeouts.
-            // (Calling stream.sink also automatically sends the FIN/CloseWrite signal when done).
-            await stream.sink((async function* () {
-                const CHUNK_SIZE = 16384; 
-                for (let i = 0; i < msg.length; i += CHUNK_SIZE) {
-                    yield msg.slice(i, i + CHUNK_SIZE);
-                }
-            })());
+            // Write in chunks to respect WebRTC SCTP message size limits (16 KB)
+            const CHUNK_SIZE = 16384; 
+            for (let i = 0; i < msg.length; i += CHUNK_SIZE) {
+                stream.sendData(msg.slice(i, i + CHUNK_SIZE));
+                
+                // THE FIX: Yield to the JS event loop for 10ms so the WebRTC buffer can drain!
+                await new Promise(r => setTimeout(r, 10)); 
+            }
+            stream.sendCloseWrite();
 
-            // 2. Read from stream.source (standard libp2p interface)
+            // Read: incomingData is an async iterator
             const chunks = [];
             let totalLen = 0;
             let gotReset = false;
 
             const readWithTimeout = async () => {
-                for await (const chunk of stream.source) {
+                for await (const chunk of stream.incomingData) {
                     const bytes = chunk instanceof Uint8Array
                         ? chunk
                         : new Uint8Array(chunk.buffer ?? chunk);
@@ -287,6 +286,7 @@ async request(req, _retries = 2) {
             await Promise.race([
                 readWithTimeout(),
                 new Promise((_, reject) =>
+                    // Uses the new shorter REQUEST_TIMEOUT_MS
                     setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS)
                 )
             ]);
@@ -307,7 +307,7 @@ async request(req, _retries = 2) {
             return JSON.parse(respJson);
 
         } finally {
-            try { stream.close(); } catch (_) {}
+            try { stream.abort(new Error('done')); } catch (_) {}
         }
 }
 

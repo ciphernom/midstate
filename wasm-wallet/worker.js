@@ -1520,7 +1520,8 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0)
     }
 
     pendingSends = [];
-    for (const inp of ctx.selected_inputs) delete wState.utxos[inp.coin_id];
+    // Do NOT eagerly delete UTXOs here! Let performScan() discover the spend naturally
+    // so it can properly register the history entry.
     
     // Scan locally rather than blindly accepting outputs to prevent mismatches
     await performScan();
