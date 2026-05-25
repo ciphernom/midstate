@@ -256,16 +256,23 @@ async request(req, _retries = 2) {
             msg.set(lenBuf, 0);
             msg.set(jsonBytes, 4);
 
-            // Let standard libp2p pipe handle backpressure and chunking naturally
-            await pipe([msg], stream);
+            // Write in chunks to respect WebRTC SCTP message size limits (16 KB)
+            const CHUNK_SIZE = 16384; 
+            for (let i = 0; i < msg.length; i += CHUNK_SIZE) {
+                stream.sendData(msg.slice(i, i + CHUNK_SIZE));
+                
+                // THE FIX: Yield to the JS event loop for 10ms so the WebRTC buffer can drain!
+                await new Promise(r => setTimeout(r, 10)); 
+            }
+            stream.sendCloseWrite();
 
-            // Read: stream.source is an async iterator
+            // Read: incomingData is an async iterator
             const chunks = [];
             let totalLen = 0;
             let gotReset = false;
 
             const readWithTimeout = async () => {
-                for await (const chunk of stream.source) {
+                for await (const chunk of stream.incomingData) {
                     const bytes = chunk instanceof Uint8Array
                         ? chunk
                         : new Uint8Array(chunk.buffer ?? chunk);
@@ -279,6 +286,7 @@ async request(req, _retries = 2) {
             await Promise.race([
                 readWithTimeout(),
                 new Promise((_, reject) =>
+                    // Uses the new shorter REQUEST_TIMEOUT_MS
                     setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS)
                 )
             ]);
@@ -299,7 +307,7 @@ async request(req, _retries = 2) {
             return JSON.parse(respJson);
 
         } finally {
-            try { stream.close(); } catch (_) {}
+            try { stream.abort(new Error('done')); } catch (_) {}
         }
 }
 

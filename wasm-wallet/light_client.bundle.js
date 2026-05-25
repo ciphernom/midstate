@@ -14043,7 +14043,7 @@ function queuelessPushable() {
  * console.info(arr) // 0, 1, 5, 6, 2, 3, 4, 7, 8, 9  <- nb. order is not guaranteed
  * ```
  */
-function isAsyncIterable$7(thing) {
+function isAsyncIterable$6(thing) {
     return thing[Symbol.asyncIterator] != null;
 }
 async function addAllToPushable(sources, output, signal) {
@@ -14087,7 +14087,7 @@ function* mergeSyncSources(syncSources) {
 function merge(...sources) {
     const syncSources = [];
     for (const source of sources) {
-        if (!isAsyncIterable$7(source)) {
+        if (!isAsyncIterable$6(source)) {
             syncSources.push(source);
         }
     }
@@ -14097,91 +14097,6 @@ function merge(...sources) {
     }
     return mergeSources(sources);
 }
-
-function pipe(first, ...rest) {
-    if (first == null) {
-        throw new Error('Empty pipeline');
-    }
-    // Duplex at start: wrap in function and return duplex source
-    if (isDuplex(first)) {
-        const duplex = first;
-        first = () => duplex.source;
-        // Iterable at start: wrap in function
-    }
-    else if (isIterable(first) || isAsyncIterable$6(first)) {
-        const source = first;
-        first = () => source;
-    }
-    const fns = [first, ...rest];
-    if (fns.length > 1) {
-        // Duplex at end: use duplex sink
-        if (isDuplex(fns[fns.length - 1])) {
-            fns[fns.length - 1] = fns[fns.length - 1].sink;
-        }
-    }
-    if (fns.length > 2) {
-        // Duplex in the middle, consume source with duplex sink and return duplex source
-        for (let i = 1; i < fns.length - 1; i++) {
-            if (isDuplex(fns[i])) {
-                fns[i] = duplexPipelineFn(fns[i]);
-            }
-        }
-    }
-    return rawPipe(...fns);
-}
-const rawPipe = (...fns) => {
-    let res;
-    while (fns.length > 0) {
-        res = fns.shift()(res);
-    }
-    return res;
-};
-const isAsyncIterable$6 = (obj) => {
-    return obj?.[Symbol.asyncIterator] != null;
-};
-const isIterable = (obj) => {
-    return obj?.[Symbol.iterator] != null;
-};
-const isDuplex = (obj) => {
-    if (obj == null) {
-        return false;
-    }
-    return obj.sink != null && obj.source != null;
-};
-const duplexPipelineFn = (duplex) => {
-    return (source) => {
-        const p = duplex.sink(source);
-        if (p?.then != null) {
-            const stream = pushable({
-                objectMode: true
-            });
-            p.then(() => {
-                stream.end();
-            }, (err) => {
-                stream.end(err);
-            });
-            let sourceWrap;
-            const source = duplex.source;
-            if (isAsyncIterable$6(source)) {
-                sourceWrap = async function* () {
-                    yield* source;
-                    stream.end();
-                };
-            }
-            else if (isIterable(source)) {
-                sourceWrap = function* () {
-                    yield* source;
-                    stream.end();
-                };
-            }
-            else {
-                throw new Error('Unknown duplex source type - must be Iterable or AsyncIterable');
-            }
-            return merge(stream, sourceWrap());
-        }
-        return duplex.source;
-    };
-};
 
 const DEFAULT_MAX_BUFFER_SIZE$1 = 4_194_304;
 class UnwrappedError extends Error {
@@ -29416,16 +29331,23 @@ async request(req, _retries = 2) {
             msg.set(lenBuf, 0);
             msg.set(jsonBytes, 4);
 
-            // Let standard libp2p pipe handle backpressure and chunking naturally
-            await pipe([msg], stream);
+            // Write in chunks to respect WebRTC SCTP message size limits (16 KB)
+            const CHUNK_SIZE = 16384; 
+            for (let i = 0; i < msg.length; i += CHUNK_SIZE) {
+                stream.sendData(msg.slice(i, i + CHUNK_SIZE));
+                
+                // THE FIX: Yield to the JS event loop for 10ms so the WebRTC buffer can drain!
+                await new Promise(r => setTimeout(r, 10)); 
+            }
+            stream.sendCloseWrite();
 
-            // Read: stream.source is an async iterator
+            // Read: incomingData is an async iterator
             const chunks = [];
             let totalLen = 0;
             let gotReset = false;
 
             const readWithTimeout = async () => {
-                for await (const chunk of stream.source) {
+                for await (const chunk of stream.incomingData) {
                     const bytes = chunk instanceof Uint8Array
                         ? chunk
                         : new Uint8Array(chunk.buffer ?? chunk);
@@ -29439,6 +29361,7 @@ async request(req, _retries = 2) {
             await Promise.race([
                 readWithTimeout(),
                 new Promise((_, reject) =>
+                    // Uses the new shorter REQUEST_TIMEOUT_MS
                     setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS)
                 )
             ]);
@@ -29459,7 +29382,7 @@ async request(req, _retries = 2) {
             return JSON.parse(respJson);
 
         } finally {
-            try { stream.close(); } catch (_) {}
+            try { stream.abort(new Error('done')); } catch (_) {}
         }
 }
 
