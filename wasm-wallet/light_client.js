@@ -19,7 +19,7 @@ import { pipe } from 'it-pipe';
 import { multiaddr } from '@multiformats/multiaddr';
 
 const LIGHT_PROTOCOL = '/midstate/light/2.0.0';
-const REQUEST_TIMEOUT_MS = 60_000;
+const REQUEST_TIMEOUT_MS = 15_000;
 const RECONNECT_DELAY_MS = 3_000;
 const MAX_RECONNECT_ATTEMPTS = 5;
 
@@ -247,64 +247,60 @@ async request(req, _retries = 2) {
     if (!conns || conns.length === 0) throw new Error('No active connection to peer');
     const stream = await conns[0].newStream([LIGHT_PROTOCOL]);
 
-    try {
-        // Build the length-prefixed message
-        const jsonBytes = new TextEncoder().encode(JSON.stringify(req));
-        const lenBuf = new Uint8Array(4);
-        new DataView(lenBuf.buffer).setUint32(0, jsonBytes.length, true);
-        const msg = new Uint8Array(4 + jsonBytes.length);
-        msg.set(lenBuf, 0);
-        msg.set(jsonBytes, 4);
+   try {
+            // Build the length-prefixed message
+            const jsonBytes = new TextEncoder().encode(JSON.stringify(req));
+            const lenBuf = new Uint8Array(4);
+            new DataView(lenBuf.buffer).setUint32(0, jsonBytes.length, true);
+            const msg = new Uint8Array(4 + jsonBytes.length);
+            msg.set(lenBuf, 0);
+            msg.set(jsonBytes, 4);
 
-         // Write in chunks to respect WebRTC SCTP message size limits (16 KB)
-        const CHUNK_SIZE = 16384; 
-        for (let i = 0; i < msg.length; i += CHUNK_SIZE) {
-            stream.sendData(msg.slice(i, i + CHUNK_SIZE));
-        }
-        stream.sendCloseWrite();
+            // Let standard libp2p pipe handle backpressure and chunking naturally
+            await pipe([msg], stream);
 
-        // Read: incomingData is an async iterator
-        const chunks = [];
-        let totalLen = 0;
-        let gotReset = false;
+            // Read: stream.source is an async iterator
+            const chunks = [];
+            let totalLen = 0;
+            let gotReset = false;
 
-        const readWithTimeout = async () => {
-            for await (const chunk of stream.incomingData) {
-                const bytes = chunk instanceof Uint8Array
-                    ? chunk
-                    : new Uint8Array(chunk.buffer ?? chunk);
-                chunks.push(bytes);
-                totalLen += bytes.length;
-                if (chunkContainsReset(bytes)) { gotReset = true; break; }
-                if (chunkContainsFin(bytes)) { break; }
+            const readWithTimeout = async () => {
+                for await (const chunk of stream.source) {
+                    const bytes = chunk instanceof Uint8Array
+                        ? chunk
+                        : new Uint8Array(chunk.buffer ?? chunk);
+                    chunks.push(bytes);
+                    totalLen += bytes.length;
+                    if (chunkContainsReset(bytes)) { gotReset = true; break; }
+                    if (chunkContainsFin(bytes)) { break; }
+                }
+            };
+
+            await Promise.race([
+                readWithTimeout(),
+                new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS)
+                )
+            ]);
+
+            if (gotReset && _retries > 0) {
+                try { stream.abort(new Error('reset')); } catch (_) {}
+                return this.request(req, _retries - 1);
             }
-        };
 
-        await Promise.race([
-            readWithTimeout(),
-            new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS)
-            )
-        ]);
+            const rawBuf = new Uint8Array(totalLen);
+            let offset = 0;
+            for (const c of chunks) { rawBuf.set(c, offset); offset += c.length; }
 
-        if (gotReset && _retries > 0) {
-            try { stream.abort(new Error('reset')); } catch (_) {}
-            return this.request(req, _retries - 1);
+            const appData = decodeWebRTCStreamData(rawBuf);
+            if (appData.length < 4) throw new Error('Response too short');
+            const respLen = new DataView(appData.buffer, appData.byteOffset).getUint32(0, true);
+            const respJson = new TextDecoder().decode(appData.slice(4, 4 + respLen));
+            return JSON.parse(respJson);
+
+        } finally {
+            try { stream.close(); } catch (_) {}
         }
-
-        const rawBuf = new Uint8Array(totalLen);
-        let offset = 0;
-        for (const c of chunks) { rawBuf.set(c, offset); offset += c.length; }
-
-        const appData = decodeWebRTCStreamData(rawBuf);
-        if (appData.length < 4) throw new Error('Response too short');
-        const respLen = new DataView(appData.buffer, appData.byteOffset).getUint32(0, true);
-        const respJson = new TextDecoder().decode(appData.slice(4, 4 + respLen));
-        return JSON.parse(respJson);
-
-    } finally {
-        try { stream.abort(new Error('done')); } catch (_) {}
-    }
 }
 
     // ── Convenience Methods (match the RPC endpoints the wallet uses) ────────
