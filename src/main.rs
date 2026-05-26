@@ -699,19 +699,90 @@ async fn wallet_spend_script(
 
     let mut spending_coins = Vec::new();
     for cref in &coin_refs {
-        let cid = wallet.resolve_coin(cref)?;
-        let coin = wallet.find_coin(&cid).cloned()
-            .ok_or_else(|| anyhow::anyhow!("Coin {} not found", cref))?;
-        spending_coins.push(coin);
+        // 1. Try local wallet first
+        if let Ok(cid) = wallet.resolve_coin(cref) {
+            if let Some(coin) = wallet.find_coin(&cid).cloned() {
+                spending_coins.push(coin);
+                continue;
+            }
+        }
+
+        // 2. Fallback: Search the blockchain via RPC (for Smart Contract UTXOs)
+        println!("Coin {} not in local wallet. Fetching from blockchain...", cref);
+        let search_req = rpc::SearchRequest { query: cref.clone() };
+        let search_url = format!("http://{}:{}/search", rpc_host, rpc_port);
+        let search_resp = client.post(&search_url).json(&search_req).send().await?;
+        
+        if !search_resp.status().is_success() {
+            anyhow::bail!("Failed to search network for coin {}", cref);
+        }
+        
+        let search_data: rpc::SearchResponse = search_resp.json().await?;
+        let mut found = false;
+        
+        for res in search_data.results {
+            if res.result_type == "output_coin_id" || res.result_type == "coinbase_coin_id" {
+                let block_url = format!("http://{}:{}/block/{}", rpc_host, rpc_port, res.height);
+                let block_resp = client.get(&block_url).send().await?;
+                if !block_resp.status().is_success() { continue; }
+                
+                let batch: midstate::core::Batch = block_resp.json().await?;
+                
+                if res.result_type == "coinbase_coin_id" {
+                    for cb in &batch.coinbase {
+                        if hex::encode(cb.coin_id()) == *cref {
+                            spending_coins.push(midstate::wallet::WalletCoin {
+                                seed: [0; 32], owner_pk: [0; 32],
+                                address: cb.address, value: cb.value, salt: cb.salt,
+                                coin_id: cb.coin_id(), label: Some("Coinbase UTXO".into()),
+                                wots_signed: false, commitment: None,
+                            });
+                            found = true;
+                            break;
+                        }
+                    }
+                } else if let Some(tx_idx) = res.tx_index {
+                    if let Some(tx) = batch.transactions.get(tx_idx) {
+                        match tx {
+                            midstate::core::Transaction::Reveal { outputs, .. } | 
+                            midstate::core::Transaction::Consolidate { outputs, .. } => {
+                                for out in outputs {
+                                    if let Some(cid) = out.coin_id() {
+                                        if hex::encode(cid) == *cref {
+                                            spending_coins.push(midstate::wallet::WalletCoin {
+                                                seed: [0; 32], owner_pk: [0; 32],
+                                                address: out.address(), value: out.value(), salt: out.salt(),
+                                                coin_id: cid, label: Some("Contract UTXO".into()),
+                                                wots_signed: false, commitment: out.commitment(),
+                                            });
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if found { break; }
+            }
+        }
+        
+        if !found {
+            anyhow::bail!("Coin {} not found in local wallet or on the blockchain.", cref);
+        }
     }
 
     let bytecode = hex::decode(&bytecode_hex).context("Invalid bytecode hex")?;
     let script_address = midstate::core::types::hash(&bytecode);
 
-    // Verify all spending coins match the bytecode address
+    // Verify all spending coins match the bytecode address OR belong to the wallet (Co-spend)
     for coin in &spending_coins {
         if script_address != coin.address {
-            anyhow::bail!("Bytecode hash does not match coin address for {}", hex::encode(coin.coin_id));
+            if wallet.find_coin(&coin.coin_id).is_none() {
+                anyhow::bail!("Coin {} does not belong to the contract AND is not in your wallet.", hex::encode(coin.coin_id));
+            }
         }
     }
 
@@ -800,30 +871,58 @@ async fn wallet_spend_script(
     let mut rpc_inputs = Vec::new();
     let mut rpc_signatures = Vec::new();
 
-    // Map each coin to its corresponding witness and state stack
-    for (i, coin) in spending_coins.iter().enumerate() {
-        let wit_arg = inputs_args.get(i).map(|s| s.as_str()).unwrap_or("");
+    // Map each selected coin to its corresponding witness and state stack.
+    // NOTE: `input_coin_ids` contains the exact coins the wallet securely selected 
+    // during prepare_commit, including any automatically grouped WOTS siblings!
+    for coin_id in &input_coin_ids {
+        // Fetch the full coin details (could be local or a remote contract coin)
+        let coin = spending_coins.iter().find(|c| c.coin_id == *coin_id)
+            .cloned()
+            .unwrap_or_else(|| wallet.find_coin(coin_id).unwrap().clone());
+            
+        // Match the CLI inputs to the coins. 
+        // Auto-selected siblings won't have a CLI argument, so they default to AUTO
+        let cli_index = spending_coins.iter().position(|c| c.coin_id == *coin_id);
+        let wit_arg = cli_index
+            .and_then(|idx| inputs_args.get(idx))
+            .map(|s| s.as_str())
+            .unwrap_or("AUTO:none"); // Siblings are auto-signed
         
         let mut stack_items = Vec::new();
         for token in wit_arg.split(',').filter(|s| !s.is_empty()) {
-            if token.trim().starts_with("AUTO:") {
-                let pk_hex = token.trim().strip_prefix("AUTO:").unwrap();
-                let pk = parse_hex32(pk_hex)?;
-                stack_items.push(wallet.auto_sign(&pk, &commitment)?);
+            let token = token.trim();
+            if token.starts_with("AUTO:") {
+                // If it's a contract coin without an explicit key, skip auto-signing.
+                // (Contracts handle their own logic). But if it's a local wallet coin, sign it!
+                if let Some(pk) = token.strip_prefix("AUTO:").filter(|s| !s.is_empty() && *s != "none") {
+                    let pk_bytes = parse_hex32(pk)?;
+                    stack_items.push(wallet.auto_sign(&pk_bytes, &commitment)?);
+                } else if wallet.find_coin(coin_id).is_some() {
+                    // It's a local coin (like an auto-selected sibling). Sign it!
+                    stack_items.push(wallet.auto_sign(&coin.owner_pk, &commitment)?);
+                }
             } else {
-                stack_items.push(hex::decode(token.trim()).context("Invalid hex in --inputs")?);
+                stack_items.push(hex::decode(token).context("Invalid hex in --inputs")?);
             }
         }
         rpc_signatures.push(stack_items.iter().map(hex::encode).collect::<Vec<_>>().join(","));
 
         // Match input states to the respective coins
-        let state_hex = input_states.get(i)
+        let state_hex = cli_index
+            .and_then(|idx| input_states.get(idx))
             .filter(|s| !s.is_empty() && *s != "none")
             .cloned()
             .or_else(|| coin.commitment.map(hex::encode));
 
+        // THE FIX: Differentiate between the Contract's Coin and Personal Wallet Coins
+        let input_bytecode = if coin.address == script_address {
+            bytecode_hex.clone()
+        } else {
+            hex::encode(midstate::core::script::compile_p2pk(&coin.owner_pk))
+        };
+
         rpc_inputs.push(rpc::InputRevealJson {
-            bytecode: bytecode_hex.clone(),
+            bytecode: input_bytecode,
             value: coin.value,
             salt: hex::encode(coin.salt),
             commitment: state_hex,
