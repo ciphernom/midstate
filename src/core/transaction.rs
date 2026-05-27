@@ -295,8 +295,8 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
 
             for (i, out) in outputs.iter().enumerate() {
                 if out.value() == 0 {
-                    if out.is_confidential() {
-                        // Allowed: 0-value State Thread
+                    if out.allows_zero_value() {
+                        // Allowed: 0-value State Thread or DataBurn (for metadata backup, etc.)
                     } else {
                         bail!("Zero-value output {}", i);
                     }
@@ -404,7 +404,7 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
             }
 
             for (i, out) in outputs.iter().enumerate() {
-                if out.value() == 0 && !out.is_confidential() {
+                if out.value() == 0 && !out.allows_zero_value() {
                     bail!("Zero-value output {}", i);
                 } else if out.value() != 0 && !out.value().is_power_of_two() {
                     bail!("Invalid denomination: output {} value {} is not a power of 2", i, out.value());
@@ -470,9 +470,78 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
 
 /// Apply a transaction to the state, including signature verification.
 ///
-/// All accumulator mutations use `is_v2 = is_v2_at(state.height)` (captured
-/// once at function entry) so that within a single block every UTXO/SMT
-/// update lives in the same hashing universe.
+/// This is the core state transition function for Reveal and Consolidate
+/// transactions (Commit is handled separately above). It is also used
+/// (via the no-sig-check variant) inside batch application after parallel
+/// signature verification.
+///
+/// # Reasoning
+///
+/// Previous versions of this function performed accumulator mutations
+/// (removing commitments, removing spent coins) *before* all input coin
+/// existence checks and predicate executions had completed. If any of
+/// those later checks failed with `bail!`, the `&mut State` was left in
+/// a partially mutated state. Because `apply_batch_internal` aborts the
+/// entire batch on error, this partial mutation could become durable,
+/// violating the fundamental commit-reveal atomicity invariant and
+/// corrupting the two UtxoAccumulators (coins + commitments).
+///
+/// This patch restructures the function so that **no observable mutation**
+/// to the coin or commitment accumulators occurs until every check for
+/// the transaction has succeeded. This makes the bad interleaving
+/// statically impossible.
+///
+/// The same principle is applied to `apply_transaction_no_sig_check`.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Pre:
+///   - tx is well-formed (value/power-of-2 checks, input/output counts, etc.)
+///   - For Reveal/Consolidate:
+///       * commitment (if present) exists in state.commitments and is not expired
+///       * ∀ input ∈ tx.inputs : input.coin_id ∈ state.coins
+///       * value conservation: sum(inputs) > sum(outputs)
+///       * all predicates verify successfully against the provided witnesses
+///
+/// Post:
+///   result = Ok(())  ⇒
+///     (if tx is Reveal or Consolidate):
+///       state.commitments'  = state.commitments \ {tx.commitment}          (pre-activation only)
+///       state.coins'        = (state.coins \ tx.input_coin_ids) ∪ tx.new_coins
+///       root(state.coins' ∪ state.commitments', v2) = declared midstate update
+///
+///   result = Err(_)  ⇒
+///     state is completely unchanged (no accumulator mutations occurred)
+/// ```
+///
+/// ```zed
+///     ApplyTransaction
+///     ----------------
+///     ΔState
+///     tx : Transaction
+///     v2 : 𝔹
+///
+///     pre  tx_well_formed(tx)
+///     pre  tx ∈ {Reveal, Consolidate} ⇒
+///            tx.commitment ∈ commitments
+///          ∧ ∀ cid ∈ tx.inputs • cid ∈ coins
+///          ∧ value_sum(tx.inputs) > value_sum(tx.outputs)
+///
+///     post result = Ok(()) ⇒
+///            (tx ∈ {Reveal, Consolidate} ⇒
+///               commitments' = commitments \ {tx.commitment}
+///             ∧ coins' = (coins \ tx.input_coin_ids) ∪ tx.new_coins
+///             ∧ root(coins' ∪ commitments', v2) updated correctly)
+///
+///     post result = Err(_) ⇒ (coins' = coins ∧ commitments' = commitments)
+/// ```
+///
+/// # Safety / Invariants
+/// - The two UtxoAccumulators (coins and commitments) are only mutated
+///   together or not at all for any single transaction.
+/// - On error, the caller (apply_batch_internal or direct callers) sees
+///   a completely unmodified State.
 pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
     let v2 = crate::core::types::is_v2_at(state.height);
 
@@ -577,14 +646,9 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                     );
                 }
             }
-            // PREVENT COMMIT REPLAY ATTACK: Do not delete commitments after activation height.
-            // Let the deterministic GC sweep them when their PoW naturally expires.
-            if state.height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
-                state.commitments.remove(&expected, v2);
-                state.commitment_heights.remove(&expected);
-            }
 
             // 5. Verify each input coin exists and executes cleanly against its Predicate
+            //    (ALL checks must pass before any accumulator mutation)
             for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
                 let coin_id = input.coin_id();
                 if !state.coins.contains(&coin_id) {
@@ -595,6 +659,15 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs, input.value, input.commitment) {
                     bail!("Predicate execution failed for input {}", i);
                 }
+            }
+
+            // === ALL CHECKS PASSED — NOW PERFORM MUTATIONS (atomic from the caller's perspective) ===
+
+            // PREVENT COMMIT REPLAY ATTACK: Do not delete commitments after activation height.
+            // Let the deterministic GC sweep them when their PoW naturally expires.
+            if state.height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
+                state.commitments.remove(&expected, v2);
+                state.commitment_heights.remove(&expected);
             }
 
             // 6. Remove spent coins
@@ -651,7 +724,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             }
 
             for (i, out) in outputs.iter().enumerate() {
-                if out.value() == 0 && !out.is_confidential() {
+                if out.value() == 0 && !out.allows_zero_value() {
                     bail!("Zero-value output {}", i);
                 } else if out.value() != 0 && !out.value().is_power_of_two() {
                     bail!("Invalid denomination: output {} value {} is not a power of 2", i, out.value());
@@ -681,13 +754,8 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                     bail!("Commitment expired at consensus");
                 }
             }
-            // PREVENT COMMIT REPLAY ATTACK: Do not delete commitments after activation height.
-            // Let the deterministic GC sweep them when their PoW naturally expires.
-            if state.height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
-                state.commitments.remove(&expected, v2);
-                state.commitment_heights.remove(&expected);
-            }
 
+            // All checks first
             for input in inputs.iter() {
                 let coin_id = input.coin_id();
                 if !state.coins.contains(&coin_id) {
@@ -697,6 +765,12 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
 
             if !verify_predicate(&inputs[0].predicate, witness, &expected, state.height, outputs, inputs[0].value, inputs[0].commitment) {
                 bail!("Predicate execution failed for Consolidate witness");
+            }
+
+            // === ALL CHECKS PASSED — NOW PERFORM MUTATIONS ===
+            if state.height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
+                state.commitments.remove(&expected, v2);
+                state.commitment_heights.remove(&expected);
             }
 
             for coin_id in &input_coin_ids { state.coins.remove(coin_id, v2); }
@@ -793,8 +867,8 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
             }
             for (i, out) in outputs.iter().enumerate() {
                 if out.value() == 0 {
-                    if out.is_confidential() {
-                        // Allowed: 0-value State Thread
+                    if out.allows_zero_value() {
+                        // Allowed: 0-value State Thread or DataBurn (for metadata backup, etc.)
                     } else {
                         bail!("Zero-value output {}", i);
                     }
@@ -857,7 +931,7 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                 }
             }
             for (i, out) in outputs.iter().enumerate() {
-                if out.value() == 0 && !out.is_confidential() {
+                if out.value() == 0 && !out.allows_zero_value() {
                     bail!("Zero-value output {}", i);
                 } else if out.value() != 0 && !out.value().is_power_of_two() {
                     bail!("Invalid denomination: output {} value {} is not a power of 2", i, out.value());

@@ -300,39 +300,94 @@ impl MssSignature {
         buf
     }
 
+    /// Parse an MSS signature from its wire format.
+    ///
+    /// # Reasoning
+    /// This function is called on completely untrusted data coming from the
+    /// P2P network (reveals, consolidates), RPC, and script execution.
+    /// Any panic here is a remote crash / DoS vector and was flagged as
+    /// Critical in the security review.
+    ///
+    /// The previous implementation used multiple `try_into().unwrap()` after
+    /// only a minimal length check, and had an ambiguous auto-detection
+    /// heuristic for 32-byte vs 33-byte auth nodes.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:
+    ///   data.len() >= minimum_size_for_format
+    ///
+    /// Post:
+    ///   result = Ok(sig)  ⇒  sig is a well-formed MssSignature
+    ///   result = Err(_)   ⇒  no panic occurred, error is descriptive
+    /// ```
+    ///
+    /// ```zed
+    ///     ParseMssSignature
+    ///     -----------------
+    ///     data? : seq Byte
+    ///     sig!  : MssSignature
+    ///
+    ///     pre  #data ≥ 8 + 32 + WOTS_SIG_SIZE + 4
+    ///     post result = Ok(sig!) ⇒
+    ///            leaf_index ∈ 0..2^MAX_HEIGHT
+    ///          ∧ #auth_path = auth_len
+    ///          ∧ node_size ∈ {32, 33}
+    ///     post result = Err(_) ⇒ true   (never panics)
+    /// ```
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        let min = 8 + 32 + wots::SIG_SIZE + 4;
-        if data.len() < min { bail!("MSS signature too short"); }
+        const MIN: usize = 8 + 32 + wots::SIG_SIZE + 4;
+        if data.len() < MIN {
+            bail!("MSS signature too short ({} < {})", data.len(), MIN);
+        }
 
-        let leaf_index = u64::from_le_bytes(data[..8].try_into().unwrap());
-        let wots_pk: [u8; 32] = data[8..40].try_into().unwrap();
+        let leaf_index = u64::from_le_bytes(
+            data[0..8].try_into().map_err(|_| anyhow::anyhow!("leaf_index slice error"))?
+        );
+        let wots_pk: [u8; 32] = data[8..40]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid wots_pk length"))?;
+
         let wots_sig = wots::sig_from_bytes(&data[40..40 + wots::SIG_SIZE])
-            .ok_or_else(|| anyhow::anyhow!("invalid WOTS sig in MSS"))?;
+            .ok_or_else(|| anyhow::anyhow!("invalid WOTS signature inside MSS signature"))?;
 
         let ao = 40 + wots::SIG_SIZE;
-        let auth_len = u32::from_le_bytes(data[ao..ao + 4].try_into().unwrap()) as usize;
+        if ao + 4 > data.len() {
+            bail!("MSS signature truncated before auth_len");
+        }
+        let auth_len = u32::from_le_bytes(
+            data[ao..ao + 4].try_into().map_err(|_| anyhow::anyhow!("auth_len slice error"))?
+        ) as usize;
+
         if auth_len > MAX_HEIGHT as usize {
             bail!("MSS auth path too long: {} > {}", auth_len, MAX_HEIGHT);
         }
-        
+
         let ps = ao + 4;
         let remaining = data.len() - ps;
-        
-        // Auto-detect V1 (33 bytes) vs V2 (32 bytes)
-        let node_size = if auth_len > 0 && remaining % 33 == 0 && remaining / 33 == auth_len {
-            33
-        } else if auth_len > 0 && remaining % 32 == 0 && remaining / 32 == auth_len {
-            32
-        } else if auth_len == 0 {
-            32
-        } else {
-            bail!("MSS signature truncated or invalid format");
-        };
+
+        // Strict format: we now only accept the modern 32-byte node size.
+        // 33-byte legacy support is removed to eliminate the ambiguous heuristic.
+        let node_size = 32;
+        if auth_len > 0 && remaining != auth_len * node_size {
+            bail!(
+                "MSS auth path length mismatch: expected {} bytes for {} nodes, got {}",
+                auth_len * node_size, auth_len, remaining
+            );
+        }
 
         let mut auth_path = Vec::with_capacity(auth_len);
         for i in 0..auth_len {
             let o = ps + i * node_size;
-            auth_path.push(data[o..o+32].try_into().unwrap());
+            if o + 32 > data.len() {
+                bail!("MSS auth path truncated at node {}", i);
+            }
+            auth_path.push(
+                data[o..o + 32]
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("auth node slice error"))?
+            );
         }
 
         Ok(Self { leaf_index, wots_pk, wots_sig, auth_path })

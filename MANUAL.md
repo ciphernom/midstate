@@ -63,6 +63,37 @@ By default, the solo miner utilizes all available CPU cores. This can starve the
 midstate node --mine --threads 3 --verify-threads 2
 ```
 
+### Archival vs Pruned Mode
+
+Midstate nodes can run in two modes regarding historical data:
+
+- **Archival mode** (default): The node keeps the full history of all blocks. This is required for serving new peers that want to sync from genesis. At least a few archival nodes must exist on the network.
+
+- **Pruned mode**: The node automatically deletes block data older than `PRUNE_DEPTH` (currently 1000 blocks). This dramatically reduces disk usage (roughly 98% savings on historical data) at the cost of not being able to serve old blocks to others.
+
+**CLI flag:**
+
+```bash
+midstate node --prune
+```
+
+**Config file (`config.toml`):**
+
+```toml
+prune = true
+```
+
+When `--prune` is passed on the command line, it takes precedence over the value in `config.toml`.
+
+**Startup messages:**
+
+- Archival: `Running in archival mode (full history retained, PRUNE_DEPTH = 1000)`
+- Pruned: `Running in pruned mode (retaining only the last 1000 blocks of history)`
+
+**Recommendation:** Most operators should run in archival mode unless disk space is a serious constraint. The network relies on having enough archival nodes for bootstrapping new participants.
+
+Pruning is safe from a consensus perspective because blocks older than `PRUNE_DEPTH` have their UTXO state fully represented in the rolling accumulator. However, pruned nodes cannot help new peers perform a full historical sync.
+
 ### WOTS Address Reuse & Co-spending (Consolidation)
 
 WOTS addresses are strictly single-use. The protocol enforces this at the consensus level. 

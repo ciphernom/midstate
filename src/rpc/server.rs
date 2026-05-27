@@ -37,13 +37,28 @@ async fn lan_only_middleware(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let ip = addr.ip();
-    if is_lan_ip(ip) {
-        Ok(next.run(req).await)
+    // Check real client IP, honoring reverse proxies (Nginx, etc.)
+    let real_ip = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .or_else(|| req.headers().get("x-real-ip").and_then(|v| v.to_str().ok()))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| addr.ip().to_string());
+
+    // Parse the IP (handle possible port in some proxies, though rare for X-Forwarded-For)
+    let ip_str = real_ip.split(':').next().unwrap_or(&real_ip);
+    if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
+        if is_lan_ip(ip) {
+            return Ok(next.run(req).await);
+        }
+        tracing::warn!("Blocked WAN access to hardware endpoint from {} (via proxy)", ip);
     } else {
-        tracing::warn!("Blocked WAN access to hardware endpoint from {}", ip);
-        Err(StatusCode::FORBIDDEN)
+        tracing::warn!("Blocked request with unparsable client IP: {}", real_ip);
     }
+
+    Err(StatusCode::FORBIDDEN)
 }
 
 pub struct RpcServer {

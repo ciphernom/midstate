@@ -569,7 +569,8 @@ mod tests {
 
         mgr.register(&mix_id, make_input(b"alice", 8), make_output(b"alice", 8), &test_sig(b"alice", &mix_id), None).unwrap();
         mgr.register(&mix_id, make_input(b"bob", 8), make_output(b"bob", 8), &test_sig(b"bob", &mix_id), None).unwrap();
-        mgr.set_fee_input(&mix_id, make_input(b"fee", 1), None).unwrap();
+        let required = crate::wallet::coinjoin::recommended_fee_for_mix(2);
+        mgr.set_fee_input(&mix_id, make_input(b"fee", required), None).unwrap();
 
         let proposal = mgr.try_finalize(&mix_id).unwrap();
         assert!(proposal.is_some());
@@ -599,7 +600,8 @@ mod tests {
 
         mgr.register(&mix_id, make_input(b"alice", 8), make_output(b"alice", 8), &test_sig(b"alice", &mix_id), None).unwrap();
         mgr.register(&mix_id, make_input(b"bob", 8), make_output(b"bob", 8), &test_sig(b"bob", &mix_id), None).unwrap();
-        mgr.set_fee_input(&mix_id, make_input(b"fee", 1), None).unwrap();
+        let required = crate::wallet::coinjoin::recommended_fee_for_mix(2);
+        mgr.set_fee_input(&mix_id, make_input(b"fee", required), None).unwrap();
 
         let proposal = mgr.try_finalize(&mix_id).unwrap().unwrap();
 
@@ -636,7 +638,8 @@ mod tests {
 
         mgr.register(&mix_id, make_input(b"alice", 8), make_output(b"alice", 8), &test_sig(b"alice", &mix_id), None).unwrap();
         mgr.register(&mix_id, make_input(b"bob", 8), make_output(b"bob", 8), &test_sig(b"bob", &mix_id), None).unwrap();
-        mgr.set_fee_input(&mix_id, make_input(b"fee", 1), None).unwrap();
+        let required = crate::wallet::coinjoin::recommended_fee_for_mix(2);
+        mgr.set_fee_input(&mix_id, make_input(b"fee", required), None).unwrap();
 
         let proposal = mgr.try_finalize(&mix_id).unwrap().unwrap();
 

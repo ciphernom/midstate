@@ -301,6 +301,39 @@ pub fn delete_spent_address(&self, address: &[u8; 32]) -> Result<()> {
         Ok(())
     }
 
+    /// Prunes old historical batches, headers, and filters according to PRUNE_DEPTH.
+    ///
+    /// This deletes data older than `current_height - PRUNE_DEPTH`.
+    /// It is safe because blocks this deep are finalized and their UTXOs
+    /// are represented in the rolling UtxoAccumulator state.
+    ///
+    /// # Formal Specification
+    /// ```text
+    /// Pre:  current_height >= PRUNE_DEPTH
+    /// Post: All data for height < (current_height - PRUNE_DEPTH) has been deleted
+    ///       from the historical tables.
+    /// ```
+    ///
+    /// ```zed
+    ///     PruneOldData
+    ///     ------------
+    ///     ΞStorage
+    ///     current_height? : ℕ
+    ///
+    ///     pre  current_height? ≥ PRUNE_DEPTH
+    ///     post ∀ h • h < current_height? - PRUNE_DEPTH ⇒
+    ///            h ∉ batches' ∧ h ∉ headers' ∧ h ∉ filters'
+    /// ```
+    pub fn prune_old_data(&self, current_height: u64) -> Result<()> {
+        if current_height < crate::core::PRUNE_DEPTH {
+            return Ok(());
+        }
+
+        let prune_up_to = current_height - crate::core::PRUNE_DEPTH;
+        self.batches.prune_tail(prune_up_to)?;
+        Ok(())
+    }
+
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;

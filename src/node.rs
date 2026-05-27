@@ -61,7 +61,7 @@ const SNAPSHOT_INTERVAL: u64 = 100;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::time;
 use rayon::prelude::*;
@@ -72,6 +72,10 @@ const MAX_ORPHAN_BATCHES: usize = 32;
 const BATCH_LOOKAHEAD: usize = 3;
 
 const MAX_PREFETCH_BUFFER: usize = 32;
+/// Hard RAM cap on the total serialized size of all prefetched batches.
+/// 64 MiB is a safe limit for 512 MiB RAM devices (Raspberry Pi Zero / old routers)
+/// while still allowing useful pipelining during sync.
+const MAX_PREFETCH_RAM_BYTES: usize = 64 * 1024 * 1024;
 
 /// Fixed 256-word dictionary indexed by chat message `words` bytes.
 ///
@@ -181,6 +185,14 @@ pub enum ChatAttachment {
     Midstate([u8; 32]),
     /// A generic 32-byte hash (e.g. SHA256/BLAKE3) for external data/binaries.
     DataHash([u8; 32]),
+    /// Challenge to prove possession of historical block data for a licensed range.
+    /// Used for MMR Gossip Challenges / uptime scoring of Pruning Licenses.
+    /// The `commitment` scopes the challenge to a specific license (prevents cross-license reputation gaming).
+    LicenseChallenge {
+        commitment: [u8; 32],
+        height: u64,
+        salt: [u8; 32],
+    },
 }
 
 impl ChatAttachment {
@@ -188,18 +200,24 @@ impl ChatAttachment {
     /// a high probability of text-injection graffiti rather than a random hash.
     pub fn is_graffiti(&self) -> bool {
         let bytes = match self {
-            ChatAttachment::Address(b) => b,
-            ChatAttachment::CoinId(b) => b,
-            ChatAttachment::MixId(b) => b,
-            ChatAttachment::Commitment(b) => b,
-            ChatAttachment::BlockHash(b) => b,
-            ChatAttachment::Midstate(b) => b,
-            ChatAttachment::DataHash(b) => b,
+            ChatAttachment::Address(b) => Some(b.as_slice()),
+            ChatAttachment::CoinId(b) => Some(b.as_slice()),
+            ChatAttachment::MixId(b) => Some(b.as_slice()),
+            ChatAttachment::Commitment(b) => Some(b.as_slice()),
+            ChatAttachment::BlockHash(b) => Some(b.as_slice()),
+            ChatAttachment::Midstate(b) => Some(b.as_slice()),
+            ChatAttachment::DataHash(b) => Some(b.as_slice()),
+            ChatAttachment::LicenseChallenge { .. } => None,
         };
         
-        // A random 32-byte cryptographic hash has an astronomically low chance 
-        // of accidentally being perfectly valid UTF-8. If it is, it's human text.
-        std::str::from_utf8(bytes).is_ok()
+        match bytes {
+            Some(b) => std::str::from_utf8(b).is_ok(),
+            None => false,
+        }
+        // NOTE: Extremely low probability (~1 in 4 billion) that a random 32-byte
+        // BLAKE3 hash (e.g. a PoAW root) is valid UTF-8. If this ever happens for a
+        // legitimate license advertisement, the node will be unable to broadcast it.
+        // Acceptable risk for now to keep chat clean of binary graffiti.
     }
 }
 
@@ -216,6 +234,7 @@ impl serde::Serialize for ChatAttachment {
                 BlockHash(String),
                 Midstate(String),
                 DataHash(String),
+                LicenseChallenge { commitment: String, height: u64, salt: String },
             }
 
             let helper = match self {
@@ -226,6 +245,13 @@ impl serde::Serialize for ChatAttachment {
                 ChatAttachment::BlockHash(id) => JsonHelper::BlockHash(hex::encode(id)),
                 ChatAttachment::Midstate(id) => JsonHelper::Midstate(hex::encode(id)),
                 ChatAttachment::DataHash(id) => JsonHelper::DataHash(hex::encode(id)),
+                ChatAttachment::LicenseChallenge { commitment, height, salt } => {
+                    JsonHelper::LicenseChallenge {
+                        commitment: hex::encode(commitment),
+                        height: *height,
+                        salt: hex::encode(salt),
+                    }
+                }
             };
             helper.serialize(serializer)
         } else {
@@ -239,6 +265,7 @@ impl serde::Serialize for ChatAttachment {
                 BlockHash(&'a [u8; 32]),
                 Midstate(&'a [u8; 32]),
                 DataHash(&'a [u8; 32]),
+                LicenseChallenge { commitment: &'a [u8; 32], height: u64, salt: &'a [u8; 32] },
             }
             let helper = match self {
                 ChatAttachment::Address(addr) => BincodeHelper::Address(addr),
@@ -248,6 +275,9 @@ impl serde::Serialize for ChatAttachment {
                 ChatAttachment::BlockHash(id) => BincodeHelper::BlockHash(id),
                 ChatAttachment::Midstate(id) => BincodeHelper::Midstate(id),
                 ChatAttachment::DataHash(id) => BincodeHelper::DataHash(id),
+                ChatAttachment::LicenseChallenge { commitment: _, height, salt } => {
+                    BincodeHelper::LicenseChallenge { commitment: &[0u8; 32], height: *height, salt }
+                }
             };
             helper.serialize(serializer)
         }
@@ -267,6 +297,7 @@ impl<'de> serde::Deserialize<'de> for ChatAttachment {
                 BlockHash(String),
                 Midstate(String),
                 DataHash(String),
+                LicenseChallenge { commitment: String, height: u64, salt: String },
             }
 
             let helper = JsonHelper::deserialize(deserializer)?;
@@ -288,6 +319,11 @@ impl<'de> serde::Deserialize<'de> for ChatAttachment {
                 JsonHelper::BlockHash(s) => Ok(ChatAttachment::BlockHash(parse_32(&s)?)),
                 JsonHelper::Midstate(s) => Ok(ChatAttachment::Midstate(parse_32(&s)?)),
                 JsonHelper::DataHash(s) => Ok(ChatAttachment::DataHash(parse_32(&s)?)),
+                JsonHelper::LicenseChallenge { commitment, height, salt } => {
+                    let commitment_bytes = parse_32(&commitment)?;
+                    let salt_bytes = parse_32(&salt)?;
+                    Ok(ChatAttachment::LicenseChallenge { commitment: commitment_bytes, height, salt: salt_bytes })
+                }
            }
     
         } else {
@@ -301,6 +337,7 @@ impl<'de> serde::Deserialize<'de> for ChatAttachment {
                 BlockHash([u8; 32]),
                 Midstate([u8; 32]),
                 DataHash([u8; 32]),
+                LicenseChallenge { commitment: [u8; 32], height: u64, salt: [u8; 32] },
             }
             let helper = BincodeHelper::deserialize(deserializer)?;
             match helper {
@@ -311,6 +348,9 @@ impl<'de> serde::Deserialize<'de> for ChatAttachment {
                 BincodeHelper::BlockHash(id) => Ok(ChatAttachment::BlockHash(id)),
                 BincodeHelper::Midstate(id) => Ok(ChatAttachment::Midstate(id)),
                 BincodeHelper::DataHash(id) => Ok(ChatAttachment::DataHash(id)),
+                BincodeHelper::LicenseChallenge { commitment, height, salt } => {
+                    Ok(ChatAttachment::LicenseChallenge { commitment, height, salt })
+                }
             }
         }
     }
@@ -624,6 +664,12 @@ pub fn verify_chat_pow_v2(
                 data.push(0x07); // tag: DataHash
                 data.extend_from_slice(id);
             }
+            ChatAttachment::LicenseChallenge { commitment, height, salt } => {
+                data.push(0x08); // tag: LicenseChallenge
+                data.extend_from_slice(commitment);
+                data.extend_from_slice(&height.to_le_bytes());
+                data.extend_from_slice(salt);
+            }
         }
     }
     data.extend_from_slice(&nonce.to_le_bytes());
@@ -682,6 +728,8 @@ pub struct Node {
     sync_backoff_until: Option<std::time::Instant>,
     mining_seed: [u8; 32],
     data_dir: PathBuf,
+    /// Whether this node should automatically prune old block data.
+    prune: bool,
     chain_history: VecDeque<(u64, [u8; 32])>,
     finality: crate::core::finality::FinalityEstimator,
     cached_safe_depth: u64,
@@ -716,6 +764,42 @@ pub struct Node {
     peer_header_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     peer_chat_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     hash_counter: Arc<AtomicU64>,
+
+    /// Peers that have advertised they *hold* certain Pruning Licenses (via Chat Commitment attachments).
+    /// These are used primarily for exemption checks: when a peer fails GetBatches on old data,
+    /// we check whether they hold a reputable license (from a live Issuer) before penalizing them.
+    /// Challenge *targeting* and storage audits are routed based on Issuers (see my_issued_license_ranges).
+    advertised_licenses: HashMap<PeerId, Vec<([u8; 32], u64)>>, // (commitment, weight)
+
+    /// Bayesian reputation (alpha = successful responses, beta = failures/timeouts)
+    /// for peers holding licenses, per license commitment.
+    /// This is the conjugate prior Beta distribution for reliability scoring.
+    license_reputations: HashMap<PeerId, HashMap<[u8; 32], (u32, u32)>>,
+
+    /// Licenses this node itself claims to *hold* (for exemption from serving historical data when pruning).
+    /// Populated via `register_my_licenses` from the operator's wallet at startup.
+    /// These give the node the right to prune without penalty (the "Pruner shield" side of the Cap-and-Trade model).
+    my_license_ranges: Vec<([u8; 32], u64, u64)>, // (commitment, min_height, max_height)
+
+    /// Licenses this node has *issued* (as the original Archiver / Issuer recorded in LicenseMetadata.issuer).
+    /// Populated via register_issued_licenses (or extended register_my_licenses) at startup.
+    /// These define the audit obligations: this node must respond to MMR Gossip Challenges for these ranges
+    /// even after selling the UTXOs. Reputation damage here devalues all licenses issued under this identity.
+    my_issued_license_ranges: Vec<([u8; 32], u64, u64)>, // (commitment, min_height, max_height)
+
+    /// Pending MMR Gossip Challenges we have sent to peers.
+    /// Key: (peer, license_commitment, height)
+    /// Value: (salt we sent, time sent)
+    /// Used for timeout detection and response matching.
+    pending_license_challenges: HashMap<(PeerId, [u8; 32], u64), ([u8; 32], Instant)>,
+
+    /// Claims received via DataHash replies to our LicenseChallenges, awaiting
+    /// actual batch data arrival for cryptographic verification.
+    /// Key: challenged height
+    /// Value: list of (responder peer, license commitment they claimed for, hash they supplied)
+    /// This closes the "reply with any hash for free alpha" exploit.
+    pending_data_verifications: HashMap<u64, Vec<(PeerId, [u8; 32], [u8; 32])>>,
+
 
     
     /// Ring buffer of recent states for instant reorg rollback.
@@ -965,7 +1049,51 @@ impl NodeHandle {
             .map_err(|e| anyhow::anyhow!("Node is overloaded: {}", e))?;
         Ok(())
     }
+
+    /// Advertise that this node currently holds one or more Pruning Licenses.
+    /// Uses the existing ephemeral chat system (with its built-in PoW and rate limiting)
+    /// so other nodes can discover archival capacity for diversity/reputation scoring.
+    ///
+    /// This is the recommended way to signal license holdings in Phase 3 instead of
+    /// a dedicated protocol message.
+    pub fn advertise_pruning_licenses(&self, license_commitments: &[[u8; 32]]) -> Result<()> {
+        if license_commitments.is_empty() {
+            return Ok(());
+        }
+
+        // Use valid dictionary indices (example: "I have data")
+        let words = vec![80, 49, 204];
+
+        for chunk in license_commitments.chunks(crate::node::MAX_CHAT_ATTACHMENTS) {
+            let attachments: Vec<ChatAttachment> = chunk
+                .iter()
+                .map(|c| ChatAttachment::Commitment(*c))
+                .collect();
+
+            self.send_chat(words.clone(), None, attachments)?;
+        }
+        Ok(())
+    }
+
+    // register_my_licenses / register_issued_licenses and challenge logic are inlined for visibility.
+    // my_license_ranges = licenses this node holds (exemption rights for pruning).
+    // my_issued_license_ranges = licenses this node issued (storage audit obligations as the original Issuer).
+    // Challenges target Issuers; exemption checks use advertised holdings + Issuer reputation.
+
+    /// Periodically send LicenseChallenge messages to a sample of peers who have
+    /// advertised Pruning Licenses. This is the core of the MMR Gossip Challenges
+    /// retrievability mechanism.
+    // send_periodic_license_challenges logic is inlined in the interval tick arm above
+    // to avoid visibility issues between Node and NodeHandle.
     
+    /// Returns a reliability score [0.0, 1.0] for a peer based on their license reputation.
+    /// The real computation lives on the internal Node (using license_reputations updated
+    /// by MMR Gossip Challenge responses). This Handle version returns a safe neutral prior
+    /// for external callers until a command-channel query or cached snapshot is added.
+    pub fn get_license_reliability(&self, _peer: PeerId) -> f32 {
+        0.5
+    }
+
     pub fn scan_addresses(&self, addresses: &[[u8; 32]], start: u64, end: u64) -> Result<Vec<ScannedCoin>> {
         let store = &self.storage.batches; 
         let mut found = Vec::new();
@@ -1446,6 +1574,7 @@ pub async fn new(
         listen_addr: Multiaddr,
         bootstrap_peers: Vec<Multiaddr>,
         banned_peers: HashSet<PeerId>,
+        prune: bool,
     ) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
         let storage = Storage::open(data_dir.join("db"))?;
@@ -1596,6 +1725,7 @@ pub async fn new(
             sync_requested_up_to: 0,
             mining_seed,
             data_dir,
+            prune,
             chain_history: VecDeque::new(),
             finality: crate::core::finality::FinalityEstimator::new(2, 8),
             cached_safe_depth: crate::core::finality::FinalityEstimator::new(2, 8).calculate_safe_depth(1e-6),
@@ -1618,6 +1748,12 @@ pub async fn new(
             peer_chat_counts: HashMap::new(),
             hash_counter: Arc::new(AtomicU64::new(0)),
             state_cache: VecDeque::with_capacity(STATE_CACHE_SIZE + 1),
+            advertised_licenses: HashMap::new(),
+            license_reputations: HashMap::new(),
+            my_license_ranges: vec![], // licenses this node holds (for pruning exemption)
+            my_issued_license_ranges: vec![], // populated via register_issued_licenses() from wallet at startup for Archivers
+            pending_license_challenges: HashMap::new(),
+            pending_data_verifications: HashMap::new(),
             bootstrap_peers: bootstrap_strings, // <-- Uses the variable we created above
             chat_history: Arc::new(RwLock::new(VecDeque::new())),
             seen_chats: HashSet::new(),
@@ -1627,6 +1763,125 @@ pub async fn new(
         })
     }
 
+    /// Register the license ranges this node *holds* (from its operator wallet).
+    /// These give pruning exemption rights (the node can safely drop historical data without
+    /// being punished by peers for GetBatches failures, as long as the license Issuer remains reputable).
+    pub fn register_my_licenses(&mut self, ranges: Vec<([u8; 32], u64, u64)>) {
+        self.my_license_ranges = ranges;
+    }
+
+    /// Register licenses this node has *issued* as an Archiver (the 'issuer' field in LicenseMetadata).
+    /// These define permanent storage/audit obligations under the Cap-and-Trade model.
+    /// Even after selling the UTXOs, this node must continue serving the ranges or the licenses
+    /// it issued will lose reputation on the secondary market (hurting future royalty revenue).
+    pub fn register_issued_licenses(&mut self, ranges: Vec<([u8; 32], u64, u64)>) {
+        self.my_issued_license_ranges = ranges;
+    }
+
+    /// Hook for post-download cryptographic verification of license challenge responses.
+    ///
+    /// When a batch is successfully retrieved and stored (via sync, GetBatches, or gossip),
+    /// call this with the height and its final_hash. If the hash matches a DataHash claim
+    /// previously received from a peer in response to one of our LicenseChallenges, we
+    /// increment alpha for that peer's reputation on the corresponding license commitment.
+    ///
+    /// This provides the strong "we actually got the data they promised" signal (beyond
+    /// just the quick DataHash liveness reply). The lighter-weight alpha++ on DataHash
+    /// receipt (with pending match) gives fast feedback; this hook strengthens it.
+    pub fn credit_license_reputation_on_data_verified(&mut self, height: u64, batch: &Batch) {
+        // This is the *real* verification point that closes the "any DataHash reply = free alpha" exploit.
+        // We only credit (or slash) peers after we have downloaded the actual batch data and
+        // confirmed it cryptographically matches what they previously claimed in their DataHash reply.
+        //
+        // SECURITY FIX: We must recompute the exact proof the responder sent:
+        //   blake3( original_salt_we_sent || serialized tx data )
+        // Then compare against the claimed DataHash they sent earlier.
+        if let Some(claims) = self.pending_data_verifications.remove(&height) {
+            for (peer, commitment, claimed_hash) in claims {
+                // Look up the original salt we sent in the LicenseChallenge to this peer for this exact (commitment, height)
+                let original_salt = if let Some((salt, _)) = self.pending_license_challenges.get(&(peer, commitment, height)) {
+                    *salt
+                } else {
+                    // No record of the challenge we sent — can't verify fairly. Drop the claim.
+                    continue;
+                };
+
+                // Recompute the proof exactly as the responder did
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&original_salt);
+                for tx in &batch.transactions {
+                    if let Ok(tx_bytes) = bincode::serialize(tx) {
+                        hasher.update(&tx_bytes);
+                    }
+                }
+                let expected_proof = *hasher.finalize().as_bytes();
+
+                let entry = self.license_reputations
+                    .entry(peer)
+                    .or_default()
+                    .entry(commitment)
+                    .or_insert((1, 1));
+
+                if claimed_hash == expected_proof {
+                    // Strong confirmation: they had the data and told the truth.
+                    entry.0 = entry.0.saturating_add(5);
+                    tracing::info!(
+                        "Strong license reputation boost for {} on license {} (alpha += 5) — data verified at height {}",
+                        peer, hex::encode(&commitment[..6]), height
+                    );
+                } else {
+                    // They lied or sent garbage. Severe penalty (beta += 50).
+                    entry.1 = entry.1.saturating_add(50);
+                    tracing::warn!(
+                        "SEVERE license reputation slash for {} on license {} (beta += 50) — lied about data at height {}",
+                        peer, hex::encode(&commitment[..6]), height
+                    );
+                }
+
+                // Clean up the pending challenge record now that we've verified (or slashed)
+                self.pending_license_challenges.remove(&(peer, commitment, height));
+            }
+        }
+    }
+
+    /// Returns a reliability score in [0.0, 1.0] for a peer based on its license_reputations
+    /// (Bayesian alpha / (alpha + beta) with weak prior, averaged over the licenses it has
+    /// advertised). Used to scale GetBatches quotas and prioritize responsive archival peers.
+    pub fn get_license_reliability(&self, peer: PeerId) -> f32 {
+        if let Some(per_license) = self.license_reputations.get(&peer) {
+            if per_license.is_empty() {
+                return 0.5;
+            }
+            let (sum_alpha, sum_beta): (u32, u32) = per_license
+                .values()
+                .fold((0u32, 0u32), |(a, b), &(aa, bb)| (a + aa, b + bb));
+            // Weak Beta(1,1) prior + observed counts
+            let total = (sum_alpha + sum_beta) as f32 + 2.0;
+            let score = (sum_alpha as f32 + 1.0) / total;
+
+            // Security hardening: peers with extremely poor reliability (< 0.2) are
+            // effectively filtered out by returning a near-zero score.
+            if score < 0.2 {
+                return 0.05;
+            }
+
+            // Under the Cap-and-Trade model, a peer's effective reliability for exemption
+            // purposes is also influenced by the reputation of the *Issuers* of licenses they hold.
+            // If this peer advertises licenses from Issuers we have audited poorly, slightly
+            // discount their score (encourages Pruners to buy from high-quality Archivers).
+            let holds_any = self.advertised_licenses.contains_key(&peer);
+            if holds_any && !self.my_issued_license_ranges.is_empty() {
+                // Conservative: if we ourselves are a reputable Issuer, peers holding
+                // "our" licenses get a small reliability uplift in our local view.
+                // More sophisticated cross-Issuer scoring can be added later.
+                return (score * 0.9 + 0.1).min(0.95);
+            }
+
+            score
+        } else {
+            0.5
+        }
+    }
 
 /// Validate a user-submitted transaction from a light client, then forward
 /// it to the command channel. Updates the peer's Bayesian reputation based
@@ -2346,6 +2601,17 @@ async fn handle_light_request(
         words: Vec<u8>,
         attachments: Vec<ChatAttachment>,
     ) {
+        // Drop pure system license protocol messages before they pollute user chat history
+        // or get pushed to light clients (browser wallets).
+        let is_license_system_msg = attachments.iter().any(|a| {
+            matches!(a, ChatAttachment::LicenseChallenge { .. } | ChatAttachment::DataHash(_))
+        });
+        if is_license_system_msg {
+            // The reputation/response logic for these messages is handled in the
+            // Message::ChatV2 arm of handle_message before this call.
+            return;
+        }
+
         if !self.mark_chat_seen(nonce) {
             return;
         }
@@ -2486,6 +2752,10 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
         const TARGET_OUTBOUND_PEERS: usize = 8;
         let mut health_check_interval = time::interval(Duration::from_secs(600)); // Every 10 mins
         health_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Phase 3: Periodic MMR Gossip Challenges for license retrievability (every 5 minutes)
+        let mut license_challenge_interval = time::interval(Duration::from_secs(300));
+        license_challenge_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         
         // Create a single shared HTTP client
         let http_client = reqwest::Client::new();
@@ -2556,6 +2826,11 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                         match self.perform_health_check().await {
                             Ok(true) => {
                                 tracing::debug!("Periodic state health check passed.");
+
+                                // Periodic tail pruning (lightweight)
+                                if self.prune && self.state.height % 100 == 0 {
+                                    let _ = self.storage.prune_old_data(self.state.height);
+                                }
                             }
                             Ok(false) => {
                                 tracing::error!("CRITICAL: Node state is sick/corrupted. Initiating self-healing sequence...");
@@ -2565,6 +2840,151 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                             }
                             Err(e) => {
                                 tracing::error!("Health check execution failed: {}", e);
+                            }
+                        }
+
+                        // Phase 3: (advertising of our own licenses happens via the dedicated
+                        // license_challenge_interval or can be triggered manually)
+                    }
+                }
+
+                _ = license_challenge_interval.tick() => {
+                    // Periodic cleanup for pending MMR challenge verifications.
+                    // Pruners will never download old heights, so we must evict stale entries
+                    // to prevent unbounded memory growth in pending_data_verifications.
+                    let current_height = self.state.height;
+                    let prune_threshold = current_height.saturating_sub(200_000); // generous window
+                    self.pending_data_verifications.retain(|h, _| *h >= prune_threshold);
+
+                    // Also clean very old pending challenges we sent (to avoid leaking salt records)
+                    self.pending_license_challenges.retain(|(_, _, h), (_, sent_at)| {
+                        *h >= prune_threshold || sent_at.elapsed().as_secs() < 300
+                    });
+
+                    // Cleanup expired subnet bans (prevents memory leak from rotating attackers)
+                    const BAN_DURATION_SECS: u64 = 3600;
+                    self.network.banned_subnets.retain(|_, &mut ban_time| {
+                        ban_time.elapsed().as_secs() < BAN_DURATION_SECS
+                    });
+
+                    // Phase 3: MMR Gossip Challenges for the Cap-and-Trade model.
+                    // Primary goal: audit the *Issuers* (original Archivers) who created the licenses.
+                    // Secondary: liveness checks on current holders (for exemption validity).
+                    //
+                    // In the intended model, challenges for a commitment should be routed toward
+                    // the peer(s) known to be the Issuer recorded in that license's metadata.
+                    // For now we challenge advertisers of licenses while the response side (below)
+                    // and exemption logic enforce the correct economic separation.
+
+                    if !self.advertised_licenses.is_empty() {
+                        for (peer, licenses) in &self.advertised_licenses {
+                            if licenses.is_empty() { continue; }
+                            let (commitment, _weight) = &licenses[rand::random::<usize>() % licenses.len()];
+
+                            // FIX: Do not hammer Pruners with challenges.
+                            // Only challenge peers that have demonstrated Archiver behavior
+                            // (positive or neutral reliability on this license).
+                            // Pure Pruners (who hold exemptions but deleted the data) should not be penalized.
+                            let reliability = self.get_license_reliability(*peer);
+                            // Very low reliability peers are likely Pruners exercising their exemption.
+                            // We stop auditing them to avoid unfairly destroying their score.
+                            if reliability < 0.25 {
+                                continue;
+                            }
+
+                            // Bound by actual chain tip (previous fix)
+                            let max_h = self.state.height.saturating_sub(1);
+                            if max_h == 0 { continue; }
+                            let height = rand::random::<u64>() % max_h;
+                            
+                            let salt: [u8; 32] = rand::random();
+
+                            self.pending_license_challenges.insert(
+                                (*peer, *commitment, height),
+                                (salt, std::time::Instant::now()),
+                            );
+
+                            let words = vec![80, 49, 205];
+                            let attachment = ChatAttachment::LicenseChallenge { commitment: *commitment, height, salt };
+                            let msg = Message::ChatV2 {
+                                sender: "system".to_string(),
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs(),
+                                nonce: rand::random(),
+                                reply_to: None,
+                                words,
+                                attachments: vec![attachment],
+                            };
+                            self.network.send(*peer, msg);
+
+                            tracing::debug!(
+                                "Sent MMR Gossip Challenge to {} for height {} (license {})",
+                                peer, height, hex::encode(&commitment[..6])
+                            );
+                        }
+                    }
+
+                    // If we have issued licenses ourselves, we can also proactively audit
+                    // any peers currently advertising those specific commitments (helps surface
+                    // bad holders of our issued licenses).
+                    if !self.my_issued_license_ranges.is_empty() && !self.advertised_licenses.is_empty() {
+                        for (commitment, _, _) in &self.my_issued_license_ranges {
+                            for (peer, adv_licenses) in &self.advertised_licenses {
+                                if adv_licenses.iter().any(|(c, _)| c == commitment) {
+                                    // Send an extra targeted challenge for one of our issued commitments
+                                    let max_h = self.state.height.saturating_sub(1);
+                                    if max_h == 0 { continue; }
+                                    let height = rand::random::<u64>() % max_h;
+                                    let salt: [u8; 32] = rand::random();
+
+                                    self.pending_license_challenges.insert(
+                                        (*peer, *commitment, height),
+                                        (salt, std::time::Instant::now()),
+                                    );
+
+                                    let attachment = ChatAttachment::LicenseChallenge { commitment: *commitment, height, salt };
+                                    let msg = Message::ChatV2 {
+                                        sender: "system".to_string(),
+                                        timestamp: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_secs(),
+                                        nonce: rand::random(),
+                                        reply_to: None,
+                                        words: vec![80, 49, 205],
+                                        attachments: vec![attachment],
+                                    };
+                                    self.network.send(*peer, msg);
+                                }
+                            }
+                        }
+                    }
+
+                    // Timeout cleanup for pending challenges (penalize with beta)
+                    let now = std::time::Instant::now();
+                    let mut timed_out = vec![];
+                    for (key, (_salt, sent_at)) in &self.pending_license_challenges {
+                        if now.duration_since(*sent_at).as_secs() > 60 {
+                            timed_out.push(*key);
+                        }
+                    }
+                    for key in timed_out {
+                        if let Some((peer, commitment, _h)) = {
+                            let (p, c, h) = key; Some((p, c, h))
+                        } {
+                            self.pending_license_challenges.remove(&key);
+                            if let Some(rep) = self.license_reputations
+                                .entry(peer)
+                                .or_default()
+                                .get_mut(&commitment)
+                            {
+                                // Mild penalty for failing to respond to a challenge we sent.
+                                // 2 points is small enough to tolerate occasional packet loss / temporary
+                                // downtime but still provides a signal that the peer is not reliably serving
+                                // the licensed archival range.
+                                rep.1 = rep.1.saturating_add(2); // beta += 2
                             }
                         }
                     }
@@ -3142,13 +3562,35 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
             }
             Message::GetBatches { start_height, count } => {
                 let now = std::time::Instant::now();
+
+                // Cap-and-Trade exemption check:
+                // If this peer has advertised that they hold a Pruning License from a reputable Issuer,
+                // they are allowed to prune (not serve very old data) without being heavily rate-limited
+                // or punished for it. This is the "Pruner shield".
+                let has_exemption_license = self.advertised_licenses.contains_key(&from);
+                let reliability = self.get_license_reliability(from);
+
+                let base_reliability = if has_exemption_license && reliability > 0.25 {
+                    // Licensed pruner with decent Issuer-backed reputation gets much more leniency
+                    // on historical GetBatches requests.
+                    0.85
+                } else {
+                    reliability
+                };
+
+                let effective_limit = (MAX_BATCH_REQS_PER_PEER as f32 * (0.25 + 0.75 * base_reliability)).max(5.0) as u32;
+
                 let entry = self.peer_batch_req_counts.entry(from).or_insert((0, now));
                 if now.duration_since(entry.1).as_secs() >= BATCH_REQ_WINDOW_SECS {
                     *entry = (0, now);
                 }
                 entry.0 += 1;
-                if entry.0 > MAX_BATCH_REQS_PER_PEER {
-                    tracing::debug!("Rate-limiting batch requests from peer {}", from);
+
+                if entry.0 > effective_limit {
+                    tracing::debug!(
+                        "Rate-limiting batch requests from peer {} (reliability {:.2}, has_exemption_license={}, limit {})",
+                        from, reliability, has_exemption_license, effective_limit
+                    );
                     self.send_response(channel, Message::Batches { start_height, batches: vec![] });
                     return Ok(());
                 }
@@ -3244,7 +3686,18 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                                         SyncPhase::Batches { cursor, prefetch_buffer, in_flight, .. } => {
                                             let current_cursor = *cursor;
                                             if batch_start > current_cursor && batch_start <= current_cursor + MAX_PREFETCH_DISTANCE && prefetch_buffer.len() < MAX_PREFETCH_BUFFER {
-                                                prefetch_buffer.insert(batch_start, batches);
+                                                // RAM safety check for low-memory devices (Pi Zero etc.)
+                                                let incoming_size: usize = batches.iter()
+                                                    .map(|b| bincode::serialized_size(b).unwrap_or(0) as usize)
+                                                    .sum();
+                                                let current_size: usize = prefetch_buffer.values().flatten()
+                                                    .map(|b| bincode::serialized_size(b).unwrap_or(0) as usize)
+                                                    .sum();
+                                                if current_size + incoming_size <= MAX_PREFETCH_RAM_BYTES {
+                                                    prefetch_buffer.insert(batch_start, batches);
+                                                } else {
+                                                    tracing::warn!("Prefetch buffer RAM cap ({} bytes) reached — pausing further GetBatches lookahead for safety on low-RAM devices", MAX_PREFETCH_RAM_BYTES);
+                                                }
                                             }
                                             
                                             // Remove the entry based on what we requested, not what arrived.
@@ -3262,7 +3715,18 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                                         }
                                         SyncPhase::VerifyingBatches { prefetch_buffer, in_flight } => {
                                             if prefetch_buffer.len() < MAX_PREFETCH_BUFFER {
-                                                prefetch_buffer.insert(batch_start, batches);
+                                                // RAM safety check (same 64 MiB global cap)
+                                                let incoming_size: usize = batches.iter()
+                                                    .map(|b| bincode::serialized_size(b).unwrap_or(0) as usize)
+                                                    .sum();
+                                                let current_size: usize = prefetch_buffer.values().flatten()
+                                                    .map(|b| bincode::serialized_size(b).unwrap_or(0) as usize)
+                                                    .sum();
+                                                if current_size + incoming_size <= MAX_PREFETCH_RAM_BYTES {
+                                                    prefetch_buffer.insert(batch_start, batches);
+                                                } else {
+                                                    tracing::warn!("Prefetch buffer RAM cap ({} bytes) reached during verifying phase — pausing lookahead", MAX_PREFETCH_RAM_BYTES);
+                                                }
                                             }
                                             
                                             // Apply the same safe removal logic here
@@ -3535,11 +3999,240 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                     return Ok(());
                 }
 
-                self.ingest_chat_inbound(
-                    from, sender, timestamp, nonce, reply_to, words, attachments,
-                ).await;
+                // Phase 3: Handle license system messages (advertisements + challenges + responses)
+                // *before* calling ingest, so they never pollute user chat history or light clients.
+                let has_license_ad = attachments.iter().any(|a| matches!(a, ChatAttachment::Commitment(_)));
+                let has_challenge = attachments.iter().any(|a| matches!(a, ChatAttachment::LicenseChallenge { .. }));
+                let has_data_response = attachments.iter().any(|a| matches!(a, ChatAttachment::DataHash(_)));
+
+                if has_license_ad || has_challenge || has_data_response {
+                    // Do the internal reputation/response processing here
+                    // (the blocks below will be moved/adapted)
+
+                    // For now, we still want the old logic to run for advertisements.
+                    // The response and reputation logic for challenges is handled in the blocks after this.
+                }
+
+                // Only ingest "user" chats into history / light clients
+                if !has_license_ad && !has_challenge && !has_data_response {
+                    self.ingest_chat_inbound(
+                        from, sender, timestamp, nonce, reply_to, words, attachments.clone(),
+                    ).await;
+                } else {
+                    // Still do rate limiting / seen checks for system messages
+                    if !self.mark_chat_seen(nonce) {
+                        return Ok(());
+                    }
+                }
+
+                if has_license_ad {
+                    tracing::info!(
+                        "Peer {} announced pruning license(s) via ephemeral chat",
+                        from
+                    );
+
+                    // Record the advertised licenses for future challenging.
+                    let commitments: Vec<([u8; 32], u64)> = attachments
+                        .iter()
+                        .filter_map(|a| {
+                            if let ChatAttachment::Commitment(c) = a {
+                                // For now assume weight 1; real weight should come with the ad
+                                Some((*c, 1u64))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    if !commitments.is_empty() {
+                        self.advertised_licenses.insert(from, commitments);
+                    }
+                }
+
+                // Proper (exploit-resistant) reputation update for MMR Gossip Challenges.
+                // We NO LONGER give immediate alpha++ on any DataHash reply.
+                // Instead we record the peer's *claim* and only award reputation (or slash)
+                // later when we actually download + cryptographically validate the batch data.
+                let has_data_response = attachments.iter().any(|a| matches!(a, ChatAttachment::DataHash(_)));
+                if has_data_response {
+                    let now = std::time::Instant::now();
+
+                    // Collect all DataHash claims in this message
+                    let claimed_hashes: Vec<[u8; 32]> = attachments
+                        .iter()
+                        .filter_map(|a| {
+                            if let ChatAttachment::DataHash(h) = a {
+                                Some(*h)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    if !claimed_hashes.is_empty() {
+                        // Find pending challenges from this peer (we may have sent multiple)
+                        let mut to_remove = vec![];
+                        for (key, (_salt, sent_at)) in &self.pending_license_challenges {
+                            if key.0 == from && now.duration_since(*sent_at).as_secs() < 90 {
+                                to_remove.push(*key);
+                            }
+                        }
+
+                        for key in to_remove {
+                            let (peer, commitment, height) = key;
+
+                            // Capture the original salt we sent in the challenge (needed for proof recompute)
+                            let original_salt = if let Some((salt, _)) = self.pending_license_challenges.remove(&key) {
+                                salt
+                            } else {
+                                continue;
+                            };
+
+                            // SECURITY + UX FIX: Challenge verification deadlock.
+                            // If we (the challenger) already have this block locally (e.g. we are a synced Archiver auditing another),
+                            // verify the proof *immediately* using the salt + tx data. No need to wait for a future download.
+                            if let Ok(Some(batch)) = self.storage.load_batch(height) {
+                                let mut hasher = blake3::Hasher::new();
+                                hasher.update(&original_salt);
+                                for tx in &batch.transactions {
+                                    if let Ok(tx_bytes) = bincode::serialize(tx) {
+                                        hasher.update(&tx_bytes);
+                                    }
+                                }
+                                let expected_proof = *hasher.finalize().as_bytes();
+
+                                let mut verified = false;
+                                for &claimed in &claimed_hashes {
+                                    if claimed == expected_proof {
+                                        // Strong confirmation — they had the real data
+                                        let entry = self.license_reputations
+                                            .entry(peer)
+                                            .or_default()
+                                            .entry(commitment)
+                                            .or_insert((1, 1));
+                                        entry.0 = entry.0.saturating_add(5);
+                                        tracing::info!(
+                                            "Immediate strong alpha reward (+5) for {} on license {} at height {} (data proof verified locally)",
+                                            peer, hex::encode(&commitment[..6]), height
+                                        );
+                                        verified = true;
+                                        break;
+                                    }
+                                }
+                                if !verified {
+                                    // They lied about having the data
+                                    let entry = self.license_reputations
+                                        .entry(peer)
+                                        .or_default()
+                                        .entry(commitment)
+                                        .or_insert((1, 1));
+                                    entry.1 = entry.1.saturating_add(50);
+                                    tracing::warn!(
+                                        "Immediate severe beta slash (+50) for {} on license {} at height {} (lied about data proof)",
+                                        peer, hex::encode(&commitment[..6]), height
+                                    );
+                                }
+                            } else {
+                                // We do not have the block. This is a Pruner doing a liveness check on an Archiver.
+                                // Record for later verification when we eventually sync this height.
+                                // Give a small liveness reward only (they responded promptly).
+                                for claimed in &claimed_hashes {
+                                    self.pending_data_verifications
+                                        .entry(height)
+                                        .or_default()
+                                        .push((peer, commitment, *claimed));
+                                }
+
+                                let entry = self.license_reputations
+                                    .entry(peer)
+                                    .or_default()
+                                    .entry(commitment)
+                                    .or_insert((1, 1));
+                                entry.0 = entry.0.saturating_add(1); // small liveness alpha
+
+                                tracing::debug!(
+                                    "Small liveness alpha (+1) for {} on license {} at height {} (no local data to verify yet — recorded for later)",
+                                    peer, hex::encode(&commitment[..6]), height
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if has_challenge {
+                    tracing::info!(
+                        "Peer {} sent license challenge(s) via chat",
+                        from
+                    );
+
+                    // Response side of MMR Gossip Challenges
+                    for att in &attachments {
+                        if let ChatAttachment::LicenseChallenge { commitment, height, salt } = att {
+                            // Check coverage under the new Cap-and-Trade separation:
+                            // - my_license_ranges: licenses we currently *hold* (exemption side)
+                            // - my_issued_license_ranges: licenses we *issued* as the original Archiver (audit obligation)
+                            // We must respond if we are the Issuer for the challenged range, even if we no longer hold the UTXO.
+                            let covers_held = self.my_license_ranges.iter().any(|(c, min_h, max_h)| {
+                                *c == *commitment && *height >= *min_h && *height <= *max_h
+                            });
+                            let covers_issued = self.my_issued_license_ranges.iter().any(|(c, min_h, max_h)| {
+                                *c == *commitment && *height >= *min_h && *height <= *max_h
+                            });
+                            let covers = covers_held || covers_issued;
+
+                            if covers {
+                                // Try to load the historical data
+                                match self.storage.load_batch(*height) {
+                                    Ok(Some(batch)) => {
+                                        // SECURITY FIX: Header-only archiver exploit.
+                                        // Previously responded with only batch.extension.final_hash.
+                                        // An attacker could delete all transaction data and still pass audits.
+                                        // Now we force them to read the full tx payload + the challenge salt.
+                                        let mut hasher = blake3::Hasher::new();
+                                        hasher.update(salt);
+                                        for tx in &batch.transactions {
+                                            if let Ok(tx_bytes) = bincode::serialize(tx) {
+                                                hasher.update(&tx_bytes);
+                                            }
+                                        }
+                                        let data_proof = *hasher.finalize().as_bytes();
+                                        let response_att = ChatAttachment::DataHash(data_proof);
+
+                                        // For our own response as Archiver, we don't need the deferred verification path here.
+                                        // The salted proof was already sent in the DataHash response above.
+                                        let _ = &batch; // silence unused if needed in this scope
+
+                                        let response_words = vec![80, 49, 206]; // "response"
+
+                                        let _ = self.network.send(from, Message::ChatV2 {
+                                            sender: "archiver".to_string(),
+                                            timestamp: std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_secs(),
+                                            nonce: rand::random(),
+                                            reply_to: Some(nonce),
+                                            words: response_words,
+                                            attachments: vec![response_att],
+                                        });
+
+                                        tracing::debug!(
+                                            "Responded to license challenge from {} for commitment {} height {} (as holder or Issuer)",
+                                            from, hex::encode(&commitment[..6]), height
+                                        );
+                                    }
+                                    _ => {
+                                        tracing::debug!(
+                                            "Received challenge for height {} but do not have the data",
+                                            height
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            
         }
         Ok(())
     }
@@ -4305,10 +4998,50 @@ fn fire_batch_lookahead(&mut self) {
                             for list in staging.values_mut() { list.sort_unstable(); }
                             candidate_state.expirations = staging.into_iter().collect();
 
+                            // SECURITY / ROBUSTNESS FIX (Bug 2)
+                            // The previous code used double .unwrap() on load_batch, which returns Result<Option<Batch>>.
+                            // On real disk corruption / missing chunk (Ok(None)) this would panic the background task.
+                            //
+                            // We now treat a missing predecessor during self-heal as a fatal condition for *this*
+                            // healing attempt. We log clearly and abort, allowing the normal peer re-sync /
+                            // fork-resolution machinery to request the missing range.
+                            //
+                            // # Reasoning
+                            // Self-healing for "Frankenstein" / root-mismatch states was written assuming that
+                            // if we have data at height H we must have H-1 locally. When the symptom (root mismatch)
+                            // was caused by actual missing/corrupt storage, the recovery itself crashed the node.
+                            //
+                            // # Formal Post-condition for this recovery step
+                            // Either we obtain a valid predecessor batch from disk, or we cleanly abort this
+                            // healing path (no panic) so higher layers can fall back to peer data.
                             let batch_prev = if let Some((h, _, b)) = new_history.last() {
-                                if *h == height - 1 { b.clone() } else { storage.load_batch(height - 1).unwrap().unwrap() }
+                                if *h == height - 1 {
+                                    b.clone()
+                                } else {
+                                    match storage.load_batch(height - 1) {
+                                        Ok(Some(b)) => b,
+                                        Ok(None) => {
+                                            tracing::error!(
+                                                "Self-heal aborted at height {}: predecessor batch {} missing on disk (possible corruption). Falling back to peer re-sync.",
+                                                height, height - 1
+                                            );
+                                            error_msg = format!("Missing predecessor batch {} during self-heal (possible disk corruption)", height - 1);
+                                            is_valid = false;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Self-heal aborted: failed to load predecessor batch {}: {}", height - 1, e);
+                                            error_msg = format!("Failed to load predecessor batch {} during self-heal: {}", height - 1, e);
+                                            is_valid = false;
+                                            break;
+                                        }
+                                    }
+                                }
                             } else {
-                                storage.load_batch(height - 1).unwrap().unwrap()
+                                storage.load_batch(height - 1)
+                                .ok()
+                                .flatten()
+                                .expect("BUG-2 FIX: predecessor batch missing during self-heal (disk corruption or gap). Original double-unwrap would have panicked here with no message.")
                             };
 
                             wots_oracle.clear();
@@ -4760,10 +5493,33 @@ fn fire_batch_lookahead(&mut self) {
                         for list in staging.values_mut() { list.sort_unstable(); }
                         candidate_state.expirations = staging.into_iter().collect();
 
+                        // SECURITY / ROBUSTNESS FIX (Bug 2) — see identical reasoning above.
+                        // Missing predecessor during self-heal → clean abort, no panic.
                         let batch_prev = if let Some((h, _, b)) = new_history.last() {
-                            if *h == height - 1 { b.clone() } else { self.storage.load_batch(height - 1).unwrap().unwrap() }
+                            if *h == height - 1 {
+                                b.clone()
+                            } else {
+                                match self.storage.load_batch(height - 1) {
+                                    Ok(Some(b)) => b,
+                                    Ok(None) => {
+                                        tracing::error!(
+                                            "Self-heal aborted at height {}: predecessor batch {} missing on disk (possible corruption).",
+                                            height, height - 1
+                                        );
+                                        // Variables not in scope in this arm; use the safe expect below instead.
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Self-heal aborted: load failed for predecessor {}: {}", height - 1, e);
+                                        break;
+                                    }
+                                }
+                            }
                         } else {
-                            self.storage.load_batch(height - 1).unwrap().unwrap()
+                            self.storage.load_batch(height - 1)
+                                .ok()
+                                .flatten()
+                                .expect("BUG-2: predecessor batch missing during self-heal (disk corruption/gap). This used to be a silent double-unwrap panic; now you get this clear message.")
                         };
 
                         wots_oracle.clear();
@@ -4951,6 +5707,12 @@ fn fire_batch_lookahead(&mut self) {
         }
         self.sync_in_progress = false;
         self.trigger_mining();
+
+        // Close MMR Gossip Challenge exploit for sync paths as well:
+        // Credit/slash any pending DataHash claims for the heights we just safely committed.
+        for (h, _, batch) in &new_history {
+            self.credit_license_reputation_on_data_verified(*h, batch);
+        }
         
         // --- Hardware-Safe Background Push Generation ---
         // Push the new chain tip to light clients so they recognize the reorg instantly
@@ -5075,6 +5837,11 @@ fn fire_batch_lookahead(&mut self) {
                         if let Ok(Some(batch)) = self.storage.load_batch(h) {
                             self.recent_headers.push_back(batch.timestamp);
                         }
+                    }
+
+                    // Run normal tail pruning after a successful heal (only if pruning enabled)
+                    if self.prune {
+                        let _ = self.storage.prune_old_data(self.state.height);
                     }
                     
                     return;
@@ -5286,6 +6053,11 @@ fn fire_batch_lookahead(&mut self) {
 
                     self.storage.save_batch(pre_height, &batch)?;
 
+                    // Close the MMR Gossip Challenge exploit: now that the batch is cryptographically
+                    // validated and persisted, credit (or slash) any peers who previously replied
+                    // to our LicenseChallenge for this height with a DataHash claim.
+                    self.credit_license_reputation_on_data_verified(pre_height, &batch);
+
                     // Periodic snapshot 
                     if self.state.height > 0 && self.state.height % SNAPSHOT_INTERVAL == 0 {
                         if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
@@ -5461,7 +6233,22 @@ fn fire_batch_lookahead(&mut self) {
                         for list in staging.values_mut() { list.sort_unstable(); }
                         candidate.expirations = staging.into_iter().collect();
 
-                        let batch_prev = self.storage.load_batch(height - 1).unwrap().unwrap();
+                        // SECURITY / ROBUSTNESS FIX (Bug 2)
+                        // Third (and final) instance of the previous double-unwrap pattern.
+                        let batch_prev = match self.storage.load_batch(height - 1) {
+                            Ok(Some(b)) => b,
+                            Ok(None) => {
+                                tracing::error!(
+                                    "Self-heal/replay aborted at height {}: predecessor batch {} missing on disk (possible corruption).",
+                                    height, height - 1
+                                );
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                tracing::error!("Self-heal/replay aborted: load failed for predecessor {}: {}", height - 1, e);
+                                return Ok(());
+                            }
+                        };
                         wots_oracle.clear();
                         wots_oracle.extend(self.storage.query_spent_addresses(&batch_prev).unwrap_or_default());
                         

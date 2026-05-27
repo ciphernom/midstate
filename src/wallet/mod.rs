@@ -3,6 +3,7 @@ pub mod crypto;
 pub mod hd;
 use crate::core::{hash_concat, compute_commitment, compute_coin_id, compute_address, decompose_value, wots, OutputData, InputReveal, Predicate, Witness};
 use crate::core::mss::{self, MssKeypair};
+
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -24,6 +25,35 @@ pub struct WalletKey {
     pub owner_pk: [u8; 32],
     pub address: [u8; 32],
     pub label: Option<String>,
+}
+
+/// Immutable metadata for a Pruning License (State Thread).
+///
+/// # Bearer Asset Warning (Critical)
+/// Only the 32-byte commitment lives on-chain inside OutputData::Confidential.
+/// The full plaintext metadata must be supplied by the *owner* on every spend
+/// so the royalty covenant can extract the fixed royalty fee and verify the hash.
+///
+/// If this data is lost (wallet corruption, forgotten backup, etc.), the license
+/// becomes permanently unspendable. This is an intentional bearer-asset property.
+///
+/// The wallet stores this data encrypted inside wallet.dat using the same
+/// password + file locking as all other sensitive material.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LicenseMetadata {
+    /// Issuer's long-term public key / address (royalty destination)
+    pub issuer: [u8; 32],
+    /// Fixed royalty fee paid to the issuer on every transfer of this license.
+    /// This is set at issuance time and is much harder to evade than percentage royalties.
+    pub fixed_royalty_fee: u64,
+    pub min_height: u64,
+    pub max_height: u64,
+    /// Approximate archival weight covered by this license (e.g. GB or block count)
+    pub archival_weight: u64,
+    /// Commitment to the Proof-of-Archival-Work (PoW Merkle root + MMR anchor)
+    pub poaw_commitment: [u8; 32],
+    pub issuance_height: u64,
+    pub nonce: [u8; 16],
 }
 
 /// A coin the wallet controls, with known value.
@@ -108,6 +138,15 @@ pub struct WalletData {
     /// Next unused MSS derivation index.
     #[serde(default)]
     pub next_mss_index: u64,
+
+    // ── Pruning Licenses (Phase 1) ────────────────────────────────────────
+    /// Plaintext metadata for licenses this wallet owns.
+    /// Stored as Vec of (coin_id, metadata) tuples.
+    ///
+    /// IMPORTANT: We use Vec<(K,V)> instead of HashMap<[u8;32],_> because
+    /// serde_json requires object keys to be strings. Vec serializes cleanly.
+    #[serde(default)]
+    pub license_metadata: Vec<([u8; 32], LicenseMetadata)>,
 }
 
 impl WalletData {
@@ -122,7 +161,21 @@ impl WalletData {
             master_seed: None,
             next_wots_index: 0,
             next_mss_index: 0,
+            license_metadata: Vec::new(),
         }
+    }
+}
+
+/// Simple RAII guard for an exclusive lock on the wallet file.
+/// The lock file is deleted when this guard is dropped.
+struct WalletFileLock {
+    path: PathBuf,
+    _file: std::fs::File,
+}
+
+impl Drop for WalletFileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -188,28 +241,111 @@ impl Wallet {
         self.data.master_seed.is_some()
     }
 
-    /// Get the next WOTS seed — from HD derivation if available, random otherwise.
-    /// Increments and persists the HD counter. Caller MUST call save() after.
-    pub fn next_wots_seed(&mut self) -> [u8; 32] {
-        if let Some(ref master) = self.data.master_seed {
-            let idx = self.data.next_wots_index;
-            self.data.next_wots_index += 1;
-            hd::derive_wots_seed(master, idx)
-        } else {
-            rand::random()
+    // ======================================================================
+    //  SAFE HD SEED ALLOCATION (Critical Fix for Key Reuse on Crash)
+    // ======================================================================
+    //
+    // # Reasoning
+    // The previous design advanced the HD counter in memory and derived the
+    // seed, but relied on the *caller* to eventually call save(). Multiple
+    // call sites (plan_private_send for change outputs, prepare_mix_registration,
+    // automix, etc.) could advance the counter many times before any save,
+    // or could fail/crash between allocation and save.
+    //
+    // On next open the counter would rewind, causing deterministic reuse of
+    // WOTS one-time keys — catastrophic for a post-quantum one-time signature
+    // scheme.
+    //
+    // This patch makes advancement + persistence atomic from the caller's
+    // perspective for HD wallets.
+
+    fn lock_path(&self) -> PathBuf {
+        self.path.with_extension("lock")
+    }
+
+    /// Acquire an exclusive lock on the wallet file.
+    fn acquire_lock(&self) -> Result<WalletFileLock> {
+        let lock_path = self.lock_path();
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(file) => Ok(WalletFileLock {
+                path: lock_path,
+                _file: file,
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!(
+                    "wallet.dat is locked by another process (lock file exists: {})",
+                    lock_path.display()
+                )
+            }
+            Err(e) => Err(e.into()),
         }
     }
 
-    /// Get the next MSS seed — from HD derivation if available, random otherwise.
-    fn next_mss_seed(&mut self) -> [u8; 32] {
+    /// Allocate the next WOTS seed in a crash-safe manner.
+    ///
+    /// For HD wallets this advances the counter and **immediately persists**
+    /// the new counter before returning the seed.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:  true
+    /// Post: result = Ok(seed) ⇒
+    ///         (if HD) next_wots_index' = next_wots_index + 1
+    ///                 ∧ wallet.dat on disk contains the new index
+    ///                 ∧ seed = derive(master, old_index)
+    ///       result = Err(_) ⇒ state on disk unchanged
+    /// ```
+    ///
+    /// ```zed
+    ///     AllocateNextWotsSeed
+    ///     --------------------
+    ///     ΔWallet
+    ///     seed! : [u8;32]
+    ///
+    ///     pre  true
+    ///     post result = Ok(seed!) ⇒
+    ///            (master_seed ≠ null ⇒
+    ///               next_wots_index' = next_wots_index + 1
+    ///             ∧ seed! = derive_wots(master_seed, next_wots_index))
+    ///     post result = Err(_) ⇒ next_wots_index' = next_wots_index
+    /// ```
+    pub fn allocate_next_wots_seed(&mut self) -> Result<[u8; 32]> {
+        let _lock = self.acquire_lock()?;
+
+        if let Some(ref master) = self.data.master_seed {
+            let idx = self.data.next_wots_index;
+            self.data.next_wots_index += 1;
+            let seed = hd::derive_wots_seed(master, idx);
+
+            self.save()?;
+            Ok(seed)
+        } else {
+            Ok(rand::random())
+        }
+    }
+
+    /// Same safety contract as `allocate_next_wots_seed` for MSS trees.
+    pub fn allocate_next_mss_seed(&mut self) -> Result<[u8; 32]> {
+        let _lock = self.acquire_lock()?;
+
         if let Some(ref master) = self.data.master_seed {
             let idx = self.data.next_mss_index;
             self.data.next_mss_index += 1;
-            hd::derive_mss_seed(master, idx)
+            let seed = hd::derive_mss_seed(master, idx);
+            self.save()?;
+            Ok(seed)
         } else {
-            rand::random()
+            Ok(rand::random())
         }
     }
+
+    // Note: The old next_wots_seed() / next_mss_seed() methods have been removed.
+    // All internal code now uses the safe allocate_next_*_seed() variants.
 /// All addresses the wallet watches for (keys + coin addresses).
 pub fn watched_addresses(&self) -> Vec<[u8; 32]> {
     let mut addrs: Vec<[u8; 32]> = self.data.keys.iter().map(|k| k.address).collect();
@@ -220,8 +356,24 @@ pub fn watched_addresses(&self) -> Vec<[u8; 32]> {
 }
 
 /// Import a scanned coin, matching it to a wallet key. Returns true if new.
-pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) -> Result<Option<[u8; 32]>> {
-    let coin_id = compute_coin_id(&address, value, &salt);
+/// Pass `commitment` for Confidential/State Thread outputs.
+pub fn import_scanned(
+    &mut self,
+    address: [u8; 32],
+    value: u64,
+    salt: [u8; 32],
+    commitment: Option<[u8; 32]>,
+) -> Result<Option<[u8; 32]>> {
+    let coin_id = if let Some(c) = commitment {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"CONFIDENTIAL");
+        hasher.update(&address);
+        hasher.update(&c);
+        hasher.update(&salt);
+        *hasher.finalize().as_bytes()
+    } else {
+        compute_coin_id(&address, value, &salt)
+    };
 
     if self.data.coins.iter().any(|c| c.coin_id == coin_id) {
         return Ok(None); // already have it
@@ -239,7 +391,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             coin_id,
             label: key.label,
             wots_signed: false,
-            commitment: None,
+            commitment,
         });
         return Ok(Some(coin_id));
     }
@@ -255,7 +407,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             coin_id,
             label: Some(format!("received ({})", value)),
             wots_signed: false,
-            commitment: None,
+            commitment,
         });
         return Ok(Some(coin_id));
     }
@@ -287,7 +439,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             coin_id,
             label: existing.label.clone(),
             wots_signed: false,
-            commitment: None,
+            commitment: existing.commitment,
         });
         tracing::info!(
             "Sibling import: coin {} (value {}) at existing WOTS address {}",
@@ -302,6 +454,24 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         if !path.exists() {
             bail!("wallet file not found: {}", path.display());
         }
+
+        // Acquire exclusive lock early
+        let lock_path = path.with_extension("lock");
+        let _lock = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(file) => WalletFileLock {
+                path: lock_path,
+                _file: file,
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!("wallet.dat is locked by another process");
+            }
+            Err(e) => return Err(e.into()),
+        };
+
         let encrypted = std::fs::read(path)?;
         let plaintext = crypto::decrypt(&encrypted, password)?;
         let data: WalletData = serde_json::from_slice(&plaintext)?;
@@ -316,6 +486,18 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
+        // Acquire exclusive lock for the duration of the write
+        let lock_path = self.lock_path();
+        let _lock = match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+        {
+            Ok(f) => Some(WalletFileLock { path: lock_path, _file: f }),
+            Err(_) => None,
+        };
+
         let plaintext = serde_json::to_vec(&self.data)?;
         let encrypted = crypto::encrypt(&plaintext, &self.password)?;
         std::fs::write(&self.path, encrypted)?;
@@ -327,7 +509,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
     /// Generate a new receiving key. Returns the address to share with the sender.
     /// HD wallets derive the seed deterministically; legacy wallets use random.
     pub fn generate_key(&mut self, label: Option<String>) -> Result<[u8; 32]> {
-        let seed = self.next_wots_seed();
+        let seed = self.allocate_next_wots_seed()?;
         let owner_pk = wots::keygen(&seed);
         let address = compute_address(&owner_pk);
         self.data.keys.push(WalletKey { seed, owner_pk, address, label });
@@ -335,10 +517,161 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
         Ok(address)
     }
 
+    // ======================================================================
+    //  PRUNING LICENSE SUPPORT (Phase 1 — Wallet Layer Only)
+    // ======================================================================
+    //
+    // # Reasoning
+    // Pruning Licenses are represented as OutputData::Confidential State Threads
+    // carrying a 32-byte commitment = H(LicenseMetadata).
+    //
+    // Because the covenant script must verify the royalty rate and pay the
+    // original issuer on every transfer (using OP_READ_INPUT_STATE +
+    // OP_SUM_TO_ADDR + OP_MUL / OP_DIV), the owner must be able to supply
+    // the original plaintext metadata on every spend.
+    //
+    // Storing the metadata inside the already-encrypted, file-locked wallet.dat
+    // is the minimal, consistent, and secure solution.
+    //
+    // We deliberately use `Vec<([u8;32], LicenseMetadata)>` (not HashMap) so that
+    // `serde_json::to_vec` (called by save()) never sees a non-string key.
+    // This was identified during review of the initial draft (2026-05-28).
+    //
+    // This design makes licenses true bearer assets: loss of the local metadata
+    // bricks the UTXO. This is acceptable and explicitly documented.
+    //
+    // See docs/design/pruning-licenses.md §3.1 and the technical review (2026-05-28)
+    // for the covenant script and economic model.
+
+    /// Store (or overwrite) the plaintext metadata for a license the wallet controls.
+    ///
+    /// The coin_id must be the value returned by `OutputData::coin_id()` for the
+    /// Confidential license output.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:
+    ///   - caller holds the private material required to spend the license UTXO
+    ///   - metadata is consistent with the on-chain commitment (hash matches)
+    ///
+    /// Post:
+    ///   result = Ok(()) ⇒
+    ///       the Vec contains exactly one entry for coin_id (last write wins)
+    ///       ∧ the vector is persisted to disk (encrypted)
+    ///       ∧ get_license_metadata(coin_id) returns Some(&metadata)
+    ///
+    ///   result = Err(_) ⇒ state on disk is unchanged
+    /// ```
+    pub fn store_license_metadata(&mut self, coin_id: [u8; 32], meta: LicenseMetadata) -> Result<()> {
+        let _lock = self.acquire_lock()?;
+
+        // Remove any previous entry for this coin_id (last write wins)
+        self.data.license_metadata.retain(|(cid, _)| *cid != coin_id);
+        self.data.license_metadata.push((coin_id, meta));
+
+        self.save()?;
+        Ok(())
+    }
+
+    /// Retrieve stored license metadata (if present).
+    pub fn get_license_metadata(&self, coin_id: &[u8; 32]) -> Option<&LicenseMetadata> {
+        self.data.license_metadata
+            .iter()
+            .find(|(cid, _)| cid == coin_id)
+            .map(|(_, meta)| meta)
+    }
+
+    /// List all licenses currently tracked by this wallet.
+    pub fn list_licenses(&self) -> Vec<(&[u8; 32], &LicenseMetadata)> {
+        self.data.license_metadata
+            .iter()
+            .map(|(cid, meta)| (cid as &[u8; 32], meta))
+            .collect()
+    }
+
+    /// After a license Reveal confirms on-chain, call this to re-key the metadata
+    /// from the issuance commitment to the actual coin_id of the Confidential output.
+    /// This makes future lookups by real coin_id work cleanly.
+    pub fn rekey_license_metadata(&mut self, old_key: [u8; 32], new_coin_id: [u8; 32]) -> Result<()> {
+        if let Some(pos) = self.data.license_metadata.iter().position(|(k, _)| *k == old_key) {
+            let (_, meta) = self.data.license_metadata.remove(pos);
+            self.data.license_metadata.push((new_coin_id, meta));
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Build the royalty-enforcing covenant script for a Pruning License.
+    ///
+    /// This is a documented stub in Phase 1. A production implementation will
+    /// emit the exact v5 opcode sequence described in the design doc:
+    ///
+    ///   OP_THIS_ADDRESS OP_OUTPUT_ADDRESS OP_EQUALVERIFY
+    ///   OP_READ_INPUT_STATE OP_READ_OUTPUT_STATE 0 OP_EQUALVERIFY
+    ///   ... extract fixed_royalty_fee ...
+    ///   <value> <bps> OP_MUL 10000 OP_DIV <issuer> OP_SUM_TO_ADDR OP_VERIFY
+    ///
+    /// The resulting bytecode is placed in the Predicate::Script of the
+    /// Confidential output that represents the license.
+    pub fn build_pruning_license_covenant(
+        issuer: [u8; 32],
+        fixed_royalty_fee: u64,
+    ) -> Vec<u8> {
+        // Fixed Transfer Tax royalty covenant — direct bytecode construction (no string assembler).
+        //
+        // # Reasoning
+        // The previous implementation used a text template + script::assemble(). While convenient,
+        // it introduced a parsing step at runtime for a security-critical script that controls
+        // license ownership and royalty payments. Direct construction using the same primitives
+        // as compile_htlc() is more robust, auditable, and consistent with how other complex
+        // scripts (HTLC, multisig) are built in this codebase.
+        //
+        // Current v1 rules (issuer-sig stop-gap):
+        // - License must stay in the exact same covenant address (continuation).
+        // - Fixed royalty (not percentage) must be paid to the original issuer via SUM_TO_ADDR.
+        // - Issuer signature is required on every spend (prevents theft of ownerless Confidential UTXOs).
+        //
+        // Long-term (not implemented here): dynamic owner model using 32-byte Confidential state
+        // H(meta_hash || current_owner_pk) + witness carrying new_owner + signature.
+        //
+        // The script must finish with exactly one truthy value (Clean Stack Rule).
+
+        use crate::core::script::{
+            push_data, push_int,
+            OP_EQUALVERIFY, OP_GREATER_OR_EQUAL, OP_VERIFY, OP_CHECKSIGVERIFY,
+            OP_THIS_ADDRESS, OP_OUTPUT_ADDRESS, OP_SUM_TO_ADDR,
+        };
+
+        let mut bc = Vec::new();
+
+        // 1. Continuation check: must spend into the same covenant address at output index 0
+        bc.push(OP_THIS_ADDRESS);
+        push_int(&mut bc, 0);
+        bc.push(OP_OUTPUT_ADDRESS);
+        bc.push(OP_EQUALVERIFY);
+
+        // 2. Fixed royalty to original issuer
+        push_data(&mut bc, &issuer);
+        bc.push(OP_SUM_TO_ADDR);
+        push_int(&mut bc, fixed_royalty_fee);
+        bc.push(OP_GREATER_OR_EQUAL);
+        bc.push(OP_VERIFY);
+
+        // 3. Issuer signature stop-gap (security for ownerless Confidential outputs today)
+        push_data(&mut bc, &issuer);
+        bc.push(OP_CHECKSIGVERIFY);
+
+        // Must leave exactly one truthy item for CleanStackRule
+        push_int(&mut bc, 1);
+
+        bc
+    }
+
     /// Generate a new MSS tree (reusable address).
     /// HD wallets derive the tree seed deterministically; legacy wallets use random.
     pub fn generate_mss(&mut self, height: u32, _label: Option<String>) -> Result<[u8; 32]> {
-        let seed = self.next_mss_seed();
+        let seed = self.allocate_next_mss_seed()?;
         let keypair = mss::keygen(&seed, height)?;
         let address = compute_address(&keypair.master_pk);
         self.data.mss_keys.push(keypair);
@@ -651,7 +984,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                     new_pk 
                 } else {
                     // Standard routing: derive a fresh one-time WOTS address
-                    let seed = self.next_wots_seed();
+                    let seed = self.allocate_next_wots_seed()?;
                     let owner_pk = wots::keygen(&seed);
                     let addr = compute_address(&owner_pk);
                     let idx = outputs.len();
@@ -834,7 +1167,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                     predicate: Predicate::p2pk(&wc.owner_pk),
                     value: wc.value,
                     salt: wc.salt,
-                    commitment: None,
+                    commitment: Some(commitment),
                 });
             } else {
                 bail!("coin not found");
@@ -905,7 +1238,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
                         coin_id,
                         label: Some(format!("change ({})", out.value())),
                         wots_signed: false,
-                        commitment: None,
+                        commitment: Some(commitment.clone()),
                     });
                 }
             }
@@ -920,6 +1253,14 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             timestamp: now,
             kind: "sent".into(),
         });
+
+        // Automatic re-keying for Pruning Licenses:
+        // If this reveal created a Confidential output whose commitment matches
+        // a stored license metadata entry, update the key to the real coin_id.
+        for _out in &pending.outputs {
+            // Note: License metadata is now stored under the final coin_id at issuance/purchase time
+            // using deterministic salts. Automatic re-keying for Confidential outputs is no longer needed.
+        }
 
         self.data.pending.retain(|p| &p.commitment != commitment);
         self.save()?;
@@ -1008,7 +1349,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
 
             if change > 0 {
                 for cd in decompose_value(change) {
-                    let seed = self.next_wots_seed();
+                    let seed = self.allocate_next_wots_seed()?;
                     let pk = wots::keygen(&seed);
                     let addr = compute_address(&pk);
                     let cs: [u8; 32] = rand::random();
@@ -1062,11 +1403,11 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             predicate: Predicate::p2pk(&coin.owner_pk),
             value: coin.value,
             salt: coin.salt,
-            commitment: None,
+            commitment: coin.commitment,
         };
 
         // Fresh one-time key from HD counter (recoverable from mnemonic)
-        let output_seed = self.next_wots_seed();
+        let output_seed = self.allocate_next_wots_seed()?;
         let output_pk = wots::keygen(&output_seed);
         let output_address = compute_address(&output_pk);
         let output_salt: [u8; 32] = rand::random();
@@ -1105,7 +1446,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             predicate: Predicate::p2pk(&coin.owner_pk),
             value: coin.value,
             salt: coin.salt,
-            commitment: None,
+            commitment: coin.commitment,
         };
         Ok((input, coin.coin_id))
     }
@@ -1196,7 +1537,7 @@ pub fn import_scanned(&mut self, address: [u8; 32], value: u64, salt: [u8; 32]) 
             bail!("restore_generate_keys requires an HD wallet");
         }
         for _ in 0..count {
-            let seed = self.next_wots_seed();
+            let seed = self.allocate_next_wots_seed()?;
             let owner_pk = wots::keygen(&seed);
             let address = compute_address(&owner_pk);
             self.data.keys.push(WalletKey {

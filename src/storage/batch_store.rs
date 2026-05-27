@@ -69,6 +69,45 @@ impl BatchStore {
         Ok(())
     }
 
+    /// Prunes ancient historical data from the *bottom* of the database.
+    /// Deletes all blocks, headers, and filters with height < `up_to_height`.
+    ///
+    /// This is the correct method for routine pruning of old history.
+    /// It is the opposite of `truncate()`, which is used for reorgs (deletes the tip).
+    ///
+    /// # Formal Specification
+    /// ```text
+    /// Pre:  up_to_height > 0
+    /// Post: ∀ h < up_to_height: data for height h has been removed
+    ///       (if it existed)
+    /// ```
+    pub fn prune_tail(&self, up_to_height: u64) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut b = write_txn.open_table(super::BATCHES_TABLE)?;
+            let mut h = write_txn.open_table(super::HEADERS_TABLE)?;
+            let mut f = write_txn.open_table(super::FILTERS_TABLE)?;
+
+            // Find the lowest existing key so we don't scan from 0 unnecessarily
+            let lowest = match b.first()? {
+                Some(first) => first.0.value(),
+                None => return Ok(()), // database is empty
+            };
+
+            if lowest >= up_to_height {
+                return Ok(()); // nothing to prune
+            }
+
+            for height in lowest..up_to_height {
+                b.remove(height)?;
+                h.remove(height)?;
+                f.remove(height)?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     /// Persists a new block to the database. Atomically writes the full Batch, 
     /// its extracted Header, and its generated Neutrino Filter.
     pub fn save(&self, height: u64, batch: &Batch) -> Result<()> {

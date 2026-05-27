@@ -80,6 +80,21 @@
         .panel { border: 1px solid var(--border); padding: 1.25rem; background: var(--bg-panel); margin-bottom: 1rem; border-radius: 12px; }
         .hidden { display: none !important; }
         .stat-val { font-size: 28px; color: var(--text-max); font-weight: bold; word-break: break-all; }
+
+        /* ═══ MDS Balance Toggle ═══ */
+        #balance-toggle-wrap {
+            display: inline-block; position: relative; cursor: pointer;
+            -webkit-tap-highlight-color: transparent; user-select: none;
+        }
+        #balance-toggle-wrap:active #lblBalance { opacity: 0.7; }
+        #lblBalance { transition: opacity 0.1s; }
+        #balance-toggle-hint {
+            font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px;
+            color: #333; margin-top: 6px; transition: color 0.2s;
+        }
+        #balance-toggle-wrap:hover #balance-toggle-hint { color: #555; }
+        .balance-unit-prefix { font-size: 18px; color: var(--accent-dim); font-weight: 400; margin-left: 3px; }
+        .balance-unit-raw    { font-size: 14px; color: #666; margin-left: 4px; }
         .list-container { border: 1px solid var(--border); background: var(--bg-panel); border-radius: 8px; overflow: hidden; }
         .list-item { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; }
         .list-item:last-child { border-bottom: none; }
@@ -295,7 +310,7 @@
         .chat-sender { color: var(--accent); font-weight: bold; cursor: pointer; font-size: 12px; text-decoration: underline; text-decoration-color: transparent; transition: all 0.2s; }
         .chat-sender:hover { text-decoration-color: var(--accent); }
         .chat-time { color: #555; font-size: 10px; margin-left: auto; }
-/* Chat attachments — full address visible, monospace, word-break. */
+        /* Chat attachments — full address visible, monospace, word-break. */
         .draft-attachment {
             display: flex;
             flex-direction: column;
@@ -522,7 +537,10 @@
 
             <div style="text-align: center; margin: 1rem 0 2.5rem 0;">
                 <div style="color: #666; text-transform: uppercase; font-size: 11px; letter-spacing: 1px; margin-bottom: 8px;">Total Balance</div>
-                <div class="stat-val" id="lblBalance" style="color: var(--accent); font-size: 42px;">0</div>
+                <div id="balance-toggle-wrap" onclick="toggleBalanceDisplay()" title="Tap to toggle display format">
+                    <div class="stat-val" id="lblBalance" style="color: var(--accent); font-size: 42px;">0</div>
+                    <div id="balance-toggle-hint">tap to expand</div>
+                </div>
                 <div id="tokenContainer" style="display: flex; justify-content: center; gap: 10px; margin-top: 15px; flex-wrap: wrap;"></div>
             </div>
 
@@ -768,7 +786,7 @@
         <!-- NAV (7 tabs now) -->
         <nav id="bottom-nav" class="hidden">
             <button class="nav-btn active" data-target="view-home"><span class="nav-icon">🏠</span><span>Home</span></button>
-            <button class="nav-btn" data-target="view-defi"><span class="nav-icon">📈</span><span>DEX</span></button>
+            <!--<button class="nav-btn" data-target="view-defi"><span class="nav-icon">📈</span><span>DEX</span></button>-->
             <button class="nav-btn" data-target="view-mine"><span class="nav-icon">⛏️</span><span>Mine</span></button>
             <button class="nav-btn" data-target="view-send"><span class="nav-icon">💸</span><span>Send</span></button>
             <button class="nav-btn" data-target="view-receive"><span class="nav-icon">⬇️</span><span>Receive</span></button>
@@ -1365,6 +1383,100 @@ if ('serviceWorker' in navigator) {
             return n.toString();
         }
 
+        // ═══════════════════════════════════════════════════════════════
+        //  MDS Base-2 Display Formatting
+        //  Midstate uses Power-of-2 UTXO consensus, so base-2 prefixes
+        //  produce perfectly clean numbers (e.g. 1073741824 → 1 gMDS).
+        //
+        //    kMDS = 1,024 MDS        (2^10)
+        //    mMDS = 1,048,576 MDS    (2^20)
+        //    gMDS = 1,073,741,824 MDS (2^30)
+        // ═══════════════════════════════════════════════════════════════
+
+        const MDS_KILO = 1024;
+        const MDS_MEGA = 1048576;          // 1024^2
+        const MDS_GIGA = 1073741824;       // 1024^3
+
+        /**
+         * Format an MDS integer using base-2 (computer-storage) prefixes.
+         * Returns an object { value: string, prefix: string } so callers
+         * can style the number and the prefix unit independently.
+         *
+         * Examples:
+         *   1073741824  →  { value: "1",       prefix: "gMDS" }
+         *   1342177280  →  { value: "1.25",    prefix: "gMDS" }
+         *   65536       →  { value: "64",      prefix: "kMDS" }
+         *   500         →  { value: "500",     prefix: "MDS"  }
+         */
+        function formatMDS(n) {
+            n = Number(n) || 0;
+            if (n === 0) return { value: '0', prefix: 'MDS' };
+
+            if (n >= MDS_GIGA) {
+                const v = n / MDS_GIGA;
+                // Trim trailing zeros up to 4 decimals
+                const s = parseFloat(v.toFixed(4)).toString();
+                return { value: s, prefix: 'gMDS' };
+            }
+            if (n >= MDS_MEGA) {
+                const v = n / MDS_MEGA;
+                const s = parseFloat(v.toFixed(4)).toString();
+                return { value: s, prefix: 'mMDS' };
+            }
+            if (n >= MDS_KILO) {
+                const v = n / MDS_KILO;
+                const s = parseFloat(v.toFixed(4)).toString();
+                return { value: s, prefix: 'kMDS' };
+            }
+            return { value: n.toLocaleString(), prefix: 'MDS' };
+        }
+
+        /**
+         * Format an MDS integer as a raw base-unit string with thousands
+         * separators for precise accounting.
+         *   1342177280  →  "1,342,177,280 MDS"
+         */
+        function rawMDS(n) {
+            n = Number(n) || 0;
+            return `${n.toLocaleString()} MDS`;
+        }
+
+        /**
+         * Render an MDS amount as an HTML string.
+         *   compact=true  → "1.25 <span>gMDS</span>"   (home balance, rewards)
+         *   compact=false → "1,342,177,280 MDS"         (lists, modals)
+         */
+        function mdsHtml(n, compact = true) {
+            if (!compact) return rawMDS(n);
+            const { value, prefix } = formatMDS(n);
+            return `${value}<span class="balance-unit-prefix">${prefix}</span>`;
+        }
+
+        // ─── Balance toggle state ────────────────────────────────────
+        let balanceRawMode = false;  // false = compact (gMDS), true = raw (1,234,567 MDS)
+        let _lastRawBalance = 0;     // cached so toggle re-renders without a worker round-trip
+
+        function toggleBalanceDisplay() {
+            balanceRawMode = !balanceRawMode;
+            renderBalanceElement(_lastRawBalance);
+        }
+
+        function renderBalanceElement(rawBalance) {
+            _lastRawBalance = Number(rawBalance) || 0;
+            const el = document.getElementById('lblBalance');
+            const hint = document.getElementById('balance-toggle-hint');
+            if (balanceRawMode) {
+                // Raw mode: exact number with thousands separators
+                el.innerHTML = `${_lastRawBalance.toLocaleString()} <span class="balance-unit-raw">MDS</span>`;
+                if (hint) hint.textContent = 'tap to collapse';
+            } else {
+                // Compact mode: base-2 prefix
+                const { value, prefix } = formatMDS(_lastRawBalance);
+                el.innerHTML = `${value}<span class="balance-unit-prefix">${prefix}</span>`;
+                if (hint) hint.textContent = 'tap to expand';
+            }
+        }
+
         function difficultyBitsFromTarget(targetHex) {
             if (!targetHex) return 0;
             let bits = 0;
@@ -1452,12 +1564,16 @@ if ('serviceWorker' in navigator) {
                 `${p.nps.toLocaleString()}<span class="mine-hero-unit">N/s</span>`;
             document.getElementById('mineStatHeight').innerText = p.chainHeight || '—';
             document.getElementById('mineStatDifficulty').innerText = difficultyFromTarget(p.target);
-            document.getElementById('mineStatReward').innerText = p.blockReward || '—';
+            document.getElementById('mineStatReward').innerHTML = p.blockReward
+                ? (() => { const { value, prefix } = formatMDS(p.blockReward); return `${value} <span style="font-size:11px;color:#666;">${prefix}</span>`; })()
+                : '—';
             document.getElementById('mineStatUptime').innerText = formatUptime(p.uptime);
             document.getElementById('mineStatNonces').innerText = formatNonces(p.totalNonces || 0);
             document.getElementById('mineStatBlocks').innerText = p.blocksFound || 0;
             document.getElementById('mineStatMempoolTxs').innerText = p.mempoolTxs || 0;
-            document.getElementById('mineStatMempoolFees').innerText = p.mempoolFees ? `+${p.mempoolFees}` : '0';
+            document.getElementById('mineStatMempoolFees').innerHTML = p.mempoolFees
+                ? (() => { const { value, prefix } = formatMDS(p.mempoolFees); return `+${value} <span style="font-size:11px;color:#666;">${prefix}</span>`; })()
+                : '0';
 
             // Time to block estimate
             document.getElementById('mineStatEta').innerText = estimateTimeToBlock(p.nps, p.target);
@@ -1469,7 +1585,8 @@ if ('serviceWorker' in navigator) {
         function showBlockCelebration(data) {
             const cele = document.getElementById('blockCelebration');
             document.getElementById('celeSubtitle').innerText = `Height ${data.height}`;
-            document.getElementById('celeReward').innerText = `+${data.reward}`;
+            const { value: cV, prefix: cP } = formatMDS(data.reward);
+            document.getElementById('celeReward').innerText = `+${cV} ${cP}`;
 
             // Spawn particles
             cele.querySelectorAll('.cele-particle').forEach(p => p.remove());
@@ -1504,11 +1621,12 @@ if ('serviceWorker' in navigator) {
             const statusText = data.accepted ? 'Accepted' : 'Rejected';
             const hashDisplay = data.finalHash ? data.finalHash.substring(0, 24) + '...' : '—';
 
+            const rewardFormatted = (() => { const { value, prefix } = formatMDS(data.reward); return `${value} ${prefix}`; })();
             const entry = document.createElement('div');
             entry.className = 'mined-block-entry';
             entry.innerHTML = `
                 <div class="flex-row">
-                    <div class="mined-block-reward">+${data.reward}</div>
+                    <div class="mined-block-reward">+${rewardFormatted}</div>
                     <span class="mined-block-status ${statusClass}">${statusText}</span>
                 </div>
                 <div class="mined-block-hash">${hashDisplay}</div>
@@ -1896,10 +2014,16 @@ if ('serviceWorker' in navigator) {
             document.getElementById('txDetailTitle').innerText = displayKind + " DETAILS";
 
             const amtEl = document.getElementById('txDetailAmount');
-            amtEl.innerText = `${sign}${tx.value}`;
+            // Show compact prefix format + raw in parentheses for precise accounting
+            const { value: amtV, prefix: amtP } = formatMDS(tx.value);
+            amtEl.innerHTML = `${sign}${amtV} <span style="color:#888;font-size:12px;">${amtP}</span> <span style="color:#555;font-size:11px;">(${Number(tx.value).toLocaleString()} MDS)</span>`;
             amtEl.style.color = color;
 
-            document.getElementById('txDetailFee').innerText = tx.fee || 0;
+            const feeVal = tx.fee || 0;
+            const { value: feeV, prefix: feeP } = formatMDS(feeVal);
+            document.getElementById('txDetailFee').innerHTML = feeVal
+                ? `${feeV} <span style="color:#888;font-size:12px;">${feeP}</span> <span style="color:#555;font-size:11px;">(${Number(feeVal).toLocaleString()} MDS)</span>`
+                : '0 MDS';
             document.getElementById('txDetailDate').innerText = new Date(tx.timestamp * 1000).toLocaleString();
 
             const inputsDiv = document.getElementById('txDetailInputs');
@@ -1933,7 +2057,7 @@ if ('serviceWorker' in navigator) {
 
                 const primaryAddress = payload.primaryAddress || "None";
                 myChatSender = primaryAddress !== "None" ? primaryAddress : null;
-                document.getElementById('lblBalance').innerHTML = `${payload.balance !== undefined ? payload.balance : "0"} <span style="font-size:14px;color:#666;">MDS</span>`;
+                renderBalanceElement(payload.balance !== undefined ? payload.balance : 0);
                 document.getElementById('lblAddress').innerText = primaryAddress;
 
                 const qrContainer = document.getElementById('qrCodeContainer');
@@ -1997,7 +2121,7 @@ if ('serviceWorker' in navigator) {
                 } else {
                     uList.innerHTML = payload.utxos.map(u => {
                         // Formatter: Detect Token vs Native UTXO
-                        let displayVal = `${u.value} MDS`;
+                        let displayVal = mdsHtml(u.value, true);
                         if (u.commitment) {
                             const balHex = u.commitment.substring(0, 16);
                             const balance = parseInt(balHex.match(/.{2}/g).reverse().join(''), 16);
@@ -2044,11 +2168,11 @@ if ('serviceWorker' in navigator) {
                             <div class="list-item" onclick="showTxDetail(${i})" style="cursor: pointer; transition: background 0.2s; ${opacityStyle}" onmouseover="this.style.background='var(--border)'" onmouseout="this.style.background='transparent'">
                                 <div class="flex-row">
                                     <span style="text-transform: uppercase; font-weight: bold; color: ${color}; font-size: 12px;">${displayKind}</span>
-                                    <span style="color: var(--text-max); font-weight: bold; font-size: 16px;">${sign}${h.value}</span>
+                                    <span style="color: var(--text-max); font-weight: bold; font-size: 16px;">${sign}${mdsHtml(h.value, true)}</span>
                                 </div>
                                 <div class="flex-row" style="margin-top: 4px;">
                                     <span style="color: #666; font-size: 11px;">${date}</span>
-                                    <span style="color: #555; font-size: 11px;">Fee: ${h.fee || 0}</span>
+                                    <span style="color: #555; font-size: 11px;">Fee: ${h.fee ? mdsHtml(h.fee, true) : '0'}</span>
                                 </div>
                             </div>
                         `;

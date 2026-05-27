@@ -522,6 +522,12 @@ impl OutputData {
     pub fn is_confidential(&self) -> bool {
         matches!(self, OutputData::Confidential { .. })
     }
+
+    /// Returns true if this output type is allowed to have a value of zero.
+    /// (Confidential state threads and DataBurns are special cases.)
+    pub fn allows_zero_value(&self) -> bool {
+        matches!(self, OutputData::Confidential { .. } | OutputData::DataBurn { .. })
+    }
 }
 
 /// Cleartext input preimage carried in a reveal transaction.
@@ -692,7 +698,7 @@ pub fn compute_header_hash(header: &BatchHeader) -> [u8; 32] {
 
 
 // ── Protocol constants ──────────────────────────────────────────────────────
-pub const MAX_BURN_DATA_SIZE: usize = 80; //OP_RETURN analog
+pub const MAX_BURN_DATA_SIZE: usize = 80; // OP_RETURN analog - keep small for consensus reasons
 pub const NETWORK_MAGIC: &[u8] = b"MIDSTATE_MAINNET_V1";
 pub const COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT: u64 = 110_000; 
 
@@ -740,6 +746,14 @@ pub const COMMITMENT_TTL: u64 = 1000;
 /// Blocks behind tip before checkpoints are pruned from stored batches.
 /// Pruning reclaims ~32 KB per block (~98% of batch storage). Pruned batches
 /// remain fully verifiable via full-chain recomputation in verify_extension.
+///
+/// Note on pruning safety:
+/// Blocks older than PRUNE_DEPTH are considered finalized for pruning purposes.
+/// Their UTXO state is fully captured in the rolling UtxoAccumulator + commitments.
+/// Therefore it is consensus-safe to delete the raw batch data.
+///
+/// However, the network must retain at least one or two archival nodes
+/// that do not prune, so that new peers can still perform a full genesis sync.
 pub const PRUNE_DEPTH: u64 = 1000;
 
 

@@ -11,7 +11,8 @@
 //! 1. Initiator creates a [`MixSession`] for a denomination (e.g. 8).
 //! 2. Participants register via [`MixSession::register`] with their input
 //!    coin and desired output address.
-//! 3. One participant sets a denomination-1 fee input via [`MixSession::set_fee_input`].
+//! 3. One participant (the separate fee donor) sets a fee input whose value is at least
+//!    [`recommended_fee_for_mix`] via [`MixSession::set_fee_input`].
 //! 4. Once ready, [`MixSession::proposal`] returns a deterministic [`MixProposal`]
 //!    containing the canonical input/output ordering and commitment hash.
 //! 5. Each participant signs the commitment for their own input.
@@ -42,14 +43,15 @@
 //! let output_b = OutputData::Standard { address: hash(b"bob-dest"), value: 8, salt: [0xDD; 32] };
 //! session.register(input_b, output_b).unwrap();
 //!
-//! // Fee coin (denomination 1)
+//! // Fee coin (value must be >= recommended_fee_for_mix(2) for a 2-participant mix)
 //! let seed_f = hash(b"fee");
 //! let pk_f = wots::keygen(&seed_f);
-//! let fee_input = InputReveal { predicate: Predicate::p2pk(&pk_f), value: 1, salt: [0xEE; 32], commitment: None };
+//! let min_fee = recommended_fee_for_mix(2);
+//! let fee_input = InputReveal { predicate: Predicate::p2pk(&pk_f), value: min_fee, salt: [0xEE; 32], commitment: None };
 //! session.set_fee_input(fee_input).unwrap();
 //!
 //! let proposal = session.proposal().unwrap();
-//! assert_eq!(proposal.inputs.len(), 3);  // 2 mix + 1 fee
+//! assert_eq!(proposal.inputs.len(), 3);  // 2 mix + 1 fee donor
 //! assert_eq!(proposal.outputs.len(), 2); // 2 mix outputs
 //!
 //! // Each participant signs the commitment for their input(s)
@@ -81,6 +83,54 @@ pub const MIN_MIX_PARTICIPANTS: usize = 2;
 
 /// Maximum participants in a single mix session.
 pub const MAX_MIX_PARTICIPANTS: usize = 16;
+
+/// Conservative estimate (in bytes) of the serialized size of a `Reveal`
+/// transaction for a uniform-denomination mix with `num_mix_participants`
+/// mix inputs + exactly one additional fee input.
+///
+/// This is used to compute the minimum fee the separate fee donor must supply
+/// so that the resulting Reveal passes the mempool's MIN_FEE_PER_KB admission check.
+///
+/// The estimate is deliberately conservative (over-estimates) because:
+/// - WOTS signatures (576 bytes each) dominate the size.
+/// - We must pass mempool validation even after full bincode serialization.
+///
+/// MUST BE KEPT REASONABLY IN SYNC with mempool.rs admission rules.
+pub fn estimated_mix_reveal_size(num_mix_participants: usize) -> u64 {
+    let total_inputs = num_mix_participants + 1; // + fee donor
+    let total_outputs = num_mix_participants;
+
+    // Very conservative per-input / per-output sizing.
+    // Real sizes vary with Predicate encoding, but this errs on the side of requiring
+    // a slightly larger fee coin (harmless — the excess simply becomes part of the fee).
+    const BASE_OVERHEAD: u64 = 256;
+    const PER_INPUT: u64 = 32 /*Predicate overhead*/ + 576 /*WOTS sig*/ + 32 /*value*/ + 32 /*salt*/ + 32 /*coin_id-ish*/;
+    const PER_OUTPUT: u64 = 64 /*OutputData overhead*/ + 32 /*value*/ + 32 /*salt*/ + 32 /*address*/;
+
+    BASE_OVERHEAD + (total_inputs as u64 * PER_INPUT) + (total_outputs as u64 * PER_OUTPUT)
+}
+
+/// Returns the minimum value the separate fee-donor input must have for a mix
+/// with the given number of mix participants (not counting the donor).
+///
+/// This uses the same MIN_FEE_PER_KB / size logic as the mempool so that
+/// a Reveal produced by this session will be accepted by the network.
+///
+/// The fee donor remains a distinct participant (per current protocol design).
+pub fn recommended_fee_for_mix(num_mix_participants: usize) -> u64 {
+    // These two constants MUST match the ones in mempool.rs.
+    const MIN_FEE_PER_KB: u64 = 10;
+    const FEE_RATE_SCALE: u128 = 1_024;
+
+    let bytes = estimated_mix_reveal_size(num_mix_participants);
+    if bytes == 0 {
+        return 0;
+    }
+    // Ceiling division: ceil( bytes * MIN_FEE_PER_KB / FEE_RATE_SCALE )
+    let numerator = (bytes as u128) * (MIN_FEE_PER_KB as u128);
+    let required = (numerator + FEE_RATE_SCALE - 1) / FEE_RATE_SCALE;
+    required as u64
+}
 
 /// A single participant's contribution to a mix.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -194,13 +244,54 @@ impl MixSession {
         Ok(())
     }
 
-    /// Set the denomination-1 fee input that covers the mandatory tx fee.
+    /// Set the fee input supplied by a separate fee donor.
     ///
-    /// Exactly one fee input per session. Must have value == 1.
+    /// Exactly one fee input per session. The value must be **at least** the
+    /// amount returned by `recommended_fee_for_mix(self.registrations.len())`
+    /// at the time this method is called (or higher if more participants join later).
+    ///
+    /// The fee donor is a distinct participant from the mix participants (per
+    /// current protocol design). Their entire input value becomes the transaction fee.
+    ///
+    /// # Reasoning
+    /// The original design hardcoded the fee input to denomination exactly 1 under the
+    /// assumption that all Reveals had a trivial fixed fee. The mempool later introduced
+    /// a strict size-based minimum fee rate (MIN_FEE_PER_KB = 10). Mix Reveals carrying
+    /// multiple 576-byte WOTS signatures easily exceed the size that a fee of 1 can satisfy,
+    /// causing every mix to be rejected by the mempool with "Fee rate too low".
+    ///
+    /// This change makes the required fee dynamic and derived from the same policy the
+    /// mempool will enforce, while preserving the separate-donor model and the uniform
+    /// permutation property of the mix.
+    ///
+    /// # Formal Specification
+    ///
+    /// Pre:
+    ///   - `self.fee_input` is None
+    ///   - `input.value > 0`
+    ///   - `input.coin_id()` does not collide with any registered mix input
+    ///   - `input.value >= recommended_fee_for_mix(self.registrations.len())`  (checked here and again at proposal())
+    ///
+    /// Post:
+    ///   (success)
+    ///     self.fee_input = Some(input)
+    ///     self.fee_input.value >= recommended_fee_for_mix(at call time)
+    ///   (failure)
+    ///     self is unchanged
+    ///
+    /// ```zed
+    ///     SetFeeInput
+    ///     ----------------
+    ///     ΔMixSession
+    ///     input? : InputReveal
+    ///     required : ℕ
+    ///
+    ///     pre  fee_input = ∅
+    ///     pre  input?.value ≥ required   (where required = recommended_fee_for_mix(|registrations|))
+    ///     pre  input?.coin_id ∉ { r.input.coin_id | r ∈ registrations }
+    ///     post fee_input' = input?
+    /// ```
     pub fn set_fee_input(&mut self, input: InputReveal) -> Result<()> {
-        if input.value != 1 {
-            bail!("fee input must be denomination 1, got {}", input.value);
-        }
         if self.fee_input.is_some() {
             bail!("fee input already set");
         }
@@ -208,6 +299,19 @@ impl MixSession {
         let coin_id = input.coin_id();
         if self.registrations.iter().any(|r| r.input.coin_id() == coin_id) {
             bail!("fee input collides with a mix input");
+        }
+        if input.value == 0 {
+            bail!("fee input value must be greater than zero");
+        }
+        // Dynamic minimum (separate donor model preserved).
+        // We check against the number of mix participants registered *so far*.
+        // proposal() will perform a final check with the exact final count.
+        let min_required = recommended_fee_for_mix(self.registrations.len());
+        if input.value < min_required {
+            bail!(
+                "fee input value {} is below the required minimum {} for {} mix participants (use recommended_fee_for_mix)",
+                input.value, min_required, self.registrations.len()
+            );
         }
         self.fee_input = Some(input);
         Ok(())
@@ -233,6 +337,17 @@ impl MixSession {
         }
         let fee = self.fee_input.as_ref()
             .ok_or_else(|| anyhow::anyhow!("fee input not set"))?;
+
+        // Final dynamic fee check with the exact number of mix participants.
+        // This is the authoritative enforcement point.
+        let num_mix = self.registrations.len();
+        let required_fee = recommended_fee_for_mix(num_mix);
+        if fee.value < required_fee {
+            bail!(
+                "fee input value {} is below the required minimum {} for {} mix participants",
+                fee.value, required_fee, num_mix
+            );
+        }
 
         // Canonical input order: mix inputs sorted by coin_id, fee last.
         let mut mix_inputs: Vec<InputReveal> = self.registrations
@@ -339,12 +454,12 @@ mod tests {
         (seed, input, output)
     }
 
-    fn make_fee_participant(name: &[u8]) -> ([u8; 32], InputReveal) {
+    fn make_fee_participant(name: &[u8], required_fee: u64) -> ([u8; 32], InputReveal) {
         let seed = hash(name);
         let pk = wots::keygen(&seed);
         let input = InputReveal {
             predicate: Predicate::p2pk(&pk),
-            value: 1,
+            value: required_fee,
             salt: hash_concat(name, b"fee-salt"),
             commitment: None,
         };
@@ -356,7 +471,8 @@ mod tests {
 
         let (seed_a, in_a, out_a) = make_participant(b"alice");
         let (seed_b, in_b, out_b) = make_participant(b"bob");
-        let (seed_f, fee) = make_fee_participant(b"fee-donor");
+        let required_fee = recommended_fee_for_mix(2);
+        let (seed_f, fee) = make_fee_participant(b"fee-donor", required_fee);
 
         session.register(in_a.clone(), out_a).unwrap();
         session.register(in_b.clone(), out_b).unwrap();
@@ -454,27 +570,28 @@ mod tests {
     // ── Fee input ───────────────────────────────────────────────────────
 
     #[test]
-    fn fee_input_accepts_denomination_1() {
+    fn fee_input_accepts_sufficient_fee() {
         let mut s = MixSession::new(8, 2).unwrap();
-        let (_, fee) = make_fee_participant(b"fee");
+        let required = recommended_fee_for_mix(2);
+        let (_, fee) = make_fee_participant(b"fee", required);
         assert!(s.set_fee_input(fee).is_ok());
         assert!(s.has_fee_input());
     }
 
     #[test]
-    fn fee_input_rejects_wrong_denomination() {
+    fn fee_input_rejects_insufficient_fee() {
         let mut s = MixSession::new(8, 2).unwrap();
-        let seed = hash(b"bad-fee");
-        let pk = wots::keygen(&seed);
-        let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 2, salt: [0; 32] , commitment: None };
+        // For 2 mix participants the required fee is > 1
+        let input = InputReveal { predicate: Predicate::p2pk(&[1;32]), value: 1, salt: [0; 32] , commitment: None };
         assert!(s.set_fee_input(input).is_err());
     }
 
     #[test]
     fn fee_input_rejects_double_set() {
         let mut s = MixSession::new(8, 2).unwrap();
-        let (_, fee1) = make_fee_participant(b"fee1");
-        let (_, fee2) = make_fee_participant(b"fee2");
+        let required = recommended_fee_for_mix(2);
+        let (_, fee1) = make_fee_participant(b"fee1", required);
+        let (_, fee2) = make_fee_participant(b"fee2", required);
         s.set_fee_input(fee1).unwrap();
         assert!(s.set_fee_input(fee2).is_err());
     }
@@ -482,15 +599,17 @@ mod tests {
     #[test]
     fn fee_input_rejects_collision_with_mix_input() {
         let mut s = MixSession::new(1, 2).unwrap();
-        // Register a denomination-1 mix input
+        // Register a small mix input (value 1 is fine here as mix input)
         let seed = hash(b"collider");
         let pk = wots::keygen(&seed);
         let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 1, salt: [0xAA; 32] , commitment: None };
         let output = OutputData::Standard { address: hash(b"dest"), value: 1, salt: [0xBB; 32] };
         s.register(input.clone(), output).unwrap();
 
-        // Same coin as fee should fail
-        assert!(s.set_fee_input(input).is_err());
+        // Same coin as fee should fail (even if value would be sufficient)
+        let required = recommended_fee_for_mix(2);
+        let bad_fee = InputReveal { predicate: Predicate::p2pk(&pk), value: required, salt: [0xAA; 32] , commitment: None };
+        assert!(s.set_fee_input(bad_fee).is_err());
     }
 
     // ── Readiness ───────────────────────────────────────────────────────
@@ -498,7 +617,8 @@ mod tests {
     #[test]
     fn not_ready_without_enough_participants() {
         let mut s = MixSession::new(8, 2).unwrap();
-        let (_, fee) = make_fee_participant(b"fee");
+        let required = recommended_fee_for_mix(2);
+        let (_, fee) = make_fee_participant(b"fee", required);
         s.set_fee_input(fee).unwrap();
 
         let (_, input, output) = make_participant(b"alice");
@@ -528,7 +648,8 @@ mod tests {
     fn proposal_fails_without_enough_participants() {
         let mut s = MixSession::new(8, 2).unwrap();
         let (_, in_a, out_a) = make_participant(b"alice");
-        let (_, fee) = make_fee_participant(b"fee");
+        let required = recommended_fee_for_mix(2);
+        let (_, fee) = make_fee_participant(b"fee", required);
         s.register(in_a, out_a).unwrap();
         s.set_fee_input(fee).unwrap();
         assert!(s.proposal().is_err());
@@ -843,7 +964,8 @@ mod tests {
             session.register(input, output).unwrap();
         }
 
-        let (_seed_f, fee) = make_fee_participant(b"fee3");
+        let required = recommended_fee_for_mix(3);
+        let (_seed_f, fee) = make_fee_participant(b"fee3", required);
         session.set_fee_input(fee).unwrap();
 
         let p = session.proposal().unwrap();
@@ -861,7 +983,8 @@ mod tests {
     fn proposal_independent_of_registration_order() {
         let (_seed_a, in_a, out_a) = make_participant(b"alice");
         let (_seed_b, in_b, out_b) = make_participant(b"bob");
-        let (_, fee) = make_fee_participant(b"fee");
+        let required = recommended_fee_for_mix(2);
+        let (_, fee) = make_fee_participant(b"fee", required);
 
         let salt = [0x77; 32];
 
@@ -908,7 +1031,8 @@ mod tests {
             session.register(input, output).unwrap();
         }
 
-        let (_, fee) = make_fee_participant(b"fee-d1");
+        let required = recommended_fee_for_mix(2);
+        let (_, fee) = make_fee_participant(b"fee-d1", required);
         session.set_fee_input(fee).unwrap();
 
         let p = session.proposal().unwrap();

@@ -14,12 +14,19 @@ const NONCE_LEN: usize = 12;
 /// # use midstate::wallet::crypto::*;
 /// // Internal doc test
 /// ```
-fn derive_key(password: &[u8], salt: &[u8]) -> [u8; 32] {
+/// Derive a 32-byte key from password + salt via Argon2id.
+///
+/// # Formal Specification
+/// ```text
+/// Pre:  password.len() > 0
+/// Post: result is 32 bytes suitable for AES-256-GCM
+/// ```
+fn derive_key(password: &[u8], salt: &[u8]) -> Result<[u8; 32]> {
     let mut key = [0u8; 32];
     Argon2::default()
         .hash_password_into(password, salt, &mut key)
-        .expect("Argon2id KDF failed");
-    key
+        .map_err(|e| anyhow::anyhow!("Argon2 KDF failed: {}", e))?;
+    Ok(key)
 }
 
 /// Encrypt plaintext with a password.
@@ -28,8 +35,9 @@ pub fn encrypt(plaintext: &[u8], password: &[u8]) -> Result<Vec<u8>> {
     let salt: [u8; SALT_LEN] = rand::random();
     let nonce_bytes: [u8; NONCE_LEN] = rand::random();
 
-    let key = derive_key(password, &salt);
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let key = derive_key(password, &salt)?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|e| anyhow::anyhow!("invalid key length: {}", e))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
@@ -53,8 +61,9 @@ pub fn decrypt(data: &[u8], password: &[u8]) -> Result<Vec<u8>> {
     let nonce_bytes = &data[SALT_LEN..SALT_LEN + NONCE_LEN];
     let ciphertext = &data[SALT_LEN + NONCE_LEN..];
 
-    let key = derive_key(password, salt);
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let key = derive_key(password, salt)?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|e| anyhow::anyhow!("invalid key length: {}", e))?;
     let nonce = Nonce::from_slice(nonce_bytes);
 
     cipher
