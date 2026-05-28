@@ -3,31 +3,66 @@ use anyhow::{bail, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-
-
-/// Create an extension by doing sequential work
+/// Create a Proof-of-Work extension by executing sequential delay iterations.
+///
+/// # Reasoning
+/// Uses a zero-allocation `[0u8; 40]` stack array to generate the initial seed, 
+/// bypassing dynamic heap allocation. It then relies entirely on the official 
+/// `blake3::hash` API, which leverages highly-tuned SSE4.1/NEON/AVX-512 assembly 
+/// to compute the internal column and diagonal matrix mixes simultaneously.
+///
+/// # Formal Specification
+/// ```zed
+///     CreateExtension
+///     ---------------
+///     midstate? : 𝔹³²
+///     nonce? : ℕ₆₄
+///     ext! : Extension
+///
+///     pre  true
+///     post ext!.nonce = nonce?
+///        ∧ ext!.final_hash = ℋ^{ITERS}(ℋ(midstate? ⌢ le8(nonce?)))
+/// ```
 pub fn create_extension(midstate: [u8; 32], nonce: u64) -> Extension {
-    let mut x = hash_concat(&midstate, &nonce.to_le_bytes());
+    let mut data = [0u8; 40];
+    data[0..32].copy_from_slice(&midstate);
+    data[32..40].copy_from_slice(&nonce.to_le_bytes());
+    
+    let mut x = *blake3::hash(&data).as_bytes();
+    
     for _ in 0..EXTENSION_ITERATIONS {
-        x = hash(&x);
+        x = *blake3::hash(&x).as_bytes();
     }
+    
     Extension { nonce, final_hash: x }
 }
 
-
 /// Verify an extension by recomputing the full sequential hash chain.
 ///
-/// Recomputes all EXTENSION_ITERATIONS hashes from `hash(midstate || nonce)`
-/// and confirms the result matches `final_hash`. This is the only
-/// cryptographically sound verification method for a linear hash chain —
-/// probabilistic spot-checking is insecure because interior checkpoints
-/// have no algebraic binding to their neighbours, enabling subset-grinding
-/// attacks regardless of the commitment scheme used.
+/// # Reasoning
+/// Recomputes all `EXTENSION_ITERATIONS` hashes by routing directly through 
+/// `create_extension`. This DRY design completely eliminates logic drift between 
+/// mining and validation. Any change to the core VDF mechanics will apply 
+/// identically to both roles.
 ///
-/// Cost: O(EXTENSION_ITERATIONS) — exactly 1,000,000 BLAKE3 hashes ≈ 1ms.
-/// This is strictly faster than mining at any non-trivial difficulty, since
-/// verification requires one deterministic pass while mining requires an
-/// expected (1 / difficulty_fraction) passes to find a valid nonce.
+/// Probabilistic spot-checking is insecure because interior checkpoints
+/// have no algebraic binding to their neighbours, enabling subset-grinding
+/// attacks. Full sequential recomputation is the only cryptographically sound method.
+///
+/// # Formal Specification
+/// ```zed
+///     VerifyExtension
+///     ---------------
+///     midstate? : 𝔹³²
+///     ext? : Extension
+///     target? : 𝔹³²
+///     result! : Result<()>
+///
+///     pre  true
+///     post result! = Ok(()) ⇔ 
+///            (ext?.final_hash < target?) ∧ 
+///            (create_extension(midstate?, ext?.nonce).final_hash = ext?.final_hash)
+/// ```
 pub fn verify_extension(midstate: [u8; 32], ext: &Extension, target: &[u8; 32]) -> Result<()> {
     if ext.final_hash >= *target {
         bail!("Extension doesn't meet difficulty target");

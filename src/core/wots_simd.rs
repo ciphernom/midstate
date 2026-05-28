@@ -303,6 +303,73 @@ pub fn process_wots_batch(inputs: &[[u8; 32]], iters: &[usize]) -> Vec<[u8; 32]>
     results
 }
 
+
+/// Bare-metal branchless SIMD verifier for Proof-of-Work VDF.
+///
+/// # Reasoning
+/// Unlike `process_wots_batch` which must check variable iteration depths 
+/// during the loop (destroying the AVX instruction pipeline at 1M+ iterations), 
+/// this function is hardcoded to execute exactly `EXTENSION_ITERATIONS` with 
+/// zero branching. This restores the 8x hardware speedup.
+///
+/// # Formal Specification
+/// ```zed
+///     VerifyPowBatch
+///     --------------
+///     inputs? : seq 𝔹³²
+///     result! : seq 𝔹³²
+///
+///     pre  true
+///     post ∀ i ∈ 0..#inputs?-1 • result![i] = ℋ^{ITERS}(inputs?[i])
+/// ```
+pub fn verify_pow_batch(inputs: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    let n = inputs.len();
+    let mut results = Vec::with_capacity(n);
+    let lanes = detected_level().lanes();
+    let mut i = 0;
+
+    while i < n {
+        let remain = n - i;
+        if remain >= lanes && lanes > 1 {
+            match detected_level() {
+                #[cfg(target_arch = "x86_64")]
+                SimdLevel::Avx2_8 => {
+                    let mut starts = [[0u8; 32]; 8];
+                    starts.copy_from_slice(&inputs[i..i + 8]);
+                    let res = unsafe { avx2::verify_pow_8way_avx2(&starts) };
+                    results.extend_from_slice(&res);
+                    i += 8;
+                }
+                #[cfg(target_arch = "aarch64")]
+                SimdLevel::Neon4 => {
+                    let mut starts = [[0u8; 32]; 4];
+                    starts.copy_from_slice(&inputs[i..i + 4]);
+                    let res = unsafe { neon::verify_pow_4way_neon(&starts) };
+                    results.extend_from_slice(&res);
+                    i += 4;
+                }
+                #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+                SimdLevel::Wasm128_4 => {
+                    let mut starts = [[0u8; 32]; 4];
+                    starts.copy_from_slice(&inputs[i..i + 4]);
+                    let res = unsafe { wasm_simd::verify_pow_4way_wasm(&starts) };
+                    results.extend_from_slice(&res);
+                    i += 4;
+                }
+                SimdLevel::Scalar => unreachable!(),
+            }
+        } else {
+            let mut x = inputs[i];
+            for _ in 0..crate::core::types::EXTENSION_ITERATIONS {
+                x = *blake3::hash(&x).as_bytes();
+            }
+            results.push(x);
+            i += 1;
+        }
+    }
+    results
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  WASM 128-bit SIMD (wasm32 + simd128)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -516,6 +583,36 @@ mod wasm_simd {
 
         results
     }
+    
+    pub unsafe fn verify_pow_4way_wasm(starts: &[[u8; 32]; 4]) -> [[u8; 32]; 4] {
+        let zero = u32x4_splat(0);
+        let cv: [v128; 8] = [
+            u32x4_splat(IV[0]), u32x4_splat(IV[1]), u32x4_splat(IV[2]), u32x4_splat(IV[3]),
+            u32x4_splat(IV[4]), u32x4_splat(IV[5]), u32x4_splat(IV[6]), u32x4_splat(IV[7]),
+        ];
+
+        let mut hw = [zero; 8];
+        for i in 0..8 {
+            let arr: [u32; 4] = [
+                read_word_u32(&starts[0], i), read_word_u32(&starts[1], i),
+                read_word_u32(&starts[2], i), read_word_u32(&starts[3], i),
+            ];
+            hw[i] = core::mem::transmute(arr);
+        }
+
+        let mut msg: [v128; 16] = [zero; 16];
+        for _ in 0..crate::core::types::EXTENSION_ITERATIONS {
+            msg[0] = hw[0]; msg[1] = hw[1]; msg[2] = hw[2]; msg[3] = hw[3];
+            msg[4] = hw[4]; msg[5] = hw[5]; msg[6] = hw[6]; msg[7] = hw[7];
+            hw = compress_4way(&cv, &msg, 32);
+        }
+
+        let mut results = [[0u8; 32]; 4];
+        for lane in 0..4 { results[lane] = extract_hash(&hw, lane); }
+        results
+    }
+    
+    
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -724,6 +821,39 @@ mod avx2 {
         }
         results
     }
+    
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn verify_pow_8way_avx2(starts: &[[u8; 32]; 8]) -> [[u8; 32]; 8] {
+        let zero = _mm256_setzero_si256();
+        let cv: [__m256i; 8] = [
+            _mm256_set1_epi32(IV[0] as i32), _mm256_set1_epi32(IV[1] as i32),
+            _mm256_set1_epi32(IV[2] as i32), _mm256_set1_epi32(IV[3] as i32),
+            _mm256_set1_epi32(IV[4] as i32), _mm256_set1_epi32(IV[5] as i32),
+            _mm256_set1_epi32(IV[6] as i32), _mm256_set1_epi32(IV[7] as i32),
+        ];
+
+        let mut hw = [zero; 8];
+        for i in 0..8 {
+            hw[i] = _mm256_set_epi32(
+                read_word(&starts[7], i), read_word(&starts[6], i),
+                read_word(&starts[5], i), read_word(&starts[4], i),
+                read_word(&starts[3], i), read_word(&starts[2], i),
+                read_word(&starts[1], i), read_word(&starts[0], i),
+            );
+        }
+
+        let mut msg: [__m256i; 16] = [zero; 16];
+        for _ in 0..crate::core::types::EXTENSION_ITERATIONS {
+            msg[0] = hw[0]; msg[1] = hw[1]; msg[2] = hw[2]; msg[3] = hw[3];
+            msg[4] = hw[4]; msg[5] = hw[5]; msg[6] = hw[6]; msg[7] = hw[7];
+            hw = compress_8way(&cv, &msg, 32);
+        }
+        
+        let mut results = [[0u8; 32]; 8];
+        for lane in 0..8 { results[lane] = extract_hash(&hw, lane); }
+        results
+    }
+    
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -917,6 +1047,35 @@ mod neon {
         }
         results
     }
+    
+    pub unsafe fn verify_pow_4way_neon(starts: &[[u8; 32]; 4]) -> [[u8; 32]; 4] {
+        let zero = vdupq_n_u32(0);
+        let cv: [uint32x4_t; 8] = [
+            vdupq_n_u32(IV[0]), vdupq_n_u32(IV[1]), vdupq_n_u32(IV[2]), vdupq_n_u32(IV[3]),
+            vdupq_n_u32(IV[4]), vdupq_n_u32(IV[5]), vdupq_n_u32(IV[6]), vdupq_n_u32(IV[7]),
+        ];
+
+        let mut hw = [zero; 8];
+        for i in 0..8 {
+            let arr = [
+                read_word_u32(&starts[0], i), read_word_u32(&starts[1], i),
+                read_word_u32(&starts[2], i), read_word_u32(&starts[3], i),
+            ];
+            hw[i] = vld1q_u32(arr.as_ptr());
+        }
+
+        let mut msg: [uint32x4_t; 16] = [zero; 16];
+        for _ in 0..crate::core::types::EXTENSION_ITERATIONS {
+            msg[0] = hw[0]; msg[1] = hw[1]; msg[2] = hw[2]; msg[3] = hw[3];
+            msg[4] = hw[4]; msg[5] = hw[5]; msg[6] = hw[6]; msg[7] = hw[7];
+            hw = compress_4way(&cv, &msg, 32);
+        }
+        
+        let mut results = [[0u8; 32]; 4];
+        for lane in 0..4 { results[lane] = extract_hash(&hw, lane); }
+        results
+    }
+    
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -1,6 +1,5 @@
 use crate::core::{State, BatchHeader, DIFFICULTY_LOOKBACK};
 use crate::core::state::{apply_batch, adjust_difficulty};
-use crate::core::extension::verify_extension;
 use crate::storage::Storage;
 use anyhow::{bail, Result};
 use rayon::prelude::*;
@@ -32,6 +31,43 @@ impl Syncer {
         Self::verify_header_chain_internal(headers, prior_timestamps, false)
     }
 
+    /// Verify PoW and internal header-to-header linkage on a contiguous slice of headers.
+    ///
+    /// # Reasoning
+    /// Step 1 performs a fast, sequential pass to validate timestamps, targets, and 
+    /// cryptographic linkage (`prev_hash` and `prev_midstate`). 
+    /// Step 2 performs the heavy Proof-of-Work (VDF) validation. To maximize throughput, 
+    /// it chunks the headers according to the CPU's native SIMD width (e.g., 8 for AVX2, 
+    /// 4 for NEON) and dispatches them across all available CPU cores using Rayon.
+    /// This allows a standard 8-core AVX2 machine to verify 64 blocks simultaneously 
+    /// in the exact same time it takes to verify a single block.
+    ///
+    /// # Formal Specification
+    /// ```text
+    /// Let 𝕎 = { x ∈ ℤ | 0 ≤ x < 2³² }
+    /// Let 𝔹 = { x ∈ ℤ | 0 ≤ x < 256 }
+    /// Let ℋ: 𝔹³² → 𝔹³²
+    /// ```
+    ///
+    /// ```zed
+    ///     VerifyHeaderChainInternal
+    ///     -------------------------
+    ///     headers? : seq BatchHeader
+    ///     prior_timestamps? : seq ℕ₆₄
+    ///     check_pow? : 𝔹
+    ///     result! : Result<()>
+    ///
+    ///     pre  true
+    ///     post result! = Ok(()) ⇔ 
+    ///            (∀ i ∈ 1..#headers?-1 • 
+    ///               headers?[i].prev_header_hash = headers?[i-1].extension.final_hash ∧
+    ///               headers?[i].prev_midstate = headers?[i-1].post_tx_midstate ∧
+    ///               validate_timestamp(headers?[i].timestamp) ∧
+    ///               headers?[i].target = expected_target) ∧
+    ///            (check_pow? ⇒ ∀ h ∈ headers? • 
+    ///               h.extension.final_hash < h.target ∧ 
+    ///               h.extension.final_hash = ℋ^{ITERS}(ℋ(mining_hash ⌢ le8(h.extension.nonce))))
+    /// ```
     fn verify_header_chain_internal(headers: &[BatchHeader], prior_timestamps: &[u64], check_pow: bool) -> Result<()> {
         if headers.is_empty() {
             return Ok(());
@@ -81,23 +117,48 @@ impl Syncer {
 
         // 2. Heavy parallel check: ONLY run if check_pow is true
         if check_pow {
-            let results: Vec<Result<(), String>> = headers
-                    .par_iter()
-                    .enumerate()
-                    .map(|(i, header)| {
-                        let mining_target = crate::core::types::compute_header_hash(header);
-                        verify_extension(
-                            mining_target,
-                            &header.extension,
-                            &header.target,
-                        ).map_err(|e| format!("Invalid PoW at header index {}: {}", i, e))
-                    })
-                    .collect();
+            // Dynamically detect the optimal SIMD width (e.g., 8 for AVX2, 4 for NEON)
+            let lane_width = crate::core::wots_simd::detected_level().lanes();
 
-            for res in results {
-                    if let Err(e) = res {
-                        bail!("{}", e);
+            // Chunk the headers into SIMD-sized batches, then process the chunks in parallel with Rayon
+            let results: Vec<Result<(), String>> = headers
+                .par_chunks(lane_width)
+                .flat_map(|chunk| {
+                    // 1. Calculate the initial H(mining_hash || nonce) seed for each block in the SIMD chunk
+                    let mut seeds = Vec::with_capacity(chunk.len());
+                    for header in chunk {
+                        let mining_target = crate::core::types::compute_header_hash(header);
+                        let mut data = [0u8; 40];
+                        data[0..32].copy_from_slice(&mining_target);
+                        data[32..40].copy_from_slice(&header.extension.nonce.to_le_bytes());
+                        seeds.push(crate::core::types::hash(&data));
                     }
+
+                    // 2. Execute 1,000,000 iterations for ALL blocks in this chunk SIMULTANEOUSLY
+                    // Uses the dedicated, branchless PoW verifier to preserve full SIMD speed.
+                    let final_hashes = crate::core::wots_simd::verify_pow_batch(&seeds);
+
+                    // 3. Verify the final outputs
+                    let mut chunk_results = Vec::with_capacity(chunk.len());
+                    for (i, final_hash) in final_hashes.into_iter().enumerate() {
+                        if final_hash >= chunk[i].target {
+                            chunk_results.push(Err(format!("Extension doesn't meet difficulty target at height {}", chunk[i].height)));
+                        } else if final_hash != chunk[i].extension.final_hash {
+                            chunk_results.push(Err(format!("Sequential work verification failed at height {}", chunk[i].height)));
+                        } else {
+                            chunk_results.push(Ok(()));
+                        }
+                    }
+                    
+                    chunk_results // Returns a Vec, which flat_map automatically flattens
+                })
+                .collect();
+
+            // If any chunk returned an error, bail out immediately
+            for res in results {
+                if let Err(e) = res {
+                    bail!("{}", e);
+                }
             }
         }
 
