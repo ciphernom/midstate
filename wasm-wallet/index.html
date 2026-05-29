@@ -1334,8 +1334,8 @@ if ('serviceWorker' in navigator) {
                 btnMineToggle.className = 'mine-toggle on';
                 btnMineToggle.innerText = 'Stop Mining';
                 btnMineToggle.disabled = false;
-                document.getElementById('homeMineStatus').innerText = `${nps.toLocaleString()} N/s`;
-                document.getElementById('homeMineRate').innerText = nps.toLocaleString();
+                document.getElementById('homeMineStatus').innerText = `${nps.toLocaleString('en')} N/s`;
+                document.getElementById('homeMineRate').innerText = nps.toLocaleString('en');
                 document.getElementById('homeMineRate').style.color = 'var(--accent)';
                 if ('wakeLock' in navigator && !wakeLock) {
                     navigator.wakeLock.request('screen').then(lock => {
@@ -1428,7 +1428,7 @@ if ('serviceWorker' in navigator) {
                 const s = parseFloat(v.toFixed(4)).toString();
                 return { value: s, prefix: 'kMDS' };
             }
-            return { value: n.toLocaleString(), prefix: 'MDS' };
+            return { value: n.toLocaleString('en'), prefix: 'MDS' };
         }
 
         /**
@@ -1438,7 +1438,7 @@ if ('serviceWorker' in navigator) {
          */
         function rawMDS(n) {
             n = Number(n) || 0;
-            return `${n.toLocaleString()} MDS`;
+            return `${n.toLocaleString('en')} MDS`;
         }
 
         /**
@@ -1467,7 +1467,7 @@ if ('serviceWorker' in navigator) {
             const hint = document.getElementById('balance-toggle-hint');
             if (balanceRawMode) {
                 // Raw mode: exact number with thousands separators
-                el.innerHTML = `${_lastRawBalance.toLocaleString()} <span class="balance-unit-raw">MDS</span>`;
+                el.innerHTML = `${_lastRawBalance.toLocaleString('en')} <span class="balance-unit-raw">MDS</span>`;
                 if (hint) hint.textContent = 'tap to collapse';
             } else {
                 // Compact mode: base-2 prefix
@@ -1561,7 +1561,7 @@ if ('serviceWorker' in navigator) {
 
         function updateMiningDashboard(p) {
             document.getElementById('mineHeroRate').innerHTML =
-                `${p.nps.toLocaleString()}<span class="mine-hero-unit">N/s</span>`;
+                `${p.nps.toLocaleString('en')}<span class="mine-hero-unit">N/s</span>`;
             document.getElementById('mineStatHeight').innerText = p.chainHeight || '—';
             document.getElementById('mineStatDifficulty').innerText = difficultyFromTarget(p.target);
             document.getElementById('mineStatReward').innerHTML = p.blockReward
@@ -2016,13 +2016,13 @@ if ('serviceWorker' in navigator) {
             const amtEl = document.getElementById('txDetailAmount');
             // Show compact prefix format + raw in parentheses for precise accounting
             const { value: amtV, prefix: amtP } = formatMDS(tx.value);
-            amtEl.innerHTML = `${sign}${amtV} <span style="color:#888;font-size:12px;">${amtP}</span> <span style="color:#555;font-size:11px;">(${Number(tx.value).toLocaleString()} MDS)</span>`;
+            amtEl.innerHTML = `${sign}${amtV} <span style="color:#888;font-size:12px;">${amtP}</span> <span style="color:#555;font-size:11px;">(${Number(tx.value).toLocaleString('en')} MDS)</span>`;
             amtEl.style.color = color;
 
             const feeVal = tx.fee || 0;
             const { value: feeV, prefix: feeP } = formatMDS(feeVal);
             document.getElementById('txDetailFee').innerHTML = feeVal
-                ? `${feeV} <span style="color:#888;font-size:12px;">${feeP}</span> <span style="color:#555;font-size:11px;">(${Number(feeVal).toLocaleString()} MDS)</span>`
+                ? `${feeV} <span style="color:#888;font-size:12px;">${feeP}</span> <span style="color:#555;font-size:11px;">(${Number(feeVal).toLocaleString('en')} MDS)</span>`
                 : '0 MDS';
             document.getElementById('txDetailDate').innerText = new Date(tx.timestamp * 1000).toLocaleString();
 
