@@ -122,31 +122,43 @@ pub fn compute_coin_id_hex(address_hex: &str, value: u64, salt_hex: &str) -> Str
     hex::encode(cid)
 }
 
-/// Mine a spam-proof PoW nonce for a transaction commitment.
+/// Safely mines the Commitment PoW in the WebAssembly context.
 ///
-/// Searches sequentially for a nonce `n` such that:
-///   `leading_zeros(BLAKE3(commitment || n_le_bytes)) >= required_pow`
+/// # Reasoning
+/// Intercepts invalid or missing hex strings (e.g., from an out-of-sync RPC cache)
+/// and handles them gracefully. Replacing `.unwrap()` with silent fallbacks prevents
+/// the Web Worker from panicking and permanently hanging the UI on "Mining PoW...".
 ///
-/// This is a CPU-bound loop that runs synchronously. At difficulty 24,
-/// it typically takes 0.5–5 seconds in WASM SIMD.
+/// # Formal Specification
+/// ```text
+/// Pre:  true
+/// Post: result = mine_pow(commitment, required_pow, target_height, header_hash) if hex valid
+///       result = 0 if commitment_hex invalid
+/// ```
 ///
-/// # Arguments
+/// ```zed
+///     MineCommitmentPowWasm
+///     ---------------------
+///     commitment_hex? : String
+///     required_pow? : ℕ₃₂
+///     target_height? : ℕ₆₄
+///     header_hash_hex? : String
+///     nonce! : ℕ₆₄
 ///
-/// * `commitment_hex` — 64-char hex string of the 32-byte commitment hash.
-/// * `required_pow` — minimum number of leading zero bits required.
-///
-/// # Panics
-///
-/// Panics if `commitment_hex` is not exactly 64 valid hex characters.
+///     pre  true
+///     post (isHex32(commitment_hex?) ⇒ nonce! = MinePow(...))
+///        ∧ (¬isHex32(commitment_hex?) ⇒ nonce! = 0)
+/// ```
 #[wasm_bindgen]
 pub fn mine_commitment_pow(commitment_hex: &str, required_pow: u32, target_height: u64, header_hash_hex: &str) -> u64 {
     let mut commitment = [0u8; 32];
-    hex::decode_to_slice(commitment_hex, &mut commitment).unwrap();
+    if hex::decode_to_slice(commitment_hex, &mut commitment).is_err() {
+        return 0; // Return gracefully so we don't kill the worker
+    }
 
     let mut header_hash = [0u8; 32];
-    hex::decode_to_slice(header_hash_hex, &mut header_hash).unwrap();
+    let _ = hex::decode_to_slice(header_hash_hex, &mut header_hash); // Ignore error, leaves as zeroes
 
-    // Call the unified V3 PoW function from the core library
     midstate::core::transaction::mine_pow(&commitment, required_pow, target_height, header_hash)
 }
 
