@@ -8,7 +8,7 @@
  *
  *   <script src="midstate-provider.js"></script>
  *   <script>
- *     Midstate.configure({ walletUrl: "https://cypherpunk.gold/wallet" });
+ *     Midstate.configure({ walletUrl: new URL("wallet/", location.href).href });
  *     const { address } = await Midstate.connect();
  *     const { txid }    = await Midstate.fundContract({ contractAddress, amount: 100_000 });
  *     const { txid }    = await Midstate.spendContract({ bytecode, inputs, outputs },
@@ -43,8 +43,12 @@
   var VERSION = 1;
 
   var config = {
-    // Where the wallet is served. Override per deployment.
-    walletUrl: "https://cypherpunk.gold/wallet",
+    // Where the wallet is served. Defaults to "<this origin>/wallet/", which is
+    // correct when the dApp and wallet share an origin (the Midstate convention).
+    // Override via Midstate.configure({ walletUrl }) for a cross-origin wallet.
+    walletUrl: (typeof window !== "undefined" && window.location)
+      ? new URL("wallet/", window.location.href).href
+      : "/wallet/",
     // Exact origin we will accept messages from. Derived from walletUrl if left null.
     walletOrigin: null,
     // Popup geometry.
@@ -267,22 +271,21 @@
     },
 
     /**
-     * Execute (spend) a contract UTXO with an arbitrary witness stack.
+     * Execute (spend) a contract with an arbitrary witness stack. Backed by the
+     * wallet's `prepare_script_spend` + `build_script_reveal`. Params are forwarded
+     * verbatim; the wallet resolves the on-chain contract coins itself.
      *
-     * NOTE: this requires a generalized signing primitive in the WASM wallet
-     * (a `build_script_spend` that accepts arbitrary witnesses + multiple coins +
-     * arbitrary outputs). The existing `build_state_thread_tx` only handles routing
-     * path "00" and cannot run general covenants. Until that ships, the wallet's
-     * spend handler should reject this with a clear error.
+     * Typical (IDE) shape:
+     *   { bytecode, contractAddress, stateWitness, inputState, valueWitness,
+     *     outputs: [{ address, value, state? }] }
+     * Advanced dApps may pass explicit { inputs: [{ coinId, witness, inputState }] }.
      *
-     * @param {object} p
-     * @param {string} p.bytecode                compiled contract hex
-     * @param {Array<{coinId?:string, witness:string, inputState?:string}>} p.inputs
-     *        one entry per contract input; witness is the comma-separated hex stack
-     *        exactly as the IDE emulator uses it; inputState is 64-hex or omitted/"none".
-     *        If coinId is omitted, the wallet resolves the contract UTXO by address.
-     * @param {string} [p.contractAddress]       used to resolve coinIds when omitted
-     * @param {Array<{address:string, value?:number|string, state?:string}>} p.outputs
+     * Limitation: a contract branch that needs a signature over THIS tx's
+     * commitment can't be driven from a pre-typed witness (the commitment isn't
+     * known until the tx is built). Preimage / timelock / routing / state-covenant
+     * paths work today.
+     *
+     * @param {object} p   must include `bytecode`
      * @returns {Promise<{txid:string}>}
      */
     spendContract: function (p, opts) {

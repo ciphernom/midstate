@@ -2968,10 +2968,13 @@ document.getElementById('btnExport').onclick = () => {
   "use strict";
 
   // Lock this to YOUR IDE + trusted dApp origins. Never "*".
+  // The wallet and IDE are served from the same origin, so we trust our own
+  // origin. This auto-adjusts: ciphernom.github.io today, cypherpunk.gold the
+  // day you point that domain at Pages — no edit needed. Add other dApp origins
+  // here only if you host third-party dApps on different domains.
   var ALLOWED_DAPP_ORIGINS = [
-    "https://cypherpunk.gold",
-    "https://ide.cypherpunk.gold",
-    "http://localhost:8080"
+    location.origin,
+    "http://localhost:8080"   // local testing; remove if unused
   ];
 
   var PROTOCOL = "midstate-bridge";

@@ -2664,7 +2664,10 @@ function updateCliInstructions(address) {
 
   // Point the provider at your wallet deployment.
   if (window.Midstate) {
-    Midstate.configure({ walletUrl: "https://cypherpunk.gold/wallet" });
+    // Derive the wallet URL from wherever the IDE is served, so this works on
+    // ciphernom.github.io now and cypherpunk.gold later with zero changes.
+    // Resolves /ide.html -> /wallet/  and  /midstate/ide.html -> /midstate/wallet/.
+    Midstate.configure({ walletUrl: new URL("wallet/", location.href).href });
   }
 
   var connectedAddress = null;
