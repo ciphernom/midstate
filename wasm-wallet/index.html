@@ -2947,7 +2947,7 @@ document.getElementById('btnExport').onclick = () => {
     </script>
 
 <!-- ── MidstateConnect: dApp approval modal ────────────────────────────────── -->
-<div id="dapp-approval" class="modal-overlay hidden" style="position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;display:flex;align-items:center;justify-content:center;">
+<div id="dapp-approval" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:99999;align-items:center;justify-content:center;padding:16px;">
   <div class="modal-card" style="background:var(--bg,#111);border:1px solid var(--border-bright,#333);border-radius:12px;max-width:420px;width:90%;padding:22px;">
     <div style="font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);margin-bottom:6px;">Connection / Signature Request</div>
     <div id="dapp-origin" style="font-size:12px;color:#888;word-break:break-all;margin-bottom:14px;">&mdash;</div>
@@ -2997,9 +2997,9 @@ document.getElementById('btnExport').onclick = () => {
   function showApproval(detailHtml, origin) {
     document.getElementById("dapp-origin").textContent = "Requested by: " + origin;
     document.getElementById("dapp-detail").innerHTML = detailHtml;
-    document.getElementById("dapp-approval").classList.remove("hidden");
+    document.getElementById("dapp-approval").style.display = "flex";
   }
-  function hideApproval() { document.getElementById("dapp-approval").classList.add("hidden"); }
+  function hideApproval() { document.getElementById("dapp-approval").style.display = "none"; }
 
   // Wait until unlocked, sending periodic keepalive progress so the provider's
   // idle timer doesn't fire while the user types their password.
@@ -3120,11 +3120,12 @@ document.getElementById('btnExport').onclick = () => {
     }
   });
 
-  // Announce readiness so the provider sends its (id-bearing) request.
+  // Announce readiness so the provider sends its (id-bearing) request. The ready
+  // ping carries NO sensitive data, so "*" is safe here; the provider validates
+  // event.origin === walletOrigin AND event.source === popup on receipt, and all
+  // real replies (result/progress/error) use the exact requesting origin.
   function announce() {
-    ALLOWED_DAPP_ORIGINS.forEach(function (o) {
-      try { window.opener.postMessage({ __mid: PROTOCOL, v: VERSION, type: "ready", id: null }, o); } catch (_) {}
-    });
+    try { window.opener.postMessage({ __mid: PROTOCOL, v: VERSION, type: "ready", id: null }, "*"); } catch (_) {}
   }
   announce();
   setTimeout(announce, 150);
