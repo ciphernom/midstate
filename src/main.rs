@@ -2665,6 +2665,26 @@ let (input_reveals, signatures) = match wallet.sign_reveal(&pending) {
             println!("  {} — revealed ✓", hex::encode(&commitment));
         } else {
             let error: rpc::ErrorResponse = response.json().await?;
+            
+            if error.error.contains("No matching commitment found") {
+                // The commitment is gone. Did it actually confirm while we were timed out?
+                // Check if the first output of this pending commit exists on-chain.
+                if let Some(first_out) = pending.outputs.first().and_then(|o| o.coin_id()) {
+                    let check_url = format!("http://{}:{}/check", rpc_host, rpc_port);
+                    let check_req = rpc::CheckCoinRequest { coin: hex::encode(first_out) };
+                    if let Ok(check_resp) = client.post(&check_url).json(&check_req).send().await {
+                        if let Ok(check_res) = check_resp.json::<rpc::CheckCoinResponse>().await {
+                            if check_res.exists {
+                                // It actually confirmed! Clean up the wallet state.
+                                wallet.complete_reveal(&commitment)?;
+                                println!("  {} — already confirmed on-chain, wallet state fixed ✓", hex::encode(&commitment));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
             println!("  {} — failed: {}", hex::encode(&commitment), error.error);
         }
     }
