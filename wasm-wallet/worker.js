@@ -38,6 +38,10 @@ let password = null;
 /** @type {boolean} Guard against concurrent send operations. */
 let isSending = false;
 
+// ── Contract tracking (MidstateConnect) ─────────────────────────────────────
+let watchedContracts = new Set();   // hex contract addresses we are tracking
+let contractCoins = {};             // coinId -> { address, value, salt, state|null, coin_id }
+
 /** @type {boolean} Guard against concurrent block submissions. */
 let isSubmitting = false;
 
@@ -832,6 +836,34 @@ self.onmessage = async (e) => {
             finally { isSending = false; }
         }
 
+        else if (type === 'WATCH_CONTRACT') {
+            // payload: { address } — start tracking a contract's coins.
+            const addr = normalizeHex(payload.address);
+            if (!watchedContracts.has(addr)) {
+                watchedContracts.add(addr);
+                updateWasmWatchlist();
+                // Rescan so we discover coins that already exist at this address.
+                scanResetPending = true;
+                scanGeneration++;
+                performScan().catch(() => {});
+            }
+            self.postMessage({ type: 'CONTRACT_WATCHED', payload: { address: addr } });
+        }
+
+        else if (type === 'FUND_CONTRACT') {
+            if (isSending) throw new Error("A transaction is already in progress.");
+            isSending = true;
+            try { await performContractTx({ kind: 'fund', ...payload }); }
+            finally { isSending = false; }
+        }
+
+        else if (type === 'SPEND_CONTRACT') {
+            if (isSending) throw new Error("A transaction is already in progress.");
+            isSending = true;
+            try { await performContractTx({ kind: 'spend', ...payload }); }
+            finally { isSending = false; }
+        }
+
         else if (type === 'NEW_ADDRESS') {
             self.postMessage({ type: 'LOG', payload: "Deriving new receiving address..." });
             await deriveNextMss(10);
@@ -1093,7 +1125,9 @@ function updateWasmWatchlist() {
     const watchList = [
         ...Object.keys(wState.wotsAddrs),
         ...Object.keys(wState.mssAddrs),
-        ...Object.keys(wState.utxos)
+        ...Object.keys(wState.utxos),
+        ...watchedContracts,                  // contract addresses
+        ...Object.keys(contractCoins),        // known contract coin ids
     ];
     wallet.set_watchlist(JSON.stringify(watchList));
 }
@@ -1328,6 +1362,22 @@ async function processFullBlock(height) {
                         spentValue += Number(inp.value);
                         matchFound = true;
                     }
+
+                    // ── Remove spent contract coins (MidstateConnect) ──
+                    {
+                        const ibc = inp.predicate?.Script?.bytecode || inp.bytecode;
+                        if (ibc) {
+                            const iAddr = blake3_hash_hex(normalizeHex(ibc));
+                            if (watchedContracts.has(iAddr)) {
+                                const iSalt = normalizeHex(inp.salt);
+                                const iComm = inp.commitment ? normalizeHex(inp.commitment) : null;
+                                const id = iComm
+                                    ? compute_confidential_coin_id(iAddr, iComm, iSalt)
+                                    : compute_coin_id_hex(iAddr, BigInt(inp.value), iSalt);
+                                if (contractCoins[id]) { delete contractCoins[id]; matchFound = true; }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1350,6 +1400,35 @@ async function processFullBlock(height) {
                     if (burnData) {
                         const payloadHex = normalizeHex(burnData.payload);
                         //could do something with the burn data here i guess
+                    }
+
+                    // ── Contract coins at a watched address (MidstateConnect) ──
+                    // Standard = value coin, Confidential = state coin. coin_id /
+                    // value / salt / state are all present in-block.
+                    {
+                        const stdC = out.Standard || out.standard;
+                        if (stdC) {
+                            const cAddr = normalizeHex(stdC.address);
+                            if (watchedContracts.has(cAddr)) {
+                                const cSalt = normalizeHex(stdC.salt);
+                                const cId = compute_coin_id_hex(cAddr, BigInt(stdC.value), cSalt);
+                                if (!contractCoins[cId]) {
+                                    contractCoins[cId] = { address: cAddr, value: Number(stdC.value), salt: cSalt, state: null, coin_id: cId };
+                                }
+                                matchFound = true;
+                            }
+                        }
+                        const conf = out.Confidential || out.confidential;
+                        if (conf) {
+                            const cAddr = normalizeHex(conf.address);
+                            if (watchedContracts.has(cAddr)) {
+                                const cSalt = normalizeHex(conf.salt);
+                                const cState = normalizeHex(conf.commitment);
+                                const cId = compute_confidential_coin_id(cAddr, cState, cSalt);
+                                contractCoins[cId] = { address: cAddr, value: 0, salt: cSalt, state: cState, coin_id: cId };
+                                matchFound = true;
+                            }
+                        }
                     }
                 }
             }
@@ -1528,6 +1607,200 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0)
 
     self.postMessage({ type: 'SEND_COMPLETE', payload: buildDashboardPayload() });
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Contract Funding & Execution (MidstateConnect)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function performContractTx(req) {
+    const prog = (msg) => self.postMessage({ type: 'CONTRACT_TX_PROGRESS', payload: { reqId: req.reqId, msg } });
+
+    if (!mssCachesReady) await loadMssCaches();
+
+    // MSS safety fast-forward (identical policy to performSend).
+    prog("Verifying MSS safety indices...");
+    for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
+        try {
+            const mssState = await rpc.getMssState(addr);
+            if (mssState && mssState.next_index > mss.next_leaf) {
+                mss.next_leaf = mssState.next_index + 20;
+            }
+        } catch (e) {
+            throw new Error("Safety Check Failed. Aborting to prevent key reuse.");
+        }
+        wallet.set_mss_leaf_index(addr, mss.next_leaf);
+    }
+
+    const utxoArray = Object.values(wState.utxos).map(u => {
+        if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
+        return u;
+    });
+
+    // ── Build the spend context (phase 1) ───────────────────────────────────
+    prog("Building transaction...");
+    let ctxStr;
+    try {
+        if (req.kind === 'fund') {
+            ctxStr = wallet.prepare_fund_tx(
+                JSON.stringify(utxoArray),
+                normalizeHex(req.contractAddress),
+                BigInt(req.amount || 0),
+                req.state ? normalizeHex(req.state) : null,
+                wState.nextWotsIndex
+            );
+        } else {
+            // SPEND. Resolve the contract's on-chain coins from our discovered
+            // bucket and assemble the inputs array prepare_script_spend expects.
+            const contractAddr = normalizeHex(req.contractAddress || blake3_hash_hex(normalizeHex(req.bytecode)));
+            const inputsArg = buildContractInputs(req, contractAddr);
+            ctxStr = wallet.prepare_script_spend(
+                JSON.stringify(utxoArray),
+                normalizeHex(req.bytecode),
+                JSON.stringify(inputsArg),
+                JSON.stringify(req.outputs || []),
+                wState.nextWotsIndex
+            );
+        }
+    } catch (e) {
+        throw new Error(`Failed to prepare transaction: ${e.toString()}`);
+    }
+
+    const ctx = JSON.parse(ctxStr);
+
+    // Reserve wallet key material exactly like performSend (so a concurrent
+    // scan/derive can't reuse a WOTS index or MSS leaf we just committed to).
+    pendingSends.push({ kind: 'pending', timestamp: Math.floor(Date.now() / 1000), fee: ctx.fee, inputs: (ctx.wallet_inputs || []).map(i => i.coin_id), outputs: [], value: 0 });
+    self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+    while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
+    const usedMss = new Set();
+    for (const inp of (ctx.wallet_inputs || [])) if (inp.is_mss) usedMss.add(inp.address);
+    for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
+    await saveState();
+
+    // ── Commit → PoW → wait → reveal → wait (identical to performSend) ───────
+    prog("Fetching network difficulty...");
+    const stateData   = await rpc.getState();
+    const requiredPow = stateData.required_pow || 24;
+
+    prog("Mining PoW...");
+    await new Promise(r => setTimeout(r, 50));
+    const spamNonce = Number(mine_commitment_pow(ctx.commitment, requiredPow, BigInt(stateData.height), stateData.header_hash));
+
+    prog("Submitting commit...");
+    const commitReq = await rpc.commit(ctx.commitment, spamNonce);
+    if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
+
+    prog("Waiting for block confirmation (phase 1)...");
+    const revealPayloadStr = wallet.build_script_reveal(ctxStr, ctx.commitment, ctx.tx_salt);
+
+    while (true) {
+        try {
+            const c = await rpc.checkCommitment(ctx.commitment);
+            if (c && c.exists) break;
+        } catch (e) {}
+        await waitForNextBlock(15000);
+    }
+
+    prog("Commit confirmed! Submitting reveal...");
+    const revealReq = await rpc.send(revealPayloadStr);
+    if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
+
+    prog("Broadcasting reveal...");
+    // Use the first input coin id (contract or wallet) to detect inclusion.
+    const firstInputId = ctx.input_coin_ids && ctx.input_coin_ids.length ? ctx.input_coin_ids[0] : null;
+    if (firstInputId) {
+        while (true) {
+            try {
+                const inp = await rpc.checkCoin(firstInputId);
+                if (inp && !inp.exists) break;
+            } catch (e) {}
+            await waitForNextBlock(15000);
+        }
+    }
+
+    pendingSends = [];
+    await performScan();
+
+    // The reveal's commitment doubles as a stable transaction identifier here.
+    self.postMessage({ type: 'CONTRACT_TX_COMPLETE', payload: { reqId: req.reqId, txid: ctx.commitment } });
+}
+
+/**
+ * Assemble the inputs[] array for prepare_script_spend from a dApp request.
+ *
+ * Accepts EITHER an explicit `req.inputs` (advanced dApps that already know the
+ * coin ids/witnesses) OR the IDE's high-level shape: a value coin + an optional
+ * state coin at the contract address, with witnesses supplied per role.
+ *
+ * IDE-style fields:
+ *   req.valueWitness  — witness stack for the value coin (e.g. "addr,01,<preimage>")
+ *   req.stateWitness  — witness stack for the state coin (if the contract has one)
+ *   (coin ids/salts/states are resolved from the discovered contractCoins bucket)
+ */
+function buildContractInputs(req, contractAddr) {
+    if (Array.isArray(req.inputs) && req.inputs.length) {
+        // Advanced path: trust the dApp's explicit inputs, but backfill
+        // value/salt/state from our bucket when only a coinId was given.
+        return req.inputs.map(i => {
+            const known = i.coinId ? contractCoins[normalizeHex(i.coinId)] : null;
+            return {
+                coin_id: i.coinId ? normalizeHex(i.coinId) : (known ? known.coin_id : ""),
+                witness: i.witness || "",
+                value:   i.value != null ? Number(i.value) : (known ? known.value : 0),
+                salt:    i.salt ? normalizeHex(i.salt) : (known ? known.salt : ""),
+                state:   i.inputState ? normalizeHex(i.inputState) : (known ? known.state : null),
+            };
+        });
+    }
+
+    // IDE high-level path: pick coins at the contract address from our bucket.
+    // Mirror the IDE's CLI convention EXACTLY (see updateCliInstructions):
+    //   - when a state coin exists, the user's witness (#ctxWitness, e.g. "BB,01")
+    //     drives the STATE coin (with its input-state), and the VALUE coin takes
+    //     the fixed routing witness "02" with no state;
+    //   - when there is no state coin, the user's witness drives the value coin.
+    const coins = Object.values(contractCoins).filter(c => c.address === contractAddr);
+    if (!coins.length) {
+        throw new Error("No on-chain coins found for this contract. Fund it first, then Sync.");
+    }
+    const stateCoin = coins.find(c => c.state);                 // the confidential state thread
+    const valueCoin = coins.find(c => !c.state && c.value > 0)  // a fundable value coin
+                   || coins.find(c => !c.state);
+
+    const userWitness = req.valueWitness || req.witness || "";  // the IDE's #ctxWitness
+    const inputs = [];
+
+    if (stateCoin) {
+        // State present: user witness → state coin; value coin → fixed "02".
+        inputs.push({
+            coin_id: stateCoin.coin_id,
+            witness: userWitness,
+            value:   0,
+            salt:    stateCoin.salt,
+            state:   stateCoin.state,
+        });
+        if (valueCoin) {
+            inputs.push({
+                coin_id: valueCoin.coin_id,
+                witness: req.fixedValueWitness || "02",
+                value:   valueCoin.value,
+                salt:    valueCoin.salt,
+                state:   null,
+            });
+        }
+    } else if (valueCoin) {
+        // No state: user witness drives the value coin.
+        inputs.push({
+            coin_id: valueCoin.coin_id,
+            witness: userWitness,
+            value:   valueCoin.value,
+            salt:    valueCoin.salt,
+            state:   null,
+        });
+    }
+    return inputs;
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Self-Test Harness

@@ -9,6 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="ide_style.css">
 
+<script src="midstate-provider.js"></script>
 </head>
 <body>
 
@@ -18,6 +19,14 @@
 <!-- TOP BAR -->
 <div id="topbar">
   <h1>MIDSTATE</h1>
+
+  <!-- MidstateConnect dApp controls -->
+  <div id="dapp-controls" style="margin-left:auto;display:flex;align-items:center;gap:10px;">
+    <span id="dapp-balance" style="font-size:11px;color:#888;"></span>
+    <button id="btnConnect" onclick="dappConnect()" style="padding:6px 14px;min-height:0;width:auto;margin:0;border-radius:6px;background:var(--accent);color:#000;font-size:12px;">Connect Wallet</button>
+    <button id="btnFund" onclick="dappFund()" disabled style="padding:6px 14px;min-height:0;width:auto;margin:0;border-radius:6px;background:transparent;border:1px solid var(--border-bright,#333);font-size:12px;">Fund</button>
+    <button id="btnExecute" onclick="dappExecute()" disabled style="padding:6px 14px;min-height:0;width:auto;margin:0;border-radius:6px;background:var(--text-max,#fff);color:#000;font-size:12px;">Execute on Network</button>
+  </div>
   <div class="tb-sep"></div>
   <button class="tb-btn" onclick="compileCode()" title="Ctrl+Enter">▶ Compile</button>
   <button class="tb-btn" onclick="runTests()" title="Ctrl+T" style="border-color: #aa00ff; color: #d488ff;">🧪 Run Tests</button>
@@ -2647,5 +2656,126 @@ function updateCliInstructions(address) {
     </div>
   </div>
 </div>
+
+<!-- MidstateConnect: dApp wiring -->
+<script>
+(function () {
+  "use strict";
+
+  // Point the provider at your wallet deployment.
+  if (window.Midstate) {
+    Midstate.configure({ walletUrl: "https://cypherpunk.gold/wallet" });
+  }
+
+  var connectedAddress = null;
+
+  function toast(msg, kind) {
+    if (typeof showToast === "function") showToast(msg, kind || "info");
+    else console.log("[dapp]", msg);
+  }
+
+  function compiledAddress() {
+    var a = window._lastAddr;
+    if (!a || a === "—") {
+      a = (document.getElementById("tb-addr") || {}).innerText || "";
+      a = a.replace(/[^0-9a-fA-F]/g, "");
+    }
+    return a && a.length >= 32 ? a : null;
+  }
+  function compiledBytecode() {
+    var el = document.getElementById("bytecodeOutput");
+    if (!el) return null;
+    var hex = (el.innerText || "").replace(/\s+/g, "");
+    return /^[0-9a-fA-F]+$/.test(hex) ? hex.toLowerCase() : null;
+  }
+
+  // Parse #ctxOutputs ("ADDR:VALUE" or "ADDR:0:STATE", comma-separated) into the
+  // outputs[] shape prepare_script_spend expects.
+  function parseOutputs() {
+    var raw = (document.getElementById("ctxOutputs") || {}).value || "";
+    var out = [];
+    raw.split(",").forEach(function (chunk) {
+      var t = chunk.trim();
+      if (!t) return;
+      var parts = t.split(":");
+      var addr = (parts[0] || "").trim();
+      var val = parts.length > 1 ? parseInt(parts[1].trim(), 10) || 0 : 0;
+      var state = parts.length > 2 ? (parts[2] || "").trim() : null;
+      if (state) {
+        out.push({ out_type: "confidential", address: addr, value: 0, state: state });
+      } else {
+        out.push({ out_type: "standard", address: addr, value: val });
+      }
+    });
+    return out;
+  }
+
+  function setConnectedUI(addr) {
+    connectedAddress = addr;
+    var btn = document.getElementById("btnConnect");
+    var bal = document.getElementById("dapp-balance");
+    btn.textContent = addr ? (addr.slice(0, 6) + "…" + addr.slice(-4)) : "Connect Wallet";
+    btn.style.background = addr ? "transparent" : "var(--accent)";
+    btn.style.border = addr ? "1px solid var(--border-bright,#333)" : "none";
+    btn.style.color = addr ? "var(--accent)" : "#000";
+    if (bal) bal.textContent = addr ? "connected" : "";
+    document.getElementById("btnFund").disabled = !addr;
+    document.getElementById("btnExecute").disabled = !addr;
+  }
+
+  // ── Button handlers (each called directly from onclick = user gesture) ──────
+
+  window.dappConnect = function () {
+    if (!window.Midstate) { toast("Provider not loaded.", "error"); return; }
+    // MUST be inside the click: connect() opens the popup synchronously.
+    Midstate.connect().then(function (res) {
+      setConnectedUI(res.address);
+      toast("Wallet connected.", "success");
+    }).catch(function (err) {
+      toast(err.message || "Connection failed.", "error");
+    });
+  };
+
+  window.dappFund = function () {
+    var addr = compiledAddress();
+    if (!addr) { toast("Compile a contract first.", "error"); return; }
+    var amount = prompt("Amount of MDS to fund the contract with:", "100000");
+    if (amount == null) return;
+    var state = (document.getElementById("ctxInputState") || {}).value.trim() || null;
+    Midstate.fundContract({ contractAddress: addr, amount: parseInt(amount, 10) || 0, state: state }, {
+      onProgress: function (m) { toast(m, "info"); },
+    }).then(function (res) {
+      toast("Contract funded. tx " + res.txid.slice(0, 12) + "…", "success");
+    }).catch(function (err) {
+      toast(err.message || "Funding failed.", "error");
+    });
+  };
+
+  window.dappExecute = function () {
+    var bytecode = compiledBytecode();
+    var addr = compiledAddress();
+    if (!bytecode || !addr) { toast("Compile a contract first.", "error"); return; }
+    var outputs = parseOutputs();
+    var valueWitness = (document.getElementById("ctxWitness") || {}).value.trim();
+    var inputState = (document.getElementById("ctxInputState") || {}).value.trim() || null;
+
+    Midstate.spendContract({
+      bytecode: bytecode,
+      contractAddress: addr,
+      valueWitness: valueWitness,   // witness stack for the value coin
+      inputState: inputState,       // current state (if the contract reads one)
+      outputs: outputs,             // parsed from #ctxOutputs, ORDER PRESERVED
+    }, {
+      onProgress: function (m) { toast(m, "info"); },
+    }).then(function (res) {
+      toast("✅ Contract executed. tx " + res.txid.slice(0, 12) + "…", "success");
+    }).catch(function (err) {
+      toast(err.message || "Execution failed.", "error");
+    });
+  };
+
+  setConnectedUI(null);
+})();
+</script>
 </body>
 </html>

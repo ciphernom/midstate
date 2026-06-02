@@ -1968,7 +1968,18 @@ if ('serviceWorker' in navigator) {
             }
         }
 
+        // MidstateConnect: subscribers that observe worker messages (bridge).
+        const __midstateExtraWorkerHandlers = [];
         const worker = new Worker('./worker.js', { type: 'module' });
+
+        // MidstateConnect: minimal hook so the dApp bridge can reach the worker
+        // and observe unlock state without touching the existing message switch.
+        window.__midstateWallet = {
+            post: (msg) => worker.postMessage(msg),
+            isUnlocked: () => { const a = document.getElementById('authView'); return a && !a.classList.contains('active'); },
+            primaryAddress: () => (document.getElementById('lblAddress') || {}).innerText || null,
+            onWorker: (fn) => { __midstateExtraWorkerHandlers.push(fn); },
+        };
         worker.onerror = (err) => {
             console.error("Worker failed to load:", err);
             alert(`Fatal Error: The Web Worker failed to load.\n\n${err.message}\n\nPlease ensure your cache is cleared and 'pkg/' is deployed.`);
@@ -2200,6 +2211,9 @@ if ('serviceWorker' in navigator) {
 
         worker.onmessage = (e) => {
             const { type, payload } = e.data;
+
+            // MidstateConnect: fan worker messages to bridge subscribers.
+            for (const __h of __midstateExtraWorkerHandlers) { try { __h(e.data); } catch (_) {} }
 
             switch (type) {
                 case 'INIT_DONE':
@@ -2931,5 +2945,189 @@ document.getElementById('btnExport').onclick = () => {
         setTimeout(fetchChatHistory, 2000);
         
     </script>
+
+<!-- ── MidstateConnect: dApp approval modal ────────────────────────────────── -->
+<div id="dapp-approval" class="modal-overlay hidden" style="position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;display:flex;align-items:center;justify-content:center;">
+  <div class="modal-card" style="background:var(--bg,#111);border:1px solid var(--border-bright,#333);border-radius:12px;max-width:420px;width:90%;padding:22px;">
+    <div style="font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);margin-bottom:6px;">Connection / Signature Request</div>
+    <div id="dapp-origin" style="font-size:12px;color:#888;word-break:break-all;margin-bottom:14px;">&mdash;</div>
+    <div id="dapp-detail" style="font-size:13px;line-height:1.5;color:var(--text-bright,#ddd);background:var(--bg,#0c0c0c);border:1px solid var(--border,#222);border-radius:8px;padding:12px;margin-bottom:18px;"></div>
+    <div style="display:flex;gap:10px;">
+      <button id="dapp-reject" style="flex:1;margin:0;background:transparent;border:1px solid var(--border-bright,#333);">Reject</button>
+      <button id="dapp-approve" style="flex:2;margin:0;background:var(--text-max,#fff);color:#000;">Approve</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── MidstateConnect: bridge (wallet side) ───────────────────────────────────
+     Implements the provider protocol: ready -> request -> progress* -> result|error.
+     SECURITY: a frame is accepted only if event.origin is in ALLOWED_DAPP_ORIGINS
+     AND event.source === window.opener; replies always use the exact origin. -->
+<script>
+(function () {
+  "use strict";
+
+  // Lock this to YOUR IDE + trusted dApp origins. Never "*".
+  var ALLOWED_DAPP_ORIGINS = [
+    "https://cypherpunk.gold",
+    "https://ide.cypherpunk.gold",
+    "http://localhost:8080"
+  ];
+
+  var PROTOCOL = "midstate-bridge";
+  var VERSION = 1;
+
+  var params = new URLSearchParams(location.search);
+  if (params.get("dapp") !== "1") return;   // only act as a bridge in dApp popups
+  if (!window.opener) return;               // must have been opened by a dApp
+
+  var active = null; // { id, action, origin, source }
+
+  function reply(source, origin, msg) {
+    source.postMessage(Object.assign({ __mid: PROTOCOL, v: VERSION }, msg), origin);
+  }
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function showApproval(detailHtml, origin) {
+    document.getElementById("dapp-origin").textContent = "Requested by: " + origin;
+    document.getElementById("dapp-detail").innerHTML = detailHtml;
+    document.getElementById("dapp-approval").classList.remove("hidden");
+  }
+  function hideApproval() { document.getElementById("dapp-approval").classList.add("hidden"); }
+
+  // Wait until unlocked, sending periodic keepalive progress so the provider's
+  // idle timer doesn't fire while the user types their password.
+  function whenUnlocked(reqId, cb) {
+    var W = window.__midstateWallet;
+    if (W && W.isUnlocked()) { cb(); return; }
+    var last = 0;
+    var t = setInterval(function () {
+      if (window.__midstateWallet && window.__midstateWallet.isUnlocked()) {
+        clearInterval(t); cb(); return;
+      }
+      var now = Date.now();
+      if (active && now - last > 8000) {
+        last = now;
+        reply(active.source, active.origin, { type: "progress", id: reqId, message: "Waiting for wallet unlock..." });
+      }
+    }, 300);
+  }
+
+  function bindApproval(onApprove, onReject) {
+    var a = document.getElementById("dapp-approve");
+    var r = document.getElementById("dapp-reject");
+    function cleanup() { a.onclick = null; r.onclick = null; hideApproval(); }
+    a.onclick = function () { cleanup(); onApprove(); };
+    r.onclick = function () { cleanup(); onReject(); };
+  }
+
+  function done() {
+    active = null;
+    setTimeout(function () { try { window.close(); } catch (_) {} }, 400);
+  }
+
+  // Stream worker progress for the active request out to the dApp.
+  function progressToDapp(reqId) {
+    var W = window.__midstateWallet;
+    if (!W || !W.onWorker) return;
+    W.onWorker(function (data) {
+      if (!active || active.id !== reqId) return;
+      if (data.type === "CONTRACT_TX_PROGRESS" && data.payload && data.payload.reqId === reqId) {
+        reply(active.source, active.origin, { type: "progress", id: reqId, message: data.payload.msg });
+      } else if (data.type === "CONTRACT_TX_COMPLETE" && data.payload && data.payload.reqId === reqId) {
+        reply(active.source, active.origin, { type: "result", id: reqId, data: { txid: data.payload.txid } });
+        done();
+      } else if (data.type === "ERROR") {
+        reply(active.source, active.origin, { type: "error", id: reqId, message: String(data.payload) });
+        done();
+      }
+    });
+  }
+
+  function handleRequest(req, origin, source) {
+    active = { id: req.id, action: req.action, origin: origin, source: source };
+
+    whenUnlocked(req.id, function () {
+      var W = window.__midstateWallet;
+
+      if (req.action === "connect") {
+        var addr = W.primaryAddress();
+        showApproval("Allow this site to see your public address?<br><br>" +
+          "<span style='color:var(--accent);word-break:break-all;'>" + esc(addr) + "</span>", origin);
+        bindApproval(
+          function () { reply(source, origin, { type: "result", id: req.id, data: { address: addr } }); done(); },
+          function () { reply(source, origin, { type: "error", id: req.id, message: "User rejected the connection." }); done(); }
+        );
+        return;
+      }
+
+      if (req.action === "fund") {
+        var p = req.params || {};
+        showApproval("Fund contract<br>" +
+          "<span style='color:var(--accent);word-break:break-all;'>" + esc(p.contractAddress) + "</span><br><br>" +
+          "Amount: <b>" + esc(p.amount) + "</b> MDS" +
+          (p.state ? "<br>Seed state: <span style='color:#888;word-break:break-all;'>" + esc(p.state) + "</span>" : ""), origin);
+        bindApproval(
+          function () {
+            progressToDapp(req.id);
+            W.post({ type: "FUND_CONTRACT", payload: { reqId: req.id, contractAddress: p.contractAddress, amount: p.amount, state: p.state || null } });
+          },
+          function () { reply(source, origin, { type: "error", id: req.id, message: "User rejected the funding request." }); done(); }
+        );
+        return;
+      }
+
+      if (req.action === "spend") {
+        var s = req.params || {};
+        var outs = (s.outputs || []).map(function (o) {
+          return "&bull; " + esc(o.value || 0) + " &rarr; " + esc(String(o.address || "").slice(0, 16)) + "&hellip;" +
+                 (o.state ? " <span style='color:#888'>(state)</span>" : "");
+        }).join("<br>");
+        showApproval("Execute contract<br>" +
+          "<span style='color:var(--accent);word-break:break-all;'>" + esc(s.contractAddress || "(from bytecode)") + "</span><br><br>" +
+          (outs ? ("Outputs:<br>" + outs) : "No value outputs (state-only execution)."), origin);
+        bindApproval(
+          function () {
+            progressToDapp(req.id);
+            W.post({ type: "WATCH_CONTRACT", payload: { address: s.contractAddress } });
+            W.post({ type: "SPEND_CONTRACT", payload: Object.assign({ reqId: req.id }, s) });
+          },
+          function () { reply(source, origin, { type: "error", id: req.id, message: "User rejected the execution request." }); done(); }
+        );
+        return;
+      }
+
+      reply(source, origin, { type: "error", id: req.id, message: "Unknown action: " + req.action });
+      done();
+    });
+  }
+
+  // The ONLY entry point. Strict origin + source gating.
+  window.addEventListener("message", function (event) {
+    if (ALLOWED_DAPP_ORIGINS.indexOf(event.origin) === -1) return;
+    if (event.source !== window.opener) return;
+    var d = event.data;
+    if (!d || d.__mid !== PROTOCOL || d.v !== VERSION) return;
+    if (d.type === "request") {
+      if (active) { reply(event.source, event.origin, { type: "error", id: d.id, message: "Wallet is busy with another request." }); return; }
+      handleRequest(d, event.origin, event.source);
+    }
+  });
+
+  // Announce readiness so the provider sends its (id-bearing) request.
+  function announce() {
+    ALLOWED_DAPP_ORIGINS.forEach(function (o) {
+      try { window.opener.postMessage({ __mid: PROTOCOL, v: VERSION, type: "ready", id: null }, o); } catch (_) {}
+    });
+  }
+  announce();
+  setTimeout(announce, 150);
+  setTimeout(announce, 500);
+})();
+</script>
+
 </body>
 </html>
