@@ -21,12 +21,12 @@
   <h1>MIDSTATE</h1>
 
   <!-- MidstateConnect dApp controls -->
-  <div id="dapp-controls" style="margin-left:auto;display:flex;align-items:center;gap:10px;">
-    <span id="dapp-balance" style="font-size:11px;color:#888;"></span>
-    <button id="btnConnect" onclick="dappConnect()" style="padding:6px 14px;min-height:0;width:auto;margin:0;border-radius:6px;background:var(--accent);color:#000;font-size:12px;">Connect Wallet</button>
-    <button id="btnFund" onclick="dappFund()" disabled style="padding:6px 14px;min-height:0;width:auto;margin:0;border-radius:6px;background:transparent;border:1px solid var(--border-bright,#333);font-size:12px;">Fund</button>
-    <button id="btnExecute" onclick="dappExecute()" disabled style="padding:6px 14px;min-height:0;width:auto;margin:0;border-radius:6px;background:var(--text-max,#fff);color:#000;font-size:12px;">Execute on Network</button>
-  </div>
+ <div id="dapp-controls" style="margin-left:auto;display:flex;align-items:center;gap:10px;">
+  <span id="dapp-balance" class="tb-stat"></span>
+  <button id="btnConnect" class="tb-btn ok-btn" onclick="dappConnect()">Connect Wallet</button>
+  <button id="btnFund"    class="tb-btn" onclick="dappFund()" disabled>Fund</button>
+  <button id="btnExecute" class="tb-btn" onclick="dappExecute()" disabled>Execute on Network</button>
+</div>
   <div class="tb-sep"></div>
   <button class="tb-btn" onclick="compileCode()" title="Ctrl+Enter">▶ Compile</button>
   <button class="tb-btn" onclick="runTests()" title="Ctrl+T" style="border-color: #aa00ff; color: #d488ff;">🧪 Run Tests</button>
@@ -2716,12 +2716,9 @@ function updateCliInstructions(address) {
   function setConnectedUI(addr) {
     connectedAddress = addr;
     var btn = document.getElementById("btnConnect");
-    var bal = document.getElementById("dapp-balance");
     btn.textContent = addr ? (addr.slice(0, 6) + "…" + addr.slice(-4)) : "Connect Wallet";
-    btn.style.background = addr ? "transparent" : "var(--accent)";
-    btn.style.border = addr ? "1px solid var(--border-bright,#333)" : "none";
-    btn.style.color = addr ? "var(--accent)" : "#000";
-    if (bal) bal.textContent = addr ? "connected" : "";
+    btn.classList.toggle("ok-btn", !addr);   // accent-green only when not yet connected
+    document.getElementById("dapp-balance").textContent = addr ? "connected" : "";
     document.getElementById("btnFund").disabled = !addr;
     document.getElementById("btnExecute").disabled = !addr;
   }
