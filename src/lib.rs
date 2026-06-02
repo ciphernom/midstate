@@ -22,6 +22,15 @@ pub mod rpc;
 pub mod metrics;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod chat;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod mining;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod license;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod sync;
 
 #[cfg(not(target_arch = "wasm32"))]

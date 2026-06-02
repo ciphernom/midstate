@@ -10,6 +10,7 @@ export const mine_commitment_pow: (a: number, b: number, c: number, d: bigint, e
 export const search_nonces: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => void;
 export const webwallet_build_coinbase: (a: number, b: number, c: bigint, d: number) => void;
 export const webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+export const webwallet_build_script_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const webwallet_build_solo_extension: (a: number, b: number, c: number, d: number, e: bigint) => void;
 export const webwallet_build_state_thread_tx: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number) => void;
 export const webwallet_check_filter: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
@@ -20,6 +21,8 @@ export const webwallet_get_wots_address: (a: number, b: number, c: number) => vo
 export const webwallet_has_mss_cache: (a: number, b: number, c: number) => number;
 export const webwallet_import_mss_bytes: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
 export const webwallet_new: (a: number, b: number, c: number) => void;
+export const webwallet_prepare_fund_tx: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number) => void;
+export const webwallet_prepare_script_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
 export const webwallet_prepare_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number, k: number, l: bigint) => void;
 export const webwallet_set_mss_leaf_index: (a: number, b: number, c: number, d: number) => void;
 export const webwallet_set_watchlist: (a: number, b: number, c: number) => void;

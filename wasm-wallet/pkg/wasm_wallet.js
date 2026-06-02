@@ -125,6 +125,48 @@ export class WebWallet {
         }
     }
     /**
+     * Phase 2: sign the wallet fee-inputs over the committed commitment and emit
+     * the wire `reveal` payload. Mirrors `build_reveal` but (a) splices contract
+     * witnesses verbatim, (b) hashes confidential outputs, (c) leaves contract
+     * inputs unsigned. `commitment_hex` / `salt_hex` are the ctx values returned
+     * by `prepare_script_spend` (pass ctx.commitment and ctx.tx_salt — there is
+     * no server-side salt contribution in this protocol).
+     * @param {string} ctx_json
+     * @param {string} commitment_hex
+     * @param {string} salt_hex
+     * @returns {string}
+     */
+    build_script_reveal(ctx_json, commitment_hex, salt_hex) {
+        let deferred5_0;
+        let deferred5_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(ctx_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(commitment_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            const ptr2 = passStringToWasm0(salt_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len2 = WASM_VECTOR_LEN;
+            wasm.webwallet_build_script_reveal(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr4 = r0;
+            var len4 = r1;
+            if (r3) {
+                ptr4 = 0; len4 = 0;
+                throw takeObject(r2);
+            }
+            deferred5_0 = ptr4;
+            deferred5_1 = len4;
+            return getStringFromWasm0(ptr4, len4);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred5_0, deferred5_1, 1);
+        }
+    }
+    /**
      * Recompute the block extension hash for a found nonce.
      *
      * Called after a mining worker finds a valid nonce. Produces the full
@@ -469,6 +511,91 @@ export class WebWallet {
         }
     }
     /**
+     * Phase 1 for FUNDING a contract. Pays `amount` to the contract address as
+     * power-of-two "value" coins, optionally seeds a confidential "state" coin,
+     * returns change to the wallet, and reuses `build_script_reveal` for phase 2
+     * (its `contract_inputs` list is simply empty here — the wallet pays).
+     *
+     * Mirrors the CLI fund instruction:  `--to addr:amount` (+ `--to addr:0:state`).
+     * `state_hex` = None for a plain value-only funding.
+     * @param {string} available_utxos_json
+     * @param {string} contract_addr_hex
+     * @param {bigint} amount
+     * @param {string | null | undefined} state_hex
+     * @param {number} next_wots_index
+     * @returns {string}
+     */
+    prepare_fund_tx(available_utxos_json, contract_addr_hex, amount, state_hex, next_wots_index) {
+        let deferred5_0;
+        let deferred5_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(available_utxos_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(contract_addr_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            var ptr2 = isLikeNone(state_hex) ? 0 : passStringToWasm0(state_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            var len2 = WASM_VECTOR_LEN;
+            wasm.webwallet_prepare_fund_tx(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, amount, ptr2, len2, next_wots_index);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr4 = r0;
+            var len4 = r1;
+            if (r3) {
+                ptr4 = 0; len4 = 0;
+                throw takeObject(r2);
+            }
+            deferred5_0 = ptr4;
+            deferred5_1 = len4;
+            return getStringFromWasm0(ptr4, len4);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred5_0, deferred5_1, 1);
+        }
+    }
+    /**
+     * @param {string} available_utxos_json
+     * @param {string} contract_bytecode_hex
+     * @param {string} contract_inputs_json
+     * @param {string} outputs_json
+     * @param {number} next_wots_index
+     * @returns {string}
+     */
+    prepare_script_spend(available_utxos_json, contract_bytecode_hex, contract_inputs_json, outputs_json, next_wots_index) {
+        let deferred6_0;
+        let deferred6_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(available_utxos_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(contract_bytecode_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            const ptr2 = passStringToWasm0(contract_inputs_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len2 = WASM_VECTOR_LEN;
+            const ptr3 = passStringToWasm0(outputs_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len3 = WASM_VECTOR_LEN;
+            wasm.webwallet_prepare_script_spend(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, next_wots_index);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr5 = r0;
+            var len5 = r1;
+            if (r3) {
+                ptr5 = 0; len5 = 0;
+                throw takeObject(r2);
+            }
+            deferred6_0 = ptr5;
+            deferred6_1 = len5;
+            return getStringFromWasm0(ptr5, len5);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred6_0, deferred6_1, 1);
+        }
+    }
+    /**
      * Select coins and build a transaction for the given send amount.
      *
      * This implements the full coin selection algorithm:
@@ -731,22 +858,33 @@ export function generate_phrase() {
 }
 
 /**
- * Mine a spam-proof PoW nonce for a transaction commitment.
+ * Safely mines the Commitment PoW in the WebAssembly context.
  *
- * Searches sequentially for a nonce `n` such that:
- *   `leading_zeros(BLAKE3(commitment || n_le_bytes)) >= required_pow`
+ * # Reasoning
+ * Intercepts invalid or missing hex strings (e.g., from an out-of-sync RPC cache)
+ * and handles them gracefully. Replacing `.unwrap()` with silent fallbacks prevents
+ * the Web Worker from panicking and permanently hanging the UI on "Mining PoW...".
  *
- * This is a CPU-bound loop that runs synchronously. At difficulty 24,
- * it typically takes 0.5–5 seconds in WASM SIMD.
+ * # Formal Specification
+ * ```text
+ * Pre:  true
+ * Post: result = mine_pow(commitment, required_pow, target_height, header_hash) if hex valid
+ *       result = 0 if commitment_hex invalid
+ * ```
  *
- * # Arguments
+ * ```zed
+ *     MineCommitmentPowWasm
+ *     ---------------------
+ *     commitment_hex? : String
+ *     required_pow? : ℕ₃₂
+ *     target_height? : ℕ₆₄
+ *     header_hash_hex? : String
+ *     nonce! : ℕ₆₄
  *
- * * `commitment_hex` — 64-char hex string of the 32-byte commitment hash.
- * * `required_pow` — minimum number of leading zero bits required.
- *
- * # Panics
- *
- * Panics if `commitment_hex` is not exactly 64 valid hex characters.
+ *     pre  true
+ *     post (isHex32(commitment_hex?) ⇒ nonce! = MinePow(...))
+ *        ∧ (¬isHex32(commitment_hex?) ⇒ nonce! = 0)
+ * ```
  * @param {string} commitment_hex
  * @param {number} required_pow
  * @param {bigint} target_height

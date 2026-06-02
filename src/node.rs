@@ -1,35 +1,7 @@
-//! # Chat subsystem
-//!
-//! Midstate's chat is a dictionary-bound P2P message bus. Every chat token
-//! is a `u8` index into [`CHAT_DICTIONARY`] (256 fixed entries), and every
-//! field that gossips across the network is either a fixed-width byte
-//! payload or a tightly-bounded enumeration the receiver controls. The
-//! design property the subsystem is built around:
-//!
-//! > **NoArbitraryText.** No field in any chat message admits
-//! > user-controllable `String` or variable-length `Vec<u8>` carrying
-//! > textual data. The only `String` is `sender`, which is validated as
-//! > a base58 libp2p `PeerId` in
-//! > [`crate::network::protocol::Message::deserialize_bin`].
-//!
-//! ## Wire variants
-//!
-//! - [`crate::network::protocol::Message::Chat`] — legacy v1. PoW
-//!   ([`verify_chat_pow`]) covers `(sender, ts, reply_to, words, nonce)`.
-//!   Receive-only on new nodes; new nodes never emit it.
-//! - [`crate::network::protocol::Message::ChatV2`] — current. PoW
-//!   ([`verify_chat_pow_v2`]) additionally covers `attachments` and is
-//!   domain-separated from v1 (Lemma 2.3.1 in `verify_chat_pow_v2` docs).
-//!
-//! ## Chat-only frame property
-//!
-//! See [`crate::network::protocol`] module docs for the wire-format
-//! frame proof: `Message::ChatV2` is **appended** to the `Message` enum
-//! and no existing variant is reordered, so every non-chat variant's
-//! bincode encoding is byte-identical before and after the chat-v2
-//! introduction.
+//! Node orchestrator. See chat.rs, sync.rs, mining.rs, license.rs for major subsystems.
+//! (Refactored from god module in Phase 3/4.)
 use crate::core::*;
-use crate::core::types::compute_address;
+// compute_address now reached via mining helpers or direct core::types when needed in node
 use crate::core::types::{CoinbaseOutput, BatchHeader};
 use crate::core::state::{apply_batch, choose_best_state};
 use crate::core::extension::create_extension;
@@ -39,9 +11,19 @@ use crate::metrics::Metrics;
 use crate::mix::{MixManager, MixPhase, MixStatusSnapshot};
 use crate::network::{Message, MidstateNetwork, NetworkEvent, MAX_GETBATCHES_COUNT, MAX_GETHEADERS_COUNT};
 use crate::storage::Storage;
-use crate::wallet::{coinbase_seed, coinbase_salt};
+// coinbase_seed / coinbase_salt moved to crate::mining (wrappers still available via coordinator)
 use crate::core::mss;
 use crate::core::wots;
+
+use crate::sync::{SyncPhase, MAX_PREFETCH_DISTANCE, MAX_PREFETCH_BUFFER, MAX_PREFETCH_RAM_BYTES};
+
+pub use crate::chat::{
+    CHAT_DICTIONARY, MAX_CHAT_ATTACHMENTS, ChatAttachment, ChatMessage,
+    verify_chat_pow, mine_chat_pow, verify_chat_pow_v2, mine_chat_pow_v2,
+};
+
+pub use crate::mining::{MinerToml, MiningConfig, MinedResult, MiningCoordinator};
+pub use crate::license::LicenseManager;
 
 use anyhow::{bail, Result};
 use libp2p::{request_response::ResponseChannel, PeerId, Multiaddr, identity::Keypair};
@@ -61,367 +43,19 @@ const SNAPSHOT_INTERVAL: u64 = 100;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration; // Instant now primarily via license manager + other std uses qualify as needed
 use tokio::sync::RwLock;
 use tokio::time;
-use rayon::prelude::*;
 
 const MAX_ORPHAN_BATCHES: usize = 32;
 /// How many batch chunks to have in-flight simultaneously across peers.
 /// Each chunk is up to 8 MB, so 3 = up to ~24 MB of in-flight data.
-const BATCH_LOOKAHEAD: usize = 3;
+// Sync session types + crate::sync::BATCH_LOOKAHEAD / MAX_PREFETCH_* / SYNC_* consts
+// moved to crate::sync::SyncManager (Phase 3 of god-module refactor).
+// A few rate-limit consts (TX_RATE, STEM, *_REQ_WINDOW) remain here as they
+// are also used outside the sync session (Dandelion, general defense).
 
-const MAX_PREFETCH_BUFFER: usize = 32;
-/// Hard RAM cap on the total serialized size of all prefetched batches.
-/// 64 MiB is a safe limit for 512 MiB RAM devices (Raspberry Pi Zero / old routers)
-/// while still allowing useful pipelining during sync.
-const MAX_PREFETCH_RAM_BYTES: usize = 64 * 1024 * 1024;
-
-/// Fixed 256-word dictionary indexed by chat message `words` bytes.
-///
-/// Cardinality (256) is load-bearing: a `Vec<u8>` lookup against this
-/// table cannot overflow `u8`, and a single byte selects exactly one
-/// canonical token. Adding or removing entries is a chat-protocol break
-/// because index 42 must mean the same word on every peer.
-///
-/// New tokens may be appended at the end of the list **only if all
-/// participating nodes upgrade simultaneously**, otherwise unmigrated peers
-/// will reject messages containing the new indices via the
-/// `w as usize >= CHAT_DICTIONARY.len()` check in
-/// [`crate::network::protocol::Message::deserialize_bin`].
-pub const CHAT_DICTIONARY: &[&str] = &[
-    // 0-19: Core Crypto & Network
-    "midstate", "network", "node", "peer", "block", "blocks", "tx", "transaction", "mempool", "hash",
-    "pow", "mine", "mining", "miner", "sync", "wallet", "address", "key", "seed", "utxo",
-
-    // 20-39: Airdrops, Trading & Finance
-    "airdrop", "incoming", "post", "claim", "free", "giveaway", "reward", "bounty", "pool", "liquidity",
-    "buy", "sell", "trade", "swap", "market", "price", "fiat", "dex", "cex", "value",
-
-    // 40-59: Verbs (Action)
-    "send", "receive", "give", "take", "make", "do", "get", "need", "want", "have",
-    "check", "verify", "update", "upgrade", "restart", "connect", "drop", "build", "fix", "run",
-
-    // 60-79: Verbs (State & Aux)
-    "is", "are", "was", "were", "be", "been", "has", "had", "will", "can",
-    "could", "should", "would", "might", "must", "stop", "wait", "see", "look", "know",
-
-    // 80-99: Pronouns
-    "I", "you", "we", "they", "he", "she", "it", "this", "that", "these",
-    "those", "who", "what", "where", "when", "why", "how", "which", "my", "your",
-
-    // 100-119: Prepositions & Conjunctions
-    "at", "to", "from", "in", "out", "on", "off", "for", "by", "about",
-    "as", "but", "if", "then", "else", "and", "or", "not", "with", "without",
-
-    // 120-139: Adjectives & Adverbs
-    "good", "bad", "fast", "slow", "full", "empty", "high", "low", "urgent", "ready",
-    "online", "offline", "hot", "cold", "big", "small", "hard", "easy", "safe", "new",
-
-    // 140-159: Quantifiers & Time
-    "all", "none", "some", "any", "many", "much", "more", "less", "every", "only",
-    "now", "later", "soon", "early", "today", "tomorrow", "yesterday", "time", "always", "never",
-
-    // 160-179: Slang & Community
-    "gm", "gn", "lol", "lfg", "wagmi", "ngmi", "ser", "anon", "mate", "based",
-    "wtf", "omg", "moon", "pump", "dump", "bull", "bear", "scam", "rug", "fren",
-
-    // 180-199: Numbers
-    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
-    "10", "20", "50", "100", "200", "500", "1k", "10k", "100k", "1m",
-
-    // 200-219: Tech / Concepts
-    "wots", "mss", "smt", "sig", "data", "disk", "linux", "pi", "hardware", "software",
-    "code", "rust", "server", "client", "ip", "webrtc", "error", "bug", "issue", "help",
-
-    // 220-239: Misc useful words
-    "please", "thanks", "ok", "yes", "no", "maybe", "here", "there", "again", "done",
-    "first", "last", "old", "true", "false", "up", "down", "left", "right", "back",
-
-    // 240-255: Punctuation & Emojis (16 items)
-    "?", "!", ".", ",", "...", ":)", ":(", "🔥", "🚀", "💀",
-    "💎", "👀", "🤝", "📈", "📉", "⚡"
-];
-
-/// A typed, fixed-shape attachment that rides alongside a v2 chat message.
-///
-/// # Invariant: NoArbitraryText
-///
-/// Every variant is structurally a fixed-width byte payload. There is no
-/// field in this enum that admits user-controlled `String` or
-/// variable-length `Vec<u8>` of textual data. The constraint is enforced
-/// at the type level by serde and bincode.
-///
-/// # Encoding
-///
-/// | Form    | Shape                                                            |
-/// |---------|------------------------------------------------------------------|
-/// | JSON    | `{"kind":"address","value":"<72-char lowercase hex w/ checksum>"}` |
-/// | Bincode | 32 raw bytes (variant tag prefix per bincode enum encoding)      |
-///
-/// # PoW canonical bytes
-///
-/// When mining or verifying via [`verify_chat_pow_v2`], each attachment
-/// is encoded as `tag_u8 ⌢ payload_bytes`:
-///
-/// | Variant   | Tag    | Payload length |
-/// |-----------|--------|----------------|
-/// | `Address` | `0x01` | 32             |
-///
-/// Future variants append new tags; existing tags are immutable.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ChatAttachment {
-    /// A 32-byte midstate address (with UI checksum support).
-    Address([u8; 32]),
-    /// A 32-byte Coin ID (UTXO). Useful for proving airdrops or payments.
-    CoinId([u8; 32]),
-    /// A 32-byte Mix ID. Useful for coordinating CoinJoin sessions.
-    MixId([u8; 32]),
-    /// A 32-byte Transaction Commitment.
-    Commitment([u8; 32]),
-    /// A 32-byte Block Hash. Useful for referencing specific blocks.
-    BlockHash([u8; 32]),
-    /// A 32-byte Chain Midstate. Useful for node operators debugging consensus forks.
-    Midstate([u8; 32]),
-    /// A generic 32-byte hash (e.g. SHA256/BLAKE3) for external data/binaries.
-    DataHash([u8; 32]),
-    /// Challenge to prove possession of historical block data for a licensed range.
-    /// Used for MMR Gossip Challenges / uptime scoring of Pruning Licenses.
-    /// The `commitment` scopes the challenge to a specific license (prevents cross-license reputation gaming).
-    LicenseChallenge {
-        commitment: [u8; 32],
-        height: u64,
-        salt: [u8; 32],
-    },
-}
-
-impl ChatAttachment {
-    /// Returns true if the 32-byte payload is valid UTF-8, which indicates
-    /// a high probability of text-injection graffiti rather than a random hash.
-    pub fn is_graffiti(&self) -> bool {
-        let bytes = match self {
-            ChatAttachment::Address(b) => Some(b.as_slice()),
-            ChatAttachment::CoinId(b) => Some(b.as_slice()),
-            ChatAttachment::MixId(b) => Some(b.as_slice()),
-            ChatAttachment::Commitment(b) => Some(b.as_slice()),
-            ChatAttachment::BlockHash(b) => Some(b.as_slice()),
-            ChatAttachment::Midstate(b) => Some(b.as_slice()),
-            ChatAttachment::DataHash(b) => Some(b.as_slice()),
-            ChatAttachment::LicenseChallenge { .. } => None,
-        };
-        
-        match bytes {
-            Some(b) => std::str::from_utf8(b).is_ok(),
-            None => false,
-        }
-        // NOTE: Extremely low probability (~1 in 4 billion) that a random 32-byte
-        // BLAKE3 hash (e.g. a PoAW root) is valid UTF-8. If this ever happens for a
-        // legitimate license advertisement, the node will be unable to broadcast it.
-        // Acceptable risk for now to keep chat clean of binary graffiti.
-    }
-}
-
-impl serde::Serialize for ChatAttachment {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if serializer.is_human_readable() {
-            #[derive(serde::Serialize)]
-            #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-            enum JsonHelper {
-                Address(String),
-                CoinId(String),
-                MixId(String),
-                Commitment(String),
-                BlockHash(String),
-                Midstate(String),
-                DataHash(String),
-                LicenseChallenge { commitment: String, height: u64, salt: String },
-            }
-
-            let helper = match self {
-                ChatAttachment::Address(a) => JsonHelper::Address(crate::core::types::encode_address_with_checksum(a)),
-                ChatAttachment::CoinId(id) => JsonHelper::CoinId(hex::encode(id)),
-                ChatAttachment::MixId(id) => JsonHelper::MixId(hex::encode(id)),
-                ChatAttachment::Commitment(id) => JsonHelper::Commitment(hex::encode(id)),
-                ChatAttachment::BlockHash(id) => JsonHelper::BlockHash(hex::encode(id)),
-                ChatAttachment::Midstate(id) => JsonHelper::Midstate(hex::encode(id)),
-                ChatAttachment::DataHash(id) => JsonHelper::DataHash(hex::encode(id)),
-                ChatAttachment::LicenseChallenge { commitment, height, salt } => {
-                    JsonHelper::LicenseChallenge {
-                        commitment: hex::encode(commitment),
-                        height: *height,
-                        salt: hex::encode(salt),
-                    }
-                }
-            };
-            helper.serialize(serializer)
-        } else {
-            // For bincode: serialize as an external enum
-            #[derive(serde::Serialize)]
-            enum BincodeHelper<'a> {
-                Address(&'a [u8; 32]),
-                CoinId(&'a [u8; 32]),
-                MixId(&'a [u8; 32]),
-                Commitment(&'a [u8; 32]),
-                BlockHash(&'a [u8; 32]),
-                Midstate(&'a [u8; 32]),
-                DataHash(&'a [u8; 32]),
-                LicenseChallenge { commitment: &'a [u8; 32], height: u64, salt: &'a [u8; 32] },
-            }
-            let helper = match self {
-                ChatAttachment::Address(addr) => BincodeHelper::Address(addr),
-                ChatAttachment::CoinId(id) => BincodeHelper::CoinId(id),
-                ChatAttachment::MixId(id) => BincodeHelper::MixId(id),
-                ChatAttachment::Commitment(id) => BincodeHelper::Commitment(id),
-                ChatAttachment::BlockHash(id) => BincodeHelper::BlockHash(id),
-                ChatAttachment::Midstate(id) => BincodeHelper::Midstate(id),
-                ChatAttachment::DataHash(id) => BincodeHelper::DataHash(id),
-                ChatAttachment::LicenseChallenge { commitment: _, height, salt } => {
-                    BincodeHelper::LicenseChallenge { commitment: &[0u8; 32], height: *height, salt }
-                }
-            };
-            helper.serialize(serializer)
-        }
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ChatAttachment {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        if deserializer.is_human_readable() {
-            #[derive(serde::Deserialize)]
-            #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-            enum JsonHelper {
-                Address(String),
-                CoinId(String),
-                MixId(String),
-                Commitment(String),
-                BlockHash(String),
-                Midstate(String),
-                DataHash(String),
-                LicenseChallenge { commitment: String, height: u64, salt: String },
-            }
-
-            let helper = JsonHelper::deserialize(deserializer)?;
-            
-            let parse_32 = |s: &str| -> Result<[u8; 32], D::Error> {
-                let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
-                bytes.try_into().map_err(|_| serde::de::Error::custom("Must be exactly 32 bytes"))
-            };
-
-            match helper {
-                JsonHelper::Address(s) => {
-                    let addr = crate::core::types::parse_address_flexible(&s)
-                        .map_err(serde::de::Error::custom)?;
-                    Ok(ChatAttachment::Address(addr))
-                }
-                JsonHelper::CoinId(s) => Ok(ChatAttachment::CoinId(parse_32(&s)?)),
-                JsonHelper::MixId(s) => Ok(ChatAttachment::MixId(parse_32(&s)?)),
-                JsonHelper::Commitment(s) => Ok(ChatAttachment::Commitment(parse_32(&s)?)),
-                JsonHelper::BlockHash(s) => Ok(ChatAttachment::BlockHash(parse_32(&s)?)),
-                JsonHelper::Midstate(s) => Ok(ChatAttachment::Midstate(parse_32(&s)?)),
-                JsonHelper::DataHash(s) => Ok(ChatAttachment::DataHash(parse_32(&s)?)),
-                JsonHelper::LicenseChallenge { commitment, height, salt } => {
-                    let commitment_bytes = parse_32(&commitment)?;
-                    let salt_bytes = parse_32(&salt)?;
-                    Ok(ChatAttachment::LicenseChallenge { commitment: commitment_bytes, height, salt: salt_bytes })
-                }
-           }
-    
-        } else {
-            // For bincode: deserialize as an external enum
-            #[derive(serde::Deserialize)]
-            enum BincodeHelper {
-                Address([u8; 32]),
-                CoinId([u8; 32]),
-                MixId([u8; 32]),
-                Commitment([u8; 32]),
-                BlockHash([u8; 32]),
-                Midstate([u8; 32]),
-                DataHash([u8; 32]),
-                LicenseChallenge { commitment: [u8; 32], height: u64, salt: [u8; 32] },
-            }
-            let helper = BincodeHelper::deserialize(deserializer)?;
-            match helper {
-                BincodeHelper::Address(addr) => Ok(ChatAttachment::Address(addr)),
-                BincodeHelper::CoinId(id) => Ok(ChatAttachment::CoinId(id)),
-                BincodeHelper::MixId(id) => Ok(ChatAttachment::MixId(id)),
-                BincodeHelper::Commitment(id) => Ok(ChatAttachment::Commitment(id)),
-                BincodeHelper::BlockHash(id) => Ok(ChatAttachment::BlockHash(id)),
-                BincodeHelper::Midstate(id) => Ok(ChatAttachment::Midstate(id)),
-                BincodeHelper::DataHash(id) => Ok(ChatAttachment::DataHash(id)),
-                BincodeHelper::LicenseChallenge { commitment, height, salt } => {
-                    Ok(ChatAttachment::LicenseChallenge { commitment, height, salt })
-                }
-            }
-        }
-    }
-}
-
-/// Hard cap on attachments per chat message.
-///
-/// Enforced at every entry point that constructs or accepts a chat:
-/// - [`crate::network::protocol::Message::deserialize_bin`] (peer-to-peer)
-/// - The `LightRequest::SendChat` handler (light-client origination)
-/// - `crate::rpc::handlers::send_chat` (LAN browser origination)
-pub const MAX_CHAT_ATTACHMENTS: usize = 4;
-
-
-/// A chat message as it appears in `Node::chat_history` and in the
-/// JSON returned by `GET /api/chat`.
-///
-/// # Schema
-///
-/// ```text
-/// ┌─ ChatMessage ──────────────────────────
-/// │  sender    : PeerId
-/// │  timestamp : ℕ
-/// │  nonce     : ℕ
-/// │  reply_to  : ℕ ∪ {⊥}
-/// │  words     : seq u8
-/// │  attachs   : seq ChatAttachment
-/// ├────────────────────────────────────────
-/// │  #words      ≤ 10
-/// │  #attachs    ≤ MAX_CHAT_ATTACHMENTS
-/// │  #sender_bytes ≤ 128
-/// │  isValidPeerId(sender)
-/// │  ∀ w ∈ ran words • w < #CHAT_DICTIONARY
-/// └────────────────────────────────────────
-/// ```
-///
-/// # JSON additive evolution
-///
-/// `attachments` is `#[serde(default)]` so payloads without the field
-/// still deserialize (legacy v1 producers); `skip_serializing_if =
-/// "Vec::is_empty"` makes the serialized form for legacy messages
-/// bit-identical to the pre-v2 wire shape.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct ChatMessage {
-    pub sender: String,
-    pub timestamp: u64,
-    pub nonce: u64,
-    pub reply_to: Option<u64>,
-    pub words: Vec<u8>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attachments: Vec<ChatAttachment>,
-}
-
-const MAX_PREFETCH_DISTANCE: u64 = 10_000;
-
-const SYNC_TIMEOUT_SECS: u64 = 30;
-/// Extra grace period for the first chunk (relay handshake, NAT traversal, etc.)
-const SYNC_INITIAL_TIMEOUT_SECS: u64 = 45;
-
-/// Max transactions accepted from a single peer per rate-limit window.
-const MAX_TX_PER_PEER_PER_WINDOW: u32 = 50;
-/// Rate-limit window duration in seconds.
-const TX_RATE_WINDOW_SECS: u64 = 10;
-
-/// Dandelion++: if a stem tx hasn't been fluffed within this many seconds,
-/// we fluff it ourselves as a safety net.
-const STEM_TIMEOUT_SECS: u64 = 30;
-/// Dandelion++: hard cap on stem pool entries. If full, new stem txs skip
-/// the privacy phase and go directly to the public mempool. This prevents
-/// unbounded memory growth under PoW spam from multiple Sybil peers.
-const MAX_STEM_POOL_SIZE: usize = 1000;
+// (old session consts + structs removed)
 
 /// GetHeaders responses are cheap when header files exist (~18 KB for 100 headers).
 /// But the fallback path loads full batches (~8 MB each) for pre-migration blocks.
@@ -436,92 +70,18 @@ const HEADER_REQ_WINDOW_SECS: u64 = 60;
 const MAX_BATCH_REQS_PER_PEER: u32 = 1000;
 const BATCH_REQ_WINDOW_SECS: u64 = 60;
 
-/// Non-blocking sync session driven by the main event loop.
-/// Replaces the old blocking `Syncer::sync_via_network` which hijacked the
-/// network and dropped unrelated messages.
-struct SyncSession {
-    peer: PeerId,
-    peer_height: u64,
-    peer_depth: u128,
-    phase: SyncPhase,
-    started_at: std::time::Instant,
-    /// Tracks when we last received useful data. Reset on every header/batch chunk.
-    /// The timeout fires based on this, not `started_at`.
-    last_progress_at: std::time::Instant,
-}
+/// Max transactions accepted from a single peer per rate-limit window.
+const MAX_TX_PER_PEER_PER_WINDOW: u32 = 50;
+/// Rate-limit window duration in seconds.
+const TX_RATE_WINDOW_SECS: u64 = 10;
 
-enum SyncPhase {
-    /// Downloading headers. If fast-forwarding, it holds the snapshot to verify against.
-    /// `verifying` is true while a per-chunk PoW verification task is in flight;
-    /// the stall monitor ignores the session in that case so queueing delays in
-    /// the rayon pool don't trip a false timeout.
-    Headers {
-        accumulated: Vec<BatchHeader>,
-        cursor: u64,
-        snapshot: Option<Box<State>>,
-        verifying: bool,
-    },
-    VerifyingHeaders,
-    /// Headers verified, now downloading batches from fork_height forward.
-    Batches {
-        headers: Vec<BatchHeader>,
-        fork_height: u64,
-        candidate_state: State,
-        cursor: u64,
-        new_history: Vec<(u64, [u8; 32], Batch)>,
-        is_fast_forward: bool,
-        /// Chunks requested from secondary peers that haven't been applied yet.
-       /// (start_height, peer_id)
-        in_flight: std::collections::BTreeMap<u64, PeerId>,
-        /// Out-of-order chunks that arrived before we were ready for them.
-        /// Keyed by start_height.
-        prefetch_buffer: std::collections::BTreeMap<u64, Vec<Batch>>,
-    },
-    VerifyingBatches {
-        in_flight: std::collections::BTreeMap<u64, PeerId>,
-        prefetch_buffer: std::collections::BTreeMap<u64, Vec<Batch>>,
-    },
-    /// Fork point found, GetBatches already sent, but state rebuild is still
-    /// running in the background. Batches arriving from the peer are buffered here.
-    PipelinedRebuild {
-        headers: Vec<BatchHeader>,
-        fork_height: u64,
-        is_fast_forward: bool,
-        buffered_batches: Vec<Batch>,
-        in_flight: std::collections::BTreeMap<u64, PeerId>,
-    },
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SyncStateBackup {
-    pub cursor: u64,
-    pub peer_height: u64,
-    pub accumulated_headers: Vec<BatchHeader>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct MinerToml {
-    pub mining: MiningConfig,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct MiningConfig {
-    pub mode: String,
-    pub pool_url: Option<String>,
-    pub payout_address: Option<String>,
-    pub pool_address: Option<String>,
-}
-
-pub enum MinedResult {
-    Block(Batch),
-    Share {
-        batch: Batch,
-        pool_url: String,
-        payout_address: String,
-    },
-}
-
-
+/// Dandelion++: if a stem tx hasn't been fluffed within this many seconds,
+/// we fluff it ourselves as a safety net.
+const STEM_TIMEOUT_SECS: u64 = 30;
+/// Dandelion++: hard cap on stem pool entries. If full, new stem txs skip
+/// the privacy phase and go directly to the public mempool. This prevents
+/// unbounded memory growth under PoW spam from multiple Sybil peers.
+const MAX_STEM_POOL_SIZE: usize = 1000;
 
 /// Verify PoW for a legacy [`crate::network::protocol::Message::Chat`].
 ///
@@ -550,32 +110,6 @@ pub enum MinedResult {
 /// Therefore a v1-valid `(m, nonce)` does not validate under v2 (and
 /// vice versa) with overwhelming probability. The receive handler
 /// dispatches v1/v2 by `Message` variant, never cross-validating.
-pub fn verify_chat_pow(sender: &str, timestamp: u64, reply_to: Option<u64>, words: &[u8], nonce: u64) -> bool {
-    let mut data = Vec::new();
-    data.extend_from_slice(sender.as_bytes());
-    data.extend_from_slice(&timestamp.to_le_bytes());
-    data.extend_from_slice(&reply_to.unwrap_or(0).to_le_bytes());
-    data.extend_from_slice(words);
-    data.extend_from_slice(&nonce.to_le_bytes());
-    
-    let h = crate::core::types::hash(&data);
-    crate::core::types::count_leading_zeros(&h) >= 20
-}
-
-/// Search nonces from 0 upward until [`verify_chat_pow`] returns `true`.
-///
-/// **Status: dead code after v2 introduction.** Kept exported in case a
-/// future tool needs to reproduce a v1-valid digest. New chat origination
-/// uses [`mine_chat_pow_v2`].
-pub fn mine_chat_pow(sender: String, timestamp: u64, reply_to: Option<u64>, words: Vec<u8>) -> u64 {
-    let mut n = 0u64;
-    loop {
-        if verify_chat_pow(&sender, timestamp, reply_to, &words, n) { 
-            return n; 
-        }
-        n += 1;
-    }
-}
 
 /// Verify PoW for a [`crate::network::protocol::Message::ChatV2`].
 ///
@@ -604,138 +138,25 @@ pub fn mine_chat_pow(sender: String, timestamp: u64, reply_to: Option<u64>, word
 /// dispatches by `Message` variant — never trying the other verifier on
 /// a failed check.
 ///
-/// # Lemma 2.3.2 — PoW binds attachments
-///
-/// Suppose `(m, nonce)` is v2-valid and `m'` is identical to `m` except
-/// for `attachments`. If `#attachments ≠ #m'.attachments`, then
-/// `encode_pow_v2(m) ≠ encode_pow_v2(m')` (different `le4` prefix). If
-/// counts match but payloads differ, the per-attachment bytes differ.
-/// Either way, the digest changes and v2 verification of `(m', nonce)`
-/// fails. Consequence: a forwarding peer cannot strip, substitute, or
-/// reorder attachments without invalidating PoW.
-///
-/// # Difficulty
-///
-/// 20 leading zero bits of `BLAKE3(preimage)`. Identical to v1.
-pub fn verify_chat_pow_v2(
-    sender: &str,
-    timestamp: u64,
-    reply_to: Option<u64>,
-    words: &[u8],
-    attachments: &[ChatAttachment],
-    nonce: u64,
-) -> bool {
-    let mut data = Vec::with_capacity(
-        sender.len() + 8 + 8 + words.len() + 4 + attachments.len() * (1 + 32) + 8,
-    );
-    data.extend_from_slice(sender.as_bytes());
-    data.extend_from_slice(&timestamp.to_le_bytes());
-    data.extend_from_slice(&reply_to.unwrap_or(0).to_le_bytes());
-    data.extend_from_slice(words);
-
-    data.extend_from_slice(&(attachments.len() as u32).to_le_bytes());
-    for att in attachments {
-        match att {
-            ChatAttachment::Address(id) => {
-                data.push(0x01); // tag: Address
-                data.extend_from_slice(id);
-            }
-            ChatAttachment::CoinId(id) => {
-                data.push(0x02); // tag: CoinId
-                data.extend_from_slice(id);
-            }
-            ChatAttachment::MixId(id) => {
-                data.push(0x03); // tag: MixId
-                data.extend_from_slice(id);
-            }
-            ChatAttachment::Commitment(id) => {
-                data.push(0x04); // tag: Commitment
-                data.extend_from_slice(id);
-            }
-            ChatAttachment::BlockHash(id) => {
-                data.push(0x05); // tag: BlockHash
-                data.extend_from_slice(id);
-            }
-            ChatAttachment::Midstate(id) => {
-                data.push(0x06); // tag: Midstate
-                data.extend_from_slice(id);
-            }
-            ChatAttachment::DataHash(id) => {
-                data.push(0x07); // tag: DataHash
-                data.extend_from_slice(id);
-            }
-            ChatAttachment::LicenseChallenge { commitment, height, salt } => {
-                data.push(0x08); // tag: LicenseChallenge
-                data.extend_from_slice(commitment);
-                data.extend_from_slice(&height.to_le_bytes());
-                data.extend_from_slice(salt);
-            }
-        }
-    }
-    data.extend_from_slice(&nonce.to_le_bytes());
-
-    let h = crate::core::types::hash(&data);
-    crate::core::types::count_leading_zeros(&h) >= 20
-}
-
-/// Search nonces from 0 upward until [`verify_chat_pow_v2`] returns `true`.
-///
-/// # Postcondition
-///
-/// ```text
-/// ∃ n : ℕ • verify_chat_pow_v2(sender, ts, reply_to, words, atts, n) = ⊤
-///         ∧ ∀ k : ℕ • k < n ⇒ ¬verify_chat_pow_v2(..., k)
-/// ```
-///
-/// (The function returns the *smallest* satisfying nonce.)
-///
-/// # Termination
-///
-/// At 20 PoW bits, the expected number of iterations is 2²⁰ ≈ 1.05 M;
-/// 99% of mines complete within ~5 M iterations. Mining is CPU-bound
-/// (~10 ms on commodity hardware) and must be invoked on a blocking
-/// task — never inside an async request handler.
-pub fn mine_chat_pow_v2(
-    sender: String,
-    timestamp: u64,
-    reply_to: Option<u64>,
-    words: Vec<u8>,
-    attachments: Vec<ChatAttachment>,
-) -> u64 {
-    let mut n = 0u64;
-    loop {
-        if verify_chat_pow_v2(&sender, timestamp, reply_to, &words, &attachments, n) {
-            return n;
-        }
-        n += 1;
-    }
-}
-
 pub struct Node {
     state: State,
     mempool: Mempool,
     storage: Storage,
     network: MidstateNetwork,
     metrics: Metrics,
-    mining_threads: Option<usize>,
+    mining: MiningCoordinator,
+    license: LicenseManager,
     recent_headers: VecDeque<u64>,
     orphan_batches: HashMap<[u8; 32], Vec<Batch>>,
     orphan_order: VecDeque<[u8; 32]>,
-    sync_in_progress: bool,
     sync_requested_up_to: u64,
-    sync_session: Option<SyncSession>,
-    sync_retry_count: u32,
-    sync_backoff_until: Option<std::time::Instant>,
-    mining_seed: [u8; 32],
+    sync: crate::sync::SyncManager,
     data_dir: PathBuf,
     /// Whether this node should automatically prune old block data.
     prune: bool,
     chain_history: VecDeque<(u64, [u8; 32])>,
     finality: crate::core::finality::FinalityEstimator,
     cached_safe_depth: u64,
-    /// Last header cursor reached during sync. Used to resume after timeout
-    /// instead of restarting from height - 360 every time.
-    last_sync_cursor: Option<u64>,
     known_pex_addrs: HashMap<String, (u32, u32)>, // Bayesian Routing (Alpha, Beta)
 
     connected_peers: HashSet<PeerId>,
@@ -765,43 +186,6 @@ pub struct Node {
     peer_chat_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     hash_counter: Arc<AtomicU64>,
 
-    /// Peers that have advertised they *hold* certain Pruning Licenses (via Chat Commitment attachments).
-    /// These are used primarily for exemption checks: when a peer fails GetBatches on old data,
-    /// we check whether they hold a reputable license (from a live Issuer) before penalizing them.
-    /// Challenge *targeting* and storage audits are routed based on Issuers (see my_issued_license_ranges).
-    advertised_licenses: HashMap<PeerId, Vec<([u8; 32], u64)>>, // (commitment, weight)
-
-    /// Bayesian reputation (alpha = successful responses, beta = failures/timeouts)
-    /// for peers holding licenses, per license commitment.
-    /// This is the conjugate prior Beta distribution for reliability scoring.
-    license_reputations: HashMap<PeerId, HashMap<[u8; 32], (u32, u32)>>,
-
-    /// Licenses this node itself claims to *hold* (for exemption from serving historical data when pruning).
-    /// Populated via `register_my_licenses` from the operator's wallet at startup.
-    /// These give the node the right to prune without penalty (the "Pruner shield" side of the Cap-and-Trade model).
-    my_license_ranges: Vec<([u8; 32], u64, u64)>, // (commitment, min_height, max_height)
-
-    /// Licenses this node has *issued* (as the original Archiver / Issuer recorded in LicenseMetadata.issuer).
-    /// Populated via register_issued_licenses (or extended register_my_licenses) at startup.
-    /// These define the audit obligations: this node must respond to MMR Gossip Challenges for these ranges
-    /// even after selling the UTXOs. Reputation damage here devalues all licenses issued under this identity.
-    my_issued_license_ranges: Vec<([u8; 32], u64, u64)>, // (commitment, min_height, max_height)
-
-    /// Pending MMR Gossip Challenges we have sent to peers.
-    /// Key: (peer, license_commitment, height)
-    /// Value: (salt we sent, time sent)
-    /// Used for timeout detection and response matching.
-    pending_license_challenges: HashMap<(PeerId, [u8; 32], u64), ([u8; 32], Instant)>,
-
-    /// Claims received via DataHash replies to our LicenseChallenges, awaiting
-    /// actual batch data arrival for cryptographic verification.
-    /// Key: challenged height
-    /// Value: list of (responder peer, license commitment they claimed for, hash they supplied)
-    /// This closes the "reply with any hash for free alpha" exploit.
-    pending_data_verifications: HashMap<u64, Vec<(PeerId, [u8; 32], [u8; 32])>>,
-
-
-    
     /// Ring buffer of recent states for instant reorg rollback.
     /// Keyed by height: state_cache[i] = (height, State) where the State
     /// is the result of applying all blocks through height-1.
@@ -1064,7 +448,7 @@ impl NodeHandle {
         // Use valid dictionary indices (example: "I have data")
         let words = vec![80, 49, 204];
 
-        for chunk in license_commitments.chunks(crate::node::MAX_CHAT_ATTACHMENTS) {
+        for chunk in license_commitments.chunks(crate::chat::MAX_CHAT_ATTACHMENTS) {
             let attachments: Vec<ChatAttachment> = chunk
                 .iter()
                 .map(|c| ChatAttachment::Commitment(*c))
@@ -1677,6 +1061,9 @@ pub async fn new(
             }
         };
 
+        let mining = MiningCoordinator::new(mining_threads, mining_seed, data_dir.clone());
+        let license = LicenseManager::new();
+
         // Load or generate libp2p keypair
         // We now persist the identity for ALL nodes using a data directory.
         // This allows nodes to have a "Static ID" that survives restarts.
@@ -1717,22 +1104,18 @@ pub async fn new(
             storage: storage.clone(),
             network,
             metrics: Metrics::new(),
-            mining_threads,
+            mining,
+            license,
             recent_headers,
             orphan_batches: HashMap::new(),
             orphan_order: VecDeque::new(),
-            sync_in_progress: false,
             sync_requested_up_to: 0,
-            mining_seed,
+            sync: crate::sync::SyncManager::new(),
             data_dir,
             prune,
             chain_history: VecDeque::new(),
             finality: crate::core::finality::FinalityEstimator::new(2, 8),
             cached_safe_depth: crate::core::finality::FinalityEstimator::new(2, 8).calculate_safe_depth(1e-6),
-            last_sync_cursor: None,
-            sync_session: None,
-            sync_retry_count: 0,
-            sync_backoff_until: None,
             known_pex_addrs: HashMap::new(),
             connected_peers: HashSet::new(),
             mining_cancel: None,
@@ -1748,12 +1131,6 @@ pub async fn new(
             peer_chat_counts: HashMap::new(),
             hash_counter: Arc::new(AtomicU64::new(0)),
             state_cache: VecDeque::with_capacity(STATE_CACHE_SIZE + 1),
-            advertised_licenses: HashMap::new(),
-            license_reputations: HashMap::new(),
-            my_license_ranges: vec![], // licenses this node holds (for pruning exemption)
-            my_issued_license_ranges: vec![], // populated via register_issued_licenses() from wallet at startup for Archivers
-            pending_license_challenges: HashMap::new(),
-            pending_data_verifications: HashMap::new(),
             bootstrap_peers: bootstrap_strings, // <-- Uses the variable we created above
             chat_history: Arc::new(RwLock::new(VecDeque::new())),
             seen_chats: HashSet::new(),
@@ -1767,7 +1144,7 @@ pub async fn new(
     /// These give pruning exemption rights (the node can safely drop historical data without
     /// being punished by peers for GetBatches failures, as long as the license Issuer remains reputable).
     pub fn register_my_licenses(&mut self, ranges: Vec<([u8; 32], u64, u64)>) {
-        self.my_license_ranges = ranges;
+        self.license.register_my_licenses(ranges);
     }
 
     /// Register licenses this node has *issued* as an Archiver (the 'issuer' field in LicenseMetadata).
@@ -1775,7 +1152,7 @@ pub async fn new(
     /// Even after selling the UTXOs, this node must continue serving the ranges or the licenses
     /// it issued will lose reputation on the secondary market (hurting future royalty revenue).
     pub fn register_issued_licenses(&mut self, ranges: Vec<([u8; 32], u64, u64)>) {
-        self.my_issued_license_ranges = ranges;
+        self.license.register_issued_licenses(ranges);
     }
 
     /// Hook for post-download cryptographic verification of license challenge responses.
@@ -1796,10 +1173,10 @@ pub async fn new(
         // SECURITY FIX: We must recompute the exact proof the responder sent:
         //   blake3( original_salt_we_sent || serialized tx data )
         // Then compare against the claimed DataHash they sent earlier.
-        if let Some(claims) = self.pending_data_verifications.remove(&height) {
+        if let Some(claims) = self.license.pending_data_verifications.remove(&height) {
             for (peer, commitment, claimed_hash) in claims {
                 // Look up the original salt we sent in the LicenseChallenge to this peer for this exact (commitment, height)
-                let original_salt = if let Some((salt, _)) = self.pending_license_challenges.get(&(peer, commitment, height)) {
+                let original_salt = if let Some((salt, _)) = self.license.pending_license_challenges.get(&(peer, commitment, height)) {
                     *salt
                 } else {
                     // No record of the challenge we sent — can't verify fairly. Drop the claim.
@@ -1816,7 +1193,7 @@ pub async fn new(
                 }
                 let expected_proof = *hasher.finalize().as_bytes();
 
-                let entry = self.license_reputations
+                let entry = self.license.license_reputations
                     .entry(peer)
                     .or_default()
                     .entry(commitment)
@@ -1839,7 +1216,7 @@ pub async fn new(
                 }
 
                 // Clean up the pending challenge record now that we've verified (or slashed)
-                self.pending_license_challenges.remove(&(peer, commitment, height));
+                self.license.pending_license_challenges.remove(&(peer, commitment, height));
             }
         }
     }
@@ -1848,7 +1225,7 @@ pub async fn new(
     /// (Bayesian alpha / (alpha + beta) with weak prior, averaged over the licenses it has
     /// advertised). Used to scale GetBatches quotas and prioritize responsive archival peers.
     pub fn get_license_reliability(&self, peer: PeerId) -> f32 {
-        if let Some(per_license) = self.license_reputations.get(&peer) {
+        if let Some(per_license) = self.license.license_reputations.get(&peer) {
             if per_license.is_empty() {
                 return 0.5;
             }
@@ -1869,8 +1246,8 @@ pub async fn new(
             // purposes is also influenced by the reputation of the *Issuers* of licenses they hold.
             // If this peer advertises licenses from Issuers we have audited poorly, slightly
             // discount their score (encourages Pruners to buy from high-quality Archivers).
-            let holds_any = self.advertised_licenses.contains_key(&peer);
-            if holds_any && !self.my_issued_license_ranges.is_empty() {
+            let holds_any = self.license.advertised_licenses.contains_key(&peer);
+            if holds_any && !self.license.my_issued_license_ranges.is_empty() {
                 // Conservative: if we ourselves are a reputable Issuer, peers holding
                 // "our" licenses get a small reliability uplift in our local view.
                 // More sophisticated cross-Issuer scoring can be added later.
@@ -1938,16 +1315,21 @@ async fn process_state_rebuild(
 ) -> Result<()> {
     if !is_valid {
         tracing::warn!("State rebuild or header validation failed, banning peer");
-        self.sync_in_progress = false;
+        self.sync.in_progress = false;
         self.ban_peer(peer, "invalid header chain or rebuild failed");
         return Ok(());
     }
 
     let headers_start_height = headers.first().map(|h| h.height).unwrap_or(0);
     if fork_height == headers_start_height && headers_start_height > 0 && !is_fast_forward {
-        let session = match self.sync_session.take() {
+        let session = match self.sync.take_session() {
             Some(s) if s.peer == peer => s,
-            other => { self.sync_session = other; return Ok(()); }
+            other => {
+                if let Some(s) = other {
+                    self.sync.set_session(s);
+                }
+                return Ok(());
+            }
         };
         let step_back = crate::network::MAX_GETHEADERS_COUNT;
         let new_start = headers_start_height.saturating_sub(step_back);
@@ -1955,19 +1337,7 @@ async fn process_state_rebuild(
             "Fork is deeper than downloaded headers ({}). Stepping back to {} to find the exact fork point.", 
             headers_start_height, new_start
         );
-        self.sync_session = Some(SyncSession {
-            peer,
-            peer_height: session.peer_height,
-            peer_depth: session.peer_depth,
-            phase: SyncPhase::Headers {
-                accumulated: headers,
-                cursor: new_start,
-                snapshot: None,
-                verifying: false,
-            },
-            started_at: session.started_at,
-            last_progress_at: std::time::Instant::now(),
-        });
+        self.sync.restart_headers_with_step_back(peer, session.peer_height, session.peer_depth, headers, new_start, session.started_at);
 
         let count = headers_start_height.saturating_sub(new_start).min(crate::network::MAX_GETHEADERS_COUNT);
         self.network.send(peer, Message::GetHeaders { start_height: new_start, count });
@@ -1977,7 +1347,7 @@ async fn process_state_rebuild(
     match candidate_state {
         None => {
             // First message: fork point found, state rebuild still in progress.
-            let session = match self.sync_session.take() {
+            let session = match self.sync.take_session() {
                 Some(s) if s.peer == peer && matches!(
                     s.phase,
                     SyncPhase::VerifyingHeaders | SyncPhase::PipelinedRebuild { .. }
@@ -1987,7 +1357,9 @@ async fn process_state_rebuild(
                         "FinishStateRebuild (None branch) arrived but session phase mismatch \
                          for peer {}, ignoring. Session will timeout.", peer
                     );
-                    self.sync_session = other;
+                    if let Some(s) = other {
+                        self.sync.set_session(s);
+                    }
                     return Ok(());
                 }
             };
@@ -2009,28 +1381,20 @@ async fn process_state_rebuild(
             };
             in_flight.insert(fork_height, peer);
 
-            self.sync_session = Some(SyncSession {
-                peer,
-                peer_height: session.peer_height,
-                peer_depth: session.peer_depth,
-                phase: SyncPhase::PipelinedRebuild {
-                    headers,
-                    fork_height,
-                    is_fast_forward,
-                    buffered_batches: existing_buffer,
-                    in_flight,
-                },
-                started_at: session.started_at,
-                last_progress_at: std::time::Instant::now(),
-            });
+            self.sync.set_pipelined_rebuild(peer, session.peer_height, session.peer_depth, headers, fork_height, is_fast_forward, existing_buffer, in_flight, session.started_at);
         }
 
         Some(state) => {
             let _ = self.storage.save_state_snapshot(fork_height, &state);
             // Second message: state is ready. Drain buffer into Batches phase.
-            let session = match self.sync_session.take() {
+            let session = match self.sync.take_session() {
                 Some(s) if s.peer == peer => s,
-                other => { self.sync_session = other; return Ok(()); }
+                other => {
+                    if let Some(s) = other {
+                        self.sync.set_session(s);
+                    }
+                    return Ok(());
+                }
             };
 
             let mut is_instant = false;
@@ -2049,28 +1413,12 @@ async fn process_state_rebuild(
 
             tracing::info!("Pipeline: state ready at height {}. {} buffered batch(es).", stored_fork_height, buffered.len());
 
-            self.sync_session = Some(SyncSession {
-                peer,
-                peer_height,
-                peer_depth,
-                phase: SyncPhase::Batches {
-                    headers: stored_headers,
-                    fork_height: stored_fork_height,
-                    candidate_state: *state,
-                    cursor: stored_fork_height,
-                    new_history: Vec::new(),
-                    is_fast_forward: stored_is_fast_forward,
-                    in_flight,
-                    prefetch_buffer: std::collections::BTreeMap::new(),
-                },
-                started_at,
-                last_progress_at: std::time::Instant::now(),
-            });
+            self.sync.set_batches_phase(peer, peer_height, peer_depth, stored_headers, stored_fork_height, *state, stored_fork_height, Vec::new(), stored_is_fast_forward, in_flight, std::collections::BTreeMap::new(), started_at);
 
             if is_instant {
                 let count = (peer_height - stored_fork_height).min(MAX_GETBATCHES_COUNT);
                 self.network.send(peer, Message::GetBatches { start_height: stored_fork_height, count });
-                if let Some(s) = &mut self.sync_session {
+                if let Some(s) = self.sync.session_mut() {
                     if let SyncPhase::Batches { in_flight, .. } = &mut s.phase { in_flight.insert(stored_fork_height, peer); }
                 }
             } else if !buffered.is_empty() {
@@ -2104,7 +1452,7 @@ async fn process_verified_batches_chunk(
         peer_depth: u128,
     ) -> Result<()> {
         // Remove the VerifyingBatches placeholder the spawn set and extract lookahead state.
-        let (mut in_flight, prefetch_buffer) = match self.sync_session.take() {
+        let (mut in_flight, prefetch_buffer) = match self.sync.take_session() {
             Some(s) => match s.phase {
                 SyncPhase::VerifyingBatches { in_flight, prefetch_buffer } => (in_flight, prefetch_buffer),
                 _ => (std::collections::BTreeMap::new(), std::collections::BTreeMap::new()),
@@ -2121,20 +1469,20 @@ async fn process_verified_batches_chunk(
                 tracing::warn!("Self-healing triggered. Shifting chunk boundary...");
                 // Shift the cursor back by 1 so the next chunk starts at current_cursor - 1.
                 // This ensures current_cursor is i=1 in the next chunk, making state_before_prev available.
-                self.last_sync_cursor = Some(current_cursor.saturating_sub(1));
+                self.sync.set_last_sync_cursor(Some(current_cursor.saturating_sub(1)));
                 self.abort_sync_session("Self-healing triggered");
                 return Ok(());
             }
 
             // Save cursor so we restart from here, not from height - 360
-            self.last_sync_cursor = Some(current_cursor.saturating_sub(1));
+            self.sync.set_last_sync_cursor(Some(current_cursor.saturating_sub(1)));
             self.abort_sync_session("peer sent corrupt batch");
             
             // --- FIX: Reorg-Proof Sync ---
             // The peer sent a batch that does not match the header they sent earlier.
             // This happens frequently when the peer reorganizes their chain while we are syncing from them.
             // We MUST NOT ban them. Reset backoff so we retry immediately.
-            self.sync_retry_count = 0; 
+            self.sync.retry_count = 0; 
             self.abort_sync_session("peer reorganized during sync (batch/header mismatch)");
             self.network.disconnect_peer(from);
             
@@ -2154,7 +1502,7 @@ async fn process_verified_batches_chunk(
         }
 
         // Restore sync state because perform_reorg clears it ---
-        self.sync_in_progress = true;
+        self.sync.in_progress = true;
         self.cancel_mining();
         
        if current_cursor < peer_height {
@@ -2166,23 +1514,7 @@ async fn process_verified_batches_chunk(
             }
             
             // Re-arm the session back into the Batches phase
-            self.sync_session = Some(SyncSession {
-                peer: from,
-                peer_height,
-                peer_depth,
-                phase: SyncPhase::Batches {
-                    headers,
-                    fork_height,
-                    candidate_state: *candidate_state,
-                    cursor: current_cursor,
-                    new_history,
-                    is_fast_forward,
-                    in_flight,
-                    prefetch_buffer,
-                },
-                started_at: session_started_at,
-                last_progress_at: std::time::Instant::now(),
-            });
+            self.sync.set_batches_phase(from, peer_height, peer_depth, headers, fork_height, *candidate_state, current_cursor, new_history, is_fast_forward, in_flight, prefetch_buffer, session_started_at);
             
             // Now that we are back in the Batches phase and cursor is advanced:
             self.fire_batch_lookahead();
@@ -2209,18 +1541,18 @@ async fn process_verified_batches_chunk(
             );
         }
 
-        self.sync_in_progress = false;
+        self.sync.in_progress = false;
 
         // By subtracting 1, we guarantee exactly 1 block of overlap for the next sync,
         // preventing the "Fork is deeper" panic, while keeping the sync instant.
-        self.last_sync_cursor = Some(self.state.height.saturating_sub(1)); 
+        self.sync.set_last_sync_cursor(Some(self.state.height.saturating_sub(1))); 
                
         // Reset backoff: successful sync proves the peer and path are healthy
-        self.sync_retry_count = 0;
-        self.sync_backoff_until = None;
+        self.sync.retry_count = 0;
+        self.sync.backoff_until = None;
 
         // CLEAR THE CACHE 
-        let _ = std::fs::remove_file(self.data_dir.join("sync_state.bin"));
+        self.sync.clear_backup(&self.data_dir);
 
         // Immediately check if the peer has mined more blocks while we were syncing.
         self.network.send(from, Message::GetState);
@@ -2481,10 +1813,10 @@ async fn handle_light_request(
                 if words.len() > 10 {
                     return LightResponse::error("Message must be between 1 and 10 words");
                 }
-                if words.iter().any(|&w| (w as usize) >= crate::node::CHAT_DICTIONARY.len()) {
+                if words.iter().any(|&w| (w as usize) >= crate::chat::CHAT_DICTIONARY.len()) {
                     return LightResponse::error("Invalid word index");
                 }
-                if attachments.len() > crate::node::MAX_CHAT_ATTACHMENTS {
+                if attachments.len() > crate::chat::MAX_CHAT_ATTACHMENTS {
                     return LightResponse::error("Too many attachments (max 4)");
                 }
                 if attachments.iter().any(|att| att.is_graffiti()) {
@@ -2679,7 +2011,7 @@ async fn handle_light_request(
         // 4. We haven't heard of a better height/depth from peers recently (SyncRequestedUpTo)
         let is_behind = self.sync_requested_up_to > self.state.height;
         
-        if self.mining_threads.is_some() && !self.sync_in_progress && !is_behind && self.mining_cancel.is_none() {
+        if self.mining.threads.is_some() && !self.sync.in_progress && !is_behind && self.mining_cancel.is_none() {
             if let Err(e) = self.spawn_mining_task() {
                 tracing::error!("Failed to trigger mining task: {}", e);
             }
@@ -2822,7 +2154,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                 
                 _ = health_check_interval.tick() => {
                     // Periodic O(1) health check to ensure we aren't desynced/corrupted
-                    if !self.sync_in_progress && self.state.height > 0 {
+                    if !self.sync.in_progress && self.state.height > 0 {
                         match self.perform_health_check().await {
                             Ok(true) => {
                                 tracing::debug!("Periodic state health check passed.");
@@ -2854,10 +2186,10 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                     // to prevent unbounded memory growth in pending_data_verifications.
                     let current_height = self.state.height;
                     let prune_threshold = current_height.saturating_sub(200_000); // generous window
-                    self.pending_data_verifications.retain(|h, _| *h >= prune_threshold);
+                    self.license.pending_data_verifications.retain(|h, _| *h >= prune_threshold);
 
                     // Also clean very old pending challenges we sent (to avoid leaking salt records)
-                    self.pending_license_challenges.retain(|(_, _, h), (_, sent_at)| {
+                    self.license.pending_license_challenges.retain(|(_, _, h), (_, sent_at)| {
                         *h >= prune_threshold || sent_at.elapsed().as_secs() < 300
                     });
 
@@ -2876,8 +2208,8 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                     // For now we challenge advertisers of licenses while the response side (below)
                     // and exemption logic enforce the correct economic separation.
 
-                    if !self.advertised_licenses.is_empty() {
-                        for (peer, licenses) in &self.advertised_licenses {
+                    if !self.license.advertised_licenses.is_empty() {
+                        for (peer, licenses) in &self.license.advertised_licenses {
                             if licenses.is_empty() { continue; }
                             let (commitment, _weight) = &licenses[rand::random::<usize>() % licenses.len()];
 
@@ -2899,7 +2231,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                             
                             let salt: [u8; 32] = rand::random();
 
-                            self.pending_license_challenges.insert(
+                            self.license.pending_license_challenges.insert(
                                 (*peer, *commitment, height),
                                 (salt, std::time::Instant::now()),
                             );
@@ -2929,9 +2261,9 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                     // If we have issued licenses ourselves, we can also proactively audit
                     // any peers currently advertising those specific commitments (helps surface
                     // bad holders of our issued licenses).
-                    if !self.my_issued_license_ranges.is_empty() && !self.advertised_licenses.is_empty() {
-                        for (commitment, _, _) in &self.my_issued_license_ranges {
-                            for (peer, adv_licenses) in &self.advertised_licenses {
+                    if !self.license.my_issued_license_ranges.is_empty() && !self.license.advertised_licenses.is_empty() {
+                        for (commitment, _, _) in &self.license.my_issued_license_ranges {
+                            for (peer, adv_licenses) in &self.license.advertised_licenses {
                                 if adv_licenses.iter().any(|(c, _)| c == commitment) {
                                     // Send an extra targeted challenge for one of our issued commitments
                                     let max_h = self.state.height.saturating_sub(1);
@@ -2939,7 +2271,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                                     let height = rand::random::<u64>() % max_h;
                                     let salt: [u8; 32] = rand::random();
 
-                                    self.pending_license_challenges.insert(
+                                    self.license.pending_license_challenges.insert(
                                         (*peer, *commitment, height),
                                         (salt, std::time::Instant::now()),
                                     );
@@ -2965,7 +2297,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                     // Timeout cleanup for pending challenges (penalize with beta)
                     let now = std::time::Instant::now();
                     let mut timed_out = vec![];
-                    for (key, (_salt, sent_at)) in &self.pending_license_challenges {
+                    for (key, (_salt, sent_at)) in &self.license.pending_license_challenges {
                         if now.duration_since(*sent_at).as_secs() > 60 {
                             timed_out.push(*key);
                         }
@@ -2974,8 +2306,8 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                         if let Some((peer, commitment, _h)) = {
                             let (p, c, h) = key; Some((p, c, h))
                         } {
-                            self.pending_license_challenges.remove(&key);
-                            if let Some(rep) = self.license_reputations
+                            self.license.pending_license_challenges.remove(&key);
+                            if let Some(rep) = self.license.license_reputations
                                 .entry(peer)
                                 .or_default()
                                 .get_mut(&commitment)
@@ -3039,15 +2371,15 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                 }
                 _ = sync_poll_interval.tick() => {
                     // Respect exponential backoff: don't poll until the window expires
-                    if let Some(until) = self.sync_backoff_until {
+                    if let Some(until) = self.sync.backoff_until {
                         if std::time::Instant::now() < until {
                             continue;
                         }
-                        self.sync_backoff_until = None;
+                        self.sync.backoff_until = None;
                     }
 
                     // Don't interrupt an active session
-                    if self.sync_session.is_some() || self.sync_in_progress {
+                    if self.sync.has_active_session() || self.sync.is_in_progress() {
                         continue;
                     }
 
@@ -3070,34 +2402,11 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                 }
                 
                 _ = sync_timeout_interval.tick() => {
-                    if let Some(session) = &self.sync_session {
-                        if !matches!(
-                            session.phase,
-                            SyncPhase::VerifyingHeaders
-                            | SyncPhase::VerifyingBatches { .. }
-                            | SyncPhase::PipelinedRebuild { .. }
-                            | SyncPhase::Headers { verifying: true, .. }
-                        ) {
-                            let idle_secs = session.last_progress_at.elapsed().as_secs();
-                            let has_made_progress = session.last_progress_at != session.started_at;
-                            let timeout = if has_made_progress { SYNC_TIMEOUT_SECS } else { SYNC_INITIAL_TIMEOUT_SECS };
-                            let peer = session.peer;
-                            let phase_name = match &session.phase {
-                                SyncPhase::Headers { cursor, .. } => format!("Headers(cursor={})", cursor),
-                                SyncPhase::Batches { cursor, .. } => format!("Batches(cursor={})", cursor),
-                                _ => "Verifying".into(),
-                            };
-                            if idle_secs > timeout {
-                                let msg = format!("timed out after {}s in phase {}", idle_secs, phase_name);
-                                self.abort_sync_session(&msg);
-                                // Do NOT ban the peer for latency/load. Just disconnect them.
-                                self.network.disconnect_peer(peer); 
-                            } else if idle_secs > timeout / 2 && idle_secs % 30 < 5 {
-                                tracing::warn!(
-                                    "Sync stall warning: {}s idle in {} (timeout={}s, peer={})",
-                                    idle_secs, phase_name, timeout, peer
-                                );
-                            }
+                    if let Some(msg) = self.sync.check_for_stall() {
+                        if let Some(peer) = self.sync.get_session_peer() {
+                            self.abort_sync_session(&msg);
+                            // Do NOT ban the peer for latency/load. Just disconnect them.
+                            self.network.disconnect_peer(peer);
                         }
                     }
                 }
@@ -3369,7 +2678,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
 
                             // If this peer had in-flight lookahead requests, drop them from
                             // tracking so fire_batch_lookahead re-requests from another peer
-                            if let Some(s) = &mut self.sync_session {
+                            if let Some(s) = self.sync.session_mut() {
                                 match &mut s.phase {
                                     SyncPhase::Batches { in_flight, .. } |
                                     SyncPhase::VerifyingBatches { in_flight, .. } |
@@ -3384,7 +2693,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                                 }
                             }
 
-                            if self.sync_session.as_ref().map_or(false, |s| s.peer == peer) {
+                            if self.sync.is_sync_peer(peer) {
                                 self.abort_sync_session("sync peer disconnected");
                             } else {
                                 self.fire_batch_lookahead();
@@ -3405,11 +2714,11 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                             }
                         }
                         NetworkEvent::RequestFailed(peer) => {
-                            if self.sync_session.as_ref().map_or(false, |s| s.peer == peer) {
+                            if self.sync.is_sync_peer(peer) {
                                 self.abort_sync_session("Outbound request failed (timeout or disconnected)");
                             } else {
                                 // If a secondary peer failed, we must clear their in-flight chunks so they can be re-requested
-                                if let Some(s) = &mut self.sync_session {
+                                if let Some(s) = self.sync.session_mut() {
                                     match &mut s.phase {
                                         SyncPhase::Batches { in_flight, .. } |
                                         SyncPhase::VerifyingBatches { in_flight, .. } |
@@ -3479,8 +2788,8 @@ async fn handle_message(
                 self.ack(channel);
                 tracing::debug!("Peer {} state: height={} depth={}", from, height, depth);
 
-                let is_syncing = self.sync_in_progress || self.sync_session.is_some();
-                let is_sync_peer = self.sync_session.as_ref().map_or(false, |s| s.peer == from);
+                let is_syncing = self.sync.is_in_progress() || self.sync.has_active_session();
+                let is_sync_peer = self.sync.is_sync_peer(from);
 
                 if is_syncing {
                     // We are actively busy syncing. 
@@ -3488,8 +2797,7 @@ async fn handle_message(
                         // The peer we are syncing with just sent us an update.
                         if midstate == self.state.midstate && height == self.state.height {
                             tracing::info!("Caught up to sync peer {}", from);
-                            self.sync_in_progress = false;
-                            self.sync_session = None;
+                            self.sync.finish_sync();
                             self.trigger_mining();
                         } else if depth > self.state.depth || height > self.state.height {
                             tracing::debug!("Sync peer {} advanced to height {}", from, height);
@@ -3567,7 +2875,7 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                 // If this peer has advertised that they hold a Pruning License from a reputable Issuer,
                 // they are allowed to prune (not serve very old data) without being heavily rate-limited
                 // or punished for it. This is the "Pruner shield".
-                let has_exemption_license = self.advertised_licenses.contains_key(&from);
+                let has_exemption_license = self.license.advertised_licenses.contains_key(&from);
                 let reliability = self.get_license_reliability(from);
 
                 let base_reliability = if has_exemption_license && reliability > 0.25 {
@@ -3639,38 +2947,14 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
             Message::Batches { start_height: batch_start, batches } => {
                 self.ack(channel);
                 if !batches.is_empty() {
-                    let session_role = self.sync_session.as_ref().and_then(|s| {
-                        match &s.phase {
-                            SyncPhase::Batches { in_flight, .. } => {
-                                if s.peer == from || in_flight.iter().any(|(_, p)| *p == from) {
-                                    Some("batches")
-                                } else { None }
-                            }
-                            SyncPhase::VerifyingBatches { in_flight, .. } => {
-                                if s.peer == from || in_flight.iter().any(|(_, p)| *p == from) {
-                                    Some("verifying")
-                                } else { None }
-                            }
-                            SyncPhase::PipelinedRebuild { .. } if s.peer == from => Some("pipeline"),
-                            _ => None,
-                        }
-                    });
+                    let session_role = self.sync.get_sync_role_for_peer(from);
 
                     match session_role {
                         Some("batches") | Some("verifying") => {
-                            let cursor = match &self.sync_session {
-                                Some(s) => match &s.phase {
-                                    SyncPhase::Batches { cursor, .. } => *cursor,
-                                    // If we are currently verifying, the effective cursor for INCOMING
-                                    // data is still the old cursor. We buffer everything that arrives.
-                                    SyncPhase::VerifyingBatches { .. } => u64::MAX, // Force buffer
-                                    _ => 0,
-                                },
-                                None => 0,
-                            };
+                            let cursor = self.sync.get_effective_cursor();
 
                             if batch_start == cursor && session_role == Some("batches") {
-                                if let Some(s) = &mut self.sync_session {
+                                if let Some(s) = self.sync.session_mut() {
                                     if let SyncPhase::Batches { in_flight, .. } = &mut s.phase {
                                         in_flight.remove(&batch_start);
                                     }
@@ -3681,7 +2965,7 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                                 }
                             } else {
                                 tracing::debug!("Prefetch: buffering chunk at {} (role={:?})", batch_start, session_role);
-                                if let Some(s) = &mut self.sync_session {
+                                if let Some(s) = self.sync.session_mut() {
                                     match &mut s.phase {
                                         SyncPhase::Batches { cursor, prefetch_buffer, in_flight, .. } => {
                                             let current_cursor = *cursor;
@@ -3743,16 +3027,16 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                                         }
                                         _ => {}
                                     }
-                                    s.last_progress_at = std::time::Instant::now();
+                                    self.sync.set_last_progress_now();
                                 }
                             }
                         }
                         Some("pipeline") => {
-                            if let Some(s) = &mut self.sync_session {
+                            if let Some(s) = &mut self.sync.session {
                                 if let SyncPhase::PipelinedRebuild { buffered_batches, .. } = &mut s.phase {
                                     if buffered_batches.len() < 1000 {
                                         buffered_batches.extend(batches);
-                                        s.last_progress_at = std::time::Instant::now();
+                                        self.sync.set_last_progress_now();
                                     } else {
                                         tracing::warn!("Pipeline buffer overflow. Aborting sync.");
                                         self.abort_sync_session("pipeline buffer overflow");
@@ -3767,7 +3051,7 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                } else {
                     // If the peer sends an empty list, and we are actively waiting 
                     // for blocks from them, abort immediately instead of stalling for 15 mins.
-                    let is_waiting = self.sync_session.as_ref().map_or(false, |s| s.peer == from);
+                    let is_waiting = self.sync.is_sync_peer(from);
                     if is_waiting {
                         tracing::warn!("Peer {} sent an empty block list. Aborting sync.", from);
                         self.abort_sync_session("peer sent empty batches response");
@@ -4045,7 +3329,7 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                         .collect();
 
                     if !commitments.is_empty() {
-                        self.advertised_licenses.insert(from, commitments);
+                        self.license.advertised_licenses.insert(from, commitments);
                     }
                 }
 
@@ -4072,7 +3356,7 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                     if !claimed_hashes.is_empty() {
                         // Find pending challenges from this peer (we may have sent multiple)
                         let mut to_remove = vec![];
-                        for (key, (_salt, sent_at)) in &self.pending_license_challenges {
+                        for (key, (_salt, sent_at)) in &self.license.pending_license_challenges {
                             if key.0 == from && now.duration_since(*sent_at).as_secs() < 90 {
                                 to_remove.push(*key);
                             }
@@ -4082,7 +3366,7 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                             let (peer, commitment, height) = key;
 
                             // Capture the original salt we sent in the challenge (needed for proof recompute)
-                            let original_salt = if let Some((salt, _)) = self.pending_license_challenges.remove(&key) {
+                            let original_salt = if let Some((salt, _)) = self.license.pending_license_challenges.remove(&key) {
                                 salt
                             } else {
                                 continue;
@@ -4105,7 +3389,7 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                                 for &claimed in &claimed_hashes {
                                     if claimed == expected_proof {
                                         // Strong confirmation — they had the real data
-                                        let entry = self.license_reputations
+                                        let entry = self.license.license_reputations
                                             .entry(peer)
                                             .or_default()
                                             .entry(commitment)
@@ -4121,7 +3405,7 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                                 }
                                 if !verified {
                                     // They lied about having the data
-                                    let entry = self.license_reputations
+                                    let entry = self.license.license_reputations
                                         .entry(peer)
                                         .or_default()
                                         .entry(commitment)
@@ -4137,13 +3421,13 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                                 // Record for later verification when we eventually sync this height.
                                 // Give a small liveness reward only (they responded promptly).
                                 for claimed in &claimed_hashes {
-                                    self.pending_data_verifications
+                                    self.license.pending_data_verifications
                                         .entry(height)
                                         .or_default()
                                         .push((peer, commitment, *claimed));
                                 }
 
-                                let entry = self.license_reputations
+                                let entry = self.license.license_reputations
                                     .entry(peer)
                                     .or_default()
                                     .entry(commitment)
@@ -4172,10 +3456,10 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                             // - my_license_ranges: licenses we currently *hold* (exemption side)
                             // - my_issued_license_ranges: licenses we *issued* as the original Archiver (audit obligation)
                             // We must respond if we are the Issuer for the challenged range, even if we no longer hold the UTXO.
-                            let covers_held = self.my_license_ranges.iter().any(|(c, min_h, max_h)| {
+                            let covers_held = self.license.my_license_ranges.iter().any(|(c, min_h, max_h)| {
                                 *c == *commitment && *height >= *min_h && *height <= *max_h
                             });
-                            let covers_issued = self.my_issued_license_ranges.iter().any(|(c, min_h, max_h)| {
+                            let covers_issued = self.license.my_issued_license_ranges.iter().any(|(c, min_h, max_h)| {
                                 *c == *commitment && *height >= *min_h && *height <= *max_h
                             });
                             let covers = covers_held || covers_issued;
@@ -4242,29 +3526,17 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
 fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u128, force_start: Option<u64>) {
         self.cancel_mining();
 
-        let sync_file_path = self.data_dir.join("sync_state.bin");
-        let mut recovered_headers = Vec::new();
-        let mut recovered_cursor = None;
-
-        if let Ok(bytes) = std::fs::read(&sync_file_path) {
-            if let Ok(backup) = bincode::deserialize::<SyncStateBackup>(&bytes) {
-                // Only resume if the peer we are connecting to has a chain at least as long
-                if peer_height > backup.cursor {
-                    tracing::info!("Recovered interrupted sync session. Resuming from height {}", backup.cursor);
-                    recovered_headers = backup.accumulated_headers;
-                    recovered_cursor = Some(backup.cursor);
-                } else {
-                    tracing::info!("Discarding recovered sync session (new peer has shorter chain).");
-                    let _ = std::fs::remove_file(&sync_file_path);
-                }
-            }
+        let (mut recovered_headers, mut recovered_cursor) = self.sync.load_backup(&self.data_dir, peer_height);
+        
+        if recovered_cursor.is_some() {
+            tracing::info!("Recovered interrupted sync session. Resuming from height {}", recovered_cursor.unwrap());
         }
         
         // <--- Prevent mixing old recovered headers with a fresh start
         if force_start.is_some() {
             recovered_headers.clear();
             recovered_cursor = None;
-            let _ = std::fs::remove_file(&sync_file_path);
+            self.sync.clear_backup(&self.data_dir);
         }
         // --------------------------------------------------------------------
 
@@ -4274,7 +3546,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
         // Prefer: explicit override > recovered_cursor > last known cursor > 360-block lookback.
         let start_height = force_start.unwrap_or_else(|| {
             recovered_cursor.unwrap_or_else(|| {
-                let base_start = self.last_sync_cursor
+                let base_start = self.sync.last_sync_cursor
                     .filter(|&c| c > effective_height.saturating_sub(360)
                                  && c <= effective_height)
                     .unwrap_or_else(|| {
@@ -4288,7 +3560,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
         // Prevent zero-header sync traps
         if peer_height <= start_height {
             tracing::debug!("Peer height {} is <= our sync cursor {}, ignoring.", peer_height, start_height);
-            self.sync_in_progress = false;
+            self.sync.in_progress = false;
             self.trigger_mining();
             return;
         }
@@ -4298,126 +3570,39 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
             "Starting headers-first sync from height {}: peer(h={}, d={}) vs us(h={}, d={})",
             start_height, peer_height, peer_depth, self.state.height, self.state.depth
         );
-        self.sync_in_progress = true;
-        let now = std::time::Instant::now();
-        self.sync_session = Some(SyncSession {
-            peer,
-            peer_height,
-            peer_depth,
-            phase: SyncPhase::Headers {
-                accumulated: recovered_headers,
-                cursor: start_height,
-                snapshot: None,
-                verifying: false,
-            },
-            started_at: now,
-            last_progress_at: now,
-        });
+        self.sync.start(peer, peer_height, peer_depth, start_height, recovered_headers);
         
-let count = MAX_GETHEADERS_COUNT.min(peer_height.saturating_sub(start_height));
-self.network.send(peer, Message::GetHeaders { start_height, count });
+        let count = MAX_GETHEADERS_COUNT.min(peer_height.saturating_sub(start_height));
+        self.network.send(peer, Message::GetHeaders { start_height, count });
     }
 
 
 
 fn fire_batch_lookahead(&mut self) {
-        let (cursor, peer_height, in_flight_len, primary_peer) = match &self.sync_session {
-            Some(s) => match &s.phase {
-                SyncPhase::Batches { cursor, in_flight, .. } => {
-                    (*cursor, s.peer_height, in_flight.len(), s.peer)
-                }
-                _ => return,
-            },
-            None => return,
-        };
-
-        let slots_available = BATCH_LOOKAHEAD.saturating_sub(in_flight_len);
-        if slots_available == 0 { return; }
-
-        let mut next_start = cursor;
-        let mut reqs_sent = 0;
-
-        while reqs_sent < slots_available && next_start < peer_height {
-            let is_in_flight = match &self.sync_session {
-                Some(s) => match &s.phase {
-                    SyncPhase::Batches { in_flight, .. } => in_flight.contains_key(&next_start),
-                    _ => false,
-                },
-                None => false,
-            };
-
-            let is_prefetched = match &self.sync_session {
-                Some(s) => match &s.phase {
-                    SyncPhase::Batches { prefetch_buffer, .. } => prefetch_buffer.contains_key(&next_start),
-                    _ => false,
-                },
-                None => false,
-            };
-
-            if !is_in_flight && !is_prefetched {
-                let target_peer = primary_peer; // ALWAYS use primary peer to avoid cross-fork corruption
-
-                let count = (peer_height - next_start).min(MAX_GETBATCHES_COUNT);
-                tracing::debug!("Lookahead: pipelining batches {}..{} from primary peer {}", next_start, next_start + count, target_peer);
-                self.network.send(target_peer, Message::GetBatches { start_height: next_start, count });
-
-                if let Some(s) = &mut self.sync_session {
-                    if let SyncPhase::Batches { in_flight, .. } = &mut s.phase {
-                        in_flight.insert(next_start, target_peer);
-                    }
-                }
-                reqs_sent += 1;
-            }
-
-            next_start += MAX_GETBATCHES_COUNT;
-        }
+        self.sync.fire_batch_lookahead(&mut self.network);
     }
 
 
 
     async fn drain_prefetch_buffer(&mut self) {
-        let cursor = match &self.sync_session {
-            Some(s) => match &s.phase {
-                SyncPhase::Batches { cursor, .. } => *cursor,
-                _ => return,
-            },
-            None => return,
-        };
-
-        let next_batches = match &mut self.sync_session {
-            Some(s) => match &mut s.phase {
-                SyncPhase::Batches { prefetch_buffer, .. } => prefetch_buffer.remove(&cursor),
-                _ => None,
-            },
-            None => None,
-        };
-
-        if let Some(batches) = next_batches {
-            tracing::debug!("Draining prefetch buffer at height {}", cursor);
-            let peer = self.sync_session.as_ref().unwrap().peer;
-            if let Err(e) = self.handle_sync_batches(peer, batches).await {
-                tracing::warn!("Error applying prefetched batches: {}", e);
-                self.abort_sync_session("prefetch batch apply failed");
+        if let Some(cursor) = self.sync.get_current_cursor() {
+            if let Some(batches) = self.sync.take_prefetch_for_cursor(cursor) {
+                tracing::debug!("Draining prefetch buffer at height {}", cursor);
+                if let Some(peer) = self.sync.get_session_peer() {
+                    if let Err(e) = self.handle_sync_batches(peer, batches).await {
+                        tracing::warn!("Error applying prefetched batches: {}", e);
+                        self.abort_sync_session("prefetch batch apply failed");
+                    }
+                }
             }
         }
     }
 
     fn abort_sync_session(&mut self, reason: &str) {
-        if self.sync_session.is_some() {
-            self.sync_retry_count += 1;
-            // Exponential backoff: 2^n seconds, capped at 5 minutes.
-            // Sequence: 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 300s, 300s...
-            let backoff_secs = 2u64.saturating_pow(self.sync_retry_count).min(300);
-            self.sync_backoff_until = Some(
-                std::time::Instant::now() + Duration::from_secs(backoff_secs)
-            );
-            tracing::warn!(
-                "Aborting sync session (attempt {}): {}. Retrying in {}s.",
-                self.sync_retry_count, reason, backoff_secs
-            );
-        }
-        self.sync_session = None;
-        self.sync_in_progress = false;
+        let (retry, backoff) = self.sync.abort(reason);
+        self.sync.retry_count = retry;
+        self.sync.backoff_until = backoff;
+        self.sync.in_progress = false;
         // Don't clear last_sync_cursor here — keep it so the next attempt resumes
     }
 
@@ -4464,28 +3649,19 @@ fn fire_batch_lookahead(&mut self) {
 
  pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHeader>) -> Result<()> {
         // Extract state from the session — only accept headers from the sync peer
-        let (_peer_height, cursor, snapshot) = match &mut self.sync_session {
-            Some(s) if s.peer == from => {
-                match &mut s.phase {
-                    SyncPhase::Headers { cursor, snapshot, .. } => (s.peer_height, *cursor, snapshot.take()),
-                    _ => return Ok(()), 
-                }
-            }
-            _ => return Ok(()), 
+        let (_peer_height, cursor, snapshot) = match self.sync.prepare_header_chunk(from) {
+            Some(info) => info,
+            None => return Ok(()),
         };
 
         if headers.is_empty() {
             self.abort_sync_session("peer sent empty headers");
-            let _ = std::fs::remove_file(self.data_dir.join("sync_state.bin"));
+            self.sync.clear_backup(&self.data_dir);
             return Ok(());
         }
 
         // Put the snapshot back for the next iteration
-        if let Some(s) = &mut self.sync_session {
-            if let SyncPhase::Headers { snapshot: snap_ref, .. } = &mut s.phase {
-                *snap_ref = snapshot;
-            }
-        }
+        self.sync.restore_header_snapshot(snapshot);
 
         let chunk_size = headers.len();
         let start_h = cursor;
@@ -4524,29 +3700,15 @@ fn fire_batch_lookahead(&mut self) {
         // is deliberately NOT reset here — the stall monitor will skip the session
         // while `verifying: true`, and `process_verified_headers_chunk` resets the
         // timer when the next GetHeaders actually goes out to the peer.
-        if let Some(s) = &mut self.sync_session {
-            if let SyncPhase::Headers { verifying, .. } = &mut s.phase {
-                *verifying = true;
-            }
-        }
+        self.sync.set_header_verifying(from, true);
 
         Ok(())
     }
 
     async fn process_verified_headers_chunk(&mut self, from: PeerId, headers: Vec<BatchHeader>, is_valid: bool) -> Result<()> {
-        let (peer_height, cursor) = match &mut self.sync_session {
-            Some(s) if s.peer == from => {
-                match &mut s.phase {
-                    SyncPhase::Headers { cursor, verifying, .. } => {
-                        // Clear the in-flight flag: the rayon task has returned.
-                        // From here on the stall monitor watches this session again.
-                        *verifying = false;
-                        (s.peer_height, *cursor)
-                    }
-                    _ => return Ok(()),
-                }
-            }
-            _ => return Ok(()),
+        let (peer_height, cursor) = match self.sync.get_verified_header_info(from) {
+            Some(info) => info,
+            None => return Ok(()),
         };
 
         if !is_valid {
@@ -4559,67 +3721,9 @@ fn fire_batch_lookahead(&mut self) {
         let pct = (new_cursor as f64 / peer_height as f64) * 100.0;
         tracing::info!("✓ Verified and saved chunk. Sync progress: {}/{} ({:.1}%)", new_cursor, peer_height, pct);
 
-        match &mut self.sync_session {
-            Some(s) => {
-                if let SyncPhase::Headers { accumulated, cursor: c, .. } = &mut s.phase {
-                    
-                    // Allow up to 10 million headers in RAM during initial sync (~19 years of blocks)
-                    if accumulated.len() + headers.len() > 10_000_000 {
-                        self.abort_sync_session("Peer attempted OOM DoS with too many headers");
-                        return Ok(());
-                    }
-                    
-                    // Prepend backward chunks for deep forks ---
-                    if !accumulated.is_empty() && headers.last().map(|h| h.height) < accumulated.first().map(|h| h.height) {
-                        tracing::info!("Prepended deep fork headers {}..{}", headers.first().unwrap().height, headers.last().unwrap().height);
-                        
-                        if let (Some(last_new), Some(first_acc)) = (headers.last(), accumulated.first()) {
-                            if first_acc.prev_header_hash != last_new.extension.final_hash || first_acc.prev_midstate != last_new.post_tx_midstate {
-                                tracing::warn!("Incoming deep-fork headers do not link to recovered sync state. Discarding sync_state.bin and restarting.");
-                                let _ = std::fs::remove_file(self.data_dir.join("sync_state.bin"));
-                                self.last_sync_cursor = None;
-                                self.abort_sync_session("sync_state.bin deep-fork mismatch");
-                                return Ok(());
-                            }
-                        }
-
-                        let mut new_acc = headers.clone();
-                        new_acc.append(accumulated); // Moves all elements from accumulated to new_acc
-                        *accumulated = new_acc;
-                        
-                        // The backward gap is now filled, and the array reaches the tip again.
-                        new_cursor = peer_height;
-                        *c = new_cursor;
-                    } else {
-                        // Normal forward sync
-                        if let (Some(last_acc), Some(first_new)) = (accumulated.last(), headers.first()) {
-                            if first_new.prev_header_hash != last_acc.extension.final_hash || first_new.prev_midstate != last_acc.post_tx_midstate {
-                                tracing::warn!("Incoming headers do not link to recovered sync state (heights: acc={}, new={}). Discarding sync_state.bin and restarting.", last_acc.height, first_new.height);
-                                let _ = std::fs::remove_file(self.data_dir.join("sync_state.bin"));
-                                self.last_sync_cursor = None;
-                                self.abort_sync_session("sync_state.bin fork mismatch");
-                                return Ok(());
-                            }
-                        }
-
-                        accumulated.extend(headers);
-                        *c = new_cursor;
-                    }
-                    
-                    let sync_file_path = self.data_dir.join("sync_state.bin");
-                    let backup = SyncStateBackup {
-                        cursor: new_cursor,
-                        peer_height,
-                        accumulated_headers: accumulated.clone(),
-                    };
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(bytes) = bincode::serialize(&backup) {
-                            let _ = std::fs::write(&sync_file_path, bytes);
-                        }
-                    });
-                }
-            }
-            _ => unreachable!(),
+        match self.sync.accumulate_verified_headers(from, headers, peer_height, &self.data_dir) {
+            Ok(nc) => { new_cursor = nc; }
+            Err(_) => return Ok(()),
         }
 
         if new_cursor < peer_height {
@@ -4627,19 +3731,15 @@ fn fire_batch_lookahead(&mut self) {
             let count = MAX_GETHEADERS_COUNT.min(peer_height - new_cursor);
             self.network.send(from, Message::GetHeaders { start_height: new_cursor, count });
 
-            if let Some(s) = &mut self.sync_session {
-                s.last_progress_at = std::time::Instant::now();
-            }
-            self.last_sync_cursor = Some(new_cursor);
+            self.sync.update_progress(new_cursor);
 
             return Ok(());
         }
 
         // All headers received — take ownership of the session data
-        let session = self.sync_session.take().unwrap();
-        let (all_headers, snapshot) = match session.phase {
-            SyncPhase::Headers { accumulated, snapshot, .. } => (accumulated, snapshot),
-            _ => unreachable!(),
+        let (all_headers, snapshot, peer, peer_height, peer_depth, started_at) = match self.sync.take_headers_for_verification() {
+            Some(t) => t,
+            None => return Ok(()),
         };
 
         let total_headers = all_headers.len(); 
@@ -4793,14 +3893,7 @@ fn fire_batch_lookahead(&mut self) {
             }).await;
         });
         
-        self.sync_session = Some(SyncSession {
-            peer: session.peer,
-            peer_height: session.peer_height,
-            peer_depth: session.peer_depth,
-            phase: SyncPhase::VerifyingHeaders,
-            started_at: session.started_at,
-            last_progress_at: std::time::Instant::now(),
-        });
+        self.sync.transition_to_verifying_headers(peer, peer_height, peer_depth, started_at);
 
         Ok(())
     }
@@ -4814,10 +3907,12 @@ fn fire_batch_lookahead(&mut self) {
         }
 
         // Take the session to work with it
-        let session = match self.sync_session.take() {
+        let session = match self.sync.take_session() {
             Some(s) if s.peer == from => s,
             other => {
-                self.sync_session = other; // put it back
+                if let Some(s) = other {
+                    self.sync.set_session(s); // put it back
+                }
                 return Ok(());
             }
         };
@@ -4834,7 +3929,7 @@ fn fire_batch_lookahead(&mut self) {
             }
             _ => {
                 // Wrong phase — put it back untouched
-                self.sync_session = Some(session);
+                self.sync.set_session(session);
                 return Ok(());
             }
         };
@@ -5122,17 +4217,7 @@ fn fire_batch_lookahead(&mut self) {
 
         // Set a placeholder phase so the timeout guard knows work is in flight
         // and the event loop stays alive processing other messages.
-        self.sync_session = Some(SyncSession {
-            peer: from,
-            peer_height: session_peer_height,
-            peer_depth: session_peer_depth,
-            phase: SyncPhase::VerifyingBatches {
-                in_flight,
-                prefetch_buffer,
-            },
-            started_at: session_started_at,
-            last_progress_at: std::time::Instant::now(),
-        });
+        self.sync.transition_to_verifying_batches(from, session_peer_height, session_peer_depth, in_flight, prefetch_buffer, session_started_at);
 
         Ok(())
     }
@@ -5705,7 +4790,7 @@ fn fire_batch_lookahead(&mut self) {
                 tracing::info!("Saved state snapshot at height {}", self.state.height);
             }
         }
-        self.sync_in_progress = false;
+        self.sync.in_progress = false;
         self.trigger_mining();
 
         // Close MMR Gossip Challenge exploit for sync paths as well:
@@ -5828,7 +4913,7 @@ fn fire_batch_lookahead(&mut self) {
                     
                     self.chain_history.clear();
                     self.recent_headers.clear();
-                    self.last_sync_cursor = Some(snap_height);
+                    self.sync.set_last_sync_cursor(Some(snap_height));
                     
                     // Repopulate recent headers
                     let window = crate::core::DIFFICULTY_LOOKBACK as u64;
@@ -6005,7 +5090,7 @@ fn fire_batch_lookahead(&mut self) {
                 }
             }
 
-            if !self.sync_in_progress {
+            if !self.sync.in_progress {
                 if let Some(peer) = from {
                     self.network.send(peer, Message::GetState);
                 }
@@ -6186,7 +5271,7 @@ fn fire_batch_lookahead(&mut self) {
         }
 
         // Always clear sync flag after processing batch response
-        self.sync_in_progress = false;
+        self.sync.in_progress = false;
         Ok(())
     }
 
@@ -6329,7 +5414,7 @@ fn fire_batch_lookahead(&mut self) {
             }
 
             if self.state.height >= self.sync_requested_up_to {
-                self.sync_in_progress = false;
+                self.sync.in_progress = false;
             } else {
                 let start = self.state.height;
                 let count = (self.sync_requested_up_to.saturating_sub(start) + 1).min(MAX_GETBATCHES_COUNT);
@@ -6365,7 +5450,7 @@ fn fire_batch_lookahead(&mut self) {
             }
 
         } else {
-            self.sync_in_progress = false;
+            self.sync.in_progress = false;
         }
 
         Ok(())
@@ -6437,100 +5522,15 @@ async fn try_apply_orphans(&mut self) {
         }
     }
 
-    fn generate_coinbase(
-        &self, 
-        height: u64, 
-        total_fees: u64,
-        pool_target: Option<([u8; 32], [u8; 32])>, // (Pool MSS Address, Miner Payout Address)
-    ) -> Vec<CoinbaseOutput> {
-        let reward = block_reward(height);
-        let total_value = reward.saturating_add(total_fees);
-        let denominations = decompose_value(total_value);
-
-        let mining_seed = self.mining_seed;
-
-        denominations.into_par_iter()
-            .enumerate()
-            .map(move |(i, value)| {
-                match pool_target {
-                    Some((pool_addr, miner_addr)) => {
-                        // POOL MINING MODE
-                        // Pay the pool's address, but embed the miner's address in the salt
-                        // so the pool can cryptographically verify who did the work.
-                        let mut salt = [0u8; 32];
-                        let mut hasher = blake3::Hasher::new();
-                        hasher.update(b"pool_share");
-                        hasher.update(&miner_addr);
-                        hasher.update(&height.to_le_bytes());
-                        hasher.update(&(i as u64).to_le_bytes());
-                        salt.copy_from_slice(hasher.finalize().as_bytes());
-
-                        CoinbaseOutput { address: pool_addr, value, salt }
-                    }
-                    None => {
-                        // SOLO MINING MODE (Original Logic)
-                        let seed = coinbase_seed(&mining_seed, height, i as u64);
-                        let owner_pk = wots::keygen(&seed);
-                        let address = compute_address(&owner_pk);
-                        let salt = coinbase_salt(&mining_seed, height, i as u64);
-                        
-                        CoinbaseOutput { address, value, salt }
-                    }
-                }
-            })
-            .collect()
-    }
-
-    fn log_coinbase(&self, height: u64, total_fees: u64) {
-        let reward = block_reward(height);
-        let total_value = reward + total_fees;
-        let denominations = decompose_value(total_value);
-        let log_path = self.data_dir.join("coinbase_seeds.jsonl");
-
-        let mining_seed = self.mining_seed; // Extract seed here
-
-        let entries: Vec<String> = denominations.into_par_iter()
-            .enumerate()
-            .map(move |(i, value)| { // Add move
-                let seed = coinbase_seed(&mining_seed, height, i as u64);
-                let owner_pk = wots::keygen(&seed);
-                let address = compute_address(&owner_pk);
-                let salt = coinbase_salt(&mining_seed, height, i as u64);
-                let coin_id = compute_coin_id(&address, value, &salt);
-                // NOTE: We intentionally do NOT log the seed (private key).
-                // It is derivable from (mining_seed, height, index) when
-                // the wallet needs to spend. Logging it in cleartext would
-                // allow anyone with filesystem or RPC access to steal funds.
-                format!(
-                    r#"{{"height":{},"index":{},"address":"{}","coin":"{}","value":{},"salt":"{}"}}"#,
-                    height, i,
-                    hex::encode(address),
-                    hex::encode(coin_id),
-                    value,
-                    hex::encode(salt)
-                )
-            })
-            .collect();
-
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true).append(true).open(&log_path)
-        {
-            use std::io::Write;
-            for entry in entries {
-                let _ = writeln!(file, "{}", entry);
-            }
-        }
-    }
-
     /// Prepare a batch template and spawn a non-blocking background mining task.
     /// Returns immediately — the result arrives via mined_batch_rx.
     fn spawn_mining_task(&mut self) -> Result<()> {
-        let threads = match self.mining_threads {
+        let threads = match self.mining.threads {
             Some(t) => t,
             None => return Ok(()),
         };
         
-        if self.sync_in_progress || self.mining_cancel.is_some() {
+        if self.sync.in_progress || self.mining_cancel.is_some() {
             return Ok(());
         }
         tracing::info!("Mining batch with {} transactions...", self.mempool.len());
@@ -6643,7 +5643,7 @@ async fn try_apply_orphans(&mut self) {
             }
         }
 
-        let coinbase = self.generate_coinbase(pre_mine_height, total_fees, pool_address_bytes);
+        let coinbase = self.mining.generate_coinbase(pre_mine_height, total_fees, pool_address_bytes);
         for cb in &coinbase {
             let coin_id = cb.coin_id();
             candidate_state.coins.insert(coin_id, v2);
@@ -6808,7 +5808,7 @@ async fn try_apply_orphans(&mut self) {
                 self.network.broadcast(Message::Batch(batch.clone()));
 
                 let total_fees: u64 = batch.transactions.iter().map(|tx| tx.fee()).sum();
-                self.log_coinbase(pre_mine_height, total_fees);
+                self.mining.log_coinbase(pre_mine_height, total_fees);
 
                 let coinbase_value: u64 = batch.coinbase.iter().map(|cb| cb.value).sum();
                 tracing::info!(
@@ -6844,11 +5844,11 @@ async fn try_apply_orphans(&mut self) {
     /// Preserves identical behavior for all existing tests.
     #[cfg(test)]
     pub async fn try_mine(&mut self) -> Result<()> {
-        if self.mining_threads.is_none() {
-            self.mining_threads = Some(0); 
+        if self.mining.threads.is_none() {
+            self.mining.threads = Some(0); 
         }
         // Short-circuit if a sync is happening so the test doesn't hang forever
-        if self.sync_in_progress {
+        if self.sync.in_progress {
             return Ok(());
         }
         
@@ -7132,7 +6132,7 @@ mod tests {
         // Bind to port 0 to let OS assign a random available port
         let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
         // Initialize node (this will create genesis if needed)
-        Node::new(dir.to_path_buf(), None, listen, vec![], std::collections::HashSet::new()).await.unwrap()
+        Node::new(dir.to_path_buf(), None, listen, vec![], std::collections::HashSet::new(), false).await.unwrap()
     }
 
     #[tokio::test]
@@ -7525,7 +6525,7 @@ mod complex_tests {
         let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
         
         // Initialize node (creates Genesis internally)
-        Node::new(dir.to_path_buf(), None, listen, vec![], std::collections::HashSet::new()).await.unwrap()
+        Node::new(dir.to_path_buf(), None, listen, vec![], std::collections::HashSet::new(), false).await.unwrap()
     }
 
     /// specific helper to manually construct a valid batch structure.
@@ -7622,7 +6622,7 @@ mod complex_tests {
         assert_eq!(node.state.height, 2);
 
         // 2. Set sync flag manually (simulating a "GetBatches" request sent to a peer)
-        node.sync_in_progress = true;
+        node.sync.in_progress = true;
 
         // 3. Try mine again. It should return Ok() immediately without doing work.
         node.try_mine().await.expect("Should return Ok implicitly");
@@ -7631,7 +6631,7 @@ mod complex_tests {
         assert_eq!(node.state.height, 2, "Mining should be paused during sync");
 
         // 5. Unset flag (simulating sync completion) and verify mining resumes
-        node.sync_in_progress = false;
+        node.sync.in_progress = false;
         node.try_mine().await.expect("Mining should succeed");
         assert_eq!(node.state.height, 3, "Mining should resume after sync");
     }
@@ -7761,7 +6761,7 @@ mod complex_tests {
         node.recent_headers = VecDeque::from(vec![node.state.timestamp]);
         
         // Simulate sync state
-        node.sync_in_progress = true;
+        node.sync.in_progress = true;
         node.sync_requested_up_to = 51;
         
         // Feed the 50 batches we generated.
@@ -7770,7 +6770,7 @@ mod complex_tests {
 
         // Verify the node caught up.
         assert_eq!(node.state.height, 51);
-        assert_eq!(node.sync_in_progress, false, "Sync should complete automatically");
+        assert_eq!(node.sync.in_progress, false, "Sync should complete automatically");
     }
 
     // ── Crash Recovery ──────────────────────────────────────────────────
@@ -7829,7 +6829,7 @@ mod complex_tests {
         assert_eq!(node2.state.height, 4);
 
         // Mining should work after restart
-        node2.mining_threads = Some(0);
+        node2.mining.threads = Some(0);
         node2.try_mine().await.unwrap();
         assert_eq!(node2.state.height, 5, "mining must resume after crash recovery");
     }
@@ -7861,7 +6861,7 @@ mod complex_tests {
         assert_eq!(fresh.state.height, 1);
 
         // 4. Feed batches as if received from a peer
-        fresh.sync_in_progress = true;
+        fresh.sync.in_progress = true;
         fresh.sync_requested_up_to = 21;
         let peer = PeerId::random();
         fresh.handle_batches_response(1, batches, peer).await.unwrap();
@@ -7870,7 +6870,7 @@ mod complex_tests {
         assert_eq!(fresh.state.height, miner.state.height);
         assert_eq!(fresh.state.midstate, miner.state.midstate);
         assert_eq!(fresh.state.coins.len(), miner.state.coins.len());
-        assert!(!fresh.sync_in_progress);
+        assert!(!fresh.sync.in_progress);
     }
 
     /// A node that is partially synced receives remaining blocks.
@@ -7892,7 +6892,7 @@ mod complex_tests {
 
         // Fresh node syncs first 5 blocks
         let mut behind = create_test_node(dir_behind.path()).await;
-        behind.sync_in_progress = true;
+        behind.sync.in_progress = true;
         behind.sync_requested_up_to = 16;
         let peer = PeerId::random();
         behind.handle_batches_response(1, all_batches[..5].to_vec(), peer).await.unwrap();
@@ -7912,16 +6912,16 @@ mod complex_tests {
     async fn full_commit_reveal_cycle() {
         let dir = tempdir().unwrap();
         let mut node = create_test_node(dir.path()).await;
-        let mining_seed = node.mining_seed;
+        let mining_seed = *node.mining.seed();
 
         let pre_mine_height = node.state.height; // = 1
         node.try_mine().await.unwrap();
         assert_eq!(node.state.height, 2);
 
-        let cb_seed = coinbase_seed(&mining_seed, pre_mine_height, 0);
+        let cb_seed = crate::wallet::coinbase_seed(&mining_seed, pre_mine_height, 0);
         let cb_owner_pk = wots::keygen(&cb_seed);
         let cb_address = compute_address(&cb_owner_pk);
-        let cb_salt = coinbase_salt(&mining_seed, pre_mine_height, 0);
+        let cb_salt = crate::wallet::coinbase_salt(&mining_seed, pre_mine_height, 0);
         let cb_value = block_reward(pre_mine_height);
         let denominations = decompose_value(cb_value);
         let first_denom = denominations[0];
@@ -7997,7 +6997,7 @@ mod complex_tests {
 
         let dir = tempdir().unwrap();
         let mut node = create_test_node(dir.path()).await;
-        let mining_seed = node.mining_seed;
+        let mining_seed = *node.mining.seed();
 
         let mine_height = node.state.height;
         node.try_mine().await.unwrap();
@@ -8178,8 +7178,8 @@ fn build_divergent_chain(
         // 3. Manually construct a sync session in the Batches phase
         let peer = PeerId::random();
         let peer_height = 5 + alt_batches.len() as u64; // = 20
-        node.sync_in_progress = true;
-        node.sync_session = Some(SyncSession {
+        node.sync.in_progress = true;
+        node.sync.session = Some(crate::sync::SyncSession {
             peer,
             peer_height,
             peer_depth: peer_height as u128 * 1_000_000,
@@ -8204,7 +7204,7 @@ fn build_divergent_chain(
             .unwrap();
 
         // Session should still be in progress (waiting for more batches)
-        assert!(node.sync_session.is_some(), "Session should still be active");
+        assert!(node.sync.session.is_some(), "Session should still be active");
 
         // 5. ABORT the sync (simulates timeout or peer disconnect)
         node.abort_sync_session("simulated timeout");
@@ -8252,8 +7252,8 @@ fn build_divergent_chain(
 
         // Set up sync session and feed some batches
         let peer = PeerId::random();
-        node.sync_in_progress = true;
-        node.sync_session = Some(SyncSession {
+        node.sync.in_progress = true;
+        node.sync.session = Some(crate::sync::SyncSession {
             peer,
             peer_height: 3 + alt_batches.len() as u64,
             peer_depth: (3 + alt_batches.len() as u128) * 1_000_000,
@@ -8312,8 +7312,8 @@ fn build_divergent_chain(
 
         let peer = PeerId::random();
         let peer_height = 1 + alt_batches.len() as u64; // 11
-        node.sync_in_progress = true;
-        node.sync_session = Some(SyncSession {
+        node.sync.in_progress = true;
+        node.sync.session = Some(crate::sync::SyncSession {
             peer,
             peer_height,
             peer_depth: peer_height as u128 * 1_000_000,
@@ -8337,7 +7337,7 @@ fn build_divergent_chain(
             .unwrap();
 
         assert_eq!(node.state.height, peer_height);
-        assert!(!node.sync_in_progress);
+        assert!(!node.sync.in_progress);
 
         // Verify that the NEW chain on disk is coherent
         let disk_headers = node.storage.batches
@@ -8373,8 +7373,8 @@ fn build_divergent_chain(
 
         // Start sync session with peer A
         let peer_a = PeerId::random();
-        node.sync_in_progress = true;
-        node.sync_session = Some(SyncSession {
+        node.sync.in_progress = true;
+        node.sync.session = Some(crate::sync::SyncSession {
             peer: peer_a,
             peer_height: 13,
             peer_depth: 13_000_000,

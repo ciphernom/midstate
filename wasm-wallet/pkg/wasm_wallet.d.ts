@@ -60,6 +60,15 @@ export class WebWallet {
      */
     build_reveal(spend_context_json: string, server_commitment_hex: string, server_salt_hex: string): string;
     /**
+     * Phase 2: sign the wallet fee-inputs over the committed commitment and emit
+     * the wire `reveal` payload. Mirrors `build_reveal` but (a) splices contract
+     * witnesses verbatim, (b) hashes confidential outputs, (c) leaves contract
+     * inputs unsigned. `commitment_hex` / `salt_hex` are the ctx values returned
+     * by `prepare_script_spend` (pass ctx.commitment and ctx.tx_salt — there is
+     * no server-side salt contribution in this protocol).
+     */
+    build_script_reveal(ctx_json: string, commitment_hex: string, salt_hex: string): string;
+    /**
      * Recompute the block extension hash for a found nonce.
      *
      * Called after a mining worker finds a valid nonce. Produces the full
@@ -200,6 +209,17 @@ export class WebWallet {
      */
     constructor(phrase: string);
     /**
+     * Phase 1 for FUNDING a contract. Pays `amount` to the contract address as
+     * power-of-two "value" coins, optionally seeds a confidential "state" coin,
+     * returns change to the wallet, and reuses `build_script_reveal` for phase 2
+     * (its `contract_inputs` list is simply empty here — the wallet pays).
+     *
+     * Mirrors the CLI fund instruction:  `--to addr:amount` (+ `--to addr:0:state`).
+     * `state_hex` = None for a plain value-only funding.
+     */
+    prepare_fund_tx(available_utxos_json: string, contract_addr_hex: string, amount: bigint, state_hex: string | null | undefined, next_wots_index: number): string;
+    prepare_script_spend(available_utxos_json: string, contract_bytecode_hex: string, contract_inputs_json: string, outputs_json: string, next_wots_index: number): string;
+    /**
      * Select coins and build a transaction for the given send amount.
      *
      * This implements the full coin selection algorithm:
@@ -321,22 +341,33 @@ export function decrypt_cli_wallet(data: Uint8Array, password: string): string;
 export function generate_phrase(): string;
 
 /**
- * Mine a spam-proof PoW nonce for a transaction commitment.
+ * Safely mines the Commitment PoW in the WebAssembly context.
  *
- * Searches sequentially for a nonce `n` such that:
- *   `leading_zeros(BLAKE3(commitment || n_le_bytes)) >= required_pow`
+ * # Reasoning
+ * Intercepts invalid or missing hex strings (e.g., from an out-of-sync RPC cache)
+ * and handles them gracefully. Replacing `.unwrap()` with silent fallbacks prevents
+ * the Web Worker from panicking and permanently hanging the UI on "Mining PoW...".
  *
- * This is a CPU-bound loop that runs synchronously. At difficulty 24,
- * it typically takes 0.5–5 seconds in WASM SIMD.
+ * # Formal Specification
+ * ```text
+ * Pre:  true
+ * Post: result = mine_pow(commitment, required_pow, target_height, header_hash) if hex valid
+ *       result = 0 if commitment_hex invalid
+ * ```
  *
- * # Arguments
+ * ```zed
+ *     MineCommitmentPowWasm
+ *     ---------------------
+ *     commitment_hex? : String
+ *     required_pow? : ℕ₃₂
+ *     target_height? : ℕ₆₄
+ *     header_hash_hex? : String
+ *     nonce! : ℕ₆₄
  *
- * * `commitment_hex` — 64-char hex string of the 32-byte commitment hash.
- * * `required_pow` — minimum number of leading zero bits required.
- *
- * # Panics
- *
- * Panics if `commitment_hex` is not exactly 64 valid hex characters.
+ *     pre  true
+ *     post (isHex32(commitment_hex?) ⇒ nonce! = MinePow(...))
+ *        ∧ (¬isHex32(commitment_hex?) ⇒ nonce! = 0)
+ * ```
  */
 export function mine_commitment_pow(commitment_hex: string, required_pow: number, target_height: bigint, header_hash_hex: string): bigint;
 
@@ -377,6 +408,7 @@ export interface InitOutput {
     readonly search_nonces: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => void;
     readonly webwallet_build_coinbase: (a: number, b: number, c: bigint, d: number) => void;
     readonly webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+    readonly webwallet_build_script_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly webwallet_build_solo_extension: (a: number, b: number, c: number, d: number, e: bigint) => void;
     readonly webwallet_build_state_thread_tx: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number) => void;
     readonly webwallet_check_filter: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
@@ -387,6 +419,8 @@ export interface InitOutput {
     readonly webwallet_has_mss_cache: (a: number, b: number, c: number) => number;
     readonly webwallet_import_mss_bytes: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly webwallet_new: (a: number, b: number, c: number) => void;
+    readonly webwallet_prepare_fund_tx: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number) => void;
+    readonly webwallet_prepare_script_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
     readonly webwallet_prepare_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number, k: number, l: bigint) => void;
     readonly webwallet_set_mss_leaf_index: (a: number, b: number, c: number, d: number) => void;
     readonly webwallet_set_watchlist: (a: number, b: number, c: number) => void;

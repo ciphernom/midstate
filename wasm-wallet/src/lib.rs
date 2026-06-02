@@ -212,6 +212,112 @@ pub fn search_nonces(midstate_hex: &str, target_hex: &str, start_nonce: u64, ite
     None
 }
 
+#[derive(serde::Deserialize)]
+struct ScriptInputArg {
+    /// 64-hex on-chain coin id of the contract UTXO being consumed.
+    coin_id: String,
+    /// Comma-separated hex witness stack, EXACTLY as the IDE emulator shows it
+    /// (pushed left→right). May be empty for contracts that take no witness.
+    #[serde(default)]
+    witness: String,
+    /// Value of this contract coin (0 for a pure state/confidential coin).
+    #[serde(default)]
+    value: u64,
+    /// 64-hex salt this coin was created with. The wallet must know it — see the
+    /// "contract-coin tracking" note in the integration plan.
+    salt: String,
+    /// 64-hex state, present iff this is a confidential (state) coin.
+    #[serde(default)]
+    state: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ScriptOutputArg {
+    /// "standard" | "confidential"
+    out_type: String,
+    /// 64-hex destination address.
+    address: String,
+    /// Value in sats (standard outputs only; confidential = 0).
+    #[serde(default)]
+    value: u64,
+    /// 64-hex state/commitment for confidential outputs.
+    #[serde(default)]
+    state: Option<String>,
+    /// Optional explicit salt (64-hex). Supply this for outputs the wallet will
+    /// later spend (e.g. a new contract-state coin) so the salt is recorded;
+    /// otherwise a random salt is generated.
+    #[serde(default)]
+    salt: Option<String>,
+}
+
+// ── Context carried between phase 1 and phase 2 ─────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ScriptWalletInput {
+    coin_id: String,
+    address: String,
+    value: u64,
+    salt: String,
+    is_mss: bool,
+    index: u32,
+    mss_leaf: u32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ScriptContractInput {
+    coin_id: String,
+    bytecode: String,
+    witness: String,
+    value: u64,
+    salt: String,
+    state: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ScriptSpendContext {
+    contract_addr: String,
+    contract_inputs: Vec<ScriptContractInput>,
+    wallet_inputs: Vec<ScriptWalletInput>,
+    /// Ordered output JSON values with salts already embedded.
+    outputs: Vec<serde_json::Value>,
+    /// Ordered input coin ids used to compute the commitment: contract…, wallet…
+    input_coin_ids: Vec<String>,
+    tx_salt: String,
+    commitment: String,
+    fee: u64,
+    next_wots_index: u32,
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Normalize a comma-separated witness string: trim each token, drop empties,
+/// validate hex, re-join without spaces. "" stays "" (empty witness stack).
+fn normalize_witness(w: &str) -> Result<String, JsValue> {
+    let mut toks = Vec::new();
+    for raw in w.split(',') {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if hex::decode(t).is_err() {
+            return Err(JsValue::from_str(&format!("Invalid hex in witness token: '{}'", t)));
+        }
+        toks.push(t.to_lowercase());
+    }
+    Ok(toks.join(","))
+}
+
+/// Coin id for a confidential (state) coin: blake3("CONFIDENTIAL" || addr || state || salt).
+fn confidential_coin_hash(addr: &[u8; 32], state: &[u8; 32], salt: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"CONFIDENTIAL");
+    h.update(addr);
+    h.update(state);
+    h.update(salt);
+    *h.finalize().as_bytes()
+}
+
+
 // ─── JSON Interop Structs ───────────────────────────────────────────────────
 
 /// A UTXO as represented in the JavaScript wallet state.
@@ -950,6 +1056,592 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
         if self.watchlist.is_empty() { return false; }
         midstate::core::filter::match_any(&filter_data, &block_hash, n as u64, &self.watchlist)
     }
+
+    #[wasm_bindgen]
+    pub fn prepare_script_spend(
+        &mut self,
+        available_utxos_json: &str,
+        contract_bytecode_hex: &str,
+        contract_inputs_json: &str,
+        outputs_json: &str,
+        next_wots_index: u32,
+    ) -> Result<String, JsValue> {
+        // ── Parse & validate ───────────────────────────────────────────────
+        let contract_bytes = hex::decode(contract_bytecode_hex)
+            .map_err(|_| JsValue::from_str("Invalid contract bytecode hex"))?;
+        let contract_addr = midstate::core::types::hash(&contract_bytes);
+
+        let available: Vec<WasmUtxo> = serde_json::from_str(available_utxos_json)
+            .map_err(|e| JsValue::from_str(&format!("Bad utxos JSON: {}", e)))?;
+        let in_args: Vec<ScriptInputArg> = serde_json::from_str(contract_inputs_json)
+            .map_err(|e| JsValue::from_str(&format!("Bad contract inputs JSON: {}", e)))?;
+        let out_args: Vec<ScriptOutputArg> = serde_json::from_str(outputs_json)
+            .map_err(|e| JsValue::from_str(&format!("Bad outputs JSON: {}", e)))?;
+        if in_args.is_empty() {
+            return Err(JsValue::from_str("At least one contract input is required"));
+        }
+
+        // ── Contract inputs (canonical hashes + verbatim witnesses) ─────────
+        let mut input_coin_ids: Vec<[u8; 32]> = Vec::new();
+        let mut contract_inputs: Vec<ScriptContractInput> = Vec::new();
+        let mut contract_in_value: u64 = 0;
+
+        for a in &in_args {
+            let mut salt_b = [0u8; 32];
+            hex::decode_to_slice(&a.salt, &mut salt_b)
+                .map_err(|_| JsValue::from_str("Invalid contract input salt hex"))?;
+
+            // CONSENSUS: a state-thread (stateful) input must have value exactly 0.
+            // apply_transaction bails on `commitment.is_some() && value != 0`. The
+            // contract's spendable funds live in a SEPARATE standard coin (state None).
+            if a.state.is_some() && a.value != 0 {
+                return Err(JsValue::from_str(
+                    "State-thread contract input must have value 0; put the contract's \
+                     funds in a separate standard coin (a second input with no state).",
+                ));
+            }
+
+            // Canonical coin id the node will derive from the reveal.
+            let canonical = if let Some(state_hex) = &a.state {
+                let mut st = [0u8; 32];
+                hex::decode_to_slice(state_hex, &mut st)
+                    .map_err(|_| JsValue::from_str("Invalid contract input state hex"))?;
+                confidential_coin_hash(&contract_addr, &st, &salt_b)
+            } else {
+                compute_coin_id(&contract_addr, a.value, &salt_b)
+            };
+
+            // Sanity: the caller's coin_id must match what the node will compute.
+            let mut given = [0u8; 32];
+            hex::decode_to_slice(&a.coin_id, &mut given)
+                .map_err(|_| JsValue::from_str("Invalid contract input coin_id hex"))?;
+            if given != canonical {
+                return Err(JsValue::from_str(
+                    "Contract input coin_id does not match (address,value,salt,state). \
+                     Wrong salt/state, or stale coin.",
+                ));
+            }
+
+            input_coin_ids.push(canonical);
+            contract_in_value = contract_in_value.saturating_add(a.value);
+            contract_inputs.push(ScriptContractInput {
+                coin_id: hex::encode(canonical),
+                bytecode: contract_bytecode_hex.to_lowercase(),
+                witness: normalize_witness(&a.witness)?,
+                value: a.value,
+                salt: a.salt.to_lowercase(),
+                state: a.state.clone(),
+            });
+        }
+
+        // ── Output value total (standard carry value; confidential = 0) ─────
+        let total_out: u64 = out_args.iter().map(|o| o.value).sum();
+
+        // ── Fee estimation + wallet coin selection (covers shortfall only) ──
+        let mut avail_sorted = available.clone();
+        avail_sorted.sort_by(|a, b| b.value.cmp(&a.value));
+
+        let mut target_fee = 100u64;
+        let mut selected: Vec<WasmUtxo> = Vec::new();
+        let mut wallet_in: u64;
+        let final_fee: u64;
+
+        loop {
+            let needed_total = total_out.saturating_add(target_fee);
+            // Shortfall the wallet must cover after the contract's own value.
+            let shortfall = needed_total.saturating_sub(contract_in_value);
+
+            selected.clear();
+            let mut selected_set = HashSet::new();
+            wallet_in = 0;
+
+            // Greedy selection up to the shortfall (may select nothing).
+            for coin in &avail_sorted {
+                if wallet_in >= shortfall {
+                    break;
+                }
+                selected_set.insert(coin.coin_id.clone());
+                selected.push(coin.clone());
+                wallet_in += coin.value;
+            }
+            if wallet_in < shortfall {
+                return Err(JsValue::from_str("Insufficient wallet funds to cover outputs + fee"));
+            }
+
+            // WOTS co-spend enforcement (SECURITY: never reuse a WOTS key across
+            // txs — pull in every coin sharing a selected non-MSS address).
+            let mut grouped = HashSet::new();
+            for c in &selected {
+                if !c.is_mss {
+                    grouped.insert(c.address.clone());
+                }
+            }
+            for coin in &available {
+                if grouped.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
+                    selected_set.insert(coin.coin_id.clone());
+                    selected.push(coin.clone());
+                    wallet_in += coin.value;
+                }
+            }
+            if selected.len() > MAX_SELECTED_INPUTS {
+                return Err(JsValue::from_str("Too many inputs selected for one transaction"));
+            }
+
+            // Precise size → fee. Bytes: base + wallet inputs (~1636 each) +
+            // contract inputs (~120 each) + outputs (~100 each) + change outputs.
+            let provisional_change =
+                contract_in_value + wallet_in - total_out.min(contract_in_value + wallet_in);
+            let change_for_size = (contract_in_value + wallet_in)
+                .saturating_sub(total_out)
+                .saturating_sub(target_fee);
+            let _ = provisional_change;
+            let num_change = decompose_value(change_for_size).len();
+            let num_outputs = out_args.len() + num_change;
+            let estimated_bytes = 100
+                + (selected.len() as u64 * 1636)
+                + (contract_inputs.len() as u64 * 120)
+                + (num_outputs as u64 * 100);
+            let required_fee = (estimated_bytes * 10) / 1024 + 10;
+
+            if contract_in_value + wallet_in >= total_out + required_fee {
+                final_fee = required_fee;
+                break;
+            } else {
+                target_fee = required_fee;
+            }
+        }
+
+        // ── Build ordered outputs (user outputs first, then change) ─────────
+        let mut outputs_out: Vec<serde_json::Value> = Vec::new();
+        let mut output_hashes: Vec<[u8; 32]> = Vec::new();
+
+        for o in &out_args {
+            let mut addr_b = [0u8; 32];
+            hex::decode_to_slice(&o.address, &mut addr_b)
+                .map_err(|_| JsValue::from_str("Invalid output address hex"))?;
+
+            // Salt: explicit if provided (recordable), else random.
+            let salt_b = match &o.salt {
+                Some(s) => {
+                    let mut b = [0u8; 32];
+                    hex::decode_to_slice(s, &mut b)
+                        .map_err(|_| JsValue::from_str("Invalid output salt hex"))?;
+                    b
+                }
+                None => {
+                    let mut b = [0u8; 32];
+                    getrandom_02::getrandom(&mut b).unwrap();
+                    b
+                }
+            };
+
+            if o.out_type == "confidential" {
+                let state_hex = o
+                    .state
+                    .clone()
+                    .ok_or_else(|| JsValue::from_str("confidential output requires a state"))?;
+                let mut st = [0u8; 32];
+                hex::decode_to_slice(&state_hex, &mut st)
+                    .map_err(|_| JsValue::from_str("Invalid output state hex"))?;
+                output_hashes.push(confidential_coin_hash(&addr_b, &st, &salt_b));
+                outputs_out.push(serde_json::json!({
+                    "type": "confidential",
+                    "address": o.address.to_lowercase(),
+                    "commitment": state_hex.to_lowercase(),
+                    "salt": hex::encode(salt_b),
+                }));
+            } else {
+                // CONSENSUS: standard outputs must be a NONZERO power of two
+                // (apply_transaction bails otherwise). We deliberately do NOT
+                // auto-decompose: that would shift output indices and break
+                // covenants that use OP_READ_OUTPUT_STATE / OP_OUTPUT_ADDRESS.
+                // The caller specifies valid denominations in contract order.
+                if o.value == 0 || !o.value.is_power_of_two() {
+                    return Err(JsValue::from_str(&format!(
+                        "Standard output to {} has value {} — each standard output must be a \
+                         nonzero power of two. Split it into power-of-two outputs yourself \
+                         (order is preserved, so index-based covenants stay valid).",
+                        o.address, o.value
+                    )));
+                }
+                output_hashes.push(compute_coin_id(&addr_b, o.value, &salt_b));
+                outputs_out.push(serde_json::json!({
+                    "type": "standard",
+                    "address": o.address.to_lowercase(),
+                    "value": o.value,
+                    "salt": hex::encode(salt_b),
+                }));
+            }
+        }
+
+        // Change → wallet (deterministic salts so we can re-find/spend it later).
+        let change = (contract_in_value + wallet_in)
+            .saturating_sub(total_out)
+            .saturating_sub(final_fee);
+        let mut current_idx = next_wots_index;
+        if change > 0 {
+            for denom in decompose_value(change) {
+                let seed = derive_wots_seed(&self.master_seed, current_idx as u64);
+                let addr = compute_address(&wots::keygen(&seed));
+                let salt = derive_deterministic_salt(&self.master_seed, current_idx as u64);
+                output_hashes.push(compute_coin_id(&addr, denom, &salt));
+                outputs_out.push(serde_json::json!({
+                    "type": "standard",
+                    "address": hex::encode(addr),
+                    "value": denom,
+                    "salt": hex::encode(salt),
+                }));
+                current_idx += 1;
+            }
+        }
+
+        // ── Wallet input coin ids (canonical) appended after contract ids ───
+        let mut wallet_inputs: Vec<ScriptWalletInput> = Vec::new();
+        for inp in &selected {
+            let pk = if inp.is_mss {
+                self.mss_cache
+                    .get(&inp.address)
+                    .ok_or_else(|| JsValue::from_str("MSS tree missing from cache"))?
+                    .master_pk
+            } else {
+                wots::keygen(&derive_wots_seed(&self.master_seed, inp.index as u64))
+            };
+            let p2pk_addr = midstate::core::types::hash(&midstate::core::script::compile_p2pk(&pk));
+            let mut salt_b = [0u8; 32];
+            hex::decode_to_slice(&inp.salt, &mut salt_b).unwrap();
+            input_coin_ids.push(compute_coin_id(&p2pk_addr, inp.value, &salt_b));
+
+            wallet_inputs.push(ScriptWalletInput {
+                coin_id: inp.coin_id.clone(),
+                address: inp.address.clone(),
+                value: inp.value,
+                salt: inp.salt.clone(),
+                is_mss: inp.is_mss,
+                index: inp.index,
+                mss_leaf: inp.mss_leaf,
+            });
+        }
+
+        // CONSENSUS: hard caps on transaction size (apply_transaction bails above these).
+        if contract_inputs.len() + wallet_inputs.len() > midstate::core::types::MAX_TX_INPUTS {
+            return Err(JsValue::from_str("Too many inputs for one transaction (max 256)"));
+        }
+        if outputs_out.len() > midstate::core::types::MAX_TX_OUTPUTS {
+            return Err(JsValue::from_str(
+                "Too many outputs for one transaction (max 256) — fewer/larger denominations needed",
+            ));
+        }
+
+        // ── Commitment over canonical [contract…, wallet…] inputs + outputs ─
+        let mut tx_salt = [0u8; 32];
+        getrandom_02::getrandom(&mut tx_salt).unwrap();
+        let commitment = compute_commitment(&input_coin_ids, &output_hashes, &tx_salt);
+
+        let ctx = ScriptSpendContext {
+            contract_addr: hex::encode(contract_addr),
+            contract_inputs,
+            wallet_inputs,
+            outputs: outputs_out,
+            input_coin_ids: input_coin_ids.iter().map(hex::encode).collect(),
+            tx_salt: hex::encode(tx_salt),
+            commitment: hex::encode(commitment),
+            fee: final_fee,
+            next_wots_index: current_idx,
+        };
+        serde_json::to_string(&ctx).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Phase 2: sign the wallet fee-inputs over the committed commitment and emit
+    /// the wire `reveal` payload. Mirrors `build_reveal` but (a) splices contract
+    /// witnesses verbatim, (b) hashes confidential outputs, (c) leaves contract
+    /// inputs unsigned. `commitment_hex` / `salt_hex` are the ctx values returned
+    /// by `prepare_script_spend` (pass ctx.commitment and ctx.tx_salt — there is
+    /// no server-side salt contribution in this protocol).
+    #[wasm_bindgen]
+    pub fn build_script_reveal(
+        &mut self,
+        ctx_json: &str,
+        commitment_hex: &str,
+        salt_hex: &str,
+    ) -> Result<String, JsValue> {
+        let ctx: ScriptSpendContext =
+            serde_json::from_str(ctx_json).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        let mut commitment = [0u8; 32];
+        hex::decode_to_slice(commitment_hex, &mut commitment)
+            .map_err(|_| JsValue::from_str("Invalid commitment hex"))?;
+        let mut salt_b = [0u8; 32];
+        hex::decode_to_slice(salt_hex, &mut salt_b)
+            .map_err(|_| JsValue::from_str("Invalid salt hex"))?;
+
+        let mut contract_addr = [0u8; 32];
+        hex::decode_to_slice(&ctx.contract_addr, &mut contract_addr).unwrap();
+
+        let mut input_reveals = Vec::new();
+        let mut signatures = Vec::new();
+        let mut safety_in: Vec<[u8; 32]> = Vec::new();
+
+        // 1) Contract inputs — reveal + verbatim witness, NOT signed by wallet.
+        for ci in &ctx.contract_inputs {
+            let mut salt = [0u8; 32];
+            hex::decode_to_slice(&ci.salt, &mut salt).unwrap();
+            if let Some(state_hex) = &ci.state {
+                let mut st = [0u8; 32];
+                hex::decode_to_slice(state_hex, &mut st).unwrap();
+                safety_in.push(confidential_coin_hash(&contract_addr, &st, &salt));
+                input_reveals.push(serde_json::json!({
+                    "bytecode": ci.bytecode,
+                    "value": ci.value,
+                    "salt": ci.salt,
+                    "commitment": state_hex,
+                }));
+            } else {
+                safety_in.push(compute_coin_id(&contract_addr, ci.value, &salt));
+                input_reveals.push(serde_json::json!({
+                    "bytecode": ci.bytecode,
+                    "value": ci.value,
+                    "salt": ci.salt,
+                }));
+            }
+            signatures.push(ci.witness.clone()); // comma-separated stack, verbatim
+        }
+
+        // 2) Wallet fee-inputs — P2PK reveal + real signature over the commitment.
+        let mut mss_sig_cache: HashMap<String, Vec<u8>> = HashMap::new();
+        for wi in &ctx.wallet_inputs {
+            let (pk, sig_bytes) = if wi.is_mss {
+                let kp = self
+                    .mss_cache
+                    .get_mut(&wi.address)
+                    .ok_or_else(|| JsValue::from_str("MSS tree missing from cache"))?;
+                if let Some(cached) = mss_sig_cache.get(&wi.address) {
+                    (kp.master_pk, cached.clone())
+                } else {
+                    kp.next_leaf = wi.mss_leaf as u64;
+                    let sig = kp.sign(&commitment).map_err(|e| JsValue::from_str(&e.to_string()))?;
+                    let b = sig.to_bytes();
+                    mss_sig_cache.insert(wi.address.clone(), b.clone());
+                    (kp.master_pk, b)
+                }
+            } else {
+                let seed = derive_wots_seed(&self.master_seed, wi.index as u64);
+                (wots::keygen(&seed), wots::sig_to_bytes(&wots::sign(&seed, &commitment)))
+            };
+
+            let bytecode = midstate::core::script::compile_p2pk(&pk);
+            let address = midstate::core::types::hash(&bytecode);
+            let mut salt = [0u8; 32];
+            hex::decode_to_slice(&wi.salt, &mut salt).unwrap();
+            safety_in.push(compute_coin_id(&address, wi.value, &salt));
+
+            input_reveals.push(serde_json::json!({
+                "bytecode": hex::encode(&bytecode),
+                "value": wi.value,
+                "salt": wi.salt,
+            }));
+            signatures.push(hex::encode(&sig_bytes));
+        }
+
+        // 3) Outputs — pass through; recompute hashes for the safety check
+        //    (standard AND confidential, unlike build_reveal).
+        let mut safety_out: Vec<[u8; 32]> = Vec::new();
+        for o in &ctx.outputs {
+            let ty = o["type"].as_str().unwrap_or("standard");
+            let mut addr = [0u8; 32];
+            hex::decode_to_slice(o["address"].as_str().unwrap(), &mut addr).unwrap();
+            let mut salt = [0u8; 32];
+            hex::decode_to_slice(o["salt"].as_str().unwrap(), &mut salt).unwrap();
+            if ty == "confidential" {
+                let mut st = [0u8; 32];
+                hex::decode_to_slice(o["commitment"].as_str().unwrap(), &mut st).unwrap();
+                safety_out.push(confidential_coin_hash(&addr, &st, &salt));
+            } else {
+                safety_out.push(compute_coin_id(&addr, o["value"].as_u64().unwrap(), &salt));
+            }
+        }
+
+        // 4) Safety: the reveal must reconstruct the committed commitment exactly.
+        if compute_commitment(&safety_in, &safety_out, &salt_b) != commitment {
+            return Err(JsValue::from_str(
+                "Fatal hash mismatch: reveal does not reconstruct the committed commitment.",
+            ));
+        }
+
+        Ok(serde_json::json!({
+            "inputs": input_reveals,
+            "signatures": signatures,
+            "outputs": ctx.outputs,
+            "salt": salt_hex,
+        })
+        .to_string())
+    }
+
+// ── Funding a contract ──────────────────────────────────────────────────
+
+    /// Phase 1 for FUNDING a contract. Pays `amount` to the contract address as
+    /// power-of-two "value" coins, optionally seeds a confidential "state" coin,
+    /// returns change to the wallet, and reuses `build_script_reveal` for phase 2
+    /// (its `contract_inputs` list is simply empty here — the wallet pays).
+    ///
+    /// Mirrors the CLI fund instruction:  `--to addr:amount` (+ `--to addr:0:state`).
+    /// `state_hex` = None for a plain value-only funding.
+    #[wasm_bindgen]
+    pub fn prepare_fund_tx(
+        &mut self,
+        available_utxos_json: &str,
+        contract_addr_hex: &str,
+        amount: u64,
+        state_hex: Option<String>,
+        next_wots_index: u32,
+    ) -> Result<String, JsValue> {
+        let mut contract_addr = [0u8; 32];
+        hex::decode_to_slice(contract_addr_hex, &mut contract_addr)
+            .map_err(|_| JsValue::from_str("Invalid contract address hex"))?;
+        let available: Vec<WasmUtxo> = serde_json::from_str(available_utxos_json)
+            .map_err(|e| JsValue::from_str(&format!("Bad utxos JSON: {}", e)))?;
+        if amount == 0 && state_hex.is_none() {
+            return Err(JsValue::from_str("Nothing to fund: amount is 0 and no state given"));
+        }
+
+        // ── Outputs: value coins (power-of-two decomposition) + optional state ──
+        let mut outputs_out: Vec<serde_json::Value> = Vec::new();
+        let mut output_hashes: Vec<[u8; 32]> = Vec::new();
+
+        for denom in decompose_value(amount) {
+            let mut salt = [0u8; 32];
+            getrandom_02::getrandom(&mut salt).unwrap();
+            output_hashes.push(compute_coin_id(&contract_addr, denom, &salt));
+            outputs_out.push(serde_json::json!({
+                "type": "standard",
+                "address": contract_addr_hex.to_lowercase(),
+                "value": denom,
+                "salt": hex::encode(salt),
+            }));
+        }
+        if let Some(st_hex) = &state_hex {
+            let mut st = [0u8; 32];
+            hex::decode_to_slice(st_hex, &mut st)
+                .map_err(|_| JsValue::from_str("Invalid state hex"))?;
+            let mut salt = [0u8; 32];
+            getrandom_02::getrandom(&mut salt).unwrap();
+            output_hashes.push(confidential_coin_hash(&contract_addr, &st, &salt));
+            outputs_out.push(serde_json::json!({
+                "type": "confidential",
+                "address": contract_addr_hex.to_lowercase(),
+                "commitment": st_hex.to_lowercase(),
+                "salt": hex::encode(salt),
+            }));
+        }
+
+        // ── Wallet coin selection: cover amount + fee (with WOTS co-spend) ──────
+        let mut avail_sorted = available.clone();
+        avail_sorted.sort_by(|a, b| b.value.cmp(&a.value));
+        let mut target_fee = 100u64;
+        let mut selected: Vec<WasmUtxo> = Vec::new();
+        let mut wallet_in: u64;
+        let final_fee;
+        loop {
+            let needed = amount.saturating_add(target_fee);
+            selected.clear();
+            let mut set = HashSet::new();
+            wallet_in = 0;
+            for c in &avail_sorted {
+                if wallet_in >= needed { break; }
+                set.insert(c.coin_id.clone());
+                selected.push(c.clone());
+                wallet_in += c.value;
+            }
+            if wallet_in < needed {
+                return Err(JsValue::from_str("Insufficient funds for amount + fee"));
+            }
+            let mut grouped = HashSet::new();
+            for c in &selected { if !c.is_mss { grouped.insert(c.address.clone()); } }
+            for c in &available {
+                if grouped.contains(&c.address) && !set.contains(&c.coin_id) {
+                    set.insert(c.coin_id.clone());
+                    selected.push(c.clone());
+                    wallet_in += c.value;
+                }
+            }
+            if selected.len() > MAX_SELECTED_INPUTS {
+                return Err(JsValue::from_str("Too many inputs selected"));
+            }
+            let change_for_size = wallet_in.saturating_sub(amount).saturating_sub(target_fee);
+            let num_outputs = outputs_out.len() + decompose_value(change_for_size).len();
+            let estimated = 100 + (selected.len() as u64 * 1636) + (num_outputs as u64 * 100);
+            let req = (estimated * 10) / 1024 + 10;
+            if wallet_in >= amount + req { final_fee = req; break; } else { target_fee = req; }
+        }
+
+        // ── Change → wallet (deterministic salts) ───────────────────────────────
+        let change = wallet_in - amount - final_fee;
+        let mut idx = next_wots_index;
+        if change > 0 {
+            for denom in decompose_value(change) {
+                let seed = derive_wots_seed(&self.master_seed, idx as u64);
+                let addr = compute_address(&wots::keygen(&seed));
+                let salt = derive_deterministic_salt(&self.master_seed, idx as u64);
+                output_hashes.push(compute_coin_id(&addr, denom, &salt));
+                outputs_out.push(serde_json::json!({
+                    "type": "standard",
+                    "address": hex::encode(addr),
+                    "value": denom,
+                    "salt": hex::encode(salt),
+                }));
+                idx += 1;
+            }
+        }
+
+        // ── Wallet input coin ids (canonical) ───────────────────────────────────
+        let mut input_coin_ids: Vec<[u8; 32]> = Vec::new();
+        let mut wallet_inputs: Vec<ScriptWalletInput> = Vec::new();
+        for inp in &selected {
+            let pk = if inp.is_mss {
+                self.mss_cache.get(&inp.address)
+                    .ok_or_else(|| JsValue::from_str("MSS tree missing from cache"))?.master_pk
+            } else {
+                wots::keygen(&derive_wots_seed(&self.master_seed, inp.index as u64))
+            };
+            let p2pk = midstate::core::types::hash(&midstate::core::script::compile_p2pk(&pk));
+            let mut salt = [0u8; 32];
+            hex::decode_to_slice(&inp.salt, &mut salt).unwrap();
+            input_coin_ids.push(compute_coin_id(&p2pk, inp.value, &salt));
+            wallet_inputs.push(ScriptWalletInput {
+                coin_id: inp.coin_id.clone(),
+                address: inp.address.clone(),
+                value: inp.value,
+                salt: inp.salt.clone(),
+                is_mss: inp.is_mss,
+                index: inp.index,
+                mss_leaf: inp.mss_leaf,
+            });
+        }
+
+        if wallet_inputs.len() > midstate::core::types::MAX_TX_INPUTS {
+            return Err(JsValue::from_str("Too many inputs (max 256)"));
+        }
+        if outputs_out.len() > midstate::core::types::MAX_TX_OUTPUTS {
+            return Err(JsValue::from_str("Too many outputs (max 256)"));
+        }
+
+        let mut tx_salt = [0u8; 32];
+        getrandom_02::getrandom(&mut tx_salt).unwrap();
+        let commitment = compute_commitment(&input_coin_ids, &output_hashes, &tx_salt);
+
+        let ctx = ScriptSpendContext {
+            contract_addr: contract_addr_hex.to_lowercase(),
+            contract_inputs: Vec::new(), // funding consumes no contract coin
+            wallet_inputs,
+            outputs: outputs_out,
+            input_coin_ids: input_coin_ids.iter().map(hex::encode).collect(),
+            tx_salt: hex::encode(tx_salt),
+            commitment: hex::encode(commitment),
+            fee: final_fee,
+            next_wots_index: idx,
+        };
+        serde_json::to_string(&ctx).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
 
     /// Select coins and build a transaction for the given send amount.
     ///
