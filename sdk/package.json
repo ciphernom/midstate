@@ -1,9 +1,17 @@
 {
   "name": "midstate-sdk",
-  "version": "1.0.0",
+  "version": "1.0.8",
   "description": "Official JavaScript SDK for the Midstate Blockchain",
   "main": "src/index.js",
   "type": "module",
+  "exports": {
+    ".": "./src/index.js",
+    "./pkg/*": "./pkg/*"
+  },
+  "files": [
+    "pkg",
+    "src"
+  ],
   "scripts": {
     "test": "node test.js"
   },
@@ -26,10 +34,5 @@
     "@multiformats/multiaddr": "^13.0.3",
     "it-pipe": "^3.0.1",
     "libp2p": "^3.3.2"
-  },
-  "devDependencies": {
-    "@rollup/plugin-commonjs": "^29.0.3",
-    "@rollup/plugin-node-resolve": "^16.0.3",
-    "rollup": "^4.60.4"
   }
 }
