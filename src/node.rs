@@ -3978,9 +3978,11 @@ fn fire_batch_lookahead(&mut self) {
             let mut wots_oracle = std::collections::HashMap::new();
 
             // --- FIX: Ignore DB oracle entries from the abandoned local chain ---
-            let mut ignored_db_addresses = std::collections::HashSet::new();
-            if cursor < current_state_height {
-                for h in cursor..current_state_height {
+            // Uses `fork_height` instead of `cursor` to ensure ALL abandoned local 
+            // blocks are ignored across all chunks, preventing Ghost DB entry loops.
+            let mut ignored_db_addresses = HashSet::new();
+            if fork_height < current_state_height {
+                for h in fork_height..current_state_height {
                     if let Ok(Some(local_batch)) = storage.load_batch(h) {
                         for addr in extract_spent_addresses(&local_batch) {
                             ignored_db_addresses.insert(addr);
@@ -4062,20 +4064,24 @@ fn fire_batch_lookahead(&mut self) {
                 if let Err(e) = &res {
                     // --- GHOST ENTRY HEALING ---
                     let err_str = e.to_string();
+                    let mut ghost_healed = false;
                     if err_str.contains("reused") && (err_str.contains("WOTS address") || err_str.contains("MSS leaf")) {
                         let split_key = if err_str.contains("WOTS address") { "WOTS address " } else { "MSS leaf " };
                         if let Some(addr_hex) = err_str.split(split_key).nth(1).and_then(|s| s.split(" ").next()) {
-                            tracing::error!("Ghost DB entry detected for key {}. Purging and forcing chunk retry...", addr_hex);
                             if let Ok(addr_bytes) = hex::decode(addr_hex) {
                                 if let Ok(addr_arr) = <[u8; 32]>::try_from(addr_bytes.as_slice()) {
-                                    let _ = storage.delete_spent_address(&addr_arr);
-                                    error_msg = format!("Ghost DB entry {} purged. Retrying chunk boundary...", addr_hex);
-                                    is_valid = false;
-                                    break;
+                                    // ONLY heal and retry if the ghost entry actually existed in the database!
+                                    if let Ok(true) = storage.delete_spent_address(&addr_arr) {
+                                        tracing::error!("Ghost DB entry detected for key {}. Purging and forcing chunk retry...", addr_hex);
+                                        error_msg = format!("Ghost DB entry {} purged. Retrying chunk boundary...", addr_hex);
+                                        is_valid = false;
+                                        ghost_healed = true;
+                                    }
                                 }
                             }
                         }
                     }
+                    if ghost_healed { break; }
                     // ---------------------------
 
                     if err_str.contains("State root mismatch") && height > header_start_height && height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
@@ -4554,11 +4560,13 @@ fn fire_batch_lookahead(&mut self) {
                 if err_str.contains("reused") && (err_str.contains("WOTS address") || err_str.contains("MSS leaf")) {
                     let split_key = if err_str.contains("WOTS address") { "WOTS address " } else { "MSS leaf " };
                     if let Some(addr_hex) = err_str.split(split_key).nth(1).and_then(|s| s.split(" ").next()) {
-                        tracing::error!("Ghost DB entry detected for key {}. Purging and aborting evaluation...", addr_hex);
                         if let Ok(addr_bytes) = hex::decode(addr_hex) {
                             if let Ok(addr_arr) = <[u8; 32]>::try_from(addr_bytes.as_slice()) {
-                                let _ = self.storage.delete_spent_address(&addr_arr);
-                                return Ok(None); // Ghost purged. It will succeed on the next sync poll.
+                                // ONLY heal if it actually existed in the database!
+                                if let Ok(true) = self.storage.delete_spent_address(&addr_arr) {
+                                    tracing::error!("Ghost DB entry detected for key {}. Purging and aborting evaluation...", addr_hex);
+                                    return Ok(None); // Ghost purged. It will succeed on the next sync poll.
+                                }
                             }
                         }
                     }
@@ -4643,7 +4651,12 @@ fn fire_batch_lookahead(&mut self) {
                 recent_headers.pop_front();
             }
             candidate_state.target = adjust_difficulty(&candidate_state);
-            new_history.push((height, candidate_state.midstate, batch.clone()));
+            
+            // FIX: Push `header_hash` instead of `midstate`. 
+            // `perform_reorg` loads the second element of this tuple into `chain_history`, 
+            // which is later used to deduplicate incoming blocks via `header_hash`. 
+            // Storing `midstate` here breaks duplicate block detection after a reorg!
+            new_history.push((height, candidate_state.header_hash, batch.clone()));
             
             // Yield to prevent event loop starvation on large forks
             tokio::task::yield_now().await;
@@ -4702,14 +4715,16 @@ fn fire_batch_lookahead(&mut self) {
         let mut abandoned_txs = Vec::new();
         let mut abandoned_batches = Vec::new(); 
         if is_actual_reorg {
-            for (h, _) in self.chain_history.iter().filter(|(h, _)| *h >= fork_height) {
-                if let Ok(Some(batch)) = self.storage.load_batch(*h) {
+            // FIX: Do not rely on `chain_history` which is empty after a node restart.
+            // Read directly from disk from `fork_height` up to the current tip to ensure
+            // ALL abandoned blocks are successfully unburned, preventing "Ghost DB entries".
+            for h in fork_height..self.state.height {
+                if let Ok(Some(batch)) = self.storage.load_batch(h) {
                     abandoned_txs.extend(batch.transactions.clone()); 
                     abandoned_batches.push(batch);                   
                 }
             }
         }
-
         // Update in-memory state FIRST
         // Trim state cache: discard all entries at or above the fork
         self.trim_cache_above(fork_height);
@@ -5371,6 +5386,16 @@ fn fire_batch_lookahead(&mut self) {
             self.cache_current_state();
             self.storage.save_batch(self.state.height - 1, &batch)?;
             
+            // FIX: Ensure linear extensions actually commit state and burn addresses!
+            // Previously, linear syncs advanced the memory state but failed to write 
+            // the state or burn addresses to the DB, causing desyncs on restart.
+            if let Err(e) = self.storage.save_state(&self.state) {
+                tracing::error!("Failed to save state during linear extension: {}", e);
+            }
+            if let Err(e) = self.storage.burn_batch_addresses(&batch, self.state.height - 1) {
+                tracing::warn!("Failed to burn addresses during linear extension: {}", e);
+            }
+            
             if self.state.height > 0 && self.state.height % SNAPSHOT_INTERVAL == 0 {
                 if let Err(e) = self.storage.save_state_snapshot(self.state.height, &self.state) {
                     tracing::warn!("Failed to save state snapshot: {}", e);
@@ -5485,6 +5510,18 @@ async fn try_apply_orphans(&mut self) {
                     self.cache_current_state();
 
                     self.storage.save_batch(self.state.height - 1, &batch).ok();
+                    
+                    // FIX: Ensure applied orphans are written to DB.
+                    // If an orphan connects and advances the chain, we MUST save the 
+                    // state and burn the addresses to disk, otherwise a node restart 
+                    // will revert the memory state and cause Ghost DB entries.
+                    if let Err(e) = self.storage.save_state(&self.state) {
+                        tracing::error!("Failed to save state during orphan apply: {}", e);
+                    }
+                    if let Err(e) = self.storage.burn_batch_addresses(&batch, self.state.height - 1) {
+                        tracing::warn!("Failed to burn addresses during orphan apply: {}", e);
+                    }
+                    
                     self.metrics.inc_batches_processed();
 
                     let mut spent_inputs = Vec::new();
@@ -5759,7 +5796,7 @@ async fn try_apply_orphans(&mut self) {
                 let cmd_tx = self.cmd_tx.as_ref().unwrap().clone(); // Pass the channel
                 let has_light_peers = self.network.has_light_peers(); // Check if we even need to bother
 
-                tokio::task::spawn_blocking(move || {
+                let db_task = tokio::task::spawn_blocking(move || {
                     if let Err(e) = storage_clone.save_state(&state_clone) {
                         tracing::error!("Failed to save state: {}", e);
                     }
@@ -5768,7 +5805,6 @@ async fn try_apply_orphans(&mut self) {
                     }
 
                     // --- PUSH GENERATION ---
-                    // We build the filter and count elements in the background, entirely avoiding main-thread CPU/Disk stalls.
                     if has_light_peers {
                         let filter = crate::core::filter::CompactFilter::build(&batch_clone);
                         let items  = crate::core::filter::CompactFilter::items_in(&batch_clone);
@@ -5784,6 +5820,12 @@ async fn try_apply_orphans(&mut self) {
                         let _ = cmd_tx.blocking_send(NodeCommand::BroadcastLightPush(notif));
                     }
                 });
+
+                // FIX: Await the DB task to ensure spent addresses are committed to disk 
+                // BEFORE the next block is processed! This prevents async double-spend race conditions.
+                if let Err(e) = db_task.await {
+                    tracing::error!("Database write task panicked: {}", e);
+                }
 
                 // 5. NOW SAVE SNAPSHOT (every SNAPSHOT_INTERVAL blocks)
                 if self.state.height > 0 && self.state.height % SNAPSHOT_INTERVAL == 0 {

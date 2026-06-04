@@ -316,11 +316,16 @@ fn apply_batch_internal(
                     if let Some(sig) = wit_inputs.first() {
                         if sig.len() == crate::core::wots::SIG_SIZE {
                             let addr = input.predicate.address();
-                            if let Some(&prior_commitment) = spent_oracle.get(&addr) {
-                                if prior_commitment != this_commitment {
-                                    bail!("Consensus violation: WOTS address {} reused", hex::encode(addr));
+                                if let Some(&prior_commitment) = spent_oracle.get(&addr) {
+                                    if prior_commitment != this_commitment {
+                                        // --- CONSENSUS EXCEPTION ---
+                                        if state.height == 139312 && hex::encode(addr) == "4f28ae9e840c35ca3a7ae7b88ebb43624fe7fc602db8555fbd75de176fb7a12d" {
+                                            tracing::warn!("Applying consensus exception for known historical double-spend at height 139312");
+                                        } else {
+                                            bail!("Consensus violation: WOTS address {} reused", hex::encode(addr));
+                                        }
+                                    }
                                 }
-                            }
                             spent_oracle.insert(addr, this_commitment);
                         } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
                             if let Some(&prior_commitment) = spent_oracle.get(&mss_sig.wots_pk) {

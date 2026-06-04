@@ -261,15 +261,16 @@ pub struct Storage {
 }
 
 impl Storage {
-pub fn delete_spent_address(&self, address: &[u8; 32]) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
-            table.remove(address)?;
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
+pub fn delete_spent_address(&self, address: &[u8; 32]) -> Result<bool> {
+    let write_txn = self.db.begin_write()?;
+    let existed = {
+        let mut table = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
+        let removed = table.remove(address)?.is_some();
+        removed
+    };
+    write_txn.commit()?;
+    Ok(existed)
+}
     /// Deletes any state snapshots at or above the given fork height.
     /// Called during a reorg to prevent stale snapshots from a dead chain
     /// from corrupting future state rebuilds.
