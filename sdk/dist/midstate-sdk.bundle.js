@@ -32451,42 +32451,42 @@ class Wallet {
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    //  Send
+    //  Transaction Execution
     // ════════════════════════════════════════════════════════════════════════
 
     /**
-     * Two-phase commit→reveal spend.
-     * @param {bigint|number|string} amountMDS amount in base units; coerced to BigInt.
+     * Internal helper to execute the 2-phase Commit/Reveal protocol.
+     * @private
      */
-    async send(client, toAddressHex, amountMDS) {
-        const amount = BigInt(amountMDS);
-        if (this.getBalance() <= amount) throw new Error("Insufficient funds (need extra for fees)");
-
-        const state = await client.getState();
-
-        // 1. Prepare Spend.
-        //    WasmUtxo.value is a u64 and serde deserializes it from a JSON
-        //    number, so convert each BigInt value back to a Number here. Coin
-        //    values are bounded powers of 2, well inside 2^53 — only the summed
-        //    balance needed BigInt, not the per-coin value at this boundary.
-        const utxosForWasm = this.utxos.map(u => ({ ...u, value: Number(u.value) }));
-        const spendCtxStr = this.inner.prepare_spend(
-            JSON.stringify(utxosForWasm),
-            toAddressHex,
-            amount,
-            this.nextWotsIndex,
-            null, null
-        );
+    async _broadcastTwoPhaseTx(client, spendCtxStr, isScript = false) {
         const ctx = JSON.parse(spendCtxStr);
         this.nextWotsIndex = ctx.next_wots_index;
 
-        // 2. Mine PoW
-        const spamNonce = mine_commitment_pow(ctx.commitment, state.required_pow, BigInt(state.height), state.header_hash);
+        // Advance MSS indices for any used inputs
+        const inputs = ctx.selected_inputs || ctx.wallet_inputs || [];
+        for (const inp of inputs) {
+            if (inp.is_mss && this.mssAddrs[inp.address]) {
+                this.mssAddrs[inp.address].next_leaf++;
+            }
+        }
+        await this.save();
 
-        // 3. Commit
-        await client.commit(ctx.commitment, Number(spamNonce));
+        const state = await client.getState();
+        const requiredPow = state.required_pow || 24;
 
-        // 4. Wait for confirmation
+        // 1. Mine PoW
+        const spamNonce = mine_commitment_pow(
+            ctx.commitment, 
+            requiredPow, 
+            BigInt(state.height), 
+            state.header_hash
+        );
+
+        // 2. Commit
+        const commitReq = await client.commit(ctx.commitment, Number(spamNonce));
+        if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
+
+        // 3. Wait for confirmation
         let mined = false;
         for (let i = 0; i < 24; i++) {
             await new Promise(r => setTimeout(r, 5000));
@@ -32495,23 +32495,93 @@ class Wallet {
         }
         if (!mined) throw new Error("Timed out waiting for Commit to be mined.");
 
-        // 5. Reveal
-        const revealPayloadStr = this.inner.build_reveal(spendCtxStr, ctx.commitment, ctx.tx_salt);
+        // 4. Reveal
+        let revealPayloadStr;
+        if (isScript) {
+            revealPayloadStr = this.inner.build_script_reveal(spendCtxStr, ctx.commitment, ctx.tx_salt);
+        } else {
+            revealPayloadStr = this.inner.build_reveal(spendCtxStr, ctx.commitment, ctx.tx_salt);
+        }
+        
         const response = await client.send(revealPayloadStr);
 
-        // 6. Cleanup Local State
-        const spentIds = ctx.selected_inputs.map(i => i.coin_id);
+        // 5. Cleanup Local State
+        const spentIds = inputs.map(i => i.coin_id);
         this.utxos = this.utxos.filter(u => !spentIds.includes(u.coin_id));
-
-        // Update MSS leaf indices
-        for (const inp of ctx.selected_inputs) {
-            if (inp.is_mss && this.mssAddrs[inp.address]) {
-                this.mssAddrs[inp.address].next_leaf++;
-            }
-        }
         await this.save();
 
         return response;
+    }
+
+    /**
+     * Two-phase commit→reveal spend, with optional DataBurn.
+     * @param {MidstateClient} client
+     * @param {string} toAddressHex
+     * @param {bigint|number|string} amountMDS 
+     * @param {string|null} burnDataHex - Optional hex payload to permanently burn onto the chain
+     * @param {bigint|number|string} burnValue - Amount of MDS to burn alongside the data (usually 0)
+     */
+    async send(client, toAddressHex, amountMDS, burnDataHex = null, burnValue = 0) {
+        const amount = BigInt(amountMDS);
+        const bValue = BigInt(burnValue);
+        
+        // Minor check, real check happens in WASM based on fees
+        if (this.getBalance() <= (amount + bValue)) throw new Error("Insufficient funds (need extra for fees)");
+
+        const utxosForWasm = this.utxos.map(u => ({ ...u, value: Number(u.value) }));
+        const spendCtxStr = this.inner.prepare_spend(
+            JSON.stringify(utxosForWasm),
+            toAddressHex,
+            amount,
+            this.nextWotsIndex,
+            burnDataHex,
+            burnDataHex ? bValue : null
+        );
+        
+        return this._broadcastTwoPhaseTx(client, spendCtxStr, false);
+    }
+
+    /**
+     * Fund a Smart Contract by sending value and/or creating a State Thread.
+     * @param {MidstateClient} client
+     * @param {string} contractAddrHex - 32-byte hex address of the contract
+     * @param {bigint|number|string} amountMDS - Value to lock in the contract
+     * @param {string|null} stateHex - Optional 32-byte initial state commitment
+     */
+    async fundContract(client, contractAddrHex, amountMDS, stateHex = null) {
+        const amount = BigInt(amountMDS);
+        const utxosForWasm = this.utxos.map(u => ({ ...u, value: Number(u.value) }));
+        
+        const ctxStr = this.inner.prepare_fund_tx(
+            JSON.stringify(utxosForWasm),
+            contractAddrHex,
+            amount,
+            stateHex,
+            this.nextWotsIndex
+        );
+
+        return this._broadcastTwoPhaseTx(client, ctxStr, true);
+    }
+
+    /**
+     * Execute a Smart Contract transaction.
+     * @param {MidstateClient} client
+     * @param {string} contractBytecodeHex - The raw compiled contract bytecode
+     * @param {Array<Object>} contractInputsArray - Array of { coin_id, witness, value, salt, state }
+     * @param {Array<Object>} outputsArray - Array of { out_type: "standard"|"confidential", address, value, state, salt }
+     */
+    async executeContract(client, contractBytecodeHex, contractInputsArray, outputsArray) {
+        const utxosForWasm = this.utxos.map(u => ({ ...u, value: Number(u.value) }));
+        
+        const ctxStr = this.inner.prepare_script_spend(
+            JSON.stringify(utxosForWasm),
+            contractBytecodeHex,
+            JSON.stringify(contractInputsArray),
+            JSON.stringify(outputsArray),
+            this.nextWotsIndex
+        );
+
+        return this._broadcastTwoPhaseTx(client, ctxStr, true);
     }
 }
 
