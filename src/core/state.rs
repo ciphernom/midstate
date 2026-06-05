@@ -320,7 +320,7 @@ fn apply_batch_internal(
                                     if prior_commitment != this_commitment {
                                         // --- CONSENSUS EXCEPTION ---
                                         if state.height == 139312 && hex::encode(addr) == "4f28ae9e840c35ca3a7ae7b88ebb43624fe7fc602db8555fbd75de176fb7a12d" {
-                                            tracing::warn!("Applying consensus exception for known historical double-spend at height 139312");
+                                            tracing::warn!("Applying consensus exception for known historical WOTS reuse at height 139312");
                                         } else {
                                             bail!("Consensus violation: WOTS address {} reused", hex::encode(addr));
                                         }
