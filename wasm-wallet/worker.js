@@ -624,26 +624,16 @@ async function handleSubmitMinedBlock(template, nonce) {
         // Timestamp is mathematically locked into the template by the node. Do not touch it!
         batch.extension = JSON.parse(extStr);
 
-        for (const entry of template.mining_addrs) wState.wotsAddrs[entry.address] = entry.index;
-        wState.nextWotsIndex = template.next_wots_index;
-
         const submitReq = await rpc.submitBatch(batch);
         const accepted = submitReq.ok;
         const rejectReason = accepted ? null : (submitReq.body || 'rejected');
 
         if (accepted) {
-            // Only commit WOTS index advancement when the block actually lands.
-            // Otherwise we burn one-time-use addresses for blocks that never existed.
-            for (const entry of template.mining_addrs) wState.wotsAddrs[entry.address] = entry.index;
-            wState.nextWotsIndex = template.next_wots_index;
-
             self.postMessage({ type: 'LOG', payload: `✅ Block accepted! Height: ${template.chainHeight}` });
             await saveState();
             await performScan();
         } else {
             self.postMessage({ type: 'LOG', payload: `❌ Block rejected: ${rejectReason}` });
-            // No state mutation — the coinbase WOTS keys are still unused, so the next
-            // template build will reuse the same indices. No bookkeeping leak.
         }
 
         const finalHashHex = Array.from(batch.extension.final_hash).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -675,7 +665,13 @@ async function buildMiningTemplate(stateObj) {
     let totalValue = stateObj.block_reward;
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        const cbStr = wallet.build_coinbase(BigInt(totalValue), wState.nextWotsIndex);
+       const mssList = Object.keys(wState.mssAddrs);
+        if (mssList.length === 0) {
+            self.postMessage({ type: 'ERROR', payload: "No MSS address available to receive mining rewards. Please generate a receive address first." });
+            return null;
+        }
+        const payoutAddr = mssList[mssList.length - 1]; // Use the primary receiving address
+        const cbStr = wallet.build_coinbase_to_mss(BigInt(totalValue), payoutAddr);
         if (!cbStr) { self.postMessage({ type: 'ERROR', payload: "Failed to build coinbase outputs." }); return null; }
         const cbData = JSON.parse(cbStr);
 

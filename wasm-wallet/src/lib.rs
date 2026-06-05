@@ -758,6 +758,40 @@ impl WebWallet {
         }).to_string())
     }
 
+    /// Build coinbase outputs for web solo mining.
+    ///
+    /// Decomposes `total_value` into power-of-2 denominations and assigns
+    /// them directly to the user's reusable MSS address.
+    #[wasm_bindgen]
+    pub fn build_coinbase_to_mss(
+        &self,
+        total_value: u64,
+        address_hex: &str,
+    ) -> Result<String, JsValue> {
+        let mut address = [0u8; 32];
+        hex::decode_to_slice(address_hex, &mut address)
+            .map_err(|_| JsValue::from_str("Invalid address hex"))?;
+
+        let denominations = decompose_value(total_value);
+        let mut coinbase_json = Vec::with_capacity(denominations.len());
+
+        for &denom in &denominations {
+            let mut salt = [0u8; 32];
+            getrandom_02::getrandom(&mut salt).unwrap();
+
+            coinbase_json.push(serde_json::json!({
+                "address": address_hex,
+                "value": denom,
+                "salt": hex::encode(salt)
+            }));
+        }
+
+        // We no longer return or advance the next_wots_index!
+        Ok(serde_json::json!({
+            "coinbase": coinbase_json
+        }).to_string())
+    }
+
     /// Build coinbase outputs for solo mining.
     ///
     /// Decomposes `total_value` (block reward + fees) into power-of-2
