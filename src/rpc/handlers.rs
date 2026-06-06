@@ -1057,13 +1057,22 @@ pub async fn axe_download_rewards(
     Ok(response)
 }
 
-pub async fn submit_batch(
-    State(node): axum::extract::State<AppState>,
-    axum::Json(batch): axum::Json<crate::core::Batch>,
-) -> Result<axum::Json<serde_json::Value>, ErrorResponse> {
-    node.submit_mined_block(batch) 
-        .map_err(|e| ErrorResponse { error: e.to_string() })?;
-    Ok(axum::Json(serde_json::json!({ "status": "accepted" })))
+/// Mined-block submission over HTTP is disabled.
+///
+/// Mining is only available over the WebRTC light protocol
+/// (`LightRequest::SubmitBatch` on /midstate/light/2.0.0). Refusing here is
+/// the authoritative enforcement: a block found while talking to the HTTP
+/// gateway cannot be submitted, even if a client builds the batch by hand.
+/// `NodeHandle::submit_mined_block` is now only reachable from the WebRTC
+/// path's `NodeCommand::SubmitMinedBlock` and can be removed if unused
+/// elsewhere.
+pub async fn submit_batch() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "Mining is only available over WebRTC. Submit mined blocks via the libp2p light protocol (/midstate/light/2.0.0), not HTTP."
+        })),
+    ).into_response()
 }
 
 pub async fn get_tx_by_input(
@@ -1189,22 +1198,24 @@ pub fn parse_reveal_json(value: serde_json::Value) -> Result<Transaction, String
     }
 }
 
-/// Build a block template for an external miner (web wallet).
+/// Block-template generation over HTTP is disabled.
 ///
-/// The miner supplies its coinbase outputs. The node selects mempool
-/// transactions, validates the coinbase total, computes the state root
-/// and mining midstate, and returns a ready-to-mine template.
+/// Mining is only available over the WebRTC light protocol
+/// (`LightRequest::BlockTemplate` on /midstate/light/2.0.0), which keeps
+/// mining coordination on the peer-to-peer path rather than the centralized
+/// HTTP gateway. The gateway remains fully functional for wallet operations
+/// (state, blocks, filters, mempool, commit, send, check).
 ///
-/// Returns 409 with `BlockTemplateMismatchError` if the coinbase total
-/// doesn't match `block_reward + mempool_fees`.
-pub async fn block_template(
-    State(node): State<AppState>,
-    Json(req): Json<BlockTemplateRequest>,
-) -> Result<Json<BlockTemplateResponse>, Response> {
-    match node.build_block_template(req).await {
-        Ok(resp) => Ok(Json(resp)),
-        Err(resp) => Err(resp),
-    }
+/// The template-building logic itself still lives in
+/// `crate::node::build_block_template_inner` and is used by the WebRTC path;
+/// only this HTTP entry point is removed.
+pub async fn block_template() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "Mining is only available over WebRTC. Request block templates via the libp2p light protocol (/midstate/light/2.0.0), not HTTP."
+        })),
+    ).into_response()
 }
 
 pub async fn get_chat(State(node): State<AppState>) -> Json<GetChatResponse> {

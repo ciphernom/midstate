@@ -342,43 +342,9 @@ impl NodeHandle {
     }
 
 
-    /// Build a block template for external miners.
-    ///
-    /// Clones the current state, applies valid mempool transactions,
-    /// validates the miner's coinbase, computes state_root and mining
-    /// midstate, and returns everything the miner needs to search nonces.
-    pub async fn build_block_template(
-    &self,
-    req: crate::rpc::types::BlockTemplateRequest,
-    ) -> Result<crate::rpc::types::BlockTemplateResponse, axum::response::Response> {
-        use axum::http::StatusCode;
-        use axum::Json;
-        use axum::response::IntoResponse;
-
-        // Take consistent snapshots of state and mempool, then drop the locks
-        // before any work — template construction is pure CPU and we don't want
-        // to hold the state lock across it.
-        let state       = self.state.read().await.clone();
-        let mempool_txs = self.mempool_txs.read().await.clone();
-
-        build_block_template_inner(&state, mempool_txs, &req).map_err(|e| match e {
-            BlockTemplateError::InvalidCoinbase(msg) => {
-                (StatusCode::BAD_REQUEST,
-                 Json(serde_json::json!({ "error": msg })))
-                    .into_response()
-            }
-            BlockTemplateError::CoinbaseTotalMismatch { expected_total, block_reward, total_fees } => {
-                (StatusCode::CONFLICT, Json(
-                    crate::rpc::types::BlockTemplateMismatchError {
-                        error: "Coinbase total mismatch".into(),
-                        expected_total,
-                        block_reward,
-                        total_fees,
-                    }
-                )).into_response()
-            }
-        })
-    }
+    // `build_block_template` (HTTP block-template entry point) removed: mining is
+    // WebRTC-only. Templates are built by `build_block_template_inner`, called
+    // from the WebRTC light handler (`LightRequest::BlockTemplate`).
 
     pub async fn get_peers(&self) -> Vec<String> {
         self.peer_addrs.read().await.clone()
@@ -394,11 +360,9 @@ impl NodeHandle {
             .map_err(|e| anyhow::anyhow!("Node is currently overloaded: {}", e))?;
         Ok(())
     }
-    pub fn submit_mined_block(&self, batch: crate::core::Batch) -> anyhow::Result<()> {
-        self.tx_sender.try_send(NodeCommand::SubmitMinedBlock(batch, None))
-            .map_err(|e| anyhow::anyhow!("Node is currently overloaded: {}", e))?;
-        Ok(())
-    }
+    // `submit_mined_block` (HTTP block-submission entry point) removed: external
+    // block submission is WebRTC-only and enqueues `NodeCommand::SubmitMinedBlock`
+    // directly from the light handler (`LightRequest::SubmitBatch`).
     
     /// Originate a chat from this node. Returns immediately after
     /// enqueueing; mining and broadcast happen asynchronously.
@@ -693,18 +657,15 @@ pub fn scan_txs_for_mss_index(txs: &[Transaction], master_pk: &[u8; 32]) -> u64 
 //  Block template assembly — single source of truth
 // ───────────────────────────────────────────────────────────────────────────
 //
-// Both the HTTP RPC (`NodeHandle::build_block_template`) and the WebRTC light
-// protocol (`LightRequest::BlockTemplate`) build mining templates from the
-// same chain state and mempool. They MUST produce byte-identical templates for
-// the same inputs — historically they drifted, and the WebRTC path silently
-// returned `post_tx_midstate` as `mining_midstate` while the HTTP path was
-// upgraded to return `compute_header_hash(&header)`. Every block mined by the
-// web wallet over WebRTC then failed verification on the node side.
-//
-// To prevent that recurring, all template assembly lives in
-// `build_block_template_inner` below. The two callers do their own state
-// acquisition (read-locking vs direct access) and map the typed error to
-// their respective response idioms (axum vs LightResponse).
+// Mining templates are built from chain state + mempool by
+// `build_block_template_inner` below. The only caller today is the WebRTC light
+// protocol (`LightRequest::BlockTemplate`); the HTTP entry point
+// (`NodeHandle::build_block_template`) was removed when mining became
+// WebRTC-only. Keeping one source of truth still matters: historically the HTTP
+// and WebRTC paths drifted — the WebRTC path returned `post_tx_midstate` as
+// `mining_midstate` while the HTTP path returned `compute_header_hash(&header)`,
+// so every block mined over WebRTC failed verification on the node side. Any
+// future caller MUST go through `build_block_template_inner` to stay identical.
 
 /// Error variants returned by `build_block_template_inner`. Both call sites
 /// translate these into their own response format.

@@ -1118,7 +1118,22 @@ if ('serviceWorker' in navigator) {
 
         // ─── Core Mining Lifecycle ──────────────────────────────────
 
+        // Mining is only available over a direct WebRTC connection to a full node.
+        // Over plain HTTPS the wallet is fully functional (balance, send/receive,
+        // chat, sync), but mining is disabled. `lightClient.isConnected` is the
+        // signal: when it is false, all RPC falls back to the HTTPS gateway.
+        function isWebRTCConnected() {
+            return !!(lightClient && lightClient.isConnected);
+        }
+
         async function startMining() {
+            if (!isWebRTCConnected()) {
+                log('Mining requires a direct WebRTC connection to a full node. Connect via a bootstrap multiaddr (Settings) to mine. Wallet functions work over HTTPS.', 'var(--red)');
+                showToast('Mining needs a WebRTC connection. The wallet works over HTTPS, but mining does not.', 'error');
+                isMiningActive = false;
+                setMiningUI(false, 0);
+                return;
+            }
             isMiningActive = true;
             miningSessionStart = Date.now();
             totalNoncesSession = 0;
@@ -1267,6 +1282,13 @@ if ('serviceWorker' in navigator) {
 
         function requestTemplate() {
             if (!isMiningActive) return;
+            // Mining is WebRTC-only. If the WebRTC link is down, skip this poll
+            // rather than fetching a template over HTTPS. LightClient auto-reconnects;
+            // polling resumes once the connection is back.
+            if (!isWebRTCConnected()) {
+                log('Waiting for WebRTC connection to fetch mining template…');
+                return;
+            }
             worker.postMessage({ type: 'GET_TEMPLATE' });
         }
 
@@ -1843,29 +1865,25 @@ if ('serviceWorker' in navigator) {
                         const resp = await lc.getBlockTemplate(params.coinbase);
                         result = { ok: resp.ok, status: resp.status ?? (resp.ok ? 200 : 500), body: resp.ok ? await resp.json() : await resp.text() };
                     } else {
-                        const r = await fetch(`${url}/block_template`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ coinbase: params.coinbase }) });
-                        result = { ok: r.ok, status: r.status, body: r.ok ? await r.json() : await r.text() };
+                        // Mining is WebRTC-only. The HTTPS gateway serves the wallet but
+                        // does not hand out mining templates. Without a WebRTC connection,
+                        // mining cannot proceed.
+                        result = { ok: false, status: 403, body: 'Mining is only available over WebRTC. Connect to a full node via a bootstrap multiaddr to mine.' };
                     }
 
                 } else if (method === 'submitBatch') {
-                    // Try light client first, fall back to HTTPS
-                    let submitted = false;
-                    if (lc) {
+                    // Mined-block submission is WebRTC-only. This is never sent over the
+                    // HTTPS gateway, so a block found while on HTTPS cannot be submitted.
+                    if (!lc) {
+                        result = { ok: false, body: 'Block submission is only available over WebRTC. Connect to a full node to submit mined blocks.' };
+                    } else {
                         try {
                             const resp = await lc.submitBatch(params.batch);
                             result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
-                            submitted = true;
                         } catch (e) {
-                            console.warn('[rpc] submitBatch via WebRTC failed, trying HTTPS:', e.message);
-                        }
-                    }
-                    if (!submitted) {
-                        try {
-                            const r = await fetch(`${url}/api/internal/submit_batch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params.batch) });
-                            result = { ok: r.ok, body: r.ok ? null : await r.text() };
-                        } catch (fetchErr) {
-                            console.warn('[rpc] HTTPS submitBatch failed:', fetchErr.message);
-                            // If both WebRTC and HTTPS fail, try to reconnect and retry once
+                            // WebRTC dropped mid-submit — try to reconnect over WebRTC and retry once.
+                            // There is deliberately no HTTPS fallback for mining.
+                            console.warn('[rpc] submitBatch via WebRTC failed, attempting WebRTC reconnect:', e.message);
                             if (lightClient && !lightClient.isConnected) {
                                 for (const addr of lightClient.knownMultiaddrs) {
                                     try { await lightClient.connectTo(addr); break; } catch(_) {}
@@ -1875,7 +1893,7 @@ if ('serviceWorker' in navigator) {
                                 const resp = await lightClient.submitBatch(params.batch);
                                 result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
                             } else {
-                                throw new Error(`Block submission failed: HTTPS rejected (${fetchErr.message}) and no WebRTC connection`);
+                                throw new Error('Block submission failed: WebRTC connection lost and mining does not fall back to HTTPS.');
                             }
                         }
                     }

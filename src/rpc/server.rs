@@ -120,7 +120,10 @@ impl RpcServer {
             .route("/metrics", get(get_metrics))
             .route("/scan", post(scan_addresses))
             .route("/mss_state", post(get_mss_state))
-            .route("/block_template", post(block_template))
+            // Mining is WebRTC-only: /block_template and /api/internal/submit_batch
+            // are intentionally NOT mounted. Templates and block submission are
+            // served exclusively over the libp2p light protocol
+            // (LightRequest::BlockTemplate / SubmitBatch on /midstate/light/2.0.0).
             .route("/mix/create", post(mix_create))
             .route("/mix/register", post(mix_register))
             .route("/mix/fee", post(mix_fee))
@@ -128,7 +131,6 @@ impl RpcServer {
             .route("/mix/status/:mix_id", get(mix_status))
             .route("/mix/list", get(mix_list))
             .nest("/axe", axe_routes) 
-            .route("/api/internal/submit_batch", post(submit_batch))
             .route("/tx/by_input", post(get_tx_by_input))
             .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB max request body
             .layer(TraceLayer::new_for_http())
