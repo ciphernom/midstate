@@ -23,6 +23,28 @@ const REQUEST_TIMEOUT_MS = 15_000;
 const RECONNECT_DELAY_MS = 3_000;
 const MAX_RECONNECT_ATTEMPTS = 5;
 
+// ── Load-balancing placement ────────────────────────────────────────────────
+// Spread light clients across full nodes instead of all dialing the first
+// bootstrap address. On startup we shuffle the candidate list (random
+// placement) and, if a node reports it's near its light-peer capacity, hop to
+// another — bounded by MAX_PLACEMENT_HOPS so we always connect quickly even
+// when every node is busy. Load is read from get_state (`light_load`, or
+// `light_connections`/`max_light_connections`); nodes that omit it are treated
+// as available, so this is a no-op against older nodes.
+const LIGHT_LOAD_SOFT_THRESHOLD = 0.85; // hop off nodes above 85% light-peer capacity
+const MAX_PLACEMENT_HOPS = 3;           // cap on nodes to probe before settling
+
+// Fisher–Yates shuffle (returns a new array). Used to randomize the order in
+// which candidate nodes are tried so clients don't all pile onto the first one.
+function shuffle(arr) {
+    const a = arr.slice();
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+}
+
 // ── WebRTC stream protobuf decoder ──────────────────────────────────────────
 // The js-libp2p WebRTC transport wraps application data in protobuf frames:
 //   [varint msg_len][protobuf Message]...
@@ -202,27 +224,121 @@ onPushEvent(cb) {
             }
         });
 
-        // Try connecting to the provided addresses in order
+        // Seed the candidate set, then place our connection load-aware across a
+        // SHUFFLED list rather than always dialing the first bootstrap address.
+        // See _placeConnection.
         if (addrs && addrs.length > 0) {
             for (const addr of addrs) {
                 this.knownMultiaddrs.add(addr);
             }
-            
-            let connected = false;
-            for (const addr of addrs) {
-                try {
-                    await this.connectTo(addr);
-                    connected = true;
-                    break; // Stop at the first successful connection
-                } catch (e) {
-                    console.warn('[light] Skipping unreachable peer:', addr);
-                }
-            }
-            
-            if (!connected) {
-                throw new Error("Could not connect to any WebRTC peers");
-            }
+            await this._placeConnection([...this.knownMultiaddrs]);
         }
+    }
+
+    // ── Load-aware placement ─────────────────────────────────────────────────
+    //
+    // Connect across a shuffled candidate set. If a node reports it's near its
+    // light-peer capacity (via get_state), drop it and try another — bounded by
+    // MAX_PLACEMENT_HOPS so startup stays fast even when every node is busy.
+    // The first reachable node and the least-loaded node seen are remembered, so
+    // heavy load can never leave us unconnected: if every sampled node is hot we
+    // reconnect to the lightest one. Nodes that don't advertise load are treated
+    // as available (no-op against older nodes).
+    async _placeConnection(candidatesIn) {
+        const candidates = shuffle(candidatesIn);
+        let firstReachable = null;
+        let lightestAddr = null;
+        let lightestLoad = Infinity;
+        let hops = 0;
+
+        for (const addr of candidates) {
+            if (hops >= MAX_PLACEMENT_HOPS) break;
+
+            try {
+                await this.connectTo(addr);
+            } catch (e) {
+                console.warn('[light] Skipping unreachable peer:', addr);
+                continue;
+            }
+
+            // peer:connect sets isConnected asynchronously — wait briefly for it.
+            await this._waitConnected(2500);
+            if (!this.isConnected) continue;
+
+            hops++;
+            if (!firstReachable) firstReachable = addr;
+
+            // Best-effort: read load + learn about more peers for failover.
+            let load = 0; // unknown / older node → treat as available
+            try {
+                const state = await this.getState();
+                if (state && Array.isArray(state.webrtc_addrs)) {
+                    for (const a of state.webrtc_addrs) this.knownMultiaddrs.add(a);
+                }
+                const r = this._loadRatio(state);
+                if (r !== null) load = r;
+            } catch (_) { /* couldn't read state; treat as available */ }
+
+            if (load < lightestLoad) { lightestLoad = load; lightestAddr = addr; }
+
+            // Comfortably loaded (or no load info) → settle here.
+            if (load < LIGHT_LOAD_SOFT_THRESHOLD) return true;
+
+            // Node is hot: drop it and try another. firstReachable / lightestAddr
+            // are remembered so we can always fall back.
+            console.log(`[light] ${addr} busy (${Math.round(load * 100)}% of light capacity); trying another node`);
+            await this._disconnectCurrent();
+        }
+
+        // Everything we sampled was busy (or we just dropped the last one).
+        // Reconnect to the least-loaded node we saw — never fail purely due to load.
+        if (this.isConnected) return true;
+        const target = lightestAddr || firstReachable;
+        if (target) {
+            try {
+                await this.connectTo(target);
+                await this._waitConnected(2500);
+            } catch (_) {}
+            if (this.isConnected) return true;
+        }
+        throw new Error('Could not connect to any WebRTC peers');
+    }
+
+    /// Poll until connected (peer:connect sets the flag) or timeout. Returns isConnected.
+    async _waitConnected(ms) {
+        const deadline = Date.now() + ms;
+        while (!this.isConnected && Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 50));
+        }
+        return this.isConnected;
+    }
+
+    /// Hang up the current peer WITHOUT triggering the reconnect scheduler.
+    /// We null connectedPeer first so the peer:disconnect handler's guard sees
+    /// no match and skips _scheduleReconnect — this is a deliberate hop during
+    /// placement, not a dropped connection.
+    async _disconnectCurrent() {
+        const peer = this.connectedPeer;
+        this.isConnected = false;
+        this.connectedPeer = null;
+        if (peer && this.node) {
+            try { await this.node.hangUp(peer); } catch (_) {}
+        }
+    }
+
+    /// Extract a light-peer load ratio in [0,1] from a get_state response,
+    /// or null if the node doesn't advertise load.
+    _loadRatio(state) {
+        if (!state) return null;
+        if (typeof state.light_load === 'number') {
+            return Math.max(0, Math.min(1, state.light_load));
+        }
+        if (typeof state.light_connections === 'number'
+            && typeof state.max_light_connections === 'number'
+            && state.max_light_connections > 0) {
+            return Math.max(0, Math.min(1, state.light_connections / state.max_light_connections));
+        }
+        return null;
     }
 
     /// Connect to a specific multiaddr with a 5-second timeout.
@@ -435,8 +551,9 @@ async request(req, _retries = 2) {
         console.log(`[light] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
 
         setTimeout(async () => {
-            // Try known multiaddrs in order
-            for (const addr of this.knownMultiaddrs) {
+            // Try known multiaddrs in RANDOM order so reconnecting clients spread
+            // across nodes instead of all reconnecting to the same one.
+            for (const addr of shuffle([...this.knownMultiaddrs])) {
                 try {
                     await this.connectTo(addr);
                     return; // Success — peer:connect event handles the rest

@@ -855,6 +855,11 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
 
                     let tx = self.light_tx.clone();
                     let guard = self.light_guard.clone();
+                    // Snapshot the current light-peer load. Only the network layer
+                    // knows the live count (light_peers lives here, not in the node's
+                    // get_state builder), so we use it to annotate the get_state
+                    // response below for load-aware client placement.
+                    let light_count = self.light_peers.len();
                     tokio::spawn(async move {
                         use light_protocol::{read_request_raw, write_response_raw, LightResponse};
                         let mut stream = stream;
@@ -897,6 +902,9 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                         tracing::debug!("Light request from {}: {:?}", peer, request);
 
                         // ── Send to node for processing ──
+                        // Capture this before `request` is moved into the channel, so
+                        // we can annotate the get_state response with live load below.
+                        let is_get_state = matches!(request, LightRequest::GetState);
                         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<LightResponse>();
                         if tx.send((peer, request, resp_tx)).is_err() {
                             guard.close_stream(peer).await;
@@ -904,7 +912,7 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                         }
 
                         // ── Await response with timeout ──
-                        let resp = match tokio::time::timeout(
+                        let mut resp = match tokio::time::timeout(
                             Duration::from_secs(LIGHT_RESPONSE_TIMEOUT_SECS),
                             resp_rx,
                         ).await {
@@ -915,6 +923,23 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                                 LightResponse::error("server timeout")
                             }
                         };
+
+                        // Annotate get_state with the current light-peer load so
+                        // wallets can spread across nodes (load-aware placement).
+                        // light_count is a snapshot taken when the stream was accepted;
+                        // a few seconds of staleness is fine for a placement hint.
+                        if is_get_state {
+                            if let Some(serde_json::Value::Object(ref mut map)) = resp.data {
+                                map.insert(
+                                    "light_connections".to_string(),
+                                    serde_json::json!(light_count),
+                                );
+                                map.insert(
+                                    "max_light_connections".to_string(),
+                                    serde_json::json!(MAX_LIGHT_PEERS),
+                                );
+                            }
+                        }
 
                         // ── Write response ──
                         if let Err(e) = write_response_raw(&mut stream, resp).await {
