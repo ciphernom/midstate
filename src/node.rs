@@ -692,11 +692,27 @@ pub enum BlockTemplateError {
 /// is `compute_header_hash(&candidate_header)`. This is the same input the
 /// consensus layer feeds to `verify_extension` (`state.rs ~472`), so a valid
 /// nonce here will validate on receipt.
-pub fn build_block_template_inner(
+/// The expensive, coinbase-INDEPENDENT part of template building: clone state,
+/// select mempool transactions, and apply them. The result is identical for
+/// every miner working on the same (tip, mempool), so it can be cached and
+/// shared across all of them (see `Node::cached_template_prefix`). The cheap,
+/// per-miner coinbase finish lives in `finish_template`.
+struct TemplatePrefix {
+    candidate: State,
+    transactions: Vec<Transaction>,
+    total_fees: u64,
+    height: u64,
+    target: [u8; 32],
+    prev_midstate: [u8; 32],
+    prev_header_hash: [u8; 32],
+    state_timestamp: u64,
+    v2: bool,
+}
+
+fn build_template_prefix(
     state: &State,
     mempool_txs: Vec<Transaction>,
-    req: &crate::rpc::types::BlockTemplateRequest,
-) -> Result<crate::rpc::types::BlockTemplateResponse, BlockTemplateError> {
+) -> TemplatePrefix {
     let mut candidate = state.clone();
     let v2 = crate::core::types::is_v2_at(candidate.height);
     let height = state.height;
@@ -825,6 +841,37 @@ pub fn build_block_template_inner(
         }
     }
 
+    TemplatePrefix {
+        candidate,
+        transactions,
+        total_fees,
+        height,
+        target,
+        prev_midstate,
+        prev_header_hash,
+        state_timestamp,
+        v2,
+    }
+}
+
+/// The cheap, per-miner finish: validate the coinbase, fold it into a CLONE of
+/// the cached candidate state, compute the state root, and produce the header
+/// hash the miner grinds on. Operates on a clone so the shared cached prefix is
+/// never mutated. The timestamp is taken fresh here, so a cached prefix never
+/// yields a stale block timestamp.
+fn finish_template(
+    prefix: &TemplatePrefix,
+    req: &crate::rpc::types::BlockTemplateRequest,
+) -> Result<crate::rpc::types::BlockTemplateResponse, BlockTemplateError> {
+    let mut candidate    = prefix.candidate.clone();
+    let v2               = prefix.v2;
+    let height           = prefix.height;
+    let target           = prefix.target;
+    let prev_midstate    = prefix.prev_midstate;
+    let prev_header_hash = prefix.prev_header_hash;
+    let state_timestamp  = prefix.state_timestamp;
+    let total_fees       = prefix.total_fees;
+
     // ── Coinbase validation ──────────────────────────────────────────────
 
     let reward = block_reward(height);
@@ -893,7 +940,7 @@ pub fn build_block_template_inner(
     let batch = Batch {
         prev_midstate,
         prev_header_hash,
-        transactions,
+        transactions: prefix.transactions.clone(),
         extension: Extension { nonce: 0, final_hash: [0u8; 32] },
         coinbase,
         timestamp: actual_timestamp,
@@ -909,6 +956,83 @@ pub fn build_block_template_inner(
         total_fees,
         block_reward: reward,
     })
+}
+
+/// Back-compat wrapper: build a full template in one call (prefix + finish).
+/// Used by tests and any non-cached caller. The hot path
+/// (`LightRequest::BlockTemplate`) instead caches the prefix via
+/// `Node::cached_template_prefix` and calls `finish_template` directly.
+pub fn build_block_template_inner(
+    state: &State,
+    mempool_txs: Vec<Transaction>,
+    req: &crate::rpc::types::BlockTemplateRequest,
+) -> Result<crate::rpc::types::BlockTemplateResponse, BlockTemplateError> {
+    let prefix = build_template_prefix(state, mempool_txs);
+    finish_template(&prefix, req)
+}
+
+// ── Template prefix cache ────────────────────────────────────────────────────
+//
+// Template building is the node's most expensive per-request operation, and now
+// that mining is WebRTC-only every miner polls `block_template` on an interval.
+// The coinbase-independent prefix is identical for all miners on the same
+// (tip, mempool), so we build it at most once per (height, header_hash, mempool
+// size) — bounded by a short TTL — and serve every polling miner from it. This
+// turns the build rate from O(miners x poll_rate) into roughly O(tip changes),
+// which is what lets a node carry many miners without melting.
+//
+// One Node runs per process, so a process-global cache is correct here. The key
+// includes the chain tip (height + header_hash), so a stale-tip template can
+// never be served; the TTL only bounds how fresh the mempool selection is (a few
+// seconds of missed fee txs at worst — never an invalid block, since timestamps
+// are recomputed in finish_template).
+const TEMPLATE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+struct CachedPrefix {
+    height: u64,
+    header_hash: [u8; 32],
+    mempool_len: usize,
+    built_at: std::time::Instant,
+    prefix: std::sync::Arc<TemplatePrefix>,
+}
+
+static TEMPLATE_PREFIX_CACHE: std::sync::Mutex<Option<CachedPrefix>> =
+    std::sync::Mutex::new(None);
+
+impl Node {
+    /// Return a shared template prefix for the current tip + mempool, building
+    /// (and caching) it only on a miss. Cheap Arc clone on a hit.
+    fn cached_template_prefix(&self) -> std::sync::Arc<TemplatePrefix> {
+        let height      = self.state.height;
+        let header_hash = self.state.header_hash;
+        let mempool_len = self.mempool.len();
+
+        {
+            let cache = TEMPLATE_PREFIX_CACHE.lock().unwrap();
+            if let Some(c) = cache.as_ref() {
+                if c.height == height
+                    && c.header_hash == header_hash
+                    && c.mempool_len == mempool_len
+                    && c.built_at.elapsed() < TEMPLATE_CACHE_TTL
+                {
+                    return c.prefix.clone();
+                }
+            }
+        } // release the lock before the (potentially heavy) build
+
+        let mempool_txs = self.mempool.transactions_cloned();
+        let prefix = std::sync::Arc::new(build_template_prefix(&self.state, mempool_txs));
+
+        let mut cache = TEMPLATE_PREFIX_CACHE.lock().unwrap();
+        *cache = Some(CachedPrefix {
+            height,
+            header_hash,
+            mempool_len,
+            built_at: std::time::Instant::now(),
+            prefix: prefix.clone(),
+        });
+        prefix
+    }
 }
 
 
@@ -1642,9 +1766,12 @@ async fn handle_light_request(
                     Err(e) => return LightResponse::error(format!("Invalid coinbase: {}", e)),
                 };
 
-                let mempool_txs = self.mempool.transactions_cloned();
+                // Use the shared, cached template prefix (built at most once per
+                // tip+mempool within the TTL) and only do the cheap per-miner
+                // coinbase finish here.
+                let prefix = self.cached_template_prefix();
 
-                match build_block_template_inner(&self.state, mempool_txs, &req) {
+                match finish_template(&prefix, &req) {
                     Ok(resp) => match serde_json::to_value(&resp) {
                         Ok(val) => LightResponse::success(val),
                         Err(e)  => LightResponse::error(format!("Serialization error: {}", e)),
