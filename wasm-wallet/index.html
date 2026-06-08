@@ -2448,15 +2448,15 @@ if ('serviceWorker' in navigator) {
                         renderChatDictionary();
                     }
                     if (payload.messages) {
-                        payload.messages.forEach(m => chatMessageMap.set(m.nonce, m));
-                        renderChatMessages(payload.messages, true); // true = overwrite
+                        const visibleMessages = payload.messages.filter(m => !(m.words && m.words[0] === 255));
+                        visibleMessages.forEach(m => chatMessageMap.set(m.nonce, m));
+                        renderChatMessages(visibleMessages, true); // true = overwrite
                     }
                     break;
 
                 case 'CHAT_MESSAGE':
                     if (payload.words && payload.words[0] === 255) {
-                        handleL2Chat(payload).catch(()=>{});
-                        return; 
+                        return; // Ignore L2 messages in the UI
                     }
                     chatMessageMap.set(payload.nonce, payload);
                     renderChatMessages([payload], false); // false = append

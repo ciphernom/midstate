@@ -770,7 +770,11 @@ self.onmessage = async (e) => {
         
         else if (type === 'PUSH_NEW_BLOCK') {
             if (payload.ChatMessage) {
-                self.postMessage({ type: 'CHAT_MESSAGE', payload: payload.ChatMessage });
+                if (payload.ChatMessage.words && payload.ChatMessage.words[0] === 255) {
+                    handleL2Chat(payload.ChatMessage).catch(()=>{});
+                } else {
+                    self.postMessage({ type: 'CHAT_MESSAGE', payload: payload.ChatMessage });
+                }
                 return;
             }
             const notif = payload.NewBlockTip;
@@ -1105,6 +1109,17 @@ else if (type === 'L2_OPEN_CHANNEL') {
         else if (type === 'GET_CHAT') {
             try {
                 const res = await rpc.getChat();
+                if (res.messages) {
+                    const normalMessages = [];
+                    for (const msg of res.messages) {
+                        if (msg.words && msg.words[0] === 255) {
+                            handleL2Chat(msg).catch(()=>{});
+                        } else {
+                            normalMessages.push(msg);
+                        }
+                    }
+                    res.messages = normalMessages;
+                }
                 self.postMessage({ type: 'CHAT_HISTORY', payload: res });
             } catch (e) {
                 self.postMessage({ type: 'ERROR', payload: `Chat sync failed: ${e}` });
