@@ -2167,8 +2167,7 @@ async function handleL2Chat(msg) {
             const destPkRaw = msg.attachments.find(a => a.kind === "address")?.value;
             const destPk = destPkRaw ? destPkRaw.substring(0, 64) : null;
             const newHtlc = htlcs[htlcs.length - 1]; // Assume latest added
-            const destPk = msg.attachments.find(a => a.kind === "address")?.value;
-            const newHtlc = htlcs[htlcs.length - 1]; // Assume latest added
+
             
             if (destPk) {
                 // WE ARE THE HUB. Forward to Dest.
