@@ -384,7 +384,7 @@ const rpc = {
     checkCoin:      (coin)       => rpcCall('checkCoin', { coinHex: coin }),
     sendChat:       (words, replyTo, attachments) => rpcCall('sendChat', { words, replyTo, attachments }),
     getChat:        ()           => rpcCall('getChat'),
-    submitChat:     (sender, timestamp, nonce, replyTo, attachments) => rpcCall('submitChat', { sender, timestamp, nonce, replyTo, attachments }),
+    submitChat:     (sender, timestamp, nonce, replyTo, words, attachments) => rpcCall('submitChat', { sender, timestamp, nonce, replyTo, words, attachments }),
     
     /**
      * Get a block template for solo mining.
@@ -413,15 +413,15 @@ async function submitClientMinedChat(words, replyTo, attachments) {
     await new Promise(r => setTimeout(r, 10)); // Yield to UI
     
     const nonce = Number(mine_chat_pow_v2_wasm(
-        sender,
-        BigInt(timestamp),
-        JSON.stringify(replyTo !== undefined ? replyTo : null),
-        JSON.stringify(words),
-        JSON.stringify(attachments)
-    ));
-    
-    return await rpc.submitChat(sender, timestamp, nonce, replyTo, attachments);
-}
+            sender,
+            BigInt(timestamp),
+            JSON.stringify(replyTo !== undefined ? replyTo : null),
+            JSON.stringify(words),
+            JSON.stringify(attachments)
+        ));
+        
+        return await rpc.submitChat(sender, timestamp, nonce, replyTo, words, attachments);
+    }
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Hex / Crypto Utilities
 // ═══════════════════════════════════════════════════════════════════════════════

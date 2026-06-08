@@ -2019,7 +2019,7 @@ if ('serviceWorker' in navigator) {
                 } else if (method === 'submitChat') {
                     const attachments = params.attachments || [];
                     if (lc) {
-                        const resp = await lc.submitChat(params.sender, params.timestamp, params.nonce, params.replyTo, attachments);
+                        const resp = await lc.submitChat(params.sender, params.timestamp, params.nonce, params.replyTo, params.words, attachments);
                         result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
                     } else {
                         const r = await fetch(`${url}/api/chat/submit`, {
@@ -2030,11 +2030,12 @@ if ('serviceWorker' in navigator) {
                                 timestamp: params.timestamp,
                                 nonce: params.nonce,
                                 reply_to: params.replyTo,
+                                words: params.words,
                                 attachments,
                             }),
                         });
                         result = { ok: r.ok, body: r.ok ? null : await r.text() };
-                    }    
+                    }
                     
                     
                 } else if (method === 'getChat') {
