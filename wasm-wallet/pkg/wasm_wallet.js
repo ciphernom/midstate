@@ -765,10 +765,10 @@ export class WebWallet {
      *
      * # Formal Specification
      * ```text
-     * Pre:  mss_address_hex ∈ dom(self.mss_cache)
+     * Pre:  ∃ kp ∈ self.mss_cache.values() s.t. kp.master_pk == mss_pk_hex
      *       commitment_hex is a valid 64-character hex string (32 bytes)
-     *       self.mss_cache[mss_address_hex].remaining() > 0
-     * Post: self.mss_cache[mss_address_hex].next_leaf' = self.mss_cache[mss_address_hex].next_leaf + 1
+     *       kp.remaining() > 0
+     * Post: kp.next_leaf' = kp.next_leaf + 1
      *       result is Ok(signature_hex)
      * ```
      *
@@ -776,25 +776,27 @@ export class WebWallet {
      *     SignMssHex
      *     ----------
      *     ΔWebWallet
-     *     mss_address_hex? : String
+     *     mss_pk_hex? : String
      *     commitment_hex? : String
      *     sig! : String
      *
-     *     pre  mss_address_hex? ∈ dom(mss_cache)
-     *     pre  mss_cache(mss_address_hex?).next_leaf < 2^{height}
-     *     post mss_cache'(mss_address_hex?).next_leaf = mss_cache(mss_address_hex?).next_leaf + 1
-     *     post sig! = hex(sign(mss_cache(mss_address_hex?).master_seed, commitment))
+     *     let kp == (μ k ∈ ran(mss_cache) | hex(k.master_pk) = mss_pk_hex?)
+     *
+     *     pre  kp exists
+     *     pre  kp.next_leaf < 2^{kp.height}
+     *     post kp'.next_leaf = kp.next_leaf + 1
+     *     post sig! = hex(sign(kp.master_seed, commitment))
      * ```
-     * @param {string} mss_address_hex
+     * @param {string} mss_pk_hex
      * @param {string} commitment_hex
      * @returns {string}
      */
-    sign_mss_hex(mss_address_hex, commitment_hex) {
+    sign_mss_hex(mss_pk_hex, commitment_hex) {
         let deferred4_0;
         let deferred4_1;
         try {
             const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            const ptr0 = passStringToWasm0(mss_address_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const ptr0 = passStringToWasm0(mss_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
             const len0 = WASM_VECTOR_LEN;
             const ptr1 = passStringToWasm0(commitment_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
             const len1 = WASM_VECTOR_LEN;

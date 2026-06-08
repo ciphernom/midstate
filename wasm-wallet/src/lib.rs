@@ -1525,10 +1525,10 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
     ///
     /// # Formal Specification
     /// ```text
-    /// Pre:  mss_address_hex ∈ dom(self.mss_cache)
+    /// Pre:  ∃ kp ∈ self.mss_cache.values() s.t. kp.master_pk == mss_pk_hex
     ///       commitment_hex is a valid 64-character hex string (32 bytes)
-    ///       self.mss_cache[mss_address_hex].remaining() > 0
-    /// Post: self.mss_cache[mss_address_hex].next_leaf' = self.mss_cache[mss_address_hex].next_leaf + 1
+    ///       kp.remaining() > 0
+    /// Post: kp.next_leaf' = kp.next_leaf + 1
     ///       result is Ok(signature_hex)
     /// ```
     ///
@@ -1536,22 +1536,29 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
     ///     SignMssHex
     ///     ----------
     ///     ΔWebWallet
-    ///     mss_address_hex? : String
+    ///     mss_pk_hex? : String
     ///     commitment_hex? : String
     ///     sig! : String
     ///
-    ///     pre  mss_address_hex? ∈ dom(mss_cache)
-    ///     pre  mss_cache(mss_address_hex?).next_leaf < 2^{height}
-    ///     post mss_cache'(mss_address_hex?).next_leaf = mss_cache(mss_address_hex?).next_leaf + 1
-    ///     post sig! = hex(sign(mss_cache(mss_address_hex?).master_seed, commitment))
+    ///     let kp == (μ k ∈ ran(mss_cache) | hex(k.master_pk) = mss_pk_hex?)
+    ///
+    ///     pre  kp exists
+    ///     pre  kp.next_leaf < 2^{kp.height}
+    ///     post kp'.next_leaf = kp.next_leaf + 1
+    ///     post sig! = hex(sign(kp.master_seed, commitment))
     /// ```
     #[wasm_bindgen]
-    pub fn sign_mss_hex(&mut self, mss_address_hex: &str, commitment_hex: &str) -> Result<String, JsValue> {
+    pub fn sign_mss_hex(&mut self, mss_pk_hex: &str, commitment_hex: &str) -> Result<String, JsValue> {
         let mut commitment = [0u8; 32];
         hex::decode_to_slice(commitment_hex, &mut commitment)
             .map_err(|_| JsValue::from_str("Invalid commitment hex"))?;
 
-        let kp = self.mss_cache.get_mut(mss_address_hex)
+        let mut pk = [0u8; 32];
+        hex::decode_to_slice(mss_pk_hex, &mut pk)
+            .map_err(|_| JsValue::from_str("Invalid PK hex"))?;
+
+        let kp = self.mss_cache.values_mut()
+            .find(|k| k.master_pk == pk)
             .ok_or_else(|| JsValue::from_str("MSS tree not found in cache. Run Network Sync."))?;
 
         if kp.remaining() == 0 {
