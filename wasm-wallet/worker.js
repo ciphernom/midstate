@@ -1739,7 +1739,10 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0)
     } catch (e) {
         throw new Error(`Failed to prepare transaction: ${e.toString()}`);
     }
-// Intercept L2 Open Intents
+
+    const ctx = JSON.parse(spendContextStr);
+
+    // Intercept L2 Open Intents
     if (pendingChannelOpen) {
         const outObj = ctx.outputs.find(o => o.address === pendingChannelOpen.channelAddr);
         if (outObj) {
@@ -1747,7 +1750,6 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0)
             pendingChannelOpen.channelCoinId = compute_coin_id_hex(outObj.address, BigInt(outObj.value), outObj.salt);
         }
     }
-    const ctx = JSON.parse(spendContextStr);
 
     pendingSends.push({ kind: 'pending', timestamp: Math.floor(Date.now() / 1000), fee: ctx.fee, inputs: ctx.selected_inputs.map(i => i.coin_id), outputs: [], value: Number(amount) });
     self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
