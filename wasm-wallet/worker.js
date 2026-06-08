@@ -413,15 +413,17 @@ async function submitClientMinedChat(words, replyTo, attachments) {
     await new Promise(r => setTimeout(r, 10)); // Yield to UI
     
     const nonce = Number(mine_chat_pow_v2_wasm(
-            sender,
-            BigInt(timestamp),
-            JSON.stringify(replyTo !== undefined ? replyTo : null),
-            JSON.stringify(words),
-            JSON.stringify(attachments)
-        ));
-        
-        return await rpc.submitChat(sender, timestamp, nonce, replyTo, words, attachments);
-    }
+        sender,
+        BigInt(timestamp),
+        JSON.stringify(replyTo !== undefined ? replyTo : null),
+        JSON.stringify(words),
+        JSON.stringify(attachments)
+    ));
+    
+    // Fixed: Passing 'words' correctly to the RPC bridge!
+    return await rpc.submitChat(sender, timestamp, nonce, replyTo, words, attachments);
+}
+    
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Hex / Crypto Utilities
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -941,7 +943,7 @@ else if (type === 'L2_OPEN_CHANNEL') {
             submitClientMinedChat([255, 100], null, [
                 { kind: "coin_id", value: channelId },
                 { kind: "address", value: myPk }, 
-                { kind: "data_hash", value: channel.channel_salt }
+                { kind: "midstate", value: channel.channel_salt }
             ]).catch(()=>{});
             
             // 2. If we have a pending UPDATE that the peer missed, resend it after a short delay
@@ -1857,7 +1859,7 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0)
         submitClientMinedChat([255, 100], null, [
             { kind: "coin_id", value: pendingChannelOpen.channelCoinId },
             { kind: "address", value: myPk }, 
-            { kind: "data_hash", value: pendingChannelOpen.channelSalt }
+            { kind: "midstate", value: pendingChannelOpen.channelSalt }
         ]).catch(()=>{});
         
         pendingChannelOpen = null;
@@ -2109,7 +2111,8 @@ async function handleL2Chat(msg) {
     if (cmd === 100) { // OPEN
         const coinId = msg.attachments.find(a => a.kind === "coin_id")?.value;
         const peerPkRaw = msg.attachments.find(a => a.kind === "address")?.value;
-        const sigAtt = msg.attachments.find(a => a.kind === "data_hash")?.value; 
+        const sigAtt = msg.attachments.find(a => a.kind === "midstate")?.value;
+
         if (!coinId || !peerPkRaw || !sigAtt) return;
 
         // Strip the 8-character checksum the node adds to address attachments
@@ -2213,12 +2216,14 @@ async function handleL2Chat(msg) {
                     channel.latest_state = { nonce: cNonce, alice_amt: nA, bob_amt: nB, htlcs: cHtlcs, alice_sig: channel.is_alice ? cSig : null, bob_sig: channel.is_alice ? null : cSig, is_fully_signed: false };
                     
                     const cBin = packChannelState(cNonce, nA, nB, cHtlcs, cSig);
-                    submitClientMinedChat([255, 43], null, [{ kind: "coin_id", value: coinId }, { kind: "signature", value: normalizeHex(cBin) }, { kind: "data_hash", value: secret }]).catch(()=>{});
+                    submitClientMinedChat([255, 43], null, [{ kind: "coin_id", value: coinId }, { kind: "signature", value: normalizeHex(cBin) }, { kind: "midstate", value: secret }]).catch(()=>{});
+
                 }
             }
         }
         else if (cmd === 43) { // CLAIM_HTLC received
-            const secret = msg.attachments.find(a => a.kind === "data_hash")?.value;
+            const secret = msg.attachments.find(a => a.kind === "midstate")?.value;
+
             if (secret) {
                 const secretHash = blake3_hash_hex(secret);
                 // We are HUB. Pull funds from original sender.
@@ -2237,7 +2242,8 @@ async function handleL2Chat(msg) {
                         pC.latest_state = { nonce: pNonce, alice_amt: pA, bob_amt: pB, htlcs: pHtlcs, alice_sig: pC.is_alice ? pSig : null, bob_sig: pC.is_alice ? null : pSig, is_fully_signed: false };
                         
                         const pBin = packChannelState(pNonce, pA, pB, pHtlcs, pSig);
-                        submitClientMinedChat([255, 43], null, [{ kind: "coin_id", value: route.fromCoinId }, { kind: "signature", value: normalizeHex(pBin) }, { kind: "data_hash", value: secret }]).catch(()=>{});
+                        submitClientMinedChat([255, 43], null, [{ kind: "coin_id", value: route.fromCoinId }, { kind: "signature", value: normalizeHex(pBin) }, { kind: "midstate", value: secret }]).catch(()=>{});
+
                     }
                 }
             }
