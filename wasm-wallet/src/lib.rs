@@ -1054,6 +1054,11 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
         self.mss_cache.contains_key(address_hex)
     }
 
+    #[wasm_bindgen]
+    pub fn get_mss_pubkey(&self, address_hex: &str) -> Option<String> {
+        self.mss_cache.get(address_hex).map(|kp| hex::encode(kp.master_pk))
+    }
+
     /// Update the next-leaf counter for an MSS tree.
     ///
     /// Called by the JS layer after loading wallet state to synchronize

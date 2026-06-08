@@ -143,6 +143,13 @@ let wState = {
     l2_routes: {}    // Stores multi-hop routing map for Hubs
 };
 
+function getPrimaryMssPk() {
+    if (!wallet) return null;
+    const mssList = Object.keys(wState.mssAddrs);
+    if (mssList.length === 0) return null;
+    return wallet.get_mss_pubkey(mssList[mssList.length - 1]);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  IndexedDB: Full MSS Tree Storage
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -399,7 +406,7 @@ const rpc = {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function submitClientMinedChat(words, replyTo, attachments) {
-    const sender = (wallet && wallet.primary_mss_pk()) || "0000000000000000000000000000000000000000000000000000000000000000";
+    const sender = getPrimaryMssPk() || "0000000000000000000000000000000000000000000000000000000000000000";
     const timestamp = Math.floor(Date.now() / 1000);
     
     self.postMessage({ type: 'LOG', payload: "Mining PoW locally for state update..." });
@@ -522,6 +529,11 @@ async function loadState(pwd, bundleStr) {
         const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
         const loadedState = JSON.parse(new TextDecoder().decode(decrypted));
         wState = loadedState;
+
+        // Ensure L2 structures exist for upgraded wallets
+        wState.l2_channels = wState.l2_channels || {};
+        wState.l2_secrets = wState.l2_secrets || {};
+        wState.l2_routes = wState.l2_routes || {};
 
         // Migrate legacy array-format UTXOs to map format
         if (Array.isArray(wState.utxos)) {
@@ -811,7 +823,8 @@ self.onmessage = async (e) => {
                 phrase: payload.phrase,
                 nextWotsIndex: 0, nextMssIndex: 0,
                 wotsAddrs: {}, mssAddrs: {}, utxos: {}, history: [],
-                lastScannedHeight: 0
+                lastScannedHeight: 0,
+                l2_channels: {}, l2_secrets: {}, l2_routes: {}
             };
             wallet = new WebWallet(payload.phrase);
             mssCachesReady = false;
@@ -863,7 +876,7 @@ self.onmessage = async (e) => {
 else if (type === 'L2_OPEN_CHANNEL') {
             if (isSending) throw new Error("Wallet busy.");
             const { peerPk, amount } = payload;
-            const myPk = wallet.primary_mss_pk();
+            const myPk = getPrimaryMssPk();
             if (!myPk) throw new Error("Network Sync required first to initialize your MSS L2 identity.");
             
             let aPk, bPk, isAlice;
@@ -941,7 +954,7 @@ else if (type === 'L2_OPEN_CHANNEL') {
             wState.l2_secrets[secretHash] = secretHex;
             await saveState();
             
-            const myPk = wallet.primary_mss_pk();
+            const myPk = getPrimaryMssPk();
             const invoice = `l2inv:${myPk}:${secretHash}:${amount}`;
             self.postMessage({ type: 'L2_INVOICE_CREATED', payload: invoice });
         }
@@ -1161,7 +1174,8 @@ else if (type === 'L2_OPEN_CHANNEL') {
                     nextMssIndex:  cliData.next_mss_index  || 0,
                     wotsAddrs: {}, mssAddrs: newMssAddrs, utxos: newUtxos,
                     history: cliData.history || [],
-                    lastScannedHeight: cliData.last_scan_height || 0
+                    lastScannedHeight: cliData.last_scan_height || 0,
+                    l2_channels: {}, l2_secrets: {}, l2_routes: {}
                 };
                 wallet   = WebWallet.from_seed_hex(normalizeHex(cliData.master_seed));
                 password = payload.password;
@@ -2066,7 +2080,7 @@ async function handleL2Chat(msg) {
         const coinData = await rpc.checkCoin(coinId);
         if (!coinData || !coinData.exists) return; 
         
-        const myPk = wallet.primary_mss_pk();
+        const myPk = getPrimaryMssPk();
         if (!myPk) return;
         
         let aPk, bPk, isAlice;

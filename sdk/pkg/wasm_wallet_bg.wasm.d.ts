@@ -24,6 +24,7 @@ export const webwallet_check_filter: (a: number, b: number, c: number, d: number
 export const webwallet_export_mss_bytes: (a: number, b: number, c: number, d: number) => void;
 export const webwallet_from_seed_hex: (a: number, b: number, c: number) => void;
 export const webwallet_get_mss_address: (a: number, b: number, c: number, d: number, e: number) => void;
+export const webwallet_get_mss_pubkey: (a: number, b: number, c: number, d: number) => void;
 export const webwallet_get_wots_address: (a: number, b: number, c: number) => void;
 export const webwallet_has_mss_cache: (a: number, b: number, c: number) => number;
 export const webwallet_import_mss_bytes: (a: number, b: number, c: number, d: number, e: number, f: number) => void;

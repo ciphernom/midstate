@@ -165,6 +165,7 @@ export class WebWallet {
      * Returns `Err` if height is 0 or exceeds `MAX_HEIGHT` (20).
      */
     get_mss_address(index: number, height: number, progress_cb?: Function | null): string;
+    get_mss_pubkey(address_hex: string): string | undefined;
     /**
      * Derive the WOTS address at a given HD index.
      *
@@ -500,6 +501,7 @@ export interface InitOutput {
     readonly webwallet_export_mss_bytes: (a: number, b: number, c: number, d: number) => void;
     readonly webwallet_from_seed_hex: (a: number, b: number, c: number) => void;
     readonly webwallet_get_mss_address: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly webwallet_get_mss_pubkey: (a: number, b: number, c: number, d: number) => void;
     readonly webwallet_get_wots_address: (a: number, b: number, c: number) => void;
     readonly webwallet_has_mss_cache: (a: number, b: number, c: number) => number;
     readonly webwallet_import_mss_bytes: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
