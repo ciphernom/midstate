@@ -930,6 +930,38 @@ else if (type === 'L2_OPEN_CHANNEL') {
             ]).catch(()=>{});
             self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
         }
+        else if (type === 'L2_SYNC') {
+            const { channelId } = payload;
+            const channel = wState.l2_channels[channelId];
+            if (!channel) return;
+            
+            const myPk = getPrimaryMssPk();
+            
+            // 1. Resend OPEN message
+            submitClientMinedChat([255, 100], null, [
+                { kind: "coin_id", value: channelId },
+                { kind: "address", value: myPk }, 
+                { kind: "data_hash", value: channel.channel_salt }
+            ]).catch(()=>{});
+            
+            // 2. If we have a pending UPDATE that the peer missed, resend it after a short delay
+            if (channel.latest_state.nonce > 0 && !channel.latest_state.is_fully_signed) {
+                const binPayload = packChannelState(
+                    channel.latest_state.nonce, 
+                    channel.latest_state.alice_amt, 
+                    channel.latest_state.bob_amt, 
+                    channel.latest_state.htlcs || [], 
+                    channel.is_alice ? channel.latest_state.alice_sig : channel.latest_state.bob_sig
+                );
+                
+                setTimeout(() => {
+                    submitClientMinedChat([255, 40], null, [
+                        { kind: "coin_id", value: channelId },
+                        { kind: "signature", value: normalizeHex(binPayload) }
+                    ]).catch(()=>{});
+                }, 2000);
+            }
+        }
         else if (type === 'L2_CLOSE') {
             const { channelId } = payload;
             const channel = wState.l2_channels[channelId];
@@ -2076,23 +2108,25 @@ async function handleL2Chat(msg) {
     
     if (cmd === 100) { // OPEN
         const coinId = msg.attachments.find(a => a.kind === "coin_id")?.value;
-        const peerPk = msg.attachments.find(a => a.kind === "address")?.value;
+        const peerPkRaw = msg.attachments.find(a => a.kind === "address")?.value;
         const sigAtt = msg.attachments.find(a => a.kind === "data_hash")?.value; 
-        if (!coinId || !peerPk || !sigAtt) return;
+        if (!coinId || !peerPkRaw || !sigAtt) return;
 
-        // Removed rpc.checkCoin to prevent P2P WebRTC vs Block propagation race conditions!
-        // An unsynced channel stored in memory with 0 balance is harmless. It naturally 
-        // syncs real capacity on the first fully signed UPDATE transaction.
+        // Strip the 8-character checksum the node adds to address attachments
+        const peerPk = peerPkRaw.substring(0, 64);
         
         const myPk = getPrimaryMssPk();
         if (!myPk) return;
         
         let aPk, bPk, isAlice;
-        if (peerPk < myPk) { aPk = peerPk; bPk = myPk; isAlice = false; }
-        else { aPk = myPk; bPk = peerPk; isAlice = true; } // FIXED: Node B is Alice if their PK is smaller
+        if (peerPk < myPk) { 
+            aPk = peerPk; bPk = myPk; isAlice = false; // Peer is smaller, Peer is Alice
+        } else { 
+            aPk = myPk; bPk = peerPk; isAlice = true;  // I am smaller, I am Alice
+        }
 
         wState.l2_channels = wState.l2_channels || {};
-        if (wState.l2_channels[coinId]) return; // Ignore duplicate network broadcasts
+        if (wState.l2_channels[coinId]) return;
 
         wState.l2_channels[coinId] = {
             alice_pk: aPk, bob_pk: bPk, channel_value: 0, channel_salt: sigAtt,
@@ -2115,7 +2149,14 @@ async function handleL2Chat(msg) {
 
         if (nonce <= channel.latest_state.nonce && channel.latest_state.is_fully_signed) return;
 
-        const stateJson = build_channel_state(coinId, channel.alice_pk, channel.bob_pk, BigInt(aliceAmt), BigInt(bobAmt), nonce, JSON.stringify(htlcs));
+        let stateJson;
+        try {
+            stateJson = build_channel_state(coinId, channel.alice_pk, channel.bob_pk, BigInt(aliceAmt), BigInt(bobAmt), nonce, JSON.stringify(htlcs));
+        } catch (e) {
+            console.error("WASM build_channel_state failed:", e);
+            return;
+        }
+        
         const parsedState = JSON.parse(stateJson);
         const counterpartyPk = channel.is_alice ? channel.bob_pk : channel.alice_pk;
         
@@ -2123,6 +2164,9 @@ async function handleL2Chat(msg) {
 
         // ── ROUTING LOGIC ──
         if (cmd === 42) { // ADD_HTLC received
+            const destPkRaw = msg.attachments.find(a => a.kind === "address")?.value;
+            const destPk = destPkRaw ? destPkRaw.substring(0, 64) : null;
+            const newHtlc = htlcs[htlcs.length - 1]; // Assume latest added
             const destPk = msg.attachments.find(a => a.kind === "address")?.value;
             const newHtlc = htlcs[htlcs.length - 1]; // Assume latest added
             

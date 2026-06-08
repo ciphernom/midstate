@@ -2266,6 +2266,7 @@ if ('serviceWorker' in navigator) {
                                 </div>
                                 <div style="display: flex; gap: 8px;">
                                     <button onclick="l2Pay('${c.id}')" style="margin:0; padding: 8px; font-size: 11px; background: transparent; border-color: var(--accent); color: var(--accent); flex: 1;">Send Payment</button>
+                                    <button onclick="l2Sync('${c.id}')" style="margin:0; padding: 8px; font-size: 11px; background: transparent; border-color: var(--text-bright); color: var(--text-bright); flex: 1;">Sync Peer</button>
                                     <button onclick="l2Close('${c.id}')" style="margin:0; padding: 8px; font-size: 11px; background: transparent; border-color: var(--red); color: var(--red); flex: 1;" ${!fullySigned ? 'disabled' : ''}>Settle On-Chain</button>
                                 </div>
                             </div>`;
@@ -2656,6 +2657,11 @@ if ('serviceWorker' in navigator) {
                 worker.postMessage({ type: 'L2_CLOSE', payload: { channelId } });
                 switchTab('view-home');
             }
+        };
+
+        window.l2Sync = function(channelId) {
+            worker.postMessage({ type: 'L2_SYNC', payload: { channelId } });
+            showToast("Sync request sent to peer.", "success");
         };
         document.getElementById('btnSend').onclick = (e) => {
             const toAddress = document.getElementById('sendAddress').value;
