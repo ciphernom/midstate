@@ -1821,9 +1821,10 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0)
         };
         await saveState();
         
+        const myPk = getPrimaryMssPk();
         submitClientMinedChat([255, 100], null, [
             { kind: "coin_id", value: pendingChannelOpen.channelCoinId },
-            { kind: "address", value: pendingChannelOpen.alicePk }, 
+            { kind: "address", value: myPk }, 
             { kind: "data_hash", value: pendingChannelOpen.channelSalt }
         ]).catch(()=>{});
         
@@ -2079,23 +2080,27 @@ async function handleL2Chat(msg) {
         const sigAtt = msg.attachments.find(a => a.kind === "data_hash")?.value; 
         if (!coinId || !peerPk || !sigAtt) return;
 
-        const coinData = await rpc.checkCoin(coinId);
-        if (!coinData || !coinData.exists) return; 
+        // Removed rpc.checkCoin to prevent P2P WebRTC vs Block propagation race conditions!
+        // An unsynced channel stored in memory with 0 balance is harmless. It naturally 
+        // syncs real capacity on the first fully signed UPDATE transaction.
         
         const myPk = getPrimaryMssPk();
         if (!myPk) return;
         
         let aPk, bPk, isAlice;
         if (peerPk < myPk) { aPk = peerPk; bPk = myPk; isAlice = false; }
-        else { aPk = myPk; bPk = peerPk; isAlice = false; }
+        else { aPk = myPk; bPk = peerPk; isAlice = true; } // FIXED: Node B is Alice if their PK is smaller
 
         wState.l2_channels = wState.l2_channels || {};
+        if (wState.l2_channels[coinId]) return; // Ignore duplicate network broadcasts
+
         wState.l2_channels[coinId] = {
             alice_pk: aPk, bob_pk: bPk, channel_value: 0, channel_salt: sigAtt,
             is_alice: isAlice,
             latest_state: { nonce: 0, alice_amt: 0, bob_amt: 0, htlcs: [], alice_sig: null, bob_sig: null, is_fully_signed: false }
         };
         await saveState();
+        self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
     }
     else if (cmd === 40 || cmd === 41 || cmd === 42 || cmd === 43) { 
         // 40=UPDATE, 41=CONFIRM, 42=ADD_HTLC, 43=CLAIM_HTLC
