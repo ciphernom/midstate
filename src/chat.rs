@@ -151,6 +151,15 @@ pub enum ChatAttachment {
         height: u64,
         salt: [u8; 32],
     },
+        /// A cryptographic signature (WOTS or MSS) for Layer 2 payment channels.
+    /// Enables the ephemeral chat protocol to act as a Lightning Network gossip overlay.
+    /// 
+    /// # Formal Specification
+    /// ```text
+    /// Pre:  payload.len() <= MAX_SIGNATURE_SIZE (1536 bytes)
+    /// Post: payload is transmitted verbatim over the P2P chat network
+    /// ```
+    Signature(Vec<u8>),
 }
 
 impl ChatAttachment {
@@ -166,6 +175,7 @@ impl ChatAttachment {
             ChatAttachment::Midstate(b) => Some(b.as_slice()),
             ChatAttachment::DataHash(b) => Some(b.as_slice()),
             ChatAttachment::LicenseChallenge { .. } => None,
+            ChatAttachment::Signature(_) => None,
         };
         
         match bytes {
@@ -193,6 +203,7 @@ impl serde::Serialize for ChatAttachment {
                 Midstate(String),
                 DataHash(String),
                 LicenseChallenge { commitment: String, height: u64, salt: String },
+                Signature(String), 
             }
 
             let helper = match self {
@@ -210,6 +221,7 @@ impl serde::Serialize for ChatAttachment {
                         salt: hex::encode(salt),
                     }
                 }
+                ChatAttachment::Signature(sig) => JsonHelper::Signature(hex::encode(sig)),
             };
             helper.serialize(serializer)
         } else {
@@ -224,6 +236,7 @@ impl serde::Serialize for ChatAttachment {
                 Midstate(&'a [u8; 32]),
                 DataHash(&'a [u8; 32]),
                 LicenseChallenge { commitment: &'a [u8; 32], height: u64, salt: &'a [u8; 32] },
+                Signature(&'a [u8]),
             }
             let helper = match self {
                 ChatAttachment::Address(addr) => BincodeHelper::Address(addr),
@@ -236,6 +249,7 @@ impl serde::Serialize for ChatAttachment {
                 ChatAttachment::LicenseChallenge { commitment: _, height, salt } => {
                     BincodeHelper::LicenseChallenge { commitment: &[0u8; 32], height: *height, salt }
                 }
+                ChatAttachment::Signature(sig) => BincodeHelper::Signature(sig.as_slice()), 
             };
             helper.serialize(serializer)
         }
@@ -256,6 +270,7 @@ impl<'de> serde::Deserialize<'de> for ChatAttachment {
                 Midstate(String),
                 DataHash(String),
                 LicenseChallenge { commitment: String, height: u64, salt: String },
+                Signature(String), 
             }
 
             let helper = JsonHelper::deserialize(deserializer)?;
@@ -282,6 +297,10 @@ impl<'de> serde::Deserialize<'de> for ChatAttachment {
                     let salt_bytes = parse_32(&salt)?;
                     Ok(ChatAttachment::LicenseChallenge { commitment: commitment_bytes, height, salt: salt_bytes })
                 }
+                JsonHelper::Signature(s) => {
+                    let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
+                    Ok(ChatAttachment::Signature(bytes))
+                }
            }
     
         } else {
@@ -296,6 +315,7 @@ impl<'de> serde::Deserialize<'de> for ChatAttachment {
                 Midstate([u8; 32]),
                 DataHash([u8; 32]),
                 LicenseChallenge { commitment: [u8; 32], height: u64, salt: [u8; 32] },
+                Signature(Vec<u8>),
             }
             let helper = BincodeHelper::deserialize(deserializer)?;
             match helper {
@@ -309,6 +329,7 @@ impl<'de> serde::Deserialize<'de> for ChatAttachment {
                 BincodeHelper::LicenseChallenge { commitment, height, salt } => {
                     Ok(ChatAttachment::LicenseChallenge { commitment, height, salt })
                 }
+                BincodeHelper::Signature(sig) => Ok(ChatAttachment::Signature(sig)), 
             }
         }
     }
@@ -490,6 +511,12 @@ pub fn verify_chat_pow_v2(
                 data.extend_from_slice(commitment);
                 data.extend_from_slice(&height.to_le_bytes());
                 data.extend_from_slice(salt);
+            }
+            ChatAttachment::Signature(sig) => {
+                data.push(0x09); // tag: Signature
+                // Must length-prefix variable data to prevent malleability collisions!
+                data.extend_from_slice(&(sig.len() as u32).to_le_bytes());
+                data.extend_from_slice(sig);
             }
         }
     }

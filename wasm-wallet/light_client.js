@@ -350,6 +350,14 @@ onPushEvent(cb) {
         return conn;
     }
 
+async submitChat(sender, timestamp, nonce, replyTo, attachments = []) {
+        const resp = await this.request({
+            method: 'submit_chat',
+            params: { sender, timestamp, nonce, reply_to: replyTo, attachments },
+        });
+        return resp;
+    }
+
     /// Send a JSON request over the light protocol and return the parsed response.
     ///
     /// req: { method: 'get_state' } or { method: 'get_block', params: { height: 42 } }
@@ -518,7 +526,13 @@ async request(req, _retries = 2) {
         });
         return resp;
     }
-
+async submitChat(sender, timestamp, nonce, replyTo, attachments = []) {
+        const resp = await this.request({
+            method: 'submit_chat',
+            params: { sender, timestamp, nonce, reply_to: replyTo, attachments },
+        });
+        return resp;
+    }
     // ── Peer Discovery ──────────────────────────────────────────────────────
 
     /// Ask the connected node for its known peers' WebRTC multiaddrs.

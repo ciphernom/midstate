@@ -221,8 +221,15 @@ export class P2PClient {
                         if (attTag.value === 0n) {
                             const addrBytes = payload.subarray(off, off + 32); off += 32;
                             attachments.push({ kind: "address", value: Array.from(addrBytes).map(b => b.toString(16).padStart(2,'0')).join('') });
+                        } else if (attTag.value === 9n) {
+                            // L2 Crypto Signature (Variable Length, prefixed by 4-byte LE u32)
+                            const sigLen = new DataView(payload.buffer, payload.byteOffset + off).getUint32(0, true);
+                            off += 4;
+                            const sigBytes = payload.subarray(off, off + sigLen);
+                            off += sigLen;
+                            attachments.push({ kind: "signature", value: Array.from(sigBytes).map(b => b.toString(16).padStart(2,'0')).join('') });
                         } else {
-                            off += 32; // Skip other 32-byte types to prevent crash
+                            off += 32; // Skip other fixed 32-byte types to prevent crash
                         }
                     }
 

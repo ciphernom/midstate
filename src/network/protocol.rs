@@ -249,8 +249,9 @@ pub fn deserialize_bin(bytes: &[u8]) -> anyhow::Result<Self> {
                 if sender.len() > 128 {
                     anyhow::bail!("ChatV2 sender too long: {}", sender.len());
                 }
-                if sender.parse::<libp2p::PeerId>().is_err() {
-                    anyhow::bail!("ChatV2 sender must be a valid cryptographic PeerId");
+                // FIX: Accept either a valid libp2p PeerId OR a 64-char hex string (MSS Identity)
+                if sender.parse::<libp2p::PeerId>().is_err() && (sender.len() != 64 || hex::decode(sender).is_err()) {
+                    anyhow::bail!("ChatV2 sender must be a valid cryptographic PeerId or a 64-hex MSS Pubkey");
                 }
                 if words.len() > 10 {
                     anyhow::bail!("ChatV2 words count {} exceeds max 10", words.len());
@@ -264,6 +265,15 @@ pub fn deserialize_bin(bytes: &[u8]) -> anyhow::Result<Self> {
                 }
                 if attachments.iter().any(|att| att.is_graffiti()) {
                     anyhow::bail!("ChatV2 attachments contain invalid data (possible text graffiti)");
+                }
+                
+                // SECURITY: Cap dynamic signature attachments to the maximum valid crypto signature size
+                for att in attachments {
+                    if let crate::node::ChatAttachment::Signature(sig) = att {
+                        if sig.len() > crate::core::MAX_SIGNATURE_SIZE {
+                            anyhow::bail!("ChatV2 signature attachment exceeds MAX_SIGNATURE_SIZE (1536 bytes)");
+                        }
+                    }
                 }
             }          
             _ => {}

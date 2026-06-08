@@ -748,6 +748,48 @@
                 <button onclick="submitChat()" id="send-chat-btn" disabled style="background: var(--accent); color: #000; flex: 2;">Send</button>
             </div>
         </main>
+        
+        <!-- LIGHTNING L2 -->
+        <main id="view-lightning" class="page">
+            <h2>Q-Bolt L2 Channels</h2>
+            <div style="font-size: 11px; color: #888; margin-top: -10px; margin-bottom: 20px;">
+                Instant, zero-fee payment channels over the Midstate P2P Chat Bus.
+            </div>
+
+            <div class="panel" style="background: rgba(212, 255, 0, 0.02); border-color: var(--accent-dim);">
+                <h3 style="font-size: 13px; color: var(--accent);">Your Q-Bolt Identity</h3>
+                <div id="l2MyIdentity" style="font-family: monospace; font-size: 11px; word-break: break-all; color: var(--text-max); margin-bottom: 8px;">Sync to generate identity...</div>
+                <button onclick="navigator.clipboard.writeText(document.getElementById('l2MyIdentity').innerText); showToast('Identity copied', 'success');" style="margin: 0; padding: 6px; font-size: 11px; width: auto; background: transparent; border-color: var(--accent-dim); color: var(--accent);">Copy Identity</button>
+            </div>
+
+            <div class="panel">
+                <h3 style="font-size: 14px;">Invoices & Routing</h3>
+                <div style="display: flex; gap: 8px;">
+                    <input type="number" id="l2InvoiceAmount" placeholder="Amount (MDS)">
+                    <button onclick="createL2Invoice()" style="width: auto;">Create Invoice</button>
+                </div>
+                <div id="l2InvoiceResult" style="margin-top: 10px; font-size: 11px; color: var(--accent); word-break: break-all; user-select: all;"></div>
+                
+                <div style="display: flex; gap: 8px; margin-top: 15px;">
+                    <input type="text" id="l2PayInvoiceData" placeholder="Paste l2inv:...">
+                    <button onclick="payL2Invoice()" style="width: auto; background: var(--text-max); color: #000;">Pay Route</button>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3 style="font-size: 14px;">Open New Channel</h3>
+                <input type="text" id="l2PeerPk" placeholder="Peer's 64-hex L2 Identity">
+                <input type="number" id="l2FundAmount" placeholder="Amount to Fund (MDS)">
+                <button id="btnOpenChannel" style="background: var(--text-max); color: #000; margin-bottom: 0;">Fund Channel</button>
+                <div style="font-size: 10px; color: #666; margin-top: 8px;">A 100 MDS reserve fee is added to cover the closing transaction.</div>
+            </div>
+
+            <h3 style="margin-top: 1.5rem; font-size: 12px; color: #666; text-transform: uppercase;">Active Channels</h3>
+            <div class="list-container" id="l2ChannelList">
+                <div class="list-item" style="text-align: center; color: #555;">No active channels.</div>
+            </div>
+        </main>
+        
 
         <!-- SETTINGS -->
         <main id="view-settings" class="page">
@@ -790,6 +832,7 @@
             <button class="nav-btn" data-target="view-mine"><span class="nav-icon">⛏️</span><span>Mine</span></button>
             <button class="nav-btn" data-target="view-send"><span class="nav-icon">💸</span><span>Send</span></button>
             <button class="nav-btn" data-target="view-receive"><span class="nav-icon">⬇️</span><span>Receive</span></button>
+            <button class="nav-btn" data-target="view-lightning"><span class="nav-icon">⚡</span><span>L2</span></button>
             <button class="nav-btn" data-target="view-chat"><span class="nav-icon">💬</span><span>Chat</span></button>
             <button class="nav-btn" data-target="view-settings"><span class="nav-icon">⚙️</span><span>Settings</span></button>
         </nav>
@@ -1973,6 +2016,27 @@ if ('serviceWorker' in navigator) {
                         });
                         result = { ok: r.ok, body: r.ok ? null : await r.text() };
                     }
+                } else if (method === 'submitChat') {
+                    const attachments = params.attachments || [];
+                    if (lc) {
+                        const resp = await lc.submitChat(params.sender, params.timestamp, params.nonce, params.replyTo, attachments);
+                        result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
+                    } else {
+                        const r = await fetch(`${url}/api/chat/submit`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                sender: params.sender,
+                                timestamp: params.timestamp,
+                                nonce: params.nonce,
+                                reply_to: params.replyTo,
+                                attachments,
+                            }),
+                        });
+                        result = { ok: r.ok, body: r.ok ? null : await r.text() };
+                    }    
+                    
+                    
                 } else if (method === 'getChat') {
                     const r = await fetch(`${url}/api/chat`, { cache: 'no-store' });
                     result = r.ok ? await r.json() : { messages: [], dictionary: [] };
@@ -2173,7 +2237,40 @@ if ('serviceWorker' in navigator) {
                         `;
                     }).join('');
                 }
+                if (payload.l2Channels) {
+                    const l2List = document.getElementById('l2ChannelList');
+                    if (payload.primaryAddress !== "None") {
+                        document.getElementById('l2MyIdentity').innerText = payload.primaryAddress;
+                    }
+                    
+                    if (payload.l2Channels.length === 0) {
+                        l2List.innerHTML = '<div class="list-item" style="text-align: center; color: #555;">No active channels.</div>';
+                    } else {
+                        l2List.innerHTML = payload.l2Channels.map(c => {
+                            const myBal = c.is_alice ? c.latest_state.alice_amt : c.latest_state.bob_amt;
+                            const peerBal = c.is_alice ? c.latest_state.bob_amt : c.latest_state.alice_amt;
+                            const peerId = c.is_alice ? c.bob_pk : c.alice_pk;
+                            const fullySigned = c.latest_state.is_fully_signed;
 
+                            return `
+                            <div class="list-item" style="display: block;">
+                                <div class="flex-row" style="margin-bottom: 8px;">
+                                    <span style="font-weight: bold; color: var(--accent); font-size: 16px;">${mdsHtml(myBal, true)}</span>
+                                    <span style="font-size: 10px; color: ${fullySigned ? 'var(--text-max)' : 'var(--red)'};">${fullySigned ? '✓ Synchronized' : '⏳ Awaiting Peer'}</span>
+                                </div>
+                                <div style="font-size: 11px; color: #888; margin-bottom: 12px; word-break: break-all;">
+                                    Peer: ${peerId.substring(0, 16)}...<br>
+                                    Peer Balance: ${peerBal} MDS<br>
+                                    Updates: ${c.latest_state.nonce}
+                                </div>
+                                <div style="display: flex; gap: 8px;">
+                                    <button onclick="l2Pay('${c.id}')" style="margin:0; padding: 8px; font-size: 11px; background: transparent; border-color: var(--accent); color: var(--accent); flex: 1;">Send Payment</button>
+                                    <button onclick="l2Close('${c.id}')" style="margin:0; padding: 8px; font-size: 11px; background: transparent; border-color: var(--red); color: var(--red); flex: 1;" ${!fullySigned ? 'disabled' : ''}>Settle On-Chain</button>
+                                </div>
+                            </div>`;
+                        }).join('');
+                    }
+                }
                 const hList = document.getElementById('historyList');
                 window.appHistory = payload.history || [];
 
@@ -2355,6 +2452,10 @@ if ('serviceWorker' in navigator) {
                     break;
 
                 case 'CHAT_MESSAGE':
+                    if (payload.words && payload.words[0] === 255) {
+                        handleL2Chat(payload).catch(()=>{});
+                        return; 
+                    }
                     chatMessageMap.set(payload.nonce, payload);
                     renderChatMessages([payload], false); // false = append
                     break;
@@ -2515,7 +2616,46 @@ if ('serviceWorker' in navigator) {
                 }
             );
         };
+        window.createL2Invoice = function() {
+            const amount = document.getElementById('l2InvoiceAmount').value;
+            if (!amount) return showToast("Enter amount.", "error");
+            worker.postMessage({ type: 'L2_CREATE_INVOICE', payload: { amount } });
+        };
+        
+        window.payL2Invoice = function() {
+            const invoice = document.getElementById('l2PayInvoiceData').value.trim();
+            if (!invoice) return showToast("Enter invoice.", "error");
+            worker.postMessage({ type: 'L2_PAY_INVOICE', payload: { invoice } });
+            document.getElementById('l2PayInvoiceData').value = '';
+        };
 
+        worker.addEventListener('message', (e) => {
+            if (e.data.type === 'L2_INVOICE_CREATED') {
+                document.getElementById('l2InvoiceResult').innerText = e.data.payload;
+            }
+        });
+        document.getElementById('btnOpenChannel').onclick = () => {
+            const peerPk = document.getElementById('l2PeerPk').value;
+            const amount = document.getElementById('l2FundAmount').value;
+            if (!peerPk || !amount) return showToast("Enter Peer Identity and Amount.", "error");
+            worker.postMessage({ type: 'L2_OPEN_CHANNEL', payload: { peerPk, amount } });
+            document.getElementById('l2PeerPk').value = '';
+            document.getElementById('l2FundAmount').value = '';
+            switchTab('view-home');
+        };
+
+        window.l2Pay = function(channelId) {
+            const amount = prompt("Enter amount to send instantly:");
+            if (!amount || isNaN(amount)) return;
+            worker.postMessage({ type: 'L2_PAY', payload: { channelId, amount: Number(amount) } });
+        };
+
+        window.l2Close = function(channelId) {
+            if (confirm("Close this channel and settle balances on-chain?")) {
+                worker.postMessage({ type: 'L2_CLOSE', payload: { channelId } });
+                switchTab('view-home');
+            }
+        };
         document.getElementById('btnSend').onclick = (e) => {
             const toAddress = document.getElementById('sendAddress').value;
             const amount = parseInt(document.getElementById('sendAmount').value);
@@ -2797,11 +2937,18 @@ document.getElementById('btnExport').onclick = () => {
 
                         const value = document.createElement('div');
                         value.className = 'chat-attachment-value';
-                        value.textContent = att.value;   // full 64-char address
+                        
+                        // Truncate massive L2 signatures visually so they don't break the UI
+                        if (att.kind === "signature" && att.value.length > 64) {
+                            value.textContent = att.value.substring(0, 32) + "..." + att.value.substring(att.value.length - 32);
+                        } else {
+                            value.textContent = att.value; 
+                        }
+                        
                         chip.appendChild(value);
 
                         chip.addEventListener('click', () => {
-                            navigator.clipboard.writeText(att.value);
+                            navigator.clipboard.writeText(att.value); // Copies the FULL payload
                             chip.classList.add('copied');
                             status.textContent = '✓ copied';
                             setTimeout(() => {

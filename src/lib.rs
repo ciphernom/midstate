@@ -21,7 +21,7 @@ pub mod rpc;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod metrics;
 
-#[cfg(not(target_arch = "wasm32"))]
+// Wasm-safe: Pure data structures and PoW math used by the light client
 pub mod chat;
 
 #[cfg(not(target_arch = "wasm32"))]

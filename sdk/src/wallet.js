@@ -1,4 +1,4 @@
-import initWasm, { WebWallet, generate_phrase, mine_commitment_pow, compute_coin_id_hex } from '../pkg/wasm_wallet.js';
+import initWasm, { WebWallet, generate_phrase, mine_commitment_pow, compute_coin_id_hex, compute_commitment_hex } from '../pkg/wasm_wallet.js';
 import { MemoryStorage } from './storage.js';
 
 // ── Hex helper ────────────────────────────────────────────────────────────────
@@ -380,6 +380,55 @@ export class Wallet {
 
         return { height: chainHeight, found, balance: this.getBalance(), utxos: this.utxos.length };
     }
+    
+    /**
+     * Compute and sign an off-chain Layer 2 Channel state update.
+     * 
+     * # Reasoning
+     * Trustless Hub-and-Spoke channels require the user to sign a new balance distribution
+     * between themselves and the hub (Bot). This function computes the exact commitment
+     * hash the Midstate blockchain expects, signs it, and securely persists the incremented
+     * MSS leaf index to prevent key reuse.
+     * 
+     * # Formal Specification
+     * ```text
+     * Pre:  params contains { channelId, botAddress, newBotAmount, userAddress, newUserAmount, salt }
+     *       wState.mssAddrs[userAddress] exists
+     * Post: wState.mssAddrs[userAddress].next_leaf' = wState.mssAddrs[userAddress].next_leaf + 1
+     *       wallet.dat is saved to disk
+     *       result is the hex-encoded MSS signature
+     * ```
+     * 
+     * @param {Object} params - The channel state parameters
+     * @returns {Promise<string>} The hex-encoded MSS signature
+     */
+    async signChannelState(params) {
+        if (!mssCachesReady) await loadMssCaches();
+
+        if (this.mssAddrs[params.userAddress] === undefined) {
+            throw new Error("User MSS address not found in wallet.");
+        }
+
+        // 1. Reconstruct the output hashes for the new channel state
+        const outBot = compute_coin_id_hex(params.botAddress, BigInt(params.newBotAmount), params.salt);
+        const outUser = compute_coin_id_hex(params.userAddress, BigInt(params.newUserAmount), params.salt);
+        
+        // 2. Compute the exact commitment hash
+        const commitmentHash = compute_commitment_hex(
+            JSON.stringify([params.channelId]), 
+            JSON.stringify([outBot, outUser]), 
+            params.salt
+        );
+
+        // 3. Sign it with the user's MSS key
+        const signatureHex = this.inner.sign_mss_hex(params.userAddress, commitmentHash);
+
+        // 4. Update the leaf counter locally and save to disk to prevent key reuse
+        this.mssAddrs[params.userAddress].next_leaf++;
+        await this.save();
+
+        return signatureHex;
+    }
 
     // ════════════════════════════════════════════════════════════════════════
     //  Transaction Execution
@@ -423,10 +472,10 @@ export class Wallet {
         const commitReq = await client.commit(ctx.commitment, Number(spamNonce));
         if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
 
-        // 3. Wait for confirmation
+        // 3. Wait for confirmation (20 minutes should cover it!)
         let mined = false;
-        for (let i = 0; i < 24; i++) {
-            await new Promise(r => setTimeout(r, 5000));
+        for (let i = 0; i < 120; i++) {
+            await new Promise(r => setTimeout(r, 10000));
             const res = await client.checkCommitment(ctx.commitment).catch(() => ({}));
             if (res?.exists) { mined = true; break; }
         }

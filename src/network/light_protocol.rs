@@ -131,7 +131,18 @@ pub enum LightRequest {
         attachments: Vec<crate::node::ChatAttachment>,
     },
     
-
+    /// Submit an already-mined chat from a browser light client.
+    /// The client provides the PoW nonce and timestamp.
+    #[serde(rename = "submit_chat")]
+    SubmitChat {
+        sender: String,
+        timestamp: u64,
+        nonce: u64,
+        reply_to: Option<u64>,
+        words: Vec<u8>,
+        #[serde(default)]
+        attachments: Vec<crate::node::ChatAttachment>,
+    },
 }
 
 /// Every response sent to a browser light client.
