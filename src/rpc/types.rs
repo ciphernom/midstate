@@ -412,7 +412,16 @@ pub struct SendChatRequest {
     #[serde(default)]
     pub attachments: Vec<crate::node::ChatAttachment>,
 }
-
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubmitChatRequest {
+    pub sender: String,
+    pub timestamp: u64,
+    pub nonce: u64,
+    pub reply_to: Option<u64>,
+    pub words: Vec<u8>,
+    #[serde(default)]
+    pub attachments: Vec<crate::node::ChatAttachment>,
+}
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetChatResponse {
     pub messages: Vec<crate::node::ChatMessage>,

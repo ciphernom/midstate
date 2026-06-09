@@ -69,6 +69,41 @@ export class WebWallet {
         }
     }
     /**
+     * Build coinbase outputs for web solo mining.
+     *
+     * Decomposes `total_value` into power-of-2 denominations and assigns
+     * them directly to the user's reusable MSS address.
+     * @param {bigint} total_value
+     * @param {string} address_hex
+     * @returns {string}
+     */
+    build_coinbase_to_mss(total_value, address_hex) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(address_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.webwallet_build_coinbase_to_mss(retptr, this.__wbg_ptr, total_value, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
      * Build the reveal payload (inputs + signatures + outputs) for a committed transaction.
      *
      * # Safety Check
@@ -697,6 +732,69 @@ export class WebWallet {
         const len0 = WASM_VECTOR_LEN;
         wasm.webwallet_set_watchlist(this.__wbg_ptr, ptr0, len0);
     }
+    /**
+     * Sign a raw commitment hash using a cached MSS key for Layer 2 Payment Channels.
+     *
+     * # Reasoning
+     * Payment channels require users to sign off-chain state updates (commitments)
+     * without immediately broadcasting a `Reveal` transaction. This exposes the raw
+     * MSS signature mechanism to JavaScript to facilitate trustless Hub-and-Spoke
+     * L2 networks.
+     *
+     * # Formal Specification
+     * ```text
+     * Pre:  mss_address_hex ∈ dom(self.mss_cache)
+     *       commitment_hex is a valid 64-character hex string (32 bytes)
+     *       self.mss_cache[mss_address_hex].remaining() > 0
+     * Post: self.mss_cache[mss_address_hex].next_leaf' = self.mss_cache[mss_address_hex].next_leaf + 1
+     *       result is Ok(signature_hex)
+     * ```
+     *
+     * ```zed
+     *     SignMssHex
+     *     ----------
+     *     ΔWebWallet
+     *     mss_address_hex? : String
+     *     commitment_hex? : String
+     *     sig! : String
+     *
+     *     pre  mss_address_hex? ∈ dom(mss_cache)
+     *     pre  mss_cache(mss_address_hex?).next_leaf < 2^{height}
+     *     post mss_cache'(mss_address_hex?).next_leaf = mss_cache(mss_address_hex?).next_leaf + 1
+     *     post sig! = hex(sign(mss_cache(mss_address_hex?).master_seed, commitment))
+     * ```
+     * @param {string} mss_address_hex
+     * @param {string} commitment_hex
+     * @returns {string}
+     */
+    sign_mss_hex(mss_address_hex, commitment_hex) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(mss_address_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(commitment_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.webwallet_sign_mss_hex(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr3 = r0;
+            var len3 = r1;
+            if (r3) {
+                ptr3 = 0; len3 = 0;
+                throw takeObject(r2);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
+        }
+    }
 }
 if (Symbol.dispose) WebWallet.prototype[Symbol.dispose] = WebWallet.prototype.free;
 
@@ -723,6 +821,122 @@ export function blake3_hash_hex(hex_data) {
     } finally {
         wasm.__wbindgen_add_to_stack_pointer(16);
         wasm.__wbindgen_export4(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * @param {bigint} channel_value
+ * @param {string} channel_salt_hex
+ * @param {string} alice_pk_hex
+ * @param {string} bob_pk_hex
+ * @param {string} state_json
+ * @param {string} alice_sig_hex
+ * @param {string} bob_sig_hex
+ * @returns {string}
+ */
+export function build_channel_reveal(channel_value, channel_salt_hex, alice_pk_hex, bob_pk_hex, state_json, alice_sig_hex, bob_sig_hex) {
+    let deferred8_0;
+    let deferred8_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(channel_salt_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(alice_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(bob_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(state_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passStringToWasm0(alice_sig_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len4 = WASM_VECTOR_LEN;
+        const ptr5 = passStringToWasm0(bob_sig_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len5 = WASM_VECTOR_LEN;
+        wasm.build_channel_reveal(retptr, channel_value, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr7 = r0;
+        var len7 = r1;
+        if (r3) {
+            ptr7 = 0; len7 = 0;
+            throw takeObject(r2);
+        }
+        deferred8_0 = ptr7;
+        deferred8_1 = len7;
+        return getStringFromWasm0(ptr7, len7);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred8_0, deferred8_1, 1);
+    }
+}
+
+/**
+ * @param {string} channel_coin_id_hex
+ * @param {string} alice_pk_hex
+ * @param {string} bob_pk_hex
+ * @param {bigint} alice_amount
+ * @param {bigint} bob_amount
+ * @param {number} nonce
+ * @param {string} htlcs_json
+ * @returns {string}
+ */
+export function build_channel_state(channel_coin_id_hex, alice_pk_hex, bob_pk_hex, alice_amount, bob_amount, nonce, htlcs_json) {
+    let deferred6_0;
+    let deferred6_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(channel_coin_id_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(alice_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(bob_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(htlcs_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        wasm.build_channel_state(retptr, ptr0, len0, ptr1, len1, ptr2, len2, alice_amount, bob_amount, nonce, ptr3, len3);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr5 = r0;
+        var len5 = r1;
+        if (r3) {
+            ptr5 = 0; len5 = 0;
+            throw takeObject(r2);
+        }
+        deferred6_0 = ptr5;
+        deferred6_1 = len5;
+        return getStringFromWasm0(ptr5, len5);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred6_0, deferred6_1, 1);
+    }
+}
+
+/**
+ * @param {string} pk1_hex
+ * @param {string} pk2_hex
+ * @returns {string}
+ */
+export function build_multisig_2of2_address(pk1_hex, pk2_hex) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(pk1_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(pk2_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.build_multisig_2of2_address(retptr, ptr0, len0, ptr1, len1);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred3_0 = r0;
+        deferred3_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
     }
 }
 
@@ -766,6 +980,51 @@ export function compute_coin_id_hex(address_hex, value, salt_hex) {
     } finally {
         wasm.__wbindgen_add_to_stack_pointer(16);
         wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * Compute a transaction commitment hash directly from WASM.
+ *
+ * # Formal Specification
+ * ```text
+ * Pre:  input_ids_json and output_hashes_json are valid JSON arrays of 64-char hex strings.
+ *       salt_hex is a valid 64-character hex string.
+ * Post: result = BLAKE3(MAGIC || len(inputs) || inputs || len(outputs) || outputs || salt)
+ * ```
+ * @param {string} input_ids_json
+ * @param {string} output_hashes_json
+ * @param {string} salt_hex
+ * @returns {string}
+ */
+export function compute_commitment_hex(input_ids_json, output_hashes_json, salt_hex) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(input_ids_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(output_hashes_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(salt_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        wasm.compute_commitment_hex(retptr, ptr0, len0, ptr1, len1, ptr2, len2);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr4 = r0;
+        var len4 = r1;
+        if (r3) {
+            ptr4 = 0; len4 = 0;
+            throw takeObject(r2);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred5_0, deferred5_1, 1);
     }
 }
 
@@ -858,6 +1117,52 @@ export function generate_phrase() {
 }
 
 /**
+ * Mine the Anti-Spam Proof of Work for a P2P Chat Message directly in the browser.
+ *
+ * # Reasoning
+ * Pushing PoW to the client prevents node CPU exhaustion and enables true
+ * decentralized P2P dApps (like L2 Lightning Hubs) over WebRTC without relying
+ * on central RPC servers to mine on the user's behalf.
+ *
+ * # Formal Specification
+ * ```text
+ * Pre:  sender is a valid PeerId string
+ *       words_json is a JSON array of u8 (0-255)
+ *       attachments_json is a JSON array of valid ChatAttachment objects
+ * Post: result = Ok(nonce) where verify_chat_pow_v2(..., nonce) == true
+ * ```
+ * @param {string} sender
+ * @param {bigint} timestamp
+ * @param {string} reply_to_json
+ * @param {string} words_json
+ * @param {string} attachments_json
+ * @returns {bigint}
+ */
+export function mine_chat_pow_v2_wasm(sender, timestamp, reply_to_json, words_json, attachments_json) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(sender, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(reply_to_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(words_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(attachments_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        wasm.mine_chat_pow_v2_wasm(retptr, ptr0, len0, timestamp, ptr1, len1, ptr2, len2, ptr3, len3);
+        var r0 = getDataViewMemory0().getBigInt64(retptr + 8 * 0, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        if (r3) {
+            throw takeObject(r2);
+        }
+        return BigInt.asUintN(64, r0);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
  * Safely mines the Commitment PoW in the WebAssembly context.
  *
  * # Reasoning
@@ -941,6 +1246,23 @@ export function search_nonces(midstate_hex, target_hex, start_nonce, iterations)
     } finally {
         wasm.__wbindgen_add_to_stack_pointer(16);
     }
+}
+
+/**
+ * @param {string} sig_hex
+ * @param {string} msg_hex
+ * @param {string} pk_hex
+ * @returns {boolean}
+ */
+export function verify_mss_sig_wasm(sig_hex, msg_hex, pk_hex) {
+    const ptr0 = passStringToWasm0(sig_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(msg_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.verify_mss_sig_wasm(ptr0, len0, ptr1, len1, ptr2, len2);
+    return ret !== 0;
 }
 
 function __wbg_get_imports() {

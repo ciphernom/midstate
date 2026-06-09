@@ -1510,6 +1510,54 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
         .to_string())
     }
 
+/// Sign a raw commitment hash using a cached MSS key for Layer 2 Payment Channels.
+    ///
+    /// # Reasoning
+    /// Payment channels require users to sign off-chain state updates (commitments) 
+    /// without immediately broadcasting a `Reveal` transaction. This exposes the raw 
+    /// MSS signature mechanism to JavaScript to facilitate trustless Hub-and-Spoke 
+    /// L2 networks.
+    ///
+    /// # Formal Specification
+    /// ```text
+    /// Pre:  mss_address_hex ∈ dom(self.mss_cache)
+    ///       commitment_hex is a valid 64-character hex string (32 bytes)
+    ///       self.mss_cache[mss_address_hex].remaining() > 0
+    /// Post: self.mss_cache[mss_address_hex].next_leaf' = self.mss_cache[mss_address_hex].next_leaf + 1
+    ///       result is Ok(signature_hex)
+    /// ```
+    ///
+    /// ```zed
+    ///     SignMssHex
+    ///     ----------
+    ///     ΔWebWallet
+    ///     mss_address_hex? : String
+    ///     commitment_hex? : String
+    ///     sig! : String
+    ///
+    ///     pre  mss_address_hex? ∈ dom(mss_cache)
+    ///     pre  mss_cache(mss_address_hex?).next_leaf < 2^{height}
+    ///     post mss_cache'(mss_address_hex?).next_leaf = mss_cache(mss_address_hex?).next_leaf + 1
+    ///     post sig! = hex(sign(mss_cache(mss_address_hex?).master_seed, commitment))
+    /// ```
+    #[wasm_bindgen]
+    pub fn sign_mss_hex(&mut self, mss_address_hex: &str, commitment_hex: &str) -> Result<String, JsValue> {
+        let mut commitment = [0u8; 32];
+        hex::decode_to_slice(commitment_hex, &mut commitment)
+            .map_err(|_| JsValue::from_str("Invalid commitment hex"))?;
+
+        let kp = self.mss_cache.get_mut(mss_address_hex)
+            .ok_or_else(|| JsValue::from_str("MSS tree not found in cache. Run Network Sync."))?;
+
+        if kp.remaining() == 0 {
+            return Err(JsValue::from_str("MSS key capacity exhausted"));
+        }
+
+        // The Rust `sign` method automatically increments `kp.next_leaf` internally
+        let sig = kp.sign(&commitment).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(hex::encode(sig.to_bytes()))
+    }
+
 // ── Funding a contract ──────────────────────────────────────────────────
 
     /// Phase 1 for FUNDING a contract. Pays `amount` to the contract address as
@@ -1998,6 +2046,257 @@ pub fn blake3_hash_hex(hex_data: &str) -> String {
     let bytes = hex::decode(hex_data).unwrap_or_default();
     let h = midstate::core::types::hash(&bytes);
     hex::encode(h)
+}
+
+
+/// Compute a transaction commitment hash directly from WASM.
+///
+/// # Formal Specification
+/// ```text
+/// Pre:  input_ids_json and output_hashes_json are valid JSON arrays of 64-char hex strings.
+///       salt_hex is a valid 64-character hex string.
+/// Post: result = BLAKE3(MAGIC || len(inputs) || inputs || len(outputs) || outputs || salt)
+/// ```
+#[wasm_bindgen]
+pub fn compute_commitment_hex(input_ids_json: &str, output_hashes_json: &str, salt_hex: &str) -> Result<String, JsValue> {
+    let inputs: Vec<String> = serde_json::from_str(input_ids_json)
+        .map_err(|e| JsValue::from_str(&format!("Invalid inputs JSON: {}", e)))?;
+    let outputs: Vec<String> = serde_json::from_str(output_hashes_json)
+        .map_err(|e| JsValue::from_str(&format!("Invalid outputs JSON: {}", e)))?;
+    
+    let in_bytes: Vec<[u8; 32]> = inputs.iter().map(|s| { 
+        let mut b = [0u8; 32]; hex::decode_to_slice(s, &mut b).unwrap(); b 
+    }).collect();
+    
+    let out_bytes: Vec<[u8; 32]> = outputs.iter().map(|s| { 
+        let mut b = [0u8; 32]; hex::decode_to_slice(s, &mut b).unwrap(); b 
+    }).collect();
+    
+    let mut salt = [0u8; 32];
+    hex::decode_to_slice(salt_hex, &mut salt).map_err(|_| JsValue::from_str("Invalid salt hex"))?;
+    
+    let commitment = midstate::core::types::compute_commitment(&in_bytes, &out_bytes, &salt);
+    Ok(hex::encode(commitment))
+}
+
+/// Mine the Anti-Spam Proof of Work for a P2P Chat Message directly in the browser.
+///
+/// # Reasoning
+/// Pushing PoW to the client prevents node CPU exhaustion and enables true 
+/// decentralized P2P dApps (like L2 Lightning Hubs) over WebRTC without relying
+/// on central RPC servers to mine on the user's behalf.
+///
+/// # Formal Specification
+/// ```text
+/// Pre:  sender is a valid PeerId string
+///       words_json is a JSON array of u8 (0-255)
+///       attachments_json is a JSON array of valid ChatAttachment objects
+/// Post: result = Ok(nonce) where verify_chat_pow_v2(..., nonce) == true
+/// ```
+#[wasm_bindgen]
+pub fn mine_chat_pow_v2_wasm(
+    sender: &str,
+    timestamp: u64,
+    reply_to_json: &str, // e.g. "null" or "42"
+    words_json: &str,    // e.g. "[42, 81, 200]"
+    attachments_json: &str, // e.g. '[{"kind":"signature", "value":"hex..."}]'
+) -> Result<u64, JsValue> {
+    let reply_to: Option<u64> = serde_json::from_str(reply_to_json)
+        .map_err(|e| JsValue::from_str(&format!("Invalid reply_to JSON: {}", e)))?;
+        
+    let words: Vec<u8> = serde_json::from_str(words_json)
+        .map_err(|e| JsValue::from_str(&format!("Invalid words JSON: {}", e)))?;
+        
+    let attachments: Vec<midstate::chat::ChatAttachment> = serde_json::from_str(attachments_json)
+        .map_err(|e| JsValue::from_str(&format!("Invalid attachments JSON: {}", e)))?;
+
+    // The Rust miner function handles the heavy lifting
+    let nonce = midstate::chat::mine_chat_pow_v2(
+        sender.to_string(),
+        timestamp,
+        reply_to,
+        words,
+        attachments,
+    );
+
+    Ok(nonce)
+}
+
+#[derive(serde::Deserialize)]
+pub struct HtlcDef {
+    pub amount: u64,
+    pub timeout: u64,
+    pub receiver_is_alice: bool,
+    pub secret_hash: String,
+}
+
+#[wasm_bindgen]
+pub fn build_channel_state(
+    channel_coin_id_hex: &str,
+    alice_pk_hex: &str,
+    bob_pk_hex: &str,
+    alice_amount: u64,
+    bob_amount: u64,
+    nonce: u32,
+    htlcs_json: &str,
+) -> Result<String, JsValue> {
+    let mut channel_coin_id = [0u8; 32];
+    hex::decode_to_slice(channel_coin_id_hex, &mut channel_coin_id).unwrap();
+
+    let mut alice_pk = [0u8; 32];
+    hex::decode_to_slice(alice_pk_hex, &mut alice_pk).unwrap();
+
+    let mut bob_pk = [0u8; 32];
+    hex::decode_to_slice(bob_pk_hex, &mut bob_pk).unwrap();
+
+    let mut output_hashes = Vec::new();
+    let mut outputs_json = Vec::new();
+
+    let alice_addr = compute_address(&alice_pk);
+    for (i, denom) in decompose_value(alice_amount).into_iter().enumerate() {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&channel_coin_id);
+        hasher.update(&nonce.to_le_bytes());
+        hasher.update(b"ALICE");
+        hasher.update(&(i as u32).to_le_bytes());
+        let salt = *hasher.finalize().as_bytes();
+
+        output_hashes.push(compute_coin_id(&alice_addr, denom, &salt));
+        outputs_json.push(serde_json::json!({
+            "type": "standard",
+            "address": hex::encode(alice_addr),
+            "value": denom,
+            "salt": hex::encode(salt)
+        }));
+    }
+
+    let bob_addr = compute_address(&bob_pk);
+    for (i, denom) in decompose_value(bob_amount).into_iter().enumerate() {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&channel_coin_id);
+        hasher.update(&nonce.to_le_bytes());
+        hasher.update(b"BOB");
+        hasher.update(&(i as u32).to_le_bytes());
+        let salt = *hasher.finalize().as_bytes();
+
+        output_hashes.push(compute_coin_id(&bob_addr, denom, &salt));
+        outputs_json.push(serde_json::json!({
+            "type": "standard",
+            "address": hex::encode(bob_addr),
+            "value": denom,
+            "salt": hex::encode(salt)
+        }));
+    }
+
+    let htlcs: Vec<HtlcDef> = serde_json::from_str(htlcs_json).unwrap_or_default();
+    for (i, h) in htlcs.into_iter().enumerate() {
+        let mut secret_hash = [0u8; 32];
+        hex::decode_to_slice(&h.secret_hash, &mut secret_hash).unwrap();
+        
+        let receiver_pk = if h.receiver_is_alice { &alice_pk } else { &bob_pk };
+        let refund_pk = if h.receiver_is_alice { &bob_pk } else { &alice_pk };
+        
+        let script = midstate::core::script::compile_htlc(&secret_hash, receiver_pk, h.timeout, refund_pk);
+        let htlc_addr = midstate::core::types::hash(&script);
+        
+        for (j, denom) in decompose_value(h.amount).into_iter().enumerate() {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&channel_coin_id);
+            hasher.update(&nonce.to_le_bytes());
+            hasher.update(b"HTLC");
+            hasher.update(&(i as u32).to_le_bytes());
+            hasher.update(&(j as u32).to_le_bytes());
+            let salt = *hasher.finalize().as_bytes();
+
+            output_hashes.push(compute_coin_id(&htlc_addr, denom, &salt));
+            outputs_json.push(serde_json::json!({
+                "type": "standard",
+                "address": hex::encode(htlc_addr),
+                "value": denom,
+                "salt": hex::encode(salt)
+            }));
+        }
+    }
+
+    let mut salt_hasher = blake3::Hasher::new();
+    salt_hasher.update(b"channel_state_salt");
+    salt_hasher.update(&nonce.to_le_bytes());
+    let tx_salt = *salt_hasher.finalize().as_bytes();
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(midstate::core::types::NETWORK_MAGIC);
+    hasher.update(&(1u32).to_le_bytes()); 
+    hasher.update(&channel_coin_id);
+    hasher.update(&(output_hashes.len() as u32).to_le_bytes());
+    for h in &output_hashes {
+        hasher.update(h);
+    }
+    hasher.update(&tx_salt);
+
+    let commitment = *hasher.finalize().as_bytes();
+
+    let result = serde_json::json!({
+        "commitment": hex::encode(commitment),
+        "outputs": outputs_json,
+        "salt": hex::encode(tx_salt)
+    });
+
+    Ok(result.to_string())
+}
+
+#[wasm_bindgen]
+pub fn build_multisig_2of2_address(pk1_hex: &str, pk2_hex: &str) -> String {
+    let mut pk1 = [0u8; 32]; hex::decode_to_slice(pk1_hex, &mut pk1).unwrap();
+    let mut pk2 = [0u8; 32]; hex::decode_to_slice(pk2_hex, &mut pk2).unwrap();
+    let script = midstate::core::script::compile_multisig_2of3(&pk1, &pk2, &pk2);
+    let addr = midstate::core::types::hash(&script);
+    hex::encode(addr)
+}
+
+#[wasm_bindgen]
+pub fn build_channel_reveal(
+    channel_value: u64,
+    channel_salt_hex: &str,
+    alice_pk_hex: &str,
+    bob_pk_hex: &str,
+    state_json: &str,
+    alice_sig_hex: &str,
+    bob_sig_hex: &str,
+) -> Result<String, JsValue> {
+    let state: serde_json::Value = serde_json::from_str(state_json).unwrap();
+    let mut pk1 = [0u8; 32]; hex::decode_to_slice(alice_pk_hex, &mut pk1).unwrap();
+    let mut pk2 = [0u8; 32]; hex::decode_to_slice(bob_pk_hex, &mut pk2).unwrap();
+    let script = midstate::core::script::compile_multisig_2of3(&pk1, &pk2, &pk2);
+
+    let input = serde_json::json!({
+        "bytecode": hex::encode(script),
+        "value": channel_value,
+        "salt": channel_salt_hex,
+    });
+
+    let sigs = format!("{},{}", alice_sig_hex, bob_sig_hex);
+
+    let reveal = serde_json::json!({
+        "inputs": [input],
+        "signatures": [sigs],
+        "outputs": state["outputs"],
+        "salt": state["salt"]
+    });
+
+    Ok(reveal.to_string())
+}
+
+#[wasm_bindgen]
+pub fn verify_mss_sig_wasm(sig_hex: &str, msg_hex: &str, pk_hex: &str) -> bool {
+    let sig_bytes = if let Ok(b) = hex::decode(sig_hex) { b } else { return false; };
+    let mut msg = [0u8; 32]; if hex::decode_to_slice(msg_hex, &mut msg).is_err() { return false; }
+    let mut pk = [0u8; 32]; if hex::decode_to_slice(pk_hex, &mut pk).is_err() { return false; }
+
+    if let Ok(sig) = midstate::core::mss::MssSignature::from_bytes(&sig_bytes) {
+        midstate::core::mss::verify(&sig, &msg, &pk)
+    } else {
+        false
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

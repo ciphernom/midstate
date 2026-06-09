@@ -37,6 +37,13 @@ export class WebWallet {
      */
     build_coinbase(total_value: bigint, next_wots_index: number): string | undefined;
     /**
+     * Build coinbase outputs for web solo mining.
+     *
+     * Decomposes `total_value` into power-of-2 denominations and assigns
+     * them directly to the user's reusable MSS address.
+     */
+    build_coinbase_to_mss(total_value: bigint, address_hex: string): string;
+    /**
      * Build the reveal payload (inputs + signatures + outputs) for a committed transaction.
      *
      * # Safety Check
@@ -274,6 +281,39 @@ export class WebWallet {
      * Replaces the entire watchlist. Invalid hex entries are silently skipped.
      */
     set_watchlist(addrs_json: string): void;
+    /**
+     * Sign a raw commitment hash using a cached MSS key for Layer 2 Payment Channels.
+     *
+     * # Reasoning
+     * Payment channels require users to sign off-chain state updates (commitments)
+     * without immediately broadcasting a `Reveal` transaction. This exposes the raw
+     * MSS signature mechanism to JavaScript to facilitate trustless Hub-and-Spoke
+     * L2 networks.
+     *
+     * # Formal Specification
+     * ```text
+     * Pre:  mss_address_hex ∈ dom(self.mss_cache)
+     *       commitment_hex is a valid 64-character hex string (32 bytes)
+     *       self.mss_cache[mss_address_hex].remaining() > 0
+     * Post: self.mss_cache[mss_address_hex].next_leaf' = self.mss_cache[mss_address_hex].next_leaf + 1
+     *       result is Ok(signature_hex)
+     * ```
+     *
+     * ```zed
+     *     SignMssHex
+     *     ----------
+     *     ΔWebWallet
+     *     mss_address_hex? : String
+     *     commitment_hex? : String
+     *     sig! : String
+     *
+     *     pre  mss_address_hex? ∈ dom(mss_cache)
+     *     pre  mss_cache(mss_address_hex?).next_leaf < 2^{height}
+     *     post mss_cache'(mss_address_hex?).next_leaf = mss_cache(mss_address_hex?).next_leaf + 1
+     *     post sig! = hex(sign(mss_cache(mss_address_hex?).master_seed, commitment))
+     * ```
+     */
+    sign_mss_hex(mss_address_hex: string, commitment_hex: string): string;
 }
 
 /**
@@ -282,6 +322,12 @@ export class WebWallet {
  * Used by the IDE to generate P2SH addresses.
  */
 export function blake3_hash_hex(hex_data: string): string;
+
+export function build_channel_reveal(channel_value: bigint, channel_salt_hex: string, alice_pk_hex: string, bob_pk_hex: string, state_json: string, alice_sig_hex: string, bob_sig_hex: string): string;
+
+export function build_channel_state(channel_coin_id_hex: string, alice_pk_hex: string, bob_pk_hex: string, alice_amount: bigint, bob_amount: bigint, nonce: number, htlcs_json: string): string;
+
+export function build_multisig_2of2_address(pk1_hex: string, pk2_hex: string): string;
 
 /**
  * Compute the coin ID (UTXO identifier) from an address, value, and salt.
@@ -302,6 +348,18 @@ export function blake3_hash_hex(hex_data: string): string;
  * than panicking.
  */
 export function compute_coin_id_hex(address_hex: string, value: bigint, salt_hex: string): string;
+
+/**
+ * Compute a transaction commitment hash directly from WASM.
+ *
+ * # Formal Specification
+ * ```text
+ * Pre:  input_ids_json and output_hashes_json are valid JSON arrays of 64-char hex strings.
+ *       salt_hex is a valid 64-character hex string.
+ * Post: result = BLAKE3(MAGIC || len(inputs) || inputs || len(outputs) || outputs || salt)
+ * ```
+ */
+export function compute_commitment_hex(input_ids_json: string, output_hashes_json: string, salt_hex: string): string;
 
 /**
  * Decompose an amount into canonical power-of-2 denominations.
@@ -339,6 +397,24 @@ export function decrypt_cli_wallet(data: Uint8Array, password: string): string;
  * Panics if the system CSPRNG fails (should never happen in a browser).
  */
 export function generate_phrase(): string;
+
+/**
+ * Mine the Anti-Spam Proof of Work for a P2P Chat Message directly in the browser.
+ *
+ * # Reasoning
+ * Pushing PoW to the client prevents node CPU exhaustion and enables true
+ * decentralized P2P dApps (like L2 Lightning Hubs) over WebRTC without relying
+ * on central RPC servers to mine on the user's behalf.
+ *
+ * # Formal Specification
+ * ```text
+ * Pre:  sender is a valid PeerId string
+ *       words_json is a JSON array of u8 (0-255)
+ *       attachments_json is a JSON array of valid ChatAttachment objects
+ * Post: result = Ok(nonce) where verify_chat_pow_v2(..., nonce) == true
+ * ```
+ */
+export function mine_chat_pow_v2_wasm(sender: string, timestamp: bigint, reply_to_json: string, words_json: string, attachments_json: string): bigint;
 
 /**
  * Safely mines the Commitment PoW in the WebAssembly context.
@@ -395,18 +471,27 @@ export function mine_commitment_pow(commitment_hex: string, required_pow: number
  */
 export function search_nonces(midstate_hex: string, target_hex: string, start_nonce: bigint, iterations: number): bigint | undefined;
 
+export function verify_mss_sig_wasm(sig_hex: string, msg_hex: string, pk_hex: string): boolean;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_webwallet_free: (a: number, b: number) => void;
     readonly blake3_hash_hex: (a: number, b: number, c: number) => void;
+    readonly build_channel_reveal: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => void;
+    readonly build_channel_state: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: bigint, j: number, k: number, l: number) => void;
+    readonly build_multisig_2of2_address: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly compute_coin_id_hex: (a: number, b: number, c: number, d: bigint, e: number, f: number) => void;
+    readonly compute_commitment_hex: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly decrypt_cli_wallet: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly generate_phrase: (a: number) => void;
+    readonly mine_chat_pow_v2_wasm: (a: number, b: number, c: number, d: bigint, e: number, f: number, g: number, h: number, i: number, j: number) => void;
     readonly mine_commitment_pow: (a: number, b: number, c: number, d: bigint, e: number, f: number) => bigint;
     readonly search_nonces: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => void;
+    readonly verify_mss_sig_wasm: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
     readonly webwallet_build_coinbase: (a: number, b: number, c: bigint, d: number) => void;
+    readonly webwallet_build_coinbase_to_mss: (a: number, b: number, c: bigint, d: number, e: number) => void;
     readonly webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly webwallet_build_script_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly webwallet_build_solo_extension: (a: number, b: number, c: number, d: number, e: bigint) => void;
@@ -424,6 +509,7 @@ export interface InitOutput {
     readonly webwallet_prepare_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number, k: number, l: bigint) => void;
     readonly webwallet_set_mss_leaf_index: (a: number, b: number, c: number, d: number) => void;
     readonly webwallet_set_watchlist: (a: number, b: number, c: number) => void;
+    readonly webwallet_sign_mss_hex: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly decompose_amount: (a: bigint) => number;
     readonly __wbindgen_export: (a: number) => void;
     readonly __wbindgen_add_to_stack_pointer: (a: number) => number;

@@ -3,12 +3,19 @@
 export const memory: WebAssembly.Memory;
 export const __wbg_webwallet_free: (a: number, b: number) => void;
 export const blake3_hash_hex: (a: number, b: number, c: number) => void;
+export const build_channel_reveal: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => void;
+export const build_channel_state: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: bigint, j: number, k: number, l: number) => void;
+export const build_multisig_2of2_address: (a: number, b: number, c: number, d: number, e: number) => void;
 export const compute_coin_id_hex: (a: number, b: number, c: number, d: bigint, e: number, f: number) => void;
+export const compute_commitment_hex: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
 export const decrypt_cli_wallet: (a: number, b: number, c: number, d: number, e: number) => void;
 export const generate_phrase: (a: number) => void;
+export const mine_chat_pow_v2_wasm: (a: number, b: number, c: number, d: bigint, e: number, f: number, g: number, h: number, i: number, j: number) => void;
 export const mine_commitment_pow: (a: number, b: number, c: number, d: bigint, e: number, f: number) => bigint;
 export const search_nonces: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => void;
+export const verify_mss_sig_wasm: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
 export const webwallet_build_coinbase: (a: number, b: number, c: bigint, d: number) => void;
+export const webwallet_build_coinbase_to_mss: (a: number, b: number, c: bigint, d: number, e: number) => void;
 export const webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const webwallet_build_script_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const webwallet_build_solo_extension: (a: number, b: number, c: number, d: number, e: bigint) => void;
@@ -26,6 +33,7 @@ export const webwallet_prepare_script_spend: (a: number, b: number, c: number, d
 export const webwallet_prepare_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number, k: number, l: bigint) => void;
 export const webwallet_set_mss_leaf_index: (a: number, b: number, c: number, d: number) => void;
 export const webwallet_set_watchlist: (a: number, b: number, c: number) => void;
+export const webwallet_sign_mss_hex: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
 export const decompose_amount: (a: bigint) => number;
 export const __wbindgen_export: (a: number) => void;
 export const __wbindgen_add_to_stack_pointer: (a: number) => number;

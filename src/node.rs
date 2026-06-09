@@ -397,7 +397,37 @@ impl NodeHandle {
             .map_err(|e| anyhow::anyhow!("Node is overloaded: {}", e))?;
         Ok(())
     }
-
+    /// Dispatch a *pre-mined* chat directly onto the wire, skipping the
+    /// node-side PoW mining step that `send_chat` triggers.
+    ///
+    /// Used by the HTTP `submit_chat` handler, where the **client** has
+    /// already computed a valid v2 Chat PoW. The caller MUST have verified
+    /// the nonce with `verify_chat_pow_v2` before calling this.
+    ///
+    /// # Failure
+    ///
+    /// Returns `Err` only if the command channel is full (back-pressure).
+    pub fn broadcast_premined_chat(
+        &self,
+        sender: String,
+        timestamp: u64,
+        nonce: u64,
+        reply_to: Option<u64>,
+        words: Vec<u8>,
+        attachments: Vec<ChatAttachment>,
+    ) -> Result<()> {
+        self.tx_sender
+            .try_send(NodeCommand::BroadcastP2PChat {
+                sender,
+                timestamp,
+                nonce,
+                reply_to,
+                words,
+                attachments,
+            })
+            .map_err(|e| anyhow::anyhow!("Node is overloaded: {}", e))?;
+        Ok(())
+    }
     /// Advertise that this node currently holds one or more Pruning Licenses.
     /// Uses the existing ephemeral chat system (with its built-in PoW and rate limiting)
     /// so other nodes can discover archival capacity for diversity/reputation scoring.
@@ -1953,6 +1983,53 @@ async fn handle_light_request(
                 }
 
                 LightResponse::success(serde_json::json!({ "status": "queued" }))
+            }
+            LightRequest::SubmitChat { sender, timestamp, nonce, reply_to, words, attachments } => {
+                if words.is_empty() && attachments.is_empty() {
+                    return LightResponse::error("Message must contain words or attachments");
+                }
+                if words.len() > 10 {
+                    return LightResponse::error("Message must be between 1 and 10 words");
+                }
+                if words.iter().any(|&w| (w as usize) >= crate::chat::CHAT_DICTIONARY.len()) {
+                    return LightResponse::error("Invalid word index");
+                }
+                if attachments.len() > crate::chat::MAX_CHAT_ATTACHMENTS {
+                    return LightResponse::error("Too many attachments (max 4)");
+                }
+                if attachments.iter().any(|att| att.is_graffiti()) {
+                    return LightResponse::error("Attachment payload rejected: must be a valid cryptographic hash, not text.");
+                }
+                
+                // VERIFY PoW (Instant, O(1))
+                if !crate::chat::verify_chat_pow_v2(&sender, timestamp, reply_to, &words, &attachments, nonce) {
+                    return LightResponse::error("Invalid Chat PoW");
+                }
+
+                // Rate Limit: Because PoW protects us, we can safely allow bursts (e.g. for L2 channel updates)
+                {
+                    let mut limits = self.light_chat_limits.lock().await;
+                    let now = std::time::Instant::now();
+                    if limits.len() > 1000 {
+                        limits.retain(|_, (_, ts)| now.duration_since(*ts).as_secs() < 60);
+                    }
+                    let entry = limits.entry(from).or_insert((0, now));
+                    if now.duration_since(entry.1).as_secs() >= 10 {
+                        *entry = (0, now);
+                    }
+                    entry.0 += 1;
+                    if entry.0 > 20 { 
+                        return LightResponse::error("Rate limit exceeded.");
+                    }
+                }
+
+                if let Some(cmd_tx) = &self.cmd_tx {
+                    let _ = cmd_tx.try_send(NodeCommand::BroadcastP2PChat {
+                        sender, timestamp, nonce, reply_to, words, attachments
+                    });
+                }
+
+                LightResponse::success(serde_json::json!({ "status": "broadcasted" }))
             }
             
         }

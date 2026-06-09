@@ -1217,7 +1217,41 @@ pub async fn block_template() -> Response {
         })),
     ).into_response()
 }
+pub async fn submit_chat(
+    State(node): State<AppState>,
+    Json(req): Json<SubmitChatRequest>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    
+    if req.words.is_empty() && req.attachments.is_empty() {
+        return Err(ErrorResponse { error: "Message must contain words or attachments".into() });
+    }
+    if req.words.len() > 10 {
+        return Err(ErrorResponse { error: "Message must contain at most 10 words".into() });
+    }
+    if req.words.iter().any(|&w| (w as usize) >= crate::node::CHAT_DICTIONARY.len()) {
+        return Err(ErrorResponse { error: "Invalid word index".into() });
+    }
+    if req.attachments.len() > crate::node::MAX_CHAT_ATTACHMENTS {
+        return Err(ErrorResponse { error: "Too many attachments (max 4)".into() });
+    }
+    
+    // Verify the client's PoW locally
+    if !crate::node::verify_chat_pow_v2(&req.sender, req.timestamp, req.reply_to, &req.words, &req.attachments, req.nonce) {
+        return Err(ErrorResponse { error: "Invalid Chat PoW".into() });
+    }
 
+    // Since the client did the PoW, we can directly dispatch it
+    node.broadcast_premined_chat(
+        req.sender,
+        req.timestamp,
+        req.nonce,
+        req.reply_to,
+        req.words,
+        req.attachments,
+    ).map_err(|e| ErrorResponse { error: e.to_string() })?;
+    
+    Ok(Json(serde_json::json!({ "status": "broadcasted" })))
+}
 pub async fn get_chat(State(node): State<AppState>) -> Json<GetChatResponse> {
     let hist = node.chat_history.read().await;
     Json(GetChatResponse {
@@ -1329,4 +1363,10 @@ pub async fn send_chat(
 
 pub async fn chat_ui() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("chat.html"))
+}
+pub async fn midstate_css() -> impl IntoResponse {
+    (
+        [("Content-Type", "text/css")],
+        include_str!("midstate.css"),
+    )
 }
