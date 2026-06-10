@@ -363,12 +363,14 @@ impl SyncManager {
     }
 
     pub fn abort(&mut self, reason: &str) -> (u32, Option<Instant>) {
+        self.in_progress = false;
         if self.session.is_some() {
             self.retry_count += 1;
             // Exponential backoff: 2^n seconds, capped at 5 minutes.
             // Sequence: 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 300s, 300s...
             let backoff_secs = 2u64.saturating_pow(self.retry_count).min(300);
             let backoff = std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs);
+            self.backoff_until = Some(backoff);
             tracing::warn!(
                 "Aborting sync session (attempt {}): {}. Retrying in {}s.",
                 self.retry_count, reason, backoff_secs
@@ -651,14 +653,15 @@ impl SyncManager {
     }
 
     /// For handle_sync_headers: extract phase info for the peer, take snapshot.
-    pub fn prepare_header_chunk(&mut self, from: PeerId) -> Option<(u64, u64, Option<Box<State>>)> {
+    pub fn prepare_header_chunk(&mut self, from: PeerId) -> Option<(u64, u128, u64, Option<Box<State>>)> {
         if let Some(s) = &mut self.session {
             if s.peer == from {
                 if let SyncPhase::Headers { cursor, snapshot, .. } = &mut s.phase {
                     let ph = s.peer_height;
+                    let pd = s.peer_depth;
                     let c = *cursor;
                     let snap = snapshot.take();
-                    return Some((ph, c, snap));
+                    return Some((ph, pd, c, snap));
                 }
             }
         }

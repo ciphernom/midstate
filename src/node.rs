@@ -1430,7 +1430,7 @@ async fn process_state_rebuild(
 ) -> Result<()> {
     if !is_valid {
         tracing::warn!("State rebuild or header validation failed, banning peer");
-        self.sync.in_progress = false;
+        self.abort_sync_session("invalid header chain or rebuild failed");
         self.ban_peer(peer, "invalid header chain or rebuild failed");
         return Ok(());
     }
@@ -1446,13 +1446,19 @@ async fn process_state_rebuild(
                 return Ok(());
             }
         };
-        let step_back = crate::network::MAX_GETHEADERS_COUNT;
+        
+        // Adaptive step-back
+        let distance_from_tip = self.state.height.saturating_sub(headers_start_height);
+        let step_back = if distance_from_tip < 360 { 360 } else { crate::network::MAX_GETHEADERS_COUNT };
         let new_start = headers_start_height.saturating_sub(step_back);
+        
         tracing::warn!(
             "Fork is deeper than downloaded headers ({}). Stepping back to {} to find the exact fork point.", 
             headers_start_height, new_start
         );
-        self.sync.restart_headers_with_step_back(peer, session.peer_height, session.peer_depth, headers, new_start, session.started_at);
+        
+        // FIX: Pass an empty Vec instead of headers so we don't trip backward prepend panics!
+        self.sync.restart_headers_with_step_back(peer, session.peer_height, session.peer_depth, Vec::new(), new_start, session.started_at);
 
         let count = headers_start_height.saturating_sub(new_start).min(crate::network::MAX_GETHEADERS_COUNT);
         self.network.send(peer, Message::GetHeaders { start_height: new_start, count });
@@ -3812,9 +3818,9 @@ fn fire_batch_lookahead(&mut self) {
         }
     }
 
- pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHeader>) -> Result<()> {
+pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHeader>) -> Result<()> {
         // Extract state from the session — only accept headers from the sync peer
-        let (_peer_height, cursor, snapshot) = match self.sync.prepare_header_chunk(from) {
+        let (peer_height, peer_depth, cursor, snapshot) = match self.sync.prepare_header_chunk(from) {
             Some(info) => info,
             None => return Ok(()),
         };
@@ -3825,11 +3831,47 @@ fn fire_batch_lookahead(&mut self) {
             return Ok(());
         }
 
+        let start_h = headers[0].height;
+
+        // --- EARLY DEEP FORK RECOGNITION ---
+        // If this is the very first chunk of our sync request, check if it actually links to our local chain.
+        // If it doesn't, we are already on a deep fork and should step back BEFORE wasting CPU verifying PoW.
+        if start_h == cursor && start_h > 0 {
+            let mut is_deep_fork = false;
+            if let Ok(Some(local_prev)) = self.storage.load_batch(start_h - 1) {
+                if headers[0].prev_header_hash != local_prev.extension.final_hash {
+                    is_deep_fork = true;
+                }
+            } else {
+                is_deep_fork = true;
+            }
+
+            if is_deep_fork {
+                // Adaptive step-back: if we just started near the tip, step back by 360.
+                // If we are already deep, take the maximum 5000-block leap.
+                let distance_from_tip = self.state.height.saturating_sub(start_h);
+                let step_back = if distance_from_tip < 360 { 360 } else { crate::network::MAX_GETHEADERS_COUNT };
+                let new_start = start_h.saturating_sub(step_back);
+
+                tracing::warn!(
+                    "Early fork detection: peer's header at {} doesn't link to our chain. Stepping back to {} before PoW verification.", 
+                    start_h, new_start
+                );
+
+                // Discard any forward headers, start fresh from new_start
+                self.sync.restart_headers_with_step_back(from, peer_height, peer_depth, Vec::new(), new_start, std::time::Instant::now());
+                self.sync.restore_header_snapshot(snapshot);
+
+                let count = crate::network::MAX_GETHEADERS_COUNT.min(peer_height - new_start);
+                self.network.send(from, Message::GetHeaders { start_height: new_start, count });
+                return Ok(());
+            }
+        }
+
         // Put the snapshot back for the next iteration
         self.sync.restore_header_snapshot(snapshot);
 
         let chunk_size = headers.len();
-        let start_h = cursor;
         let end_h = cursor + chunk_size as u64 - 1;
         tracing::info!("Received headers {}..{} ({} total). Verifying Proof-of-Work...", start_h, end_h, chunk_size);
 
