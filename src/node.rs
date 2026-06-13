@@ -3833,38 +3833,67 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
 
         let start_h = headers[0].height;
 
+        let is_accumulated_empty = match self.sync.session.as_ref() {
+            Some(s) => match &s.phase {
+                SyncPhase::Headers { accumulated, .. } => accumulated.is_empty(),
+                _ => true,
+            },
+            None => true,
+        };
+
         // --- EARLY DEEP FORK RECOGNITION ---
         // If this is the very first chunk of our sync request, check if it actually links to our local chain.
         // If it doesn't, we are already on a deep fork and should step back BEFORE wasting CPU verifying PoW.
         if start_h == cursor && start_h > 0 {
-            let mut is_deep_fork = false;
-            if let Ok(Some(local_prev)) = self.storage.load_batch(start_h - 1) {
-                if headers[0].prev_header_hash != local_prev.extension.final_hash {
+            if is_accumulated_empty {
+                let mut is_deep_fork = false;
+                if let Ok(Some(local_prev)) = self.storage.load_batch(start_h - 1) {
+                    if headers[0].prev_header_hash != local_prev.extension.final_hash {
+                        is_deep_fork = true;
+                    }
+                } else {
                     is_deep_fork = true;
                 }
+
+                if is_deep_fork {
+                    // Adaptive step-back: if we just started near the tip, step back by 360.
+                    // If we are already deep, take the maximum 5000-block leap.
+                    let distance_from_tip = self.state.height.saturating_sub(start_h);
+                    let step_back = if distance_from_tip < 360 { 360 } else { crate::network::MAX_GETHEADERS_COUNT };
+                    let new_start = start_h.saturating_sub(step_back);
+
+                    tracing::warn!(
+                        "Early fork detection: peer's header at {} doesn't link to our chain. Stepping back to {} before PoW verification.", 
+                        start_h, new_start
+                    );
+
+                    // Discard any forward headers, start fresh from new_start
+                    self.sync.restart_headers_with_step_back(from, peer_height, peer_depth, Vec::new(), new_start, std::time::Instant::now());
+                    self.sync.restore_header_snapshot(snapshot);
+
+                    let count = crate::network::MAX_GETHEADERS_COUNT.min(peer_height - new_start);
+                    self.network.send(from, Message::GetHeaders { start_height: new_start, count });
+                    return Ok(());
+                }
             } else {
-                is_deep_fork = true;
-            }
+                let mut links_to_accumulated = true;
+                if let Some(s) = self.sync.session.as_ref() {
+                    if let SyncPhase::Headers { accumulated, .. } = &s.phase {
+                        if let Some(last_acc) = accumulated.last() {
+                            if headers[0].prev_header_hash != last_acc.extension.final_hash || headers[0].prev_midstate != last_acc.post_tx_midstate {
+                                links_to_accumulated = false;
+                            }
+                        }
+                    }
+                }
 
-            if is_deep_fork {
-                // Adaptive step-back: if we just started near the tip, step back by 360.
-                // If we are already deep, take the maximum 5000-block leap.
-                let distance_from_tip = self.state.height.saturating_sub(start_h);
-                let step_back = if distance_from_tip < 360 { 360 } else { crate::network::MAX_GETHEADERS_COUNT };
-                let new_start = start_h.saturating_sub(step_back);
-
-                tracing::warn!(
-                    "Early fork detection: peer's header at {} doesn't link to our chain. Stepping back to {} before PoW verification.", 
-                    start_h, new_start
-                );
-
-                // Discard any forward headers, start fresh from new_start
-                self.sync.restart_headers_with_step_back(from, peer_height, peer_depth, Vec::new(), new_start, std::time::Instant::now());
-                self.sync.restore_header_snapshot(snapshot);
-
-                let count = crate::network::MAX_GETHEADERS_COUNT.min(peer_height - new_start);
-                self.network.send(from, Message::GetHeaders { start_height: new_start, count });
-                return Ok(());
+                if !links_to_accumulated {
+                    tracing::warn!("Header chunk at {} does not link to previously accumulated headers. Aborting sync.", start_h);
+                    self.sync.clear_backup(&self.data_dir);
+                    self.sync.set_last_sync_cursor(None);
+                    self.abort_sync_session("sync_state.bin fork mismatch");
+                    return Ok(());
+                }
             }
         }
 
