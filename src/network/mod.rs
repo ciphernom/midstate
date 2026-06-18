@@ -347,6 +347,7 @@ pub struct MidstateNetwork {
     subnet_peers: HashMap<IpAddr, HashSet<PeerId>>,
     pub banned_subnets: HashMap<IpAddr, std::time::Instant>,
     pub static_banned_peers: HashSet<PeerId>,
+     pending_dials: HashSet<PeerId>,
 }
 
 impl MidstateNetwork {
@@ -482,6 +483,7 @@ let autonat = autonat::Behaviour::new(
             subnet_peers: HashMap::new(),
             banned_subnets: HashMap::new(),
             static_banned_peers,
+            pending_dials: HashSet::new(), 
         };
 
         net.swarm.listen_on(listen_addr.clone())?;
@@ -770,22 +772,17 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
     /// Try to dial a multiaddr string. Ignores bad parses or dial failures.
     pub fn dial_addr(&mut self, addr_str: &str) {
         // SERVER-TO-SERVER WEBRTC LEAK FIX:
-        // webrtc-rs has a known bug where outbound ICE agents leak mDNS sockets (UDP 5353)
-        // on connection failure. Nodes do not speak to each other over WebRTC anyway 
-        // (they use TCP/QUIC). WebRTC addresses are collected via PEX *only* to be 
-        // served to the browser UI. Ignore them for actual daemon dialing.
         if addr_str.contains("webrtc-direct") {
             return;
         }
         match addr_str.parse::<Multiaddr>() {
             Ok(addr) => {
-            // NEW: Add the is_routable check here
-            if !is_routable(&addr) {
-                tracing::debug!("PEX ignoring non-routable address: {}", addr_str);
-                return;
-            }
+                if !is_routable(&addr) {
+                    tracing::debug!("PEX ignoring non-routable address: {}", addr_str);
+                    return;
+                }
 
-            if let Some(peer) = extract_peer_id(&addr) {
+                if let Some(peer) = extract_peer_id(&addr) {
                     if self.static_banned_peers.contains(&peer) {
                         tracing::debug!("PEX ignoring statically banned peer: {}", peer);
                         return;
@@ -794,20 +791,25 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                         return; 
                     }
 
-                    // --- NEW: Prevent dialing saturated subnets ---
+                    // --- NEW: Prevent duplicate in-flight dials ---
+                    if self.pending_dials.contains(&peer) {
+                        return;
+                    }
+
+                    // --- Subnet Limit Defense ---
                     if let Some(subnet) = extract_subnet(&addr) {
                         if let Some(peers) = self.subnet_peers.get(&subnet) {
-                            // Only reject if there are 4+ peers AND this specific peer isn't one of them
                             if peers.len() >= 4 && !peers.contains(&peer) {
                                 tracing::debug!("PEX ignoring {}: subnet limit reached", addr_str);
                                 return;
                             }
                         }
                     }
-                    // ----------------------------------------------
-
                     
+                    self.pending_dials.insert(peer); // Track in-flight dial
+
                     if let Err(e) = self.swarm.dial(addr) {
+                        self.pending_dials.remove(&peer); // Cleanup on sync failure
                         tracing::debug!("PEX dial {} failed: {}", addr_str, e);
                     }
                 } else {
@@ -942,8 +944,12 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                         }
 
                         // ── Write response ──
-                        if let Err(e) = write_response_raw(&mut stream, resp).await {
-                            tracing::debug!("Light {}: write failed: {}", peer, e);
+                        // Enforce a strict timeout. If the WebRTC client is dead or malicious
+                        // and stops reading, this prevents the task from hanging forever,
+                        // which allows libp2p to drop the connection and webrtc-rs to GC the UDP socket.
+                        let write_fut = write_response_raw(&mut stream, resp);
+                        if let Err(_) = tokio::time::timeout(Duration::from_secs(5), write_fut).await {
+                            tracing::debug!("Light {}: write timed out (client stalled)", peer);
                         }
 
                         guard.close_stream(peer).await;
@@ -1108,7 +1114,9 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                         let _ = self.swarm.disconnect_peer_id(peer_id);
                         continue;
                     }
-
+                    
+                    self.pending_dials.remove(&peer_id); 
+                    
                     // --- STATIC BANNED PEER DEFENSE ---
                     if self.static_banned_peers.contains(&peer_id) {
                         tracing::warn!("Rejected connection from statically banned peer: {}", peer_id);
@@ -1217,6 +1225,8 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     if peer_id == *self.swarm.local_peer_id() {
                         continue;
                     }
+                    
+                    self.pending_dials.remove(&peer_id); 
                     // ------------------------------------------------
                     
                     if num_established == 0 {
@@ -1252,16 +1262,31 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     tracing::info!("Listening on {}", address);
                     self.listen_addrs.push(address);
                 }
-                SwarmEvent::OutgoingConnectionError { error, .. } => {
-                    // Extract the failed multiaddr based on the type of dial error
-                    if let libp2p::swarm::DialError::Transport(failed_addrs) = error {
-                        // Just grab the first failed address from the transport error
-                        if let Some((multiaddr, _)) = failed_addrs.first() {
-                            return NetworkEvent::OutgoingConnectionFailed(multiaddr.to_string());
+                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                    // 1. If libp2p knows the PeerId natively, remove it.
+                    if let Some(pid) = peer_id {
+                        self.pending_dials.remove(&pid);
+                    }
+
+                    // 2. Extract failed multiaddrs and scrub them from pending_dials
+                    match error {
+                        libp2p::swarm::DialError::Transport(failed_addrs) => {
+                            for (addr, _) in &failed_addrs {
+                                if let Some(pid) = extract_peer_id(addr) {
+                                    self.pending_dials.remove(&pid);
+                                }
+                            }
+                            if let Some((multiaddr, _)) = failed_addrs.first() {
+                                return NetworkEvent::OutgoingConnectionFailed(multiaddr.to_string());
+                            }
                         }
-                    } else if let libp2p::swarm::DialError::WrongPeerId { address, .. } = error {
-                        // The peer answered, but lied about its PeerId (malicious/misconfigured)
-                        return NetworkEvent::OutgoingConnectionFailed(address.to_string());
+                        libp2p::swarm::DialError::WrongPeerId { address, .. } => {
+                            if let Some(pid) = extract_peer_id(&address) {
+                                self.pending_dials.remove(&pid);
+                            }
+                            return NetworkEvent::OutgoingConnectionFailed(address.to_string());
+                        }
+                        _ => {}
                     }
                 }
                 SwarmEvent::ExternalAddrConfirmed { address } => {

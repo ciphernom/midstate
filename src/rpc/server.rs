@@ -10,7 +10,9 @@ use axum::{
 };
 
 use tower_http::trace::TraceLayer;
-use tower_http::cors::{CorsLayer, Any};  
+use tower_http::cors::{CorsLayer, Any};
+use tower_http::timeout::TimeoutLayer;
+use std::time::Duration;
 use axum::http::{Method, HeaderValue, StatusCode};
 use axum::extract::DefaultBodyLimit;
 
@@ -135,6 +137,7 @@ impl RpcServer {
             .nest("/axe", axe_routes) 
             .route("/tx/by_input", post(get_tx_by_input))
             .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB max request body
+            .layer(TimeoutLayer::new(Duration::from_secs(30))) // Forcefully drop stalled requests
             .layer(TraceLayer::new_for_http())
             .layer(cors)
             .with_state(node_handle);

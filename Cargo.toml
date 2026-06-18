@@ -35,7 +35,7 @@ tokio = { version = "1.35", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 redb = "2.0"
 axum = "0.7"
-tower-http = { version = "0.5", features = ["trace", "cors"] }
+tower-http = { version = "0.5.2", features = ["trace", "cors", "timeout"] }
 rpassword = "7.3"
 dirs = "5.0"
 
@@ -70,9 +70,4 @@ panic = "abort"
 strip = true
 
 
-[target.aarch64-unknown-linux-gnu]
-linker = "aarch64-linux-gnu-gcc"
-rustflags = [
-    "-C", "target-cpu=cortex-a76",
-    "-C", "link-arg=-lgcc",
-]
+

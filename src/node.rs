@@ -2260,8 +2260,12 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
         let mut license_challenge_interval = time::interval(Duration::from_secs(300));
         license_challenge_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         
-        // Create a single shared HTTP client
-        let http_client = reqwest::Client::new();
+        // Create a single shared HTTP client with a strict timeout to prevent 
+        // socket leaks if a mining pool server hangs or responds slowly.
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         
         // Initial sync: ask all peers for their height
         if self.network.peer_count() > 0 {
