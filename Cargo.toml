@@ -1,6 +1,6 @@
 [package]
 name = "midstate"
-version = "3.4.1a"
+version = "3.4.1"
 edition = "2021"
 
 [dependencies]
