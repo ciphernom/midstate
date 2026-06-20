@@ -1118,6 +1118,13 @@ pub async fn new(
 
             let new_state = rebuild_state_from_disk(storage.clone(), crate::core::types::V4_ACTIVATION_HEIGHT, None).await?;
             storage.save_state(&new_state)?;
+            
+            // --- DOS FIX: Save a snapshot AT the activation height ---
+            // This guarantees that any future forks near the activation height
+            // take 0 seconds to rebuild, preventing V3 peers from causing CPU spikes.
+            let _ = storage.save_state_snapshot(crate::core::types::V4_ACTIVATION_HEIGHT, &new_state);
+            // ---------------------------------------------------------
+            
             storage.truncate_chain(crate::core::types::V4_ACTIVATION_HEIGHT)?;
             state = new_state;
             tracing::info!("Rollback complete. Node is now enforcing new State Root rules at height {}.", state.height);
@@ -1641,10 +1648,15 @@ async fn process_verified_batches_chunk(
             self.sync.set_last_sync_cursor(Some(current_cursor.saturating_sub(1)));
             self.abort_sync_session("peer sent corrupt batch");
             
-            // --- FIX: Reorg-Proof Sync & V4 HARD FORK BAN HAMMER ---
+             // --- FIX: Reorg-Proof Sync & V4 HARD FORK BAN HAMMER ---
             if error_msg.contains("Consensus violation") || error_msg.contains("State root mismatch") {
                 // This is not a harmless reorg. This peer is running the old software and feeding us dirty blocks.
                 // We MUST permanently ban them so they don't constantly reconnect and cancel our local miner!
+                
+                // Clear the poisoned sync state so we don't infinitely resume it with the next peer
+                self.sync.clear_backup(&self.data_dir);
+                self.sync.set_last_sync_cursor(None);
+                
                 self.abort_sync_session("peer sent V3 dirty block");
                 self.ban_peer(from, &error_msg);
             } else {
