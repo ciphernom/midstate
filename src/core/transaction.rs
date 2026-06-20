@@ -713,9 +713,20 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 state.commitment_heights.remove(&expected);
             }
 
-            // 6. Remove spent coins
-            for coin_id in &input_coin_ids {
-                state.coins.remove(coin_id, v2);
+            // 6. Remove spent coins and update Epoch 2 Oracle
+            for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                state.coins.remove(&input.coin_id(), v2);
+                
+                if state.height >= crate::core::types::V4_ACTIVATION_HEIGHT {
+                    let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                    if let Some(sig) = wit_inputs.first() {
+                        if sig.len() == crate::core::wots::SIG_SIZE {
+                            state.burned_wots.insert(input.predicate.address(), v2);
+                        } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                            state.burned_wots.insert(mss_sig.wots_pk, v2);
+                        }
+                    }
+                }
             }
 
             // 7. Add new coins (Ignore DataBurns, protecting the SMT!)
@@ -817,6 +828,18 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             }
 
             for coin_id in &input_coin_ids { state.coins.remove(coin_id, v2); }
+            
+            if state.height >= crate::core::types::V4_ACTIVATION_HEIGHT {
+                let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                if let Some(sig) = wit_inputs.first() {
+                    if sig.len() == crate::core::wots::SIG_SIZE {
+                        state.burned_wots.insert(inputs[0].predicate.address(), v2);
+                    } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                        state.burned_wots.insert(mss_sig.wots_pk, v2);
+                    }
+                }
+            }
+            
             for out in outputs {
                 if let Some(coin_id) = out.coin_id() {
                     if !state.coins.insert(coin_id, v2) { bail!("Duplicate coin created"); }
@@ -1021,15 +1044,16 @@ mod tests {
         State {
             midstate: [0u8; 32],
             coins: UtxoAccumulator::new(),
-            commitments: UtxoAccumulator::new(),
+            commitments: UtxoAccumulator::new(),            
             depth: 0,
             target: [0xff; 32],
             height: 1,
             timestamp: 1000,
             commitment_heights: im::HashMap::new(),
             expirations: im::OrdMap::new(),
-            chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
             header_hash: [0u8; 32],
+            chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
+            burned_wots: UtxoAccumulator::new(),
         }
     }
 

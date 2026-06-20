@@ -243,6 +243,8 @@ pub struct State {
     #[serde(default)]
     pub chain_mmr: crate::core::mmr::MerkleMountainRange,
     pub header_hash: [u8; 32],
+    #[serde(default)]
+    pub burned_wots: UtxoAccumulator,
 }
 
 impl State {
@@ -301,7 +303,7 @@ impl State {
         let state = Self {
             midstate: initial_midstate,
             coins: UtxoAccumulator::new(),
-            commitments: UtxoAccumulator::new(),
+            commitments: UtxoAccumulator::new(),           
             depth: 0,
             target,
             height: 0,
@@ -310,6 +312,7 @@ impl State {
             expirations: im::OrdMap::new(),
             chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
             header_hash: initial_midstate, 
+             burned_wots: UtxoAccumulator::new(),
         };
         (state, genesis_coinbase)
     }
@@ -756,6 +759,8 @@ pub const COMMITMENT_TTL: u64 = 1000;
 /// that do not prune, so that new peers can still perform a full genesis sync.
 pub const PRUNE_DEPTH: u64 = 1000;
 
+
+pub const V4_ACTIVATION_HEIGHT: u64 = 163_675;
 
 pub const COMMIT_POW_WINDOW: u64 = 1000;
 

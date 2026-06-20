@@ -89,43 +89,68 @@ fn deserialize_state(bytes: &[u8]) -> Result<State> {
     // FIX: Match bincode::serialize()'s implicit Fixint encoding!
     let strict = bincode::DefaultOptions::new()
         .with_limit(100_000_000)
-        .with_fixint_encoding(); // <--- ADD THIS LINE
+        .with_fixint_encoding(); 
 
     let mut state = match strict.deserialize::<State>(bytes) {
         Ok(s) => s,
-        Err(strict_err) => match legacy::deserialize_legacy_state(bytes) {
-            Ok(migrated) => {
-                tracing::warn!(
-                    "State on disk is in the pre-domain-separation wire format \
-                     (strict parse failed: {}). Migrated successfully; the next \
-                     save_state will write canonical form.",
-                    strict_err
-                );
-                migrated
+        Err(strict_err) => {
+            // V3 -> V4 Safe Migration Fallback
+            // This struct MUST exactly match the V3 disk format (NO burned_wots field!)
+            #[derive(serde::Deserialize)]
+            struct StateV3 {
+                midstate: [u8; 32],
+                coins: crate::core::mmr::UtxoAccumulator,
+                commitments: crate::core::mmr::UtxoAccumulator,
+                depth: u128,
+                target: [u8; 32],
+                height: u64,
+                timestamp: u64,
+                #[serde(default)]
+                commitment_heights: im::HashMap<[u8; 32], u64>,
+                #[serde(default)]
+                chain_mmr: crate::core::mmr::MerkleMountainRange,
+                header_hash: [u8; 32],
             }
-            Err(legacy_err) => {
-                // Both parses failed. The strict-new error is usually the
-                // more informative one (e.g. "Slice had bytes remaining"
-                // immediately tells the operator what's going on); the
-                // legacy error is logged for diagnostics in case the file
-                // turns out to be a third unknown format.
-                tracing::error!(
-                    "Legacy migration also failed: {}",
-                    legacy_err
-                );
-                return Err(anyhow::anyhow!(
-                    "State deserialization failed: {}",
-                    strict_err
-                ));
+
+            match strict.deserialize::<StateV3>(bytes) {
+                Ok(v3) => State {
+                    midstate: v3.midstate,
+                    coins: v3.coins,
+                    commitments: v3.commitments,
+                    depth: v3.depth,
+                    target: v3.target,
+                    height: v3.height,
+                    timestamp: v3.timestamp,
+                    commitment_heights: v3.commitment_heights,
+                    expirations: im::OrdMap::new(),
+                    chain_mmr: v3.chain_mmr,
+                    header_hash: v3.header_hash,
+                    burned_wots: crate::core::mmr::UtxoAccumulator::new(), // Add the empty V4 SMT
+                },
+                Err(_) => match legacy::deserialize_legacy_state(bytes) {
+                    Ok(migrated) => {
+                        tracing::warn!(
+                            "State on disk is in the pre-domain-separation wire format \
+                             (strict parse failed: {}). Migrated successfully; the next \
+                             save_state will write canonical form.",
+                            strict_err
+                        );
+                        migrated
+                    }
+                    Err(legacy_err) => {
+                        tracing::error!("Legacy migration also failed: {}", legacy_err);
+                        return Err(anyhow::anyhow!("State deserialization failed: {}", strict_err));
+                    }
+                },
             }
-        },
+        }
     };
 
     // Rebuild the SMT caches under the chain-height-implied hashing mode.
-
     let v2 = crate::core::types::is_v2_at(state.height);
     state.coins.rebuild_tree(v2);
     state.commitments.rebuild_tree(v2);
+    state.burned_wots.rebuild_tree(v2);
 
     // Rebuild the expirations B-tree from commitment_heights.
     use std::collections::BTreeMap;
@@ -242,6 +267,7 @@ mod legacy {
             midstate: legacy.midstate,
             coins,
             commitments,
+            burned_wots: crate::core::mmr::UtxoAccumulator::new(),
             depth: legacy.depth,
             target: legacy.target,
             height: legacy.height,

@@ -597,7 +597,13 @@ impl Mempool {
     ///
     /// Completely avoids hashing or signature verification — safe to call
     /// on the main event loop.
-    pub fn prune_on_new_block(&mut self, state: &State, newly_spent_inputs: &[[u8; 32]], newly_mined_commits: &[[u8; 32]]) {
+    pub fn prune_on_new_block(
+        &mut self, 
+        state: &State, 
+        newly_spent_inputs: &[[u8; 32]], 
+        newly_mined_commits: &[[u8; 32]],
+        newly_burned_addresses: &[[u8; 32]] // <-- NEW
+    ) {
         // 1. O(K) Prune Reveals based on spent inputs
         for coin in newly_spent_inputs {
             if let Some(tx_id) = self.txs_by_input.remove(coin) {
@@ -612,7 +618,48 @@ impl Mempool {
             }
         }
 
-        // 3. O(R) TTL Prune (Instant, no signatures verified).
+        // 3. O(R) Prune Reveals that reuse a newly burned WOTS address/MSS leaf
+        let mut to_evict = Vec::new();
+        for (id, mempool_tx) in &self.reveals {
+            match &*mempool_tx.tx {
+                Transaction::Reveal { inputs, witnesses, .. } => {
+                    for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                        let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                        if let Some(sig) = wit_inputs.first() {
+                            let addr = if sig.len() == crate::core::wots::SIG_SIZE {
+                                input.predicate.address()
+                            } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                                mss_sig.wots_pk
+                            } else { continue };
+
+                            if newly_burned_addresses.contains(&addr) {
+                                to_evict.push(*id);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Transaction::Consolidate { inputs, witness, .. } => {
+                    if inputs.is_empty() { continue; }
+                    let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+                    if let Some(sig) = wit_inputs.first() {
+                        let addr = if sig.len() == crate::core::wots::SIG_SIZE {
+                            inputs[0].predicate.address()
+                        } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                            mss_sig.wots_pk
+                        } else { continue };
+
+                        if newly_burned_addresses.contains(&addr) {
+                            to_evict.push(*id);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for id in to_evict { self.remove_reveal_internal(&id); }
+
+        // 4. O(R) TTL Prune (Instant, no signatures verified).
         // Handles both Reveal and Consolidate — both reference an underlying
         // commitment via the same inputs/outputs/salt construction.
         let expired: Vec<_> = self.reveals.iter().filter(|(_, mempool_tx)| {
@@ -758,7 +805,7 @@ mod tests {
         State {
             midstate: [0u8; 32],
             coins: UtxoAccumulator::new(),
-            commitments: UtxoAccumulator::new(),
+            commitments: UtxoAccumulator::new(),            
             depth: 0,
             target: [0xff; 32],
             height: 1,
@@ -767,6 +814,7 @@ mod tests {
             expirations: im::OrdMap::new(),
             header_hash: [0u8; 32],
             chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
+            burned_wots: UtxoAccumulator::new(),
         }
     }
 

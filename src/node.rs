@@ -938,8 +938,11 @@ fn finish_template(
         candidate.coins.insert(cb.coin_id(), v2);
     }
 
-    let smt_root  = hash_concat(&candidate.coins.root(v2), &candidate.commitments.root(v2));
-    let state_root = hash_concat(&smt_root, &candidate.chain_mmr.root(v2));
+     let smt_root  = hash_concat(&candidate.coins.root(v2), &candidate.commitments.root(v2));
+    let mut state_root = hash_concat(&smt_root, &candidate.chain_mmr.root(v2));
+    if height >= crate::core::types::V4_ACTIVATION_HEIGHT {
+        state_root = hash_concat(&state_root, &candidate.burned_wots.root(v2));
+    }
     candidate.midstate = hash_concat(&candidate.midstate, &state_root);
 
     // Lock the timestamp now: it's a header field, so the miner cannot bump
@@ -1086,6 +1089,39 @@ pub async fn new(
             "Loaded state: height={} depth={} coins={} commitments={}",
             state.height, state.depth, state.coins.len(), state.commitments.len()
         );
+
+        if state.height > crate::core::types::V4_ACTIVATION_HEIGHT {
+            tracing::warn!("🚨 V4 HARD FORK: Truncating dirty chain to block {} 🚨", crate::core::types::V4_ACTIVATION_HEIGHT);
+
+            // SURGICAL DB FIX: Purge the known reused WOTS keys from the database 
+            // BEFORE replaying, so they don't poison their original legitimate spends.
+            let bad_keys = vec![
+                "4f28ae9e840c35ca3a7ae7b88ebb43624fe7fc602db8555fbd75de176fb7a12d",
+                "38987156176e7931c427c89f2ee2bd3963ea5e554acfc2967c322fc506f95618"
+            ];
+            for key_hex in bad_keys {
+                if let Ok(bytes) = hex::decode(key_hex) {
+                    if let Ok(addr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                        let _ = storage.delete_spent_address(&addr);
+                    }
+                }
+            }
+
+            // 1. Unburn addresses from the dirty chain BEFORE replaying, 
+            // to prevent Ghost DB entries from crashing the historical replay!
+            for h in crate::core::types::V4_ACTIVATION_HEIGHT..state.height {
+                if let Ok(Some(batch)) = storage.load_batch(h) {
+                    let _ = storage.unburn_batch_addresses(&batch);
+                }
+            }
+
+            // 2. Safely rebuild the state up to the fork point
+            let new_state = rebuild_state_from_disk(storage.clone(), crate::core::types::V4_ACTIVATION_HEIGHT, None).await?;
+            storage.save_state(&new_state)?;
+            storage.truncate_chain(crate::core::types::V4_ACTIVATION_HEIGHT)?;
+            state = new_state;
+            tracing::info!("Rollback complete. Node is now enforcing new State Root rules at height {}.", state.height);
+        }
 
         if state.height == 0 {
             match storage.load_batch(0)? {
@@ -5419,7 +5455,7 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
                             }
                         }
                     }
-                    self.mempool.prune_on_new_block(&self.state, &spent_inputs, &mined_commits);
+                    self.mempool.prune_on_new_block(&self.state, &spent_inputs, &mined_commits, &crate::node::extract_spent_addresses(&batch));
 
                     self.chain_history.push_back((pre_height, self.state.header_hash));
 
@@ -5774,7 +5810,7 @@ async fn try_apply_orphans(&mut self) {
                             }
                         }
                     }
-                    self.mempool.prune_on_new_block(&self.state, &spent_inputs, &mined_commits);
+                    self.mempool.prune_on_new_block(&self.state, &spent_inputs, &mined_commits, &crate::node::extract_spent_addresses(&batch));
 
                     applied += 1;
                     matched = true;
@@ -5929,7 +5965,10 @@ async fn try_apply_orphans(&mut self) {
 
         // --- Calculate state root ---
         let smt_root = hash_concat(&candidate_state.coins.root(v2), &candidate_state.commitments.root(v2));
-        let state_root = hash_concat(&smt_root, &candidate_state.chain_mmr.root(v2));
+        let mut state_root = hash_concat(&smt_root, &candidate_state.chain_mmr.root(v2));
+        if pre_mine_height >= crate::core::types::V4_ACTIVATION_HEIGHT {
+            state_root = hash_concat(&state_root, &candidate_state.burned_wots.root(v2));
+        }
         candidate_state.midstate = hash_concat(&candidate_state.midstate, &state_root);
         // ---------------------------------
 
@@ -6111,7 +6150,7 @@ async fn try_apply_orphans(&mut self) {
                         }
                     }
                 }
-                self.mempool.prune_on_new_block(&self.state, &spent_inputs, &mined_commits);
+                self.mempool.prune_on_new_block(&self.state, &spent_inputs, &mined_commits, &crate::node::extract_spent_addresses(&batch));
                 self.check_pending_mix_reveals().await;
             }
             Err(e) => {
@@ -6849,9 +6888,12 @@ mod complex_tests {
             candidate_state.midstate = hash_concat(&candidate_state.midstate, &coin_id);
         }
 
-        // 3. Compute State Root
+       // 3. Compute State Root
         let smt_root = hash_concat(&candidate_state.coins.root(v2), &candidate_state.commitments.root(v2));
-        let state_root = hash_concat(&smt_root, &candidate_state.chain_mmr.root(v2));
+        let mut state_root = hash_concat(&smt_root, &candidate_state.chain_mmr.root(v2));
+        if prev_state.height >= crate::core::types::V4_ACTIVATION_HEIGHT {
+            state_root = hash_concat(&state_root, &candidate_state.burned_wots.root(v2));
+        }
         candidate_state.midstate = hash_concat(&candidate_state.midstate, &state_root);
 
         let target = prev_state.target;

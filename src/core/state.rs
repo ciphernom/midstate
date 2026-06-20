@@ -457,8 +457,11 @@ fn apply_batch_internal(
     for coin_id in &coinbase_ids {
         temp_state_coins.insert(*coin_id, v2);
     }
-    let smt_root = hash_concat(&temp_state_coins.root(v2), &state.commitments.root(v2));
-    let expected_state_root = hash_concat(&smt_root, &state.chain_mmr.root(v2));
+     let smt_root = hash_concat(&temp_state_coins.root(v2), &state.commitments.root(v2));
+    let mut expected_state_root = hash_concat(&smt_root, &state.chain_mmr.root(v2));
+    if state.height >= crate::core::types::V4_ACTIVATION_HEIGHT {
+        expected_state_root = hash_concat(&expected_state_root, &state.burned_wots.root(v2));
+    }
 
     if batch.state_root != expected_state_root {
         bail!("State root mismatch: expected {}, got {}", hex::encode(expected_state_root), hex::encode(batch.state_root));
