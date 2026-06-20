@@ -1093,16 +1093,13 @@ pub async fn new(
          if state.height > crate::core::types::V4_ACTIVATION_HEIGHT {
             tracing::warn!("🚨 V4 HARD FORK: Truncating dirty chain to block {} 🚨", crate::core::types::V4_ACTIVATION_HEIGHT);
 
-
             // 1. Unburn addresses from the dirty chain BEFORE replaying, 
-            // to prevent Ghost DB entries from crashing the historical replay!
             for h in crate::core::types::V4_ACTIVATION_HEIGHT..state.height {
                 if let Ok(Some(batch)) = storage.load_batch(h) {
                     let _ = storage.unburn_batch_addresses(&batch);
                 }
             }
 
-            // 2. Safely rebuild the state up to the fork point
             let new_state = rebuild_state_from_disk(storage.clone(), crate::core::types::V4_ACTIVATION_HEIGHT, None).await?;
             storage.save_state(&new_state)?;
             storage.truncate_chain(crate::core::types::V4_ACTIVATION_HEIGHT)?;
@@ -1236,6 +1233,8 @@ pub async fn new(
         // Convert Multiaddrs to Strings to store for the fallback dialer
         let (mined_batch_tx, mined_batch_rx) = tokio::sync::mpsc::channel(100);
 
+        let starting_height = state.height; // <-- Extract the u64 before 'state' is moved
+
         Ok(Self {
             state,
             mempool: Mempool::new(),
@@ -1247,8 +1246,12 @@ pub async fn new(
             recent_headers,
             orphan_batches: HashMap::new(),
             orphan_order: VecDeque::new(),
-            sync_requested_up_to: 0,
-            sync: crate::sync::SyncManager::new(),
+            sync_requested_up_to: starting_height,
+            sync: {
+                let mut s = crate::sync::SyncManager::new();
+                s.set_last_sync_cursor(Some(starting_height));
+                s
+            },
             data_dir,
             prune,
             chain_history: VecDeque::new(),
@@ -1622,13 +1625,18 @@ async fn process_verified_batches_chunk(
             self.sync.set_last_sync_cursor(Some(current_cursor.saturating_sub(1)));
             self.abort_sync_session("peer sent corrupt batch");
             
-            // --- FIX: Reorg-Proof Sync ---
-            // The peer sent a batch that does not match the header they sent earlier.
-            // This happens frequently when the peer reorganizes their chain while we are syncing from them.
-            // We MUST NOT ban them. Reset backoff so we retry immediately.
-            self.sync.retry_count = 0; 
-            self.abort_sync_session("peer reorganized during sync (batch/header mismatch)");
-            self.network.disconnect_peer(from);
+            // --- FIX: Reorg-Proof Sync & V4 HARD FORK BAN HAMMER ---
+            if error_msg.contains("Consensus violation") || error_msg.contains("State root mismatch") {
+                // This is not a harmless reorg. This peer is running the old software and feeding us dirty blocks.
+                // We MUST permanently ban them so they don't constantly reconnect and cancel our local miner!
+                self.abort_sync_session("peer sent V3 dirty block");
+                self.ban_peer(from, &error_msg);
+            } else {
+                // Harmless reorg/mismatch. Just disconnect and retry.
+                self.sync.retry_count = 0; 
+                self.abort_sync_session("peer reorganized during sync (batch/header mismatch)");
+                self.network.disconnect_peer(from);
+            }
             
             return Ok(());
         }
