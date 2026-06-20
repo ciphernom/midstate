@@ -1090,22 +1090,9 @@ pub async fn new(
             state.height, state.depth, state.coins.len(), state.commitments.len()
         );
 
-        if state.height > crate::core::types::V4_ACTIVATION_HEIGHT {
+         if state.height > crate::core::types::V4_ACTIVATION_HEIGHT {
             tracing::warn!("🚨 V4 HARD FORK: Truncating dirty chain to block {} 🚨", crate::core::types::V4_ACTIVATION_HEIGHT);
 
-            // SURGICAL DB FIX: Purge the known reused WOTS keys from the database 
-            // BEFORE replaying, so they don't poison their original legitimate spends.
-            let bad_keys = vec![
-                "4f28ae9e840c35ca3a7ae7b88ebb43624fe7fc602db8555fbd75de176fb7a12d",
-                "38987156176e7931c427c89f2ee2bd3963ea5e554acfc2967c322fc506f95618"
-            ];
-            for key_hex in bad_keys {
-                if let Ok(bytes) = hex::decode(key_hex) {
-                    if let Ok(addr) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                        let _ = storage.delete_spent_address(&addr);
-                    }
-                }
-            }
 
             // 1. Unburn addresses from the dirty chain BEFORE replaying, 
             // to prevent Ghost DB entries from crashing the historical replay!
