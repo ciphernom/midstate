@@ -1090,7 +1090,40 @@ pub async fn new(
             state.height, state.depth, state.coins.len(), state.commitments.len()
         );
 
-         if state.height > crate::core::types::V4_ACTIVATION_HEIGHT {
+         let mut needs_rollback = false;
+        
+        if state.height > crate::core::types::V4_ACTIVATION_HEIGHT {
+            // Load the actual block 163,676 from disk to see if it was mined with V3 or V4 rules.
+            if let Ok(Some(activation_batch)) = storage.load_batch(crate::core::types::V4_ACTIVATION_HEIGHT) {
+                // Reconstruct what the V3 state root WOULD have been for this block
+                let temp_state = rebuild_state_from_disk(storage.clone(), crate::core::types::V4_ACTIVATION_HEIGHT, None).await?;
+                let v2 = crate::core::types::is_v2_at(temp_state.height);
+                let mut wots_oracle = storage.query_spent_addresses(&activation_batch).unwrap_or_default();
+                
+                // Temporarily disable the V4 check in apply_batch so we can calculate the naked V3 root
+                let mut candidate_v3 = temp_state.clone();
+                let _ = crate::core::state::apply_batch_skip_pow(
+                    &mut candidate_v3, 
+                    &activation_batch, 
+                    &[], 
+                    &mut wots_oracle,
+                    crate::core::types::compute_header_hash(&activation_batch.header())
+                );
+                
+                let smt_root = crate::core::types::hash_concat(&candidate_v3.coins.root(v2), &candidate_v3.commitments.root(v2));
+                let v3_state_root = crate::core::types::hash_concat(&smt_root, &candidate_v3.chain_mmr.root(v2));
+
+                // If the block on disk has the V3 state root, it is a dirty block. We must roll back.
+                if activation_batch.state_root == v3_state_root {
+                    needs_rollback = true;
+                }
+            } else {
+                // We are past activation height but don't have the block on disk? Corrupt state.
+                needs_rollback = true;
+            }
+        }
+
+        if needs_rollback {
             tracing::warn!("🚨 V4 HARD FORK: Truncating dirty chain to block {} 🚨", crate::core::types::V4_ACTIVATION_HEIGHT);
 
             // SURGICAL DB FIX: Purge the known reused WOTS keys from the database 
@@ -1099,7 +1132,7 @@ pub async fn new(
             let bad_keys = vec![
                 "4f28ae9e840c35ca3a7ae7b88ebb43624fe7fc602db8555fbd75de176fb7a12d",
                 "38987156176e7931c427c89f2ee2bd3963ea5e554acfc2967c322fc506f95618",
-                "63dab6d20f4f6a23cf80981d575c434171fce7f422c04dad41a3cdf8f8b87d22" // The block 142500 reuse!
+                "63dab6d20f4f6a23cf80981d575c434171fce7f422c04dad41a3cdf8f8b87d22" 
             ];
             for key_hex in bad_keys {
                 if let Ok(bytes) = hex::decode(key_hex) {
@@ -1120,8 +1153,6 @@ pub async fn new(
             storage.save_state(&new_state)?;
             
             // --- DOS FIX: Save a snapshot AT the activation height ---
-            // This guarantees that any future forks near the activation height
-            // take 0 seconds to rebuild, preventing V3 peers from causing CPU spikes.
             let _ = storage.save_state_snapshot(crate::core::types::V4_ACTIVATION_HEIGHT, &new_state);
             // ---------------------------------------------------------
             
