@@ -1093,6 +1093,22 @@ pub async fn new(
          if state.height > crate::core::types::V4_ACTIVATION_HEIGHT {
             tracing::warn!("🚨 V4 HARD FORK: Truncating dirty chain to block {} 🚨", crate::core::types::V4_ACTIVATION_HEIGHT);
 
+            // SURGICAL DB FIX: Purge the known reused WOTS keys from the database 
+            // BEFORE replaying, so they don't poison their original legitimate spends
+            // when storage.rs queries the oracle during the historical replay.
+            let bad_keys = vec![
+                "4f28ae9e840c35ca3a7ae7b88ebb43624fe7fc602db8555fbd75de176fb7a12d",
+                "38987156176e7931c427c89f2ee2bd3963ea5e554acfc2967c322fc506f95618",
+                "63dab6d20f4f6a23cf80981d575c434171fce7f422c04dad41a3cdf8f8b87d22" // The block 142500 reuse!
+            ];
+            for key_hex in bad_keys {
+                if let Ok(bytes) = hex::decode(key_hex) {
+                    if let Ok(addr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                        let _ = storage.delete_spent_address(&addr);
+                    }
+                }
+            }
+
             // 1. Unburn addresses from the dirty chain BEFORE replaying, 
             for h in crate::core::types::V4_ACTIVATION_HEIGHT..state.height {
                 if let Ok(Some(batch)) = storage.load_batch(h) {
