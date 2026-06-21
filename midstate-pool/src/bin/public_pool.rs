@@ -5,7 +5,7 @@ use axum::{
     Json, Router,
 };
 use moka::future::Cache;
-use redb::{Database, ReadableTable, TableDefinition}; // <-- Added ReadableTable
+use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use midstate::core::extension::verify_extension;
-use midstate::core::types::{Batch, hash_concat}; // <-- Removed unused types
+use midstate::core::types::{Batch, hash_concat};
 use midstate::core::mss::{self, MssKeypair};
 
 // ── Database Schema ────────────────────────────────────────────────────────
@@ -161,7 +161,7 @@ async fn main() {
             .build(),
         db_tx,
         network_height,
-        network_target,  // <-- add this
+        network_target, 
     });
 
     // 7. Start HTTP Server
@@ -222,7 +222,6 @@ async fn handle_submit(
     let header = batch.header();
 
     // 1. Replay Protection (O(1) Memory Cache)
-    // A share is uniquely identified by the parent midstate and the nonce.
     let share_id = hash_concat(&batch.prev_midstate, &batch.extension.nonce.to_le_bytes());
     if state.seen_shares.contains_key(&share_id) {
         return Err((StatusCode::BAD_REQUEST, "Duplicate share (Replay Attack)".into()));
@@ -245,7 +244,9 @@ async fn handle_submit(
     }
 
     // 4. Proof of Work Check
-    if verify_extension(header.post_tx_midstate, &batch.extension, &state.share_target).is_err() {
+    // --- FIX: MUST USE THE HEADER HASH, NOT POST_TX_MIDSTATE ---
+    let mining_hash = midstate::core::types::compute_header_hash(&header);
+    if verify_extension(mining_hash, &batch.extension, &state.share_target).is_err() {
         return Err((StatusCode::BAD_REQUEST, "Insufficient Proof of Work for pool share".into()));
     }
 
@@ -279,14 +280,12 @@ async fn handle_submit(
         return Err((StatusCode::SERVICE_UNAVAILABLE, "Pool not yet synced with node".into()));
     }
     let is_full_block = verify_extension(
-        header.post_tx_midstate,
+        mining_hash, // --- FIX: Use mining_hash here too ---
         &batch.extension,
         &actual_target,
     ).is_ok();
 
     // 7. Accept Share — queue to DB worker first, then mark as seen.
-    // Order matters: if try_send fails, we must NOT insert to seen_shares,
-    // otherwise the share is permanently replay-blocked but never credited.
     let msg = VerifiedShare {
         miner_address: miner_addr,
         is_full_block,
@@ -298,7 +297,7 @@ async fn handle_submit(
         return Err((StatusCode::SERVICE_UNAVAILABLE, "Pool overloaded".into()));
     }
 
-    // Insert AFTER successful queue — share is now guaranteed to be credited.
+    // Insert AFTER successful queue
     state.seen_shares.insert(share_id, ()).await;
 
     Ok(Json(SubmitShareResponse {
@@ -310,15 +309,12 @@ async fn handle_submit(
 // ── Database Worker Task ───────────────────────────────────────────────────
 
 /// Runs infinitely in the background. Receives fully verified shares and writes
-/// them to the ACID database sequentially, maximizing IO throughput and preventing DB locks.
+/// them to the ACID database sequentially.
 async fn database_writer_task(db: Arc<Database>, mut rx: mpsc::Receiver<VerifiedShare>) {
-    let client = reqwest::Client::new();
-    
-    // We batch DB writes to maximize disk throughput
     let mut batch_buffer = Vec::new();
 
     loop {
-        // Collect shares available in the channel (up to 1000 per DB transaction)
+        // Collect shares available in the channel
         let mut got_messages = false;
         while let Ok(msg) = rx.try_recv() {
             batch_buffer.push(msg);
@@ -327,11 +323,10 @@ async fn database_writer_task(db: Arc<Database>, mut rx: mpsc::Receiver<Verified
         }
 
         if !got_messages {
-            // Block until we get at least one message
             if let Some(msg) = rx.recv().await {
                 batch_buffer.push(msg);
             } else {
-                break; // Channel closed, server shutting down
+                break; // Channel closed
             }
         }
 
@@ -349,12 +344,23 @@ async fn database_writer_task(db: Arc<Database>, mut rx: mpsc::Receiver<Verified
                     if share.is_full_block {
                         tracing::info!("🥇 Committing FULL BLOCK win by miner {}!", hex::encode(&share.miner_address[..8]));
                         
-                        //we immediately forward this to the node
                         if let Some(ref b) = share.batch {
-                            let _ = client.post("http://127.0.0.1:8545/api/internal/submit_batch")
-                                .json(b)
-                                .send()
-                                .await;
+                            // --- FIX: Send via TCP Light Protocol instead of HTTP ---
+                            let batch_value = serde_json::to_value(b).unwrap();
+                            tokio::spawn(async move {
+                                if let Ok(mut stream) = tokio::net::TcpStream::connect("127.0.0.1:9333").await {
+                                    let req = midstate::network::light_protocol::LightRequest::SubmitBatch {
+                                        batch: batch_value
+                                    };
+                                    let bytes = serde_json::to_vec(&req).unwrap();
+                                    let len = (bytes.len() as u32).to_le_bytes();
+                                    use tokio::io::AsyncWriteExt;
+                                    let _ = stream.write_all(&len).await;
+                                    let _ = stream.write_all(&bytes).await;
+                                } else {
+                                    tracing::error!("Failed to connect to node TCP port to submit block!");
+                                }
+                            });
                         }
                     }
                 }

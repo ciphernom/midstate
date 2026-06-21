@@ -124,10 +124,8 @@ impl RpcServer {
             .route("/metrics", get(get_metrics))
             .route("/scan", post(scan_addresses))
             .route("/mss_state", post(get_mss_state))
-            // Mining is WebRTC-only: /block_template and /api/internal/submit_batch
-            // are intentionally NOT mounted. Templates and block submission are
-            // served exclusively over the libp2p light protocol
-            // (LightRequest::BlockTemplate / SubmitBatch on /midstate/light/2.0.0).
+            .route("/block_template", post(block_template))
+            .route("/submit_batch", post(submit_batch))
             .route("/mix/create", post(mix_create))
             .route("/mix/register", post(mix_register))
             .route("/mix/fee", post(mix_fee))

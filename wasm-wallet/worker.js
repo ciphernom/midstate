@@ -73,6 +73,10 @@ let mempoolSize = 0;
 let nextBlockResolvers = [];
 /** @type {Object|null} Tracks an outgoing Lightning channel open intent */
 let pendingChannelOpen = null;
+let miningMode = 'solo'; // 'solo' | 'pool'
+let poolUrl = '';
+let payoutAddress = '';
+
 /**
  * Suspend execution until the next block arrives via WebRTC push, 
  * or fallback to resolving after a maximum timeout.
@@ -562,7 +566,13 @@ async function loadState(pwd, bundleStr) {
         }
 
         password = pwd;
-        wallet = new WebWallet(wState.phrase);
+        if (wState.phrase) {
+            wallet = new WebWallet(wState.phrase);
+        } else if (wState.master_seed) {
+            wallet = WebWallet.from_seed_hex(wState.master_seed);
+        } else {
+            throw new Error("Corrupted wallet: No seed phrase or master seed found.");
+        }
 
         // Load MSS trees from IndexedDB into WASM (instant if previously cached or just restored)
         mssCachesReady = false;
@@ -594,14 +604,12 @@ async function loadState(pwd, bundleStr) {
  */
 async function handleGetTemplate() {
     if (!wallet) throw new Error("Wallet not initialized.");
-    
-    // FIX: Prevent concurrent executions which would spam the node and trigger a peer ban
     if (isFetchingTemplate) return null;
     isFetchingTemplate = true;
 
     try {
-        const stateObj = await rpc.getState();
-
+        // Update dashboard stats regardless of mode
+        const stateObj = await rpc.getState().catch(() => ({ height: networkHeight, block_reward: 0 }));
         let mempoolTxs = 0, mempoolFees = 0;
         try {
             const mempool = await rpc.getMempool();
@@ -609,7 +617,7 @@ async function handleGetTemplate() {
             mempoolFees = (mempool.transactions || []).reduce((s, tx) => s + (tx.fee || 0), 0);
         } catch (e) {}
 
-        networkHeight = stateObj.height;
+        networkHeight = stateObj.height || networkHeight;
         mempoolSize = mempoolTxs;
         self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
 
@@ -618,11 +626,38 @@ async function handleGetTemplate() {
             await performScan();
         }
 
+        // --- POOL MODE LOGIC ---
+        if (miningMode === 'pool') {
+            if (!poolUrl) throw new Error("Pool URL not set.");
+            const cleanUrl = poolUrl.replace(/\/+$/, '');
+            const res = await fetch(`${cleanUrl}/api/template`, { cache: 'no-store' });
+            if (!res.ok) throw new Error(`Pool error: ${await res.text()}`);
+            
+            const tmpl = await res.json();
+            const txCount = tmpl.batch_template.transactions?.length || 0;
+            self.postMessage({ type: 'LOG', payload: `Pool Template | ${txCount} txs | Your Shares: ${tmpl.shares_recorded}` });
+
+            return {
+                mining_midstate: tmpl.mining_midstate,
+                target:          tmpl.target,
+                batch_template:  tmpl.batch_template,
+                mining_addrs:    [], // Pool handles keys
+                next_wots_index: wState.nextWotsIndex, // We don't advance our counter
+                total_fees:      0, // Pool handles fees
+                chainHeight:     networkHeight,
+                blockReward:     stateObj.block_reward || 0,
+                mempoolTxs,
+                mempoolFees
+            };
+        }
+        // --- END POOL MODE LOGIC ---
+
+        // Solo Mode Logic (Original)
         const template = await buildMiningTemplate(stateObj);
         if (!template) return null;
 
         const txCount = template.batch_template.transactions?.length || 0;
-        self.postMessage({ type: 'LOG', payload: `Template at height ${stateObj.height} | ${txCount} txs | fees: ${template.total_fees}` });
+        self.postMessage({ type: 'LOG', payload: `Solo Template at height ${stateObj.height} | ${txCount} txs | fees: ${template.total_fees}` });
 
         return {
             mining_midstate: template.mining_midstate,
@@ -660,29 +695,49 @@ async function handleSubmitMinedBlock(template, nonce) {
         if (!extStr) throw new Error("Failed to recompute extension hash.");
 
         const batch = JSON.parse(JSON.stringify(template.batch_template));
-        // Timestamp is mathematically locked into the template by the node. Do not touch it!
         batch.extension = JSON.parse(extStr);
 
-        for (const entry of template.mining_addrs) wState.wotsAddrs[entry.address] = entry.index;
-        wState.nextWotsIndex = template.next_wots_index;
+        let accepted = false;
+        let rejectReason = null;
 
-        const submitReq = await rpc.submitBatch(batch);
-        const accepted = submitReq.ok;
-        const rejectReason = accepted ? null : (submitReq.body || 'rejected');
+        // --- POOL MODE SUBMISSION ---
+        if (miningMode === 'pool') {
+            payoutAddress = getPrimaryMssPk() || "";
+            if (!payoutAddress) {
+                throw new Error("No L2/MSS Identity found! Generate a new address first to receive pool payouts.");
+            }
 
-        if (accepted) {
-            // Only commit WOTS index advancement when the block actually lands.
-            // Otherwise we burn one-time-use addresses for blocks that never existed.
-            for (const entry of template.mining_addrs) wState.wotsAddrs[entry.address] = entry.index;
-            wState.nextWotsIndex = template.next_wots_index;
+            const cleanUrl = poolUrl.replace(/\/+$/, '');
+            const res = await fetch(`${cleanUrl}/api/submit`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ batch, payout_address: payoutAddress })
+            });
+            
+            accepted = res.ok;
+            if (accepted) {
+                const respJson = await res.json();
+                self.postMessage({ type: 'LOG', payload: `✅ Pool: ${respJson.message}` });
+            } else {
+                rejectReason = await res.text();
+                self.postMessage({ type: 'LOG', payload: `❌ Pool Rejected: ${rejectReason}` });
+            }
+        } 
+        // --- SOLO MODE SUBMISSION ---
+        else {
+            const submitReq = await rpc.submitBatch(batch);
+            accepted = submitReq.ok;
+            rejectReason = accepted ? null : (submitReq.body || 'rejected');
 
-            self.postMessage({ type: 'LOG', payload: `✅ Block accepted! Height: ${template.chainHeight}` });
-            await saveState();
-            await performScan();
-        } else {
-            self.postMessage({ type: 'LOG', payload: `❌ Block rejected: ${rejectReason}` });
-            // No state mutation — the coinbase WOTS keys are still unused, so the next
-            // template build will reuse the same indices. No bookkeeping leak.
+            if (accepted) {
+                for (const entry of template.mining_addrs) wState.wotsAddrs[entry.address] = entry.index;
+                wState.nextWotsIndex = template.next_wots_index;
+                self.postMessage({ type: 'LOG', payload: `✅ Solo Block accepted! Height: ${template.chainHeight}` });
+                await saveState();
+                await performScan();
+            } else {
+                self.postMessage({ type: 'LOG', payload: `❌ Solo Block rejected: ${rejectReason}` });
+            }
         }
 
         const finalHashHex = Array.from(batch.extension.final_hash).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -1219,6 +1274,7 @@ else if (type === 'L2_OPEN_CHANNEL') {
                 }
                 wState = {
                     phrase: null,
+                    master_seed: normalizeHex(cliData.master_seed),
                     nextWotsIndex: cliData.next_wots_index || 0,
                     nextMssIndex:  cliData.next_mss_index  || 0,
                     wotsAddrs: {}, mssAddrs: newMssAddrs, utxos: newUtxos,

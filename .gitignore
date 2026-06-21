@@ -19,3 +19,4 @@ wasm-wallet/target/
 wasm-wallet/node_modules/
 target/
 Cargo.lock
+midstate-pool/data/

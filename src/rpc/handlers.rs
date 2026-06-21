@@ -1057,22 +1057,22 @@ pub async fn axe_download_rewards(
     Ok(response)
 }
 
-/// Mined-block submission over HTTP is disabled.
-///
-/// Mining is only available over the WebRTC light protocol
-/// (`LightRequest::SubmitBatch` on /midstate/light/2.0.0). Refusing here is
-/// the authoritative enforcement: a block found while talking to the HTTP
-/// gateway cannot be submitted, even if a client builds the batch by hand.
-/// `NodeHandle::submit_mined_block` is now only reachable from the WebRTC
-/// path's `NodeCommand::SubmitMinedBlock` and can be removed if unused
-/// elsewhere.
-pub async fn submit_batch() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(serde_json::json!({
-            "error": "Mining is only available over WebRTC. Submit mined blocks via the libp2p light protocol (/midstate/light/2.0.0), not HTTP."
-        })),
-    ).into_response()
+pub async fn submit_batch(
+    State(node): State<AppState>,
+    Json(batch): Json<crate::core::Batch>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    
+    if node.tx_sender.try_send(crate::node::NodeCommand::SubmitMinedBlock(batch, Some(ack_tx))).is_err() {
+        return Err(ErrorResponse { error: "Node is currently overloaded".into() });
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
+        Ok(Ok(Ok(()))) => Ok(Json(serde_json::json!({ "accepted": true }))),
+        Ok(Ok(Err(e))) => Err(ErrorResponse { error: format!("Block rejected: {}", e) }),
+        Ok(Err(_))     => Err(ErrorResponse { error: "Node dropped submission ack".into() }),
+        Err(_)         => Err(ErrorResponse { error: "Block validation timed out".into() }),
+    }
 }
 
 pub async fn get_tx_by_input(
@@ -1198,25 +1198,24 @@ pub fn parse_reveal_json(value: serde_json::Value) -> Result<Transaction, String
     }
 }
 
-/// Block-template generation over HTTP is disabled.
-///
-/// Mining is only available over the WebRTC light protocol
-/// (`LightRequest::BlockTemplate` on /midstate/light/2.0.0), which keeps
-/// mining coordination on the peer-to-peer path rather than the centralized
-/// HTTP gateway. The gateway remains fully functional for wallet operations
-/// (state, blocks, filters, mempool, commit, send, check).
-///
-/// The template-building logic itself still lives in
-/// `crate::node::build_block_template_inner` and is used by the WebRTC path;
-/// only this HTTP entry point is removed.
-pub async fn block_template() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(serde_json::json!({
-            "error": "Mining is only available over WebRTC. Request block templates via the libp2p light protocol (/midstate/light/2.0.0), not HTTP."
-        })),
-    ).into_response()
+pub async fn block_template(
+    State(node): State<AppState>,
+    Json(req): Json<crate::rpc::types::BlockTemplateRequest>,
+) -> Result<Json<crate::rpc::types::BlockTemplateResponse>, ErrorResponse> {
+    let state = node.get_state().await;
+    let (_, txs) = node.get_mempool_info().await;
+    
+    match crate::node::build_block_template_inner(&state, txs, &req) {
+        Ok(resp) => Ok(Json(resp)),
+        Err(crate::node::BlockTemplateError::InvalidCoinbase(msg)) => {
+            Err(ErrorResponse { error: msg.into() })
+        }
+        Err(crate::node::BlockTemplateError::CoinbaseTotalMismatch { expected_total, .. }) => {
+            Err(ErrorResponse { error: format!("Coinbase mismatch. Expected: {}", expected_total) })
+        }
+    }
 }
+
 pub async fn submit_chat(
     State(node): State<AppState>,
     Json(req): Json<SubmitChatRequest>,

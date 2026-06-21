@@ -574,6 +574,18 @@
 
         <!-- MINING DASHBOARD -->
         <main id="view-mine" class="page">
+            <div class="panel" style="margin-bottom: 1rem; border-color: var(--border);">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <h3 style="margin: 0; font-size: 14px;">Mining Mode</h3>
+                        <select id="mineModeSelect" style="width: auto; margin: 0; padding: 4px 8px; font-size: 12px; background: var(--bg); border: 1px solid var(--border-bright); color: var(--text-max); border-radius: 4px;">
+                            <option value="solo">Solo (WebRTC)</option>
+                            <option value="pool">Smart Pool (HTTPS)</option>
+                        </select>
+                    </div>
+                    <div id="poolConfigParams" class="hidden">
+                        <input type="text" id="poolUrlInput" placeholder="Pool URL (e.g. http://127.0.0.1:8081)" style="font-size: 12px; padding: 8px; margin-bottom: 0;">
+                    </div>
+                </div>
             <div class="mine-hero">
                 <div class="mine-hero-label">Hashrate</div>
                 <div class="mine-hero-rate" id="mineHeroRate">0<span class="mine-hero-unit">N/s</span></div>
@@ -1168,26 +1180,63 @@ if ('serviceWorker' in navigator) {
         function isWebRTCConnected() {
             return !!(lightClient && lightClient.isConnected);
         }
+        const mineModeSelect = document.getElementById('mineModeSelect');
+        const poolConfigParams = document.getElementById('poolConfigParams');
+        const poolUrlInput = document.getElementById('poolUrlInput');
 
+        // Load saved preferences
+        if (localStorage.getItem('mineMode')) {
+            mineModeSelect.value = localStorage.getItem('mineMode');
+            if (mineModeSelect.value === 'pool') poolConfigParams.classList.remove('hidden');
+        }
+        if (localStorage.getItem('poolUrl')) {
+            poolUrlInput.value = localStorage.getItem('poolUrl');
+        }
+
+        mineModeSelect.addEventListener('change', (e) => {
+            const mode = e.target.value;
+            localStorage.setItem('mineMode', mode);
+            if (mode === 'pool') {
+                poolConfigParams.classList.remove('hidden');
+            } else {
+                poolConfigParams.classList.add('hidden');
+            }
+            worker.postMessage({ type: 'SET_MINING_MODE', payload: { mode, url: poolUrlInput.value.trim() } });
+        });
+
+        poolUrlInput.addEventListener('change', (e) => {
+            const url = e.target.value.trim();
+            localStorage.setItem('poolUrl', url);
+            worker.postMessage({ type: 'SET_MINING_MODE', payload: { mode: mineModeSelect.value, url } });
+        });
         async function startMining() {
-            if (!isWebRTCConnected()) {
-                log('Mining requires a direct WebRTC connection to a full node. Connect via a bootstrap multiaddr (Settings) to mine. Wallet functions work over HTTPS.', 'var(--red)');
-                showToast('Mining needs a WebRTC connection. The wallet works over HTTPS, but mining does not.', 'error');
+            const mode = mineModeSelect.value;
+            
+            if (mode === 'solo' && !isWebRTCConnected()) {
+                log('Solo Mining requires a direct WebRTC connection to a full node. Connect via a bootstrap multiaddr (Settings) to mine.', 'var(--red)');
+                showToast('Solo Mining needs a WebRTC connection.', 'error');
                 isMiningActive = false;
                 setMiningUI(false, 0);
                 return;
             }
+            if (mode === 'pool' && !poolUrlInput.value.trim()) {
+                showToast('Please enter a Pool URL.', 'error');
+                return;
+            }
+
+            // Tell the worker our current settings before starting
+            worker.postMessage({ type: 'SET_MINING_MODE', payload: { mode, url: poolUrlInput.value.trim() } });
+
             isMiningActive = true;
             miningSessionStart = Date.now();
             totalNoncesSession = 0;
             blocksFoundSession = 0;
             setMiningUI(true, 0);
-            log('Starting miners...');
+            log(`Starting miners in ${mode.toUpperCase()} mode...`);
 
             const targetCount = parseInt(threadSlider.value);
             spawnMiners(targetCount);
 
-            // Periodic UI refresh (even if no HASHRATE messages arrive)
             uiRefreshTimer = setInterval(() => {
                 if (isMiningActive) updateAggregateHashrate();
             }, 1500);

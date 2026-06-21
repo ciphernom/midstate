@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use midstate::core::types::{decompose_value, InputReveal, OutputData, Predicate}; // <-- Removed unused types
+use midstate::core::types::{decompose_value, InputReveal, OutputData, Predicate};
 use midstate::core::mss::MssKeypair;
 use midstate::rpc::{CommitRequest, CommitResponse, InputRevealJson, OutputDataJson, SendTransactionRequest};
-use redb::{Database, ReadableTable, TableDefinition}; // <-- Added ReadableTable
+use redb::{Database, ReadableTable, TableDefinition};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -53,7 +53,6 @@ async fn main() -> Result<()> {
     tracing::info!("Pool Address: {}", hex::encode(pool_address));
 
     // 2. Scan the local node for the pool's available UTXOs
-    // Load the last successfully paid-out scan height from DB.
     let last_scan_height: u64 = {
         let read_txn = db.begin_read()?;
         let meta = read_txn.open_table(METADATA_TABLE)?;
@@ -80,7 +79,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-let mut total_balance = 0u64;
+    let mut total_balance = 0u64;
     let mut inputs_to_spend = Vec::new();
 
     for c in &res.coins {
@@ -90,12 +89,12 @@ let mut total_balance = 0u64;
             predicate: Predicate::p2pk(&pool_address),
             value: c.value,
             salt: salt_bytes,
+            commitment: None, // <-- FIX: Added missing commitment field
         });
         total_balance += c.value;
     }
 
     tracing::info!("Pool Balance: {} units across {} UTXOs", total_balance, inputs_to_spend.len());
-
 
     // 3. Tally Shares from the Database
     let read_txn = db.begin_read()?;
@@ -156,29 +155,51 @@ let mut total_balance = 0u64;
     }
 
     // 5. Phase 1: Submit the COMMIT
-    tracing::info!("Submitting Commit transaction...");
-    let input_ids: Vec<String> = inputs_to_spend.iter().map(|i| hex::encode(i.coin_id())).collect();
-    let dest_hashes: Vec<String> = outputs.iter().map(|o| hex::encode(o.hash_for_commitment())).collect();
+    // --- FIX: Locally compute commitment and mine PoW ---
+    tracing::info!("Mining Commit PoW locally...");
+    let input_ids: Vec<[u8; 32]> = inputs_to_spend.iter().map(|i| i.coin_id()).collect();
+    let dest_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+    let salt: [u8; 32] = rand::random();
+    
+    // Calculate the commitment hash locally
+    let commitment = midstate::core::compute_commitment(&input_ids, &dest_hashes, &salt);
 
-    let commit_req = CommitRequest {
-        coins: input_ids.clone(),
-        destinations: dest_hashes,
-    };
-
-    let commit_res: CommitResponse = client.post(&format!("{}/commit", NODE_RPC_URL))
-        .json(&commit_req)
+    // Fetch the required PoW difficulty and current state from the node
+    let state_resp: midstate::rpc::GetStateResponse = client.get(&format!("{}/state", NODE_RPC_URL))
         .send().await?.json().await?;
         
-    let commitment = hex::decode(&commit_res.commitment)?.try_into().unwrap();
+    let mut header_hash = [0u8; 32];
+    hex::decode_to_slice(&state_resp.header_hash, &mut header_hash)?;
+
+    // Mine the PoW locally using a blocking thread
+    let commitment_clone = commitment.clone();
+    let spam_nonce = tokio::task::spawn_blocking(move || {
+        midstate::core::transaction::mine_pow(
+            &commitment_clone, 
+            state_resp.required_pow, 
+            state_resp.height, 
+            header_hash
+        )
+    }).await?;
+
+    let commit_req = CommitRequest {
+        commitment: hex::encode(commitment),
+        spam_nonce,
+    };
+
+    let _commit_res: CommitResponse = client.post(&format!("{}/commit", NODE_RPC_URL))
+        .json(&commit_req)
+        .send().await?.json().await?;
     
-    tracing::info!("Commit accepted: {}. Waiting for it to be mined...", commit_res.commitment);
+    let commitment_hex = hex::encode(commitment);
+    tracing::info!("Commit accepted: {}. Waiting for it to be mined...", commitment_hex);
 
     // Poll until commit is mined
     loop {
         tokio::time::sleep(Duration::from_secs(10)).await;
         let mp: serde_json::Value = client.get(&format!("{}/mempool", NODE_RPC_URL)).send().await?.json().await?;
         let is_pending = mp["transactions"].as_array().unwrap().iter().any(|tx| {
-            tx.get("commitment").and_then(|c| c.as_str()) == Some(&commit_res.commitment)
+            tx.get("commitment").and_then(|c| c.as_str()) == Some(&commitment_hex)
         });
         
         if !is_pending {
@@ -216,17 +237,20 @@ let mut total_balance = 0u64;
         save_mss_key(&db, &mss_keypair)?;
     }
 
-    tracing::info!("MSS state verified. Generating {} signature(s)...", inputs_to_spend.len());
+    tracing::info!("MSS state verified.");
+    let is_consolidate = inputs_to_spend.len() > 1;
     let mut signatures = Vec::new();
-    for _ in &inputs_to_spend {
-        if mss_keypair.remaining() == 0 {
-            anyhow::bail!("CRITICAL: MSS key capacity exhausted during payout!");
-        }
-        // sign() internally advances next_leaf. Save to disk immediately
-        // after so a crash mid-loop doesn't lose the advancement.
-        // If we crash AFTER sign but BEFORE save, the next run's
-        // /mss_state startup check will detect the on-chain usage and
-        // fast-forward past it, preventing reuse.
+    
+    // --- FIX: Use Dust-Sweep Consolidate Feature ---
+    if is_consolidate {
+        tracing::info!("Using Dust-Sweep Consolidate ({} inputs, 1 signature)...", inputs_to_spend.len());
+        if mss_keypair.remaining() == 0 { anyhow::bail!("CRITICAL: MSS key capacity exhausted!"); }
+        let sig = mss_keypair.sign(&commitment)?;
+        save_mss_key(&db, &mss_keypair)?;
+        signatures.push(hex::encode(sig.to_bytes()));
+    } else {
+        tracing::info!("Standard Reveal (1 input, 1 signature)...");
+        if mss_keypair.remaining() == 0 { anyhow::bail!("CRITICAL: MSS key capacity exhausted!"); }
         let sig = mss_keypair.sign(&commitment)?;
         save_mss_key(&db, &mss_keypair)?;
         signatures.push(hex::encode(sig.to_bytes()));
@@ -237,14 +261,16 @@ let mut total_balance = 0u64;
             bytecode: hex::encode(match &i.predicate { Predicate::Script { bytecode } => bytecode }),
             value: i.value,
             salt: hex::encode(i.salt),
+            commitment: None, // <-- FIX: Added commitment None
         }).collect(),
-        signatures, // One signature per input
+        signatures,
         outputs: outputs.iter().map(|o| OutputDataJson::Standard {
             address: hex::encode(o.address()),
             value: o.value(),
             salt: hex::encode(o.salt()),
         }).collect(),
-        salt: commit_res.salt,
+        salt: hex::encode(salt), // <-- FIX: Uses the salt generated during Commit locally
+        is_consolidate,          // <-- FIX: Tells the node this is a Consolidate sweep
     };
 
     tracing::info!("Submitting Reveal transaction...");
@@ -258,8 +284,6 @@ let mut total_balance = 0u64;
     }
 
     // 7. Atomically mark the send as complete BEFORE wiping shares.
-    // If we crash between this write and the wipe below, the startup
-    // guard above will finish the cleanup on the next invocation.
     {
         let write_txn = db.begin_write()?;
         {

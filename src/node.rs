@@ -210,7 +210,7 @@ pub struct NodeHandle {
     mempool_txs: Arc<RwLock<Vec<Transaction>>>,
     peer_addrs: Arc<RwLock<Vec<String>>>,
     webrtc_addrs: Arc<RwLock<Vec<String>>>, 
-    tx_sender: tokio::sync::mpsc::Sender<NodeCommand>,
+    pub tx_sender: tokio::sync::mpsc::Sender<NodeCommand>,
     pub storage: crate::storage::Storage,
     pub mix_manager: Arc<RwLock<MixManager>>,
     pub commit_limiter: Arc<tokio::sync::Semaphore>, 
