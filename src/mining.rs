@@ -14,6 +14,17 @@ use crate::wallet::{coinbase_seed, coinbase_salt};
 use crate::core::wots;
 use std::path::PathBuf;
 use rayon::prelude::*;
+use tokio::net::TcpStream;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::Arc;
+
+#[derive(Default, Clone)]
+pub struct StratumStats {
+    pub network_target: [u8; 32],
+    pub accepted_shares: u64,
+    pub rejected_shares: u64,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MinerToml {
@@ -173,5 +184,179 @@ impl MiningCoordinator {
     /// Convenience wrapper for logging using the coordinator's seed + data_dir.
     pub fn log_coinbase(&self, height: u64, total_fees: u64) {
         log_coinbase(&self.seed, &self.data_dir, height, total_fees);
+    }
+}
+
+pub async fn run_stratum_client(
+    pool_url: String, 
+    payout_address: String,
+    threads: usize,
+    hash_counter: Arc<AtomicU64>,
+    stats: Arc<std::sync::RwLock<StratumStats>> 
+) {
+    let host = pool_url.replace("stratum+tcp://", "");
+    
+    let mut api_host = host.clone();
+    if let Some((ip, port_str)) = host.rsplit_once(':') {
+        if let Ok(port) = port_str.parse::<u16>() {
+            let offset = port.saturating_sub(3333);
+            let api_port = 8081 + offset;
+            api_host = format!("{}:{}", ip, api_port);
+        }
+    }
+    
+    let http_client = reqwest::Client::new();
+    
+    loop {
+        tracing::info!("stratum client connecting to {} (api: {})", host, api_host);
+        if let Ok(mut stream) = TcpStream::connect(&host).await {
+            let (read_half, mut write_half) = stream.split();
+            let mut reader = BufReader::new(read_half);
+
+            let auth_req = serde_json::json!({
+                "id": 1, "method": "mining.authorize", "params": [payout_address.clone(), "worker1"]
+            });
+            let _ = write_half.write_all(format!("{}\n", auth_req).as_bytes()).await;
+
+            let mut line = String::new();
+            let current_job_id = Arc::new(std::sync::RwLock::new(0u64));
+            let mining_cancel = Arc::new(AtomicBool::new(false));
+            let (share_tx, mut share_rx) = tokio::sync::mpsc::channel::<(u64, u64)>(100);
+
+            let mut s_target = [0xff; 32];
+            s_target[0] = 0x00; s_target[1] = 0x0f;
+
+            loop {
+                tokio::select! {
+                    res = reader.read_line(&mut line) => {
+                        if res.unwrap_or(0) == 0 { break; } 
+                        let msg: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+                        line.clear();
+
+                        if msg["method"] == "mining.notify" {
+                            let params = msg["params"].as_array().unwrap();
+                            let job_id = params[0].as_u64().unwrap();
+                            let hash_hex = params[1].as_str().unwrap();
+                            let template_val = &params[2];
+
+                            let mut m_hash = [0u8; 32];
+                            hex::decode_to_slice(hash_hex, &mut m_hash).unwrap();
+
+                            let batch: crate::core::Batch = match serde_json::from_value(template_val.clone()) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    tracing::error!("failed to parse batch template: {}", e);
+                                    break;
+                                }
+                            };
+                            let header = batch.header();
+                            let n_target = batch.target; 
+                            {
+                                let mut s = stats.write().unwrap();
+                                s.network_target = n_target;
+                            }
+                            let calculated_hash = crate::core::types::compute_header_hash(&header);
+                            
+                            if calculated_hash != m_hash {
+                                tracing::error!("audit failed: template header hash mismatch. disconnecting.");
+                                break;
+                            }
+
+                            if let Some(pool_cb) = batch.coinbase.first() {
+                                let claimed_root = hex::encode(pool_cb.salt);
+                                
+                                if let Ok(res) = http_client.get(format!("http://{}/api/proof?address={}", api_host, payout_address)).send().await {
+                                    if let Ok(proof_data) = res.json::<serde_json::Value>().await {
+                                        if proof_data.get("error").is_none() {
+                                            
+                                            let payout_bytes = crate::core::types::parse_address_flexible(&payout_address).unwrap();
+                                            let score = proof_data["score"].as_u64().unwrap_or(0);
+                                            let mut data = [0u8; 40];
+                                            data[0..32].copy_from_slice(&payout_bytes);
+                                            data[32..40].copy_from_slice(&score.to_le_bytes());
+                                            let mut current_hash = crate::core::types::hash(&data);
+
+                                            if let (Some(proof_array), Some(mut current_idx)) = (proof_data["proof"].as_array(), proof_data["index"].as_u64()) {
+                                                for sibling_hex in proof_array {
+                                                    let mut sibling = [0u8; 32];
+                                                    hex::decode_to_slice(sibling_hex.as_str().unwrap(), &mut sibling).unwrap();
+                                                    if current_idx % 2 == 1 {
+                                                        current_hash = crate::core::types::hash_concat(&sibling, &current_hash);
+                                                    } else {
+                                                        current_hash = crate::core::types::hash_concat(&current_hash, &sibling);
+                                                    }
+                                                    current_idx /= 2;
+                                                }
+                                            }
+
+                                            if hex::encode(current_hash) != claimed_root {
+                                                tracing::error!("audit failed: merkle root mismatch (computed {}, claimed {}). disconnecting.", hex::encode(current_hash), claimed_root);
+                                                break;
+                                            }
+                                            
+                                            if score > 0 {
+                                                let mut found_payout = false;
+                                                for cb in &batch.coinbase {
+                                                    if cb.address == payout_bytes {
+                                                        found_payout = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if !found_payout {
+                                                    tracing::error!("audit failed: omitted from payout array despite score of {}. disconnecting.", score);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            tracing::info!("audit passed. starting job {}", job_id);
+                            
+                            mining_cancel.store(true, Ordering::Relaxed);
+                            *current_job_id.write().unwrap() = job_id;
+                            
+                            let new_cancel = Arc::new(AtomicBool::new(false));
+                            let share_tx_clone = share_tx.clone();
+                            let j_id = job_id;
+                            let nc = new_cancel.clone();
+                            let hc = hash_counter.clone();
+                            
+                            std::thread::spawn(move || {
+                                loop {
+                                    if nc.load(Ordering::Relaxed) { break; }
+                                    
+                                    if let Some(res) = crate::core::extension::mine_extension(
+                                        m_hash, n_target, Some(s_target), threads, nc.clone(), hc.clone()
+                                    ) {
+                                        let nonce = match res {
+                                            crate::core::extension::MiningResult::Block(ext) => ext.nonce,
+                                            crate::core::extension::MiningResult::Share(ext) => ext.nonce,
+                                        };
+                                        let _ = share_tx_clone.blocking_send((j_id, nonce));
+                                    } else {
+                                        break; 
+                                    }
+                                }
+                            });
+                        } else if msg["result"].as_bool() == Some(true) && msg["id"].as_u64() == Some(2) {
+                            tracing::info!("share accepted");
+                            stats.write().unwrap().accepted_shares += 1; 
+                        } else if let Some(err) = msg["error"].as_str() {
+                            tracing::warn!("share rejected: {}", err);
+                            stats.write().unwrap().rejected_shares += 1; 
+                        }
+                    }
+                    Some((job_id, nonce)) = share_rx.recv() => {
+                        let submit_req = serde_json::json!({
+                            "id": 2, "method": "mining.submit", "params": [payout_address.clone(), job_id, nonce]
+                        });
+                        let _ = write_half.write_all(format!("{}\n", submit_req).as_bytes()).await;
+                    }
+                }
+            }
+        }
+        tracing::warn!("disconnected from stratum pool. reconnecting in 5s...");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }

@@ -31,6 +31,9 @@ pub mod mining;
 pub mod license;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod pool;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod sync;
 
 #[cfg(not(target_arch = "wasm32"))]

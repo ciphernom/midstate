@@ -5900,6 +5900,32 @@ async fn try_apply_orphans(&mut self) {
         if self.sync.in_progress || self.mining_cancel.is_some() {
             return Ok(());
         }
+        
+        if let Ok(toml_str) = std::fs::read_to_string("miner.toml") {
+            if let Ok(config) = toml::from_str::<crate::mining::MinerToml>(&toml_str) {
+                if config.mining.mode == "stratum" {
+                    if let (Some(url), Some(addr)) = (config.mining.pool_url, config.mining.payout_address) {
+                        let hc = self.hash_counter.clone();
+                        
+                        // Set the cancel flag so we don't spawn multiple instances
+                        let cancel = Arc::new(AtomicBool::new(false));
+                        self.mining_cancel = Some(cancel.clone());
+                        
+                        tracing::info!("Stratum mode enabled. Bypassing local solo-mining template generation.");
+                        
+                        let dummy_stats = Arc::new(std::sync::RwLock::new(crate::mining::StratumStats::default()));
+                        
+                        tokio::spawn(async move {
+                            crate::mining::run_stratum_client(url, addr, threads, hc, dummy_stats).await;
+                        });
+                        return Ok(());
+                    } else {
+                        tracing::error!("Stratum mode selected but pool_url or payout_address is missing in miner.toml");
+                    }
+                }
+            }
+        }
+        
         tracing::info!("Mining batch with {} transactions...", self.mempool.len());
 
         let mut pool_target = None;
