@@ -207,7 +207,13 @@ pub async fn run_stratum_client(
     
     let http_client = reqwest::Client::new();
     
+    // Declare the mutable cancel flag outside so it persists across reconnects
+    let mut mining_cancel = Arc::new(AtomicBool::new(false));
+
     loop {
+        // Kill any lingering threads before attempting to reconnect
+        mining_cancel.store(true, Ordering::Relaxed);
+        
         tracing::info!("stratum client connecting to {} (api: {})", host, api_host);
         if let Ok(mut stream) = TcpStream::connect(&host).await {
             let (read_half, mut write_half) = stream.split();
@@ -220,7 +226,8 @@ pub async fn run_stratum_client(
 
             let mut line = String::new();
             let current_job_id = Arc::new(std::sync::RwLock::new(0u64));
-            let mining_cancel = Arc::new(AtomicBool::new(false));
+            
+            // Create a fresh channel for shares on each successful connection
             let (share_tx, mut share_rx) = tokio::sync::mpsc::channel::<(u64, u64)>(100);
 
             let mut s_target = [0xff; 32];
@@ -311,12 +318,17 @@ pub async fn run_stratum_client(
                                     }
                                 }
                             }
-                            tracing::info!("audit passed. starting job {}", job_id);
+                           tracing::info!("audit passed. starting job {}", job_id);
                             
+                            // Cancel the PREVIOUS thread pool
                             mining_cancel.store(true, Ordering::Relaxed);
                             *current_job_id.write().unwrap() = job_id;
                             
                             let new_cancel = Arc::new(AtomicBool::new(false));
+                            
+                            // Store the new reference so we can cancel it next time!
+                            mining_cancel = new_cancel.clone(); 
+                            
                             let share_tx_clone = share_tx.clone();
                             let j_id = job_id;
                             let nc = new_cancel.clone();
