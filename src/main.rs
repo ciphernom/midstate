@@ -204,6 +204,29 @@ enum Command {
         #[arg(long, default_value = "9333")]
         port: u16,
     },
+ /// Run the Provably Fair Stratum Pool Server
+    Pool {
+        #[arg(long)]
+        pool_address: String,
+        #[arg(long, default_value = "0.0.0.0:3333")]
+        bind_addr: String,
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
+        /// The percentage fee the pool takes from block rewards (e.g. 1.0 for 1%)
+        #[arg(long, default_value = "1.0")]
+        fee: f64,
+    },
+    /// Pure Hasher: Connect to a Stratum pool without running a full node
+    Miner {
+        #[arg(long)]
+        pool_url: String,
+        #[arg(long)]
+        payout_address: String,
+        #[arg(long, default_value = "0")]
+        threads: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -646,6 +669,129 @@ async fn main() -> Result<()> {
         Command::Peers { rpc_port, rpc_host } => get_peers(rpc_port, rpc_host).await,
         Command::Keygen { rpc_port, rpc_host } => keygen(rpc_port, rpc_host).await,
         Command::Sync { data_dir, peer, port } => sync_from_genesis(data_dir, peer, port).await,
+        Command::Pool { pool_address, bind_addr, rpc_port, rpc_host, fee } => {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let node_rpc_url = format!("http://{}:{}", rpc_host, rpc_port);
+                midstate::pool::run_stratum_pool(pool_address, bind_addr, node_rpc_url, fee).await;
+                Ok(())
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                anyhow::bail!("Pool server cannot run in WebAssembly");
+            }
+        }
+        Command::Miner { pool_url, payout_address, threads } => {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let hash_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let stats = std::sync::Arc::new(std::sync::RwLock::new(midstate::mining::StratumStats::default()));
+                
+                let hc = hash_counter.clone();
+                let stats_clone = stats.clone();
+                
+                tokio::spawn(async move {
+                    use tokio::io::AsyncBufReadExt;
+                    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+                    let mut line = String::new();
+                    
+                    let mut last_hashes = 0;
+                    let mut last_time = std::time::Instant::now();
+
+                    // Hardcoded share target matching the pool (0x000f...)
+                    let share_target = {
+                        let mut t = [0xff; 32];
+                        t[0] = 0x00; t[1] = 0x0f;
+                        t
+                    };
+
+                    fn u256_to_f64(u: primitive_types::U256) -> f64 {
+                        u.0[0] as f64 +
+                        (u.0[1] as f64) * 2.0f64.powi(64) +
+                        (u.0[2] as f64) * 2.0f64.powi(128) +
+                        (u.0[3] as f64) * 2.0f64.powi(192)
+                    }
+
+                    fn format_time(secs: f64) -> String {
+                        if secs < 60.0 { return format!("{:.0}s", secs); }
+                        if secs < 3600.0 { return format!("{:.0}m {:.0}s", secs / 60.0, secs % 60.0); }
+                        if secs < 86400.0 { return format!("{:.0}h {:.0}m", secs / 3600.0, (secs % 3600.0) / 60.0); }
+                        if secs < 31536000.0 { return format!("{:.0}d {:.0}h", secs / 86400.0, (secs % 86400.0) / 3600.0); }
+                        format!("{:.1} years", secs / 31536000.0)
+                    }
+
+                    let share_target_f64 = u256_to_f64(primitive_types::U256::from_big_endian(&share_target));
+
+                    loop {
+                        line.clear();
+                        if stdin.read_line(&mut line).await.unwrap_or(0) == 0 { break; } 
+                        
+                        let current = hc.load(std::sync::atomic::Ordering::Relaxed);
+                        let now = std::time::Instant::now();
+                        let elapsed = now.duration_since(last_time).as_secs_f64();
+                        let rate = if elapsed > 0.0 { (current - last_hashes) as f64 / elapsed } else { 0.0 };
+                        
+                        println!("\n╔════════════ MINER STATUS ════════════╗");
+                        println!("║ Hashrate:      {:.2} nonces/s", rate);
+                        
+                        let s = stats_clone.read().unwrap().clone();
+                        if s.network_target != [0u8; 32] {
+                            let target_f64 = u256_to_f64(primitive_types::U256::from_big_endian(&s.network_target));
+                            
+                            let expected_nonces = 2.0f64.powi(256) / target_f64.max(1.0);
+                            let network_nps = expected_nonces / 60.0;
+                            let share_pct = if network_nps > 0.0 { (rate / network_nps) * 100.0 } else { 0.0 };
+                            
+                            // Luck Math
+                            let expected_shares_per_block = share_target_f64 / target_f64.max(1.0);
+                            let session_effort_pct = if expected_shares_per_block > 0.0 {
+                                (s.accepted_shares as f64 / expected_shares_per_block) * 100.0
+                            } else { 0.0 };
+                            
+                            println!("║ Network:       {:.2} nonces/s", network_nps);
+                            
+                            if share_pct < 0.001 {
+                                println!("║ Your Share:    < 0.001%");
+                            } else {
+                                println!("║ Your Share:    {:.4}%", share_pct);
+                            }
+                            
+                            if rate > 0.0 {
+                                println!("║ Solo ETA:      {}", format_time(expected_nonces / rate));
+                            } else {
+                                println!("║ Solo ETA:      ---");
+                            }
+                            println!("╠┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈╣");
+                            println!("║ Shares:        {} acc / {} rej", s.accepted_shares, s.rejected_shares);
+                            
+                            // Formatting the Luck / Effort string
+                            println!("║ Expected:      1 block per {} shares", expected_shares_per_block.round() as u64);
+                            println!("║ Session Luck:  {:.2}% {}", 
+                                session_effort_pct, 
+                                if session_effort_pct >= 100.0 { "🍀 (Due for a block!)" } else { "⏳" }
+                            );
+                        } else {
+                            println!("║ Network:       Waiting for job...");
+                        }
+                        
+                        println!("╚══════════════════════════════════════╝\n");
+                        
+                        last_hashes = current;
+                        last_time = now;
+                    }
+                });
+
+                tracing::info!("starting hasher (threads: {})", if threads == 0 { "max".to_string() } else { threads.to_string() });
+                tracing::info!("press [ENTER] at any time to view dashboard");
+                
+                midstate::mining::run_stratum_client(pool_url, payout_address, threads, hash_counter, stats).await;
+                Ok(())
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                anyhow::bail!("Pure miner cannot run in WebAssembly");
+            }
+        }
     }
 }
 
