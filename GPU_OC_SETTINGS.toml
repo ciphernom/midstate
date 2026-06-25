@@ -63,8 +63,7 @@ responsive_iters = 384
 # ── duty ─────────────────────────────────────────────────────────────────────
 # Fraction of time the GPU does work, 0.02..=1.0. Below 1.0 inserts idle gaps so
 # the GPU isn't pinned at 100% — trades hashrate for desktop responsiveness and
-# lower heat. Overridden by the GPU_MINE_DUTY env var (live, no restart) and by a
-# --gpu-duty CLI flag if you wire one up.
+# lower heat. Overridden by the GPU_MINE_DUTY env var (live, no restart) 
 #   1.0  = full speed
 #   0.5  = ~half load, desktop stays usable
 # default 1.0

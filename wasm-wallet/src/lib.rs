@@ -1236,21 +1236,33 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
             let _ = provisional_change;
             let num_change = decompose_value(change_for_size).len();
             let num_outputs = out_args.len() + num_change;
-            // Each contract input serializes its bytecode AND its witness in the reveal.
-            // The witness can carry a full MSS signature (e.g. an HTLC CHECKSIGVERIFY) — the
-            // flat 120 wildly undercounted it, so the mempool rejected swept claims with
-            // "fee rate too low". The witness is often injected AFTER the commitment (HTLC
-            // claim), so it's empty here; when it is, budget a worst-case signature
-            // allowance rather than trusting len(). Over-budgeting only rounds the fee up,
-            // which the node always accepts.
+            // ── Fee sizing for contract inputs ──────────────────────────────
+            // The node admits a reveal iff fee*1024 >= MIN_FEE_PER_KB * bincode_size(tx)
+            // (mempool.rs). So estimated_bytes must track the REAL serialized size.
+            // The dominant term per contract input is its witness, which for an HTLC
+            // claim carries a full MSS signature. Its exact serialized length is the
+            // same one mss.rs uses:
+            //   leaf_index(8) + wots_pk(32) + wots_sig(SIG_SIZE) + auth_len(4)
+            //   + auth_path(height * 32)
+            let mss_sig_len: u64 = (8 + 32 + wots::SIG_SIZE + 4
+                + (midstate::core::mss::DEFAULT_HEIGHT as usize) * 32) as u64;
+
             let contract_bytes_est: u64 = contract_inputs.iter().map(|ci| {
                 let bytecode_bytes = ci.bytecode.len() as u64 / 2;
-                let witness_bytes  = if ci.witness.is_empty() {
-                    1000 // room for an MSS signature + preimage + flag bytes
+                // Witness is injected AFTER the commitment for HTLC claims, so it's
+                // empty here — budget the worst case: an MSS signature plus the
+                // preimage and routing-flag stack items, encoded as Vec<Vec<u8>>.
+                let witness_bytes = if ci.witness.is_empty() {
+                    mss_sig_len + 96
                 } else {
-                    ci.witness.len() as u64 / 2
+                    let raw: u64 = ci.witness.split(',')
+                        .filter(|t| !t.is_empty())
+                        .map(|t| t.len() as u64 / 2)
+                        .sum();
+                    let items = ci.witness.split(',').filter(|t| !t.is_empty()).count() as u64;
+                    raw + items * 8 + 16
                 };
-                bytecode_bytes + witness_bytes + 40 // per-input serialization overhead
+                bytecode_bytes + witness_bytes + 64 // input-reveal struct + bincode overhead
             }).sum();
 
             let estimated_bytes = 100

@@ -4,16 +4,6 @@ pragma solidity ^0.8.20;
 /// @title  MidstateAtomicSwap
 /// @notice ETH side of a cross-chain HTLC atomic swap with the Midstate chain.
 ///
-///         Midstate's script VM hashes preimages with BLAKE3 (its `OP_HASH`).
-///         For a single secret to unlock BOTH chains, this contract must verify
-///         the SAME hash. The original contract used keccak256, which can never
-///         equal a BLAKE3 hashlock — so a swap was cryptographically impossible.
-///         This contract verifies BLAKE3(secret) instead.
-///
-///         The secret is exactly 32 bytes, which is a single BLAKE3 block
-///         (block_len = 32) in one chunk that is also the root. `blake3_256`
-///         below was validated byte-for-byte against the reference BLAKE3.
-///
 /// Protocol (maker sells MDS, taker pays ETH; the MAKER generates the secret):
 ///   1. Maker locks MDS in a Midstate HTLC with hashlock H = BLAKE3(secret),
 ///      receiver = taker, refund = maker after a LONG timeout.
