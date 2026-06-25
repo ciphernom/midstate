@@ -3291,7 +3291,7 @@ document.getElementById('btnExport').onclick = () => {
         // ═══════════════════════════════════════════════════════════════
 
         // The public HTLC contract on Base (Needs deploying once via Remix)
-        const BASE_HTLC_CONTRACT = "0xYourDeployedBaseContractAddressHere";
+        const BASE_HTLC_CONTRACT = "0x97C104d252BbEc09dFf91a375B22805C30355dc8";
         const HTLC_ABI = [
             "function lockFunds(bytes32 _expectedKeccak, address payable _maker, uint256 _timeoutBlocks) external payable",
             "function claim(bytes32 _secret) external"
@@ -3397,25 +3397,46 @@ document.getElementById('btnExport').onclick = () => {
                 }
             }
             else if (e.data.type === 'DEX_MIDSTATE_LOCKED_SUCCESS') {
+                const data = e.data.payload;
                 const mySwap = dexMySwaps.find(s => s.status === 'locking_midstate');
                 if (mySwap) {
-                    mySwap.status = 'waiting_for_taker_base_lock';
+                    mySwap.status = 'ready_to_claim_base';
                     localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps));
                     renderDexSwaps();
                     
                     worker.postMessage({ type: 'DEX_BROADCAST_LOCKED', payload: {
-                        offerNonce: mySwap.offerNonce
+                        offerNonce: mySwap.offerNonce,
+                        htlcCoinId: data.htlcCoinId,
+                        htlcSalt: data.htlcSalt,
+                        htlcValue: data.htlcValue,
+                        timeoutHeight: data.timeoutHeight,
+                        makerMdsPk: document.getElementById('l2MyIdentity').innerText
                     }});
                 }
             }
             else if (e.data.type === 'DEX_LOCKED_RECEIVED') {
-                const mySwap = dexMySwaps.find(s => s.role === 'taker' && s.status === 'waiting_for_maker_lock');
-                if (mySwap) {
+                const lockData = e.data.payload;
+                const mySwap = dexMySwaps.find(s => s.role === 'taker' && s.nonce === lockData.offerNonce);
+                if (mySwap && mySwap.status === 'waiting_for_maker_lock') {
                     mySwap.status = 'ready_to_lock_base';
+                    // Save HTLC details so we can claim later!
+                    mySwap.htlcCoinId = lockData.htlcCoinId;
+                    mySwap.htlcSalt = lockData.htlcSalt;
+                    mySwap.htlcValue = lockData.htlcValue;
+                    mySwap.timeoutHeight = lockData.timeoutHeight;
+                    mySwap.makerMdsPk = lockData.makerMdsPk;
                     localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps));
                     renderDexSwaps();
                     showToast("Maker locked Midstate! You can now lock Base ETH.", "success");
                 }
+            }
+            else if (e.data.type === 'DEX_CLAIM_SUCCESS') {
+                hideActivity();
+                const idx = e.data.payload.swapIdx;
+                dexMySwaps[idx].status = 'completed';
+                localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps));
+                renderDexSwaps();
+                showToast("Successfully claimed Midstate!", "success");
             }
         });
 
@@ -3452,15 +3473,34 @@ document.getElementById('btnExport').onclick = () => {
             `).join('');
         }
 
+        window.dexClaimMidstate = async function(idx) {
+            const swap = dexMySwaps[idx];
+            const rawSecret = prompt("Enter the Raw Secret revealed by the Maker on Base:");
+            if (!rawSecret) return;
+            
+            showActivity("Claiming Midstate...");
+            worker.postMessage({ type: 'DEX_CLAIM_MIDSTATE', payload: {
+                swapIdx: idx,
+                rawSecret: rawSecret.trim(),
+                htlcCoinId: swap.htlcCoinId,
+                htlcValue: swap.htlcValue,
+                htlcSalt: swap.htlcSalt,
+                takerMdsPk: document.getElementById('l2MyIdentity').innerText,
+                makerMdsPk: swap.makerMdsPk,
+                secretHashMidstate: swap.secretHashMidstate,
+                timeoutHeight: swap.timeoutHeight
+            }});
+        };
+
         function renderDexSwaps() {
             const container = document.getElementById('dexActiveSwaps');
             if (dexMySwaps.length === 0) return container.innerHTML = '<div class="list-item" style="text-align: center; color: #555;">No active swaps.</div>';
             
             container.innerHTML = dexMySwaps.map((s, i) => {
                 let btn = '';
-                if (s.status === 'ready_to_lock_base') {
-                    btn = `<button style="margin:0; width:auto; padding:6px 12px; font-size:11px;" onclick="dexLockBase(${i})">Lock Base ETH</button>`;
                 } else if (s.status === 'ready_to_claim_midstate') {
+                    btn = `<button style="margin:0; width:auto; padding:6px 12px; font-size:11px; background:var(--accent); color:#000;" onclick="dexClaimMidstate(${i})">Claim MDS</button>`;
+                } else if (s.status === 'ready_to_claim_base') {
                     btn = `<button style="margin:0; width:auto; padding:6px 12px; font-size:11px; background:var(--accent); color:#000;" onclick="alert('Execute Spend Contract with Raw Secret: ${s.rawSecretHex}')">Claim MDS</button>`;
                 }
                 return `

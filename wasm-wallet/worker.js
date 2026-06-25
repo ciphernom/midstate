@@ -866,6 +866,101 @@ self.onmessage = async (e) => {
                 isSending = false;
             }
         }
+        else if (type === 'DEX_CLAIM_MIDSTATE') {
+            if (isSending) throw new Error("Wallet busy.");
+            isSending = true;
+            try {
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Claiming HTLC..." } });
+                const { swapIdx, rawSecret, htlcCoinId, htlcValue, htlcSalt, takerMdsPk, makerMdsPk, secretHashMidstate, timeoutHeight } = payload;
+                
+                // Reconstruct the exact HTLC bytecode
+                const htlcScriptHex = build_htlc_bytecode_hex(secretHashMidstate, takerMdsPk, BigInt(timeoutHeight), makerMdsPk);
+
+                if (!mssCachesReady) await loadMssCaches();
+                const utxoArray = Object.values(wState.utxos).map(u => {
+                    if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
+                    return u;
+                });
+
+                // Grab the Taker's primary wallet address to receive the funds
+                const takerAddressHex = Object.keys(wState.mssAddrs)[0]; 
+
+                // Setup the inputs and outputs
+                const outputsJson = JSON.stringify([{
+                    out_type: "standard",
+                    address: takerAddressHex,
+                    value: htlcValue,
+                    salt: null // Auto-generates random salt
+                }]);
+
+                const contractInputsJson = JSON.stringify([{
+                    coin_id: htlcCoinId,
+                    witness: "", // Filled later
+                    value: htlcValue,
+                    salt: htlcSalt,
+                    state: null
+                }]);
+
+                // 1. Generate the Transaction Context
+                let ctxStr = wallet.prepare_script_spend(
+                    JSON.stringify(utxoArray),
+                    htlcScriptHex,
+                    contractInputsJson,
+                    outputsJson,
+                    wState.nextWotsIndex
+                );
+
+                let ctx = JSON.parse(ctxStr);
+
+                // 2. Sign the commitment hash using the Taker's private key
+                const sigHex = wallet.sign_mss_hex(takerMdsPk, ctx.commitment);
+
+                // 3. Inject the Witness Stack: [Signature, Secret, 0x01 (True)]
+                ctx.contract_inputs[0].witness = `${sigHex},${rawSecret},01`;
+
+                // 4. Build the final Reveal transaction
+                const revealPayloadStr = wallet.build_script_reveal(JSON.stringify(ctx), ctx.commitment, ctx.tx_salt);
+
+                // 5. Update Wallet Keys
+                while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
+                const usedMss = new Set();
+                for (const inp of ctx.wallet_inputs) if (inp.is_mss) usedMss.add(inp.address);
+                for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
+                await saveState();
+
+                // 6. Mine & Submit
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining PoW..." } });
+                const stateData = await rpc.getState();
+                await new Promise(r => setTimeout(r, 50));
+                const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
+
+                const commitReq = await rpc.commit(ctx.commitment, spamNonce);
+                if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for Block Confirmation..." } });
+                while (true) {
+                    try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {}
+                    await waitForNextBlock(15000);
+                }
+
+                const revealReq = await rpc.send(revealPayloadStr);
+                if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting claim..." } });
+                while (true) {
+                    try { const inp = await rpc.checkCoin(htlcCoinId); if (inp && !inp.exists) break; } catch (e) {}
+                    await waitForNextBlock(15000);
+                }
+
+                await performScan();
+                self.postMessage({ type: 'DEX_CLAIM_SUCCESS', payload: { swapIdx } });
+
+            } catch (err) {
+                throw new Error(`Claim failed: ${err.message}`);
+            } finally {
+                isSending = false;
+            }
+        }
         else if (type === 'PUSH_NEW_BLOCK') {
             if (payload.ChatMessage) {
                 if (payload.ChatMessage.words && payload.ChatMessage.words[0] === 255) {
