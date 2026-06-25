@@ -454,6 +454,10 @@
         .chat-controls { display: flex; gap: 12px; margin-bottom: 16px; }
 
         /* ═══ DEX UI Upgrades ═══ */
+        .tabs { display: flex; gap: 8px; margin-bottom: 1.5rem; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+        .tab { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #666; cursor: pointer; padding: 6px 12px; border-radius: 6px; transition: all 0.2s; }
+        .tab:hover { background: rgba(255,255,255,0.05); color: var(--text-bright); }
+        .tab.active { background: var(--bg-panel); color: var(--accent); border: 1px solid var(--border-bright); }
         .dex-table { width: 100%; border-collapse: collapse; text-align: left; }
         .dex-table th { color: #666; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; padding: 12px; border-bottom: 1px solid var(--border); }
         .dex-table td { padding: 12px; border-bottom: 1px solid var(--border); font-size: 13px; font-variant-numeric: tabular-nums; }
@@ -3341,6 +3345,115 @@ document.getElementById('btnExport').onclick = () => {
     active = null;
     setTimeout(function () { try { window.close(); } catch (_) {} }, 400);
   }
+  // Stream worker progress for the active request out to the dApp.
+  function progressToDapp(reqId) {
+    var W = window.__midstateWallet;
+    if (!W || !W.onWorker) return;
+    W.onWorker(function (data) {
+      if (!active || active.id !== reqId) return;
+      if (data.type === "CONTRACT_TX_PROGRESS" && data.payload && data.payload.reqId === reqId) {
+        reply(active.source, active.origin, { type: "progress", id: reqId, message: data.payload.msg });
+      } else if (data.type === "CONTRACT_TX_COMPLETE" && data.payload && data.payload.reqId === reqId) {
+        reply(active.source, active.origin, { type: "result", id: reqId, data: { txid: data.payload.txid } });
+        done();
+      } else if (data.type === "ERROR") {
+        reply(active.source, active.origin, { type: "error", id: reqId, message: String(data.payload) });
+        done();
+      }
+    });
+  }
+
+  function handleRequest(req, origin, source) {
+    active = { id: req.id, action: req.action, origin: origin, source: source };
+
+    whenUnlocked(req.id, function () {
+      var W = window.__midstateWallet;
+
+      if (req.action === "connect") {
+        var addr = W.primaryAddress();
+        showApproval("Allow this site to see your public address?<br><br>" +
+          "<span style='color:var(--accent);word-break:break-all;'>" + esc(addr) + "</span>", origin);
+        bindApproval(
+          function () { reply(source, origin, { type: "result", id: req.id, data: { address: addr } }); done(); },
+          function () { reply(source, origin, { type: "error", id: req.id, message: "User rejected the connection." }); done(); }
+        );
+        return;
+      }
+
+      if (req.action === "fund") {
+        var p = req.params || {};
+        showApproval("Fund contract<br>" +
+          "<span style='color:var(--accent);word-break:break-all;'>" + esc(p.contractAddress) + "</span><br><br>" +
+          "Amount: <b>" + esc(p.amount) + "</b> MDS" +
+          (p.state ? "<br>Seed state: <span style='color:#888;word-break:break-all;'>" + esc(p.state) + "</span>" : ""), origin);
+        bindApproval(
+          function () {
+            progressToDapp(req.id);
+            W.post({ type: "FUND_CONTRACT", payload: { reqId: req.id, contractAddress: p.contractAddress, amount: p.amount, state: p.state || null } });
+          },
+          function () { reply(source, origin, { type: "error", id: req.id, message: "User rejected the funding request." }); done(); }
+        );
+        return;
+      }
+
+      if (req.action === "spend") {
+        var s = req.params || {};
+        var outs = (s.outputs || []).map(function (o) {
+          return "&bull; " + esc(o.value || 0) + " &rarr; " + esc(String(o.address || "").slice(0, 16)) + "&hellip;" +
+                 (o.state ? " <span style='color:#888'>(state)</span>" : "");
+        }).join("<br>");
+        showApproval("Execute contract<br>" +
+          "<span style='color:var(--accent);word-break:break-all;'>" + esc(s.contractAddress || "(from bytecode)") + "</span><br><br>" +
+          (outs ? ("Outputs:<br>" + outs) : "No value outputs (state-only execution)."), origin);
+        bindApproval(
+          function () {
+            progressToDapp(req.id);
+            W.post({ type: "WATCH_CONTRACT", payload: { address: s.contractAddress } });
+            W.post({ type: "SPEND_CONTRACT", payload: Object.assign({ reqId: req.id }, s) });
+          },
+          function () { reply(source, origin, { type: "error", id: req.id, message: "User rejected the execution request." }); done(); }
+        );
+        return;
+      }
+
+      reply(source, origin, { type: "error", id: req.id, message: "Unknown action: " + req.action });
+      done();
+    });
+  }
+
+  // The ONLY entry point. Strict origin + source gating.
+  window.addEventListener("message", function (event) {
+    if (ALLOWED_DAPP_ORIGINS.indexOf(event.origin) === -1) return;
+    if (event.source !== window.opener) return;
+    var d = event.data;
+    if (!d || d.__mid !== PROTOCOL || d.v !== VERSION) return;
+    if (d.type === "request") {
+      if (active) { reply(event.source, event.origin, { type: "error", id: d.id, message: "Wallet is busy with another request." }); return; }
+      handleRequest(d, event.origin, event.source);
+    }
+  });
+
+  // Announce readiness so the provider sends its (id-bearing) request. The ready
+  // ping carries NO sensitive data, so "*" is safe here; the provider validates
+  // event.origin === walletOrigin AND event.source === popup on receipt, and all
+  // real replies (result/progress/error) use the exact requesting origin.
+  function announce() {
+    try { window.opener.postMessage({ __mid: PROTOCOL, v: VERSION, type: "ready", id: null }, "*"); } catch (_) {}
+  }
+  announce();
+  setTimeout(announce, 150);
+  setTimeout(announce, 500);
+})();
+
+</script>
+
+<!-- ═══ DEX / WALLET-TAB ENGINE ═══
+     Moved OUT of the dApp-bridge IIFE above. That IIFE returns early when the
+     page is not a ?dapp=1 popup, which was preventing ALL of this code from
+     running in the normal wallet view (connect button + every dex* fn were dead).
+     This runs at top level, after the main wallet script, so `worker`, `showToast`,
+     `showActivity`, `hideActivity`, `ethers`, etc. are all in scope. -->
+<script>
         // ═══════════════════════════════════════════════════════════════
         //  LAYER-1 DEX ENGINE (Zero-Fork Cross-Chain Swaps)
         // ═══════════════════════════════════════════════════════════════
@@ -3673,111 +3786,8 @@ window.switchTabDex = function(tab) {
                 </div>
             `}).join('');
         }
-        
-        
-        
-        
-  // Stream worker progress for the active request out to the dApp.
-  function progressToDapp(reqId) {
-    var W = window.__midstateWallet;
-    if (!W || !W.onWorker) return;
-    W.onWorker(function (data) {
-      if (!active || active.id !== reqId) return;
-      if (data.type === "CONTRACT_TX_PROGRESS" && data.payload && data.payload.reqId === reqId) {
-        reply(active.source, active.origin, { type: "progress", id: reqId, message: data.payload.msg });
-      } else if (data.type === "CONTRACT_TX_COMPLETE" && data.payload && data.payload.reqId === reqId) {
-        reply(active.source, active.origin, { type: "result", id: reqId, data: { txid: data.payload.txid } });
-        done();
-      } else if (data.type === "ERROR") {
-        reply(active.source, active.origin, { type: "error", id: reqId, message: String(data.payload) });
-        done();
-      }
-    });
-  }
-
-  function handleRequest(req, origin, source) {
-    active = { id: req.id, action: req.action, origin: origin, source: source };
-
-    whenUnlocked(req.id, function () {
-      var W = window.__midstateWallet;
-
-      if (req.action === "connect") {
-        var addr = W.primaryAddress();
-        showApproval("Allow this site to see your public address?<br><br>" +
-          "<span style='color:var(--accent);word-break:break-all;'>" + esc(addr) + "</span>", origin);
-        bindApproval(
-          function () { reply(source, origin, { type: "result", id: req.id, data: { address: addr } }); done(); },
-          function () { reply(source, origin, { type: "error", id: req.id, message: "User rejected the connection." }); done(); }
-        );
-        return;
-      }
-
-      if (req.action === "fund") {
-        var p = req.params || {};
-        showApproval("Fund contract<br>" +
-          "<span style='color:var(--accent);word-break:break-all;'>" + esc(p.contractAddress) + "</span><br><br>" +
-          "Amount: <b>" + esc(p.amount) + "</b> MDS" +
-          (p.state ? "<br>Seed state: <span style='color:#888;word-break:break-all;'>" + esc(p.state) + "</span>" : ""), origin);
-        bindApproval(
-          function () {
-            progressToDapp(req.id);
-            W.post({ type: "FUND_CONTRACT", payload: { reqId: req.id, contractAddress: p.contractAddress, amount: p.amount, state: p.state || null } });
-          },
-          function () { reply(source, origin, { type: "error", id: req.id, message: "User rejected the funding request." }); done(); }
-        );
-        return;
-      }
-
-      if (req.action === "spend") {
-        var s = req.params || {};
-        var outs = (s.outputs || []).map(function (o) {
-          return "&bull; " + esc(o.value || 0) + " &rarr; " + esc(String(o.address || "").slice(0, 16)) + "&hellip;" +
-                 (o.state ? " <span style='color:#888'>(state)</span>" : "");
-        }).join("<br>");
-        showApproval("Execute contract<br>" +
-          "<span style='color:var(--accent);word-break:break-all;'>" + esc(s.contractAddress || "(from bytecode)") + "</span><br><br>" +
-          (outs ? ("Outputs:<br>" + outs) : "No value outputs (state-only execution)."), origin);
-        bindApproval(
-          function () {
-            progressToDapp(req.id);
-            W.post({ type: "WATCH_CONTRACT", payload: { address: s.contractAddress } });
-            W.post({ type: "SPEND_CONTRACT", payload: Object.assign({ reqId: req.id }, s) });
-          },
-          function () { reply(source, origin, { type: "error", id: req.id, message: "User rejected the execution request." }); done(); }
-        );
-        return;
-      }
-
-      reply(source, origin, { type: "error", id: req.id, message: "Unknown action: " + req.action });
-      done();
-    });
-  }
-
-  // The ONLY entry point. Strict origin + source gating.
-  window.addEventListener("message", function (event) {
-    if (ALLOWED_DAPP_ORIGINS.indexOf(event.origin) === -1) return;
-    if (event.source !== window.opener) return;
-    var d = event.data;
-    if (!d || d.__mid !== PROTOCOL || d.v !== VERSION) return;
-    if (d.type === "request") {
-      if (active) { reply(event.source, event.origin, { type: "error", id: d.id, message: "Wallet is busy with another request." }); return; }
-      handleRequest(d, event.origin, event.source);
-    }
-  });
-
-  // Announce readiness so the provider sends its (id-bearing) request. The ready
-  // ping carries NO sensitive data, so "*" is safe here; the provider validates
-  // event.origin === walletOrigin AND event.source === popup on receipt, and all
-  // real replies (result/progress/error) use the exact requesting origin.
-  function announce() {
-    try { window.opener.postMessage({ __mid: PROTOCOL, v: VERSION, type: "ready", id: null }, "*"); } catch (_) {}
-  }
-  announce();
-  setTimeout(announce, 150);
-  setTimeout(announce, 500);
-})();
-
 </script>
+
 
 </body>
 </html>
