@@ -2315,197 +2315,195 @@ function unpackChannelState(binPayload) {
 }
 
 async function handleL2Chat(msg) {
-    const cmd = msg.words[1];
-    
-    if (cmd === 100) { // OPEN
-        const coinId = msg.attachments.find(a => a.kind === "coin_id")?.value;
-        const peerPkRaw = msg.attachments.find(a => a.kind === "address")?.value;
-        const sigAtt = msg.attachments.find(a => a.kind === "midstate")?.value;
-
-        if (!coinId || !peerPkRaw || !sigAtt) return;
-
-        // Strip the 8-character checksum the node adds to address attachments
-        const peerPk = peerPkRaw.substring(0, 64);
+        const cmd = msg.words[1];
         
-        const myPk = getPrimaryMssPk();
-        if (!myPk) return;
-        
-        let aPk, bPk, isAlice;
-        if (peerPk < myPk) { 
-            aPk = peerPk; bPk = myPk; isAlice = false; // Peer is smaller, Peer is Alice
-        } else { 
-            aPk = myPk; bPk = peerPk; isAlice = true;  // I am smaller, I am Alice
-        }
+        if (cmd === 100) { // OPEN
+            const coinId = msg.attachments.find(a => a.kind === "coin_id")?.value;
+            const peerPkRaw = msg.attachments.find(a => a.kind === "address")?.value;
+            const sigAtt = msg.attachments.find(a => a.kind === "midstate")?.value;
 
-        wState.l2_channels = wState.l2_channels || {};
-        if (wState.l2_channels[coinId]) return;
+            if (!coinId || !peerPkRaw || !sigAtt) return;
 
-        wState.l2_channels[coinId] = {
-            alice_pk: aPk, bob_pk: bPk, channel_value: 0, channel_salt: sigAtt,
-            is_alice: isAlice,
-            latest_state: { nonce: 0, alice_amt: 0, bob_amt: 0, htlcs: [], alice_sig: null, bob_sig: null, is_fully_signed: false }
-        };
-        await saveState();
-        self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
-    }
-    else if (cmd === 40 || cmd === 41 || cmd === 42 || cmd === 43) { 
-        // 40=UPDATE, 41=CONFIRM, 42=ADD_HTLC, 43=CLAIM_HTLC
-        const coinId = msg.attachments.find(a => a.kind === "coin_id")?.value;
-        const sigAtt = msg.attachments.find(a => a.kind === "signature")?.value;
-        if (!coinId || !sigAtt) return;
-
-        const channel = wState.l2_channels[coinId];
-        if (!channel) return;
-
-        const { nonce, aliceAmt, bobAmt, htlcs, sigHex: counterpartySig } = unpackChannelState(sigAtt);
-
-        if (nonce <= channel.latest_state.nonce && channel.latest_state.is_fully_signed) return;
-
-        let stateJson;
-        try {
-            stateJson = build_channel_state(coinId, channel.alice_pk, channel.bob_pk, BigInt(aliceAmt), BigInt(bobAmt), nonce, JSON.stringify(htlcs));
-        } catch (e) {
-            console.error("WASM build_channel_state failed:", e);
-            return;
-        }
-        
-        const parsedState = JSON.parse(stateJson);
-        const counterpartyPk = channel.is_alice ? channel.bob_pk : channel.alice_pk;
-        
-        if (!verify_mss_sig_wasm(counterpartySig, parsedState.commitment, counterpartyPk)) return;
-
-        // ── ROUTING LOGIC ──
-        if (cmd === 42) { // ADD_HTLC received
-            const destPkRaw = msg.attachments.find(a => a.kind === "address")?.value;
-            const destPk = destPkRaw ? destPkRaw.substring(0, 64) : null;
-            const newHtlc = htlcs[htlcs.length - 1]; // Assume latest added
-
+            // Strip the 8-character checksum the node adds to address attachments
+            const peerPk = peerPkRaw.substring(0, 64);
             
-            if (destPk) {
-                // WE ARE THE HUB. Forward to Dest.
-                let forwardChannelId = null;
-                for (const [cid, c] of Object.entries(wState.l2_channels)) {
-                    if ((c.alice_pk === destPk || c.bob_pk === destPk) && c.latest_state.is_fully_signed) {
-                        forwardChannelId = cid; break;
-                    }
-                }
-                if (forwardChannelId) {
-                    const fC = wState.l2_channels[forwardChannelId];
-                    let nA = fC.latest_state.alice_amt; let nB = fC.latest_state.bob_amt;
-                    if (fC.is_alice) nA -= newHtlc.amount; else nB -= newHtlc.amount;
-                    
-                    const fHtlcs = [...(fC.latest_state.htlcs || [])];
-                    fHtlcs.push({ amount: newHtlc.amount, timeout: newHtlc.timeout - 10, receiver_is_alice: !fC.is_alice, secret_hash: newHtlc.secret_hash });
-                    
-                    const fNonce = fC.latest_state.nonce + 1;
-                    const fStateJson = build_channel_state(forwardChannelId, fC.alice_pk, fC.bob_pk, BigInt(nA), BigInt(nB), fNonce, JSON.stringify(fHtlcs));
-                    const fSig = wallet.sign_mss_hex(fC.is_alice ? fC.alice_pk : fC.bob_pk, JSON.parse(fStateJson).commitment);
-                    
-                    fC.latest_state = { nonce: fNonce, alice_amt: nA, bob_amt: nB, htlcs: fHtlcs, alice_sig: fC.is_alice ? fSig : null, bob_sig: fC.is_alice ? null : fSig, is_fully_signed: false };
-                    
-                    wState.l2_routes = wState.l2_routes || {};
-                    wState.l2_routes[newHtlc.secret_hash] = { fromCoinId: coinId, amount: newHtlc.amount };
-                    
-                    const fBin = packChannelState(fNonce, nA, nB, fHtlcs, fSig);
-                    submitClientMinedChat([255, 42], null, [{ kind: "coin_id", value: forwardChannelId }, { kind: "signature", value: normalizeHex(fBin) }, { kind: "address", value: destPk }]).catch(()=>{});
-                }
-            } else {
-                // WE ARE THE DESTINATION.
-                const secret = wState.l2_secrets ? wState.l2_secrets[newHtlc.secret_hash] : null;
-                if (secret) {
-                    // We know the secret! Claim it immediately.
-                    const cHtlcs = htlcs.filter(h => h.secret_hash !== newHtlc.secret_hash);
-                    let nA = aliceAmt; let nB = bobAmt;
-                    if (channel.is_alice) nA += newHtlc.amount; else nB += newHtlc.amount;
-                    
-                    const cNonce = nonce + 1;
-                    const cStateJson = build_channel_state(coinId, channel.alice_pk, channel.bob_pk, BigInt(nA), BigInt(nB), cNonce, JSON.stringify(cHtlcs));
-                    const cSig = wallet.sign_mss_hex(channel.is_alice ? channel.alice_pk : channel.bob_pk, JSON.parse(cStateJson).commitment);
-                    
-                    channel.latest_state = { nonce: cNonce, alice_amt: nA, bob_amt: nB, htlcs: cHtlcs, alice_sig: channel.is_alice ? cSig : null, bob_sig: channel.is_alice ? null : cSig, is_fully_signed: false };
-                    
-                    const cBin = packChannelState(cNonce, nA, nB, cHtlcs, cSig);
-                    submitClientMinedChat([255, 43], null, [{ kind: "coin_id", value: coinId }, { kind: "signature", value: normalizeHex(cBin) }, { kind: "midstate", value: secret }]).catch(()=>{});
-
-                }
+            const myPk = getPrimaryMssPk();
+            if (!myPk) return;
+            
+            let aPk, bPk, isAlice;
+            if (peerPk < myPk) { 
+                aPk = peerPk; bPk = myPk; isAlice = false; // Peer is smaller, Peer is Alice
+            } else { 
+                aPk = myPk; bPk = peerPk; isAlice = true;  // I am smaller, I am Alice
             }
+
+            wState.l2_channels = wState.l2_channels || {};
+            if (wState.l2_channels[coinId]) return;
+
+            wState.l2_channels[coinId] = {
+                alice_pk: aPk, bob_pk: bPk, channel_value: 0, channel_salt: sigAtt,
+                is_alice: isAlice,
+                latest_state: { nonce: 0, alice_amt: 0, bob_amt: 0, htlcs: [], alice_sig: null, bob_sig: null, is_fully_signed: false }
+            };
+            await saveState();
+            self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
         }
-        else if (cmd === 43) { // CLAIM_HTLC received
-            const secret = msg.attachments.find(a => a.kind === "midstate")?.value;
+        else if (cmd === 40 || cmd === 41 || cmd === 42 || cmd === 43) { 
+            // 40=UPDATE, 41=CONFIRM, 42=ADD_HTLC, 43=CLAIM_HTLC
+            const coinId = msg.attachments.find(a => a.kind === "coin_id")?.value;
+            const sigAtt = msg.attachments.find(a => a.kind === "signature")?.value;
+            if (!coinId || !sigAtt) return;
 
-            if (secret) {
-                const secretHash = blake3_hash_hex(secret);
-                // We are HUB. Pull funds from original sender.
-                if (wState.l2_routes && wState.l2_routes[secretHash]) {
-                    const route = wState.l2_routes[secretHash];
-                    const pC = wState.l2_channels[route.fromCoinId];
-                    if (pC) {
-                        let pA = pC.latest_state.alice_amt; let pB = pC.latest_state.bob_amt;
-                        if (pC.is_alice) pA += route.amount; else pB += route.amount;
-                        const pHtlcs = (pC.latest_state.htlcs || []).filter(h => h.secret_hash !== secretHash);
-                        const pNonce = pC.latest_state.nonce + 1;
-                        
-                        const pStateJson = build_channel_state(route.fromCoinId, pC.alice_pk, pC.bob_pk, BigInt(pA), BigInt(pB), pNonce, JSON.stringify(pHtlcs));
-                        const pSig = wallet.sign_mss_hex(pC.is_alice ? pC.alice_pk : pC.bob_pk, JSON.parse(pStateJson).commitment);
-                        
-                        pC.latest_state = { nonce: pNonce, alice_amt: pA, bob_amt: pB, htlcs: pHtlcs, alice_sig: pC.is_alice ? pSig : null, bob_sig: pC.is_alice ? null : pSig, is_fully_signed: false };
-                        
-                        const pBin = packChannelState(pNonce, pA, pB, pHtlcs, pSig);
-                        submitClientMinedChat([255, 43], null, [{ kind: "coin_id", value: route.fromCoinId }, { kind: "signature", value: normalizeHex(pBin) }, { kind: "midstate", value: secret }]).catch(()=>{});
+            const channel = wState.l2_channels[coinId];
+            if (!channel) return;
 
+            const { nonce, aliceAmt, bobAmt, htlcs, sigHex: counterpartySig } = unpackChannelState(sigAtt);
+
+            if (nonce <= channel.latest_state.nonce && channel.latest_state.is_fully_signed) return;
+
+            let stateJson;
+            try {
+                stateJson = build_channel_state(coinId, channel.alice_pk, channel.bob_pk, BigInt(aliceAmt), BigInt(bobAmt), nonce, JSON.stringify(htlcs));
+            } catch (e) {
+                console.error("WASM build_channel_state failed:", e);
+                return;
+            }
+            
+            const parsedState = JSON.parse(stateJson);
+            const counterpartyPk = channel.is_alice ? channel.bob_pk : channel.alice_pk;
+            
+            if (!verify_mss_sig_wasm(counterpartySig, parsedState.commitment, counterpartyPk)) return;
+
+            // ── ROUTING LOGIC ──
+            if (cmd === 42) { // ADD_HTLC received
+                const destPkRaw = msg.attachments.find(a => a.kind === "address")?.value;
+                const destPk = destPkRaw ? destPkRaw.substring(0, 64) : null;
+                const newHtlc = htlcs[htlcs.length - 1]; // Assume latest added
+                
+                if (destPk) {
+                    // WE ARE THE HUB. Forward to Dest.
+                    let forwardChannelId = null;
+                    for (const [cid, c] of Object.entries(wState.l2_channels)) {
+                        if ((c.alice_pk === destPk || c.bob_pk === destPk) && c.latest_state.is_fully_signed) {
+                            forwardChannelId = cid; break;
+                        }
+                    }
+                    if (forwardChannelId) {
+                        const fC = wState.l2_channels[forwardChannelId];
+                        let nA = fC.latest_state.alice_amt; let nB = fC.latest_state.bob_amt;
+                        if (fC.is_alice) nA -= newHtlc.amount; else nB -= newHtlc.amount;
+                        
+                        const fHtlcs = [...(fC.latest_state.htlcs || [])];
+                        fHtlcs.push({ amount: newHtlc.amount, timeout: newHtlc.timeout - 10, receiver_is_alice: !fC.is_alice, secret_hash: newHtlc.secret_hash });
+                        
+                        const fNonce = fC.latest_state.nonce + 1;
+                        const fStateJson = build_channel_state(forwardChannelId, fC.alice_pk, fC.bob_pk, BigInt(nA), BigInt(nB), fNonce, JSON.stringify(fHtlcs));
+                        const fSig = wallet.sign_mss_hex(fC.is_alice ? fC.alice_pk : fC.bob_pk, JSON.parse(fStateJson).commitment);
+                        
+                        fC.latest_state = { nonce: fNonce, alice_amt: nA, bob_amt: nB, htlcs: fHtlcs, alice_sig: fC.is_alice ? fSig : null, bob_sig: fC.is_alice ? null : fSig, is_fully_signed: false };
+                        
+                        wState.l2_routes = wState.l2_routes || {};
+                        wState.l2_routes[newHtlc.secret_hash] = { fromCoinId: coinId, amount: newHtlc.amount };
+                        
+                        const fBin = packChannelState(fNonce, nA, nB, fHtlcs, fSig);
+                        submitClientMinedChat([255, 42], null, [{ kind: "coin_id", value: forwardChannelId }, { kind: "signature", value: normalizeHex(fBin) }, { kind: "address", value: destPk }]).catch(()=>{});
+                    }
+                } else {
+                    // WE ARE THE DESTINATION.
+                    const secret = wState.l2_secrets ? wState.l2_secrets[newHtlc.secret_hash] : null;
+                    if (secret) {
+                        // We know the secret! Claim it immediately.
+                        const cHtlcs = htlcs.filter(h => h.secret_hash !== newHtlc.secret_hash);
+                        let nA = aliceAmt; let nB = bobAmt;
+                        if (channel.is_alice) nA += newHtlc.amount; else nB += newHtlc.amount;
+                        
+                        const cNonce = nonce + 1;
+                        const cStateJson = build_channel_state(coinId, channel.alice_pk, channel.bob_pk, BigInt(nA), BigInt(nB), cNonce, JSON.stringify(cHtlcs));
+                        const cSig = wallet.sign_mss_hex(channel.is_alice ? channel.alice_pk : channel.bob_pk, JSON.parse(cStateJson).commitment);
+                        
+                        channel.latest_state = { nonce: cNonce, alice_amt: nA, bob_amt: nB, htlcs: cHtlcs, alice_sig: channel.is_alice ? cSig : null, bob_sig: channel.is_alice ? null : cSig, is_fully_signed: false };
+                        
+                        const cBin = packChannelState(cNonce, nA, nB, cHtlcs, cSig);
+                        submitClientMinedChat([255, 43], null, [{ kind: "coin_id", value: coinId }, { kind: "signature", value: normalizeHex(cBin) }, { kind: "midstate", value: secret }]).catch(()=>{});
                     }
                 }
             }
+            else if (cmd === 43) { // CLAIM_HTLC received
+                const secret = msg.attachments.find(a => a.kind === "midstate")?.value;
+
+                if (secret) {
+                    const secretHash = blake3_hash_hex(secret);
+                    // We are HUB. Pull funds from original sender.
+                    if (wState.l2_routes && wState.l2_routes[secretHash]) {
+                        const route = wState.l2_routes[secretHash];
+                        const pC = wState.l2_channels[route.fromCoinId];
+                        if (pC) {
+                            let pA = pC.latest_state.alice_amt; let pB = pC.latest_state.bob_amt;
+                            if (pC.is_alice) pA += route.amount; else pB += route.amount;
+                            const pHtlcs = (pC.latest_state.htlcs || []).filter(h => h.secret_hash !== secretHash);
+                            const pNonce = pC.latest_state.nonce + 1;
+                            
+                            const pStateJson = build_channel_state(route.fromCoinId, pC.alice_pk, pC.bob_pk, BigInt(pA), BigInt(pB), pNonce, JSON.stringify(pHtlcs));
+                            const pSig = wallet.sign_mss_hex(pC.is_alice ? pC.alice_pk : pC.bob_pk, JSON.parse(pStateJson).commitment);
+                            
+                            pC.latest_state = { nonce: pNonce, alice_amt: pA, bob_amt: pB, htlcs: pHtlcs, alice_sig: pC.is_alice ? pSig : null, bob_sig: pC.is_alice ? null : pSig, is_fully_signed: false };
+                            
+                            const pBin = packChannelState(pNonce, pA, pB, pHtlcs, pSig);
+                            submitClientMinedChat([255, 43], null, [{ kind: "coin_id", value: route.fromCoinId }, { kind: "signature", value: normalizeHex(pBin) }, { kind: "midstate", value: secret }]).catch(()=>{});
+                        }
+                    }
+                }
+            }
+            
+            // Apply state locally
+            const myPk = channel.is_alice ? channel.alice_pk : channel.bob_pk;
+            const mySig = wallet.sign_mss_hex(myPk, parsedState.commitment);
+
+            channel.latest_state = {
+                nonce, alice_amt: aliceAmt, bob_amt: bobAmt, htlcs,
+                alice_sig: channel.is_alice ? mySig : counterpartySig,
+                bob_sig: channel.is_alice ? counterpartySig : mySig,
+                is_fully_signed: true
+            };
+            
+            if (channel.channel_value === 0) {
+                channel.channel_value = aliceAmt + bobAmt + 100;
+            }
+            await saveState();
+
+            if (cmd === 40 || cmd === 42) { // If UPDATE or ADD_HTLC, reply CONFIRM
+                const binPayload = packChannelState(nonce, aliceAmt, bobAmt, htlcs, mySig);
+                submitClientMinedChat([255, 41], null, [
+                    { kind: "coin_id", value: coinId },
+                    { kind: "signature", value: normalizeHex(binPayload) }
+                ]).catch(()=>{});
+            }
+            self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
         }
         // ── L2 DEX ROUTING ──
-            if (cmd >= 200 && cmd <= 202) {
-                const sigAtt = msg.attachments.find(a => a.kind === "signature")?.value;
-                if (!sigAtt) return;
+        else if (cmd >= 200 && cmd <= 202) {
+            const sigAtt = msg.attachments.find(a => a.kind === "signature")?.value;
+            if (!sigAtt) return;
 
-                try {
-                    // Decode the arbitrary JSON payload we tunneled through the Signature attachment
-                    const hexPairs = sigAtt.match(/.{1,2}/g) || [];
-                    const jsonStr = new TextDecoder().decode(new Uint8Array(hexPairs.map(b => parseInt(b, 16))));
-                    const payload = JSON.parse(jsonStr);
-                    payload.nonce = msg.nonce;
+            try {
+                // Decode the arbitrary JSON payload we tunneled through the Signature attachment
+                const hexPairs = sigAtt.match(/.{1,2}/g) || [];
+                const jsonStr = new TextDecoder().decode(new Uint8Array(hexPairs.map(b => parseInt(b, 16))));
+                const payload = JSON.parse(jsonStr);
+                payload.nonce = msg.nonce;
 
-                    // Route to the UI Thread
-                    if (cmd === 200) {
-                        self.postMessage({ type: 'DEX_OFFER_RECEIVED', payload });
-                    } else if (cmd === 201) {
-                        self.postMessage({ type: 'DEX_ACCEPT_RECEIVED', payload });
-                    } else if (cmd === 202) {
-                        self.postMessage({ type: 'DEX_LOCKED_RECEIVED', payload });
-                    }
-                } catch (e) {
-                    console.error("Failed to parse DEX L2 payload", e);
+                // Route to the UI Thread
+                if (cmd === 200) {
+                    self.postMessage({ type: 'DEX_OFFER_RECEIVED', payload });
+                } else if (cmd === 201) {
+                    self.postMessage({ type: 'DEX_ACCEPT_RECEIVED', payload });
+                } else if (cmd === 202) {
+                    self.postMessage({ type: 'DEX_LOCKED_RECEIVED', payload });
                 }
+            } catch (e) {
+                console.error("Failed to parse DEX L2 payload", e);
             }
         }
-        // Apply state locally
-        const myPk = channel.is_alice ? channel.alice_pk : channel.bob_pk;
-        const mySig = wallet.sign_mss_hex(myPk, parsedState.commitment);
-
-        channel.latest_state = {
-            nonce, alice_amt: aliceAmt, bob_amt: bobAmt, htlcs,
-            alice_sig: channel.is_alice ? mySig : counterpartySig,
-            bob_sig: channel.is_alice ? counterpartySig : mySig,
-            is_fully_signed: true
-        };
-        
-        if (channel.channel_value === 0) {
-            channel.channel_value = aliceAmt + bobAmt + 100;
-        }
-        await saveState();
-
-        if (cmd === 40 || cmd === 42) { // If UPDATE or ADD_HTLC, reply CONFIRM
-            const binPayload = packChannelState(nonce, aliceAmt, bobAmt, htlcs, mySig);
-            submitClientMinedChat([255, 41], null, [
-                { kind: "coin_id", value: coinId },
-                { kind: "signature", value: normalizeHex(binPayload) }
-            ]).catch(()=>{});
-        }
-        self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
     }
 }
 
