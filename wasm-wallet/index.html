@@ -465,6 +465,8 @@
         .dex-table tr:last-child td { border-bottom: none; }
         
         .swap-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+        .dex-phase-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent, #7CFF6B); flex: 0 0 auto; animation: dexPhasePulse 1.1s ease-in-out infinite; box-shadow: 0 0 6px var(--accent, #7CFF6B); }
+        @keyframes dexPhasePulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.35; transform: scale(0.7); } }
         .swap-card-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 12px; margin-bottom: 16px; }
         
         .stepper { display: flex; justify-content: space-between; position: relative; margin-bottom: 20px; }
@@ -3668,6 +3670,7 @@ document.getElementById('btnExport').onclick = () => {
                 swap.timeoutHeight = data.timeoutHeight;
                 swap.mdsLockerPk = data.makerMdsPk;   // worker returns the locker's own pubkey here
                 swap.status = 'ready_to_claim_base';
+                delete swap.phase;                    // lock leg done — stop showing commit/reveal steps
                 saveSwaps();
                 renderDexSwaps();
                 hideActivity();
@@ -3719,8 +3722,14 @@ document.getElementById('btnExport').onclick = () => {
             else if (e.data.type === 'DEX_CLAIM_SUCCESS') {
                 hideActivity();
                 const idx = e.data.payload.swapIdx;
-                if (dexMySwaps[idx]) { dexMySwaps[idx].status = 'completed'; saveSwaps(); renderDexSwaps(); }
+                if (dexMySwaps[idx]) { dexMySwaps[idx].status = 'completed'; delete dexMySwaps[idx].phase; saveSwaps(); renderDexSwaps(); }
                 showToast("Successfully claimed MDS! Swap complete.", "success");
+            }
+            else if (e.data.type === 'DEX_PHASE') {
+                // Live commit/reveal progress for a Midstate leg (lock or claim).
+                const { offerId, phase } = e.data.payload;
+                const swap = dexMySwaps.find(s => s.offerId === offerId);
+                if (swap) { swap.phase = phase; renderDexSwaps(); } // transient — not persisted
             }
         });
 
@@ -3793,9 +3802,11 @@ document.getElementById('btnExport').onclick = () => {
                 hideActivity();
                 if (!rawSecret) return showToast("The secret hasn't been revealed yet (the seller must claim the ETH first). It will auto-claim once they do.", "error");
             }
-            showActivity("Claiming MDS…");
+            swap.phase = "Starting claim\u2026";
+            saveSwaps(); renderDexSwaps();
             worker.postMessage({ type: 'DEX_CLAIM_MIDSTATE', payload: {
                 swapIdx: idx,
+                offerId: swap.offerId,          // lets the worker report claim phases to this card
                 rawSecret: rawSecret,
                 htlcCoins: swap.htlcCoins,
                 makerMdsPk: swap.mdsLockerPk,   // worker key: refund = the MDS-side's pubkey
@@ -3975,13 +3986,21 @@ document.getElementById('btnExport').onclick = () => {
                     statusText = 'Swap complete.';
                 }
 
+                // A Midstate commit/reveal step is in flight: show the live phase with a
+                // pulse and hide the action button so it can't be re-triggered.
+                let statusHtml = statusText;
+                if (s.phase) {
+                    btn = '';
+                    statusHtml = `<span class="dex-phase-dot"></span><span>${s.phase}</span>`;
+                }
+
                 return `<div class="swap-card">
                     <div class="swap-card-header">
                         <div><span style="font-weight:bold;color:var(--text-max);font-size:14px;">${headline}</span> <span style="font-size:11px;color:#888;">for ${eth} ETH</span></div>
                         <span style="font-size:11px;color:#888;text-transform:uppercase;">${s.role} · ${s.side === 'mds' ? 'MDS side' : 'ETH side'}</span>
                     </div>
                     ${getStepperHtml(s)}
-                    <div style="font-size:12px;color:var(--text-bright);text-align:center;margin-bottom:${btn ? '15px' : '0'};">${statusText}</div>
+                    <div style="font-size:12px;color:var(--text-bright);text-align:center;margin-bottom:${btn ? '15px' : '0'};display:flex;align-items:center;justify-content:center;gap:7px;">${statusHtml}</div>
                     ${btn}
                 </div>`;
             }).join('');

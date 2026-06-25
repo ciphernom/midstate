@@ -877,6 +877,7 @@ self.onmessage = async (e) => {
                 // the taker can only spend them if we transmit {coin_id,value,salt}).
                 const fundRes = await performContractTx({
                     reqId: 999,
+                    dexOfferId: offerId,   // routes commit/reveal phase progress to this swap card
                     kind: 'fund',
                     contractAddress: htlcAddressHex,
                     amount: expectedAmount
@@ -893,6 +894,11 @@ self.onmessage = async (e) => {
                     makerMdsPk: myPk,
                     takerMdsPk: takerPk
                 }});
+            } catch (err) {
+                // Clear the card's live phase on failure so it doesn't sit on a stale
+                // commit/reveal step; re-throw so the outer handler still reports it.
+                if (payload && payload.offerId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId: payload.offerId, phase: null } });
+                throw err;
             } finally {
                 isSending = false;
             }
@@ -946,7 +952,9 @@ self.onmessage = async (e) => {
             isSending = true;
             try {
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Claiming HTLC..." } });
-                const { swapIdx, rawSecret, htlcCoins, makerMdsPk, secretHash, timeoutHeight } = payload;
+                const { swapIdx, rawSecret, htlcCoins, makerMdsPk, secretHash, timeoutHeight, offerId } = payload;
+                const dexPhase = (phase) => { if (offerId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId, phase } }); };
+                dexPhase("Building claim transaction\u2026");
 
                 if (!Array.isArray(htlcCoins) || htlcCoins.length === 0) throw new Error("No HTLC coins to claim");
 
@@ -1023,6 +1031,7 @@ self.onmessage = async (e) => {
 
                 // 6. Mine, commit, wait, reveal, wait.
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining PoW..." } });
+                dexPhase("Mining spam-proof (PoW)\u2026");
                 const stateData = await rpc.getState();
                 await new Promise(r => setTimeout(r, 50));
                 const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
@@ -1031,6 +1040,7 @@ self.onmessage = async (e) => {
                 if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for Block Confirmation..." } });
+                dexPhase("Commit broadcast \u2014 waiting to be mined (step 1 of 2)\u2026");
                 while (true) {
                     try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {}
                     await waitForNextBlock(15000);
@@ -1040,16 +1050,21 @@ self.onmessage = async (e) => {
                 if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting claim..." } });
+                dexPhase("Reveal broadcast \u2014 waiting to be mined (step 2 of 2)\u2026");
                 const firstCoin = normalizeHex(htlcCoins[0].coin_id);
                 while (true) {
                     try { const inp = await rpc.checkCoin(firstCoin); if (inp && !inp.exists) break; } catch (e) {}
                     await waitForNextBlock(15000);
                 }
 
+                dexPhase("Confirmed \u2713 \u2014 syncing wallet\u2026");
                 await performScan();
                 self.postMessage({ type: 'DEX_CLAIM_SUCCESS', payload: { swapIdx } });
 
             } catch (err) {
+                // Clear the card's live phase so a failed claim doesn't sit on a stale
+                // "waiting to be mined" line (payload is in scope here; dexPhase isn't).
+                if (payload && payload.offerId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId: payload.offerId, phase: null } });
                 // wasm-bindgen throws Err(JsValue::from_str(...)) as a bare JS STRING,
                 // which has no .message — so reading err.message swallowed the real
                 // Rust reason. Extract it from whatever shape the throw actually is.
@@ -2185,7 +2200,11 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function performContractTx(req) {
-    const prog = (msg) => self.postMessage({ type: 'CONTRACT_TX_PROGRESS', payload: { reqId: req.reqId, msg } });
+    const prog = (msg) => {
+        self.postMessage({ type: 'CONTRACT_TX_PROGRESS', payload: { reqId: req.reqId, msg } });
+        // If this tx belongs to a DEX swap, also surface the phase on that swap's card.
+        if (req.dexOfferId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId: req.dexOfferId, phase: msg } });
+    };
 
     if (!mssCachesReady) await loadMssCaches();
 
@@ -2262,7 +2281,7 @@ async function performContractTx(req) {
     const commitReq = await rpc.commit(ctx.commitment, spamNonce);
     if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
 
-    prog("Waiting for block confirmation (phase 1)...");
+    prog("Commit broadcast — waiting to be mined (step 1 of 2)…");
     const revealPayloadStr = wallet.build_script_reveal(ctxStr, ctx.commitment, ctx.tx_salt);
 
     while (true) {
@@ -2273,11 +2292,11 @@ async function performContractTx(req) {
         await waitForNextBlock(15000);
     }
 
-    prog("Commit confirmed! Submitting reveal...");
+    prog("Commit mined ✓ — submitting reveal…");
     const revealReq = await rpc.send(revealPayloadStr);
     if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
 
-    prog("Broadcasting reveal...");
+    prog("Reveal broadcast — waiting to be mined (step 2 of 2)…");
     // Use the first input coin id (contract or wallet) to detect inclusion.
     const firstInputId = ctx.input_coin_ids && ctx.input_coin_ids.length ? ctx.input_coin_ids[0] : null;
     if (firstInputId) {
