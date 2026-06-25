@@ -10,6 +10,8 @@
     <link rel="apple-touch-icon" href="icon-192.png">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
     <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
+
     <title>MIDSTATE // WALLET</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap');
@@ -682,6 +684,37 @@
             </div>
         </main>
 
+<!-- DEX -->
+        <main id="view-dex" class="page">
+            <h2>Atomic Swap DEX</h2>
+            <div style="font-size: 11px; color: #888; margin-top: -10px; margin-bottom: 20px;">
+                Trustless cross-chain swaps via Base (EVM) smart contracts.
+            </div>
+
+            <div class="panel">
+                <h3 style="font-size: 14px;">Web3 Connection</h3>
+                <button id="btnConnectBase" style="background: var(--text-max); color: #000;">Connect MetaMask (Base)</button>
+                <div id="evmAddressDisplay" style="font-family: monospace; font-size: 11px; margin-top: 8px; color: var(--accent);">Not Connected</div>
+            </div>
+
+            <div class="panel">
+                <h3 style="font-size: 14px;">Create Offer (Sell MDS)</h3>
+                <input type="number" id="dexOfferAmount" placeholder="Amount of MDS to Sell">
+                <input type="number" id="dexAskAmount" placeholder="Amount of ETH to Ask (in Wei)">
+                <button onclick="dexCreateOffer()">Broadcast Offer</button>
+            </div>
+
+            <h3 style="margin-top: 1.5rem; font-size: 12px; color: #666; text-transform: uppercase;">Live Orderbook</h3>
+            <div class="list-container" id="dexOrderbook">
+                <div class="list-item" style="text-align: center; color: #555;">Listening to P2P network...</div>
+            </div>
+
+            <h3 style="margin-top: 1.5rem; font-size: 12px; color: #666; text-transform: uppercase;">My Active Swaps</h3>
+            <div class="list-container" id="dexActiveSwaps">
+                <div class="list-item" style="text-align: center; color: #555;">No active swaps.</div>
+            </div>
+        </main>
+
         <!-- SEND -->
         <main id="view-send" class="page">
             <h2>Send Funds</h2>
@@ -840,11 +873,12 @@
         <!-- NAV (7 tabs now) -->
         <nav id="bottom-nav" class="hidden">
             <button class="nav-btn active" data-target="view-home"><span class="nav-icon">🏠</span><span>Home</span></button>
-            <!--<button class="nav-btn" data-target="view-defi"><span class="nav-icon">📈</span><span>DEX</span></button>-->
+            <!--<button class="nav-btn" data-target="view-dex"><span class="nav-icon">📈</span><span>DEX</span></button>-->
+
             <button class="nav-btn" data-target="view-mine"><span class="nav-icon">⛏️</span><span>Mine</span></button>
             <button class="nav-btn" data-target="view-send"><span class="nav-icon">💸</span><span>Send</span></button>
             <button class="nav-btn" data-target="view-receive"><span class="nav-icon">⬇️</span><span>Receive</span></button>
-            <button class="nav-btn" data-target="view-lightning"><span class="nav-icon">⚡</span><span>Q-Bolt L2</span></button>
+             <!--<button class="nav-btn" data-target="view-lightning"><span class="nav-icon">⚡</span><span>Q-Bolt L2</span></button>-->
             <button class="nav-btn" data-target="view-chat"><span class="nav-icon">💬</span><span>Chat</span></button>
             <button class="nav-btn" data-target="view-settings"><span class="nav-icon">⚙️</span><span>Settings</span></button>
         </nav>
@@ -3252,7 +3286,193 @@ document.getElementById('btnExport').onclick = () => {
     active = null;
     setTimeout(function () { try { window.close(); } catch (_) {} }, 400);
   }
+// ═══════════════════════════════════════════════════════════════
+        //  LAYER-1 DEX ENGINE (Zero-Fork Cross-Chain Swaps)
+        // ═══════════════════════════════════════════════════════════════
 
+        // The public HTLC contract on Base (Needs deploying once via Remix)
+        const BASE_HTLC_CONTRACT = "0xYourDeployedBaseContractAddressHere";
+        const HTLC_ABI = [
+            "function lockFunds(bytes32 _expectedKeccak, address payable _maker, uint256 _timeoutBlocks) external payable",
+            "function claim(bytes32 _secret) external"
+        ];
+
+        let evmProvider = null;
+        let evmSigner = null;
+        let evmAddress = null;
+
+        let dexOrderbook = [];
+        let dexMySwaps = JSON.parse(localStorage.getItem('midstate_dex_swaps')) || [];
+
+        document.getElementById('btnConnectBase').onclick = async () => {
+            if (!window.ethereum) return showToast("MetaMask not found!", "error");
+            try {
+                await window.ethereum.request({ method: 'eth_requestAccounts' });
+                evmProvider = new ethers.BrowserProvider(window.ethereum);
+                const network = await evmProvider.getNetwork();
+                if (network.chainId !== 8453n) { // Base Mainnet
+                    return showToast("Please switch MetaMask to Base Network", "error");
+                }
+                evmSigner = await evmProvider.getSigner();
+                evmAddress = await evmSigner.getAddress();
+                document.getElementById('evmAddressDisplay').innerText = "Base: " + evmAddress;
+                document.getElementById('btnConnectBase').style.display = 'none';
+                showToast("Connected to Base Network", "success");
+            } catch (e) {
+                showToast("Failed to connect EVM wallet", "error");
+            }
+        };
+
+        window.dexCreateOffer = function() {
+            if (!evmAddress) return showToast("Connect MetaMask first", "error");
+            const mdsAmt = Number(document.getElementById('dexOfferAmount').value);
+            const ethAmt = document.getElementById('dexAskAmount').value;
+            if (!mdsAmt || !ethAmt) return showToast("Enter amounts", "error");
+
+            const myPk = getPrimaryMssPk();
+            if (!myPk) return showToast("MDS identity not initialized", "error");
+
+            worker.postMessage({ type: 'DEX_BROADCAST_OFFER', payload: {
+                makerMdsPk: myPk,
+                makerEvmAddr: evmAddress,
+                offeredMds: mdsAmt,
+                askedWei: ethAmt,
+                timestamp: Date.now()
+            }});
+
+            dexMySwaps.push({ role: 'maker', status: 'waiting_for_taker', offeredMds: mdsAmt, askedWei: ethAmt });
+            localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps));
+            renderDexSwaps();
+            showToast("Offer broadcasted to P2P network", "success");
+        };
+
+        window.dexAcceptOffer = async function(nonce, makerMdsPk, makerEvmAddr, offeredMds, askedWei) {
+            if (!evmAddress) return showToast("Connect MetaMask first", "error");
+
+            // Taker generates the secret
+            const rawSecretBytes = crypto.getRandomValues(new Uint8Array(32));
+            const rawSecretHex = Array.from(rawSecretBytes).map(b => b.toString(16).padStart(2,'0')).join('');
+            
+            // Taker generates BOTH hashes (Base uses Keccak256, Midstate uses Blake3)
+            const keccakHash = ethers.keccak256("0x" + rawSecretHex).substring(2);
+            
+            worker.postMessage({ type: 'DEX_BROADCAST_ACCEPT', payload: {
+                offerNonce: nonce,
+                takerMdsPk: getPrimaryMssPk(),
+                secretHashEvm: keccakHash,
+                rawSecret: rawSecretHex, // UI passes to worker to hash with Blake3, then broadast
+            }});
+
+            dexMySwaps.push({ role: 'taker', status: 'waiting_for_maker_lock', rawSecretHex, keccakHash, makerEvmAddr, askedWei });
+            localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps));
+            renderDexSwaps();
+            showToast("Accepted! Sent hashes to Maker.", "success");
+        };
+
+        // Worker Intercepts for Orderbook
+        worker.addEventListener('message', (e) => {
+            if (e.data.type === 'DEX_OFFER_RECEIVED') {
+                const offer = e.data.payload;
+                if (!dexOrderbook.find(o => o.nonce === offer.nonce)) {
+                    dexOrderbook.push(offer);
+                    renderDexOrderbook();
+                }
+            }
+            else if (e.data.type === 'DEX_ACCEPT_RECEIVED') {
+                const acc = e.data.payload;
+                const mySwap = dexMySwaps.find(s => s.role === 'maker' && s.status === 'waiting_for_taker');
+                if (mySwap) {
+                    showToast("Your offer was accepted! Locking Midstate...", "success");
+                    mySwap.status = 'locking_midstate';
+                    mySwap.takerMdsPk = acc.takerMdsPk;
+                    mySwap.secretHashMidstate = acc.secretHashMidstate;
+                    mySwap.secretHashEvm = acc.secretHashEvm;
+                    mySwap.offerNonce = acc.nonce;
+                    
+                    worker.postMessage({ type: 'DEX_LOCK_MIDSTATE', payload: {
+                        expectedAmount: mySwap.offeredMds,
+                        takerPk: acc.takerMdsPk,
+                        secretHashMidstate: acc.secretHashMidstate
+                    }});
+                }
+            }
+            else if (e.data.type === 'DEX_MIDSTATE_LOCKED_SUCCESS') {
+                const mySwap = dexMySwaps.find(s => s.status === 'locking_midstate');
+                if (mySwap) {
+                    mySwap.status = 'waiting_for_taker_base_lock';
+                    localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps));
+                    renderDexSwaps();
+                    
+                    worker.postMessage({ type: 'DEX_BROADCAST_LOCKED', payload: {
+                        offerNonce: mySwap.offerNonce
+                    }});
+                }
+            }
+            else if (e.data.type === 'DEX_LOCKED_RECEIVED') {
+                const mySwap = dexMySwaps.find(s => s.role === 'taker' && s.status === 'waiting_for_maker_lock');
+                if (mySwap) {
+                    mySwap.status = 'ready_to_lock_base';
+                    localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps));
+                    renderDexSwaps();
+                    showToast("Maker locked Midstate! You can now lock Base ETH.", "success");
+                }
+            }
+        });
+
+        window.dexLockBase = async function(idx) {
+            const swap = dexMySwaps[idx];
+            try {
+                const contract = new ethers.Contract(BASE_HTLC_CONTRACT, HTLC_ABI, evmSigner);
+                const tx = await contract.lockFunds("0x" + swap.keccakHash, swap.makerEvmAddr, 5760, { value: swap.askedWei });
+                showActivity("Locking ETH on Base...");
+                await tx.wait();
+                hideActivity();
+                
+                swap.status = 'ready_to_claim_midstate';
+                localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps));
+                renderDexSwaps();
+                showToast("Base ETH Locked! Await Maker Claim.", "success");
+            } catch (e) {
+                showToast("Failed to lock Base ETH: " + e.message, "error");
+            }
+        };
+
+        function renderDexOrderbook() {
+            const container = document.getElementById('dexOrderbook');
+            if (dexOrderbook.length === 0) return container.innerHTML = '<div class="list-item" style="text-align: center; color: #555;">Listening to P2P network...</div>';
+            
+            container.innerHTML = dexOrderbook.map(o => `
+                <div class="list-item flex-row">
+                    <div>
+                        <div style="color:var(--text-max); font-weight:bold;">Sell ${o.offeredMds} MDS</div>
+                        <div style="font-size:11px; color:#888;">For ${o.askedWei} Wei</div>
+                    </div>
+                    <button style="margin:0; width:auto; padding:6px 12px; font-size:11px;" onclick="dexAcceptOffer(${o.nonce}, '${o.makerMdsPk}', '${o.makerEvmAddr}', ${o.offeredMds}, '${o.askedWei}')">Accept</button>
+                </div>
+            `).join('');
+        }
+
+        function renderDexSwaps() {
+            const container = document.getElementById('dexActiveSwaps');
+            if (dexMySwaps.length === 0) return container.innerHTML = '<div class="list-item" style="text-align: center; color: #555;">No active swaps.</div>';
+            
+            container.innerHTML = dexMySwaps.map((s, i) => {
+                let btn = '';
+                if (s.status === 'ready_to_lock_base') {
+                    btn = `<button style="margin:0; width:auto; padding:6px 12px; font-size:11px;" onclick="dexLockBase(${i})">Lock Base ETH</button>`;
+                } else if (s.status === 'ready_to_claim_midstate') {
+                    btn = `<button style="margin:0; width:auto; padding:6px 12px; font-size:11px; background:var(--accent); color:#000;" onclick="alert('Execute Spend Contract with Raw Secret: ${s.rawSecretHex}')">Claim MDS</button>`;
+                }
+                return `
+                <div class="list-item flex-row">
+                    <div>
+                        <div style="color:var(--text-max); font-weight:bold;">${s.role.toUpperCase()}</div>
+                        <div style="font-size:11px; color:#888;">Status: ${s.status.replace(/_/g, ' ')}</div>
+                    </div>
+                    ${btn}
+                </div>
+            `}).join('');
+        }
   // Stream worker progress for the active request out to the dApp.
   function progressToDapp(reqId) {
     var W = window.__midstateWallet;
@@ -3352,6 +3572,7 @@ document.getElementById('btnExport').onclick = () => {
   setTimeout(announce, 150);
   setTimeout(announce, 500);
 })();
+
 </script>
 
 </body>

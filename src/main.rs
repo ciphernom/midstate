@@ -132,6 +132,11 @@ enum Command {
         mine: bool,
         #[arg(long)] 
         threads: Option<usize>,
+        
+         /// Mining backend: "auto" (default, prefer GPU), "gpu", or "cpu".
+        #[arg(long, default_value = "auto")]
+        backend: String,
+        
         #[arg(long)]
         verify_threads: Option<usize>,
         #[arg(long)]
@@ -656,9 +661,20 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Node { data_dir, port, rpc_port, rpc_bind, peer, mine, threads, verify_threads, listen, config, prune, license_wallet } => {
-            run_node(data_dir, port, rpc_port, rpc_bind, peer, mine, threads, verify_threads, listen, config, prune, license_wallet).await
-        }
+        Command::Node { data_dir, port, rpc_port, rpc_bind, peer, mine, threads,
+                verify_threads, listen, config, prune, license_wallet, backend } => {
+                    midstate::core::gpu_mining::set_backend(match backend.to_ascii_lowercase().as_str() {
+                        "gpu"  => midstate::core::gpu_mining::Backend::Gpu,
+                        "cpu"  => midstate::core::gpu_mining::Backend::Cpu,
+                        "auto" => midstate::core::gpu_mining::Backend::Auto,
+                        other  => {
+                            tracing::warn!("unknown --backend '{other}', using auto");
+                            midstate::core::gpu_mining::Backend::Auto
+                        }
+                    });
+                    run_node(data_dir, port, rpc_port, rpc_bind, peer, mine, threads,
+                             verify_threads, listen, config, prune, license_wallet).await
+                }
         Command::Wallet { action } => handle_wallet(action).await,
         Command::Commit { rpc_port, rpc_host, coin, dest } => {
             commit_transaction(rpc_port, rpc_host, coin, dest).await

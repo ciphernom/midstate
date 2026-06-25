@@ -2311,6 +2311,30 @@ pub fn verify_mss_sig_wasm(sig_hex: &str, msg_hex: &str, pk_hex: &str) -> bool {
     }
 }
 
+/// Builds the Midstate HTLC bytecode for cross-chain atomic swaps.
+#[wasm_bindgen]
+pub fn build_htlc_bytecode_hex(
+    secret_hash_hex: &str, 
+    receiver_pk_hex: &str, 
+    timeout_height: u64, 
+    refund_pk_hex: &str
+) -> Result<String, JsValue> {
+    let mut sh = [0u8; 32];
+    hex::decode_to_slice(secret_hash_hex, &mut sh)
+        .map_err(|_| JsValue::from_str("Invalid secret_hash"))?;
+        
+    let mut rpk = [0u8; 32];
+    hex::decode_to_slice(receiver_pk_hex, &mut rpk)
+        .map_err(|_| JsValue::from_str("Invalid receiver_pk"))?;
+        
+    let mut refpk = [0u8; 32];
+    hex::decode_to_slice(refund_pk_hex, &mut refpk)
+        .map_err(|_| JsValue::from_str("Invalid refund_pk"))?;
+
+    let bytecode = midstate::core::script::compile_htlc(&sh, &rpk, timeout_height, &refpk);
+    Ok(hex::encode(bytecode))
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Tests
 // ═══════════════════════════════════════════════════════════════════════════════

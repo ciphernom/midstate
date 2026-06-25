@@ -38,6 +38,9 @@ axum = "0.7"
 tower-http = { version = "0.5.2", features = ["trace", "cors", "timeout"] }
 rpassword = "7.3"
 dirs = "5.0"
+wgpu = "29"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
 
 libp2p = { version = "0.56", features = ["tokio", "noise", "tcp", "yamux", "kad", "identify", "request-response", "macros", "quic", "relay", "dcutr", "autonat"] }
 libp2p-stream = "0.4.0-alpha"          # ← updated for libp2p 0.56
