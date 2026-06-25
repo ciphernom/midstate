@@ -3458,12 +3458,27 @@ document.getElementById('btnExport').onclick = () => {
         //  LAYER-1 DEX ENGINE (Zero-Fork Cross-Chain Swaps)
         // ═══════════════════════════════════════════════════════════════
 
-        // The public HTLC contract on Base (Needs deploying once via Remix)
-        const BASE_HTLC_CONTRACT = "0x97C104d252BbEc09dFf91a375B22805C30355dc8";
+        // ─────────────────────────────────────────────────────────────────
+        //  NEW Base HTLC contract (MidstateAtomicSwap.sol). It verifies BLAKE3
+        //  (matching Midstate's OP_HASH) so ONE 32-byte secret unlocks BOTH
+        //  chains. REDEPLOY MidstateAtomicSwap.sol and paste its address here.
+        // ─────────────────────────────────────────────────────────────────
+        const BASE_HTLC_CONTRACT = "0xFBE5FF48bEeD9CaB26C7B7C2C2424a218aa52c18";
         const HTLC_ABI = [
-            "function lockFunds(bytes32 _expectedKeccak, address payable _maker, uint256 _timeoutBlocks) external payable",
-            "function claim(bytes32 _secret) external"
+            "function lock(bytes32 hashlock, address payable beneficiary, uint256 refundDelay) external payable returns (bytes32)",
+            "function claim(bytes32 swapId, bytes32 preimage) external",
+            "function refund(bytes32 swapId) external",
+            "event Locked(bytes32 indexed swapId, address indexed beneficiary, address indexed refundTo, uint256 amount, uint64 timeout, bytes32 hashlock)",
+            "event Claimed(bytes32 indexed swapId, bytes32 hashlock, bytes32 preimage)",
+            "event Refunded(bytes32 indexed swapId)"
         ];
+
+        // Timeout policy. The Base refund delay (the SHORT leg) MUST be safely
+        // shorter than the Midstate HTLC timeout (~1440 blocks ≈ 24h at 1-minute
+        // blocks, set in the worker), so that after the maker reveals the secret
+        // — at the latest just before the Base refund — the taker still has many
+        // hours to claim MDS. 6h ≪ 24h leaves an 18h safety margin.
+        const BASE_REFUND_DELAY_SECS = 6 * 3600;
 
         let evmProvider = null;
         let evmSigner = null;
@@ -3471,6 +3486,7 @@ document.getElementById('btnExport').onclick = () => {
 
         let dexOrderbook = [];
         let dexMySwaps = JSON.parse(localStorage.getItem('midstate_dex_swaps')) || [];
+        function saveSwaps() { localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps)); }
 
         document.getElementById('btnConnectBase').onclick = async () => {
             if (!window.ethereum) return showToast("MetaMask not found!", "error");
@@ -3486,306 +3502,429 @@ document.getElementById('btnExport').onclick = () => {
                 document.getElementById('evmAddressDisplay').innerText = "Base: " + evmAddress;
                 document.getElementById('btnConnectBase').style.display = 'none';
                 showToast("Connected to Base Network", "success");
+                resumeDexWatchers();
             } catch (e) {
                 showToast("Failed to connect EVM wallet", "error");
             }
         };
 
+        // ── Maker: broadcast an offer ───────────────────────────────────────
         window.dexCreateOffer = function() {
             if (!evmAddress) return showToast("Connect MetaMask first", "error");
             const mdsAmt = Number(document.getElementById('dexOfferAmount').value);
             const ethAmt = document.getElementById('dexAskAmount').value;
             if (!mdsAmt || !ethAmt) return showToast("Enter amounts", "error");
+            try { if (BigInt(ethAmt) <= 0n) throw 0; } catch (_) { return showToast("Ask must be a positive integer amount in wei", "error"); }
 
-            const myPk = getPrimaryMssPk();
-            if (!myPk) return showToast("MDS identity not initialized", "error");
+            // App-level id correlates offer → accept → lock regardless of chat nonce.
+            const offerId = Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2, '0')).join('');
 
+            // The worker injects makerMdsPk (our identity lives only in the worker).
             worker.postMessage({ type: 'DEX_BROADCAST_OFFER', payload: {
-                makerMdsPk: myPk,
+                offerId,
                 makerEvmAddr: evmAddress,
                 offeredMds: mdsAmt,
-                askedWei: ethAmt,
-                timestamp: Date.now()
+                askedWei: String(ethAmt),
+                ts: Date.now()
             }});
 
-            dexMySwaps.push({ role: 'maker', status: 'waiting_for_taker', offeredMds: mdsAmt, askedWei: ethAmt });
-            localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps));
+            dexMySwaps.push({ role: 'maker', status: 'waiting_for_taker', offerId, offeredMds: mdsAmt, askedWei: String(ethAmt), makerEvmAddr: evmAddress });
+            saveSwaps();
             renderDexSwaps();
-            showToast("Offer broadcasted to P2P network", "success");
+            showToast("Offer broadcast to the P2P network", "success");
         };
 
-        window.dexAcceptOffer = async function(nonce, makerMdsPk, makerEvmAddr, offeredMds, askedWei) {
+        // ── Taker: accept an offer (no secret is generated or sent) ─────────
+        window.dexAcceptOffer = async function(offer) {
             if (!evmAddress) return showToast("Connect MetaMask first", "error");
+            if (!offer || !offer.offerId) return showToast("Malformed offer", "error");
 
-            // Taker generates the secret
-            const rawSecretBytes = crypto.getRandomValues(new Uint8Array(32));
-            const rawSecretHex = Array.from(rawSecretBytes).map(b => b.toString(16).padStart(2,'0')).join('');
-            
-            // Taker generates BOTH hashes (Base uses Keccak256, Midstate uses Blake3)
-            const keccakHash = ethers.keccak256("0x" + rawSecretHex).substring(2);
-            
             worker.postMessage({ type: 'DEX_BROADCAST_ACCEPT', payload: {
-                offerNonce: nonce,
-                takerMdsPk: getPrimaryMssPk(),
-                secretHashEvm: keccakHash,
-                rawSecret: rawSecretHex, // UI passes to worker to hash with Blake3, then broadast
+                offerId: offer.offerId,
+                offerNonce: offer.nonce ?? null,   // chat-bus threading hint only
+                takerEvmAddr: evmAddress
             }});
 
-            dexMySwaps.push({ role: 'taker', status: 'waiting_for_maker_lock', rawSecretHex, keccakHash, makerEvmAddr, askedWei });
-            localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps));
+            dexMySwaps.push({
+                role: 'taker', status: 'waiting_for_maker_lock',
+                offerId: offer.offerId,
+                makerMdsPk: offer.makerMdsPk,
+                makerEvmAddr: offer.makerEvmAddr,
+                offeredMds: offer.offeredMds,
+                askedWei: String(offer.askedWei)
+            });
+            saveSwaps();
             renderDexSwaps();
-            showToast("Accepted! Sent hashes to Maker.", "success");
+            showToast("Offer accepted — waiting for the maker to lock MDS.", "success");
         };
 
-        // Worker Intercepts for Orderbook
+        window.dexAcceptFromBook = function(i) {
+            const o = dexOrderbook[i];
+            if (o) dexAcceptOffer(o);
+        };
+
+        // ── Worker / P2P event handling ─────────────────────────────────────
         worker.addEventListener('message', (e) => {
             if (e.data.type === 'DEX_OFFER_RECEIVED') {
                 const offer = e.data.payload;
-                if (!dexOrderbook.find(o => o.nonce === offer.nonce)) {
+                const key = offer.offerId || offer.nonce;
+                if (!dexOrderbook.find(o => (o.offerId || o.nonce) === key)) {
                     dexOrderbook.push(offer);
                     renderDexOrderbook();
                 }
             }
             else if (e.data.type === 'DEX_ACCEPT_RECEIVED') {
                 const acc = e.data.payload;
-                const mySwap = dexMySwaps.find(s => s.role === 'maker' && s.status === 'waiting_for_taker');
-                if (mySwap) {
-                    showToast("Your offer was accepted! Locking Midstate...", "success");
-                    mySwap.status = 'locking_midstate';
-                    mySwap.takerMdsPk = acc.takerMdsPk;
-                    mySwap.secretHashMidstate = acc.secretHashMidstate;
-                    mySwap.secretHashEvm = acc.secretHashEvm;
-                    mySwap.offerNonce = acc.nonce;
-                    
-                    worker.postMessage({ type: 'DEX_LOCK_MIDSTATE', payload: {
-                        expectedAmount: mySwap.offeredMds,
-                        takerPk: acc.takerMdsPk,
-                        secretHashMidstate: acc.secretHashMidstate
-                    }});
-                }
+                const swap = dexMySwaps.find(s => s.role === 'maker' && s.offerId === acc.offerId && s.status === 'waiting_for_taker');
+                if (!swap) return;
+                showToast("Your offer was accepted! Locking MDS…", "success");
+                swap.status = 'locking_midstate';
+                swap.takerMdsPk = acc.takerMdsPk;
+                swap.takerEvmAddr = acc.takerEvmAddr;
+                saveSwaps();
+                renderDexSwaps();
+                worker.postMessage({ type: 'DEX_LOCK_MIDSTATE', payload: {
+                    offerId: swap.offerId,
+                    expectedAmount: swap.offeredMds,
+                    takerPk: acc.takerMdsPk
+                }});
             }
             else if (e.data.type === 'DEX_MIDSTATE_LOCKED_SUCCESS') {
                 const data = e.data.payload;
-                const mySwap = dexMySwaps.find(s => s.status === 'locking_midstate');
-                if (mySwap) {
-                    mySwap.status = 'ready_to_claim_base';
-                    localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps));
-                    renderDexSwaps();
-                    
-                    worker.postMessage({ type: 'DEX_BROADCAST_LOCKED', payload: {
-                        offerNonce: mySwap.offerNonce,
-                        htlcCoinId: data.htlcCoinId,
-                        htlcSalt: data.htlcSalt,
-                        htlcValue: data.htlcValue,
-                        timeoutHeight: data.timeoutHeight,
-                        makerMdsPk: document.getElementById('l2MyIdentity').innerText
-                    }});
-                }
+                const swap = dexMySwaps.find(s => s.role === 'maker' && s.offerId === data.offerId);
+                if (!swap) return;
+                // The secret stays on the maker's device until they reveal it by
+                // claiming the ETH on Base. Persist it so a reload can still claim.
+                swap.secret = data.secret;
+                swap.secretHash = data.secretHash;
+                swap.htlcCoins = data.htlcCoins;
+                swap.htlcAddressHex = data.htlcAddressHex;
+                swap.timeoutHeight = data.timeoutHeight;
+                swap.makerMdsPk = data.makerMdsPk;
+                swap.status = 'ready_to_claim_base';
+                saveSwaps();
+                renderDexSwaps();
+                hideActivity();
+
+                // Broadcast the lock to the taker: H + coin set + timeout. NO secret.
+                worker.postMessage({ type: 'DEX_BROADCAST_LOCKED', payload: {
+                    offerId: swap.offerId,
+                    replyTo: null,
+                    secretHash: data.secretHash,
+                    htlcCoins: data.htlcCoins,
+                    timeoutHeight: data.timeoutHeight,
+                    makerMdsPk: data.makerMdsPk
+                }});
+                showToast("MDS locked. Waiting for the taker to lock ETH…", "success");
+                startMakerLockWatch(swap.offerId);
             }
             else if (e.data.type === 'DEX_LOCKED_RECEIVED') {
                 const lockData = e.data.payload;
-                const mySwap = dexMySwaps.find(s => s.role === 'taker' && s.nonce === lockData.offerNonce);
-                if (mySwap && mySwap.status === 'waiting_for_maker_lock') {
-                    mySwap.status = 'ready_to_lock_base';
-                    // Save HTLC details so we can claim later!
-                    mySwap.htlcCoinId = lockData.htlcCoinId;
-                    mySwap.htlcSalt = lockData.htlcSalt;
-                    mySwap.htlcValue = lockData.htlcValue;
-                    mySwap.timeoutHeight = lockData.timeoutHeight;
-                    mySwap.makerMdsPk = lockData.makerMdsPk;
-                    localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps));
-                    renderDexSwaps();
-                    showToast("Maker locked Midstate! You can now lock Base ETH.", "success");
+                const swap = dexMySwaps.find(s => s.role === 'taker' && s.offerId === lockData.offerId && s.status === 'waiting_for_maker_lock');
+                if (!swap) return;
+                swap.secretHash = lockData.secretHash;
+                swap.htlcCoins = lockData.htlcCoins;
+                swap.timeoutHeight = lockData.timeoutHeight;
+                swap.makerMdsPk = lockData.makerMdsPk;
+                swap.status = 'verifying_htlc';
+                saveSwaps();
+                renderDexSwaps();
+                // Verify the maker's MDS HTLC really exists on-chain BEFORE locking ETH.
+                worker.postMessage({ type: 'DEX_VERIFY_HTLC', payload: {
+                    offerId: swap.offerId,
+                    secretHash: lockData.secretHash,
+                    timeoutHeight: lockData.timeoutHeight,
+                    makerMdsPk: lockData.makerMdsPk,
+                    htlcCoins: lockData.htlcCoins,
+                    expectedTotal: swap.offeredMds,
+                    baseRefundSecs: BASE_REFUND_DELAY_SECS
+                }});
+            }
+            else if (e.data.type === 'DEX_HTLC_VERIFIED') {
+                const { offerId, ok, reason } = e.data.payload;
+                const swap = dexMySwaps.find(s => s.role === 'taker' && s.offerId === offerId);
+                if (!swap) return;
+                if (ok) {
+                    swap.status = 'ready_to_lock_base';
+                    saveSwaps(); renderDexSwaps();
+                    showToast("Maker's MDS lock verified on-chain. You can now lock ETH.", "success");
+                } else {
+                    swap.status = 'htlc_invalid';
+                    swap.invalidReason = reason || "unknown";
+                    saveSwaps(); renderDexSwaps();
+                    showToast("Could not verify maker's MDS lock: " + (reason || "unknown") + ". Do NOT lock ETH.", "error");
                 }
             }
             else if (e.data.type === 'DEX_CLAIM_SUCCESS') {
                 hideActivity();
                 const idx = e.data.payload.swapIdx;
-                dexMySwaps[idx].status = 'completed';
-                localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps));
-                renderDexSwaps();
-                showToast("Successfully claimed Midstate!", "success");
+                if (dexMySwaps[idx]) { dexMySwaps[idx].status = 'completed'; saveSwaps(); renderDexSwaps(); }
+                showToast("Successfully claimed MDS! Swap complete.", "success");
             }
         });
 
+        // ── Taker: lock ETH on Base (the SHORT leg) ─────────────────────────
         window.dexLockBase = async function(idx) {
             const swap = dexMySwaps[idx];
+            if (!evmSigner) return showToast("Connect MetaMask first", "error");
+            if (!swap.secretHash) return showToast("Missing hashlock — cannot lock.", "error");
             try {
-                const contract = new ethers.Contract(BASE_HTLC_CONTRACT, HTLC_ABI, evmSigner);
-                const tx = await contract.lockFunds("0x" + swap.keccakHash, swap.makerEvmAddr, 5760, { value: swap.askedWei });
-                showActivity("Locking ETH on Base...");
-                await tx.wait();
-                hideActivity();
-                
+                showActivity("Locking ETH on Base…");
+                const c = dexWriteContract();
+                const tx = await c.lock("0x" + swap.secretHash, swap.makerEvmAddr, BASE_REFUND_DELAY_SECS, { value: swap.askedWei });
+                const receipt = await tx.wait();
+
+                // Capture our swapId from the Locked event for later claim/refund.
+                let swapId = null;
+                for (const log of receipt.logs) {
+                    try { const p = c.interface.parseLog(log); if (p && p.name === 'Locked') { swapId = p.args.swapId; break; } } catch (_) {}
+                }
+                swap.baseSwapId = swapId;
+                swap.fromBlock = receipt.blockNumber;
                 swap.status = 'ready_to_claim_midstate';
-                localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps));
+                saveSwaps();
                 renderDexSwaps();
-                showToast("Base ETH Locked! Await Maker Claim.", "success");
-            } catch (e) {
-                showToast("Failed to lock Base ETH: " + e.message, "error");
+                hideActivity();
+                showToast("ETH locked. Auto-claiming MDS once the maker reveals the secret…", "success");
+                startTakerSecretWatch(swap.offerId);
+            } catch (err) {
+                hideActivity();
+                showToast("Failed to lock Base ETH: " + (err.shortMessage || err.message), "error");
             }
         };
 
+        // ── Maker: claim ETH on Base, revealing the secret ──────────────────
+        window.dexClaimBase = async function(idx) {
+            const swap = dexMySwaps[idx];
+            if (!evmSigner) return showToast("Connect MetaMask first", "error");
+            if (!swap.secret) return showToast("Secret unavailable on this device — cannot claim ETH.", "error");
+            try {
+                showActivity("Claiming ETH on Base…");
+                let swapId = swap.baseSwapId;
+                if (!swapId) {
+                    // Discover the taker's lock (beneficiary = us, hashlock = H).
+                    const cr = new ethers.Contract(BASE_HTLC_CONTRACT, HTLC_ABI, evmProvider);
+                    const from = swap.fromBlock || Math.max(0, (await evmProvider.getBlockNumber()) - 60000);
+                    const evs = await cr.queryFilter(cr.filters.Locked(null, evmAddress), from);
+                    const m = evs.find(ev => ev.args.hashlock.toLowerCase() === ("0x" + swap.secretHash).toLowerCase());
+                    if (!m) { hideActivity(); return showToast("No matching ETH lock found yet — the taker may not have locked.", "error"); }
+                    swapId = m.args.swapId; swap.baseSwapId = swapId; saveSwaps();
+                }
+                const c = dexWriteContract();
+                const tx = await c.claim(swapId, "0x" + swap.secret);
+                await tx.wait();
+                swap.status = 'completed';
+                saveSwaps();
+                renderDexSwaps();
+                hideActivity();
+                showToast("Claimed ETH! The taker can now claim your MDS.", "success");
+            } catch (err) {
+                hideActivity();
+                showToast("Failed to claim ETH: " + (err.shortMessage || err.message), "error");
+            }
+        };
 
-window.switchTabDex = function(tab) {
+        // ── Taker: claim MDS using the secret revealed on Base ──────────────
+        window.dexClaimMidstate = async function(idx, secretOverride) {
+            const swap = dexMySwaps[idx];
+            let rawSecret = secretOverride;
+            if (!rawSecret) {
+                showActivity("Reading the revealed secret from Base…");
+                rawSecret = await dexFetchRevealedSecret(swap).catch(() => null);
+                hideActivity();
+                if (!rawSecret) return showToast("The maker hasn't revealed the secret yet (they must claim the ETH first). It will auto-claim once they do.", "error");
+            }
+            showActivity("Claiming Midstate…");
+            worker.postMessage({ type: 'DEX_CLAIM_MIDSTATE', payload: {
+                swapIdx: idx,
+                rawSecret: rawSecret,
+                htlcCoins: swap.htlcCoins,
+                makerMdsPk: swap.makerMdsPk,
+                secretHash: swap.secretHash,
+                timeoutHeight: swap.timeoutHeight
+            }});
+        };
+
+        // ── Event watchers (auto-advance the swap) ──────────────────────────
+        const _dexWatchers = new Set();
+
+        async function dexFetchRevealedSecret(swap) {
+            if (!swap.baseSwapId || !evmProvider) return null;
+            const c = new ethers.Contract(BASE_HTLC_CONTRACT, HTLC_ABI, evmProvider);
+            const from = swap.fromBlock || 0;
+            const evs = await c.queryFilter(c.filters.Claimed(swap.baseSwapId), from);
+            if (evs.length) return evs[0].args.preimage.substring(2); // strip 0x → raw hex
+            return null;
+        }
+
+        // Taker: poll for the maker's Base claim, then auto-claim MDS.
+        function startTakerSecretWatch(offerId) {
+            const key = 'secret:' + offerId;
+            if (_dexWatchers.has(key)) return;
+            _dexWatchers.add(key);
+            const tick = async () => {
+                const swap = dexMySwaps.find(s => s.offerId === offerId && s.role === 'taker');
+                if (!swap || swap.status === 'completed') { _dexWatchers.delete(key); return; }
+                if (swap.status !== 'ready_to_claim_midstate') { setTimeout(tick, 15000); return; }
+                try {
+                    const secret = await dexFetchRevealedSecret(swap);
+                    if (secret) { _dexWatchers.delete(key); dexClaimMidstate(dexMySwaps.indexOf(swap), secret); return; }
+                } catch (_) {}
+                setTimeout(tick, 15000);
+            };
+            setTimeout(tick, 4000);
+        }
+
+        // Maker: poll for the taker's Base lock, then enable the Claim-ETH button.
+        function startMakerLockWatch(offerId) {
+            const key = 'lock:' + offerId;
+            if (_dexWatchers.has(key)) return;
+            _dexWatchers.add(key);
+            const tick = async () => {
+                const swap = dexMySwaps.find(s => s.offerId === offerId && s.role === 'maker');
+                if (!swap || swap.status === 'completed' || swap.takerLocked) { _dexWatchers.delete(key); return; }
+                try {
+                    const c = new ethers.Contract(BASE_HTLC_CONTRACT, HTLC_ABI, evmProvider);
+                    const from = swap.fromBlock || Math.max(0, (await evmProvider.getBlockNumber()) - 60000);
+                    const evs = await c.queryFilter(c.filters.Locked(null, evmAddress), from);
+                    const m = evs.find(ev => ev.args.hashlock.toLowerCase() === ("0x" + swap.secretHash).toLowerCase());
+                    if (m) {
+                        swap.baseSwapId = m.args.swapId;
+                        swap.takerLocked = true;
+                        saveSwaps(); renderDexSwaps();
+                        _dexWatchers.delete(key);
+                        showToast("Taker locked ETH — you can now claim it.", "success");
+                        return;
+                    }
+                } catch (_) {}
+                setTimeout(tick, 15000);
+            };
+            setTimeout(tick, 4000);
+        }
+
+        function resumeDexWatchers() {
+            if (!evmProvider) return;
+            for (const s of dexMySwaps) {
+                if (s.role === 'taker' && s.status === 'ready_to_claim_midstate') startTakerSecretWatch(s.offerId);
+                if (s.role === 'maker' && s.status === 'ready_to_claim_base' && !s.takerLocked) startMakerLockWatch(s.offerId);
+            }
+        }
+
+        window.switchTabDex = function(tab) {
             document.getElementById('dex-tab-market').style.display = tab === 'market' ? 'block' : 'none';
             document.getElementById('dex-tab-create').style.display = tab === 'create' ? 'block' : 'none';
             document.getElementById('dex-tab-portfolio').style.display = tab === 'portfolio' ? 'block' : 'none';
-            
+
             document.getElementById('tab-market').classList.toggle('active', tab === 'market');
             document.getElementById('tab-create').classList.toggle('active', tab === 'create');
             document.getElementById('tab-portfolio').classList.toggle('active', tab === 'portfolio');
-            
+
             if (tab === 'portfolio') renderDexSwaps();
         };
 
-        
-
         function getStepperHtml(role, status) {
-            // Determine step 1-4 based on status
             let step = 1;
-            if (status.includes('lock_base') || status === 'waiting_for_taker_base_lock') step = 2;
-            if (status.includes('claim')) step = 3;
+            if (status === 'ready_to_lock_base') step = 2;
+            if (status === 'ready_to_claim_base' || status === 'ready_to_claim_midstate') step = 3;
             if (status === 'completed') step = 4;
 
             const s1 = step > 1 ? 'completed' : (step === 1 ? 'active' : '');
             const s1Icon = step > 1 ? '✓' : '1';
-            
             const s2 = step > 2 ? 'completed' : (step === 2 ? 'active' : '');
             const s2Icon = step > 2 ? '✓' : '2';
-
             const s3 = step > 3 ? 'completed' : (step === 3 ? 'active' : '');
             const s3Icon = step > 3 ? '✓' : '3';
-
             const s4 = step === 4 ? 'completed active' : '';
             const s4Icon = step === 4 ? '✓' : '4';
 
             return `
                 <div class="stepper">
-                    <div class="step ${s1}">
-                        <div class="step-circle">${s1Icon}</div>
-                        <div class="step-label">Offer<br>Accepted</div>
-                    </div>
-                    <div class="step ${s2}">
-                        <div class="step-circle">${s2Icon}</div>
-                        <div class="step-label">Maker Locks<br>Midstate</div>
-                    </div>
-                    <div class="step ${s3}">
-                        <div class="step-circle">${s3Icon}</div>
-                        <div class="step-label">Taker Locks<br>Base ETH</div>
-                    </div>
-                    <div class="step ${s4}">
-                        <div class="step-circle">${s4Icon}</div>
-                        <div class="step-label">Funds<br>Claimed</div>
-                    </div>
-                </div>
-            `;
+                    <div class="step ${s1}"><div class="step-circle">${s1Icon}</div><div class="step-label">Offer<br>Accepted</div></div>
+                    <div class="step ${s2}"><div class="step-circle">${s2Icon}</div><div class="step-label">Maker Locks<br>Midstate</div></div>
+                    <div class="step ${s3}"><div class="step-circle">${s3Icon}</div><div class="step-label">Taker Locks<br>Base ETH</div></div>
+                    <div class="step ${s4}"><div class="step-circle">${s4Icon}</div><div class="step-label">Funds<br>Claimed</div></div>
+                </div>`;
         }
-
-        
 
         function renderDexOrderbook() {
             const container = document.getElementById('dexOrderbook');
-            if (dexOrderbook.length === 0) return container.innerHTML = '<div class="list-item" style="text-align: center; color: #555;">Listening to P2P network...</div>';
-            
-            container.innerHTML = dexOrderbook.map(o => `
+            if (dexOrderbook.length === 0) return container.innerHTML = '<div class="list-item" style="text-align:center; color:#555;">Listening to P2P network…</div>';
+            container.innerHTML = dexOrderbook.map((o, i) => {
+                let ethStr = '?';
+                try { ethStr = parseFloat(ethers.formatEther(o.askedWei)).toFixed(6); } catch (_) {}
+                return `
                 <div class="list-item flex-row">
                     <div>
                         <div style="color:var(--text-max); font-weight:bold;">Sell ${o.offeredMds} MDS</div>
-                        <div style="font-size:11px; color:#888;">For ${o.askedWei} Wei</div>
+                        <div style="font-size:11px; color:#888;">For ${o.askedWei} wei (${ethStr} ETH)</div>
                     </div>
-                    <button style="margin:0; width:auto; padding:6px 12px; font-size:11px;" onclick="dexAcceptOffer(${o.nonce}, '${o.makerMdsPk}', '${o.makerEvmAddr}', ${o.offeredMds}, '${o.askedWei}')">Accept</button>
-                </div>
-            `).join('');
+                    <button style="margin:0; width:auto; padding:6px 12px; font-size:11px;" onclick="dexAcceptFromBook(${i})">Accept</button>
+                </div>`;
+            }).join('');
         }
-
-       window.dexClaimMidstate = async function(idx) {
-            const swap = dexMySwaps[idx];
-            const rawSecret = prompt("Enter the Raw Secret revealed by the Maker on Base:");
-            if (!rawSecret) return;
-            
-            showActivity("Claiming Midstate...");
-            worker.postMessage({ type: 'DEX_CLAIM_MIDSTATE', payload: {
-                swapIdx: idx,
-                rawSecret: rawSecret.trim(),
-                htlcCoinId: swap.htlcCoinId,
-                htlcValue: swap.htlcValue,
-                htlcSalt: swap.htlcSalt,
-                takerMdsPk: document.getElementById('l2MyIdentity').innerText,
-                makerMdsPk: swap.makerMdsPk,
-                secretHashMidstate: swap.secretHashMidstate,
-                timeoutHeight: swap.timeoutHeight
-            }});
-        };
 
         function renderDexSwaps() {
             const container = document.getElementById('dexActiveSwaps');
+            if (!container) return;
             if (dexMySwaps.length === 0) {
-                container.innerHTML = '<div class="panel" style="text-align: center; color: #555;">No active swaps.</div>';
+                container.innerHTML = '<div class="panel" style="text-align:center; color:#555;">No active swaps.</div>';
                 return;
             }
-            
-            // Put newest swaps at the top
             const sortedSwaps = [...dexMySwaps].reverse();
-
             container.innerHTML = sortedSwaps.map((s) => {
-                // Find original index for the button callbacks
                 const origIdx = dexMySwaps.indexOf(s);
                 let btn = '';
-                let statusText = 'Processing...';
-
-                if (s.status === 'open') {
-                    statusText = 'Waiting for someone to buy your MDS...';
-                    return `
-                        <div class="swap-card">
-                            <div class="swap-card-header">
-                                <div>
-                                    <span style="font-weight:bold; color:var(--text-max); font-size:14px;">SELLING ${s.amount || s.offeredMds} MDS</span>
-                                    <span style="font-size:11px; color:#888; margin-left:8px;">(Maker)</span>
-                                </div>
-                                <span style="font-size:11px; color:var(--accent); background:rgba(212,255,0,0.1); padding:4px 8px; border-radius:4px;">LISTED ON ORDERBOOK</span>
-                            </div>
-                            <div style="text-align:center; font-size:12px; color:#888;">${statusText}</div>
-                        </div>`;
-                }
-
-                if (s.status === 'ready_to_lock_base') {
-                    statusText = 'Maker has locked MDS. You must now lock your ETH.';
-                    btn = `<button style="margin:0; width:100%; padding:10px; font-size:13px; background:var(--accent); color:#000;" onclick="dexLockBase(${origIdx})">Pay ${parseFloat(ethers.formatEther(s.askedWei)).toFixed(6)} ETH to Smart Contract</button>`;
-                } else if (s.status === 'ready_to_claim_midstate') {
-                    statusText = 'Your ETH is locked. Waiting for Maker to claim it...';
-                    btn = `<button style="margin:0; width:100%; padding:10px; font-size:13px; background:var(--text-max); color:#000;" onclick="dexClaimMidstate(${origIdx})">Claim Midstate</button>`;
-                } else if (s.status === 'ready_to_claim_base') {
-                    statusText = 'Taker has locked their ETH. Claim it now!';
-                    btn = `<button style="margin:0; width:100%; padding:10px; font-size:13px; background:var(--accent); color:#000;" onclick="dexClaimBase(${origIdx})">Claim ${parseFloat(ethers.formatEther(s.askedWei)).toFixed(6)} ETH</button>`;
-                } else if (s.status === 'waiting_for_maker_lock' || s.status === 'locking_midstate') {
-                    statusText = 'Waiting for Midstate transaction to mine...';
-                } else if (s.status === 'waiting_for_taker_base_lock') {
-                    statusText = 'Waiting for Taker to send ETH to Base contract...';
-                } else if (s.status === 'completed') {
-                    statusText = 'Swap successful!';
-                }
-
+                let statusText = 'Processing…';
+                let ethStr = '?';
+                try { ethStr = parseFloat(ethers.formatEther(s.askedWei)).toFixed(6); } catch (_) {}
                 const displayAmount = s.amount || s.offeredMds || 0;
+
+                if (s.role === 'maker') {
+                    if (s.status === 'waiting_for_taker') {
+                        statusText = 'Listed on the orderbook — waiting for a taker…';
+                    } else if (s.status === 'locking_midstate') {
+                        statusText = 'Locking your MDS in the on-chain HTLC…';
+                    } else if (s.status === 'ready_to_claim_base') {
+                        if (s.takerLocked) {
+                            statusText = 'Taker locked ETH. Claim it now (this reveals the secret).';
+                            btn = `<button style="margin:0; width:100%; padding:10px; font-size:13px; background:var(--accent); color:#000;" onclick="dexClaimBase(${origIdx})">Claim ${ethStr} ETH</button>`;
+                        } else {
+                            statusText = 'MDS locked. Waiting for the taker to lock ETH on Base…';
+                        }
+                    } else if (s.status === 'completed') {
+                        statusText = 'Swap complete — you received ETH.';
+                    }
+                } else { // taker
+                    if (s.status === 'waiting_for_maker_lock') {
+                        statusText = 'Waiting for the maker to lock MDS…';
+                    } else if (s.status === 'verifying_htlc') {
+                        statusText = 'Verifying the maker\u2019s MDS lock on-chain…';
+                    } else if (s.status === 'htlc_invalid') {
+                        statusText = '⚠ Could not verify the maker\u2019s MDS lock: ' + (s.invalidReason || 'unknown') + '. Do NOT lock ETH.';
+                    } else if (s.status === 'ready_to_lock_base') {
+                        statusText = 'Maker locked MDS (verified). Lock your ETH to proceed.';
+                        btn = `<button style="margin:0; width:100%; padding:10px; font-size:13px; background:var(--accent); color:#000;" onclick="dexLockBase(${origIdx})">Pay ${ethStr} ETH to HTLC</button>`;
+                    } else if (s.status === 'ready_to_claim_midstate') {
+                        statusText = 'ETH locked. Auto-claiming MDS when the maker reveals the secret…';
+                        btn = `<button style="margin:0; width:100%; padding:10px; font-size:13px; background:var(--text-max); color:#000;" onclick="dexClaimMidstate(${origIdx})">Claim MDS now</button>`;
+                    } else if (s.status === 'completed') {
+                        statusText = 'Swap complete — you received MDS.';
+                    }
+                }
 
                 return `
                 <div class="swap-card">
                     <div class="swap-card-header">
-                        <div>
-                            <span style="font-weight:bold; color:var(--text-max); font-size:14px;">${s.role === 'maker' ? 'SELLING' : 'BUYING'} ${displayAmount.toLocaleString('en')} MDS</span>
-                        </div>
+                        <div><span style="font-weight:bold; color:var(--text-max); font-size:14px;">${s.role === 'maker' ? 'SELLING' : 'BUYING'} ${Number(displayAmount).toLocaleString('en')} MDS</span></div>
                         <span style="font-size:11px; color:#888; text-transform:uppercase;">${s.role}</span>
                     </div>
-                    
                     ${getStepperHtml(s.role, s.status)}
-                    
-                    <div style="font-size:12px; color:var(--text-bright); text-align:center; margin-bottom: ${btn ? '15px' : '0'};">
-                        ${statusText}
-                    </div>
+                    <div style="font-size:12px; color:var(--text-bright); text-align:center; margin-bottom: ${btn ? '15px' : '0'};">${statusText}</div>
                     ${btn}
-                </div>
-            `}).join('');
+                </div>`;
+            }).join('');
         }
+
 </script>
 
 
