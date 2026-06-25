@@ -934,7 +934,11 @@ self.onmessage = async (e) => {
                 }
                 self.postMessage({ type: 'DEX_HTLC_VERIFIED', payload: { offerId, ok, reason, htlcAddressHex: addrHex } });
             } catch (e) {
-                self.postMessage({ type: 'DEX_HTLC_VERIFIED', payload: { offerId, ok: false, reason: e.message } });
+                const detail = (e && e.message) ? e.message
+                             : (typeof e === 'string') ? e
+                             : (e && typeof e.toString === 'function' && e.toString() !== '[object Object]') ? e.toString()
+                             : JSON.stringify(e);
+                self.postMessage({ type: 'DEX_HTLC_VERIFIED', payload: { offerId, ok: false, reason: detail } });
             }
         }
         else if (type === 'DEX_CLAIM_MIDSTATE') {
@@ -1034,7 +1038,14 @@ self.onmessage = async (e) => {
                 self.postMessage({ type: 'DEX_CLAIM_SUCCESS', payload: { swapIdx } });
 
             } catch (err) {
-                throw new Error(`Claim failed: ${err.message}`);
+                // wasm-bindgen throws Err(JsValue::from_str(...)) as a bare JS STRING,
+                // which has no .message — so reading err.message swallowed the real
+                // Rust reason. Extract it from whatever shape the throw actually is.
+                const detail = (err && err.message) ? err.message
+                             : (typeof err === 'string') ? err
+                             : (err && typeof err.toString === 'function' && err.toString() !== '[object Object]') ? err.toString()
+                             : JSON.stringify(err);
+                throw new Error(`Claim failed: ${detail}`);
             } finally {
                 isSending = false;
             }
