@@ -453,6 +453,27 @@
         
         .chat-controls { display: flex; gap: 12px; margin-bottom: 16px; }
 
+        /* ═══ DEX UI Upgrades ═══ */
+        .dex-table { width: 100%; border-collapse: collapse; text-align: left; }
+        .dex-table th { color: #666; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; padding: 12px; border-bottom: 1px solid var(--border); }
+        .dex-table td { padding: 12px; border-bottom: 1px solid var(--border); font-size: 13px; font-variant-numeric: tabular-nums; }
+        .dex-table tr:hover td { background: rgba(255,255,255,0.02); }
+        .dex-table tr:last-child td { border-bottom: none; }
+        
+        .swap-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+        .swap-card-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 12px; margin-bottom: 16px; }
+        
+        .stepper { display: flex; justify-content: space-between; position: relative; margin-bottom: 20px; }
+        .stepper::before { content: ''; position: absolute; top: 12px; left: 10%; right: 10%; height: 2px; background: var(--border); z-index: 1; }
+        .step { display: flex; flex-direction: column; align-items: center; z-index: 2; width: 25%; }
+        .step-circle { width: 26px; height: 26px; border-radius: 50%; background: var(--bg); border: 2px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: bold; color: #666; transition: all 0.3s; }
+        .step-label { font-size: 10px; color: #666; margin-top: 8px; text-align: center; text-transform: uppercase; letter-spacing: 0.5px; }
+        
+        .step.active .step-circle { border-color: var(--accent); color: var(--accent); box-shadow: 0 0 10px rgba(212,255,0,0.2); }
+        .step.active .step-label { color: var(--text-max); font-weight: bold; }
+        .step.completed .step-circle { background: var(--accent); border-color: var(--accent); color: #000; }
+        .step.completed .step-label { color: var(--text-bright); }
+        
         /* Desktop */
         @media (min-width: 768px) {
             body, html { display: flex; align-items: center; justify-content: center; background: #050505; }
@@ -686,33 +707,67 @@
 
 <!-- DEX -->
         <main id="view-dex" class="page">
-            <h2>Atomic Swap DEX</h2>
-            <div style="font-size: 11px; color: #888; margin-top: -10px; margin-bottom: 20px;">
-                Trustless cross-chain swaps via Base (EVM) smart contracts.
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                <h2 style="margin: 0;">P2P OTC Market</h2>
+                <div id="evmAddressDisplay" style="font-size: 11px; color: var(--accent); background: rgba(212,255,0,0.1); padding: 4px 8px; border-radius: 4px; border: 1px solid var(--accent-dim);">Base: Not Connected</div>
+            </div>
+            <p style="font-size: 11px; color: #888; margin-top: -10px; margin-bottom: 20px;">
+                Trustless cross-chain Atomic Swaps. Trade MDS for Base ETH with zero middleman fees.
+            </p>
+
+            <div class="tabs" style="margin-bottom: 1rem;">
+                <div class="tab active" id="tab-market" onclick="switchTabDex('market')">Live Orderbook</div>
+                <div class="tab" id="tab-create" onclick="switchTabDex('create')">Create Offer</div>
+                <div class="tab" id="tab-portfolio" onclick="switchTabDex('portfolio')">Active Swaps</div>
             </div>
 
-            <div class="panel">
-                <h3 style="font-size: 14px;">Web3 Connection</h3>
-                <button id="btnConnectBase" style="background: var(--text-max); color: #000;">Connect MetaMask (Base)</button>
-                <div id="evmAddressDisplay" style="font-family: monospace; font-size: 11px; margin-top: 8px; color: var(--accent);">Not Connected</div>
+            <!-- TAB: MARKET -->
+            <div id="dex-tab-market">
+                <div class="panel" style="padding: 0;">
+                    <table class="dex-table">
+                        <thead>
+                            <tr>
+                                <th>Price (ETH/MDS)</th>
+                                <th>Selling (MDS)</th>
+                                <th>Cost (Base ETH)</th>
+                                <th style="text-align: right;">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="dexOrderbook">
+                            <tr><td colspan="4" style="text-align: center; color: #555;">Listening to P2P network...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
             </div>
 
-            <div class="panel">
-                <h3 style="font-size: 14px;">Create Offer (Sell MDS)</h3>
-                <input type="number" id="dexOfferAmount" placeholder="Amount of MDS to Sell">
-                <input type="number" id="dexAskAmount" placeholder="Amount of ETH to Ask (in Wei)">
-                <button onclick="dexCreateOffer()">Broadcast Offer</button>
+            <!-- TAB: CREATE OFFER -->
+            <div id="dex-tab-create" style="display: none;">
+                <div class="panel">
+                    <h3 style="font-size: 14px; margin-bottom: 15px;">Create Sell Offer</h3>
+                    <div class="flex-row" style="gap: 15px;">
+                        <div style="flex: 1;">
+                            <label style="font-size: 11px; color: #666; text-transform: uppercase;">Amount to Sell (MDS)</label>
+                            <input type="number" id="dexOfferAmount" placeholder="e.g. 1000">
+                        </div>
+                        <div style="flex: 1;">
+                            <label style="font-size: 11px; color: #666; text-transform: uppercase;">Total Asking Price (Wei)</label>
+                            <input type="number" id="dexAskAmount" placeholder="Amount in Wei">
+                        </div>
+                    </div>
+                    <label style="font-size: 11px; color: #666; text-transform: uppercase;">Your Base Network Receiving Address</label>
+                    <input type="text" id="offerAddr" placeholder="0x...">
+                    <button onclick="dexCreateOffer()" style="background: var(--text-max); color: #000; margin-top: 10px;">Broadcast Offer</button>
+                </div>
             </div>
 
-            <h3 style="margin-top: 1.5rem; font-size: 12px; color: #666; text-transform: uppercase;">Live Orderbook</h3>
-            <div class="list-container" id="dexOrderbook">
-                <div class="list-item" style="text-align: center; color: #555;">Listening to P2P network...</div>
+            <!-- TAB: MY SWAPS -->
+            <div id="dex-tab-portfolio" style="display: none;">
+                <div id="dexActiveSwaps">
+                    <div class="panel" style="text-align: center; color: #555;">No active swaps.</div>
+                </div>
             </div>
-
-            <h3 style="margin-top: 1.5rem; font-size: 12px; color: #666; text-transform: uppercase;">My Active Swaps</h3>
-            <div class="list-container" id="dexActiveSwaps">
-                <div class="list-item" style="text-align: center; color: #555;">No active swaps.</div>
-            </div>
+            
+            <button id="btnConnectBase" style="background: transparent; border: 1px dashed var(--border-bright); color: var(--text-bright); margin-top: 10px;">Connect MetaMask (Base)</button>
         </main>
 
         <!-- SEND -->
@@ -3458,6 +3513,64 @@ document.getElementById('btnExport').onclick = () => {
             }
         };
 
+
+window.switchTabDex = function(tab) {
+            document.getElementById('dex-tab-market').style.display = tab === 'market' ? 'block' : 'none';
+            document.getElementById('dex-tab-create').style.display = tab === 'create' ? 'block' : 'none';
+            document.getElementById('dex-tab-portfolio').style.display = tab === 'portfolio' ? 'block' : 'none';
+            
+            document.getElementById('tab-market').classList.toggle('active', tab === 'market');
+            document.getElementById('tab-create').classList.toggle('active', tab === 'create');
+            document.getElementById('tab-portfolio').classList.toggle('active', tab === 'portfolio');
+            
+            if (tab === 'portfolio') renderDexSwaps();
+        };
+
+        
+
+        function getStepperHtml(role, status) {
+            // Determine step 1-4 based on status
+            let step = 1;
+            if (status.includes('lock_base') || status === 'waiting_for_taker_base_lock') step = 2;
+            if (status.includes('claim')) step = 3;
+            if (status === 'completed') step = 4;
+
+            const s1 = step > 1 ? 'completed' : (step === 1 ? 'active' : '');
+            const s1Icon = step > 1 ? '✓' : '1';
+            
+            const s2 = step > 2 ? 'completed' : (step === 2 ? 'active' : '');
+            const s2Icon = step > 2 ? '✓' : '2';
+
+            const s3 = step > 3 ? 'completed' : (step === 3 ? 'active' : '');
+            const s3Icon = step > 3 ? '✓' : '3';
+
+            const s4 = step === 4 ? 'completed active' : '';
+            const s4Icon = step === 4 ? '✓' : '4';
+
+            return `
+                <div class="stepper">
+                    <div class="step ${s1}">
+                        <div class="step-circle">${s1Icon}</div>
+                        <div class="step-label">Offer<br>Accepted</div>
+                    </div>
+                    <div class="step ${s2}">
+                        <div class="step-circle">${s2Icon}</div>
+                        <div class="step-label">Maker Locks<br>Midstate</div>
+                    </div>
+                    <div class="step ${s3}">
+                        <div class="step-circle">${s3Icon}</div>
+                        <div class="step-label">Taker Locks<br>Base ETH</div>
+                    </div>
+                    <div class="step ${s4}">
+                        <div class="step-circle">${s4Icon}</div>
+                        <div class="step-label">Funds<br>Claimed</div>
+                    </div>
+                </div>
+            `;
+        }
+
+        
+
         function renderDexOrderbook() {
             const container = document.getElementById('dexOrderbook');
             if (dexOrderbook.length === 0) return container.innerHTML = '<div class="list-item" style="text-align: center; color: #555;">Listening to P2P network...</div>';
@@ -3473,7 +3586,7 @@ document.getElementById('btnExport').onclick = () => {
             `).join('');
         }
 
-        window.dexClaimMidstate = async function(idx) {
+       window.dexClaimMidstate = async function(idx) {
             const swap = dexMySwaps[idx];
             const rawSecret = prompt("Enter the Raw Secret revealed by the Maker on Base:");
             if (!rawSecret) return;
@@ -3494,25 +3607,76 @@ document.getElementById('btnExport').onclick = () => {
 
         function renderDexSwaps() {
             const container = document.getElementById('dexActiveSwaps');
-            if (dexMySwaps.length === 0) return container.innerHTML = '<div class="list-item" style="text-align: center; color: #555;">No active swaps.</div>';
+            if (dexMySwaps.length === 0) {
+                container.innerHTML = '<div class="panel" style="text-align: center; color: #555;">No active swaps.</div>';
+                return;
+            }
             
-            container.innerHTML = dexMySwaps.map((s, i) => {
+            // Put newest swaps at the top
+            const sortedSwaps = [...dexMySwaps].reverse();
+
+            container.innerHTML = sortedSwaps.map((s) => {
+                // Find original index for the button callbacks
+                const origIdx = dexMySwaps.indexOf(s);
                 let btn = '';
-                } else if (s.status === 'ready_to_claim_midstate') {
-                    btn = `<button style="margin:0; width:auto; padding:6px 12px; font-size:11px; background:var(--accent); color:#000;" onclick="dexClaimMidstate(${i})">Claim MDS</button>`;
-                } else if (s.status === 'ready_to_claim_base') {
-                    btn = `<button style="margin:0; width:auto; padding:6px 12px; font-size:11px; background:var(--accent); color:#000;" onclick="alert('Execute Spend Contract with Raw Secret: ${s.rawSecretHex}')">Claim MDS</button>`;
+                let statusText = 'Processing...';
+
+                if (s.status === 'open') {
+                    statusText = 'Waiting for someone to buy your MDS...';
+                    return `
+                        <div class="swap-card">
+                            <div class="swap-card-header">
+                                <div>
+                                    <span style="font-weight:bold; color:var(--text-max); font-size:14px;">SELLING ${s.amount || s.offeredMds} MDS</span>
+                                    <span style="font-size:11px; color:#888; margin-left:8px;">(Maker)</span>
+                                </div>
+                                <span style="font-size:11px; color:var(--accent); background:rgba(212,255,0,0.1); padding:4px 8px; border-radius:4px;">LISTED ON ORDERBOOK</span>
+                            </div>
+                            <div style="text-align:center; font-size:12px; color:#888;">${statusText}</div>
+                        </div>`;
                 }
+
+                if (s.status === 'ready_to_lock_base') {
+                    statusText = 'Maker has locked MDS. You must now lock your ETH.';
+                    btn = `<button style="margin:0; width:100%; padding:10px; font-size:13px; background:var(--accent); color:#000;" onclick="dexLockBase(${origIdx})">Pay ${parseFloat(ethers.formatEther(s.askedWei)).toFixed(6)} ETH to Smart Contract</button>`;
+                } else if (s.status === 'ready_to_claim_midstate') {
+                    statusText = 'Your ETH is locked. Waiting for Maker to claim it...';
+                    btn = `<button style="margin:0; width:100%; padding:10px; font-size:13px; background:var(--text-max); color:#000;" onclick="dexClaimMidstate(${origIdx})">Claim Midstate</button>`;
+                } else if (s.status === 'ready_to_claim_base') {
+                    statusText = 'Taker has locked their ETH. Claim it now!';
+                    btn = `<button style="margin:0; width:100%; padding:10px; font-size:13px; background:var(--accent); color:#000;" onclick="dexClaimBase(${origIdx})">Claim ${parseFloat(ethers.formatEther(s.askedWei)).toFixed(6)} ETH</button>`;
+                } else if (s.status === 'waiting_for_maker_lock' || s.status === 'locking_midstate') {
+                    statusText = 'Waiting for Midstate transaction to mine...';
+                } else if (s.status === 'waiting_for_taker_base_lock') {
+                    statusText = 'Waiting for Taker to send ETH to Base contract...';
+                } else if (s.status === 'completed') {
+                    statusText = 'Swap successful!';
+                }
+
+                const displayAmount = s.amount || s.offeredMds || 0;
+
                 return `
-                <div class="list-item flex-row">
-                    <div>
-                        <div style="color:var(--text-max); font-weight:bold;">${s.role.toUpperCase()}</div>
-                        <div style="font-size:11px; color:#888;">Status: ${s.status.replace(/_/g, ' ')}</div>
+                <div class="swap-card">
+                    <div class="swap-card-header">
+                        <div>
+                            <span style="font-weight:bold; color:var(--text-max); font-size:14px;">${s.role === 'maker' ? 'SELLING' : 'BUYING'} ${displayAmount.toLocaleString('en')} MDS</span>
+                        </div>
+                        <span style="font-size:11px; color:#888; text-transform:uppercase;">${s.role}</span>
+                    </div>
+                    
+                    ${getStepperHtml(s.role, s.status)}
+                    
+                    <div style="font-size:12px; color:var(--text-bright); text-align:center; margin-bottom: ${btn ? '15px' : '0'};">
+                        ${statusText}
                     </div>
                     ${btn}
                 </div>
             `}).join('');
         }
+        
+        
+        
+        
   // Stream worker progress for the active request out to the dApp.
   function progressToDapp(reqId) {
     var W = window.__midstateWallet;
