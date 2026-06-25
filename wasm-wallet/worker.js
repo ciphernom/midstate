@@ -965,12 +965,24 @@ self.onmessage = async (e) => {
                 const takerAddressHex = Object.keys(wState.mssAddrs)[0];
                 const totalValue = htlcCoins.reduce((a, c) => a + Number(c.value), 0);
 
-                const outputsJson = JSON.stringify([{
+                // CONSENSUS: every standard output must be a NONZERO power of two
+                // (apply_transaction rejects anything else). prepare_script_spend
+                // splits its OWN fee-change via decompose_value, but it does NOT
+                // split the caller's outputs — so we must hand it power-of-two coins.
+                // Decompose the swept total into one coin per set bit (the same shape
+                // the node uses). The receive side has no index-based covenant, so
+                // ordering is irrelevant; the wallet rediscovers each coin (and its
+                // salt) from the on-chain reveal on the next scan.
+                const pow2Parts = [];
+                { let n = BigInt(totalValue), bit = 0n;
+                  while (n > 0n) { if (n & 1n) pow2Parts.push(Number(1n << bit)); n >>= 1n; bit += 1n; } }
+
+                const outputsJson = JSON.stringify(pow2Parts.map(v => ({
                     out_type: "standard",
                     address: takerAddressHex,
-                    value: totalValue,
-                    salt: null // auto-generates a random salt
-                }]);
+                    value: v,
+                    salt: null // prepare_script_spend generates a salt; it lands in the reveal
+                })));
 
                 // One contract input PER funded HTLC coin, all sharing the one bytecode.
                 const contractInputsJson = JSON.stringify(htlcCoins.map(c => ({
