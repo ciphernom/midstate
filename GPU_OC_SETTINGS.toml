@@ -1,0 +1,71 @@
+# GPU_OC_SETTINGS.toml — runtime tuning for the GPU miner (crate::core::gpu_mining)
+#
+# Place this file in the working directory you launch the node/miner from, or
+# point at it explicitly:   GPU_OC_SETTINGS=/path/to/GPU_OC_SETTINGS.toml
+#
+# The file is OPTIONAL. Any key you omit falls back to its built-in default, and
+# if the file is missing entirely the miner just uses defaults. Values are
+# clamped to safe ranges on load. Changes take effect on the next launch.
+#
+# These are scheduling/throughput knobs — NOT voltage/clock controls. For power
+# and temperature limits use your vendor tool (e.g. `nvidia-smi -pl <watts>`);
+# that's independent of and complementary to these settings.
+
+# ── adapter ──────────────────────────────────────────────────────────────────
+# Force a specific GPU by case-insensitive name substring. By default the miner
+# enumerates all GPUs, logs them, and auto-picks the discrete card over an
+# integrated one — but if it still grabs the wrong GPU, name the one you want.
+# Look at the "GPU adapter found: ..." lines in the log for exact names.
+#   adapter = "NVIDIA"      # or "Quadro", "RTX 4080", "Radeon", etc.
+# Equivalent to the WGPU_ADAPTER_NAME env var. Leave unset for automatic.
+#
+# NOTE: wgpu uses Vulkan/GL, NOT CUDA. If your NVIDIA card never appears in the
+# log at all, the Vulkan driver/ICD is missing — verify with `vulkaninfo
+# --summary`. Having CUDA working is not sufficient.
+#
+# adapter = "NVIDIA"
+
+# ── batch_nonces ─────────────────────────────────────────────────────────────
+# Nonces ground per batch. This is the main throughput/latency dial.
+#
+#   * Too LOW  -> the GPU isn't saturated (low utilization / power, low hashrate).
+#   * Too HIGH -> a batch takes longer to finish than your pool's job interval,
+#                 so it's cancelled before the (end-of-batch) target test runs
+#                 and NO shares/blocks are ever surfaced — even though the
+#                 hashrate counter keeps climbing.
+#
+# Rule of thumb: a batch finishes in roughly  batch_nonces / nonces_per_sec
+# seconds. Keep that comfortably under your job/tip interval. Raise it until GPU
+# power/utilization plateaus near 100%, then stop.
+#
+#   default 8192   (conservative: completes fast on any GPU, but under-saturates
+#                   bigger cards)
+#   Quadro M6000 / mid-range discrete: 24576 saturates it and a batch still
+#   finishes in ~1.5-2 s — well inside typical pool intervals.
+batch_nonces = 24576
+
+# ── iters_per_dispatch ───────────────────────────────────────────────────────
+# Chain steps issued per GPU dispatch. Higher = fewer host<->GPU round-trips
+# (a bit more throughput) but each dispatch holds the GPU longer.
+#   * On a HEADLESS / compute-only GPU (no display attached): raise to 8000-20000
+#     to cut overhead.
+#   * If a display is attached: keep it modest, or large dispatches freeze the
+#     screen. If you ever get "device lost"/timeout errors, lower it.
+# default 2000
+iters_per_dispatch = 2000
+
+# ── responsive_iters ─────────────────────────────────────────────────────────
+# Dispatch size used ONLY while throttling (duty < 1.0). Smaller holds the GPU
+# for just a few ms at a time so the desktop stays smooth. Ignored at duty 1.0.
+# default 384
+responsive_iters = 384
+
+# ── duty ─────────────────────────────────────────────────────────────────────
+# Fraction of time the GPU does work, 0.02..=1.0. Below 1.0 inserts idle gaps so
+# the GPU isn't pinned at 100% — trades hashrate for desktop responsiveness and
+# lower heat. Overridden by the GPU_MINE_DUTY env var (live, no restart) and by a
+# --gpu-duty CLI flag if you wire one up.
+#   1.0  = full speed
+#   0.5  = ~half load, desktop stays usable
+# default 1.0
+duty = 1.0

@@ -1,4 +1,3 @@
-#![cfg(not(target_arch = "wasm32"))]
 //! GPU mining backend (wgpu / WGSL) for the PoW extension chain.
 //!
 //! This mirrors the CPU search in `simd_mining` / `extension`, but spreads the
@@ -26,59 +25,125 @@
 // is the only line to touch.
 use super::types::{Extension, EXTENSION_ITERATIONS};
 use super::extension::{create_extension, mine_extension, MiningResult};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 use std::sync::{Arc, Mutex, OnceLock};
 
 // ── Tunables ────────────────────────────────────────────────────────────────
+//
+// All of these can be overridden at runtime from a `GPU_OC_SETTINGS.toml` file
+// (path overridable via the GPU_OC_SETTINGS env var) without recompiling. The
+// file is optional; if it's absent or unparseable these defaults are used.
+//
+//     # GPU_OC_SETTINGS.toml
+//     batch_nonces       = 24576   # nonces per batch (GPU saturation ↔ share latency)
+//     iters_per_dispatch = 2000    # chain steps per dispatch (host round-trips ↔ watchdog)
+//     responsive_iters   = 384     # dispatch size while throttled (duty < 1.0)
+//     duty               = 1.0     # 0.02..=1.0 fraction of time the GPU works
 
-/// Nonces ground per batch. **CRITICAL for finding blocks/shares:** a batch is
-/// only tested against the target *after every nonce in it finishes the full
-/// EXTENSION_ITERATIONS chain*. So the batch must **complete faster than the
-/// mining job changes** — otherwise `cancel` fires mid-batch, the test phase
-/// never runs, and nothing is ever surfaced (while the hash counter still
-/// climbs, making it look like it's working). Batch time ≈ BATCH_NONCES ÷
-/// (nonces/sec). At ~2k nonces/s, 8192 finishes in ~4s, which fits typical pool
-/// job intervals. Keep `BATCH_NONCES ÷ your_nonces_per_sec` below your job/tip
-/// interval: lower it if your pool pushes jobs very frequently; raise it for
-/// solo or pure throughput on a big GPU. State buffer is BATCH_NONCES * 32 bytes
-/// (256 KiB at 8192). Must stay ≥ a few thousand to keep the GPU saturated.
-pub const BATCH_NONCES: u32 = 1 << 13; // 8,192
+const DEFAULT_BATCH_NONCES: u32 = 1 << 13; // 8,192
+const DEFAULT_ITERS_PER_DISPATCH: u32 = 2_000;
+const DEFAULT_RESPONSIVE_ITERS: u32 = 384;
+const DEFAULT_DUTY: f32 = 1.0;
 
-/// 32-byte iterations applied per `k_step` dispatch. Picked so each dispatch
-/// stays well under the ~2s GPU watchdog even on slow GPUs. On a headless /
-/// compute-only GPU (no display, no TDR) you can raise this to cut per-dispatch
-/// overhead; lower it if you ever see device-lost / timeout errors.
-pub const ITERS_PER_DISPATCH: u32 = 2_000;
+/// Runtime-tunable GPU knobs, loaded once from `GPU_OC_SETTINGS.toml`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+pub struct GpuSettings {
+    /// Nonces ground per batch. **Critical for finding blocks/shares:** a batch
+    /// is only tested after every nonce finishes the full EXTENSION_ITERATIONS
+    /// chain, so it must *complete* faster than the mining job changes
+    /// (≈ batch_nonces ÷ nonces_per_sec < job interval) or nothing is surfaced.
+    /// Bigger = better GPU saturation but longer batches; keep it ≥ a few
+    /// thousand to keep the GPU busy. State buffer is batch_nonces × 32 bytes.
+    pub batch_nonces: u32,
+    /// Chain steps per GPU dispatch. Higher cuts host↔GPU round-trips but each
+    /// dispatch holds the GPU longer (watchdog / display-freeze risk).
+    pub iters_per_dispatch: u32,
+    /// Dispatch size used while throttled (duty < 1.0); smaller = smoother desktop.
+    pub responsive_iters: u32,
+    /// Fraction of time the GPU works, `0.02..=1.0`. Overridden by the
+    /// `GPU_MINE_DUTY` env var and by `set_gpu_duty()` when those are set.
+    pub duty: f32,
+    /// Force a specific GPU by case-insensitive name substring, e.g. "NVIDIA",
+    /// "Quadro", "RTX 4080". Overrides automatic selection (which prefers the
+    /// discrete card). Also settable via the `WGPU_ADAPTER_NAME` env var. Unset =
+    /// automatic.
+    pub adapter: Option<String>,
+}
 
-/// When throttled (duty < 1.0), each dispatch is capped to this many iterations
-/// so the GPU is held for only a few ms at a time, letting the desktop
-/// compositor interleave frames. Full-speed mining keeps using ITERS_PER_DISPATCH.
-const RESPONSIVE_ITERS: u32 = 384;
+impl Default for GpuSettings {
+    fn default() -> Self {
+        Self {
+            batch_nonces: DEFAULT_BATCH_NONCES,
+            iters_per_dispatch: DEFAULT_ITERS_PER_DISPATCH,
+            responsive_iters: DEFAULT_RESPONSIVE_ITERS,
+            duty: DEFAULT_DUTY,
+            adapter: None,
+        }
+    }
+}
 
-/// GPU duty cycle × 1000 (1000 = full speed). See [`set_gpu_duty`].
-static GPU_DUTY_MILLI: AtomicU32 = AtomicU32::new(1000);
+impl GpuSettings {
+    fn sanitized(mut self) -> Self {
+        self.batch_nonces = self.batch_nonces.clamp(64, 1 << 24);
+        self.iters_per_dispatch = self.iters_per_dispatch.max(1);
+        self.responsive_iters = self.responsive_iters.max(1);
+        self.duty = self.duty.clamp(0.02, 1.0);
+        self
+    }
+}
+
+/// Process-wide GPU settings, loaded once from `GPU_OC_SETTINGS.toml` (or the
+/// path in the `GPU_OC_SETTINGS` env var). A missing/invalid file → defaults.
+fn settings() -> &'static GpuSettings {
+    static S: OnceLock<GpuSettings> = OnceLock::new();
+    S.get_or_init(|| {
+        let path =
+            std::env::var("GPU_OC_SETTINGS").unwrap_or_else(|_| "GPU_OC_SETTINGS.toml".to_string());
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match toml::from_str::<GpuSettings>(&text) {
+                Ok(s) => {
+                    let s = s.sanitized();
+                    tracing::info!("loaded GPU OC settings from {path}: {s:?}");
+                    s
+                }
+                Err(e) => {
+                    tracing::warn!("failed to parse {path} ({e}); using GPU defaults");
+                    GpuSettings::default()
+                }
+            },
+            Err(_) => GpuSettings::default(), // no file -> silent defaults
+        }
+    })
+}
+
+/// GPU duty × 1000 set via [`set_gpu_duty`]; 0 = unset (fall back to TOML/default).
+static GPU_DUTY_MILLI: AtomicU32 = AtomicU32::new(0);
 
 /// Set the GPU duty cycle, clamped to `0.02..=1.0` (1.0 = full speed). Values
 /// below 1.0 insert idle gaps between dispatches so the GPU isn't pinned at 100%,
 /// trading hashrate for desktop responsiveness / lower heat. Call once at startup
-/// (e.g. from a `--gpu-duty` flag).
+/// (e.g. from a `--gpu-duty` flag); overrides the TOML `duty`.
 pub fn set_gpu_duty(duty: f32) {
     GPU_DUTY_MILLI.store((duty.clamp(0.02, 1.0) * 1000.0) as u32, Ordering::Relaxed);
 }
 
-/// Current duty cycle. The `GPU_MINE_DUTY` env var (if set and parseable) takes
-/// precedence so it can be tuned live without a rebuild; otherwise the value from
-/// [`set_gpu_duty`] (default 1.0) is used.
+/// Current duty cycle. Precedence: `GPU_MINE_DUTY` env (live, no rebuild) >
+/// `set_gpu_duty` (CLI) > TOML `duty` > 1.0.
 fn gpu_duty() -> f32 {
     if let Ok(s) = std::env::var("GPU_MINE_DUTY") {
         if let Ok(v) = s.parse::<f32>() {
             return v.clamp(0.02, 1.0);
         }
     }
-    GPU_DUTY_MILLI.load(Ordering::Relaxed) as f32 / 1000.0
+    let milli = GPU_DUTY_MILLI.load(Ordering::Relaxed);
+    if milli != 0 {
+        return milli as f32 / 1000.0;
+    }
+    settings().duty
 }
 
 const MAX_WINNERS: u32 = 256;
@@ -399,6 +464,68 @@ fn words_be(b: &[u8; 32]) -> [u32; 8] {
     w
 }
 
+/// Choose the GPU adapter to mine on. Enumerates all adapters across all
+/// backends, logs them, then: (1) if a name override is set (TOML `adapter` or
+/// the `WGPU_ADAPTER_NAME` env var) returns the first whose name contains it;
+/// otherwise (2) drops pure-software adapters and ranks the rest discrete >
+/// integrated > virtual, preferring Vulkan > Dx12 > Metal > GL within a tier.
+/// Errors (→ CPU fallback) if nothing usable is found.
+async fn pick_adapter(instance: &wgpu::Instance) -> Result<wgpu::Adapter> {
+    let mut adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+    if adapters.is_empty() {
+        bail!(
+            "no GPU adapters found. wgpu uses Vulkan/GL, not CUDA — an NVIDIA card \
+             needs its Vulkan ICD installed (verify with `vulkaninfo --summary`)."
+        );
+    }
+    for a in &adapters {
+        let i = a.get_info();
+        tracing::info!("GPU adapter found: {} [{:?} via {:?}]", i.name, i.device_type, i.backend);
+    }
+
+    // (1) explicit override by case-insensitive name substring.
+    let name_pref = settings()
+        .adapter
+        .clone()
+        .or_else(|| std::env::var("WGPU_ADAPTER_NAME").ok())
+        .filter(|s| !s.trim().is_empty());
+    if let Some(want) = name_pref {
+        let want_lc = want.to_lowercase();
+        if let Some(pos) = adapters
+            .iter()
+            .position(|a| a.get_info().name.to_lowercase().contains(&want_lc))
+        {
+            return Ok(adapters.swap_remove(pos));
+        }
+        tracing::warn!("no GPU adapter matched name '{want}'; using automatic selection");
+    }
+
+    // (2) drop software adapters — the real CPU SIMD miner beats llvmpipe etc.
+    adapters.retain(|a| a.get_info().device_type != wgpu::DeviceType::Cpu);
+    if adapters.is_empty() {
+        bail!("only software (CPU) GPU adapters available; using the CPU miner instead");
+    }
+
+    adapters.sort_by_key(|a| {
+        let i = a.get_info();
+        let type_rank = match i.device_type {
+            wgpu::DeviceType::DiscreteGpu => 0u8,
+            wgpu::DeviceType::IntegratedGpu => 1,
+            wgpu::DeviceType::VirtualGpu => 2,
+            _ => 3, // Other
+        };
+        let backend_rank = match i.backend {
+            wgpu::Backend::Vulkan => 0u8,
+            wgpu::Backend::Dx12 => 1,
+            wgpu::Backend::Metal => 2,
+            wgpu::Backend::Gl => 3,
+            _ => 4,
+        };
+        (type_rank, backend_rank)
+    });
+    Ok(adapters.into_iter().next().unwrap())
+}
+
 // ── The reusable GPU context ──────────────────────────────────────────────────
 
 /// Identifies a mining job. Surplus winners from one job must never be served to
@@ -438,24 +565,23 @@ impl GpuMiner {
     }
 
     async fn new_async() -> Result<Self> {
-        // wgpu 29: InstanceDescriptor lost `Default`; this constructor reads
-        // backend/power prefs from env vars (e.g. WGPU_BACKEND=vulkan) and needs
-        // no window/display handle (we're headless compute).
+        // wgpu 29: InstanceDescriptor lost `Default`. This constructor reads
+        // backend/power prefs from env (e.g. WGPU_BACKEND=vulkan to force Vulkan)
+        // and needs no window/display handle (we're headless compute).
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
 
-        // VERSION: wgpu >=24 returns Result here. On <=23 it returns Option ->
-        // use `.ok_or_else(|| anyhow!("no GPU adapter"))?` instead of `map_err`.
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await
-            .map_err(|e| anyhow!("no suitable GPU adapter: {e:?}"))?;
-
-        let adapter_name = adapter.get_info().name;
+        // Don't trust request_adapter's power-preference hint — on mixed-GPU Linux
+        // it often returns the integrated GPU. Enumerate everything, log it, and
+        // pick deliberately (discrete > integrated, Vulkan > GL), honoring an
+        // optional user override.
+        let adapter = pick_adapter(&instance).await?;
+        let info = adapter.get_info();
+        tracing::info!(
+            "GPU adapter selected: {} [{:?} via {:?}]",
+            info.name, info.device_type, info.backend
+        );
+        let adapter_name = info.name.clone();
 
         // VERSION: wgpu >=24 takes a single `&DeviceDescriptor` and returns
         // Result. The `trace` field exists on >=~25; delete it on older
@@ -522,7 +648,7 @@ impl GpuMiner {
         });
         let state_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("state"),
-            size: (BATCH_NONCES as u64) * 8 * 4,
+            size: (settings().batch_nonces as u64) * 8 * 4,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -626,7 +752,8 @@ impl GpuMiner {
         // responsive. `collect_winners` is false only for the self-test.
         let duty = if collect_winners { gpu_duty() } else { 1.0 };
         let throttling = duty < 0.999;
-        let chunk = if throttling { ITERS_PER_DISPATCH.min(RESPONSIVE_ITERS) } else { ITERS_PER_DISPATCH };
+        let ipd = settings().iters_per_dispatch;
+        let chunk = if throttling { ipd.min(settings().responsive_iters) } else { ipd };
 
         let mut remaining = total;
         while remaining > 0 {
@@ -714,7 +841,7 @@ impl GpuMiner {
             midstate: words_le(&midstate),
             target: words_be(&target),
             pool: pool_words,
-            base_lo: 0, base_hi: 0, n_nonces: BATCH_NONCES, iters: 0, has_pool,
+            base_lo: 0, base_hi: 0, n_nonces: settings().batch_nonces, iters: 0, has_pool,
             pad0: 0, pad1: 0, pad2: 0,
         };
 
@@ -724,7 +851,7 @@ impl GpuMiner {
                 return None;
             }
             let base: u64 = rand::random();
-            let winners = self.run_batch(&mut params, base, BATCH_NONCES, &cancel, &hash_counter, true)?;
+            let winners = self.run_batch(&mut params, base, settings().batch_nonces, &cancel, &hash_counter, true)?;
 
             // CPU-verify every candidate; the CPU result is authoritative. Blocks
             // sort ahead of shares so a block is always returned first.
