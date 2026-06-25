@@ -27,7 +27,7 @@
  * @module worker
  */
 
-import init, { WebWallet, generate_phrase, compute_coin_id_hex, decrypt_cli_wallet, mine_commitment_pow, blake3_hash_hex, build_multisig_2of2_address, build_channel_state, build_channel_reveal, verify_mss_sig_wasm, mine_chat_pow_v2_wasm } from './pkg/wasm_wallet.js';
+import init, { WebWallet, generate_phrase, compute_coin_id_hex, decrypt_cli_wallet, mine_commitment_pow, blake3_hash_hex, build_multisig_2of2_address, build_channel_state, build_channel_reveal, verify_mss_sig_wasm, mine_chat_pow_v2_wasm, build_htlc_bytecode_hex } from './pkg/wasm_wallet.js';
 
 /** @type {WebWallet|null} The WASM wallet instance. Null until CREATE or LOGIN. */
 let wallet = null;
@@ -540,7 +540,8 @@ async function loadState(pwd, bundleStr) {
         wState.l2_channels = wState.l2_channels || {};
         wState.l2_secrets = wState.l2_secrets || {};
         wState.l2_routes = wState.l2_routes || {};
-
+        wState.dex_swaps = wState.dex_swaps || {};
+        
         // Migrate legacy array-format UTXOs to map format
         if (Array.isArray(wState.utxos)) {
             const utxoMap = {};
@@ -822,7 +823,49 @@ self.onmessage = async (e) => {
         else if (type === 'GENERATE') {
             self.postMessage({ type: 'PHRASE_GENERATED', payload: generate_phrase() });
         }
-        
+        else if (type === 'DEX_BROADCAST_OFFER') {
+            const jsonBytes = new TextEncoder().encode(JSON.stringify(payload));
+            submitClientMinedChat([255, 200], null, [
+                { kind: "signature", value: normalizeHex(jsonBytes) }
+            ]).catch(()=>{});
+        }
+        else if (type === 'DEX_BROADCAST_ACCEPT') {
+            const jsonBytes = new TextEncoder().encode(JSON.stringify(payload));
+            submitClientMinedChat([255, 201], payload.offerNonce, [
+                { kind: "signature", value: normalizeHex(jsonBytes) }
+            ]).catch(()=>{});
+        }
+        else if (type === 'DEX_BROADCAST_LOCKED') {
+            const jsonBytes = new TextEncoder().encode(JSON.stringify(payload));
+            submitClientMinedChat([255, 202], payload.offerNonce, [
+                { kind: "signature", value: normalizeHex(jsonBytes) }
+            ]).catch(()=>{});
+        }
+        else if (type === 'DEX_LOCK_MIDSTATE') {
+            if (isSending) throw new Error("Wallet busy.");
+            isSending = true;
+            try {
+                const { expectedAmount, takerPk, secretHashMidstate } = payload;
+                const myPk = getPrimaryMssPk();
+                const timeoutHeight = networkHeight + 1440; // ~24 hours
+                
+                // Build the HTLC
+                const htlcScriptHex = build_htlc_bytecode_hex(secretHashMidstate, takerPk, BigInt(timeoutHeight), myPk);
+                const htlcAddressHex = blake3_hash_hex(htlcScriptHex);
+
+                // We piggy-back off the existing FUND_CONTRACT logic!
+                await performContractTx({ 
+                    reqId: 999, 
+                    kind: 'fund', 
+                    contractAddress: htlcAddressHex, 
+                    amount: expectedAmount 
+                });
+
+                self.postMessage({ type: 'DEX_MIDSTATE_LOCKED_SUCCESS', payload: { htlcScriptHex, htlcAddressHex } });
+            } finally {
+                isSending = false;
+            }
+        }
         else if (type === 'PUSH_NEW_BLOCK') {
             if (payload.ChatMessage) {
                 if (payload.ChatMessage.words && payload.ChatMessage.words[0] === 255) {
@@ -2319,7 +2362,31 @@ async function handleL2Chat(msg) {
                 }
             }
         }
+        // ── L2 DEX ROUTING ──
+            if (cmd >= 200 && cmd <= 202) {
+                const sigAtt = msg.attachments.find(a => a.kind === "signature")?.value;
+                if (!sigAtt) return;
 
+                try {
+                    // Decode the arbitrary JSON payload we tunneled through the Signature attachment
+                    const hexPairs = sigAtt.match(/.{1,2}/g) || [];
+                    const jsonStr = new TextDecoder().decode(new Uint8Array(hexPairs.map(b => parseInt(b, 16))));
+                    const payload = JSON.parse(jsonStr);
+                    payload.nonce = msg.nonce;
+
+                    // Route to the UI Thread
+                    if (cmd === 200) {
+                        self.postMessage({ type: 'DEX_OFFER_RECEIVED', payload });
+                    } else if (cmd === 201) {
+                        self.postMessage({ type: 'DEX_ACCEPT_RECEIVED', payload });
+                    } else if (cmd === 202) {
+                        self.postMessage({ type: 'DEX_LOCKED_RECEIVED', payload });
+                    }
+                } catch (e) {
+                    console.error("Failed to parse DEX L2 payload", e);
+                }
+            }
+        }
         // Apply state locally
         const myPk = channel.is_alice ? channel.alice_pk : channel.bob_pk;
         const mySig = wallet.sign_mss_hex(myPk, parsedState.commitment);

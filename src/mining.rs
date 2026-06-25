@@ -338,7 +338,7 @@ pub async fn run_stratum_client(
                                 loop {
                                     if nc.load(Ordering::Relaxed) { break; }
                                     
-                                    if let Some(res) = crate::core::extension::mine_extension(
+                                    if let Some(res) = crate::core::gpu_mining::mine(
                                         m_hash, n_target, Some(s_target), threads, nc.clone(), hc.clone()
                                     ) {
                                         let nonce = match res {

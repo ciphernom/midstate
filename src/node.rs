@@ -6093,7 +6093,7 @@ async fn try_apply_orphans(&mut self) {
         std::thread::spawn(move || {
             use crate::core::extension::MiningResult;
             // Mine against the secure header hash!
-            if let Some(mining_result) = crate::core::extension::mine_extension(
+            if let Some(mining_result) = crate::core::gpu_mining::mine(
                 mining_hash, target, pool_target, threads, cancel, hash_counter
             ) {
                 match mining_result {

@@ -10,6 +10,7 @@ pub mod script;
 pub mod filter;
 pub mod simd_mining;
 pub mod wots_simd;
+pub mod gpu_mining;  
 
 pub use finality::*;
 pub use types::*;
