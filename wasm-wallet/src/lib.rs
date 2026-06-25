@@ -1236,7 +1236,7 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
             let _ = provisional_change;
             let num_change = decompose_value(change_for_size).len();
             let num_outputs = out_args.len() + num_change;
-=            // Each contract input serializes its bytecode AND its witness in the reveal.
+            // Each contract input serializes its bytecode AND its witness in the reveal.
             // The witness can carry a full MSS signature (e.g. an HTLC CHECKSIGVERIFY) — the
             // flat 120 wildly undercounted it, so the mempool rejected swept claims with
             // "fee rate too low". The witness is often injected AFTER the commitment (HTLC
