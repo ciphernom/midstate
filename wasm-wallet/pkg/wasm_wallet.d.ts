@@ -330,6 +330,11 @@ export function build_channel_reveal(channel_value: bigint, channel_salt_hex: st
 
 export function build_channel_state(channel_coin_id_hex: string, alice_pk_hex: string, bob_pk_hex: string, alice_amount: bigint, bob_amount: bigint, nonce: number, htlcs_json: string): string;
 
+/**
+ * Builds the Midstate HTLC bytecode for cross-chain atomic swaps.
+ */
+export function build_htlc_bytecode_hex(secret_hash_hex: string, receiver_pk_hex: string, timeout_height: bigint, refund_pk_hex: string): string;
+
 export function build_multisig_2of2_address(pk1_hex: string, pk2_hex: string): string;
 
 /**
@@ -484,6 +489,7 @@ export interface InitOutput {
     readonly blake3_hash_hex: (a: number, b: number, c: number) => void;
     readonly build_channel_reveal: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => void;
     readonly build_channel_state: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: bigint, j: number, k: number, l: number) => void;
+    readonly build_htlc_bytecode_hex: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number) => void;
     readonly build_multisig_2of2_address: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly compute_coin_id_hex: (a: number, b: number, c: number, d: bigint, e: number, f: number) => void;
     readonly compute_commitment_hex: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;

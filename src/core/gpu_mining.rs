@@ -1,3 +1,4 @@
+#![cfg(not(target_arch = "wasm32"))]
 //! GPU mining backend (wgpu / WGSL) for the PoW extension chain.
 //!
 //! This mirrors the CPU search in `simd_mining` / `extension`, but spreads the

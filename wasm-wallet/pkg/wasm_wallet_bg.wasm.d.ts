@@ -5,6 +5,7 @@ export const __wbg_webwallet_free: (a: number, b: number) => void;
 export const blake3_hash_hex: (a: number, b: number, c: number) => void;
 export const build_channel_reveal: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => void;
 export const build_channel_state: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: bigint, j: number, k: number, l: number) => void;
+export const build_htlc_bytecode_hex: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number) => void;
 export const build_multisig_2of2_address: (a: number, b: number, c: number, d: number, e: number) => void;
 export const compute_coin_id_hex: (a: number, b: number, c: number, d: bigint, e: number, f: number) => void;
 export const compute_commitment_hex: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
