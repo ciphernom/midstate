@@ -20,3 +20,4 @@ wasm-wallet/node_modules/
 target/
 Cargo.lock
 midstate-pool/data/
+state.redb
