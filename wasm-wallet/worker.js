@@ -824,20 +824,28 @@ self.onmessage = async (e) => {
             self.postMessage({ type: 'PHRASE_GENERATED', payload: generate_phrase() });
         }
         else if (type === 'DEX_BROADCAST_OFFER') {
-            const jsonBytes = new TextEncoder().encode(JSON.stringify(payload));
+            // The worker is the single source of truth for our MDS identity. Inject it
+            // here so the UI never has to call getPrimaryMssPk() (which lives only here).
+            const full = { ...payload, makerMdsPk: getPrimaryMssPk() };
+            const jsonBytes = new TextEncoder().encode(JSON.stringify(full));
             submitClientMinedChat([255, 200], null, [
                 { kind: "signature", value: normalizeHex(jsonBytes) }
             ]).catch(()=>{});
         }
         else if (type === 'DEX_BROADCAST_ACCEPT') {
-            const jsonBytes = new TextEncoder().encode(JSON.stringify(payload));
-            submitClientMinedChat([255, 201], payload.offerNonce, [
+            // Taker side. We send ONLY our identity + EVM address — never any secret or
+            // secret hash. The maker generates the secret (see DEX_LOCK_MIDSTATE).
+            const full = { offerId: payload.offerId, takerMdsPk: getPrimaryMssPk(), takerEvmAddr: payload.takerEvmAddr };
+            const jsonBytes = new TextEncoder().encode(JSON.stringify(full));
+            submitClientMinedChat([255, 201], payload.offerNonce ?? null, [
                 { kind: "signature", value: normalizeHex(jsonBytes) }
             ]).catch(()=>{});
         }
         else if (type === 'DEX_BROADCAST_LOCKED') {
+            // Maker → taker. Carries the hashlock H, the funded HTLC coin set, the
+            // timeout height and the maker's pubkey. NEVER the secret.
             const jsonBytes = new TextEncoder().encode(JSON.stringify(payload));
-            submitClientMinedChat([255, 202], payload.offerNonce, [
+            submitClientMinedChat([255, 202], payload.replyTo ?? null, [
                 { kind: "signature", value: normalizeHex(jsonBytes) }
             ]).catch(()=>{});
         }
@@ -845,25 +853,88 @@ self.onmessage = async (e) => {
             if (isSending) throw new Error("Wallet busy.");
             isSending = true;
             try {
-                const { expectedAmount, takerPk, secretHashMidstate } = payload;
+                const { offerId, expectedAmount, takerPk } = payload;
+
+                // ── The MAKER generates the secret ──────────────────────────────
+                // Both chains hash-lock on H = BLAKE3(secret). The maker reveals the
+                // secret by claiming the ETH on Base; the taker then reads it and
+                // claims the MDS here. Because both sides use the SAME BLAKE3 hash,
+                // a single preimage unlocks both — no cross-hash theft vector.
+                const secretBytes = crypto.getRandomValues(new Uint8Array(32));
+                const rawSecret = Array.from(secretBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                const secretHash = blake3_hash_hex(rawSecret); // BLAKE3 of the 32 secret bytes
+
                 const myPk = getPrimaryMssPk();
-                const timeoutHeight = networkHeight + 1440; // ~24 hours
-                
-                // Build the HTLC
-                const htlcScriptHex = build_htlc_bytecode_hex(secretHashMidstate, takerPk, BigInt(timeoutHeight), myPk);
+                const timeoutHeight = networkHeight + 1440; // ~24h at 1-minute blocks (the LONG leg)
+
+                // HTLC: receiver = taker (claims with the secret), refund = maker (after timeout).
+                const htlcScriptHex = build_htlc_bytecode_hex(secretHash, takerPk, BigInt(timeoutHeight), myPk);
                 const htlcAddressHex = blake3_hash_hex(htlcScriptHex);
 
-                // We piggy-back off the existing FUND_CONTRACT logic!
-                await performContractTx({ 
-                    reqId: 999, 
-                    kind: 'fund', 
-                    contractAddress: htlcAddressHex, 
-                    amount: expectedAmount 
+                // Fund the HTLC. prepare_fund_tx splits the amount into power-of-two
+                // coins, EACH with a random salt, so funding yields a SET of coins.
+                // performContractTx now returns that set (salts are not on-chain, so
+                // the taker can only spend them if we transmit {coin_id,value,salt}).
+                const fundRes = await performContractTx({
+                    reqId: 999,
+                    kind: 'fund',
+                    contractAddress: htlcAddressHex,
+                    amount: expectedAmount
                 });
+                const htlcCoins = (fundRes && fundRes.coins) || [];
 
-                self.postMessage({ type: 'DEX_MIDSTATE_LOCKED_SUCCESS', payload: { htlcScriptHex, htlcAddressHex } });
+                self.postMessage({ type: 'DEX_MIDSTATE_LOCKED_SUCCESS', payload: {
+                    offerId,
+                    secret: rawSecret,        // for the MAKER only — needed to claim ETH on Base
+                    secretHash,               // H = BLAKE3(secret); the Base hashlock is identical
+                    htlcAddressHex,
+                    htlcCoins,                // [{coin_id, value, salt}] — the taker sweeps these
+                    timeoutHeight,
+                    makerMdsPk: myPk,
+                    takerMdsPk: takerPk
+                }});
             } finally {
                 isSending = false;
+            }
+        }
+        else if (type === 'DEX_VERIFY_HTLC') {
+            // Taker-side safety check: before locking ETH, prove the maker's MDS HTLC
+            // actually exists on-chain with the agreed hashlock, our pubkey as receiver,
+            // and the full expected value. Without this a malicious maker could get the
+            // taker to lock ETH against a fake or short Midstate lock.
+            const { offerId, secretHash, timeoutHeight, makerMdsPk, htlcCoins, expectedTotal, baseRefundSecs } = payload;
+            try {
+                const myPk = getPrimaryMssPk();
+                const scriptHex = build_htlc_bytecode_hex(secretHash, myPk, BigInt(timeoutHeight), makerMdsPk);
+                const addrHex = blake3_hash_hex(scriptHex);
+                let total = 0, ok = true, reason = "";
+
+                // SAFETY: the Midstate HTLC timeout is ABSOLUTE (fixed when the maker
+                // locked), but our Base refund is RELATIVE to when we lock. If the
+                // Midstate leg expires too soon, a malicious maker could refund MDS
+                // AND claim our ETH. Require the remaining Midstate window to exceed
+                // the Base refund by a wide margin (~12h at 1-minute blocks).
+                const refundBlocks = Math.ceil((Number(baseRefundSecs) || 21600) / 60);
+                const minRemaining = refundBlocks + 720; // + ~12h margin
+                const remaining = Number(timeoutHeight) - networkHeight;
+                if (remaining < minRemaining) {
+                    ok = false;
+                    reason = `Midstate HTLC expires in ~${remaining} blocks; need ≥ ${minRemaining}. Unsafe to lock ETH.`;
+                }
+
+                for (const c of (ok ? (htlcCoins || []) : [])) {
+                    const expectId = compute_coin_id_hex(normalizeHex(addrHex), BigInt(c.value), normalizeHex(c.salt));
+                    if (normalizeHex(expectId) !== normalizeHex(c.coin_id)) { ok = false; reason = "HTLC parameters do not match the advertised coins"; break; }
+                    const chk = await rpc.checkCoin(normalizeHex(c.coin_id)).catch(() => null);
+                    if (!chk || !chk.exists) { ok = false; reason = "HTLC coin not found on-chain yet"; break; }
+                    total += Number(c.value);
+                }
+                if (ok && expectedTotal != null && total !== Number(expectedTotal)) {
+                    ok = false; reason = `HTLC locks ${total} MDS but the offer was ${expectedTotal} MDS`;
+                }
+                self.postMessage({ type: 'DEX_HTLC_VERIFIED', payload: { offerId, ok, reason, htlcAddressHex: addrHex } });
+            } catch (e) {
+                self.postMessage({ type: 'DEX_HTLC_VERIFIED', payload: { offerId, ok: false, reason: e.message } });
             }
         }
         else if (type === 'DEX_CLAIM_MIDSTATE') {
@@ -871,10 +942,14 @@ self.onmessage = async (e) => {
             isSending = true;
             try {
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Claiming HTLC..." } });
-                const { swapIdx, rawSecret, htlcCoinId, htlcValue, htlcSalt, takerMdsPk, makerMdsPk, secretHashMidstate, timeoutHeight } = payload;
-                
-                // Reconstruct the exact HTLC bytecode
-                const htlcScriptHex = build_htlc_bytecode_hex(secretHashMidstate, takerMdsPk, BigInt(timeoutHeight), makerMdsPk);
+                const { swapIdx, rawSecret, htlcCoins, makerMdsPk, secretHash, timeoutHeight } = payload;
+
+                if (!Array.isArray(htlcCoins) || htlcCoins.length === 0) throw new Error("No HTLC coins to claim");
+
+                // We are the receiver baked into the HTLC, so reconstruct the script
+                // with OUR pubkey (never trust a pubkey passed across the wire for this).
+                const myPk = getPrimaryMssPk();
+                const htlcScriptHex = build_htlc_bytecode_hex(secretHash, myPk, BigInt(timeoutHeight), makerMdsPk);
 
                 if (!mssCachesReady) await loadMssCaches();
                 const utxoArray = Object.values(wState.utxos).map(u => {
@@ -882,53 +957,55 @@ self.onmessage = async (e) => {
                     return u;
                 });
 
-                // Grab the Taker's primary wallet address to receive the funds
-                const takerAddressHex = Object.keys(wState.mssAddrs)[0]; 
+                // Receive the full HTLC value to our primary address.
+                const takerAddressHex = Object.keys(wState.mssAddrs)[0];
+                const totalValue = htlcCoins.reduce((a, c) => a + Number(c.value), 0);
 
-                // Setup the inputs and outputs
                 const outputsJson = JSON.stringify([{
                     out_type: "standard",
                     address: takerAddressHex,
-                    value: htlcValue,
-                    salt: null // Auto-generates random salt
+                    value: totalValue,
+                    salt: null // auto-generates a random salt
                 }]);
 
-                const contractInputsJson = JSON.stringify([{
-                    coin_id: htlcCoinId,
-                    witness: "", // Filled later
-                    value: htlcValue,
-                    salt: htlcSalt,
+                // One contract input PER funded HTLC coin, all sharing the one bytecode.
+                const contractInputsJson = JSON.stringify(htlcCoins.map(c => ({
+                    coin_id: normalizeHex(c.coin_id),
+                    witness: "",            // filled after we have the commitment
+                    value: Number(c.value),
+                    salt: normalizeHex(c.salt),
                     state: null
-                }]);
+                })));
 
-                // 1. Generate the Transaction Context
-                let ctxStr = wallet.prepare_script_spend(
+                // 1. Build the spend context across all inputs.
+                let ctx = JSON.parse(wallet.prepare_script_spend(
                     JSON.stringify(utxoArray),
                     htlcScriptHex,
                     contractInputsJson,
                     outputsJson,
                     wState.nextWotsIndex
-                );
+                ));
 
-                let ctx = JSON.parse(ctxStr);
+                // 2. Sign the (single) commitment with our key. The same signature
+                //    satisfies CHECKSIGVERIFY for every input (same pk, same commitment).
+                const sigHex = wallet.sign_mss_hex(myPk, ctx.commitment);
 
-                // 2. Sign the commitment hash using the Taker's private key
-                const sigHex = wallet.sign_mss_hex(takerMdsPk, ctx.commitment);
+                // 3. Inject the claim witness [Signature, Secret, 0x01] into each input.
+                for (let i = 0; i < ctx.contract_inputs.length; i++) {
+                    ctx.contract_inputs[i].witness = `${sigHex},${rawSecret},01`;
+                }
 
-                // 3. Inject the Witness Stack: [Signature, Secret, 0x01 (True)]
-                ctx.contract_inputs[0].witness = `${sigHex},${rawSecret},01`;
-
-                // 4. Build the final Reveal transaction
+                // 4. Build the reveal.
                 const revealPayloadStr = wallet.build_script_reveal(JSON.stringify(ctx), ctx.commitment, ctx.tx_salt);
 
-                // 5. Update Wallet Keys
+                // 5. Advance key material exactly once.
                 while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
                 const usedMss = new Set();
                 for (const inp of ctx.wallet_inputs) if (inp.is_mss) usedMss.add(inp.address);
                 for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
                 await saveState();
 
-                // 6. Mine & Submit
+                // 6. Mine, commit, wait, reveal, wait.
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining PoW..." } });
                 const stateData = await rpc.getState();
                 await new Promise(r => setTimeout(r, 50));
@@ -947,8 +1024,9 @@ self.onmessage = async (e) => {
                 if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting claim..." } });
+                const firstCoin = normalizeHex(htlcCoins[0].coin_id);
                 while (true) {
-                    try { const inp = await rpc.checkCoin(htlcCoinId); if (inp && !inp.exists) break; } catch (e) {}
+                    try { const inp = await rpc.checkCoin(firstCoin); if (inp && !inp.exists) break; } catch (e) {}
                     await waitForNextBlock(15000);
                 }
 
@@ -2194,6 +2272,24 @@ async function performContractTx(req) {
 
     // The reveal's commitment doubles as a stable transaction identifier here.
     self.postMessage({ type: 'CONTRACT_TX_COMPLETE', payload: { reqId: req.reqId, txid: ctx.commitment } });
+
+    // For funds, surface the freshly created coins at the contract address. Their
+    // salts are random and NOT recoverable from chain, so callers (e.g. the DEX
+    // maker) must capture them here to let a counterparty spend the contract later.
+    let createdCoins = [];
+    if (req.kind === 'fund') {
+        const cAddr = normalizeHex(req.contractAddress || (req.bytecode ? blake3_hash_hex(normalizeHex(req.bytecode)) : ""));
+        for (const o of (ctx.outputs || [])) {
+            if (normalizeHex(o.address) === cAddr) {
+                createdCoins.push({
+                    coin_id: compute_coin_id_hex(normalizeHex(o.address), BigInt(o.value), normalizeHex(o.salt)),
+                    value: o.value,
+                    salt: normalizeHex(o.salt)
+                });
+            }
+        }
+    }
+    return { txid: ctx.commitment, coins: createdCoins };
 }
 
 /**
