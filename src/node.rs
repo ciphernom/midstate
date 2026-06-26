@@ -1090,9 +1090,12 @@ pub async fn new(
             state.height, state.depth, state.coins.len(), state.commitments.len()
         );
 
-         let mut needs_rollback = false;
+        // --- NEW: V4 Migration Marker Check ---
+        let v4_marker = data_dir.join(".v4_migration_done");
+        let mut needs_rollback = false;
         
-        if state.height > crate::core::types::V4_ACTIVATION_HEIGHT {
+        if state.height > crate::core::types::V4_ACTIVATION_HEIGHT && !v4_marker.exists() {
+            tracing::info!("Performing one-time V4 activation state check...");
             // Load the actual block 163,676 from disk to see if it was mined with V3 or V4 rules.
             if let Ok(Some(activation_batch)) = storage.load_batch(crate::core::types::V4_ACTIVATION_HEIGHT) {
                 // Reconstruct what the V3 state root WOULD have been for this block
@@ -1116,6 +1119,9 @@ pub async fn new(
                 // If the block on disk has the V3 state root, it is a dirty block. We must roll back.
                 if activation_batch.state_root == v3_state_root {
                     needs_rollback = true;
+                } else {
+                    // SUCCESS: The chain is already clean V4! Mark the migration as done.
+                    let _ = std::fs::write(&v4_marker, b"done");
                 }
             } else {
                 // We are past activation height but don't have the block on disk? Corrupt state.
@@ -1159,6 +1165,9 @@ pub async fn new(
             storage.truncate_chain(crate::core::types::V4_ACTIVATION_HEIGHT)?;
             state = new_state;
             tracing::info!("Rollback complete. Node is now enforcing new State Root rules at height {}.", state.height);
+            
+            // --- NEW: Mark rollback as complete so we don't check next boot
+            let _ = std::fs::write(&v4_marker, b"done");
         }
 
         if state.height == 0 {

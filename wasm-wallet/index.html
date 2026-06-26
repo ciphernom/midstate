@@ -3488,6 +3488,9 @@ document.getElementById('btnExport').onclick = () => {
         let dexMySwaps = JSON.parse(localStorage.getItem('midstate_dex_swaps')) || [];
         function saveSwaps() { localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps)); }
 
+        function dexReadContract()  { return new ethers.Contract(BASE_HTLC_CONTRACT, HTLC_ABI, evmProvider); }
+        function dexWriteContract() { return new ethers.Contract(BASE_HTLC_CONTRACT, HTLC_ABI, evmSigner); }
+
         document.getElementById('btnConnectBase').onclick = async () => {
             if (!window.ethereum) return showToast("MetaMask not found!", "error");
             try {
