@@ -849,14 +849,6 @@ self.onmessage = async (e) => {
                 { kind: "signature", value: normalizeHex(jsonBytes) }
             ]).catch(()=>{});
         }
-        else if (type === 'DEX_BROADCAST_LOCKING') {
-            // Tiny notice (cmd 203) so the counterparty knows we've begun the on-chain
-            // MDS lock. Carries only the offerId — no secret, no hash, no coins.
-            const jsonBytes = new TextEncoder().encode(JSON.stringify({ offerId: payload.offerId }));
-            submitClientMinedChat([255, 203], null, [
-                { kind: "signature", value: normalizeHex(jsonBytes) }
-            ]).catch(()=>{});
-        }
         else if (type === 'DEX_LOCK_MIDSTATE') {
             if (isSending) throw new Error("Wallet busy.");
             isSending = true;
@@ -2627,7 +2619,7 @@ async function handleL2Chat(msg) {
         self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
     }
     // ── L2 DEX ROUTING ──
-    else if (cmd >= 200 && cmd <= 203) {
+    else if (cmd >= 200 && cmd <= 202) {
         const sigAtt = msg.attachments.find(a => a.kind === "signature")?.value;
         if (!sigAtt) return;
 
@@ -2645,8 +2637,6 @@ async function handleL2Chat(msg) {
                 self.postMessage({ type: 'DEX_ACCEPT_RECEIVED', payload });
             } else if (cmd === 202) {
                 self.postMessage({ type: 'DEX_LOCKED_RECEIVED', payload });
-            } else if (cmd === 203) {
-                self.postMessage({ type: 'DEX_LOCKING_RECEIVED', payload });
             }
         } catch (e) {
             console.error("Failed to parse DEX L2 payload", e);

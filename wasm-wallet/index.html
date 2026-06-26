@@ -714,7 +714,7 @@
 <!-- DEX -->
         <main id="view-dex" class="page">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                <h2 style="margin: 0;">P2P OTC Market</h2>
+                <h2 style="margin: 0;">HIGHLY EXPERIMENTAL P2P OTC Market -- USE AT OWN RISK</h2>
                 <div id="evmAddressDisplay" style="font-size: 11px; color: var(--accent); background: rgba(212,255,0,0.1); padding: 4px 8px; border-radius: 4px; border: 1px solid var(--accent-dim);">Base: Not Connected</div>
             </div>
             <p style="font-size: 11px; color: #888; margin-top: -10px; margin-bottom: 20px;">
@@ -939,7 +939,7 @@
         <!-- NAV (7 tabs now) -->
         <nav id="bottom-nav" class="hidden">
             <button class="nav-btn active" data-target="view-home"><span class="nav-icon">🏠</span><span>Home</span></button>
-            <!--<button class="nav-btn" data-target="view-dex"><span class="nav-icon">📈</span><span>DEX</span></button>-->
+            <button class="nav-btn" data-target="view-dex"><span class="nav-icon">📈</span><span>EXPERIMENTAL DEX</span></button>-->
 
             <button class="nav-btn" data-target="view-mine"><span class="nav-icon">⛏️</span><span>Mine</span></button>
             <button class="nav-btn" data-target="view-send"><span class="nav-icon">💸</span><span>Send</span></button>
@@ -3506,15 +3506,6 @@ document.getElementById('btnExport').onclick = () => {
         function counterMdsPk(swap)  { return swap.role === 'maker' ? swap.takerMdsPk  : swap.makerMdsPk; }
         function counterEvmAddr(swap) { return swap.role === 'maker' ? swap.takerEvmAddr : swap.makerEvmAddr; }
         function prettyEth(wei) { try { return parseFloat(ethers.formatEther(wei)).toFixed(6); } catch (_) { return '?'; } }
-        // An offer is "engaged" once we're actively trading it — we took it (a taker
-        // swap exists) or our own offer was accepted (maker swap past the waiting
-        // stage). The P2P bus re-delivers the original offer message periodically, so
-        // without this guard a taken offer pops back into the book (sometimes rendered
-        // from the maker's side, i.e. a sell showing as a buy). Suppress those.
-        function dexOfferEngaged(offerId) {
-            return dexMySwaps.some(s => s.offerId === offerId &&
-                (s.role === 'taker' || (s.role === 'maker' && s.status !== 'waiting_for_taker')));
-        }
 
         document.getElementById('btnConnectBase').onclick = async () => {
             if (!window.ethereum) return showToast("MetaMask not found!", "error");
@@ -3623,25 +3614,7 @@ document.getElementById('btnExport').onclick = () => {
             dexMySwaps.splice(idx, 1);
             saveSwaps();
             renderDexSwaps();
-            renderDexOrderbook();
             showToast("Offer cancelled.", "success");
-        };
-
-        // Abandon an in-progress swap — ONLY safe for ETH-side states where this party
-        // has locked nothing on-chain. A swap that already locked funds must be unwound
-        // with refund-after-timeout (Base refund / Midstate HTLC refund), not removed,
-        // or the funds would be orphaned. This guard refuses the unsafe cases.
-        window.dexAbandonSwap = function(idx) {
-            const s = dexMySwaps[idx];
-            if (!s) return;
-            const safe = s.side === 'eth' && ['htlc_invalid', 'waiting_for_mds_lock', 'ready_to_lock_base'].includes(s.status);
-            if (!safe) return showToast("This swap has funds committed on-chain — it can't be abandoned. Use refund after the timeout.", "error");
-            if (!confirm("Abandon this swap? You have nothing locked on-chain, so this only removes it from your list. If the counterparty already locked MDS, they reclaim it automatically after their timeout.")) return;
-            dexMySwaps.splice(idx, 1);
-            saveSwaps();
-            renderDexSwaps();
-            renderDexOrderbook();
-            showToast("Swap abandoned.", "success");
         };
 
         // The MDS-side (whoever holds MDS) locks the Midstate HTLC and generates
@@ -3650,10 +3623,6 @@ document.getElementById('btnExport').onclick = () => {
             swap.status = 'locking_midstate';
             saveSwaps();
             renderDexSwaps();
-            renderDexOrderbook();   // we're engaged now — clear our own offer from the book
-            // Let the counterparty (ETH-side) know we've actually started the on-chain
-            // lock, so their card can show real activity instead of a dead "waiting…".
-            worker.postMessage({ type: 'DEX_BROADCAST_LOCKING', payload: { offerId: swap.offerId } });
             worker.postMessage({ type: 'DEX_LOCK_MIDSTATE', payload: {
                 offerId: swap.offerId,
                 expectedAmount: swap.mdsAmount,
@@ -3666,7 +3635,6 @@ document.getElementById('btnExport').onclick = () => {
             if (e.data.type === 'DEX_OFFER_RECEIVED') {
                 const offer = e.data.payload;
                 if (offer.ts && (Date.now() - offer.ts) > OFFER_TTL_MS) return;
-                if (dexOfferEngaged(offer.offerId)) return;   // taken/accepted — don't let the bus re-add it
                 const key = offer.offerId || offer.nonce;
                 const ex = dexOrderbook.find(o => (o.offerId || o.nonce) === key);
                 if (ex) Object.assign(ex, offer); else dexOrderbook.push(offer);
@@ -3688,7 +3656,6 @@ document.getElementById('btnExport').onclick = () => {
                     swap.status = 'waiting_for_mds_lock';
                     saveSwaps();
                     renderDexSwaps();
-                    renderDexOrderbook();   // engaged — clear our own offer from the book
                     showToast("Offer accepted — waiting for the buyer to lock MDS…", "success");
                 }
             }
@@ -3715,13 +3682,6 @@ document.getElementById('btnExport').onclick = () => {
                 }});
                 showToast("MDS locked. Waiting for the counterparty to lock ETH…", "success");
                 startEthLockWatch(swap.offerId);
-            }
-            else if (e.data.type === 'DEX_LOCKING_RECEIVED') {
-                // The MDS-side told us they've started locking. Surface real activity on
-                // our waiting card so it doesn't look stalled during their ~2-block lock.
-                const { offerId } = e.data.payload;
-                const swap = dexMySwaps.find(s => s.offerId === offerId && s.side === 'eth' && s.status === 'waiting_for_mds_lock');
-                if (swap) { swap.counterpartyLocking = true; renderDexSwaps(); } // transient
             }
             else if (e.data.type === 'DEX_LOCKED_RECEIVED') {
                 const lockData = e.data.payload;
@@ -3958,7 +3918,7 @@ document.getElementById('btnExport').onclick = () => {
             const tb = document.getElementById('dexOrderbook');
             if (!tb) return;
             const now = Date.now();
-            const live = dexOrderbook.filter(o => (!o.ts || (now - o.ts) <= OFFER_TTL_MS) && !dexOfferEngaged(o.offerId));
+            const live = dexOrderbook.filter(o => !o.ts || (now - o.ts) <= OFFER_TTL_MS);
             if (live.length === 0) {
                 tb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#555;">No live orders. Listening to P2P network…</td></tr>';
                 return;
@@ -4004,9 +3964,7 @@ document.getElementById('btnExport').onclick = () => {
                 } else if (s.status === 'locking_midstate') {
                     statusText = 'Locking your MDS in the on-chain HTLC…';
                 } else if (s.status === 'waiting_for_mds_lock') {
-                    statusText = s.counterpartyLocking
-                        ? 'Seller is locking MDS on-chain — commit + reveal, usually a few minutes…'
-                        : 'Waiting for the seller to lock MDS (a 2-step on-chain process)…';
+                    statusText = 'Waiting for the seller to lock MDS…';
                 } else if (s.status === 'verifying_htlc') {
                     statusText = 'Verifying the MDS lock on-chain…';
                 } else if (s.status === 'htlc_invalid') {
@@ -4029,27 +3987,11 @@ document.getElementById('btnExport').onclick = () => {
                 }
 
                 // A Midstate commit/reveal step is in flight: show the live phase with a
-                // pulse and hide the action button so it can't be re-triggered. Also pulse
-                // when we're simply waiting on the counterparty, so the card reads as alive.
-                const waitingOnPeer = (s.status === 'waiting_for_mds_lock') ||
-                                      (s.status === 'ready_to_claim_base' && !s.counterpartyLocked);
+                // pulse and hide the action button so it can't be re-triggered.
                 let statusHtml = statusText;
                 if (s.phase) {
                     btn = '';
                     statusHtml = `<span class="dex-phase-dot"></span><span>${s.phase}</span>`;
-                } else if (waitingOnPeer) {
-                    statusHtml = `<span class="dex-phase-dot"></span><span>${statusText}</span>`;
-                }
-
-                // Safe cancel: only ETH-side states where THIS party has locked nothing
-                // on-chain. (Funds-locked swaps recover via refund-after-timeout instead.)
-                let secondaryBtn = '';
-                if (s.side === 'eth' && !s.phase &&
-                    (s.status === 'htlc_invalid' || s.status === 'waiting_for_mds_lock' || s.status === 'ready_to_lock_base')) {
-                    const style = btn
-                        ? 'margin:8px 0 0;width:100%;padding:7px;font-size:11px;background:transparent;border:1px solid var(--border);color:#888;'
-                        : 'margin:0;width:100%;padding:9px;font-size:12px;background:transparent;border:1px solid var(--border-bright);color:var(--text-bright);';
-                    secondaryBtn = `<button style="${style}" onclick="dexAbandonSwap(${idx})">Abandon swap</button>`;
                 }
 
                 return `<div class="swap-card">
@@ -4058,8 +4000,8 @@ document.getElementById('btnExport').onclick = () => {
                         <span style="font-size:11px;color:#888;text-transform:uppercase;">${s.role} · ${s.side === 'mds' ? 'MDS side' : 'ETH side'}</span>
                     </div>
                     ${getStepperHtml(s)}
-                    <div style="font-size:12px;color:var(--text-bright);text-align:center;margin-bottom:${(btn || secondaryBtn) ? '15px' : '0'};display:flex;align-items:center;justify-content:center;gap:7px;">${statusHtml}</div>
-                    ${btn}${secondaryBtn}
+                    <div style="font-size:12px;color:var(--text-bright);text-align:center;margin-bottom:${btn ? '15px' : '0'};display:flex;align-items:center;justify-content:center;gap:7px;">${statusHtml}</div>
+                    ${btn}
                 </div>`;
             }).join('');
         }
