@@ -713,13 +713,66 @@
 
 <!-- DEX -->
         <main id="view-dex" class="page">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                <h2 style="margin: 0;">P2P OTC Market</h2>
-                <div id="evmAddressDisplay" style="font-size: 11px; color: var(--accent); background: rgba(212,255,0,0.1); padding: 4px 8px; border-radius: 4px; border: 1px solid var(--accent-dim);">Base: Not Connected</div>
+    <div style="margin-bottom: 1rem;">
+        <!-- Header -->
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px;">
+            <div>
+                <h2 style="margin: 0; font-size: 1.5rem; font-weight: 700;">P2P OTC Market</h2>
+                
+                <!-- Warning Stickers -->
+                <div style="display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap;">
+                    <span style="
+                        background-color: #dc2626; 
+                        color: white; 
+                        font-size: 11px; 
+                        font-weight: 700; 
+                        padding: 4px 11px; 
+                        border-radius: 9999px; 
+                        letter-spacing: 0.5px;
+                        box-shadow: 0 2px 4px rgba(220, 38, 38, 0.35);
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 4px;
+                    ">
+                        ⚠ HIGHLY EXPERIMENTAL
+                    </span>
+                    
+                    <span style="
+                        background-color: #dc2626; 
+                        color: white; 
+                        font-size: 11px; 
+                        font-weight: 700; 
+                        padding: 4px 11px; 
+                        border-radius: 9999px; 
+                        letter-spacing: 0.5px;
+                        box-shadow: 0 2px 4px rgba(220, 38, 38, 0.35);
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 4px;
+                    ">
+                        ⚠ USE AT YOUR OWN RISK
+                    </span>
+                </div>
             </div>
-            <p style="font-size: 11px; color: #888; margin-top: -10px; margin-bottom: 20px;">
-                Trustless cross-chain Atomic Swaps. Trade MDS for Base ETH with zero middleman fees.
-            </p>
+
+            <!-- Connection Status -->
+            <div id="evmAddressDisplay" style="
+                font-size: 11px; 
+                color: var(--accent); 
+                background: rgba(212,255,0,0.1); 
+                padding: 4px 8px; 
+                border-radius: 4px; 
+                border: 1px solid var(--accent-dim);
+                white-space: nowrap;
+            ">
+                Base: Not Connected
+            </div>
+        </div>
+
+        <!-- Subtitle -->
+        <p style="font-size: 12px; color: #888; margin: 0; line-height: 1.4;">
+            Trustless cross-chain Atomic Swaps. Trade MDS for Base ETH with zero middleman fees.
+        </p>
 
             <div class="tabs" style="margin-bottom: 1rem;">
                 <div class="tab active" id="tab-market" onclick="switchTabDex('market')">Live Orderbook</div>
@@ -939,8 +992,7 @@
         <!-- NAV (7 tabs now) -->
         <nav id="bottom-nav" class="hidden">
             <button class="nav-btn active" data-target="view-home"><span class="nav-icon">🏠</span><span>Home</span></button>
-            <!--<button class="nav-btn" data-target="view-dex"><span class="nav-icon">📈</span><span>DEX</span></button>-->
-
+            <button class="nav-btn" data-target="view-dex"><span class="nav-icon">📈</span><span>P2P OTC DEX</span></button>
             <button class="nav-btn" data-target="view-mine"><span class="nav-icon">⛏️</span><span>Mine</span></button>
             <button class="nav-btn" data-target="view-send"><span class="nav-icon">💸</span><span>Send</span></button>
             <button class="nav-btn" data-target="view-receive"><span class="nav-icon">⬇️</span><span>Receive</span></button>
