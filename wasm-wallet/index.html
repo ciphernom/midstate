@@ -714,7 +714,7 @@
 <!-- DEX -->
         <main id="view-dex" class="page">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                <h2 style="margin: 0;">HIGHLY EXPERIMENTAL P2P OTC Market -- USE AT OWN RISK</h2>
+                <h2 style="margin: 0;">P2P OTC Market</h2>
                 <div id="evmAddressDisplay" style="font-size: 11px; color: var(--accent); background: rgba(212,255,0,0.1); padding: 4px 8px; border-radius: 4px; border: 1px solid var(--accent-dim);">Base: Not Connected</div>
             </div>
             <p style="font-size: 11px; color: #888; margin-top: -10px; margin-bottom: 20px;">
@@ -939,7 +939,7 @@
         <!-- NAV (7 tabs now) -->
         <nav id="bottom-nav" class="hidden">
             <button class="nav-btn active" data-target="view-home"><span class="nav-icon">🏠</span><span>Home</span></button>
-            <button class="nav-btn" data-target="view-dex"><span class="nav-icon">📈</span><span>EXPERIMENTAL DEX</span></button>-->
+            <!--<button class="nav-btn" data-target="view-dex"><span class="nav-icon">📈</span><span>DEX</span></button>-->
 
             <button class="nav-btn" data-target="view-mine"><span class="nav-icon">⛏️</span><span>Mine</span></button>
             <button class="nav-btn" data-target="view-send"><span class="nav-icon">💸</span><span>Send</span></button>
@@ -3506,6 +3506,15 @@ document.getElementById('btnExport').onclick = () => {
         function counterMdsPk(swap)  { return swap.role === 'maker' ? swap.takerMdsPk  : swap.makerMdsPk; }
         function counterEvmAddr(swap) { return swap.role === 'maker' ? swap.takerEvmAddr : swap.makerEvmAddr; }
         function prettyEth(wei) { try { return parseFloat(ethers.formatEther(wei)).toFixed(6); } catch (_) { return '?'; } }
+        // An offer is "engaged" once we're actively trading it — we took it (a taker
+        // swap exists) or our own offer was accepted (maker swap past the waiting
+        // stage). The P2P bus re-delivers the original offer message periodically, so
+        // without this guard a taken offer pops back into the book (sometimes rendered
+        // from the maker's side, i.e. a sell showing as a buy). Suppress those.
+        function dexOfferEngaged(offerId) {
+            return dexMySwaps.some(s => s.offerId === offerId &&
+                (s.role === 'taker' || (s.role === 'maker' && s.status !== 'waiting_for_taker')));
+        }
 
         document.getElementById('btnConnectBase').onclick = async () => {
             if (!window.ethereum) return showToast("MetaMask not found!", "error");
@@ -3554,12 +3563,14 @@ document.getElementById('btnExport').onclick = () => {
             const offerId = Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2, '0')).join('');
             const kind = dexDirection;
             worker.postMessage({ type: 'DEX_BROADCAST_OFFER', payload: {
-                offerId, kind, mdsAmount: mdsAmt, weiAmount: String(weiAmt), makerEvmAddr: evmAddress, ts: Date.now()
+                offerId, kind, mdsAmount: mdsAmt, weiAmount: String(weiAmt), makerEvmAddr: evmAddress, ts: Date.now(),
+                swapMode: 'covenant'   // fee-less for the MDS buyer; HTLC stays available for legacy peers
             }});
 
             dexMySwaps.push({
                 role: 'maker', side: makerSideForKind(kind), kind, status: 'waiting_for_taker',
-                offerId, mdsAmount: mdsAmt, weiAmount: String(weiAmt), makerEvmAddr: evmAddress
+                offerId, mdsAmount: mdsAmt, weiAmount: String(weiAmt), makerEvmAddr: evmAddress,
+                swapMode: 'covenant'
             });
             saveSwaps();
             renderDexSwaps();
@@ -3587,7 +3598,8 @@ document.getElementById('btnExport').onclick = () => {
                 offerId: offer.offerId,
                 makerMdsPk: offer.makerMdsPk, makerEvmAddr: offer.makerEvmAddr,
                 takerEvmAddr: evmAddress,
-                mdsAmount: offer.mdsAmount, weiAmount: String(offer.weiAmount)
+                mdsAmount: offer.mdsAmount, weiAmount: String(offer.weiAmount),
+                swapMode: offer.swapMode || 'htlc'   // honour the maker's mode; legacy offers => htlc
             };
             dexMySwaps.push(swap);
             saveSwaps();
@@ -3614,7 +3626,25 @@ document.getElementById('btnExport').onclick = () => {
             dexMySwaps.splice(idx, 1);
             saveSwaps();
             renderDexSwaps();
+            renderDexOrderbook();
             showToast("Offer cancelled.", "success");
+        };
+
+        // Abandon an in-progress swap — ONLY safe for ETH-side states where this party
+        // has locked nothing on-chain. A swap that already locked funds must be unwound
+        // with refund-after-timeout (Base refund / Midstate HTLC refund), not removed,
+        // or the funds would be orphaned. This guard refuses the unsafe cases.
+        window.dexAbandonSwap = function(idx) {
+            const s = dexMySwaps[idx];
+            if (!s) return;
+            const safe = s.side === 'eth' && ['htlc_invalid', 'waiting_for_mds_lock', 'ready_to_lock_base'].includes(s.status);
+            if (!safe) return showToast("This swap has funds committed on-chain — it can't be abandoned. Use refund after the timeout.", "error");
+            if (!confirm("Abandon this swap? You have nothing locked on-chain, so this only removes it from your list. If the counterparty already locked MDS, they reclaim it automatically after their timeout.")) return;
+            dexMySwaps.splice(idx, 1);
+            saveSwaps();
+            renderDexSwaps();
+            renderDexOrderbook();
+            showToast("Swap abandoned.", "success");
         };
 
         // The MDS-side (whoever holds MDS) locks the Midstate HTLC and generates
@@ -3623,10 +3653,18 @@ document.getElementById('btnExport').onclick = () => {
             swap.status = 'locking_midstate';
             saveSwaps();
             renderDexSwaps();
+            renderDexOrderbook();   // we're engaged now — clear our own offer from the book
+            // NOTE: we intentionally do NOT broadcast a "locking started" chat here.
+            // Sending a client-mined chat message immediately before the HTLC commit can
+            // contend with it in the mempool (same sender) and get the commit rejected,
+            // stalling the lock. The counterparty still gets a clear waiting state below;
+            // a live "started" signal can be re-added later via a path that can't race
+            // the commit (e.g. emitted by the worker after the commit is accepted).
             worker.postMessage({ type: 'DEX_LOCK_MIDSTATE', payload: {
                 offerId: swap.offerId,
                 expectedAmount: swap.mdsAmount,
-                takerPk: counterMdsPk(swap)   // worker key: HTLC receiver = the ETH-side's MDS pubkey
+                takerPk: counterMdsPk(swap),  // worker key: HTLC receiver = the ETH-side's MDS pubkey
+                swapMode: swap.swapMode || 'htlc'
             }});
         }
 
@@ -3635,6 +3673,7 @@ document.getElementById('btnExport').onclick = () => {
             if (e.data.type === 'DEX_OFFER_RECEIVED') {
                 const offer = e.data.payload;
                 if (offer.ts && (Date.now() - offer.ts) > OFFER_TTL_MS) return;
+                if (dexOfferEngaged(offer.offerId)) return;   // taken/accepted — don't let the bus re-add it
                 const key = offer.offerId || offer.nonce;
                 const ex = dexOrderbook.find(o => (o.offerId || o.nonce) === key);
                 if (ex) Object.assign(ex, offer); else dexOrderbook.push(offer);
@@ -3656,6 +3695,7 @@ document.getElementById('btnExport').onclick = () => {
                     swap.status = 'waiting_for_mds_lock';
                     saveSwaps();
                     renderDexSwaps();
+                    renderDexOrderbook();   // engaged — clear our own offer from the book
                     showToast("Offer accepted — waiting for the buyer to lock MDS…", "success");
                 }
             }
@@ -3669,6 +3709,8 @@ document.getElementById('btnExport').onclick = () => {
                 swap.htlcAddressHex = data.htlcAddressHex;
                 swap.timeoutHeight = data.timeoutHeight;
                 swap.mdsLockerPk = data.makerMdsPk;   // worker returns the locker's own pubkey here
+                swap.swapMode = data.swapMode || swap.swapMode || 'htlc';
+                if (data.minPayout != null) swap.minPayout = data.minPayout;
                 swap.status = 'ready_to_claim_base';
                 delete swap.phase;                    // lock leg done — stop showing commit/reveal steps
                 saveSwaps();
@@ -3678,10 +3720,18 @@ document.getElementById('btnExport').onclick = () => {
                     offerId: swap.offerId, replyTo: null,
                     secretHash: data.secretHash, htlcCoins: data.htlcCoins,
                     timeoutHeight: data.timeoutHeight,
-                    mdsLockerPk: data.makerMdsPk       // the MDS-side's (refund) pubkey
+                    mdsLockerPk: data.makerMdsPk,      // the MDS-side's (refund) pubkey
+                    swapMode: swap.swapMode            // so the ETH-side verifies/settles the same way
                 }});
                 showToast("MDS locked. Waiting for the counterparty to lock ETH…", "success");
                 startEthLockWatch(swap.offerId);
+            }
+            else if (e.data.type === 'DEX_LOCKING_RECEIVED') {
+                // The MDS-side told us they've started locking. Surface real activity on
+                // our waiting card so it doesn't look stalled during their ~2-block lock.
+                const { offerId } = e.data.payload;
+                const swap = dexMySwaps.find(s => s.offerId === offerId && s.side === 'eth' && s.status === 'waiting_for_mds_lock');
+                if (swap) { swap.counterpartyLocking = true; renderDexSwaps(); } // transient
             }
             else if (e.data.type === 'DEX_LOCKED_RECEIVED') {
                 const lockData = e.data.payload;
@@ -3691,6 +3741,7 @@ document.getElementById('btnExport').onclick = () => {
                 swap.htlcCoins = lockData.htlcCoins;
                 swap.timeoutHeight = lockData.timeoutHeight;
                 swap.mdsLockerPk = lockData.mdsLockerPk;
+                swap.swapMode = lockData.swapMode || swap.swapMode || 'htlc';
                 swap.status = 'verifying_htlc';
                 saveSwaps();
                 renderDexSwaps();
@@ -3701,7 +3752,8 @@ document.getElementById('btnExport').onclick = () => {
                     makerMdsPk: lockData.mdsLockerPk,  // worker key: refund = the MDS-side's pubkey
                     htlcCoins: lockData.htlcCoins,
                     expectedTotal: swap.mdsAmount,
-                    baseRefundSecs: BASE_REFUND_DELAY_SECS
+                    baseRefundSecs: BASE_REFUND_DELAY_SECS,
+                    swapMode: swap.swapMode
                 }});
             }
             else if (e.data.type === 'DEX_HTLC_VERIFIED') {
@@ -3721,9 +3773,48 @@ document.getElementById('btnExport').onclick = () => {
             }
             else if (e.data.type === 'DEX_CLAIM_SUCCESS') {
                 hideActivity();
-                const idx = e.data.payload.swapIdx;
-                if (dexMySwaps[idx]) { dexMySwaps[idx].status = 'completed'; delete dexMySwaps[idx].phase; saveSwaps(); renderDexSwaps(); }
+                const { swapIdx, offerId } = e.data.payload;
+                // Identify by offerId (the claim is always the ETH-side sweeping MDS), not
+                // by array index — splices/reorders can make a stale index hit the wrong swap.
+                const swap = (offerId && dexMySwaps.find(s => s.offerId === offerId && s.side === 'eth')) || dexMySwaps[swapIdx];
+                if (swap) { swap.status = 'completed'; delete swap.phase; saveSwaps(); renderDexSwaps(); }
                 showToast("Successfully claimed MDS! Swap complete.", "success");
+            }
+            else if (e.data.type === 'DEX_SETTLE_SUCCESS') {
+                // A covenant delivery confirmed. role 'seller' = we delivered the buyer's
+                // MDS after taking their ETH; role 'buyer' = we self-delivered our own MDS.
+                hideActivity();
+                const { offerId, role } = e.data.payload;
+                const side = role === 'buyer' ? 'eth' : 'mds';
+                const swap = dexMySwaps.find(s => s.offerId === offerId && s.side === side) || dexMySwaps[e.data.payload.swapIdx];
+                if (swap) { swap.status = 'completed'; delete swap.phase; delete swap.settleError; saveSwaps(); renderDexSwaps(); }
+                showToast(role === 'buyer' ? "MDS delivered to your wallet! Swap complete." : "MDS delivered to the buyer. Swap complete.", "success");
+            }
+            else if (e.data.type === 'DEX_SETTLE_FAILED') {
+                hideActivity();
+                const { offerId, role, error } = e.data.payload;
+                const side = role === 'buyer' ? 'eth' : 'mds';
+                const swap = dexMySwaps.find(s => s.offerId === offerId && s.side === side);
+                if (swap) { delete swap.phase; swap.settleError = error || "delivery failed"; saveSwaps(); renderDexSwaps(); }
+                showToast("MDS delivery failed: " + (error || "unknown") + ". You can retry it.", "error");
+            }
+            else if (e.data.type === 'DEX_SETTLED_STATUS') {
+                // Reply to a delivery poll. If the covenant coins are spent, the MDS has
+                // moved to the buyer's address — finish the swap on whichever side we are.
+                const { offerId, settled } = e.data.payload;
+                if (!settled) return;
+                const swap = dexMySwaps.find(s => s.offerId === offerId &&
+                    ((s.side === 'eth' && s.status === 'waiting_for_delivery') ||
+                     (s.side === 'mds' && s.status === 'delivering_midstate')));
+                if (swap) {
+                    swap.status = 'completed';
+                    delete swap.phase;
+                    delete swap.settleError;
+                    saveSwaps();
+                    renderDexSwaps();
+                    if (swap.side === 'eth') worker.postMessage({ type: 'SCAN' });   // surface delivered coins
+                    showToast(swap.side === 'eth' ? "Your MDS was delivered! Swap complete." : "Delivery confirmed. Swap complete.", "success");
+                }
             }
             else if (e.data.type === 'DEX_PHASE') {
                 // Live commit/reveal progress for a Midstate leg (lock or claim).
@@ -3750,12 +3841,24 @@ document.getElementById('btnExport').onclick = () => {
                 }
                 swap.baseSwapId = swapId;
                 swap.fromBlock = receipt.blockNumber;
-                swap.status = 'ready_to_claim_midstate';
-                saveSwaps();
-                renderDexSwaps();
-                hideActivity();
-                showToast("ETH locked. Auto-claiming MDS once the secret is revealed…", "success");
-                startSecretWatch(swap.offerId);
+                if ((swap.swapMode || 'htlc') === 'covenant') {
+                    // Fee-less path: we do NOTHING on Midstate. The seller delivers our MDS
+                    // (covenant forces it to our address); we just watch for it to land, with
+                    // a zero-MDS self-deliver as a fallback if they stall.
+                    swap.status = 'waiting_for_delivery';
+                    saveSwaps();
+                    renderDexSwaps();
+                    hideActivity();
+                    showToast("ETH locked. Your MDS will be delivered automatically — no MDS or fee needed.", "success");
+                    startDeliveryWatch(swap.offerId);
+                } else {
+                    swap.status = 'ready_to_claim_midstate';
+                    saveSwaps();
+                    renderDexSwaps();
+                    hideActivity();
+                    showToast("ETH locked. Auto-claiming MDS once the secret is revealed…", "success");
+                    startSecretWatch(swap.offerId);
+                }
             } catch (err) {
                 hideActivity();
                 showToast("Failed to lock ETH: " + (err.shortMessage || err.message), "error");
@@ -3781,11 +3884,32 @@ document.getElementById('btnExport').onclick = () => {
                 const c = dexWriteContract();
                 const tx = await c.claim(swapId, "0x" + swap.secret);
                 await tx.wait();
-                swap.status = 'completed';
-                saveSwaps();
-                renderDexSwaps();
                 hideActivity();
-                showToast("Claimed ETH! The counterparty can now claim your MDS.", "success");
+                if ((swap.swapMode || 'htlc') === 'covenant') {
+                    // We just got the ETH and we hold the secret — deliver the buyer's MDS
+                    // now. The covenant pins it to their address and the fee comes from the
+                    // surplus we over-funded, which returns to us as change.
+                    swap.status = 'delivering_midstate';
+                    saveSwaps();
+                    renderDexSwaps();
+                    showToast("Claimed ETH! Delivering the buyer's MDS…", "success");
+                    worker.postMessage({ type: 'DEX_SETTLE_COVENANT', payload: {
+                        offerId: swap.offerId,
+                        swapIdx: idx,
+                        role: 'seller',
+                        rawSecret: swap.secret,
+                        buyerPk: counterMdsPk(swap),     // the ETH-side buyer (works for ASK and BID)
+                        minPayout: swap.minPayout != null ? swap.minPayout : Number(swap.mdsAmount),
+                        timeoutHeight: swap.timeoutHeight,
+                        makerMdsPk: swap.mdsLockerPk,    // refund pk baked into the covenant
+                        htlcCoins: swap.htlcCoins
+                    }});
+                } else {
+                    swap.status = 'completed';
+                    saveSwaps();
+                    renderDexSwaps();
+                    showToast("Claimed ETH! The counterparty can now claim your MDS.", "success");
+                }
             } catch (err) {
                 hideActivity();
                 showToast("Failed to claim ETH: " + (err.shortMessage || err.message), "error");
@@ -3812,6 +3936,53 @@ document.getElementById('btnExport').onclick = () => {
                 makerMdsPk: swap.mdsLockerPk,   // worker key: refund = the MDS-side's pubkey
                 secretHash: swap.secretHash,
                 timeoutHeight: swap.timeoutHeight
+            }});
+        };
+
+        // ── ETH-side: COVENANT self-delivery (fallback) ─────────────────────
+        // For covenant swaps the seller normally delivers our MDS automatically. If they
+        // stall, we can deliver it to ourselves — the covenant forces it to our address
+        // and the fee comes from the maker's locked surplus, so this works with ZERO MDS.
+        // Only possible once the seller has claimed our ETH (which reveals the secret).
+        window.dexSelfDeliver = async function(idx) {
+            const swap = dexMySwaps[idx];
+            if (!swap) return;
+            showActivity("Reading the revealed secret from Base…");
+            const rawSecret = await dexFetchRevealedSecret(swap).catch(() => null);
+            hideActivity();
+            if (!rawSecret) return showToast("The secret isn't on Base yet — the seller must claim your ETH first. It'll deliver automatically once they do.", "error");
+            delete swap.settleError;
+            swap.phase = "Starting self-delivery\u2026";
+            saveSwaps(); renderDexSwaps();
+            worker.postMessage({ type: 'DEX_SETTLE_COVENANT', payload: {
+                offerId: swap.offerId,
+                swapIdx: idx,
+                role: 'buyer',                  // worker uses OUR pubkey as the receiver
+                rawSecret,
+                minPayout: swap.minPayout != null ? swap.minPayout : Number(swap.mdsAmount),
+                timeoutHeight: swap.timeoutHeight,
+                makerMdsPk: swap.mdsLockerPk,   // refund pk baked into the covenant
+                htlcCoins: swap.htlcCoins
+            }});
+        };
+
+        // ── MDS-side: retry a covenant delivery that failed ─────────────────
+        window.dexRetryDeliver = function(idx) {
+            const swap = dexMySwaps[idx];
+            if (!swap || !swap.secret) return;
+            delete swap.settleError;
+            swap.phase = "Retrying delivery\u2026";
+            saveSwaps(); renderDexSwaps();
+            worker.postMessage({ type: 'DEX_SETTLE_COVENANT', payload: {
+                offerId: swap.offerId,
+                swapIdx: idx,
+                role: 'seller',
+                rawSecret: swap.secret,
+                buyerPk: counterMdsPk(swap),
+                minPayout: swap.minPayout != null ? swap.minPayout : Number(swap.mdsAmount),
+                timeoutHeight: swap.timeoutHeight,
+                makerMdsPk: swap.mdsLockerPk,
+                htlcCoins: swap.htlcCoins
             }});
         };
 
@@ -3877,7 +4048,37 @@ document.getElementById('btnExport').onclick = () => {
             for (const s of dexMySwaps) {
                 if (s.side === 'eth' && s.status === 'ready_to_claim_midstate') startSecretWatch(s.offerId);
                 if (s.side === 'mds' && s.status === 'ready_to_claim_base' && !s.counterpartyLocked) startEthLockWatch(s.offerId);
+                if (s.side === 'eth' && s.status === 'waiting_for_delivery') startDeliveryWatch(s.offerId);
+                if (s.side === 'mds' && s.status === 'delivering_midstate') {
+                    // Interrupted mid-delivery. Ask whether it actually landed; if it did,
+                    // DEX_SETTLED_STATUS completes the swap, otherwise we surface a retry.
+                    const firstCoin = s.htlcCoins && s.htlcCoins[0] && s.htlcCoins[0].coin_id;
+                    if (firstCoin) worker.postMessage({ type: 'DEX_CHECK_SETTLED', payload: { offerId: s.offerId, coinId: firstCoin } });
+                    s.settleError = s.settleError || "Delivery was interrupted on reload — retry.";
+                }
             }
+            renderDexSwaps();
+        }
+
+        // ETH-side (covenant): wait for the seller to deliver our MDS. We do no Midstate
+        // tx ourselves. Poll whether the covenant coins were spent (= delivered), and in
+        // parallel learn when the secret hits Base so the self-deliver fallback unlocks.
+        function startDeliveryWatch(offerId) {
+            const key = 'delivery:' + offerId;
+            if (_dexWatchers.has(key)) return;
+            _dexWatchers.add(key);
+            const tick = async () => {
+                const swap = dexMySwaps.find(s => s.offerId === offerId && s.side === 'eth');
+                if (!swap || swap.status === 'completed') { _dexWatchers.delete(key); return; }
+                if (swap.status !== 'waiting_for_delivery') { setTimeout(tick, 12000); return; }
+                const firstCoin = swap.htlcCoins && swap.htlcCoins[0] && swap.htlcCoins[0].coin_id;
+                if (firstCoin) worker.postMessage({ type: 'DEX_CHECK_SETTLED', payload: { offerId, coinId: firstCoin } });
+                if (!swap.secretRevealed) {
+                    try { const sec = await dexFetchRevealedSecret(swap); if (sec) { swap.secretRevealed = true; saveSwaps(); renderDexSwaps(); } } catch (_) {}
+                }
+                setTimeout(tick, 12000);
+            };
+            setTimeout(tick, 5000);
         }
 
         window.switchTabDex = function(tab) {
@@ -3893,6 +4094,8 @@ document.getElementById('btnExport').onclick = () => {
 
         function stepForStatus(st) {
             if (st === 'completed') return 4;
+            // Covenant settlement: ETH is locked and MDS is being delivered (step 4 work).
+            if (st === 'waiting_for_delivery' || st === 'delivering_midstate') return 3;
             if (st === 'ready_to_claim_base' || st === 'ready_to_claim_midstate') return 3;
             if (st === 'ready_to_lock_base' || st === 'verifying_htlc' || st === 'htlc_invalid') return 3;
             if (st === 'locking_midstate' || st === 'waiting_for_mds_lock') return 2;
@@ -3918,7 +4121,7 @@ document.getElementById('btnExport').onclick = () => {
             const tb = document.getElementById('dexOrderbook');
             if (!tb) return;
             const now = Date.now();
-            const live = dexOrderbook.filter(o => !o.ts || (now - o.ts) <= OFFER_TTL_MS);
+            const live = dexOrderbook.filter(o => (!o.ts || (now - o.ts) <= OFFER_TTL_MS) && !dexOfferEngaged(o.offerId));
             if (live.length === 0) {
                 tb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#555;">No live orders. Listening to P2P network…</td></tr>';
                 return;
@@ -3964,7 +4167,9 @@ document.getElementById('btnExport').onclick = () => {
                 } else if (s.status === 'locking_midstate') {
                     statusText = 'Locking your MDS in the on-chain HTLC…';
                 } else if (s.status === 'waiting_for_mds_lock') {
-                    statusText = 'Waiting for the seller to lock MDS…';
+                    statusText = s.counterpartyLocking
+                        ? 'Seller is locking MDS on-chain — commit + reveal, usually a few minutes…'
+                        : 'Waiting for the seller to lock MDS (a 2-step on-chain process)…';
                 } else if (s.status === 'verifying_htlc') {
                     statusText = 'Verifying the MDS lock on-chain…';
                 } else if (s.status === 'htlc_invalid') {
@@ -3982,16 +4187,52 @@ document.getElementById('btnExport').onclick = () => {
                 } else if (s.status === 'ready_to_claim_midstate') {
                     statusText = 'ETH locked. Auto-claiming MDS when the secret is revealed…';
                     btn = `<button style="margin:0;width:100%;padding:10px;font-size:13px;background:var(--text-max);color:#000;" onclick="dexClaimMidstate(${idx})">Claim MDS now</button>`;
+                } else if (s.status === 'waiting_for_delivery') {
+                    // Covenant buyer: the seller delivers our MDS (no fee, no MDS needed). We
+                    // only need the self-deliver fallback if they stall — and only once the
+                    // secret is on Base (which happens when they claim our ETH).
+                    statusText = s.secretRevealed
+                        ? 'Your ETH was claimed — MDS is being delivered to you. No action needed.'
+                        : 'ETH locked. Your MDS will be delivered automatically — no MDS or fee needed.';
+                    if (s.secretRevealed) {
+                        btn = `<button style="margin:0;width:100%;padding:9px;font-size:12px;background:transparent;border:1px solid var(--border-bright);color:var(--text-bright);" onclick="dexSelfDeliver(${idx})">Seller stalling? Deliver it yourself</button>`;
+                    }
+                } else if (s.status === 'delivering_midstate') {
+                    // Covenant seller: we took the ETH and are pushing the MDS to the buyer.
+                    if (s.settleError) {
+                        statusText = '⚠ Delivery failed: ' + s.settleError;
+                        btn = `<button style="margin:0;width:100%;padding:10px;font-size:13px;background:var(--accent);color:#000;" onclick="dexRetryDeliver(${idx})">Retry delivery</button>`;
+                    } else {
+                        statusText = "Delivering the buyer's MDS (you already hold the ETH)…";
+                    }
                 } else if (s.status === 'completed') {
                     statusText = 'Swap complete.';
                 }
 
                 // A Midstate commit/reveal step is in flight: show the live phase with a
-                // pulse and hide the action button so it can't be re-triggered.
+                // pulse and hide the action button so it can't be re-triggered. Also pulse
+                // when we're simply waiting on the counterparty, so the card reads as alive.
+                const waitingOnPeer = (s.status === 'waiting_for_mds_lock') ||
+                                      (s.status === 'ready_to_claim_base' && !s.counterpartyLocked) ||
+                                      (s.status === 'waiting_for_delivery') ||
+                                      (s.status === 'delivering_midstate' && !s.settleError);
                 let statusHtml = statusText;
                 if (s.phase) {
                     btn = '';
                     statusHtml = `<span class="dex-phase-dot"></span><span>${s.phase}</span>`;
+                } else if (waitingOnPeer) {
+                    statusHtml = `<span class="dex-phase-dot"></span><span>${statusText}</span>`;
+                }
+
+                // Safe cancel: only ETH-side states where THIS party has locked nothing
+                // on-chain. (Funds-locked swaps recover via refund-after-timeout instead.)
+                let secondaryBtn = '';
+                if (s.side === 'eth' && !s.phase &&
+                    (s.status === 'htlc_invalid' || s.status === 'waiting_for_mds_lock' || s.status === 'ready_to_lock_base')) {
+                    const style = btn
+                        ? 'margin:8px 0 0;width:100%;padding:7px;font-size:11px;background:transparent;border:1px solid var(--border);color:#888;'
+                        : 'margin:0;width:100%;padding:9px;font-size:12px;background:transparent;border:1px solid var(--border-bright);color:var(--text-bright);';
+                    secondaryBtn = `<button style="${style}" onclick="dexAbandonSwap(${idx})">Abandon swap</button>`;
                 }
 
                 return `<div class="swap-card">
@@ -4000,8 +4241,8 @@ document.getElementById('btnExport').onclick = () => {
                         <span style="font-size:11px;color:#888;text-transform:uppercase;">${s.role} · ${s.side === 'mds' ? 'MDS side' : 'ETH side'}</span>
                     </div>
                     ${getStepperHtml(s)}
-                    <div style="font-size:12px;color:var(--text-bright);text-align:center;margin-bottom:${btn ? '15px' : '0'};display:flex;align-items:center;justify-content:center;gap:7px;">${statusHtml}</div>
-                    ${btn}
+                    <div style="font-size:12px;color:var(--text-bright);text-align:center;margin-bottom:${(btn || secondaryBtn) ? '15px' : '0'};display:flex;align-items:center;justify-content:center;gap:7px;">${statusHtml}</div>
+                    ${btn}${secondaryBtn}
                 </div>`;
             }).join('');
         }

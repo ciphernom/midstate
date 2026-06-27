@@ -1,0 +1,855 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MIDSTATE // POOL</title>
+
+<!-- Theme bootstrap: apply saved theme before first paint, shared with Explorer + Chat -->
+<script>
+(function(){try{var t=localStorage.getItem('midstate-theme');if(t)document.documentElement.setAttribute('data-theme',t);}catch(e){}})();
+function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-theme')==='light'?'dark':'light';d.setAttribute('data-theme',n);try{localStorage.setItem('midstate-theme',n);}catch(e){}}
+</script>
+
+<!--
+  Styling note: the dashboard links to the canonical /midstate.css below so it stays
+  identical to the Explorer and Chat and inherits the global light/dark theme. The
+  block right here is a self-contained mirror so the file still renders if opened
+  directly (file://) or if the stylesheet route is ever unavailable. Because <link>
+  comes AFTER this <style>, the served midstate.css wins on every shared token/class.
+  Pool-specific layout classes (.pool-*, .card, .chart-wrap, ...) live only here.
+-->
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@300;400;500;700&display=swap');
+
+:root, [data-theme="dark"] {
+  --bg:#0a0a0a; --bg-alt:#141414; --bg-raised:#141414; --bg-panel:#161616;
+  --code-bg:#181818; --accent-bg:#1f1f1f;
+  --border:#262626; --border-bright:#363636;
+  --text-max:#f5f5f5; --text-main:#f5f5f5; --text-bright:#cfcfcf;
+  --text:#9a9a9a; --text-muted:#9a9a9a; --text-faint:#5a5a5a;
+  --accent:#f5f5f5; --accent-dim:#9a9a9a; --on-accent:#0a0a0a; --stark-accent:#f5f5f5;
+  --green:#f5f5f5; --red:#9a9a9a;
+  --radius:0; --shadow:none;
+}
+[data-theme="light"] {
+  --bg:#ffffff; --bg-alt:#ffffff; --bg-raised:#ffffff; --bg-panel:#fafafa;
+  --code-bg:#f4f4f4; --accent-bg:#efefef;
+  --border:#e3e3e3; --border-bright:#cfcfcf;
+  --text-max:#111111; --text-main:#111111; --text-bright:#383838;
+  --text:#565656; --text-muted:#565656; --text-faint:#a2a2a2;
+  --accent:#111111; --accent-dim:#565656; --on-accent:#ffffff; --stark-accent:#111111;
+  --green:#111111; --red:#565656;
+  --radius:0; --shadow:none;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.5;
+  display: flex; flex-direction: column; min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+::selection { background: var(--accent); color: var(--on-accent); }
+a:focus-visible, button:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 0; }
+
+/* shared chrome (mirror of midstate.css) */
+.hdr { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--bg); flex-shrink: 0; }
+.hdr h1 { font-size: 14px; font-weight: 700; color: var(--text-max); letter-spacing: 2px; }
+.hdr-right { display: flex; gap: 14px; color: var(--text); font-size: 10px; align-items: center; }
+.hdr-right span { display: flex; align-items: center; gap: 4px; }
+.hdr-right .label { color: var(--text-muted); }
+.hdr-right .val { color: var(--text-bright); font-variant-numeric: tabular-nums; }
+.live-dot { width: 5px; height: 5px; border-radius: 0; border: 1px solid var(--border); background: var(--green); }
+.btn { background: transparent; border: 1px solid var(--border); color: var(--text-main); font-family: 'Inter', sans-serif; font-size: 13px; font-weight: 500; padding: 6px 12px; cursor: pointer; text-decoration: none; line-height: 1.4; }
+.btn:hover { border-color: var(--accent); }
+.btn-sm { font-size: 11px; padding: 4px 10px; }
+.theme-toggle { display: inline-flex; align-items: center; justify-content: center; padding: 6px; color: var(--text-muted); line-height: 0; }
+.theme-toggle:hover { color: var(--text-main); }
+.theme-toggle svg { display: block; }
+.theme-toggle .icon-moon { display: none; }
+[data-theme="light"] .theme-toggle .icon-sun { display: none; }
+[data-theme="light"] .theme-toggle .icon-moon { display: block; }
+
+/* layout */
+.pool-wrap { max-width: 1100px; margin: 20px auto; padding: 0 20px; flex: 1; width: 100%; }
+.pool-wrap a { color: var(--text-bright); text-decoration: none; }
+.pool-wrap a:hover { color: var(--accent); text-decoration: underline; }
+.pool-box { background: var(--bg-alt); border: 1px solid var(--border); padding: 18px; margin-bottom: 18px; }
+.pool-box h2 { font-size: 13px; font-weight: 700; color: var(--text-max); margin-bottom: 14px; border-bottom: 1px solid var(--border); padding-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
+.mono { font-family: 'JetBrains Mono', monospace; }
+.num { font-variant-numeric: tabular-nums; }
+
+/* provably-fair anchor */
+.anchor { background: var(--code-bg); border: 1px solid var(--border); border-left: 3px solid var(--stark-accent); padding: 13px 16px; margin-bottom: 18px; }
+.anchor .k { font-family: 'Inter', sans-serif; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 6px; }
+.anchor .root { font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--text-bright); word-break: break-all; user-select: all; }
+.anchor .sub { font-size: 10px; color: var(--text-faint); margin-top: 6px; }
+
+/* metric cards */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin-bottom: 18px; }
+.card { border: 1px solid var(--border); background: var(--bg-panel); padding: 14px 16px; display: flex; flex-direction: column; gap: 5px; }
+.card-k { font-family: 'Inter', sans-serif; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); }
+.card-v { font-family: 'JetBrains Mono', monospace; font-size: 21px; font-weight: 700; color: var(--text-max); line-height: 1.1; font-variant-numeric: tabular-nums; word-break: break-word; }
+.card-sub { font-size: 11px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.effort-bar { height: 8px; border: 1px solid var(--border); background: transparent; margin-top: 5px; }
+.effort-bar .fill { height: 100%; width: 0; background: var(--accent); }
+
+/* charts */
+.charts { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.chart-wrap { position: relative; height: 240px; }
+.chart-box h2 { margin-bottom: 12px; }
+
+/* tables */
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; margin-top: 4px; font-size: 12px; }
+th, td { border: 1px solid var(--border); padding: 8px; text-align: left; vertical-align: top; }
+th { background-color: var(--bg); color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 1px; font-size: 10px; white-space: nowrap; }
+td { color: var(--text-main); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.addr { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-bright); word-break: break-all; }
+.empty-row td { text-align: center; color: var(--text-muted); }
+.pay { display: flex; justify-content: space-between; gap: 10px; padding: 1px 0; }
+.pay .amt { color: var(--text-bright); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.eff-tag { display: inline-block; min-width: 54px; text-align: right; font-variant-numeric: tabular-nums; }
+.eff-good { color: var(--green); }
+.eff-bad { color: var(--red); }
+
+/* connect box */
+.code { background: var(--code-bg); color: var(--text-bright); padding: 10px 12px; border-left: 3px solid var(--stark-accent); overflow-x: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; user-select: all; }
+.hint { color: var(--text-muted); font-size: 12px; margin-bottom: 10px; }
+
+/* miner view header */
+.ctx { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+.ctx .k { font-family: 'Inter', sans-serif; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 6px; }
+.ctx .ctx-addr { font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--text-bright); word-break: break-all; user-select: all; }
+.back { font-family: 'Inter', sans-serif; font-size: 12px; color: var(--text-muted); white-space: nowrap; }
+
+/* audit */
+.audit-out { margin-top: 10px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-faint); line-height: 1.7; word-break: break-all; }
+.audit-out .ok { color: var(--green); font-weight: 700; }
+.audit-out .bad { color: var(--red); font-weight: 700; }
+
+@media (max-width: 800px) {
+  .charts { grid-template-columns: 1fr; }
+  .pool-wrap { margin: 12px auto; padding: 0 12px; }
+}
+</style>
+
+<!-- Canonical stylesheet (served by the pool binary). Overrides the mirror above. -->
+<link rel="stylesheet" href="/midstate.css">
+
+<!-- Chart.js (sharp/monochrome styling applied at runtime). Optional: tables work without it. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+</head>
+
+<body class="page-pool">
+
+<div class="hdr">
+  <h1>MIDSTATE<span style="color:var(--accent);">.</span>POOL</h1>
+  <div class="hdr-right">
+    <span><span class="label">FEE</span> <span class="val" id="h-fee">--</span></span>
+    <span><span class="label">MINERS</span> <span class="val" id="h-miners">--</span></span>
+    <span><div class="live-dot" id="live-dot" style="background: var(--red);"></div> <span class="label">STATUS</span> <span class="val" id="status-text">OFFLINE</span></span>
+    <button id="theme-toggle" class="btn theme-toggle" onclick="toggleTheme()" aria-label="Toggle theme"><svg class="icon-sun" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg><svg class="icon-moon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
+  </div>
+</div>
+
+<main class="pool-wrap">
+
+  <!-- ============ VIEW A: GLOBAL POOL OVERVIEW ============ -->
+  <section id="view-pool">
+
+    <div class="anchor">
+      <div class="k">Merkle Pre-Commitment Root</div>
+      <div class="root" id="merkle-root">--</div>
+      <div class="sub">Embedded in this block's coinbase before any hashing begins. Your miner reconstructs it from <span class="mono">/api/proof</span> every block and disconnects on mismatch.</div>
+    </div>
+
+    <div class="cards">
+      <div class="card">
+        <div class="card-k">Network Hashrate</div>
+        <div class="card-v" id="m-net-hr">--</div>
+        <div class="card-sub">est. from network target</div>
+      </div>
+      <div class="card">
+        <div class="card-k">Pool Hashrate</div>
+        <div class="card-v" id="m-pool-hr">--</div>
+        <div class="card-sub" id="m-pool-share">share of network --</div>
+      </div>
+      <div class="card">
+        <div class="card-k">Current Effort</div>
+        <div class="card-v" id="m-effort">--</div>
+        <div class="effort-bar"><div class="fill" id="m-effort-fill"></div></div>
+        <div class="card-sub" id="m-effort-label">accumulated vs expected shares</div>
+      </div>
+      <div class="card">
+        <div class="card-k">Active Miners</div>
+        <div class="card-v" id="m-miners">--</div>
+        <div class="card-sub" id="m-pool-meta">fee -- / -- shares staked</div>
+      </div>
+    </div>
+
+    <div class="charts">
+      <div class="pool-box chart-box">
+        <h2>Hashrate -- Pool vs Network (10 min)</h2>
+        <div class="chart-wrap"><canvas id="chart-hr"></canvas></div>
+      </div>
+      <div class="pool-box chart-box">
+        <h2>Block Effort -- History + Current Round</h2>
+        <div class="chart-wrap"><canvas id="chart-effort"></canvas></div>
+      </div>
+    </div>
+
+    <div class="pool-box">
+      <h2>Miner Leaderboard (Active Shares)</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Miner Address</th><th class="num">Live Hashrate</th><th class="num">Active Shares</th><th class="num">Weight</th></tr></thead>
+          <tbody id="miners-table"><tr class="empty-row"><td colspan="4">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="pool-box">
+      <h2>Recent Blocks Found &amp; Payouts</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th class="num">Age</th><th>Block Hash</th><th class="num">Effort</th><th>Paid</th></tr></thead>
+          <tbody id="blocks-table"><tr class="empty-row"><td colspan="4">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="pool-box">
+      <h2>How to Connect</h2>
+      <p class="hint">Provably-fair SPV pool. Your miner mathematically audits the pool every block.</p>
+      <div class="code">./midstate miner --pool-url stratum+tcp://rpc.cypherpunk.gold:3333 --payout-address &lt;YOUR_WALLET_ADDRESS&gt;</div>
+    </div>
+
+  </section>
+
+  <!-- ============ VIEW B: INDIVIDUAL MINER DASHBOARD ============ -->
+  <section id="view-miner" hidden>
+
+    <div class="pool-box">
+      <div class="ctx">
+        <div>
+          <div class="k">Miner Address</div>
+          <div class="ctx-addr" id="miner-addr">--</div>
+        </div>
+        <a class="back" href="#/">&larr; Back to Pool</a>
+      </div>
+    </div>
+
+    <div class="cards">
+      <div class="card">
+        <div class="card-k">Live Hashrate</div>
+        <div class="card-v" id="mn-hr">--</div>
+        <div class="card-sub">60-second rolling average</div>
+      </div>
+      <div class="card">
+        <div class="card-k">Active Shares</div>
+        <div class="card-v" id="mn-shares">--</div>
+        <div class="card-sub" id="mn-weight">-- of next block reward</div>
+      </div>
+      <div class="card">
+        <div class="card-k">Blocks Won</div>
+        <div class="card-v" id="mn-won">--</div>
+        <div class="card-sub">of last 100 blocks</div>
+      </div>
+      <div class="card">
+        <div class="card-k">Total Earned</div>
+        <div class="card-v" id="mn-earned">--</div>
+        <div class="card-sub">across last 100 blocks</div>
+      </div>
+    </div>
+
+    <div class="charts">
+      <div class="pool-box chart-box">
+        <h2>Miner Hashrate (10 min)</h2>
+        <div class="chart-wrap"><canvas id="chart-mn-hr"></canvas></div>
+      </div>
+      <div class="pool-box chart-box">
+        <h2>Earnings History -- Last 100 Blocks</h2>
+        <div class="chart-wrap"><canvas id="chart-mn-earn"></canvas></div>
+      </div>
+    </div>
+
+    <div class="pool-box">
+      <h2>Inclusion Audit</h2>
+      <button class="btn btn-sm" id="audit-btn" type="button">Run inclusion audit</button>
+      <div class="audit-out" id="audit-out">Proves this address's shares are committed in the current block's coinbase before you hash.</div>
+    </div>
+
+    <div class="pool-box">
+      <h2>Recent Payouts</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th class="num">Age</th><th>Block Hash</th><th class="num">Amount Paid</th></tr></thead>
+          <tbody id="mn-payouts"><tr class="empty-row"><td colspan="3">No payouts to this address in the last 100 blocks.</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+  </section>
+
+</main>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+const POLL_MS   = 5000;                 // backend polling interval
+const WINDOW_MS = 10 * 60 * 1000;       // 10-minute rolling chart window
+const HASHRATE_WINDOW_MS = 60 * 1000;   // 60-second rolling-average hashrate window
+const TWO256    = 2n ** 256n;           // numerator for hashes-per-target
+
+// Explorer deep-links use a root query param (confirmed with the node team).
+const EXPLORER_BLOCK_URL = (hash) => '/?q=' + hash;
+
+// ---------------------------------------------------------------------------
+// Live state
+// ---------------------------------------------------------------------------
+let latest = null;                      // last /pool/stats payload
+
+let snapshots = [];                     // [{ t, total: BigInt, miners: {addrKey: BigInt} }] within 60s
+
+let displayPoolHashrate   = 0;          // Number (N/s), 60s rolling average
+let displayMinerHashrates = {};         // addrKey -> Number, 60s rolling average
+
+let shareTargetBig    = 0n;
+let expectedSharesBig = 0n;             // expected pool shares to find one block
+let networkHashrate   = 0;              // Number (N/s)
+
+const poolHist  = [];                   // [{t, v}]
+const netHist   = [];                   // [{t, v}]
+const minerHist = {};                   // addrKey -> [{t, v}]
+
+const charts = {};                      // id -> Chart instance
+const haveChart = (typeof Chart !== 'undefined');
+if (haveChart) {
+  Chart.defaults.font.family = "'JetBrains Mono', monospace";
+  Chart.defaults.font.size = 9;
+  Chart.defaults.animation = false;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+function fmtInt(n) {
+  n = Number(n) || 0;
+  return n.toLocaleString('en-US', { maximumFractionDigits: 0 });
+}
+
+function formatHashrate(nps) {
+  nps = Number(nps) || 0;
+  if (nps >= 1e9) return (nps / 1e9).toFixed(2) + ' GN/s';
+  if (nps >= 1e6) return (nps / 1e6).toFixed(2) + ' MN/s';
+  if (nps >= 1e3) return (nps / 1e3).toFixed(1) + ' kN/s';
+  return nps.toFixed(1) + ' N/s';
+}
+
+function relAge(tsSecs) {
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - Number(tsSecs)));
+  if (s < 60) return s + 's ago';
+  const m = Math.floor(s / 60); if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60); if (h < 24) return h + 'h ago';
+  return Math.floor(h / 24) + 'd ago';
+}
+
+const timeLabel = (t) => new Date(t).toLocaleTimeString('en-US', { hour12: false });
+const shortHash = (h) => (h && h.length > 20) ? (h.slice(0, 10) + '...' + h.slice(-8)) : (h || '');
+const shortAddr = (a) => (a && a.length > 20) ? (a.slice(0, 10) + '...' + a.slice(-8)) : (a || '');
+
+// Canonical 64-hex key for matching addresses regardless of checksum form.
+const addrKey = (a) => (a || '').toLowerCase().replace(/[^0-9a-f]/g, '').slice(0, 64);
+
+function targetBig(hex) {
+  if (!hex) return 0n;
+  try { return BigInt('0x' + hex); } catch (e) { return 0n; }
+}
+
+// Expected pool shares to find a block, given a network target (falls back to current).
+function blockExpected(netHex) {
+  const net = targetBig(netHex);
+  if (net > 0n && shareTargetBig > 0n) return shareTargetBig / net;
+  return expectedSharesBig;
+}
+
+function effortPct(scoreVal, expBig) {
+  if (!expBig || expBig <= 0n) return null;
+  try { return Number(BigInt(scoreVal) * 10000n / expBig) / 100; } catch (e) { return null; }
+}
+
+function effortStyle(pct) {
+  if (pct == null) return { color: 'var(--text-faint)', label: 'no data', w: 0 };
+  let color, label;
+  if (pct < 100)       { color = 'var(--green)';  label = 'lucky'; }
+  else if (pct <= 150) { color = 'var(--accent)'; label = 'on pace'; }
+  else if (pct <= 200) { color = 'var(--red)';    label = 'high'; }
+  else                 { color = 'var(--red)';    label = 'running hot'; }
+  const w = Math.max(2, Math.min(100, pct / 2));   // 200% effort fills the bar
+  return { color, label, w };
+}
+
+// Collapse a block's coinbase outputs into one row per address (power-of-2 coins summed).
+function aggregate(payouts) {
+  const m = new Map();
+  (payouts || []).forEach((p) => {
+    const k = addrKey(p.address);
+    const cur = m.get(k) || { address: p.address, value: 0 };
+    cur.value += Number(p.value) || 0;
+    m.set(k, cur);
+  });
+  return [...m.values()].sort((a, b) => b.value - a.value);
+}
+
+function palette() {
+  return {
+    accent:   cssVar('--accent'),
+    accentBg: cssVar('--accent-bg'),
+    text:     cssVar('--text-muted'),
+    bright:   cssVar('--text-bright'),
+    faint:    cssVar('--text-faint'),
+    border:   cssVar('--border'),
+    grid:     cssVar('--border'),
+    green:    cssVar('--green'),
+    red:      cssVar('--red'),
+    max:      cssVar('--text-max'),
+    panel:    cssVar('--bg-panel')
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Chart option builders (sharp terminal look: tension 0, no points, monochrome)
+// ---------------------------------------------------------------------------
+function lineOpts(yFmt) {
+  const pal = palette();
+  return {
+    responsive: true, maintainAspectRatio: false, animation: false,
+    interaction: { intersect: false, mode: 'index' },
+    plugins: {
+      legend: { display: true, labels: { color: pal.text, boxWidth: 10, boxHeight: 2, font: { size: 9 } } },
+      tooltip: { backgroundColor: pal.panel, borderColor: pal.border, borderWidth: 1, titleColor: pal.max, bodyColor: pal.bright,
+        callbacks: yFmt ? { label: (c) => c.dataset.label + ': ' + yFmt(c.parsed.y) } : {} }
+    },
+    scales: {
+      x: { grid: { color: pal.grid, drawTicks: false }, ticks: { color: pal.faint, maxTicksLimit: 6, maxRotation: 0, autoSkip: true }, border: { color: pal.border } },
+      y: { grid: { color: pal.grid, drawTicks: false }, ticks: { color: pal.faint, maxTicksLimit: 5, callback: (v) => yFmt ? yFmt(v) : v }, border: { color: pal.border }, beginAtZero: true }
+    }
+  };
+}
+
+function barOpts(yFmt) {
+  const pal = palette();
+  return {
+    responsive: true, maintainAspectRatio: false, animation: false,
+    plugins: {
+      legend: { display: false },
+      tooltip: { backgroundColor: pal.panel, borderColor: pal.border, borderWidth: 1, titleColor: pal.max, bodyColor: pal.bright,
+        callbacks: yFmt ? { label: (c) => yFmt(c.parsed.y) } : {} }
+    },
+    scales: {
+      x: { grid: { display: false }, ticks: { color: pal.faint, maxTicksLimit: 8, maxRotation: 0, autoSkip: true }, border: { color: pal.border } },
+      y: { grid: { color: pal.grid, drawTicks: false }, ticks: { color: pal.faint, maxTicksLimit: 5, callback: (v) => yFmt ? yFmt(v) : v }, border: { color: pal.border }, beginAtZero: true }
+    }
+  };
+}
+
+function destroyAllCharts() {
+  Object.keys(charts).forEach((k) => { try { charts[k].destroy(); } catch (e) {} delete charts[k]; });
+}
+
+function renderHashrateChart() {
+  if (!haveChart) return;
+  const ctx = $('chart-hr'); if (!ctx) return;
+  const labels = poolHist.map((p) => timeLabel(p.t));
+  const pool = poolHist.map((p) => p.v);
+  const net  = netHist.map((p) => p.v);
+  const pal = palette();
+  if (!charts.hr) {
+    charts.hr = new Chart(ctx, {
+      type: 'line',
+      data: { labels, datasets: [
+        { label: 'Pool',    data: pool, borderColor: pal.accent, backgroundColor: 'transparent', borderWidth: 1.5, tension: 0, pointRadius: 0, fill: false },
+        { label: 'Network', data: net,  borderColor: pal.faint,  backgroundColor: 'transparent', borderWidth: 1.5, borderDash: [4, 4], tension: 0, pointRadius: 0, fill: false }
+      ] },
+      options: lineOpts(formatHashrate)
+    });
+  } else {
+    charts.hr.data.labels = labels;
+    charts.hr.data.datasets[0].data = pool;
+    charts.hr.data.datasets[1].data = net;
+    charts.hr.update('none');
+    charts.hr.resize();
+  }
+}
+
+function renderEffortChart(blocks, currentEffort) {
+  if (!haveChart) return;
+  const ctx = $('chart-effort'); if (!ctx) return;
+  const pal = palette();
+  const arr = blocks.slice().reverse();                 // oldest -> newest
+
+  const labels = arr.map((b, i) => '#' + (i + 1));
+  const data   = arr.map((b) => effortPct(b.total_score, blockExpected(b.net_target)));
+  const bg     = data.map((v) => (v != null && v < 100) ? pal.green : pal.red);
+  const bd     = data.map(() => 'transparent');
+  const bw     = data.map(() => 0);
+
+  // Always append the live round as the right-most bar, so the chart is never empty
+  // and miners can watch the current round grow against history. Rendered hollow
+  // (faint fill + accent outline) to read as "active / not yet settled" -- this stays
+  // distinct in both themes, where accent/green/max all collapse to the same ink.
+  labels.push('Current');
+  data.push(currentEffort != null ? currentEffort : 0);
+  bg.push(pal.accentBg);
+  bd.push(pal.accent);
+  bw.push(2);
+
+  if (!charts.effort) {
+    charts.effort = new Chart(ctx, {
+      type: 'bar',
+      data: { labels, datasets: [{ label: 'Effort %', data, backgroundColor: bg, borderColor: bd, borderWidth: bw }] },
+      options: barOpts((v) => v + '%')
+    });
+  } else {
+    const ds = charts.effort.data.datasets[0];
+    charts.effort.data.labels = labels;
+    ds.data = data;
+    ds.backgroundColor = bg;
+    ds.borderColor = bd;
+    ds.borderWidth = bw;
+    charts.effort.update('none');
+    charts.effort.resize();
+  }
+}
+
+function renderMinerHrChart(key) {
+  if (!haveChart) return;
+  const ctx = $('chart-mn-hr'); if (!ctx) return;
+  const hist = minerHist[key] || [];
+  const labels = hist.map((p) => timeLabel(p.t));
+  const data = hist.map((p) => p.v);
+  const pal = palette();
+  if (!charts.mnhr) {
+    charts.mnhr = new Chart(ctx, {
+      type: 'line',
+      data: { labels, datasets: [{ label: 'Hashrate', data, borderColor: pal.accent, backgroundColor: 'transparent', borderWidth: 1.5, tension: 0, pointRadius: 0, fill: false }] },
+      options: lineOpts(formatHashrate)
+    });
+  } else {
+    charts.mnhr.data.labels = labels;
+    charts.mnhr.data.datasets[0].data = data;
+    charts.mnhr.data.datasets[0].borderColor = pal.accent;
+    charts.mnhr.update('none');
+    charts.mnhr.resize();
+  }
+}
+
+function renderMinerEarnChart(events) {
+  if (!haveChart) return;
+  const ctx = $('chart-mn-earn'); if (!ctx) return;
+  const arr = events.slice().reverse();                 // oldest -> newest
+  const labels = arr.map((e) => relAge(e.b.timestamp));
+  const data = arr.map((e) => e.sum);
+  const pal = palette();
+  if (!charts.mnearn) {
+    charts.mnearn = new Chart(ctx, {
+      type: 'bar',
+      data: { labels, datasets: [{ label: 'Paid', data, backgroundColor: pal.accent, borderWidth: 0 }] },
+      options: barOpts(fmtInt)
+    });
+  } else {
+    charts.mnearn.data.labels = labels;
+    charts.mnearn.data.datasets[0].data = data;
+    charts.mnearn.data.datasets[0].backgroundColor = pal.accent;
+    charts.mnearn.update('none');
+    charts.mnearn.resize();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Polling + client-side BigInt math
+// ---------------------------------------------------------------------------
+async function fetchStats() {
+  try {
+    const res = await fetch('/pool/stats');
+    const data = await res.json();
+    latest = data;
+
+    $('live-dot').style.background = 'var(--green)';
+    $('status-text').innerText = 'LIVE';
+
+    // Difficulty constants straight from raw targets -- no server-side floats.
+    shareTargetBig = targetBig(data.share_target);
+    const netBig = targetBig(data.network_target);
+    expectedSharesBig = (netBig > 0n && shareTargetBig > 0n) ? (shareTargetBig / netBig) : 0n;
+    const blockTime = Number(data.block_time_secs) || 60;
+    const hashesPerShareBig = shareTargetBig > 0n ? (TWO256 / shareTargetBig) : 0n;
+    networkHashrate = netBig > 0n ? (Number(TWO256 / netBig) / blockTime) : 0;
+
+    // ---- 60-second rolling-average hashrate ----
+    // Share submissions are Poisson, so a raw 5s delta spikes and craters between polls.
+    // Instead, diff the newest snapshot against the oldest one still inside a 60s window.
+    const now = Date.now();
+    const snap = { t: now, total: BigInt(data.total_score), miners: {} };
+    (data.miners || []).forEach((m) => { snap.miners[addrKey(m.address)] = BigInt(m.score); });
+
+    // Block-find reset: scores are deducted when a block lands, so total_score drops.
+    // Flush the buffer so the rate cleanly falls to 0 and rebuilds over the next 60s
+    // (which doubles as a visual "block just hit" indicator).
+    const prevSnap = snapshots.length ? snapshots[snapshots.length - 1] : null;
+    if (prevSnap && snap.total < prevSnap.total) snapshots = [];
+
+    snapshots.push(snap);
+    while (snapshots.length && snapshots[0].t < now - HASHRATE_WINDOW_MS) snapshots.shift();
+
+    const oldest = snapshots[0];
+    const newest = snapshots[snapshots.length - 1];
+    const dt = (newest.t - oldest.t) / 1000;
+    if (snapshots.length >= 2 && dt > 0 && hashesPerShareBig > 0n) {
+      const dPool = newest.total - oldest.total;
+      displayPoolHashrate = dPool > 0n ? Number(dPool * hashesPerShareBig) / dt : 0;
+      const hr = {};
+      Object.keys(newest.miners).forEach((k) => {
+        const o = oldest.miners[k] || 0n;
+        const d = newest.miners[k] - o;
+        hr[k] = d > 0n ? Number(d * hashesPerShareBig) / dt : 0;
+      });
+      displayMinerHashrates = hr;
+    } else {
+      // One snapshot only (fresh start or just after a block) -> rate is still rebuilding.
+      displayPoolHashrate = 0;
+      displayMinerHashrates = {};
+    }
+
+    // ---- 10-minute rolling chart history (consumes the smoothed values) ----
+    poolHist.push({ t: now, v: displayPoolHashrate });
+    netHist.push({ t: now, v: networkHashrate });
+    (data.miners || []).forEach((m) => {
+      const k = addrKey(m.address);
+      (minerHist[k] = minerHist[k] || []).push({ t: now, v: displayMinerHashrates[k] || 0 });
+    });
+
+    const cutoff = now - WINDOW_MS;
+    while (poolHist.length && poolHist[0].t < cutoff) poolHist.shift();
+    while (netHist.length && netHist[0].t < cutoff) netHist.shift();
+    Object.keys(minerHist).forEach((k) => {
+      const a = minerHist[k];
+      while (a.length && a[0].t < cutoff) a.shift();
+      if (!a.length) delete minerHist[k];
+    });
+
+    renderRoute();
+  } catch (err) {
+    $('live-dot').style.background = 'var(--red)';
+    $('status-text').innerText = 'OFFLINE';
+    console.error(err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Routing
+// ---------------------------------------------------------------------------
+function currentRoute() {
+  const h = location.hash.replace(/^#/, '');
+  const m = h.match(/^\/miner\/(.+)$/);
+  if (m) return { view: 'miner', address: decodeURIComponent(m[1]) };
+  return { view: 'pool' };
+}
+
+function renderRoute() {
+  const r = currentRoute();
+  $('view-pool').hidden  = (r.view !== 'pool');
+  $('view-miner').hidden = (r.view !== 'miner');
+  if (!latest) return;
+  if (r.view === 'pool') renderPool(latest);
+  else renderMiner(latest, r.address);
+}
+
+// ---------------------------------------------------------------------------
+// View A
+// ---------------------------------------------------------------------------
+function renderPool(data) {
+  const hasRoot = data.merkle_root && /[1-9a-f]/i.test(data.merkle_root);
+  $('merkle-root').textContent = hasRoot ? data.merkle_root : 'awaiting first job...';
+
+  const feeTxt = (data.pool_fee_percent != null ? data.pool_fee_percent : '--');
+  $('h-fee').textContent = feeTxt + '%';
+  $('h-miners').textContent = fmtInt(data.active_miners);
+
+  const total = Number(data.total_score) || 0;
+
+  $('m-net-hr').textContent = formatHashrate(networkHashrate);
+  $('m-pool-hr').textContent = formatHashrate(displayPoolHashrate);
+  const sharePct = networkHashrate > 0 ? (displayPoolHashrate / networkHashrate * 100) : 0;
+  $('m-pool-share').textContent = 'share of network ' + sharePct.toFixed(2) + '%';
+
+  const eff = effortPct(data.total_score, expectedSharesBig);
+  const st = effortStyle(eff);
+  $('m-effort').textContent = (eff == null) ? '--' : eff.toFixed(1) + '%';
+  const fill = $('m-effort-fill');
+  fill.style.width = st.w + '%';
+  fill.style.background = st.color;
+  const expTxt = expectedSharesBig > 0n ? fmtInt(Number(expectedSharesBig)) : '--';
+  $('m-effort-label').textContent = (eff == null)
+    ? 'accumulated vs expected shares'
+    : (st.label + ' / ' + fmtInt(total) + ' of ' + expTxt + ' shares');
+
+  $('m-miners').textContent = fmtInt(data.active_miners);
+  $('m-pool-meta').textContent = 'fee ' + feeTxt + '% / ' + fmtInt(total) + ' shares staked';
+
+  // Leaderboard
+  const tb = $('miners-table');
+  const miners = data.miners || [];
+  if (!miners.length) {
+    tb.innerHTML = '<tr class="empty-row"><td colspan="4">No active shares yet. Waiting for hashes...</td></tr>';
+  } else {
+    tb.innerHTML = miners.map((m) => {
+      const k = addrKey(m.address);
+      const hr = displayMinerHashrates[k] || 0;
+      const pct = total > 0 ? (Number(m.score) / total * 100) : 0;
+      const href = '#/miner/' + encodeURIComponent(m.address);
+      return '<tr>' +
+        '<td><a class="addr" href="' + href + '" title="' + esc(m.address) + '">' + esc(shortAddr(m.address)) + '</a></td>' +
+        '<td class="num">' + formatHashrate(hr) + '</td>' +
+        '<td class="num">' + fmtInt(m.score) + '</td>' +
+        '<td class="num">' + pct.toFixed(2) + '%</td>' +
+      '</tr>';
+    }).join('');
+  }
+
+  // Recent blocks
+  const bt = $('blocks-table');
+  const blocks = data.recent_blocks || [];
+  if (!blocks.length) {
+    bt.innerHTML = '<tr class="empty-row"><td colspan="4">No blocks found yet. Keep hashing!</td></tr>';
+  } else {
+    bt.innerHTML = blocks.map((b) => {
+      const e = effortPct(b.total_score, blockExpected(b.net_target));
+      const effCls = (e != null && e < 100) ? 'eff-good' : 'eff-bad';
+      const effTxt = (e == null) ? '--' : e.toFixed(1) + '%';
+      const hashCell = b.hash
+        ? ('<a href="' + EXPLORER_BLOCK_URL(b.hash) + '" target="_blank" rel="noopener" title="' + esc(b.hash) + '">' + esc(shortHash(b.hash)) + '</a>')
+        : '<span class="addr">--</span>';
+      const paid = aggregate(b.payouts).map((p) => {
+        const href = '#/miner/' + encodeURIComponent(p.address);
+        return '<div class="pay"><a class="addr" href="' + href + '" title="' + esc(p.address) + '">' + esc(shortAddr(p.address)) + '</a><span class="amt">' + fmtInt(p.value) + '</span></div>';
+      }).join('') || '--';
+      return '<tr>' +
+        '<td class="num">' + relAge(b.timestamp) + '</td>' +
+        '<td class="mono">' + hashCell + '</td>' +
+        '<td class="num"><span class="eff-tag ' + effCls + '">' + effTxt + '</span></td>' +
+        '<td>' + paid + '</td>' +
+      '</tr>';
+    }).join('');
+  }
+
+  renderHashrateChart();
+  renderEffortChart(blocks, eff);
+}
+
+// ---------------------------------------------------------------------------
+// View B
+// ---------------------------------------------------------------------------
+function renderMiner(data, address) {
+  const key = addrKey(address);
+  $('miner-addr').textContent = address;
+  $('audit-btn').onclick = () => runAudit(address);
+
+  const total = Number(data.total_score) || 0;
+  const miner = (data.miners || []).find((m) => addrKey(m.address) === key);
+  const score = miner ? Number(miner.score) : 0;
+  const hr = displayMinerHashrates[key] || 0;
+  const weight = total > 0 ? (score / total * 100) : 0;
+
+  const blocks = data.recent_blocks || [];
+  const events = blocks.map((b) => {
+    const sum = aggregate(b.payouts)
+      .filter((p) => addrKey(p.address) === key)
+      .reduce((acc, p) => acc + p.value, 0);
+    return { b, sum };
+  }).filter((e) => e.sum > 0);
+  const won = events.length;
+  const earned = events.reduce((acc, e) => acc + e.sum, 0);
+
+  $('mn-hr').textContent = formatHashrate(hr);
+  $('mn-shares').textContent = fmtInt(score);
+  $('mn-weight').textContent = weight.toFixed(2) + '% of next block reward';
+  $('mn-won').textContent = fmtInt(won);
+  $('mn-earned').textContent = fmtInt(earned);
+
+  const pt = $('mn-payouts');
+  if (!events.length) {
+    pt.innerHTML = '<tr class="empty-row"><td colspan="3">No payouts to this address in the last 100 blocks.</td></tr>';
+  } else {
+    pt.innerHTML = events.map((e) => {
+      const hashCell = e.b.hash
+        ? ('<a href="' + EXPLORER_BLOCK_URL(e.b.hash) + '" target="_blank" rel="noopener" title="' + esc(e.b.hash) + '">' + esc(shortHash(e.b.hash)) + '</a>')
+        : '<span class="addr">--</span>';
+      return '<tr>' +
+        '<td class="num">' + relAge(e.b.timestamp) + '</td>' +
+        '<td class="mono">' + hashCell + '</td>' +
+        '<td class="num">' + fmtInt(e.sum) + '</td>' +
+      '</tr>';
+    }).join('');
+  }
+
+  renderMinerHrChart(key);
+  renderMinerEarnChart(events);
+}
+
+// ---------------------------------------------------------------------------
+// Provably-fair inclusion audit (uses the existing /api/proof endpoint)
+// ---------------------------------------------------------------------------
+async function runAudit(address) {
+  const out = $('audit-out');
+  out.textContent = 'Querying /api/proof ...';
+  try {
+    const r = await fetch('/api/proof?address=' + encodeURIComponent(address));
+    const j = await r.json();
+    if (j.error) { out.textContent = 'Audit: ' + j.error; return; }
+    const live = (latest && latest.merkle_root) ? latest.merkle_root.toLowerCase() : '';
+    const match = j.root && live && (j.root.toLowerCase() === live);
+    out.innerHTML =
+      '<div>root&nbsp; <span class="mono">' + esc(j.root) + '</span></div>' +
+      '<div>score ' + fmtInt(j.score) + ' / index ' + esc(String(j.index)) + ' / proof depth ' + ((j.proof || []).length) + '</div>' +
+      '<div class="' + (match ? 'ok' : 'bad') + '">' +
+        (match ? 'OK - precommitment verified; this root matches the live block.'
+               : 'MISMATCH - this root does not match the current precommitment.') +
+      '</div>';
+  } catch (e) {
+    out.textContent = 'Audit failed: ' + e.message;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+window.addEventListener('hashchange', renderRoute);
+
+// Rebuild charts with a fresh palette whenever the theme flips.
+new MutationObserver((muts) => {
+  if (muts.some((m) => m.attributeName === 'data-theme')) {
+    destroyAllCharts();
+    renderRoute();
+  }
+}).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+renderRoute();                          // set the correct view immediately
+fetchStats();                           // first load
+setInterval(fetchStats, POLL_MS);       // then every 5s
+</script>
+</body>
+</html>

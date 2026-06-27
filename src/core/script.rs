@@ -591,6 +591,47 @@ pub fn compile_htlc(
     bc
 }
 
+
+/// HTLC whose CLAIM path is a covenant rather than a signature check.
+///
+/// The claim branch verifies the secret AND forces the spending transaction to
+/// pay at least `min_payout` onto `receiver_addr` (OP_SUM_TO_ADDR). It carries NO
+/// signature, so once the secret is public ANYONE can broadcast the claim and the
+/// value is pinned to the buyer's address. That is what lets a buyer holding zero
+/// MDS receive (or self-deliver) MDS without funding a separate fee coin: the
+/// delivery fee is taken from the value the seller over-funded into the lock.
+///
+/// Witnesses (pushed bottom -> top):
+///   claim  (covenant): [secret, 0x01]            // no signature
+///   refund (timeout):  [sig, <32 bytes>, 0x00]   // unchanged from compile_htlc
+pub fn compile_covenant_htlc(
+    secret_hash:    &[u8; 32],
+    receiver_addr:  &[u8; 32],   // the buyer's P2PK address = compute_address(buyer_pk)
+    min_payout:     u64,         // force >= this much value onto receiver_addr
+    timeout_height: u64,
+    refund_pk:      &[u8; 32],
+) -> Vec<u8> {
+    let mut bc = Vec::new();
+    bc.push(OP_IF);
+        bc.push(OP_HASH);
+        push_data(&mut bc, secret_hash);
+        bc.push(OP_EQUALVERIFY);                 // secret matches the hashlock
+        push_data(&mut bc, receiver_addr);
+        bc.push(OP_SUM_TO_ADDR);                 // sum of outputs going to the buyer
+        push_int(&mut bc, min_payout);
+        bc.push(OP_GREATER_OR_EQUAL);            // ... must be >= min_payout
+        bc.push(OP_VERIFY);
+    bc.push(OP_ELSE);
+        bc.push(OP_DROP);                        // drop the 32-byte dummy
+        push_int(&mut bc, timeout_height);
+        bc.push(OP_CHECKTIMEVERIFY);
+        push_data(&mut bc, refund_pk);
+        bc.push(OP_CHECKSIGVERIFY);              // seller reclaims after timeout
+    bc.push(OP_ENDIF);
+    push_int(&mut bc, 1);
+    bc
+}
+
 /// 2-of-3 multisig script. Witness: [Sig1, Sig2, Sig3] (0x00 for missing)
 pub fn compile_multisig_2of3(
     pk1: &[u8; 32], pk2: &[u8; 32], pk3: &[u8; 32],
@@ -1242,5 +1283,63 @@ mod tests {
             input_value: 0, input_state: None, this_address: [0u8; 32],
         };
         assert!(execute_script(&bc, &[], &ctx).is_ok());
+    }
+    #[test]
+    fn covenant_htlc_claim_pays_buyer() {
+        let secret = *b"covenant secret preimage!!!!!!!!"; // 32 bytes
+        let secret_hash = hash(&secret);
+        let buyer = [0xBB; 32];
+        let bc = compile_covenant_htlc(&secret_hash, &buyer, 48, 500, &[0xCC; 32]);
+
+        // Pays the buyer exactly 48 (32 + 16) across two coins; change sits elsewhere.
+        let outputs = vec![
+            OutputData::Standard { address: buyer,     value: 32, salt: [0; 32] },
+            OutputData::Standard { address: buyer,     value: 16, salt: [1; 32] },
+            OutputData::Standard { address: [0xEE;32], value: 8,  salt: [2; 32] },
+        ];
+        let ctx = ExecContext { commitment: &[0u8;32], height: 0, outputs: &outputs,
+                                input_value: 0, input_state: None, this_address: [0u8;32] };
+        let witness = vec![secret.to_vec(), vec![0x01]]; // [secret, selector] — no signature
+        assert!(execute_script(&bc, &witness, &ctx).is_ok());
+    }
+
+    #[test]
+    fn covenant_htlc_underpay_fails() {
+        let secret = *b"covenant secret preimage!!!!!!!!";
+        let secret_hash = hash(&secret);
+        let buyer = [0xBB; 32];
+        let bc = compile_covenant_htlc(&secret_hash, &buyer, 48, 500, &[0xCC; 32]);
+        let outputs = vec![ OutputData::Standard { address: buyer, value: 16, salt: [0;32] } ]; // < 48
+        let ctx = ExecContext { commitment: &[0u8;32], height: 0, outputs: &outputs,
+                                input_value: 0, input_state: None, this_address: [0u8;32] };
+        let witness = vec![secret.to_vec(), vec![0x01]];
+        assert!(execute_script(&bc, &witness, &ctx).is_err()); // covenant blocks short-paying the buyer
+    }
+
+    #[test]
+    fn covenant_htlc_wrong_secret_fails() {
+        let secret_hash = hash(b"the real preimage");
+        let buyer = [0xBB; 32];
+        let bc = compile_covenant_htlc(&secret_hash, &buyer, 16, 500, &[0xCC; 32]);
+        let outputs = vec![ OutputData::Standard { address: buyer, value: 16, salt: [0;32] } ];
+        let ctx = ExecContext { commitment: &[0u8;32], height: 0, outputs: &outputs,
+                                input_value: 0, input_state: None, this_address: [0u8;32] };
+        let witness = vec![[0x99u8;32].to_vec(), vec![0x01]]; // wrong preimage
+        assert!(execute_script(&bc, &witness, &ctx).is_err());
+    }
+
+    #[test]
+    fn covenant_htlc_refund_after_timeout() {
+        let secret_hash = [0xAA; 32];
+        let buyer = [0xBB; 32];
+        let refund_seed = hash(b"covenant refund seed");
+        let refund_pk = wots::keygen(&refund_seed);
+        let commitment = hash(b"covenant refund commitment");
+        let bc = compile_covenant_htlc(&secret_hash, &buyer, 16, 500, &refund_pk);
+        let sig = wots::sig_to_bytes(&wots::sign(&refund_seed, &commitment));
+        let witness = vec![sig, vec![0u8; 32], vec![0u8]]; // [sig, dummy, selector=0]
+        let ctx = ExecContext { commitment: &commitment, height: 600, outputs: &[],
+                                input_value: 0, input_state: None, this_address: [0u8;32] };
+        assert!(execute_script(&bc, &witness, &ctx).is_ok());
     }
 }

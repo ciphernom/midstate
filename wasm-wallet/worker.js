@@ -27,7 +27,7 @@
  * @module worker
  */
 
-import init, { WebWallet, generate_phrase, compute_coin_id_hex, decrypt_cli_wallet, mine_commitment_pow, blake3_hash_hex, build_multisig_2of2_address, build_channel_state, build_channel_reveal, verify_mss_sig_wasm, mine_chat_pow_v2_wasm, build_htlc_bytecode_hex } from './pkg/wasm_wallet.js';
+import init, { WebWallet, generate_phrase, compute_coin_id_hex, decrypt_cli_wallet, mine_commitment_pow, blake3_hash_hex, build_multisig_2of2_address, build_channel_state, build_channel_reveal, verify_mss_sig_wasm, mine_chat_pow_v2_wasm, build_htlc_bytecode_hex, build_covenant_htlc_bytecode_hex, compute_p2pk_address_hex } from './pkg/wasm_wallet.js';
 
 /** @type {WebWallet|null} The WASM wallet instance. Null until CREATE or LOGIN. */
 let wallet = null;
@@ -37,6 +37,15 @@ let password = null;
 
 /** @type {boolean} Guard against concurrent send operations. */
 let isSending = false;
+// Covenant swaps: the MDS-side over-funds the HTLC by this many sats so the
+// DELIVERY fee is paid out of the LOCKED value, not from a separate coin. That
+// is what lets a buyer who holds zero MDS still self-deliver as a fallback.
+// Unused budget (FEE_BUDGET − actual fee) returns to whoever broadcasts the
+// delivery as change. Generous on purpose; the real cost is only the network fee.
+const COVENANT_FEE_BUDGET = 1024;
+// What a buyer requires the lock to be over-funded by before locking ETH, so the
+// delivery is guaranteed to be affordable from the locked value.
+const COVENANT_MIN_FEE_RESERVE = 256;
 
 // ── Contract tracking (MidstateConnect) ─────────────────────────────────────
 let watchedContracts = new Set();   // hex contract addresses we are tracking
@@ -849,11 +858,20 @@ self.onmessage = async (e) => {
                 { kind: "signature", value: normalizeHex(jsonBytes) }
             ]).catch(()=>{});
         }
+        else if (type === 'DEX_BROADCAST_LOCKING') {
+            // Tiny notice (cmd 203) so the counterparty knows we've begun the on-chain
+            // MDS lock. Carries only the offerId — no secret, no hash, no coins.
+            const jsonBytes = new TextEncoder().encode(JSON.stringify({ offerId: payload.offerId }));
+            submitClientMinedChat([255, 203], null, [
+                { kind: "signature", value: normalizeHex(jsonBytes) }
+            ]).catch(()=>{});
+        }
         else if (type === 'DEX_LOCK_MIDSTATE') {
             if (isSending) throw new Error("Wallet busy.");
             isSending = true;
             try {
-                const { offerId, expectedAmount, takerPk } = payload;
+                const { offerId, expectedAmount, takerPk, swapMode } = payload;
+                const covenant = (swapMode === 'covenant');
 
                 // ── The MAKER generates the secret ──────────────────────────────
                 // Both chains hash-lock on H = BLAKE3(secret). The maker reveals the
@@ -867,9 +885,28 @@ self.onmessage = async (e) => {
                 const myPk = getPrimaryMssPk();
                 const timeoutHeight = networkHeight + 1440; // ~24h at 1-minute blocks (the LONG leg)
 
-                // HTLC: receiver = taker (claims with the secret), refund = maker (after timeout).
-                const htlcScriptHex = build_htlc_bytecode_hex(secretHash, takerPk, BigInt(timeoutHeight), myPk);
-                const htlcAddressHex = blake3_hash_hex(htlcScriptHex);
+                let htlcScriptHex, htlcAddressHex, fundAmount;
+                if (covenant) {
+                    // COVENANT HTLC: the claim path needs NO signature — it instead forces
+                    // the spend to pay >= minPayout to the BUYER's address. So anyone (the
+                    // seller, or the buyer themselves) can deliver the MDS once the secret
+                    // is public, and the buyer needs no MDS. receiver = the ETH-side's
+                    // RECEIVING ADDRESS (= compute_p2pk_address of their pubkey).
+                    const buyerAddr = compute_p2pk_address_hex(normalizeHex(takerPk));
+                    htlcScriptHex = build_covenant_htlc_bytecode_hex(
+                        secretHash, buyerAddr, BigInt(expectedAmount), BigInt(timeoutHeight), myPk
+                    );
+                    htlcAddressHex = blake3_hash_hex(htlcScriptHex);
+                    // Over-fund by the fee budget so the DELIVERY fee comes from the locked
+                    // value (keeps the buyer's self-deliver fallback affordable with 0 MDS).
+                    fundAmount = Number(expectedAmount) + COVENANT_FEE_BUDGET;
+                } else {
+                    // Classic HTLC: receiver = taker (claims with the secret + their sig),
+                    // refund = maker (after timeout). The taker pays the claim fee.
+                    htlcScriptHex = build_htlc_bytecode_hex(secretHash, takerPk, BigInt(timeoutHeight), myPk);
+                    htlcAddressHex = blake3_hash_hex(htlcScriptHex);
+                    fundAmount = expectedAmount;
+                }
 
                 // Fund the HTLC. prepare_fund_tx splits the amount into power-of-two
                 // coins, EACH with a random salt, so funding yields a SET of coins.
@@ -880,7 +917,7 @@ self.onmessage = async (e) => {
                     dexOfferId: offerId,   // routes commit/reveal phase progress to this swap card
                     kind: 'fund',
                     contractAddress: htlcAddressHex,
-                    amount: expectedAmount
+                    amount: fundAmount
                 });
                 const htlcCoins = (fundRes && fundRes.coins) || [];
 
@@ -892,7 +929,9 @@ self.onmessage = async (e) => {
                     htlcCoins,                // [{coin_id, value, salt}] — the taker sweeps these
                     timeoutHeight,
                     makerMdsPk: myPk,
-                    takerMdsPk: takerPk
+                    takerMdsPk: takerPk,
+                    swapMode: covenant ? 'covenant' : 'htlc',
+                    minPayout: covenant ? Number(expectedAmount) : undefined
                 }});
             } catch (err) {
                 // Clear the card's live phase on failure so it doesn't sit on a stale
@@ -908,10 +947,22 @@ self.onmessage = async (e) => {
             // actually exists on-chain with the agreed hashlock, our pubkey as receiver,
             // and the full expected value. Without this a malicious maker could get the
             // taker to lock ETH against a fake or short Midstate lock.
-            const { offerId, secretHash, timeoutHeight, makerMdsPk, htlcCoins, expectedTotal, baseRefundSecs } = payload;
+            const { offerId, secretHash, timeoutHeight, makerMdsPk, htlcCoins, expectedTotal, baseRefundSecs, swapMode } = payload;
+            const covenant = (swapMode === 'covenant');
             try {
                 const myPk = getPrimaryMssPk();
-                const scriptHex = build_htlc_bytecode_hex(secretHash, myPk, BigInt(timeoutHeight), makerMdsPk);
+                // Reconstruct the script ourselves — NEVER trust parameters off the wire.
+                // For a covenant we bake in OUR OWN receiving address and minPayout =
+                // the agreed amount, so a mismatch (e.g. a smaller minPayout) fails here.
+                let scriptHex;
+                if (covenant) {
+                    const myAddr = compute_p2pk_address_hex(myPk);
+                    scriptHex = build_covenant_htlc_bytecode_hex(
+                        secretHash, myAddr, BigInt(expectedTotal), BigInt(timeoutHeight), makerMdsPk
+                    );
+                } else {
+                    scriptHex = build_htlc_bytecode_hex(secretHash, myPk, BigInt(timeoutHeight), makerMdsPk);
+                }
                 const addrHex = blake3_hash_hex(scriptHex);
                 let total = 0, ok = true, reason = "";
 
@@ -935,8 +986,20 @@ self.onmessage = async (e) => {
                     if (!chk || !chk.exists) { ok = false; reason = "HTLC coin not found on-chain yet"; break; }
                     total += Number(c.value);
                 }
-                if (ok && expectedTotal != null && total !== Number(expectedTotal)) {
-                    ok = false; reason = `HTLC locks ${total} MDS but the offer was ${expectedTotal} MDS`;
+                if (ok && expectedTotal != null) {
+                    if (covenant) {
+                        // The maker OVER-funds a covenant by the fee budget so the delivery
+                        // fee comes from the locked value. Require enough headroom that the
+                        // delivery (which pays the buyer the full amount) can afford its fee;
+                        // otherwise the MDS could get stranded after we've locked ETH.
+                        const need = Number(expectedTotal) + COVENANT_MIN_FEE_RESERVE;
+                        if (total < need) {
+                            ok = false;
+                            reason = `Covenant holds ${total} MDS; needs ≥ ${need} (amount + fee reserve) to be deliverable`;
+                        }
+                    } else if (total !== Number(expectedTotal)) {
+                        ok = false; reason = `HTLC locks ${total} MDS but the offer was ${expectedTotal} MDS`;
+                    }
                 }
                 self.postMessage({ type: 'DEX_HTLC_VERIFIED', payload: { offerId, ok, reason, htlcAddressHex: addrHex } });
             } catch (e) {
@@ -1059,7 +1122,7 @@ self.onmessage = async (e) => {
 
                 dexPhase("Confirmed \u2713 \u2014 syncing wallet\u2026");
                 await performScan();
-                self.postMessage({ type: 'DEX_CLAIM_SUCCESS', payload: { swapIdx } });
+                self.postMessage({ type: 'DEX_CLAIM_SUCCESS', payload: { swapIdx, offerId } });
 
             } catch (err) {
                 // Clear the card's live phase so a failed claim doesn't sit on a stale
@@ -1076,6 +1139,145 @@ self.onmessage = async (e) => {
             } finally {
                 isSending = false;
             }
+        }
+        else if (type === 'DEX_SETTLE_COVENANT') {
+            // COVENANT DELIVERY. Spend the covenant-HTLC coins so the MDS lands on the
+            // BUYER's address. The covenant's claim path has NO signature — it only
+            // checks the secret AND forces >= minPayout to the buyer — so the witness is
+            // just [secret, 0x01] and ANYONE can broadcast it. Two callers use this:
+            //   • the SELLER (happy path), right after claiming the ETH, with the secret
+            //     it generated. Its change (the over-funded fee budget minus the real
+            //     fee) comes back to the seller.
+            //   • the BUYER (fallback), if the seller never delivers, using the secret it
+            //     read from the Base `Claimed` event. A buyer holding ZERO MDS can still
+            //     do this because the fee is paid out of the locked value, not a fee coin.
+            if (isSending) throw new Error("Wallet busy.");
+            isSending = true;
+            try {
+                const { offerId, swapIdx, rawSecret, buyerPk, minPayout, timeoutHeight, makerMdsPk, htlcCoins, role } = payload;
+                const dexPhase = (phase) => { if (offerId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId, phase } }); };
+                dexPhase(role === 'buyer' ? "Self-delivering your MDS\u2026" : "Delivering MDS to the buyer\u2026");
+
+                if (!Array.isArray(htlcCoins) || htlcCoins.length === 0) throw new Error("No covenant coins to deliver");
+
+                // Reconstruct the EXACT covenant bytecode used at lock time, so the coin
+                // ids match. secretHash is derived from the secret (guarantees the witness
+                // preimage actually satisfies the hashlock). The receiver address baked in
+                // is the buyer's P2PK address — derived from the buyer's pubkey, never
+                // trusted off the wire for our own side.
+                const secretHash = blake3_hash_hex(rawSecret);
+                // The receiver baked into the covenant is the ETH-side's P2PK address. When
+                // WE are that buyer (self-deliver fallback), use our own pubkey — never trust
+                // one off the wire for our own side. When we're the seller delivering, use the
+                // buyer's pubkey we were given.
+                const buyerPkResolved = (role === 'buyer') ? getPrimaryMssPk() : normalizeHex(buyerPk);
+                const buyerAddr = compute_p2pk_address_hex(buyerPkResolved);
+                const covScriptHex = build_covenant_htlc_bytecode_hex(
+                    secretHash, buyerAddr, BigInt(minPayout), BigInt(timeoutHeight), makerMdsPk
+                );
+
+                if (!mssCachesReady) await loadMssCaches();
+                const utxoArray = Object.values(wState.utxos).map(u => {
+                    if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
+                    return u;
+                });
+
+                // Force exactly `minPayout` (the agreed amount) to the buyer, decomposed
+                // into power-of-two coins (consensus). The fee comes from the over-funded
+                // surplus the maker locked, so we add NO wallet inputs of our own; the
+                // surplus-minus-fee returns to whoever is spending as change.
+                const payout = Number(minPayout);
+                const pow2Parts = [];
+                { let n = BigInt(payout), bit = 0n;
+                  while (n > 0n) { if (n & 1n) pow2Parts.push(Number(1n << bit)); n >>= 1n; bit += 1n; } }
+
+                const outputsJson = JSON.stringify(pow2Parts.map(v => ({
+                    out_type: "standard",
+                    address: buyerAddr,
+                    value: v,
+                    salt: null // generated into the reveal; the buyer rediscovers it on scan
+                })));
+
+                // One contract input per covenant coin. Witness is COMPLETE up front —
+                // [secret, 0x01], no signature — because the covenant claim path has no
+                // CHECKSIG. build_script_reveal passes contract witnesses through verbatim.
+                const contractInputsJson = JSON.stringify(htlcCoins.map(c => ({
+                    coin_id: normalizeHex(c.coin_id),
+                    witness: `${rawSecret},01`,
+                    value: Number(c.value),
+                    salt: normalizeHex(c.salt),
+                    state: null
+                })));
+
+                let ctx = JSON.parse(wallet.prepare_script_spend(
+                    JSON.stringify(utxoArray),
+                    covScriptHex,
+                    contractInputsJson,
+                    outputsJson,
+                    wState.nextWotsIndex
+                ));
+
+                // No contract-input signing needed. Any wallet fee inputs (there should be
+                // none for a covenant delivery) are signed inside build_script_reveal.
+                const revealPayloadStr = wallet.build_script_reveal(JSON.stringify(ctx), ctx.commitment, ctx.tx_salt);
+
+                while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
+                const usedMss = new Set();
+                for (const inp of ctx.wallet_inputs) if (inp.is_mss) usedMss.add(inp.address);
+                for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
+                await saveState();
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining PoW..." } });
+                dexPhase("Mining spam-proof (PoW)\u2026");
+                const stateData = await rpc.getState();
+                await new Promise(r => setTimeout(r, 50));
+                const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
+
+                const commitReq = await rpc.commit(ctx.commitment, spamNonce);
+                if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for Block Confirmation..." } });
+                dexPhase("Commit broadcast \u2014 waiting to be mined (step 1 of 2)\u2026");
+                while (true) {
+                    try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {}
+                    await waitForNextBlock(15000);
+                }
+
+                const revealReq = await rpc.send(revealPayloadStr);
+                if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting delivery..." } });
+                dexPhase("Reveal broadcast \u2014 waiting to be mined (step 2 of 2)\u2026");
+                const firstCoin = normalizeHex(htlcCoins[0].coin_id);
+                while (true) {
+                    try { const inp = await rpc.checkCoin(firstCoin); if (inp && !inp.exists) break; } catch (e) {}
+                    await waitForNextBlock(15000);
+                }
+
+                dexPhase("Confirmed \u2713 \u2014 syncing wallet\u2026");
+                // The buyer scans to pick up the freshly delivered coins; the seller scans
+                // to pick up the surplus change. Either way a scan is correct here.
+                await performScan();
+                self.postMessage({ type: 'DEX_SETTLE_SUCCESS', payload: { offerId, swapIdx, role } });
+
+            } catch (err) {
+                if (payload && payload.offerId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId: payload.offerId, phase: null } });
+                const detail = (err && err.message) ? err.message
+                             : (typeof err === 'string') ? err
+                             : (err && typeof err.toString === 'function' && err.toString() !== '[object Object]') ? err.toString()
+                             : JSON.stringify(err);
+                self.postMessage({ type: 'DEX_SETTLE_FAILED', payload: { offerId: payload && payload.offerId, swapIdx: payload && payload.swapIdx, role: payload && payload.role, error: detail } });
+            } finally {
+                isSending = false;
+            }
+        }
+        else if (type === 'DEX_CHECK_SETTLED') {
+            // Lightweight read-only poll used by the buyer while waiting for delivery:
+            // once the covenant lock coin is spent, the MDS has been delivered to them.
+            const { offerId, coinId } = payload;
+            let settled = false;
+            try { const chk = await rpc.checkCoin(normalizeHex(coinId)); settled = !!(chk && !chk.exists); } catch (e) {}
+            self.postMessage({ type: 'DEX_SETTLED_STATUS', payload: { offerId, settled } });
         }
         else if (type === 'PUSH_NEW_BLOCK') {
             if (payload.ChatMessage) {
@@ -2619,7 +2821,7 @@ async function handleL2Chat(msg) {
         self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
     }
     // ── L2 DEX ROUTING ──
-    else if (cmd >= 200 && cmd <= 202) {
+    else if (cmd >= 200 && cmd <= 203) {
         const sigAtt = msg.attachments.find(a => a.kind === "signature")?.value;
         if (!sigAtt) return;
 
@@ -2637,6 +2839,8 @@ async function handleL2Chat(msg) {
                 self.postMessage({ type: 'DEX_ACCEPT_RECEIVED', payload });
             } else if (cmd === 202) {
                 self.postMessage({ type: 'DEX_LOCKED_RECEIVED', payload });
+            } else if (cmd === 203) {
+                self.postMessage({ type: 'DEX_LOCKING_RECEIVED', payload });
             }
         } catch (e) {
             console.error("Failed to parse DEX L2 payload", e);

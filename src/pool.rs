@@ -38,6 +38,9 @@ use crate::core::extension::create_extension;
 /// The database table storing the cumulative scores of all miners.
 /// Key: 32-byte cryptographic address hash. Value: u64 share count.
 const SHARES_TABLE: TableDefinition<&[u8; 32], u64> = TableDefinition::new("shares");
+/// The database table storing historical blocks found and their exact payouts.
+/// Key: Block timestamp (u64). Value: JSON string of payouts.
+const BLOCKS_TABLE: TableDefinition<u64, &str> = TableDefinition::new("blocks");
 
 // ── Stratum Protocol Types ──────────────────────────────────────────────────
 
@@ -218,6 +221,147 @@ async fn get_proof(
     }
 }
 
+/// Serves the Provably Fair Pool HTML dashboard.
+///
+/// # Reasoning
+/// Providing a built-in dashboard allows pool operators to transparently display
+/// current hash weights and historical payouts without needing external infrastructure.
+/// By serving this alongside the stratum port offset, it does not conflict with the core node.
+///
+/// # Formal Specification
+/// ```text
+/// Pre:  true
+/// Post: result is an HTML response containing the dashboard UI
+/// ```
+async fn pool_ui() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("pool.html"))
+}
+
+/// Serves the shared Midstate stylesheet.
+///
+/// # Reasoning
+/// The dashboard links to `/midstate.css` rather than embedding its own palette so it
+/// stays visually identical to the Explorer and Chat and inherits the global light/dark
+/// theme automatically. The sheet is baked into the binary with `include_str!`, so there
+/// is no runtime "file not found" failure mode — if it compiles, it serves.
+///
+/// Path note: `pool.rs` lives in `src/` while the shared web assets live in `src/rpc/`,
+/// so this resolves to the single canonical `src/rpc/midstate.css` (the temporary copy
+/// in `src/` can be deleted). `include_str!` is relative to THIS source file.
+async fn pool_css() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("rpc/midstate.css"),
+    )
+}
+
+/// Aggregates and returns current pool statistics as JSON.
+///
+/// # Reasoning
+/// Iterates over the `shares` table to calculate current miner weights, and reads
+/// the last 100 entries from the `blocks` table to show recent payouts and to give
+/// the dashboard enough history to draw the rolling effort/earnings charts. This
+/// provides total transparency to the miners so they can verify their payout equity
+/// matches their hash contribution.
+///
+/// Note: the raw `network_target` and `share_target` are returned verbatim so the
+/// browser can do all hashrate/effort math locally with native `BigInt`. The node's
+/// own `/state` endpoint is intentionally NOT exposed to the public (it sits behind a
+/// firewall/VPN), so the pool relays the only two values the UI needs to stay honest.
+///
+/// # Formal Specification
+/// ```text
+/// Pre:  true
+/// Post: result contains (pool_fee_percent, total_score, active_miners, miners[], recent_blocks[])
+/// ```
+async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json::Value> {
+    let mut miners = Vec::new();
+    let mut total_score = 0u64;
+
+    if let Ok(read_txn) = state.db.begin_read() {
+        if let Ok(table) = read_txn.open_table(SHARES_TABLE) {
+            for iter in table.iter().unwrap() {
+                let (addr, score) = iter.unwrap();
+                let mut a = [0u8; 32];
+                a.copy_from_slice(addr.value());
+                let s = score.value();
+                if s > 0 {
+                    miners.push(serde_json::json!({
+                        "address": crate::core::types::encode_address_with_checksum(&a),
+                        "score": s
+                    }));
+                    total_score += s;
+                }
+            }
+        }
+    }
+
+    miners.sort_by_key(|m| std::cmp::Reverse(m["score"].as_u64().unwrap_or(0)));
+
+    let mut blocks = Vec::new();
+    if let Ok(read_txn) = state.db.begin_read() {
+        if let Ok(table) = read_txn.open_table(BLOCKS_TABLE) {
+            for iter in table.iter().unwrap().rev().take(100) {
+                let (_, data) = iter.unwrap();
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data.value()) {
+                    blocks.push(json);
+                }
+            }
+        }
+    }
+
+    // --- RAW TARGETS + PRECOMMITMENT FOR CLIENT-SIDE BIGINT MATH ---
+    // The browser does ALL hashrate/effort math locally with native BigInt against
+    // these raw 32-byte targets, so the server never touches floating point for it.
+    let current_job = state.current_job.read().await.clone();
+    let share_target_hex = hex::encode(state.share_target);
+    let network_target_hex = current_job
+        .as_ref()
+        .map(|job| hex::encode(job.network_target))
+        .unwrap_or_default();
+    // The current Merkle precommitment root (what miners audit against this block).
+    let merkle_root_hex = hex::encode(state.current_tree.read().await.root);
+    const BLOCK_TIME_SECS: u64 = 60;
+
+    // --- OPTIONAL FLOAT FALLBACK (legacy clients / non-BigInt environments) ---
+    let mut network_hashrate = 0.0;
+    let mut hashes_per_share = 0.0;
+    if let Some(job) = current_job {
+        // Helper to convert U256 target to a float for math
+        fn u256_to_f64(u: primitive_types::U256) -> f64 {
+            u.0[0] as f64 +
+            (u.0[1] as f64) * 2.0f64.powi(64) +
+            (u.0[2] as f64) * 2.0f64.powi(128) +
+            (u.0[3] as f64) * 2.0f64.powi(192)
+        }
+
+        let net_target = primitive_types::U256::from_big_endian(&job.network_target);
+        let share_target = primitive_types::U256::from_big_endian(&state.share_target);
+        
+        let max_u256 = 2.0f64.powi(256);
+        let net_diff_hashes = max_u256 / u256_to_f64(net_target).max(1.0);
+        network_hashrate = net_diff_hashes / BLOCK_TIME_SECS as f64;
+        
+        hashes_per_share = max_u256 / u256_to_f64(share_target).max(1.0);
+    }
+
+    Json(serde_json::json!({
+        "pool_fee_percent": state.pool_fee_percent,
+        "total_score": total_score,
+        "active_miners": miners.len(),
+        "miners": miners,
+        "recent_blocks": blocks,
+        // Provably-fair anchor + raw targets for local BigInt math:
+        "merkle_root": merkle_root_hex,
+        "network_target": network_target_hex,
+        "share_target": share_target_hex,
+        "block_time_secs": BLOCK_TIME_SECS,
+        // Float fallbacks (kept for backwards compatibility):
+        "network_hashrate": network_hashrate,
+        "hashes_per_share": hashes_per_share
+    }))
+}
+
 // ── Main Server Boot ────────────────────────────────────────────────────────
 
 /// Boots the Provably Fair Stratum Server and its companion HTTP Audit API.
@@ -242,6 +386,7 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_
     
     let write_txn = db.begin_write().unwrap();
     let _ = write_txn.open_table(SHARES_TABLE).unwrap();
+    let _ = write_txn.open_table(BLOCKS_TABLE).unwrap(); 
     write_txn.commit().unwrap();
 
     let (job_notifier, _) = broadcast::channel(32);
@@ -302,11 +447,14 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_
 
     tokio::spawn(async move {
         let app = Router::new()
-            .route("/api/proof", get(get_proof))
+            .route("/pool", get(pool_ui))            
+            .route("/midstate.css", get(pool_css))   
+            .route("/pool/stats", get(get_pool_stats)) 
+            .route("/api/proof", get(get_proof))     
             .with_state(api_state);
         axum::serve(api_listener, app).await.unwrap();
     });
-
+    
     // ── Core Polling & Template Builder Task ──
     let state_clone = state.clone();
     tokio::spawn(async move {
@@ -558,6 +706,12 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
 
                                         if ext.final_hash < job.network_target {
                                             tracing::info!("block found by miner {}. submitting to network.", hex::encode(&miner_addr[..8]));
+                                            // Capture block identity for the dashboard BEFORE `ext`/`job` are consumed:
+                                            // the PoW hash (for the Explorer hyperlink) and the network target in
+                                            // force for this block, so historical "luck" can be computed exactly
+                                            // instead of approximated against the *current* difficulty.
+                                            let block_hash_hex = hex::encode(ext.final_hash);
+                                            let block_net_target_hex = hex::encode(job.network_target);
                                             let mut batch: Batch = serde_json::from_value(job.batch_template).unwrap();
                                             batch.extension = ext;
                                             
@@ -579,12 +733,31 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                                             let mut total_score = 0u128;
                                                             for iter in table.iter().unwrap() { total_score += iter.unwrap().1.value() as u128; }
                                                             
+                                                            let mut payouts = Vec::new(); 
+
                                                             for cb in &batch.coinbase {
                                                                 let mut a = [0u8; 32]; a.copy_from_slice(&cb.address);
                                                                 let deduction = ((cb.value as u128 * total_score) / (total_reward as u128)) as u64;
                                                                 let current = table.get(&a).unwrap().map(|v| v.value()).unwrap_or(0);
                                                                 table.insert(&a, current.saturating_sub(deduction)).unwrap();
+                                                                
+                                                                // <--- Record payout for dashboard
+                                                                payouts.push(serde_json::json!({
+                                                                    "address": crate::core::types::encode_address_with_checksum(&a),
+                                                                    "value": cb.value
+                                                                }));
                                                             }
+
+                                                            // <--- Save block payout history to DB
+                                                            let mut b_table = write_txn.open_table(BLOCKS_TABLE).unwrap();
+                                                            let block_data = serde_json::json!({
+                                                                "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                                                "hash": block_hash_hex,
+                                                                "total_score": total_score as u64,
+                                                                "net_target": block_net_target_hex,
+                                                                "payouts": payouts
+                                                            }).to_string();
+                                                            b_table.insert(batch.timestamp, block_data.as_str()).unwrap();
                                                         }
                                                         write_txn.commit().unwrap();
                                                     } else {
