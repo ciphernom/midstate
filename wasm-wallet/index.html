@@ -1006,7 +1006,16 @@
                     </div>
                     <div style="margin-bottom: 4px;">
                         <label style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">MDS Amount</label>
-                        <input type="number" id="dexOfferAmount" placeholder="e.g. 1000">
+                        <div class="amount-field">
+                            <input type="number" inputmode="decimal" step="any" min="0" id="dexOfferAmount" placeholder="e.g. 1000" oninput="updateDexMdsConversion()">
+                            <div class="unit-select" id="dexMdsUnitSelect">
+                                <button type="button" class="unit-opt active" data-unit="MDS" onclick="setDexMdsUnit(this)">MDS</button>
+                                <button type="button" class="unit-opt" data-unit="kMDS" onclick="setDexMdsUnit(this)">kMDS</button>
+                                <button type="button" class="unit-opt" data-unit="mMDS" onclick="setDexMdsUnit(this)">mMDS</button>
+                                <button type="button" class="unit-opt" data-unit="gMDS" onclick="setDexMdsUnit(this)">gMDS</button>
+                            </div>
+                        </div>
+                        <div id="dexMdsReadout" class="send-conversion"></div>
                     </div>
                     <div>
                         <label style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Price <span id="dexRate" class="dex-rate"></span></label>
@@ -3985,10 +3994,50 @@ document.getElementById('btnExport').onclick = () => {
         fetchEthUsd();
         setInterval(fetchEthUsd, 90000);
 
+        // ── DEX MDS amount: MDS / kMDS / mMDS / gMDS entry ───────────────────
+        //  Mirrors the send form: the amount is entered in any denomination and
+        //  resolved to a whole number of base MDS for the offer.
+        let dexMdsUnit = 'MDS';
+
+        function setDexMdsUnit(btn) {
+            dexMdsUnit = btn.dataset.unit || 'MDS';
+            document.querySelectorAll('#dexMdsUnitSelect .unit-opt').forEach(b => b.classList.toggle('active', b === btn));
+            updateDexMdsConversion();
+        }
+
+        // Resolve the MDS field + unit to a base-MDS integer.
+        // Returns { raw: <int>|null, error: <string>|null }.
+        function dexResolveMds() {
+            const f = document.getElementById('dexOfferAmount');
+            const txt = (f ? f.value : '').trim();
+            if (txt === '') return { raw: null, error: null };
+            const val = Number(txt);
+            if (!isFinite(val) || val <= 0) return { raw: null, error: 'Enter a positive amount.' };
+            const mult = MDS_UNITS[dexMdsUnit] || 1;
+            const raw = val * mult;
+            if (raw < 1) return { raw: null, error: 'Below the minimum of 1 MDS.' };
+            if (!Number.isInteger(raw)) return { raw: null, error: `${txt} ${dexMdsUnit} is not a whole number of MDS.` };
+            if (!Number.isSafeInteger(raw)) return { raw: null, error: 'Amount is too large.' };
+            return { raw, error: null };
+        }
+
+        function updateDexMdsConversion() {
+            const el = document.getElementById('dexMdsReadout');
+            if (!el) return;
+            const { raw, error } = dexResolveMds();
+            if (error) { el.className = 'send-conversion'; el.textContent = error; return; }
+            if (raw === null) { el.className = 'send-conversion'; el.textContent = ''; return; }
+            el.className = 'send-conversion ok';
+            const { value, prefix } = formatMDS(raw);
+            const showTail = (prefix !== 'MDS') && (prefix !== dexMdsUnit);
+            const tail = showTail ? ` &middot; ${value} ${prefix}` : '';
+            el.innerHTML = `= <strong>${raw.toLocaleString('en')}</strong> MDS${tail}`;
+        }
+
         window.dexCreateOffer = function() {
             if (!evmAddress) return showToast("Connect MetaMask first", "error");
-            const mdsAmt = Number(document.getElementById('dexOfferAmount').value);
-            if (!mdsAmt) return showToast("Enter the MDS amount", "error");
+            const { raw: mdsAmt, error: mdsErr } = dexResolveMds();
+            if (!mdsAmt) return showToast(mdsErr || "Enter the MDS amount", "error");
             const { wei, error } = dexWeiFromInput();
             if (!wei) return showToast(error || "Enter a price", "error");
             const weiAmt = wei.toString();
@@ -4570,7 +4619,7 @@ document.getElementById('btnExport').onclick = () => {
                 const btnStyle = isAsk ? 'background:var(--accent);color:var(--on-accent);' : 'background:transparent;color:var(--text-max);border:1px solid var(--border-bright);';
                 return `<tr>
                     <td>${orderLabel}${mine ? ' <span style="color:#666;font-size:10px;">(yours)</span>' : ''}</td>
-                    <td>${Number(o.mdsAmount).toLocaleString('en')}</td>
+                    <td>${(() => { const m = formatMDS(o.mdsAmount); return `${m.value} ${m.prefix}`; })()}<br><span style="font-size:10px;color:var(--text-faint);">${Number(o.mdsAmount).toLocaleString('en')} MDS</span></td>
                     <td>${prettyEth(o.weiAmount)} ETH${(() => { const u = weiToUsd(o.weiAmount); return u ? `<br><span style="font-size:10px;color:var(--text-muted);">\u2248 ${u}</span>` : ''; })()}<br><span style="font-size:10px;color:var(--text-faint);">${o.weiAmount} wei</span></td>
                     <td style="text-align:right;"><button style="margin:0;width:auto;padding:6px 12px;font-size:11px;${btnStyle}" onclick="dexAcceptFromBook(${i})">${action}</button></td>
                 </tr>`;
@@ -4592,7 +4641,7 @@ document.getElementById('btnExport').onclick = () => {
 
                 // What this user is doing with their MDS:
                 const sellingMds = (s.side === 'mds');
-                const headline = `${sellingMds ? 'SELLING' : 'BUYING'} ${Number(s.mdsAmount || 0).toLocaleString('en')} MDS`;
+                const headline = `${sellingMds ? 'SELLING' : 'BUYING'} ${(() => { const m = formatMDS(s.mdsAmount || 0); return `${m.value} ${m.prefix}`; })()}`;
 
                 if (s.status === 'waiting_for_taker') {
                     statusText = sellingMds ? 'Listed (selling MDS) — waiting for a taker…' : 'Listed (buying MDS) — waiting for a taker…';
