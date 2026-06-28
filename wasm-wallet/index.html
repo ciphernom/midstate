@@ -650,17 +650,27 @@
                ultra-wide monitors read as a workspace, not a stretched strip. */
             .page {
                 grid-area: content; width: 100%;
-                max-width: 1320px; margin-inline: auto;
+                max-width: 1440px; margin-inline: auto;
                 padding: 2rem 2.5rem; padding-bottom: 2rem;
             }
             #authView.page { grid-column: 1 / -1; max-width: 460px; }
-            #view-chat.page { max-width: 980px; }
+            #view-chat.page { max-width: 1200px; }
             #view-send.page, #view-receive.page,
             #view-settings.page, #view-lightning.page { max-width: 780px; }
 
             input, button { font-size: 14px; }
             .mine-stats { grid-template-columns: repeat(3, 1fr); }
         }
+
+        /* Mobile-first: the home and send wrappers are single stacked columns.
+           These come BEFORE the >=1200px overrides so source order lets the
+           grid rules win when that breakpoint matches (media queries add no
+           specificity), with no sub-pixel gap at the boundary. */
+        .home-grid { display: flex; flex-direction: column; }
+        .send-grid { display: flex; flex-direction: column; gap: 1.25rem; }
+        .home-col { min-width: 0; }
+        .send-grid > div { min-width: 0; }
+        .send-utxo-col > h3 { margin-top: 0; }
 
         /* Wider screens: more columns, two-column home, roomier rhythm. */
         @media (min-width: 1200px) {
@@ -672,18 +682,19 @@
                 display: grid; grid-template-columns: 1.4fr 1fr;
                 gap: 2.5rem; align-items: start;
             }
+            #view-send.page { max-width: 1180px; }
+            .send-grid {
+                display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+                gap: 2.5rem; align-items: start;
+            }
             .list-item { flex-direction: row; justify-content: space-between; align-items: center; }
             .list-item .flex-row { gap: 2rem; width: auto; }
         }
 
         @media (min-width: 1600px) {
             #app-container { grid-template-columns: 260px minmax(0, 1fr); }
-            .page { max-width: 1480px; }
+            .page { max-width: 1600px; }
         }
-
-        /* Home two-column wrapper collapses to a single column on mobile. */
-        .home-grid { display: flex; flex-direction: column; }
-        .home-col { min-width: 0; }
     </style>
 </head>
 <body>
@@ -1027,6 +1038,8 @@
         <!-- SEND -->
         <main id="view-send" class="page">
             <h2>Send Funds</h2>
+            <div class="send-grid">
+            <div class="send-form-col">
             <div class="panel">
                 <div class="flex-row" style="margin-bottom: 10px;">
                     <label style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Recipient Address</label>
@@ -1055,10 +1068,14 @@
                 </details>
                 <button id="btnSend" style="margin-top: 4px; background: var(--text-max); color: #000;">Swipe to Send</button>
             </div>
-            <h3 style="margin-top: 1.5rem; font-size: 12px; color: #666;">Available UTXOs</h3>
+            </div><!-- /send-form-col -->
+            <div class="send-utxo-col">
+            <h3 style="font-size: 12px; color: var(--text-muted);">Available UTXOs</h3>
             <div class="list-container" id="utxoList">
-                <div class="list-item" style="text-align: center; color: #555;">No UTXOs.</div>
+                <div class="list-item" style="text-align: center; color: var(--text-faint);">No UTXOs.</div>
             </div>
+            </div><!-- /send-utxo-col -->
+            </div><!-- /send-grid -->
         </main>
 
         <!-- RECEIVE -->
