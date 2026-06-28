@@ -2340,6 +2340,37 @@ pub fn verify_mss_sig_wasm(sig_hex: &str, msg_hex: &str, pk_hex: &str) -> bool {
     }
 }
 
+#[wasm_bindgen]
+pub fn compute_p2pk_address_hex(owner_pk_hex: &str) -> Result<String, JsValue> {
+    let mut pk = [0u8; 32];
+    hex::decode_to_slice(owner_pk_hex, &mut pk)
+        .map_err(|_| JsValue::from_str("Invalid pubkey"))?;
+    Ok(hex::encode(midstate::core::types::compute_address(&pk)))
+}
+
+#[wasm_bindgen]
+pub fn build_covenant_htlc_bytecode_hex(
+    secret_hash_hex:   &str,
+    receiver_addr_hex: &str,
+    min_payout:        u64,
+    timeout_height:    u64,
+    refund_pk_hex:     &str,
+) -> Result<String, JsValue> {
+    let mut sh = [0u8; 32];
+    hex::decode_to_slice(secret_hash_hex, &mut sh)
+        .map_err(|_| JsValue::from_str("Invalid secret_hash"))?;
+    let mut ra = [0u8; 32];
+    hex::decode_to_slice(receiver_addr_hex, &mut ra)
+        .map_err(|_| JsValue::from_str("Invalid receiver_addr"))?;
+    let mut refpk = [0u8; 32];
+    hex::decode_to_slice(refund_pk_hex, &mut refpk)
+        .map_err(|_| JsValue::from_str("Invalid refund_pk"))?;
+    let bytecode = midstate::core::script::compile_covenant_htlc(
+        &sh, &ra, min_payout, timeout_height, &refpk,
+    );
+    Ok(hex::encode(bytecode))
+}
+
 /// Builds the Midstate HTLC bytecode for cross-chain atomic swaps.
 #[wasm_bindgen]
 pub fn build_htlc_bytecode_hex(
