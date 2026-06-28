@@ -229,6 +229,8 @@ enum Command {
         pool_url: String,
         #[arg(long)]
         payout_address: String,
+        #[arg(long, default_value = "default")]
+        worker: String,
         #[arg(long, default_value = "0")]
         threads: usize,
     },
@@ -697,7 +699,7 @@ async fn main() -> Result<()> {
                 anyhow::bail!("Pool server cannot run in WebAssembly");
             }
         }
-        Command::Miner { pool_url, payout_address, threads } => {
+        Command::Miner { pool_url, payout_address, worker, threads } => {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let hash_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -800,7 +802,7 @@ async fn main() -> Result<()> {
                 tracing::info!("starting hasher (threads: {})", if threads == 0 { "max".to_string() } else { threads.to_string() });
                 tracing::info!("press [ENTER] at any time to view dashboard");
                 
-                midstate::mining::run_stratum_client(pool_url, payout_address, threads, hash_counter, stats).await;
+                midstate::mining::run_stratum_client(pool_url, payout_address, worker, threads, hash_counter, stats).await;
                 Ok(())
             }
             #[cfg(target_arch = "wasm32")]

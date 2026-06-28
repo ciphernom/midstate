@@ -923,6 +923,7 @@ pub async fn axe_save_config(
             pool_url: req.pool_url.clone(),
             payout_address: req.payout_address.clone(),
             pool_address: req.pool_address.clone(), // <-- NEW
+            worker: None, // Axe hardware config carries no rig name; reports as "default"
         }
     };
 

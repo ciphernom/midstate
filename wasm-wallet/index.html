@@ -4,6 +4,18 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <meta name="theme-color" content="#0a0a0a">
+    <script>
+        // Apply persisted theme before first paint (default: dark). Keeps the
+        // ink-on-paper palette consistent and avoids a flash on reload.
+        (function () {
+            try {
+                var t = localStorage.getItem('mds-theme') || 'dark';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) {
+                document.documentElement.setAttribute('data-theme', 'dark');
+            }
+        })();
+    </script>
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <link rel="manifest" href="manifest.json">
@@ -14,505 +26,674 @@
 
     <title>MIDSTATE // WALLET</title>
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap');
-        
-        :root { 
-            --bg: #0a0a0a; --bg-panel: #111; --border: #1e1e1e; --border-bright: #2a2a2a; 
-            --text: #999; --text-bright: #ccc; --text-max: #eee; 
-            --accent: #d4ff00; --accent-dim: #6b8000; --red: #ff4444; 
-        }
-        
-        * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-        
-        body, html { 
-            background: var(--bg); color: var(--text); 
-            font-family: 'JetBrains Mono', monospace; 
-            font-size: 14px; line-height: 1.5; 
-            height: 100%; width: 100%; overflow: hidden;
+        /* =====================================================================
+        MIDSTATE // WALLET — restyled to the Midstate house sheet.
+        ---------------------------------------------------------------------
+        ABSOLUTE HYPER-MEGA-MINIMAL. Pure ink on paper.
+        Zero hue. Zero shadow. Zero radius. Zero motion. Zero decorative fills.
+        Zero background changes on hover.
+
+        All state (live/idle, send/receive, mining/stopped, accepted/rejected,
+        own/other, primary/secondary) is carried by:
+          - sign (+ / −)
+          - weight & shade
+          - labels & values
+          - structural hairline borders
+          - underline on text links
+        Hue/semantic tokens are collapsed to ink / grey.
+        Mobile-first; desktop opens into a full-bleed explorer shell.
+        ===================================================================== */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@300;400;500;700&display=swap');
+
+        /* ── Design tokens ─────────────────────────────────────────────── */
+        :root,
+        [data-theme="dark"] {
+            --bg: #0a0a0a; --bg-alt: #141414; --bg-raised: #141414; --bg-panel: #161616;
+            --msg-bg: #0f0f0f; --code-bg: #181818; --highlight: #1f1f1f;
+            --warn-bg: #1f1f1f; --accent-bg: #1f1f1f; --green-bg: #1f1f1f; --red-bg: #1f1f1f;
+
+            --border: #262626; --border-bright: #363636;
+
+            --text-max: #f5f5f5; --text-main: #f5f5f5; --text-bright: #cfcfcf;
+            --text: #9a9a9a; --text-muted: #9a9a9a; --text-faint: #5a5a5a;
+
+            /* accent + semantic — collapsed to ink / grey */
+            --accent: #f5f5f5; --accent-dim: #9a9a9a; --on-accent: #0a0a0a;
+            --stark-accent: #f5f5f5; --link-color: #f5f5f5; --blue: #f5f5f5;
+            --warn-accent: #9a9a9a; --green: #f5f5f5; --red: #9a9a9a;
+
+            --radius: 0; --radius-sm: 0; --radius-xs: 0; --shadow: none;
         }
 
-        h1, h2, h3 { font-weight: normal; color: var(--text-max); margin-bottom: 1rem; }
-        
+        [data-theme="light"] {
+            --bg: #ffffff; --bg-alt: #ffffff; --bg-raised: #ffffff; --bg-panel: #fafafa;
+            --msg-bg: #fbfbfb; --code-bg: #f4f4f4; --highlight: #efefef;
+            --warn-bg: #efefef; --accent-bg: #efefef; --green-bg: #efefef; --red-bg: #efefef;
+
+            --border: #e3e3e3; --border-bright: #cfcfcf;
+
+            --text-max: #111111; --text-main: #111111; --text-bright: #383838;
+            --text: #565656; --text-muted: #565656; --text-faint: #a2a2a2;
+
+            --accent: #111111; --accent-dim: #565656; --on-accent: #ffffff;
+            --stark-accent: #111111; --link-color: #111111; --blue: #111111;
+            --warn-accent: #565656; --green: #111111; --red: #565656;
+
+            --radius: 0; --radius-sm: 0; --radius-xs: 0; --shadow: none;
+        }
+
+        /* ── Dogmatic guards: zero radius / shadow / motion everywhere ───
+           These !important rules neutralise rounded corners, glows and
+           animation that leak in from inline styles or generated markup,
+           so the whole surface holds the line without per-node edits. */
+        *, *::before, *::after {
+            box-sizing: border-box;
+            border-radius: 0 !important;
+            box-shadow: none !important;
+            text-shadow: none !important;
+            animation: none !important;
+            transition: none !important;
+        }
+        * { margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+
+        /* ── Base ────────────────────────────────────────────────────── */
+        body, html {
+            background: var(--bg); color: var(--text);
+            font-family: 'JetBrains Mono', ui-monospace, 'Menlo', monospace;
+            font-size: 14px; line-height: 1.5;
+            height: 100%; width: 100%; overflow: hidden;
+            -webkit-font-smoothing: antialiased;
+            scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+        }
+
+        ::selection { background: var(--accent); color: var(--on-accent); }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--border); }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-faint); }
+
+        a, .sender, .chat-sender { color: var(--link-color); }
+        a:focus-visible, button:focus-visible,
+        select:focus-visible, input:focus-visible {
+            outline: 1px solid var(--accent); outline-offset: 2px;
+        }
+
+        h1, h2, h3 {
+            font-weight: 600; color: var(--text-max); margin-bottom: 1rem;
+            letter-spacing: 0.5px; line-height: 1.3;
+        }
+        h2 { font-size: 18px; }
+        h3 { font-size: 14px; }
+
+        /* ── App shell (mobile-first) ────────────────────────────────── */
         #app-container {
-            display: flex; flex-direction: column; height: 100%; max-width: 600px; margin: 0 auto;
+            display: flex; flex-direction: column; height: 100%;
+            max-width: 600px; margin: 0 auto;
             border-left: 1px solid var(--border); border-right: 1px solid var(--border);
         }
 
         header {
             padding: env(safe-area-inset-top, 1rem) 1.5rem 1rem 1.5rem;
             border-bottom: 1px solid var(--border);
-            display: flex; justify-content: center; align-items: center;
-            background: var(--bg-panel); z-index: 10;
+            display: flex; justify-content: space-between; align-items: center; gap: 12px;
+            background: var(--bg); z-index: 10; flex-shrink: 0;
         }
-        header h1 { margin: 0; font-size: 16px; font-weight: 700; letter-spacing: 2px; }
+        .brand {
+            margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 2px;
+            color: var(--text-max); display: flex; align-items: center; gap: 10px;
+        }
+        /* static square mark — no pulse */
+        .brand-indicator {
+            width: 6px; height: 6px; flex-shrink: 0;
+            background-color: var(--stark-accent); border: 1px solid var(--border);
+        }
+        .brand-dot { color: var(--text-faint); }
 
+        .theme-toggle {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: auto; background: transparent; border: none; padding: 6px; margin: 0;
+            color: var(--text-muted); line-height: 0; cursor: pointer;
+        }
+        .theme-toggle:hover { color: var(--text-main); border: none; }
+        .theme-toggle svg { display: block; }
+        .theme-toggle .icon-moon { display: none; }
+        [data-theme="light"] .theme-toggle .icon-sun { display: none; }
+        [data-theme="light"] .theme-toggle .icon-moon { display: block; }
+
+        /* ── Network stat strip — static square marks, label-carried ──── */
         #global-network-stats {
             display: flex; justify-content: center; gap: 20px; padding: 8px 1.5rem;
-            background: rgba(10,10,10,0.95); border-bottom: 1px solid var(--border);
-            font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: #888;
-            z-index: 9;
+            background: var(--bg); border-bottom: 1px solid var(--border);
+            font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+            color: var(--text-muted); z-index: 9; flex-shrink: 0;
         }
         #global-network-stats .stat { display: flex; align-items: center; gap: 6px; }
-        #global-network-stats .val { color: var(--text-max); font-weight: bold; font-variant-numeric: tabular-nums; }
-        .pulse-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
-        .pulse-dot.wallet { background: #00e5ff; box-shadow: 0 0 5px #00e5ff; }
-        .pulse-dot.network { background: var(--accent); box-shadow: 0 0 5px var(--accent); }
-        .pulse-dot.mempool { background: #ffa500; box-shadow: 0 0 5px #ffa500; }
+        #global-network-stats .val { color: var(--text-bright); font-weight: 600; font-variant-numeric: tabular-nums; }
+        .pulse-dot {
+            width: 6px; height: 6px; flex-shrink: 0;
+            border: 1px solid var(--border); background: var(--text-faint);
+        }
+        .pulse-dot.wallet,
+        .pulse-dot.network { background: var(--stark-accent); }
+        .pulse-dot.mempool { background: var(--text-faint); }
 
+        /* ── Activity banner / static work mark ──────────────────────── */
+        #activity-banner {
+            display: none; padding: 10px 1.5rem; background: var(--bg-panel);
+            border-bottom: 1px solid var(--border-bright); font-size: 12px; color: var(--text-bright);
+            align-items: center; gap: 10px; z-index: 10; flex-shrink: 0;
+        }
+        #activity-banner.active { display: flex; }
+        /* a spinner with zero motion is just a static filled mark */
+        .spinner {
+            width: 10px; height: 10px; flex-shrink: 0;
+            border: 1px solid var(--border-bright); background: var(--stark-accent);
+        }
+
+        /* ── Pages ───────────────────────────────────────────────────── */
         .page {
             flex: 1; overflow-y: auto; padding: 1.5rem;
             padding-bottom: calc(env(safe-area-inset-bottom, 1rem) + 80px);
             display: none;
         }
-        .page.active { display: block; animation: fadeIn 0.2s ease; }
+        .page.active { display: block; }
         #authView.active { display: flex; flex-direction: column; justify-content: center; }
-        
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
 
-        input, button { 
-            font-family: inherit; background: var(--bg); color: var(--text-max); 
-            border: 1px solid var(--border-bright); padding: 14px; width: 100%; 
-            font-size: 16px; outline: none; border-radius: 8px; margin-bottom: 12px;
+        /* ── Forms ───────────────────────────────────────────────────── */
+        input, select, textarea {
+            font-family: inherit; background: var(--bg); color: var(--text-max);
+            border: 1px solid var(--border); padding: 12px 14px; width: 100%;
+            font-size: 15px; outline: none; margin-bottom: 12px;
         }
-        input:focus { border-color: var(--accent-dim); }
-        button { background: var(--border-bright); cursor: pointer; font-weight: bold; transition: background 0.15s; }
-        button:active { background: var(--accent); color: #000; }
-        button:disabled { opacity: 0.5; cursor: not-allowed; }
-        
-        .panel { border: 1px solid var(--border); padding: 1.25rem; background: var(--bg-panel); margin-bottom: 1rem; border-radius: 12px; }
-        .hidden { display: none !important; }
-        .stat-val { font-size: 28px; color: var(--text-max); font-weight: bold; word-break: break-all; }
+        input::placeholder { color: var(--text-muted); }
+        input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+        select { cursor: pointer; }
 
-        /* ═══ MDS Balance Toggle ═══ */
+        button {
+            font-family: inherit; background: transparent; color: var(--text-main);
+            border: 1px solid var(--border); padding: 12px 14px; width: 100%;
+            font-size: 14px; font-weight: 500; cursor: pointer; margin-bottom: 12px; line-height: 1.4;
+        }
+        button:hover:not(:disabled) { border-color: var(--accent); }
+        button:active:not(:disabled) { background: var(--highlight); }
+        button:disabled { color: var(--text-faint); border-color: var(--border); cursor: not-allowed; }
+
+        /* Filled "primary" actions: tokenise every inline-filled button so the
+           ink/paper inversion holds in both themes regardless of literal colours. */
+        button[style*="background: var(--accent)"],
+        button[style*="background:var(--accent)"],
+        button[style*="background: var(--text-max)"],
+        button[style*="background:var(--text-max)"] {
+            background: var(--accent) !important;
+            color: var(--on-accent) !important;
+            border: 1px solid var(--accent) !important;
+            font-weight: 600;
+        }
+        button[style*="background: var(--accent)"]:hover:not(:disabled),
+        button[style*="background:var(--accent)"]:hover:not(:disabled),
+        button[style*="background: var(--text-max)"]:hover:not(:disabled),
+        button[style*="background:var(--text-max)"]:hover:not(:disabled) {
+            border-color: var(--text-max) !important;
+        }
+
+        /* ── Send: amount unit selector + live conversion ──────────────
+           Segmented MDS / kMDS / mMDS / gMDS picker (selected = inked),
+           a live base-MDS readout, and an expandable denomination table.
+           All monochrome, square, JetBrains Mono for the figures. */
+        .amount-field { margin-bottom: 8px; }
+        .amount-field input { margin-bottom: 8px; }
+        .unit-select { display: flex; margin: 0; border: 1px solid var(--border); }
+        .unit-select .unit-opt {
+            flex: 1; width: auto; margin: 0; padding: 9px 4px;
+            background: transparent; color: var(--text-muted);
+            border: none; border-left: 1px solid var(--border);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px; font-weight: 500; letter-spacing: 0.5px;
+        }
+        .unit-select .unit-opt:first-child { border-left: none; }
+        .unit-select .unit-opt:hover:not(:disabled) { color: var(--text-bright); border-color: var(--border); }
+        .unit-select .unit-opt.active { color: var(--on-accent); background: var(--accent); }
+
+        .send-conversion {
+            font-family: 'JetBrains Mono', monospace; font-size: 12px;
+            color: var(--text-muted); min-height: 16px; margin-bottom: 12px;
+            word-break: break-word; line-height: 1.5;
+        }
+        .send-conversion.ok { color: var(--text-bright); }
+        .send-conversion.ok strong { color: var(--text-max); font-weight: 600; }
+
+        .denom-ref { border: 1px solid var(--border); margin-bottom: 12px; font-size: 12px; }
+        .denom-ref summary {
+            cursor: pointer; padding: 9px 12px; color: var(--text-muted);
+            text-transform: uppercase; letter-spacing: 1px; font-size: 11px;
+            list-style: none; user-select: none;
+        }
+        .denom-ref summary::-webkit-details-marker { display: none; }
+        .denom-ref summary::after { content: '+'; float: right; color: var(--text-faint); }
+        .denom-ref[open] summary::after { content: '\2212'; }
+        .denom-ref summary:hover { color: var(--text-bright); }
+        .denom-grid {
+            display: grid; grid-template-columns: auto 1fr; gap: 5px 16px;
+            padding: 2px 12px 10px 12px; font-family: 'JetBrains Mono', monospace;
+        }
+        .denom-grid span:nth-child(odd) { color: var(--text-max); }
+        .denom-grid span:nth-child(even) { color: var(--text-muted); text-align: right; }
+        .denom-note { padding: 0 12px 10px 12px; color: var(--text-faint); font-size: 11px; line-height: 1.5; }
+        /* live ETH/USD rate shown beside the DEX price label */
+        .dex-rate { color: var(--text-faint); font-weight: 400; letter-spacing: 0; text-transform: none; font-family: 'JetBrains Mono', monospace; }
+
+        .panel {
+            border: 1px solid var(--border); padding: 1.25rem;
+            background: var(--bg-panel); margin-bottom: 1rem;
+        }
+        .hidden { display: none !important; }
+        .stat-val { font-size: 28px; color: var(--text-max); font-weight: 700; word-break: break-all; }
+
+        /* ── Balance toggle ──────────────────────────────────────────── */
         #balance-toggle-wrap {
             display: inline-block; position: relative; cursor: pointer;
             -webkit-tap-highlight-color: transparent; user-select: none;
         }
         #balance-toggle-wrap:active #lblBalance { opacity: 0.7; }
-        #lblBalance { transition: opacity 0.1s; }
         #balance-toggle-hint {
             font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px;
-            color: #333; margin-top: 6px; transition: color 0.2s;
+            color: var(--text-faint); margin-top: 6px;
         }
-        #balance-toggle-wrap:hover #balance-toggle-hint { color: #555; }
-        .balance-unit-prefix { font-size: 18px; color: var(--accent-dim); font-weight: 400; margin-left: 3px; }
-        .balance-unit-raw    { font-size: 14px; color: #666; margin-left: 4px; }
-        .list-container { border: 1px solid var(--border); background: var(--bg-panel); border-radius: 8px; overflow: hidden; }
+        #balance-toggle-wrap:hover #balance-toggle-hint { color: var(--text-muted); }
+        .balance-unit-prefix { font-size: 18px; color: var(--text-muted); font-weight: 400; margin-left: 3px; }
+        .balance-unit-raw    { font-size: 14px; color: var(--text-faint); margin-left: 4px; }
+
+        /* ── Lists ───────────────────────────────────────────────────── */
+        .list-container { border: 1px solid var(--border); background: var(--bg-panel); overflow: hidden; }
         .list-item { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; }
         .list-item:last-child { border-bottom: none; }
         .flex-row { display: flex; justify-content: space-between; align-items: center; }
 
+        /* ── Bottom nav (mobile) ─────────────────────────────────────── */
         nav {
             position: fixed; bottom: 0; left: 0; right: 0; max-width: 600px; margin: 0 auto;
-            background: rgba(17, 17, 17, 0.95); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
-            border-top: 1px solid var(--border); border-left: 1px solid var(--border); border-right: 1px solid var(--border);
+            background: var(--bg);
+            border-top: 1px solid var(--border);
+            border-left: 1px solid var(--border); border-right: 1px solid var(--border);
             display: flex; justify-content: space-around;
-            padding-bottom: env(safe-area-inset-bottom, 0); 
-            z-index: 100; border-top-left-radius: 16px; border-top-right-radius: 16px;
+            padding-bottom: env(safe-area-inset-bottom, 0); z-index: 100;
         }
         .nav-btn {
-            background: transparent; border: none; color: #666; padding: 12px 0; margin: 0; width: 20%;
-            font-size: 10px; text-transform: uppercase; letter-spacing: 1px; font-weight: normal;
-            display: flex; flex-direction: column; align-items: center; gap: 6px; border-radius: 0;
+            background: transparent; border: none; color: var(--text-muted);
+            padding: 10px 0; margin: 0; width: 20%;
+            font-size: 9px; text-transform: uppercase; letter-spacing: 1px; font-weight: 500;
+            display: flex; flex-direction: column; align-items: center; gap: 5px;
         }
-        .nav-btn.active { color: var(--accent); }
-        .nav-icon { font-size: 20px; }
+        .nav-btn:hover:not(:disabled) { color: var(--text-bright); border: none; }
+        .nav-btn.active { color: var(--text-max); }
+        .nav-btn svg { display: block; width: 20px; height: 20px; stroke: currentColor; }
+        .nav-icon { font-size: 18px; line-height: 1; }
 
-        .terminal { border: 1px solid var(--border); background: var(--bg); border-radius: 8px; }
-        .terminal summary { background: #000; padding: 12px; font-size: 11px; color: #666; text-transform: uppercase; cursor: pointer; list-style: none; display: flex; justify-content: space-between; }
-        .terminal[open] summary { border-bottom: 1px solid var(--border); color: var(--accent); }
+        /* ── Developer terminal ──────────────────────────────────────── */
+        .terminal { border: 1px solid var(--border); background: var(--bg); }
+        .terminal summary {
+            background: var(--bg); padding: 12px; font-size: 11px; color: var(--text-muted);
+            text-transform: uppercase; letter-spacing: 1px; cursor: pointer; list-style: none;
+            display: flex; justify-content: space-between;
+        }
+        .terminal summary::-webkit-details-marker { display: none; }
+        .terminal[open] summary { border-bottom: 1px solid var(--border); color: var(--text-max); }
         .term-log { height: 200px; overflow-y: auto; padding: 10px; font-size: 11px; }
         .term-line { padding: 2px 0; color: var(--text-bright); word-break: break-all; }
-        
-        progress { width: 100%; height: 4px; border: none; background: var(--border); margin-bottom: 1rem; border-radius: 2px; }
-        progress::-webkit-progress-bar { background: var(--border); border-radius: 2px; }
-        progress::-webkit-progress-value { background: var(--accent); border-radius: 2px; transition: width 0.1s; }
 
-        #activity-banner {
-            display: none; padding: 10px 1.5rem; background: rgba(212, 255, 0, 0.06);
-            border-bottom: 1px solid var(--accent-dim); font-size: 12px; color: var(--accent);
-            align-items: center; gap: 10px; z-index: 10;
-        }
-        #activity-banner.active { display: flex; }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .spinner { width: 14px; height: 14px; border: 2px solid var(--accent-dim); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }
+        /* ── Progress (a value, not motion) ──────────────────────────── */
+        progress { width: 100%; height: 4px; border: none; background: var(--border); margin-bottom: 1rem; }
+        progress::-webkit-progress-bar { background: var(--border); }
+        progress::-webkit-progress-value { background: var(--accent); }
+        progress::-moz-progress-bar { background: var(--accent); }
 
-        /* Toasts */
-        #toast-container { 
-            position: fixed; top: calc(env(safe-area-inset-top, 0px) + 20px); left: 50%; transform: translateX(-50%); 
-            z-index: 9999; display: flex; flex-direction: column; gap: 10px; width: 90%; max-width: 400px; pointer-events: none; 
+        /* ── Toasts (instant, monochrome, border-carried) ────────────── */
+        #toast-container {
+            position: fixed; top: calc(env(safe-area-inset-top, 0px) + 20px); left: 50%; transform: translateX(-50%);
+            z-index: 9999; display: flex; flex-direction: column; gap: 10px; width: 90%; max-width: 400px; pointer-events: none;
         }
-        .toast { 
-            padding: 14px 16px; border-radius: 8px; font-weight: 500; text-align: center; font-size: 13px;
-            opacity: 0; transform: translateY(-20px); transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); 
-            box-shadow: 0 10px 30px rgba(0,0,0,0.8); white-space: pre-wrap;
+        .toast {
+            padding: 14px 16px; font-weight: 500; text-align: center; font-size: 13px;
+            opacity: 0; white-space: pre-wrap; background: var(--bg-panel);
         }
-        .toast.show { opacity: 1; transform: translateY(0); }
-        .toast.success { background: var(--bg-panel); border: 1px solid var(--accent); color: var(--accent); }
-        .toast.error { background: #3a0000; border: 1px solid var(--red); color: #fff; }
-        .toast.info { background: var(--bg-panel); border: 1px solid var(--border-bright); color: var(--text-max); }
+        .toast.show { opacity: 1; }
+        .toast.success { border: 1px solid var(--border-bright); color: var(--text-max); }
+        .toast.error   { border: 1px solid var(--text-bright);  color: var(--text-max); font-weight: 600; }
+        .toast.info    { border: 1px solid var(--border);       color: var(--text-bright); }
 
-        /* Modals */
-        .modal-overlay { 
-            position: fixed; top: 0; left: 0; right: 0; bottom: 0; 
-            background: rgba(0,0,0,0.85); backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px);
-            z-index: 1000; display: flex; align-items: center; justify-content: center; 
-            opacity: 0; pointer-events: none; transition: opacity 0.2s; padding: 1rem; 
+        /* ── Modals (instant) ────────────────────────────────────────── */
+        .modal-overlay {
+            position: fixed; inset: 0; background: rgba(0,0,0,0.85);
+            z-index: 1000; display: flex; align-items: center; justify-content: center;
+            opacity: 0; pointer-events: none; padding: 1rem;
         }
+        [data-theme="light"] .modal-overlay { background: rgba(0,0,0,0.45); }
         .modal-overlay.active { opacity: 1; pointer-events: auto; }
-        .modal { 
-            background: var(--bg); border: 1px solid var(--border-bright); border-radius: 12px; padding: 1.5rem; 
-            width: 100%; max-width: 400px; transform: scale(0.95); transition: transform 0.2s; box-shadow: 0 20px 40px rgba(0,0,0,0.9); 
+        .modal {
+            background: var(--bg); border: 1px solid var(--border-bright); padding: 1.5rem;
+            width: 100%; max-width: 400px;
         }
-        .modal-overlay.active .modal { transform: scale(1); }
         .modal h2 { margin-top: 0; font-size: 18px; margin-bottom: 1rem; color: var(--text-max); border-bottom: 1px solid var(--border); padding-bottom: 10px; }
-        .modal p { color: var(--text-bright); font-size: 13px; margin-bottom: 1.5rem; line-height: 1.6; }
+        .modal p { color: var(--text-bright); font-size: 13px; margin-bottom: 1.5rem; line-height: 1.6; font-family: 'Inter', sans-serif; }
         .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
         .modal-actions button { margin: 0; width: auto; padding: 10px 20px; min-height: 0; font-size: 13px; }
-        .btn-cancel { background: transparent; border: 1px solid var(--border-bright); }
-        .btn-cancel:active { background: var(--border); }
+        .btn-cancel { background: transparent; border: 1px solid var(--border-bright); color: var(--text-main); }
+        .btn-cancel:active { background: var(--highlight); }
 
-        #reader { width: 100%; border-radius: 8px; overflow: hidden; border: 1px solid var(--border-bright); }
+        #reader { width: 100%; overflow: hidden; border: 1px solid var(--border-bright); }
         #reader video { object-fit: cover; }
 
-        .seed-grid { 
-            display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 1.5rem; 
-            max-height: 40vh; overflow-y: auto; padding: 10px; background: var(--bg-panel); 
-            border: 1px inset var(--border); border-radius: 8px; 
+        /* ── Seed reveal ─────────────────────────────────────────────── */
+        .seed-grid {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 1.5rem;
+            max-height: 40vh; overflow-y: auto; padding: 10px; background: var(--bg-panel);
+            border: 1px solid var(--border);
         }
-        .seed-word { 
-            background: var(--bg); border: 1px solid var(--border); padding: 8px; border-radius: 6px; 
-            color: var(--accent); font-weight: bold; font-size: 14px; user-select: all; display: flex; align-items: center;
+        .seed-word {
+            background: var(--bg); border: 1px solid var(--border); padding: 8px;
+            color: var(--text-max); font-weight: 600; font-size: 14px; user-select: all; display: flex; align-items: center;
         }
-        .seed-word span { color: #555; font-size: 10px; margin-right: 8px; user-select: none; font-weight: normal; }
+        .seed-word span { color: var(--text-faint); font-size: 10px; margin-right: 8px; user-select: none; font-weight: 400; }
 
-        /* ═══ Mining Dashboard ═══ */
+        /* ── Mining dashboard ────────────────────────────────────────── */
         .mine-hero { text-align: center; padding: 1.5rem 0 1rem 0; }
-        .mine-hero-label { font-size: 10px; text-transform: uppercase; letter-spacing: 2px; color: #555; margin-bottom: 4px; }
-        .mine-hero-rate { font-size: 48px; font-weight: 700; color: #333; transition: color 0.3s; font-variant-numeric: tabular-nums; }
-        .mine-hero-rate.active { color: var(--accent); }
-        .mine-hero-unit { font-size: 14px; color: #555; font-weight: 300; margin-left: 4px; }
-        .mine-hero-rate.active .mine-hero-unit { color: var(--accent-dim); }
-        @keyframes hashPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
-        .mine-hero-rate.active { animation: hashPulse 2s ease-in-out infinite; }
+        .mine-hero-label { font-size: 10px; text-transform: uppercase; letter-spacing: 2px; color: var(--text-faint); margin-bottom: 4px; }
+        .mine-hero-rate { font-size: 48px; font-weight: 700; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+        .mine-hero-rate.active { color: var(--text-max); }
+        .mine-hero-unit { font-size: 14px; color: var(--text-faint); font-weight: 300; margin-left: 4px; }
+        .mine-hero-rate.active .mine-hero-unit { color: var(--text-muted); }
 
         .mine-stats {
             display: grid; grid-template-columns: 1fr 1fr; gap: 1px;
-            background: var(--border); border: 1px solid var(--border); border-radius: 8px;
+            background: var(--border); border: 1px solid var(--border);
             overflow: hidden; margin-bottom: 1rem;
         }
         .mine-stat { background: var(--bg-panel); padding: 12px 14px; display: flex; flex-direction: column; gap: 2px; }
-        .mine-stat-label { font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px; color: #555; }
+        .mine-stat-label { font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--text-faint); }
         .mine-stat-val { font-size: 15px; color: var(--text-bright); font-weight: 500; font-variant-numeric: tabular-nums; }
 
         .mine-hw-badge {
             display: inline-flex; align-items: center; gap: 6px;
             font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
-            color: var(--accent-dim); border: 1px solid var(--border);
-            padding: 6px 10px; border-radius: 4px; background: rgba(212, 255, 0, 0.03);
-            margin-bottom: 1rem;
+            color: var(--text-muted); border: 1px solid var(--border);
+            padding: 6px 10px; background: transparent; margin-bottom: 1rem;
         }
-        .mine-hw-dot { width: 6px; height: 6px; border-radius: 50%; background: #333; }
-        .mine-hw-dot.on { background: var(--accent); box-shadow: 0 0 6px var(--accent-dim); }
+        .mine-hw-dot { width: 6px; height: 6px; background: var(--text-faint); border: 1px solid var(--border); }
+        .mine-hw-dot.on { background: var(--stark-accent); }
 
         .mine-toggle {
             width: 100%; padding: 16px; font-size: 15px; font-weight: 700;
-            text-transform: uppercase; letter-spacing: 2px; border-radius: 8px;
-            margin-bottom: 1.5rem; transition: all 0.2s;
+            text-transform: uppercase; letter-spacing: 2px; margin-bottom: 1.5rem;
         }
-        .mine-toggle.off { background: var(--accent); color: #000; border-color: var(--accent); }
-        .mine-toggle.on { background: transparent; color: var(--red); border: 2px solid var(--red); }
+        .mine-toggle.off { background: var(--accent); color: var(--on-accent); border: 1px solid var(--accent); }
+        .mine-toggle.on  { background: transparent; color: var(--text-bright); border: 1px solid var(--border-bright); }
 
         .mine-throttle { padding: 0 1rem; margin-bottom: 1.25rem; }
         .mine-throttle-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-        .mine-throttle-label { font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px; color: #555; flex-shrink: 0; min-width: 70px; }
+        .mine-throttle-label { font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--text-faint); flex-shrink: 0; min-width: 70px; }
         .mine-throttle-val { font-size: 13px; color: var(--text-bright); font-weight: 500; min-width: 48px; text-align: right; font-variant-numeric: tabular-nums; }
         .mine-throttle input[type="range"] {
-            flex: 1; -webkit-appearance: none; appearance: none; height: 4px;
-            background: var(--border-bright); border-radius: 2px; outline: none;
+            flex: 1; -webkit-appearance: none; appearance: none; height: 2px;
+            background: var(--border-bright); outline: none; margin: 0; padding: 0; border: none;
         }
         .mine-throttle input[type="range"]::-webkit-slider-thumb {
-            -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%;
-            background: var(--accent); cursor: pointer; border: none;
+            -webkit-appearance: none; width: 12px; height: 12px;
+            background: var(--stark-accent); cursor: pointer; border: 1px solid var(--border);
         }
         .mine-throttle input[type="range"]::-moz-range-thumb {
-            width: 16px; height: 16px; border-radius: 50%;
-            background: var(--accent); cursor: pointer; border: none;
+            width: 12px; height: 12px; background: var(--stark-accent); cursor: pointer; border: 1px solid var(--border);
         }
 
         .mine-blocks-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.75rem; }
-        .mine-blocks-count { font-size: 11px; color: var(--accent); font-weight: 700; background: rgba(212, 255, 0, 0.1); padding: 2px 8px; border-radius: 4px; }
+        .mine-blocks-count { font-size: 11px; color: var(--text-bright); font-weight: 700; background: var(--highlight); border: 1px solid var(--border); padding: 2px 8px; }
 
-        .mined-block-entry { padding: 14px 16px; border-bottom: 1px solid var(--border); animation: blockSlideIn 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+        .mined-block-entry { padding: 14px 16px; border-bottom: 1px solid var(--border); }
         .mined-block-entry:last-child { border-bottom: none; }
-        @keyframes blockSlideIn { from { opacity: 0; transform: translateX(-20px); } to { opacity: 1; transform: translateX(0); } }
-        .mined-block-reward { font-size: 18px; font-weight: 700; color: var(--accent); }
-        .mined-block-hash { font-size: 10px; color: #555; word-break: break-all; margin-top: 4px; }
-        .mined-block-meta { font-size: 11px; color: #666; margin-top: 6px; display: flex; gap: 12px; flex-wrap: wrap; }
-        .mined-block-status { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; padding: 2px 6px; border-radius: 3px; }
-        .mined-block-status.accepted { color: var(--accent); background: rgba(212, 255, 0, 0.1); }
-        .mined-block-status.rejected { color: var(--red); background: rgba(255, 68, 68, 0.1); }
+        .mined-block-reward { font-size: 18px; font-weight: 700; color: var(--text-max); }
+        .mined-block-hash { font-size: 10px; color: var(--text-faint); word-break: break-all; margin-top: 4px; }
+        .mined-block-meta { font-size: 11px; color: var(--text-muted); margin-top: 6px; display: flex; gap: 12px; flex-wrap: wrap; }
+        .mined-block-status { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; padding: 2px 6px; border: 1px solid var(--border); }
+        .mined-block-status.accepted { color: var(--text-max); background: var(--highlight); }
+        .mined-block-status.rejected { color: var(--text-muted); background: var(--code-bg); }
 
-        /* Block Found Celebration */
-        #blockCelebration { position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 2000; pointer-events: none; display: none; align-items: center; justify-content: center; }
+        /* Block-found notice — static, stark, ink */
+        #blockCelebration { position: fixed; inset: 0; z-index: 2000; pointer-events: none; display: none; align-items: center; justify-content: center; }
         #blockCelebration.active { display: flex; }
-        .cele-flash { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: var(--accent); opacity: 0; animation: celeFlash 0.6s ease-out; }
-        @keyframes celeFlash { 0% { opacity: 0.3; } 100% { opacity: 0; } }
-        .cele-text { position: relative; text-align: center; animation: celeText 2s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
-        @keyframes celeText { 0% { opacity: 0; transform: scale(0.5); } 15% { opacity: 1; transform: scale(1.1); } 25% { transform: scale(1); } 80% { opacity: 1; } 100% { opacity: 0; transform: scale(0.95) translateY(-10px); } }
-        .cele-title { font-size: 42px; font-weight: 700; color: var(--accent); text-shadow: 0 0 40px rgba(212, 255, 0, 0.4), 0 0 80px rgba(212, 255, 0, 0.15); letter-spacing: 4px; }
+        .cele-flash { position: absolute; inset: 0; background: transparent; opacity: 0; }
+        .cele-text { position: relative; text-align: center; background: var(--bg); border: 1px solid var(--border-bright); padding: 2rem 2.5rem; }
+        .cele-title { font-size: 32px; font-weight: 700; color: var(--text-max); letter-spacing: 4px; }
         .cele-subtitle { font-size: 14px; color: var(--text-bright); margin-top: 8px; letter-spacing: 2px; }
-        .cele-reward { font-size: 28px; font-weight: 700; color: #fff; margin-top: 12px; }
-        .cele-particle { position: absolute; width: 4px; height: 4px; border-radius: 50%; background: var(--accent); animation: particleFly 1.5s ease-out forwards; }
-        @keyframes particleFly { 0% { opacity: 1; transform: translate(0, 0) scale(1); } 100% { opacity: 0; transform: translate(var(--tx), var(--ty)) scale(0); } }
+        .cele-reward { font-size: 28px; font-weight: 700; color: var(--text-max); margin-top: 12px; font-variant-numeric: tabular-nums; }
+        .cele-particle { display: none !important; }
 
         /* Home mining widget */
-        .home-mine-widget { border: 1px solid var(--border); border-radius: 12px; background: var(--bg-panel); padding: 1.25rem; margin-bottom: 1rem; cursor: pointer; transition: border-color 0.2s; }
+        .home-mine-widget { border: 1px solid var(--border); background: var(--bg-panel); padding: 1.25rem; margin-bottom: 1rem; cursor: pointer; }
         .home-mine-widget:hover { border-color: var(--border-bright); }
-        .home-mine-widget.mining { border-color: var(--accent-dim); background: rgba(212, 255, 0, 0.02); }
-        .home-mine-indicator { width: 8px; height: 8px; border-radius: 50%; background: #333; flex-shrink: 0; }
-        .home-mine-indicator.on { background: var(--accent); box-shadow: 0 0 8px var(--accent-dim); animation: indicatorPulse 1.5s ease-in-out infinite; }
-        @keyframes indicatorPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+        .home-mine-widget.mining { border-color: var(--border-bright); background: var(--bg-panel); border-left: 3px solid var(--stark-accent); }
+        .home-mine-indicator { width: 8px; height: 8px; background: var(--text-faint); border: 1px solid var(--border); flex-shrink: 0; }
+        .home-mine-indicator.on { background: var(--stark-accent); }
 
-
+        /* ── Chat ────────────────────────────────────────────────────── */
         #view-chat.active { display: flex; flex-direction: column; height: 100%; }
 
-        
-        #chat-box { 
-            flex-grow: 1; border: 1px solid var(--border); 
-            overflow-y: auto; padding: 16px; margin-bottom: 12px; 
-            background: #080808; display: flex; flex-direction: column;
-            gap: 12px; border-radius: 12px;
-            box-shadow: inset 0 2px 10px rgba(0,0,0,0.5);
+        #chat-box {
+            flex-grow: 1; border: 1px solid var(--border);
+            overflow-y: auto; padding: 12px; margin-bottom: 12px;
+            background: var(--bg-alt); display: flex; flex-direction: column; gap: 8px;
         }
-        
-        .chat-msg { 
-            line-height: 1.4; padding: 10px 14px 6px 14px; border-radius: 14px;
-            background: var(--bg-panel); border: 1px solid var(--border-bright);
-            position: relative; width: fit-content; max-width: 85%;
-            align-self: flex-start; transition: border-color 0.2s;
-            border-bottom-left-radius: 4px;
+        .chat-msg {
+            line-height: 1.5; padding: 8px 12px; background: var(--msg-bg);
+            border: 1px solid var(--border); position: relative;
+            width: fit-content; max-width: 85%; align-self: flex-start;
         }
-        .chat-msg:hover { border-color: #444; }
-
-        /* Own messages: flipped right, accent-tinted */
-        .chat-msg.is-own {
-            align-self: flex-end;
-            background: rgba(212, 255, 0, 0.06);
-            border-color: var(--accent-dim);
-            border-bottom-left-radius: 14px;
-            border-bottom-right-radius: 4px;
-        }
-
-        .chat-msg.is-reply { margin-left: 24px; }
-        .chat-msg.is-own.is-reply { margin-left: 0; margin-right: 24px; }
-        .chat-msg.pinged { background: rgba(212, 255, 0, 0.12); border-color: var(--accent); }
+        .chat-msg:hover { border-color: var(--border-bright); }
+        .chat-msg.is-own { align-self: flex-end; background: var(--code-bg); border-color: var(--border-bright); }
+        .chat-msg.is-reply { margin-left: 24px; border-left: 3px solid var(--border); }
+        .chat-msg.is-own.is-reply { margin-left: 0; margin-right: 24px; border-left: 1px solid var(--border); border-right: 3px solid var(--border); }
+        .chat-msg.pinged { background: var(--accent-bg); border-left: 3px solid var(--stark-accent); }
 
         .chat-header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
-        .chat-sender { color: var(--accent); font-weight: bold; cursor: pointer; font-size: 12px; text-decoration: underline; text-decoration-color: transparent; transition: all 0.2s; }
-        .chat-sender:hover { text-decoration-color: var(--accent); }
-        .chat-time { color: #555; font-size: 10px; margin-left: auto; }
-        /* Chat attachments — full address visible, monospace, word-break. */
+        .chat-sender { color: var(--link-color); font-weight: 500; cursor: pointer; font-size: 12px; text-decoration: underline; text-decoration-color: transparent; }
+        .chat-sender:hover { text-decoration-color: currentColor; }
+        .chat-time { color: var(--text-muted); font-size: 10px; margin-left: auto; font-variant-numeric: tabular-nums; }
+        .chat-words { color: var(--text-main); font-size: 15px; font-weight: 400; display: block; letter-spacing: 0.2px; font-family: 'Inter', -apple-system, sans-serif; }
+
         .draft-attachment {
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-            background: #1a1a1a;
-            border: 1px solid var(--accent);
-            padding: 7px 9px;
-            border-radius: 4px;
-            min-width: 0;
-            max-width: 100%;
+            display: flex; flex-direction: column; gap: 4px;
+            background: var(--code-bg); border: 1px solid var(--stark-accent);
+            padding: 7px 9px; min-width: 0; max-width: 100%;
         }
-        .draft-attachment-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 8px;
-        }
-        .draft-attachment-label {
-            color: var(--accent);
-            font-weight: 600;
-            font-size: 9px;
-            letter-spacing: 1px;
-            text-transform: uppercase;
-        }
-        .draft-attachment-remove {
-            background: transparent;
-            border: none;
-            color: #888;
-            cursor: pointer;
-            padding: 0 6px;
-            font-size: 16px;
-            line-height: 1;
-            min-height: 0;
-            margin: 0;
-            width: auto;
-        }
-        .draft-attachment-remove:hover { color: var(--red); }
-        .draft-attachment-value {
-            font-family: 'JetBrains Mono', 'Menlo', monospace;
-            color: var(--text-max, #fff);
-            font-size: 11px;
-            word-break: break-all;
-            user-select: all;
-            line-height: 1.5;
-        }
+        .draft-attachment-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+        .draft-attachment-label { color: var(--text-bright); font-weight: 600; font-size: 9px; letter-spacing: 1px; text-transform: uppercase; }
+        .draft-attachment-remove { background: transparent; border: none; color: var(--text-muted); cursor: pointer; padding: 0 6px; font-size: 16px; line-height: 1; min-height: 0; margin: 0; width: auto; }
+        .draft-attachment-remove:hover { color: var(--text-max); border: none; }
+        .draft-attachment-value { font-family: 'JetBrains Mono', monospace; color: var(--text-main); font-size: 11px; word-break: break-all; user-select: all; line-height: 1.5; }
 
-        .chat-attachments {
-            display: flex;
-            flex-direction: column;
-            gap: 5px;
-            margin-top: 8px;
-        }
+        .chat-attachments { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
         .chat-attachment {
-            display: flex;
-            flex-direction: column;
-            gap: 3px;
-            background: #161616;
-            border: 1px solid #2c2c2c;
-            padding: 7px 9px;
-            border-radius: 4px;
-            cursor: pointer;
-            transition: border-color 0.15s, background 0.15s;
-            min-width: 0;
-            max-width: 100%;
+            display: flex; flex-direction: column; gap: 3px;
+            background: var(--code-bg); border: 1px solid var(--border);
+            padding: 7px 9px; cursor: pointer; min-width: 0; max-width: 100%;
         }
-        .chat-attachment:hover { border-color: var(--accent); }
-        .chat-attachment.copied { border-color: var(--accent); background: rgba(212, 255, 0, 0.08); }
-        .chat-attachment-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            font-size: 9px;
-            letter-spacing: 1px;
-            text-transform: uppercase;
-            color: #888;
-        }
-        .chat-attachment-label::before { content: "📎 "; }
-        .chat-attachment-status { color: var(--accent); }
-        .chat-attachment-value {
-            font-family: 'JetBrains Mono', 'Menlo', monospace;
-            color: var(--text-max, #fff);
-            font-size: 11px;
-            word-break: break-all;
-            user-select: all;
-            line-height: 1.5;
-        }
-        .chat-words { color: var(--text-max); font-size: 15px; font-weight: 500; display: block; letter-spacing: 0.3px; }
+        .chat-attachment:hover { border-color: var(--border-bright); }
+        .chat-attachment.copied { border-color: var(--stark-accent); background: var(--accent-bg); }
+        .chat-attachment-header { display: flex; align-items: center; justify-content: space-between; font-size: 9px; letter-spacing: 1px; text-transform: uppercase; color: var(--text-muted); }
+        .chat-attachment-label::before { content: ""; }
+        .chat-attachment-status { color: var(--text-bright); }
+        .chat-attachment-value { font-family: 'JetBrains Mono', monospace; color: var(--text-bright); font-size: 11px; word-break: break-all; user-select: all; line-height: 1.5; }
 
-        .reply-context { font-size: 11px; color: #888; margin-bottom: 6px; display: block; background: rgba(255,255,255,0.04); padding: 4px 8px; border-radius: 4px; border-left: 2px solid var(--accent-dim); }
+        .reply-context { font-size: 11px; color: var(--text-muted); margin-bottom: 6px; display: block; background: var(--highlight); padding: 4px 8px; border-left: 2px solid var(--border); font-family: 'JetBrains Mono', monospace; }
 
-        /* Reply: always visible (mobile-friendly), inline at bottom of bubble */
         .reply-btn {
-            background: transparent; color: #666; border: none;
+            background: transparent; color: var(--text-muted); border: none;
             padding: 4px 0 0 0; margin: 4px 0 0 0; width: auto; min-height: 0;
             font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
-            cursor: pointer; display: block; border-radius: 0; transition: color 0.15s;
+            cursor: pointer; display: block;
         }
-        .reply-btn:hover, .reply-btn:active { background: transparent; color: var(--accent); }
+        .reply-btn:hover, .reply-btn:active { background: transparent; color: var(--text-max); border: none; }
         @media (hover: hover) {
-            .reply-btn { opacity: 0.4; }
+            .reply-btn { opacity: 0.45; }
             .chat-msg:hover .reply-btn { opacity: 1; }
         }
 
-        .chat-empty { text-align: center; color: #555; padding: 30px 20px; font-size: 12px; align-self: center; }
+        .chat-empty { text-align: center; color: var(--text-faint); padding: 30px 20px; font-size: 12px; align-self: center; }
 
         #active-reply {
-            display: none; background: rgba(212, 255, 0, 0.1); padding: 8px 12px;
-            border: 1px solid var(--accent-dim); border-radius: 8px; margin-bottom: 12px;
-            color: var(--accent); justify-content: space-between; align-items: center; font-size: 12px;
+            display: none; background: var(--highlight); padding: 8px 12px;
+            border: 1px solid var(--border); border-left: 3px solid var(--stark-accent); margin-bottom: 12px;
+            color: var(--text-main); justify-content: space-between; align-items: center; font-size: 12px;
         }
 
-        #draft-box { 
-            border: 1px solid var(--border-bright); padding: 8px 12px; margin-bottom: 12px; 
-            min-height: 50px; background: var(--bg-panel); display: flex; 
-            align-items: center; gap: 8px; flex-wrap: wrap; border-radius: 12px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        #draft-box {
+            border: 1px solid var(--border); padding: 8px 12px; margin-bottom: 12px;
+            min-height: 50px; background: var(--bg); display: flex;
+            align-items: center; gap: 8px; flex-wrap: wrap;
         }
-        
-        .draft-word { 
-            background: var(--accent); color: #000; padding: 4px 10px; border-radius: 16px; 
-            cursor: pointer; font-size: 13px; font-weight: bold; transition: all 0.15s;
+        #draft-box:focus-within { border-color: var(--accent); }
+
+        .draft-word {
+            background: var(--highlight); color: var(--text-main); border: 1px solid var(--border);
+            padding: 3px 10px; cursor: pointer; font-size: 13px; font-weight: 500;
+            font-family: 'JetBrains Mono', monospace;
         }
-        .draft-word:hover { background: var(--red); color: #fff; text-decoration: line-through; }
-        
+        .draft-word:hover { color: var(--warn-accent); border-color: var(--border-bright); text-decoration: line-through; }
+
         #chat-input {
             background: transparent; border: none; color: var(--text-max);
-            font-size: 15px; outline: none; flex-grow: 1; min-width: 150px; padding: 4px; margin: 0;
+            font-family: 'JetBrains Mono', monospace; font-size: 15px; outline: none;
+            flex-grow: 1; min-width: 150px; padding: 4px; margin: 0;
         }
-        #chat-input::placeholder { color: #666; font-style: italic; }
+        #chat-input::placeholder { color: var(--text-muted); font-style: normal; }
 
-        #dictionary-box { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; max-height: 120px; overflow-y: auto; padding-right: 5px; }
-        .dict-btn { 
-            background: var(--bg); color: var(--text-bright); border: 1px solid var(--border); 
-            padding: 6px 12px; cursor: pointer; border-radius: 6px; width: auto; min-height: 0; margin: 0; font-size: 12px; transition: all 0.1s;
+        #dictionary-box { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; max-height: 120px; overflow-y: auto; padding-right: 5px; align-content: flex-start; }
+        .dict-btn {
+            background: var(--bg); color: var(--text-muted); border: 1px solid var(--border);
+            padding: 6px 12px; cursor: pointer; width: auto; min-height: 0; margin: 0; font-size: 12px;
+            font-family: 'JetBrains Mono', monospace;
         }
-        .dict-btn:hover:not(:disabled) { background: var(--border-bright); color: var(--text-max); border-color: #555; }
+        .dict-btn:hover:not(:disabled) { color: var(--text-main); border-color: var(--accent); }
         .dict-btn:disabled { opacity: 0.3; cursor: not-allowed; }
-        
+
         .chat-controls { display: flex; gap: 12px; margin-bottom: 16px; }
 
-        /* ═══ DEX UI Upgrades ═══ */
-        .tabs { display: flex; gap: 8px; margin-bottom: 1.5rem; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
-        .tab { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #666; cursor: pointer; padding: 6px 12px; border-radius: 6px; transition: all 0.2s; }
-        .tab:hover { background: rgba(255,255,255,0.05); color: var(--text-bright); }
-        .tab.active { background: var(--bg-panel); color: var(--accent); border: 1px solid var(--border-bright); }
+        /* ── DEX / P2P market ────────────────────────────────────────── */
+        .tabs { display: flex; gap: 8px; margin-bottom: 1.5rem; border-bottom: 1px solid var(--border); padding-bottom: 12px; flex-wrap: wrap; }
+        .tab { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); cursor: pointer; padding: 6px 12px; border: 1px solid transparent; }
+        .tab:hover { color: var(--text-bright); border-color: var(--border); }
+        .tab.active { background: var(--bg-panel); color: var(--text-max); border: 1px solid var(--border-bright); }
         .dex-table { width: 100%; border-collapse: collapse; text-align: left; }
-        .dex-table th { color: #666; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; padding: 12px; border-bottom: 1px solid var(--border); }
-        .dex-table td { padding: 12px; border-bottom: 1px solid var(--border); font-size: 13px; font-variant-numeric: tabular-nums; }
-        .dex-table tr:hover td { background: rgba(255,255,255,0.02); }
+        .dex-table th { color: var(--text-muted); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; padding: 12px; border-bottom: 1px solid var(--border); }
+        .dex-table td { padding: 12px; border-bottom: 1px solid var(--border); font-size: 13px; font-variant-numeric: tabular-nums; color: var(--text-bright); }
         .dex-table tr:last-child td { border-bottom: none; }
-        
-        .swap-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-        .dex-phase-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent, #7CFF6B); flex: 0 0 auto; animation: dexPhasePulse 1.1s ease-in-out infinite; box-shadow: 0 0 6px var(--accent, #7CFF6B); }
-        @keyframes dexPhasePulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.35; transform: scale(0.7); } }
+
+        .swap-card { background: var(--bg-panel); border: 1px solid var(--border); padding: 16px; margin-bottom: 16px; }
+        .dex-phase-dot { width: 8px; height: 8px; background: var(--stark-accent); border: 1px solid var(--border); flex: 0 0 auto; }
         .swap-card-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 12px; margin-bottom: 16px; }
-        
+
         .stepper { display: flex; justify-content: space-between; position: relative; margin-bottom: 20px; }
-        .stepper::before { content: ''; position: absolute; top: 12px; left: 10%; right: 10%; height: 2px; background: var(--border); z-index: 1; }
+        .stepper::before { content: ''; position: absolute; top: 12px; left: 10%; right: 10%; height: 1px; background: var(--border); z-index: 1; }
         .step { display: flex; flex-direction: column; align-items: center; z-index: 2; width: 25%; }
-        .step-circle { width: 26px; height: 26px; border-radius: 50%; background: var(--bg); border: 2px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: bold; color: #666; transition: all 0.3s; }
-        .step-label { font-size: 10px; color: #666; margin-top: 8px; text-align: center; text-transform: uppercase; letter-spacing: 0.5px; }
-        
-        .step.active .step-circle { border-color: var(--accent); color: var(--accent); box-shadow: 0 0 10px rgba(212,255,0,0.2); }
-        .step.active .step-label { color: var(--text-max); font-weight: bold; }
-        .step.completed .step-circle { background: var(--accent); border-color: var(--accent); color: #000; }
+        .step-circle { width: 24px; height: 24px; background: var(--bg); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; color: var(--text-muted); }
+        .step-label { font-size: 10px; color: var(--text-muted); margin-top: 8px; text-align: center; text-transform: uppercase; letter-spacing: 0.5px; }
+        .step.active .step-circle { border-color: var(--text-max); color: var(--text-max); }
+        .step.active .step-label { color: var(--text-max); font-weight: 700; }
+        .step.completed .step-circle { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
         .step.completed .step-label { color: var(--text-bright); }
-        
-        /* Desktop */
+
+        /* =====================================================================
+        DESKTOP — open into a full-bleed explorer shell that uses the screen.
+        ===================================================================== */
         @media (min-width: 768px) {
-            body, html { display: flex; align-items: center; justify-content: center; background: #050505; }
+            body, html { overflow: hidden; }
+
             #app-container {
-                width: 100%; max-width: 1000px; height: 85vh; min-height: 600px;
-                border: 1px solid var(--border-bright); border-radius: 12px;
-                box-shadow: 0 20px 50px rgba(0,0,0,0.5); display: grid; background: var(--bg);
-                grid-template-columns: 220px 1fr; grid-template-rows: 60px auto 1fr;
-                grid-template-areas: "nav header" "nav banner" "nav content";
+                max-width: none; width: 100%; height: 100vh; margin: 0;
+                border-left: none; border-right: none;
+                display: grid;
+                grid-template-columns: 220px minmax(0, 1fr);
+                grid-template-rows: auto auto auto minmax(0, 1fr);
+                grid-template-areas:
+                    "nav header"
+                    "nav stats"
+                    "nav banner"
+                    "nav content";
             }
-            header { grid-area: header; border-bottom: 1px solid var(--border); justify-content: flex-start; padding: 0 2rem; }
-            header h1 { margin: 0; }
-            #activity-banner { grid-area: banner; }
+
+            header {
+                grid-area: header; justify-content: space-between;
+                padding: 0 2rem; height: 56px; border-bottom: 1px solid var(--border);
+            }
+            #global-network-stats {
+                grid-area: stats; justify-content: flex-start; gap: 32px;
+                padding: 9px 2rem; border-bottom: 1px solid var(--border);
+            }
+            #activity-banner { grid-area: banner; padding: 10px 2rem; }
+
             #bottom-nav {
-                position: static; grid-area: nav; flex-direction: column; justify-content: flex-start; gap: 8px;
-                border-top: none; border-right: 1px solid var(--border); background: var(--bg-panel); border-radius: 0; padding: 2rem 1rem;
+                position: static; grid-area: nav;
+                flex-direction: column; justify-content: flex-start; align-items: stretch; gap: 2px;
+                border: none; border-right: 1px solid var(--border);
+                background: var(--bg); max-width: none; margin: 0;
+                padding: 1.5rem 0.75rem;
             }
-            .nav-btn { width: 100%; flex-direction: row; justify-content: flex-start; padding: 12px 16px; font-size: 13px; font-weight: 500; border-radius: 8px; transition: background 0.2s; }
-            .nav-btn:hover { background: var(--border); }
-            .nav-btn.active { background: var(--border-bright); color: var(--text-max); }
-            .nav-icon { font-size: 18px; margin-right: 12px; }
-            .page { grid-area: content; padding: 2.5rem; padding-bottom: 2.5rem; }
+            .nav-btn {
+                width: 100%; flex-direction: row; justify-content: flex-start; gap: 12px;
+                padding: 10px 12px; font-size: 12px; letter-spacing: 1px;
+                border-left: 2px solid transparent;
+            }
+            .nav-btn:hover:not(:disabled) { color: var(--text-bright); }
+            .nav-btn.active { color: var(--text-max); border-left: 2px solid var(--text-max); }
+            .nav-btn svg { width: 16px; height: 16px; }
+            .nav-icon { font-size: 15px; }
+
+            /* Content area: fill the shell, but cap line length sensibly so
+               ultra-wide monitors read as a workspace, not a stretched strip. */
+            .page {
+                grid-area: content; width: 100%;
+                max-width: 1320px; margin-inline: auto;
+                padding: 2rem 2.5rem; padding-bottom: 2rem;
+            }
+            #authView.page { grid-column: 1 / -1; max-width: 460px; }
+            #view-chat.page { max-width: 980px; }
+            #view-send.page, #view-receive.page,
+            #view-settings.page, #view-lightning.page { max-width: 780px; }
+
+            input, button { font-size: 14px; }
+            .mine-stats { grid-template-columns: repeat(3, 1fr); }
+        }
+
+        /* Wider screens: more columns, two-column home, roomier rhythm. */
+        @media (min-width: 1200px) {
+            #app-container { grid-template-columns: 240px minmax(0, 1fr); }
+            .page { padding: 2.5rem 3rem; }
+            .mine-stats { grid-template-columns: repeat(4, 1fr); }
+
+            .home-grid {
+                display: grid; grid-template-columns: 1.4fr 1fr;
+                gap: 2.5rem; align-items: start;
+            }
             .list-item { flex-direction: row; justify-content: space-between; align-items: center; }
             .list-item .flex-row { gap: 2rem; width: auto; }
-            input, button { padding: 10px 14px; font-size: 14px; min-height: auto; }
-            .mine-stats { grid-template-columns: 1fr 1fr 1fr; }
         }
+
+        @media (min-width: 1600px) {
+            #app-container { grid-template-columns: 260px minmax(0, 1fr); }
+            .page { max-width: 1480px; }
+        }
+
+        /* Home two-column wrapper collapses to a single column on mobile. */
+        .home-grid { display: flex; flex-direction: column; }
+        .home-col { min-width: 0; }
     </style>
 </head>
 <body>
         <div id="app-container">
         <header>
-            <h1>MIDSTATE<span style="color:var(--accent);">.</span>WALLET</h1>
+            <h1 class="brand"><span class="brand-indicator"></span>MIDSTATE<span class="brand-dot">.</span>WALLET</h1>
+            <button class="theme-toggle" onclick="toggleTheme()" title="Toggle theme" aria-label="Toggle theme">
+                <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"></path></svg>
+                <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg>
+            </button>
         </header>
         
         <div id="global-network-stats">
@@ -555,6 +736,8 @@
 
         <!-- HOME -->
         <main id="view-home" class="page">
+          <div class="home-grid">
+            <div class="home-col home-col-main">
             <div class="panel flex-row" style="margin-bottom: 2rem; background: transparent; border-color: var(--border-bright);">
                 <div style="display: flex; flex-direction: column; gap: 4px;">
                     <span style="font-weight: bold; color: var(--text-max); font-size: 16px;">Network Sync</span>
@@ -591,14 +774,18 @@
             </div>
 
             <div class="flex-row" style="gap: 12px; margin-bottom: 2rem;">
-                <button class="nav-trigger" data-target="view-send" style="margin: 0; background: var(--bg-panel);">💸 Send</button>
-                <button class="nav-trigger" data-target="view-receive" style="margin: 0; background: var(--bg-panel);">⬇️ Receive</button>
+                <button class="nav-trigger" data-target="view-send" style="margin: 0; background: var(--bg-panel);">Send</button>
+                <button class="nav-trigger" data-target="view-receive" style="margin: 0; background: var(--bg-panel);">Receive</button>
             </div>
+            </div><!-- /home-col-main -->
 
+            <div class="home-col home-col-side">
             <h3>Recent Activity</h3>
             <div class="list-container" id="historyList">
-                <div class="list-item" style="text-align: center; color: #555;">No history.</div>
+                <div class="list-item" style="text-align: center; color: var(--text-faint);">No history.</div>
             </div>
+            </div><!-- /home-col-side -->
+          </div><!-- /home-grid -->
         </main>
 
         <!-- MINING DASHBOARD -->
@@ -722,14 +909,13 @@
                 <!-- Warning Stickers -->
                 <div style="display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap;">
                     <span style="
-                        background-color: #dc2626; 
-                        color: white; 
+                        background-color: transparent; 
+                        color: var(--text-bright); 
                         font-size: 11px; 
                         font-weight: 700; 
                         padding: 4px 11px; 
-                        border-radius: 9999px; 
+                        border: 1px solid var(--border-bright);
                         letter-spacing: 0.5px;
-                        box-shadow: 0 2px 4px rgba(220, 38, 38, 0.35);
                         display: inline-flex;
                         align-items: center;
                         gap: 4px;
@@ -738,14 +924,13 @@
                     </span>
                     
                     <span style="
-                        background-color: #dc2626; 
-                        color: white; 
+                        background-color: transparent; 
+                        color: var(--text-bright); 
                         font-size: 11px; 
                         font-weight: 700; 
                         padding: 4px 11px; 
-                        border-radius: 9999px; 
+                        border: 1px solid var(--border-bright);
                         letter-spacing: 0.5px;
-                        box-shadow: 0 2px 4px rgba(220, 38, 38, 0.35);
                         display: inline-flex;
                         align-items: center;
                         gap: 4px;
@@ -758,11 +943,10 @@
             <!-- Connection Status -->
             <div id="evmAddressDisplay" style="
                 font-size: 11px; 
-                color: var(--accent); 
-                background: rgba(212,255,0,0.1); 
+                color: var(--text-bright); 
+                background: var(--highlight); 
                 padding: 4px 8px; 
-                border-radius: 4px; 
-                border: 1px solid var(--accent-dim);
+                border: 1px solid var(--border);
                 white-space: nowrap;
             ">
                 Base: Not Connected
@@ -809,15 +993,21 @@
                         <button type="button" id="dexDirBuy" onclick="dexSetDirection('bid')"
                             style="flex:1; margin:0; padding:10px; font-size:12px; background:transparent; border:1px solid var(--border-bright); color:var(--text-bright);">Buy MDS ← ETH</button>
                     </div>
-                    <div class="flex-row" style="gap: 15px;">
-                        <div style="flex: 1;">
-                            <label style="font-size: 11px; color: #666; text-transform: uppercase;">MDS Amount</label>
-                            <input type="number" id="dexOfferAmount" placeholder="e.g. 1000">
+                    <div style="margin-bottom: 4px;">
+                        <label style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">MDS Amount</label>
+                        <input type="number" id="dexOfferAmount" placeholder="e.g. 1000">
+                    </div>
+                    <div>
+                        <label style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Price <span id="dexRate" class="dex-rate"></span></label>
+                        <div class="amount-field">
+                            <input type="number" inputmode="decimal" step="any" min="0" id="dexAskAmount" placeholder="e.g. 0.05" oninput="updateDexPrice()">
+                            <div class="unit-select" id="dexUnitSelect">
+                                <button type="button" class="unit-opt active" data-unit="ETH" onclick="setDexUnit(this)">ETH</button>
+                                <button type="button" class="unit-opt" data-unit="Gwei" onclick="setDexUnit(this)">Gwei</button>
+                                <button type="button" class="unit-opt" data-unit="Wei" onclick="setDexUnit(this)">Wei</button>
+                            </div>
                         </div>
-                        <div style="flex: 1;">
-                            <label style="font-size: 11px; color: #666; text-transform: uppercase;">Price (Wei)</label>
-                            <input type="number" id="dexAskAmount" placeholder="Total price in Wei">
-                        </div>
+                        <div id="dexPriceReadout" class="send-conversion"></div>
                     </div>
                     <div id="dexGiveHint" style="font-size: 11px; color: var(--text-bright); margin: 8px 0 4px;">You lock MDS first; you receive ETH.</div>
                     <button onclick="dexCreateOffer()" style="background: var(--text-max); color: #000; margin-top: 10px;">Broadcast Offer</button>
@@ -839,13 +1029,31 @@
             <h2>Send Funds</h2>
             <div class="panel">
                 <div class="flex-row" style="margin-bottom: 10px;">
-                    <label style="font-size: 11px; color: #666; text-transform: uppercase;">Recipient Address</label>
-                    <button id="btnScanQR" style="background: transparent; border: 1px dashed var(--border-bright); color: var(--accent); padding: 4px 12px; width: auto; min-height: 0; font-size: 11px; margin: 0;">📷 Scan</button>
+                    <label style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Recipient Address</label>
+                    <button id="btnScanQR" style="background: transparent; border: 1px dashed var(--border-bright); color: var(--accent); padding: 4px 12px; width: auto; min-height: 0; font-size: 11px; margin: 0;">Scan</button>
                 </div>
                 <input type="text" id="sendAddress" placeholder="Paste or scan hex address...">
-                <label style="font-size: 11px; color: #666; text-transform: uppercase;">Amount</label>
-                <input type="number" inputmode="numeric" id="sendAmount" placeholder="0">
-                <button id="btnSend" style="margin-top: 10px; background: var(--text-max); color: #000;">Swipe to Send</button>
+                <label style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Amount</label>
+                <div class="amount-field">
+                    <input type="number" inputmode="decimal" step="any" min="0" id="sendAmount" placeholder="0" oninput="updateSendConversion()">
+                    <div class="unit-select" id="sendUnitSelect">
+                        <button type="button" class="unit-opt active" data-unit="MDS" onclick="setSendUnit(this)">MDS</button>
+                        <button type="button" class="unit-opt" data-unit="kMDS" onclick="setSendUnit(this)">kMDS</button>
+                        <button type="button" class="unit-opt" data-unit="mMDS" onclick="setSendUnit(this)">mMDS</button>
+                        <button type="button" class="unit-opt" data-unit="gMDS" onclick="setSendUnit(this)">gMDS</button>
+                    </div>
+                </div>
+                <div id="sendConversion" class="send-conversion"></div>
+                <details class="denom-ref">
+                    <summary>Denominations</summary>
+                    <div class="denom-grid">
+                        <span>1 kMDS</span><span>1,024 MDS</span>
+                        <span>1 mMDS</span><span>1,048,576 MDS</span>
+                        <span>1 gMDS</span><span>1,073,741,824 MDS</span>
+                    </div>
+                    <div class="denom-note">Each step is &times;1,024 (2<sup>10</sup>) &mdash; so 1,024 kMDS = 1 mMDS and 1,024 mMDS = 1 gMDS, matching Midstate's power-of-2 UTXOs.</div>
+                </details>
+                <button id="btnSend" style="margin-top: 4px; background: var(--text-max); color: #000;">Swipe to Send</button>
             </div>
             <h3 style="margin-top: 1.5rem; font-size: 12px; color: #666;">Available UTXOs</h3>
             <div class="list-container" id="utxoList">
@@ -920,7 +1128,7 @@
                 Instant, zero-fee payment channels over the Midstate P2P Chat Bus.
             </div>
 
-            <div class="panel" style="background: rgba(212, 255, 0, 0.02); border-color: var(--accent-dim);">
+            <div class="panel" style="background: var(--bg-panel); border-color: var(--border);">
                 <h3 style="font-size: 13px; color: var(--accent);">Your Q-Bolt Identity</h3>
                 <div id="l2MyIdentity" style="font-family: monospace; font-size: 11px; word-break: break-all; color: var(--text-max); margin-bottom: 8px;">Sync to generate identity...</div>
                 <button onclick="navigator.clipboard.writeText(document.getElementById('l2MyIdentity').innerText); showToast('Identity copied', 'success');" style="margin: 0; padding: 6px; font-size: 11px; width: auto; background: transparent; border-color: var(--accent-dim); color: var(--accent);">Copy Identity</button>
@@ -991,14 +1199,14 @@
 
         <!-- NAV (7 tabs now) -->
         <nav id="bottom-nav" class="hidden">
-            <button class="nav-btn active" data-target="view-home"><span class="nav-icon">🏠</span><span>Home</span></button>
-            <button class="nav-btn" data-target="view-dex"><span class="nav-icon">📈</span><span>P2P OTC DEX</span></button>
-            <button class="nav-btn" data-target="view-mine"><span class="nav-icon">⛏️</span><span>Mine</span></button>
-            <button class="nav-btn" data-target="view-send"><span class="nav-icon">💸</span><span>Send</span></button>
-            <button class="nav-btn" data-target="view-receive"><span class="nav-icon">⬇️</span><span>Receive</span></button>
+            <button class="nav-btn active" data-target="view-home"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9v12h14V9"/></svg><span>Home</span></button>
+            <button class="nav-btn" data-target="view-dex"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M7 7h13l-3-3M17 17H4l3 3"/></svg><span>P2P OTC DEX</span></button>
+            <button class="nav-btn" data-target="view-mine"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/></svg><span>Mine</span></button>
+            <button class="nav-btn" data-target="view-send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M5 19L19 5M9 5h10v10"/></svg><span>Send</span></button>
+            <button class="nav-btn" data-target="view-receive"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M12 4v12M6 12l6 6 6-6"/></svg><span>Receive</span></button>
              <!--<button class="nav-btn" data-target="view-lightning"><span class="nav-icon">⚡</span><span>Q-Bolt L2</span></button>-->
-            <button class="nav-btn" data-target="view-chat"><span class="nav-icon">💬</span><span>Chat</span></button>
-            <button class="nav-btn" data-target="view-settings"><span class="nav-icon">⚙️</span><span>Settings</span></button>
+            <button class="nav-btn" data-target="view-chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M21 15a2 2 0 0 1-2 2H8l-4 4V5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2z"/></svg><span>Chat</span></button>
+            <button class="nav-btn" data-target="view-settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="8" cy="18" r="1.6"/></svg><span>Settings</span></button>
         </nav>
     </div>
 
@@ -1106,11 +1314,11 @@ if ('serviceWorker' in navigator) {
         if (window.location.hostname === "ciphernom.github.io" && !localStorage.getItem('hideMigrationBanner')) {
             const banner = document.createElement('div');
             // We added display: flex here to easily push the text to the center and the X to the right
-            banner.style = "background: #ff4444; color: white; padding: 12px; text-align: center; font-size: 13px; font-weight: bold; position: fixed; top: 0; left: 0; right: 0; z-index: 10000; border-bottom: 2px solid black; display: flex; justify-content: space-between; align-items: center;";
+            banner.style = "background: var(--text-max); color: var(--bg); padding: 12px; text-align: center; font-size: 13px; font-weight: bold; position: fixed; top: 0; left: 0; right: 0; z-index: 10000; border-bottom: 1px solid var(--border-bright); display: flex; justify-content: space-between; align-items: center;";
             
             banner.innerHTML = `
-                <div style="flex: 1;">NOTICE: We are moving to <a href='https://cypherpunk.gold/wallet' style='color: white; text-decoration: underline;'>cypherpunk.gold</a>. Please export your backup and import it on the new domain.</div>
-                <button id="closeBannerBtn" style="background: transparent; border: none; color: white; font-size: 18px; cursor: pointer; padding: 0 10px; width: auto; margin: 0; min-height: auto;">✕</button>
+                <div style="flex: 1;">NOTICE: We are moving to <a href='https://cypherpunk.gold/wallet' style='color: var(--bg); text-decoration: underline;'>cypherpunk.gold</a>. Please export your backup and import it on the new domain.</div>
+                <button id="closeBannerBtn" style="background: transparent; border: none; color: var(--bg); font-size: 18px; cursor: pointer; padding: 0 10px; width: auto; margin: 0; min-height: auto;">✕</button>
             `;
             
             document.body.prepend(banner);
@@ -1718,6 +1926,62 @@ if ('serviceWorker' in navigator) {
             return `${value}<span class="balance-unit-prefix">${prefix}</span>`;
         }
 
+        // ─── Send: unit-tagged amount entry ──────────────────────────
+        //  The base unit is MDS (integer, min 1). kMDS/mMDS/gMDS are the
+        //  power-of-2 multiples, so an entered amount is resolved to a
+        //  whole number of base MDS before it is handed to the worker.
+        const MDS_UNITS = { MDS: 1, kMDS: MDS_KILO, mMDS: MDS_MEGA, gMDS: MDS_GIGA };
+        let sendUnit = 'MDS';
+
+        function setSendUnit(btn) {
+            sendUnit = btn.dataset.unit || 'MDS';
+            document.querySelectorAll('#sendUnitSelect .unit-opt').forEach(b => {
+                b.classList.toggle('active', b === btn);
+            });
+            updateSendConversion();
+        }
+
+        // Resolve the input + selected unit to a base-MDS integer.
+        // Returns { raw: <int>|null, error: <string>|null }.
+        function resolveSendAmount() {
+            const field = document.getElementById('sendAmount');
+            const txt = (field ? field.value : '').trim();
+            if (txt === '') return { raw: null, error: null };
+            const val = Number(txt);
+            if (!isFinite(val) || val <= 0) return { raw: null, error: 'Enter a positive amount.' };
+            const mult = MDS_UNITS[sendUnit] || 1;
+            const raw = val * mult;
+            if (raw < 1) return { raw: null, error: 'Below the minimum of 1 MDS.' };
+            if (!Number.isInteger(raw)) {
+                return { raw: null, error: `${txt} ${sendUnit} is not a whole number of MDS.` };
+            }
+            if (!Number.isSafeInteger(raw)) return { raw: null, error: 'Amount is too large.' };
+            return { raw, error: null };
+        }
+
+        // Live "= N MDS" readout beneath the amount field.
+        function updateSendConversion() {
+            const el = document.getElementById('sendConversion');
+            if (!el) return;
+            const { raw, error } = resolveSendAmount();
+            if (error) { el.className = 'send-conversion'; el.textContent = error; return; }
+            if (raw === null) { el.className = 'send-conversion'; el.textContent = ''; return; }
+            el.className = 'send-conversion ok';
+            const { value, prefix } = formatMDS(raw);
+            // Only append the compact form when it actually condenses the figure
+            // (a different, larger prefix than plain MDS and than what was typed).
+            const showTail = (prefix !== 'MDS') && (prefix !== sendUnit);
+            const tail = showTail ? ` &middot; ${value} ${prefix}` : '';
+            el.innerHTML = `= <strong>${raw.toLocaleString('en')}</strong> MDS${tail}`;
+        }
+
+        function resetSendForm() {
+            const f = document.getElementById('sendAmount'); if (f) f.value = '';
+            const a = document.getElementById('sendAddress'); if (a) a.value = '';
+            const mdsBtn = document.querySelector('#sendUnitSelect .unit-opt[data-unit="MDS"]');
+            if (mdsBtn) setSendUnit(mdsBtn); else updateSendConversion();
+        }
+
         // ─── Balance toggle state ────────────────────────────────────
         let balanceRawMode = false;  // false = compact (gMDS), true = raw (1,234,567 MDS)
         let _lastRawBalance = 0;     // cached so toggle re-renders without a worker round-trip
@@ -2303,7 +2567,7 @@ if ('serviceWorker' in navigator) {
 
             let color = 'var(--accent)';
             if (isSent) color = 'var(--red)';
-            if (isPending) color = '#ffa500';
+            if (isPending) color = 'var(--text-faint)';
 
             const displayKind = isPending ? '⏳ PENDING' : tx.kind.toUpperCase();
             document.getElementById('txDetailTitle').innerText = displayKind + " DETAILS";
@@ -2402,9 +2666,9 @@ if ('serviceWorker' in navigator) {
                 } else {
                     let tokensHtml = '';
                     for (const [asset, bal] of Object.entries(tokenBalances)) {
-                        tokensHtml += `<div style="background: rgba(212, 255, 0, 0.05); border: 1px solid var(--accent-dim); padding: 8px 16px; border-radius: 8px; display: inline-flex; align-items: baseline; gap: 6px;">
+                        tokensHtml += `<div style="background: var(--highlight); border: 1px solid var(--border); padding: 8px 16px; display: inline-flex; align-items: baseline; gap: 6px;">
                             <span style="font-size: 18px; font-weight: bold; color: var(--text-max);">${bal}</span>
-                            <span style="font-size: 11px; color: var(--accent); font-weight: bold;">${asset}</span>
+                            <span style="font-size: 11px; color: var(--text-muted); font-weight: bold;">${asset}</span>
                         </div>`;
                     }
                     tokenContainer.innerHTML = tokensHtml;
@@ -2487,7 +2751,7 @@ if ('serviceWorker' in navigator) {
 
                         let color = 'var(--accent)';
                         if (isSent) color = 'var(--red)';
-                        if (isPending) color = '#ffa500';
+                        if (isPending) color = 'var(--text-faint)';
 
                         const sign = (isSent || isPending) ? '-' : '+';
                         const displayKind = isPending ? '⏳ PENDING' : h.kind;
@@ -2866,19 +3130,27 @@ if ('serviceWorker' in navigator) {
         };
         document.getElementById('btnSend').onclick = (e) => {
             const toAddress = document.getElementById('sendAddress').value;
-            const amount = parseInt(document.getElementById('sendAmount').value);
-            if (!toAddress || !amount) return showToast("Fill out transaction parameters.", "error");
+            const entered = (document.getElementById('sendAmount').value || '').trim();
+            const { raw: amount, error } = resolveSendAmount();
+            if (!toAddress) return showToast("Enter a recipient address.", "error");
+            if (!amount) return showToast(error || "Enter an amount to send.", "error");
             if (sendInProgress) return showToast("A transaction is already in progress.", "info");
+
+            // In the confirmation, show the entered unit form and the exact
+            // base-MDS figure it resolves to (so there is no ambiguity).
+            const { value: cV, prefix: cP } = formatMDS(amount);
+            const amtLine = (sendUnit === 'MDS')
+                ? `<strong style="color:var(--text-max)">${amount.toLocaleString('en')}</strong> MDS`
+                : `<strong style="color:var(--text-max)">${entered} ${sendUnit}</strong> <span style="color:var(--text-muted)">= ${amount.toLocaleString('en')} MDS</span>`;
 
             showConfirm(
                 "Confirm Transaction",
-                `Are you sure you want to send <strong style="color:var(--text-max)">${amount}</strong> units to <br><span style="font-size:12px; word-break:break-all; color:var(--accent); display:block; margin-top:8px;">${toAddress}</span>?`,
+                `Send ${amtLine} to <br><span style="font-size:12px; word-break:break-all; color:var(--accent); display:block; margin-top:8px;">${toAddress}</span>?`,
                 () => {
                     sendInProgress = true;
                     e.target.disabled = true;
                     e.target.innerText = "Processing...";
-                    document.getElementById('sendAmount').value = '';
-                    document.getElementById('sendAddress').value = '';
+                    resetSendForm();
                     switchTab('view-home');
                     showActivity("Preparing transaction...");
                     worker.postMessage({ type: 'SEND', payload: { toAddress, amount } });
@@ -3230,7 +3502,7 @@ document.getElementById('btnExport').onclick = () => {
 
                 const label = document.createElement('span');
                 label.className = 'draft-attachment-label';
-                label.textContent = `📎 ${att.kind}`;
+                label.textContent = `${att.kind}`;
                 header.appendChild(label);
 
                 const removeBtn = document.createElement('button');
@@ -3605,23 +3877,115 @@ document.getElementById('btnExport').onclick = () => {
                 : 'You receive MDS; you lock ETH after the seller locks MDS.';
         };
 
+        // ── DEX price: ETH / Gwei / Wei entry with live USD value ────────────
+        //  Wei are unwieldy to type, so the price is entered in ETH (default)
+        //  and converted to an exact wei BigInt for the on-chain value. A live
+        //  USD estimate uses a public spot price (best-effort; degrades to just
+        //  the ETH/wei figures if no feed is reachable).
+        let dexUnit = 'ETH';
+        let ethUsdPrice = null;
+
+        function fmtUsd(n) {
+            if (!isFinite(n)) return null;
+            const frac = (n !== 0 && Math.abs(n) < 1) ? 4 : 2;
+            return n.toLocaleString('en', { style: 'currency', currency: 'USD', maximumFractionDigits: frac });
+        }
+
+        function setDexUnit(btn) {
+            dexUnit = btn.dataset.unit || 'ETH';
+            document.querySelectorAll('#dexUnitSelect .unit-opt').forEach(b => b.classList.toggle('active', b === btn));
+            updateDexPrice();
+        }
+
+        // Resolve the price field + unit to an exact wei BigInt.
+        // Returns { wei: BigInt|null, eth: string|null, error: string|null }.
+        function dexWeiFromInput() {
+            const f = document.getElementById('dexAskAmount');
+            const txt = (f ? f.value : '').trim();
+            if (txt === '') return { wei: null, eth: null, error: null };
+            let wei;
+            try {
+                if (dexUnit === 'ETH') wei = ethers.parseEther(txt);
+                else if (dexUnit === 'Gwei') wei = ethers.parseUnits(txt, 'gwei');
+                else {
+                    if (!/^\d+$/.test(txt)) return { wei: null, eth: null, error: 'Wei must be a whole number.' };
+                    wei = BigInt(txt);
+                }
+            } catch (_) {
+                return { wei: null, eth: null, error: 'Enter a valid amount.' };
+            }
+            if (wei <= 0n) return { wei: null, eth: null, error: 'Price must be greater than zero.' };
+            return { wei, eth: ethers.formatEther(wei), error: null };
+        }
+
+        // USD string for a wei value using the cached spot price (or null).
+        function weiToUsd(wei) {
+            if (!ethUsdPrice) return null;
+            try { return fmtUsd(parseFloat(ethers.formatEther(wei)) * ethUsdPrice); }
+            catch (_) { return null; }
+        }
+
+        // Live "= N ETH · ≈ $N · N wei" readout under the price field.
+        function updateDexPrice() {
+            const el = document.getElementById('dexPriceReadout');
+            if (!el) return;
+            const { wei, eth, error } = dexWeiFromInput();
+            if (error) { el.className = 'send-conversion'; el.textContent = error; return; }
+            if (wei === null) { el.className = 'send-conversion'; el.textContent = ''; return; }
+            el.className = 'send-conversion ok';
+            const ethStr = (eth.indexOf('.') >= 0 ? eth.replace(/0+$/, '').replace(/\.$/, '') : eth);
+            const bits = [`<strong>${ethStr} ETH</strong>`];
+            const usd = weiToUsd(wei);
+            if (usd) bits.push(`&asymp; ${usd}`);
+            bits.push(`<span style="color:var(--text-faint)">${wei.toString()} wei</span>`);
+            el.innerHTML = '= ' + bits.join(' &middot; ');
+        }
+
+        function onEthPrice() {
+            const rate = document.getElementById('dexRate');
+            if (rate) rate.textContent = ethUsdPrice ? `\u00b7 1 ETH \u2248 ${fmtUsd(ethUsdPrice)}` : '';
+            updateDexPrice();
+            try { renderDexOrderbook(); } catch (_) {}
+            try { renderDexSwaps(); } catch (_) {}
+        }
+
+        async function fetchEthUsd() {
+            const sources = [
+                { url: 'https://api.coinbase.com/v2/prices/ETH-USD/spot', pick: j => parseFloat(j && j.data && j.data.amount) },
+                { url: 'https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd', pick: j => parseFloat(j && j.ethereum && j.ethereum.usd) },
+                { url: 'https://min-api.cryptocompare.com/data/price?fsym=ETH&tsyms=USD', pick: j => parseFloat(j && j.USD) }
+            ];
+            for (const s of sources) {
+                try {
+                    const r = await fetch(s.url, { cache: 'no-store' });
+                    if (!r.ok) continue;
+                    const p = s.pick(await r.json());
+                    if (isFinite(p) && p > 0) { ethUsdPrice = p; onEthPrice(); return; }
+                } catch (_) { /* try next source */ }
+            }
+        }
+        // Fetch once on load, then refresh periodically while the app is open.
+        fetchEthUsd();
+        setInterval(fetchEthUsd, 90000);
+
         window.dexCreateOffer = function() {
             if (!evmAddress) return showToast("Connect MetaMask first", "error");
             const mdsAmt = Number(document.getElementById('dexOfferAmount').value);
-            const weiAmt = document.getElementById('dexAskAmount').value;
-            if (!mdsAmt || !weiAmt) return showToast("Enter both amounts", "error");
-            try { if (BigInt(weiAmt) <= 0n) throw 0; } catch (_) { return showToast("Price must be a positive integer in wei", "error"); }
+            if (!mdsAmt) return showToast("Enter the MDS amount", "error");
+            const { wei, error } = dexWeiFromInput();
+            if (!wei) return showToast(error || "Enter a price", "error");
+            const weiAmt = wei.toString();
 
             const offerId = Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2, '0')).join('');
             const kind = dexDirection;
             worker.postMessage({ type: 'DEX_BROADCAST_OFFER', payload: {
-                offerId, kind, mdsAmount: mdsAmt, weiAmount: String(weiAmt), makerEvmAddr: evmAddress, ts: Date.now(),
+                offerId, kind, mdsAmount: mdsAmt, weiAmount: weiAmt, makerEvmAddr: evmAddress, ts: Date.now(),
                 swapMode: 'covenant'   // fee-less for the MDS buyer; HTLC stays available for legacy peers
             }});
 
             dexMySwaps.push({
                 role: 'maker', side: makerSideForKind(kind), kind, status: 'waiting_for_taker',
-                offerId, mdsAmount: mdsAmt, weiAmount: String(weiAmt), makerEvmAddr: evmAddress,
+                offerId, mdsAmount: mdsAmt, weiAmount: weiAmt, makerEvmAddr: evmAddress,
                 swapMode: 'covenant'
             });
             saveSwaps();
@@ -4183,14 +4547,14 @@ document.getElementById('btnExport').onclick = () => {
                 const isAsk = (o.kind || 'ask') === 'ask';
                 const mine = o.makerEvmAddr && evmAddress && o.makerEvmAddr.toLowerCase() === evmAddress.toLowerCase();
                 const orderLabel = isAsk
-                    ? '<span style="color:#7CFF6B;">Selling MDS</span>'
-                    : '<span style="color:#6BA8FF;">Buying MDS</span>';
+                    ? '<span style="color:var(--text-max);font-weight:600;">Selling MDS</span>'
+                    : '<span style="color:var(--text-muted);">Buying MDS</span>';
                 const action = isAsk ? 'Buy' : 'Sell';
-                const btnStyle = isAsk ? 'background:var(--accent);color:#000;' : 'background:#6BA8FF;color:#000;';
+                const btnStyle = isAsk ? 'background:var(--accent);color:var(--on-accent);' : 'background:transparent;color:var(--text-max);border:1px solid var(--border-bright);';
                 return `<tr>
                     <td>${orderLabel}${mine ? ' <span style="color:#666;font-size:10px;">(yours)</span>' : ''}</td>
                     <td>${Number(o.mdsAmount).toLocaleString('en')}</td>
-                    <td>${prettyEth(o.weiAmount)} ETH<br><span style="font-size:10px;color:#666;">${o.weiAmount} wei</span></td>
+                    <td>${prettyEth(o.weiAmount)} ETH${(() => { const u = weiToUsd(o.weiAmount); return u ? `<br><span style="font-size:10px;color:var(--text-muted);">\u2248 ${u}</span>` : ''; })()}<br><span style="font-size:10px;color:var(--text-faint);">${o.weiAmount} wei</span></td>
                     <td style="text-align:right;"><button style="margin:0;width:auto;padding:6px 12px;font-size:11px;${btnStyle}" onclick="dexAcceptFromBook(${i})">${action}</button></td>
                 </tr>`;
             }).join('');
@@ -4289,7 +4653,7 @@ document.getElementById('btnExport').onclick = () => {
 
                 return `<div class="swap-card">
                     <div class="swap-card-header">
-                        <div><span style="font-weight:bold;color:var(--text-max);font-size:14px;">${headline}</span> <span style="font-size:11px;color:#888;">for ${eth} ETH</span></div>
+                        <div><span style="font-weight:bold;color:var(--text-max);font-size:14px;">${headline}</span> <span style="font-size:11px;color:var(--text-muted);">for ${eth} ETH${(() => { const u = weiToUsd(s.weiAmount); return u ? ` (\u2248 ${u})` : ''; })()}</span></div>
                         <span style="font-size:11px;color:#888;text-transform:uppercase;">${s.role} · ${s.side === 'mds' ? 'MDS side' : 'ETH side'}</span>
                     </div>
                     ${getStepperHtml(s)}
@@ -4307,6 +4671,25 @@ document.getElementById('btnExport').onclick = () => {
 
         </script>
 
+    <script>
+        // Theme toggle — flips between the dark and light ink-on-paper palettes
+        // and updates the browser chrome color to match. Persisted across loads.
+        function toggleTheme() {
+            var cur = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+            var next = cur === 'light' ? 'dark' : 'light';
+            document.documentElement.setAttribute('data-theme', next);
+            try { localStorage.setItem('mds-theme', next); } catch (e) {}
+            var meta = document.querySelector('meta[name="theme-color"]');
+            if (meta) meta.setAttribute('content', next === 'light' ? '#ffffff' : '#0a0a0a');
+        }
+        // Sync browser chrome color with the theme restored before paint.
+        (function () {
+            var meta = document.querySelector('meta[name="theme-color"]');
+            if (meta && document.documentElement.getAttribute('data-theme') === 'light') {
+                meta.setAttribute('content', '#ffffff');
+            }
+        })();
+    </script>
 
 </body>
 </html>

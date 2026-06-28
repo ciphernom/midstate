@@ -37,6 +37,9 @@ pub struct MiningConfig {
     pub pool_url: Option<String>,
     pub payout_address: Option<String>,
     pub pool_address: Option<String>,
+    /// Optional rig name reported to the pool in mining.authorize for the per-worker
+    /// breakdown. Absent in older miner.toml files -> deserializes to None -> "default".
+    pub worker: Option<String>,
 }
 
 pub enum MinedResult {
@@ -190,6 +193,7 @@ impl MiningCoordinator {
 pub async fn run_stratum_client(
     pool_url: String, 
     payout_address: String,
+    worker: String,
     threads: usize,
     hash_counter: Arc<AtomicU64>,
     stats: Arc<std::sync::RwLock<StratumStats>> 
@@ -220,7 +224,7 @@ pub async fn run_stratum_client(
             let mut reader = BufReader::new(read_half);
 
             let auth_req = serde_json::json!({
-                "id": 1, "method": "mining.authorize", "params": [payout_address.clone(), "worker1"]
+                "id": 1, "method": "mining.authorize", "params": [payout_address.clone(), worker.clone()]
             });
             let _ = write_half.write_all(format!("{}\n", auth_req).as_bytes()).await;
 

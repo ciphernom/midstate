@@ -41,6 +41,11 @@ const SHARES_TABLE: TableDefinition<&[u8; 32], u64> = TableDefinition::new("shar
 /// The database table storing historical blocks found and their exact payouts.
 /// Key: Block timestamp (u64). Value: JSON string of payouts.
 const BLOCKS_TABLE: TableDefinition<u64, &str> = TableDefinition::new("blocks");
+/// The committed per-miner score snapshot for each found block, keyed by the same
+/// block timestamp as BLOCKS_TABLE. Stored separately so the frequently-polled
+/// /pool/stats payload stays lean; served on demand via /api/block_scores for
+/// historical split-verification (proving each payout was proportional to score).
+const BLOCK_SCORES_TABLE: TableDefinition<u64, &str> = TableDefinition::new("block_scores");
 
 // ── Stratum Protocol Types ──────────────────────────────────────────────────
 
@@ -70,6 +75,13 @@ struct Job {
     network_target: [u8; 32],
     /// The full block template, used to reconstruct the block if a full hash is found.
     batch_template: serde_json::Value,
+    /// The chain height this job is mining (the block found from it will have this height).
+    height: u64,
+    /// The committed (address, score) leaves backing this job's Merkle root. These are
+    /// the exact scores the coinbase payout was computed from, captured per job so a
+    /// found block can be split-verified against the precommitment it actually used.
+    /// Arc so cloning the Job onto the broadcast channel stays cheap.
+    committed_scores: Arc<Vec<([u8; 32], u64)>>,
 }
 
 // ── Merkle Tree Logic for Share Proofs ──────────────────────────────────────
@@ -177,6 +189,20 @@ struct PoolState {
     node_rpc_url: String,
     /// The percentage fee the pool takes from block rewards (e.g., 1.0 for 1%).
     pool_fee_percent: f64,
+    /// The most recent network block reward seen from the node, relayed to the
+    /// dashboard so it can estimate expected payouts / coins-per-day before the
+    /// pool has found its first block. Lock-free; updated each polling cycle.
+    current_block_reward: std::sync::atomic::AtomicU64,
+    /// The most recent confirmed chain height seen from the node, relayed so the
+    /// dashboard can show the live height and label blocks. Updated each poll.
+    current_height: std::sync::atomic::AtomicU64,
+    /// Cumulative per-miner share outcomes: address -> (accepted, rejected). Lifetime
+    /// totals (never deducted on block-find, unlike score) so the dashboard can show a
+    /// stable accept/reject efficiency per miner.
+    share_stats: RwLock<HashMap<[u8; 32], (u64, u64)>>,
+    /// Cumulative accepted shares per (address, worker-name). A pure stats layer for
+    /// per-rig breakdown; payout accounting stays strictly per-address and is untouched.
+    worker_stats: RwLock<HashMap<([u8; 32], String), u64>>,
 }
 
 #[derive(Deserialize)]
@@ -219,6 +245,35 @@ async fn get_proof(
     } else {
         Json(serde_json::json!({ "error": "Miner not found in current block precommitment" }))
     }
+}
+
+#[derive(Deserialize)]
+struct BlockScoresQuery {
+    /// Block timestamp (the key the dashboard already has from recent_blocks[].timestamp).
+    ts: u64,
+}
+
+/// Serves the committed per-miner score snapshot for one found block, so the dashboard
+/// can prove every payout in that block was proportional to committed score (the
+/// "prove the split" check). Held out of /pool/stats to keep that payload lean, and
+/// fetched on demand only when a miner clicks to verify a specific block.
+///
+/// Returns `{ total_score, scores: [{address, score}] }` where `total_score` is the
+/// committed total the coinbase payouts were actually proportioned against.
+async fn get_block_scores(
+    State(state): State<Arc<PoolState>>,
+    Query(query): Query<BlockScoresQuery>,
+) -> Json<serde_json::Value> {
+    if let Ok(read_txn) = state.db.begin_read() {
+        if let Ok(table) = read_txn.open_table(BLOCK_SCORES_TABLE) {
+            if let Ok(Some(v)) = table.get(query.ts) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(v.value()) {
+                    return Json(json);
+                }
+            }
+        }
+    }
+    Json(serde_json::json!({ "error": "No committed score snapshot stored for that block" }))
 }
 
 /// Serves the Provably Fair Pool HTML dashboard.
@@ -278,6 +333,10 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
     let mut miners = Vec::new();
     let mut total_score = 0u64;
 
+    // Lifetime accept/reject tallies, snapshotted so we don't hold the lock across the
+    // redb scan. Attached per-miner below for an efficiency readout.
+    let share_snapshot = state.share_stats.read().await.clone();
+
     if let Ok(read_txn) = state.db.begin_read() {
         if let Ok(table) = read_txn.open_table(SHARES_TABLE) {
             for iter in table.iter().unwrap() {
@@ -286,9 +345,12 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
                 a.copy_from_slice(addr.value());
                 let s = score.value();
                 if s > 0 {
+                    let (accepted, rejected) = share_snapshot.get(&a).copied().unwrap_or((0, 0));
                     miners.push(serde_json::json!({
                         "address": crate::core::types::encode_address_with_checksum(&a),
-                        "score": s
+                        "score": s,
+                        "accepted": accepted,
+                        "rejected": rejected
                     }));
                     total_score += s;
                 }
@@ -297,6 +359,19 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
     }
 
     miners.sort_by_key(|m| std::cmp::Reverse(m["score"].as_u64().unwrap_or(0)));
+
+    // Per-(address, worker) accepted-share tallies for the rig breakdown.
+    let mut workers = Vec::new();
+    {
+        let ws = state.worker_stats.read().await;
+        for ((addr, name), count) in ws.iter() {
+            workers.push(serde_json::json!({
+                "address": crate::core::types::encode_address_with_checksum(addr),
+                "worker": name,
+                "score": count
+            }));
+        }
+    }
 
     let mut blocks = Vec::new();
     if let Ok(read_txn) = state.db.begin_read() {
@@ -356,6 +431,14 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
         "network_target": network_target_hex,
         "share_target": share_target_hex,
         "block_time_secs": BLOCK_TIME_SECS,
+        // Pool fee address (so the UI can label + verify the fee coin in every block)
+        // and the live network reward (for payout / coins-per-day estimates):
+        "pool_address": state.pool_address,
+        "block_reward": state.current_block_reward.load(std::sync::atomic::Ordering::Relaxed),
+        // Live confirmed chain height (blocks the pool finds are stamped with their own
+        // height), and the per-rig worker breakdown (stats only; payouts are per-address):
+        "network_height": state.current_height.load(std::sync::atomic::Ordering::Relaxed),
+        "workers": workers,
         // Float fallbacks (kept for backwards compatibility):
         "network_hashrate": network_hashrate,
         "hashes_per_share": hashes_per_share
@@ -410,6 +493,10 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_
         valid_shares: RwLock::new(HashSet::new()),
         node_rpc_url,
         pool_fee_percent,
+        current_block_reward: std::sync::atomic::AtomicU64::new(0),
+        current_height: std::sync::atomic::AtomicU64::new(0),
+        share_stats: RwLock::new(HashMap::new()),
+        worker_stats: RwLock::new(HashMap::new()),
     });
 
     let api_state = state.clone();
@@ -451,6 +538,7 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_
             .route("/midstate.css", get(pool_css))   
             .route("/pool/stats", get(get_pool_stats)) 
             .route("/api/proof", get(get_proof))     
+            .route("/api/block_scores", get(get_block_scores))
             .with_state(api_state);
         axum::serve(api_listener, app).await.unwrap();
     });
@@ -475,6 +563,12 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_
             if let Some(t_hex) = net_state["target"].as_str() {
                 let _ = hex::decode_to_slice(t_hex, &mut n_target);
             }
+
+            // The node's reported height is the confirmed tip; the block a found job
+            // produces is the next one (tip + 1). Refreshed every poll so the dashboard
+            // can show the live chain height even between our own block finds.
+            let tip_height = net_state["height"].as_u64().unwrap_or(0);
+            state_clone.current_height.store(tip_height, std::sync::atomic::Ordering::Relaxed);
 
             if current_tip != last_network_tip && !current_tip.is_empty() {
                 job_counter += 1;
@@ -501,6 +595,7 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_
                 *state_clone.current_tree.write().await = tree.clone();
 
                 let mut expected_total = net_state["block_reward"].as_u64().unwrap_or(0);
+                state_clone.current_block_reward.store(expected_total, std::sync::atomic::Ordering::Relaxed);
                 
                 // ── Proportional Reward Distribution Algorithm ──
                 // Calculates the pool fee, then distributes the remaining reward 
@@ -593,6 +688,8 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_
                             share_target: state_clone.share_target,
                             network_target: n_target,
                             batch_template: template["batch_template"].clone(),
+                            height: tip_height.saturating_add(1),
+                            committed_scores: std::sync::Arc::new(shares_vec.clone()),
                         };
 
                         *state_clone.current_job.write().await = Some(job.clone());
@@ -630,6 +727,10 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
     let mut line = String::new();
     let mut job_rx = state.job_notifier.subscribe();
     let mut authorized_address = None;
+    // Worker name from mining.authorize params[1] (stratum convention). Scopes this
+    // connection's accepted shares to a rig for the per-worker breakdown; defaults
+    // when a miner omits it (today's reference miner sends "worker1").
+    let mut authorized_worker: String = "default".to_string();
 
     loop {
         tokio::select! {
@@ -648,6 +749,11 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                     }
                     "mining.authorize" => {
                         let address = req.params[0].as_str().unwrap_or("").to_string();
+                        // params[1] is the worker name by stratum convention (the reference
+                        // miner sends "worker1"); record it for this connection's breakdown.
+                        if let Some(w) = req.params.get(1).and_then(|v| v.as_str()) {
+                            if !w.is_empty() { authorized_worker = w.to_string(); }
+                        }
                         // Strip the UI checksum from the miner's address
                         if let Ok(addr_bytes) = crate::core::types::parse_address_flexible(&address) {
                             authorized_address = Some(addr_bytes);
@@ -681,6 +787,8 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                     {
                                         let mut cache = state.valid_shares.write().await;
                                         if !cache.insert(nonce) {
+                                            drop(cache);
+                                            state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
                                             let res = StratumResponse { id: req.id, result: Some(serde_json::json!(false)), error: Some("Duplicate share".into()) };
                                             write_half.write_all(format!("{}\n", serde_json::to_string(&res)?).as_bytes()).await?;
                                             continue;
@@ -701,6 +809,12 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                         }
                                         write_txn.commit()?;
 
+                                        // Tally the accepted share: per-miner (efficiency) and
+                                        // per-(miner,worker) (rig breakdown). Stats only; payout
+                                        // accounting in SHARES_TABLE above is untouched.
+                                        state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).0 += 1;
+                                        *state.worker_stats.write().await.entry((miner_addr, authorized_worker.clone())).or_insert(0) += 1;
+
                                         let res = StratumResponse { id: req.id, result: Some(serde_json::json!(true)), error: None };
                                         write_half.write_all(format!("{}\n", serde_json::to_string(&res)?).as_bytes()).await?;
 
@@ -712,6 +826,11 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                             // instead of approximated against the *current* difficulty.
                                             let block_hash_hex = hex::encode(ext.final_hash);
                                             let block_net_target_hex = hex::encode(job.network_target);
+                                            // Block height and the committed score snapshot this job's payout was
+                                            // built from — captured before `batch_template` is consumed below, and
+                                            // moved into the spawn so the block can later be split-verified.
+                                            let block_height = job.height;
+                                            let committed_scores = job.committed_scores.clone();
                                             let mut batch: Batch = serde_json::from_value(job.batch_template).unwrap();
                                             batch.extension = ext;
                                             
@@ -752,12 +871,30 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                                             let mut b_table = write_txn.open_table(BLOCKS_TABLE).unwrap();
                                                             let block_data = serde_json::json!({
                                                                 "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                                                "block_ts": batch.timestamp,
                                                                 "hash": block_hash_hex,
+                                                                "height": block_height,
                                                                 "total_score": total_score as u64,
                                                                 "net_target": block_net_target_hex,
                                                                 "payouts": payouts
                                                             }).to_string();
                                                             b_table.insert(batch.timestamp, block_data.as_str()).unwrap();
+
+                                                            // <--- Persist the committed score snapshot (split-verification).
+                                                            // `committed_total` is the sum of the snapshot — the basis the coinbase
+                                                            // payouts were proportioned against, not the accept-time table total
+                                                            // used for the deductions above.
+                                                            let committed_total: u128 = committed_scores.iter().map(|(_, s)| *s as u128).sum();
+                                                            let scores_json: Vec<serde_json::Value> = committed_scores.iter().map(|(a, s)| serde_json::json!({
+                                                                "address": crate::core::types::encode_address_with_checksum(a),
+                                                                "score": s
+                                                            })).collect();
+                                                            let scores_data = serde_json::json!({
+                                                                "total_score": committed_total as u64,
+                                                                "scores": scores_json
+                                                            }).to_string();
+                                                            let mut s_table = write_txn.open_table(BLOCK_SCORES_TABLE).unwrap();
+                                                            s_table.insert(batch.timestamp, scores_data.as_str()).unwrap();
                                                         }
                                                         write_txn.commit().unwrap();
                                                     } else {
@@ -767,6 +904,7 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                             });
                                         }
                                     } else {
+                                        state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
                                         let res = StratumResponse { id: req.id, result: Some(serde_json::json!(false)), error: Some("Low difficulty".into()) };
                                         write_half.write_all(format!("{}\n", serde_json::to_string(&res)?).as_bytes()).await?;
                                     }
