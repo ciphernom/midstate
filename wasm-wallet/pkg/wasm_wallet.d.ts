@@ -217,6 +217,21 @@ export class WebWallet {
      */
     constructor(phrase: string);
     /**
+     * Fund MANY contract addresses in ONE transaction.
+     *
+     * Identical to [`prepare_fund_tx`] but takes a list of `{address, amount}`
+     * fundings instead of a single address. Every funding's amount is split into
+     * power-of-two coins paid to its address; wallet inputs cover the SUM plus a
+     * size-scaled fee, with change returned to deterministic wallet addresses.
+     * Used to fund a bundle of independent limit-order covenants (one fresh
+     * secret/address each) in a single ~2-block commit/reveal rather than N of them.
+     *
+     * `fundings_json` — JSON array: `[{ "address": <64-hex>, "amount": <u64> }, ...]`.
+     * Returns the same `ScriptSpendContext` JSON as `prepare_fund_tx`; the caller
+     * recovers each covenant's coin by matching `outputs[].address`.
+     */
+    prepare_fund_many(available_utxos_json: string, fundings_json: string, next_wots_index: number): string;
+    /**
      * Phase 1 for FUNDING a contract. Pays `amount` to the contract address as
      * power-of-two "value" coins, optionally seeds a confidential "state" coin,
      * returns change to the wallet, and reuses `build_script_reveal` for phase 2
@@ -228,8 +243,6 @@ export class WebWallet {
     prepare_fund_tx(available_utxos_json: string, contract_addr_hex: string, amount: bigint, state_hex: string | null | undefined, next_wots_index: number): string;
     prepare_script_spend(available_utxos_json: string, contract_bytecode_hex: string, contract_inputs_json: string, outputs_json: string, next_wots_index: number): string;
     /**
-     * Select coins and build a transaction for the given send amount.
-     *
      * This implements the full coin selection algorithm:
      *
      * 1. **Greedy selection**: picks largest coins first until the amount + fee is covered.
@@ -330,10 +343,18 @@ export function build_channel_reveal(channel_value: bigint, channel_salt_hex: st
 
 export function build_channel_state(channel_coin_id_hex: string, alice_pk_hex: string, bob_pk_hex: string, alice_amount: bigint, bob_amount: bigint, nonce: number, htlcs_json: string): string;
 
+export function build_covenant_htlc_bytecode_hex(secret_hash_hex: string, receiver_addr_hex: string, min_payout: bigint, timeout_height: bigint, refund_pk_hex: string): string;
+
 /**
  * Builds the Midstate HTLC bytecode for cross-chain atomic swaps.
  */
 export function build_htlc_bytecode_hex(secret_hash_hex: string, receiver_pk_hex: string, timeout_height: bigint, refund_pk_hex: string): string;
+
+/**
+ * Builds the limit-order covenant bytecode (Feature 1). See
+ * `midstate::core::script::compile_limit_order_covenant` for the security notes.
+ */
+export function build_limit_order_covenant_bytecode_hex(secret_hash_hex: string, max_claim: bigint, timeout_height: bigint, refund_pk_hex: string): string;
 
 export function build_multisig_2of2_address(pk1_hex: string, pk2_hex: string): string;
 
@@ -368,6 +389,8 @@ export function compute_coin_id_hex(address_hex: string, value: bigint, salt_hex
  * ```
  */
 export function compute_commitment_hex(input_ids_json: string, output_hashes_json: string, salt_hex: string): string;
+
+export function compute_p2pk_address_hex(owner_pk_hex: string): string;
 
 /**
  * Decompose an amount into canonical power-of-2 denominations.
@@ -489,10 +512,13 @@ export interface InitOutput {
     readonly blake3_hash_hex: (a: number, b: number, c: number) => void;
     readonly build_channel_reveal: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => void;
     readonly build_channel_state: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: bigint, j: number, k: number, l: number) => void;
+    readonly build_covenant_htlc_bytecode_hex: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: bigint, h: number, i: number) => void;
     readonly build_htlc_bytecode_hex: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number) => void;
+    readonly build_limit_order_covenant_bytecode_hex: (a: number, b: number, c: number, d: bigint, e: bigint, f: number, g: number) => void;
     readonly build_multisig_2of2_address: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly compute_coin_id_hex: (a: number, b: number, c: number, d: bigint, e: number, f: number) => void;
     readonly compute_commitment_hex: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly compute_p2pk_address_hex: (a: number, b: number, c: number) => void;
     readonly decrypt_cli_wallet: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly generate_phrase: (a: number) => void;
     readonly mine_chat_pow_v2_wasm: (a: number, b: number, c: number, d: bigint, e: number, f: number, g: number, h: number, i: number, j: number) => void;
@@ -514,6 +540,7 @@ export interface InitOutput {
     readonly webwallet_has_mss_cache: (a: number, b: number, c: number) => number;
     readonly webwallet_import_mss_bytes: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly webwallet_new: (a: number, b: number, c: number) => void;
+    readonly webwallet_prepare_fund_many: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly webwallet_prepare_fund_tx: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number) => void;
     readonly webwallet_prepare_script_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
     readonly webwallet_prepare_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number, k: number, l: bigint) => void;

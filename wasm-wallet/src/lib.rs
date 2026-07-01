@@ -1765,9 +1765,175 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
         serde_json::to_string(&ctx).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-
-    /// Select coins and build a transaction for the given send amount.
+    /// Fund MANY contract addresses in ONE transaction.
     ///
+    /// Identical to [`prepare_fund_tx`] but takes a list of `{address, amount}`
+    /// fundings instead of a single address. Every funding's amount is split into
+    /// power-of-two coins paid to its address; wallet inputs cover the SUM plus a
+    /// size-scaled fee, with change returned to deterministic wallet addresses.
+    /// Used to fund a bundle of independent limit-order covenants (one fresh
+    /// secret/address each) in a single ~2-block commit/reveal rather than N of them.
+    ///
+    /// `fundings_json` — JSON array: `[{ "address": <64-hex>, "amount": <u64> }, ...]`.
+    /// Returns the same `ScriptSpendContext` JSON as `prepare_fund_tx`; the caller
+    /// recovers each covenant's coin by matching `outputs[].address`.
+    #[wasm_bindgen]
+    pub fn prepare_fund_many(
+        &mut self,
+        available_utxos_json: &str,
+        fundings_json: &str,
+        next_wots_index: u32,
+    ) -> Result<String, JsValue> {
+        #[derive(serde::Deserialize)]
+        struct Funding { address: String, amount: u64 }
+        let fundings: Vec<Funding> = serde_json::from_str(fundings_json)
+            .map_err(|e| JsValue::from_str(&format!("Bad fundings JSON: {}", e)))?;
+        if fundings.is_empty() {
+            return Err(JsValue::from_str("No fundings provided"));
+        }
+        let available: Vec<WasmUtxo> = serde_json::from_str(available_utxos_json)
+            .map_err(|e| JsValue::from_str(&format!("Bad utxos JSON: {}", e)))?;
+
+        // ── Outputs: per-funding power-of-two coins to each address ──────────────
+        let mut outputs_out: Vec<serde_json::Value> = Vec::new();
+        let mut output_hashes: Vec<[u8; 32]> = Vec::new();
+        let mut total_amount: u64 = 0;
+
+        for f in &fundings {
+            let mut addr = [0u8; 32];
+            hex::decode_to_slice(&f.address, &mut addr)
+                .map_err(|_| JsValue::from_str("Invalid funding address hex"))?;
+            if f.amount == 0 {
+                return Err(JsValue::from_str("A funding amount is 0"));
+            }
+            total_amount = total_amount.checked_add(f.amount)
+                .ok_or_else(|| JsValue::from_str("Funding total overflows u64"))?;
+            for denom in decompose_value(f.amount) {
+                let mut salt = [0u8; 32];
+                getrandom_02::getrandom(&mut salt).unwrap();
+                output_hashes.push(compute_coin_id(&addr, denom, &salt));
+                outputs_out.push(serde_json::json!({
+                    "type": "standard",
+                    "address": f.address.to_lowercase(),
+                    "value": denom,
+                    "salt": hex::encode(salt),
+                }));
+            }
+        }
+
+        // ── Wallet coin selection: cover total_amount + fee (WOTS co-spend) ──────
+        let mut avail_sorted = available.clone();
+        avail_sorted.sort_by(|a, b| b.value.cmp(&a.value));
+        let mut target_fee = 100u64;
+        let mut selected: Vec<WasmUtxo> = Vec::new();
+        let mut wallet_in: u64;
+        let final_fee;
+        loop {
+            let needed = total_amount.saturating_add(target_fee);
+            selected.clear();
+            let mut set = HashSet::new();
+            wallet_in = 0;
+            for c in &avail_sorted {
+                if wallet_in >= needed { break; }
+                set.insert(c.coin_id.clone());
+                selected.push(c.clone());
+                wallet_in += c.value;
+            }
+            if wallet_in < needed {
+                return Err(JsValue::from_str("Insufficient funds for fundings + fee"));
+            }
+            let mut grouped = HashSet::new();
+            for c in &selected { if !c.is_mss { grouped.insert(c.address.clone()); } }
+            for c in &available {
+                if grouped.contains(&c.address) && !set.contains(&c.coin_id) {
+                    set.insert(c.coin_id.clone());
+                    selected.push(c.clone());
+                    wallet_in += c.value;
+                }
+            }
+            if selected.len() > MAX_SELECTED_INPUTS {
+                return Err(JsValue::from_str("Too many inputs selected"));
+            }
+            let change_for_size = wallet_in.saturating_sub(total_amount).saturating_sub(target_fee);
+            let num_outputs = outputs_out.len() + decompose_value(change_for_size).len();
+            let estimated = 100 + (selected.len() as u64 * 1636) + (num_outputs as u64 * 100);
+            let req = (estimated * 10) / 1024 + 10;
+            if wallet_in >= total_amount + req { final_fee = req; break; } else { target_fee = req; }
+        }
+
+        // ── Change → wallet (deterministic salts) ───────────────────────────────
+        let change = wallet_in - total_amount - final_fee;
+        let mut idx = next_wots_index;
+        if change > 0 {
+            for denom in decompose_value(change) {
+                let seed = derive_wots_seed(&self.master_seed, idx as u64);
+                let addr = compute_address(&wots::keygen(&seed));
+                let salt = derive_deterministic_salt(&self.master_seed, idx as u64);
+                output_hashes.push(compute_coin_id(&addr, denom, &salt));
+                outputs_out.push(serde_json::json!({
+                    "type": "standard",
+                    "address": hex::encode(addr),
+                    "value": denom,
+                    "salt": hex::encode(salt),
+                }));
+                idx += 1;
+            }
+        }
+
+        // ── Wallet input coin ids (canonical) ───────────────────────────────────
+        let mut input_coin_ids: Vec<[u8; 32]> = Vec::new();
+        let mut wallet_inputs: Vec<ScriptWalletInput> = Vec::new();
+        for inp in &selected {
+            let pk = if inp.is_mss {
+                self.mss_cache.get(&inp.address)
+                    .ok_or_else(|| JsValue::from_str("MSS tree missing from cache"))?.master_pk
+            } else {
+                wots::keygen(&derive_wots_seed(&self.master_seed, inp.index as u64))
+            };
+            let p2pk = midstate::core::types::hash(&midstate::core::script::compile_p2pk(&pk));
+            let mut salt = [0u8; 32];
+            hex::decode_to_slice(&inp.salt, &mut salt).unwrap();
+            input_coin_ids.push(compute_coin_id(&p2pk, inp.value, &salt));
+            wallet_inputs.push(ScriptWalletInput {
+                coin_id: inp.coin_id.clone(),
+                address: inp.address.clone(),
+                value: inp.value,
+                salt: inp.salt.clone(),
+                is_mss: inp.is_mss,
+                index: inp.index,
+                mss_leaf: inp.mss_leaf,
+            });
+        }
+
+        if wallet_inputs.len() > midstate::core::types::MAX_TX_INPUTS {
+            return Err(JsValue::from_str("Too many inputs (max 256)"));
+        }
+        if outputs_out.len() > midstate::core::types::MAX_TX_OUTPUTS {
+            return Err(JsValue::from_str("Too many outputs (max 256) — post fewer units per bundle"));
+        }
+
+        let mut tx_salt = [0u8; 32];
+        getrandom_02::getrandom(&mut tx_salt).unwrap();
+        let commitment = compute_commitment(&input_coin_ids, &output_hashes, &tx_salt);
+
+        let ctx = ScriptSpendContext {
+            // Multi-address funding consumes NO contract coin, so there is no single
+            // contract address. build_script_reveal still hex-decodes this field, so
+            // give it a valid (all-zero) placeholder; it is never otherwise used here.
+            contract_addr: hex::encode([0u8; 32]),
+            contract_inputs: Vec::new(),
+            wallet_inputs,
+            outputs: outputs_out,
+            input_coin_ids: input_coin_ids.iter().map(hex::encode).collect(),
+            tx_salt: hex::encode(tx_salt),
+            commitment: hex::encode(commitment),
+            fee: final_fee,
+            next_wots_index: idx,
+        };
+        serde_json::to_string(&ctx).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+
     /// This implements the full coin selection algorithm:
     ///
     /// 1. **Greedy selection**: picks largest coins first until the amount + fee is covered.
@@ -2289,7 +2455,10 @@ pub fn build_channel_state(
 pub fn build_multisig_2of2_address(pk1_hex: &str, pk2_hex: &str) -> String {
     let mut pk1 = [0u8; 32]; hex::decode_to_slice(pk1_hex, &mut pk1).unwrap();
     let mut pk2 = [0u8; 32]; hex::decode_to_slice(pk2_hex, &mut pk2).unwrap();
-    let script = midstate::core::script::compile_multisig_2of3(&pk1, &pk2, &pk2);
+    // FIX: a real 2-of-2 (two CHECKSIG slots). The old compile_multisig_2of3(pk1,pk2,pk2)
+    // needed a 3-item witness, but the channel close only ever supplies two signatures,
+    // so the spend underflowed and channels could never cooperatively close.
+    let script = midstate::core::script::compile_multisig_2of2(&pk1, &pk2);
     let addr = midstate::core::types::hash(&script);
     hex::encode(addr)
 }
@@ -2307,7 +2476,10 @@ pub fn build_channel_reveal(
     let state: serde_json::Value = serde_json::from_str(state_json).unwrap();
     let mut pk1 = [0u8; 32]; hex::decode_to_slice(alice_pk_hex, &mut pk1).unwrap();
     let mut pk2 = [0u8; 32]; hex::decode_to_slice(bob_pk_hex, &mut pk2).unwrap();
-    let script = midstate::core::script::compile_multisig_2of3(&pk1, &pk2, &pk2);
+    // FIX: must match build_multisig_2of2_address — the channel address is hash(script),
+    // so both call sites have to build the SAME 2-of-2 script or the funded address and
+    // the spend bytecode diverge.
+    let script = midstate::core::script::compile_multisig_2of2(&pk1, &pk2);
 
     let input = serde_json::json!({
         "bytecode": hex::encode(script),
@@ -2367,6 +2539,27 @@ pub fn build_covenant_htlc_bytecode_hex(
         .map_err(|_| JsValue::from_str("Invalid refund_pk"))?;
     let bytecode = midstate::core::script::compile_covenant_htlc(
         &sh, &ra, min_payout, timeout_height, &refpk,
+    );
+    Ok(hex::encode(bytecode))
+}
+
+/// Builds the limit-order covenant bytecode (Feature 1). See
+/// `midstate::core::script::compile_limit_order_covenant` for the security notes.
+#[wasm_bindgen]
+pub fn build_limit_order_covenant_bytecode_hex(
+    secret_hash_hex: &str,
+    max_claim:       u64,
+    timeout_height:  u64,
+    refund_pk_hex:   &str,
+) -> Result<String, JsValue> {
+    let mut sh = [0u8; 32];
+    hex::decode_to_slice(secret_hash_hex, &mut sh)
+        .map_err(|_| JsValue::from_str("Invalid secret_hash"))?;
+    let mut refpk = [0u8; 32];
+    hex::decode_to_slice(refund_pk_hex, &mut refpk)
+        .map_err(|_| JsValue::from_str("Invalid refund_pk"))?;
+    let bytecode = midstate::core::script::compile_limit_order_covenant(
+        &sh, max_claim, timeout_height, &refpk,
     );
     Ok(hex::encode(bytecode))
 }

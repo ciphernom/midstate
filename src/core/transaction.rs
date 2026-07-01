@@ -644,7 +644,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             // 1. Validate all output values are power of 2 and nonzero
             for (i, out) in outputs.iter().enumerate() {
                 if out.value() == 0 {
-                    if out.is_confidential()  {
+                    if out.allows_zero_value() { 
                         // Allowed: 0-value State Thread
                     } else {
                         bail!("Zero-value output {}", i);
