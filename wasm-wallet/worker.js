@@ -27,7 +27,7 @@
  * @module worker
  */
 
-import init, { WebWallet, generate_phrase, compute_coin_id_hex, decrypt_cli_wallet, mine_commitment_pow, blake3_hash_hex, build_multisig_2of2_address, build_channel_state, build_channel_reveal, verify_mss_sig_wasm, mine_chat_pow_v2_wasm, build_htlc_bytecode_hex, build_covenant_htlc_bytecode_hex, compute_p2pk_address_hex } from './pkg/wasm_wallet.js';
+import init, { WebWallet, generate_phrase, compute_coin_id_hex, decrypt_cli_wallet, mine_commitment_pow, blake3_hash_hex, build_multisig_2of2_address, build_channel_state, build_channel_reveal, verify_mss_sig_wasm, mine_chat_pow_v2_wasm, build_htlc_bytecode_hex, build_covenant_htlc_bytecode_hex, build_limit_order_covenant_bytecode_hex, compute_p2pk_address_hex } from './pkg/wasm_wallet.js';
 
 /** @type {WebWallet|null} The WASM wallet instance. Null until CREATE or LOGIN. */
 let wallet = null;
@@ -458,6 +458,51 @@ function normalizeHex(data) {
     return "";
 }
 
+// ── On-chain DEX limit-order BUNDLE announcement codec ──────────────────────
+// Published as a 0-value DataBurn so any taker can discover standing orders by
+// scanning the chain (no chat dependency, survives node restarts, maker offline).
+// Layout (big-endian): MAGIC(4) VER(1) makerEvmAddr(20) makerMdsPk(32)
+//   timeoutHeight(8) groupId(6) unitCount(1)  then per unit: H(32) salt(32)
+//   valueExp(1) weiAmount(16)  = 81 bytes/unit. Recovery of covAddr/coin_id is
+//   recomputed by the reader from H+value+timeout+makerMdsPk, so it isn't stored.
+const ANN_MAGIC = "4d445841"; // "MDXA"
+const ANN_VER = 1;
+function _annHb(h){ h=(h||"").replace(/^0x/,''); const a=new Uint8Array(h.length/2); for(let i=0;i<a.length;i++) a[i]=parseInt(h.substr(i*2,2),16); return a; }
+function _annU(n,bytes){ const a=new Uint8Array(bytes); let v=BigInt(n); for(let i=bytes-1;i>=0;i--){a[i]=Number(v&0xffn);v>>=8n;} return a; }
+function _annRd(a,o,n){ let v=0n; for(let i=0;i<n;i++) v=(v<<8n)|BigInt(a[o+i]); return v; }
+function _annLog2(v){ let n=BigInt(v),e=0; if(n<=0n) throw new Error("value<=0"); while(n>1n){ if(n&1n) throw new Error("value not power of two"); n>>=1n; e++; } return e; }
+function encodeAnnouncement({ makerEvmAddr, makerMdsPk, timeoutHeight, groupId, units }) {
+    if (!units.length || units.length > 255) throw new Error("unit count out of range");
+    const parts = [ _annHb(ANN_MAGIC), new Uint8Array([ANN_VER]), _annHb(makerEvmAddr), _annHb(makerMdsPk),
+                    _annU(timeoutHeight,8), _annHb((groupId||"").padStart(12,'0')).slice(0,6), new Uint8Array([units.length]) ];
+    for (const u of units) parts.push(_annHb(u.secretHash), _annHb(u.salt), new Uint8Array([_annLog2(u.value)]), _annU(u.weiAmount,16));
+    const len = parts.reduce((s,p)=>s+p.length,0), out = new Uint8Array(len); let off=0;
+    for (const p of parts){ out.set(p,off); off+=p.length; }
+    return normalizeHex(out);
+}
+function tryDecodeAnnouncement(hex) {
+    if (typeof hex !== 'string') return null;
+    hex = hex.replace(/^0x/,'').toLowerCase();
+    if (!/^[0-9a-f]+$/.test(hex) || hex.length < 144 || hex.slice(0,8) !== ANN_MAGIC) return null;
+    const a = _annHb(hex); let o = 4;
+    if (a[o] !== ANN_VER) return null; o += 1;
+    const makerEvmAddr = '0x'+normalizeHex(a.slice(o,o+20)); o += 20;
+    const makerMdsPk = normalizeHex(a.slice(o,o+32)); o += 32;
+    const timeoutHeight = Number(_annRd(a,o,8)); o += 8;
+    const groupId = normalizeHex(a.slice(o,o+6)); o += 6;
+    const count = a[o]; o += 1;
+    const units = [];
+    for (let i=0;i<count;i++){
+        if (o + 81 > a.length) return null;
+        const secretHash = normalizeHex(a.slice(o,o+32)); o += 32;
+        const salt = normalizeHex(a.slice(o,o+32)); o += 32;
+        const value = Number(1n << BigInt(a[o])); o += 1;
+        const weiAmount = _annRd(a,o,16).toString(); o += 16;
+        units.push({ secretHash, salt, value, weiAmount });
+    }
+    return { makerEvmAddr, makerMdsPk, timeoutHeight, groupId, units };
+}
+
 /**
  * Derive an AES-GCM-256 key from a password and salt using PBKDF2.
  *
@@ -510,6 +555,68 @@ async function saveState() {
         data: normalizeHex(new Uint8Array(encrypted))
     };
     self.postMessage({ type: 'SAVE_WALLET', payload: JSON.stringify(bundle) });
+}
+
+// ── MSS leaf-reuse recovery ─────────────────────────────────────────────────
+// A reveal signs its wallet inputs with one-time MSS leaves. The leaf floor we
+// pick comes from getMssState, which can be stale: the queried peer may lag the
+// tip, or rapid back-to-back txs can outrun the counter before it updates. When
+// that happens the network rejects the reveal with "MSS leaf <pk> already spent".
+//
+// Crucially the leaf is a *witness*, not part of the commitment — the commitment
+// is H(input_coin_ids, output_hashes, salt) and does not depend on which leaf
+// signs it. So we can advance to a fresh leaf and re-sign against the SAME,
+// already-mined commitment. No re-commit, no new PoW: just rebuild the reveal
+// with a higher leaf and resend. Each retry re-queries getMssState (in case the
+// peer has since caught up) and also steps forward locally (in case it hasn't).
+//
+// Works for both reveal builders: covenant/funding reveals (build_script_reveal,
+// inputs under `wallet_inputs`) and ordinary sends (build_reveal, inputs under
+// `selected_inputs`). Callers pass a `rebuild(ctxStr)` for the send path; funding
+// callers can omit it and get build_script_reveal by default.
+async function sendRevealWithMssLeafRetry(prebuiltPayload, ctxStrOrObj, commitment, txSalt, phase, rebuild) {
+    const MAX_RETRIES = 6;
+    const STEP = 4; // leaves to skip per retry when getMssState is still behind
+    const ctxObj = (typeof ctxStrOrObj === 'string')
+        ? JSON.parse(ctxStrOrObj)
+        : JSON.parse(JSON.stringify(ctxStrOrObj));
+    // Funding contexts name their inputs `wallet_inputs`; spend contexts use `selected_inputs`.
+    const inputs = Array.isArray(ctxObj.wallet_inputs) ? ctxObj.wallet_inputs
+        : Array.isArray(ctxObj.selected_inputs) ? ctxObj.selected_inputs : [];
+    const mssAddrs = [...new Set(inputs.filter(i => i.is_mss).map(i => i.address))];
+    // Default rebuild = the covenant/funding path; the send path passes build_reveal.
+    const rebuildFn = rebuild || ((cs) => wallet.build_script_reveal(cs, commitment, txSalt));
+    let payloadStr = prebuiltPayload;
+
+    for (let attempt = 0; ; attempt++) {
+        const res = await rpc.send(payloadStr);
+        if (res.ok) return res;
+
+        const msg = String(res.body || res.error || '');
+        const leafReuse = /leaf\s+[0-9a-fA-F]+\s+already spent/i.test(msg);
+        // Only self-heal leaf reuse; anything else (or out of retries) surfaces as-is.
+        if (!leafReuse || attempt >= MAX_RETRIES || mssAddrs.length === 0) return res;
+
+        for (const addr of mssAddrs) {
+            const cur = (wState.mssAddrs[addr] && wState.mssAddrs[addr].next_leaf) || 0;
+            let useLeaf = cur + STEP;
+            try {
+                const st = await rpc.getMssState(addr);
+                if (st && (st.next_index + STEP) > useLeaf) useLeaf = st.next_index + STEP;
+            } catch (e) { /* keep the local step-forward */ }
+            // Re-tag this address's inputs (one leaf per address per tx) and advance
+            // the persistent counter past it.
+            for (const inp of inputs) {
+                if (inp.is_mss && inp.address === addr) inp.mss_leaf = useLeaf;
+            }
+            if (wState.mssAddrs[addr]) wState.mssAddrs[addr].next_leaf = useLeaf + 1;
+            wallet.set_mss_leaf_index(addr, useLeaf + 1);
+        }
+        await saveState();
+        if (phase) phase(`MSS leaf reuse detected — re-signing with a fresh key (retry ${attempt + 1}/${MAX_RETRIES})\u2026`);
+        // Same commitment, fresh leaves: rebuild the reveal only.
+        payloadStr = rebuildFn(JSON.stringify(ctxObj));
+    }
 }
 
 /**
@@ -942,6 +1049,276 @@ self.onmessage = async (e) => {
                 isSending = false;
             }
         }
+        else if (type === 'DEX_CREATE_LIMIT_ORDER') {
+            // FEATURE 1 (maker origination). Lock MDS into a limit-order covenant and post a
+            // standing on-chain order. ONE order = ONE fresh secret = ONE covenant coin, filled
+            // atomically. (A larger order is just N of these — call this N times, one secret
+            // each — because a single hashlock can back only one trustless fill: the maker
+            // reveals the secret on Base to get paid, after which that H is public.)
+            if (isSending) throw new Error("Wallet busy.");
+            isSending = true;
+            try {
+                const { offerId, unitValue, weiAmount, makerEvmAddr } = payload;
+                const v = Number(unitValue);
+                // Power-of-two => exactly one covenant coin => one clean atomic fill unit.
+                if (!Number.isInteger(v) || v < 1 || (v & (v - 1)) !== 0)
+                    throw new Error("Unit size must be a power of two (one atomic covenant coin).");
+
+                // The MAKER generates the secret (matches the Base contract's protocol).
+                const secretBytes = crypto.getRandomValues(new Uint8Array(32));
+                const rawSecret = Array.from(secretBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                const secretHash = blake3_hash_hex(rawSecret);   // H = BLAKE3(secret), shared with Base
+
+                const myPk = getPrimaryMssPk();
+                const timeoutHeight = networkHeight + 1440;       // ~24h refund window (the LONG leg)
+
+                // max_claim = the full unit value => the whole coin is claimed atomically, no
+                // remainder, so the post-reveal remainder-drain can't apply to this order.
+                const covScriptHex = build_limit_order_covenant_bytecode_hex(
+                    secretHash, BigInt(v), BigInt(timeoutHeight), myPk
+                );
+                const covAddr = blake3_hash_hex(covScriptHex);    // = hash(script); the taker recomputes the same
+
+                // Fund the covenant with exactly the unit value (one power-of-two coin).
+                const fundRes = await performContractTx({
+                    reqId: 998, dexOfferId: offerId, kind: 'fund', contractAddress: covAddr, amount: v
+                });
+                const coins = (fundRes && fundRes.coins) || [];
+                if (!coins.length) throw new Error("Funding produced no covenant coin");
+
+                self.postMessage({ type: 'DEX_LIMIT_ORDER_CREATED', payload: {
+                    offerId,
+                    covAddr,
+                    coins,                 // [{coin_id, value, salt}] — one coin for a power-of-two value
+                    secret: rawSecret,     // MAKER ONLY — reveal on Base (claim) to get paid; NEVER broadcast
+                    secretHash,            // advertised to takers; also the Base hashlock
+                    maxClaim: v,
+                    timeoutHeight,
+                    makerMdsPk: myPk,      // refund pk baked into the covenant
+                    makerEvmAddr,
+                    weiAmount
+                }});
+            } catch (err) {
+                if (payload && payload.offerId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId: payload.offerId, phase: null } });
+                self.postMessage({ type: 'DEX_LIMIT_ORDER_FAILED', payload: { offerId: payload && payload.offerId, error: (err && err.message) || String(err) } });
+            } finally {
+                isSending = false;
+            }
+        }
+        else if (type === 'DEX_CREATE_LIMIT_BUNDLE') {
+            // FEATURE 1 (maker origination, batched). Posts a non-power-of-two amount as a BUNDLE
+            // of independent single-fill units — one fresh secret/covenant per unit — but funds
+            // ALL of them in ONE transaction (one ~2-block commit/reveal) via prepare_fund_many,
+            // instead of N serial funds. The N independent secrets are still required (one hashlock
+            // backs one trustless fill); only the funding is batched. All-or-nothing: if the single
+            // funding tx fails, nothing is locked.
+            if (isSending) throw new Error("Wallet busy.");
+            isSending = true;
+            try {
+                const { groupId, units, makerEvmAddr } = payload;
+                if (!Array.isArray(units) || !units.length) throw new Error("No units supplied");
+                const dexPhase = (p) => self.postMessage({ type: 'DEX_PHASE', payload: { offerId: groupId, phase: p } });
+
+                const myPk = getPrimaryMssPk();
+                const timeoutHeight = networkHeight + 1440;   // ~24h refund window
+
+                // Per unit: fresh secret -> H -> covenant -> covAddr. Collect the fundings list.
+                const built = units.map(u => {
+                    const v = Number(u.unitValue);
+                    if (!Number.isInteger(v) || v < 1 || (v & (v - 1)) !== 0) throw new Error(`Unit ${v} is not a power of two`);
+                    const sb = crypto.getRandomValues(new Uint8Array(32));
+                    const rawSecret = Array.from(sb).map(b => b.toString(16).padStart(2, '0')).join('');
+                    const secretHash = blake3_hash_hex(rawSecret);
+                    const covScriptHex = build_limit_order_covenant_bytecode_hex(secretHash, BigInt(v), BigInt(timeoutHeight), myPk);
+                    const covAddr = blake3_hash_hex(covScriptHex);
+                    return { v, rawSecret, secretHash, covAddr, weiAmount: u.weiAmount };
+                });
+                const fundings = built.map(b => ({ address: normalizeHex(b.covAddr), amount: b.v }));
+
+                if (!mssCachesReady) await loadMssCaches();
+                // MSS safety fast-forward (identical policy to performContractTx).
+                for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
+                    try {
+                        const mssState = await rpc.getMssState(addr);
+                        if (mssState && mssState.next_index > mss.next_leaf) mss.next_leaf = mssState.next_index + 20;
+                    } catch (e) { throw new Error("Safety Check Failed. Aborting to prevent key reuse."); }
+                    wallet.set_mss_leaf_index(addr, mss.next_leaf);
+                }
+                const utxoArray = Object.values(wState.utxos).map(u =>
+                    (u.is_mss && wState.mssAddrs[u.address]) ? { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf } : u);
+
+                // ONE transaction funding all N covenant addresses.
+                const ctxStr = wallet.prepare_fund_many(JSON.stringify(utxoArray), JSON.stringify(fundings), wState.nextWotsIndex);
+                const ctx = JSON.parse(ctxStr);
+
+                // Map each unit to its funded coin NOW: ctx.outputs carries the random salts, and a
+                // coin is unspendable without its salt (coin_id = H(addr||value||salt)). The salt is
+                // NOT recoverable from chain, so we must capture it before the tx goes out.
+                const outUnits = built.map(b => {
+                    const o = (ctx.outputs || []).find(o => o.type === "standard" && normalizeHex(o.address) === normalizeHex(b.covAddr));
+                    if (!o) throw new Error(`Funded coin for unit ${b.v} not found in tx outputs`);
+                    const coin_id = compute_coin_id_hex(normalizeHex(o.address), BigInt(o.value), normalizeHex(o.salt));
+                    return {
+                        offerId: Array.from(crypto.getRandomValues(new Uint8Array(8))).map(x => x.toString(16).padStart(2, '0')).join(''),
+                        covAddr: b.covAddr,
+                        coin: { coin_id, value: o.value, salt: normalizeHex(o.salt) },
+                        secret: b.rawSecret, secretHash: b.secretHash,
+                        maxClaim: b.v, timeoutHeight, makerMdsPk: myPk, makerEvmAddr, weiAmount: b.weiAmount
+                    };
+                });
+
+                // CRASH-SAFETY: persist the recovery record (secrets + coins + params) BEFORE the
+                // commit is broadcast. If we die after the tx confirms but before the UI registers
+                // these units, DEX_RECOVER_BUNDLES rebuilds them from here; without it the locked MDS
+                // would be unspendable (salts gone) and even un-refundable (no covenant params). The
+                // saveState() just below persists this; it is cleared on success.
+                if (!wState.pendingLimitBundles) wState.pendingLimitBundles = {};
+                wState.pendingLimitBundles[groupId] = {
+                    groupId, units: outUnits, commitment: ctx.commitment,
+                    firstCoinId: outUnits[0].coin.coin_id, createdAt: Date.now()
+                };
+
+                // Reserve key material once (mirrors performContractTx / prepare_fund_tx flow).
+                while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
+                const usedMss = new Set();
+                for (const inp of (ctx.wallet_inputs || [])) if (inp.is_mss) usedMss.add(inp.address);
+                for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
+                await saveState();
+
+                // Funding consumes no contract coin, so build_script_reveal signs the wallet
+                // inputs internally — no separate covenant signature needed.
+                const revealPayloadStr = wallet.build_script_reveal(ctxStr, ctx.commitment, ctx.tx_salt);
+
+                dexPhase("Mining spam-proof (PoW)\u2026");
+                const stateData = await rpc.getState();
+                await new Promise(r => setTimeout(r, 50));
+                const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
+                const commitReq = await rpc.commit(ctx.commitment, spamNonce);
+                if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
+                dexPhase("Commit broadcast — waiting to be mined (1/2)\u2026");
+                while (true) { try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {} await waitForNextBlock(15000); }
+                // Self-heal MSS leaf reuse: if the leaf floor was stale, advance and re-sign
+                // against the SAME already-mined commitment (leaf is a witness, not committed to).
+                const revealReq = await sendRevealWithMssLeafRetry(revealPayloadStr, ctxStr, ctx.commitment, ctx.tx_salt, dexPhase);
+                if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
+                dexPhase("Reveal broadcast — waiting to be mined (2/2)\u2026");
+                const firstInputId = ctx.input_coin_ids && ctx.input_coin_ids.length ? ctx.input_coin_ids[0] : null;
+                if (firstInputId) { while (true) { try { const inp = await rpc.checkCoin(firstInputId); if (inp && !inp.exists) break; } catch (e) {} await waitForNextBlock(15000); } }
+                dexPhase("Confirmed \u2713 — syncing\u2026");
+                await performScan();
+
+                // Funded and confirmed — hand the units to the UI, then clear the recovery record.
+                self.postMessage({ type: 'DEX_LIMIT_BUNDLE_CREATED', payload: { groupId, units: outUnits } });
+                if (wState.pendingLimitBundles) delete wState.pendingLimitBundles[groupId];
+                await saveState();
+                dexPhase(null);
+            } catch (err) {
+                if (payload && payload.groupId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId: payload.groupId, phase: null } });
+                self.postMessage({ type: 'DEX_LIMIT_BUNDLE_FAILED', payload: { groupId: payload && payload.groupId, error: (err && err.message) || String(err) } });
+            } finally {
+                isSending = false;
+            }
+        }
+        else if (type === 'DEX_RECOVER_BUNDLES') {
+            // On reload: re-deliver any limit-order bundle whose funding tx confirmed but whose
+            // units never got registered (page closed between confirmation and the UI handling
+            // DEX_LIMIT_BUNDLE_CREATED). The UI dedupes by offerId, so re-emitting is idempotent.
+            // A record whose coin still isn't on-chain after a grace window is treated as a funding
+            // that never landed and is dropped (the wallet inputs return on the next scan).
+            try {
+                const pend = wState.pendingLimitBundles || {};
+                const GRACE_MS = 10 * 60 * 1000;
+                let changed = false;
+                for (const groupId of Object.keys(pend)) {
+                    const rec = pend[groupId];
+                    if (!rec || !rec.firstCoinId || !Array.isArray(rec.units)) { delete pend[groupId]; changed = true; continue; }
+                    let funded = null;
+                    try { const inp = await rpc.checkCoin(normalizeHex(rec.firstCoinId)); funded = !!(inp && inp.exists); }
+                    catch (e) { continue; }   // RPC not ready — leave it; a later call retries
+                    if (funded) {
+                        self.postMessage({ type: 'DEX_LIMIT_BUNDLE_CREATED', payload: { groupId, units: rec.units, recovered: true } });
+                        delete pend[groupId]; changed = true;
+                    } else if (Date.now() - (rec.createdAt || 0) > GRACE_MS) {
+                        delete pend[groupId]; changed = true;
+                        self.postMessage({ type: 'DEX_LIMIT_BUNDLE_FAILED', payload: { groupId, error: "Funding did not confirm; nothing was locked.", recovered: true } });
+                    }
+                }
+                if (changed) await saveState();
+            } catch (e) { /* best-effort recovery */ }
+        }
+        else if (type === 'DEX_ANNOUNCE_BUNDLE') {
+            // MAKER: publish the bundle on-chain as a 0-value DataBurn so takers can discover it by
+            // scanning the chain — independent of the ephemeral chat bus and of the maker staying
+            // online. Permanent once mined, so it's published ONCE (no re-announce needed).
+            try {
+                const { groupId, makerEvmAddr, makerMdsPk, timeoutHeight, units } = payload;
+                const announcementHex = encodeAnnouncement({ makerEvmAddr, makerMdsPk, timeoutHeight, groupId, units });
+                const myAddr = compute_p2pk_address_hex(getPrimaryMssPk());
+                // Send the smallest coin (1) to self + attach the 0-value burn; net cost is just the fee.
+                await performSend(myAddr, 1, announcementHex, 0);
+                self.postMessage({ type: 'DEX_ANNOUNCE_DONE', payload: { groupId } });
+            } catch (err) {
+                self.postMessage({ type: 'DEX_ANNOUNCE_FAILED', payload: { groupId: payload && payload.groupId, error: (err && err.message) || String(err) } });
+            }
+        }
+        else if (type === 'DEX_SCAN_ANNOUNCEMENTS') {
+            // TAKER: scan blocks for on-chain order announcements. Parsing is shape-agnostic — we
+            // pull any magic-prefixed hex out of the block JSON, so we don't depend on the node's
+            // exact OutputData serde. Each unit's covenant address + coin id is RECOMPUTED from the
+            // announced fields and then verified on-chain, so a forged/garbage announcement can't
+            // inject a fake order (the coin simply won't exist).
+            try {
+                const ANNOUNCE_SCAN_DEPTH = 1440;   // ~ the order timeout window
+                const tip = networkHeight;
+                let from = Number.isFinite(payload && payload.fromHeight) ? payload.fromHeight : Math.max(0, tip - ANNOUNCE_SCAN_DEPTH);
+                from = Math.max(0, Math.min(from, tip));
+                const orders = [];
+                const seenCoin = new Set();
+                const BATCH = 12;
+                for (let h = from; h <= tip; h += BATCH) {
+                    const heights = [];
+                    for (let k = h; k < h + BATCH && k <= tip; k++) heights.push(k);
+                    const blocks = await Promise.all(heights.map(ht => rpc.getBlock(ht).then(b => b).catch(() => null)));
+                    for (const blk of blocks) {
+                        if (!blk) continue;
+                        const blob = JSON.stringify(blk);
+                        const matches = blob.match(/[0-9a-fA-F]{144,}/g);
+                        if (!matches) continue;
+                        for (const m of matches) {
+                            const ann = tryDecodeAnnouncement(m);
+                            if (!ann) continue;
+                            for (const u of ann.units) {
+                                try {
+                                    const covScriptHex = build_limit_order_covenant_bytecode_hex(u.secretHash, BigInt(u.value), BigInt(ann.timeoutHeight), ann.makerMdsPk);
+                                    const covAddr = blake3_hash_hex(covScriptHex);
+                                    const coinId = compute_coin_id_hex(covAddr, BigInt(u.value), normalizeHex(u.salt));
+                                    if (seenCoin.has(coinId)) continue;
+                                    seenCoin.add(coinId);
+                                    // Verify the covenant coin actually exists (not spent/filled, not forged).
+                                    let exists = false;
+                                    try { const r = await rpc.checkCoin(coinId); exists = !!(r && r.exists); } catch (e) { exists = false; }
+                                    if (!exists) continue;
+                                    orders.push({
+                                        offerId: 'chain:' + coinId.slice(0, 16),
+                                        kind: 'ask', mdsAmount: u.value, weiAmount: u.weiAmount,
+                                        makerEvmAddr: ann.makerEvmAddr, onchain: true,
+                                        covenant: {
+                                            coinId, value: u.value, salt: normalizeHex(u.salt), covAddr,
+                                            secretHash: u.secretHash, maxClaim: u.value, timeoutHeight: ann.timeoutHeight,
+                                            makerMdsPk: ann.makerMdsPk, makerEvmAddr: ann.makerEvmAddr, weiAmount: u.weiAmount
+                                        }
+                                    });
+                                } catch (e) { /* skip bad unit */ }
+                            }
+                        }
+                    }
+                    self.postMessage({ type: 'DEX_SCAN_PROGRESS', payload: { at: Math.min(h + BATCH, tip), tip, from } });
+                }
+                self.postMessage({ type: 'DEX_ANNOUNCED_ORDERS', payload: { orders, scannedToHeight: tip } });
+            } catch (err) {
+                self.postMessage({ type: 'DEX_ANNOUNCED_ORDERS', payload: { orders: [], scannedToHeight: networkHeight, error: (err && err.message) || String(err) } });
+            }
+        }
         else if (type === 'DEX_VERIFY_HTLC') {
             // Taker-side safety check: before locking ETH, prove the maker's MDS HTLC
             // actually exists on-chain with the agreed hashlock, our pubkey as receiver,
@@ -1271,6 +1648,224 @@ self.onmessage = async (e) => {
                 isSending = false;
             }
         }
+        else if (type === 'DEX_FILL_LIMIT') {
+            // FEATURE 1 — taker-side partial fill of a maker's limit-order covenant.
+            // Spends EXACTLY ONE covenant coin (single-input safety — see the multi-coin
+            // caveat in compile_limit_order_covenant), pays `claimed` MDS to the taker and
+            // routes `coinValue - claimed` back to the covenant address. Mirrors the proven
+            // DEX_SETTLE_COVENANT covenant-spend template.
+            if (isSending) throw new Error("Wallet busy.");
+            isSending = true;
+            try {
+                const { offerId, rawSecret, coin, claimed, maxClaim, timeoutHeight, makerMdsPk } = payload;
+                const dexPhase = (p) => { if (offerId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId, phase: p } }); };
+
+                if (!coin || !coin.coin_id) throw new Error("No covenant coin supplied");
+                const coinValue = Number(coin.value);
+                const claimAmt  = Number(claimed);
+                if (claimAmt <= 0 || claimAmt > coinValue) throw new Error("claimed must be within (0, coinValue]");
+                if (claimAmt > Number(maxClaim)) throw new Error(`claimed ${claimAmt} exceeds covenant max_claim ${maxClaim}`);
+                const remainder = coinValue - claimAmt;
+
+                // Reconstruct the EXACT covenant bytecode the maker locked, so coin ids match.
+                const secretHash = blake3_hash_hex(rawSecret);
+                const covScriptHex = build_limit_order_covenant_bytecode_hex(
+                    secretHash, BigInt(maxClaim), BigInt(timeoutHeight), makerMdsPk
+                );
+                const covAddr = blake3_hash_hex(covScriptHex);   // = hash(script); matches lock-time address
+
+                // sanity: the coin we're about to spend really belongs to this covenant
+                const expectId = compute_coin_id_hex(covAddr, BigInt(coinValue), normalizeHex(coin.salt));
+                if (normalizeHex(expectId) !== normalizeHex(coin.coin_id)) {
+                    throw new Error("Coin does not match the reconstructed covenant address/params");
+                }
+
+                const myPk = getPrimaryMssPk();
+                const buyerAddr = compute_p2pk_address_hex(myPk);
+
+                const pow2 = (n) => { const out = []; let v = BigInt(n), bit = 0n; while (v > 0n) { if (v & 1n) out.push(Number(1n << bit)); v >>= 1n; bit += 1n; } return out; };
+
+                // outputs: `claimed` -> taker, `remainder` -> back into the covenant (keeps order live)
+                const outputs = [
+                    ...pow2(claimAmt).map(v => ({ out_type: "standard", address: buyerAddr, value: v, salt: null })),
+                    ...pow2(remainder).map(v => ({ out_type: "standard", address: covAddr,   value: v, salt: null })),
+                ];
+                const outputsJson = JSON.stringify(outputs);
+
+                // single covenant input; witness complete up front: [secret, 0x01] (no signature)
+                const contractInputsJson = JSON.stringify([{
+                    coin_id: normalizeHex(coin.coin_id),
+                    witness: `${rawSecret},01`,
+                    value: coinValue,
+                    salt: normalizeHex(coin.salt),
+                    state: null
+                }]);
+
+                if (!mssCachesReady) await loadMssCaches();
+                const utxoArray = Object.values(wState.utxos).map(u =>
+                    (u.is_mss && wState.mssAddrs[u.address]) ? { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf } : u);
+
+                let ctx = JSON.parse(wallet.prepare_script_spend(
+                    JSON.stringify(utxoArray), covScriptHex, contractInputsJson, outputsJson, wState.nextWotsIndex
+                ));
+                const revealPayloadStr = wallet.build_script_reveal(JSON.stringify(ctx), ctx.commitment, ctx.tx_salt);
+
+                while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
+                const usedMss = new Set();
+                for (const inp of ctx.wallet_inputs) if (inp.is_mss) usedMss.add(inp.address);
+                for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
+                await saveState();
+
+                dexPhase("Mining spam-proof (PoW)…");
+                const stateData = await rpc.getState();
+                await new Promise(r => setTimeout(r, 50));
+                const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
+                const commitReq = await rpc.commit(ctx.commitment, spamNonce);
+                if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
+
+                dexPhase("Commit broadcast — waiting to be mined (1/2)…");
+                while (true) { try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {} await waitForNextBlock(15000); }
+
+                const revealReq = await rpc.send(revealPayloadStr);
+                if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
+
+                dexPhase("Reveal broadcast — waiting to be mined (2/2)…");
+                const firstCoin = normalizeHex(coin.coin_id);
+                while (true) { try { const inp = await rpc.checkCoin(firstCoin); if (inp && !inp.exists) break; } catch (e) {} await waitForNextBlock(15000); }
+
+                dexPhase("Confirmed ✓ — syncing…");
+                await performScan();
+                // Revealing `rawSecret` in the spend witness lets the maker harvest it and claim the
+                // taker's ETH on Base. The NEW remainder coin (at covAddr) stays on the book.
+                self.postMessage({ type: 'DEX_FILL_SUCCESS', payload: { offerId, claimed: claimAmt, remainder, covAddr } });
+            } catch (err) {
+                const detail = (err && err.message) ? err.message : String(err);
+                self.postMessage({ type: 'DEX_FILL_FAILED', payload: { offerId: payload && payload.offerId, error: detail } });
+            } finally {
+                isSending = false;
+            }
+        }
+        else if (type === 'DEX_REFUND_LIMIT_ORDER') {
+            // FEATURE 1 — maker reclaims an UNFILLED limit-order unit after its timeout.
+            // Spends the covenant coin via the ELSE (refund) branch: the VM enforces
+            // height >= timeout (CHECKTIMEVERIFY) and a maker signature (CHECKSIGVERIFY),
+            // then we route the full coin value back to the maker. Witness = [sig, dummy, 0x00].
+            if (isSending) throw new Error("Wallet busy.");
+            isSending = true;
+            try {
+                const { offerId, coin, secretHash, maxClaim, timeoutHeight, makerMdsPk } = payload;
+                const dexPhase = (p) => { if (offerId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId, phase: p } }); };
+                if (!coin || !coin.coin_id) throw new Error("No covenant coin supplied");
+                if (networkHeight < Number(timeoutHeight))
+                    throw new Error(`Too early — this order's refund unlocks at height ${timeoutHeight} (now ${networkHeight}).`);
+
+                const coinValue = Number(coin.value);
+                const refundPk = makerMdsPk || getPrimaryMssPk();
+
+                // Reconstruct the EXACT covenant bytecode so the coin id + address match what was locked.
+                const covScriptHex = build_limit_order_covenant_bytecode_hex(
+                    secretHash, BigInt(maxClaim), BigInt(timeoutHeight), refundPk
+                );
+                const covAddr = blake3_hash_hex(covScriptHex);
+                const expectId = compute_coin_id_hex(covAddr, BigInt(coinValue), normalizeHex(coin.salt));
+                if (normalizeHex(expectId) !== normalizeHex(coin.coin_id))
+                    throw new Error("Coin does not match the reconstructed covenant address/params");
+
+                const myAddr = compute_p2pk_address_hex(refundPk);
+                // coinValue is a power of two => one coin back to the maker; the fee comes from wallet inputs.
+                const pow2 = (n) => { const out = []; let v = BigInt(n), bit = 0n; while (v > 0n) { if (v & 1n) out.push(Number(1n << bit)); v >>= 1n; bit += 1n; } return out; };
+                const outputsJson = JSON.stringify(pow2(coinValue).map(v => ({ out_type: "standard", address: myAddr, value: v, salt: null })));
+
+                // Witness filled AFTER the commitment is known (it carries our signature).
+                const contractInputsJson = JSON.stringify([{
+                    coin_id: normalizeHex(coin.coin_id), witness: "", value: coinValue, salt: normalizeHex(coin.salt), state: null
+                }]);
+
+                if (!mssCachesReady) await loadMssCaches();
+                const utxoArray = Object.values(wState.utxos).map(u =>
+                    (u.is_mss && wState.mssAddrs[u.address]) ? { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf } : u);
+
+                let ctx = JSON.parse(wallet.prepare_script_spend(
+                    JSON.stringify(utxoArray), covScriptHex, contractInputsJson, outputsJson, wState.nextWotsIndex
+                ));
+                // Sign the spend with the refund key, then inject the ELSE-branch witness [sig, dummy(32B), 0x00].
+                const sigHex = wallet.sign_mss_hex(refundPk, ctx.commitment);
+                const dummy = "00".repeat(32);
+                for (let i = 0; i < ctx.contract_inputs.length; i++) ctx.contract_inputs[i].witness = `${sigHex},${dummy},00`;
+
+                const revealPayloadStr = wallet.build_script_reveal(JSON.stringify(ctx), ctx.commitment, ctx.tx_salt);
+
+                while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
+                const usedMss = new Set();
+                for (const inp of ctx.wallet_inputs) if (inp.is_mss) usedMss.add(inp.address);
+                for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
+                await saveState();
+
+                dexPhase("Mining spam-proof (PoW)\u2026");
+                const stateData = await rpc.getState();
+                await new Promise(r => setTimeout(r, 50));
+                const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
+                const commitReq = await rpc.commit(ctx.commitment, spamNonce);
+                if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
+                dexPhase("Commit broadcast — waiting to be mined (1/2)\u2026");
+                while (true) { try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {} await waitForNextBlock(15000); }
+                const revealReq = await rpc.send(revealPayloadStr);
+                if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
+                dexPhase("Reveal broadcast — waiting to be mined (2/2)\u2026");
+                const firstCoin = normalizeHex(coin.coin_id);
+                while (true) { try { const inp = await rpc.checkCoin(firstCoin); if (inp && !inp.exists) break; } catch (e) {} await waitForNextBlock(15000); }
+                dexPhase("Confirmed \u2713 — syncing\u2026");
+                await performScan();
+                self.postMessage({ type: 'DEX_REFUND_SUCCESS', payload: { offerId, reclaimed: coinValue } });
+            } catch (err) {
+                const detail = (err && err.message) ? err.message : String(err);
+                self.postMessage({ type: 'DEX_REFUND_FAILED', payload: { offerId: payload && payload.offerId, error: detail } });
+            } finally {
+                isSending = false;
+            }
+        }
+        else if (type === 'DEX_LOCK_L2') {
+            // FEATURE 2 — submarine-swap intercept (MAKER side). Called by the EVM watcher
+            // when the taker's ETH lock for an L2-settled offer is seen. Routes ADD_HTLC over
+            // an open L2 channel to the taker with the SAME hashlock instead of DEX_LOCK_MIDSTATE.
+            // RELIES on the L2 HTLC fixes above (Bugs A/B/C) being in place.
+            const { offerId, takerL2Pk, mdsAmount, secretHash, baseRefundSecs } = payload;
+
+            let chanId = null, chan = null;
+            for (const [cid, c] of Object.entries(wState.l2_channels)) {
+                const peer = c.is_alice ? c.bob_pk : c.alice_pk;
+                const myBal = c.is_alice ? c.latest_state.alice_amt : c.latest_state.bob_amt;
+                if (peer === takerL2Pk && c.latest_state.is_fully_signed && myBal >= Number(mdsAmount)) { chanId = cid; chan = c; break; }
+            }
+            if (!chan) { self.postMessage({ type: 'DEX_LOCK_L2_FAILED', payload: { offerId, error: "No L2 channel to taker with capacity" } }); return; }
+
+            // Tie the L2 HTLC timeout under the Base refund window so the maker can always sweep
+            // ETH before refunding and the L2 leg can't outlive the Base leg unsafely.
+            const htlcTimeout = networkHeight + Math.max(20, Math.floor(Number(baseRefundSecs) / 12 / 2));
+
+            let nA = chan.latest_state.alice_amt, nB = chan.latest_state.bob_amt;
+            if (chan.is_alice) nA -= Number(mdsAmount); else nB -= Number(mdsAmount);
+            const htlcs = [...(chan.latest_state.htlcs || []), {
+                amount: Number(mdsAmount), timeout: htlcTimeout,
+                receiver_is_alice: !chan.is_alice, secret_hash: secretHash
+            }];
+            const newNonce = chan.latest_state.nonce + 1;
+            const stateJson = build_channel_state(chanId, chan.alice_pk, chan.bob_pk, BigInt(nA), BigInt(nB), newNonce, JSON.stringify(htlcs));
+            const sigHex = wallet.sign_mss_hex(chan.is_alice ? chan.alice_pk : chan.bob_pk, JSON.parse(stateJson).commitment);
+            chan.latest_state = { nonce: newNonce, alice_amt: nA, bob_amt: nB, htlcs, alice_sig: chan.is_alice ? sigHex : null, bob_sig: chan.is_alice ? null : sigHex, is_fully_signed: false };
+            await saveState();
+
+            // Send ADD_HTLC straight to the taker (they ARE the destination → destPk = their pk).
+            const bin = packChannelState(newNonce, nA, nB, htlcs, sigHex);
+            submitClientMinedChat([255, 42], null, [
+                { kind: "coin_id", value: chanId },
+                { kind: "signature", value: normalizeHex(bin) },
+                { kind: "address", value: takerL2Pk }
+            ]).catch(() => {});
+
+            self.postMessage({ type: 'DEX_LOCK_L2_SENT', payload: { offerId, chanId, secretHash } });
+        }
+
         else if (type === 'DEX_CHECK_SETTLED') {
             // Lightweight read-only poll used by the buyer while waiting for delivery:
             // once the covenant lock coin is spent, the MDS has been delivered to them.
@@ -1387,7 +1982,7 @@ self.onmessage = async (e) => {
         else if (type === 'SEND') {
             if (isSending) throw new Error("A transaction is already in progress. Please wait for it to complete.");
             isSending = true;
-            try { await performSend(payload.toAddress, payload.amount); }
+            try { await performSend(payload.toAddress, payload.amount, null, 0, !!payload.sendAll); }
             finally { isSending = false; }
         }
 else if (type === 'L2_OPEN_CHANNEL') {
@@ -2262,7 +2857,7 @@ function addUtxo(address, value, salt, coinId, commitment = null) {
  * @returns {Promise<void>}
  * @throws {Error} On any failure (insufficient funds, network errors, timeouts).
  */
-async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0) {
+async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0, sendAll = false) {
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Selecting coins and building transaction..." } });
     await new Promise(r => setTimeout(r, 10));
 
@@ -2286,6 +2881,39 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0)
         if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
         return u;
     });
+
+    // "Send all": spend the whole balance with no change. The fee is size-based, so instead
+    // of guessing it we ask the wallet (prepare_spend returns the exact fee) and back it out.
+    // The fee depends on the output count, which depends on (total - fee), so iterate to a
+    // fixed point — it settles in 1-2 rounds. prepare_spend has no side effects (it only
+    // builds a context), so probing it here is safe.
+    if (sendAll) {
+        let total = 0n;
+        for (const u of utxoArray) total += BigInt(u.value);
+        if (total <= 0n) throw new Error("Nothing to send — balance is zero.");
+        let amt = total > 300n ? total - 300n : total;   // start just under a safe fee overestimate
+        let fee = 300n, converged = false;
+        for (let i = 0; i < 6; i++) {
+            let est;
+            try {
+                est = JSON.parse(wallet.prepare_spend(JSON.stringify(utxoArray), toAddress, amt, wState.nextWotsIndex, null, null));
+            } catch (e) {
+                amt = amt > 100n ? amt - 100n : 0n;      // fee didn't fit yet; step down and retry
+                if (amt <= 0n) throw new Error("Balance is too small to cover the network fee.");
+                continue;
+            }
+            fee = BigInt(est.fee || 0);
+            const target = total - fee;                   // spend everything minus the fee (zero change)
+            if (target === amt) { converged = true; break; }
+            amt = target > 0n ? target : 1n;
+        }
+        // If the fee wobbled by an output between rounds, leave a 2-MDS buffer so we can
+        // never tip into over-spend; when it converged exactly, send the whole balance.
+        if (!converged) amt = total - fee - 2n;
+        if (amt <= 0n) throw new Error("Balance is too small to cover the network fee.");
+        amount = amt.toString();
+        self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: 'Sending your full balance minus fee\u2026' } });
+    }
 
     let spendContextStr;
     try {
@@ -2347,7 +2975,13 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0)
     }
 
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commit confirmed! Submitting reveal..." } });
-    const revealReq = await rpc.send(revealPayloadStr);
+    // Self-heal MSS leaf reuse on the send/announce path too: re-sign against the same
+    // already-mined commitment with a fresh leaf (the leaf is a witness, not committed to).
+    const sendLeafPhase = (p) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: p } });
+    const revealReq = await sendRevealWithMssLeafRetry(
+        revealPayloadStr, spendContextStr, ctx.commitment, ctx.tx_salt, sendLeafPhase,
+        (cs) => wallet.build_reveal(cs, ctx.commitment, ctx.tx_salt)
+    );
     if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
 
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting reveal..." } });
@@ -2688,7 +3322,7 @@ async function handleL2Chat(msg) {
         await saveState();
         self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
     }
-    else if (cmd === 40 || cmd === 41 || cmd === 42 || cmd === 43) { 
+    else if (cmd === 40 || cmd === 41 || cmd === 42 || cmd === 43) {
         // 40=UPDATE, 41=CONFIRM, 42=ADD_HTLC, 43=CLAIM_HTLC
         const coinId = msg.attachments.find(a => a.kind === "coin_id")?.value;
         const sigAtt = msg.attachments.find(a => a.kind === "signature")?.value;
@@ -2698,126 +3332,112 @@ async function handleL2Chat(msg) {
         if (!channel) return;
 
         const { nonce, aliceAmt, bobAmt, htlcs, sigHex: counterpartySig } = unpackChannelState(sigAtt);
-
         if (nonce <= channel.latest_state.nonce && channel.latest_state.is_fully_signed) return;
 
         let stateJson;
         try {
             stateJson = build_channel_state(coinId, channel.alice_pk, channel.bob_pk, BigInt(aliceAmt), BigInt(bobAmt), nonce, JSON.stringify(htlcs));
-        } catch (e) {
-            console.error("WASM build_channel_state failed:", e);
-            return;
-        }
-        
+        } catch (e) { console.error("WASM build_channel_state failed:", e); return; }
+
         const parsedState = JSON.parse(stateJson);
         const counterpartyPk = channel.is_alice ? channel.bob_pk : channel.alice_pk;
-        
         if (!verify_mss_sig_wasm(counterpartySig, parsedState.commitment, counterpartyPk)) return;
 
-        // ── ROUTING LOGIC ──
-        if (cmd === 42) { // ADD_HTLC received
-            const destPkRaw = msg.attachments.find(a => a.kind === "address")?.value;
-            const destPk = destPkRaw ? destPkRaw.substring(0, 64) : null;
-            const newHtlc = htlcs[htlcs.length - 1]; // Assume latest added
-            
-            if (destPk) {
-                // WE ARE THE HUB. Forward to Dest.
-                let forwardChannelId = null;
-                for (const [cid, c] of Object.entries(wState.l2_channels)) {
-                    if ((c.alice_pk === destPk || c.bob_pk === destPk) && c.latest_state.is_fully_signed) {
-                        forwardChannelId = cid; break;
-                    }
-                }
-                if (forwardChannelId) {
-                    const fC = wState.l2_channels[forwardChannelId];
-                    let nA = fC.latest_state.alice_amt; let nB = fC.latest_state.bob_amt;
-                    if (fC.is_alice) nA -= newHtlc.amount; else nB -= newHtlc.amount;
-                    
-                    const fHtlcs = [...(fC.latest_state.htlcs || [])];
-                    fHtlcs.push({ amount: newHtlc.amount, timeout: newHtlc.timeout - 10, receiver_is_alice: !fC.is_alice, secret_hash: newHtlc.secret_hash });
-                    
-                    const fNonce = fC.latest_state.nonce + 1;
-                    const fStateJson = build_channel_state(forwardChannelId, fC.alice_pk, fC.bob_pk, BigInt(nA), BigInt(nB), fNonce, JSON.stringify(fHtlcs));
-                    const fSig = wallet.sign_mss_hex(fC.is_alice ? fC.alice_pk : fC.bob_pk, JSON.parse(fStateJson).commitment);
-                    
-                    fC.latest_state = { nonce: fNonce, alice_amt: nA, bob_amt: nB, htlcs: fHtlcs, alice_sig: fC.is_alice ? fSig : null, bob_sig: fC.is_alice ? null : fSig, is_fully_signed: false };
-                    
-                    wState.l2_routes = wState.l2_routes || {};
-                    wState.l2_routes[newHtlc.secret_hash] = { fromCoinId: coinId, amount: newHtlc.amount };
-                    
-                    const fBin = packChannelState(fNonce, nA, nB, fHtlcs, fSig);
-                    submitClientMinedChat([255, 42], null, [{ kind: "coin_id", value: forwardChannelId }, { kind: "signature", value: normalizeHex(fBin) }, { kind: "address", value: destPk }]).catch(()=>{});
-                }
-            } else {
-                // WE ARE THE DESTINATION.
-                const secret = wState.l2_secrets ? wState.l2_secrets[newHtlc.secret_hash] : null;
-                if (secret) {
-                    // We know the secret! Claim it immediately.
-                    const cHtlcs = htlcs.filter(h => h.secret_hash !== newHtlc.secret_hash);
-                    let nA = aliceAmt; let nB = bobAmt;
-                    if (channel.is_alice) nA += newHtlc.amount; else nB += newHtlc.amount;
-                    
-                    const cNonce = nonce + 1;
-                    const cStateJson = build_channel_state(coinId, channel.alice_pk, channel.bob_pk, BigInt(nA), BigInt(nB), cNonce, JSON.stringify(cHtlcs));
-                    const cSig = wallet.sign_mss_hex(channel.is_alice ? channel.alice_pk : channel.bob_pk, JSON.parse(cStateJson).commitment);
-                    
-                    channel.latest_state = { nonce: cNonce, alice_amt: nA, bob_amt: nB, htlcs: cHtlcs, alice_sig: channel.is_alice ? cSig : null, bob_sig: channel.is_alice ? null : cSig, is_fully_signed: false };
-                    
-                    const cBin = packChannelState(cNonce, nA, nB, cHtlcs, cSig);
-                    submitClientMinedChat([255, 43], null, [{ kind: "coin_id", value: coinId }, { kind: "signature", value: normalizeHex(cBin) }, { kind: "midstate", value: secret }]).catch(()=>{});
-                }
-            }
-        }
-        else if (cmd === 43) { // CLAIM_HTLC received
-            const secret = msg.attachments.find(a => a.kind === "midstate")?.value;
-
-            if (secret) {
-                const secretHash = blake3_hash_hex(secret);
-                // We are HUB. Pull funds from original sender.
-                if (wState.l2_routes && wState.l2_routes[secretHash]) {
-                    const route = wState.l2_routes[secretHash];
-                    const pC = wState.l2_channels[route.fromCoinId];
-                    if (pC) {
-                        let pA = pC.latest_state.alice_amt; let pB = pC.latest_state.bob_amt;
-                        if (pC.is_alice) pA += route.amount; else pB += route.amount;
-                        const pHtlcs = (pC.latest_state.htlcs || []).filter(h => h.secret_hash !== secretHash);
-                        const pNonce = pC.latest_state.nonce + 1;
-                        
-                        const pStateJson = build_channel_state(route.fromCoinId, pC.alice_pk, pC.bob_pk, BigInt(pA), BigInt(pB), pNonce, JSON.stringify(pHtlcs));
-                        const pSig = wallet.sign_mss_hex(pC.is_alice ? pC.alice_pk : pC.bob_pk, JSON.parse(pStateJson).commitment);
-                        
-                        pC.latest_state = { nonce: pNonce, alice_amt: pA, bob_amt: pB, htlcs: pHtlcs, alice_sig: pC.is_alice ? pSig : null, bob_sig: pC.is_alice ? null : pSig, is_fully_signed: false };
-                        
-                        const pBin = packChannelState(pNonce, pA, pB, pHtlcs, pSig);
-                        submitClientMinedChat([255, 43], null, [{ kind: "coin_id", value: route.fromCoinId }, { kind: "signature", value: normalizeHex(pBin) }, { kind: "midstate", value: secret }]).catch(()=>{});
-                    }
-                }
-            }
-        }
-        
-        // Apply state locally
         const myPk = channel.is_alice ? channel.alice_pk : channel.bob_pk;
-        const mySig = wallet.sign_mss_hex(myPk, parsedState.commitment);
 
+        // ── STEP 1: commit the incoming state (co-sign + store + CONFIRM) ──
+        // This makes an HTLC-add irrevocable BEFORE we act on it. Doing this FIRST
+        // (rather than after the routing logic) is the fix for Bug B: the old code
+        // built the claim state then let this tail clobber it back a nonce.
+        const mySig = wallet.sign_mss_hex(myPk, parsedState.commitment);
         channel.latest_state = {
             nonce, alice_amt: aliceAmt, bob_amt: bobAmt, htlcs,
             alice_sig: channel.is_alice ? mySig : counterpartySig,
-            bob_sig: channel.is_alice ? counterpartySig : mySig,
+            bob_sig:   channel.is_alice ? counterpartySig : mySig,
             is_fully_signed: true
         };
-        
-        if (channel.channel_value === 0) {
-            channel.channel_value = aliceAmt + bobAmt + 100;
-        }
+        if (channel.channel_value === 0) channel.channel_value = aliceAmt + bobAmt + 100;
         await saveState();
 
-        if (cmd === 40 || cmd === 42) { // If UPDATE or ADD_HTLC, reply CONFIRM
-            const binPayload = packChannelState(nonce, aliceAmt, bobAmt, htlcs, mySig);
+        if (cmd === 40 || cmd === 42) { // reply CONFIRM for UPDATE / ADD_HTLC
+            const confirmBin = packChannelState(nonce, aliceAmt, bobAmt, htlcs, mySig);
             submitClientMinedChat([255, 41], null, [
                 { kind: "coin_id", value: coinId },
-                { kind: "signature", value: normalizeHex(binPayload) }
-            ]).catch(()=>{});
+                { kind: "signature", value: normalizeHex(confirmBin) }
+            ]).catch(() => {});
         }
+
+        // ── STEP 2: act on the now-committed state (advances to nonce+1) ──
+        if (cmd === 42) { // ADD_HTLC
+            const destPkRaw = msg.attachments.find(a => a.kind === "address")?.value;
+            const destPk = destPkRaw ? destPkRaw.substring(0, 64) : null;
+            const iAmDestination = !destPk || destPk === myPk;            // Bug C fix
+            const newHtlc = htlcs[htlcs.length - 1];
+
+            if (!iAmDestination) {
+                // WE ARE A HUB — forward to dest on another fully-signed channel.
+                let fwdId = null;
+                for (const [cid, c] of Object.entries(wState.l2_channels)) {
+                    if (cid === coinId) continue;                          // never forward onto the incoming channel
+                    if ((c.alice_pk === destPk || c.bob_pk === destPk) && c.latest_state.is_fully_signed) { fwdId = cid; break; }
+                }
+                if (fwdId) {
+                    const fC = wState.l2_channels[fwdId];
+                    let nA = fC.latest_state.alice_amt, nB = fC.latest_state.bob_amt;
+                    if (fC.is_alice) nA -= newHtlc.amount; else nB -= newHtlc.amount;
+                    const fHtlcs = [...(fC.latest_state.htlcs || []), { amount: newHtlc.amount, timeout: newHtlc.timeout - 10, receiver_is_alice: !fC.is_alice, secret_hash: newHtlc.secret_hash }];
+                    const fNonce = fC.latest_state.nonce + 1;
+                    const fState = build_channel_state(fwdId, fC.alice_pk, fC.bob_pk, BigInt(nA), BigInt(nB), fNonce, JSON.stringify(fHtlcs));
+                    const fSig = wallet.sign_mss_hex(fC.is_alice ? fC.alice_pk : fC.bob_pk, JSON.parse(fState).commitment);
+                    fC.latest_state = { nonce: fNonce, alice_amt: nA, bob_amt: nB, htlcs: fHtlcs, alice_sig: fC.is_alice ? fSig : null, bob_sig: fC.is_alice ? null : fSig, is_fully_signed: false };
+                    wState.l2_routes = wState.l2_routes || {};
+                    wState.l2_routes[newHtlc.secret_hash] = { fromCoinId: coinId, amount: newHtlc.amount };
+                    await saveState();
+                    const fBin = packChannelState(fNonce, nA, nB, fHtlcs, fSig);
+                    submitClientMinedChat([255, 42], null, [{ kind: "coin_id", value: fwdId }, { kind: "signature", value: normalizeHex(fBin) }, { kind: "address", value: destPk }]).catch(() => {});
+                }
+            } else {
+                // WE ARE THE DESTINATION — if we know the preimage, claim by advancing nonce+1.
+                const secret = wState.l2_secrets ? wState.l2_secrets[newHtlc.secret_hash] : null;
+                if (secret) {
+                    const cHtlcs = (channel.latest_state.htlcs || []).filter(h => h.secret_hash !== newHtlc.secret_hash);
+                    let nA = channel.latest_state.alice_amt, nB = channel.latest_state.bob_amt;
+                    if (channel.is_alice) nA += newHtlc.amount; else nB += newHtlc.amount;
+                    const cNonce = channel.latest_state.nonce + 1;
+                    const cState = build_channel_state(coinId, channel.alice_pk, channel.bob_pk, BigInt(nA), BigInt(nB), cNonce, JSON.stringify(cHtlcs));
+                    const cSig = wallet.sign_mss_hex(myPk, JSON.parse(cState).commitment);
+                    channel.latest_state = { nonce: cNonce, alice_amt: nA, bob_amt: nB, htlcs: cHtlcs, alice_sig: channel.is_alice ? cSig : null, bob_sig: channel.is_alice ? null : cSig, is_fully_signed: false };
+                    await saveState();
+                    const cBin = packChannelState(cNonce, nA, nB, cHtlcs, cSig);
+                    submitClientMinedChat([255, 43], null, [{ kind: "coin_id", value: coinId }, { kind: "signature", value: normalizeHex(cBin) }, { kind: "midstate", value: secret }]).catch(() => {});
+                    // Feature 2 hook: a maker fulfilling a submarine swap now has the preimage
+                    // surfaced and can sweep the Base ETH using `secret`.
+                }
+            }
+        } else if (cmd === 43) { // CLAIM_HTLC — a hub pulls funds from the upstream sender
+            const secret = msg.attachments.find(a => a.kind === "midstate")?.value;
+            if (secret) {
+                const secretHash = blake3_hash_hex(secret);
+                const route = wState.l2_routes && wState.l2_routes[secretHash];
+                if (route) {
+                    const pC = wState.l2_channels[route.fromCoinId];
+                    if (pC) {
+                        let pA = pC.latest_state.alice_amt, pB = pC.latest_state.bob_amt;
+                        if (pC.is_alice) pA += route.amount; else pB += route.amount;
+                        const pHtlcs = (pC.latest_state.htlcs || []).filter(h => h.secret_hash !== secretHash);
+                        const pNonce = pC.latest_state.nonce + 1;
+                        const pState = build_channel_state(route.fromCoinId, pC.alice_pk, pC.bob_pk, BigInt(pA), BigInt(pB), pNonce, JSON.stringify(pHtlcs));
+                        const pSig = wallet.sign_mss_hex(pC.is_alice ? pC.alice_pk : pC.bob_pk, JSON.parse(pState).commitment);
+                        pC.latest_state = { nonce: pNonce, alice_amt: pA, bob_amt: pB, htlcs: pHtlcs, alice_sig: pC.is_alice ? pSig : null, bob_sig: pC.is_alice ? null : pSig, is_fully_signed: false };
+                        delete wState.l2_routes[secretHash];
+                        await saveState();
+                        const pBin = packChannelState(pNonce, pA, pB, pHtlcs, pSig);
+                        submitClientMinedChat([255, 43], null, [{ kind: "coin_id", value: route.fromCoinId }, { kind: "signature", value: normalizeHex(pBin) }, { kind: "midstate", value: secret }]).catch(() => {});
+                    }
+                }
+            }
+        }
+
         self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
     }
     // ── L2 DEX ROUTING ──

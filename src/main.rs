@@ -4355,7 +4355,7 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
             // --- RESTART SIMULATION HEAL LOGIC ---
             if let Err(e) = &res {
                 if e.to_string().contains("State root mismatch") && height > 0 && height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
-                    tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", height);
+                  //  tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", height);
                     if let (Some(s_prev), Some(h_prev)) = (state_before_prev.clone(), headers_before_prev.clone()) {
                         state = s_prev;
                         recent_headers = h_prev;

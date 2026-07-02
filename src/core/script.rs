@@ -632,6 +632,87 @@ pub fn compile_covenant_htlc(
     bc
 }
 
+/// Limit-order covenant with partial fills (Feature 1).
+///
+/// A maker locks bulk MDS — as the usual power-of-two coins — at this covenant's
+/// address. The claim path lets ANYONE spend a coin provided they:
+///   (a) satisfy the hashlock (HASH(secret) == secret_hash). This is the same
+///       preimage the maker harvests from the spend witness to claim the ETH that
+///       the taker locked on Base; and
+///   (b) route the untouched remainder back to THIS covenant address (OP_THIS_ADDRESS),
+///       keeping the order alive on the book.
+///
+/// `max_claim` caps how much a single fill may extract FROM ONE COIN. The remainder
+/// rule is written as `(value_back_to_self + max_claim) >= INPUT_VALUE` using OP_ADD
+/// (NOT OP_SUB) on purpose: with OP_SUB, any coin whose value is below `max_claim`
+/// would underflow and abort the script, making that coin permanently unspendable.
+/// The OP_ADD form instead makes a sub-`max_claim` coin simply fully claimable.
+///
+/// ── SECURITY (read before deploying) ───────────────────────────────────────
+/// This VM has no "sum of the inputs that share this address" opcode; OP_INPUT_VALUE
+/// is per-coin. So the per-coin remainder rule does NOT compose across a multi-coin
+/// spend: a taker who spends several covenant coins in ONE transaction satisfies
+/// every input with a single shared remainder output and walks away with the rest.
+/// Until there is an OP_SUM_INPUT_VALUE (or a consensus "one covenant input per tx"
+/// rule), fills MUST be constrained to a single covenant input by the node/relayer.
+/// Also note a hashlock alone does NOT prove the Base ETH lock.
+///
+/// Witnesses (pushed bottom -> top):
+///   claim : [secret, 0x01]
+///   refund: [refund_sig, <32-byte dummy>, 0x00]
+pub fn compile_limit_order_covenant(
+    secret_hash:    &[u8; 32],
+    max_claim:      u64,
+    timeout_height: u64,
+    refund_pk:      &[u8; 32],
+) -> Vec<u8> {
+    let mut bc = Vec::new();
+    bc.push(OP_IF);
+        // (a) hashlock — the preimage the maker harvests to sweep ETH on Base
+        bc.push(OP_HASH);
+        push_data(&mut bc, secret_hash);
+        bc.push(OP_EQUALVERIFY);
+        // (b) remainder continuation: (back_to_self + max_claim) >= input_value
+        bc.push(OP_THIS_ADDRESS);
+        bc.push(OP_SUM_TO_ADDR);          // sum of outputs paying back into this covenant
+        push_int(&mut bc, max_claim);
+        bc.push(OP_ADD);
+        bc.push(OP_INPUT_VALUE);
+        bc.push(OP_GREATER_OR_EQUAL);
+        bc.push(OP_VERIFY);
+    bc.push(OP_ELSE);
+        bc.push(OP_DROP);                 // drop the 32-byte dummy
+        push_int(&mut bc, timeout_height);
+        bc.push(OP_CHECKTIMEVERIFY);
+        push_data(&mut bc, refund_pk);
+        bc.push(OP_CHECKSIGVERIFY);       // maker reclaims the whole order after timeout
+    bc.push(OP_ENDIF);
+    push_int(&mut bc, 1);
+    bc
+}
+
+/// True 2-of-2 multisig. Witness: [Sig1, Sig2]  (Sig1 = sig over pk1, bottom of stack).
+///
+/// Replaces the channel code's previous reuse of `compile_multisig_2of3(pk1, pk2, pk2)`,
+/// which emitted THREE OP_CHECKSIG slots and therefore required THREE witness items.
+/// The cooperative close only ever supplies two (alice_sig, bob_sig), so the old script
+/// underflowed the stack and NO channel could ever be cooperatively closed.
+///
+/// Witness ordering: the first comma-element produced by build_channel_reveal (alice_sig)
+/// must land at the BOTTOM of the stack (Sig1), matching the existing 2-of-3 convention.
+pub fn compile_multisig_2of2(pk1: &[u8; 32], pk2: &[u8; 32]) -> Vec<u8> {
+    let mut bc = Vec::new();
+    push_data(&mut bc, pk2);
+    bc.push(OP_CHECKSIG);
+    bc.push(OP_SWAP);
+    push_data(&mut bc, pk1);
+    bc.push(OP_CHECKSIG);
+    bc.push(OP_ADD);
+    push_int(&mut bc, 2);
+    bc.push(OP_GREATER_OR_EQUAL);
+    bc
+}
+
 /// 2-of-3 multisig script. Witness: [Sig1, Sig2, Sig3] (0x00 for missing)
 pub fn compile_multisig_2of3(
     pk1: &[u8; 32], pk2: &[u8; 32], pk3: &[u8; 32],

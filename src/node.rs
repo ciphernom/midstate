@@ -4424,7 +4424,7 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
                     // ---------------------------
 
                     if err_str.contains("State root mismatch") && height > header_start_height && height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
-                        tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", height);
+                        //tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", height);
 
                         if let (Some(s_prev), Some(h_prev)) = (state_before_prev.clone(), headers_before_prev.clone()) {
                             candidate_state = s_prev;
@@ -4912,7 +4912,7 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
                 }
                 // ---------------------------
                 if e.to_string().contains("State root mismatch") && height > 0 && height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
-                    tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", height);
+                   // tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", height);
                     if let (Some(s_prev), Some(h_prev)) = (state_before_prev.clone(), headers_before_prev.clone()) {
                         candidate_state = s_prev;
                         recent_headers = h_prev.clone();
@@ -5659,7 +5659,7 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
             if let Err(e) = &res {
                 let height = self.state.height;
                 if e.to_string().contains("State root mismatch") && height > 0 && height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
-                    tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", height);
+                   // tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", height);
                     if let (Some(s_prev), Some(h_prev)) = (state_before_prev.clone(), headers_before_prev.clone()) {
                         candidate = s_prev;
                         let mut recent_ts = h_prev.clone();
@@ -6347,7 +6347,7 @@ fn replay_blocks_into_state(
             // decision regarding ghost keys at the END of the previous block (H-1).
             if let Err(e) = &res {
                 if e.to_string().contains("State root mismatch") && h > start && h < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
-                    tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", h);
+                  //  tracing::warn!("State root mismatch at {}. Simulating historical node restart to self-heal...", h);
                     
                     // Roll back to the state BEFORE H-1
                     *state = state_before_prev.clone();

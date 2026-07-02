@@ -977,6 +977,16 @@
 
             <!-- TAB: MARKET -->
             <div id="dex-tab-market">
+                <!-- Settlement path: L1 partial-fill covenant vs L2 submarine swap (Feature 1/2) -->
+                <div class="panel" style="padding:10px 12px;margin-bottom:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                    <span style="font-size:11px;color:var(--text-muted);">Settlement</span>
+                    <div id="dexSettleSelect" style="display:flex;gap:6px;">
+                        <button class="unit-opt active" data-path="L1" onclick="setDexSettlePath(this)" style="padding:5px 10px;font-size:11px;">Settle on L1</button>
+                        <button class="unit-opt" data-path="L2" onclick="setDexSettlePath(this)" style="padding:5px 10px;font-size:11px;">Settle on L2</button>
+                    </div>
+                    <span id="dexSettleHint" style="font-size:10px;color:var(--text-faint);margin-left:auto;">Partial-fill covenant on Midstate L1.</span>
+                </div>
+                <div id="dexScanStatus" style="font-size:10px;color:var(--text-faint);margin:0 2px 6px;min-height:12px;"></div>
                 <div class="panel" style="padding: 0;">
                     <table class="dex-table">
                         <thead>
@@ -1030,7 +1040,16 @@
                         <div id="dexPriceReadout" class="send-conversion"></div>
                     </div>
                     <div id="dexGiveHint" style="font-size: 11px; color: var(--text-bright); margin: 8px 0 4px;">You lock MDS first; you receive ETH.</div>
-                    <button onclick="dexCreateOffer()" style="background: var(--text-max); color: #000; margin-top: 10px;">Broadcast Offer</button>
+                    <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--text-muted);margin-top:10px;cursor:pointer;">
+                        <input type="checkbox" id="dexLimitMode" onchange="dexToggleLimitMode()" style="width:auto;margin:0;">
+                        Lock MDS on-chain as an L1 limit order (sell side; one atomic power-of-two unit)
+                    </label>
+                    <div id="dexLimitHint" style="font-size:10px;color:var(--text-faint);margin-top:4px;display:none;"></div>
+                    <button id="dexBroadcastBtn" onclick="dexCreateOffer()" style="background: var(--text-max); color: #000; margin-top: 10px;">Broadcast Offer</button>
+                    <div id="dexRebroadcastRow" style="display:none; font-size:10px; color:var(--text-muted); margin-top:6px; text-align:center;">
+                        Order posted. <a href="#" onclick="dexForceRebroadcastSame(event)" style="color:var(--text-bright); text-decoration:underline; cursor:pointer;">Post the same order again</a>
+                    </div>
+                    <div id="dexBroadcastProgress" style="display:none; margin-top:10px; border:1px solid var(--border-bright); border-radius:6px; padding:10px 12px; font-size:11px; line-height:1.5;"></div>
                 </div>
             </div>
 
@@ -1055,9 +1074,12 @@
                     <button id="btnScanQR" style="background: transparent; border: 1px dashed var(--border-bright); color: var(--accent); padding: 4px 12px; width: auto; min-height: 0; font-size: 11px; margin: 0;">Scan</button>
                 </div>
                 <input type="text" id="sendAddress" placeholder="Paste or scan hex address...">
-                <label style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Amount</label>
+                <div style="display:flex; justify-content:space-between; align-items:baseline; margin-top:2px;">
+                    <label style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Amount</label>
+                    <span style="font-size:11px; color:var(--text-muted);">Balance: <span id="sendBalanceLine">&mdash;</span> <!--a href="#" onclick="sendSetMax(event)" style="color:var(--accent); text-decoration:underline; cursor:pointer; margin-left:4px;">Max</a--></span>
+                </div>
                 <div class="amount-field">
-                    <input type="number" inputmode="decimal" step="any" min="0" id="sendAmount" placeholder="0" oninput="updateSendConversion()">
+                    <input type="number" inputmode="decimal" step="any" min="0" id="sendAmount" placeholder="0" oninput="onSendAmountInput()">
                     <div class="unit-select" id="sendUnitSelect">
                         <button type="button" class="unit-opt active" data-unit="MDS" onclick="setSendUnit(this)">MDS</button>
                         <button type="button" class="unit-opt" data-unit="kMDS" onclick="setSendUnit(this)">kMDS</button>
@@ -1958,14 +1980,55 @@ if ('serviceWorker' in navigator) {
         //  whole number of base MDS before it is handed to the worker.
         const MDS_UNITS = { MDS: 1, kMDS: MDS_KILO, mMDS: MDS_MEGA, gMDS: MDS_GIGA };
         let sendUnit = 'MDS';
+        let _sendMax = false;   // "send entire balance minus fee" armed
 
         function setSendUnit(btn) {
             sendUnit = btn.dataset.unit || 'MDS';
             document.querySelectorAll('#sendUnitSelect .unit-opt').forEach(b => {
                 b.classList.toggle('active', b === btn);
             });
+            // If Max is armed, re-express the full balance in the newly chosen unit.
+            if (_sendMax) { const f = document.getElementById('sendAmount'); if (f) f.value = _sendMaxFieldValue(); }
             updateSendConversion();
+            updateSendBalanceLine();
         }
+
+        // Balance shown next to the Amount label, in the currently selected unit.
+        function updateSendBalanceLine() {
+            const el = document.getElementById('sendBalanceLine');
+            if (!el) return;
+            const mult = MDS_UNITS[sendUnit] || 1;
+            const inUnit = _lastRawBalance / mult;
+            const shown = (sendUnit === 'MDS')
+                ? _lastRawBalance.toLocaleString('en')
+                : (Number.isInteger(inUnit) ? inUnit.toLocaleString('en') : inUnit.toFixed(6).replace(/\.?0+$/, ''));
+            el.textContent = `${shown} ${sendUnit}`;
+        }
+
+        // The amount-field string for the full balance in the current unit.
+        function _sendMaxFieldValue() {
+            const mult = MDS_UNITS[sendUnit] || 1;
+            const inUnit = _lastRawBalance / mult;
+            return (sendUnit === 'MDS')
+                ? String(_lastRawBalance)
+                : (Number.isInteger(inUnit) ? String(inUnit) : inUnit.toFixed(6).replace(/\.?0+$/, ''));
+        }
+
+        // Tapping "Max" arms send-all: the field shows the full balance, and the actual
+        // send deducts the wallet-computed fee (the worker figures the exact amount).
+        window.sendSetMax = function(ev) {
+            if (ev && ev.preventDefault) ev.preventDefault();
+            if (!_lastRawBalance || _lastRawBalance <= 0) return showToast("No spendable balance.", "info");
+            _sendMax = true;
+            const f = document.getElementById('sendAmount'); if (f) f.value = _sendMaxFieldValue();
+            updateSendConversion();
+        };
+
+        // Any manual edit cancels Max (they're choosing a specific amount now).
+        window.onSendAmountInput = function() {
+            _sendMax = false;
+            updateSendConversion();
+        };
 
         // Resolve the input + selected unit to a base-MDS integer.
         // Returns { raw: <int>|null, error: <string>|null }.
@@ -1999,9 +2062,11 @@ if ('serviceWorker' in navigator) {
             const showTail = (prefix !== 'MDS') && (prefix !== sendUnit);
             const tail = showTail ? ` &middot; ${value} ${prefix}` : '';
             el.innerHTML = `= <strong>${raw.toLocaleString('en')}</strong> MDS${tail}`;
+            if (_sendMax) el.innerHTML += ` <span style="color:var(--text-muted)">&middot; full balance, minus fee</span>`;
         }
 
         function resetSendForm() {
+            _sendMax = false;
             const f = document.getElementById('sendAmount'); if (f) f.value = '';
             const a = document.getElementById('sendAddress'); if (a) a.value = '';
             const mdsBtn = document.querySelector('#sendUnitSelect .unit-opt[data-unit="MDS"]');
@@ -2019,6 +2084,8 @@ if ('serviceWorker' in navigator) {
 
         function renderBalanceElement(rawBalance) {
             _lastRawBalance = Number(rawBalance) || 0;
+            if (typeof updateSendBalanceLine === 'function') updateSendBalanceLine();
+            if (_sendMax) { const f = document.getElementById('sendAmount'); if (f) f.value = _sendMaxFieldValue(); updateSendConversion(); }
             const el = document.getElementById('lblBalance');
             const hint = document.getElementById('balance-toggle-hint');
             if (balanceRawMode) {
@@ -2992,6 +3059,9 @@ if ('serviceWorker' in navigator) {
 
                 case 'SEND_PROGRESS':
                     showActivity(payload.msg);
+                    // During a DEX broadcast, the announce leg runs through performSend →
+                    // SEND_PROGRESS. Mirror it into the on-form progress panel.
+                    if (dexBroadcastInFlight && typeof dexSetProgress === 'function') dexSetProgress('Announcing order on-chain \u2014 ' + payload.msg, null);
                     break;
 
                 case 'SEND_COMPLETE':
@@ -3021,6 +3091,18 @@ if ('serviceWorker' in navigator) {
                     resetUIState();
                     showToast("Sync complete.", "success");
                     updateDashboard(payload);
+                    // Once per session, after the worker is synced (rpc ready), re-deliver any
+                    // limit-order bundle whose funding was interrupted before the UI registered it.
+                    if (!window._dexBundleRecoveryDone) {
+                        window._dexBundleRecoveryDone = true;
+                        worker.postMessage({ type: 'DEX_RECOVER_BUNDLES' });
+                        // Re-advertise our own live orders immediately (don't wait for the heartbeat),
+                        // and re-verify restored orders — they may have been filled while we were away.
+                        try { dexHeartbeat(); } catch (_) {}
+                        for (const o of dexOrderbook) { if (o.covenant && o.covenant.coinId) { o.verified = null; dexVerifyCovenantCoin(o); } }
+                        try { renderDexOrderbook(); } catch (_) {}
+                        try { dexScanAnnouncements(); } catch (_) {}   // discover on-chain orders
+                    }
                     break;
 
                 case 'ERROR':
@@ -3164,10 +3246,13 @@ if ('serviceWorker' in navigator) {
 
             // In the confirmation, show the entered unit form and the exact
             // base-MDS figure it resolves to (so there is no ambiguity).
+            const sendAll = _sendMax;   // capture before resetSendForm() clears it
             const { value: cV, prefix: cP } = formatMDS(amount);
-            const amtLine = (sendUnit === 'MDS')
-                ? `<strong style="color:var(--text-max)">${amount.toLocaleString('en')}</strong> MDS`
-                : `<strong style="color:var(--text-max)">${entered} ${sendUnit}</strong> <span style="color:var(--text-muted)">= ${amount.toLocaleString('en')} MDS</span>`;
+            const amtLine = sendAll
+                ? `your <strong style="color:var(--text-max)">entire balance</strong> <span style="color:var(--text-muted)">(\u2248 ${amount.toLocaleString('en')} MDS) minus the network fee</span>`
+                : (sendUnit === 'MDS')
+                    ? `<strong style="color:var(--text-max)">${amount.toLocaleString('en')}</strong> MDS`
+                    : `<strong style="color:var(--text-max)">${entered} ${sendUnit}</strong> <span style="color:var(--text-muted)">= ${amount.toLocaleString('en')} MDS</span>`;
 
             showConfirm(
                 "Confirm Transaction",
@@ -3179,7 +3264,7 @@ if ('serviceWorker' in navigator) {
                     resetSendForm();
                     switchTab('view-home');
                     showActivity("Preparing transaction...");
-                    worker.postMessage({ type: 'SEND', payload: { toAddress, amount } });
+                    worker.postMessage({ type: 'SEND', payload: { toAddress, amount, sendAll } });
                 }
             );
         };
@@ -3836,7 +3921,38 @@ document.getElementById('btnExport').onclick = () => {
 
         let evmProvider = null, evmSigner = null, evmAddress = null;
 
-        let dexOrderbook = [];
+        // Orderbook persists across reloads now (the chat bus is fire-and-forget, so without this
+        // a refresh emptied the book). Stale entries are pruned by TTL in renderDexOrderbook.
+        let dexOrderbook = (() => { try { return JSON.parse(localStorage.getItem('midstate_dex_orderbook')) || []; } catch (_) { return []; } })();
+        function saveOrderbook() { try { localStorage.setItem('midstate_dex_orderbook', JSON.stringify(dexOrderbook)); } catch (_) {} }
+
+        // Settlement path the taker prefers: 'L1' = partial-fill covenant, 'L2' = submarine swap.
+        let dexSettlePath = localStorage.getItem('midstate_dex_settle_path') || 'L1';
+        window.setDexSettlePath = function(btn) {
+            dexSettlePath = btn.dataset.path || 'L1';
+            localStorage.setItem('midstate_dex_settle_path', dexSettlePath);
+            document.querySelectorAll('#dexSettleSelect .unit-opt').forEach(b => b.classList.toggle('active', b === btn));
+            const hint = document.getElementById('dexSettleHint');
+            if (hint) hint.textContent = dexSettlePath === 'L2'
+                ? 'Submarine swap: instant L2 settlement (needs an open L2 channel to the maker).'
+                : 'Partial-fill covenant on Midstate L1.';
+            try { renderDexOrderbook(); } catch (_) {}
+        };
+        // Reflect the persisted choice on load (after the toggle DOM exists).
+        setTimeout(() => {
+            const b = document.querySelector(`#dexSettleSelect .unit-opt[data-path="${dexSettlePath}"]`);
+            if (b) setDexSettlePath(b);
+        }, 0);
+
+        // Verify an advertised covenant order actually exists on-chain (Feature 1: the book
+        // reads verified L1 covenant UTXOs, not chat promises). Reuses the worker's checkCoin
+        // via DEX_CHECK_SETTLED with a 'verify:' sentinel offerId; the reply
+        // (DEX_SETTLED_STATUS, settled = coin spent/absent) is read as verified = !settled.
+        function dexVerifyCovenantCoin(o) {
+            const cid = o && o.covenant && o.covenant.coinId;
+            if (!cid || o.verified === true) return;
+            worker.postMessage({ type: 'DEX_CHECK_SETTLED', payload: { offerId: 'verify:' + cid, coinId: cid } });
+        }
         let dexMySwaps = JSON.parse(localStorage.getItem('midstate_dex_swaps')) || [];
         // ── Migrate legacy swaps (pre two-sided): all were ASK ──────────────
         for (const s of dexMySwaps) {
@@ -4034,8 +4150,151 @@ document.getElementById('btnExport').onclick = () => {
             el.innerHTML = `= <strong>${raw.toLocaleString('en')}</strong> MDS${tail}`;
         }
 
+        // Feature 1 limit-order origination. A non-power-of-two amount becomes a BUNDLE of
+        // independent single-fill units (one fresh secret/covenant/coin each), but ALL units are
+        // funded in ONE transaction (~2 blocks) via the worker's DEX_CREATE_LIMIT_BUNDLE →
+        // prepare_fund_many. Each returned unit is then registered as its own offer/swap/watcher.
+        function dexRegisterLimitUnit(u) {
+            if (dexMySwaps.some(s => s.offerId === u.offerId)) return;   // idempotent (recovery re-emits)
+            const covenant = {
+                coinId: u.coin.coin_id, value: u.coin.value, salt: u.coin.salt, covAddr: u.covAddr,
+                secretHash: u.secretHash, maxClaim: u.maxClaim, timeoutHeight: u.timeoutHeight,
+                makerMdsPk: u.makerMdsPk, makerEvmAddr: u.makerEvmAddr, weiAmount: u.weiAmount
+            };
+            dexMySwaps.push({
+                role: 'maker', side: 'mds', kind: 'limit', status: 'limit_posted',
+                offerId: u.offerId, mdsAmount: u.coin.value, weiAmount: u.weiAmount,
+                makerEvmAddr: u.makerEvmAddr, secret: u.secret, secretHash: u.secretHash, covenant,
+                orderGroup: u.orderGroup || null
+            });
+            worker.postMessage({ type: 'DEX_BROADCAST_OFFER', payload: {
+                offerId: u.offerId, kind: 'ask', mdsAmount: u.coin.value, weiAmount: u.weiAmount,
+                makerEvmAddr: u.makerEvmAddr, ts: Date.now(), swapMode: 'covenant', covenant
+            }});
+            startMakerLimitWatch(u.offerId);
+        }
+
+        // Maker: reclaim an unfilled limit-order unit after its on-chain timeout.
+        window.dexRefundLimitOrder = function(offerId) {
+            const s = dexMySwaps.find(x => x.offerId === offerId && x.kind === 'limit' && x.role === 'maker');
+            if (!s || !s.covenant) return showToast("Order not found.", "error");
+            const cov = s.covenant;
+            if (!confirm(`Reclaim ${Number(cov.value).toLocaleString('en')} MDS from this order?\n\nThis only succeeds after the ~24h timeout height; if a taker has already locked ETH, let the fill complete instead.`)) return;
+            s.status = 'limit_refunding'; saveSwaps(); renderDexSwaps();
+            worker.postMessage({ type: 'DEX_REFUND_LIMIT_ORDER', payload: {
+                offerId,
+                coin: { coin_id: cov.coinId, value: Number(cov.value), salt: cov.salt },
+                secretHash: cov.secretHash, maxClaim: Number(cov.maxClaim),
+                timeoutHeight: cov.timeoutHeight, makerMdsPk: cov.makerMdsPk
+            }});
+            showToast("Submitting reclaim…", "success");
+        };
+
+        window.dexToggleLimitMode = function() {
+            const on = document.getElementById('dexLimitMode') && document.getElementById('dexLimitMode').checked;
+            const hint = document.getElementById('dexLimitHint');
+            if (hint) {
+                hint.style.display = on ? 'block' : 'none';
+                hint.textContent = on
+                    ? 'Your MDS is locked into an on-chain covenant (one power-of-two unit). Takers verify it on-chain and fill it without you negotiating; it refunds to you after ~24h if unfilled. Sell side only.'
+                    : '';
+            }
+        };
+
+        // ── Broadcast progress panel + button guard ─────────────────────────
+        // Persistent, on-the-create-form feedback from click through "posted", plus a
+        // guard that disables the button while broadcasting and after (until the order
+        // changes) so you don't accidentally re-post the same order.
+        var dexBroadcastInFlight = false;
+        var dexBroadcastGroupId = null;
+        var dexBroadcastStart = 0;
+        var dexBroadcastHeartbeat = null;
+        var dexBroadcastStageMsg = '';
+        var dexLastBroadcastSig = null;
+        var dexForceRebroadcast = false;
+
+        function dexOrderSignature() {
+            var mdsRaw = '', wei = '';
+            try { mdsRaw = String((dexResolveMds() || {}).raw || ''); } catch (e) {}
+            try { var w = (dexWeiFromInput() || {}).wei; wei = w ? w.toString() : ''; } catch (e) {}
+            var limit = !!(document.getElementById('dexLimitMode') && document.getElementById('dexLimitMode').checked);
+            return JSON.stringify({ dir: dexDirection, mdsRaw: mdsRaw, wei: wei, limit: limit });
+        }
+
+        function dexRefreshBroadcastBtn() {
+            var btn = document.getElementById('dexBroadcastBtn');
+            var row = document.getElementById('dexRebroadcastRow');
+            if (!btn) return;
+            if (dexBroadcastInFlight) {
+                btn.disabled = true; btn.textContent = 'Broadcasting\u2026';
+                btn.style.opacity = '0.6'; btn.style.cursor = 'progress';
+                if (row) row.style.display = 'none';
+                return;
+            }
+            var unchanged = dexLastBroadcastSig !== null && dexOrderSignature() === dexLastBroadcastSig && !dexForceRebroadcast;
+            btn.disabled = unchanged;
+            btn.textContent = unchanged ? 'Order posted \u2713' : 'Broadcast Offer';
+            btn.style.opacity = unchanged ? '0.5' : '1';
+            btn.style.cursor = unchanged ? 'not-allowed' : 'pointer';
+            if (row) row.style.display = unchanged ? 'block' : 'none';
+        }
+
+        window.dexForceRebroadcastSame = function(ev) {
+            if (ev && ev.preventDefault) ev.preventDefault();
+            dexForceRebroadcast = true;
+            dexRefreshBroadcastBtn();
+        };
+
+        // Re-enable the broadcast button the moment the order changes: recompute the
+        // signature on any input, unit toggle, or direction click in the create form.
+        (function dexWireBroadcastGuard() {
+            function attach() {
+                ['dexOfferAmount', 'dexAskAmount'].forEach(function (id) { var el = document.getElementById(id); if (el) el.addEventListener('input', dexRefreshBroadcastBtn); });
+                var lim = document.getElementById('dexLimitMode'); if (lim) lim.addEventListener('change', dexRefreshBroadcastBtn);
+                ['dexMdsUnitSelect', 'dexUnitSelect', 'dexDirSell', 'dexDirBuy'].forEach(function (id) { var el = document.getElementById(id); if (el) el.addEventListener('click', dexRefreshBroadcastBtn); });
+            }
+            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', attach); else attach();
+        })();
+
+        function dexSetProgress(msg, kind) {
+            dexBroadcastStageMsg = msg || '';
+            var el = document.getElementById('dexBroadcastProgress');
+            if (!el) return;
+            el.style.display = 'block';
+            var terminal = (kind === 'done' || kind === 'error');
+            var color = kind === 'error' ? 'var(--danger, #d66)' : kind === 'done' ? 'var(--success, #3a7a3a)' : 'var(--text-bright)';
+            var mark = kind === 'done' ? '\u2713 ' : kind === 'error' ? '\u2717 ' : '\u25CF ';
+            var elapsed = (!terminal && dexBroadcastStart) ? ' \u00b7 ' + Math.floor((Date.now() - dexBroadcastStart) / 1000) + 's' : '';
+            el.innerHTML = '<span style="color:' + color + '">' + mark + msg + elapsed + '</span>';
+        }
+
+        function dexBeginBroadcastUI(groupId) {
+            dexBroadcastInFlight = true;
+            dexBroadcastGroupId = groupId || null;
+            dexBroadcastStart = Date.now();
+            dexForceRebroadcast = false;
+            dexRefreshBroadcastBtn();
+            dexSetProgress('Preparing order \u2014 verifying keys\u2026', null);
+            if (dexBroadcastHeartbeat) clearInterval(dexBroadcastHeartbeat);
+            // Keep the elapsed counter live so long block-waits never look frozen.
+            dexBroadcastHeartbeat = setInterval(function () { if (dexBroadcastInFlight) dexSetProgress(dexBroadcastStageMsg, null); }, 1000);
+        }
+
+        function dexFinishBroadcastUI(kind, msg) {
+            dexBroadcastInFlight = false;
+            if (dexBroadcastHeartbeat) { clearInterval(dexBroadcastHeartbeat); dexBroadcastHeartbeat = null; }
+            dexSetProgress(msg, kind);
+            if (kind === 'done') dexLastBroadcastSig = dexOrderSignature();
+            dexRefreshBroadcastBtn();
+            if (kind === 'done') {
+                // Fade the success banner after a while; leave errors up.
+                setTimeout(function () { if (!dexBroadcastInFlight) { var el = document.getElementById('dexBroadcastProgress'); if (el) el.style.display = 'none'; } }, 12000);
+            }
+        }
+
         window.dexCreateOffer = function() {
             if (!evmAddress) return showToast("Connect MetaMask first", "error");
+            if (dexBroadcastInFlight) return showToast("A broadcast is already in progress\u2014let it finish.", "error");
             const { raw: mdsAmt, error: mdsErr } = dexResolveMds();
             if (!mdsAmt) return showToast(mdsErr || "Enter the MDS amount", "error");
             const { wei, error } = dexWeiFromInput();
@@ -4044,6 +4303,37 @@ document.getElementById('btnExport').onclick = () => {
 
             const offerId = Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2, '0')).join('');
             const kind = dexDirection;
+
+            // FEATURE 1: on-chain limit order (sell side). Splits a non-power-of-two amount into a
+            // bundle of independent single-fill units (one fresh secret each) and funds them ALL in
+            // ONE transaction (~2 blocks) via DEX_CREATE_LIMIT_BUNDLE → prepare_fund_many.
+            const limitMode = document.getElementById('dexLimitMode') && document.getElementById('dexLimitMode').checked;
+            if (limitMode) {
+                if (kind !== 'ask') return showToast("Limit orders are sell-side (they lock MDS on-chain).", "error");
+                if (dexMySwaps.some(s => s.status === 'limit_funding')) return showToast("A limit order is still being funded — wait for it to finish.", "error");
+                const total = BigInt(mdsAmt);
+                const unitsBig = [];
+                { let v = total, bit = 0n; while (v > 0n) { if (v & 1n) unitsBig.push(1n << bit); v >>= 1n; bit += 1n; } }
+                unitsBig.reverse();   // largest unit first
+                if (!unitsBig.length) return showToast("Amount too small for a limit order.", "error");
+                const groupId = Array.from(crypto.getRandomValues(new Uint8Array(6))).map(b => b.toString(16).padStart(2, '0')).join('');
+                const units = unitsBig.map(u => ({ unitValue: Number(u), weiAmount: (wei * u / total).toString() }));
+                // Progress placeholder card (offerId = groupId) so the funding phase animates; it's
+                // replaced by the real per-unit cards when DEX_LIMIT_BUNDLE_CREATED returns.
+                dexMySwaps.push({
+                    role: 'maker', side: 'mds', kind: 'limit', status: 'limit_funding',
+                    offerId: groupId, orderGroup: groupId, mdsAmount: Number(total), weiAmount: weiAmt
+                });
+                saveSwaps(); renderDexSwaps();
+                showToast(units.length === 1
+                    ? `Locking ${Number(unitsBig[0]).toLocaleString('en')} MDS on-chain (one tx)…`
+                    : `Posting ${units.length} units (sizes ${unitsBig.map(u => Number(u).toLocaleString('en')).join(', ')}) — funding in ONE tx…`, "success");
+                dexBeginBroadcastUI(groupId);
+                worker.postMessage({ type: 'DEX_CREATE_LIMIT_BUNDLE', payload: { groupId, units, makerEvmAddr: evmAddress } });
+                return;
+            }
+
+            // Legacy interactive offer (ephemeral chat promise).
             worker.postMessage({ type: 'DEX_BROADCAST_OFFER', payload: {
                 offerId, kind, mdsAmount: mdsAmt, weiAmount: weiAmt, makerEvmAddr: evmAddress, ts: Date.now(),
                 swapMode: 'covenant'   // fee-less for the MDS buyer; HTLC stays available for legacy peers
@@ -4057,6 +4347,8 @@ document.getElementById('btnExport').onclick = () => {
             saveSwaps();
             renderDexSwaps();
             showToast(kind === 'ask' ? "Sell offer broadcast." : "Buy offer broadcast.", "success");
+            dexBeginBroadcastUI(offerId);
+            dexFinishBroadcastUI('done', 'Offer broadcast to the P2P relay.');
         };
 
         // ── Accept an offer ─────────────────────────────────────────────────
@@ -4098,8 +4390,124 @@ document.getElementById('btnExport').onclick = () => {
 
         window.dexAcceptFromBook = function(i) {
             const o = dexOrderbook[i];
-            if (o) dexAcceptOffer(o);
+            if (!o) return;
+            // Covenant-backed orders use the new async settlement paths; legacy offers
+            // (no covenant UTXO advertised) fall back to the interactive swap.
+            if (o.covenant && o.covenant.coinId) {
+                if (o.verified !== true) return showToast("This order isn't verified on-chain yet.", "error");
+                return (dexSettlePath === 'L2') ? dexSubmarineL2(o) : dexFillLimitL1(o);
+            }
+            dexAcceptOffer(o);
         };
+
+        // ── Feature 1: fill an on-chain limit order ────────────────────────────
+        // The order is one atomic unit. The taker locks ETH on Base under the order's
+        // hashlock H; the maker's watcher claims it (revealing the preimage); the taker
+        // then spends the covenant coin (DEX_FILL_LIMIT) to receive the MDS.
+        window.dexFillLimitL1 = async function(o) {
+            const cov = o.covenant || {};
+            if (!cov.coinId || !cov.secretHash) return showToast("Order is missing covenant fields.", "error");
+            if (!evmSigner) return showToast("Connect MetaMask first", "error");
+            if (!cov.makerEvmAddr) return showToast("Order has no maker Base address.", "error");
+            const coinValue = Number(cov.value);
+            const weiAmount = (o.weiAmount != null) ? String(o.weiAmount)
+                            : (cov.weiAmount != null) ? String(cov.weiAmount) : null;
+            if (!weiAmount) return showToast("Order has no price.", "error");
+            if (dexMySwaps.some(s => s.kind === 'limit' && s.offerId === o.offerId))
+                return showToast("You're already filling this order.", "error");
+
+            try {
+                showActivity("Locking ETH on Base for the order…");
+                const c = dexWriteContract();
+                const tx = await c.lock("0x" + cov.secretHash, cov.makerEvmAddr, BASE_REFUND_DELAY_SECS, { value: weiAmount });
+                const receipt = await tx.wait();
+                let baseSwapId = null;
+                for (const log of receipt.logs) { try { const p = c.interface.parseLog(log); if (p && p.name === 'Locked') { baseSwapId = p.args.swapId; break; } } catch (_) {} }
+                hideActivity();
+
+                dexMySwaps.push({
+                    role: 'taker', side: 'eth', kind: 'limit', status: 'limit_waiting_secret',
+                    offerId: o.offerId, weiAmount, mdsAmount: coinValue,
+                    covenant: cov, baseSwapId, fromBlock: receipt.blockNumber, makerEvmAddr: cov.makerEvmAddr
+                });
+                saveSwaps(); renderDexSwaps();
+                dexOrderbook = dexOrderbook.filter(x => (x.offerId || x.nonce) !== (o.offerId || o.nonce));
+                renderDexOrderbook();
+                showToast("ETH locked. Waiting for the maker to reveal the preimage; your MDS then auto-claims.", "success");
+                startLimitSecretWatch(o.offerId);
+            } catch (err) {
+                hideActivity();
+                showToast("Failed to lock ETH: " + (err.shortMessage || err.message), "error");
+            }
+        };
+
+        // Taker: poll Base for the maker's claim (which reveals the preimage), then spend
+        // the covenant to receive the MDS.
+        function startLimitSecretWatch(offerId) {
+            const key = 'limitsecret:' + offerId;
+            if (_dexWatchers.has(key)) return;
+            _dexWatchers.add(key);
+            const tick = async () => {
+                const swap = dexMySwaps.find(s => s.offerId === offerId && s.kind === 'limit' && s.role === 'taker');
+                if (!swap || swap.status === 'completed') { _dexWatchers.delete(key); return; }
+                if (swap.status !== 'limit_waiting_secret') { setTimeout(tick, 12000); return; }
+                try {
+                    const secret = await dexFetchRevealedSecret(swap);
+                    if (secret) {
+                        _dexWatchers.delete(key);
+                        swap.status = 'limit_filling'; saveSwaps(); renderDexSwaps();
+                        const cov = swap.covenant;
+                        worker.postMessage({ type: 'DEX_FILL_LIMIT', payload: {
+                            offerId, rawSecret: secret,
+                            coin: { coin_id: cov.coinId, value: Number(cov.value), salt: cov.salt },
+                            claimed: Number(cov.value),       // atomic: take the whole unit
+                            maxClaim: Number(cov.maxClaim),
+                            timeoutHeight: cov.timeoutHeight, makerMdsPk: cov.makerMdsPk
+                        }});
+                        showToast("Preimage revealed — claiming your MDS on L1…", "success");
+                        return;
+                    }
+                } catch (_) {}
+                setTimeout(tick, 12000);
+            };
+            setTimeout(tick, 5000);
+        }
+
+        // ── Feature 2: submarine swap (instant L2 settlement) ──────────────────
+        // The taker mints + stores a hashlock secret (reusing L2_CREATE_INVOICE so the worker
+        // keeps the preimage for auto-claim), then locks ETH on Base under that H. The maker's
+        // EVM watcher then routes an L2 ADD_HTLC (DEX_LOCK_L2) and this wallet auto-claims the
+        // HTLC off-chain (handleL2Chat destination path). Requires an open L2 channel to the maker.
+        let dexPendingSubmarine = null;
+        window.dexSubmarineL2 = function(o) {
+            if (!evmSigner) return showToast("Connect MetaMask first", "error");
+            dexPendingSubmarine = { offerId: o.offerId, weiAmount: o.weiAmount, makerEvmAddr: o.makerEvmAddr, mdsAmount: o.mdsAmount };
+            worker.postMessage({ type: 'L2_CREATE_INVOICE', payload: { amount: o.mdsAmount } });
+            showToast("Preparing submarine swap\u2026", "success");
+        };
+
+        // Continuation: when the worker returns the invoice (carrying the hashlock H), lock ETH
+        // on Base under H. Only fires when a submarine swap is pending (otherwise this is just a
+        // normal Lightning-tab invoice and is ignored here).
+        worker.addEventListener('message', (e) => {
+            if (e.data.type !== 'L2_INVOICE_CREATED' || !dexPendingSubmarine) return;
+            const pend = dexPendingSubmarine; dexPendingSubmarine = null;
+            const secretHash = String(e.data.payload).split(':')[2];   // l2inv:<pk>:<secretHash>:<amount>
+            if (!secretHash) return showToast("Failed to mint hashlock for submarine swap.", "error");
+            (async () => {
+                try {
+                    showActivity("Locking ETH on Base (submarine)\u2026");
+                    const c = dexWriteContract();
+                    const tx = await c.lock("0x" + secretHash, pend.makerEvmAddr, BASE_REFUND_DELAY_SECS, { value: pend.weiAmount });
+                    await tx.wait();
+                    hideActivity();
+                    showToast("ETH locked. The maker will route your MDS over L2 \u2014 it auto-claims off-chain.", "success");
+                } catch (err) {
+                    hideActivity();
+                    showToast("Submarine swap ETH lock failed: " + (err.shortMessage || err.message), "error");
+                }
+            })();
+        });
 
         window.dexCancelOffer = function(idx) {
             const s = dexMySwaps[idx];
@@ -4157,9 +4565,110 @@ document.getElementById('btnExport').onclick = () => {
                 if (offer.ts && (Date.now() - offer.ts) > OFFER_TTL_MS) return;
                 if (dexOfferEngaged(offer.offerId)) return;   // taken/accepted — don't let the bus re-add it
                 const key = offer.offerId || offer.nonce;
-                const ex = dexOrderbook.find(o => (o.offerId || o.nonce) === key);
-                if (ex) Object.assign(ex, offer); else dexOrderbook.push(offer);
+                const cid = offer.covenant && offer.covenant.coinId;
+                const ex = dexOrderbook.find(o => (o.offerId || o.nonce) === key || (cid && o.covenant && o.covenant.coinId === cid));
+                // The worker replays every [255,200] message from chat_history on each poll, so an
+                // older copy can arrive after a newer one — only refresh if this copy is at least as
+                // fresh, so an order's ts never regresses (and verified, a client-only field, is kept
+                // since the broadcast payload doesn't carry it). Never let a gossip copy clobber an
+                // on-chain-discovered entry (it's verified and shouldn't be TTL-pruned).
+                if (ex) { if (!ex.onchain && (!ex.ts || (offer.ts || 0) >= ex.ts)) Object.assign(ex, offer); }
+                else dexOrderbook.push(offer);
+                // Feature 1: covenant-backed offers must be verified on-chain before they can be filled.
+                const entry = dexOrderbook.find(o => (o.offerId || o.nonce) === key);
+                if (entry && entry.covenant && entry.covenant.coinId && entry.verified == null) {
+                    entry.verified = null;            // pending until DEX_SETTLED_STATUS replies
+                    dexVerifyCovenantCoin(entry);
+                }
                 renderDexOrderbook();
+            }
+            else if (e.data.type === 'DEX_LIMIT_BUNDLE_CREATED') {
+                // Maker side: the WHOLE bundle's MDS is now locked on-chain in one tx. Drop the
+                // funding placeholder and register each unit (keep its secret locally, advertise
+                // the order, start its Base watcher).
+                const { groupId, units, recovered } = e.data.payload;
+                dexMySwaps = dexMySwaps.filter(s => !(s.status === 'limit_funding' && s.offerId === groupId));
+                (units || []).forEach(u => dexRegisterLimitUnit({ ...u, orderGroup: groupId }));
+                saveSwaps(); renderDexSwaps();
+                // Publish the bundle on-chain (0-value DataBurn) so takers discover it without the
+                // chat bus and even with us offline. Permanent once mined → publish once; skip on
+                // recovery (it was already announced when first created).
+                if (!recovered && units && units.length) {
+                    const u0 = units[0];
+                    worker.postMessage({ type: 'DEX_ANNOUNCE_BUNDLE', payload: {
+                        groupId, makerEvmAddr: u0.makerEvmAddr, makerMdsPk: u0.makerMdsPk, timeoutHeight: u0.timeoutHeight,
+                        units: units.map(u => ({ secretHash: u.secretHash, salt: u.coin.salt, value: Number(u.coin.value), weiAmount: u.weiAmount }))
+                    }});
+                }
+                const totalMds = (units || []).reduce((a, u) => a + Number(u.coin.value), 0);
+                showToast(recovered
+                    ? `Recovered ${units.length} on-chain unit(s) (${totalMds.toLocaleString('en')} MDS) from an interrupted funding.`
+                    : `Posted ${units.length} on-chain unit(s) totalling ${totalMds.toLocaleString('en')} MDS.`, "success");
+                if (dexBroadcastInFlight && groupId === dexBroadcastGroupId) {
+                    if (recovered || !(units && units.length)) dexFinishBroadcastUI('done', `Locked \u2713 \u2014 ${units ? units.length : 0} unit(s), ${totalMds.toLocaleString('en')} MDS live on-chain.`);
+                    else dexSetProgress('MDS locked \u2713 \u00b7 announcing order on-chain\u2026', null);
+                }
+            }
+            else if (e.data.type === 'DEX_LIMIT_BUNDLE_FAILED') {
+                const { groupId, error } = e.data.payload;
+                dexMySwaps = dexMySwaps.filter(s => !(s.status === 'limit_funding' && s.offerId === groupId));
+                saveSwaps(); renderDexSwaps();
+                showToast("Limit order funding failed: " + (error || "unknown") + " (nothing was locked).", "error");
+                if (dexBroadcastInFlight && groupId === dexBroadcastGroupId) dexFinishBroadcastUI('error', 'Funding failed: ' + (error || 'unknown') + ' \u2014 nothing was locked.');
+            }
+            else if (e.data.type === 'DEX_ANNOUNCE_DONE') {
+                const { groupId } = e.data.payload;
+                for (const s of dexMySwaps) if (s.orderGroup === groupId && s.kind === 'limit') s.announced = true;
+                saveSwaps();
+                showToast("Order published on-chain — discoverable without the chat relay.", "success");
+                if (dexBroadcastInFlight && groupId === dexBroadcastGroupId) dexFinishBroadcastUI('done', 'Order posted \u2713 \u2014 locked and live on-chain, discoverable by takers.');
+            }
+            else if (e.data.type === 'DEX_ANNOUNCE_FAILED') {
+                showToast("On-chain announce failed: " + ((e.data.payload && e.data.payload.error) || "unknown") + ". Order still advertised over chat; you can retry.", "error");
+                if (dexBroadcastInFlight) dexFinishBroadcastUI('error', 'MDS locked \u2713, but the on-chain announce failed: ' + ((e.data.payload && e.data.payload.error) || 'unknown') + '. Funds are safe & refundable; you can retry.');
+            }
+            else if (e.data.type === 'DEX_SCAN_PROGRESS') {
+                const { at, tip, from } = e.data.payload;
+                if (tip - from > 50) { const el = document.getElementById('dexScanStatus'); if (el) el.textContent = `Scanning chain for orders… block ${at}/${tip}`; }
+            }
+            else if (e.data.type === 'DEX_ANNOUNCED_ORDERS') {
+                const { orders, scannedToHeight } = e.data.payload;
+                let added = 0;
+                for (const o of (orders || [])) {
+                    const cid = o.covenant && o.covenant.coinId;
+                    const ex = dexOrderbook.find(x => (x.covenant && x.covenant.coinId) === cid || (x.offerId || x.nonce) === o.offerId);
+                    if (ex) { ex.onchain = true; ex.verified = true; ex.ts = Date.now(); if (!ex.covenant) ex.covenant = o.covenant; }
+                    else { dexOrderbook.push({ ...o, verified: true, ts: Date.now() }); added++; }
+                }
+                if (Number.isFinite(scannedToHeight)) { try { localStorage.setItem('midstate_dex_scan_height', String(scannedToHeight)); } catch (_) {} }
+                const el = document.getElementById('dexScanStatus'); if (el) el.textContent = '';
+                if (added) { saveOrderbook(); renderDexOrderbook(); }
+                _dexScanInFlight = false;
+            }
+            else if (e.data.type === 'DEX_REFUND_SUCCESS') {
+                const { offerId, reclaimed } = e.data.payload;
+                const s = dexMySwaps.find(x => x.offerId === offerId && x.kind === 'limit' && x.role === 'maker');
+                if (s) { s.status = 'limit_refunded'; saveSwaps(); renderDexSwaps(); }
+                worker.postMessage({ type: 'SCAN' });
+                showToast(`Reclaimed ${Number(reclaimed).toLocaleString('en')} MDS from the expired order.`, "success");
+            }
+            else if (e.data.type === 'DEX_REFUND_FAILED') {
+                const { offerId, error } = e.data.payload;
+                const s = dexMySwaps.find(x => x.offerId === offerId && x.kind === 'limit' && x.role === 'maker');
+                if (s) { s.status = 'limit_posted'; saveSwaps(); renderDexSwaps(); }   // revert so it can be retried
+                showToast("Reclaim failed: " + (error || "unknown"), "error");
+            }
+            else if (e.data.type === 'DEX_FILL_SUCCESS') {
+                const { offerId } = e.data.payload;
+                const swap = dexMySwaps.find(s => s.offerId === offerId && s.kind === 'limit' && s.role === 'taker');
+                if (swap) { swap.status = 'completed'; saveSwaps(); renderDexSwaps(); worker.postMessage({ type: 'SCAN' }); }
+                showToast("Order filled — your MDS has been delivered.", "success");
+            }
+            else if (e.data.type === 'DEX_FILL_FAILED') {
+                const { offerId, error } = e.data.payload;
+                const swap = dexMySwaps.find(s => s.offerId === offerId && s.kind === 'limit' && s.role === 'taker');
+                if (swap) { swap.status = 'limit_waiting_secret'; swap.fillError = error; saveSwaps(); renderDexSwaps(); }
+                showToast("Claim failed: " + (error || "unknown") + ". It will retry when the preimage is seen.", "error");
             }
             else if (e.data.type === 'DEX_ACCEPT_RECEIVED') {
                 const acc = e.data.payload;
@@ -4284,6 +4793,19 @@ document.getElementById('btnExport').onclick = () => {
                 // Reply to a delivery poll. If the covenant coins are spent, the MDS has
                 // moved to the buyer's address — finish the swap on whichever side we are.
                 const { offerId, settled } = e.data.payload;
+                // Feature 1: a 'verify:' sentinel is an orderbook on-chain existence check —
+                // the covenant UTXO exists iff it is NOT (yet) settled/spent.
+                if (typeof offerId === 'string' && offerId.startsWith('verify:')) {
+                    const cid = offerId.slice('verify:'.length);
+                    const o = dexOrderbook.find(x => x.covenant && x.covenant.coinId === cid);
+                    if (o) {
+                        o.verified = !settled;
+                        // A spent coin on an on-chain order means it was filled/refunded — drop it.
+                        if (settled && o.onchain) { dexOrderbook = dexOrderbook.filter(x => x !== o); saveOrderbook(); }
+                        renderDexOrderbook();
+                    }
+                    return;
+                }
                 if (!settled) return;
                 const swap = dexMySwaps.find(s => s.offerId === offerId &&
                     ((s.side === 'eth' && s.status === 'waiting_for_delivery') ||
@@ -4303,6 +4825,8 @@ document.getElementById('btnExport').onclick = () => {
                 const { offerId, phase } = e.data.payload;
                 const swap = dexMySwaps.find(s => s.offerId === offerId);
                 if (swap) { swap.phase = phase; renderDexSwaps(); } // transient — not persisted
+                // Mirror the lock's phases into the on-form progress panel.
+                if (dexBroadcastInFlight && offerId === dexBroadcastGroupId && phase) dexSetProgress('Locking MDS on-chain \u2014 ' + phase, null);
             }
         });
 
@@ -4527,10 +5051,22 @@ document.getElementById('btnExport').onclick = () => {
 
         function resumeDexWatchers() {
             if (!evmProvider) return;
+            // A funding placeholder that survived a reload means the bundle tx was interrupted;
+            // the worker does not resume it. Drop the placeholder and warn — if the tx had already
+            // landed, those covenants are recoverable only via refund after timeout.
+            const orphan = dexMySwaps.some(s => s.status === 'limit_funding');
+            if (orphan) {
+                dexMySwaps = dexMySwaps.filter(s => s.status !== 'limit_funding');
+                saveSwaps();
+                showToast("A limit-order funding was interrupted by reload — if it had already confirmed, reclaim those funds after the timeout.", "error");
+            }
             for (const s of dexMySwaps) {
                 if (s.side === 'eth' && s.status === 'ready_to_claim_midstate') startSecretWatch(s.offerId);
                 if (s.side === 'mds' && s.status === 'ready_to_claim_base' && !s.counterpartyLocked) startEthLockWatch(s.offerId);
                 if (s.side === 'eth' && s.status === 'waiting_for_delivery') startDeliveryWatch(s.offerId);
+                // Feature 1 limit-order watchers.
+                if (s.kind === 'limit' && s.role === 'maker' && s.status === 'limit_posted') startMakerLimitWatch(s.offerId);
+                if (s.kind === 'limit' && s.role === 'taker' && s.status === 'limit_waiting_secret') startLimitSecretWatch(s.offerId);
                 if (s.side === 'mds' && s.status === 'delivering_midstate') {
                     // Interrupted mid-delivery. Ask whether it actually landed; if it did,
                     // DEX_SETTLED_STATUS completes the swap, otherwise we surface a retry.
@@ -4540,6 +5076,40 @@ document.getElementById('btnExport').onclick = () => {
                 }
             }
             renderDexSwaps();
+        }
+
+        // Maker side (Feature 1): poll Base for a taker's ETH lock against our standing order's
+        // hashlock H. When one appears, claim it — which pays us the ETH AND publishes the
+        // preimage, letting the taker spend our covenant to receive the MDS.
+        function startMakerLimitWatch(offerId) {
+            const key = 'makerlimit:' + offerId;
+            if (_dexWatchers.has(key)) return;
+            _dexWatchers.add(key);
+            const tick = async () => {
+                const swap = dexMySwaps.find(s => s.offerId === offerId && s.kind === 'limit' && s.role === 'maker');
+                if (!swap || swap.status === 'completed') { _dexWatchers.delete(key); return; }
+                if (!evmProvider || !evmSigner) { setTimeout(tick, 15000); return; }
+                try {
+                    const c = new ethers.Contract(BASE_HTLC_CONTRACT, HTLC_ABI, evmProvider);
+                    const from = swap.watchFrom || Math.max(0, (await evmProvider.getBlockNumber()) - 60000);
+                    // Locks whose beneficiary is us, carrying our hashlock H.
+                    const evs = await c.queryFilter(c.filters.Locked(null, swap.makerEvmAddr), from);
+                    const m = evs.find(ev => ev.args.hashlock.toLowerCase() === ("0x" + swap.secretHash).toLowerCase());
+                    if (m) {
+                        _dexWatchers.delete(key);
+                        showActivity("A taker locked ETH — claiming it (reveals the preimage)…");
+                        const cw = dexWriteContract();
+                        const tx = await cw.claim(m.args.swapId, "0x" + swap.secret);
+                        await tx.wait();
+                        hideActivity();
+                        swap.status = 'completed'; saveSwaps(); renderDexSwaps();
+                        showToast("Order filled: ETH claimed; the taker can now take your MDS.", "success");
+                        return;
+                    }
+                } catch (_) {}
+                setTimeout(tick, 15000);
+            };
+            setTimeout(tick, 6000);
         }
 
         // ETH-side (covenant): wait for the seller to deliver our MDS. We do no Midstate
@@ -4603,7 +5173,14 @@ document.getElementById('btnExport').onclick = () => {
             const tb = document.getElementById('dexOrderbook');
             if (!tb) return;
             const now = Date.now();
-            const live = dexOrderbook.filter(o => (!o.ts || (now - o.ts) <= OFFER_TTL_MS) && !dexOfferEngaged(o.offerId));
+            // Persisted book: drop expired entries from the array itself and save (survives reloads;
+            // a maker who goes offline stops re-advertising, so their orders age out here).
+            // On-chain orders aren't chat-advertised, so they don't expire by chat-ts — they live
+            // until their covenant coin is spent (filled/refunded), which the periodic re-verify
+            // detects. Gossip orders still age out by TTL.
+            dexOrderbook = dexOrderbook.filter(o => o.onchain || !o.ts || (now - o.ts) <= OFFER_TTL_MS);
+            saveOrderbook();
+            const live = dexOrderbook.filter(o => !dexOfferEngaged(o.offerId));
             if (live.length === 0) {
                 tb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#555;">No live orders. Listening to P2P network…</td></tr>';
                 return;
@@ -4615,13 +5192,26 @@ document.getElementById('btnExport').onclick = () => {
                 const orderLabel = isAsk
                     ? '<span style="color:var(--text-max);font-weight:600;">Selling MDS</span>'
                     : '<span style="color:var(--text-muted);">Buying MDS</span>';
+                // Feature 1: covenant-backed orders carry an on-chain verification badge;
+                // legacy offers (no covenant UTXO) are flagged as unverified chat promises.
+                const hasCov = !!(o.covenant && o.covenant.coinId);
+                let badge;
+                if (!hasCov)                   badge = '<span style="font-size:10px;color:var(--text-faint);">chat promise</span>';
+                else if (o.verified === true)  badge = '<span style="font-size:10px;color:#3fb950;">\u2713 on-chain</span>';
+                else if (o.verified === false) badge = '<span style="font-size:10px;color:#f85149;">\u2717 not found</span>';
+                else                           badge = '<span style="font-size:10px;color:var(--text-faint);">\u29d6 verifying\u2026</span>';
                 const action = isAsk ? 'Buy' : 'Sell';
+                // Covenant orders: button is path-aware (L1/L2) and gated on verification.
+                const covGated = hasCov && o.verified !== true;
+                const pathTag = hasCov ? ` \u00b7 ${dexSettlePath}` : '';
                 const btnStyle = isAsk ? 'background:var(--accent);color:var(--on-accent);' : 'background:transparent;color:var(--text-max);border:1px solid var(--border-bright);';
+                const disabledStyle = covGated ? 'opacity:.45;cursor:not-allowed;' : '';
+                const btn = `<button ${covGated ? 'disabled' : ''} style="margin:0;width:auto;padding:6px 12px;font-size:11px;${btnStyle}${disabledStyle}" onclick="dexAcceptFromBook(${i})">${action}${pathTag}</button>`;
                 return `<tr>
-                    <td>${orderLabel}${mine ? ' <span style="color:#666;font-size:10px;">(yours)</span>' : ''}</td>
+                    <td>${orderLabel}${mine ? ' <span style="color:#666;font-size:10px;">(yours)</span>' : ''}<br>${badge}</td>
                     <td>${(() => { const m = formatMDS(o.mdsAmount); return `${m.value} ${m.prefix}`; })()}<br><span style="font-size:10px;color:var(--text-faint);">${Number(o.mdsAmount).toLocaleString('en')} MDS</span></td>
                     <td>${prettyEth(o.weiAmount)} ETH${(() => { const u = weiToUsd(o.weiAmount); return u ? `<br><span style="font-size:10px;color:var(--text-muted);">\u2248 ${u}</span>` : ''; })()}<br><span style="font-size:10px;color:var(--text-faint);">${o.weiAmount} wei</span></td>
-                    <td style="text-align:right;"><button style="margin:0;width:auto;padding:6px 12px;font-size:11px;${btnStyle}" onclick="dexAcceptFromBook(${i})">${action}</button></td>
+                    <td style="text-align:right;">${btn}</td>
                 </tr>`;
             }).join('');
         }
@@ -4687,6 +5277,19 @@ document.getElementById('btnExport').onclick = () => {
                     } else {
                         statusText = "Delivering the buyer's MDS (you already hold the ETH)…";
                     }
+                } else if (s.status === 'limit_funding') {
+                    statusText = 'Funding the limit-order bundle on-chain (one transaction)…';
+                } else if (s.status === 'limit_posted') {
+                    statusText = 'Limit order live on-chain — waiting for a taker to lock ETH.';
+                    btn = `<button style="margin:0;width:100%;padding:8px;font-size:12px;background:transparent;border:1px solid var(--border-bright);color:var(--text-bright);" onclick="dexRefundLimitOrder('${s.offerId}')">Reclaim MDS (after timeout)</button>`;
+                } else if (s.status === 'limit_waiting_secret') {
+                    statusText = 'ETH locked. Waiting for the maker to reveal the preimage; your MDS auto-claims.';
+                } else if (s.status === 'limit_filling') {
+                    statusText = 'Preimage revealed — claiming your MDS on L1…';
+                } else if (s.status === 'limit_refunding') {
+                    statusText = 'Reclaiming your MDS from the expired covenant…';
+                } else if (s.status === 'limit_refunded') {
+                    statusText = 'Order expired — your MDS was reclaimed.';
                 } else if (s.status === 'completed') {
                     statusText = 'Swap complete.';
                 }
@@ -4697,6 +5300,9 @@ document.getElementById('btnExport').onclick = () => {
                 const waitingOnPeer = (s.status === 'waiting_for_mds_lock') ||
                                       (s.status === 'ready_to_claim_base' && !s.counterpartyLocked) ||
                                       (s.status === 'waiting_for_delivery') ||
+                                      (s.status === 'limit_posted') ||
+                                      (s.status === 'limit_funding') ||
+                                      (s.status === 'limit_waiting_secret') ||
                                       (s.status === 'delivering_midstate' && !s.settleError);
                 let statusHtml = statusText;
                 if (s.phase) {
@@ -4734,6 +5340,48 @@ document.getElementById('btnExport').onclick = () => {
             const mk = document.getElementById('dex-tab-market');
             if (mk && mk.style.display !== 'none') renderDexOrderbook();
         }, 30000);
+
+        // Maker heartbeat: re-advertise our live orders so peers who joined after the order was
+        // created discover it, and so the entry stays within OFFER_TTL_MS on takers' books.
+        // Broadcasts are PoW-secured chat (20-bit, ~sub-second; no one-time key burned). The bus is
+        // SHARED with the L2 channel subsystem and chat_history is finite, so we re-advertise on a
+        // gentle 3-min cadence — comfortably under the 10-min TTL (tolerates ~2 missed beats) while
+        // keeping our footprint in the shared history small. (Late joiners don't wait for a beat:
+        // they receive standing orders from chat_history on their first poll.)
+        function dexHeartbeat() {
+            if (!dexMySwaps || !dexMySwaps.length) return;
+            for (const s of dexMySwaps) {
+                if (s.role !== 'maker') continue;
+                if (s.kind === 'limit' && s.status === 'limit_posted' && s.covenant) {
+                    worker.postMessage({ type: 'DEX_BROADCAST_OFFER', payload: {
+                        offerId: s.offerId, kind: 'ask', mdsAmount: s.mdsAmount, weiAmount: s.weiAmount,
+                        makerEvmAddr: s.makerEvmAddr, ts: Date.now(), swapMode: 'covenant', covenant: s.covenant
+                    }});
+                } else if (s.status === 'waiting_for_taker') {
+                    worker.postMessage({ type: 'DEX_BROADCAST_OFFER', payload: {
+                        offerId: s.offerId, kind: s.kind, mdsAmount: s.mdsAmount, weiAmount: s.weiAmount,
+                        makerEvmAddr: s.makerEvmAddr, ts: Date.now(), swapMode: s.swapMode || 'covenant'
+                    }});
+                }
+            }
+        }
+        setInterval(dexHeartbeat, 180000);
+
+        // On-chain order discovery: scan the chain for announcement DataBurns. First run (no saved
+        // height) cold-scans a bounded recent window in the worker; afterward it resumes from the
+        // last scanned height (incremental, cheap). On-chain orders persist until their coin is
+        // spent, so we also periodically re-verify them (which drops filled ones).
+        let _dexScanInFlight = false;
+        function dexScanAnnouncements() {
+            if (_dexScanInFlight) return;
+            _dexScanInFlight = true;
+            const saved = parseInt(localStorage.getItem('midstate_dex_scan_height') || '', 10);
+            worker.postMessage({ type: 'DEX_SCAN_ANNOUNCEMENTS', payload: Number.isFinite(saved) ? { fromHeight: saved } : {} });
+        }
+        setInterval(() => {
+            dexScanAnnouncements();
+            for (const o of dexOrderbook) if (o.onchain && o.covenant && o.covenant.coinId) dexVerifyCovenantCoin(o);
+        }, 180000);
 
         </script>
 

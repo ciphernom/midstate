@@ -568,6 +568,52 @@ export class WebWallet {
         }
     }
     /**
+     * Fund MANY contract addresses in ONE transaction.
+     *
+     * Identical to [`prepare_fund_tx`] but takes a list of `{address, amount}`
+     * fundings instead of a single address. Every funding's amount is split into
+     * power-of-two coins paid to its address; wallet inputs cover the SUM plus a
+     * size-scaled fee, with change returned to deterministic wallet addresses.
+     * Used to fund a bundle of independent limit-order covenants (one fresh
+     * secret/address each) in a single ~2-block commit/reveal rather than N of them.
+     *
+     * `fundings_json` — JSON array: `[{ "address": <64-hex>, "amount": <u64> }, ...]`.
+     * Returns the same `ScriptSpendContext` JSON as `prepare_fund_tx`; the caller
+     * recovers each covenant's coin by matching `outputs[].address`.
+     * @param {string} available_utxos_json
+     * @param {string} fundings_json
+     * @param {number} next_wots_index
+     * @returns {string}
+     */
+    prepare_fund_many(available_utxos_json, fundings_json, next_wots_index) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(available_utxos_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(fundings_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.webwallet_prepare_fund_many(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, next_wots_index);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr3 = r0;
+            var len3 = r1;
+            if (r3) {
+                ptr3 = 0; len3 = 0;
+                throw takeObject(r2);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
      * Phase 1 for FUNDING a contract. Pays `amount` to the contract address as
      * power-of-two "value" coins, optionally seeds a confidential "state" coin,
      * returns change to the wallet, and reuses `build_script_reveal` for phase 2
@@ -653,8 +699,6 @@ export class WebWallet {
         }
     }
     /**
-     * Select coins and build a transaction for the given send amount.
-     *
      * This implements the full coin selection algorithm:
      *
      * 1. **Greedy selection**: picks largest coins first until the amount + fee is covered.
@@ -939,6 +983,45 @@ export function build_channel_state(channel_coin_id_hex, alice_pk_hex, bob_pk_he
 }
 
 /**
+ * @param {string} secret_hash_hex
+ * @param {string} receiver_addr_hex
+ * @param {bigint} min_payout
+ * @param {bigint} timeout_height
+ * @param {string} refund_pk_hex
+ * @returns {string}
+ */
+export function build_covenant_htlc_bytecode_hex(secret_hash_hex, receiver_addr_hex, min_payout, timeout_height, refund_pk_hex) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(secret_hash_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(receiver_addr_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(refund_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        wasm.build_covenant_htlc_bytecode_hex(retptr, ptr0, len0, ptr1, len1, min_payout, timeout_height, ptr2, len2);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr4 = r0;
+        var len4 = r1;
+        if (r3) {
+            ptr4 = 0; len4 = 0;
+            throw takeObject(r2);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred5_0, deferred5_1, 1);
+    }
+}
+
+/**
  * Builds the Midstate HTLC bytecode for cross-chain atomic swaps.
  * @param {string} secret_hash_hex
  * @param {string} receiver_pk_hex
@@ -974,6 +1057,44 @@ export function build_htlc_bytecode_hex(secret_hash_hex, receiver_pk_hex, timeou
     } finally {
         wasm.__wbindgen_add_to_stack_pointer(16);
         wasm.__wbindgen_export4(deferred5_0, deferred5_1, 1);
+    }
+}
+
+/**
+ * Builds the limit-order covenant bytecode (Feature 1). See
+ * `midstate::core::script::compile_limit_order_covenant` for the security notes.
+ * @param {string} secret_hash_hex
+ * @param {bigint} max_claim
+ * @param {bigint} timeout_height
+ * @param {string} refund_pk_hex
+ * @returns {string}
+ */
+export function build_limit_order_covenant_bytecode_hex(secret_hash_hex, max_claim, timeout_height, refund_pk_hex) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(secret_hash_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(refund_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.build_limit_order_covenant_bytecode_hex(retptr, ptr0, len0, max_claim, timeout_height, ptr1, len1);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr3 = r0;
+        var len3 = r1;
+        if (r3) {
+            ptr3 = 0; len3 = 0;
+            throw takeObject(r2);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
     }
 }
 
@@ -1088,6 +1209,37 @@ export function compute_commitment_hex(input_ids_json, output_hashes_json, salt_
     } finally {
         wasm.__wbindgen_add_to_stack_pointer(16);
         wasm.__wbindgen_export4(deferred5_0, deferred5_1, 1);
+    }
+}
+
+/**
+ * @param {string} owner_pk_hex
+ * @returns {string}
+ */
+export function compute_p2pk_address_hex(owner_pk_hex) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(owner_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.compute_p2pk_address_hex(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr2 = r0;
+        var len2 = r1;
+        if (r3) {
+            ptr2 = 0; len2 = 0;
+            throw takeObject(r2);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
     }
 }
 
