@@ -4067,26 +4067,21 @@ document.getElementById('btnExport').onclick = () => {
 
         // Settlement path the taker prefers: 'L1' = partial-fill covenant, 'L2' = submarine swap.
 
-        // ── Simplified trading UI: single sell-order flow, escrow language, no L2 paths ──
+        // ── Simplified trading UI: keep the Buy/Sell choice, hide only L2 paths ──
         function dexApplySimpleUi() {
             const hide = el => { if (el) el.style.display = 'none'; };
             hide(document.getElementById('dexSettleSelect'));
             const sh = document.getElementById('dexSettleHint');
             if (sh) sh.textContent = 'Orders settle on-chain with automatic escrow.';
-            hide(document.getElementById('dexDirBuy'));
-            hide(document.getElementById('dexDirSell'));
-            try { dexSetDirection('ask'); } catch (_) {}
-            const lm = document.getElementById('dexLimitMode');
-            if (lm) {
-                if (!lm.checked) { lm.checked = true; try { dexToggleLimitMode(); } catch (_) {} }
-                const wrap = lm.closest('label') || lm.parentElement; if (wrap) wrap.style.display = 'none';
-            }
-            hide(document.getElementById('dexLimitHint'));
-            const bb = document.getElementById('dexBroadcastBtn');
-            if (bb) bb.textContent = 'Place Sell Order';
-            const tc = document.getElementById('tab-create'); if (tc) tc.textContent = 'Sell MDS';
-            const gh = document.getElementById('dexGiveHint');
-            if (gh) gh.textContent = 'Your MDS is escrowed on-chain until a buyer pays, or you reclaim it after the expiry.';
+            // Relabel the direction buttons in plain language (jargon-free), but keep BOTH
+            // so users can post buy offers as well as sell orders.
+            const sellBtn = document.getElementById('dexDirSell');
+            const buyBtn = document.getElementById('dexDirBuy');
+            if (sellBtn) sellBtn.textContent = 'Sell MDS';
+            if (buyBtn) buyBtn.textContent = 'Buy MDS';
+            const tc = document.getElementById('tab-create'); if (tc) tc.textContent = 'Create Order';
+            // Drive all the mode-specific labelling/visibility from the current direction.
+            try { dexSetDirection(dexDirection || 'ask'); } catch (_) {}
         }
 
         let dexSettlePath = 'L1'; // L2/submarine settlement is UI-disabled for now (worker plumbing intact)
@@ -4185,18 +4180,43 @@ document.getElementById('btnExport').onclick = () => {
         let dexDirection = 'ask';
         window.dexSetDirection = function(d) {
             dexDirection = d;
-            document.getElementById('dexDirSell').classList.toggle('active', d === 'ask');
-            document.getElementById('dexDirSell').style.background = d === 'ask' ? '' : 'transparent';
-            document.getElementById('dexDirSell').style.border = d === 'ask' ? '' : '1px solid var(--border-bright)';
-            document.getElementById('dexDirSell').style.color = d === 'ask' ? '' : 'var(--text-bright)';
-            document.getElementById('dexDirBuy').classList.toggle('active', d === 'bid');
-            document.getElementById('dexDirBuy').style.background = d === 'bid' ? '' : 'transparent';
-            document.getElementById('dexDirBuy').style.border = d === 'bid' ? '' : '1px solid var(--border-bright)';
-            document.getElementById('dexDirBuy').style.color = d === 'bid' ? '' : 'var(--text-bright)';
+            const sell = document.getElementById('dexDirSell');
+            const buy = document.getElementById('dexDirBuy');
+            if (sell) {
+                sell.classList.toggle('active', d === 'ask');
+                sell.style.background = d === 'ask' ? '' : 'transparent';
+                sell.style.border = d === 'ask' ? '' : '1px solid var(--border-bright)';
+                sell.style.color = d === 'ask' ? '' : 'var(--text-bright)';
+            }
+            if (buy) {
+                buy.classList.toggle('active', d === 'bid');
+                buy.style.background = d === 'bid' ? '' : 'transparent';
+                buy.style.border = d === 'bid' ? '' : '1px solid var(--border-bright)';
+                buy.style.color = d === 'bid' ? '' : 'var(--text-bright)';
+            }
+
+            const lm = document.getElementById('dexLimitMode');
+            const lmWrap = lm ? (lm.closest('label') || lm.parentElement) : null;
             const hint = document.getElementById('dexGiveHint');
-            if (hint) hint.textContent = d === 'ask'
-                ? 'You lock MDS first; you receive ETH.'
-                : 'You receive MDS; you lock ETH after the seller locks MDS.';
+            const btn = document.getElementById('dexBroadcastBtn');
+
+            if (d === 'ask') {
+                // SELL MDS → on-chain limit order. Lock MDS in escrow up front; a buyer
+                // pays ETH and the fill settles automatically. Limit mode is the only
+                // sell path now, so force it on and hide the toggle (no jargon surfaced).
+                if (lm && !lm.checked) { lm.checked = true; try { dexToggleLimitMode(); } catch (_) {} }
+                if (lmWrap) lmWrap.style.display = 'none';
+                if (hint) hint.textContent = 'Your MDS is escrowed on-chain until a buyer pays, or you reclaim it after the expiry.';
+                if (btn) btn.textContent = 'Place Sell Order';
+            } else {
+                // BUY MDS ← ETH. A buy offer is an open request: you receive MDS and lock
+                // ETH only after a seller commits, so there's nothing to escrow up front —
+                // it's a standing offer broadcast to the network. Limit mode doesn't apply.
+                if (lm && lm.checked) { lm.checked = false; try { dexToggleLimitMode(); } catch (_) {} }
+                if (lmWrap) lmWrap.style.display = 'none';
+                if (hint) hint.textContent = 'Open buy offer: you receive MDS and lock ETH only after a seller accepts. Nothing is escrowed up front.';
+                if (btn) btn.textContent = 'Place Buy Order';
+            }
         };
 
         // ── DEX price: ETH / Gwei / Wei entry with live USD value ────────────
