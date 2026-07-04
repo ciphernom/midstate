@@ -230,7 +230,7 @@ export class WebWallet {
      * Returns the same `ScriptSpendContext` JSON as `prepare_fund_tx`; the caller
      * recovers each covenant's coin by matching `outputs[].address`.
      */
-    prepare_fund_many(available_utxos_json: string, fundings_json: string, next_wots_index: number): string;
+    prepare_fund_many(available_utxos_json: string, fundings_json: string, next_wots_index: number, databurns_json?: string | null): string;
     /**
      * Phase 1 for FUNDING a contract. Pays `amount` to the contract address as
      * power-of-two "value" coins, optionally seeds a confidential "state" coin,
@@ -540,7 +540,7 @@ export interface InitOutput {
     readonly webwallet_has_mss_cache: (a: number, b: number, c: number) => number;
     readonly webwallet_import_mss_bytes: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly webwallet_new: (a: number, b: number, c: number) => void;
-    readonly webwallet_prepare_fund_many: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly webwallet_prepare_fund_many: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
     readonly webwallet_prepare_fund_tx: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number) => void;
     readonly webwallet_prepare_script_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
     readonly webwallet_prepare_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number, k: number, l: bigint) => void;

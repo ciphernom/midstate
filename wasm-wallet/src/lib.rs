@@ -1511,20 +1511,44 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
         }
 
         // 3) Outputs — pass through; recompute hashes for the safety check
-        //    (standard AND confidential, unlike build_reveal).
+        //    (standard, confidential AND data_burn — the burn branch matters for the
+        //    DEX atomic announce, where prepare_fund_many embeds an MDXA burn: burns
+        //    have no address/salt/value, so the old unconditional field unwraps here
+        //    panicked and trapped the whole wasm module with `unreachable`).
         let mut safety_out: Vec<[u8; 32]> = Vec::new();
         for o in &ctx.outputs {
             let ty = o["type"].as_str().unwrap_or("standard");
+            if ty == "data_burn" {
+                // Hash exactly as prepare_spend / prepare_fund_many committed it:
+                // blake3("DATABURN" ‖ value_burned_le ‖ payload).
+                let payload_hex = o["payload"].as_str()
+                    .ok_or_else(|| JsValue::from_str("data_burn output missing payload"))?;
+                let payload = hex::decode(payload_hex)
+                    .map_err(|_| JsValue::from_str("Invalid data_burn payload hex"))?;
+                let value_burned = o["value_burned"].as_u64()
+                    .ok_or_else(|| JsValue::from_str("data_burn output missing value_burned"))?;
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"DATABURN");
+                hasher.update(&value_burned.to_le_bytes());
+                hasher.update(&payload);
+                safety_out.push(*hasher.finalize().as_bytes());
+                continue;
+            }
             let mut addr = [0u8; 32];
-            hex::decode_to_slice(o["address"].as_str().unwrap(), &mut addr).unwrap();
+            hex::decode_to_slice(o["address"].as_str().unwrap_or_default(), &mut addr)
+                .map_err(|_| JsValue::from_str("Invalid output address hex"))?;
             let mut salt = [0u8; 32];
-            hex::decode_to_slice(o["salt"].as_str().unwrap(), &mut salt).unwrap();
+            hex::decode_to_slice(o["salt"].as_str().unwrap_or_default(), &mut salt)
+                .map_err(|_| JsValue::from_str("Invalid output salt hex"))?;
             if ty == "confidential" {
                 let mut st = [0u8; 32];
-                hex::decode_to_slice(o["commitment"].as_str().unwrap(), &mut st).unwrap();
+                hex::decode_to_slice(o["commitment"].as_str().unwrap_or_default(), &mut st)
+                    .map_err(|_| JsValue::from_str("Invalid output commitment hex"))?;
                 safety_out.push(confidential_coin_hash(&addr, &st, &salt));
             } else {
-                safety_out.push(compute_coin_id(&addr, o["value"].as_u64().unwrap(), &salt));
+                let value = o["value"].as_u64()
+                    .ok_or_else(|| JsValue::from_str("Output missing value"))?;
+                safety_out.push(compute_coin_id(&addr, value, &salt));
             }
         }
 
@@ -1783,9 +1807,22 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
         available_utxos_json: &str,
         fundings_json: &str,
         next_wots_index: u32,
+        databurns_json: Option<String>,
     ) -> Result<String, JsValue> {
         #[derive(serde::Deserialize)]
-        struct Funding { address: String, amount: u64 }
+        struct Funding {
+            address: String,
+            amount: u64,
+            /// Optional caller-chosen coin salt (hex, 32 bytes). Lets the caller compute
+            /// the resulting coin_id BEFORE this call — which is what allows the DEX to
+            /// encode its MDXA announcement (salts included) and ship it via `databurns_json`
+            /// so the announcement rides INSIDE the funding tx (atomic announce). Only
+            /// valid when `amount` is a single power-of-two denomination; multi-denom
+            /// fundings would need one salt per denom and are rejected instead of
+            /// silently mis-binding. Old callers omit the field (serde default).
+            #[serde(default)]
+            salt: Option<String>,
+        }
         let fundings: Vec<Funding> = serde_json::from_str(fundings_json)
             .map_err(|e| JsValue::from_str(&format!("Bad fundings JSON: {}", e)))?;
         if fundings.is_empty() {
@@ -1808,15 +1845,64 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
             }
             total_amount = total_amount.checked_add(f.amount)
                 .ok_or_else(|| JsValue::from_str("Funding total overflows u64"))?;
-            for denom in decompose_value(f.amount) {
+            let denoms = decompose_value(f.amount);
+            if f.salt.is_some() && denoms.len() != 1 {
+                return Err(JsValue::from_str(
+                    "A per-funding salt override requires a single power-of-two amount",
+                ));
+            }
+            for denom in denoms {
                 let mut salt = [0u8; 32];
-                getrandom_02::getrandom(&mut salt).unwrap();
+                match f.salt {
+                    Some(ref s) => hex::decode_to_slice(s, &mut salt)
+                        .map_err(|_| JsValue::from_str("Invalid funding salt hex (need 32 bytes)"))?,
+                    None => getrandom_02::getrandom(&mut salt).unwrap(),
+                }
                 output_hashes.push(compute_coin_id(&addr, denom, &salt));
                 outputs_out.push(serde_json::json!({
                     "type": "standard",
                     "address": f.address.to_lowercase(),
                     "value": denom,
                     "salt": hex::encode(salt),
+                }));
+            }
+        }
+
+        // ── Optional 0-value DataBurns riding IN the funding tx (atomic announce) ─
+        // JSON array: [{"payload":"<hex>","value_burned":0}, ...]. Multiple burns let
+        // large DEX bundles ship several SELF-CONTAINED MDXA announcements (each must
+        // fit the node\'s MAX_BURN_DATA_SIZE) inside the same transaction. The hash of
+        // each burn is consensus-identical to OutputData::hash_for_commitment:
+        // blake3("DATABURN" || value_burned_le || payload). Ordering (fundings, burns,
+        // change) is fixed here and mirrored by build_script_reveal iterating
+        // ctx.outputs in order. burn_payload_bytes feeds the fee estimate below —
+        // the mempool enforces MIN_FEE_PER_KB against ACTUAL serialized size, so
+        // counting burns as flat 100-byte outputs would underpay and get rejected.
+        let mut db_val: u64 = 0;
+        let mut burn_payload_bytes: u64 = 0;
+        if let Some(ref burns_str) = databurns_json {
+            #[derive(serde::Deserialize)]
+            struct BurnSpec { payload: String, #[serde(default)] value_burned: u64 }
+            let burns: Vec<BurnSpec> = serde_json::from_str(burns_str)
+                .map_err(|_| JsValue::from_str("Invalid databurns JSON"))?;
+            for b in &burns {
+                let payload = hex::decode(&b.payload)
+                    .map_err(|_| JsValue::from_str("Invalid databurn payload hex"))?;
+                if payload.len() > midstate::core::MAX_BURN_DATA_SIZE {
+                    return Err(JsValue::from_str(&format!(
+                        "DataBurn payload {}B exceeds node max {}B",
+                        payload.len(), midstate::core::MAX_BURN_DATA_SIZE)));
+                }
+                db_val = db_val.checked_add(b.value_burned)
+                    .ok_or_else(|| JsValue::from_str("Burn value overflow"))?;
+                burn_payload_bytes += payload.len() as u64;
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"DATABURN");
+                hasher.update(&b.value_burned.to_le_bytes());
+                hasher.update(&payload);
+                output_hashes.push(*hasher.finalize().as_bytes());
+                outputs_out.push(serde_json::json!({
+                    "type": "data_burn", "payload": b.payload, "value_burned": b.value_burned
                 }));
             }
         }
@@ -1829,7 +1915,7 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
         let mut wallet_in: u64;
         let final_fee;
         loop {
-            let needed = total_amount.saturating_add(target_fee);
+            let needed = total_amount.saturating_add(db_val).saturating_add(target_fee);
             selected.clear();
             let mut set = HashSet::new();
             wallet_in = 0;
@@ -1854,15 +1940,16 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
             if selected.len() > MAX_SELECTED_INPUTS {
                 return Err(JsValue::from_str("Too many inputs selected"));
             }
-            let change_for_size = wallet_in.saturating_sub(total_amount).saturating_sub(target_fee);
+            // outputs_out already includes the optional data_burn, so it is counted here.
+            let change_for_size = wallet_in.saturating_sub(total_amount).saturating_sub(db_val).saturating_sub(target_fee);
             let num_outputs = outputs_out.len() + decompose_value(change_for_size).len();
-            let estimated = 100 + (selected.len() as u64 * 1636) + (num_outputs as u64 * 100);
+            let estimated = 100 + (selected.len() as u64 * 1636) + (num_outputs as u64 * 100) + burn_payload_bytes;
             let req = (estimated * 10) / 1024 + 10;
-            if wallet_in >= total_amount + req { final_fee = req; break; } else { target_fee = req; }
+            if wallet_in >= total_amount + db_val + req { final_fee = req; break; } else { target_fee = req; }
         }
 
         // ── Change → wallet (deterministic salts) ───────────────────────────────
-        let change = wallet_in - total_amount - final_fee;
+        let change = wallet_in - total_amount - db_val - final_fee;
         let mut idx = next_wots_index;
         if change > 0 {
             for denom in decompose_value(change) {
@@ -2055,7 +2142,8 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
             let final_change_val = total.saturating_sub(send_amount).saturating_sub(db_val).saturating_sub(target_fee);
             num_outputs += decompose_value(final_change_val).len();
 
-            let estimated_bytes = 100 + (selected.len() as u64 * 1636) + (num_outputs as u64 * 100);
+            let estimated_bytes = 100 + (selected.len() as u64 * 1636) + (num_outputs as u64 * 100)
+                + databurn_hex.as_ref().map(|h| (h.len() / 2) as u64).unwrap_or(0);
             let required_fee = (estimated_bytes * 10) / 1024 + 10;
 
             if total >= send_amount + db_val + required_fee {

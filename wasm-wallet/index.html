@@ -585,6 +585,40 @@
         .dex-table th { color: var(--text-muted); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; padding: 12px; border-bottom: 1px solid var(--border); }
         .dex-table td { padding: 12px; border-bottom: 1px solid var(--border); font-size: 13px; font-variant-numeric: tabular-nums; color: var(--text-bright); }
         .dex-table tr:last-child td { border-bottom: none; }
+        /* ── CEX-style two-sided depth ladder ───────────────────────────────── */
+        .dex-ladder-head { display:grid; grid-template-columns: 1.3fr 1fr 1fr 1fr; gap:0;
+            padding:8px 12px; font-size:9px; text-transform:uppercase; letter-spacing:.8px;
+            color:var(--text-muted); border-bottom:1px solid var(--border); }
+        .dex-ladder-head > span:first-child { text-align:left; }
+        .dex-ladder-side { display:flex; flex-direction:column; }
+        .dex-lvl { position:relative; display:grid; grid-template-columns: 1.3fr 1fr 1fr 1fr; gap:0;
+            padding:5px 12px; font-size:12px; font-variant-numeric:tabular-nums; cursor:pointer;
+            border-bottom:1px solid rgba(255,255,255,.03); align-items:center; isolation:isolate; }
+        .dex-lvl:hover { background:var(--bg-raised); }
+        .dex-lvl > .c { text-align:right; z-index:1; }
+        .dex-lvl > .c.price { text-align:left; font-weight:600; }
+        /* depth bar sits behind the row, grown from the price side */
+        .dex-lvl > .bar { position:absolute; top:0; bottom:0; z-index:0; opacity:.16; }
+        .dex-lvl.ask > .bar { right:0; background:var(--red); }
+        .dex-lvl.bid > .bar { right:0; background:var(--green); }
+        .dex-lvl.ask > .c.price { color:var(--red); }
+        .dex-lvl.bid > .c.price { color:var(--green); }
+        /* monochrome themes: --red/--green are grey, so add a left tick for side cue */
+        .dex-lvl.ask { border-left:2px solid color-mix(in srgb, var(--red) 55%, transparent); }
+        .dex-lvl.bid { border-left:2px solid color-mix(in srgb, var(--green) 55%, transparent); }
+        .dex-lvl .mine-tag { font-size:9px; color:var(--text-faint); margin-left:5px; }
+        .dex-lvl .cnt { font-size:9px; color:var(--text-faint); margin-left:5px; }
+        .dex-spread-row { padding:6px 12px; font-size:10px; color:var(--text-muted);
+            background:var(--bg-raised); border-top:1px solid var(--border); border-bottom:1px solid var(--border);
+            display:flex; justify-content:center; gap:8px; letter-spacing:.5px; }
+        .dex-expand { background:var(--bg); border-bottom:1px solid var(--border); }
+        .dex-expand .dex-suborder { display:grid; grid-template-columns: 1.3fr 1fr 1fr auto; gap:8px;
+            padding:6px 12px 6px 24px; font-size:11px; font-variant-numeric:tabular-nums;
+            color:var(--text-muted); align-items:center; border-bottom:1px solid rgba(255,255,255,.03); }
+        .dex-suborder .obtn { padding:4px 12px; font-size:10px; border-radius:var(--radius-sm); cursor:pointer; }
+        .dex-suborder .obtn.ask { background:var(--accent); color:var(--on-accent); border:none; }
+        .dex-suborder .obtn.bid { background:transparent; color:var(--text-max); border:1px solid var(--border-bright); }
+        .dex-suborder .obtn:disabled { opacity:.4; cursor:not-allowed; }
 
         .swap-card { background: var(--bg-panel); border: 1px solid var(--border); padding: 16px; margin-bottom: 16px; }
         .dex-phase-dot { width: 8px; height: 8px; background: var(--stark-accent); border: 1px solid var(--border); flex: 0 0 auto; }
@@ -984,23 +1018,89 @@
                         <button class="unit-opt active" data-path="L1" onclick="setDexSettlePath(this)" style="padding:5px 10px;font-size:11px;">Settle on L1</button>
                         <button class="unit-opt" data-path="L2" onclick="setDexSettlePath(this)" style="padding:5px 10px;font-size:11px;">Settle on L2</button>
                     </div>
-                    <span id="dexSettleHint" style="font-size:10px;color:var(--text-faint);margin-left:auto;">Partial-fill covenant on Midstate L1.</span>
+                    <span id="dexSettleHint" style="font-size:10px;color:var(--text-faint);margin-left:auto;">Orders settle on-chain with automatic escrow.</span>
                 </div>
                 <div id="dexScanStatus" style="font-size:10px;color:var(--text-faint);margin:0 2px 6px;min-height:12px;"></div>
-                <div class="panel" style="padding: 0;">
-                    <table class="dex-table">
-                        <thead>
-                            <tr>
-                                <th>Order</th>
-                                <th>Amount (MDS)</th>
-                                <th>Price (Base ETH)</th>
-                                <th style="text-align: right;">Action</th>
-                            </tr>
-                        </thead>
-                        <tbody id="dexOrderbook">
-                            <tr><td colspan="4" style="text-align: center; color: #555;">Listening to P2P network...</td></tr>
-                        </tbody>
-                    </table>
+
+                <!-- Stats strip + depth chart (hidden until there are priced orders) -->
+                <div class="panel" id="dexBookStats" style="padding:12px 14px;margin-bottom:8px;display:none;">
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:10px 16px;font-size:11px;color:var(--text-muted);margin-bottom:10px;">
+                        <div>Best ask<br><b id="dexStatBestAsk" style="color:var(--red);font-variant-numeric:tabular-nums;font-size:13px;">—</b></div>
+                        <div>Mid<br><b id="dexStatMid" style="color:var(--text-max);font-variant-numeric:tabular-nums;font-size:13px;">—</b></div>
+                        <div>Best bid<br><b id="dexStatBestBid" style="color:var(--green);font-variant-numeric:tabular-nums;font-size:13px;">—</b></div>
+                        <div>Spread<br><b id="dexStatSpread" style="color:var(--text-max);font-variant-numeric:tabular-nums;font-size:13px;">—</b> <span id="dexStatSpreadPct" style="font-size:9px;color:var(--text-faint);"></span></div>
+                        <div>Ask depth<br><b id="dexStatAskDepth" style="color:var(--text-max);">—</b> <span style="font-size:9px;color:var(--text-faint);">MDS</span></div>
+                        <div>Bid depth<br><b id="dexStatBidDepth" style="color:var(--text-max);">—</b> <span style="font-size:9px;color:var(--text-faint);">MDS</span></div>
+                        <div>Sell liquidity<br><b id="dexStatAskEth" style="color:var(--text-max);">—</b> <span style="font-size:9px;color:var(--text-faint);">ETH</span></div>
+                        <div>Orders<br><b id="dexStatCount" style="color:var(--text-max);">0</b> <span id="dexStatSideSplit" style="font-size:9px;color:var(--text-faint);"></span></div>
+                    </div>
+                    <div style="position:relative;">
+                        <canvas id="dexDepthChart" height="140" style="width:100%;display:block;cursor:crosshair;" onmousemove="dexDepthHover(event)" onmouseleave="dexDepthLeave()"></canvas>
+                        <div id="dexDepthTip" style="position:absolute;pointer-events:none;display:none;background:var(--bg-raised);border:1px solid var(--border-bright);padding:4px 7px;font-size:10px;color:var(--text-max);white-space:nowrap;transform:translate(-50%,-115%);font-variant-numeric:tabular-nums;z-index:5;"></div>
+                    </div>
+                </div>
+
+                <!-- Market order (sweep): fill best orders sequentially until filled -->
+                <div class="panel" id="dexMarketPanel" style="padding:12px 14px;margin-bottom:8px;display:none;">
+                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+                        <span style="font-size:12px;font-weight:600;color:var(--text-max);">Market order</span>
+                        <span style="font-size:10px;color:var(--text-faint);">sweeps the best on-chain orders — no price to set</span>
+                        <div style="display:flex;margin-left:auto;border:1px solid var(--border-bright);border-radius:var(--radius-sm);overflow:hidden;">
+                            <button id="dexMktBuyBtn" onclick="dexMarketSetSide('buy')" style="padding:5px 12px;font-size:11px;border:none;background:var(--accent);color:var(--on-accent);cursor:pointer;">Buy MDS</button>
+                            <button id="dexMktSellBtn" onclick="dexMarketSetSide('sell')" style="padding:5px 12px;font-size:11px;border:none;background:transparent;color:var(--text-muted);cursor:pointer;">Sell MDS</button>
+                        </div>
+                    </div>
+                    <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
+                        <div style="flex:1;min-width:140px;">
+                            <label style="font-size:10px;color:var(--text-muted);display:block;margin-bottom:3px;">Amount (MDS)</label>
+                            <input id="dexMktAmount" type="number" min="0" step="any" placeholder="0" oninput="dexUpdateMarketEstimate()"
+                                style="width:100%;padding:7px 10px;font-size:13px;background:var(--bg-raised);border:1px solid var(--border-bright);color:var(--text-max);border-radius:var(--radius-sm);font-variant-numeric:tabular-nums;">
+                            <div style="display:flex;gap:4px;margin-top:4px;">
+                                <button onclick="dexMarketFillPct(0.25)" style="flex:1;padding:3px;font-size:9px;background:transparent;border:1px solid var(--border);color:var(--text-faint);border-radius:var(--radius-sm);cursor:pointer;">25%</button>
+                                <button onclick="dexMarketFillPct(0.5)" style="flex:1;padding:3px;font-size:9px;background:transparent;border:1px solid var(--border);color:var(--text-faint);border-radius:var(--radius-sm);cursor:pointer;">50%</button>
+                                <button onclick="dexMarketFillPct(1)" style="flex:1;padding:3px;font-size:9px;background:transparent;border:1px solid var(--border);color:var(--text-faint);border-radius:var(--radius-sm);cursor:pointer;">Max</button>
+                            </div>
+                        </div>
+                        <button id="dexMktExecBtn" onclick="dexExecuteMarketOrder()" disabled
+                            style="flex:1;min-width:140px;padding:10px;font-size:13px;background:var(--accent);color:var(--on-accent);border:none;border-radius:var(--radius-sm);cursor:pointer;opacity:.5;">Enter an amount</button>
+                    </div>
+                    <div id="dexMktEstimate" style="font-size:11px;color:var(--text-muted);margin-top:8px;min-height:16px;font-variant-numeric:tabular-nums;"></div>
+                </div>
+
+                <!-- Controls -->
+                <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px;">
+                    <input id="dexBookSearch" type="text" placeholder="Filter by price, size, address…" oninput="dexBookSetSearch(this.value)"
+                        style="flex:1;min-width:150px;padding:6px 10px;font-size:12px;background:var(--bg-raised);border:1px solid var(--border-bright);color:var(--text-max);border-radius:var(--radius-sm);">
+                    <div style="display:flex;align-items:center;gap:4px;font-size:10px;color:var(--text-faint);">
+                        <span>Bucket</span>
+                        <select id="dexBookBucket" onchange="dexBookSetBucket(this.value)"
+                            style="padding:5px 6px;font-size:11px;background:var(--bg-raised);border:1px solid var(--border-bright);color:var(--text-max);border-radius:var(--radius-sm);cursor:pointer;">
+                            <option value="auto">Auto</option>
+                            <option value="0">None (every order)</option>
+                            <option value="1">Coarse</option>
+                            <option value="2">Medium</option>
+                            <option value="3">Fine</option>
+                        </select>
+                    </div>
+                    <button id="dexBookVerifiedBtn" onclick="dexBookToggleVerified()" title="Show only on-chain verified orders"
+                        style="padding:6px 10px;font-size:11px;background:transparent;border:1px solid var(--border-bright);color:var(--text-muted);border-radius:var(--radius-sm);cursor:pointer;">On-chain only</button>
+                    <button id="dexBookMineBtn" onclick="dexBookToggleMine()" title="Show only your orders"
+                        style="padding:6px 10px;font-size:11px;background:transparent;border:1px solid var(--border-bright);color:var(--text-muted);border-radius:var(--radius-sm);cursor:pointer;">Mine</button>
+                </div>
+
+                <!-- Two-sided ladder: asks (top, ascending to spread) / spread / bids (below) -->
+                <div class="panel" id="dexLadderPanel" style="padding:0;">
+                    <div class="dex-ladder-head">
+                        <span>Price <span style="color:var(--text-faint);">ETH/MDS</span></span>
+                        <span style="text-align:right;">Size <span style="color:var(--text-faint);">MDS</span></span>
+                        <span style="text-align:right;">Total <span style="color:var(--text-faint);">ETH</span></span>
+                        <span style="text-align:right;">Sum <span style="color:var(--text-faint);">MDS</span></span>
+                    </div>
+                    <div id="dexAsks" class="dex-ladder-side"></div>
+                    <div id="dexSpreadRow" class="dex-spread-row" style="display:none;"></div>
+                    <div id="dexBids" class="dex-ladder-side"></div>
+                    <div id="dexOrderbook" style="display:none;"></div>
+                    <div id="dexBookEmpty" style="text-align:center;color:var(--text-faint);padding:28px 12px;font-size:12px;">Listening to P2P network…</div>
                 </div>
             </div>
 
@@ -1045,7 +1145,7 @@
                         Lock MDS on-chain as an L1 limit order (sell side; one atomic power-of-two unit)
                     </label>
                     <div id="dexLimitHint" style="font-size:10px;color:var(--text-faint);margin-top:4px;display:none;"></div>
-                    <button id="dexBroadcastBtn" onclick="dexCreateOffer()" style="background: var(--text-max); color: #000; margin-top: 10px;">Broadcast Offer</button>
+                    <button id="dexBroadcastBtn" onclick="dexCreateOffer()" style="background: var(--text-max); color: #000; margin-top: 10px;">Place Sell Order</button>
                     <div id="dexRebroadcastRow" style="display:none; font-size:10px; color:var(--text-muted); margin-top:6px; text-align:center;">
                         Order posted. <a href="#" onclick="dexForceRebroadcastSame(event)" style="color:var(--text-bright); text-decoration:underline; cursor:pointer;">Post the same order again</a>
                     </div>
@@ -2458,8 +2558,21 @@ if ('serviceWorker' in navigator) {
                     }
 
                 } else if (method === 'getMssState') {
-                    if (lc) { result = await lc.mssState(params.masterPkHex); }
-                    else { const r = await fetch(`${url}/mss_state`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ master_pk: params.masterPkHex }) }); result = await r.json(); }
+                    // RESILIENCE FIX: this was the ONLY read RPC with no try/catch and no
+                    // HTTPS fallback around the WebRTC path — a single stream hiccup here
+                    // aborted whole sends with "Safety Check Failed / key reuse" (it hit
+                    // the DEX announce hardest, being the first send right after the
+                    // funding flow's heavy network activity). Same pattern as getFilters.
+                    let success = false;
+                    if (lc) {
+                        try { result = await lc.mssState(params.masterPkHex); success = true; }
+                        catch (e) { console.warn("WebRTC mss_state failed, falling back to HTTPS:", e.message); }
+                    }
+                    if (!success) {
+                        const r = await fetch(`${url}/mss_state`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ master_pk: params.masterPkHex }), cache: 'no-store' });
+                        if (!r.ok) throw new Error('mss_state fetch failed: HTTP ' + r.status);
+                        result = await r.json();
+                    }
 
                 } else if (method === 'getBlockTemplate') {
                     if (lc) {
@@ -3904,8 +4017,24 @@ document.getElementById('btnExport').onclick = () => {
         //  Base HTLC contract (MidstateAtomicSwap.sol) — verifies BLAKE3 so a
         //  single 32-byte secret unlocks BOTH chains.
         // ─────────────────────────────────────────────────────────────────
-        const BASE_HTLC_CONTRACT = "0xFBE5FF48bEeD9CaB26C7B7C2C2424a218aa52c18";
-        const HTLC_ABI = [
+        // V1 (current, live). Leave as-is until the V2 bridge contract is deployed.
+        const BASE_HTLC_CONTRACT_V1 = "0xFBE5FF48bEeD9CaB26C7B7C2C2424a218aa52c18";
+        // V2 (bridge): set to the deployed MidstateAtomicSwapV2 address to enable the
+        // trustless-bridge path (relayer bounty → offline makers get paid). Empty = stay on V1.
+        const BASE_HTLC_CONTRACT_V2 = "";
+        const DEX_BRIDGE_ENABLED = !!BASE_HTLC_CONTRACT_V2;
+        const BASE_HTLC_CONTRACT = DEX_BRIDGE_ENABLED ? BASE_HTLC_CONTRACT_V2 : BASE_HTLC_CONTRACT_V1;
+        // Fraction of the ETH lock offered to a relayer for settling on behalf of an
+        // offline maker. 0.5% is ample vs Base gas; ignored entirely on V1.
+        const DEX_RELAYER_BOUNTY_BPS = 50; // 0.50%
+        const HTLC_ABI = DEX_BRIDGE_ENABLED ? [
+            "function lock(bytes32 hashlock, address payable beneficiary, uint256 refundDelay, uint256 relayerBounty) external payable returns (bytes32)",
+            "function claim(bytes32 swapId, bytes32 preimage) external",
+            "function refund(bytes32 swapId) external",
+            "event Locked(bytes32 indexed swapId, address indexed beneficiary, address indexed refundTo, uint256 amount, uint256 relayerBounty, uint64 timeout, bytes32 hashlock)",
+            "event Claimed(bytes32 indexed swapId, bytes32 hashlock, bytes32 preimage)",
+            "event Refunded(bytes32 indexed swapId)"
+        ] : [
             "function lock(bytes32 hashlock, address payable beneficiary, uint256 refundDelay) external payable returns (bytes32)",
             "function claim(bytes32 swapId, bytes32 preimage) external",
             "function refund(bytes32 swapId) external",
@@ -3913,6 +4042,16 @@ document.getElementById('btnExport').onclick = () => {
             "event Claimed(bytes32 indexed swapId, bytes32 hashlock, bytes32 preimage)",
             "event Refunded(bytes32 indexed swapId)"
         ];
+        // Build lock() args for whichever contract version is active (V2 appends bounty).
+        function dexLockArgs(hashlockHex, beneficiary, weiAmount) {
+            const base = ["0x" + hashlockHex, beneficiary, BASE_REFUND_DELAY_SECS];
+            if (DEX_BRIDGE_ENABLED) {
+                const wei = BigInt(weiAmount);
+                base.push((wei * BigInt(DEX_RELAYER_BOUNTY_BPS)) / 10000n);
+            }
+            base.push({ value: weiAmount });
+            return base;
+        }
 
         // The Base refund (SHORT leg) must be safely shorter than the Midstate HTLC
         // timeout (~1440 blocks ≈ 24h at 1-minute blocks). 6h ≪ 24h.
@@ -3927,7 +4066,31 @@ document.getElementById('btnExport').onclick = () => {
         function saveOrderbook() { try { localStorage.setItem('midstate_dex_orderbook', JSON.stringify(dexOrderbook)); } catch (_) {} }
 
         // Settlement path the taker prefers: 'L1' = partial-fill covenant, 'L2' = submarine swap.
-        let dexSettlePath = localStorage.getItem('midstate_dex_settle_path') || 'L1';
+
+        // ── Simplified trading UI: single sell-order flow, escrow language, no L2 paths ──
+        function dexApplySimpleUi() {
+            const hide = el => { if (el) el.style.display = 'none'; };
+            hide(document.getElementById('dexSettleSelect'));
+            const sh = document.getElementById('dexSettleHint');
+            if (sh) sh.textContent = 'Orders settle on-chain with automatic escrow.';
+            hide(document.getElementById('dexDirBuy'));
+            hide(document.getElementById('dexDirSell'));
+            try { dexSetDirection('ask'); } catch (_) {}
+            const lm = document.getElementById('dexLimitMode');
+            if (lm) {
+                if (!lm.checked) { lm.checked = true; try { dexToggleLimitMode(); } catch (_) {} }
+                const wrap = lm.closest('label') || lm.parentElement; if (wrap) wrap.style.display = 'none';
+            }
+            hide(document.getElementById('dexLimitHint'));
+            const bb = document.getElementById('dexBroadcastBtn');
+            if (bb) bb.textContent = 'Place Sell Order';
+            const tc = document.getElementById('tab-create'); if (tc) tc.textContent = 'Sell MDS';
+            const gh = document.getElementById('dexGiveHint');
+            if (gh) gh.textContent = 'Your MDS is escrowed on-chain until a buyer pays, or you reclaim it after the expiry.';
+        }
+
+        let dexSettlePath = 'L1'; // L2/submarine settlement is UI-disabled for now (worker plumbing intact)
+        setTimeout(dexApplySimpleUi, 0);
         window.setDexSettlePath = function(btn) {
             dexSettlePath = btn.dataset.path || 'L1';
             localStorage.setItem('midstate_dex_settle_path', dexSettlePath);
@@ -3935,7 +4098,7 @@ document.getElementById('btnExport').onclick = () => {
             const hint = document.getElementById('dexSettleHint');
             if (hint) hint.textContent = dexSettlePath === 'L2'
                 ? 'Submarine swap: instant L2 settlement (needs an open L2 channel to the maker).'
-                : 'Partial-fill covenant on Midstate L1.';
+                : 'Orders settle on-chain with automatic escrow.';
             try { renderDexOrderbook(); } catch (_) {}
         };
         // Reflect the persisted choice on load (after the toggle DOM exists).
@@ -3987,6 +4150,23 @@ document.getElementById('btnExport').onclick = () => {
             try {
                 await window.ethereum.request({ method: 'eth_requestAccounts' });
                 evmProvider = new ethers.BrowserProvider(window.ethereum);
+                // EIP-3326: land the user on Base automatically (EIP-3085 add-chain fallback).
+                try {
+                    await window.ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: '0x2105' }] });
+                } catch (swErr) {
+                    if (swErr && (swErr.code === 4902 || (swErr.data && swErr.data.originalError && swErr.data.originalError.code === 4902))) {
+                        try {
+                            await window.ethereum.request({ method: 'wallet_addEthereumChain', params: [{
+                                chainId: '0x2105', chainName: 'Base',
+                                nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+                                rpcUrls: ['https://mainnet.base.org'], blockExplorerUrls: ['https://basescan.org']
+                            }] });
+                        } catch (_) { showToast('Please switch MetaMask to the Base network.', 'error'); }
+                    } else if (swErr && swErr.code !== 4001) {
+                        showToast('Please switch MetaMask to the Base network.', 'error');
+                    }
+                }
+
                 const network = await evmProvider.getNetwork();
                 if (network.chainId !== 8453n) return showToast("Please switch MetaMask to Base Network", "error");
                 evmSigner = await evmProvider.getSigner();
@@ -4233,7 +4413,7 @@ document.getElementById('btnExport').onclick = () => {
             }
             var unchanged = dexLastBroadcastSig !== null && dexOrderSignature() === dexLastBroadcastSig && !dexForceRebroadcast;
             btn.disabled = unchanged;
-            btn.textContent = unchanged ? 'Order posted \u2713' : 'Broadcast Offer';
+            btn.textContent = unchanged ? 'Order posted \u2713' : 'Place Sell Order';
             btn.style.opacity = unchanged ? '0.5' : '1';
             btn.style.cursor = unchanged ? 'not-allowed' : 'pointer';
             if (row) row.style.display = unchanged ? 'block' : 'none';
@@ -4257,15 +4437,7 @@ document.getElementById('btnExport').onclick = () => {
         })();
 
         function dexSetProgress(msg, kind) {
-            dexBroadcastStageMsg = msg || '';
-            var el = document.getElementById('dexBroadcastProgress');
-            if (!el) return;
-            el.style.display = 'block';
-            var terminal = (kind === 'done' || kind === 'error');
-            var color = kind === 'error' ? 'var(--danger, #d66)' : kind === 'done' ? 'var(--success, #3a7a3a)' : 'var(--text-bright)';
-            var mark = kind === 'done' ? '\u2713 ' : kind === 'error' ? '\u2717 ' : '\u25CF ';
-            var elapsed = (!terminal && dexBroadcastStart) ? ' \u00b7 ' + Math.floor((Date.now() - dexBroadcastStart) / 1000) + 's' : '';
-            el.innerHTML = '<span style="color:' + color + '">' + mark + msg + elapsed + '</span>';
+            showActivity(msg); // simplified: quiet activity line, no step modal
         }
 
         function dexBeginBroadcastUI(groupId) {
@@ -4281,15 +4453,9 @@ document.getElementById('btnExport').onclick = () => {
         }
 
         function dexFinishBroadcastUI(kind, msg) {
-            dexBroadcastInFlight = false;
-            if (dexBroadcastHeartbeat) { clearInterval(dexBroadcastHeartbeat); dexBroadcastHeartbeat = null; }
-            dexSetProgress(msg, kind);
-            if (kind === 'done') dexLastBroadcastSig = dexOrderSignature();
-            dexRefreshBroadcastBtn();
-            if (kind === 'done') {
-                // Fade the success banner after a while; leave errors up.
-                setTimeout(function () { if (!dexBroadcastInFlight) { var el = document.getElementById('dexBroadcastProgress'); if (el) el.style.display = 'none'; } }, 12000);
-            }
+            dexBroadcastInFlight = false; dexBroadcastGroupId = null;
+            hideActivity();
+            showToast(msg, kind === 'error' ? 'error' : 'success');
         }
 
         window.dexCreateOffer = function() {
@@ -4406,7 +4572,7 @@ document.getElementById('btnExport').onclick = () => {
         // then spends the covenant coin (DEX_FILL_LIMIT) to receive the MDS.
         window.dexFillLimitL1 = async function(o) {
             const cov = o.covenant || {};
-            if (!cov.coinId || !cov.secretHash) return showToast("Order is missing covenant fields.", "error");
+            if (!cov.coinId || !cov.secretHash) return showToast("Order is missing escrow details.", "error");
             if (!evmSigner) return showToast("Connect MetaMask first", "error");
             if (!cov.makerEvmAddr) return showToast("Order has no maker Base address.", "error");
             const coinValue = Number(cov.value);
@@ -4419,7 +4585,7 @@ document.getElementById('btnExport').onclick = () => {
             try {
                 showActivity("Locking ETH on Base for the order…");
                 const c = dexWriteContract();
-                const tx = await c.lock("0x" + cov.secretHash, cov.makerEvmAddr, BASE_REFUND_DELAY_SECS, { value: weiAmount });
+                const tx = await c.lock(...dexLockArgs(cov.secretHash, cov.makerEvmAddr, weiAmount));
                 const receipt = await tx.wait();
                 let baseSwapId = null;
                 for (const log of receipt.logs) { try { const p = c.interface.parseLog(log); if (p && p.name === 'Locked') { baseSwapId = p.args.swapId; break; } } catch (_) {} }
@@ -4474,40 +4640,116 @@ document.getElementById('btnExport').onclick = () => {
         }
 
         // ── Feature 2: submarine swap (instant L2 settlement) ──────────────────
-        // The taker mints + stores a hashlock secret (reusing L2_CREATE_INVOICE so the worker
-        // keeps the preimage for auto-claim), then locks ETH on Base under that H. The maker's
-        // EVM watcher then routes an L2 ADD_HTLC (DEX_LOCK_L2) and this wallet auto-claims the
-        // HTLC off-chain (handleL2Chat destination path). Requires an open L2 channel to the maker.
+        // Fixed flow (the original stub locked ETH with no signaling at all):
+        //   1. Pre-check an open, fully-signed L2 channel to the maker with enough
+        //      maker-side balance (DEX_CHECK_L2_CHANNEL) BEFORE any funds move.
+        //   2. Mint a hashlock we hold the preimage for (L2_CREATE_INVOICE — the worker
+        //      stores the secret, so the routed HTLC auto-claims).
+        //   3. Broadcast the submarine intent to the maker (cmd 204), keyed on the
+        //      covenant coinId — the one identifier BOTH sides always share (maker unit
+        //      offerIds are random; chain-scanned orders carry 'chain:<coinId…>' ids).
+        //   4. Lock ETH on Base under that hash, record the swap (with baseSwapId), and
+        //      start a watcher that completes on the L2 auto-claim — or refunds the ETH
+        //      automatically after the Base window if the maker never routes.
         let dexPendingSubmarine = null;
         window.dexSubmarineL2 = function(o) {
             if (!evmSigner) return showToast("Connect MetaMask first", "error");
-            dexPendingSubmarine = { offerId: o.offerId, weiAmount: o.weiAmount, makerEvmAddr: o.makerEvmAddr, mdsAmount: o.mdsAmount };
-            worker.postMessage({ type: 'L2_CREATE_INVOICE', payload: { amount: o.mdsAmount } });
-            showToast("Preparing submarine swap\u2026", "success");
+            const cov = o.covenant || {};
+            if (!cov.coinId || !cov.makerMdsPk) return showToast("Order is missing escrow details.", "error");
+            const makerEvmAddr = o.makerEvmAddr || cov.makerEvmAddr;
+            if (!makerEvmAddr) return showToast("Order has no maker Base address.", "error");
+            const weiAmount = (o.weiAmount != null) ? String(o.weiAmount)
+                            : (cov.weiAmount != null) ? String(cov.weiAmount) : null;
+            if (!weiAmount) return showToast("Order has no price.", "error");
+            if (dexMySwaps.some(s => s.kind === 'limit' && s.offerId === o.offerId))
+                return showToast("You're already filling this order.", "error");
+            dexPendingSubmarine = {
+                offerId: o.offerId, coinId: cov.coinId, weiAmount, makerEvmAddr,
+                mdsAmount: Number(o.mdsAmount || cov.value), makerMdsPk: cov.makerMdsPk, covenant: cov
+            };
+            worker.postMessage({ type: 'DEX_CHECK_L2_CHANNEL', payload: {
+                offerId: o.offerId, peerPk: cov.makerMdsPk, amount: Number(o.mdsAmount || cov.value)
+            }});
+            showToast("Checking your L2 channel to the maker\u2026", "success");
         };
 
-        // Continuation: when the worker returns the invoice (carrying the hashlock H), lock ETH
-        // on Base under H. Only fires when a submarine swap is pending (otherwise this is just a
-        // normal Lightning-tab invoice and is ignored here).
         worker.addEventListener('message', (e) => {
+            // Step 1 result: channel is usable → mint the hashlock. Abort BEFORE any ETH moves otherwise.
+            if (e.data.type === 'DEX_L2_CHANNEL_STATUS') {
+                const { offerId, ok, reason } = e.data.payload;
+                if (!dexPendingSubmarine || dexPendingSubmarine.offerId !== offerId) return;
+                if (!ok) {
+                    dexPendingSubmarine = null;
+                    return showToast("Submarine swap unavailable: " + (reason || "no usable L2 channel to the maker."), "error");
+                }
+                worker.postMessage({ type: 'L2_CREATE_INVOICE', payload: { amount: dexPendingSubmarine.mdsAmount } });
+                return;
+            }
+            // Steps 2–4: invoice (hashlock) minted → announce intent (cmd 204), THEN lock the ETH.
             if (e.data.type !== 'L2_INVOICE_CREATED' || !dexPendingSubmarine) return;
             const pend = dexPendingSubmarine; dexPendingSubmarine = null;
             const secretHash = String(e.data.payload).split(':')[2];   // l2inv:<pk>:<secretHash>:<amount>
             if (!secretHash) return showToast("Failed to mint hashlock for submarine swap.", "error");
+            // Tell the maker BEFORE locking, so their watcher recognises this hash the
+            // moment the Locked event lands (their watcher polls; ordering isn't racy).
+            worker.postMessage({ type: 'DEX_BROADCAST_SUBMARINE', payload: {
+                coinId: pend.coinId, offerId: pend.offerId,
+                takerEvmAddr: evmAddress, secretHash
+            }});
             (async () => {
                 try {
                     showActivity("Locking ETH on Base (submarine)\u2026");
                     const c = dexWriteContract();
-                    const tx = await c.lock("0x" + secretHash, pend.makerEvmAddr, BASE_REFUND_DELAY_SECS, { value: pend.weiAmount });
-                    await tx.wait();
+                    const tx = await c.lock(...dexLockArgs(secretHash, pend.makerEvmAddr, pend.weiAmount));
+                    const receipt = await tx.wait();
+                    let baseSwapId = null;
+                    for (const log of receipt.logs) { try { const p = c.interface.parseLog(log); if (p && p.name === 'Locked') { baseSwapId = p.args.swapId; break; } } catch (_) {} }
                     hideActivity();
+                    dexMySwaps.push({
+                        role: 'taker', side: 'eth', kind: 'limit', swapMode: 'submarine',
+                        status: 'submarine_waiting_l2', offerId: pend.offerId,
+                        weiAmount: pend.weiAmount, mdsAmount: pend.mdsAmount,
+                        covenant: pend.covenant, submarineHash: secretHash, baseSwapId,
+                        fromBlock: receipt.blockNumber, lockedAt: Date.now(),
+                        makerEvmAddr: pend.makerEvmAddr, makerMdsPk: pend.makerMdsPk
+                    });
+                    saveSwaps(); renderDexSwaps();
+                    dexOrderbook = dexOrderbook.filter(x => (x.offerId || x.nonce) !== pend.offerId);
+                    renderDexOrderbook();
                     showToast("ETH locked. The maker will route your MDS over L2 \u2014 it auto-claims off-chain.", "success");
+                    startSubmarineTakerWatch(pend.offerId);
                 } catch (err) {
                     hideActivity();
                     showToast("Submarine swap ETH lock failed: " + (err.shortMessage || err.message), "error");
                 }
             })();
         });
+
+        // ── Announce retry (manual + auto) ─────────────────────────────────────
+        // The announce is a SEPARATE commit+reveal tx fired immediately after the
+        // bundle funding, and used to die permanently on one transient RPC blip
+        // ("Safety Check Failed"). The worker/RPC layers now retry the blip itself;
+        // this rebuilds the announce payload from the persisted unit records so a
+        // failed announce can be re-fired at any time — even after a reload, and
+        // also for crash-recovered bundles that never got their first announce.
+        // A duplicate announce is benign: takers verify each unit's coin on-chain
+        // and dedupe by coinId, so a double burn only costs one extra fee.
+        const _dexAnnounceRetries = {};
+        window.dexRetryAnnounce = function(groupId) {
+            if (!groupId) return;
+            const units = dexMySwaps.filter(s => s.kind === 'limit' && s.role === 'maker' &&
+                s.orderGroup === groupId && s.covenant);
+            if (!units.length) return showToast("No units found for that order group.", "error");
+            if (units.every(s => s.announced)) return showToast("This order is already announced on-chain.", "success");
+            const c0 = units[0].covenant;
+            worker.postMessage({ type: 'DEX_ANNOUNCE_BUNDLE', payload: {
+                groupId,
+                makerEvmAddr: c0.makerEvmAddr, makerMdsPk: c0.makerMdsPk, timeoutHeight: c0.timeoutHeight,
+                units: units.map(s => ({ secretHash: s.secretHash, salt: s.covenant.salt,
+                                         value: Number(s.covenant.value), weiAmount: s.covenant.weiAmount }))
+            }});
+            showToast("Re-announcing the order on-chain\u2026", "success");
+        };
 
         window.dexCancelOffer = function(idx) {
             const s = dexMySwaps[idx];
@@ -4582,18 +4824,136 @@ document.getElementById('btnExport').onclick = () => {
                 }
                 renderDexOrderbook();
             }
+            else if (e.data.type === 'DEX_SUBMARINE_RECEIVED') {
+                // A taker announced (cmd 204) that they're taking one of our limit units via
+                // an L2 submarine swap. The chat bus is unauthenticated, so: validate shapes,
+                // match by covenant coinId (offerId only as a fallback), register ADDITIVELY —
+                // never flip the order's mode, so a spoofed message can't blind us to genuine
+                // L1 fills under the original hash — and cap registrations against bus spam.
+                const d = e.data.payload || {};
+                const hexOk = (v, n) => typeof v === 'string' && new RegExp('^[0-9a-f]{' + n + '}$').test(v);
+                if (!hexOk(d.submarineHash, 64) || !hexOk(d.takerL2Pk, 64)) return;
+                if (!/^0x[0-9a-fA-F]{40}$/.test(String(d.takerEvmAddr || ''))) return;
+                const swap = dexMySwaps.find(s => s.role === 'maker' && s.kind === 'limit' &&
+                    ((d.coinId && s.covenant && s.covenant.coinId === d.coinId) || (d.offerId && s.offerId === d.offerId)));
+                if (!swap || swap.status === 'completed' || swap.status === 'limit_refunded' || swap.status === 'limit_refunding') return;
+                swap.submarines = swap.submarines || {};
+                if (swap.submarines[d.submarineHash]) return;                       // chat-history replay
+                if (Object.keys(swap.submarines).length >= 8) return;               // spam cap
+                swap.submarines[d.submarineHash] = { takerL2Pk: d.takerL2Pk, takerEvmAddr: d.takerEvmAddr, ts: Date.now() };
+                saveSwaps(); renderDexSwaps();
+                showToast("A taker registered a submarine (L2) intent on your order. Watching for their ETH lock\u2026", "success");
+            }
+            else if (e.data.type === 'DEX_LOCK_L2_SENT') {
+                const { offerId } = e.data.payload;
+                const swap = dexMySwaps.find(s => s.offerId === offerId && s.role === 'maker' && s.kind === 'limit');
+                if (!swap) return;
+                showToast("MDS routed to the taker over L2. Sweeping the Base ETH when they claim\u2026", "success");
+                startSubmarineSweepWatch(offerId);
+            }
+            else if (e.data.type === 'DEX_LOCK_L2_FAILED') {
+                const { offerId, error } = e.data.payload;
+                const swap = dexMySwaps.find(s => s.offerId === offerId && s.role === 'maker' && s.kind === 'limit');
+                if (!swap || swap.status !== 'submarine_routing') return;
+                // Revert so the order stays live for L1 fills and the submarine can retry on a
+                // fresh lock. (The taker's ETH is safe — it refunds after the Base window.)
+                if (swap.activeSubmarineHash && swap.submarines && swap.submarines[swap.activeSubmarineHash])
+                    delete swap.submarines[swap.activeSubmarineHash].routed;
+                swap.activeSubmarineHash = null; swap.baseSwapId = null;
+                swap.status = 'limit_posted'; saveSwaps(); renderDexSwaps();
+                startMakerLimitWatch(offerId);
+                showToast("L2 routing failed: " + (error || "unknown") + ". The taker's ETH refunds automatically after the Base window.", "error");
+            }
+            else if (e.data.type === 'DEX_SUBMARINE_STATUS_RESULT') {
+                const { offerId, secretHash, observedSecret, claimedAmount, htlcPending } = e.data.payload;
+                const swap = dexMySwaps.find(x => x.offerId === offerId &&
+                    (x.activeSubmarineHash === secretHash || x.submarineHash === secretHash));
+                if (!swap) return;
+                if (swap.role === 'maker' && swap.activeSubmarineHash === secretHash && !swap.submarineSwept) {
+                    if (observedSecret && !swap._sweeping) {
+                        // The taker's L2 claim (cmd 43) published the preimage — sweep the Base ETH.
+                        swap._sweeping = true;
+                        (async () => {
+                            try {
+                                showActivity("Taker claimed on L2 \u2014 sweeping your ETH on Base\u2026");
+                                const tx = await dexWriteContract().claim(swap.baseSwapId, "0x" + observedSecret);
+                                await tx.wait();
+                                hideActivity();
+                                swap.submarineSwept = true; swap._sweeping = false;
+                                if (swap.status === 'submarine_routing') swap.status = 'submarine_swept';
+                                saveSwaps(); renderDexSwaps();
+                                showToast("Submarine swap complete: ETH claimed. Reclaim this unit's L1 MDS after its timeout.", "success");
+                            } catch (err) {
+                                hideActivity(); swap._sweeping = false;
+                                showToast("ETH sweep failed (will retry): " + (err.shortMessage || err.message), "error");
+                            }
+                        })();
+                    } else if (!observedSecret && htlcPending === false && !swap._relocked && swap.status === 'submarine_routing') {
+                        // The route never landed (e.g. reload before DEX_LOCK_L2 ran). The HTLC is
+                        // absent from every channel state, so re-issuing cannot double-pay. Once only.
+                        const sub = swap.submarines && swap.submarines[swap.activeSubmarineHash];
+                        if (sub) {
+                            swap._relocked = true;
+                            worker.postMessage({ type: 'DEX_LOCK_L2', payload: {
+                                offerId: swap.offerId, takerL2Pk: sub.takerL2Pk,
+                                mdsAmount: swap.mdsAmount, secretHash: swap.activeSubmarineHash,
+                                baseRefundSecs: BASE_REFUND_DELAY_SECS
+                            }});
+                        }
+                    }
+                }
+                else if (swap.role === 'taker' && swap.status === 'submarine_waiting_l2') {
+                    if (claimedAmount != null) {
+                        swap.status = 'completed'; saveSwaps(); renderDexSwaps();
+                        showToast(`Submarine swap complete: ${Number(claimedAmount).toLocaleString('en')} MDS received on L2.`, "success");
+                    } else if (swap.baseSwapId && Date.now() > (swap.lockedAt || 0) + (BASE_REFUND_DELAY_SECS + 300) * 1000 && !swap._refunding) {
+                        // The maker never routed (or our claim never happened) — pull the ETH back.
+                        swap._refunding = true;
+                        (async () => {
+                            try {
+                                showActivity("Submarine swap timed out \u2014 refunding your ETH\u2026");
+                                const tx = await dexWriteContract().refund(swap.baseSwapId);
+                                await tx.wait();
+                                hideActivity();
+                                swap.status = 'submarine_refunded'; swap._refunding = false;
+                                saveSwaps(); renderDexSwaps();
+                                showToast("Submarine swap expired \u2014 your ETH was refunded.", "success");
+                            } catch (err) {
+                                hideActivity(); swap._refunding = false;
+                                showToast("ETH refund failed (will retry): " + (err.shortMessage || err.message), "error");
+                            }
+                        })();
+                    }
+                }
+            }
+            else if (e.data.type === 'L2_HTLC_CLAIMED') {
+                // Our worker auto-claimed an inbound L2 HTLC. If it backs a submarine swap we're
+                // the taker of, complete the card immediately (the poll also covers reloads).
+                const { secretHash, amount } = e.data.payload;
+                const swap = dexMySwaps.find(s => s.role === 'taker' && s.swapMode === 'submarine' &&
+                    s.submarineHash === secretHash && s.status === 'submarine_waiting_l2');
+                if (!swap) return;
+                swap.status = 'completed'; saveSwaps(); renderDexSwaps();
+                showToast(`Submarine swap complete: ${Number(amount).toLocaleString('en')} MDS received on L2.`, "success");
+            }
             else if (e.data.type === 'DEX_LIMIT_BUNDLE_CREATED') {
                 // Maker side: the WHOLE bundle's MDS is now locked on-chain in one tx. Drop the
                 // funding placeholder and register each unit (keep its secret locally, advertise
                 // the order, start its Base watcher).
-                const { groupId, units, recovered } = e.data.payload;
+                const { groupId, units, recovered, announcedAtomically } = e.data.payload;
                 dexMySwaps = dexMySwaps.filter(s => !(s.status === 'limit_funding' && s.offerId === groupId));
                 (units || []).forEach(u => dexRegisterLimitUnit({ ...u, orderGroup: groupId }));
+                if (announcedAtomically) {
+                    // The MDXA announcement rode INSIDE the funding tx as a 0-value burn — the
+                    // order became discoverable in the very block that funded it. There is no
+                    // second announce tx to run (and nothing that can fail separately).
+                    for (const s of dexMySwaps) if (s.orderGroup === groupId && s.kind === 'limit') s.announced = true;
+                }
                 saveSwaps(); renderDexSwaps();
-                // Publish the bundle on-chain (0-value DataBurn) so takers discover it without the
-                // chat bus and even with us offline. Permanent once mined → publish once; skip on
-                // recovery (it was already announced when first created).
-                if (!recovered && units && units.length) {
+                // FALLBACK (older wasm builds): publish the bundle as a separate 0-value DataBurn
+                // tx. Recovered bundles skip the auto-announce here; if they weren't announced
+                // atomically, their cards expose the "Retry on-chain announce" button instead.
+                if (!announcedAtomically && !recovered && units && units.length) {
                     const u0 = units[0];
                     worker.postMessage({ type: 'DEX_ANNOUNCE_BUNDLE', payload: {
                         groupId, makerEvmAddr: u0.makerEvmAddr, makerMdsPk: u0.makerMdsPk, timeoutHeight: u0.timeoutHeight,
@@ -4603,9 +4963,12 @@ document.getElementById('btnExport').onclick = () => {
                 const totalMds = (units || []).reduce((a, u) => a + Number(u.coin.value), 0);
                 showToast(recovered
                     ? `Recovered ${units.length} on-chain unit(s) (${totalMds.toLocaleString('en')} MDS) from an interrupted funding.`
-                    : `Posted ${units.length} on-chain unit(s) totalling ${totalMds.toLocaleString('en')} MDS.`, "success");
+                    : announcedAtomically
+                        ? `Posted ${units.length} unit(s) totalling ${totalMds.toLocaleString('en')} MDS — locked AND announced in one on-chain tx.`
+                        : `Posted ${units.length} on-chain unit(s) totalling ${totalMds.toLocaleString('en')} MDS.`, "success");
                 if (dexBroadcastInFlight && groupId === dexBroadcastGroupId) {
-                    if (recovered || !(units && units.length)) dexFinishBroadcastUI('done', `Locked \u2713 \u2014 ${units ? units.length : 0} unit(s), ${totalMds.toLocaleString('en')} MDS live on-chain.`);
+                    if (announcedAtomically) dexFinishBroadcastUI('done', `Locked & announced \u2713 \u2014 ${units.length} unit(s), ${totalMds.toLocaleString('en')} MDS live and discoverable on-chain.`);
+                    else if (recovered || !(units && units.length)) dexFinishBroadcastUI('done', `Locked \u2713 \u2014 ${units ? units.length : 0} unit(s), ${totalMds.toLocaleString('en')} MDS live on-chain.`);
                     else dexSetProgress('MDS locked \u2713 \u00b7 announcing order on-chain\u2026', null);
                 }
             }
@@ -4618,14 +4981,29 @@ document.getElementById('btnExport').onclick = () => {
             }
             else if (e.data.type === 'DEX_ANNOUNCE_DONE') {
                 const { groupId } = e.data.payload;
+                delete _dexAnnounceRetries[groupId];
                 for (const s of dexMySwaps) if (s.orderGroup === groupId && s.kind === 'limit') s.announced = true;
-                saveSwaps();
+                saveSwaps(); renderDexSwaps();
                 showToast("Order published on-chain — discoverable without the chat relay.", "success");
                 if (dexBroadcastInFlight && groupId === dexBroadcastGroupId) dexFinishBroadcastUI('done', 'Order posted \u2713 \u2014 locked and live on-chain, discoverable by takers.');
             }
             else if (e.data.type === 'DEX_ANNOUNCE_FAILED') {
-                showToast("On-chain announce failed: " + ((e.data.payload && e.data.payload.error) || "unknown") + ". Order still advertised over chat; you can retry.", "error");
-                if (dexBroadcastInFlight) dexFinishBroadcastUI('error', 'MDS locked \u2713, but the on-chain announce failed: ' + ((e.data.payload && e.data.payload.error) || 'unknown') + '. Funds are safe & refundable; you can retry.');
+                const groupId = e.data.payload && e.data.payload.groupId;
+                const errMsg = (e.data.payload && e.data.payload.error) || "unknown";
+                const n = (_dexAnnounceRetries[groupId] || 0) + 1;
+                if (groupId) _dexAnnounceRetries[groupId] = n;
+                if (groupId && n <= 3) {
+                    // Transient failures (WebRTC blips right after the heavy funding flow)
+                    // clear on their own — retry automatically before bothering the user.
+                    const delayS = 20 * n;
+                    showToast(`On-chain announce failed (${errMsg}). Auto-retrying in ${delayS}s (attempt ${n}/3)\u2026`, "error");
+                    if (dexBroadcastInFlight) dexSetProgress(`MDS locked \u2713 \u00b7 announce failed, auto-retrying (${n}/3)\u2026`, null);
+                    setTimeout(() => dexRetryAnnounce(groupId), delayS * 1000);
+                } else {
+                    showToast("On-chain announce failed: " + errMsg + ". Order still advertised over chat; use the order card's Retry button.", "error");
+                    if (dexBroadcastInFlight) dexFinishBroadcastUI('error', 'MDS locked \u2713, but the on-chain announce failed: ' + errMsg + '. Funds are safe \u2014 retry from the order card; chat gossip still advertises it meanwhile.');
+                    renderDexSwaps();   // surface the per-card "Retry on-chain announce" button
+                }
             }
             else if (e.data.type === 'DEX_SCAN_PROGRESS') {
                 const { at, tip, from } = e.data.payload;
@@ -4702,7 +5080,7 @@ document.getElementById('btnExport').onclick = () => {
                 swap.mdsLockerPk = data.makerMdsPk;   // worker returns the locker's own pubkey here
                 swap.swapMode = data.swapMode || swap.swapMode || 'htlc';
                 if (data.minPayout != null) swap.minPayout = data.minPayout;
-                swap.status = 'ready_to_claim_base';
+                swap.status = 'ready_to_claim_base'; if (!swap._autoClaimed) { swap._autoClaimed = true; setTimeout(() => { try { dexClaimBase(swap.offerId); } catch (e) { swap._autoClaimed = false; } }, 400); }
                 delete swap.phase;                    // lock leg done — stop showing commit/reveal steps
                 saveSwaps();
                 renderDexSwaps();
@@ -4839,7 +5217,7 @@ document.getElementById('btnExport').onclick = () => {
                 showActivity("Locking ETH on Base…");
                 const c = dexWriteContract();
                 const beneficiary = counterEvmAddr(swap); // the MDS-side claims this ETH
-                const tx = await c.lock("0x" + swap.secretHash, beneficiary, BASE_REFUND_DELAY_SECS, { value: swap.weiAmount });
+                const tx = await c.lock(...dexLockArgs(swap.secretHash, beneficiary, swap.weiAmount));
                 const receipt = await tx.wait();
                 let swapId = null;
                 for (const log of receipt.logs) {
@@ -4858,7 +5236,7 @@ document.getElementById('btnExport').onclick = () => {
                     showToast("ETH locked. Your MDS will be delivered automatically — no MDS or fee needed.", "success");
                     startDeliveryWatch(swap.offerId);
                 } else {
-                    swap.status = 'ready_to_claim_midstate';
+                    swap.status = 'ready_to_claim_midstate'; if (!swap._autoClaimed) { swap._autoClaimed = true; setTimeout(() => { try { dexClaimMidstate(swap.offerId); } catch (e) { swap._autoClaimed = false; } }, 400); }
                     saveSwaps();
                     renderDexSwaps();
                     hideActivity();
@@ -5061,12 +5439,22 @@ document.getElementById('btnExport').onclick = () => {
                 showToast("A limit-order funding was interrupted by reload — if it had already confirmed, reclaim those funds after the timeout.", "error");
             }
             for (const s of dexMySwaps) {
+                // Transient "tx in flight" flags must never survive a reload: an unrelated
+                // saveSwaps() can persist them mid-transaction, and a stale true would block
+                // the sweep/refund/re-route from ever retrying. (htlcPending — not _relocked —
+                // is what makes re-routing double-pay-safe, so clearing these is always sound.)
+                delete s._sweeping; delete s._refunding; delete s._relocked;
                 if (s.side === 'eth' && s.status === 'ready_to_claim_midstate') startSecretWatch(s.offerId);
                 if (s.side === 'mds' && s.status === 'ready_to_claim_base' && !s.counterpartyLocked) startEthLockWatch(s.offerId);
                 if (s.side === 'eth' && s.status === 'waiting_for_delivery') startDeliveryWatch(s.offerId);
                 // Feature 1 limit-order watchers.
                 if (s.kind === 'limit' && s.role === 'maker' && s.status === 'limit_posted') startMakerLimitWatch(s.offerId);
                 if (s.kind === 'limit' && s.role === 'taker' && s.status === 'limit_waiting_secret') startLimitSecretWatch(s.offerId);
+                // Feature 2 submarine watchers. The maker keeps the limit watch alive too:
+                // the covenant coin is still locked under the original hash, so an L1 fill
+                // remains valid while (or after) the L2 leg settles.
+                if (s.kind === 'limit' && s.role === 'maker' && s.status === 'submarine_routing') { startMakerLimitWatch(s.offerId); startSubmarineSweepWatch(s.offerId); }
+                if (s.role === 'taker' && s.swapMode === 'submarine' && s.status === 'submarine_waiting_l2') startSubmarineTakerWatch(s.offerId);
                 if (s.side === 'mds' && s.status === 'delivering_midstate') {
                     // Interrupted mid-delivery. Ask whether it actually landed; if it did,
                     // DEX_SETTLED_STATUS completes the swap, otherwise we surface a retry.
@@ -5087,29 +5475,82 @@ document.getElementById('btnExport').onclick = () => {
             _dexWatchers.add(key);
             const tick = async () => {
                 const swap = dexMySwaps.find(s => s.offerId === offerId && s.kind === 'limit' && s.role === 'maker');
-                if (!swap || swap.status === 'completed') { _dexWatchers.delete(key); return; }
+                if (!swap || swap.status === 'completed' || swap.status === 'limit_refunding' || swap.status === 'limit_refunded') { _dexWatchers.delete(key); return; }
                 if (!evmProvider || !evmSigner) { setTimeout(tick, 15000); return; }
                 try {
                     const c = new ethers.Contract(BASE_HTLC_CONTRACT, HTLC_ABI, evmProvider);
                     const from = swap.watchFrom || Math.max(0, (await evmProvider.getBlockNumber()) - 60000);
-                    // Locks whose beneficiary is us, carrying our hashlock H.
+                    // Locks whose beneficiary is us: either our order hashlock H (an L1 fill)
+                    // or a hash a taker registered via a cmd-204 submarine intent (an L2 fill).
                     const evs = await c.queryFilter(c.filters.Locked(null, swap.makerEvmAddr), from);
-                    const m = evs.find(ev => ev.args.hashlock.toLowerCase() === ("0x" + swap.secretHash).toLowerCase());
-                    if (m) {
-                        _dexWatchers.delete(key);
-                        showActivity("A taker locked ETH — claiming it (reveals the preimage)…");
-                        const cw = dexWriteContract();
-                        const tx = await cw.claim(m.args.swapId, "0x" + swap.secret);
-                        await tx.wait();
-                        hideActivity();
-                        swap.status = 'completed'; saveSwaps(); renderDexSwaps();
-                        showToast("Order filled: ETH claimed; the taker can now take your MDS.", "success");
-                        return;
+                    for (const ev of evs) {
+                        const h = String(ev.args.hashlock).toLowerCase().replace(/^0x/, '');
+                        // ── Path A: L1 fill under OUR hash → claim it (reveals the preimage). ──
+                        if (h === swap.secretHash.toLowerCase()) {
+                            _dexWatchers.delete(key);
+                            showActivity("A taker locked ETH — claiming it (reveals the preimage)…");
+                            const cw = dexWriteContract();
+                            const tx = await cw.claim(ev.args.swapId, "0x" + swap.secret);
+                            await tx.wait();
+                            hideActivity();
+                            swap.status = 'completed'; saveSwaps(); renderDexSwaps();
+                            showToast("Order filled: ETH claimed; the taker can now take your MDS.", "success");
+                            return;
+                        }
+                        // ── Path B: lock under a REGISTERED submarine hash → route MDS over L2. ──
+                        // Do NOT claim this ETH — we don't know its preimage. The taker reveals it
+                        // by claiming our L2 HTLC (cmd 43); the sweep watcher then collects the ETH.
+                        // One active route per unit; the watcher stays alive because the covenant
+                        // coin is still locked under the ORIGINAL hash, so an L1 fill stays valid.
+                        const sub = swap.submarines && swap.submarines[h];
+                        if (sub && !sub.routed && !swap.activeSubmarineHash && swap.status === 'limit_posted') {
+                            sub.routed = true;
+                            swap.activeSubmarineHash = h;
+                            swap.baseSwapId = ev.args.swapId;
+                            swap.status = 'submarine_routing';
+                            saveSwaps(); renderDexSwaps();
+                            worker.postMessage({ type: 'DEX_LOCK_L2', payload: {
+                                offerId: swap.offerId, takerL2Pk: sub.takerL2Pk,
+                                mdsAmount: swap.mdsAmount, secretHash: h,
+                                baseRefundSecs: BASE_REFUND_DELAY_SECS
+                            }});
+                        }
                     }
                 } catch (_) {}
                 setTimeout(tick, 15000);
             };
             setTimeout(tick, 6000);
+        }
+
+        // Maker (Feature 2): poll the worker for the preimage the taker publishes when they
+        // claim our L2 HTLC (the worker persists every cmd-43 secret it sees on the bus),
+        // then sweep the Base ETH with it. A poll — not a push — so it survives reloads.
+        function startSubmarineSweepWatch(offerId) {
+            const key = 'subsweep:' + offerId;
+            if (_dexWatchers.has(key)) return;
+            _dexWatchers.add(key);
+            const tick = () => {
+                const swap = dexMySwaps.find(s => s.offerId === offerId && s.kind === 'limit' && s.role === 'maker');
+                if (!swap || !swap.activeSubmarineHash || swap.submarineSwept) { _dexWatchers.delete(key); return; }
+                worker.postMessage({ type: 'DEX_SUBMARINE_STATUS', payload: { offerId, secretHash: swap.activeSubmarineHash } });
+                setTimeout(tick, 15000);
+            };
+            setTimeout(tick, 4000);
+        }
+
+        // Taker (Feature 2): poll until our worker auto-claims the routed HTLC (completing
+        // the swap) or the Base refund window passes with no route (auto-refund our ETH).
+        function startSubmarineTakerWatch(offerId) {
+            const key = 'subtaker:' + offerId;
+            if (_dexWatchers.has(key)) return;
+            _dexWatchers.add(key);
+            const tick = () => {
+                const swap = dexMySwaps.find(s => s.offerId === offerId && s.role === 'taker' && s.swapMode === 'submarine');
+                if (!swap || swap.status !== 'submarine_waiting_l2') { _dexWatchers.delete(key); return; }
+                worker.postMessage({ type: 'DEX_SUBMARINE_STATUS', payload: { offerId, secretHash: swap.submarineHash } });
+                setTimeout(tick, 12000);
+            };
+            setTimeout(tick, 5000);
         }
 
         // ETH-side (covenant): wait for the seller to deliver our MDS. We do no Midstate
@@ -5169,51 +5610,512 @@ document.getElementById('btnExport').onclick = () => {
             </div>`;
         }
 
+        // ── Order book view state ───────────────────────────────────────────────
+        let dexBookSearch = '';
+        let dexBookBucket = 'auto';        // auto | 0(none) | 1(coarse) | 2(medium) | 3(fine)
+        let dexBookVerifiedOnly = false;
+        let dexBookMineOnly = false;
+        let dexExpandedLevels = new Set();  // keys of price levels the user drilled into
+
+        // Price per MDS in ETH — the axis everything hangs off. Uses a high-precision
+        // integer-safe divide (wei is a BigInt) then converts once.
+        function dexPricePerMds(o) {
+            try {
+                const wei = BigInt(o.weiAmount);
+                const mds = Number(o.mdsAmount);
+                if (!mds || wei <= 0n) return null;
+                return parseFloat(ethers.formatEther(wei)) / mds;
+            } catch (_) { return null; }
+        }
+        function dexFmtPpm(ppm) {
+            if (ppm == null) return '—';
+            if (ppm === 0) return '0';
+            if (ppm >= 1) return ppm.toFixed(4);
+            if (ppm >= 0.0001) return ppm.toFixed(6);
+            return ppm.toExponential(2);
+        }
+
+        function dexBookSetSearch(v) { dexBookSearch = (v || '').trim().toLowerCase(); renderDexOrderbook(); }
+        function dexBookSetBucket(v) { dexBookBucket = v; dexExpandedLevels.clear(); renderDexOrderbook(); }
+        function dexBookToggleVerified() {
+            dexBookVerifiedOnly = !dexBookVerifiedOnly;
+            const b = document.getElementById('dexBookVerifiedBtn');
+            if (b) { b.style.background = dexBookVerifiedOnly ? 'var(--accent)' : 'transparent'; b.style.color = dexBookVerifiedOnly ? 'var(--on-accent)' : 'var(--text-muted)'; }
+            renderDexOrderbook();
+        }
+        function dexBookToggleMine() {
+            dexBookMineOnly = !dexBookMineOnly;
+            const b = document.getElementById('dexBookMineBtn');
+            if (b) { b.style.background = dexBookMineOnly ? 'var(--accent)' : 'transparent'; b.style.color = dexBookMineOnly ? 'var(--on-accent)' : 'var(--text-muted)'; }
+            renderDexOrderbook();
+        }
+
+        function dexBookApplyFilters(live) {
+            return live.filter(o => {
+                if (dexBookVerifiedOnly && !(o.verified === true)) return false;
+                if (dexBookMineOnly) {
+                    const mine = o.makerEvmAddr && evmAddress && o.makerEvmAddr.toLowerCase() === evmAddress.toLowerCase();
+                    if (!mine) return false;
+                }
+                if (dexBookSearch) {
+                    const isAsk = (o.kind || 'ask') === 'ask';
+                    const ppm = dexPricePerMds(o);
+                    const hay = [
+                        isAsk ? 'sell selling ask' : 'buy buying bid',
+                        String(o.mdsAmount), formatMDS(o.mdsAmount).prefix,
+                        prettyEth(o.weiAmount), ppm != null ? dexFmtPpm(ppm) : '',
+                        o.makerEvmAddr || '', (o.covenant && o.covenant.coinId) || '',
+                        o.verified === true ? 'verified onchain' : 'chat promise'
+                    ].join(' ').toLowerCase();
+                    if (!hay.includes(dexBookSearch)) return false;
+                }
+                return true;
+            });
+        }
+
+        // Choose a bucket size (in ETH/MDS) so the visible price range splits into a sane
+        // number of levels. Auto scales to the data; explicit levels are fractions of range.
+        function dexComputeBucketSize(prices) {
+            if (dexBookBucket === '0') return 0; // no bucketing → one level per distinct price
+            if (!prices.length) return 0;
+            const min = Math.min(...prices), max = Math.max(...prices);
+            const range = max - min;
+            if (range <= 0) return 0;
+            const targetLevels = dexBookBucket === '1' ? 8 : dexBookBucket === '2' ? 16 : dexBookBucket === '3' ? 32 : 14;
+            // round bucket to a "nice" number (1/2/5 × 10^n) for readable price rungs
+            const raw = range / targetLevels;
+            const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+            const norm = raw / mag;
+            const nice = norm < 1.5 ? 1 : norm < 3.5 ? 2 : norm < 7.5 ? 5 : 10;
+            return nice * mag;
+        }
+
+        // Aggregate one side into price levels. Returns levels sorted best-first
+        // (asks ascending, bids descending), each with summed size, orders, and a
+        // cumulative running total for the depth column + bar.
+        function dexAggregateSide(orders, isAsk, bucket) {
+            const levels = new Map();
+            for (const o of orders) {
+                const ppm = dexPricePerMds(o);
+                if (ppm == null) continue;
+                const key = bucket > 0 ? Math.round(ppm / bucket) : Number(ppm.toPrecision(9));
+                let L = levels.get(key);
+                if (!L) { L = { keyLo: bucket > 0 ? key * bucket : ppm, price: ppm, mds: 0, wei: 0n, orders: [], allVerified: true }; levels.set(key, L); }
+                L.mds += Number(o.mdsAmount) || 0;
+                try { L.wei += BigInt(o.weiAmount); } catch (_) {}
+                L.orders.push(o);
+                if (o.verified !== true) L.allVerified = false;
+                // representative price for a bucket = size-weighted-ish (use bucket floor)
+                if (bucket > 0) L.price = key * bucket;
+            }
+            const arr = [...levels.values()];
+            arr.sort((a, b) => isAsk ? a.price - b.price : b.price - a.price);
+            let cum = 0;
+            for (const L of arr) { cum += L.mds; L.cum = cum; }
+            return arr;
+        }
+
+        function dexLevelKey(isAsk, L) { return (isAsk ? 'a' : 'b') + ':' + (L.keyLo != null ? L.keyLo.toPrecision(9) : L.price); }
+
         function renderDexOrderbook() {
-            const tb = document.getElementById('dexOrderbook');
-            if (!tb) return;
+            const asksEl = document.getElementById('dexAsks');
+            const bidsEl = document.getElementById('dexBids');
+            const spreadEl = document.getElementById('dexSpreadRow');
+            const emptyEl = document.getElementById('dexBookEmpty');
+            if (!asksEl || !bidsEl) return;
+
             const now = Date.now();
-            // Persisted book: drop expired entries from the array itself and save (survives reloads;
-            // a maker who goes offline stops re-advertising, so their orders age out here).
-            // On-chain orders aren't chat-advertised, so they don't expire by chat-ts — they live
-            // until their covenant coin is spent (filled/refunded), which the periodic re-verify
-            // detects. Gossip orders still age out by TTL.
             dexOrderbook = dexOrderbook.filter(o => o.onchain || !o.ts || (now - o.ts) <= OFFER_TTL_MS);
             saveOrderbook();
             const live = dexOrderbook.filter(o => !dexOfferEngaged(o.offerId));
-            if (live.length === 0) {
-                tb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#555;">No live orders. Listening to P2P network…</td></tr>';
+
+            // Stats + chart always reflect the UNFILTERED live book.
+            dexRenderBookStats(live);
+            dexRenderDepthChart(live);
+
+            const filtered = dexBookApplyFilters(live);
+            const priced = filtered.filter(o => dexPricePerMds(o) != null);
+
+            if (filtered.length === 0) {
+                asksEl.innerHTML = ''; bidsEl.innerHTML = ''; spreadEl.style.display = 'none';
+                emptyEl.style.display = 'block';
+                emptyEl.textContent = live.length ? 'No orders match your filters.' : 'No live orders. Listening to P2P network…';
                 return;
             }
-            tb.innerHTML = live.map(o => {
-                const i = dexOrderbook.indexOf(o);
-                const isAsk = (o.kind || 'ask') === 'ask';
-                const mine = o.makerEvmAddr && evmAddress && o.makerEvmAddr.toLowerCase() === evmAddress.toLowerCase();
-                const orderLabel = isAsk
-                    ? '<span style="color:var(--text-max);font-weight:600;">Selling MDS</span>'
-                    : '<span style="color:var(--text-muted);">Buying MDS</span>';
-                // Feature 1: covenant-backed orders carry an on-chain verification badge;
-                // legacy offers (no covenant UTXO) are flagged as unverified chat promises.
-                const hasCov = !!(o.covenant && o.covenant.coinId);
-                let badge;
-                if (!hasCov)                   badge = '<span style="font-size:10px;color:var(--text-faint);">chat promise</span>';
-                else if (o.verified === true)  badge = '<span style="font-size:10px;color:#3fb950;">\u2713 on-chain</span>';
-                else if (o.verified === false) badge = '<span style="font-size:10px;color:#f85149;">\u2717 not found</span>';
-                else                           badge = '<span style="font-size:10px;color:var(--text-faint);">\u29d6 verifying\u2026</span>';
-                const action = isAsk ? 'Buy' : 'Sell';
-                // Covenant orders: button is path-aware (L1/L2) and gated on verification.
-                const covGated = hasCov && o.verified !== true;
-                const pathTag = hasCov ? ` \u00b7 ${dexSettlePath}` : '';
-                const btnStyle = isAsk ? 'background:var(--accent);color:var(--on-accent);' : 'background:transparent;color:var(--text-max);border:1px solid var(--border-bright);';
-                const disabledStyle = covGated ? 'opacity:.45;cursor:not-allowed;' : '';
-                const btn = `<button ${covGated ? 'disabled' : ''} style="margin:0;width:auto;padding:6px 12px;font-size:11px;${btnStyle}${disabledStyle}" onclick="dexAcceptFromBook(${i})">${action}${pathTag}</button>`;
-                return `<tr>
-                    <td>${orderLabel}${mine ? ' <span style="color:#666;font-size:10px;">(yours)</span>' : ''}<br>${badge}</td>
-                    <td>${(() => { const m = formatMDS(o.mdsAmount); return `${m.value} ${m.prefix}`; })()}<br><span style="font-size:10px;color:var(--text-faint);">${Number(o.mdsAmount).toLocaleString('en')} MDS</span></td>
-                    <td>${prettyEth(o.weiAmount)} ETH${(() => { const u = weiToUsd(o.weiAmount); return u ? `<br><span style="font-size:10px;color:var(--text-muted);">\u2248 ${u}</span>` : ''; })()}<br><span style="font-size:10px;color:var(--text-faint);">${o.weiAmount} wei</span></td>
-                    <td style="text-align:right;">${btn}</td>
-                </tr>`;
-            }).join('');
+            emptyEl.style.display = 'none';
+
+            const asks = priced.filter(o => (o.kind || 'ask') === 'ask');
+            const bids = priced.filter(o => (o.kind || 'ask') === 'bid');
+            const bucket = dexComputeBucketSize(priced.map(dexPricePerMds));
+
+            const askLevels = dexAggregateSide(asks, true, bucket);
+            const bidLevels = dexAggregateSide(bids, false, bucket);
+            const maxCum = Math.max(
+                askLevels.length ? askLevels[askLevels.length - 1].cum : 0,
+                bidLevels.length ? bidLevels[bidLevels.length - 1].cum : 0, 1
+            );
+
+            // Asks render worst→best downward so the best ask sits just above the spread
+            // (classic book layout). We aggregated best-first, so reverse for display.
+            asksEl.innerHTML = askLevels.slice().reverse().map(L => dexLadderRow(L, true, maxCum)).join('') || `<div style="padding:10px 12px;font-size:11px;color:var(--text-faint);">No sell orders</div>`;
+            bidsEl.innerHTML = bidLevels.map(L => dexLadderRow(L, false, maxCum)).join('') || `<div style="padding:10px 12px;font-size:11px;color:var(--text-faint);">No buy orders</div>`;
+
+            // Spread row
+            const bestAsk = askLevels.length ? askLevels[0].price : null;
+            const bestBid = bidLevels.length ? bidLevels[0].price : null;
+            if (bestAsk != null && bestBid != null) {
+                const spread = bestAsk - bestBid;
+                const pct = bestBid > 0 ? (spread / bestBid) * 100 : 0;
+                const crossed = spread < 0;
+                spreadEl.style.display = 'flex';
+                spreadEl.innerHTML = crossed
+                    ? `<span style="color:var(--warn-accent);">⚠ crossed book — a buyer bids above the cheapest ask (fillable now)</span>`
+                    : `<span>spread</span><b style="color:var(--text-max);">${dexFmtPpm(spread)}</b><span>ETH/MDS</span><span style="color:var(--text-faint);">(${pct.toFixed(2)}%)</span>`;
+            } else {
+                spreadEl.style.display = 'none';
+            }
+        }
+
+        function dexLadderRow(L, isAsk, maxCum) {
+            const barW = Math.max(1.5, (L.cum / maxCum) * 100);
+            const count = L.orders.length;
+            const bucketed = count > 1;
+            const key = dexLevelKey(isAsk, L);
+            const expanded = dexExpandedLevels.has(key);
+            const mine = evmAddress && L.orders.some(o => o.makerEvmAddr && o.makerEvmAddr.toLowerCase() === evmAddress.toLowerCase());
+            const m = formatMDS(L.mds);
+            const anyGated = L.orders.some(o => (o.covenant && o.covenant.coinId) && o.verified !== true);
+            const vTick = L.allVerified ? '<span style="color:var(--green);font-size:9px;margin-left:4px;">✓</span>' : '';
+
+            let row = `<div class="dex-lvl ${isAsk ? 'ask' : 'bid'}" onclick="dexToggleLevel('${key}')" title="${count} order${count>1?'s':''} at this price · click to ${expanded?'collapse':'expand'}">
+                <div class="bar" style="width:${barW}%;"></div>
+                <div class="c price">${dexFmtPpm(L.price)}${vTick}</div>
+                <div class="c">${m.value} ${m.prefix}${bucketed ? `<span class="cnt">×${count}</span>` : ''}${mine ? '<span class="mine-tag">my order</span>' : ''}</div>
+                <div class="c">${prettyEth(L.wei.toString())}${(() => { const u = weiToUsd(L.wei.toString()); return u ? `<span style="color:var(--text-faint);font-size:9px;margin-left:4px;">${u}</span>` : ''; })()}</div>
+                <div class="c" style="color:var(--text-muted);">${formatMDS(L.cum).value} ${formatMDS(L.cum).prefix}</div>
+            </div>`;
+
+            if (expanded) {
+                // individual orders at this level, each independently fillable
+                const subs = L.orders.slice().sort((a, b) => Number(b.mdsAmount) - Number(a.mdsAmount)).map(o => {
+                    const i = dexOrderbook.indexOf(o);
+                    const hasCov = !!(o.covenant && o.covenant.coinId);
+                    const gated = hasCov && o.verified !== true;
+                    const isMine = o.makerEvmAddr && evmAddress && o.makerEvmAddr.toLowerCase() === evmAddress.toLowerCase();
+                    const badge = !hasCov ? '<span style="color:var(--text-faint);">chat promise</span>'
+                        : o.verified === true ? '<span style="color:var(--green);">✓ on-chain</span>'
+                        : o.verified === false ? '<span style="color:var(--red);">✗ not found</span>'
+                        : '<span style="color:var(--text-faint);">⧖ verifying…</span>';
+                    const mm = formatMDS(o.mdsAmount);
+                    return `<div class="dex-suborder">
+                        <span>${badge}${isMine ? ' <span style="color:var(--text-faint);">(my order)</span>' : ''}</span>
+                        <span style="text-align:right;">${mm.value} ${mm.prefix}</span>
+                        <span style="text-align:right;color:var(--text-muted);">${prettyEth(o.weiAmount)} ETH${(() => { const u = weiToUsd(o.weiAmount); return u ? `<br><span style="color:var(--text-faint);font-size:9px;">${u}</span>` : ''; })()}</span>
+                        <button class="obtn ${isAsk ? 'ask' : 'bid'}" ${gated ? 'disabled' : ''} onclick="event.stopPropagation();dexAcceptFromBook(${i})">Buy</button>
+                    </div>`;
+                }).join('');
+                row += `<div class="dex-expand">${subs}</div>`;
+            }
+            return row;
+        }
+
+        function dexToggleLevel(key) {
+            if (dexExpandedLevels.has(key)) dexExpandedLevels.delete(key); else dexExpandedLevels.add(key);
+            renderDexOrderbook();
+        }
+
+        function dexRenderBookStats(live) {
+            const box = document.getElementById('dexBookStats');
+            if (!box) return;
+            const priced = live.filter(o => dexPricePerMds(o) != null);
+            if (!priced.length) { box.style.display = 'none'; return; }
+            box.style.display = 'block';
+            const askOrders = priced.filter(o => (o.kind || 'ask') === 'ask');
+            const bidOrders = priced.filter(o => (o.kind || 'ask') === 'bid');
+            const asks = askOrders.map(dexPricePerMds);
+            const bids = bidOrders.map(dexPricePerMds);
+            const bestAsk = asks.length ? Math.min(...asks) : null;
+            const bestBid = bids.length ? Math.max(...bids) : null;
+            const mid = (bestAsk != null && bestBid != null) ? (bestAsk + bestBid) / 2 : (bestAsk ?? bestBid);
+            const askDepthMds = askOrders.reduce((a, o) => a + (Number(o.mdsAmount) || 0), 0);
+            const bidDepthMds = bidOrders.reduce((a, o) => a + (Number(o.mdsAmount) || 0), 0);
+            let askWei = 0n; for (const o of askOrders) { try { askWei += BigInt(o.weiAmount); } catch (_) {} }
+            const set = (id, v) => { const el = document.getElementById(id); if (el) el.innerHTML = v; };
+            set('dexStatBestAsk', bestAsk != null ? dexFmtPpm(bestAsk) : '—');
+            set('dexStatBestBid', bestBid != null ? dexFmtPpm(bestBid) : '—');
+            set('dexStatMid', mid != null ? dexFmtPpm(mid) : '—');
+            const spread = (bestAsk != null && bestBid != null) ? Math.max(0, bestAsk - bestBid) : null;
+            set('dexStatSpread', spread != null ? dexFmtPpm(spread) : '—');
+            const pctEl = document.getElementById('dexStatSpreadPct');
+            if (pctEl) pctEl.textContent = (spread != null && bestBid > 0) ? `(${((spread / bestBid) * 100).toFixed(2)}%)` : '';
+            const fmA = formatMDS(askDepthMds), fmB = formatMDS(bidDepthMds);
+            set('dexStatAskDepth', `${fmA.value} ${fmA.prefix}`);
+            set('dexStatBidDepth', `${fmB.value} ${fmB.prefix}`);
+            const usd = weiToUsd(askWei.toString());
+            set('dexStatAskEth', `${prettyEth(askWei.toString())}${usd ? ` <span style="font-size:9px;color:var(--text-faint);">${usd}</span>` : ''}`);
+            set('dexStatCount', String(live.length));
+            const splitEl = document.getElementById('dexStatSideSplit');
+            if (splitEl) splitEl.textContent = `(${askOrders.length} sell / ${bidOrders.length} buy)`;
+
+            // Feed the market-order panel with current best prices + available depth.
+            dexUpdateMarketPanel({ bestAsk, bestBid, askOrders, bidOrders, askDepthMds, bidDepthMds });
+        }
+
+        // Depth chart: filled cumulative step curves, asks (right of mid) vs bids (left),
+        // shared price X-axis, with hover readout. Monochrome-safe (uses --green/--red,
+        // which are grey in the default theme but structurally separated by side + label).
+        let _dexDepthGeom = null; // saved for hover hit-testing
+        function dexRenderDepthChart(live) {
+            const cv = document.getElementById('dexDepthChart');
+            if (!cv) return;
+            const ctx = cv.getContext('2d');
+            const cssW = cv.clientWidth || 320, cssH = 140;
+            const dpr = window.devicePixelRatio || 1;
+            if (cv.width !== Math.floor(cssW * dpr) || cv.height !== Math.floor(cssH * dpr)) { cv.width = Math.floor(cssW * dpr); cv.height = Math.floor(cssH * dpr); }
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, cssW, cssH);
+            _dexDepthGeom = null;
+
+            const mk = o => ({ p: dexPricePerMds(o), m: Number(o.mdsAmount) || 0 });
+            const asks = live.filter(o => (o.kind || 'ask') === 'ask').map(mk).filter(x => x.p != null && x.m > 0).sort((a, b) => a.p - b.p);
+            const bids = live.filter(o => (o.kind || 'ask') === 'bid').map(mk).filter(x => x.p != null && x.m > 0).sort((a, b) => b.p - a.p);
+            if (!asks.length && !bids.length) {
+                ctx.fillStyle = 'rgba(150,150,150,.4)'; ctx.font = '11px sans-serif'; ctx.textAlign = 'center';
+                ctx.fillText('No priced orders to chart yet', cssW / 2, cssH / 2);
+                return;
+            }
+            let c = 0; const asksCum = asks.map(x => ({ p: x.p, c: (c += x.m) }));
+            c = 0; const bidsCum = bids.map(x => ({ p: x.p, c: (c += x.m) }));
+            const maxDepth = Math.max(asksCum.length ? asksCum[asksCum.length - 1].c : 0, bidsCum.length ? bidsCum[bidsCum.length - 1].c : 0, 1);
+            const prices = [...asks, ...bids].map(x => x.p);
+            const minP = Math.min(...prices), maxP = Math.max(...prices);
+            const pad = (maxP - minP) * 0.06 || maxP * 0.06 || 1;
+            const lo = Math.max(0, minP - pad), hi = maxP + pad;
+            const padB = 16; // bottom axis space
+            const X = p => (hi === lo) ? cssW / 2 : ((p - lo) / (hi - lo)) * cssW;
+            const Y = d => (cssH - padB) - (d / maxDepth) * (cssH - padB - 6) + 0;
+
+            const css = getComputedStyle(document.documentElement);
+            const green = (css.getPropertyValue('--green') || '#3fb950').trim();
+            const red = (css.getPropertyValue('--red') || '#f85149').trim();
+            const isMono = green === red; // default theme: fall back to distinguishable tints
+            const bidColor = isMono ? '#6f9f6f' : green;
+            const askColor = isMono ? '#b57070' : red;
+
+            const drawSide = (pts, stroke, fillRGBA) => {
+                if (!pts.length) return;
+                const sorted = pts.slice().sort((a, b) => a.p - b.p);
+                ctx.beginPath();
+                ctx.moveTo(X(sorted[0].p), cssH - padB);
+                let prevY = Y(sorted[0].c);
+                ctx.lineTo(X(sorted[0].p), prevY);
+                for (let i = 0; i < sorted.length; i++) {
+                    const x = X(sorted[i].p), y = Y(sorted[i].c);
+                    ctx.lineTo(x, prevY); ctx.lineTo(x, y); prevY = y;
+                }
+                ctx.lineTo(X(sorted[sorted.length - 1].p), cssH - padB);
+                ctx.closePath();
+                ctx.fillStyle = fillRGBA; ctx.fill();
+                ctx.strokeStyle = stroke; ctx.lineWidth = 1.5; ctx.stroke();
+            };
+            const hex2rgba = (hex, a) => {
+                const m = hex.replace('#', ''); const n = m.length === 3 ? m.split('').map(c => c + c).join('') : m;
+                const r = parseInt(n.slice(0, 2), 16), g = parseInt(n.slice(2, 4), 16), b = parseInt(n.slice(4, 6), 16);
+                return `rgba(${r},${g},${b},${a})`;
+            };
+            drawSide(bidsCum, bidColor, hex2rgba(bidColor, 0.15));
+            drawSide(asksCum, askColor, hex2rgba(askColor, 0.15));
+
+            // mid guide
+            const bestBid = bids.length ? bids[0].p : null;
+            const bestAsk = asks.length ? asks[0].p : null;
+            if (bestBid != null && bestAsk != null) {
+                const mid = (bestBid + bestAsk) / 2, mx = X(mid);
+                ctx.strokeStyle = 'rgba(150,150,150,.35)'; ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
+                ctx.beginPath(); ctx.moveTo(mx, 0); ctx.lineTo(mx, cssH - padB); ctx.stroke(); ctx.setLineDash([]);
+                ctx.fillStyle = 'rgba(150,150,150,.6)'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center';
+                ctx.fillText('mid ' + dexFmtPpm(mid), mx, 9);
+            }
+            // axis ticks
+            ctx.fillStyle = 'rgba(150,150,150,.55)'; ctx.font = '9px sans-serif';
+            ctx.textAlign = 'left'; ctx.fillText(dexFmtPpm(lo), 2, cssH - 4);
+            ctx.textAlign = 'right'; ctx.fillText(dexFmtPpm(hi), cssW - 2, cssH - 4);
+
+            _dexDepthGeom = { lo, hi, maxDepth, cssW, cssH, padB, asksCum, bidsCum, X };
+        }
+
+        // Hover readout on the depth chart: price under cursor + cumulative depth each side.
+        function dexDepthHover(ev) {
+            const cv = document.getElementById('dexDepthChart');
+            const tip = document.getElementById('dexDepthTip');
+            const g = _dexDepthGeom;
+            if (!cv || !tip || !g) return;
+            const rect = cv.getBoundingClientRect();
+            const x = ev.clientX - rect.left;
+            const price = g.lo + (x / g.cssW) * (g.hi - g.lo);
+            const askDepth = g.asksCum.filter(p => p.p <= price).reduce((a, p) => Math.max(a, p.c), 0);
+            const bidDepth = g.bidsCum.filter(p => p.p >= price).reduce((a, p) => Math.max(a, p.c), 0);
+            const fmA = formatMDS(askDepth), fmB = formatMDS(bidDepth);
+            tip.style.display = 'block';
+            tip.style.left = x + 'px';
+            tip.style.top = '4px';
+            tip.innerHTML = `${dexFmtPpm(price)} ETH/MDS · asks ${fmA.value}${fmA.prefix} · bids ${fmB.value}${fmB.prefix}`;
+        }
+        function dexDepthLeave() { const t = document.getElementById('dexDepthTip'); if (t) t.style.display = 'none'; }
+
+        // ── Market orders (sequential sweep) ────────────────────────────────────
+        // No atomic multi-fill exists pre-bridge, so a "market order" fills the best
+        // available orders ONE AT A TIME until the requested MDS is covered. Only
+        // on-chain-verified orders are eligible (chat promises can't be swept safely).
+        let dexMarketSide = 'buy';                 // buy = take asks; sell = take bids
+        let _dexMarketBook = { asks: [], bids: [] }; // eligible orders, kept fresh by stats
+        let _dexMarketSweeping = false;
+
+        function dexMarketSetSide(s) {
+            dexMarketSide = s;
+            const buy = document.getElementById('dexMktBuyBtn'), sell = document.getElementById('dexMktSellBtn');
+            if (buy && sell) {
+                buy.style.background = s === 'buy' ? 'var(--accent)' : 'transparent';
+                buy.style.color = s === 'buy' ? 'var(--on-accent)' : 'var(--text-muted)';
+                sell.style.background = s === 'sell' ? 'var(--accent)' : 'transparent';
+                sell.style.color = s === 'sell' ? 'var(--on-accent)' : 'var(--text-muted)';
+            }
+            dexUpdateMarketEstimate();
+        }
+
+        // Show/hide the panel and cache the eligible (verified) orders each side.
+        function dexUpdateMarketPanel(stats) {
+            const panel = document.getElementById('dexMarketPanel');
+            if (!panel) return;
+            // eligible = on-chain verified covenant orders only, best-first
+            _dexMarketBook.asks = stats.askOrders
+                .filter(o => o.covenant && o.covenant.coinId && o.verified === true && dexPricePerMds(o) != null)
+                .sort((a, b) => dexPricePerMds(a) - dexPricePerMds(b));
+            _dexMarketBook.bids = stats.bidOrders
+                .filter(o => o.covenant && o.covenant.coinId && o.verified === true && dexPricePerMds(o) != null)
+                .sort((a, b) => dexPricePerMds(b) - dexPricePerMds(a));
+            const anyEligible = _dexMarketBook.asks.length || _dexMarketBook.bids.length;
+            panel.style.display = anyEligible ? 'block' : 'none';
+            if (anyEligible) dexUpdateMarketEstimate();
+        }
+
+        // Walk the eligible book accumulating orders until `targetMds` is covered.
+        // Returns { fills, filledMds, totalWei, avgPpm, shortfall, bestPpm, worstPpm }.
+        function dexSimulateSweep(targetMds) {
+            const side = dexMarketSide === 'buy' ? _dexMarketBook.asks : _dexMarketBook.bids;
+            const fills = [];
+            let filledMds = 0, totalWei = 0n, worstPpm = null, bestPpm = null;
+            for (const o of side) {
+                if (filledMds >= targetMds - 1e-9) break;
+                const ppm = dexPricePerMds(o);
+                fills.push(o);
+                filledMds += Number(o.mdsAmount) || 0;
+                try { totalWei += BigInt(o.weiAmount); } catch (_) {}
+                if (bestPpm == null) bestPpm = ppm;
+                worstPpm = ppm;
+            }
+            const totalEth = parseFloat(ethers.formatEther(totalWei));
+            const avgPpm = filledMds > 0 ? totalEth / filledMds : null;
+            return { fills, filledMds, totalWei, avgPpm, bestPpm, worstPpm, shortfall: Math.max(0, targetMds - filledMds) };
+        }
+
+        function dexMarketFillPct(pct) {
+            const side = dexMarketSide === 'buy' ? _dexMarketBook.asks : _dexMarketBook.bids;
+            const avail = side.reduce((a, o) => a + (Number(o.mdsAmount) || 0), 0);
+            const inp = document.getElementById('dexMktAmount');
+            if (inp) { inp.value = Math.floor(avail * pct); dexUpdateMarketEstimate(); }
+        }
+
+        function dexUpdateMarketEstimate() {
+            const est = document.getElementById('dexMktEstimate');
+            const btn = document.getElementById('dexMktExecBtn');
+            if (!est || !btn) return;
+            const target = parseFloat(document.getElementById('dexMktAmount')?.value || '0');
+            const side = dexMarketSide === 'buy' ? _dexMarketBook.asks : _dexMarketBook.bids;
+            const avail = side.reduce((a, o) => a + (Number(o.mdsAmount) || 0), 0);
+            const availFmt = formatMDS(avail);
+
+            if (!target || target <= 0) {
+                est.innerHTML = `<span style="color:var(--text-faint);">Available to ${dexMarketSide}: ${availFmt.value} ${availFmt.prefix} across ${side.length} order${side.length !== 1 ? 's' : ''}.</span>`;
+                btn.disabled = true; btn.style.opacity = '.5'; btn.textContent = 'Enter an amount';
+                return;
+            }
+            if (side.length === 0) {
+                est.innerHTML = `<span style="color:var(--warn-accent);">No verified orders to ${dexMarketSide} against right now.</span>`;
+                btn.disabled = true; btn.style.opacity = '.5'; btn.textContent = 'No liquidity';
+                return;
+            }
+
+            const sim = dexSimulateSweep(target);
+            const mdsFmt = formatMDS(sim.filledMds);
+            const eth = prettyEth(sim.totalWei.toString());
+            const usd = weiToUsd(sim.totalWei.toString());
+            const verb = dexMarketSide === 'buy' ? 'pay' : 'receive';
+            const nFills = sim.fills.length;
+            const slip = (sim.bestPpm != null && sim.worstPpm != null && sim.bestPpm > 0)
+                ? Math.abs((sim.worstPpm - sim.bestPpm) / sim.bestPpm) * 100 : 0;
+
+            let lines = [];
+            lines.push(`Fills <b style="color:var(--text-max);">${nFills}</b> order${nFills !== 1 ? 's' : ''} → <b style="color:var(--text-max);">${mdsFmt.value} ${mdsFmt.prefix}</b> MDS`);
+            lines.push(`You ${verb} <b style="color:var(--text-max);">${eth} ETH</b>${usd ? ` (${usd})` : ''}`);
+            if (sim.avgPpm != null) lines.push(`Avg <b style="color:var(--text-max);">${dexFmtPpm(sim.avgPpm)}</b> ETH/MDS`);
+            if (slip > 0.01) lines.push(`<span style="color:${slip > 5 ? 'var(--warn-accent)' : 'var(--text-faint)'};">slippage ${slip.toFixed(2)}%</span>`);
+            if (sim.shortfall > 1e-9) {
+                const sf = formatMDS(sim.shortfall);
+                lines.push(`<span style="color:var(--warn-accent);">only ${mdsFmt.value} ${mdsFmt.prefix} available — ${sf.value} ${sf.prefix} short</span>`);
+            }
+            est.innerHTML = lines.join(' · ');
+
+            btn.disabled = false; btn.style.opacity = '1';
+            const label = dexMarketSide === 'buy' ? 'Buy' : 'Sell';
+            btn.textContent = sim.shortfall > 1e-9
+                ? `${label} available ${mdsFmt.value} ${mdsFmt.prefix} (${nFills} order${nFills !== 1 ? 's' : ''})`
+                : `${label} ${mdsFmt.value} ${mdsFmt.prefix} · ${nFills} order${nFills !== 1 ? 's' : ''}`;
+        }
+
+        // Execute: fill each order in the sweep sequentially. Because each fill is its
+        // own Base tx, we fire them one after another and report progress. Market SELL
+        // is only meaningful once the user is a maker; pre-bridge we only support the
+        // taker-side sweep (buying MDS by taking asks, or selling MDS by taking bids).
+        async function dexExecuteMarketOrder() {
+            if (_dexMarketSweeping) return;
+            if (!evmSigner) return showToast("Connect MetaMask first", "error");
+            const target = parseFloat(document.getElementById('dexMktAmount')?.value || '0');
+            if (!target || target <= 0) return;
+            const sim = dexSimulateSweep(target);
+            if (!sim.fills.length) return showToast("No verified orders to fill.", "error");
+
+            const mdsFmt = formatMDS(sim.filledMds);
+            const eth = prettyEth(sim.totalWei.toString());
+            const verb = dexMarketSide === 'buy' ? 'pay' : 'receive';
+            const ok = confirm(`Market ${dexMarketSide}: fill ${sim.fills.length} order(s) for ${mdsFmt.value} ${mdsFmt.prefix} MDS.\nYou ${verb} ~${eth} ETH.\n\nEach order is a separate on-chain transaction — you'll approve them one at a time. Continue?`);
+            if (!ok) return;
+
+            _dexMarketSweeping = true;
+            const btn = document.getElementById('dexMktExecBtn');
+            if (btn) { btn.disabled = true; btn.style.opacity = '.6'; }
+            let done = 0, failed = 0;
+            for (const o of sim.fills) {
+                // Re-check the order is still live (someone else may have taken it).
+                const stillLive = dexOrderbook.find(x => (x.offerId || x.nonce) === (o.offerId || o.nonce));
+                if (!stillLive) { continue; }
+                try {
+                    showActivity(`Market ${dexMarketSide}: filling order ${done + 1} of ${sim.fills.length}…`);
+                    // Route through the same single-order fill path; await each in turn.
+                    await dexFillLimitL1(o);
+                    done++;
+                } catch (err) {
+                    failed++;
+                    // keep going — one failed fill shouldn't abort the whole sweep
+                }
+            }
+            hideActivity();
+            _dexMarketSweeping = false;
+            const inp = document.getElementById('dexMktAmount'); if (inp) inp.value = '';
+            dexUpdateMarketEstimate();
+            if (done && !failed) showToast(`Market ${dexMarketSide} complete: ${done} order(s) filled.`, "success");
+            else if (done && failed) showToast(`Filled ${done} order(s), ${failed} failed. Check your swaps.`, "error");
+            else showToast(`Market ${dexMarketSide} failed — no orders filled.`, "error");
         }
 
         function renderDexSwaps() {
@@ -5250,15 +6152,9 @@ document.getElementById('btnExport').onclick = () => {
                     statusText = 'MDS locked (verified). Lock your ETH to proceed.';
                     btn = `<button style="margin:0;width:100%;padding:10px;font-size:13px;background:var(--accent);color:#000;" onclick="dexLockBase(${idx})">Pay ${eth} ETH to HTLC</button>`;
                 } else if (s.status === 'ready_to_claim_base') {
-                    if (s.counterpartyLocked) {
-                        statusText = 'Counterparty locked ETH. Claim it now (this reveals the secret).';
-                        btn = `<button style="margin:0;width:100%;padding:10px;font-size:13px;background:var(--accent);color:#000;" onclick="dexClaimBase(${idx})">Claim ${eth} ETH</button>`;
-                    } else {
-                        statusText = 'MDS locked. Waiting for the counterparty to lock ETH…';
-                    }
+                    statusText = 'Counterparty payment detected — claiming for you automatically…';
                 } else if (s.status === 'ready_to_claim_midstate') {
-                    statusText = 'ETH locked. Auto-claiming MDS when the secret is revealed…';
-                    btn = `<button style="margin:0;width:100%;padding:10px;font-size:13px;background:var(--text-max);color:#000;" onclick="dexClaimMidstate(${idx})">Claim MDS now</button>`;
+                    statusText = 'Counterparty payment detected — claiming for you automatically…';
                 } else if (s.status === 'waiting_for_delivery') {
                     // Covenant buyer: the seller delivers our MDS (no fee, no MDS needed). We
                     // only need the self-deliver fallback if they stall — and only once the
@@ -5280,16 +6176,31 @@ document.getElementById('btnExport').onclick = () => {
                 } else if (s.status === 'limit_funding') {
                     statusText = 'Funding the limit-order bundle on-chain (one transaction)…';
                 } else if (s.status === 'limit_posted') {
-                    statusText = 'Limit order live on-chain — waiting for a taker to lock ETH.';
+                    statusText = 'Sell order live — waiting for a buyer.';
                     btn = `<button style="margin:0;width:100%;padding:8px;font-size:12px;background:transparent;border:1px solid var(--border-bright);color:var(--text-bright);" onclick="dexRefundLimitOrder('${s.offerId}')">Reclaim MDS (after timeout)</button>`;
+                    if (!s.announced && s.orderGroup) {
+                        // Funding confirmed but the announce burn never landed: chain-scanning
+                        // takers can't discover this order yet (chat gossip still advertises it).
+                        statusText = "MDS locked on-chain, but the announce hasn't landed — takers scanning the chain can't see this order yet (chat gossip still advertises it).";
+                        btn = `<button style="margin:0 0 8px;width:100%;padding:9px;font-size:12px;background:var(--accent);color:#000;" onclick="dexRetryAnnounce('${s.orderGroup}')">Retry on-chain announce</button>` + btn;
+                    }
                 } else if (s.status === 'limit_waiting_secret') {
                     statusText = 'ETH locked. Waiting for the maker to reveal the preimage; your MDS auto-claims.';
                 } else if (s.status === 'limit_filling') {
                     statusText = 'Preimage revealed — claiming your MDS on L1…';
                 } else if (s.status === 'limit_refunding') {
-                    statusText = 'Reclaiming your MDS from the expired covenant…';
+                    statusText = 'Reclaiming your MDS from the expired escrow…';
                 } else if (s.status === 'limit_refunded') {
                     statusText = 'Order expired — your MDS was reclaimed.';
+                } else if (s.status === 'submarine_waiting_l2') {
+                    statusText = 'ETH locked (submarine). Waiting for the maker to route your MDS over L2 — it auto-claims. Auto-refunds if they never do.';
+                } else if (s.status === 'submarine_routing') {
+                    statusText = 'Taker locked ETH under an L2 hashlock — MDS routed over your channel. Sweeping the ETH when they claim…';
+                } else if (s.status === 'submarine_swept') {
+                    statusText = 'Submarine swap complete — ETH swept. This unit\'s L1 MDS is still locked under the original hash.';
+                    btn = `<button style="margin:0;width:100%;padding:8px;font-size:12px;background:transparent;border:1px solid var(--border-bright);color:var(--text-bright);" onclick="dexRefundLimitOrder('${s.offerId}')">Reclaim L1 MDS (after timeout)</button>`;
+                } else if (s.status === 'submarine_refunded') {
+                    statusText = 'Submarine swap expired — your ETH was refunded.';
                 } else if (s.status === 'completed') {
                     statusText = 'Swap complete.';
                 }
@@ -5303,6 +6214,8 @@ document.getElementById('btnExport').onclick = () => {
                                       (s.status === 'limit_posted') ||
                                       (s.status === 'limit_funding') ||
                                       (s.status === 'limit_waiting_secret') ||
+                                      (s.status === 'submarine_waiting_l2') ||
+                                      (s.status === 'submarine_routing') ||
                                       (s.status === 'delivering_midstate' && !s.settleError);
                 let statusHtml = statusText;
                 if (s.phase) {

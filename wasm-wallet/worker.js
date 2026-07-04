@@ -471,6 +471,60 @@ function _annHb(h){ h=(h||"").replace(/^0x/,''); const a=new Uint8Array(h.length
 function _annU(n,bytes){ const a=new Uint8Array(bytes); let v=BigInt(n); for(let i=bytes-1;i>=0;i--){a[i]=Number(v&0xffn);v>>=8n;} return a; }
 function _annRd(a,o,n){ let v=0n; for(let i=0;i<n;i++) v=(v<<8n)|BigInt(a[o+i]); return v; }
 function _annLog2(v){ let n=BigInt(v),e=0; if(n<=0n) throw new Error("value<=0"); while(n>1n){ if(n&1n) throw new Error("value not power of two"); n>>=1n; e++; } return e; }
+// Node-side DataBurn payload cap (types.rs MAX_BURN_DATA_SIZE = 80, an OP_RETURN analog).
+// CONSENSUS — DO NOT RAISE. A self-contained MDXA announcement is 72B header + 81B/unit, so
+// it can NEVER fit one burn. Instead the wallet splits each announcement into MDXF fragments
+// — 12B header (magic4 + groupId6 + idx1 + total1) + up to 68B of MDXA bytes — and ships ALL
+// fragments as separate 0-value burns inside the SAME funding tx, so they land in one block
+// and reassemble trivially. Multiple burns per tx are already legal; consensus is untouched.
+const NODE_MAX_BURN_BYTES = 80;
+const FRAG_MAGIC = "4d445846";      // "MDXF"
+const FRAG_HEADER_BYTES = 12;       // magic4 + groupId6 + idx1 + total1
+const FRAG_PAYLOAD_BYTES = NODE_MAX_BURN_BYTES - FRAG_HEADER_BYTES; // 68
+
+// Split a full MDXA announcement (hex) into MDXF fragment burns (hex[]), each <= 80 bytes.
+function fragmentAnnouncement(annHex, groupId) {
+    const g6 = normalizeHex(_annHb((groupId || "").padStart(12, '0')).slice(0, 6)); // same slice as encodeAnnouncement
+    const body = annHex.toLowerCase();
+    const step = FRAG_PAYLOAD_BYTES * 2;
+    const total = Math.max(1, Math.ceil(body.length / step));
+    if (total > 255) throw new Error("Announcement too large: > 255 fragments");
+    const frags = [];
+    for (let i = 0; i < total; i++) {
+        frags.push(FRAG_MAGIC + g6 + i.toString(16).padStart(2, '0') + total.toString(16).padStart(2, '0') + body.slice(i * step, (i + 1) * step));
+    }
+    return frags;
+}
+
+// Parse one MDXF fragment (hex) -> { key, idx, total, chunk } or null.
+function tryParseFragment(hex) {
+    if (typeof hex !== 'string') return null;
+    hex = hex.replace(/^0x/, '').toLowerCase();
+    if (hex.length < FRAG_HEADER_BYTES * 2 + 2 || hex.slice(0, 8) !== FRAG_MAGIC) return null;
+    const groupId = hex.slice(8, 20);
+    const idx = parseInt(hex.slice(20, 22), 16);
+    const total = parseInt(hex.slice(22, 24), 16);
+    if (!total || idx >= total) return null;
+    return { key: groupId + ':' + total, idx, total, chunk: hex.slice(24) };
+}
+
+// Pull every DataBurn payload out of a block object, whatever shape serde gave it.
+// LightRequest::GetBlock serializes core types with derive(Serialize): externally-tagged
+// enums with Vec<u8> as JSON NUMBER ARRAYS — {"DataBurn":{"payload":[77,68,...],...}} —
+// which no hex-run regex can ever match. So we walk the object tree and accept
+// number-array OR hex-string payloads (normalizeHex handles both).
+function extractBurnPayloadHexes(node, out) {
+    if (!node || typeof node !== 'object') return out;
+    if (node.DataBurn && node.DataBurn.payload !== undefined) out.push(normalizeHex(node.DataBurn.payload));
+    if (node.type === 'data_burn' && node.payload !== undefined) out.push(normalizeHex(node.payload));
+    for (const k in node) {
+        const v = node[k];
+        if (v && typeof v === 'object') extractBurnPayloadHexes(v, out);
+    }
+    return out;
+}
+
+
 function encodeAnnouncement({ makerEvmAddr, makerMdsPk, timeoutHeight, groupId, units }) {
     if (!units.length || units.length > 255) throw new Error("unit count out of range");
     const parts = [ _annHb(ANN_MAGIC), new Uint8Array([ANN_VER]), _annHb(makerEvmAddr), _annHb(makerMdsPk),
@@ -973,6 +1027,27 @@ self.onmessage = async (e) => {
                 { kind: "signature", value: normalizeHex(jsonBytes) }
             ]).catch(()=>{});
         }
+        else if (type === 'DEX_BROADCAST_SUBMARINE') {
+            // FEATURE 2, taker → maker (cmd 204): "I'm taking this limit unit via an L2
+            // submarine swap — here is my L2 identity and the NEW invoice hashlock."
+            // Keyed on the covenant coinId: the one identifier BOTH sides always share.
+            // (Maker unit offerIds are random 8-byte hex; a taker who discovered the order
+            // by chain scan only has 'chain:<coinId…>' — offerId alone would never match.)
+            // Carries no secret — only its hash. The maker routes MDS against this hash
+            // ONLY after seeing real ETH locked under it on Base, so spoofing this message
+            // costs an attacker an actual ETH lock, which just completes the swap honestly.
+            const full = {
+                coinId: payload.coinId,
+                offerId: payload.offerId,
+                takerL2Pk: getPrimaryMssPk(),
+                takerEvmAddr: payload.takerEvmAddr,
+                submarineHash: payload.secretHash
+            };
+            const jsonBytes = new TextEncoder().encode(JSON.stringify(full));
+            submitClientMinedChat([255, 204], null, [
+                { kind: "signature", value: normalizeHex(jsonBytes) }
+            ]).catch(()=>{});
+        }
         else if (type === 'DEX_LOCK_MIDSTATE') {
             if (isSending) throw new Error("Wallet busy.");
             isSending = true;
@@ -1131,25 +1206,53 @@ self.onmessage = async (e) => {
                     const secretHash = blake3_hash_hex(rawSecret);
                     const covScriptHex = build_limit_order_covenant_bytecode_hex(secretHash, BigInt(v), BigInt(timeoutHeight), myPk);
                     const covAddr = blake3_hash_hex(covScriptHex);
-                    return { v, rawSecret, secretHash, covAddr, weiAmount: u.weiAmount };
+                    // Pre-generate the unit's coin salt CLIENT-SIDE. The MDXA announcement must
+                    // carry each salt (takers recompute coin_id = H(covAddr‖value‖salt) to bind
+                    // the coin to the covenant), so choosing salts here — instead of letting
+                    // prepare_fund_many roll them — is what lets the announcement be encoded
+                    // BEFORE the funding tx and ride inside it as a burn (atomic announce).
+                    const salt = Array.from(crypto.getRandomValues(new Uint8Array(32))).map(b => b.toString(16).padStart(2, '0')).join('');
+                    return { v, rawSecret, secretHash, covAddr, salt, weiAmount: u.weiAmount };
                 });
-                const fundings = built.map(b => ({ address: normalizeHex(b.covAddr), amount: b.v }));
+                const fundings = built.map(b => ({ address: normalizeHex(b.covAddr), amount: b.v, salt: b.salt }));
 
                 if (!mssCachesReady) await loadMssCaches();
-                // MSS safety fast-forward (identical policy to performContractTx).
-                for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
-                    try {
-                        const mssState = await rpc.getMssState(addr);
-                        if (mssState && mssState.next_index > mss.next_leaf) mss.next_leaf = mssState.next_index + 20;
-                    } catch (e) { throw new Error("Safety Check Failed. Aborting to prevent key reuse."); }
-                    wallet.set_mss_leaf_index(addr, mss.next_leaf);
-                }
+                // MSS safety fast-forward (identical policy to performContractTx), with retries.
+                dexPhase("Verifying MSS safety indices\u2026");
+                await verifyMssSafetyIndices(dexPhase);
                 const utxoArray = Object.values(wState.utxos).map(u =>
                     (u.is_mss && wState.mssAddrs[u.address]) ? { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf } : u);
 
-                // ONE transaction funding all N covenant addresses.
-                const ctxStr = wallet.prepare_fund_many(JSON.stringify(utxoArray), JSON.stringify(fundings), wState.nextWotsIndex);
+                // ATOMIC ANNOUNCE: encode ONE MDXA announcement for the whole bundle NOW
+                // (we chose the salts above) and ship it as MDXF fragment burns riding IN
+                // the funding tx itself — each fragment <= the 80-byte consensus DataBurn
+                // cap, which stays untouched. One commit+reveal: covenants and every
+                // fragment land in the same transaction/block, so discovery is atomic with
+                // funding and the scanner reassembles them from a single block.
+                const announcementHex = encodeAnnouncement({
+                    makerEvmAddr, makerMdsPk: myPk, timeoutHeight, groupId,
+                    units: built.map(b => ({ secretHash: b.secretHash, salt: b.salt, value: b.v, weiAmount: b.weiAmount }))
+                });
+                const annFrags = fragmentAnnouncement(announcementHex, groupId);
+                const burnsJson = JSON.stringify(annFrags.map(h => ({ payload: h, value_burned: 0 })));
+
+                // ONE transaction funding all N covenant addresses (+ the fragment burns).
+                const ctxStr = wallet.prepare_fund_many(JSON.stringify(utxoArray), JSON.stringify(fundings), wState.nextWotsIndex, burnsJson);
                 const ctx = JSON.parse(ctxStr);
+
+                // FEATURE-DETECT the WASM build. A pkg from the current lib.rs honours the
+                // per-funding salts and embeds EVERY fragment; older pkgs ignore the extra
+                // arg and the unknown salt field and roll their own salts. Both must hold
+                // together, else fall back to the separate-announce path with the ctx's
+                // REAL salts.
+                const burnPayloads = new Set((ctx.outputs || []).filter(o => o.type === 'data_burn').map(o => String(o.payload).toLowerCase()));
+                const burnEmbedded = annFrags.every(h => burnPayloads.has(h.toLowerCase()));
+                const saltsHonoured = built.every(b => {
+                    const o = (ctx.outputs || []).find(x => x.type === 'standard' && normalizeHex(x.address) === normalizeHex(b.covAddr));
+                    return o && normalizeHex(o.salt) === b.salt;
+                });
+                const atomicAnnounce = burnEmbedded && saltsHonoured;
+                if (!atomicAnnounce) self.postMessage({ type: 'LOG', payload: 'prepare_fund_many: wasm build without atomic announce — using separate announce tx.' });
 
                 // Map each unit to its funded coin NOW: ctx.outputs carries the random salts, and a
                 // coin is unspendable without its salt (coin_id = H(addr||value||salt)). The salt is
@@ -1175,6 +1278,7 @@ self.onmessage = async (e) => {
                 if (!wState.pendingLimitBundles) wState.pendingLimitBundles = {};
                 wState.pendingLimitBundles[groupId] = {
                     groupId, units: outUnits, commitment: ctx.commitment,
+                    announcedAtomically: atomicAnnounce,
                     firstCoinId: outUnits[0].coin.coin_id, createdAt: Date.now()
                 };
 
@@ -1208,13 +1312,19 @@ self.onmessage = async (e) => {
                 await performScan();
 
                 // Funded and confirmed — hand the units to the UI, then clear the recovery record.
-                self.postMessage({ type: 'DEX_LIMIT_BUNDLE_CREATED', payload: { groupId, units: outUnits } });
+                self.postMessage({ type: 'DEX_LIMIT_BUNDLE_CREATED', payload: { groupId, units: outUnits, announcedAtomically: atomicAnnounce } });
                 if (wState.pendingLimitBundles) delete wState.pendingLimitBundles[groupId];
                 await saveState();
                 dexPhase(null);
             } catch (err) {
+                let errMsg = (err && err.message) || String(err);
+                // A wasm trap ("unreachable") leaves the wallet object POISONED: wasm-bindgen's
+                // borrow flag stays set, so every later wallet.* call throws "recursive use of
+                // an object … unsafe aliasing in rust". Only reloading re-instantiates the
+                // module — say so, instead of letting in-place retries mislead.
+                if (/unreachable|unsafe aliasing/i.test(errMsg)) errMsg += " (the WASM module hit a fatal trap — reload the page before retrying)";
                 if (payload && payload.groupId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId: payload.groupId, phase: null } });
-                self.postMessage({ type: 'DEX_LIMIT_BUNDLE_FAILED', payload: { groupId: payload && payload.groupId, error: (err && err.message) || String(err) } });
+                self.postMessage({ type: 'DEX_LIMIT_BUNDLE_FAILED', payload: { groupId: payload && payload.groupId, error: errMsg } });
             } finally {
                 isSending = false;
             }
@@ -1236,7 +1346,7 @@ self.onmessage = async (e) => {
                     try { const inp = await rpc.checkCoin(normalizeHex(rec.firstCoinId)); funded = !!(inp && inp.exists); }
                     catch (e) { continue; }   // RPC not ready — leave it; a later call retries
                     if (funded) {
-                        self.postMessage({ type: 'DEX_LIMIT_BUNDLE_CREATED', payload: { groupId, units: rec.units, recovered: true } });
+                        self.postMessage({ type: 'DEX_LIMIT_BUNDLE_CREATED', payload: { groupId, units: rec.units, recovered: true, announcedAtomically: !!rec.announcedAtomically } });
                         delete pend[groupId]; changed = true;
                     } else if (Date.now() - (rec.createdAt || 0) > GRACE_MS) {
                         delete pend[groupId]; changed = true;
@@ -1247,16 +1357,22 @@ self.onmessage = async (e) => {
             } catch (e) { /* best-effort recovery */ }
         }
         else if (type === 'DEX_ANNOUNCE_BUNDLE') {
-            // MAKER: publish the bundle on-chain as a 0-value DataBurn so takers can discover it by
-            // scanning the chain — independent of the ephemeral chat bus and of the maker staying
-            // online. Permanent once mined, so it's published ONCE (no re-announce needed).
+            // MAKER FALLBACK: with a current wasm build the announcement fragments ride
+            // INSIDE the funding tx (see DEX_CREATE_LIMIT_BUNDLE), so this handler only
+            // serves older pkg builds and manual/auto re-announce retries. Old prepare_spend
+            // carries ONE burn per tx, so fragments go out as consecutive small sends —
+            // usually the same or adjacent blocks; the scanner's persistent fragment pool
+            // reassembles across blocks either way. A retry after partial failure re-sends
+            // all fragments (duplicates are benign: same key/idx overwrite, and orders
+            // dedupe by coinId — it only costs fees).
             try {
-                const { groupId, makerEvmAddr, makerMdsPk, timeoutHeight, units } = payload;
-                const announcementHex = encodeAnnouncement({ makerEvmAddr, makerMdsPk, timeoutHeight, groupId, units });
-                const myAddr = compute_p2pk_address_hex(getPrimaryMssPk());
-                // Send the smallest coin (1) to self + attach the 0-value burn; net cost is just the fee.
-                await performSend(myAddr, 1, announcementHex, 0);
-                self.postMessage({ type: 'DEX_ANNOUNCE_DONE', payload: { groupId } });
+                const announcementHex = encodeAnnouncement(payload);
+                const frags = fragmentAnnouncement(announcementHex, payload.groupId);
+                for (let i = 0; i < frags.length; i++) {
+                    if (frags.length > 1) self.postMessage({ type: 'LOG', payload: `Announcing fragment ${i + 1}/${frags.length}…` });
+                    await performSend(myAddr, 1, frags[i], 0);
+                }
+                self.postMessage({ type: 'DEX_ANNOUNCE_DONE', payload: { groupId: payload.groupId } });
             } catch (err) {
                 self.postMessage({ type: 'DEX_ANNOUNCE_FAILED', payload: { groupId: payload && payload.groupId, error: (err && err.message) || String(err) } });
             }
@@ -1275,16 +1391,34 @@ self.onmessage = async (e) => {
                 const orders = [];
                 const seenCoin = new Set();
                 const BATCH = 12;
+                let fragPoolDirty = false;
                 for (let h = from; h <= tip; h += BATCH) {
                     const heights = [];
                     for (let k = h; k < h + BATCH && k <= tip; k++) heights.push(k);
                     const blocks = await Promise.all(heights.map(ht => rpc.getBlock(ht).then(b => b).catch(() => null)));
                     for (const blk of blocks) {
                         if (!blk) continue;
-                        const blob = JSON.stringify(blk);
-                        const matches = blob.match(/[0-9a-fA-F]{144,}/g);
-                        if (!matches) continue;
-                        for (const m of matches) {
+                        // Burns arrive as serde number-arrays, not hex runs, so walk the
+                        // block object instead of regexing its JSON.
+                        const payloads = extractBurnPayloadHexes(blk, []);
+                        const fullAnns = [];
+                        for (const p of payloads) {
+                            const frag = tryParseFragment(p);
+                            if (frag) {
+                                wState.annFragPool = wState.annFragPool || {};
+                                const slot = wState.annFragPool[frag.key] || { total: frag.total, parts: {}, ts: Date.now() };
+                                if (!slot.parts[frag.idx]) { slot.parts[frag.idx] = frag.chunk; slot.ts = Date.now(); fragPoolDirty = true; }
+                                wState.annFragPool[frag.key] = slot;
+                                if (Object.keys(slot.parts).length === slot.total) {
+                                    let full = '';
+                                    for (let i = 0; i < slot.total; i++) full += slot.parts[i];
+                                    fullAnns.push(full);
+                                }
+                            } else if (p.slice(0, 8) === ANN_MAGIC) {
+                                fullAnns.push(p);   // tolerate any full-size announcement shape
+                            }
+                        }
+                        for (const m of fullAnns) {
                             const ann = tryDecodeAnnouncement(m);
                             if (!ann) continue;
                             for (const u of ann.units) {
@@ -1314,6 +1448,16 @@ self.onmessage = async (e) => {
                     }
                     self.postMessage({ type: 'DEX_SCAN_PROGRESS', payload: { at: Math.min(h + BATCH, tip), tip, from } });
                 }
+                // Persist partial fragment sets so announcements whose fragments straddle
+                // a scan boundary (possible only via the multi-tx FALLBACK announce path)
+                // still assemble on a later scan; GC stale partials after ~3 days.
+                if (wState.annFragPool) {
+                    const cutoff = Date.now() - 72 * 3600 * 1000;
+                    for (const k of Object.keys(wState.annFragPool)) {
+                        if (wState.annFragPool[k].ts < cutoff) { delete wState.annFragPool[k]; fragPoolDirty = true; }
+                    }
+                }
+                if (fragPoolDirty) { try { await saveState(); } catch (_) {} }
                 self.postMessage({ type: 'DEX_ANNOUNCED_ORDERS', payload: { orders, scannedToHeight: tip } });
             } catch (err) {
                 self.postMessage({ type: 'DEX_ANNOUNCED_ORDERS', payload: { orders: [], scannedToHeight: networkHeight, error: (err && err.message) || String(err) } });
@@ -1841,7 +1985,13 @@ self.onmessage = async (e) => {
 
             // Tie the L2 HTLC timeout under the Base refund window so the maker can always sweep
             // ETH before refunding and the L2 leg can't outlive the Base leg unsafely.
-            const htlcTimeout = networkHeight + Math.max(20, Math.floor(Number(baseRefundSecs) / 12 / 2));
+            // UNITS FIX: htlcTimeout is a MIDSTATE height (~60s blocks), so convert seconds
+            // with /60, not /12 (Base's block time). The old math made the L2 leg ~5× LONGER
+            // than the Base refund window (900 blocks ≈ 15h vs 6h), letting a taker refund
+            // their ETH on Base and STILL claim the L2 HTLC afterwards — taking both legs.
+            // Half the window (6h → ~3h of Midstate blocks) leaves the maker ~3h of Base
+            // lock left to sweep after the latest possible L2 claim reveals the preimage.
+            const htlcTimeout = networkHeight + Math.max(20, Math.floor(Number(baseRefundSecs) / 60 / 2));
 
             let nA = chan.latest_state.alice_amt, nB = chan.latest_state.bob_amt;
             if (chan.is_alice) nA -= Number(mdsAmount); else nB -= Number(mdsAmount);
@@ -1864,6 +2014,44 @@ self.onmessage = async (e) => {
             ]).catch(() => {});
 
             self.postMessage({ type: 'DEX_LOCK_L2_SENT', payload: { offerId, chanId, secretHash } });
+        }
+
+        else if (type === 'DEX_CHECK_L2_CHANNEL') {
+            // FEATURE 2 pre-flight (TAKER side): verify — BEFORE any ETH is locked — that a
+            // fully-signed channel to the maker exists whose MAKER-side balance can cover the
+            // trade. Mirrors DEX_LOCK_L2's own channel selection from the other side, so a
+            // passing check here means the maker's route will actually find a channel.
+            const { offerId, peerPk, amount } = payload;
+            let ok = false, reason = "No open L2 channel to the maker. Open one on the Lightning tab first.";
+            for (const c of Object.values(wState.l2_channels || {})) {
+                const peer = c.is_alice ? c.bob_pk : c.alice_pk;
+                if (peer !== peerPk) continue;
+                if (!c.latest_state.is_fully_signed) { reason = "Your channel to the maker has an unconfirmed state — retry in a moment."; continue; }
+                const peerBal = c.is_alice ? c.latest_state.bob_amt : c.latest_state.alice_amt;
+                if (peerBal < Number(amount)) { reason = `The maker's channel balance (${peerBal} MDS) can't cover ${amount} MDS.`; continue; }
+                ok = true; reason = null; break;
+            }
+            self.postMessage({ type: 'DEX_L2_CHANNEL_STATUS', payload: { offerId, ok, reason } });
+        }
+
+        else if (type === 'DEX_SUBMARINE_STATUS') {
+            // FEATURE 2 read-only poll, used by BOTH submarine roles (a poll — unlike a push —
+            // survives page reloads mid-swap):
+            //   observedSecret — preimage harvested from a cmd-43 claim seen on the chat bus
+            //                    (lets the MAKER sweep the Base ETH);
+            //   claimedAmount  — an inbound HTLC our own wallet auto-claimed as destination
+            //                    (lets the TAKER mark the swap complete);
+            //   htlcPending    — the hash still sits in a live channel state (the maker's
+            //                    re-route guard: re-issuing DEX_LOCK_L2 is only safe when the
+            //                    HTLC is provably absent, otherwise it would double-pay).
+            const { offerId, secretHash } = payload;
+            const observedSecret = (wState.l2_observed_secrets && wState.l2_observed_secrets[secretHash]) || null;
+            const claimedAmount = (wState.l2_claimed && wState.l2_claimed[secretHash] != null) ? wState.l2_claimed[secretHash] : null;
+            let htlcPending = false;
+            for (const c of Object.values(wState.l2_channels || {})) {
+                if ((c.latest_state.htlcs || []).some(h => h.secret_hash === secretHash)) { htlcPending = true; break; }
+            }
+            self.postMessage({ type: 'DEX_SUBMARINE_STATUS_RESULT', payload: { offerId, secretHash, observedSecret, claimedAmount, htlcPending } });
         }
 
         else if (type === 'DEX_CHECK_SETTLED') {
@@ -2857,6 +3045,47 @@ function addUtxo(address, value, salt, coinId, commitment = null) {
  * @returns {Promise<void>}
  * @throws {Error} On any failure (insufficient funds, network errors, timeouts).
  */
+/**
+ * MSS safety fast-forward, shared by performSend / performContractTx / the DEX
+ * bundle funding. Verifies the local MSS leaf index against the node for every
+ * tracked MSS address so a used leaf can never be re-signed.
+ *
+ * RESILIENCE FIX: each getMssState now gets 3 attempts with backoff before we
+ * abort. The old code took ONE un-retried shot per address over WebRTC — whose
+ * stream layer throws on a momentary disconnect flag, a stale-connection
+ * newStream, or a single 15s read timeout — so any transient hiccup surfaced as
+ * the scary "Safety Check Failed / key reuse" abort. It hit the DEX announce
+ * hardest: that is the first send fired immediately after the bundle-funding
+ * flow has spent minutes hammering the connection (PoW, block polling, then a
+ * full rescan), exactly when the channel is most likely mid-renegotiation.
+ * Aborting when the state is truly unverifiable is still the right policy;
+ * giving up on the first blip was the bug.
+ */
+async function verifyMssSafetyIndices(onProgress) {
+    const ATTEMPTS = 3, BACKOFF_MS = [0, 1500, 4000];
+    for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
+        let mssState = null, lastErr = null, got = false;
+        for (let i = 0; i < ATTEMPTS; i++) {
+            if (BACKOFF_MS[i]) await new Promise(r => setTimeout(r, BACKOFF_MS[i]));
+            try { mssState = await rpc.getMssState(addr); got = true; break; }
+            catch (e) {
+                lastErr = e;
+                if (onProgress && i < ATTEMPTS - 1) onProgress(`Network hiccup verifying MSS state \u2014 retry ${i + 1}/${ATTEMPTS - 1}\u2026`);
+            }
+        }
+        if (!got) {
+            throw new Error("Safety Check Failed. Aborting to prevent key reuse. " +
+                `(Could not verify MSS key state after ${ATTEMPTS} attempts: ` +
+                `${(lastErr && lastErr.message) || lastErr}. Nothing was broadcast \u2014 safe to retry.)`);
+        }
+        if (mssState && mssState.next_index > mss.next_leaf) {
+            mss.next_leaf = mssState.next_index + 20;
+            self.postMessage({ type: 'LOG', payload: `\u26a0\ufe0f Fast-forwarded MSS index for safety.` });
+        }
+        wallet.set_mss_leaf_index(addr, mss.next_leaf);
+    }
+}
+
 async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0, sendAll = false) {
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Selecting coins and building transaction..." } });
     await new Promise(r => setTimeout(r, 10));
@@ -2864,18 +3093,7 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
     if (!mssCachesReady) await loadMssCaches();
 
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Verifying MSS safety indices..." } });
-    for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
-        try {
-            const mssState = await rpc.getMssState(addr);
-            if (mssState && mssState.next_index > mss.next_leaf) {
-                mss.next_leaf = mssState.next_index + 20;
-                self.postMessage({ type: 'LOG', payload: `⚠️ Fast-forwarded MSS index for safety.` });
-            }
-        } catch (e) {
-            throw new Error(`Safety Check Failed. Aborting to prevent key reuse.`);
-        }
-        wallet.set_mss_leaf_index(addr, mss.next_leaf);
-    }
+    await verifyMssSafetyIndices((m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
 
     const utxoArray = Object.values(wState.utxos).map(u => {
         if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
@@ -3046,17 +3264,7 @@ async function performContractTx(req) {
 
     // MSS safety fast-forward (identical policy to performSend).
     prog("Verifying MSS safety indices...");
-    for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
-        try {
-            const mssState = await rpc.getMssState(addr);
-            if (mssState && mssState.next_index > mss.next_leaf) {
-                mss.next_leaf = mssState.next_index + 20;
-            }
-        } catch (e) {
-            throw new Error("Safety Check Failed. Aborting to prevent key reuse.");
-        }
-        wallet.set_mss_leaf_index(addr, mss.next_leaf);
-    }
+    await verifyMssSafetyIndices(prog);
 
     const utxoArray = Object.values(wState.utxos).map(u => {
         if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
@@ -3407,17 +3615,35 @@ async function handleL2Chat(msg) {
                     const cState = build_channel_state(coinId, channel.alice_pk, channel.bob_pk, BigInt(nA), BigInt(nB), cNonce, JSON.stringify(cHtlcs));
                     const cSig = wallet.sign_mss_hex(myPk, JSON.parse(cState).commitment);
                     channel.latest_state = { nonce: cNonce, alice_amt: nA, bob_amt: nB, htlcs: cHtlcs, alice_sig: channel.is_alice ? cSig : null, bob_sig: channel.is_alice ? null : cSig, is_fully_signed: false };
+                    // FEATURE 2 (taker side): record the settled claim so the UI (live event
+                    // below, or the DEX_SUBMARINE_STATUS poll after a reload) can complete the
+                    // submarine swap card.
+                    wState.l2_claimed = wState.l2_claimed || {};
+                    wState.l2_claimed[newHtlc.secret_hash] = newHtlc.amount;
                     await saveState();
                     const cBin = packChannelState(cNonce, nA, nB, cHtlcs, cSig);
                     submitClientMinedChat([255, 43], null, [{ kind: "coin_id", value: coinId }, { kind: "signature", value: normalizeHex(cBin) }, { kind: "midstate", value: secret }]).catch(() => {});
-                    // Feature 2 hook: a maker fulfilling a submarine swap now has the preimage
-                    // surfaced and can sweep the Base ETH using `secret`.
+                    // Feature 2 hook: broadcasting cmd 43 above publishes `secret` on the bus —
+                    // a maker fulfilling a submarine swap harvests it there (see cmd 43 below)
+                    // and sweeps the Base ETH with it.
+                    self.postMessage({ type: 'L2_HTLC_CLAIMED', payload: { secretHash: newHtlc.secret_hash, amount: newHtlc.amount } });
                 }
             }
         } else if (cmd === 43) { // CLAIM_HTLC — a hub pulls funds from the upstream sender
             const secret = msg.attachments.find(a => a.kind === "midstate")?.value;
             if (secret) {
                 const secretHash = blake3_hash_hex(secret);
+                // FEATURE 2 (maker side): every cmd-43 claim publishes its preimage on the bus.
+                // Persist it keyed by hash so a maker mid-submarine-swap can sweep the Base ETH
+                // — via the live event below, or via the DEX_SUBMARINE_STATUS poll after a
+                // reload. (Previously this secret was dropped on the floor: it never reached
+                // l2_secrets, which only ever holds preimages for invoices WE generated.)
+                wState.l2_observed_secrets = wState.l2_observed_secrets || {};
+                if (!wState.l2_observed_secrets[secretHash]) {
+                    wState.l2_observed_secrets[secretHash] = secret;
+                    await saveState();
+                    self.postMessage({ type: 'DEX_SUBMARINE_SECRET', payload: { secretHash, secret } });
+                }
                 const route = wState.l2_routes && wState.l2_routes[secretHash];
                 if (route) {
                     const pC = wState.l2_channels[route.fromCoinId];
@@ -3441,7 +3667,7 @@ async function handleL2Chat(msg) {
         self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
     }
     // ── L2 DEX ROUTING ──
-    else if (cmd >= 200 && cmd <= 203) {
+    else if (cmd >= 200 && cmd <= 204) {
         const sigAtt = msg.attachments.find(a => a.kind === "signature")?.value;
         if (!sigAtt) return;
 
@@ -3461,6 +3687,9 @@ async function handleL2Chat(msg) {
                 self.postMessage({ type: 'DEX_LOCKED_RECEIVED', payload });
             } else if (cmd === 203) {
                 self.postMessage({ type: 'DEX_LOCKING_RECEIVED', payload });
+            } else if (cmd === 204) {
+                // Feature 2: a taker's submarine (L2) intent for one of our limit units.
+                self.postMessage({ type: 'DEX_SUBMARINE_RECEIVED', payload });
             }
         } catch (e) {
             console.error("Failed to parse DEX L2 payload", e);
