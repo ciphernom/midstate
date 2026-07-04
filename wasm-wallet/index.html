@@ -1113,8 +1113,7 @@
                             style="flex:1; margin:0; padding:10px; font-size:12px;">Sell MDS → ETH</button>
                         <button type="button" id="dexDirBuy" onclick="dexSetDirection('bid')"
                             style="flex:1; margin:0; padding:10px; font-size:12px; background:transparent; border:1px solid var(--border-bright); color:var(--text-bright);">Buy MDS ← ETH</button>
-                    </div>
-                    <div style="margin-bottom: 4px;">
+                    </div>                    <div style="margin-bottom: 4px;">
                         <label style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">MDS Amount</label>
                         <div class="amount-field">
                             <input type="number" inputmode="decimal" step="any" min="0" id="dexOfferAmount" placeholder="e.g. 1000" oninput="updateDexMdsConversion()">
@@ -4218,6 +4217,23 @@ document.getElementById('btnExport').onclick = () => {
                 if (btn) btn.textContent = 'Place Buy Order';
             }
         };
+        // Belt-and-suspenders: bind the direction buttons via real listeners too, not only
+        // the inline onclick attributes. If anything ever interferes with inline-handler
+        // resolution (extensions, CSP, re-parenting), these still fire. Idempotent.
+        (function bindDexDirectionButtons() {
+            const wire = () => {
+                const sell = document.getElementById('dexDirSell');
+                const buy = document.getElementById('dexDirBuy');
+                if (sell && !sell._dexBound) { sell._dexBound = true; sell.addEventListener('click', () => window.dexSetDirection('ask')); }
+                if (buy && !buy._dexBound) { buy._dexBound = true; buy.addEventListener('click', () => window.dexSetDirection('bid')); }
+                return sell && buy;
+            };
+            if (!wire()) {
+                // DOM not ready yet — retry on load and after a tick.
+                if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wire);
+                setTimeout(wire, 0); setTimeout(wire, 500);
+            }
+        })();
 
         // ── DEX price: ETH / Gwei / Wei entry with live USD value ────────────
         //  Wei are unwieldy to type, so the price is entered in ETH (default)
@@ -4433,7 +4449,8 @@ document.getElementById('btnExport').onclick = () => {
             }
             var unchanged = dexLastBroadcastSig !== null && dexOrderSignature() === dexLastBroadcastSig && !dexForceRebroadcast;
             btn.disabled = unchanged;
-            btn.textContent = unchanged ? 'Order posted \u2713' : 'Place Sell Order';
+            var placeLabel = (typeof dexDirection !== 'undefined' && dexDirection === 'bid') ? 'Place Buy Order' : 'Place Sell Order';
+            btn.textContent = unchanged ? 'Order posted \u2713' : placeLabel;
             btn.style.opacity = unchanged ? '0.5' : '1';
             btn.style.cursor = unchanged ? 'not-allowed' : 'pointer';
             if (row) row.style.display = unchanged ? 'block' : 'none';
@@ -4531,7 +4548,20 @@ document.getElementById('btnExport').onclick = () => {
                 swapMode: 'covenant'
             });
             saveSwaps();
+            // Show our OWN offer in the book immediately. The P2P broadcast never loops
+            // back to the sender, so without this the maker sees an empty book after
+            // posting (buy offers especially — they have nothing on-chain to rediscover).
+            // Tagged so the ladder marks it "my order"; it ages out on the same TTL as
+            // any gossip order if we stop re-broadcasting.
+            if (!dexOrderbook.some(o => (o.offerId || o.nonce) === offerId)) {
+                dexOrderbook.push({
+                    offerId, kind, mdsAmount: mdsAmt, weiAmount: weiAmt,
+                    makerEvmAddr: evmAddress, ts: Date.now(), swapMode: 'covenant', mine: true
+                });
+                saveOrderbook();
+            }
             renderDexSwaps();
+            renderDexOrderbook();
             showToast(kind === 'ask' ? "Sell offer broadcast." : "Buy offer broadcast.", "success");
             dexBeginBroadcastUI(offerId);
             dexFinishBroadcastUI('done', 'Offer broadcast to the P2P relay.');
@@ -5843,7 +5873,7 @@ document.getElementById('btnExport').onclick = () => {
                         <span>${badge}${isMine ? ' <span style="color:var(--text-faint);">(my order)</span>' : ''}</span>
                         <span style="text-align:right;">${mm.value} ${mm.prefix}</span>
                         <span style="text-align:right;color:var(--text-muted);">${prettyEth(o.weiAmount)} ETH${(() => { const u = weiToUsd(o.weiAmount); return u ? `<br><span style="color:var(--text-faint);font-size:9px;">${u}</span>` : ''; })()}</span>
-                        <button class="obtn ${isAsk ? 'ask' : 'bid'}" ${gated ? 'disabled' : ''} onclick="event.stopPropagation();dexAcceptFromBook(${i})">Buy</button>
+                        <button class="obtn ${isAsk ? 'ask' : 'bid'}" ${gated ? 'disabled' : ''} onclick="event.stopPropagation();dexAcceptFromBook(${i})">${isAsk ? 'Buy' : 'Sell'}</button>
                     </div>`;
                 }).join('');
                 row += `<div class="dex-expand">${subs}</div>`;
@@ -5893,14 +5923,17 @@ document.getElementById('btnExport').onclick = () => {
             dexUpdateMarketPanel({ bestAsk, bestBid, askOrders, bidOrders, askDepthMds, bidDepthMds });
         }
 
-        // Depth chart: filled cumulative step curves, asks (right of mid) vs bids (left),
-        // shared price X-axis, with hover readout. Monochrome-safe (uses --green/--red,
-        // which are grey in the default theme but structurally separated by side + label).
-        let _dexDepthGeom = null; // saved for hover hit-testing
+        // Depth chart: a classic mid-centered "valley". Bids accumulate from the mid
+        // price leftward (descending price); asks accumulate from the mid rightward
+        // (ascending price), so the two curves rise away from the spread. The price
+        // window is clipped around the mid so a single far-off order can't crush all
+        // the real liquidity into one pixel. Monochrome-safe.
+        let _dexDepthGeom = null;
         function dexRenderDepthChart(live) {
             const cv = document.getElementById('dexDepthChart');
             if (!cv) return;
-            const ctx = cv.getContext('2d');
+            const ctx = cv.getContext && cv.getContext('2d');
+            if (!ctx) return; // no canvas support (or headless) — skip chart, book still renders
             const cssW = cv.clientWidth || 320, cssH = 140;
             const dpr = window.devicePixelRatio || 1;
             if (cv.width !== Math.floor(cssW * dpr) || cv.height !== Math.floor(cssH * dpr)) { cv.width = Math.floor(cssW * dpr); cv.height = Math.floor(cssH * dpr); }
@@ -5909,69 +5942,93 @@ document.getElementById('btnExport').onclick = () => {
             _dexDepthGeom = null;
 
             const mk = o => ({ p: dexPricePerMds(o), m: Number(o.mdsAmount) || 0 });
-            const asks = live.filter(o => (o.kind || 'ask') === 'ask').map(mk).filter(x => x.p != null && x.m > 0).sort((a, b) => a.p - b.p);
-            const bids = live.filter(o => (o.kind || 'ask') === 'bid').map(mk).filter(x => x.p != null && x.m > 0).sort((a, b) => b.p - a.p);
+            let asks = live.filter(o => (o.kind || 'ask') === 'ask').map(mk).filter(x => x.p != null && x.m > 0).sort((a, b) => a.p - b.p);
+            let bids = live.filter(o => (o.kind || 'ask') === 'bid').map(mk).filter(x => x.p != null && x.m > 0).sort((a, b) => a.p - b.p);
             if (!asks.length && !bids.length) {
                 ctx.fillStyle = 'rgba(150,150,150,.4)'; ctx.font = '11px sans-serif'; ctx.textAlign = 'center';
                 ctx.fillText('No priced orders to chart yet', cssW / 2, cssH / 2);
                 return;
             }
-            let c = 0; const asksCum = asks.map(x => ({ p: x.p, c: (c += x.m) }));
-            c = 0; const bidsCum = bids.map(x => ({ p: x.p, c: (c += x.m) }));
-            const maxDepth = Math.max(asksCum.length ? asksCum[asksCum.length - 1].c : 0, bidsCum.length ? bidsCum[bidsCum.length - 1].c : 0, 1);
-            const prices = [...asks, ...bids].map(x => x.p);
-            const minP = Math.min(...prices), maxP = Math.max(...prices);
-            const pad = (maxP - minP) * 0.06 || maxP * 0.06 || 1;
-            const lo = Math.max(0, minP - pad), hi = maxP + pad;
-            const padB = 16; // bottom axis space
+
+            // Anchor the view on the mid (or the single side's best). Clip the price window
+            // to a multiplicative band around the mid so extreme outliers don't dominate.
+            const bestAsk = asks.length ? asks[0].p : null;                    // lowest ask
+            const bestBid = bids.length ? bids[bids.length - 1].p : null;      // highest bid
+            const mid = (bestAsk != null && bestBid != null) ? (bestAsk + bestBid) / 2 : (bestAsk ?? bestBid);
+            // Window: from mid/BAND to mid*BAND, but never narrower than the best bid/ask.
+            const BAND = 4; // show up to 4x away from mid before clipping
+            let lo = mid / BAND, hi = mid * BAND;
+            if (bestBid != null) lo = Math.min(lo, bestBid);
+            if (bestAsk != null) hi = Math.max(hi, bestAsk);
+            // Expand slightly so best bid/ask aren't flush against the edge.
+            const span = hi - lo || mid || 1;
+            lo = Math.max(0, lo - span * 0.04); hi = hi + span * 0.04;
+
+            const inWin = x => x.p >= lo && x.p <= hi;
+            // Cumulative depth, accumulating AWAY from the mid on each side.
+            // Bids: sort descending price (mid → left), cumulate. Asks: ascending (mid → right).
+            const bidsIn = bids.filter(inWin).sort((a, b) => b.p - a.p);
+            const asksIn = asks.filter(inWin).sort((a, b) => a.p - b.p);
+            let c = 0; const bidsCum = bidsIn.map(x => ({ p: x.p, c: (c += x.m) }));
+            c = 0; const asksCum = asksIn.map(x => ({ p: x.p, c: (c += x.m) }));
+            const maxDepth = Math.max(
+                bidsCum.length ? bidsCum[bidsCum.length - 1].c : 0,
+                asksCum.length ? asksCum[asksCum.length - 1].c : 0, 1
+            );
+
+            const padB = 16;
             const X = p => (hi === lo) ? cssW / 2 : ((p - lo) / (hi - lo)) * cssW;
-            const Y = d => (cssH - padB) - (d / maxDepth) * (cssH - padB - 6) + 0;
+            const Y = d => (cssH - padB) - (d / maxDepth) * (cssH - padB - 8);
 
             const css = getComputedStyle(document.documentElement);
             const green = (css.getPropertyValue('--green') || '#3fb950').trim();
             const red = (css.getPropertyValue('--red') || '#f85149').trim();
-            const isMono = green === red; // default theme: fall back to distinguishable tints
+            const isMono = green === red;
             const bidColor = isMono ? '#6f9f6f' : green;
             const askColor = isMono ? '#b57070' : red;
+            const hex2rgba = (hex, a) => {
+                const mm = hex.replace('#', ''); const n = mm.length === 3 ? mm.split('').map(c => c + c).join('') : mm;
+                return `rgba(${parseInt(n.slice(0,2),16)},${parseInt(n.slice(2,4),16)},${parseInt(n.slice(4,6),16)},${a})`;
+            };
 
-            const drawSide = (pts, stroke, fillRGBA) => {
-                if (!pts.length) return;
-                const sorted = pts.slice().sort((a, b) => a.p - b.p);
+            // Draw one side as a filled step area. `points` must be ordered left→right in X.
+            const drawArea = (pointsLtoR, stroke, fill) => {
+                if (!pointsLtoR.length) return;
                 ctx.beginPath();
-                ctx.moveTo(X(sorted[0].p), cssH - padB);
-                let prevY = Y(sorted[0].c);
-                ctx.lineTo(X(sorted[0].p), prevY);
-                for (let i = 0; i < sorted.length; i++) {
-                    const x = X(sorted[i].p), y = Y(sorted[i].c);
+                ctx.moveTo(X(pointsLtoR[0].p), cssH - padB);
+                let prevY = Y(pointsLtoR[0].c);
+                ctx.lineTo(X(pointsLtoR[0].p), prevY);
+                for (let i = 0; i < pointsLtoR.length; i++) {
+                    const x = X(pointsLtoR[i].p), y = Y(pointsLtoR[i].c);
                     ctx.lineTo(x, prevY); ctx.lineTo(x, y); prevY = y;
                 }
-                ctx.lineTo(X(sorted[sorted.length - 1].p), cssH - padB);
+                ctx.lineTo(X(pointsLtoR[pointsLtoR.length - 1].p), cssH - padB);
                 ctx.closePath();
-                ctx.fillStyle = fillRGBA; ctx.fill();
+                ctx.fillStyle = fill; ctx.fill();
                 ctx.strokeStyle = stroke; ctx.lineWidth = 1.5; ctx.stroke();
             };
-            const hex2rgba = (hex, a) => {
-                const m = hex.replace('#', ''); const n = m.length === 3 ? m.split('').map(c => c + c).join('') : m;
-                const r = parseInt(n.slice(0, 2), 16), g = parseInt(n.slice(2, 4), 16), b = parseInt(n.slice(4, 6), 16);
-                return `rgba(${r},${g},${b},${a})`;
-            };
-            drawSide(bidsCum, bidColor, hex2rgba(bidColor, 0.15));
-            drawSide(asksCum, askColor, hex2rgba(askColor, 0.15));
+            // Bids on the left: order ascending-X (so reverse the mid→left cumulation).
+            drawArea(bidsCum.slice().sort((a, b) => a.p - b.p), bidColor, hex2rgba(bidColor, 0.15));
+            // Asks on the right: already ascending-X.
+            drawArea(asksCum, askColor, hex2rgba(askColor, 0.15));
 
-            // mid guide
-            const bestBid = bids.length ? bids[0].p : null;
-            const bestAsk = asks.length ? asks[0].p : null;
-            if (bestBid != null && bestAsk != null) {
-                const mid = (bestBid + bestAsk) / 2, mx = X(mid);
+            // Mid guide line + label at the spread.
+            if (mid != null && mid >= lo && mid <= hi) {
+                const mx = X(mid);
                 ctx.strokeStyle = 'rgba(150,150,150,.35)'; ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
-                ctx.beginPath(); ctx.moveTo(mx, 0); ctx.lineTo(mx, cssH - padB); ctx.stroke(); ctx.setLineDash([]);
-                ctx.fillStyle = 'rgba(150,150,150,.6)'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center';
+                ctx.beginPath(); ctx.moveTo(mx, 12); ctx.lineTo(mx, cssH - padB); ctx.stroke(); ctx.setLineDash([]);
+                ctx.fillStyle = 'rgba(150,150,150,.7)'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center';
                 ctx.fillText('mid ' + dexFmtPpm(mid), mx, 9);
             }
-            // axis ticks
-            ctx.fillStyle = 'rgba(150,150,150,.55)'; ctx.font = '9px sans-serif';
+            // Depth scale (top-left) + price axis ticks (bottom corners).
+            ctx.fillStyle = 'rgba(150,150,150,.5)'; ctx.font = '9px sans-serif';
             ctx.textAlign = 'left'; ctx.fillText(dexFmtPpm(lo), 2, cssH - 4);
             ctx.textAlign = 'right'; ctx.fillText(dexFmtPpm(hi), cssW - 2, cssH - 4);
+            const fmD = formatMDS(maxDepth);
+            ctx.textAlign = 'left'; ctx.fillText(`${fmD.value}${fmD.prefix} depth`, 2, cssH - 15);
+            // Note any orders hidden by the clip window so the chart isn't silently partial.
+            const hidden = (asks.length - asksIn.length) + (bids.length - bidsIn.length);
+            if (hidden > 0) { ctx.textAlign = 'right'; ctx.fillStyle = 'rgba(150,150,150,.4)'; ctx.fillText(`+${hidden} off-scale`, cssW - 2, 9); }
 
             _dexDepthGeom = { lo, hi, maxDepth, cssW, cssH, padB, asksCum, bidsCum, X };
         }
