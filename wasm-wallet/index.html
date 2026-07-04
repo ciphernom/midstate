@@ -4488,7 +4488,7 @@ document.getElementById('btnExport').onclick = () => {
             const weiAmt = wei.toString();
 
             const offerId = Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2, '0')).join('');
-            const kind = dexDirection;
+            const kind = dexDirection;   // 'ask' = sell MDS, 'bid' = buy MDS — the single source of truth
 
             // FEATURE 1: on-chain limit order (sell side). Splits a non-power-of-two amount into a
             // bundle of independent single-fill units (one fresh secret each) and funds them ALL in
@@ -5603,6 +5603,9 @@ document.getElementById('btnExport').onclick = () => {
             document.getElementById('tab-portfolio').classList.toggle('active', tab === 'portfolio');
             if (tab === 'portfolio') renderDexSwaps();
             if (tab === 'market') renderDexOrderbook();
+            // Re-assert the Buy/Sell direction UI (button label, hint, limit mode) every
+            // time the create form is shown, so it can't drift out of sync with dexDirection.
+            if (tab === 'create') { try { dexSetDirection(dexDirection || 'ask'); } catch (_) {} }
         };
 
         function stepForStatus(st) {
@@ -5652,7 +5655,8 @@ document.getElementById('btnExport').onclick = () => {
             if (ppm === 0) return '0';
             if (ppm >= 1) return ppm.toFixed(4);
             if (ppm >= 0.0001) return ppm.toFixed(6);
-            return ppm.toExponential(2);
+            if (ppm > 0) return ppm.toExponential(2); // tiny but nonzero → 4.19e-13, never a bare 0
+            return '0';
         }
 
         function dexBookSetSearch(v) { dexBookSearch = (v || '').trim().toLowerCase(); renderDexOrderbook(); }
@@ -5720,15 +5724,23 @@ document.getElementById('btnExport').onclick = () => {
                 if (ppm == null) continue;
                 const key = bucket > 0 ? Math.round(ppm / bucket) : Number(ppm.toPrecision(9));
                 let L = levels.get(key);
-                if (!L) { L = { keyLo: bucket > 0 ? key * bucket : ppm, price: ppm, mds: 0, wei: 0n, orders: [], allVerified: true }; levels.set(key, L); }
+                if (!L) { L = { keyLo: bucket > 0 ? key * bucket : ppm, priceSum: 0, priceN: 0, price: ppm, minPrice: ppm, maxPrice: ppm, mds: 0, wei: 0n, orders: [], allVerified: true }; levels.set(key, L); }
                 L.mds += Number(o.mdsAmount) || 0;
                 try { L.wei += BigInt(o.weiAmount); } catch (_) {}
                 L.orders.push(o);
+                L.priceSum += ppm; L.priceN += 1;
+                if (ppm < L.minPrice) L.minPrice = ppm;
+                if (ppm > L.maxPrice) L.maxPrice = ppm;
                 if (o.verified !== true) L.allVerified = false;
-                // representative price for a bucket = size-weighted-ish (use bucket floor)
-                if (bucket > 0) L.price = key * bucket;
             }
             const arr = [...levels.values()];
+            // Representative price for the level: the volume-blended actual price
+            // (total ETH / total MDS at this level), NOT the bucket floor — which can
+            // round to 0 at extreme scales (e.g. billions of gMDS for micro-ETH).
+            for (const L of arr) {
+                const ethTotal = parseFloat(ethers.formatEther(L.wei.toString()));
+                L.price = L.mds > 0 ? ethTotal / L.mds : (L.priceN ? L.priceSum / L.priceN : L.keyLo);
+            }
             arr.sort((a, b) => isAsk ? a.price - b.price : b.price - a.price);
             let cum = 0;
             for (const L of arr) { cum += L.mds; L.cum = cum; }
