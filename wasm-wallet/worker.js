@@ -37,6 +37,30 @@ let password = null;
 
 /** @type {boolean} Guard against concurrent send operations. */
 let isSending = false;
+// FIFO waiters for the send lock. acquireSendLock() resolves when the caller may proceed;
+// releaseSendLock() hands the lock to the next waiter (or clears it). This turns the old
+// "throw if busy" guard into "wait your turn", while keeping the strict one-at-a-time
+// serialization that WOTS/MSS key-index safety depends on. Handler bodies are unchanged:
+// they just `await acquireSendLock()` instead of `if (isSending) throw`, and call
+// releaseSendLock() where they used to set `isSending = false`.
+const _sendWaiters = [];
+function acquireSendLock(label) {
+    self.postMessage({ type: 'TX_QUEUE', payload: { running: isSending ? undefined : (label || 'transaction'), waiting: _sendWaiters.length + (isSending ? 1 : 0) } });
+    if (!isSending) { isSending = true; self.postMessage({ type: 'TX_QUEUE', payload: { running: label || 'transaction', waiting: _sendWaiters.length } }); return Promise.resolve(); }
+    return new Promise((resolve) => { _sendWaiters.push({ resolve, label: label || 'transaction' }); });
+}
+function releaseSendLock() {
+    const next = _sendWaiters.shift();
+    if (next) {
+        // Keep isSending true — lock passes directly to the next waiter (no gap where a
+        // fresh request could jump the queue).
+        self.postMessage({ type: 'TX_QUEUE', payload: { running: next.label, waiting: _sendWaiters.length } });
+        next.resolve();
+    } else {
+        isSending = false;
+        self.postMessage({ type: 'TX_QUEUE', payload: { running: null, waiting: 0 } });
+    }
+}
 // Covenant swaps: the MDS-side over-funds the HTLC by this many sats so the
 // DELIVERY fee is paid out of the LOCKED value, not from a separate coin. That
 // is what lets a buyer who holds zero MDS still self-deliver as a fallback.
@@ -1049,8 +1073,7 @@ self.onmessage = async (e) => {
             ]).catch(()=>{});
         }
         else if (type === 'DEX_LOCK_MIDSTATE') {
-            if (isSending) throw new Error("Wallet busy.");
-            isSending = true;
+            await acquireSendLock();
             try {
                 const { offerId, expectedAmount, takerPk, swapMode } = payload;
                 const covenant = (swapMode === 'covenant');
@@ -1108,6 +1131,7 @@ self.onmessage = async (e) => {
                     secret: rawSecret,        // for the MAKER only — needed to claim ETH on Base
                     secretHash,               // H = BLAKE3(secret); the Base hashlock is identical
                     htlcAddressHex,
+                    htlcReceiverAddr: covenant ? compute_p2pk_address_hex(normalizeHex(takerPk)) : normalizeHex(takerPk), // needed to rebuild the script for reclaim
                     htlcCoins,                // [{coin_id, value, salt}] — the taker sweeps these
                     timeoutHeight,
                     makerMdsPk: myPk,
@@ -1121,7 +1145,7 @@ self.onmessage = async (e) => {
                 if (payload && payload.offerId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId: payload.offerId, phase: null } });
                 throw err;
             } finally {
-                isSending = false;
+                releaseSendLock();
             }
         }
         else if (type === 'DEX_CREATE_LIMIT_ORDER') {
@@ -1130,8 +1154,7 @@ self.onmessage = async (e) => {
             // atomically. (A larger order is just N of these — call this N times, one secret
             // each — because a single hashlock can back only one trustless fill: the maker
             // reveals the secret on Base to get paid, after which that H is public.)
-            if (isSending) throw new Error("Wallet busy.");
-            isSending = true;
+            await acquireSendLock();
             try {
                 const { offerId, unitValue, weiAmount, makerEvmAddr } = payload;
                 const v = Number(unitValue);
@@ -1177,7 +1200,7 @@ self.onmessage = async (e) => {
                 if (payload && payload.offerId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId: payload.offerId, phase: null } });
                 self.postMessage({ type: 'DEX_LIMIT_ORDER_FAILED', payload: { offerId: payload && payload.offerId, error: (err && err.message) || String(err) } });
             } finally {
-                isSending = false;
+                releaseSendLock();
             }
         }
         else if (type === 'DEX_CREATE_LIMIT_BUNDLE') {
@@ -1187,8 +1210,7 @@ self.onmessage = async (e) => {
             // instead of N serial funds. The N independent secrets are still required (one hashlock
             // backs one trustless fill); only the funding is batched. All-or-nothing: if the single
             // funding tx fails, nothing is locked.
-            if (isSending) throw new Error("Wallet busy.");
-            isSending = true;
+            await acquireSendLock();
             try {
                 const { groupId, units, makerEvmAddr } = payload;
                 if (!Array.isArray(units) || !units.length) throw new Error("No units supplied");
@@ -1326,7 +1348,7 @@ self.onmessage = async (e) => {
                 if (payload && payload.groupId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId: payload.groupId, phase: null } });
                 self.postMessage({ type: 'DEX_LIMIT_BUNDLE_FAILED', payload: { groupId: payload && payload.groupId, error: errMsg } });
             } finally {
-                isSending = false;
+                releaseSendLock();
             }
         }
         else if (type === 'DEX_RECOVER_BUNDLES') {
@@ -1532,8 +1554,7 @@ self.onmessage = async (e) => {
             }
         }
         else if (type === 'DEX_CLAIM_MIDSTATE') {
-            if (isSending) throw new Error("Wallet busy.");
-            isSending = true;
+            await acquireSendLock();
             try {
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Claiming HTLC..." } });
                 const { swapIdx, rawSecret, htlcCoins, makerMdsPk, secretHash, timeoutHeight, offerId } = payload;
@@ -1658,7 +1679,7 @@ self.onmessage = async (e) => {
                              : JSON.stringify(err);
                 throw new Error(`Claim failed: ${detail}`);
             } finally {
-                isSending = false;
+                releaseSendLock();
             }
         }
         else if (type === 'DEX_SETTLE_COVENANT') {
@@ -1672,8 +1693,7 @@ self.onmessage = async (e) => {
             //   • the BUYER (fallback), if the seller never delivers, using the secret it
             //     read from the Base `Claimed` event. A buyer holding ZERO MDS can still
             //     do this because the fee is paid out of the locked value, not a fee coin.
-            if (isSending) throw new Error("Wallet busy.");
-            isSending = true;
+            await acquireSendLock();
             try {
                 const { offerId, swapIdx, rawSecret, buyerPk, minPayout, timeoutHeight, makerMdsPk, htlcCoins, role } = payload;
                 const dexPhase = (phase) => { if (offerId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId, phase } }); };
@@ -1789,7 +1809,7 @@ self.onmessage = async (e) => {
                              : JSON.stringify(err);
                 self.postMessage({ type: 'DEX_SETTLE_FAILED', payload: { offerId: payload && payload.offerId, swapIdx: payload && payload.swapIdx, role: payload && payload.role, error: detail } });
             } finally {
-                isSending = false;
+                releaseSendLock();
             }
         }
         else if (type === 'DEX_FILL_LIMIT') {
@@ -1798,8 +1818,7 @@ self.onmessage = async (e) => {
             // caveat in compile_limit_order_covenant), pays `claimed` MDS to the taker and
             // routes `coinValue - claimed` back to the covenant address. Mirrors the proven
             // DEX_SETTLE_COVENANT covenant-spend template.
-            if (isSending) throw new Error("Wallet busy.");
-            isSending = true;
+            await acquireSendLock();
             try {
                 const { offerId, rawSecret, coin, claimed, maxClaim, timeoutHeight, makerMdsPk } = payload;
                 const dexPhase = (p) => { if (offerId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId, phase: p } }); };
@@ -1886,7 +1905,7 @@ self.onmessage = async (e) => {
                 const detail = (err && err.message) ? err.message : String(err);
                 self.postMessage({ type: 'DEX_FILL_FAILED', payload: { offerId: payload && payload.offerId, error: detail } });
             } finally {
-                isSending = false;
+                releaseSendLock();
             }
         }
         else if (type === 'DEX_REFUND_LIMIT_ORDER') {
@@ -1894,8 +1913,7 @@ self.onmessage = async (e) => {
             // Spends the covenant coin via the ELSE (refund) branch: the VM enforces
             // height >= timeout (CHECKTIMEVERIFY) and a maker signature (CHECKSIGVERIFY),
             // then we route the full coin value back to the maker. Witness = [sig, dummy, 0x00].
-            if (isSending) throw new Error("Wallet busy.");
-            isSending = true;
+            await acquireSendLock();
             try {
                 const { offerId, coin, secretHash, maxClaim, timeoutHeight, makerMdsPk } = payload;
                 const dexPhase = (p) => { if (offerId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId, phase: p } }); };
@@ -1965,7 +1983,100 @@ self.onmessage = async (e) => {
                 const detail = (err && err.message) ? err.message : String(err);
                 self.postMessage({ type: 'DEX_REFUND_FAILED', payload: { offerId: payload && payload.offerId, error: detail } });
             } finally {
-                isSending = false;
+                releaseSendLock();
+            }
+        }
+        else if (type === 'DEX_RECLAIM_HTLC') {
+            // Reclaim a STUCK taker-side (or any) HTLC lock after its timeout. This is the
+            // safety net for a half-completed swap: the MDS was locked in an HTLC covenant
+            // and the swap stalled, so we spend the refund branch back to ourselves. Handles
+            // BOTH lock shapes — covenant HTLC (build_covenant_htlc_bytecode_hex, refund =
+            // refund_pk after timeout) and classic HTLC (build_htlc_bytecode_hex). A lock
+            // funds a SET of power-of-two coins, so we reclaim each in turn.
+            await acquireSendLock();
+            try {
+                const { offerId, htlcCoins, secretHash, timeoutHeight, refundPk, receiverAddr, minPayout, swapMode } = payload;
+                const dexPhase = (p) => { if (offerId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId, phase: p } }); };
+                if (!Array.isArray(htlcCoins) || htlcCoins.length === 0) throw new Error("No locked coins to reclaim");
+                if (networkHeight < Number(timeoutHeight))
+                    throw new Error(`Too early — refund unlocks at height ${timeoutHeight} (now ${networkHeight}).`);
+
+                const myPk = refundPk || getPrimaryMssPk();
+                const myAddr = compute_p2pk_address_hex(myPk);
+                const covenant = (swapMode === 'covenant');
+
+                // Reconstruct the EXACT script that was locked, so coin ids/address match.
+                let scriptHex;
+                if (covenant) {
+                    if (!receiverAddr) throw new Error("Missing receiver address for covenant HTLC reclaim");
+                    scriptHex = build_covenant_htlc_bytecode_hex(
+                        secretHash, receiverAddr, BigInt(minPayout || 0), BigInt(timeoutHeight), myPk
+                    );
+                } else {
+                    scriptHex = build_htlc_bytecode_hex(secretHash, receiverAddr, BigInt(timeoutHeight), myPk);
+                }
+                const scriptAddr = blake3_hash_hex(scriptHex);
+
+                const pow2 = (n) => { const out = []; let v = BigInt(n), bit = 0n; while (v > 0n) { if (v & 1n) out.push(Number(1n << bit)); v >>= 1n; bit += 1n; } return out; };
+                let totalReclaimed = 0, reclaimedCoins = 0;
+
+                for (const coin of htlcCoins) {
+                    if (!coin || !coin.coin_id || !coin.salt) continue;
+                    const coinValue = Number(coin.value);
+                    // Verify the coin actually belongs to this reconstructed script.
+                    const expectId = compute_coin_id_hex(scriptAddr, BigInt(coinValue), normalizeHex(coin.salt));
+                    if (normalizeHex(expectId) !== normalizeHex(coin.coin_id)) {
+                        self.postMessage({ type: 'LOG', payload: `Reclaim: coin ${coin.coin_id.slice(0,12)}… doesn't match reconstructed HTLC — skipping.` });
+                        continue;
+                    }
+                    // Skip coins already spent (e.g. a partially-completed swap).
+                    try { const chk = await rpc.checkCoin(normalizeHex(coin.coin_id)); if (chk && !chk.exists) { continue; } } catch (_) {}
+
+                    const outputsJson = JSON.stringify(pow2(coinValue).map(v => ({ out_type: "standard", address: myAddr, value: v, salt: null })));
+                    const contractInputsJson = JSON.stringify([{ coin_id: normalizeHex(coin.coin_id), witness: "", value: coinValue, salt: normalizeHex(coin.salt), state: null }]);
+
+                    if (!mssCachesReady) await loadMssCaches();
+                    const utxoArray = Object.values(wState.utxos).map(u =>
+                        (u.is_mss && wState.mssAddrs[u.address]) ? { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf } : u);
+
+                    let ctx = JSON.parse(wallet.prepare_script_spend(
+                        JSON.stringify(utxoArray), scriptHex, contractInputsJson, outputsJson, wState.nextWotsIndex
+                    ));
+                    // Refund branch witness: [sig, dummy(32B), 0x00] selects the ELSE/timeout path.
+                    const sigHex = wallet.sign_mss_hex(myPk, ctx.commitment);
+                    const dummy = "00".repeat(32);
+                    for (let i = 0; i < ctx.contract_inputs.length; i++) ctx.contract_inputs[i].witness = `${sigHex},${dummy},00`;
+
+                    const revealPayloadStr = wallet.build_script_reveal(JSON.stringify(ctx), ctx.commitment, ctx.tx_salt);
+                    while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
+                    const usedMss = new Set();
+                    for (const inp of ctx.wallet_inputs) if (inp.is_mss) usedMss.add(inp.address);
+                    for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
+                    await saveState();
+
+                    dexPhase(`Reclaiming coin ${reclaimedCoins + 1}/${htlcCoins.length} — mining PoW…`);
+                    const stateData = await rpc.getState();
+                    await new Promise(r => setTimeout(r, 50));
+                    const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
+                    const commitReq = await rpc.commit(ctx.commitment, spamNonce);
+                    if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
+                    while (true) { try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {} await waitForNextBlock(15000); }
+                    const revealReq = await rpc.send(revealPayloadStr);
+                    if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
+                    while (true) { try { const inp = await rpc.checkCoin(normalizeHex(coin.coin_id)); if (inp && !inp.exists) break; } catch (e) {} await waitForNextBlock(15000); }
+
+                    totalReclaimed += coinValue; reclaimedCoins++;
+                }
+
+                dexPhase("Confirmed ✓ — syncing…");
+                await performScan();
+                if (reclaimedCoins === 0) throw new Error("Nothing to reclaim — coins already spent or not found on-chain.");
+                self.postMessage({ type: 'DEX_RECLAIM_SUCCESS', payload: { offerId, reclaimed: totalReclaimed, coins: reclaimedCoins } });
+            } catch (err) {
+                const detail = (err && err.message) ? err.message : String(err);
+                self.postMessage({ type: 'DEX_RECLAIM_FAILED', payload: { offerId: payload && payload.offerId, error: detail } });
+            } finally {
+                releaseSendLock();
             }
         }
         else if (type === 'DEX_LOCK_L2') {
@@ -2168,13 +2279,11 @@ self.onmessage = async (e) => {
         }
 
         else if (type === 'SEND') {
-            if (isSending) throw new Error("A transaction is already in progress. Please wait for it to complete.");
-            isSending = true;
+            await acquireSendLock();
             try { await performSend(payload.toAddress, payload.amount, null, 0, !!payload.sendAll); }
-            finally { isSending = false; }
+            finally { releaseSendLock(); }
         }
 else if (type === 'L2_OPEN_CHANNEL') {
-            if (isSending) throw new Error("Wallet busy.");
             const { peerPk, amount } = payload;
             const myPk = getPrimaryMssPk();
             if (!myPk) throw new Error("Network Sync required first to initialize your MSS L2 identity.");
@@ -2186,9 +2295,9 @@ else if (type === 'L2_OPEN_CHANNEL') {
             const channelAddr = build_multisig_2of2_address(aPk, bPk);
             pendingChannelOpen = { channelAddr, alicePk: aPk, bobPk: bPk, amount: Number(amount), isAlice };
             
-            isSending = true;
+            await acquireSendLock();
             try { await performSend(channelAddr, Number(amount) + 100); } 
-            finally { isSending = false; }
+            finally { releaseSendLock(); }
         }
         else if (type === 'L2_PAY') {
             const { channelId, amount } = payload;
@@ -2359,21 +2468,18 @@ else if (type === 'L2_OPEN_CHANNEL') {
         }
 
         else if (type === 'FUND_CONTRACT') {
-            if (isSending) throw new Error("A transaction is already in progress.");
-            isSending = true;
+            await acquireSendLock();
             try { await performContractTx({ kind: 'fund', ...payload }); }
-            finally { isSending = false; }
+            finally { releaseSendLock(); }
         }
 
         else if (type === 'SPEND_CONTRACT') {
-            if (isSending) throw new Error("A transaction is already in progress.");
-            isSending = true;
+            await acquireSendLock();
             try { await performContractTx({ kind: 'spend', ...payload }); }
-            finally { isSending = false; }
+            finally { releaseSendLock(); }
         }
         else if (type === 'SIGN_CHANNEL') {
-            if (isSending) throw new Error("A transaction is already in progress.");
-            isSending = true;
+            await acquireSendLock();
             try {
                 self.postMessage({ type: 'CONTRACT_TX_PROGRESS', payload: { reqId: payload.reqId, msg: "Signing L2 Channel State..." } });
                 
@@ -2385,7 +2491,7 @@ else if (type === 'L2_OPEN_CHANNEL') {
                 // Return the error back across the dApp bridge
                 self.postMessage({ type: 'ERROR', payload: { reqId: payload.reqId, msg: err.toString() } });
             } finally {
-                isSending = false;
+                releaseSendLock();
             }
         }
         else if (type === 'NEW_ADDRESS') {

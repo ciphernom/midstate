@@ -747,6 +747,14 @@
             <div class="stat" title="Pending transactions waiting to be mined"><span class="pulse-dot mempool"></span>Mempool <span id="uiMempoolSize" class="val">0</span></div>
         </div>
 
+        <div id="txQueueStatus" style="display:none;font-size:11px;color:var(--text-muted);text-align:center;padding:4px 8px;background:var(--bg-raised);border-bottom:1px solid var(--border);"></div>
+
+        <div id="saltRiskBanner" style="display:none;font-size:12px;color:#111;text-align:center;padding:8px 12px;background:#f5c542;border-bottom:1px solid #c99a00;line-height:1.5;">
+            <b>⚠ You have <span id="saltRiskCount">0</span> open trade(s) with funds locked on-chain.</b>
+            The only key to reclaim them lives in this browser's storage. <b>Do NOT clear browser data or uninstall</b> without exporting a backup first — clearing data will permanently freeze these funds.
+            <button onclick="document.getElementById('btnExport') && document.getElementById('btnExport').click()" style="margin-left:8px;padding:4px 10px;font-size:11px;background:#111;color:#f5c542;border:none;border-radius:3px;cursor:pointer;">Export backup now</button>
+        </div>
+
         <div id="activity-banner">
             <div class="spinner"></div>
             <span id="activity-msg">Processing...</span>
@@ -1091,7 +1099,7 @@
                 <!-- Two-sided ladder: asks (top, ascending to spread) / spread / bids (below) -->
                 <div class="panel" id="dexLadderPanel" style="padding:0;">
                     <div class="dex-ladder-head">
-                        <span>Price <span style="color:var(--text-faint);">ETH/MDS</span></span>
+                        <span>Price <span style="color:var(--text-faint);" id="dexPriceUnitHdr">ETH/gMDS</span></span>
                         <span style="text-align:right;">Size <span style="color:var(--text-faint);">MDS</span></span>
                         <span style="text-align:right;">Total <span style="color:var(--text-faint);">ETH</span></span>
                         <span style="text-align:right;">Sum <span style="color:var(--text-faint);">MDS</span></span>
@@ -3034,7 +3042,28 @@ if ('serviceWorker' in navigator) {
 
                 case 'BACKUP_READY': {
                     hideActivity();
-                    const blob = new Blob([payload], { type: "application/json" });
+                    // The worker's payload is the encrypted wallet bundle (seed/UTXOs/MSS).
+                    // Historically that was the whole backup — but DEX swap records live in
+                    // localStorage, NOT in the worker's wState, so they were silently omitted.
+                    // A swap's random salt is the ONLY key to reclaiming a stuck HTLC and is
+                    // not recoverable from seed or chain, so leaving it out could permanently
+                    // brick a refund. We now wrap the wallet bundle in an envelope that also
+                    // carries the local DEX data. BACKWARD COMPATIBLE: importing detects the
+                    // envelope; a legacy backup (bare bundle) still imports as before.
+                    let fileText = payload;
+                    try {
+                        const walletBundle = JSON.parse(payload);
+                        const envelope = {
+                            _midstate_backup: 2,           // version marker; absent in legacy backups
+                            wallet: walletBundle,          // the exact legacy bundle, unchanged
+                            dex: {
+                                swaps: JSON.parse(localStorage.getItem('midstate_dex_swaps') || '[]'),
+                                orderbook: JSON.parse(localStorage.getItem('midstate_dex_orderbook') || '[]')
+                            }
+                        };
+                        fileText = JSON.stringify(envelope);
+                    } catch (_) { /* if anything fails, fall back to the bare wallet bundle */ }
+                    const blob = new Blob([fileText], { type: "application/json" });
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.href = url;
@@ -3043,7 +3072,7 @@ if ('serviceWorker' in navigator) {
                     a.click();
                     document.body.removeChild(a);
                     URL.revokeObjectURL(url);
-                    showToast("Backup exported successfully.", "success");
+                    showToast("Backup exported (wallet + open trades).", "success");
                     break;
                 }
 
@@ -3317,6 +3346,24 @@ if ('serviceWorker' in navigator) {
         };
 
         worker.addEventListener('message', (e) => {
+            if (e.data.type === 'TX_QUEUE') {
+                // The wallet runs transactions strictly one-at-a-time (key-index safety).
+                // Instead of rejecting extra requests, they queue — surface that here so a
+                // user who fires several actions sees them waiting rather than failing.
+                const { running, waiting } = e.data.payload || {};
+                const el = document.getElementById('txQueueStatus');
+                if (el) {
+                    if (running || waiting > 0) {
+                        el.style.display = 'block';
+                        el.textContent = waiting > 0
+                            ? `Processing… ${waiting} more queued`
+                            : 'Processing transaction…';
+                    } else {
+                        el.style.display = 'none';
+                    }
+                }
+                return;
+            }
             if (e.data.type === 'L2_INVOICE_CREATED') {
                 document.getElementById('l2InvoiceResult').innerText = e.data.payload;
             }
@@ -3439,9 +3486,27 @@ document.getElementById('btnExport').onclick = () => {
                 const reader = new FileReader();
                 reader.onload = function(event) {
                     try {
-                        const parsed = JSON.parse(event.target.result);
+                        let parsed = JSON.parse(event.target.result);
+                        let walletJsonText = event.target.result;
+                        // v2 envelope: { _midstate_backup, wallet:{salt,iv,data}, dex:{swaps,orderbook} }.
+                        // Legacy backups are the bare wallet bundle and have no _midstate_backup
+                        // marker — those fall straight through to the original behavior.
+                        if (parsed && parsed._midstate_backup && parsed.wallet) {
+                            // Restore the DEX swap records FIRST — these carry the salts needed to
+                            // reclaim any open/stuck trades, and are the whole reason v2 exists.
+                            try {
+                                if (parsed.dex && Array.isArray(parsed.dex.swaps)) {
+                                    localStorage.setItem('midstate_dex_swaps', JSON.stringify(parsed.dex.swaps));
+                                }
+                                if (parsed.dex && Array.isArray(parsed.dex.orderbook)) {
+                                    localStorage.setItem('midstate_dex_orderbook', JSON.stringify(parsed.dex.orderbook));
+                                }
+                            } catch (_) {}
+                            parsed = parsed.wallet;
+                            walletJsonText = JSON.stringify(parsed);
+                        }
                         if (!parsed.salt || !parsed.iv || !parsed.data) throw new Error("Invalid backup format.");
-                        localStorage.setItem('midstate_wallet', event.target.result);
+                        localStorage.setItem('midstate_wallet', walletJsonText);
                         walletExists = true;
                         createSec.classList.add('hidden');
                         loginSec.classList.remove('hidden');
@@ -3497,6 +3562,9 @@ document.getElementById('btnExport').onclick = () => {
         // Auto-fetch chat history every 30s just in case WebRTC disconnects,
         // but rely on push events for instant updates.
         setInterval(fetchChatHistory, 30000);
+        // Keep the salt-loss warning current even if the swaps tab is never opened.
+        setInterval(() => { try { dexUpdateSaltRiskBanner(); } catch (_) {} }, 5000);
+        setTimeout(() => { try { dexUpdateSaltRiskBanner(); } catch (_) {} }, 1500);
 
         function startReply(nonce, sender) {
             replyingToNonce = Number(nonce); // Cast to number safely
@@ -4391,6 +4459,34 @@ document.getElementById('btnExport').onclick = () => {
         }
 
         // Maker: reclaim an unfilled limit-order unit after its on-chain timeout.
+        // Reclaim a stuck HTLC lock (either side of a trade) after its timeout. Unlike
+        // dexRefundLimitOrder (maker limit orders only), this handles the taker-side MDS
+        // lock — the case that previously had NO reclaim path. Pulls the exact HTLC params
+        // from the swap record so the worker can rebuild the covenant and spend the refund.
+        window.dexReclaimStuckLock = function(idx) {
+            const s = dexMySwaps[idx];
+            if (!s) return showToast("Swap not found.", "error");
+            if (!Array.isArray(s.htlcCoins) || s.htlcCoins.length === 0)
+                return showToast("This swap has no locked coins on record to reclaim.", "error");
+            if (!s.timeoutHeight) return showToast("Missing timeout info for this lock.", "error");
+            if (networkHeight < Number(s.timeoutHeight))
+                return showToast(`Too early — reclaim unlocks at block ${s.timeoutHeight}.`, "error");
+            // receiver address: for a covenant HTLC the receiver is the buyer's address; for a
+            // classic HTLC it's the taker pubkey. Prefer explicitly-stored fields.
+            const receiverAddr = s.htlcReceiverAddr || s.buyerAddr || s.takerMdsPk || s.receiverAddr || null;
+            showToast("Submitting reclaim…", "success");
+            worker.postMessage({ type: 'DEX_RECLAIM_HTLC', payload: {
+                offerId: s.offerId,
+                htlcCoins: s.htlcCoins,
+                secretHash: s.secretHash,
+                timeoutHeight: s.timeoutHeight,
+                refundPk: s.makerMdsPk || s.refundPk,   // the key the lock refunds to (us)
+                receiverAddr,
+                minPayout: s.minPayout,
+                swapMode: s.swapMode || 'covenant'
+            }});
+        };
+
         window.dexRefundLimitOrder = function(offerId) {
             const s = dexMySwaps.find(x => x.offerId === offerId && x.kind === 'limit' && x.role === 'maker');
             if (!s || !s.covenant) return showToast("Order not found.", "error");
@@ -4607,14 +4703,40 @@ document.getElementById('btnExport').onclick = () => {
         window.dexAcceptFromBook = function(i) {
             const o = dexOrderbook[i];
             if (!o) return;
-            // Covenant-backed orders use the new async settlement paths; legacy offers
-            // (no covenant UTXO advertised) fall back to the interactive swap.
+            // CONFIRMATION GATE: before committing funds, show exactly what this does in
+            // plain language. Filling a BID means YOU SELL your MDS; filling an ASK means
+            // YOU BUY MDS. This is the safety step that stops an accidental fill (e.g. a
+            // mislabeled button) from moving real money without the user seeing the terms.
+            const isAsk = (o.kind || 'ask') === 'ask';
+            const mds = Number(o.mdsAmount) || 0;
+            const mdsFmt = formatMDS(mds);
+            const eth = prettyEth(o.weiAmount);
+            const usd = weiToUsd(o.weiAmount);
+            const ppm = dexPricePerMds(o);
+            let title, line;
+            if (isAsk) {
+                // taker buys MDS, pays ETH
+                title = `Buy ${mdsFmt.value} ${mdsFmt.prefix} MDS?`;
+                line = `You will PAY ${eth} ETH${usd ? ` (${usd})` : ''} to receive ${Number(mds).toLocaleString('en')} MDS.`;
+            } else {
+                // taker sells MDS, receives ETH
+                title = `Sell ${mdsFmt.value} ${mdsFmt.prefix} MDS?`;
+                line = `You will SELL ${Number(mds).toLocaleString('en')} MDS and receive ${eth} ETH${usd ? ` (${usd})` : ''}.`;
+            }
+            const priceLine = ppm != null ? `<br><br>Price: <b>${dexFmtPpm(ppm)}</b> ${dexPriceUnitLabel()}.` : '';
+            const warn = (usd && /\$0\.0/.test(usd)) ? `<br><br><span style="color:var(--warn-accent,#c60);">⚠ This is a very small total value — double-check the price is what you expect.</span>` : '';
+            showConfirm(title, `<div style="line-height:1.6;">${line}${priceLine}${warn}</div>`, () => dexAcceptFromBookConfirmed(i));
+        };
+        // The actual fill, after the user confirms the terms above.
+        function dexAcceptFromBookConfirmed(i) {
+            const o = dexOrderbook[i];
+            if (!o) return;
             if (o.covenant && o.covenant.coinId) {
                 if (o.verified !== true) return showToast("This order isn't verified on-chain yet.", "error");
                 return (dexSettlePath === 'L2') ? dexSubmarineL2(o) : dexFillLimitL1(o);
             }
             dexAcceptOffer(o);
-        };
+        }
 
         // ── Feature 1: fill an on-chain limit order ────────────────────────────
         // The order is one atomic unit. The taker locks ETH on Base under the order's
@@ -5073,6 +5195,19 @@ document.getElementById('btnExport').onclick = () => {
                 if (added) { saveOrderbook(); renderDexOrderbook(); }
                 _dexScanInFlight = false;
             }
+            else if (e.data.type === 'DEX_RECLAIM_SUCCESS') {
+                const { offerId, reclaimed, coins } = e.data.payload;
+                const s = dexMySwaps.find(x => x.offerId === offerId);
+                if (s) { s.status = 'limit_refunded'; delete s.phase; saveSwaps(); renderDexSwaps(); }
+                worker.postMessage({ type: 'SCAN' });
+                showToast(`Reclaimed ${Number(reclaimed).toLocaleString('en')} MDS from ${coins} locked coin${coins > 1 ? 's' : ''}.`, "success");
+            }
+            else if (e.data.type === 'DEX_RECLAIM_FAILED') {
+                const { offerId, error } = e.data.payload;
+                const s = dexMySwaps.find(x => x.offerId === offerId);
+                if (s) { delete s.phase; saveSwaps(); renderDexSwaps(); }
+                showToast("Reclaim failed: " + (error || "unknown"), "error");
+            }
             else if (e.data.type === 'DEX_REFUND_SUCCESS') {
                 const { offerId, reclaimed } = e.data.payload;
                 const s = dexMySwaps.find(x => x.offerId === offerId && x.kind === 'limit' && x.role === 'maker');
@@ -5126,8 +5261,10 @@ document.getElementById('btnExport').onclick = () => {
                 swap.secretHash = data.secretHash;
                 swap.htlcCoins = data.htlcCoins;
                 swap.htlcAddressHex = data.htlcAddressHex;
+                swap.htlcReceiverAddr = data.htlcReceiverAddr; // needed to rebuild the HTLC for reclaim
                 swap.timeoutHeight = data.timeoutHeight;
                 swap.mdsLockerPk = data.makerMdsPk;   // worker returns the locker's own pubkey here
+                swap.makerMdsPk = data.makerMdsPk;    // the refund key (us) — used by reclaim
                 swap.swapMode = data.swapMode || swap.swapMode || 'htlc';
                 if (data.minPayout != null) swap.minPayout = data.minPayout;
                 swap.status = 'ready_to_claim_base'; if (!swap._autoClaimed) { swap._autoClaimed = true; setTimeout(() => { try { dexClaimBase(swap.offerId); } catch (e) { swap._autoClaimed = false; } }, 400); }
@@ -5680,14 +5817,45 @@ document.getElementById('btnExport').onclick = () => {
                 return parseFloat(ethers.formatEther(wei)) / mds;
             } catch (_) { return null; }
         }
-        function dexFmtPpm(ppm) {
-            if (ppm == null) return '—';
-            if (ppm === 0) return '0';
-            if (ppm >= 1) return ppm.toFixed(4);
-            if (ppm >= 0.0001) return ppm.toFixed(6);
-            if (ppm > 0) return ppm.toExponential(2); // tiny but nonzero → 4.19e-13, never a bare 0
-            return '0';
+        // Price display honours the MDS unit convention. Raw price is ETH per single MDS,
+        // which is astronomically small (MDS trades in the billions), so we quote price per
+        // a larger unit — by default per gMDS — landing the number in a human range. The
+        // unit is chosen from the book's typical order size so prices read like "0.0014
+        // ETH/gMDS" instead of "1.3e-12". _dexPriceUnitDiv is the MDS-per-unit divisor and
+        // _dexPriceUnitLabel is the unit shown next to prices; both are refreshed per render.
+        let _dexPriceUnitDiv = MDS_GIGA;          // default: price per gMDS
+        let _dexPriceUnitLabel = 'gMDS';
+
+        // Pick the price unit from the median order size so the per-unit price is readable.
+        function dexChoosePriceUnit(live) {
+            const sizes = live.map(o => Number(o.mdsAmount) || 0).filter(v => v > 0).sort((a, b) => a - b);
+            if (!sizes.length) { _dexPriceUnitDiv = MDS_GIGA; _dexPriceUnitLabel = 'gMDS'; return; }
+            const median = sizes[Math.floor(sizes.length / 2)];
+            // Use the same thresholds as formatMDS so price unit matches amount unit.
+            if (median >= MDS_GIGA)      { _dexPriceUnitDiv = MDS_GIGA; _dexPriceUnitLabel = 'gMDS'; }
+            else if (median >= MDS_MEGA) { _dexPriceUnitDiv = MDS_MEGA; _dexPriceUnitLabel = 'mMDS'; }
+            else if (median >= MDS_KILO) { _dexPriceUnitDiv = MDS_KILO; _dexPriceUnitLabel = 'kMDS'; }
+            else                         { _dexPriceUnitDiv = 1;        _dexPriceUnitLabel = 'MDS'; }
         }
+
+        // Format a price (ETH per single MDS) as ETH per the chosen unit, plainly — no
+        // scientific notation in the normal range, trailing zeros trimmed, never a bare 0
+        // for a nonzero price.
+        function dexFmtPpm(ppmPerMds) {
+            if (ppmPerMds == null) return '—';
+            if (ppmPerMds === 0) return '0';
+            const p = ppmPerMds * _dexPriceUnitDiv;   // price per unit (e.g. per gMDS)
+            if (p === 0) return '0';
+            let s;
+            if (p >= 1000)      s = p.toFixed(2);
+            else if (p >= 1)    s = p.toFixed(4);
+            else if (p >= 0.0001) s = p.toFixed(6);
+            else if (p >= 0.00000001) s = p.toFixed(8);
+            else return p.toExponential(2);           // truly microscopic even per unit → last resort
+            return parseFloat(s).toString();          // trim trailing zeros
+        }
+        // The unit label to show beside prices (e.g. "ETH/gMDS").
+        function dexPriceUnitLabel() { return 'ETH/' + _dexPriceUnitLabel; }
 
         function dexBookSetSearch(v) { dexBookSearch = (v || '').trim().toLowerCase(); renderDexOrderbook(); }
         function dexBookSetBucket(v) { dexBookBucket = v; dexExpandedLevels.clear(); renderDexOrderbook(); }
@@ -5791,6 +5959,11 @@ document.getElementById('btnExport').onclick = () => {
             saveOrderbook();
             const live = dexOrderbook.filter(o => !dexOfferEngaged(o.offerId));
 
+            // Pick the price unit (per gMDS/mMDS/…) from the book so prices read plainly.
+            dexChoosePriceUnit(live);
+            const _hdr = document.getElementById('dexPriceUnitHdr');
+            if (_hdr) _hdr.textContent = dexPriceUnitLabel();
+
             // Stats + chart always reflect the UNFILTERED live book.
             dexRenderBookStats(live);
             dexRenderDepthChart(live);
@@ -5832,7 +6005,7 @@ document.getElementById('btnExport').onclick = () => {
                 spreadEl.style.display = 'flex';
                 spreadEl.innerHTML = crossed
                     ? `<span style="color:var(--warn-accent);">⚠ crossed book — a buyer bids above the cheapest ask (fillable now)</span>`
-                    : `<span>spread</span><b style="color:var(--text-max);">${dexFmtPpm(spread)}</b><span>ETH/MDS</span><span style="color:var(--text-faint);">(${pct.toFixed(2)}%)</span>`;
+                    : `<span>spread</span><b style="color:var(--text-max);">${dexFmtPpm(spread)}</b><span>${dexPriceUnitLabel()}</span><span style="color:var(--text-faint);">(${pct.toFixed(2)}%)</span>`;
             } else {
                 spreadEl.style.display = 'none';
             }
@@ -6048,7 +6221,7 @@ document.getElementById('btnExport').onclick = () => {
             tip.style.display = 'block';
             tip.style.left = x + 'px';
             tip.style.top = '4px';
-            tip.innerHTML = `${dexFmtPpm(price)} ETH/MDS · asks ${fmA.value}${fmA.prefix} · bids ${fmB.value}${fmB.prefix}`;
+            tip.innerHTML = `${dexFmtPpm(price)} ${dexPriceUnitLabel()} · asks ${fmA.value}${fmA.prefix} · bids ${fmB.value}${fmB.prefix}`;
         }
         function dexDepthLeave() { const t = document.getElementById('dexDepthTip'); if (t) t.style.display = 'none'; }
 
@@ -6147,7 +6320,7 @@ document.getElementById('btnExport').onclick = () => {
             let lines = [];
             lines.push(`Fills <b style="color:var(--text-max);">${nFills}</b> order${nFills !== 1 ? 's' : ''} → <b style="color:var(--text-max);">${mdsFmt.value} ${mdsFmt.prefix}</b> MDS`);
             lines.push(`You ${verb} <b style="color:var(--text-max);">${eth} ETH</b>${usd ? ` (${usd})` : ''}`);
-            if (sim.avgPpm != null) lines.push(`Avg <b style="color:var(--text-max);">${dexFmtPpm(sim.avgPpm)}</b> ETH/MDS`);
+            if (sim.avgPpm != null) lines.push(`Avg <b style="color:var(--text-max);">${dexFmtPpm(sim.avgPpm)}</b> ${dexPriceUnitLabel()}`);
             if (slip > 0.01) lines.push(`<span style="color:${slip > 5 ? 'var(--warn-accent)' : 'var(--text-faint)'};">slippage ${slip.toFixed(2)}%</span>`);
             if (sim.shortfall > 1e-9) {
                 const sf = formatMDS(sim.shortfall);
@@ -6207,8 +6380,48 @@ document.getElementById('btnExport').onclick = () => {
             else showToast(`Market ${dexMarketSide} failed — no orders filled.`, "error");
         }
 
+        // ── Salt-loss guard ─────────────────────────────────────────────────
+        // A swap that locked MDS on-chain can only be reclaimed with its coin salt,
+        // which is random and lives ONLY in this browser's localStorage. If the user
+        // clears browser data (or uninstalls) while such a swap is open, those funds are
+        // frozen forever. A web page can't intercept the browser's own "clear data", so
+        // we make the risk impossible to miss from inside the app: a persistent banner
+        // whenever at-risk swaps exist, and a beforeunload nudge. The real protection is
+        // the now-complete backup (which includes these salts) — the banner drives it.
+        function dexAtRiskSwaps() {
+            const done = ['completed', 'limit_refunded', 'limit_refunding', 'swap_complete'];
+            return dexMySwaps.filter(s =>
+                Array.isArray(s.htlcCoins) && s.htlcCoins.length > 0 &&
+                s.htlcCoins.every(c => c && c.coin_id && c.salt) &&
+                !done.includes(s.status)
+            );
+        }
+        function dexUpdateSaltRiskBanner() {
+            const banner = document.getElementById('saltRiskBanner');
+            if (!banner) return;
+            const atRisk = dexAtRiskSwaps();
+            const cnt = document.getElementById('saltRiskCount');
+            if (atRisk.length > 0) {
+                if (cnt) cnt.textContent = String(atRisk.length);
+                banner.style.display = 'block';
+            } else {
+                banner.style.display = 'none';
+            }
+        }
+        // Warn on tab close / navigation while funds are at risk (best-effort; the browser
+        // shows its own generic prompt, but it's one more chance to not lose the salt).
+        window.addEventListener('beforeunload', (e) => {
+            try {
+                if (dexAtRiskSwaps().length > 0) {
+                    e.preventDefault();
+                    e.returnValue = 'You have open trades with funds locked on-chain. Export a backup before leaving or you may permanently lose access to them.';
+                    return e.returnValue;
+                }
+            } catch (_) {}
+        });
+
         function renderDexSwaps() {
-            const container = document.getElementById('dexActiveSwaps');
+            dexUpdateSaltRiskBanner();            const container = document.getElementById('dexActiveSwaps');
             if (!container) return;
             if (dexMySwaps.length === 0) {
                 container.innerHTML = '<div class="panel" style="text-align:center;color:#555;">No active swaps.</div>';
@@ -6323,6 +6536,24 @@ document.getElementById('btnExport').onclick = () => {
                         ? 'margin:8px 0 0;width:100%;padding:7px;font-size:11px;background:transparent;border:1px solid var(--border);color:#888;'
                         : 'margin:0;width:100%;padding:9px;font-size:12px;background:transparent;border:1px solid var(--border-bright);color:var(--text-bright);';
                     secondaryBtn = `<button style="${style}" onclick="dexAbandonSwap(${idx})">Abandon swap</button>`;
+                }
+
+                // Universal reclaim: ANY swap that locked MDS on-chain (holds htlcCoins) and
+                // then stalled — including the TAKER side of a buy-offer, which previously had
+                // no reclaim UI at all — can refund after the timeout. This is the safety net
+                // that was missing: without it, a half-completed swap left MDS reclaimable only
+                // if you happened to be the maker. We show it whenever there are locked coins,
+                // the swap isn't already done/refunding, and no other primary action is offered.
+                const doneStatuses = ['completed', 'limit_refunded', 'limit_refunding', 'swap_complete'];
+                const hasLockedMds = Array.isArray(s.htlcCoins) && s.htlcCoins.length > 0
+                    && s.htlcCoins.every(c => c && c.coin_id && c.salt);
+                if (!btn && hasLockedMds && !doneStatuses.includes(s.status) && s.timeoutHeight) {
+                    const ready = networkHeight >= Number(s.timeoutHeight);
+                    const blocksLeft = Math.max(0, Number(s.timeoutHeight) - networkHeight);
+                    const mins = Math.max(1, Math.round(blocksLeft)); // ~1 block/min
+                    btn = ready
+                        ? `<button style="margin:0;width:100%;padding:9px;font-size:12px;background:transparent;border:1px solid var(--border-bright);color:var(--text-bright);" onclick="dexReclaimStuckLock(${idx})">Reclaim your locked MDS</button>`
+                        : `<button disabled style="margin:0;width:100%;padding:9px;font-size:12px;background:transparent;border:1px solid var(--border);color:#888;opacity:.7;cursor:not-allowed;" title="Refund unlocks at block ${s.timeoutHeight}">Reclaim available in ~${mins} min (block ${s.timeoutHeight})</button>`;
                 }
 
                 return `<div class="swap-card">
