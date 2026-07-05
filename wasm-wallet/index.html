@@ -729,6 +729,8 @@
             #app-container { grid-template-columns: 260px minmax(0, 1fr); }
             .page { max-width: 1600px; }
         }
+        @keyframes dexProgIndet { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+        .dex-prog-indet { animation: dexProgIndet 1.2s ease-in-out infinite; border-radius: 3px; }
     </style>
 </head>
 <body>
@@ -4569,8 +4571,34 @@ document.getElementById('btnExport').onclick = () => {
             if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', attach); else attach();
         })();
 
-        function dexSetProgress(msg, kind) {
-            showActivity(msg); // simplified: quiet activity line, no step modal
+        // Progress for order creation renders IN PLACE, right under the button (the element
+        // that was previously defined but never used), so the user gets immediate, visible
+        // feedback instead of only a top banner + a card on another tab. Shows an animated
+        // bar, the current phase, and elapsed time. `pct` null = indeterminate (striped
+        // animation); a number 0..100 = determinate.
+        let _dexProgPct = null;
+        function dexSetProgress(msg, pct) {
+            dexBroadcastStageMsg = msg || dexBroadcastStageMsg;
+            const box = document.getElementById('dexBroadcastProgress');
+            if (!box) { showActivity(msg); return; }
+            if (!dexBroadcastInFlight && pct == null && !msg) { box.style.display = 'none'; return; }
+            box.style.display = 'block';
+            const elapsed = dexBroadcastStart ? Math.floor((Date.now() - dexBroadcastStart) / 1000) : 0;
+            const mm = String(Math.floor(elapsed / 60)).padStart(1, '0');
+            const ss = String(elapsed % 60).padStart(2, '0');
+            const determinate = (typeof pct === 'number' && pct >= 0);
+            if (determinate) _dexProgPct = Math.min(100, Math.max(0, pct));
+            const barInner = determinate
+                ? `<div style="height:100%;width:${_dexProgPct}%;background:var(--accent);transition:width .4s ease;"></div>`
+                : `<div class="dex-prog-indet" style="height:100%;width:40%;background:var(--accent);"></div>`;
+            box.innerHTML = `
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:7px;">
+                    <span style="color:var(--text-bright);">${msg || dexBroadcastStageMsg || 'Working…'}</span>
+                    <span style="color:var(--text-faint);font-variant-numeric:tabular-nums;">${mm}:${ss}</span>
+                </div>
+                <div style="height:6px;background:var(--bg-raised);border-radius:3px;overflow:hidden;">${barInner}</div>
+                ${determinate ? `<div style="text-align:right;font-size:10px;color:var(--text-faint);margin-top:4px;">${Math.round(_dexProgPct)}%</div>` : ''}
+            `;
         }
 
         function dexBeginBroadcastUI(groupId) {
@@ -4578,16 +4606,35 @@ document.getElementById('btnExport').onclick = () => {
             dexBroadcastGroupId = groupId || null;
             dexBroadcastStart = Date.now();
             dexForceRebroadcast = false;
+            _dexProgPct = 3;
             dexRefreshBroadcastBtn();
-            dexSetProgress('Preparing order \u2014 verifying keys\u2026', null);
+            // Show the bar IMMEDIATELY at a low pct so the first click gives instant feedback.
+            dexSetProgress('Preparing order \u2014 verifying keys\u2026', 3);
             if (dexBroadcastHeartbeat) clearInterval(dexBroadcastHeartbeat);
-            // Keep the elapsed counter live so long block-waits never look frozen.
-            dexBroadcastHeartbeat = setInterval(function () { if (dexBroadcastInFlight) dexSetProgress(dexBroadcastStageMsg, null); }, 1000);
+            // Keep the elapsed counter live so long block-waits never look frozen, preserving
+            // the current pct so the bar doesn't reset to indeterminate each tick.
+            dexBroadcastHeartbeat = setInterval(function () {
+                if (dexBroadcastInFlight) dexSetProgress(dexBroadcastStageMsg, _dexProgPct);
+            }, 1000);
         }
 
         function dexFinishBroadcastUI(kind, msg) {
             dexBroadcastInFlight = false; dexBroadcastGroupId = null;
+            if (dexBroadcastHeartbeat) { clearInterval(dexBroadcastHeartbeat); dexBroadcastHeartbeat = null; }
+            const box = document.getElementById('dexBroadcastProgress');
+            if (box) {
+                if (kind === 'error') {
+                    // Leave a visible error state briefly so it isn't missed.
+                    box.style.display = 'block';
+                    box.innerHTML = `<div style="color:var(--red);">${msg || 'Order failed.'}</div>`;
+                    setTimeout(() => { if (!dexBroadcastInFlight) box.style.display = 'none'; }, 6000);
+                } else {
+                    box.innerHTML = `<div style="color:var(--text-max);">✓ ${msg || 'Order posted.'}</div>`;
+                    setTimeout(() => { if (!dexBroadcastInFlight) box.style.display = 'none'; }, 3000);
+                }
+            }
             hideActivity();
+            dexRefreshBroadcastBtn();
             showToast(msg, kind === 'error' ? 'error' : 'success');
         }
 
@@ -5391,7 +5438,19 @@ document.getElementById('btnExport').onclick = () => {
                 const swap = dexMySwaps.find(s => s.offerId === offerId);
                 if (swap) { swap.phase = phase; renderDexSwaps(); } // transient — not persisted
                 // Mirror the lock's phases into the on-form progress panel.
-                if (dexBroadcastInFlight && offerId === dexBroadcastGroupId && phase) dexSetProgress('Locking MDS on-chain \u2014 ' + phase, null);
+                if (dexBroadcastInFlight && offerId === dexBroadcastGroupId && phase) {
+                    const p = String(phase).toLowerCase();
+                    let pct = null;
+                    if (p.includes('verify') || p.includes('safety') || p.includes('preparing')) pct = 8;
+                    else if (p.includes('pow') || p.includes('mining')) pct = 20;
+                    else if (p.includes('commit broadcast') || p.includes('(1/2)')) pct = 35;
+                    else if (p.includes('waiting') && p.includes('commit')) pct = 45;
+                    else if (p.includes('reveal broadcast') || p.includes('(2/2)')) pct = 70;
+                    else if (p.includes('waiting') && p.includes('reveal')) pct = 82;
+                    else if (p.includes('announc')) pct = 90;
+                    else if (p.includes('confirm') || p.includes('syncing')) pct = 96;
+                    dexSetProgress('Locking MDS on-chain \u2014 ' + phase, pct);
+                }
             }
         });
 
@@ -6390,11 +6449,19 @@ document.getElementById('btnExport').onclick = () => {
         // the now-complete backup (which includes these salts) — the banner drives it.
         function dexAtRiskSwaps() {
             const done = ['completed', 'limit_refunded', 'limit_refunding', 'swap_complete'];
-            return dexMySwaps.filter(s =>
-                Array.isArray(s.htlcCoins) && s.htlcCoins.length > 0 &&
-                s.htlcCoins.every(c => c && c.coin_id && c.salt) &&
-                !done.includes(s.status)
-            );
+            return dexMySwaps.filter(s => {
+                if (done.includes(s.status)) return false;
+                // Locked MDS lives in one of two shapes depending on the path:
+                //  • htlcCoins[]  — taker locks & interactive swaps
+                //  • covenant{}   — maker limit orders (posted sell units)
+                // BOTH hold a random salt that only exists in this browser, so both are
+                // at risk if the user clears data. Count either.
+                const htlcLocked = Array.isArray(s.htlcCoins) && s.htlcCoins.length > 0
+                    && s.htlcCoins.every(c => c && c.coin_id && c.salt);
+                const covLocked = s.covenant && s.covenant.coinId && s.covenant.salt
+                    && s.status !== 'waiting_for_taker'; // not yet locked until funded
+                return htlcLocked || covLocked;
+            });
         }
         function dexUpdateSaltRiskBanner() {
             const banner = document.getElementById('saltRiskBanner');
@@ -6421,14 +6488,29 @@ document.getElementById('btnExport').onclick = () => {
         });
 
         function renderDexSwaps() {
-            dexUpdateSaltRiskBanner();            const container = document.getElementById('dexActiveSwaps');
+            dexUpdateSaltRiskBanner();
+            const container = document.getElementById('dexActiveSwaps');
             if (!container) return;
-            if (dexMySwaps.length === 0) {
+            if (!Array.isArray(dexMySwaps) || dexMySwaps.length === 0) {
                 container.innerHTML = '<div class="panel" style="text-align:center;color:#555;">No active swaps.</div>';
                 return;
             }
             const sorted = [...dexMySwaps].reverse();
-            container.innerHTML = sorted.map((s) => {
+            // Render each card in isolation: a single malformed swap must never throw and
+            // leave the whole list blank (which would show the stale "No active swaps"
+            // placeholder even though trades exist — the bug this guards against).
+            const cards = sorted.map((s) => {
+                try { return dexRenderSwapCard(s); }
+                catch (err) {
+                    const oid = (s && s.offerId) ? String(s.offerId).slice(0, 8) : '?';
+                    return `<div class="swap-card" style="border:1px solid var(--red);"><div style="font-size:12px;color:var(--red);">Swap ${oid} couldn't render (${(err && err.message) || 'error'}). Your funds are unaffected — reclaim from here if it's past timeout.</div></div>`;
+                }
+            });
+            container.innerHTML = cards.join('') || '<div class="panel" style="text-align:center;color:#555;">No active swaps.</div>';
+        }
+
+        // One swap card. Extracted so renderDexSwaps can isolate failures per-card.
+        function dexRenderSwapCard(s) {
                 const idx = dexMySwaps.indexOf(s);
                 const eth = prettyEth(s.weiAmount);
                 let btn = '', statusText = 'Processing…';
@@ -6565,7 +6647,6 @@ document.getElementById('btnExport').onclick = () => {
                     <div style="font-size:12px;color:var(--text-bright);text-align:center;margin-bottom:${(btn || secondaryBtn) ? '15px' : '0'};display:flex;align-items:center;justify-content:center;gap:7px;">${statusHtml}</div>
                     ${btn}${secondaryBtn}
                 </div>`;
-            }).join('');
         }
 
         // Periodically prune expired offers from the visible book.
