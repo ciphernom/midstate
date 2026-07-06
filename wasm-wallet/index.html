@@ -2845,7 +2845,8 @@ if ('serviceWorker' in navigator) {
         let walletExists = false;
         let sendInProgress = false;
         window.appHistory = [];
-
+        let networkHeight = 0; 
+        
         function log(msg, color = 'var(--text-bright)') {
             const el = document.createElement('div');
             el.className = 'term-line';
@@ -2914,7 +2915,10 @@ if ('serviceWorker' in navigator) {
                 if (!payload) return;
 
                 if (payload.lastScannedHeight !== undefined) document.getElementById('uiWalletHeight').innerText = payload.lastScannedHeight;
-                if (payload.networkHeight !== undefined) document.getElementById('uiNetworkHeight').innerText = payload.networkHeight;
+                if (payload.networkHeight !== undefined) {
+                    document.getElementById('uiNetworkHeight').innerText = payload.networkHeight;
+                    networkHeight = payload.networkHeight; 
+                }
                 if (payload.mempoolSize !== undefined) document.getElementById('uiMempoolSize').innerText = payload.mempoolSize;
 
                 const primaryAddress = payload.primaryAddress || "None";
@@ -4197,6 +4201,11 @@ document.getElementById('btnExport').onclick = () => {
         // Fraction of the ETH lock offered to a relayer for settling on behalf of an
         // offline maker. 0.5% is ample vs Base gas; ignored entirely on V1.
         const DEX_RELAYER_BOUNTY_BPS = 50; // 0.50%
+        // ── Public-market order hygiene ──
+        const DEX_MIN_ORDER_WEI     = 100000000000000n; // 0.0001 ETH — reject dust-notional orders
+        const DEX_MIN_WEI_PER_MDS   = 0n;               // price floor: min wei per 1 MDS. 0n = floor disabled
+        const DEX_MAX_PRICE_SIGFIGS = 12;               // keep ETH amounts under JS float precision (must be < 15)
+        
         const HTLC_ABI = DEX_BRIDGE_ENABLED ? [
             "function lock(bytes32 hashlock, address payable beneficiary, uint256 refundDelay, uint256 relayerBounty) external payable returns (bytes32)",
             "function claim(bytes32 swapId, bytes32 preimage) external",
@@ -4212,6 +4221,34 @@ document.getElementById('btnExport').onclick = () => {
             "event Claimed(bytes32 indexed swapId, bytes32 hashlock, bytes32 preimage)",
             "event Refunded(bytes32 indexed swapId)"
         ];
+        
+        // Cap a wei value to DEX_MAX_PRICE_SIGFIGS significant digits, so the ETH figure
+        // MetaMask formats for its confirmation/price display never blows past float precision.
+        function sanitizeWei(weiLike) {
+            let w = BigInt(weiLike);                        // throws on a fractional/garbage string — good
+            const s = w.toString();
+            if (s.length > DEX_MAX_PRICE_SIGFIGS) {
+                const scale = 10n ** BigInt(s.length - DEX_MAX_PRICE_SIGFIGS);
+                w = (w / scale) * scale;                    // zero out the low-order noise digits
+            }
+            return w.toString();
+        }
+
+        // Returns an error string if an order breaks the market limits, else null. All BigInt (no float drift).
+        function dexValidateOrder(weiAmount, mdsAmount) {
+            let wei, mds;
+            try { wei = BigInt(weiAmount); mds = BigInt(mdsAmount); }
+            catch { return "Order has a malformed amount."; }
+            if (mds <= 0n) return "Amount must be greater than zero.";
+            if (wei < DEX_MIN_ORDER_WEI)
+                return `Order total ${ethers.formatEther(wei)} ETH is below the ${ethers.formatEther(DEX_MIN_ORDER_WEI)} ETH minimum.`;
+            if (DEX_MIN_WEI_PER_MDS > 0n && wei < DEX_MIN_WEI_PER_MDS * mds)
+                return `Price is below the floor of ${DEX_MIN_WEI_PER_MDS} wei per MDS.`;
+            if (wei.toString().replace(/0+$/, '').length > DEX_MAX_PRICE_SIGFIGS)
+                return "Price has too many significant digits — round it before posting.";
+            return null;
+        }
+        
         // Build lock() args for whichever contract version is active (V2 appends bounty).
         function dexLockArgs(hashlockHex, beneficiary, weiAmount) {
             const base = ["0x" + hashlockHex, beneficiary, BASE_REFUND_DELAY_SECS];
@@ -4757,7 +4794,9 @@ document.getElementById('btnExport').onclick = () => {
             if (!mdsAmt) return showToast(mdsErr || "Enter the MDS amount", "error");
             const { wei, error } = dexWeiFromInput();
             if (!wei) return showToast(error || "Enter a price", "error");
-            const weiAmt = wei.toString();
+            const weiAmt = sanitizeWei(wei);
+            const orderErr = dexValidateOrder(weiAmt, mdsAmt);
+            if (orderErr) return showToast(orderErr, "error");
 
             const offerId = Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2, '0')).join('');
             const kind = dexDirection;   // 'ask' = sell MDS, 'bid' = buy MDS — the single source of truth
@@ -4910,6 +4949,8 @@ document.getElementById('btnExport').onclick = () => {
             const weiAmount = (o.weiAmount != null) ? String(o.weiAmount)
                             : (cov.weiAmount != null) ? String(cov.weiAmount) : null;
             if (!weiAmount) return showToast("Order has no price.", "error");
+            const fillErr = dexValidateOrder(weiAmount, coinValue);
+            if (fillErr) return showToast("Can't fill — " + fillErr, "error");
             if (dexMySwaps.some(s => s.kind === 'limit' && s.offerId === o.offerId))
                 return showToast("You're already filling this order.", "error");
 
@@ -4919,23 +4960,28 @@ document.getElementById('btnExport').onclick = () => {
                 const tx = await c.lock(...dexLockArgs(cov.secretHash, cov.makerEvmAddr, weiAmount));
                 const receipt = await tx.wait();
                 let baseSwapId = null;
-                for (const log of receipt.logs) { try { const p = c.interface.parseLog(log); if (p && p.name === 'Locked') { baseSwapId = p.args.swapId; break; } } catch (_) {} }
-                hideActivity();
+                for (const log of receipt.logs) { try { const p = c.interface.parseLog(log); if (p?.name === 'Locked') { baseSwapId = p.args.swapId; break; } } catch (_) {} }
 
+                // ETH is locked on-chain now — save the recovery-critical record FIRST.
                 dexMySwaps.push({
                     role: 'taker', side: 'eth', kind: 'limit', status: 'limit_waiting_secret',
-                    offerId: o.offerId, weiAmount, mdsAmount: coinValue,
-                    covenant: cov, baseSwapId, fromBlock: receipt.blockNumber, makerEvmAddr: cov.makerEvmAddr,
-                    lockedAtHeight: networkHeight // Track Midstate height
+                    offerId: o.offerId, weiAmount, mdsAmount: coinValue, covenant: cov,
+                    baseSwapId, fromBlock: receipt.blockNumber, makerEvmAddr: cov.makerEvmAddr,
+                    lockedAtHeight: (typeof networkHeight === 'number' ? networkHeight : 0)
                 });
-                saveSwaps(); renderDexSwaps();
-                dexOrderbook = dexOrderbook.filter(x => (x.offerId || x.nonce) !== (o.offerId || o.nonce));
-                renderDexOrderbook();
-                showToast("ETH locked. Waiting for the maker to reveal the preimage; your MDS then auto-claims.", "success");
-                startLimitSecretWatch(o.offerId);
+                saveSwaps();
+
+                hideActivity();
+                try {
+                    renderDexSwaps();
+                    dexOrderbook = dexOrderbook.filter(x => (x.offerId||x.nonce) !== (o.offerId||o.nonce));
+                    renderDexOrderbook();
+                    startLimitSecretWatch(o.offerId);
+                } catch (uiErr) { console.error('post-lock UI error (swap is saved & safe):', uiErr); }
+                showToast("ETH locked. Waiting for the maker to reveal the preimage…", "success");
             } catch (err) {
                 hideActivity();
-                showToast("Failed to lock ETH: " + (err.shortMessage || err.message), "error");
+                showToast("Could not lock ETH (nothing was sent): " + (err.shortMessage || err.message), "error");
                 throw err;
             }
         };
@@ -4994,6 +5040,10 @@ document.getElementById('btnExport').onclick = () => {
             const weiAmount = (o.weiAmount != null) ? String(o.weiAmount)
                             : (cov.weiAmount != null) ? String(cov.weiAmount) : null;
             if (!weiAmount) return showToast("Order has no price.", "error");
+            const fillErr = dexValidateOrder(weiAmount, o.mdsAmount || cov.value);
+            if (fillErr) return showToast("Can't fill — " + fillErr, "error");
+            
+            
             if (dexMySwaps.some(s => s.kind === 'limit' && s.offerId === o.offerId))
                 return showToast("You're already filling this order.", "error");
             dexPendingSubmarine = {
