@@ -3171,10 +3171,26 @@ async function processFullBlock(height) {
             if (action.inputs) {
                 for (const inp of action.inputs) {
                     const saltHex = normalizeHex(inp.salt);
-                    const cid     = ourSalts.get(saltHex);
-                    if (cid) {
+                    const bytecode = inp.predicate?.Script?.bytecode || inp.bytecode;
+                    
+                    let cid = null;
+                    if (bytecode) {
+                        // Recompute the exact Coin ID from the blockchain data
+                        const addrHex = blake3_hash_hex(normalizeHex(bytecode));
+                        if (inp.commitment) {
+                            cid = compute_confidential_coin_id(addrHex, normalizeHex(inp.commitment), saltHex);
+                        } else {
+                            cid = compute_coin_id_hex(addrHex, BigInt(inp.value), saltHex);
+                        }
+                    }
+
+                    // Fallback to the salt map only if the block data is severely malformed
+                    if (!cid) cid = ourSalts.get(saltHex);
+
+                    // Safely delete the accurately identified coin
+                    if (cid && wState.utxos[cid]) {
                         delete wState.utxos[cid];
-                        ourSalts.delete(saltHex);
+                        if (ourSalts.get(saltHex) === cid) ourSalts.delete(saltHex);
                         spentIds.push(cid);
                         spentValue += Number(inp.value);
                         matchFound = true;

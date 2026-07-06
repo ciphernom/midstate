@@ -3290,19 +3290,19 @@ if ('serviceWorker' in navigator) {
 
                 case 'SEND_PROGRESS':
                     showActivity(payload.msg);
-                    { const st = document.getElementById('txProgressStatus'); if (st && document.getElementById('txProgressModal') && document.getElementById('txProgressModal').classList.contains('active')) st.textContent = payload.msg; }
                     if (dexBroadcastInFlight && typeof dexSetProgress === 'function') dexSetProgress('Announcing order on-chain \u2014 ' + payload.msg, null);
                     break;
 
                 case 'SEND_STEP':
-                    txProgressAddStep(payload);
+                    // Route the granular step-by-step progress to the Developer Terminal 
+                    // instead of a blocking modal, so power users can still see it.
+                    log(`[Tx] ${payload.title || payload.step}: ${payload.detail || ''}`, 'var(--text-bright)');
                     break;
 
                 case 'SEND_COMPLETE':
                     hideActivity();
                     sendInProgress = false;
                     { const b = document.getElementById('btnSend'); if (b) { b.disabled = false; b.innerText = "Swipe to Send"; } }
-                    txProgressFinish('success', 'Transaction confirmed on-chain.');
                     showToast("Transaction confirmed on-chain.", "success");
                     updateDashboard(payload);
                     break;
@@ -3311,9 +3311,6 @@ if ('serviceWorker' in navigator) {
                     hideActivity();
                     sendInProgress = false;
                     { const b = document.getElementById('btnSend'); if (b) { b.disabled = false; b.innerText = "Swipe to Send"; } }
-                    // Pin the error in the tx panel so it stays visible until dismissed —
-                    // never a disappearing card. Also mirror to the DEX progress if relevant.
-                    txProgressFinish('error', (payload && payload.error) ? payload.error : 'Transaction failed.');
                     if (dexBroadcastInFlight && typeof dexFinishBroadcastUI === 'function') dexFinishBroadcastUI('error', (payload && payload.error) ? payload.error : 'Transaction failed.');
                     showToast((payload && payload.error) ? ('Send failed: ' + payload.error) : 'Send failed.', "error");
                     break;
@@ -3525,8 +3522,10 @@ if ('serviceWorker' in navigator) {
                     e.target.innerText = "Processing...";
                     resetSendForm();
                     switchTab('view-home');
+                    // Remove the blocking openTxProgress() modal call.
+                    // Let the top #txQueueStatus banner and #activity-banner handle the UI natively.
                     showActivity("Preparing transaction...");
-                    openTxProgress('Sending transaction', `${amtLine} → ${toAddress.slice(0, 10)}…${toAddress.slice(-6)}`);
+                    showToast(`Queued send of ${amount.toLocaleString('en')} MDS...`, "info");
                     worker.postMessage({ type: 'SEND', payload: { toAddress, amount, sendAll } });
                 }
             );
@@ -4926,7 +4925,8 @@ document.getElementById('btnExport').onclick = () => {
                 dexMySwaps.push({
                     role: 'taker', side: 'eth', kind: 'limit', status: 'limit_waiting_secret',
                     offerId: o.offerId, weiAmount, mdsAmount: coinValue,
-                    covenant: cov, baseSwapId, fromBlock: receipt.blockNumber, makerEvmAddr: cov.makerEvmAddr
+                    covenant: cov, baseSwapId, fromBlock: receipt.blockNumber, makerEvmAddr: cov.makerEvmAddr,
+                    lockedAtHeight: networkHeight // Track Midstate height
                 });
                 saveSwaps(); renderDexSwaps();
                 dexOrderbook = dexOrderbook.filter(x => (x.offerId || x.nonce) !== (o.offerId || o.nonce));
@@ -5043,7 +5043,7 @@ document.getElementById('btnExport').onclick = () => {
                         status: 'submarine_waiting_l2', offerId: pend.offerId,
                         weiAmount: pend.weiAmount, mdsAmount: pend.mdsAmount,
                         covenant: pend.covenant, submarineHash: secretHash, baseSwapId,
-                        fromBlock: receipt.blockNumber, lockedAt: Date.now(),
+                        fromBlock: receipt.blockNumber, lockedAtHeight: networkHeight,
                         makerEvmAddr: pend.makerEvmAddr, makerMdsPk: pend.makerMdsPk
                     });
                     saveSwaps(); renderDexSwaps();
@@ -5243,7 +5243,7 @@ document.getElementById('btnExport').onclick = () => {
                     if (claimedAmount != null) {
                         swap.status = 'completed'; saveSwaps(); renderDexSwaps();
                         showToast(`Submarine swap complete: ${Number(claimedAmount).toLocaleString('en')} MDS received on L2.`, "success");
-                    } else if (swap.baseSwapId && Date.now() > (swap.lockedAt || 0) + (BASE_REFUND_DELAY_SECS + 300) * 1000 && !swap._refunding) {
+                    } else if (swap.baseSwapId && swap.lockedAtHeight && networkHeight > (swap.lockedAtHeight + Math.ceil(BASE_REFUND_DELAY_SECS / 60) + 5) && !swap._refunding) {
                         // The maker never routed (or our claim never happened) — pull the ETH back.
                         swap._refunding = true;
                         (async () => {
@@ -6670,6 +6670,33 @@ document.getElementById('btnExport').onclick = () => {
             container.innerHTML = cards.join('') || '<div class="panel" style="text-align:center;color:#555;">No active swaps.</div>';
         }
 
+        window.dexRefundEth = async function(idx) {
+            const swap = dexMySwaps[idx];
+            if (!swap || !swap.baseSwapId) return showToast("No ETH lock found.", "error");
+            if (!evmSigner) return showToast("Connect MetaMask first.", "error");
+            
+            try {
+                showActivity("Refunding ETH from Base contract…");
+                const c = dexWriteContract();
+                const tx = await c.refund(swap.baseSwapId);
+                await tx.wait();
+                hideActivity();
+                
+                swap.status = 'limit_refunded';
+                saveSwaps();
+                renderDexSwaps();
+                showToast("ETH successfully refunded from Base!", "success");
+            } catch (err) {
+                hideActivity();
+                // Base EVM reverts if we try to refund before the exact timestamp expires
+                if (err.message && err.message.includes("execution reverted")) {
+                    showToast("Base contract rejected refund. Midstate blocks may have been fast — wait a few more minutes.", "error");
+                } else {
+                    showToast("Refund failed: " + (err.shortMessage || err.message), "error");
+                }
+            }
+        };
+
         // One swap card. Extracted so renderDexSwaps can isolate failures per-card.
         function dexRenderSwapCard(s) {
                 const idx = dexMySwaps.indexOf(s);
@@ -6800,7 +6827,22 @@ document.getElementById('btnExport').onclick = () => {
                         ? `<button style="margin:0;width:100%;padding:9px;font-size:12px;background:transparent;border:1px solid var(--border-bright);color:var(--text-bright);" onclick="dexReclaimStuckLock(${idx})">Reclaim your locked MDS</button>`
                         : `<button disabled style="margin:0;width:100%;padding:9px;font-size:12px;background:transparent;border:1px solid var(--border);color:#888;opacity:.7;cursor:not-allowed;" title="Refund unlocks at block ${s.timeoutHeight}">Reclaim available in ~${mins} min (block ${s.timeoutHeight})</button>`;
                 }
-
+                
+                // FIX: Universal ETH Refund (Block-Height Based)
+                const hasLockedEth = s.baseSwapId && !doneStatuses.includes(s.status) && s.side === 'eth';
+                if (!btn && hasLockedEth && s.lockedAtHeight) {
+                    const refundBlocks = Math.ceil(BASE_REFUND_DELAY_SECS / 60);
+                    // Add a +2 block UI buffer to account for Base EVM timestamp slight desyncs
+                    const refundHeight = s.lockedAtHeight + refundBlocks + 2; 
+                    const ready = networkHeight >= refundHeight;
+                    const blocksLeft = Math.max(0, refundHeight - networkHeight);
+                    
+                    btn = ready
+                        ? `<button style="margin:0;width:100%;padding:9px;font-size:12px;background:transparent;border:1px solid var(--border-bright);color:var(--text-bright);" onclick="dexRefundEth(${idx})">Refund your stuck ETH</button>`
+                        : `<button disabled style="margin:0;width:100%;padding:9px;font-size:12px;background:transparent;border:1px solid var(--border);color:#888;opacity:.7;cursor:not-allowed;" title="Refund unlocks at block ${refundHeight}">ETH locked for ~${blocksLeft} more blocks</button>`;
+                }
+                
+                
                 return `<div class="swap-card">
                     <div class="swap-card-header">
                         <div><span style="font-weight:bold;color:var(--text-max);font-size:14px;">${headline}</span> <span style="font-size:11px;color:var(--text-muted);">for ${eth} ETH${(() => { const u = weiToUsd(s.weiAmount); return u ? ` (\u2248 ${u})` : ''; })()}</span></div>
