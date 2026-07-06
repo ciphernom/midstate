@@ -4936,6 +4936,7 @@ document.getElementById('btnExport').onclick = () => {
             } catch (err) {
                 hideActivity();
                 showToast("Failed to lock ETH: " + (err.shortMessage || err.message), "error");
+                throw err;
             }
         };
 
@@ -5138,6 +5139,10 @@ document.getElementById('btnExport').onclick = () => {
                 const offer = e.data.payload;
                 if (offer.ts && (Date.now() - offer.ts) > OFFER_TTL_MS) return;
                 if (dexOfferEngaged(offer.offerId)) return;   // taken/accepted — don't let the bus re-add it
+                
+                // Hard cap to prevent memory exhaustion from P2P spam
+                if (dexOrderbook.length > 10000) return; 
+                
                 const key = offer.offerId || offer.nonce;
                 const cid = offer.covenant && offer.covenant.coinId;
                 const ex = dexOrderbook.find(o => (o.offerId || o.nonce) === key || (cid && o.covenant && o.covenant.coinId === cid));
@@ -5325,12 +5330,10 @@ document.getElementById('btnExport').onclick = () => {
                 const n = (_dexAnnounceRetries[groupId] || 0) + 1;
                 if (groupId) _dexAnnounceRetries[groupId] = n;
                 if (groupId && n <= 3) {
-                    // Transient failures (WebRTC blips right after the heavy funding flow)
-                    // clear on their own — retry automatically before bothering the user.
                     const delayS = 20 * n;
-                    showToast(`On-chain announce failed (${errMsg}). Auto-retrying in ${delayS}s (attempt ${n}/3)\u2026`, "error");
-                    if (dexBroadcastInFlight) dexSetProgress(`MDS locked \u2713 \u00b7 announce failed, auto-retrying (${n}/3)\u2026`, null);
-                    setTimeout(() => dexRetryAnnounce(groupId), delayS * 1000);
+                    // Instruct the main thread (UI) to handle the retry, since the worker can't access window functions
+                    self.postMessage({ type: 'LOG', payload: `On-chain announce failed. Auto-retrying in ${delayS}s (attempt ${n}/3)...` });
+                    self.postMessage({ type: 'DEX_RETRY_ANNOUNCE_UI', payload: { groupId, delayS } });
                 } else {
                     showToast("On-chain announce failed: " + errMsg + ". Order still advertised over chat; use the order card's Retry button.", "error");
                     if (dexBroadcastInFlight) dexFinishBroadcastUI('error', 'MDS locked \u2713, but the on-chain announce failed: ' + errMsg + '. Funds are safe \u2014 retry from the order card; chat gossip still advertises it meanwhile.');
@@ -5545,10 +5548,11 @@ document.getElementById('btnExport').onclick = () => {
             else if (e.data.type === 'DEX_SETTLED_STATUS') {
                 // Reply to a delivery poll. If the covenant coins are spent, the MDS has
                 // moved to the buyer's address — finish the swap on whichever side we are.
-                const { offerId, settled } = e.data.payload;
+                const { offerId, settled, success } = e.data.payload;
                 // Feature 1: a 'verify:' sentinel is an orderbook on-chain existence check —
                 // the covenant UTXO exists iff it is NOT (yet) settled/spent.
                 if (typeof offerId === 'string' && offerId.startsWith('verify:')) {
+                    if (!success) return; // Do not falsely verify if the RPC call failed
                     const cid = offerId.slice('verify:'.length);
                     const o = dexOrderbook.find(x => x.covenant && x.covenant.coinId === cid);
                     if (o) {
@@ -5592,6 +5596,12 @@ document.getElementById('btnExport').onclick = () => {
                     else if (p.includes('confirm') || p.includes('syncing')) pct = 96;
                     dexSetProgress('Locking MDS on-chain \u2014 ' + phase, pct);
                 }
+            }
+            else if (e.data.type === 'DEX_RETRY_ANNOUNCE_UI') {
+                const { groupId, delayS } = e.data.payload;
+                showToast(`On-chain announce failed. Auto-retrying in ${delayS}s...`, "error");
+                if (dexBroadcastInFlight) dexSetProgress(`MDS locked \u2713 \u00b7 announce failed, auto-retrying...`, null);
+                setTimeout(() => dexRetryAnnounce(groupId), delayS * 1000);
             }
         });
 

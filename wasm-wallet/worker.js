@@ -2329,12 +2329,17 @@ self.onmessage = async (e) => {
         }
 
         else if (type === 'DEX_CHECK_SETTLED') {
-            // Lightweight read-only poll used by the buyer while waiting for delivery:
-            // once the covenant lock coin is spent, the MDS has been delivered to them.
             const { offerId, coinId } = payload;
             let settled = false;
-            try { const chk = await rpc.checkCoin(normalizeHex(coinId)); settled = !!(chk && !chk.exists); } catch (e) {}
-            self.postMessage({ type: 'DEX_SETTLED_STATUS', payload: { offerId, settled } });
+            let success = false;
+            try { 
+                const chk = await rpc.checkCoin(normalizeHex(coinId)); 
+                if (chk) {
+                    settled = !chk.exists; 
+                    success = true;
+                }
+            } catch (e) {}
+            self.postMessage({ type: 'DEX_SETTLED_STATUS', payload: { offerId, settled, success } });
         }
         else if (type === 'PUSH_NEW_BLOCK') {
             if (payload.ChatMessage) {
