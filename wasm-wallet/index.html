@@ -645,13 +645,17 @@
                 border-left: none; border-right: none;
                 display: grid;
                 grid-template-columns: 220px minmax(0, 1fr);
-                grid-template-rows: auto auto auto minmax(0, 1fr);
+                grid-template-rows: auto auto auto auto auto minmax(0, 1fr);
                 grid-template-areas:
+                    "queuebar queuebar"
+                    "riskbar  riskbar"
                     "nav header"
                     "nav stats"
                     "nav banner"
                     "nav content";
             }
+            #txQueueStatus { grid-area: queuebar; padding-left: 2rem; padding-right: 2rem; }
+            #saltRiskBanner { grid-area: riskbar; padding-left: 2rem; padding-right: 2rem; }
 
             header {
                 grid-area: header; justify-content: space-between;
@@ -662,6 +666,9 @@
                 padding: 9px 2rem; border-bottom: 1px solid var(--border);
             }
             #activity-banner { grid-area: banner; padding: 10px 2rem; }
+            /* The two status strips get their own full-width rows at the top of the grid
+               (queuebar/riskbar areas) so they span nav+content instead of squashing into
+               the narrow nav column. */
 
             #bottom-nav {
                 position: static; grid-area: nav;
@@ -751,10 +758,13 @@
 
         <div id="txQueueStatus" style="display:none;font-size:11px;color:var(--text-muted);text-align:center;padding:4px 8px;background:var(--bg-raised);border-bottom:1px solid var(--border);"></div>
 
-        <div id="saltRiskBanner" style="display:none;font-size:12px;color:#111;text-align:center;padding:8px 12px;background:#f5c542;border-bottom:1px solid #c99a00;line-height:1.5;">
-            <b>⚠ You have <span id="saltRiskCount">0</span> open trade(s) with funds locked on-chain.</b>
-            The only key to reclaim them lives in this browser's storage. <b>Do NOT clear browser data or uninstall</b> without exporting a backup first — clearing data will permanently freeze these funds.
-            <button onclick="document.getElementById('btnExport') && document.getElementById('btnExport').click()" style="margin-left:8px;padding:4px 10px;font-size:11px;background:#111;color:#f5c542;border:none;border-radius:3px;cursor:pointer;">Export backup now</button>
+        <div id="saltRiskBanner" style="display:none; font-size:12px; color:var(--text-muted); padding:8px 16px; background:var(--bg-panel); border-bottom:1px solid var(--border); align-items:center; gap:12px;">
+            <span style="flex:1; line-height:1.4;">
+                <b id="saltRiskCount" style="color:var(--text-max);">0</b> open trade(s) with MDS locked on-chain — keep a backup to move them between devices. 
+                <span style="color:var(--text-faint);">(Recoverable from your seed even if you clear data.)</span>
+            </span>
+            <button onclick="document.getElementById('btnExport') && document.getElementById('btnExport').click()" style="width:auto !important; flex-shrink:0; margin:0 !important; padding:4px 10px !important; font-size:11px; background:transparent; border:1px solid var(--border-bright) !important; color:var(--text-bright); cursor:pointer; white-space:nowrap; min-height:0;">Export backup</button>
+            <button onclick="dexDismissSaltBanner()" title="Dismiss" style="width:auto !important; flex-shrink:0; margin:0 !important; padding:4px 8px !important; font-size:16px; background:transparent !important; border:none !important; color:var(--text-muted); cursor:pointer; line-height:1; min-height:0;">&times;</button>
         </div>
 
         <div id="activity-banner">
@@ -1164,6 +1174,13 @@
 
             <!-- TAB: MY SWAPS -->
             <div id="dex-tab-portfolio" style="display: none;">
+                <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-raised);">
+                    <div style="flex:1;min-width:180px;font-size:11px;color:var(--text-muted);line-height:1.5;">
+                        Restored your wallet on a new device or cleared data? Your locked sell orders can be rebuilt from the blockchain — no backup needed.
+                    </div>
+                    <button id="dexRecoverBtn" onclick="dexRecoverOrders()" style="padding:8px 14px;font-size:12px;background:transparent;border:1px solid var(--border-bright);color:var(--text-bright);border-radius:4px;cursor:pointer;white-space:nowrap;">Recover my orders from chain</button>
+                </div>
+                <div id="dexRecoverStatus" style="font-size:11px;color:var(--text-muted);margin-bottom:10px;min-height:14px;"></div>
                 <div id="dexActiveSwaps">
                     <div class="panel" style="text-align: center; color: #555;">No active swaps.</div>
                 </div>
@@ -1413,6 +1430,19 @@
         </div>
     </div>
     
+    <!-- Live transaction progress: shows every commit/reveal step with hashes + block
+         heights, persists on screen, and on error/success stays until the user closes it. -->
+    <div id="txProgressModal" class="modal-overlay">
+        <div class="modal" style="max-width: 560px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+                <h2 id="txProgressTitle" style="margin:0;">Sending transaction</h2>
+                <button id="txProgressClose" onclick="closeTxProgress()" title="Close" style="display:none;background:transparent;border:1px solid var(--border-bright);color:var(--text-bright);border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer;">Close</button>
+            </div>
+            <div id="txProgressStatus" style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">Working through the two-phase commit/reveal…</div>
+            <div id="txProgressSteps" style="display:flex;flex-direction:column;gap:0;max-height:52vh;overflow-y:auto;font-size:12px;"></div>
+        </div>
+    </div>
+
     <div id="txDetailModal" class="modal-overlay">
         <div class="modal" style="max-width: 500px;">
             <h2 id="txDetailTitle">Transaction Details</h2>
@@ -1517,8 +1547,66 @@ if ('serviceWorker' in navigator) {
             document.getElementById('activity-banner').classList.remove('active');
         }
 
-        function showConfirm(title, htmlMessage, onConfirm) {
-            document.getElementById('modalTitle').innerText = title;
+        // ── Live transaction-progress panel ─────────────────────────────────
+        // Shows each commit/reveal step (with commitment hash, PoW nonce, block heights)
+        // as it happens, and stays on screen on success OR error until the
+        // user closes it. 
+        function openTxProgress(title, subtitle) {
+            const modal = document.getElementById('txProgressModal');
+            const steps = document.getElementById('txProgressSteps');
+            const status = document.getElementById('txProgressStatus');
+            const closeBtn = document.getElementById('txProgressClose');
+            const titleEl = document.getElementById('txProgressTitle');
+            if (!modal) return;
+            if (titleEl) titleEl.textContent = title || 'Sending transaction';
+            if (status) { status.innerHTML = subtitle || 'Working through the two-phase commit/reveal…'; status.style.color = 'var(--text-muted)'; }
+            if (steps) steps.innerHTML = '';
+            if (closeBtn) closeBtn.style.display = 'none';   // can't close mid-flight
+            modal.classList.add('active');
+        }
+        function txProgressAddStep({ step, title, detail, sub }) {
+            const steps = document.getElementById('txProgressSteps');
+            if (!steps) return;
+            const row = document.createElement('div');
+            row.style.cssText = 'padding:8px 0;border-bottom:1px solid var(--border);';
+            const mono = 'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all;';
+            row.innerHTML =
+                `<div style="display:flex;align-items:baseline;gap:8px;">
+                    <span style="color:var(--accent);flex-shrink:0;">▸</span>
+                    <span style="color:var(--text-max);font-weight:600;">${title || step || ''}</span>
+                 </div>` +
+                (detail ? `<div style="${mono}color:var(--text-bright);font-size:11px;margin-left:16px;margin-top:2px;">${detail}</div>` : '') +
+                (sub ? `<div style="color:var(--text-faint);font-size:10px;margin-left:16px;margin-top:1px;">${sub}</div>` : '');
+            steps.appendChild(row);
+            steps.scrollTop = steps.scrollHeight;
+        }
+        function txProgressFinish(kind, message) {
+            const status = document.getElementById('txProgressStatus');
+            const closeBtn = document.getElementById('txProgressClose');
+            const titleEl = document.getElementById('txProgressTitle');
+            const modal = document.getElementById('txProgressModal');
+            if (!modal || !modal.classList.contains('active')) {
+                // Send failed before the panel was open (or after it was closed) — for an
+                // error, still make sure the user sees it.
+                if (kind === 'error') { openTxProgress('Transaction failed', ''); }
+                else return;
+            }
+            if (kind === 'error') {
+                if (titleEl) titleEl.textContent = 'Transaction failed';
+                if (status) { status.innerHTML = `<span style="color:var(--red);">✕ ${message || 'The transaction did not complete.'}</span>`; }
+                txProgressAddStep({ title: 'Error', detail: message || 'The transaction did not complete.', sub: 'Nothing further was broadcast. You can retry the send.' });
+            } else {
+                if (titleEl) titleEl.textContent = 'Transaction complete';
+                if (status) { status.innerHTML = `<span style="color:var(--text-max);">✓ ${message || 'Confirmed on-chain.'}</span>`; }
+            }
+            if (closeBtn) closeBtn.style.display = 'inline-block';   // now dismissible
+        }
+        function closeTxProgress() {
+            const modal = document.getElementById('txProgressModal');
+            if (modal) modal.classList.remove('active');
+        }
+
+        function showConfirm(title, htmlMessage, onConfirm) {            document.getElementById('modalTitle').innerText = title;
             document.getElementById('modalMsg').innerHTML = htmlMessage;
             const confirmBtn = document.getElementById('modalConfirmBtn');
             const newBtn = confirmBtn.cloneNode(true);
@@ -3202,19 +3290,32 @@ if ('serviceWorker' in navigator) {
 
                 case 'SEND_PROGRESS':
                     showActivity(payload.msg);
-                    // During a DEX broadcast, the announce leg runs through performSend →
-                    // SEND_PROGRESS. Mirror it into the on-form progress panel.
+                    { const st = document.getElementById('txProgressStatus'); if (st && document.getElementById('txProgressModal') && document.getElementById('txProgressModal').classList.contains('active')) st.textContent = payload.msg; }
                     if (dexBroadcastInFlight && typeof dexSetProgress === 'function') dexSetProgress('Announcing order on-chain \u2014 ' + payload.msg, null);
+                    break;
+
+                case 'SEND_STEP':
+                    txProgressAddStep(payload);
                     break;
 
                 case 'SEND_COMPLETE':
                     hideActivity();
                     sendInProgress = false;
-                    const btnSendDone = document.getElementById('btnSend');
-                    btnSendDone.disabled = false;
-                    btnSendDone.innerText = "Swipe to Send";
+                    { const b = document.getElementById('btnSend'); if (b) { b.disabled = false; b.innerText = "Swipe to Send"; } }
+                    txProgressFinish('success', 'Transaction confirmed on-chain.');
                     showToast("Transaction confirmed on-chain.", "success");
                     updateDashboard(payload);
+                    break;
+
+                case 'SEND_ERROR':
+                    hideActivity();
+                    sendInProgress = false;
+                    { const b = document.getElementById('btnSend'); if (b) { b.disabled = false; b.innerText = "Swipe to Send"; } }
+                    // Pin the error in the tx panel so it stays visible until dismissed —
+                    // never a disappearing card. Also mirror to the DEX progress if relevant.
+                    txProgressFinish('error', (payload && payload.error) ? payload.error : 'Transaction failed.');
+                    if (dexBroadcastInFlight && typeof dexFinishBroadcastUI === 'function') dexFinishBroadcastUI('error', (payload && payload.error) ? payload.error : 'Transaction failed.');
+                    showToast((payload && payload.error) ? ('Send failed: ' + payload.error) : 'Send failed.', "error");
                     break;
 
                 case 'LOG':
@@ -3425,6 +3526,7 @@ if ('serviceWorker' in navigator) {
                     resetSendForm();
                     switchTab('view-home');
                     showActivity("Preparing transaction...");
+                    openTxProgress('Sending transaction', `${amtLine} → ${toAddress.slice(0, 10)}…${toAddress.slice(-6)}`);
                     worker.postMessage({ type: 'SEND', payload: { toAddress, amount, sendAll } });
                 }
             );
@@ -4465,6 +4567,17 @@ document.getElementById('btnExport').onclick = () => {
         // dexRefundLimitOrder (maker limit orders only), this handles the taker-side MDS
         // lock — the case that previously had NO reclaim path. Pulls the exact HTLC params
         // from the swap record so the worker can rebuild the covenant and spend the refund.
+        // Trigger seed-only recovery: scan the chain for this wallet's own locked orders
+        // and rebuild them locally. Works with nothing in localStorage — the on-chain
+        // announcement carries the salt, and the refund key is our own MSS pubkey.
+        window.dexRecoverOrders = function() {
+            const btn = document.getElementById('dexRecoverBtn');
+            const el = document.getElementById('dexRecoverStatus');
+            if (btn) { btn.disabled = true; btn.textContent = 'Scanning…'; }
+            if (el) el.textContent = 'Scanning chain for your orders…';
+            worker.postMessage({ type: 'DEX_RECOVER_ORDERS', payload: {} });
+        };
+
         window.dexReclaimStuckLock = function(idx) {
             const s = dexMySwaps[idx];
             if (!s) return showToast("Swap not found.", "error");
@@ -5241,6 +5354,34 @@ document.getElementById('btnExport').onclick = () => {
                 const el = document.getElementById('dexScanStatus'); if (el) el.textContent = '';
                 if (added) { saveOrderbook(); renderDexOrderbook(); }
                 _dexScanInFlight = false;
+            }
+            else if (e.data.type === 'DEX_RECOVER_PROGRESS') {
+                const { at, tip, from, found } = e.data.payload;
+                const pct = tip > from ? Math.round(((at - from) / (tip - from)) * 100) : 100;
+                const el = document.getElementById('dexRecoverStatus');
+                if (el) el.textContent = `Scanning chain for your orders… ${pct}% (${found} found)`;
+            }
+            else if (e.data.type === 'DEX_RECOVER_DONE') {
+                const { recovered, error } = e.data.payload;
+                const el = document.getElementById('dexRecoverStatus');
+                const btn = document.getElementById('dexRecoverBtn');
+                if (btn) { btn.disabled = false; btn.textContent = 'Recover my orders from chain'; }
+                if (error) { if (el) el.textContent = 'Recovery scan failed: ' + error; return; }
+                // Merge — skip any order we already have locally (by coinId or offerId).
+                let added = 0;
+                for (const r of (recovered || [])) {
+                    const cid = r.covenant && r.covenant.coinId;
+                    const dup = dexMySwaps.some(s =>
+                        s.offerId === r.offerId ||
+                        (s.covenant && cid && s.covenant.coinId === cid)
+                    );
+                    if (!dup) { dexMySwaps.push(r); added++; }
+                }
+                if (added > 0) { saveSwaps(); renderDexSwaps(); }
+                if (el) el.textContent = added > 0
+                    ? `Recovered ${added} locked order${added > 1 ? 's' : ''} — see Active Swaps. Reclaim becomes available after each order's timeout.`
+                    : (recovered && recovered.length ? 'Your orders were already present locally — nothing new to recover.' : 'No locked orders found on-chain for this wallet.');
+                showToast(added > 0 ? `Recovered ${added} order(s) from chain.` : 'No new orders to recover.', added > 0 ? 'success' : 'info');
             }
             else if (e.data.type === 'DEX_RECLAIM_SUCCESS') {
                 const { offerId, reclaimed, coins } = e.data.payload;
@@ -6444,9 +6585,10 @@ document.getElementById('btnExport').onclick = () => {
         // which is random and lives ONLY in this browser's localStorage. If the user
         // clears browser data (or uninstalls) while such a swap is open, those funds are
         // frozen forever. A web page can't intercept the browser's own "clear data", so
-        // we make the risk impossible to miss from inside the app: a persistent banner
-        // whenever at-risk swaps exist, and a beforeunload nudge. The real protection is
-        // the now-complete backup (which includes these salts) — the banner drives it.
+        // Locked MDS lives in one of two shapes (htlcCoins[] or covenant{}), each holding a
+        // salt. Locked orders are recoverable from the seed via on-chain rescan (see the
+        // Recover button + DEX_RECOVER_ORDERS), so this is now just a calm, dismissible
+        // reminder to keep a backup for moving trades between devices — not a loss warning.
         function dexAtRiskSwaps() {
             const done = ['completed', 'limit_refunded', 'limit_refunding', 'swap_complete'];
             return dexMySwaps.filter(s => {
@@ -6463,29 +6605,38 @@ document.getElementById('btnExport').onclick = () => {
                 return htlcLocked || covLocked;
             });
         }
+        let _saltBannerShown = null;   // track state so we only touch the DOM on change
+        let _saltBannerDismissed = false;
+        function dexDismissSaltBanner() {
+            _saltBannerDismissed = true;
+            const b = document.getElementById('saltRiskBanner');
+            if (b) b.style.display = 'none';
+        }
         function dexUpdateSaltRiskBanner() {
             const banner = document.getElementById('saltRiskBanner');
             if (!banner) return;
-            const atRisk = dexAtRiskSwaps();
-            const cnt = document.getElementById('saltRiskCount');
-            if (atRisk.length > 0) {
-                if (cnt) cnt.textContent = String(atRisk.length);
-                banner.style.display = 'block';
+            // Never show on the locked/auth screen — there's no session yet, and it just
+            // clutters the unlock view. Only surface once the wallet is actually open.
+            const authView = document.getElementById('authView');
+            const locked = authView && authView.classList.contains('active');
+            const n = locked ? 0 : dexAtRiskSwaps().length;
+            const shouldShow = n > 0 && !_saltBannerDismissed;
+            // Only mutate the DOM when something actually changed — otherwise the 5s timer
+            // reflows the page continuously (the "flying around" flicker). Update the count
+            // in place; toggle display only on transition.
+            if (shouldShow) {
+                const cnt = document.getElementById('saltRiskCount');
+                if (cnt && cnt.textContent !== String(n)) cnt.textContent = String(n);
+                if (_saltBannerShown !== true) { banner.style.display = 'flex'; _saltBannerShown = true; }
             } else {
-                banner.style.display = 'none';
+                if (_saltBannerShown !== false) { banner.style.display = 'none'; _saltBannerShown = false; }
             }
+            // If all at-risk trades clear, allow the banner to show again on a future one.
+            if (n === 0) _saltBannerDismissed = false;
         }
-        // Warn on tab close / navigation while funds are at risk (best-effort; the browser
-        // shows its own generic prompt, but it's one more chance to not lose the salt).
-        window.addEventListener('beforeunload', (e) => {
-            try {
-                if (dexAtRiskSwaps().length > 0) {
-                    e.preventDefault();
-                    e.returnValue = 'You have open trades with funds locked on-chain. Export a backup before leaving or you may permanently lose access to them.';
-                    return e.returnValue;
-                }
-            } catch (_) {}
-        });
+        // (Removed the beforeunload "are you sure" prompt: locked orders are now recoverable
+        // from the seed via chain rescan, so blocking every tab-close was heavy-handed and
+        // added to the noise. The slim banner + Recover button cover this calmly instead.)
 
         function renderDexSwaps() {
             dexUpdateSaltRiskBanner();
@@ -6559,6 +6710,8 @@ document.getElementById('btnExport').onclick = () => {
                     }
                 } else if (s.status === 'limit_funding') {
                     statusText = 'Funding the limit-order bundle on-chain (one transaction)…';
+                } else if (s.status === 'recovered_locked') {
+                    statusText = 'Recovered from chain — MDS locked on-chain. Reclaim it below once past the timeout.';
                 } else if (s.status === 'limit_posted') {
                     statusText = 'Sell order live — waiting for a buyer.';
                     btn = `<button style="margin:0;width:100%;padding:8px;font-size:12px;background:transparent;border:1px solid var(--border-bright);color:var(--text-bright);" onclick="dexRefundLimitOrder('${s.offerId}')">Reclaim MDS (after timeout)</button>`;

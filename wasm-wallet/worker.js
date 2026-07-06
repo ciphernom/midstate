@@ -558,6 +558,52 @@ function encodeAnnouncement({ makerEvmAddr, makerMdsPk, timeoutHeight, groupId, 
     for (const p of parts){ out.set(p,off); off+=p.length; }
     return normalizeHex(out);
 }
+
+// ── TAKER-LOCK ANNOUNCEMENT (MDXT) ──────────────────────────────────────────
+// Mirror of the maker MDXA announcement, but for the TAKER side of a swap (someone
+// who locked MDS to fill a buy offer — the shape that had no on-chain breadcrumb and
+// so couldn't be recovered after a data-clear, i.e. the Alice case). Publishing this
+// makes a taker lock recoverable from seed alone, exactly like a maker order.
+//
+// SAFETY: carries secretHASH, never the secret preimage. The hash is already public
+// (it's the Base contract hashlock and appears in the covenant script), and BLAKE3 is
+// one-way, so an observer learns nothing that enables theft. The taker's REFUND path
+// needs only their own signature + the timeout — never the secret. So everything here
+// is safe to publish, and only the taker (holding the refund key) can act on it.
+const ANN_T_MAGIC = "4d445854"; // "MDXT"
+const ANN_T_VER = 1;
+function encodeTakerAnnouncement({ takerMdsPk, secretHash, salt, receiverAddr, timeoutHeight, value, weiAmount }) {
+    const parts = [
+        _annHb(ANN_T_MAGIC), new Uint8Array([ANN_T_VER]),
+        _annHb(takerMdsPk),           // 32 — refund key; how the taker recognises their own lock
+        _annHb(secretHash),           // 32 — safe (already the public hashlock)
+        _annHb(salt),                 // 32 — the coin salt (the thing localStorage loses)
+        _annHb(receiverAddr),         // 32 — buyer's receiving address (needed to rebuild covAddr)
+        _annU(timeoutHeight, 8),
+        new Uint8Array([_annLog2(value)]),
+        _annU(weiAmount, 16)
+    ];
+    const len = parts.reduce((s, p) => s + p.length, 0), out = new Uint8Array(len); let off = 0;
+    for (const p of parts) { out.set(p, off); off += p.length; }
+    return normalizeHex(out);
+}
+function tryDecodeTakerAnnouncement(hex) {
+    if (typeof hex !== 'string') return null;
+    hex = hex.replace(/^0x/, '').toLowerCase();
+    if (!/^[0-9a-f]+$/.test(hex) || hex.slice(0, 8) !== ANN_T_MAGIC) return null;
+    const a = _annHb(hex); let o = 4;
+    if (a[o] !== ANN_T_VER) return null; o += 1;
+    if (a.length < 4 + 1 + 32 + 32 + 32 + 32 + 8 + 1 + 16) return null;
+    const takerMdsPk = normalizeHex(a.slice(o, o + 32)); o += 32;
+    const secretHash = normalizeHex(a.slice(o, o + 32)); o += 32;
+    const salt = normalizeHex(a.slice(o, o + 32)); o += 32;
+    const receiverAddr = normalizeHex(a.slice(o, o + 32)); o += 32;
+    const timeoutHeight = Number(_annRd(a, o, 8)); o += 8;
+    const value = Number(1n << BigInt(a[o])); o += 1;
+    const weiAmount = _annRd(a, o, 16).toString(); o += 16;
+    return { takerMdsPk, secretHash, salt, receiverAddr, timeoutHeight, value, weiAmount };
+}
+
 function tryDecodeAnnouncement(hex) {
     if (typeof hex !== 'string') return null;
     hex = hex.replace(/^0x/,'').toLowerCase();
@@ -1126,6 +1172,29 @@ self.onmessage = async (e) => {
                 });
                 const htlcCoins = (fundRes && fundRes.coins) || [];
 
+                // RECOVERY BREADCRUMB: publish a taker-lock announcement on-chain so this
+                // lock can be rebuilt from the seed alone if local data is later cleared
+                // (the gap that froze Alice's funds). One MDXT announcement per coin; each
+                // carries the salt + params but NOT the secret, so it's safe. Best-effort:
+                // a failure here doesn't fail the lock (the swap still works with local
+                // data) — it only forgoes seed-only recoverability for this coin.
+                try {
+                    const myAddr = compute_p2pk_address_hex(myPk);
+                    const recvAddr = covenant ? compute_p2pk_address_hex(normalizeHex(takerPk)) : normalizeHex(takerPk);
+                    for (const c of htlcCoins) {
+                        if (!c || !c.salt || !c.coin_id) continue;
+                        const annHex = encodeTakerAnnouncement({
+                            takerMdsPk: myPk, secretHash, salt: normalizeHex(c.salt),
+                            receiverAddr: recvAddr, timeoutHeight, value: Number(c.value),
+                            weiAmount: String(Math.max(1, Math.floor(Number(expectedAmount) / Math.max(1, htlcCoins.length))))
+                        });
+                        const frags = fragmentAnnouncement(annHex, (c.coin_id || '').slice(0, 12));
+                        for (const f of frags) { try { await performSend(myAddr, 1, f, 0); } catch (_) {} }
+                    }
+                } catch (annErr) {
+                    self.postMessage({ type: 'LOG', payload: 'Taker recovery announcement failed (lock is fine, seed-only recovery unavailable for it): ' + ((annErr && annErr.message) || annErr) });
+                }
+
                 self.postMessage({ type: 'DEX_MIDSTATE_LOCKED_SUCCESS', payload: {
                     offerId,
                     secret: rawSecret,        // for the MAKER only — needed to claim ETH on Base
@@ -1397,6 +1466,100 @@ self.onmessage = async (e) => {
                 self.postMessage({ type: 'DEX_ANNOUNCE_DONE', payload: { groupId: payload.groupId } });
             } catch (err) {
                 self.postMessage({ type: 'DEX_ANNOUNCE_FAILED', payload: { groupId: payload && payload.groupId, error: (err && err.message) || String(err) } });
+            }
+        }
+        else if (type === 'DEX_RECOVER_ORDERS') {
+            // SEED-ONLY RECOVERY. Rebuilds the user's own stuck limit orders purely from
+            // on-chain data — no localStorage needed. This is the real fix for the "cleared
+            // my browser, lost my salt" failure: the MDXA announcement published on-chain
+            // when an order was posted already carries {secretHash, salt, value, timeout}
+            // for each unit, and the refund key is our own primary MSS pubkey. So after
+            // restoring a seed we can: scan DataBurns → keep announcements whose makerMdsPk
+            // is OURS → rebuild each covenant + coin id → check it's still unspent on-chain →
+            // recreate the swap record so the reclaim button works. Filled/in-flight swaps
+            // (which also need the random secret + counterparty address) are NOT recovered
+            // here; only unfilled locked orders, which is the common stuck case.
+            try {
+                const myPk = normalizeHex(getPrimaryMssPk() || "");
+                if (!myPk) throw new Error("Wallet not ready.");
+                const SCAN_DEPTH = 1440 * 3;   // look back ~3 timeout windows
+                const tip = networkHeight;
+                let from = Number.isFinite(payload && payload.fromHeight) ? payload.fromHeight : Math.max(0, tip - SCAN_DEPTH);
+                from = Math.max(0, Math.min(from, tip));
+                const recovered = [];
+                const seenCoin = new Set();
+                const BATCH = 12;
+                for (let h = from; h <= tip; h += BATCH) {
+                    const heights = [];
+                    for (let k = h; k < h + BATCH && k <= tip; k++) heights.push(k);
+                    const blocks = await Promise.all(heights.map(ht => rpc.getBlock(ht).then(b => b).catch(() => null)));
+                    for (const blk of blocks) {
+                        if (!blk) continue;
+                        const payloads = extractBurnPayloadHexes(blk, []);
+                        for (const m of payloads) {
+                            // --- Maker limit orders (MDXA) ---
+                            const ann = tryDecodeAnnouncement(m);
+                            if (ann && normalizeHex(ann.makerMdsPk) === myPk) {
+                                for (const u of ann.units) {
+                                    try {
+                                        const covScriptHex = build_limit_order_covenant_bytecode_hex(u.secretHash, BigInt(u.value), BigInt(ann.timeoutHeight), myPk);
+                                        const covAddr = blake3_hash_hex(covScriptHex);
+                                        const coinId = compute_coin_id_hex(covAddr, BigInt(u.value), normalizeHex(u.salt));
+                                        if (seenCoin.has(coinId)) continue;
+                                        seenCoin.add(coinId);
+                                        let exists = false;
+                                        try { const r = await rpc.checkCoin(coinId); exists = !!(r && r.exists); } catch (e) { exists = false; }
+                                        if (!exists) continue;
+                                        recovered.push({
+                                            offerId: 'chain:' + coinId.slice(0, 16),
+                                            role: 'maker', side: 'mds', kind: 'limit', status: 'limit_posted',
+                                            mdsAmount: u.value, weiAmount: u.weiAmount, makerEvmAddr: ann.makerEvmAddr,
+                                            secretHash: u.secretHash, recoveredFromChain: true,
+                                            covenant: {
+                                                coinId, value: u.value, salt: normalizeHex(u.salt), covAddr,
+                                                secretHash: u.secretHash, maxClaim: u.value, timeoutHeight: ann.timeoutHeight,
+                                                makerMdsPk: myPk, makerEvmAddr: ann.makerEvmAddr, weiAmount: u.weiAmount
+                                            }
+                                        });
+                                    } catch (e) { /* skip bad unit */ }
+                                }
+                                continue;
+                            }
+                            // --- Taker locks (MDXT) — the Alice-shape, now recoverable ---
+                            const tann = tryDecodeTakerAnnouncement(m);
+                            if (tann && normalizeHex(tann.takerMdsPk) === myPk) {
+                                try {
+                                    // Taker covenant HTLC: rebuild with the receiver addr the
+                                    // announcement carries (the buyer's address). Refund goes to us.
+                                    const covScriptHex = build_covenant_htlc_bytecode_hex(
+                                        tann.secretHash, tann.receiverAddr, BigInt(tann.value), BigInt(tann.timeoutHeight), myPk
+                                    );
+                                    const covAddr = blake3_hash_hex(covScriptHex);
+                                    const coinId = compute_coin_id_hex(covAddr, BigInt(tann.value), normalizeHex(tann.salt));
+                                    if (seenCoin.has(coinId)) continue;
+                                    seenCoin.add(coinId);
+                                    let exists = false;
+                                    try { const r = await rpc.checkCoin(coinId); exists = !!(r && r.exists); } catch (e) { exists = false; }
+                                    if (!exists) continue;
+                                    recovered.push({
+                                        offerId: 'chain:' + coinId.slice(0, 16),
+                                        role: 'taker', side: 'mds', kind: 'swap', status: 'recovered_locked',
+                                        mdsAmount: tann.value, weiAmount: tann.weiAmount, recoveredFromChain: true,
+                                        secretHash: tann.secretHash, swapMode: 'covenant',
+                                        timeoutHeight: tann.timeoutHeight,
+                                        htlcReceiverAddr: tann.receiverAddr, makerMdsPk: myPk, minPayout: tann.value,
+                                        htlcCoins: [{ coin_id: coinId, value: tann.value, salt: normalizeHex(tann.salt) }]
+                                    });
+                                } catch (e) { /* skip bad taker unit */ }
+                                continue;
+                            }
+                        }
+                    }
+                    self.postMessage({ type: 'DEX_RECOVER_PROGRESS', payload: { at: Math.min(h + BATCH, tip), tip, from, found: recovered.length } });
+                }
+                self.postMessage({ type: 'DEX_RECOVER_DONE', payload: { recovered, scannedToHeight: tip } });
+            } catch (err) {
+                self.postMessage({ type: 'DEX_RECOVER_DONE', payload: { recovered: [], error: (err && err.message) || String(err) } });
             }
         }
         else if (type === 'DEX_SCAN_ANNOUNCEMENTS') {
@@ -2281,6 +2444,11 @@ self.onmessage = async (e) => {
         else if (type === 'SEND') {
             await acquireSendLock();
             try { await performSend(payload.toAddress, payload.amount, null, 0, !!payload.sendAll); }
+            catch (err) {
+                // Surface send failures as a distinct, persistent error the UI can pin —
+                // never let a send just silently stop. Include the message verbatim.
+                self.postMessage({ type: 'SEND_ERROR', payload: { error: (err && err.message) ? err.message : String(err) } });
+            }
             finally { releaseSendLock(); }
         }
 else if (type === 'L2_OPEN_CHANNEL') {
@@ -2979,23 +3147,24 @@ async function processFullBlock(height) {
 
     if (block.transactions) {
         for (const tx of block.transactions) {
-            const reveal = tx.Reveal || tx.reveal;
-            if (!reveal) continue;
+            // FIX: Parse both Reveal AND Consolidate transactions for UTXO tracking
+            const action = tx.Reveal || tx.reveal || tx.Consolidate || tx.consolidate;
+            if (!action) continue;
 
             let spentIds = [], spentValue = 0, createdOutputs = [];
             
             // Extract Sender Identity 
             let senderAddrHex = "";
             let txId = "";
-            if (reveal.inputs && reveal.inputs.length > 0) {
-                const bytecode = reveal.inputs[0].predicate?.Script?.bytecode || reveal.inputs[0].bytecode;
+            if (action.inputs && action.inputs.length > 0) {
+                const bytecode = action.inputs[0].predicate?.Script?.bytecode || action.inputs[0].bytecode;
                 if (bytecode) senderAddrHex = blake3_hash_hex(normalizeHex(bytecode));
-                const saltHex = normalizeHex(reveal.inputs[0].salt);
-                txId = compute_coin_id_hex(senderAddrHex, BigInt(reveal.inputs[0].value), saltHex);
+                const saltHex = normalizeHex(action.inputs[0].salt);
+                txId = compute_coin_id_hex(senderAddrHex, BigInt(action.inputs[0].value), saltHex);
             }
 
-            if (reveal.inputs) {
-                for (const inp of reveal.inputs) {
+            if (action.inputs) {
+                for (const inp of action.inputs) {
                     const saltHex = normalizeHex(inp.salt);
                     const cid     = ourSalts.get(saltHex);
                     if (cid) {
@@ -3024,8 +3193,8 @@ async function processFullBlock(height) {
                 }
             }
 
-            if (reveal.outputs) {
-                for (const out of reveal.outputs) {
+            if (action.outputs) {
+                for (const out of action.outputs) {
                     const outData = out.Standard || out.standard;
                     if (outData) {
                         const addrHex = normalizeHex(outData.address);
@@ -3042,12 +3211,9 @@ async function processFullBlock(height) {
                     const burnData = out.DataBurn || out.data_burn;
                     if (burnData) {
                         const payloadHex = normalizeHex(burnData.payload);
-                        //could do something with the burn data here i guess
                     }
 
                     // ── Contract coins at a watched address (MidstateConnect) ──
-                    // Standard = value coin, Confidential = state coin. coin_id /
-                    // value / salt / state are all present in-block.
                     {
                         const stdC = out.Standard || out.standard;
                         if (stdC) {
@@ -3080,8 +3246,8 @@ async function processFullBlock(height) {
                 const alreadyRecorded = wState.history.some(h => (h.kind === 'sent' || h.kind === 'mixed') && h.inputs.some(inp => spentIds.includes(inp)));
                 if (!alreadyRecorded) {
                     let totalTxIn = 0, totalTxOut = 0;
-                    if (reveal.inputs)  reveal.inputs.forEach(i  => totalTxIn  += Number(i.value));
-                    if (reveal.outputs) reveal.outputs.forEach(o => { let od = o.Standard || o.standard; if (od) totalTxOut += Number(od.value); });
+                    if (action.inputs)  action.inputs.forEach(i  => totalTxIn  += Number(i.value));
+                    if (action.outputs) action.outputs.forEach(o => { let od = o.Standard || o.standard; if (od) totalTxOut += Number(od.value); });
                     let actualFee = totalTxIn - totalTxOut;
                     let netSent   = Math.max(0, spentValue - createdOutputs.reduce((s,c) => s+c.val, 0) - actualFee);
                     wState.history.push({
@@ -3254,6 +3420,11 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
     }
 
     const ctx = JSON.parse(spendContextStr);
+    self.postMessage({ type: 'SEND_STEP', payload: {
+        step: 'built', title: 'Transaction built',
+        detail: `${ctx.selected_inputs.length} input(s) → ${(ctx.outputs || []).length} output(s)`,
+        sub: `fee ${ctx.fee} MDS`
+    }});
 
     // Intercept L2 Open Intents
     if (pendingChannelOpen) {
@@ -3279,26 +3450,47 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
     const stateData   = await rpc.getState();
     const requiredPow = stateData.required_pow || 24;
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Mining PoW...` } });
+    // Verbose step log: the commitment is the tx's binding hash; report it plus the PoW
+    // parameters so the user can see exactly what's being mined and later match it on-chain.
+    self.postMessage({ type: 'SEND_STEP', payload: {
+        step: 'pow', title: 'Mining proof-of-work for the commitment',
+        detail: `commitment ${ctx.commitment}`, sub: `difficulty ${requiredPow} bits · anchored to block ${stateData.height}`
+    }});
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Mining PoW (difficulty ${requiredPow})…` } });
     await new Promise(r => setTimeout(r, 50));
+    const _powT0 = Date.now();
     const spamNonce = Number(mine_commitment_pow(ctx.commitment, requiredPow, BigInt(stateData.height), stateData.header_hash));
+    self.postMessage({ type: 'SEND_STEP', payload: {
+        step: 'pow_done', title: 'Proof-of-work found',
+        detail: `nonce ${spamNonce}`, sub: `${((Date.now() - _powT0) / 1000).toFixed(1)}s`
+    }});
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Submitting commit..." } });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting commit…" } });
     const commitReq = await rpc.commit(ctx.commitment, spamNonce);
-    if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
+    if (!commitReq.ok) throw new Error(`Commit rejected by node: ${commitReq.body || commitReq.error}`);
+    self.postMessage({ type: 'SEND_STEP', payload: {
+        step: 'commit_sent', title: 'Commit broadcast to the network',
+        detail: `commitment ${ctx.commitment}`, sub: 'waiting for a block to include it…'
+    }});
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for Block Confirmation (Phase 1)..." } });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for the commit to be mined (phase 1 of 2)…" } });
     const revealPayloadStr = wallet.build_reveal(spendContextStr, ctx.commitment, ctx.tx_salt);
 
+    let _commitHeight = null;
     while (true) {
         try {
             const checkResp = await rpc.checkCommitment(ctx.commitment);
-            if (checkResp && checkResp.exists) break;
+            if (checkResp && checkResp.exists) { _commitHeight = checkResp.height ?? checkResp.block_height ?? null; break; }
         } catch (e) {}
         await waitForNextBlock(15000);
     }
+    self.postMessage({ type: 'SEND_STEP', payload: {
+        step: 'commit_mined', title: 'Commit confirmed on-chain',
+        detail: _commitHeight != null ? `included in block ${_commitHeight}` : 'commit is now on-chain',
+        sub: `commitment ${ctx.commitment}`
+    }});
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commit confirmed! Submitting reveal..." } });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Commit confirmed — broadcasting reveal…" } });
     // Self-heal MSS leaf reuse on the send/announce path too: re-sign against the same
     // already-mined commitment with a fresh leaf (the leaf is a witness, not committed to).
     const sendLeafPhase = (p) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: p } });
@@ -3306,18 +3498,28 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
         revealPayloadStr, spendContextStr, ctx.commitment, ctx.tx_salt, sendLeafPhase,
         (cs) => wallet.build_reveal(cs, ctx.commitment, ctx.tx_salt)
     );
-    if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
+    if (!revealReq.ok) throw new Error(`Reveal rejected by node: ${revealReq.body || revealReq.error}`);
+    self.postMessage({ type: 'SEND_STEP', payload: {
+        step: 'reveal_sent', title: 'Reveal broadcast to the network',
+        detail: `links to commitment ${ctx.commitment}`, sub: 'waiting for a block to include it…'
+    }});
 
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting reveal..." } });
+    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for the reveal to be mined (phase 2 of 2)…" } });
     const inputCoinToCheck = ctx.selected_inputs[0].coin_id;
 
+    let _revealHeight = null;
     while (true) {
         try {
             const checkInp = await rpc.checkCoin(inputCoinToCheck);
-            if (checkInp && !checkInp.exists) break;
+            if (checkInp && !checkInp.exists) { _revealHeight = checkInp.spentHeight ?? checkInp.height ?? null; break; }
         } catch (e) {}
         await waitForNextBlock(15000);
     }
+    self.postMessage({ type: 'SEND_STEP', payload: {
+        step: 'reveal_mined', title: 'Reveal confirmed — transaction complete',
+        detail: _revealHeight != null ? `settled in block ${_revealHeight}` : 'transaction is now settled on-chain',
+        sub: `commit ${_commitHeight != null ? 'block ' + _commitHeight : ''} → reveal ${_revealHeight != null ? 'block ' + _revealHeight : ''}`.trim()
+    }});
 
     pendingSends = [];
     // Do NOT eagerly delete UTXOs here! Let performScan() discover the spend naturally
