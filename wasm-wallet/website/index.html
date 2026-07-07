@@ -9,44 +9,67 @@
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
 
-/* ── Minimalist Theme Variables ──────────────────────────────────────────── */
+/* ── Minimalist Theme Variables (Ink on Paper) ───────────────────────────── */
 :root[data-theme="light"] {
     --bg: #ffffff;
-    --bg-alt: #f7f7f8;
-    --border: #e5e7eb;
-    --text-main: #111827;
-    --text-muted: #4b5563;
-    --code-bg: #f3f4f6;
-    --accent: #000000;
-    --highlight: #eff6ff;
-    --terminal-bg: #111827;
-    --terminal-text: #10b981;
-    --stark-accent: #8b5cf6;
-    --stark-bg: #f5f3ff;
-    --warn-accent: #ea580c;
-    --warn-bg: #fff7ed;
-    --link-color: #2563eb;
+    --bg-alt: #ffffff;
+    --border: #e3e3e3;
+    --border-bright: #cfcfcf;
+    --text-max: #111111;
+    --text-main: #111111;
+    --text-bright: #383838;
+    --text-muted: #565656;
+    --text-faint: #a2a2a2;
+    --code-bg: #f4f4f4;
+    --accent: #111111;
+    --highlight: #efefef;
+    --terminal-bg: #f4f4f4;
+    --terminal-text: #111111;
+    --stark-accent: #111111;
+    --stark-bg: #efefef;
+    --warn-accent: #565656;
+    --warn-bg: #efefef;
+    --link-color: #111111;
+    
+    --radius: 0;
+    --shadow: none;
 }
 
 :root[data-theme="dark"] {
-    --bg: #0e0e0e;
-    --bg-alt: #161616;
-    --border: #2c2c2c;
-    --text-main: #ededed;
-    --text-muted: #a1a1aa;
-    --code-bg: #1a1a1a;
-    --accent: #ffffff;
-    --highlight: #1e1e1e;
-    --terminal-bg: #000000;
-    --terminal-text: #4ade80;
-    --stark-accent: #a78bfa;
-    --stark-bg: #2e1065;
-    --warn-accent: #fb923c;
-    --warn-bg: #431407;
-    --link-color: #60a5fa;
+    --bg: #0a0a0a;
+    --bg-alt: #141414;
+    --border: #262626;
+    --border-bright: #363636;
+    --text-max: #f5f5f5;
+    --text-main: #f5f5f5;
+    --text-bright: #cfcfcf;
+    --text-muted: #9a9a9a;
+    --text-faint: #5a5a5a;
+    --code-bg: #181818;
+    --accent: #f5f5f5;
+    --highlight: #1f1f1f;
+    --terminal-bg: #0a0a0a;
+    --terminal-text: #f5f5f5;
+    --stark-accent: #f5f5f5;
+    --stark-bg: #1f1f1f;
+    --warn-accent: #9a9a9a;
+    --warn-bg: #1f1f1f;
+    --link-color: #f5f5f5;
+
+    --radius: 0;
+    --shadow: none;
 }
 
-* { box-sizing: border-box; margin: 0; padding: 0; }
+/* Dogmatic guards: zero radius / shadow / motion everywhere */
+*, *::before, *::after { 
+    box-sizing: border-box; 
+    border-radius: 0 !important; 
+    box-shadow: none !important; 
+    text-shadow: none !important; 
+    animation: none !important; 
+    transition: none !important; 
+}
+* { margin: 0; padding: 0; }
 
 body {
     background-color: var(--bg);
@@ -57,12 +80,11 @@ body {
     display: flex;
     flex-direction: column;
     min-height: 100vh;
-    transition: background-color 0.2s, color 0.2s;
     -webkit-font-smoothing: antialiased;
 }
 
-a { color: var(--link-color); text-decoration: none; transition: all 0.2s; }
-a:hover { text-decoration: underline; text-underline-offset: 4px; }
+a { color: var(--link-color); text-decoration: underline; text-underline-offset: 4px; }
+a:hover { color: var(--text-max); text-decoration-style: solid; }
 h1, h2, h3, h4, .mono { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
 
 /* ── Top Navigation ─────────────────────────────────────────────────────── */
@@ -85,20 +107,14 @@ h1, h2, h3, h4, .mono { font-family: 'JetBrains Mono', monospace; font-weight: 6
     display: flex;
     align-items: center;
     gap: 12px;
+    color: var(--text-max);
 }
 
 .brand-indicator {
     width: 8px;
     height: 8px;
-    background-color: var(--text-main);
-    border-radius: 50%;
-    animation: pulse 2s infinite;
-}
-
-@keyframes pulse {
-    0% { box-shadow: 0 0 0 0 rgba(150, 150, 150, 0.4); }
-    70% { box-shadow: 0 0 0 6px rgba(150, 150, 150, 0); }
-    100% { box-shadow: 0 0 0 0 rgba(150, 150, 150, 0); }
+    background-color: var(--text-max);
+    border: 1px solid var(--border-bright);
 }
 
 .nav-actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
@@ -111,10 +127,8 @@ h1, h2, h3, h4, .mono { font-family: 'JetBrains Mono', monospace; font-weight: 6
     font-size: 13px;
     font-weight: 500;
     padding: 6px 12px;
-    border-radius: 6px;
     cursor: pointer;
     text-decoration: none !important;
-    transition: all 0.15s;
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -122,12 +136,12 @@ h1, h2, h3, h4, .mono { font-family: 'JetBrains Mono', monospace; font-weight: 6
 
 .btn:hover {
     background: var(--bg-alt);
-    border-color: var(--text-muted);
+    border-color: var(--text-max);
 }
 
 /* Theme Toggle Icons */
-#theme-btn { padding: 6px 10px; background: transparent; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; color: var(--text-main); transition: all 0.15s;}
-#theme-btn:hover { background: var(--bg-alt); border-color: var(--text-muted); }
+#theme-btn { padding: 6px 10px; background: transparent; border: 1px solid var(--border); cursor: pointer; color: var(--text-main); }
+#theme-btn:hover { background: var(--bg-alt); border-color: var(--text-max); }
 .sun-icon, .moon-icon { width: 16px; height: 16px; fill: currentColor; }
 :root[data-theme="light"] .sun-icon { display: none; }
 :root[data-theme="dark"] .moon-icon { display: none; }
@@ -158,20 +172,18 @@ h1, h2, h3, h4, .mono { font-family: 'JetBrains Mono', monospace; font-weight: 6
     cursor: pointer;
     color: var(--text-muted);
     font-size: 14px;
-    border-radius: 6px;
-    transition: all 0.1s;
     display: flex;
     justify-content: space-between;
     align-items: center;
+    border-left: 3px solid transparent;
 }
 
-.menu-item:hover { color: var(--text-main); background: var(--bg-alt); }
+.menu-item:hover { color: var(--text-main); background: var(--bg-alt); border-color: var(--border); }
 .menu-item.active {
-    color: var(--text-main);
+    color: var(--text-max);
     font-weight: 600;
     background: var(--bg-alt);
-    border-left: 3px solid var(--text-main);
-    border-radius: 0 6px 6px 0;
+    border-left: 3px solid var(--text-max);
 }
 
 /* ── Output / Content Area ─────────────────────────────────────────────── */
@@ -183,32 +195,22 @@ h1, h2, h3, h4, .mono { font-family: 'JetBrains Mono', monospace; font-weight: 6
     padding-bottom: 100px;
 }
 
-.content-pane {
-    display: none;
-    animation: fadeIn 0.3s ease-out;
-}
-
+.content-pane { display: none; }
 .content-pane.active { display: block; }
 
-@keyframes fadeIn {
-    from { opacity: 0; transform: translateY(10px); }
-    to { opacity: 1; transform: translateY(0); }
-}
-
-h2 { font-size: 28px; margin-bottom: 24px; letter-spacing: -0.5px; border-bottom: 2px solid var(--border); padding-bottom: 12px;}
-h3 { font-size: 20px; margin-top: 48px; margin-bottom: 16px; letter-spacing: -0.3px; color: var(--text-main);}
-h4 { font-size: 15px; margin-top: 24px; margin-bottom: 12px; font-weight: 600; color: var(--text-main); }
+h2 { font-size: 28px; margin-bottom: 24px; letter-spacing: -0.5px; border-bottom: 2px solid var(--border); padding-bottom: 12px; color: var(--text-max); }
+h3 { font-size: 20px; margin-top: 48px; margin-bottom: 16px; letter-spacing: -0.3px; color: var(--text-max); }
+h4 { font-size: 15px; margin-top: 24px; margin-bottom: 12px; font-weight: 600; color: var(--text-main); text-transform: uppercase; letter-spacing: 1px; }
 
 p { margin-bottom: 18px; color: var(--text-muted); }
 ul { padding-left: 20px; margin-bottom: 24px; color: var(--text-muted); }
 li { margin-bottom: 10px; }
-strong { color: var(--text-main); }
+strong { color: var(--text-max); font-weight: 600; }
 
 code {
     background: var(--code-bg);
     padding: 3px 6px;
     border: 1px solid var(--border);
-    border-radius: 4px;
     font-family: 'JetBrains Mono', monospace;
     font-size: 0.85em;
     color: var(--text-main);
@@ -218,7 +220,6 @@ pre {
     background: var(--bg-alt);
     padding: 16px;
     border: 1px solid var(--border);
-    border-radius: 6px;
     overflow-x: auto;
     margin-bottom: 24px;
     font-family: 'JetBrains Mono', monospace;
@@ -231,9 +232,7 @@ pre {
 details.deep-dive {
     background: var(--bg);
     border: 1px solid var(--border);
-    border-radius: 8px;
     margin: 24px 0;
-    overflow: hidden;
 }
 
 details.deep-dive summary {
@@ -242,27 +241,27 @@ details.deep-dive summary {
     font-weight: 600;
     cursor: pointer;
     list-style: none;
-    color: var(--text-main);
+    color: var(--text-max);
     background: var(--bg-alt);
     display: flex;
     align-items: center;
     font-family: 'JetBrains Mono', monospace;
+    border-bottom: 1px solid transparent;
 }
 
 details.deep-dive summary::-webkit-details-marker { display: none; }
 details.deep-dive summary::before { 
-    content: '▶'; 
+    content: '[+] '; 
     display: inline-block; 
-    width: 20px; 
+    width: 30px; 
     color: var(--text-muted);
-    transition: transform 0.2s;
 }
-details.deep-dive[open] summary::before { transform: rotate(90deg); }
+details.deep-dive[open] summary::before { content: '[-] '; color: var(--text-max); }
+details.deep-dive[open] summary { border-bottom: 1px solid var(--border); }
 details.deep-dive summary:hover { background: var(--code-bg); }
 
 .dd-content {
     padding: 20px;
-    border-top: 1px solid var(--border);
     font-size: 14px;
 }
 .dd-content p:last-child { margin-bottom: 0; }
@@ -279,7 +278,6 @@ details.deep-dive summary:hover { background: var(--code-bg); }
     background: var(--bg-alt);
     border: 1px solid var(--border);
     padding: 20px;
-    border-radius: 8px;
 }
 
 .stat-label {
@@ -288,20 +286,19 @@ details.deep-dive summary:hover { background: var(--code-bg); }
     text-transform: uppercase;
     letter-spacing: 1px;
     margin-bottom: 8px;
+    font-family: 'JetBrains Mono', monospace;
 }
 
 .stat-value {
     font-family: 'JetBrains Mono', monospace;
     font-size: 24px;
-    color: var(--text-main);
+    color: var(--text-max);
 }
 
 /* ── Interactive Tabs ──────────────────────────────────────────────────── */
 .tabs {
     margin: 24px 0;
     border: 1px solid var(--border);
-    border-radius: 8px;
-    overflow: hidden;
 }
 
 .tab-nav {
@@ -316,21 +313,19 @@ details.deep-dive summary:hover { background: var(--code-bg); }
     text-align: center;
     padding: 14px 12px;
     border: none;
-    border-radius: 0;
     border-right: 1px solid var(--border);
     background: transparent;
     font-weight: 600;
     white-space: nowrap;
     cursor: pointer;
     color: var(--text-muted);
-    transition: all 0.2s;
 }
-.tab-btn:hover { color: var(--text-main); background: var(--bg); }
+.tab-btn:hover { color: var(--text-max); background: var(--bg); }
 .tab-btn:last-child { border-right: none; }
 .tab-btn.active {
     background: var(--bg);
-    color: var(--text-main);
-    border-bottom: 2px solid var(--text-main);
+    color: var(--text-max);
+    border-bottom: 2px solid var(--text-max);
 }
 
 .tab-content {
@@ -343,40 +338,35 @@ details.deep-dive summary:hover { background: var(--code-bg); }
 /* ── Callout Boxes ─────────────────────────────────────────────────────── */
 .callout {
     padding: 20px;
-    border-radius: 8px;
     border-left: 4px solid var(--border);
     background: var(--bg-alt);
     margin-bottom: 24px;
 }
-.callout.stark { border-left-color: var(--stark-accent); background: var(--stark-bg); }
-.callout.warn { border-left-color: var(--warn-accent); background: var(--warn-bg); }
+.callout.stark { border-left-color: var(--text-max); background: var(--highlight); }
+.callout.warn { border-left-color: var(--text-muted); background: var(--bg-alt); }
 
-.callout h4 { margin-top: 0; margin-bottom: 12px; font-size: 16px; }
-.callout.stark h4 { color: var(--stark-accent); }
-.callout.warn h4 { color: var(--warn-accent); }
-
-.callout p { margin-bottom: 12px; font-size: 14px; color: var(--text-main); }
+.callout h4 { margin-top: 0; margin-bottom: 12px; font-size: 16px; color: var(--text-max); }
+.callout p { margin-bottom: 12px; font-size: 14px; color: var(--text-muted); }
 .callout p:last-child { margin-bottom: 0; }
-.callout code { background: rgba(0,0,0,0.1); border: none;}
+.callout code { background: var(--bg); border: 1px solid var(--border); }
 
 /* ── Terminal Simulation ───────────────────────────────────────────────── */
 .terminal {
     background: var(--terminal-bg);
-    border-radius: 8px;
+    border: 1px solid var(--border);
     padding: 20px;
     font-family: 'JetBrains Mono', monospace;
     font-size: 13px;
     color: var(--text-muted);
     margin: 24px 0;
-    box-shadow: inset 0 0 20px rgba(0,0,0,0.8);
     overflow-x: auto;
 }
 
 .term-line { margin-bottom: 6px; display: flex; gap: 16px; }
-.term-time { color: #6b7280; min-width: 90px;}
-.term-info { color: #3b82f6; min-width: 45px;}
-.term-success { color: var(--terminal-text); }
-.term-warn { color: #f59e0b; }
+.term-time { color: var(--text-faint); min-width: 90px;}
+.term-info { color: var(--text-muted); min-width: 45px; font-weight: bold;}
+.term-success { color: var(--text-max); }
+.term-warn { color: var(--text-muted); }
 
 /* ── Flow Diagrams ─────────────────────────────────────────────────────── */
 .flow-diagram {
@@ -385,9 +375,8 @@ details.deep-dive summary:hover { background: var(--code-bg); }
     gap: 12px;
     margin: 24px 0;
     padding: 24px;
-    background: var(--highlight);
+    background: var(--bg-alt);
     border: 1px solid var(--border);
-    border-radius: 8px;
     overflow-x: auto;
 }
 
@@ -396,15 +385,12 @@ details.deep-dive summary:hover { background: var(--code-bg); }
     border: 1px solid var(--border);
     padding: 14px 20px;
     font-size: 13px;
-    border-radius: 6px;
-    color: var(--text-main);
+    color: var(--text-max);
     white-space: nowrap;
     font-family: 'JetBrains Mono', monospace;
-    box-shadow: 0 4px 6px rgba(0,0,0,0.05);
     text-align: center;
 }
-.flow-box.stark { border-color: var(--stark-accent); border-width: 2px; }
-.flow-box.warn { border-color: var(--warn-accent); border-width: 2px; }
+.flow-box.stark { border-color: var(--text-max); border-width: 2px; }
 
 .flow-arrow {
     color: var(--text-muted);
@@ -416,12 +402,11 @@ details.deep-dive summary:hover { background: var(--code-bg); }
 .math-block {
     background: var(--bg-alt);
     padding: 20px;
-    border-radius: 6px;
     border: 1px solid var(--border);
     font-family: 'JetBrains Mono', monospace;
     font-size: 14px;
     margin-bottom: 24px;
-    color: var(--text-main);
+    color: var(--text-max);
     overflow-x: auto;
     border-left: 3px solid var(--text-muted);
 }
@@ -433,8 +418,6 @@ table {
     margin-top: 24px;
     font-size: 14px;
     border: 1px solid var(--border);
-    border-radius: 8px;
-    overflow: hidden;
 }
 
 th, td {
@@ -443,16 +426,16 @@ th, td {
     text-align: left;
 }
 
-th { background: var(--bg-alt); color: var(--text-main); font-weight: 600; font-family: 'JetBrains Mono', monospace;}
+th { background: var(--bg-alt); color: var(--text-max); font-weight: 600; font-family: 'JetBrains Mono', monospace;}
 td { color: var(--text-muted); background: var(--bg); }
-td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight); }
+td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); }
 
 @media (max-width: 900px) {
     .nav-actions { justify-content: flex-end; }
     .workspace { flex-direction: column; padding: 0 20px; }
     .sidebar { width: 100%; padding-right: 0; margin-bottom: 30px; position: static; flex-direction: row; flex-wrap: wrap; gap: 8px; border-bottom: 1px solid var(--border); padding-bottom: 20px;}
-    .menu-item { flex: 1 1 auto; justify-content: center; text-align: center; border-left: none; border-bottom: 3px solid transparent; border-radius: 6px 6px 0 0; }
-    .menu-item.active { border-left: none; border-bottom-color: var(--text-main); }
+    .menu-item { flex: 1 1 auto; justify-content: center; text-align: center; border-left: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+    .menu-item.active { border-left: 1px solid var(--border); border-bottom-color: var(--text-max); }
     .flow-diagram { flex-direction: column; align-items: flex-start; }
     .flow-arrow { transform: rotate(90deg); margin-left: 20px; }
     .tab-btn { border-right: none; border-bottom: 1px solid var(--border); width: 100%; text-align: left;}
@@ -465,10 +448,9 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
     <div class="brand"><div class="brand-indicator"></div> MIDSTATE</div>
     <div class="nav-actions">
         <a href="./wallet/" target="_blank" class="btn">Web Wallet</a>
-        <a href="./ide.html" target="_blank" class="btn">Midscript IDE & Compiler</a>
+        <a href="./ide.html" target="_blank" class="btn">Midscript IDE</a>
         <a href="https://rpc.cypherpunk.gold" target="_blank" class="btn">Explorer</a>
         <a href="https://github.com/ciphernom/midstate/blob/main/whypaper.md" target="_blank" class="btn">Whypaper</a>
-        <a href="https://github.com/ciphernom/midstate/releases" target="_blank" class="btn">Releases</a>
         <a href="https://github.com/ciphernom/midstate" target="_blank" class="btn">GitHub</a>
         <button id="theme-btn" aria-label="Toggle Theme">
             <svg class="sun-icon" viewBox="0 0 24 24"><path d="M12 2.25a.75.75 0 01.75.75v2.25a.75.75 0 01-1.5 0V3a.75.75 0 01.75-.75zM7.5 12a4.5 4.5 0 119 0 4.5 4.5 0 01-9 0zM18.894 6.166a.75.75 0 00-1.06-1.06l-1.591 1.59a.75.75 0 101.06 1.061l1.591-1.59zM21.75 12a.75.75 0 01-.75.75h-2.25a.75.75 0 010-1.5H21a.75.75 0 01.75.75zM17.834 18.894a.75.75 0 001.06-1.06l-1.59-1.591a.75.75 0 10-1.061 1.06l1.59 1.591zM12 18a.75.75 0 01.75.75V21a.75.75 0 01-1.5 0v-2.25A.75.75 0 0112 18zM7.758 17.303a.75.75 0 00-1.061-1.06l-1.591 1.59a.75.75 0 001.06 1.061l1.591-1.59zM6 12a.75.75 0 01-.75.75H3a.75.75 0 010-1.5h2.25A.75.75 0 016 12zM6.697 7.757a.75.75 0 001.06-1.06l-1.59-1.591a.75.75 0 00-1.061 1.06l1.59 1.591z" /></svg>
@@ -478,64 +460,50 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
 </div>
 
 <div class="workspace">
-    
     <div class="sidebar">
         <div class="menu-item active" data-target="overview">Overview <span>→</span></div>
         <div class="menu-item" data-target="genesis">Genesis & Fair Launch <span>→</span></div>
         <div class="menu-item" data-target="crypto">Cryptography <span>→</span></div>
         <div class="menu-item" data-target="consensus">Mining & Consensus <span>→</span></div>
-         <div class="menu-item" data-target="economics">Economics & Supply <span>→</span></div>
-        <div class="menu-item" data-target="privacy">Privacy & Fungibility<span>→</span></div>
+        <div class="menu-item" data-target="economics">Economics & Supply <span>→</span></div>
+        <div class="menu-item" data-target="privacy">Privacy & Fungibility <span>→</span></div>
         <div class="menu-item" data-target="state">State Mgmt & Sync <span>→</span></div>
         <div class="menu-item" data-target="vm">Virtual Machine <span>→</span></div>
         <div class="menu-item" data-target="axe-hw">MidstateAxe Hardware <span>→</span></div>
         <div class="menu-item" data-target="adversarial">Adversarial Analysis <span>→</span></div>
-        <div class="menu-item" data-target="quickstart">CLI Quickstart <span>→</span></div>
-        <div class="menu-item" data-target="vs-legacy">Comparison <span>→</span></div>
+        <div class="menu-item" data-target="vs-legacy">Architecture Comp. <span>→</span></div>
     </div>
 
     <div class="output-area">
 
+        <!-- ── OVERVIEW ── -->
         <div class="content-pane active" id="overview">
             <h2>System Overview</h2>
             <p>Midstate is a peer-to-peer electronic cash system engineered from the ground up for constrained edge environments (specifically Cortex-A53/A72/A76 architectures). It entirely abandons elliptic curve mathematics in favor of post-quantum hash functions.</p>
             
             <p>By enforcing sequential CPU mining, forcing all UTXOs into uniform power-of-2 denominations, it creates a robust, relatively private financial network that cannot be dominated by parallel ASICs or dismantled by blockchain surveillance firms.</p>
 
-<div class="callout">
+            <div class="callout">
                 <h4>Why the name "Midstate"?</h4>
                 <p>In traditional blockchains, blocks are distinct data structures linked by their header hashes. Midstate elevates this by maintaining a continuous, mathematically chained <strong>BLAKE3 Midstate</strong> for transactions, while binding it to the chain using sequential header hashing.</p>
                 
-                <div class="mermaid" style="text-align: center; margin: 20px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px;">
-                graph LR
-                    H0([Header Hash N-1]) --> Combine1{+ Midstate<br>+ State Root<br>+ Nonce}
-                    Combine1 --> HashLoop1[BLAKE3<br>x 1,000,000]
-                    HashLoop1 --> H1([Header Hash N])
-                    
-                    H1 --> Combine2{+ Midstate<br>+ State Root<br>+ Nonce}
-                    Combine2 --> HashLoop2[BLAKE3<br>x 1,000,000]
-                    HashLoop2 --> H2([Header Hash N+1])
-                    
-                    H2 -.-> Combine3{...}
-
-                    style H0 fill:#431407,stroke:#ea580c,stroke-width:2px
-                    style H1 fill:#431407,stroke:#ea580c,stroke-width:2px
-                    style H2 fill:#431407,stroke:#ea580c,stroke-width:2px
-                    style HashLoop1 fill:#064e3b,stroke:#10b981,stroke-width:2px
-                    style HashLoop2 fill:#064e3b,stroke:#10b981,stroke-width:2px
+                <div class="math-block">
+                    H_0 = Header Hash N-1<br>
+                    H_1 = BLAKE3_1M_Iters(H_0 || Midstate || State Root || Nonce)<br>
+                    H_2 = BLAKE3_1M_Iters(H_1 || Midstate || State Root || Nonce)
                 </div>
 
                 <p>The <code>midstate</code> tracks the continuous mathematical state of the UTXO set. When a miner processes a block, they construct a <strong>Block Header</strong> (containing the new midstate, the state root, and the previous header hash), and subject it to exactly 1,000,000 sequential BLAKE3 compression cycles. Every transaction permanently mutates this internal state, securely anchoring the ledger to a sequential proof of time.</p>
             </div>
 
             <h3>How is Midstate Different?</h3>
-            <p>Unlike first-generation blockchains (like Bitcoin or Ethereum), Midstate was engineered specifically to solve hardware centralization and on-chain surveillance:</p>
             <ul>
-                <li><strong>No Elliptic Curves (Post-Quantum):</strong> It uses zero ECC math (no secp256k1). Every signature, commitment, and <!--ZK proof-->script relies solely on the BLAKE3 hash function, immunizing the network against Shor's algorithm.</li>
+                <li><strong>No Elliptic Curves (Post-Quantum):</strong> It uses zero ECC math (no secp256k1). Every signature, commitment, and script relies solely on the BLAKE3 hash function, immunizing the network against Shor's algorithm.</li>
                 <li><strong>Sequential vs. Parallel Mining:</strong> Typical PoW allows ASICs to run trillions of hashes in parallel. Midstate forces miners to compute hashes in a strict, unrollable sequence, shifting the bottleneck from parallel throughput to single-thread latency.</li>
-                <li><strong>Power-of-2 UTXOs:</strong> Standard UTXOs use exact amounts (e.g., 1.452 coins), creating unique cryptographic fingerprints. Midstate forces all coins into identical power-of-2 denominations, fracturing surveillance graphs.</li>
-                <li><strong>Commit-Reveal Mempool:</strong> Standard mempools broadcast cleartext trades, enabling MEV (Miner Extractable Value) front-running. Midstate blinds transactions in the mempool until a miner cryptographically commits to processing them.</li>
+                <li><strong>Power-of-2 UTXOs:</strong> Standard UTXOs use exact amounts, creating unique cryptographic fingerprints. Midstate forces all coins into identical power-of-2 denominations, fracturing surveillance graphs.</li>
+                <li><strong>Commit-Reveal Mempool:</strong> Standard mempools broadcast cleartext trades. Midstate blinds transactions in the mempool until a miner cryptographically commits to processing them.</li>
                 <li><strong>Bounded State (Sparse Merkle Trees):</strong> Instead of an infinitely growing LevelDB database, Midstate accumulates UTXOs into a rolling Sparse Merkle Tree, heavily capping the RAM required to run a full node.</li>
+                <li><strong>Decentralized-Auditable Pools:</strong> Midstate implements a native Stratum pool design where miners independently audit Merkle Precommitments. Block templates pay miners <em>directly</em> on-chain proportional to their verified score, avoiding pool custody entirely.</li>
             </ul>
 
             <div class="stat-grid">
@@ -559,10 +527,9 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                 <div class="term-line"><span class="term-time">22:49:44.152</span> <span class="term-info">INFO</span> <span>Mining SIMD: NEON 4-way (4 nonces/batch)</span></div>
                 <div class="term-line"><span class="term-time">22:50:11.883</span> <span class="term-success">INFO</span> <span class="term-success">Mined batch! height=29001 outputs=2 target=000ffff...</span></div>
             </div>
-
-            <p>A full Midstate node can sync, validate transaction proofs, and mine blocks concurrently on a $15 Raspberry Pi Zero 2 W with 512MB of RAM.</p>
         </div>
 
+        <!-- ── CRYPTOGRAPHY ── -->
         <div class="content-pane" id="crypto">
             <h2>Post-Quantum Cryptography</h2>
             <p>Elliptic Curve Cryptography (secp256k1) is vulnerable to Shor's algorithm via quantum computers. Midstate uses exactly zero elliptic curve mathematics, relying strictly on the <code>BLAKE3</code> hash function for all cryptographic signatures, commitments, and proofs.</p>
@@ -614,25 +581,42 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                     <h3>The SIMD Masking Trick</h3>
                     <p>With <code>w=16</code>, WOTS chain iterations vary wildly. Chain 0 might need 5 hashes, while Chain 1 needs 60,000 hashes. Standard scalar execution handles these one by one.</p>
                     
-                    <p>Midstate accelerates this using hardware SIMD registers (AVX2 256-bit on x86, NEON 128-bit on ARM). But because SIMD lanes execute in strict lockstep, how do you handle varying lengths?</p>
+                    <p>Midstate accelerates this using hand-rolled hardware SIMD registers (AVX2 256-bit on x86, NEON 128-bit on ARM). But because SIMD lanes execute in strict lockstep, how do you handle varying lengths without breaking the pipeline?</p>
 
-                    <div class="callout">
-                        <h4>Ghost Hashing</h4>
-                        <p>Midstate feeds 8 chains (AVX2) into a single register. It loops up to the maximum iterations required by the longest chain in the batch. As the loop progresses, it checks if the current step matches a lane's target depth. If it does, it extracts and saves that lane's 32-byte state. The lane then continues to compute garbage hashes ("ghost hashing") alongside its neighbors until the longest chain finishes.</p>
-                        <p>Even with millions of wasted "ghost" cycles, keeping the CPU pipeline saturated via SIMD results in a <strong>10x faster signature generation</strong> on edge devices.</p>
+                    <div class="callout stark">
+                        <h4>Ghost Hashing & Batch Sorting</h4>
+                        <p>Before executing, the node sorts the required WOTS chains by depth (descending). It packs them into batches (e.g., 8 chains per AVX2 register). The SIMD loop then runs up to the maximum iterations required by the longest chain in that specific batch.</p>
+                        <p>As the loop progresses, a mask checks if the current step matches a specific lane's target depth. If it does, it extracts and saves that lane's 32-byte state. The lane then continues to compute garbage hashes ("ghost hashing") alongside its neighbors until the longest chain finishes.</p>
+                        <p>Even with millions of wasted "ghost" cycles, keeping the CPU pipeline saturated via branchless SIMD results in a <strong>10x faster signature generation</strong> on edge devices.</p>
                     </div>
+
+                    <pre><code>// Example WGSL/SIMD extraction mask logic
+for step in 0..max_iters {
+    hw = compress_8way(&cv, &msg, 32);
+
+    // SIMD Masking Extraction: capture each lane's result the moment it
+    // reaches its target iteration, then let it ghost-hash freely.
+    for lane in 0..8 {
+        if iters[lane] > 0 && step == iters[lane] - 1 {
+            results[lane] = extract_hash(&hw, lane);
+        }
+    }
+}</code></pre>
                 </div>
             </div>
         </div>
-<div class="content-pane" id="consensus">
+
+        <!-- ── CONSENSUS ── -->
+        <div class="content-pane" id="consensus">
             <h2>Mining & Consensus</h2>
             
             <div class="tabs">
                 <div class="tab-nav">
-                    <button class="tab-btn active" data-tab="seq-hash">Sequential Hashing & ASICs</button>
-                    <button class="tab-btn" data-tab="asert">ASERT Difficulty (16.16)</button>
+                    <button class="tab-btn active" data-tab="seq-hash">Sequential Hashing</button>
+                    <button class="tab-btn" data-tab="hw-accel">Hardware Acceleration (SIMD & GPU)</button>
+                    <button class="tab-btn" data-tab="asert">ASERT Difficulty</button>
                     <button class="tab-btn" data-tab="bayesian">Bayesian Finality</button>
-                    <button class="tab-btn" data-tab="pool-mining">Pool Mining Protocol</button>
+                    <button class="tab-btn" data-tab="pool-mining">Provably Fair Pools</button>
                 </div>
 
                 <div class="tab-content active" id="seq-hash">
@@ -641,50 +625,33 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                     
                     <p>Midstate inverts this model using <strong>Sequential Hashing</strong>. Finding a nonce is no longer a lottery; it is a marathon.</p>
 
-                    <div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
-                    graph TD
-                        subgraph Parallel [Bitcoin: Parallel PoW - ASIC Friendly]
-                            direction LR
-                            N1([Nonce 1]) -.-> H1[SHA256] --> C1{Check}
-                            N2([Nonce 2]) -.-> H2[SHA256] --> C2{Check}
-                            N3([Nonce 3]) -.-> H3[SHA256] --> C3{Check}
-                        end
-
-                        subgraph Sequential [Midstate: Sequential PoW - CPU Friendly]
-                            direction LR
-                            S1([Header + Nonce]) --> S2[BLAKE3] --> S3[BLAKE3] --> S4[... x 1,000,000] --> S5[Final Hash] --> C4{Check}
-                        end
-
-                        style Parallel fill:#1f2937,stroke:#4b5563,stroke-width:2px,color:#d1d5db
-                        style Sequential fill:#431407,stroke:#ea580c,stroke-width:2px,color:#fed7aa
-                        style S2 fill:#064e3b,stroke:#10b981,stroke-width:2px
-                        style S3 fill:#064e3b,stroke:#10b981,stroke-width:2px
-                        style S4 fill:#064e3b,stroke:#10b981,stroke-width:2px
-                        style S5 fill:#064e3b,stroke:#10b981,stroke-width:2px
-                    </div>
-
                     <p>To mine a block, a node must calculate 1,000,000 BLAKE3 hashes in a strict sequence: <code>H_n = BLAKE3(H_{n-1})</code>. Because the input of the next hash relies entirely on the output of the previous, the computation cannot be unrolled or divided across multiple cores.</p>
                     
-                    <div class="callout">
-                        <h4>Proof 1: The Poisson Process (Memorylessness)</h4>
-                        <p>Does sequential hashing make block times predictable (like a VDF)? No. The algorithm does not guarantee a block after 1,000,000 hashes. It guarantees that <em>a single attempt</em> (one nonce) takes exactly 1,000,000 hashes. The miner must still check if the <code>final_hash</code> meets the difficulty target.</p>
-                        <p>Each full sequence remains an independent Bernoulli trial. If the probability of meeting the target is <em>p</em>, and the network computes <em>λ</em> sequences per second, the probability of finding a block in time <em>t</em> follows the standard exponential distribution:</p>
-                        <div class="math-block">
-                            P(T ≤ t) = 1 - e<sup>-λpt</sup>
-                        </div>
-                        <p>Midstate simply scales the duration of the trial. Block arrivals remain a memoryless Poisson process, preserving the exact game theory and security guarantees of Nakamoto Consensus.</p>
-                    </div>
-
-                    <div class="callout">
-                        <h4>Proof 2: The Ratio of Power (ASIC Resistance Bound)</h4>
+                    <div class="callout stark">
+                        <h4>The Ratio of Power (ASIC Resistance Bound)</h4>
                         <p>In Bitcoin, parallel hashrate is <em>H = C / L</em> (where <em>C</em> is cores, <em>L</em> is latency). ASICs win by scaling <em>C</em> to millions.</p>
                         <p>In Midstate, a trial requires <em>S</em> sequential hashes. The time for one trial is <em>S × L_core</em>. An ASIC designer must optimize <em>L_core</em> (clock speed) because increasing parallel cores requires duplicating the entire 1,000,000-step state machine per core, demanding massive silicon area.</p>
-                        <p>The Maximum Attacker Advantage (<em>A_max</em>) is the ratio of an ASIC's latency to a consumer CPU's latency:</p>
-                        <div class="math-block">
-                            A_max = L_cpu / L_asic
-                        </div>
-                        <p>Because silicon physics caps clock speeds around 4–5 GHz, <em>L_asic</em> cannot physically be millions of times faster than <em>L_cpu</em>. While a datacenter will mine more blocks, their advantage is strictly bounded by single-thread execution limits, creating a provable ~1000:1 hardware ceiling between a supercomputer and a Raspberry Pi.</p>
+                        <p>Because silicon physics caps clock speeds around 4–5 GHz, an ASIC cannot physically be millions of times faster than a standard CPU. The advantage is strictly bounded by single-thread execution limits, creating a provable ~1000:1 hardware ceiling between a supercomputer and a Raspberry Pi.</p>
                     </div>
+                </div>
+
+                <div class="tab-content" id="hw-accel">
+                    <h3>Hardware Acceleration (SIMD & GPU)</h3>
+                    <p>While the sequential nature of the PoW chain prevents ASICs from collapsing the computation into a single cycle, nodes must still maximize hardware utilization to search multiple nonces concurrently. Midstate achieves this via bare-metal hardware integrations.</p>
+
+                    <h4>CPU SIMD: The Dual-Issue NEON Exploit</h4>
+                    <p>On x86_64 architectures, Midstate uses handwritten AVX2 intrinsics to process 8 nonces concurrently in 256-bit registers. However, ARM NEON registers are only 128-bit (4 lanes).</p>
+                    <p>Modern ARM out-of-order execution cores (like the Cortex-A76 in the Raspberry Pi 5, or Apple M-Series chips) feature <strong>two independent ASIMD pipelines</strong>. Midstate exploits this by manually interleaving two separate 4-way NEON streams in the assembly code. This intentionally exceeds the physical register count (32), forcing the compiler to spill to the L1 cache. The CPU then hides the L1 latency behind the dual-issued ALU work, resulting in nearly <strong>2.0x throughput</strong> compared to a standard 4-way implementation.</p>
+
+                    <h4>GPU Mining: Bypassing the Watchdog</h4>
+                    <p>GPUs are designed for massive parallelism, but sequential hashing (1,000,000 iterations) takes hundreds of milliseconds to complete a single chain. If a GPU compute shader runs for that long without yielding, the Operating System assumes the graphics driver has crashed and triggers a TDR (Timeout Detection and Recovery), killing the miner.</p>
+                    
+                    <div class="callout stark">
+                        <h4>The VRAM State Buffer Solution</h4>
+                        <p>Midstate's <code>WGSL</code> GPU miner solves this by breaking the 1,000,000-iteration chain into tiny micro-dispatches (e.g., 2,000 hashes at a time). Between each dispatch, the shader saves the exact 32-byte intermediate state of every single nonce (often tens of thousands) into a persistent VRAM storage buffer. It then yields to the OS, checks for network cancellations, and re-dispatches, picking up exactly where it left off.</p>
+                    </div>
+
+                    <p><strong>Trustless Hardware:</strong> Because GPU drivers can be buggy or non-deterministic, the GPU kernel is treated strictly as an oracle. It only surfaces <em>candidate</em> nonces. The CPU mathematically re-verifies every winning nonce using the canonical scalar function before broadcasting it to the network, guaranteeing consensus safety.</p>
                 </div>
 
                 <div class="tab-content" id="asert">
@@ -697,12 +664,6 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                     </ul>
 
                     <p>If the network hashrate spikes and blocks are mined in 30 seconds, the ASERT algorithm guarantees the difficulty will exactly double every 4 hours until the 60-second equilibrium is restored.</p>
-
-                    <div class="math-block">
-                        // ASERT Algorithm<br>
-                        drift = actual_elapsed_time - (height * 60_seconds)<br>
-                        target = genesis_target * 2<sup>(drift / 4_hours)</sup>
-                    </div>
 
                     <div class="callout warn">
                         <h4>The Determinism Problem</h4>
@@ -721,72 +682,46 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                     </div>
                 </div>
 
-<div class="tab-content" id="bayesian">
+                <div class="tab-content" id="bayesian">
                     <h3>Bayesian Finality: Autonomous Risk Management</h3>
-                    <p>Most blockchains rely on arbitrary "magic numbers" for finality (e.g., Bitcoin's 6-block rule). This assumes the network's hashpower distribution is static and universally honest. In reality, networks experience partitions, hashpower drops, and active 51% attacks. A static rule is dangerously fragile during a consensus crisis.</p>
+                    <p>Most blockchains rely on arbitrary "magic numbers" for finality (e.g., Bitcoin's 6-block rule). This assumes the network's hashpower distribution is static and universally honest. In reality, networks experience partitions, hashpower drops, and active 51% attacks.</p>
 
                     <p>Midstate solves this by treating finality as a dynamic probability problem. Every node runs a <strong>Bayesian Finality Estimator</strong> that continuously models network health to calculate the exact depth <em>z</em> required to keep the risk of a chain reorganization below a strict <code>10<sup>-6</sup></code> threshold.</p>
-
-                    <h4>1. The Base Model: Gambler's Ruin</h4>
-                    <p>Assume honest miners control proportion <em>p</em> of the total hashpower, and an attacker controls <em>q = 1 - p</em>. The probability of an attacker successfully rewriting <em>z</em> blocks of history is a classic Gambler's Ruin problem:</p>
-                    
-                    <div class="math-block">
-                        If p > 0.5: P(catchup | p, z) = (q / p)<sup>z</sup> = ((1 - p) / p)<sup>z</sup><br>
-                        If p ≤ 0.5: P(catchup | p, z) = 1.0 (Catchup is mathematically guaranteed)
-                    </div>
-
-                    <h4>2. Modeling Uncertainty (The Beta Distribution)</h4>
-                    <p>In a decentralized network, a node never truly knows the exact value of <em>p</em>. It must infer it from local observations. Midstate models this uncertainty using a <strong>Beta distribution</strong> parameterized by α and β.</p>
-
-                    <p><strong>The Game-Theoretic Prior:</strong> Nodes initialize with a hostile prior (e.g., <code>α=2, β=8</code>), assuming 80% of the network is malicious until proven otherwise. As blocks arrive, the node updates its parameters:</p>
-                    
-                    <div class="math-block">
-                        // Update Rules (Capped at 10,000 to maintain agility)<br>
-                        On valid block extension: α = min(α + 1, 10000)<br>
-                        On orphan or reorg:       β = min(β + 1, 10000)
-                    </div>
-
-                    <p>If we didn't cap these values, a node running for 5 years would have such a high <em>α</em> that it would become completely blind to a sudden 51% attack. The 10,000 cap ensures the node's memory is bounded, allowing the probability density function (PDF) to shift rapidly if hostility spikes.</p>
-
-                    <h4>3. The Expected Risk Integral</h4>
-                    <p>Rather than blindly trusting the average estimate of <em>p</em>, the node calculates the <strong>Expected Risk</strong> by integrating the Gambler's Ruin probability across the entire Beta PDF. It searches for the lowest depth <em>z</em> where this risk drops below 1-in-a-million:</p>
 
                     <div class="math-block">
                         Expected Risk = ∫<sub>0</sub><sup>1</sup> P(catchup | p, z) * f<sub>Beta</sub>(p; α, β) dp &nbsp;≤&nbsp; 10<sup>-6</sup>
                     </div>
-                    <p><span style="color: var(--text-muted); font-size: 13px;"><em>Engineering detail: To prevent IEEE-754 floating-point underflow in Rust, this integral is approximated using Log-Sum-Exp over 1,000 discrete slices.</em></span></p>
 
-                    <div class="callout warn">
+                    <div class="callout stark">
                         <h4>Game Theory: Bankrupting the Attacker</h4>
                         <p>In Bitcoin, an attacker renting hashpower for a 51% attack simply waits 6 blocks to execute an exchange double-spend. The cost of the attack is fixed and predictable.</p>
-                        <p>In Midstate, an attacker trying to secretly mine a shadow chain will inevitably cause orphan races as their blocks occasionally leak or compete with honest blocks. Every orphan increments <em>β</em> on honest nodes. As <em>β</em> rises, the variance of the Beta distribution widens, increasing the "tail risk" that <em>p ≤ 0.5</em>. <strong>The integral forces the safe depth <em>z</em> to skyrocket.</strong></p>
-                        <p>Instead of waiting 6 blocks, merchants and exchanges are mathematically instructed by their nodes to wait 100+ blocks. The attacker is forced to burn millions of dollars sustaining their 51% hashpower monopoly for hours or days, completely bankrupting them before the victim ever considers the transaction "final."</p>
+                        <p>In Midstate, an attacker trying to secretly mine a shadow chain will inevitably cause orphan races. Every orphan increments <em>β</em> (adversarial prior) on honest nodes. As <em>β</em> rises, the variance of the Beta distribution widens, increasing the "tail risk". <strong>The integral forces the safe depth <em>z</em> to skyrocket.</strong></p>
+                        <p>Instead of waiting 6 blocks, merchants and exchanges are mathematically instructed by their nodes to wait 100+ blocks. The attacker is forced to burn millions of dollars sustaining their 51% hashpower monopoly for hours or days.</p>
                     </div>
                 </div>
 
                 <div class="tab-content" id="pool-mining">
-                    <h3>Pool Mining Protocol</h3>
+                    <h3>Provably Fair Stratum Pools</h3>
                     <p>Because Midstate uses Sequential Hashing, traditional Bitcoin stratum protocols (where the pool builds the block and sends just the header to the miner) do not work. Miners must construct the block template locally to run the 1,000,000-hash state progression.</p>
                     
-                    <p>To enable pooled mining without allowing miners to steal blocks, Midstate employs a <strong>Cryptographic Watermark</strong> system.</p>
+                    <p>To enable pooled mining without requiring miners to blindly trust the pool operator, Midstate employs a <strong>Decentralized-Auditable Merkle Precommitment</strong>.</p>
 
                     <div class="callout stark">
-                        <h4>The Watermark Defense</h4>
-                        <p>When a miner configures their node for a pool, they assign the block's reward address to the Pool's MSS Public Key. To prove they actually did the work, the miner embeds their own payout address deep within the Coinbase transaction's <code>salt</code> parameter.</p>
-                        <code>salt = BLAKE3("pool_share" || miner_address || height || output_idx)</code>
-                        <br><br>
-                        <p>When the miner submits a share, the pool server independently recalculates this hash. If it matches, the pool knows the miner expended the PoW for the pool's benefit. The miner cannot redirect the funds to themselves without changing the address, which would change the state root, invalidating the entire 1,000,000-hash PoW sequence.</p>
+                        <h4>SPV-Audited Direct Payouts</h4>
+                        <p>When a miner connects, the pool doesn't hold the funds in custody. Instead, the pool's block template <strong>pays the miners directly</strong> in the coinbase transaction, strictly proportional to their submitted shares.</p>
+                        <p>To prove it isn't skimming or omitting miners, the pool builds a Merkle Tree of all current miner scores: <code>H(Miner_Address || Score)</code>. The 32-byte Merkle Root is embedded into the fee coin's salt inside the block template.</p>
+                        <p>Before computing a single hash, a miner's software queries the pool's HTTP Audit API for an <strong>O(log N) Merkle inclusion proof</strong>. If the pool operator lies about the miner's score or omits them, the local node instantly detects the mismatch and disconnects before hashing.</p>
                     </div>
 
                     <h4>Share Aggregation & Payouts</h4>
-                    <p>The pool server accepts shares at a lower difficulty target (e.g., 20 leading zeros instead of 30) and tallies them in an ACID database (<code>redb</code>). If a submitted share happens to meet the actual network difficulty, the pool server immediately broadcasts it to the network as a full block win.</p>
-
-                    <p>Periodically, an automated Payout Engine scans the chain for the pool's UTXOs. It calculates proportional payouts based on the tallied shares, constructs a massive 1-to-N transaction, and executes the 2-phase Commit-Reveal spend using the pool's reusable MSS keys.</p>
+                    <p>The pool server accepts shares at a lower difficulty target (e.g., 20 leading zeros instead of 30) and tallies them in an ACID database. If a submitted share happens to meet the actual network difficulty, the pool server immediately broadcasts it to the network as a full block win.</p>
+                    <p>Because the payouts are handled directly via the Coinbase transaction generated in the block template, there is no delayed payout process, no minimum withdrawal threshold, and no pool wallet that can be hacked or seized.</p>
                 </div>
             </div>
         </div>
 
-<div class="content-pane" id="economics">
+        <!-- ── ECONOMICS ── -->
+        <div class="content-pane" id="economics">
             <h2>Economics & Supply</h2>
             <p>Sound money requires an unforgeable costliness to produce and a strictly bounded, mathematically predictable supply schedule. Midstate enforces a disinflationary emission curve that asymptotically approaches a hard cap, but includes a vital tail emission to ensure perpetual security.</p>
 
@@ -800,7 +735,7 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                     <div class="stat-grid">
                         <div class="stat-card">
                             <div class="stat-label">Maximum Supply</div>
-                            <div class="stat-value">1.12 Quadrillion</div>
+                            <div class="stat-value">~1.05M gMDS</div>
                         </div>
                         <div class="stat-card">
                             <div class="stat-label">Halving Interval</div>
@@ -808,22 +743,28 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                         </div>
                         <div class="stat-card">
                             <div class="stat-label">Initial Reward</div>
-                            <div class="stat-value">2<sup>30</sup> (1.07 Billion)</div>
+                            <div class="stat-value">1 gMDS</div>
                         </div>
                     </div>
 
                     <div class="callout stark">
-                        <h4>The 64-bit Engineering Advantage</h4>
-                        <p>A maximum supply of 1.12 quadrillion sounds massive, but a standard unsigned 64-bit integer (<code>u64</code>) can hold up to <strong>18.4 quintillion</strong>. Midstate's entire lifetime supply uses only <strong>0.006%</strong> of a <code>u64</code>'s capacity.</p>
-                        <p>This is a critical architectural decision: the node never has to perform expensive <code>BigInt</code> or 256-bit math to calculate balances, entirely preventing integer overflow vulnerabilities. </p>
+                        <h4>Base-2 Denominations (gMDS, mMDS, kMDS)</h4>
+                        <p>Because Midstate enforces strict power-of-2 UTXO amounts (to fracture surveillance graphs), standard base-10 decimals are messy. Instead, Midstate uses computer-storage binary prefixes:</p>
+                        <ul>
+                            <li><strong>MDS:</strong> 1 base unit (2⁰)</li>
+                            <li><strong>kMDS:</strong> 1,024 MDS (2¹⁰)</li>
+                            <li><strong>mMDS:</strong> 1,048,576 MDS (2²⁰)</li>
+                            <li><strong>gMDS:</strong> 1,073,741,824 MDS (2³⁰)</li>
+                        </ul>
+                        <p>The initial block reward is exactly <strong>1 gMDS</strong> per block. The total maximum lifetime supply is roughly <strong>1.05 Million gMDS</strong> (1.12 Quadrillion base MDS units).</p>
                     </div>
 
                     <h3>The Disinflationary Curve</h3>
-                    <p>The block reward begins at <code>1,073,741,824</code> units per 60-second block. Every 525,600 blocks (exactly one year), the reward is bit-shifted to the right (halved).</p>
+                    <p>The block reward begins at <code>1 gMDS</code> per 60-second block. Every 525,600 blocks (exactly one year), the reward is bit-shifted to the right (halved).</p>
                     
                     <p>Unlike Bitcoin, which will eventually hit a block reward of exactly 0, Midstate enforces a <strong>Tail Emission</strong>. After 30 years, the block reward reaches a permanent floor of <code>1</code> unit per block. This guarantees miners are always mathematically incentivized to process blocks and secure the chain, even if transaction volume temporarily drops to zero.</p>
 
-                    <div style="background: var(--bg-alt); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-top: 24px;">
+                    <div style="background: var(--bg-alt); border: 1px solid var(--border); padding: 20px; margin-top: 24px;">
                         <canvas id="supplyChart" height="120"></canvas>
                     </div>
                 </div>
@@ -853,37 +794,36 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
             </div>
         </div>
 
+        <!-- ── GENESIS ── -->
+        <div class="content-pane" id="genesis">
+            <h2>Genesis Construction & Provable Fair Launch</h2>
+            <p>Midstate was engineered with absolute mathematical certainty that <strong>no pre-mining, no developer allocation, and no hidden coins ever existed</strong>. The entire genesis block is deterministically derived from a real, verifiable Bitcoin block mined in 2026 — making it impossible to have started the chain one second earlier.</p>
 
+            <div class="callout stark">
+                <h4>Bitcoin Block Anchor (Height 938708)</h4>
+                <p>The genesis <code>midstate</code> is not arbitrary. It is constructed by hashing a specific Bitcoin block that everyone could independently verify existed on the Bitcoin network:</p>
+                <div class="math-block">
+                    // Bitcoin block used as cryptographic anchor
+                    BITCOIN_BLOCK_HASH   = "000000000000000000018f5ad5625d43356136c2e50c6dc18967a90a18f0af2e"<br>
+                    BITCOIN_BLOCK_HEIGHT = 938708<br>
+                    BITCOIN_BLOCK_TIME   = 1772274770 (Feb 24 2026 UTC)<br><br>
+                    initial_midstate = BLAKE3( BitcoinHash || Height.to_le_bytes() )
+                </div>
+                <p>Anyone can open any Bitcoin explorer (e.g. mempool.space, blockchain.com) and confirm this exact block existed. Because the Midstate genesis depends on its hash, the Midstate chain <strong>could not have been started before that Bitcoin block was mined</strong>.</p>
+            </div>
 
-<div class="content-pane" id="genesis">
-    <h2>Genesis Construction & Provable Fair Launch</h2>
-    <p>Midstate was engineered with absolute mathematical certainty that <strong>no pre-mining, no developer allocation, and no hidden coins ever existed</strong>. The entire genesis block is deterministically derived from a real, verifiable Bitcoin block mined in 2026 — making it impossible to have started the chain one second earlier.</p>
+            <h3>The Permanent Inscription (Burned Genesis Coins)</h3>
+            <p>The genesis coinbase creates exactly the initial reward of <code>1 gMDS</code> (1,073,741,824 MDS) — split into two power-of-2 outputs of 536,870,912 each.</p>
+            
+            <p>Instead of real public keys, the <code>address</code> and <code>salt</code> fields contain the following plaintext inscription, permanently embedded into the blockchain on disk:</p>
+            
+            <div class="terminal" style="font-size:13px; line-height:1.4;">
+                <div class="term-line">Harvest Now, Decrypt Later: The Quantum Era's Encryption Challenge</div>
+                <div class="term-line">(Published Feb 24, 2026, by RBC Disruptors)</div>
+            </div>
 
-    <div class="callout stark">
-        <h4>Bitcoin Block Anchor (Height 938708)</h4>
-        <p>The genesis <code>midstate</code> is not arbitrary. It is constructed by hashing a specific Bitcoin block that everyone could independently verify existed on the Bitcoin network:</p>
-        <div class="math-block">
-            // Bitcoin block used as cryptographic anchor
-            BITCOIN_BLOCK_HASH   = "000000000000000000018f5ad5625d43356136c2e50c6dc18967a90a18f0af2e"<br>
-            BITCOIN_BLOCK_HEIGHT = 938708<br>
-            BITCOIN_BLOCK_TIME   = 1772274770 (Feb 24 2026 UTC)<br><br>
-            initial_midstate = BLAKE3( BitcoinHash || Height.to_le_bytes() )
-        </div>
-        <p>Anyone can open any Bitcoin explorer (e.g. mempool.space, blockchain.com) and confirm this exact block existed. Because the Midstate genesis depends on its hash, the Midstate chain <strong>could not have been started before that Bitcoin block was mined</strong>.</p>
-    </div>
-
-    <h3>The Permanent Inscription (Burned Genesis Coins)</h3>
-    <p>The genesis coinbase creates exactly the initial reward of <code>2³⁰ = 1,073,741,824</code> units — split into two power-of-2 outputs of <code>2²⁹ = 536,870,912</code> each (perfectly compliant with the power-of-2 UTXO rule).</p>
-    
-    <p>Instead of real public keys, the <code>address</code> and <code>salt</code> fields contain the following plaintext inscription, permanently embedded into the blockchain on disk:</p>
-    
-    <div class="terminal" style="font-size:13px; line-height:1.4;">
-        <div class="term-line">Harvest Now, Decrypt Later: The Quantum Era's Encryption Challenge</div>
-        <div class="term-line">(Published Feb 24, 2026, by RBC Disruptors)</div>
-    </div>
-
-    <p>This is the exact Rust code that generates the genesis block (from the canonical implementation):</p>
-    <pre><code>impl State {
+            <p>This is the exact Rust code that generates the genesis block (from the canonical implementation):</p>
+            <pre><code>impl State {
     pub fn genesis() -> (Self, Vec&lt;CoinbaseOutput&gt;) {
         // Bitcoin block anchor
         const BITCOIN_BLOCK_HASH: &amp;str = "000000000000000000018f5ad5625d43356136c2e50c6dc18967a90a18f0af2e";
@@ -909,53 +849,22 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
     }
 }</code></pre>
 
-    <div class="callout warn">
-        <h4>Why These Coins Are Mathematically Burned</h4>
-        <p>The <code>address</code> fields contain human-readable text instead of valid WOTS+ or MSS public keys. There is no corresponding private key anywhere in the universe that can spend them. The outputs are therefore <strong>provably unspendable</strong> — they are permanently removed from the circulating supply the instant the genesis block is created. This is the cryptographic equivalent of burning the initial coins in public.</p>
-    </div>
+            <div class="callout warn">
+                <h4>Why These Coins Are Mathematically Burned</h4>
+                <p>The <code>address</code> fields contain human-readable text instead of valid WOTS+ or MSS public keys. There is no corresponding private key anywhere in the universe that can spend them. The outputs are therefore <strong>provably unspendable</strong> — they are permanently removed from the circulating supply the instant the genesis block is created. This is the cryptographic equivalent of burning the initial coins in public.</p>
+            </div>
 
-    <h3>Mathematical Proof of No Pre-Mining</h3>
-    <ul>
-        <li><strong>Time-lock via Bitcoin anchor:</strong> The chain cannot exist before Bitcoin block 938708 was mined (verifiable by every node).</li>
-        <li><strong>Inscription date lock:</strong> The embedded message explicitly references February 24, 2026. Any earlier genesis would have a different anchor hash.</li>
-        <li><strong>Exact initial supply:</strong> 1.073 billion units created in the coinbase, immediately burned → zero developer allocation, zero hidden pre-mine.</li>
-        <li><strong>Deterministic &amp; auditable:</strong> Every node recomputes the exact same genesis state from the same Bitcoin block. There is no “trusted setup” or hidden parameters.</li>
-    </ul>
+            <h3>Mathematical Proof of No Pre-Mining</h3>
+            <ul>
+                <li><strong>Time-lock via Bitcoin anchor:</strong> The chain cannot exist before Bitcoin block 938708 was mined (verifiable by every node).</li>
+                <li><strong>Inscription date lock:</strong> The embedded message explicitly references February 24, 2026. Any earlier genesis would have a different anchor hash.</li>
+                <li><strong>Exact initial supply:</strong> 1 gMDS created in the coinbase, immediately burned → zero developer allocation, zero hidden pre-mine.</li>
+                <li><strong>Deterministic &amp; auditable:</strong> Every node recomputes the exact same genesis state from the same Bitcoin block. There is no “trusted setup” or hidden parameters.</li>
+            </ul>
 
-<div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
-    graph LR
-        BTC[Bitcoin Block 938708<br>Feb 2026] --> Hash[BLAKE3 Anchor Hash<br>+ Inscription Chunks]
-        Hash --> Midstate[Genesis Midstate<br>+ Burned Coinbase]
-        Midstate --> Block0([Block 0<br>Fair Launch Proven])
+        </div>
 
-        style BTC fill:#1f2937,stroke:#4b5563,stroke-width:2px,color:#d1d5db
-        style Hash fill:#064e3b,stroke:#10b981,stroke-width:2px
-        style Midstate fill:#064e3b,stroke:#10b981,stroke-width:2px
-        style Block0 fill:#431407,stroke:#ea580c,stroke-width:2px,color:#fed7aa
-    </div>
-
-<h3>Verify It Yourself on Your Own Node</h3>
-    <p>Because Midstate's storage engine saves blocks as raw <code>bincode</code> serialized files, any node operator can inspect the genesis block directly on disk. The ASCII text of the burned coinbase outputs is clearly visible within the binary data.</p>
-    
-    <p>Use <code>hexdump</code> to view the exact hexadecimal memory layout of the burned genesis UTXOs, showing exactly how the message spans across the 32-byte <code>address</code> and <code>salt</code> arrays:</p>
-
-<div class="terminal">
-        <div class="term-line"><span style="color: #60a5fa;">$</span> hexdump -C data/db/batches/000000/batch_0.bin | grep -A 8 "Harvest"</div>
-        <div class="term-line" style="color: var(--text-muted);">00000050&nbsp;&nbsp;02 00 00 00 00 00 00 00&nbsp;&nbsp;48 61 72 76 65 73 74 20&nbsp;&nbsp;|........Harvest |</div>
-        <div class="term-line" style="color: var(--text-muted);">00000060&nbsp;&nbsp;4e 6f 77 2c 20 44 65 63&nbsp;&nbsp;72 79 70 74 20 4c 61 74&nbsp;&nbsp;|Now, Decrypt Lat|</div>
-        <div class="term-line" style="color: var(--text-muted);">00000070&nbsp;&nbsp;65 72 3a 20 54 68 65 20&nbsp;&nbsp;00 00 00 20 00 00 00 00&nbsp;&nbsp;|er: The ... ....|</div>
-        <div class="term-line" style="color: var(--text-muted);">00000080&nbsp;&nbsp;51 75 61 6e 74 75 6d 20&nbsp;&nbsp;45 72 61 27 73 20 45 6e&nbsp;&nbsp;|Quantum Era's En|</div>
-        <div class="term-line" style="color: var(--text-muted);">00000090&nbsp;&nbsp;63 72 79 70 74 69 6f 6e&nbsp;&nbsp;20 43 68 61 6c 6c 65 6e&nbsp;&nbsp;|cryption Challen|</div>
-        <div class="term-line" style="color: var(--text-muted);">000000a0&nbsp;&nbsp;67 65 20 28 50 75 62 6c&nbsp;&nbsp;69 73 68 65 64 20 46 65&nbsp;&nbsp;|ge (Published Fe|</div>
-        <div class="term-line" style="color: var(--text-muted);">000000b0&nbsp;&nbsp;62 20 32 34 2c 20 32 30&nbsp;&nbsp;32 36 2c 20 62 79 20 52&nbsp;&nbsp;|b 24, 2026, by R|</div>
-        <div class="term-line" style="color: var(--text-muted);">000000c0&nbsp;&nbsp;00 00 00 20 00 00 00 00&nbsp;&nbsp;42 43 20 44 69 73 72 75&nbsp;&nbsp;|... ....BC Disru|</div>
-        <div class="term-line" style="color: var(--text-muted);">000000d0&nbsp;&nbsp;70 74 6f 72 73 29 00 00&nbsp;&nbsp;00 00 00 00 00 00 00 00&nbsp;&nbsp;|ptors)..........|</div>
-    </div>
-
-
-    <p>Every single Midstate node in the world independently verifies this construction. There is no trust required — only math.</p>
-</div>
-
+        <!-- ── PRIVACY ── -->
         <div class="content-pane" id="privacy">
             <h2>Privacy & MEV Resistance</h2>
             <p>Midstate achieves profound transaction privacy without compromising the auditability of the global state.</p>
@@ -992,16 +901,6 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
 
                     <p>This mechanism blinds transaction topology prior to block inclusion and enforces perfect subset sum ambiguity upon execution.</p>
 
-
-                    <h4>Two-Phase Dark Pool Execution</h4>
-                    <p>Transactions are split into <code>Commit</code> and <code>Reveal</code> phases to decouple mempool admission from the cleartext execution of the state transition.</p>
-                    <ul>
-                        <li><strong>Commit Phase:</strong> A 32-byte hash binds the inputs, outputs, and a 32-byte cryptographic salt: <code>BLAKE3(NETWORK_MAGIC || input_coin_ids || output_commit_hashes || salt)</code>. The client must compute a Proof-of-Work nonce yielding 16 to 30 leading zero bits (dynamically scaled based on current mempool congestion) to admit the <code>Commit</code> into the mempool.</li>
-                        <li><strong>Reveal Phase:</strong> After the <code>Commit</code> is included in a block, the user broadcasts the <code>Reveal</code> transaction containing the cleartext preimages, executing the state transition. Commitments expire and are garbage-collected from the state after <code>COMMITMENT_TTL</code> (1,000 blocks).</li>
-                    </ul>
-                    
-
-                    
                     <details class="deep-dive">
                         <summary>Dynamic Anti-Spam PoW</summary>
                         <div class="dd-content">
@@ -1011,143 +910,46 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                     </details>
                 </div>
 
-<div class="tab-content active" id="coinjoin">
-    <h3>Native CoinJoin</h3>
-    <p>Midstate ships a <strong>denomination-uniform CoinJoin</strong> mixer built directly into the wallet and P2P layer. The final on-chain transaction is an ordinary <code>Reveal</code> that passes every validation rule. The privacy guarantee is mathematical: because every input and every output (except the mandatory fee coin) has identical power-of-2 value, subset-sum analysis yields <em>zero</em> information about the input→output mapping.</p>
-    
-    <div class="callout stark">
-        <h4>Core Invariants (from <code>wallet/coinjoin.rs</code>)</h4>
-        <ul>
-            <li><code>MIN_MIX_PARTICIPANTS = 2</code>, <code>MAX_MIX_PARTICIPANTS = 16</code></li>
-            <li>All mix inputs <strong>and</strong> outputs must share the exact same power-of-2 denomination (1, 2, 4, …, 2⁶³)</li>
-            <li>Exactly one additional input of value <code>1</code> covers the mandatory network fee</li>
-            <li>Coordinator is <strong>ephemeral</strong> — any node can start a session; no trusted third party</li>
-        </ul>
-    </div>
+                <div class="tab-content" id="coinjoin">
+                    <h3>Native CoinJoin</h3>
+                    <p>Midstate ships a <strong>denomination-uniform CoinJoin</strong> mixer built directly into the wallet and P2P layer. The final on-chain transaction is an ordinary <code>Reveal</code> that passes every validation rule. The privacy guarantee is mathematical: because every input and every output (except the mandatory fee coin) has identical power-of-2 value, subset-sum analysis yields <em>zero</em> information about the input→output mapping.</p>
+                    
+                    <div class="callout stark">
+                        <h4>Core Invariants (from <code>wallet/coinjoin.rs</code>)</h4>
+                        <ul>
+                            <li><code>MIN_MIX_PARTICIPANTS = 2</code>, <code>MAX_MIX_PARTICIPANTS = 16</code></li>
+                            <li>All mix inputs <strong>and</strong> outputs must share the exact same power-of-2 denomination (1, 2, 4, …, 2⁶³)</li>
+                            <li>Exactly one additional input of value <code>1</code> covers the mandatory network fee</li>
+                            <li>Coordinator is <strong>ephemeral</strong> — any node can start a session; no trusted third party</li>
+                        </ul>
+                    </div>
 
-    <h4>Ephemeral CoinJoin Coordination (libp2p)</h4>
-    <p>Any node can initialise a session by broadcasting a <code>MixAnnounce</code> message containing a unique <code>MixID</code> and the target denomination.</p>
+                    <h4>Ephemeral CoinJoin Coordination (libp2p)</h4>
+                    <p>Any node can initialise a session by broadcasting a <code>MixAnnounce</code> message containing a unique <code>MixID</code> and the target denomination.</p>
 
-    <!-- Diagram 1: Announcement + PoW Join -->
-    <div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
-    graph TD
-        C(("Coordinator<br>PeerID: QmYw...")) -->|"Broadcast MixAnnounce<br>MixID: 0xabc123...<br>Denom: 8"| N["P2P Network"]
-       
-        subgraph PeerA ["Peer A (PeerID: QmXa...)"]
-            direction TB
-            P1["Receive Announce"] --> P2["Compute PoW Nonce"]
-            P2 -->|"BLAKE3(mix_id || coin_id || peer_id || nonce) ≥ 30 leading zeros"| P3{"Sufficient?"}
-            P3 --Yes--> P4["Send MixJoin"]
-            P3 --No--> P2
-        end
-        N --> P1
-        P4 -->|"Route to QmYw..."| C
-       
-        style C fill:#2e1065,stroke:#8b5cf6,stroke-width:2px,color:#fff
-        style P2 fill:#1f2937,stroke:#8b5cf6,color:#fff,stroke-dasharray: 5 5
-        style P3 fill:#064e3b,stroke:#10b981,color:#fff
-    </div>
-    <p class="callout" style="margin-top:-12px;">The coordinator broadcasts the session. Peers prove they control a real coin (and are not Sybils) by solving a <code>BLAKE3</code> PoW challenge bound to their <code>PeerId</code> and <code>coin_id</code>. This anti-Sybil mechanism requires 30 leading zero bits (approx. 1 billion hashes), heavily punishing Sybil attackers.</p>
-    <!-- Diagram 2: Registration & Canonical Proposal -->
-    <div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
-    graph LR
-        subgraph libp2p Network
-            A[Peer A: Input + PoW] -->|MixJoin| M
-            B[Peer B: Input + PoW] -->|MixJoin| M
-            C[Peer C: Fee Input] -->|MixFee| M
-        end
-       
-        M((Ephemeral<br>Coordinator))
-       
-        subgraph Canonical Proposal
-            M -->|Lexicographical Sort by coin_id<br>Fee input appended last| P[MixProposal]
-            P -.->|Verify MY outputs present?| A
-            P -.->|Verify MY outputs present?| B
-            P -.->|Verify MY outputs present?| C
-        end
-       
-        style M fill:#2e1065,stroke:#8b5cf6,stroke-width:2px
-        style A fill:#1f2937,stroke:#4b5563,color:#fff
-        style B fill:#1f2937,stroke:#4b5563,color:#fff
-        style C fill:#1f2937,stroke:#4b5563,color:#fff
-    </div>
-    <p class="callout" style="margin-top:-12px;"> Participants register their <code>InputReveal</code> and desired <code>OutputData</code>. When the session reaches the minimum participant count and the fee input is supplied, the coordinator produces a <strong>deterministic</strong> <code>MixProposal</code> (see <code>MixSession::proposal()</code>). Inputs are sorted by <code>coin_id</code> (mix coins first, fee last); outputs are sorted by <code>coin_id</code>. This ordering guarantees every honest participant computes the exact same commitment hash.</p>
+                    <p class="callout" style="margin-top:12px;">The coordinator broadcasts the session. Peers prove they control a real coin (and are not Sybils) by solving a <code>BLAKE3</code> PoW challenge bound to their <code>PeerId</code> and <code>coin_id</code>. This anti-Sybil mechanism requires 30 leading zero bits (approx. 1 billion hashes), heavily punishing Sybil attackers.</p>
+                    
+                    <p class="callout" style="margin-top:12px;"> Participants register their <code>InputReveal</code> and desired <code>OutputData</code>. When the session reaches the minimum participant count and the fee input is supplied, the coordinator produces a <strong>deterministic</strong> <code>MixProposal</code> (see <code>MixSession::proposal()</code>). Inputs are sorted by <code>coin_id</code> (mix coins first, fee last); outputs are sorted by <code>coin_id</code>. This ordering guarantees every honest participant computes the exact same commitment hash.</p>
 
-    <!-- Diagram 3: Verification & Signing -->
-    <div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
-    sequenceDiagram
-        participant C as Coordinator
-        participant P as Peer A
-        participant L as Peer A Local State
-        Note over C: All registrations received.<br/>Inputs/Outputs deterministically sorted.
-        C->>P: Broadcast MixProposal (Registered Inputs + Desired Outputs)
-       
-        Note over P: Begin Verification Procedure
-        P->>L: Retrieve locally registered outputs
-       
-        rect rgb(30, 41, 59)
-        Note over P, L: CRITICAL CHECK: Are MY outputs in the coordinator's proposal?
-       
-        alt Outputs Missing or Altered
-            P--x C: DROP PROPOSAL (Refuse to Sign)
-            Note right of P: Coordinator attempt failed. Funds safe.
-        else Outputs Matched Exactly
-            P->>P: Sign Proposal Commitment Hash
-            P->>C: Send Signature
-        end
-        end
-    </div>
-    <p class="callout" style="margin-top:-12px;"> This is the <strong>trustless verification step</strong>. Each peer independently checks that the coordinator has not altered, omitted, or stolen their outputs before signing the single 32-byte commitment hash. If the check fails, the peer aborts — the coordinator gains nothing. The collected signatures are later assembled into the final <code>Reveal</code> transaction.</p>
+                    <p class="callout" style="margin-top:12px;"> This is the <strong>trustless verification step</strong>. Each peer independently checks that the coordinator has not altered, omitted, or stolen their outputs before signing the single 32-byte commitment hash. If the check fails, the peer aborts — the coordinator gains nothing. The collected signatures are later assembled into the final <code>Reveal</code> transaction.</p>
 
-    <ul>
-        <li><strong>Uniformity Constraints:</strong> Enforced in <code>MixSession::register</code> and <code>set_fee_input</code>. DataBurn outputs are explicitly forbidden.</li>
-        <li><strong>Anti-Sybil Proof-of-Work:</strong> <code>BLAKE3(mix_id || coin_id || peer_id || nonce) ≥ 30 leading zeros</code> — enforced via <code>MIX_JOIN_POW_BITS</code>.</li>
-        <li><strong>Trustless Proposal Assembly:</strong> Lexicographical sort by <code>coin_id</code> (see <code>proposal()</code>). Participants sign only the final commitment hash after local verification.</li>
-        <li><strong>On-Chain Detection:</strong> Any observer can call <code>is_uniform_mix(tx)</code> — it simply counts inputs/outputs of identical power-of-2 value plus at most one fee coin. The transaction remains fully valid even if the heuristic is unknown.</li>
-    </ul>
-
-    <h4>Dandelion++ Stem Routing (Post-Mix Privacy)</h4>
-    <p>After the reveal is constructed, the wallet routes the final <code>Reveal</code> transaction through Dandelion++ to decouple the broadcasting node’s IP from the transaction payload.</p>
-    
-    <div class="mermaid" style="text-align: center; margin: 20px 0;">
-    graph LR
-        A([Origin Node]) -.->|Stem phase| B([Node 2])
-        B -.->|10% Probability| C([Node 3])
-        C -.->|10% Probability| D([Node 4])
-        D ==>|Broadcast Trigger| E([Peer A])
-        D ==>|Broadcast| F([Peer B])
-        D ==>|Broadcast| G([Peer C])
-       
-        style A fill:#2e1065,stroke:#8b5cf6,stroke-width:2px,color:#fff
-        style D fill:#064e3b,stroke:#10b981,stroke-width:2px,color:#fff
-    </div>
-    <p class="callout" style="margin-top:-12px;"><strong>Diagram explanation:</strong> Transactions stay in the “stem” (single-peer forwarding) until a random 10% probability (<code>STEM_FLUFF_PERCENT</code>) flips them into the public “fluff” phase. Stem pool is capped at 1,000 entries to prevent memory exhaustion.</p>
-
-    <div class="math-block">
-        // Commitment Hash (identical on every honest node)
-        commitment = BLAKE3(
-            input_coin_ids_sorted ||
-            output_commit_hashes_sorted ||
-            session_salt
-        )
-    </div>
-
-    <p>The entire mixing protocol lives in <code>wallet/coinjoin.rs</code> (≈180 LOC). It is used automatically by the wallet’s <code>--private</code> send flag and can be invoked manually via the CLI or libp2p RPC for advanced users.</p>
-</div>
-
-
+                    <h4>Dandelion++ Stem Routing (Post-Mix Privacy)</h4>
+                    <p>After the reveal is constructed, the wallet routes the final <code>Reveal</code> transaction through Dandelion++ to decouple the broadcasting node’s IP from the transaction payload.</p>
+                </div>
             </div>
         </div>
 
-<div class="content-pane" id="state">
+        <!-- ── STATE MGMT & SYNC ── -->
+        <div class="content-pane" id="state">
             <h2>State Management & Syncing</h2>
             <p>Midstate discards the traditional unbounded UTXO database model (like Bitcoin's LevelDB). Instead, unspent outputs, pending commitments, and chain history are mathematically accumulated into cryptographically verifiable data structures, strictly bounding the RAM requirements for edge devices.</p>
 
             <div class="tabs">
                 <div class="tab-nav">
                     <button class="tab-btn active" data-tab="state-smt">SMT & MMR Architecture</button>
+                    <button class="tab-btn" data-tab="state-pruning">Pruning & Licenses</button>
                     <button class="tab-btn" data-tab="state-sync">Fast-Forward Sync & Snapshots</button>
-                    <button class="tab-btn" data-tab="state-filters">Compact Filters (Privacy)</button>
+                    <button class="tab-btn" data-tab="state-filters">Compact Filters</button>
                 </div>
 
                 <div class="tab-content active" id="state-smt">
@@ -1163,32 +965,27 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
 
                     <h4>2. The Merkle Mountain Range (MMR)</h4>
                     <p>While the SMT tracks <em>active</em> state, the MMR tracks <em>historical</em> state. Every time a block is mined, its <code>final_hash</code> is appended to the MMR. This provides an append-only log of the entire chain history, allowing light clients to request <code>O(log N)</code> inclusion proofs to verify that a specific block existed at a specific height in the past.</p>
-
-                <div class="mermaid" style="text-align: center; margin: 24px 0; padding: 16px; background: var(--highlight); border: 1px solid var(--border); border-radius: 8px;">
-                    graph TD
-                        Root([Global State Root]) --> SMT([Combined SMT Root])
-                        Root --> MMR([Chain History MMR Root])
-                        
-                        SMT --> Mempool([Pending Commits SMT])
-                        SMT --> UTXO([Active UTXO SMT])
-                        
-                        UTXO --> TopCache[Top 16 Levels<br/>RAM Cache<br/>Max 65,536 Nodes]
-                        TopCache -.-> BottomTree[Bottom 240 Levels<br/>Disk-backed<br/>Dynamic Bucket Folding]
-                        
-                        MMR --> B1[Block 1]
-                        MMR --> B2[Block 2]
-                        MMR --> B3[Block N...]
-                        
-                        style Root fill:#431407,stroke:#ea580c,stroke-width:2px
-                        style TopCache stroke:#3b82f6,stroke-dasharray: 5 5
-                        style BottomTree stroke:#64748b
-                    </div>
                     
                     <div class="math-block">
                         // The Final State Root Equation<br>
                         smt_root = BLAKE3( utxo_smt_root || pending_commitments_smt_root )<br>
                         state_root = BLAKE3( smt_root || historical_chain_mmr_root )
                     </div>
+                </div>
+
+                <div class="tab-content" id="state-pruning">
+                    <h3>Pruning Licenses & Cap-and-Trade</h3>
+                    <p>Unlike traditional blockchains where every node must store the entire history forever, Midstate uses a <strong>Cap-and-Trade</strong> market for historical data storage.</p>
+
+                    <p>Nodes can safely discard historical blocks (Pruning Mode) without being penalized by their peers, provided they hold a <strong>Pruning License</strong>. These licenses are created by Archiver nodes who cryptographically prove they possess the historical data.</p>
+
+                    <h4>Proof of Archival Work (PoAW)</h4>
+                    <p>To issue a license, an Archiver must perform heavy, address-salted PoW over historical block payloads. The resulting Merkle Root is stored on-chain inside a <code>Confidential</code> UTXO (a State Thread). This creates a verifiable, tradable <strong>Bearer Asset</strong> representing archival capacity.</p>
+
+                    <h4>Bayesian Reputation & Gossip Challenges</h4>
+                    <p>A license is only as good as the Archiver backing it. Nodes continuously audit license issuers using <strong>MMR Gossip Challenges</strong> sent over the ephemeral P2P Chat bus. If an Archiver fails to provide the requested data block, nodes update their internal Bayesian estimator, slashing the Archiver's reputation.</p>
+                    
+                    <p>If an Archiver's reputation drops too low, the Pruning Licenses they issued lose their exemption power, forcing Pruners to buy higher-quality licenses from reliable Archivers, creating a free market for decentralized storage.</p>
                 </div>
 
                 <div class="tab-content" id="state-sync">
@@ -1202,14 +999,6 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
                         <p>How does a node trust a peer's snapshot without replaying the history? It uses the headers. The node downloads the lightweight headers and verifies the Proof-of-Work. If the very first header mathematically builds exactly on top of the downloaded snapshot's <code>midstate</code>, the snapshot is authentic.</p>
                         <p><strong>The Security Gate:</strong> To prevent an attacker from forging a fake snapshot and mining just 1 or 2 blocks on top of it, Midstate enforces a <code>PRUNE_DEPTH</code> rule. A node will only trust a snapshot if the peer can provide 1,000 valid blocks of Proof-of-Work natively built on top of it (1 billion sequential hashes). This makes state injection economically impossible.</p>
                     </div>
-
-                    <details class="deep-dive">
-                        <summary>Reorg Defense & Frankenstein Chains</summary>
-                        <div class="dd-content">
-                            <p>When a node detects a longer chain, it must perform a reorg. A catastrophic failure mode during sync is the "Frankenstein chain"—where a node writes the peer's alternative blocks to disk, but crashes before updating the <code>STATE_TABLE</code> pointer. Upon reboot, the database has half the old chain and half the new chain, destroying consensus.</p>
-                            <p>Midstate prevents this via strict ACID transactions. Incoming alternative batches are written to <code>.tmp</code> files. Only after the <code>STATE_TABLE</code> pointer is atomically updated in the <code>redb</code> database does the node promote the files to <code>.bin</code>. If a crash occurs, the node's WAL recovery checks the committed height and either deletes orphaned <code>.tmp</code> files or finishes the promotion, ensuring the disk is always perfectly coherent.</p>
-                        </div>
-                    </details>
                 </div>
 
                 <div class="tab-content" id="state-filters">
@@ -1227,213 +1016,139 @@ td.hl { color: var(--text-main); font-weight: 500; background: var(--highlight);
             </div>
         </div>
 
+        <!-- ── VM ── -->
+        <div class="content-pane" id="vm">
+            <h2>Virtual Machine</h2>
+            <p>Every UTXO in Midstate is locked by a compiled bytecode script. The VM executes witness inputs pushed onto the <code>SmallVec</code> stack, then evaluates the locking script. Execution succeeds if and only if the final top-of-stack item is exactly <code>[1]</code>.</p>
 
+            <p>The stack machine in Midstate is Turing-incomplete by design — no loops, no unbounded recursion, no on-chain state mutation. However, it features <strong>output introspection</strong> via <code>OP_SUM_TO_ADDR</code> and <strong>State Threads</strong> via <code>OP_READ_INPUT_STATE</code>. These capabilities unlock Covenants, AMMs, native tokens, and DAOs without any of the security risks associated with EVM smart contracts.</p>
 
-<div class="content-pane" id="vm">
-    <h2>Virtual Machine</h2>
-    <p>Every UTXO in Midstate is locked by a compiled bytecode script. The VM executes witness inputs pushed onto the <code>SmallVec</code> stack, then evaluates the locking script. Execution succeeds if and only if the final top-of-stack item is exactly <code>[1]</code>.</p>
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Max Script Size</div>
+                    <div class="stat-value">1,024 bytes</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Max Stack Depth</div>
+                    <div class="stat-value">64 items</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Clean Stack Rule</div>
+                    <div class="stat-value">Exactly [1]</div>
+                </div>
+            </div>
 
-    <p>The stack machine in Midstate is Turing-incomplete by design — no loops, no unbounded recursion, no on-chain state mutation. However, it features <strong>output introspection</strong> via <code>OP_SUM_TO_ADDR</code> and <strong>State Threads</strong> via <code>OP_READ_INPUT_STATE</code>. These capabilities unlock Covenants, AMMs, native tokens, and DAOs without any of the security risks associated with EVM smart contracts.</p>
+            <div class="tabs">
+                <div class="tab-nav">
+                    <button class="tab-btn active" data-tab="vm-midscript">Midscript (High-Level)</button>
+                    <button class="tab-btn" data-tab="vm-state">State Threads (eUTXO)</button>
+                    <button class="tab-btn" data-tab="vm-p2pk">P2PK</button>
+                    <button class="tab-btn" data-tab="vm-multisig">Multi-Sig</button>
+                    <button class="tab-btn" data-tab="vm-htlc">Atomic Swap (HTLC)</button>
+                    <button class="tab-btn" data-tab="vm-timelock">Timelocks</button>
+                    <button class="tab-btn" data-tab="vm-covenant">Covenants</button>
+                    <button class="tab-btn" data-tab="vm-opcodes">Opcode Reference</button>
+                </div>
+                <!-- ── MIDSCRIPT ─────────────────────────────────────────────────── -->
+                <div class="tab-content active" id="vm-midscript">
+                    <h2>Midscript: The Definitive Reference Manual</h2>
+                    <p>Midscript is a high-level, expression-oriented language that compiles strictly into zero-overhead Midstate stack machine bytecode. Unlike Solidity or Rust-based smart contracts, Midscript operates purely as an advanced static analyzer and pre-processor: it manages stack depth, type safety, and memory offsets entirely at compile time, eliminating the need for runtime memory allocation, garbage collection, or local variable storage.</p>
 
-    <div class="stat-grid">
-        <div class="stat-card">
-            <div class="stat-label">Max Script Size</div>
-            <div class="stat-value">1,024 bytes</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-label">Max Stack Depth</div>
-            <div class="stat-value">64 items</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-label">Clean Stack Rule</div>
-            <div class="stat-value">Exactly [1]</div>
-        </div>
-    </div>
+                    <div class="callout stark">
+                        <h4>The Zero-Cost Abstraction Guarantee</h4>
+                        <p>Midscript has no concept of a heap, stack frames, or runtime variables. Constructs like <code>let</code>, <code>var</code>, <code>macro</code>, <code>state</code>, <code>struct</code>, and <code>repeat</code> exist only in the compiler. The compiler tracks the physical depth of every item on the stack and dynamically generates <code>DUP</code>, <code>SWAP</code>, <code>OVER</code>, and <code>ROT</code> opcodes to route data to the execution head exactly when needed.</p>
+                    </div>
 
-    <div class="tabs">
-<div class="tab-nav">
-            <button class="tab-btn active" data-tab="vm-midscript">Midscript (High-Level)</button>
-            <button class="tab-btn" data-tab="vm-state">State Threads (eUTXO)</button>
-            <button class="tab-btn" data-tab="vm-p2pk">P2PK</button>
-            <button class="tab-btn" data-tab="vm-multisig">Multi-Sig</button>
-            <button class="tab-btn" data-tab="vm-htlc">Atomic Swap (HTLC)</button>
-            <button class="tab-btn" data-tab="vm-timelock">Timelocks</button>
-            <button class="tab-btn" data-tab="vm-covenant">Covenants</button>
-            <button class="tab-btn" data-tab="vm-dao">DAO Treasury</button>
-            <button class="tab-btn" data-tab="vm-streaming">Streaming Payments</button>
-            <button class="tab-btn" data-tab="vm-opcodes">Opcode Reference</button>
-        </div>
-<!-- ── MIDSCRIPT ─────────────────────────────────────────────────── -->
-      <div class="tab-content active" id="vm-midscript">
-    <h2>Midscript: The Definitive Reference Manual</h2>
-    <p>Midscript is a high-level, expression-oriented language that compiles strictly into zero-overhead Midstate stack machine bytecode. Unlike Solidity or Rust-based smart contracts, Midscript operates purely as an advanced static analyzer and pre-processor: it manages stack depth, type safety, and memory offsets entirely at compile time, eliminating the need for runtime memory allocation, garbage collection, or local variable storage.</p>
+                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">1. The Compilation Pipeline</h3>
+                    <p>Midscript compiles code entirely within the browser using a custom three-stage pipeline: Lexer, Parser, and CodeGen. There is no intermediate representation (IR) or optimization pass beyond basic peephole reduction.</p>
 
-    <div class="stat-grid">
-        <div class="stat-card">
-            <div class="stat-label">Memory Allocation</div>
-            <div class="stat-value">Zero (Stack Only)</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-label">Execution Paradigm</div>
-            <div class="stat-value">Expression-Oriented</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-label">Turing Completeness</div>
-            <div class="stat-value">Incomplete (Bounded)</div>
-        </div>
-    </div>
+                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">2. Type System & Physical Stack Tracking</h3>
+                    <p>Midscript enforces strict compile-time typing to prevent invalid opcode operations. All literals are pushed to the physical VM stack as little-endian byte arrays.</p>
 
-    <div class="callout stark">
-        <h4>The Zero-Cost Abstraction Guarantee</h4>
-        <p>Midscript has no concept of a heap, stack frames, or runtime variables. Constructs like <code>let</code>, <code>var</code>, <code>macro</code>, <code>state</code>, <code>struct</code>, and <code>repeat</code> exist only in the compiler. The compiler tracks the physical depth of every item on the stack and dynamically generates <code>DUP</code>, <code>SWAP</code>, <code>OVER</code>, and <code>ROT</code> opcodes to route data to the execution head exactly when needed.</p>
-    </div>
+                    <ul>
+                        <li><strong>Hexadecimal Strings (<code>hex</code>):</strong> Enclosed in quotes. Compiles directly to <code>PUSH_HEX</code>. Example: <code>"a1b2c3d4"</code></li>
+                        <li><strong>Integers (<code>int</code>):</strong> Base-10 numerical literals. The compiler converts these to little-endian hex representations and emits <code>PUSH_INT</code>. Example: <code>10000</code></li>
+                        <li><strong>Booleans (<code>int</code>):</strong> The keywords <code>true</code> and <code>false</code> compile to <code>PUSH_INT 1</code> and <code>PUSH_INT 0</code>.</li>
+                    </ul>
 
-    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">1. The Compilation Pipeline</h3>
-    <p>Midscript compiles code entirely within the browser using a custom three-stage pipeline: Lexer, Parser, and CodeGen. There is no intermediate representation (IR) or optimization pass beyond basic peephole reduction.</p>
+                    <h4>Variable Binding (<code>var</code>)</h4>
+                    <p>The <code>var</code> keyword binds an identifier to the item currently at the top of the physical stack. The compiler maintains a <code>locals</code> array that tracks the relative depth of these variables. When a <code>var</code> is referenced, the CodeGen engine calculates its current depth offset and issues the appropriate fetch opcode.</p>
 
-<div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
-    flowchart TD
-        Src[Midscript Source Code] -->|Lexer| Tokens[Token Stream]
-        Tokens -->|Parser| AST[Abstract Syntax Tree]
-        AST -->|CodeGen| ASM[Raw Stack Assembly]
-        ASM -->|Assembler| Hex[Executable Bytecode]
+                    <div class="math-block">
+                        // Maximum Fetch Depth Limit<br>
+                        Because the VM lacks opcodes to fetch arbitrarily deep items (e.g., OP_PICK is not supported), Midscript restricts variable fetching to depth 0, 1, and 2. Referencing a variable deeper than depth 2 results in a compile-time Semantic Error: "Variable 'x' is too deep. Max fetch depth is 2."
+                    </div>
 
-        subgraph CodeGenPhase [CodeGen Constraints]
-            direction LR
-            Scope[Macro Unrolling]
-            Depth[Stack Depth Tracker]
-            Type[Type Checker]
-        end
-        AST -.-> CodeGenPhase
-
-        style Src fill:#1f2937,stroke:#4b5563,color:#d1d5db
-        style Hex fill:#431407,stroke:#ea580c,stroke-width:2px,color:#fed7aa
-        style CodeGenPhase fill:#064e3b,stroke:#10b981,stroke-width:2px,color:#d1d5db
-    </div>
-
-    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">2. Type System & Physical Stack Tracking</h3>
-    <p>Midscript enforces strict compile-time typing to prevent invalid opcode operations. All literals are pushed to the physical VM stack as little-endian byte arrays.</p>
-
-    <ul>
-        <li><strong>Hexadecimal Strings (<code>hex</code>):</strong> Enclosed in quotes. Compiles directly to <code>PUSH_HEX</code>. Example: <code>"a1b2c3d4"</code></li>
-        <li><strong>Integers (<code>int</code>):</strong> Base-10 numerical literals. The compiler converts these to little-endian hex representations and emits <code>PUSH_INT</code>. Example: <code>10000</code></li>
-        <li><strong>Booleans (<code>int</code>):</strong> The keywords <code>true</code> and <code>false</code> compile to <code>PUSH_INT 1</code> and <code>PUSH_INT 0</code>.</li>
-    </ul>
-
-    <h4>Variable Binding (<code>var</code>)</h4>
-    <p>The <code>var</code> keyword binds an identifier to the item currently at the top of the physical stack. The compiler maintains a <code>locals</code> array that tracks the relative depth of these variables. When a <code>var</code> is referenced, the CodeGen engine calculates its current depth offset and issues the appropriate fetch opcode.</p>
-
-    <div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
-    graph LR
-        subgraph Physical Stack
-            direction TB
-            S0[Depth 0: Top]
-            S1[Depth 1: Middle]
-            S2[Depth 2: Bottom]
-        end
-
-        subgraph Compiler Ast Resolution
-            direction TB
-            R0(var c) -.->|Emits: DUP| S0
-            R1(var b) -.->|Emits: OVER| S1
-            R2(var a) -.->|Emits: ROT| S2
-        end
-
-        style Physical Stack fill:#1f2937,stroke:#4b5563,color:#d1d5db
-        style Compiler Ast Resolution fill:#2e1065,stroke:#a78bfa,color:#d1d5db
-    </div>
-
-    <div class="math-block">
-        // Maximum Fetch Depth Limit<br>
-        Because the VM lacks opcodes to fetch arbitrarily deep items (e.g., OP_PICK is not supported), Midscript restricts variable fetching to depth 0, 1, and 2. Referencing a variable deeper than depth 2 results in a compile-time Semantic Error: "Variable 'x' is too deep. Max fetch depth is 2."
-    </div>
-
-    <h4>Variable Mutation (Reassignment)</h4>
-    <p>Reassigning a variable does not alter memory. The compiler calculates the variable's depth and generates surgical opcodes to overwrite that specific stack slot without disrupting adjacent items.</p>
-    <pre><code>var a = pop_int();
+                    <h4>Variable Mutation (Reassignment)</h4>
+                    <p>Reassigning a variable does not alter memory. The compiler calculates the variable's depth and generates surgical opcodes to overwrite that specific stack slot without disrupting adjacent items.</p>
+                    <pre><code>var a = pop_int();
 var b = pop_int();
 
 // To reassign 'a' (currently at Depth 1), the compiler emits:
 // [Evaluate Expression] -> SWAP -> DROP -> [Insert New Value] -> SWAP
 a = b + 10; </code></pre>
 
-    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">3. Extended UTXO State & Structs</h3>
-    <p>To support advanced smart contracts (AMMs, DAOs, CDP Vaults), Midscript maps high-level object fields to specific byte offsets within a 32-byte <code>state</code> payload using dot-notation.</p>
-    
-    <pre><code>state Vault {
+                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">3. Extended UTXO State & Structs</h3>
+                    <p>To support advanced smart contracts (AMMs, DAOs, CDP Vaults), Midscript maps high-level object fields to specific byte offsets within a 32-byte <code>state</code> payload using dot-notation.</p>
+                    
+                    <pre><code>state Vault {
     col: 8,      // Offset 0, Size 8 bytes
     debt: 8,     // Offset 8, Size 8 bytes
     padding: 16  // Offset 16, Size 16 bytes
 }</code></pre>
 
-    <div class="mermaid" style="text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; overflow-x: auto;">
-    sequenceDiagram
-        participant Code as AST Node
-        participant Gen as CodeGen Engine
-        participant VM as Midstate VM
-
-        Code->>Gen: Access 'Vault.debt'
-        Gen->>VM: Emits READ_INPUT_STATE
-        Gen->>VM: Emits PUSH_INT 8 (Offset)
-        Gen->>VM: Emits PUSH_INT 8 (Size)
-        Gen->>VM: Emits SLICE
-        Note over Gen, VM: Automatic Type Casting: Size <= 8
-        Gen->>VM: Emits PUSH_INT 0
-        Gen->>VM: Emits ADD (Casts hex to int)
-    </div>
-
-    <p><strong>Automatic Casting:</strong> If the defined field size is 8 bytes or fewer, the CodeGen engine automatically appends <code>PUSH_INT 0 ADD</code>, casting the raw hex slice into an actionable integer for immediate arithmetic use. Sizes larger than 8 bytes remain raw <code>hex</code> strings (useful for hashes and public keys).</p>
+                    <p><strong>Automatic Casting:</strong> If the defined field size is 8 bytes or fewer, the CodeGen engine automatically appends <code>PUSH_INT 0 ADD</code>, casting the raw hex slice into an actionable integer for immediate arithmetic use. Sizes larger than 8 bytes remain raw <code>hex</code> strings (useful for hashes and public keys).</p>
 
 
-    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">4. Control Flow & Routing</h3>
-    <p>Midscript abstracts stack-based conditional jumps into standard bracketed control flows.</p>
+                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">4. Control Flow & Routing</h3>
+                    <p>Midscript abstracts stack-based conditional jumps into standard bracketed control flows.</p>
 
-    <ul>
-        <li><strong>If / Else:</strong> Compiles to <code>IF</code>, <code>ELSE</code>, and <code>ENDIF</code>. Note that Midstate's <code>IF</code> opcode strictly consumes the top stack item. The compiler implicitly leaves the evaluation result on the stack prior to the jump.</li>
-        
-        <li><strong>Switch Statements:</strong> Evaluates an expression and sequentially executes equality checks.
-        <pre><code>switch(Vault.debt) {
+                    <ul>
+                        <li><strong>If / Else:</strong> Compiles to <code>IF</code>, <code>ELSE</code>, and <code>ENDIF</code>. Note that Midstate's <code>IF</code> opcode strictly consumes the top stack item. The compiler implicitly leaves the evaluation result on the stack prior to the jump.</li>
+                        
+                        <li><strong>Switch Statements:</strong> Evaluates an expression and sequentially executes equality checks.
+                        <pre><code>switch(Vault.debt) {
     case 0: { /* Emits: DUP 0 EQUAL IF DROP ... ELSE */ }
     case 100: { /* Emits: DUP 100 EQUAL IF DROP ... ELSE */ }
     default: { fail(); }
 } // Compiler appends ENDIF for every evaluated case</code></pre></li>
 
-        <li><strong>Route:</strong> A specialized version of <code>switch</code> designed for the top-level contract entry point. It implicitly reads the top integer off the stack (pushed by the Witness as the execution path) without requiring an explicit parameter.
-        <pre><code>route {
+                        <li><strong>Route:</strong> A specialized version of <code>switch</code> designed for the top-level contract entry point. It implicitly reads the top integer off the stack (pushed by the Witness as the execution path) without requiring an explicit parameter.
+                        <pre><code>route {
     case 0: { require_signed_by(OWNER_PK); }
     case 1: { require_timelock(TIMEOUT); }
     default: { fail(); }
 }</code></pre></li>
 
-        <li><strong>Repeat (Compile-Time Loops):</strong> Because the Midstate VM lacks native loop opcodes (to prevent infinite execution vectors and guarantee <code>O(1)</code> verification time per opcode), <code>repeat(N)</code> instructs the CodeGen engine to physically unroll the AST block <code>N</code> times into the bytecode.
-        <pre><code>repeat(3) { merkle_update_step(); }</code></pre></li>
-    </ul>
+                        <li><strong>Repeat (Compile-Time Loops):</strong> Because the Midstate VM lacks native loop opcodes (to prevent infinite execution vectors and guarantee <code>O(1)</code> verification time per opcode), <code>repeat(N)</code> instructs the CodeGen engine to physically unroll the AST block <code>N</code> times into the bytecode.
+                        <pre><code>repeat(3) { merkle_update_step(); }</code></pre></li>
+                    </ul>
 
-    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">5. Operators & Safe Math</h3>
-    <p>Midscript compiles standard infix operators into postfix stack operations. The CodeGen engine enforces strict type-checking: math operations (`+`, `-`, `*`, `/`) will throw a Semantic Error if either operand is determined to be a raw <code>hex</code> string or an unevaluated boolean.</p>
+                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">5. Operators & Safe Math</h3>
+                    <p>Midscript compiles standard infix operators into postfix stack operations. The CodeGen engine enforces strict type-checking: math operations (`+`, `-`, `*`, `/`) will throw a Semantic Error if either operand is determined to be a raw <code>hex</code> string or an unevaluated boolean.</p>
 
-    <div class="math-block">
-        // Safe Math Guarantees<br>
-        Addition, Subtraction, Multiplication, and Division are clamped to 64-bit integers. <code>SUB</code> natively halts the VM on underflow. <code>DIV</code> natively halts on division by zero. There is no need for SafeMath libraries; overflows are prevented at the protocol layer.
-    </div>
+                    <div class="math-block">
+                        // Safe Math Guarantees<br>
+                        Addition, Subtraction, Multiplication, and Division are clamped to 64-bit integers. <code>SUB</code> natively halts the VM on underflow. <code>DIV</code> natively halts on division by zero. There is no need for SafeMath libraries; overflows are prevented at the protocol layer.
+                    </div>
 
-    <ul>
-        <li><strong>Comparison:</strong> <code>==</code> (EQUAL), <code>>=</code> (GREATER_OR_EQUAL). 
-        <br><br><em>Synthesized Comparisons:</em> Midstate VM only supports two native comparison opcodes to save space. Midscript synthesizes the rest:
-        <ul>
-            <li><code>></code> compiles to: <code>PUSH_INT 1 ADD GREATER_OR_EQUAL</code></li>
-            <li><code><=</code> compiles to: <code>SWAP GREATER_OR_EQUAL</code></li>
-            <li><code><</code> compiles to: <code>SWAP PUSH_INT 1 ADD GREATER_OR_EQUAL</code></li>
-        </ul>
-        </li>
-        <li><strong>Logical:</strong> <code>&&</code> is synthesized using <code>ADD PUSH_INT 2 EQUAL</code>. <code>||</code> is synthesized using <code>ADD PUSH_INT 1 GREATER_OR_EQUAL</code>.</li>
-    </ul>
+                    <ul>
+                        <li><strong>Comparison:</strong> <code>==</code> (EQUAL), <code>>=</code> (GREATER_OR_EQUAL). 
+                        <br><br><em>Synthesized Comparisons:</em> Midstate VM only supports two native comparison opcodes to save space. Midscript synthesizes the rest:
+                        <ul>
+                            <li><code>></code> compiles to: <code>PUSH_INT 1 ADD GREATER_OR_EQUAL</code></li>
+                            <li><code><=</code> compiles to: <code>SWAP GREATER_OR_EQUAL</code></li>
+                            <li><code><</code> compiles to: <code>SWAP PUSH_INT 1 ADD GREATER_OR_EQUAL</code></li>
+                        </ul>
+                        </li>
+                        <li><strong>Logical:</strong> <code>&&</code> is synthesized using <code>ADD PUSH_INT 2 EQUAL</code>. <code>||</code> is synthesized using <code>ADD PUSH_INT 1 GREATER_OR_EQUAL</code>.</li>
+                    </ul>
 
 
-    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">6. Macros vs Functions</h3>
-    <p>Midscript does not support functions, call stacks, or return addresses. The <code>macro</code> keyword defines a reusable AST fragment. When a macro is invoked, the compiler takes a snapshot of the current <code>locals</code> array, registers the arguments as new physical variables, unrolls the macro body into the CodeGen stream, and then issues <code>DROP</code> opcodes to wipe the macro's scope before restoring the original <code>locals</code> snapshot.</p>
+                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">6. Macros vs Functions</h3>
+                    <p>Midscript does not support functions, call stacks, or return addresses. The <code>macro</code> keyword defines a reusable AST fragment. When a macro is invoked, the compiler takes a snapshot of the current <code>locals</code> array, registers the arguments as new physical variables, unrolls the macro body into the CodeGen stream, and then issues <code>DROP</code> opcodes to wipe the macro's scope before restoring the original <code>locals</code> snapshot.</p>
 
-    <pre><code>macro check_both_sigs(pk_a, pk_b) {
+                    <pre><code>macro check_both_sigs(pk_a, pk_b) {
     swap();
     check_sig(pk_a);
     swap();
@@ -1441,47 +1156,47 @@ a = b + 10; </code></pre>
     add();
 }</code></pre>
 
-    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">7. The Standard Library</h3>
-    
-    <table>
-        <thead><tr><th>Built-in Function</th><th>Compiled Opcodes</th><th>Description</th></tr></thead>
-        <tbody>
-            <tr><td class="hl"><code>pop_int() / pop_hex()</code></td><td>(Context Update)</td><td>Registers the top stack item to the compiler's type-tracker without emitting code.</td></tr>
-            <tr><td class="hl"><code>peek() / dup()</code></td><td><code>DUP</code></td><td>Duplicates the top stack item.</td></tr>
-            <tr><td class="hl"><code>drop()</code></td><td><code>DROP</code></td><td>Discards the top stack item.</td></tr>
-            <tr><td class="hl"><code>swap()</code></td><td><code>SWAP</code></td><td>Swaps the top two stack items.</td></tr>
-            <tr><td class="hl"><code>over()</code></td><td><code>OVER</code></td><td>Copies the second-to-top item to the top.</td></tr>
-            <tr><td class="hl"><code>rot()</code></td><td><code>ROT</code></td><td>Rotates the third item to the top.</td></tr>
-            <tr><td class="hl"><code>assert(expr)</code></td><td><code>[expr] VERIFY</code></td><td>Evaluates an expression and aborts execution if it resolves to 0.</td></tr>
-            <tr><td class="hl"><code>fail()</code></td><td><code>PUSH_INT 0 VERIFY</code></td><td>Guarantees script termination and failure.</td></tr>
-            <tr><td class="hl"><code>verify_gte(v)</code></td><td><code>v GREATER_OR_EQUAL VERIFY</code></td><td>Aborts if the top item is less than <code>v</code>.</td></tr>
-            <tr><td class="hl"><code>check_sig(pk)</code></td><td><code>pk CHECKSIG</code></td><td>Verifies signature against pubkey. Pushes 1 (valid) or 0 (invalid).</td></tr>
-            <tr><td class="hl"><code>require_sig(pk)<br>require_signed_by(pk)</code></td><td><code>pk CHECKSIGVERIFY</code></td><td>Verifies signature. Aborts immediately if invalid.</td></tr>
-            <tr><td class="hl"><code>hash()</code></td><td><code>HASH</code></td><td>Executes a BLAKE3 hash on the top item.</td></tr>
-            <tr><td class="hl"><code>require_preimage(h)</code></td><td><code>HASH h EQUALVERIFY</code></td><td>Hashes the top item and aborts if it does not equal <code>h</code>.</td></tr>
-            <tr><td class="hl"><code>require_time(h)<br>require_timelock(h)</code></td><td><code>h CHECKTIMEVERIFY</code></td><td>Aborts if current block height is less than <code>h</code>.</td></tr>
-            <tr><td class="hl"><code>sum_to_addr(a)</code></td><td><code>a SUM_TO_ADDR</code></td><td>Sums transaction outputs sent to address <code>a</code> and pushes total.</td></tr>
-            <tr><td class="hl"><code>require_transfer(a, v)<br>require_funds_transferred(a, v)</code></td><td><code>a SUM_TO_ADDR v EQUALVERIFY</code></td><td>Asserts that exactly <code>v</code> units are sent to address <code>a</code>.</td></tr>
-            <tr><td class="hl"><code>read_input_state()</code></td><td><code>READ_INPUT_STATE</code></td><td>Pushes the 32-byte state of the currently executing input.</td></tr>
-            <tr><td class="hl"><code>read_output_state(i)</code></td><td><code>i READ_OUTPUT_STATE</code></td><td>Pushes the 32-byte state of the newly created output at index <code>i</code>.</td></tr>
-            <tr><td class="hl"><code>slice(val, off, len)</code></td><td><code>val off len SLICE</code></td><td>Extracts a substring of bytes.</td></tr>
-            <tr><td class="hl"><code>concat(a, b)</code></td><td><code>a b CONCAT</code></td><td>Concatenates two byte arrays.</td></tr>
-            <tr><td class="hl"><code>merkle_step()</code></td><td>(Macro Unroll)</td><td>Processes a standard static Merkle Proof step. Expects <code>[..., Sibling, Dir, Current]</code>.</td></tr>
-            <tr><td class="hl"><code>merkle_update_step()</code></td><td>(Macro Unroll)</td><td>Simultaneously verifies an old root and calculates a new root. Expects <code>[..., Sibling, Dir, Old_Acc, New_Acc]</code>.</td></tr>
-        </tbody>
-    </table>
+                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">7. The Standard Library</h3>
+                    
+                    <table>
+                        <thead><tr><th>Built-in Function</th><th>Compiled Opcodes</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td class="hl"><code>pop_int() / pop_hex()</code></td><td>(Context Update)</td><td>Registers the top stack item to the compiler's type-tracker without emitting code.</td></tr>
+                            <tr><td class="hl"><code>peek() / dup()</code></td><td><code>DUP</code></td><td>Duplicates the top stack item.</td></tr>
+                            <tr><td class="hl"><code>drop()</code></td><td><code>DROP</code></td><td>Discards the top stack item.</td></tr>
+                            <tr><td class="hl"><code>swap()</code></td><td><code>SWAP</code></td><td>Swaps the top two stack items.</td></tr>
+                            <tr><td class="hl"><code>over()</code></td><td><code>OVER</code></td><td>Copies the second-to-top item to the top.</td></tr>
+                            <tr><td class="hl"><code>rot()</code></td><td><code>ROT</code></td><td>Rotates the third item to the top.</td></tr>
+                            <tr><td class="hl"><code>assert(expr)</code></td><td><code>[expr] VERIFY</code></td><td>Evaluates an expression and aborts execution if it resolves to 0.</td></tr>
+                            <tr><td class="hl"><code>fail()</code></td><td><code>PUSH_INT 0 VERIFY</code></td><td>Guarantees script termination and failure.</td></tr>
+                            <tr><td class="hl"><code>verify_gte(v)</code></td><td><code>v GREATER_OR_EQUAL VERIFY</code></td><td>Aborts if the top item is less than <code>v</code>.</td></tr>
+                            <tr><td class="hl"><code>check_sig(pk)</code></td><td><code>pk CHECKSIG</code></td><td>Verifies signature against pubkey. Pushes 1 (valid) or 0 (invalid).</td></tr>
+                            <tr><td class="hl"><code>require_sig(pk)<br>require_signed_by(pk)</code></td><td><code>pk CHECKSIGVERIFY</code></td><td>Verifies signature. Aborts immediately if invalid.</td></tr>
+                            <tr><td class="hl"><code>hash()</code></td><td><code>HASH</code></td><td>Executes a BLAKE3 hash on the top item.</td></tr>
+                            <tr><td class="hl"><code>require_preimage(h)</code></td><td><code>HASH h EQUALVERIFY</code></td><td>Hashes the top item and aborts if it does not equal <code>h</code>.</td></tr>
+                            <tr><td class="hl"><code>require_time(h)<br>require_timelock(h)</code></td><td><code>h CHECKTIMEVERIFY</code></td><td>Aborts if current block height is less than <code>h</code>.</td></tr>
+                            <tr><td class="hl"><code>sum_to_addr(a)</code></td><td><code>a SUM_TO_ADDR</code></td><td>Sums transaction outputs sent to address <code>a</code> and pushes total.</td></tr>
+                            <tr><td class="hl"><code>require_transfer(a, v)<br>require_funds_transferred(a, v)</code></td><td><code>a SUM_TO_ADDR v EQUALVERIFY</code></td><td>Asserts that exactly <code>v</code> units are sent to address <code>a</code>.</td></tr>
+                            <tr><td class="hl"><code>read_input_state()</code></td><td><code>READ_INPUT_STATE</code></td><td>Pushes the 32-byte state of the currently executing input.</td></tr>
+                            <tr><td class="hl"><code>read_output_state(i)</code></td><td><code>i READ_OUTPUT_STATE</code></td><td>Pushes the 32-byte state of the newly created output at index <code>i</code>.</td></tr>
+                            <tr><td class="hl"><code>slice(val, off, len)</code></td><td><code>val off len SLICE</code></td><td>Extracts a substring of bytes.</td></tr>
+                            <tr><td class="hl"><code>concat(a, b)</code></td><td><code>a b CONCAT</code></td><td>Concatenates two byte arrays.</td></tr>
+                            <tr><td class="hl"><code>merkle_step()</code></td><td>(Macro Unroll)</td><td>Processes a standard static Merkle Proof step. Expects <code>[..., Sibling, Dir, Current]</code>.</td></tr>
+                            <tr><td class="hl"><code>merkle_update_step()</code></td><td>(Macro Unroll)</td><td>Simultaneously verifies an old root and calculates a new root. Expects <code>[..., Sibling, Dir, Old_Acc, New_Acc]</code>.</td></tr>
+                        </tbody>
+                    </table>
 
-    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">8. Raw Assembly Interop</h3>
-    <p>If required, developers can bypass the Midscript type-checker and stack-tracker by injecting raw Midstate Assembly directly into the code using all-caps mnemonics. The compiler treats these as raw string arguments and pushes them directly to the bytecode array without analysis.</p>
-    <pre><code>let ADMIN = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">8. Raw Assembly Interop</h3>
+                    <p>If required, developers can bypass the Midscript type-checker and stack-tracker by injecting raw Midstate Assembly directly into the code using all-caps mnemonics. The compiler treats these as raw string arguments and pushes them directly to the bytecode array without analysis.</p>
+                    <pre><code>let ADMIN = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
 PUSH_HEX(ADMIN);
 CHECKSIGVERIFY;
 PUSH_INT(1);</code></pre>
-    <p>Supported raw opcodes: <code>PUSH_HEX</code>, <code>PUSH_INT</code>, <code>DROP</code>, <code>DUP</code>, <code>SWAP</code>, <code>OVER</code>, <code>ROT</code>, <code>SLICE</code>, <code>CONCAT</code>, <code>EQUAL</code>, <code>VERIFY</code>, <code>EQUALVERIFY</code>, <code>ADD</code>, <code>SUB</code>, <code>MUL</code>, <code>DIV</code>, <code>GREATER_OR_EQUAL</code>, <code>HASH</code>, <code>CHECKSIG</code>, <code>CHECKSIGVERIFY</code>, <code>CHECKTIMEVERIFY</code>, <code>SUM_TO_ADDR</code>, <code>READ_INPUT_STATE</code>, <code>READ_OUTPUT_STATE</code>.</p>
+                    <p>Supported raw opcodes: <code>PUSH_HEX</code>, <code>PUSH_INT</code>, <code>DROP</code>, <code>DUP</code>, <code>SWAP</code>, <code>OVER</code>, <code>ROT</code>, <code>SLICE</code>, <code>CONCAT</code>, <code>EQUAL</code>, <code>VERIFY</code>, <code>EQUALVERIFY</code>, <code>ADD</code>, <code>SUB</code>, <code>MUL</code>, <code>DIV</code>, <code>GREATER_OR_EQUAL</code>, <code>HASH</code>, <code>CHECKSIG</code>, <code>CHECKSIGVERIFY</code>, <code>CHECKTIMEVERIFY</code>, <code>SUM_TO_ADDR</code>, <code>READ_INPUT_STATE</code>, <code>READ_OUTPUT_STATE</code>.</p>
 
-    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">9. Headless Unit Testing</h3>
-    <p>Midscript features a native test runner that compiles and executes against a headless simulation of the VM. Tests evaluate the physical stack output without requiring network deployment. A test passes if it terminates successfully and conforms to the Clean Stack Rule (leaving exactly <code>[1]</code> on the stack).</p>
-    <pre><code>test "Validates a Left-Sibling Merkle Step" {
+                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">9. Headless Unit Testing</h3>
+                    <p>Midscript features a native test runner that compiles and executes against a headless simulation of the VM. Tests evaluate the physical stack output without requiring network deployment. A test passes if it terminates successfully and conforms to the Clean Stack Rule (leaving exactly <code>[1]</code> on the stack).</p>
+                    <pre><code>test "Validates a Left-Sibling Merkle Step" {
     // Setup Mock Stack: [Sibling, Direction(Left=1), Current]
     push_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     push_int(1); 
@@ -1493,28 +1208,28 @@ PUSH_INT(1);</code></pre>
     push_hex("7e244b7fa716d86fb5a0f274291c984caebef9df451e0ff0d48cb96d66e74b3e"); 
     assert(pop_hex() == pop_hex()); 
 }</code></pre>
-</div>
-        
-        <!-- ── STATE THREADS ─────────────────────────────────────────────── -->
-        <div class="tab-content" id="vm-state">
-            <h3>State Threads (Extended UTXO)</h3>
-            <p>At Block 65,000, Midstate activates the <strong>State Threads</strong> soft-fork, officially upgrading the network from stateless scripting to a full Cardano-style Extended UTXO (eUTXO) smart contract platform.</p>
+                </div>
+                
+                <!-- ── STATE THREADS ─────────────────────────────────────────────── -->
+                <div class="tab-content" id="vm-state">
+                    <h3>State Threads (Extended UTXO)</h3>
+                    <p>At Block 65,000, Midstate activates the <strong>State Threads</strong> soft-fork, officially upgrading the network from stateless scripting to a full Cardano-style Extended UTXO (eUTXO) smart contract platform.</p>
 
-            <div class="callout stark">
-                <h4>What is a State Thread?</h4>
-                <p>A State Thread is a special UTXO with a value of exactly <code>0</code>. Because it has no monetary value, anyone can attach one to a transaction for free. Instead of holding coins, it carries a mutable <strong>32-byte State Variable</strong>. When you spend a State Thread, the locking script can read the old state, execute logic, and enforce what the <em>next</em> 32-byte state must be.</p>
-            </div>
+                    <div class="callout stark">
+                        <h4>What is a State Thread?</h4>
+                        <p>A State Thread is a special UTXO with a value of exactly <code>0</code>. Because it has no monetary value, anyone can attach one to a transaction for free. Instead of holding coins, it carries a mutable <strong>32-byte State Variable</strong>. When you spend a State Thread, the locking script can read the old state, execute logic, and enforce what the <em>next</em> 32-byte state must be.</p>
+                    </div>
 
-            <h4>The Two Magic Opcodes</h4>
-            <p>State Threads are driven by two new opcodes (available in Midscript as functions):</p>
-            <ul>
-                <li><code>read_input_state()</code>: Pushes the 32-byte state of the currently executing input onto the stack.</li>
-                <li><code>read_output_state(index)</code>: Pushes the 32-byte state of the newly created output at the specified index.</li>
-            </ul>
+                    <h4>The Two Magic Opcodes</h4>
+                    <p>State Threads are driven by two new opcodes (available in Midscript as functions):</p>
+                    <ul>
+                        <li><code>read_input_state()</code>: Pushes the 32-byte state of the currently executing input onto the stack.</li>
+                        <li><code>read_output_state(index)</code>: Pushes the 32-byte state of the newly created output at the specified index.</li>
+                    </ul>
 
-            <h4>Example: A Decentralized DEX Limit Order</h4>
-            <p>Stateless blockchains can't do limit orders natively because they can't "remember" partial fills. State Threads solve this instantly. A Maker locks 10,000 coins in a contract, and sets a State Thread tracking <code>[Coins_Remaining, Price]</code>.</p>
-            <pre><code>// 1. Read the old state (Coins_Remaining)
+                    <h4>Example: A Decentralized DEX Limit Order</h4>
+                    <p>Stateless blockchains can't do limit orders natively because they can't "remember" partial fills. State Threads solve this instantly. A Maker locks 10,000 coins in a contract, and sets a State Thread tracking <code>[Coins_Remaining, Price]</code>.</p>
+                    <pre><code>// 1. Read the old state (Coins_Remaining)
 read_input_state();
 
 // 2. Subtract the amount the Taker is buying
@@ -1532,12 +1247,12 @@ EQUALVERIFY;
 require_transfer(MAKER_ADDR, &lt;taker_buy_amount&gt; * PRICE);
 true;</code></pre>
 
-            <p>This simple script creates a fully on-chain, decentralized AMM/Orderbook without any centralized sequencers, gas fees, or re-entrancy vulnerabilities.</p>
-            
-            
-            <h4>Example: Bonding Curve AMM (Algorithmic Pricing)</h4>
-            <p>Stateless blockchains cannot execute Automated Market Makers (AMMs) because they cannot track reserve balances or adjust prices. State Threads solve this instantly. Here is a fully decentralized <strong>Linear Bonding Curve AMM</strong>, where the 32-byte State tracks the <code>Current_Token_Supply</code>.</p>
-            <pre><code>// The AMM algorithmic rule: The Price of the next token is equal to Current_Supply.
+                    <p>This simple script creates a fully on-chain, decentralized AMM/Orderbook without any centralized sequencers, gas fees, or re-entrancy vulnerabilities.</p>
+                    
+                    
+                    <h4>Example: Bonding Curve AMM (Algorithmic Pricing)</h4>
+                    <p>Stateless blockchains cannot execute Automated Market Makers (AMMs) because they cannot track reserve balances or adjust prices. State Threads solve this instantly. Here is a fully decentralized <strong>Linear Bonding Curve AMM</strong>, where the 32-byte State tracks the <code>Current_Token_Supply</code>.</p>
+                    <pre><code>// The AMM algorithmic rule: The Price of the next token is equal to Current_Supply.
 
 // 1. Read Current Supply (This acts as our dynamic Price)
 read_input_state(); 
@@ -1558,17 +1273,17 @@ EQUALVERIFY;
 
 true;</code></pre>
 
-            <p>This 15-line contract demonstrates a fully autonomous, on-chain Automated Market Maker. The price of the token scales automatically based purely on supply and demand—without any central sequencers, external price oracles, gas fees, or re-entrancy vulnerabilities.</p>
-            
-            
-            
-            
-            
-            
-            
-<h4>Example: Constant Product AMM (Uniswap X * Y = K)</h4>
-            <p>Stateless blockchains cannot execute Automated Market Makers (AMMs) because they cannot track reserve balances or calculate slippage. State Threads solve this instantly. Here is a fully decentralized <strong>Constant Product AMM</strong>, where the 32-byte State tracks the token reserves: <code>[Reserve_X, Reserve_Y]</code>.</p>
-            <pre><code>// 1. Calculate Old K = Old_X * Old_Y
+                    <p>This 15-line contract demonstrates a fully autonomous, on-chain Automated Market Maker. The price of the token scales automatically based purely on supply and demand—without any central sequencers, external price oracles, gas fees, or re-entrancy vulnerabilities.</p>
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+        <h4>Example: Constant Product AMM (Uniswap X * Y = K)</h4>
+                    <p>Stateless blockchains cannot execute Automated Market Makers (AMMs) because they cannot track reserve balances or calculate slippage. State Threads solve this instantly. Here is a fully decentralized <strong>Constant Product AMM</strong>, where the 32-byte State tracks the token reserves: <code>[Reserve_X, Reserve_Y]</code>.</p>
+                    <pre><code>// 1. Calculate Old K = Old_X * Old_Y
 read_input_state();
 dup(); PUSH_INT 0; PUSH_INT 8; slice(); // Extract Old_X
 swap(); PUSH_INT 8; PUSH_INT 8; slice(); // Extract Old_Y
@@ -1585,15 +1300,15 @@ swap(); // Stack is now [New_K, Old_K]
 GREATER_OR_EQUAL;
 VERIFY;</code></pre>
 
-            <p>This 12-line contract demonstrates a fully autonomous, on-chain Automated Market Maker. Because Midstate natively supports integer multiplication and slicing, the contract perfectly calculates the <code>X * Y = K</code> invariant curve. The price scales automatically based purely on supply and demand—without any central sequencers, external price oracles, gas fees, or re-entrancy vulnerabilities.</p>
-        </div>
-        
-        
-        <!-- ── P2PK ──────────────────────────────────────────────────────── -->
-        <div class="tab-content" id="vm-p2pk">
-            <h3>Pay-to-Public-Key (P2PK)</h3>
-            <p>The default script type. The owner's public key is embedded in the locking script. To spend, the owner provides a WOTS+ or MSS signature in the witness.</p>
-            <pre><code>Script:  PUSH_DATA(&lt;owner_pk&gt;) CHECKSIGVERIFY PUSH_INT(1)
+                    <p>This 12-line contract demonstrates a fully autonomous, on-chain Automated Market Maker. Because Midstate natively supports integer multiplication and slicing, the contract perfectly calculates the <code>X * Y = K</code> invariant curve. The price scales automatically based purely on supply and demand—without any central sequencers, external price oracles, gas fees, or re-entrancy vulnerabilities.</p>
+                </div>
+                
+                
+                <!-- ── P2PK ──────────────────────────────────────────────────────── -->
+                <div class="tab-content" id="vm-p2pk">
+                    <h3>Pay-to-Public-Key (P2PK)</h3>
+                    <p>The default script type. The owner's public key is embedded in the locking script. To spend, the owner provides a WOTS+ or MSS signature in the witness.</p>
+                    <pre><code>Script:  PUSH_DATA(&lt;owner_pk&gt;) CHECKSIGVERIFY PUSH_INT(1)
 Witness: [ &lt;signature&gt; ]
 
 Execution Trace:
@@ -1608,22 +1323,22 @@ Execution Trace:
 
 Result: VALID ✓</code></pre>
 
-            <div class="callout">
-                <h4>P2SH Addresses</h4>
-                <p>In practice, wallets hash the entire locking script with BLAKE3 and present only the 32-byte hash as the "address." The sender locks funds to <code>HASH PUSH_DATA(&lt;script_hash&gt;) EQUALVERIFY &lt;script&gt;</code>. This hides the script until spend time, improving privacy and keeping addresses a uniform 32 bytes regardless of script complexity.</p>
-            </div>
-        </div>
+                    <div class="callout">
+                        <h4>P2SH Addresses</h4>
+                        <p>In practice, wallets hash the entire locking script with BLAKE3 and present only the 32-byte hash as the "address." The sender locks funds to <code>HASH PUSH_DATA(&lt;script_hash&gt;) EQUALVERIFY &lt;script&gt;</code>. This hides the script until spend time, improving privacy and keeping addresses a uniform 32 bytes regardless of script complexity.</p>
+                    </div>
+                </div>
 
 
 
-        <!-- ── MULTI-SIG ─────────────────────────────────────────────────── -->
-        <div class="tab-content" id="vm-multisig">
-            <h3>M-of-N Multi-Signature</h3>
-            <p>Funds that require multiple independent parties to sign before they can be spent. Useful for joint accounts, exchange cold storage, and escrow. Because the Midstate stack machine executes <code>CHECKSIGVERIFY</code> sequentially, M-of-N is constructed by chaining signature checks — no special opcode needed.</p>
+                <!-- ── MULTI-SIG ─────────────────────────────────────────────────── -->
+                <div class="tab-content" id="vm-multisig">
+                    <h3>M-of-N Multi-Signature</h3>
+                    <p>Funds that require multiple independent parties to sign before they can be spent. Useful for joint accounts, exchange cold storage, and escrow. Because the Midstate stack machine executes <code>CHECKSIGVERIFY</code> sequentially, M-of-N is constructed by chaining signature checks — no special opcode needed.</p>
 
-            <h4>2-of-3 Example</h4>
-            <p>Alice, Bob, and Carol hold keys. Any two of the three must sign to release funds.</p>
-            <pre><code>// Locking Script (2-of-3: Alice, Bob, Carol)
+                    <h4>2-of-3 Example</h4>
+                    <p>Alice, Bob, and Carol hold keys. Any two of the three must sign to release funds.</p>
+                    <pre><code>// Locking Script (2-of-3: Alice, Bob, Carol)
 Script:
   IF
     PUSH_DATA(&lt;alice_pk&gt;) CHECKSIGVERIFY
@@ -1655,26 +1370,26 @@ Execution Trace (Alice + Bob):
 
 Result: VALID ✓</code></pre>
 
-            <div class="callout">
-                <h4>Key Type Flexibility</h4>
-                <p>Each signer can independently use WOTS+ one-time keys or MSS reusable keys. A company cold wallet might use MSS (so the address never changes) while individual signers rotate fresh WOTS+ keys for each co-signature. The VM doesn't care — <code>CHECKSIGVERIFY</code> handles both signature types transparently.</p>
-            </div>
-        </div>
+                    <div class="callout">
+                        <h4>Key Type Flexibility</h4>
+                        <p>Each signer can independently use WOTS+ one-time keys or MSS reusable keys. A company cold wallet might use MSS (so the address never changes) while individual signers rotate fresh WOTS+ keys for each co-signature. The VM doesn't care — <code>CHECKSIGVERIFY</code> handles both signature types transparently.</p>
+                    </div>
+                </div>
 
-        <!-- ── HTLC ──────────────────────────────────────────────────────── -->
-        <div class="tab-content" id="vm-htlc">
-            <h3>Atomic Swaps via Hash Time-Locked Contracts (HTLCs)</h3>
-            <p>HTLCs enable trustless cross-chain swaps and payment channels. Alice locks funds that can be claimed by Bob <em>only if</em> he reveals a secret preimage within a time window. If Bob doesn't claim in time, Alice gets her funds back.</p>
+                <!-- ── HTLC ──────────────────────────────────────────────────────── -->
+                <div class="tab-content" id="vm-htlc">
+                    <h3>Atomic Swaps via Hash Time-Locked Contracts (HTLCs)</h3>
+                    <p>HTLCs enable trustless cross-chain swaps and payment channels. Alice locks funds that can be claimed by Bob <em>only if</em> he reveals a secret preimage within a time window. If Bob doesn't claim in time, Alice gets her funds back.</p>
 
-            <div class="flow-diagram">
-                <div class="flow-box"><strong>Alice locks funds</strong><br><span style="color:var(--text-muted); font-size:12px;">Commits to BLAKE3(secret)</span></div>
-                <div class="flow-arrow">→</div>
-                <div class="flow-box"><strong>Bob reveals secret</strong><br><span style="color:var(--text-muted); font-size:12px;">Claims within timeout</span></div>
-                <div class="flow-arrow">→</div>
-                <div class="flow-box warn"><strong>OR: Timeout expires</strong><br><span style="color:var(--text-muted); font-size:12px;">Alice reclaims funds</span></div>
-            </div>
+                    <div class="flow-diagram">
+                        <div class="flow-box"><strong>Alice locks funds</strong><br><span style="color:var(--text-muted); font-size:12px;">Commits to BLAKE3(secret)</span></div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-box"><strong>Bob reveals secret</strong><br><span style="color:var(--text-muted); font-size:12px;">Claims within timeout</span></div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-box warn"><strong>OR: Timeout expires</strong><br><span style="color:var(--text-muted); font-size:12px;">Alice reclaims funds</span></div>
+                    </div>
 
-            <pre><code>// Locking Script
+                    <pre><code>// Locking Script
 Script:
   IF
     HASH
@@ -1715,23 +1430,23 @@ Execution Trace (Bob claims):
 
 Result: VALID ✓  Bob receives funds and reveals the secret.</code></pre>
 
-            <details class="deep-dive">
-                <summary>Cross-Chain Atomic Swaps</summary>
-                <div class="dd-content">
-                    <p>Alice wants to swap Midstate coins for coins on another chain. She generates a random secret <code>S</code> and computes <code>H = BLAKE3(S)</code>. She locks her Midstate coins in an HTLC using <code>H</code> as the hash lock, with a 48-hour timeout. Bob simultaneously locks the agreed amount on the other chain using the same <code>H</code> (adapted for that chain's hash function), with a 24-hour timeout.</p>
-                    <p>Bob claims Alice's Midstate coins by revealing <code>S</code>. Alice now sees <code>S</code> on-chain and uses it to claim Bob's coins before his 24-hour timeout expires. If either party abandons the swap, both get their funds back after their respective timeouts. No trusted third party required.</p>
+                    <details class="deep-dive">
+                        <summary>Cross-Chain Atomic Swaps</summary>
+                        <div class="dd-content">
+                            <p>Alice wants to swap Midstate coins for coins on another chain. She generates a random secret <code>S</code> and computes <code>H = BLAKE3(S)</code>. She locks her Midstate coins in an HTLC using <code>H</code> as the hash lock, with a 48-hour timeout. Bob simultaneously locks the agreed amount on the other chain using the same <code>H</code> (adapted for that chain's hash function), with a 24-hour timeout.</p>
+                            <p>Bob claims Alice's Midstate coins by revealing <code>S</code>. Alice now sees <code>S</code> on-chain and uses it to claim Bob's coins before his 24-hour timeout expires. If either party abandons the swap, both get their funds back after their respective timeouts. No trusted third party required.</p>
+                        </div>
+                    </details>
                 </div>
-            </details>
-        </div>
 
-        <!-- ── TIMELOCKS ─────────────────────────────────────────────────── -->
-        <div class="tab-content" id="vm-timelock">
-            <h3>Timelocks & Dead Man's Switch</h3>
-            <p><code>CHECKTIMEVERIFY</code> (CTV) compares a height encoded in the script against the current block height. The script hard-fails if the chain hasn't reached that height yet. This enables inheritance contracts, vesting schedules, and dead man's switches.</p>
+                <!-- ── TIMELOCKS ─────────────────────────────────────────────────── -->
+                <div class="tab-content" id="vm-timelock">
+                    <h3>Timelocks & Dead Man's Switch</h3>
+                    <p><code>CHECKTIMEVERIFY</code> (CTV) compares a height encoded in the script against the current block height. The script hard-fails if the chain hasn't reached that height yet. This enables inheritance contracts, vesting schedules, and dead man's switches.</p>
 
-            <h4>Inheritance Contract</h4>
-            <p>Alice can spend at any time. If she doesn't spend within ~1 year (52,560 blocks), Bob can claim the funds as an heir.</p>
-            <pre><code>// Locking Script
+                    <h4>Inheritance Contract</h4>
+                    <p>Alice can spend at any time. If she doesn't spend within ~1 year (52,560 blocks), Bob can claim the funds as an heir.</p>
+                    <pre><code>// Locking Script
 Script:
   IF
     PUSH_DATA(&lt;alice_pk&gt;)
@@ -1751,17 +1466,17 @@ Witness: [ &lt;alice_sig&gt;, &lt;1&gt; ]
 // Bob inherits (after 52,560 blocks):
 Witness: [ &lt;bob_sig&gt;, &lt;0&gt; ]</code></pre>
 
-            <h4>Vesting Schedule</h4>
-            <p>A team member's allocation unlocks in tranches. Each UTXO is created with a different <code>CHECKTIMEVERIFY</code> height, so 25% unlocks per year over four years automatically — no central custodian needed.</p>
-            <pre><code>// Year 1 tranche (locked until height 525,600)
+                    <h4>Vesting Schedule</h4>
+                    <p>A team member's allocation unlocks in tranches. Each UTXO is created with a different <code>CHECKTIMEVERIFY</code> height, so 25% unlocks per year over four years automatically — no central custodian needed.</p>
+                    <pre><code>// Year 1 tranche (locked until height 525,600)
 Script: DROP PUSH_INT 525600 CHECKTIMEVERIFY PUSH_DATA(&lt;team_pk&gt;) CHECKSIGVERIFY PUSH_INT 1
 
 // Year 2 tranche (locked until height 1,051,200)
 Script: DROP PUSH_INT 1051200 CHECKTIMEVERIFY PUSH_DATA(&lt;team_pk&gt;) CHECKSIGVERIFY PUSH_INT 1</code></pre>
 
-            <h4>Dead Man's Switch</h4>
-            <p>Funds auto-release to a backup address if the primary key holder goes dark for 6 months (~26,280 blocks). The primary holder simply needs to "refresh" the timelock by spending and re-locking to a new output before the deadline.</p>
-            <pre><code>Script:
+                    <h4>Dead Man's Switch</h4>
+                    <p>Funds auto-release to a backup address if the primary key holder goes dark for 6 months (~26,280 blocks). The primary holder simply needs to "refresh" the timelock by spending and re-locking to a new output before the deadline.</p>
+                    <pre><code>Script:
   IF
     PUSH_DATA(&lt;primary_pk&gt;)
     CHECKSIGVERIFY
@@ -1774,24 +1489,27 @@ Script: DROP PUSH_INT 1051200 CHECKTIMEVERIFY PUSH_DATA(&lt;team_pk&gt;) CHECKSI
   ENDIF
   PUSH_INT 1</code></pre>
 
-            <div class="callout warn">
-                <h4>Height vs. Time</h4>
-                <p>Midstate's <code>CHECKTIMEVERIFY</code> operates on <strong>block height</strong>, not Unix timestamps. At a 60-second target block time, 1 year ≈ 525,600 blocks, 6 months ≈ 262,800 blocks, 1 week ≈ 10,080 blocks. Height-based locks are more predictable than timestamp-based ones since miners cannot trivially manipulate the block height.</p>
-            </div>
-        </div>
+                    <div class="callout warn">
+                        <h4>Height vs. Time</h4>
+                        <p>Midstate's <code>CHECKTIMEVERIFY</code> operates on <strong>block height</strong>, not Unix timestamps. At a 60-second target block time, 1 year ≈ 525,600 blocks, 6 months ≈ 262,800 blocks, 1 week ≈ 10,080 blocks. Height-based locks are more predictable than timestamp-based ones since miners cannot trivially manipulate the block height.</p>
+                    </div>
+                </div>
 
-        <!-- ── COVENANTS ─────────────────────────────────────────────────── -->
-        <div class="tab-content" id="vm-covenant">
-            <h3>Covenants via OP_SUM_TO_ADDR</h3>
+                <!-- ── COVENANTS ─────────────────────────────────────────────────── -->
+                <div class="tab-content" id="vm-covenant">
+                    <h3>Covenants via OP_SUM_TO_ADDR</h3>
 
-            <div class="callout stark">
-                <h4>The Capability Bitcoin Still Lacks</h4>
-                <p><code>OP_SUM_TO_ADDR</code> introspects the <em>current transaction's outputs</em> at script execution time. It pops an address from the stack, sums the total value of all outputs in the transaction sent to that address, and pushes the result. This is <strong>output-set awareness</strong> — the ability for a locking script to constrain how the coin can be spent, not just who can spend it. Bitcoin has been debating adding this capability (OP_CTV, OP_CAT) for years. Midstate ships it natively.</p>
-            </div>
+                    <div class="callout stark">
+                        <h4>The Capability Bitcoin Still Lacks</h4>
+                        <p><code>OP_SUM_TO_ADDR</code> introspects the <em>current transaction's outputs</em> at script execution time. It pops an address from the stack, sums the total value of all outputs in the transaction sent to that address, and pushes the result. This is <strong>output-set awareness</strong> — the ability for a locking script to constrain how the coin can be spent, not just who can spend it. Bitcoin has been debating adding this capability (OP_CTV, OP_CAT) for years. Midstate ships it natively.</p>
+                    </div>
 
-            <h4>Enforced Donation (Simple Covenant)</h4>
-            <p>"You can spend this coin, but only if you send at least 100 units to Alice in the same transaction."</p>
-            <pre><code>Script:
+                    <h4>P2P OTC DEX Limit Orders</h4>
+                    <p>Using <code>OP_THIS_ADDRESS</code> and <code>OP_INPUT_VALUE</code>, a Maker can lock MDS on-chain. Takers fill the order by taking the MDS and routing the required remainder back to the covenant address. Order discovery happens entirely over Midstate's ephemeral P2P Chat Bus.</p>
+
+                    <h4>Enforced Donation (Simple Covenant)</h4>
+                    <p>"You can spend this coin, but only if you send at least 100 units to Alice in the same transaction."</p>
+                    <pre><code>Script:
   PUSH_HEX &lt;alice_addr&gt;
   SUM_TO_ADDR             // Sums all outputs going to alice_addr in this tx
   PUSH_INT 100
@@ -1824,9 +1542,9 @@ Result: VALID ✓
 // If owner tries to spend without sending to Alice:
 // Step 3 returns 0. GREATER_OR_EQUAL → 0. VERIFY → FAIL ✗</code></pre>
 
-            <h4>Percentage-Based Covenant</h4>
-            <p>Enforce that at least 10% of any spend goes to a community fund — useful for protocol treasuries, royalties, or charitable commitments baked into a UTXO at creation time.</p>
-            <pre><code">// Suppose the coin has value V. Owner must route at least V/10 to the fund.
+                    <h4>Percentage-Based Covenant</h4>
+                    <p>Enforce that at least 10% of any spend goes to a community fund — useful for protocol treasuries, royalties, or charitable commitments baked into a UTXO at creation time.</p>
+                    <pre><code>// Suppose the coin has value V. Owner must route at least V/10 to the fund.
 // Since we can't divide on-stack, the wallet constructs outputs such that
 // fund_output >= total_input / 10. The script verifies the absolute amount:
 
@@ -1839,204 +1557,102 @@ Script:
   PUSH_DATA &lt;owner_pk&gt;
   CHECKSIGVERIFY
   PUSH_INT 1</code></pre>
-        </div>
-
-        <!-- ── DAO ────────────────────────────────────────────────────────── -->
-        <div class="tab-content" id="vm-dao">
-            <h3>DAO Treasury</h3>
-            <p>A decentralized treasury where funds can only be disbursed if multiple keyholders agree AND the transaction routes a minimum amount to the treasury's own address (enforcing that the DAO can't be fully drained in a single transaction).</p>
-
-            <pre><code">// DAO Treasury Script
-// Rules:
-//   1. Requires 2-of-3 signatures from council members
-//   2. At least 50% of the treasury UTXO value must remain in the treasury
-//      (i.e., the treasury address must receive >= half the input value)
-//   3. The disbursement address receives the rest
-
-Script:
-  // Rule 2: Covenant — treasury must retain at least half
-  PUSH_HEX &lt;treasury_addr&gt;
-  SUM_TO_ADDR
-  PUSH_INT &lt;half_of_input_value&gt;    // wallet computes this off-chain
-  GREATER_OR_EQUAL
-  VERIFY
-
-  // Rule 1: 2-of-3 multisig (Alice OR Bob, plus Carol always required)
-  IF
-    PUSH_DATA &lt;alice_pk&gt;  CHECKSIGVERIFY
-  ELSE
-    PUSH_DATA &lt;bob_pk&gt;    CHECKSIGVERIFY
-  ENDIF
-  PUSH_DATA &lt;carol_pk&gt;    CHECKSIGVERIFY   // Carol always required
-
-  PUSH_INT 1
-
-// Witness (Alice + Carol disbursement):
-Witness: [ &lt;alice_sig&gt;, &lt;carol_sig&gt;, &lt;1&gt; ]
-
-// The wallet MUST construct the tx so that treasury_addr receives
-// >= half the input. If it doesn't, SUM_TO_ADDR will return a lower
-// value and VERIFY will fail — regardless of whether the sigs are valid.</code></pre>
-
-            <div class="callout">
-                <h4>No Smart Contract Runtime Required</h4>
-                <p>This DAO has <strong>zero on-chain state</strong>. There's no contract account, no storage slots, no gas, no upgrade proxy. The rules are entirely encoded in the UTXO's locking script. An auditor can read 12 lines of Midstate stack machine assembly and fully understand every constraint. Contrast this with a Solidity DAO where you need to audit thousands of lines of EVM bytecode and re-entrancy guards.</p>
-            </div>
-
-            <details class="deep-dive">
-                <summary>Bootstrapping a DAO Treasury</summary>
-                <div class="dd-content">
-                    <p>To bootstrap a DAO, a founder creates a UTXO locked with the treasury script above and sends it to the DAO's treasury address. Any subsequent spend of that UTXO must satisfy both the multisig AND the covenant — meaning the treasury can never be fully drained by a single colluding quorum. The only way to wind down the DAO is to progressively drain it across many transactions, each time leaving at least half behind, which requires sustained consensus across many blocks.</p>
-                    <p>New contributions to the treasury simply send coins to the treasury address. Those coins become locked under the same script when the next disbursement transaction consumes them as inputs.</p>
                 </div>
-            </details>
-        </div>
 
-        <!-- ── STREAMING ─────────────────────────────────────────────────── -->
-        <div class="tab-content" id="vm-streaming">
-            <h3>Streaming / Rate-Limited Payments</h3>
-            <p>A covenant that enforces a maximum withdrawal rate per transaction. Useful for salary streams, subscription services, and protocol treasury drawdowns. The key insight: <code>SUM_TO_ADDR</code> can verify that the "change" output sent back to the sender is large enough, which is mathematically equivalent to verifying the withdrawal is small enough.</p>
+                <!-- ── OPCODE REF ─────────────────────────────────────────────────── -->
+                <div class="tab-content" id="vm-opcodes">
+                    <h3>Writing & Compiling Midstate Stack Machine Bytecode</h3>
+                    <p>Midstate Stack Machine Code assembly files use the <code>.msc</code> extension. Compile them with the CLI:</p>
+                    <div class="terminal">
+                        $ midstate wallet compile --file my_script.msc<br>
+                        <span class="term-success">SUCCESS</span> Compiled to 48 bytes. P2SH address: 9f3a...c12b
+                    </div>
 
-            <h4>Salary Stream</h4>
-            <p>An employer locks 1,000,000 units for an employee. The employee can withdraw at most 10,000 units per spend. The remaining balance must be routed back to the stream address, re-locking it under the same script.</p>
+                    <h4>Stack Opcodes</h4>
+                    <table>
+                        <thead><tr><th>Mnemonic</th><th>Stack Effect</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>PUSH_INT &lt;n&gt;</code></td><td>→ n</td><td>Push integer literal</td></tr>
+                            <tr><td><code>PUSH_HEX &lt;hex&gt;</code></td><td>→ bytes</td><td>Push raw bytes from hex string</td></tr>
+                            <tr><td><code>PUSH_DATA &lt;data&gt;</code></td><td>→ data</td><td>Push data blob (pk, address, etc.)</td></tr>
+                            <tr><td><code>DROP</code></td><td>x →</td><td>Discard top item</td></tr>
+                            <tr><td><code>DUP</code></td><td>x → x x</td><td>Duplicate top item</td></tr>
+                            <tr><td><code>SWAP</code></td><td>a b → b a</td><td>Swap top two items</td></tr>
+                            <tr><td><code>OVER</code></td><td>a b → a b a</td><td>Copy second-to-top item to top</td></tr>
+                            <tr><td><code>ROT</code></td><td>a b c → b c a</td><td>Rotate top three items</td></tr>
+                            <tr><td><code>PICK</code></td><td>n → nth</td><td>Copy the nth item to the top</td></tr>
+                            <tr><td><code>SIZE</code></td><td>x → x size</td><td>Push byte size of top item</td></tr>
+                        </tbody>
+                    </table>
 
-            <pre><code">// Stream Script (max 10,000 units per withdrawal)
-// The stream_addr is this script's own P2SH address.
-// After each withdrawal, the change goes back to stream_addr,
-// re-locking it under the same rules.
+                    <h4>Arithmetic & Logic</h4>
+                    <table>
+                        <thead><tr><th>Mnemonic</th><th>Stack Effect</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>ADD</code></td><td>a b → a+b</td><td>Integer addition</td></tr>
+                            <tr><td><code>SUB</code></td><td>a b → a-b</td><td>Integer subtraction (fails on underflow)</td></tr>
+                            <tr><td><code>MUL</code></td><td>a b → a*b</td><td>Integer multiplication</td></tr>
+                            <tr><td><code>DIV</code></td><td>a b → a/b</td><td>Integer division</td></tr>
+                            <tr><td><code>MOD</code></td><td>a b → a%b</td><td>Integer modulo</td></tr>
+                            <tr><td><code>EQUAL</code></td><td>a b → bool</td><td>Push 1 if equal, 0 otherwise</td></tr>
+                            <tr><td><code>EQUALVERIFY</code></td><td>a b →</td><td>Fail if not equal, else pop both</td></tr>
+                            <tr><td><code>GREATER_OR_EQUAL</code></td><td>a b → bool</td><td>Push 1 if a &gt;= b</td></tr>
+                            <tr><td><code>VERIFY</code></td><td>x →</td><td>Fail if top is not 1</td></tr>
+                        </tbody>
+                    </table>
 
-Script:
-  // Enforce that stream_addr receives back (input_value - max_withdrawal)
-  // i.e., at least (input_value - 10000) must be returned to the stream.
-  PUSH_HEX &lt;stream_addr&gt;
-  SUM_TO_ADDR
-  PUSH_INT &lt;input_value_minus_10000&gt;   // computed off-chain: input - 10000
-  GREATER_OR_EQUAL
-  VERIFY
+                    <h4>Bytes & Data</h4>
+                    <table>
+                        <thead><tr><th>Mnemonic</th><th>Stack Effect</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>SLICE</code></td><td>data off len → slice</td><td>Extracts a substring of bytes.</td></tr>
+                            <tr><td><code>CONCAT</code></td><td>a b → ab</td><td>Concatenates two byte arrays.</td></tr>
+                        </tbody>
+                    </table>
 
-  // Employee must sign to authorize the withdrawal
-  PUSH_DATA &lt;employee_pk&gt;
-  CHECKSIGVERIFY
-  PUSH_INT 1
+                    <h4>Control Flow</h4>
+                    <table>
+                        <thead><tr><th>Mnemonic</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>IF</code></td><td>Pops top item. Executes IF block if 1, ELSE block if 0.</td></tr>
+                            <tr><td><code>ELSE</code></td><td>Alternate branch of IF.</td></tr>
+                            <tr><td><code>ENDIF</code></td><td>Closes IF/ELSE block.</td></tr>
+                        </tbody>
+                    </table>
 
-// tx structure for a valid withdrawal:
-//   Input:  stream UTXO (value: 1,000,000)
-//   Output 1: employee_addr (value: 10,000)     ← the withdrawal
-//   Output 2: stream_addr   (value: 990,000)    ← change, re-locked
+                    <h4>Cryptographic Opcodes</h4>
+                    <table>
+                        <thead><tr><th>Mnemonic</th><th>Stack Effect</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>HASH</code></td><td>data → BLAKE3(data)</td><td>BLAKE3 hash of top item</td></tr>
+                            <tr><td><code>CHECKSIG</code></td><td>sig pk → bool</td><td>Verify WOTS+/MSS signature. Push result.</td></tr>
+                            <tr><td><code>CHECKSIGVERIFY</code></td><td>sig pk →</td><td>Verify signature. Fail if invalid.</td></tr>
+                        </tbody>
+                    </table>
 
-// SUM_TO_ADDR(stream_addr) returns 990,000.
-// 990,000 >= (1,000,000 - 10,000) = 990,000 → VALID ✓
+                    <h4>Introspection & Covenants</h4>
+                    <table>
+                        <thead><tr><th>Mnemonic</th><th>Stack Effect</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>CHECKTIMEVERIFY</code></td><td>height →</td><td>Fail if chain height &lt; height. Pop height.</td></tr>
+                            <tr><td><code>SUM_TO_ADDR</code></td><td>addr → amount</td><td>Sum all output values in this tx sent to addr. Push total.</td></tr>
+                            <tr><td><code>READ_INPUT_STATE</code></td><td>→ state</td><td>Push the 32-byte state of the current input (v3).</td></tr>
+                            <tr><td><code>READ_OUTPUT_STATE</code></td><td>index → state</td><td>Push the 32-byte state of the output at 'index' (v3).</td></tr>
+                            <tr><td><code>INPUT_VALUE</code></td><td>→ value</td><td>Push value of the executing input coin (v4).</td></tr>
+                            <tr><td><code>OUTPUT_ADDRESS</code></td><td>index → addr</td><td>Push address of the output at 'index' (v5).</td></tr>
+                            <tr><td><code>THIS_ADDRESS</code></td><td>→ addr</td><td>Push the 32-byte address of the executing script (v5).</td></tr>
+                        </tbody>
+                    </table>
 
-// If employee tries to withdraw 50,000:
-//   Output 2: stream_addr (value: 950,000)
-//   SUM_TO_ADDR returns 950,000.
-//   950,000 >= 990,000 → FALSE → VERIFY FAILS ✗</code></pre>
-
-            <div class="callout warn">
-                <h4>The Change Re-Lock Pattern</h4>
-                <p>For streaming payments to work correctly, the wallet <strong>must</strong> send the change output to the exact same stream address (which hashes to the same script). If the change goes to any other address, <code>SUM_TO_ADDR</code> returns 0 for the stream address and the transaction fails. This self-enforcing property means the employee cannot accidentally (or intentionally) break the stream by sending change elsewhere.</p>
-            </div>
-
-            <h4>Subscription Service</h4>
-            <p>A user locks funds for a service provider. The provider can pull exactly the subscription fee per billing period, enforced by combining <code>SUM_TO_ADDR</code> with <code>CHECKTIMEVERIFY</code>.</p>
-            <pre><code">// Subscription: provider pulls 500/month, user can cancel anytime
-
-Script:
-  IF
-    // Provider pull: max 500, must be after next billing height
-    PUSH_INT &lt;next_billing_height&gt;
-    CHECKTIMEVERIFY
-    PUSH_HEX &lt;subscription_addr&gt;
-    SUM_TO_ADDR
-    PUSH_INT &lt;balance_minus_500&gt;
-    GREATER_OR_EQUAL
-    VERIFY
-    PUSH_DATA &lt;provider_pk&gt;
-    CHECKSIGVERIFY
-  ELSE
-    // User cancels: full balance, any time
-    PUSH_DATA &lt;user_pk&gt;
-    CHECKSIGVERIFY
-  ENDIF
-  PUSH_INT 1</code></pre>
-        </div>
-
-        <!-- ── OPCODE REF ─────────────────────────────────────────────────── -->
-        <div class="tab-content" id="vm-opcodes">
-            <h3>Writing & Compiling Midstate Stack Machine Bytecode</h3>
-            <p>Midstate Stack Machine Code assembly files use the <code>.msc</code> extension. Compile them with the CLI:</p>
-            <div class="terminal">
-                $ midstate wallet compile --file my_script.msc<br>
-                <span class="term-success">SUCCESS</span> Compiled to 48 bytes. P2SH address: 9f3a...c12b
-            </div>
-
-<h4>Stack Opcodes</h4>
-            <table>
-                <thead><tr><th>Mnemonic</th><th>Stack Effect</th><th>Description</th></tr></thead>
-                <tbody>
-                    <tr><td><code>PUSH_INT &lt;n&gt;</code></td><td>→ n</td><td>Push integer literal</td></tr>
-                    <tr><td><code>PUSH_HEX &lt;hex&gt;</code></td><td>→ bytes</td><td>Push raw bytes from hex string</td></tr>
-                    <tr><td><code>PUSH_DATA &lt;data&gt;</code></td><td>→ data</td><td>Push data blob (pk, address, etc.)</td></tr>
-                    <tr><td><code>DROP</code></td><td>x →</td><td>Discard top item</td></tr>
-                    <tr><td><code>DUP</code></td><td>x → x x</td><td>Duplicate top item</td></tr>
-                    <tr><td><code>SWAP</code></td><td>a b → b a</td><td>Swap top two items</td></tr>
-                    <tr><td><code>OVER</code></td><td>a b → a b a</td><td>Copy second-to-top item to top</td></tr>
-                    <tr><td><code>ROT</code></td><td>a b c → b c a</td><td>Rotate top three items</td></tr>
-                </tbody>
-            </table>
-
-<h4>Arithmetic & Logic</h4>
-            <table>
-                <thead><tr><th>Mnemonic</th><th>Stack Effect</th><th>Description</th></tr></thead>
-                <tbody>
-                    <tr><td><code>ADD</code></td><td>a b → a+b</td><td>Integer addition</td></tr>
-                    <tr><td><code>SUB</code></td><td>a b → a-b</td><td>Integer subtraction (fails on underflow)</td></tr>
-                    <tr><td><code>EQUAL</code></td><td>a b → bool</td><td>Push 1 if equal, 0 otherwise</td></tr>
-                    <tr><td><code>EQUALVERIFY</code></td><td>a b →</td><td>Fail if not equal, else pop both</td></tr>
-                    <tr><td><code>GREATER_OR_EQUAL</code></td><td>a b → bool</td><td>Push 1 if a &gt;= b</td></tr>
-                    <tr><td><code>VERIFY</code></td><td>x →</td><td>Fail if top is not 1</td></tr>
-                </tbody>
-            </table>
-
-            <h4>Control Flow</h4>
-            <table>
-                <thead><tr><th>Mnemonic</th><th>Description</th></tr></thead>
-                <tbody>
-                    <tr><td><code>IF</code></td><td>Pops top item. Executes IF block if 1, ELSE block if 0.</td></tr>
-                    <tr><td><code>ELSE</code></td><td>Alternate branch of IF.</td></tr>
-                    <tr><td><code>ENDIF</code></td><td>Closes IF/ELSE block.</td></tr>
-                </tbody>
-            </table>
-
-            <h4>Cryptographic Opcodes</h4>
-            <table>
-                <thead><tr><th>Mnemonic</th><th>Stack Effect</th><th>Description</th></tr></thead>
-                <tbody>
-                    <tr><td><code>HASH</code></td><td>data → BLAKE3(data)</td><td>BLAKE3 hash of top item</td></tr>
-                    <tr><td><code>CHECKSIG</code></td><td>sig pk → bool</td><td>Verify WOTS+/MSS signature. Push result.</td></tr>
-                    <tr><td><code>CHECKSIGVERIFY</code></td><td>sig pk →</td><td>Verify signature. Fail if invalid.</td></tr>
-                </tbody>
-            </table>
-
-            <h4>Introspection & Covenants</h4>
-            <table>
-                <thead><tr><th>Mnemonic</th><th>Stack Effect</th><th>Description</th></tr></thead>
-                <tbody>
-                    <tr><td><code>CHECKTIMEVERIFY</code></td><td>height →</td><td>Fail if chain height &lt; height. Pop height.</td></tr>
-                    <tr><td><code>SUM_TO_ADDR</code></td><td>addr → amount</td><td>Sum all output values in this tx sent to addr. Push total.</td></tr>
-                    <tr><td><code>READ_INPUT_STATE</code></td><td>→ state</td><td>Push the 32-byte state of the current input (v3).</td></tr>
-                    <tr><td><code>READ_OUTPUT_STATE</code></td><td>index → state</td><td>Push the 32-byte state of the output at 'index' (v3).</td></tr>
-                </tbody>
-            </table>
-
-            <div class="callout warn">
-                <h4>The Clean Stack Rule</h4>
-                <p>Every valid script execution must leave <strong>exactly one item</strong> on the stack at termination, and it must be <code>[1]</code>. A script that leaves <code>[1, 1]</code> or terminates with an empty stack both fail. This prevents scripts from accidentally succeeding due to leftover garbage values and makes script behavior unambiguous.</p>
+                    <div class="callout warn">
+                        <h4>The Clean Stack Rule</h4>
+                        <p>Every valid script execution must leave <strong>exactly one item</strong> on the stack at termination, and it must be <code>[1]</code>. A script that leaves <code>[1, 1]</code> or terminates with an empty stack both fail. This prevents scripts from accidentally succeeding due to leftover garbage values and makes script behavior unambiguous.</p>
+                    </div>
+                </div>
             </div>
         </div>
-    </div>
-</div>
 
+        <!-- ── MIDSTATEAXE HARDWARE ── -->
         <div class="content-pane" id="axe-hw">
             <h2>The MidstateAxe Ecosystem</h2>
             <p>The Midstate node is highly optimized for the <strong>MidstateAxe</strong>—a custom OS image built via Buildroot for Raspberry Pi hardware (Zero 2 W, Pi 3, Pi 4). The node exposes exclusive hardware APIs when it detects the physical device.</p>
@@ -2071,147 +1687,9 @@ Script:
                 <p>The MidstateAxe nodes are protected from state bloat. Users can embed arbitrary data in the blockchain using <code>OutputData::DataBurn</code> (capped at 80 bytes). However, these outputs yield no <code>coin_id</code> and are <strong>completely ignored by the UTXO Sparse Merkle Tree</strong>. Miners process the data, but the RAM of edge devices is never burdened by tracking unspendable data.</p>
             </div>
         </div>
-<div class="content-pane" id="quickstart">
-            <h2>CLI Quickstart Guide</h2>
-            <p>Midstate is controlled entirely via a unified command-line interface. This guide covers the essential commands for interacting with the network, managing keys, and sending private transactions.</p>
 
-            <div class="tabs">
-                <div class="tab-nav">
-                    <button class="tab-btn active" data-tab="qs-wallet">Wallet Setup</button>
-                    <button class="tab-btn" data-tab="qs-receive">Receiving Funds</button>
-                    <button class="tab-btn" data-tab="qs-send">Sending & Privacy</button>
-                    <button class="tab-btn" data-tab="qs-node">Running a Node</button>
-                </div>
-
-                <div class="tab-content active" id="qs-wallet">
-                    <h3>Creating a Wallet</h3>
-                    <p>Midstate uses HD (Hierarchical Deterministic) wallets by default. To create a new wallet, run:</p>
-                    <div class="terminal">
-                        $ midstate wallet create<br>
-                        <span class="term-info">INFO</span> Enter a strong password to encrypt your wallet.dat file.<br>
-                        <span class="term-success">SUCCESS</span> Wallet created. Write down your 24-word seed phrase.
-                    </div>
-
-                    <h3>Checking Your Balance</h3>
-                    <p>To view your total balance, live on-chain coins, and pending commits:</p>
-                    <div class="terminal">
-                        $ midstate wallet balance<br>
-                        Coins in wallet:  45<br>
-                        Live on-chain:    42 (value: 10500)<br>
-                        Unused keys:      5<br>
-                        Pending commits:  1
-                    </div>
-
-                    <div class="callout warn">
-                        <h4>Always Scan Before Spending!</h4>
-                        <p>Because Midstate uses client-side compact block filters for privacy, your wallet does not automatically know when it receives funds. You must scan the chain to update your local state:</p>
-                        <code>$ midstate wallet scan</code>
-                    </div>
-                </div>
-
-                <div class="tab-content" id="qs-receive">
-                    <h3>Receiving Funds (One-Time Addresses)</h3>
-                    <p>By default, Midstate uses WOTS+ signatures. These are strictly one-time-use to preserve post-quantum security. To generate a fresh receiving address:</p>
-                    <div class="terminal">
-                        $ midstate wallet receive --label "Payment from Alice"<br>
-                        Your receiving address:<br>
-                        7a9b...c3d4<br>
-                        Share this with the sender.
-                    </div>
-
-                    <h3>Reusable Addresses (MSS)</h3>
-                    <p>If you need a static address (e.g., for a mining pool payout or a donation link), you must generate a Merkle Signature Scheme (MSS) tree. A height-10 tree allows exactly 1,024 signatures.</p>
-                    <div class="terminal">
-                        $ midstate wallet generate-mss --height 10 --label "Donations"<br>
-                        <span class="term-info">INFO</span> Generating MSS tree (Height 10 = 1024 signatures)...<br>
-                        <span class="term-success">SUCCESS</span> Address: 9f8e...1a2b
-                    </div>
-                </div>
-
-                <div class="tab-content" id="qs-send">
-                    <h3>Sending Funds</h3>
-                    <p>To send funds, specify the destination address and the exact amount. The wallet will automatically select the necessary UTXOs, group WOTS siblings to prevent key reuse, and generate exact change.</p>
-                    <div class="terminal">
-                        $ midstate wallet send --to 7a9b...c3d4:500<br>
-                        <span class="term-info">INFO</span> Submitting Phase 1 Commit...<br>
-                        <span class="term-success">SUCCESS</span> Commit mined!<br>
-                        <span class="term-info">INFO</span> Submitting Phase 2 Reveal...<br>
-                        <span class="term-success">SUCCESS</span> Transfer complete!
-                    </div>
-
-                    <h3>Private Sending (Dandelion++)</h3>
-                    <p>To maximize privacy, use the <code>--private</code> flag. This instructs the wallet to split your payment into independent power-of-2 denominations, route them through the Dandelion++ stem network, and add random execution delays to thwart timing analysis.</p>
-                    <div class="terminal">
-                        $ midstate wallet send --to 7a9b...c3d4:500 --private<br>
-                        Private send: 3 independent transaction(s)
-                    </div>
-                </div>
-
-                <div class="tab-content" id="qs-node">
-                    <h3>Running a Full Node & Mining</h3>
-                    <p>To start a full node, sync the chain, and begin CPU mining on all available cores, simply run:</p>
-                    <div class="terminal">
-                        $ midstate node --mine<br>
-                        <span class="term-time">14:02:11</span> <span class="term-info">INFO</span> Node started (mining: true, threads: 8, rpc: 8545)<br>
-                        <span class="term-time">14:02:11</span> <span class="term-info">INFO</span> Mining SIMD: AVX2 8-way (8 nonces/batch)
-                    </div>
-
-                    <h3>Fast-Forward Syncing</h3>
-                    <p>If you are spinning up a new node, you can sync from a specific trusted peer. The node will download the latest state snapshot and cryptographically verify it against the headers.</p>
-                    <div class="terminal">
-                        $ midstate sync --peer /ip4/198.51.100.5/tcp/9333/p2p/12D3K...
-                    </div>
-                </div>
-            </div>
-        </div>
-        <div class="content-pane" id="vs-legacy">
-            <h2>Architecture Comparison</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Subsystem</th>
-                        <th>Legacy Chains</th>
-                        <th>Midstate</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr>
-                        <td><strong>Cryptography</strong></td>
-                        <td>Elliptic Curve (Shor vulnerable)</td>
-                        <td class="hl">BLAKE3, WOTS+, MSS</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Mining Hardware</strong></td>
-                        <td>Parallel ASICs / GPUs</td>
-                        <td class="hl">Sequential Hashing (CPUs)</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Transaction Ordering</strong></td>
-                        <td>Cleartext Bidding (MEV)</td>
-                        <td class="hl">2-Phase Commit-Reveal</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Value Privacy</strong></td>
-                        <td>Public cleartext ledgers</td>
-                        <td class="hl">Power-of-2 UTXOs & Coinjoin </td>
-                    </tr>
-                    <tr>
-                        <td><strong>State Storage</strong></td>
-                        <td>Unbounded UTXO LevelDB</td>
-                        <td class="hl">Pruned Sparse Merkle Tree</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Difficulty Target</strong></td>
-                        <td>Sliding-window average</td>
-                        <td class="hl">ASERT (16.16 Fixed Point)</td>
-                    </tr>
-                </tbody>
-            </table>
-        </div>
-
-    </div>
-    
-    <div class="content-pane" id="adversarial">
+        <!-- ── ADVERSARIAL ANALYSIS ── -->
+        <div class="content-pane" id="adversarial">
             <h2>Adversarial Analysis & Edge Cases</h2>
             <p>A protocol is only as robust as its worst-case scenario. Midstate was designed with strict mathematical bounds to survive hostility, spam, and hardware constraints without relying on benevolent actor assumptions.</p>
 
@@ -2275,7 +1753,54 @@ Script:
                 </div>
             </div>
         </div>
-    
+
+        <!-- ── COMPARISON ── -->
+        <div class="content-pane" id="vs-legacy">
+            <h2>Architecture Comparison</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Subsystem</th>
+                        <th>Legacy Chains</th>
+                        <th>Midstate</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Cryptography</strong></td>
+                        <td>Elliptic Curve (Shor vulnerable)</td>
+                        <td class="hl">BLAKE3, WOTS+, MSS</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Mining Hardware</strong></td>
+                        <td>Parallel ASICs / GPUs</td>
+                        <td class="hl">Sequential Hashing (CPUs)</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Transaction Ordering</strong></td>
+                        <td>Cleartext Bidding (MEV)</td>
+                        <td class="hl">2-Phase Commit-Reveal</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Value Privacy</strong></td>
+                        <td>Public cleartext ledgers</td>
+                        <td class="hl">Power-of-2 UTXOs & Coinjoin </td>
+                    </tr>
+                    <tr>
+                        <td><strong>State Storage</strong></td>
+                        <td>Unbounded UTXO LevelDB</td>
+                        <td class="hl">Pruned Sparse Merkle Tree</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Difficulty Target</strong></td>
+                        <td>Sliding-window average</td>
+                        <td class="hl">ASERT (16.16 Fixed Point)</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+    </div>
 </div>
 
 <script type="module">
@@ -2312,7 +1837,7 @@ Script:
         setTheme(current === 'dark' ? 'light' : 'dark');
     });
 
-    // --- FIX: Robust visibility check for both tabbed and non-tabbed sections ---
+    // Robust visibility check for both tabbed and non-tabbed sections
     async function renderVisibleDiagrams() {
         // Find all unrendered mermaid divs in the active pane
         const unrendered = Array.from(document.querySelectorAll('.content-pane.active .mermaid:not([data-processed="true"])'))
@@ -2378,7 +1903,7 @@ Script:
 
         const years = Array.from({length: 35}, (_, i) => i);
         const blocksPerYear = 525600;
-        let currentReward = 1073741824; // 2^30
+        let currentReward = 1; // 1 gMDS
         
         let supplyData = [];
         let rewardData = [];
@@ -2386,16 +1911,17 @@ Script:
 
         for (let i = 0; i < 35; i++) {
             circulating += currentReward * blocksPerYear;
-            supplyData.push(circulating / 1e12); // Trillions for readability
+            supplyData.push(circulating); // in gMDS
             rewardData.push(currentReward);
             
-            // Halve the reward, floor at 1
-            currentReward = Math.max(1, Math.floor(currentReward / 2));
+            // Halve the reward
+            currentReward = currentReward / 2;
         }
 
         const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
-        const gridColor = isDark ? '#2c2c2c' : '#e5e7eb';
-        const textColor = isDark ? '#a1a1aa' : '#4b5563';
+        const gridColor = isDark ? '#262626' : '#e3e3e3';
+        const textColor = isDark ? '#9a9a9a' : '#565656';
+        const accent = isDark ? '#f5f5f5' : '#111111';
 
         new Chart(ctx, {
             type: 'line',
@@ -2403,20 +1929,19 @@ Script:
                 labels: years.map(y => `Year ${y}`),
                 datasets: [
                     {
-                        label: 'Circulating Supply (Trillions)',
+                        label: 'Circulating Supply (gMDS)',
                         data: supplyData,
-                        borderColor: '#3b82f6',
-                        backgroundColor: 'rgba(59, 130, 246, 0.1)',
-                        borderWidth: 2,
-                        fill: true,
+                        borderColor: textColor,
+                        backgroundColor: 'transparent',
+                        borderWidth: 1,
                         yAxisID: 'y'
                     },
                     {
-                        label: 'Block Reward',
+                        label: 'Block Reward (gMDS)',
                         data: rewardData,
-                        borderColor: '#10b981',
+                        borderColor: accent,
                         borderDash: [5, 5],
-                        borderWidth: 2,
+                        borderWidth: 1,
                         yAxisID: 'y1'
                     }
                 ]
@@ -2437,7 +1962,7 @@ Script:
                         type: 'linear',
                         display: true,
                         position: 'left',
-                        title: { display: true, text: 'Total Supply (Trillions)', color: textColor },
+                        title: { display: true, text: 'Total Supply (gMDS)', color: textColor },
                         grid: { color: gridColor },
                         ticks: { color: textColor, font: { family: "'JetBrains Mono', monospace" } }
                     },

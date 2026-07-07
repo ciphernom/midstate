@@ -95,7 +95,7 @@ impl RpcServer {
             .route("/", get(axe_ui))
             .route("/stats", get(axe_stats))
             .route("/wifi", post(axe_wifi_setup))
-            .route("/config", post(axe_save_config))
+            .route("/config", get(axe_get_config).post(axe_save_config))
             .route("/overclock", post(axe_apply_overclock))
             .route("/rewards", get(axe_download_rewards))
             .route_layer(middleware::from_fn(lan_only_middleware));

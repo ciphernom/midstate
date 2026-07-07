@@ -69,6 +69,17 @@ const blockCache = {};
 
 let currentTab = 'explorer';
 let lastMempoolData = null;
+let lastState = null;
+// Reveal cards the user has expanded in the mempool view, keyed by first
+// input coin id so expansion survives the 4s poll re-render.
+const mpExpanded = new Set();
+// One-shot flag: scroll the mempool view to the search match on next render.
+let mpScrollPending = false;
+// What the main panel currently shows: 'welcome' | 'mempool' | 'block' | 'analytics'.
+// Guards the mempool renderer's skip-identical logic against stale snapshots.
+let mainViewContent = 'welcome';
+let lastMempoolHtml = '';
+let lastBatchListHtml = '';
 
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -94,6 +105,14 @@ function shortHex(h) {
     h = toHex(h);
     if (h.length <= 16) return h;
     return h.substring(0,8) + '\u2026' + h.substring(h.length-8);
+}
+
+function fmtAge(secs) {
+    if (secs == null) return '';
+    if (secs < 60) return secs + 's';
+    if (secs < 3600) return Math.floor(secs / 60) + 'm';
+    const m = Math.floor((secs % 3600) / 60);
+    return Math.floor(secs / 3600) + 'h' + (m ? ' ' + m + 'm' : '');
 }
 
 function hexLink(hex, label) {
@@ -156,6 +175,7 @@ async function poll() {
         document.getElementById('live-dot').style.background = 'var(--green)';
 
         lastMempoolData = mempool;
+        lastState = state;
 
         if (prevTip > 0 && tipHeight > prevTip) {
             log(`New batch ${tipHeight}`, 'var(--green)');
@@ -180,7 +200,13 @@ function renderBatchList() {
             <span class="num">${i}</span>${txLabel}
         </div>`;
     }
+    // Re-assigning innerHTML resets the sidebar's scroll position, so only
+    // repaint when the list actually changed — and keep the scroll when it did.
+    if (html === lastBatchListHtml) return;
+    lastBatchListHtml = html;
+    const prevScroll = el.scrollTop;
     el.innerHTML = html;
+    el.scrollTop = prevScroll;
 }
 
 // ── Commands ────────────────────────────────────────────────────────────
@@ -211,6 +237,16 @@ async function execCmd(cmd) {
 async function searchHash(hash) {
     log(`Searching for ${shortHex(hash)}\u2026`);
 
+    // Pending state first: the mempool snapshot is at most a few seconds old,
+    // so a hit here is the freshest possible answer for this query.
+    const mpHit = findInMempool(hash);
+    if (mpHit) {
+        log(`In mempool: ${mpHit.desc}`, 'var(--green)');
+        if (mpHit.expandId) mpExpanded.add(mpHit.expandId);
+        mpScrollPending = true;
+        switchTab('mempool');
+    }
+
     try {
         // Check UTXO set first
         const coinRes = await fetch(`/coin/${hash}`);
@@ -237,8 +273,15 @@ async function searchHash(hash) {
                 log(`  [${r.height}] ${r.result_type}: ${r.detail}`, 'var(--text-bright)');
             }
 
-            // Load the first matching block
-            await loadBlock(heights[0]);
+            if (mpHit) {
+                // Keep the mempool view (loading a block would overwrite it).
+                log('  Staying on mempool view \u2014 type a height to open its block.', 'var(--text-faint)');
+            } else {
+                // Load the first matching block
+                await loadBlock(heights[0]);
+            }
+        } else if (mpHit) {
+            log('Not in any mined block yet \u2014 pending only.', 'var(--text-faint)');
         } else {
             log('No results found in last 5000 blocks.', '#884400');
             activeQuery = null;
@@ -282,11 +325,18 @@ function isUniformMix(txReveal) {
 
 // ── Tab Management & Visualizers ────────────────────────────────────────
 
-function switchTab(tab) {
+// Update currentTab + the tab bar WITHOUT rendering. Used by switchTab, and
+// by loadBlock: clicking a batch must claim the explorer tab, otherwise the
+// next poll still thinks we're on 'mempool' and repaints it over the block.
+function setActiveTab(tab) {
     currentTab = tab;
     document.querySelectorAll('.tab-link').forEach(el => el.classList.remove('active'));
-    document.querySelector(`.tab-link[onclick="switchTab('${tab}')"]`).classList.add('active');
-    
+    const link = document.querySelector(`.tab-link[onclick="switchTab('${tab}')"]`);
+    if (link) link.classList.add('active');
+}
+
+function switchTab(tab) {
+    setActiveTab(tab);
     const mv = document.getElementById('main-view');
     if (tab === 'mempool') {
         renderMempoolView();
@@ -294,48 +344,247 @@ function switchTab(tab) {
         renderAnalyticsView();
     } else {
         if (activeBatch !== null) loadBlock(activeBatch);
-        else mv.innerHTML = `<div style="color:var(--text-faint); padding:40px 0; text-align:center;">Select a batch to view</div>`;
+        else {
+            mv.innerHTML = `<div style="color:var(--text-faint); padding:40px 0; text-align:center;">Select a batch to view</div>`;
+            mainViewContent = 'welcome';
+        }
     }
 }
 
 
 
-// Renders the Dual-Queue Mempool
+// Renders the Dual-Queue Mempool.
+// Each column is sorted by its queue's TRUE priority key — the same order the
+// mempool evicts from: commits by achieved PoW, reveals by fee-per-KB.
 function renderMempoolView() {
     const mv = document.getElementById('main-view');
     const data = lastMempoolData;
     if (!data) return;
 
     let commits = []; let reveals = [];
-    data.transactions.forEach((tx) => {
-        if (tx.commitment && !tx.input_coins) commits.push(tx);
+    (data.transactions || []).forEach((tx) => {
+        if (tx.tx_type === 'commit' || (tx.commitment && !tx.input_coins)) commits.push(tx);
         else reveals.push(tx);
     });
-    reveals.sort((a,b) => (b.fee||0) - (a.fee||0)); // Sort by fee descending
+    commits.sort((a,b) => (b.pow_zeros ?? -1) - (a.pow_zeros ?? -1));
+    reveals.sort((a,b) => (b.fee_per_kb ?? b.fee ?? 0) - (a.fee_per_kb ?? a.fee ?? 0));
+
+    const reqPow = lastState ? lastState.required_pow : null;
+
+    // Cross-link the two phases: commitments already opened by a pending reveal.
+    const revealedCommits = new Set();
+    reveals.forEach(r => (r.inputs || []).forEach(i => { if (i.commitment) revealedCommits.add(i.commitment); }));
+
+    const totalFees  = reveals.reduce((s,r) => s + (r.fee || 0), 0);
+    const totalBytes = reveals.reduce((s,r) => s + (r.size_bytes || 0), 0);
 
     let html = `<div class="block-hdr"><h2>DUAL-QUEUE MEMPOOL</h2></div><div class="mempool-split">`;
 
-    html += `<div class="mp-col"><div class="mp-col-hdr">COMMITS (PoW QUEUE) - ${commits.length}</div><div class="mp-col-body"><div class="commit-grid">`;
-    commits.forEach(c => {
-        html += `<div class="commit-block" title="${c.commitment}" onclick="execCmd('${c.commitment}')">[c]</div>`;
-    });
+    // ── Phase 1: commit queue (priority = proof-of-work) ──
+    html += `<div class="mp-col"><div class="mp-col-hdr">COMMITS (PoW QUEUE) \u2014 ${commits.length}${reqPow != null ? ` \u00b7 REQUIRED \u2265 ${reqPow} BITS` : ''}</div><div class="mp-col-body">`;
+    if (commits.length === 0) {
+        html += `<div class="mp-empty">No pending commits. Phase-1 queue is clear.</div>`;
+    } else {
+        const CAP = 200;
+        commits.slice(0, CAP).forEach(c => {
+            const hasPow = c.pow_zeros != null;
+            const strong = hasPow && reqPow != null && c.pow_zeros >= reqPow + 2;
+            const powBadge = hasPow
+                ? `<span class="pow-badge${strong ? ' strong' : ''}" title="Achieved proof-of-work${reqPow != null ? ` (required \u2265 ${reqPow} bits)` : ''}">${c.pow_zeros} bits</span>`
+                : '';
+            const revBadge = revealedCommits.has(c.commitment)
+                ? `<span class="mp-flag" title="A pending reveal in the fee market opens this commitment">reveal \u29d7</span>` : '';
+            const age = c.age_secs != null ? `<span class="mp-dim mp-age" title="Waiting in the mempool">${fmtAge(c.age_secs)}</span>` : '';
+            const hlCls = c.commitment === activeQuery ? ' mp-match' : '';
+            html += `<div class="mp-row${hlCls}" onclick="execCmd('${c.commitment}')" title="${c.commitment}">
+                <span class="mp-hash">${shortHex(c.commitment)}</span>
+                <span class="mp-row-right">${age}${revBadge}${powBadge}</span>
+            </div>`;
+        });
+        if (commits.length > CAP) html += `<div class="mp-note">+ ${commits.length - CAP} more, weakest PoW last</div>`;
+    }
+    html += `</div></div>`;
+
+    // ── Phase 2: reveal queue (priority = fee per byte) ──
+    const sizeStat = totalBytes > 0 ? ` \u00b7 ${(totalBytes/1024).toFixed(1)} KB` : '';
+    html += `<div class="mp-col"><div class="mp-col-hdr">REVEALS (FEE MARKET) \u2014 ${reveals.length}${reveals.length ? ` \u00b7 \u03a3 FEES ${totalFees.toLocaleString()}${sizeStat}` : ''}</div><div class="mp-col-body">`;
+    if (reveals.length === 0) {
+        html += `<div class="mp-empty">No pending reveals. Fee market is empty.</div>`;
+    } else {
+        const rates = reveals.map(x => x.fee_per_kb).filter(v => v != null).sort((a,b) => a-b);
+        if (rates.length >= 2) {
+            const med = rates[Math.floor(rates.length / 2)];
+            html += `<div class="mp-ladder" title="Fee rates waiting in the queue \u2014 pay above these to outrank them">rates /KB \u2014 top ${rates[rates.length-1]} \u00b7 median ${med} \u00b7 low ${rates[0]}</div>`;
+        }
+        const CAP = 100;
+        reveals.slice(0, CAP).forEach((r, idx) => { html += renderMempoolReveal(r, idx); });
+        if (reveals.length > CAP) html += `<div class="mp-note">+ ${reveals.length - CAP} more, cheapest per byte last</div>`;
+    }
     html += `</div></div></div>`;
 
-    html += `<div class="mp-col"><div class="mp-col-hdr">REVEALS (FEE MARKET) - ${reveals.length}</div><div class="mp-col-body">`;
-    reveals.forEach(r => {
-        const ins = (r.input_coins||[]).length; const outs = (r.output_coins||[]).length;
-        html += `<div class="reveal-item" onclick="execCmd('${r.input_coins[0]||''}')">
-            <span>${ins} IN → ${outs} OUT</span><span class="fee-rate">${r.fee} fee</span>
-        </div>`;
-    });
-    html += `</div></div></div></div>`;
+    // ── Disruption-free update ──
+    // Re-assigning innerHTML rebuilds both scroll containers from scratch,
+    // yanking the reader back to the top every poll. Three tiers instead:
+    //   1. Identical repaint            -> skip entirely.
+    //   2. Only the age chips ticked    -> patch their text in the live DOM.
+    //   3. Genuine structural change    -> repaint, then restore scroll.
+    const stripAges = h => h.replace(/(<span class="mp-dim mp-age"[^>]*>)[^<]*(<\/span>)/g, '$1$2');
+    if (mainViewContent === 'mempool' && html === lastMempoolHtml) {
+        // Nothing changed.
+    } else if (mainViewContent === 'mempool' && stripAges(html) === stripAges(lastMempoolHtml)) {
+        const newAges = [...html.matchAll(/class="mp-dim mp-age"[^>]*>([^<]*)</g)].map(m => m[1]);
+        mv.querySelectorAll('.mp-age').forEach((el, i) => {
+            if (newAges[i] != null) el.textContent = newAges[i];
+        });
+        lastMempoolHtml = html;
+    } else {
+        const prevMain = mv.scrollTop;
+        const prevCols = Array.from(mv.querySelectorAll('.mp-col-body')).map(el => el.scrollTop);
+        mv.innerHTML = html;
+        lastMempoolHtml = html;
+        mv.scrollTop = prevMain;
+        mv.querySelectorAll('.mp-col-body').forEach((el, i) => {
+            if (prevCols[i] != null) el.scrollTop = prevCols[i];
+        });
+    }
+    mainViewContent = 'mempool';
 
-    mv.innerHTML = html;
+    if (mpScrollPending) {
+        mpScrollPending = false;
+        const m = document.querySelector('.mp-match');
+        if (m && m.scrollIntoView) m.scrollIntoView({ block: 'center' });
+    }
+}
+
+// Stable identity for a pending reveal card: its first input coin id
+// (a reveal always spends at least one coin, so the index fallback is
+// only a belt-and-braces default).
+function mpTxId(r, idx) {
+    const ins = r.inputs || [];
+    return (ins[0] ? ins[0].coin_id : (r.input_coins || [])[0]) || ('idx' + idx);
+}
+
+// Does a 64-hex query touch this pending reveal (coins, addresses, or the
+// commitment it opens)? Drives both search hits and the match highlight.
+function revealMatches(r, q) {
+    if (!q) return false;
+    if ((r.inputs || []).some(i => i.coin_id === q || i.commitment === q)) return true;
+    if ((r.outputs || []).some(o => o.coin_id === q || o.address === q)) return true;
+    return (r.input_coins || []).includes(q) || (r.output_coins || []).includes(q);
+}
+
+// Look for a query in the live mempool snapshot. Returns a description and,
+// for reveals, the card id to auto-expand — or null when nothing pends.
+function findInMempool(q) {
+    const data = lastMempoolData;
+    if (!data || !q) return null;
+    const txs = data.transactions || [];
+    for (let i = 0; i < txs.length; i++) {
+        const t = txs[i];
+        const isCommit = t.tx_type === 'commit' || (t.commitment && !t.input_coins);
+        if (isCommit) {
+            if (t.commitment === q) return { desc: 'pending Phase-1 commit (PoW queue)', expandId: null };
+            continue;
+        }
+        if (!revealMatches(t, q)) continue;
+        const kind = t.tx_type === 'consolidate' ? 'consolidate' : 'reveal';
+        let desc = `part of a pending ${kind}`;
+        if ((t.inputs || []).some(x => x.coin_id === q) || (t.input_coins || []).includes(q)) desc = `input coin of a pending ${kind}`;
+        else if ((t.inputs || []).some(x => x.commitment === q)) desc = `commitment opened by a pending ${kind}`;
+        else if ((t.outputs || []).some(x => x.address === q)) desc = `output address of a pending ${kind}`;
+        else if ((t.outputs || []).some(x => x.coin_id === q) || (t.output_coins || []).includes(q)) desc = `output coin of a pending ${kind}`;
+        return { desc, expandId: mpTxId(t, i) };
+    }
+    return null;
+}
+
+// Power-of-2 uniform-denomination detection on the flat mempool summary shape
+// (mirrors isUniformMix, which works on the raw in-block transaction shape).
+function isUniformMixSummary(r) {
+    const ins = r.inputs || [];
+    const outs = (r.outputs || []).filter(o => o.kind === 'standard');
+    if (ins.length < 3 || outs.length < 2) return false;
+    if (outs.length !== (r.outputs || []).length) return false; // contains burns/confidential
+    const denom = outs[0].value;
+    if (!denom || !Number.isInteger(Math.log2(denom))) return false;
+    if (!outs.every(o => o.value === denom)) return false;
+    const mixIns = ins.filter(i => i.value === denom).length;
+    const feeIns = ins.filter(i => i.value === 1).length;
+    return (mixIns === outs.length) && (feeIns <= 1) && (mixIns + feeIns === ins.length);
+}
+
+function toggleMpTx(id) {
+    if (mpExpanded.has(id)) mpExpanded.delete(id); else mpExpanded.add(id);
+    renderMempoolView();
+}
+
+function renderMempoolReveal(r, idx) {
+    const hasDetail = Array.isArray(r.inputs);
+    const ins = r.inputs || [];
+    const outs = r.outputs || [];
+    const nIn  = hasDetail ? ins.length  : (r.input_coins  || []).length;
+    const nOut = hasDetail ? outs.length : (r.output_coins || []).length;
+    const id = mpTxId(r, idx);
+    const open = mpExpanded.has(id);
+    const matched = revealMatches(r, activeQuery);
+    const age = r.age_secs != null ? `<span class="mp-dim mp-age" title="Waiting in the mempool">${fmtAge(r.age_secs)}</span>` : '';
+    const isMix = hasDetail && isUniformMixSummary(r);
+    const typeStr = r.tx_type === 'consolidate' ? 'CONSOLIDATE' : 'REVEAL';
+    const badge = isMix ? `<span class="badge-mix">DARK POOL MIX</span>` : '';
+    const rate = r.fee_per_kb != null ? `<span class="mp-dim" title="Fee per KB \u2014 the fee market's priority key">${r.fee_per_kb}/KB</span>` : '';
+    const size = r.size_bytes != null ? `<span class="mp-dim">${r.size_bytes} B</span>` : '';
+
+    let html = `<div class="mp-tx${isMix ? ' mix' : ''}${matched ? ' mp-match' : ''}">
+        <div class="mp-tx-hdr" onclick="toggleMpTx('${id}')">
+            <span class="mp-caret">${open ? '\u25be' : '\u25b8'}</span>
+            <span class="tx-type">${typeStr}</span>${badge}
+            <span class="mp-io-count">${nIn} in \u2192 ${nOut} out</span>
+            <span class="mp-hdr-right">${age}${size}${rate}<span class="fee-rate">${(r.fee ?? 0).toLocaleString()} fee</span></span>
+        </div>`;
+
+    if (open) {
+        html += `<div class="mp-tx-body">`;
+        if (!hasDetail) {
+            // Older node: /mempool carries only coin id summaries.
+            html += `<div class="mp-note">Connected node predates detailed mempool info; showing coin ids only.</div>`;
+            (r.input_coins  || []).forEach(cid => { html += `<div class="mp-io-row"><span class="val-badge negative">IN</span>${hexLink(cid)}</div>`; });
+            (r.output_coins || []).forEach(cid => { html += `<div class="mp-io-row"><span class="val-badge positive">OUT</span>${hexLink(cid)}</div>`; });
+        } else {
+            html += `<div class="mp-io-hdr">Inputs (${ins.length})</div>`;
+            ins.forEach(i => {
+                const commitLink = i.commitment ? `<span class="mp-dim">\u21a9 commit ${hexLink(i.commitment)}</span>` : '';
+                html += `<div class="mp-io-row">
+                    <span class="val-badge negative">-${i.value}</span>
+                    ${hexLink(i.coin_id)}
+                    ${commitLink}
+                </div>`;
+            });
+            html += `<div class="mp-io-hdr">Outputs (${outs.length})</div>`;
+            outs.forEach(o => {
+                if (o.kind === 'standard') {
+                    html += `<div class="mp-io-row"><span class="val-badge positive">+${o.value}</span>${hexLink(o.address)}${o.coin_id ? `<span class="mp-dim">coin ${hexLink(o.coin_id)}</span>` : ''}</div>`;
+                } else if (o.kind === 'confidential') {
+                    html += `<div class="mp-io-row"><span class="val-badge">CONF</span>${hexLink(o.address)}<span class="mp-dim">value hidden until reveal</span></div>`;
+                } else if (o.kind === 'data_burn') {
+                    const ascii = toAscii(o.payload_preview || '');
+                    const truncated = (o.payload_len || 0) > 64 ? '\u2026' : '';
+                    html += `<div class="mp-io-row"><span class="val-badge burn">\u{1F525} -${o.value ?? 0}</span><span class="mp-burn">${escHtml(ascii)}${truncated}</span><span class="mp-dim">${o.payload_len || 0} B payload</span></div>`;
+                }
+            });
+            const tIn  = r.total_in  ?? ins.reduce((s,i) => s + i.value, 0);
+            const tOut = r.total_out ?? 0;
+            html += `<div class="mp-totals">in ${tIn.toLocaleString()} \u00b7 out ${tOut.toLocaleString()} \u00b7 fee ${(r.fee ?? (tIn - tOut)).toLocaleString()}</div>`;
+        }
+        html += `</div>`;
+    }
+    html += `</div>`;
+    return html;
 }
 
 // Renders the Analytics Charts
 async function renderAnalyticsView() {
     const mv = document.getElementById('main-view');
+    mainViewContent = 'analytics';
     mv.innerHTML = `<div style="padding:20px; color:var(--text-faint);">Loading analytics...</div>`;
     try {
         const res = await fetch('/stats/history');
@@ -391,6 +640,8 @@ async function renderAnalyticsView() {
 }
 
 async function loadBlock(h) {
+    setActiveTab('explorer');
+    mainViewContent = 'block';
     activeBatch = h;
     renderBatchList();
     const mv = document.getElementById('main-view');
@@ -627,8 +878,19 @@ document.getElementById('cmd-input').addEventListener('keydown', function(e) {
 });
 
 log('Explorer ready. Type a height, hash, or "mempool".', 'var(--accent-dim)');
+// Visibility-aware polling: 3s while the tab is visible, 15s in the
+// background, and an immediate refresh the moment the tab regains focus.
+let pollTimer = null;
+function schedulePoll() {
+    clearTimeout(pollTimer);
+    pollTimer = setTimeout(async () => { await poll(); schedulePoll(); }, document.hidden ? 15000 : 3000);
+}
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) poll();
+    schedulePoll();
+});
 poll();
-setInterval(poll, 4000);
+schedulePoll();
 
 // --- NEW: Deep Linking / URL Parameter Parsing ---
 // Supports:

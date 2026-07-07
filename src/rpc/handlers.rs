@@ -249,30 +249,105 @@ pub async fn check_commitment(
 }
 
 pub async fn get_mempool(State(node): State<AppState>) -> Json<GetMempoolResponse> {
-    let (size, transactions) = node.get_mempool_info().await;
+    let (size, transactions) = node.get_mempool_with_meta().await;
+    // Chain state is needed to evaluate each commit's PoW (the commit queue's
+    // actual priority key), which is bound to the current chain state.
+    let state = node.get_state().await;
+    // One reference clock for the whole response, so all ages are mutually
+    // consistent within a single poll.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    /// Cap on the hex payload preview for DataBurn outputs, so a maximal burn
+    /// can't bloat the polled /mempool response.
+    const BURN_PREVIEW_BYTES: usize = 64;
+
+    fn describe_io(
+        inputs: &[InputReveal],
+        outputs: &[OutputData],
+    ) -> (Vec<MempoolInputInfo>, Vec<MempoolOutputInfo>, u64, u64) {
+        let ins: Vec<MempoolInputInfo> = inputs.iter().map(|i| MempoolInputInfo {
+            coin_id: hex::encode(i.coin_id()),
+            value: i.value,
+            commitment: i.commitment.map(hex::encode),
+        }).collect();
+
+        let outs: Vec<MempoolOutputInfo> = outputs.iter().map(|o| match o {
+            OutputData::Standard { address, value, .. } => MempoolOutputInfo {
+                kind: "standard".into(),
+                address: Some(hex::encode(address)),
+                value: Some(*value),
+                coin_id: o.coin_id().map(hex::encode),
+                payload_preview: None,
+                payload_len: None,
+            },
+            OutputData::Confidential { address, .. } => MempoolOutputInfo {
+                kind: "confidential".into(),
+                address: Some(hex::encode(address)),
+                value: None, // hidden by design
+                coin_id: o.coin_id().map(hex::encode),
+                payload_preview: None,
+                payload_len: None,
+            },
+            OutputData::DataBurn { payload, value_burned } => MempoolOutputInfo {
+                kind: "data_burn".into(),
+                address: None,
+                value: Some(*value_burned),
+                coin_id: None,
+                payload_preview: Some(hex::encode(&payload[..payload.len().min(BURN_PREVIEW_BYTES)])),
+                payload_len: Some(payload.len()),
+            },
+        }).collect();
+
+        let total_in: u64 = inputs.iter().map(|i| i.value).sum();
+        let total_out: u64 = outputs.iter().map(|o| o.value()).sum();
+        (ins, outs, total_in, total_out)
+    }
 
     let tx_info: Vec<_> = transactions
         .iter()
-        .map(|tx| match tx {
-            Transaction::Commit { commitment, .. } => TransactionInfo  {
+        .map(|(tx, received)| {
+            let age_secs = Some(now.saturating_sub(*received));
+            match tx {
+            Transaction::Commit { commitment, spam_nonce } => TransactionInfo {
                 commitment: Some(hex::encode(commitment)),
-                input_coins: None,
-                output_coins: None,
-                fee: None,
+                tx_type: Some("commit".into()),
+                age_secs,
+                // The commit queue is priority-sorted by achieved PoW; expose it
+                // so the explorer can show each commit against required_pow.
+                pow_zeros: crate::core::transaction::evaluate_commit_pow(commitment, *spam_nonce, &state).ok(),
+                ..Default::default()
             },
-            Transaction::Reveal { inputs, outputs, .. } => TransactionInfo {
-                commitment: None,
-                input_coins: Some(inputs.iter().map(|i| hex::encode(i.coin_id())).collect()),
-                output_coins: Some(outputs.iter().filter_map(|o| o.coin_id().map(hex::encode)).collect()),                
-                fee: Some(tx.fee()),
-            },
-            Transaction::Consolidate { inputs, outputs, .. } => TransactionInfo {
-                commitment: None,
-                input_coins: Some(inputs.iter().map(|i| hex::encode(i.coin_id())).collect()),
-                output_coins: Some(outputs.iter().filter_map(|o| o.coin_id().map(hex::encode)).collect()),                
-                fee: Some(tx.fee()),
-            },
-        })
+            Transaction::Reveal { inputs, outputs, .. }
+            | Transaction::Consolidate { inputs, outputs, .. } => {
+                let (ins, outs, total_in, total_out) = describe_io(inputs, outputs);
+                let fee = tx.fee();
+                let size_bytes = bincode::serialized_size(tx).unwrap_or(0);
+                let fee_per_kb = if size_bytes > 0 {
+                    ((fee as u128 * 1024) / size_bytes as u128) as u64
+                } else { 0 };
+                TransactionInfo {
+                    input_coins: Some(ins.iter().map(|i| i.coin_id.clone()).collect()),
+                    output_coins: Some(outs.iter().filter_map(|o| o.coin_id.clone()).collect()),
+                    fee: Some(fee),
+                    tx_type: Some(if matches!(tx, Transaction::Consolidate { .. }) {
+                        "consolidate".into()
+                    } else {
+                        "reveal".into()
+                    }),
+                    size_bytes: Some(size_bytes),
+                    fee_per_kb: Some(fee_per_kb),
+                    total_in: Some(total_in),
+                    total_out: Some(total_out),
+                    inputs: Some(ins),
+                    outputs: Some(outs),
+                    age_secs,
+                    ..Default::default()
+                }
+            }
+        }})
         .collect();
 
     Json(GetMempoolResponse { size, transactions: tx_info })
@@ -858,11 +933,19 @@ pub async fn axe_stats(State(node): State<AppState>) -> Json<AxeStatsResponse> {
     // Read REAL hardware hashrate counter
     let total_nonces = node.hash_counter.load(std::sync::atomic::Ordering::Relaxed);
 
+    // Live CPU frequency (kHz -> MHz) so the dashboard reflects the actual
+    // clock (thermal throttling included) rather than a hardcoded value.
+    let freq_mhz = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|khz| (khz / 1000) as u32);
+
     Json(AxeStatsResponse { 
         temp_c, 
         uptime_s, 
         total_nonces,
         is_axe_hardware: is_axe_device(), 
+        freq_mhz,
     })
 }
 
@@ -957,7 +1040,8 @@ pub async fn axe_save_config(
             pool_url: req.pool_url.clone(),
             payout_address: req.payout_address.clone(),
             pool_address: req.pool_address.clone(), // <-- NEW
-            worker: None, // Axe hardware config carries no rig name; reports as "default"
+            // Optional rig name for per-worker pool stats; blank means "default".
+            worker: req.worker.clone().filter(|w| !w.trim().is_empty()),
         }
     };
 
@@ -981,6 +1065,47 @@ pub async fn axe_save_config(
         "status": "config_saved", 
         "message": "Mining configuration written to miner.toml successfully." 
     })))
+}
+
+/// GET /axe/config — read the *active* configuration back so the dashboard
+/// can pre-fill its forms with reality instead of hardcoded defaults.
+///
+/// Sources: `miner.toml` (the same file `axe_save_config` writes) for the
+/// mining mode, and the Pi boot config for the persisted overclock. All
+/// fields are best-effort `null` on a fresh device. Read-only, so no
+/// hardware gate is needed (the /axe scope is already LAN-only).
+pub async fn axe_get_config() -> Json<serde_json::Value> {
+    let mining = std::fs::read_to_string("miner.toml")
+        .ok()
+        .and_then(|s| toml::from_str::<crate::node::MinerToml>(&s).ok())
+        .map(|c| c.mining);
+
+    // Parse the persisted overclock back out of the boot config.
+    let mut configured_freq_mhz: Option<u32> = None;
+    let mut configured_overvoltage: Option<u32> = None;
+    for path in ["/boot/firmware/config.txt", "/boot/config.txt"] {
+        if let Ok(cfg) = std::fs::read_to_string(path) {
+            for line in cfg.lines() {
+                if let Some(v) = line.strip_prefix("arm_freq=") {
+                    configured_freq_mhz = v.trim().parse().ok();
+                }
+                if let Some(v) = line.strip_prefix("over_voltage=") {
+                    configured_overvoltage = v.trim().parse().ok();
+                }
+            }
+            break;
+        }
+    }
+
+    Json(serde_json::json!({
+        "mode": mining.as_ref().map(|m| m.mode.clone()).unwrap_or_else(|| "solo".to_string()),
+        "pool_url": mining.as_ref().and_then(|m| m.pool_url.clone()),
+        "payout_address": mining.as_ref().and_then(|m| m.payout_address.clone()),
+        "pool_address": mining.as_ref().and_then(|m| m.pool_address.clone()),
+        "worker": mining.as_ref().and_then(|m| m.worker.clone()),
+        "configured_freq_mhz": configured_freq_mhz,
+        "configured_overvoltage": configured_overvoltage,
+    }))
 }
 
 pub async fn axe_apply_overclock(

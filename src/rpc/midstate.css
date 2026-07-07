@@ -1,5 +1,6 @@
 /* =====================================================================
-Midstate — shared stylesheet for chat.html and explorer.html
+Midstate — shared stylesheet for chat.html, explorer.html and
+miner_dashboard.html (the MidstateAxe hardware console)
 ---------------------------------------------------------------------
 ABSOLUTE HYPER-MEGA-MINIMAL.
 
@@ -54,6 +55,7 @@ Accent/semantic tokens remain collapsed to ink/grey.
   --link-color: #f5f5f5;
   --blue: #f5f5f5;
   --warn-accent: #9a9a9a;
+  --orange: #9a9a9a; /* collapsed to warn grey; name kept for axe dashboard */
   --green: #f5f5f5;
   --red: #9a9a9a;
 
@@ -93,6 +95,7 @@ Accent/semantic tokens remain collapsed to ink/grey.
   --link-color: #111111;
   --blue: #111111;
   --warn-accent: #565656;
+  --orange: #565656; /* collapsed to warn grey; name kept for axe dashboard */
   --green: #111111;
   --red: #565656;
 
@@ -732,6 +735,132 @@ EXPLORER (body.page-explorer)
 .reveal-item:hover { background: var(--highlight); }
 .fee-rate { color: var(--text-max); font-weight: bold; }
 
+/* Mempool detail view: each queue rendered by its true priority key */
+.mp-empty { color: var(--text-faint); font-size: 11px; text-align: center; padding: 24px 8px; }
+.mp-note { color: var(--text-faint); font-size: 10px; padding: 6px 2px; text-align: center; }
+.mp-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 5px 6px; border-bottom: 1px dashed var(--border); font-size: 10px; cursor: pointer; }
+.mp-row:hover { background: var(--highlight); }
+.mp-hash { color: var(--text-bright); }
+.mp-row-right { display: flex; align-items: center; gap: 6px; }
+.pow-badge { font-size: 9px; padding: 1px 5px; border: 1px solid var(--border-bright); background: var(--code-bg); color: var(--text-muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.pow-badge.strong { color: var(--text-max); border-color: var(--accent); }
+.mp-flag { font-size: 9px; padding: 1px 5px; border: 1px dashed var(--border-bright); color: var(--text-muted); white-space: nowrap; }
+.mp-tx { border: 1px solid var(--border); background: var(--bg-alt); margin-bottom: 8px; }
+.mp-tx.mix { border-style: dashed; }
+.mp-tx-hdr { display: flex; align-items: center; gap: 8px; padding: 7px 8px; font-size: 10px; cursor: pointer; background: var(--code-bg); }
+.mp-tx-hdr:hover { background: var(--highlight); }
+.mp-caret { color: var(--text-faint); width: 10px; flex-shrink: 0; }
+.mp-io-count { color: var(--text-muted); white-space: nowrap; }
+.mp-hdr-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.mp-dim { color: var(--text-faint); font-size: 9px; white-space: nowrap; }
+.mp-tx-body { padding: 8px; border-top: 1px dashed var(--border); }
+.mp-io-hdr { font-size: 9px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; margin: 8px 0 4px; }
+.mp-io-hdr:first-child { margin-top: 0; }
+.mp-io-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 10px; border-bottom: 1px dashed var(--border); flex-wrap: wrap; }
+.mp-io-row:last-child { border-bottom: none; }
+.mp-burn { color: var(--text-bright); font-style: italic; }
+.mp-totals { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--border); font-size: 10px; color: var(--text-max); text-align: right; font-variant-numeric: tabular-nums; }
+.mp-match { outline: 1px solid var(--accent); outline-offset: -1px; }
+.mp-ladder { font-size: 9px; color: var(--text-muted); text-align: center; letter-spacing: 0.5px; text-transform: uppercase; padding: 2px 0 10px; font-variant-numeric: tabular-nums; }
+@media (max-width: 900px) {
+  .mempool-split { flex-direction: column; height: auto; }
+  .mp-col { min-height: 240px; max-height: 60vh; }
+}
+
 /* Analytics Chart */
 .chart-container { border: 1px solid var(--border); background: var(--bg); padding: 16px; margin-bottom: 16px; height: 250px; position: relative; }
 .chart-title { font-size: 10px; font-weight: bold; letter-spacing: 1px; color: var(--text-max); margin-bottom: 8px; text-transform: uppercase; }
+
+/* =====================================================================
+MINER DASHBOARD (body.page-axe) — MidstateAxe hardware console
+Shares the explorer chrome above (.hdr, .hdr-right, .live-dot, .layout,
+.sidebar, .sidebar-section, .metric, .main-panel, .terminal, .term-log).
+Below: axe-only components plus a few dimension overrides, all scoped.
+===================================================================== */
+body.page-axe {
+  height: 100vh;
+  overflow: hidden;
+  color: var(--text);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.page-axe .hdr-sep { width: 1px; height: 16px; background: var(--border-bright); }
+.page-axe .sidebar { width: 260px; overflow-y: auto; }
+.page-axe .sidebar-section { padding: 14px 12px; }
+.page-axe .sidebar-section .title { font-size: 10px; margin-bottom: 10px; font-weight: 700; }
+.page-axe .metric { padding: 3px 0; }
+.page-axe .main-panel { padding: 16px 20px; }
+/* the explorer's inverse-highlight reads wrong inside stat cards */
+.page-axe .hl { background: transparent; color: var(--text-bright); padding: 0; }
+
+/* Forms */
+.page-axe .field-group { margin-bottom: 12px; }
+.page-axe .field-group label { display: block; font-size: 10px; color: var(--text-muted); text-transform: uppercase; margin-bottom: 4px; }
+.page-axe .field-group input,
+.page-axe .field-group select {
+  width: 100%;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-bright);
+  color: var(--text-max);
+  font-family: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+  border-radius: 0;
+}
+.page-axe .field-group input:focus,
+.page-axe .field-group select:focus { border-color: var(--accent); }
+.page-axe .sidebar button {
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--accent-dim);
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 6px;
+  cursor: pointer;
+  text-transform: uppercase;
+  border-radius: 0;
+}
+.page-axe .sidebar button:hover { background: var(--accent); color: var(--on-accent); }
+.page-axe .sidebar button.danger { border-color: var(--warn-accent); color: var(--warn-accent); }
+.page-axe .sidebar button.danger:hover { background: var(--warn-accent); color: var(--on-accent); }
+
+/* Stat cards — variant hues collapsed to ink/grey; .accent marks the lead metric */
+.page-axe .section-label { font-size: 10px; color: var(--text-muted); letter-spacing: 1.5px; text-transform: uppercase; font-weight: 700; margin-bottom: 10px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+.page-axe .cards-row { display: grid; gap: 10px; margin-bottom: 10px; }
+.page-axe .cards-row.cols-4 { grid-template-columns: repeat(4, 1fr); }
+.page-axe .cards-row.cols-3 { grid-template-columns: repeat(3, 1fr); }
+.page-axe .card { background: var(--bg-panel); border: 1px solid var(--border); border-left: 2px solid var(--border-bright); padding: 12px 14px; }
+.page-axe .card.accent { border-left-color: var(--accent); }
+.page-axe .card-label { font-size: 10px; color: var(--text-muted); letter-spacing: 1px; text-transform: uppercase; margin-bottom: 6px; }
+.page-axe .card-value { font-size: 22px; font-weight: 700; color: var(--text-max); line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.page-axe .card-value.smaller { font-size: 16px; }
+.page-axe .card-value.tiny { font-size: 13px; letter-spacing: 0.5px; }
+.page-axe .card-sub { font-size: 10px; color: var(--text); margin-top: 4px; }
+.page-axe .card-sub .good { color: var(--green); }
+.page-axe .card-sub .warn { color: var(--warn-accent); }
+.page-axe .card-sub .bad { color: var(--red); font-weight: 700; }
+
+/* Telemetry chart */
+.page-axe .chart-card { background: var(--bg-panel); border: 1px solid var(--border); padding: 12px 14px; margin-bottom: 10px; }
+.page-axe .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.page-axe .chart-legend { display: flex; gap: 14px; font-size: 10px; color: var(--text); }
+.page-axe .chart-legend span { display: flex; align-items: center; gap: 4px; }
+.page-axe .chart-legend .dot { width: 8px; height: 2px; }
+.page-axe canvas#telemetryChart { display: block; width: 100%; height: 110px; }
+
+/* Console */
+.page-axe .terminal { height: 160px; }
+.page-axe .term-hdr { padding: 4px 12px; background: var(--bg-panel); border-bottom: 1px solid var(--border); font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; display: flex; justify-content: space-between; align-items: center; }
+.page-axe .term-hdr-right { color: var(--text-faint); }
+.page-axe .term-log { font-size: 11px; padding: 6px 12px; }
+.page-axe .term-line { padding: 1px 0; }
+.page-axe .log-time { color: var(--text-faint); margin-right: 8px; }
+
+@media (max-width: 900px) {
+  .page-axe .cards-row.cols-4 { grid-template-columns: repeat(2, 1fr); }
+  .page-axe .sidebar { width: 220px; }
+}

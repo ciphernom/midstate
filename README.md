@@ -59,12 +59,18 @@ midstate wallet receive --path wallet.dat --label "payment1"
 
 ```
 
+WARNING: REUSING WOTS ADDRESSES EXPOSES YOUR PRIVATE KEY 
+
+
 **Generate an MSS Address (Multi-use):**
 
 ```bash
 midstate wallet generate-mss --path wallet.dat --height 10 --label "donation"
 
 ```
+
+For mining rewards from a pool, the MSS address type is the ONLY address type you should use.
+
 
 **Smart Contracts & Covenants:**
 Compile a human-readable `.msc` assembly file into a Pay-to-Script-Hash (P2SH) address.

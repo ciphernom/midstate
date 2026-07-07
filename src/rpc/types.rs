@@ -140,7 +140,7 @@ pub struct GetMempoolResponse {
     pub transactions: Vec<TransactionInfo>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct TransactionInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commitment: Option<String>,
@@ -150,6 +150,64 @@ pub struct TransactionInfo {
     pub output_coins: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fee: Option<u64>,
+    // ── Detail fields (additive: older clients ignore them, and every field
+    //    is an Option so newer clients tolerate older nodes omitting them) ──
+    /// "commit" | "reveal" | "consolidate"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_type: Option<String>,
+    /// Seconds this entry has been waiting in the mempool. Computed
+    /// server-side (now − arrival), so it is immune to client clock skew.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_secs: Option<u64>,
+    /// Commits: achieved PoW in leading zero bits — the commit queue's actual
+    /// priority key (weakest is evicted first).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pow_zeros: Option<u32>,
+    /// Reveals: serialized transaction size in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    /// Reveals: integer fee rate (fee × 1024 / size_bytes) — mirrors the fee
+    /// market's actual priority key (cheapest per byte is evicted first).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_per_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_in: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_out: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<Vec<MempoolInputInfo>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<Vec<MempoolOutputInfo>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MempoolInputInfo {
+    pub coin_id: String,
+    pub value: u64,
+    /// The Phase-1 commitment this input opens, when present — lets the
+    /// explorer link a pending Reveal back to its Commit in the other queue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commitment: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MempoolOutputInfo {
+    /// "standard" | "confidential" | "data_burn"
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// Standard value or DataBurn value_burned; None for Confidential
+    /// outputs, whose value is hidden by design.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coin_id: Option<String>,
+    /// DataBurn: hex payload preview, capped at 64 bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_preview: Option<String>,
+    /// DataBurn: full payload length in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_len: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -281,6 +339,10 @@ pub struct AxeStatsResponse {
     pub uptime_s: u64,
     pub total_nonces: u64,
     pub is_axe_hardware: bool,
+    /// Live CPU frequency in MHz (from cpufreq), when readable. Lets the
+    /// dashboard show the *actual* clock instead of a hardcoded guess.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freq_mhz: Option<u32>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AxeWifiRequest {
@@ -294,6 +356,10 @@ pub struct AxeConfigRequest {
     pub pool_url: Option<String>,
     pub payout_address: Option<String>,
     pub pool_address: Option<String>, // <-- NEW: The pool's MSS address
+    /// Optional rig name reported to the pool for per-worker stats.
+    /// `default` keeps requests from older dashboards (no field) parsing.
+    #[serde(default)]
+    pub worker: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

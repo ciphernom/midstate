@@ -86,12 +86,25 @@ struct MempoolTx {
     tx: Arc<Transaction>,
     /// Byte size of `tx` as computed by `bincode::serialized_size` at insertion.
     size: u64,
+    /// Unix time (secs) this entry was admitted — surfaced by the RPC layer so
+    /// the explorer can show how long each entry has been waiting. Reorg
+    /// restorations via `re_add` intentionally get a fresh stamp: the entry
+    /// genuinely re-entered the queue at that moment.
+    received: u64,
 }
 
 impl MempoolTx {
     fn new(tx: Arc<Transaction>, size: u64) -> Self {
-        Self { tx, size }
+        Self { tx, size, received: now_unix() }
     }
+}
+
+/// Current Unix time in seconds; used to stamp mempool arrivals.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// A highly efficient, priority-sorted memory pool for pending transactions.
@@ -113,8 +126,9 @@ impl MempoolTx {
 /// **Reveal** opens the commitment and executes the spend. Commits require a
 /// Proof-of-Work nonce to resist spam; Reveals pay a fee.
 pub struct Mempool {
-    /// Commit transactions keyed by their commitment hash.
-    commits: HashMap<[u8; 32], Arc<Transaction>>,
+    /// Commit transactions keyed by their commitment hash, paired with the
+    /// Unix time (secs) each was admitted (see [`MempoolTx::received`]).
+    commits: HashMap<[u8; 32], (Arc<Transaction>, u64)>,
     /// Priority index for commits: `(leading_zero_bits, commitment)`.
     /// The entry with the *lowest* PoW is at the front (eviction candidate).
     commits_by_pow: BTreeSet<(u32, [u8; 32])>,
@@ -281,7 +295,7 @@ impl Mempool {
                 }
 
                 let arc_tx = Arc::new(tx_ref);
-                self.commits.insert(commitment, arc_tx);
+                self.commits.insert(commitment, (arc_tx, now_unix()));
                 self.commits_by_pow.insert((actual_zeros, commitment));
             }
 
@@ -466,7 +480,7 @@ impl Mempool {
                 Transaction::Commit { commitment, spam_nonce } => {
                     if let Ok(zeros) = crate::core::transaction::evaluate_commit_pow(&commitment, spam_nonce, state) {
                         let arc_tx = Arc::new(Transaction::Commit { commitment, spam_nonce });
-                        self.commits.insert(commitment, arc_tx);
+                        self.commits.insert(commitment, (arc_tx, now_unix()));
                         self.commits_by_pow.insert((zeros, commitment));
                     }
                 }
@@ -525,7 +539,7 @@ impl Mempool {
         while drained.len() < max {
             if let Some(&(pow, comm)) = self.commits_by_pow.iter().next_back() {
                 self.commits_by_pow.remove(&(pow, comm));
-                let arc_tx = self.commits.remove(&comm).unwrap();
+                let (arc_tx, _) = self.commits.remove(&comm).unwrap();
                 drained.push(Arc::unwrap_or_clone(arc_tx));
             } else {
                 break;
@@ -556,7 +570,7 @@ impl Mempool {
             }
         }
         for &(_, comm) in self.commits_by_pow.iter().rev() {
-            if let Some(arc_tx) = self.commits.get(&comm) {
+            if let Some((arc_tx, _)) = self.commits.get(&comm) {
                 all.push(Arc::clone(arc_tx));
             }
         }
@@ -569,7 +583,7 @@ impl Mempool {
     /// fee-paying reveals from starving zero-fee commits out of blocks.
     pub fn transactions_split(&self) -> (Vec<Arc<Transaction>>, Vec<Arc<Transaction>>) {
         let commits: Vec<Arc<Transaction>> = self.commits_by_pow.iter().rev()
-            .filter_map(|&(_, comm)| self.commits.get(&comm).map(Arc::clone))
+            .filter_map(|&(_, comm)| self.commits.get(&comm).map(|(t, _)| Arc::clone(t)))
             .collect();
         let reveals: Vec<Arc<Transaction>> = self.reveals_by_fee.iter().rev()
             .filter_map(|&(_, id)| self.reveals.get(&id).map(|m| Arc::clone(&m.tx)))
@@ -584,6 +598,26 @@ impl Mempool {
     /// a `Vec<Transaction>` (e.g. for RPC serialisation) rather than shared references.
     pub fn transactions_cloned(&self) -> Vec<Transaction> {
         self.transactions().into_iter().map(|arc| (*arc).clone()).collect()
+    }
+
+    /// Priority-sorted snapshot of `(transaction, received_at_unix_secs)`.
+    ///
+    /// Same order as [`transactions`](Self::transactions). Consumed by the
+    /// RPC layer so the explorer can show how long each entry has been
+    /// waiting in its queue.
+    pub fn transactions_with_meta(&self) -> Vec<(Transaction, u64)> {
+        let mut all = Vec::with_capacity(self.len());
+        for &(_, id) in self.reveals_by_fee.iter().rev() {
+            if let Some(mempool_tx) = self.reveals.get(&id) {
+                all.push(((*mempool_tx.tx).clone(), mempool_tx.received));
+            }
+        }
+        for &(_, comm) in self.commits_by_pow.iter().rev() {
+            if let Some((arc_tx, received)) = self.commits.get(&comm) {
+                all.push(((**arc_tx).clone(), *received));
+            }
+        }
+        all
     }
 
     /// Event-driven, O(K) pruning executed immediately when a block is mined/received.
@@ -696,8 +730,8 @@ impl Mempool {
         // --- Prune commits ---
         // Validate PoW requirements which may have shifted due to height changes.
         // `evaluate_commit_pow` is very fast (max 1000 hashes), safe for main thread.
-        let commits_to_remove: Vec<[u8; 32]> = self.commits.iter().filter(|(_, arc_tx)| {
-                match &***arc_tx {
+        let commits_to_remove: Vec<[u8; 32]> = self.commits.iter().filter(|(_, entry)| {
+                match entry.0.as_ref() {
                     Transaction::Commit { commitment, spam_nonce } => {
                         crate::core::transaction::evaluate_commit_pow(commitment, *spam_nonce, state).is_err()
                     }
@@ -784,7 +818,7 @@ impl Mempool {
         let h = crate::core::types::hash_concat(&commitment, &spam_nonce.to_le_bytes());
         let zeros = crate::core::types::count_leading_zeros(&h);
         let arc_tx = Arc::new(tx);
-        self.commits.insert(commitment, arc_tx);
+        self.commits.insert(commitment, (arc_tx, now_unix()));
         self.commits_by_pow.insert((zeros, commitment));
     }
 }

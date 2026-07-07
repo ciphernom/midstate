@@ -207,7 +207,9 @@ pub struct NodeHandle {
     state: Arc<RwLock<State>>,
     safe_depth: Arc<RwLock<u64>>,
     mempool_size: Arc<RwLock<usize>>,
-    mempool_txs: Arc<RwLock<Vec<Transaction>>>,
+    /// Mempool snapshot with each transaction's arrival time (unix secs),
+    /// refreshed every UI tick. Timestamps feed the explorer's age display.
+    mempool_txs: Arc<RwLock<Vec<(Transaction, u64)>>>,
     peer_addrs: Arc<RwLock<Vec<String>>>,
     webrtc_addrs: Arc<RwLock<Vec<String>>>, 
     pub tx_sender: tokio::sync::mpsc::Sender<NodeCommand>,
@@ -348,6 +350,15 @@ impl NodeHandle {
     }
 
     pub async fn get_mempool_info(&self) -> (usize, Vec<Transaction>) {
+        let size = *self.mempool_size.read().await;
+        let txs = self.mempool_txs.read().await.iter().map(|(t, _)| t.clone()).collect();
+        (size, txs)
+    }
+
+    /// Like [`get_mempool_info`](Self::get_mempool_info), but pairs each
+    /// transaction with its mempool arrival time (unix secs) so the RPC
+    /// layer can report entry ages.
+    pub async fn get_mempool_with_meta(&self) -> (usize, Vec<(Transaction, u64)>) {
         let size = *self.mempool_size.read().await;
         let txs = self.mempool_txs.read().await.clone();
         (size, txs)
@@ -2306,7 +2317,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
             state: Arc::new(RwLock::new(self.state.clone())),
             safe_depth: Arc::new(RwLock::new(self.finality.calculate_safe_depth(1e-6))),
             mempool_size: Arc::new(RwLock::new(self.mempool.len())),
-            mempool_txs: Arc::new(RwLock::new(self.mempool.transactions_cloned())),
+            mempool_txs: Arc::new(RwLock::new(self.mempool.transactions_with_meta())),
             peer_addrs: Arc::new(RwLock::new(Vec::new())),
             webrtc_addrs: Arc::new(RwLock::new(Vec::new())),
             tx_sender: tx,
@@ -2614,7 +2625,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                     *handle.state.write().await = self.state.clone();
                     *handle.safe_depth.write().await = current_safe_depth;
                     *handle.mempool_size.write().await = self.mempool.len();
-                    *handle.mempool_txs.write().await = self.mempool.transactions_cloned();
+                    *handle.mempool_txs.write().await = self.mempool.transactions_with_meta();
                     *handle.peer_addrs.write().await = self.network.peer_addrs();
                     // Publish sync status so /state can tell pools/miners to pause.
                     // Same definition the StateInfo handler uses internally.
