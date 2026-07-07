@@ -831,7 +831,25 @@ async fn wallet_scan(path: &PathBuf, rpc_port: u16, rpc_host: String, from_genes
     let chain_height = state.height;
 
     // Use the from_genesis flag here:
-    let start = if from_genesis { 0 } else { wallet.data.last_scan_height };
+    let mut start = if from_genesis { 0 } else { wallet.data.last_scan_height };
+
+    // ── Reorg guard ──
+    // If the network tip is now BELOW our last scanned height, the chain we scanned
+    // was (partly) orphaned. Without clamping, the `start >= chain_height` early
+    // return below fires on every run until the new fork outgrows the stale pointer
+    // — and the replaced block range is then skipped forever, so coins on the
+    // winning fork are never discovered. Rewind the pointer to the new tip and
+    // PERSIST it, so scanning resumes from there as the winning fork grows.
+    if !from_genesis && start > chain_height {
+        println!(
+            "Chain reorg detected: network height {} is below last scanned height {}. Rewinding scan pointer to {}.",
+            chain_height, start, chain_height
+        );
+        println!("  (Coins received on the orphaned fork may no longer exist; run `wallet scan --from-genesis` if balances look wrong.)");
+        start = chain_height;
+        wallet.data.last_scan_height = chain_height;
+        wallet.save()?;
+    }
 
     if start >= chain_height && !from_genesis {
         println!("Already scanned to height {}. Chain is at {}.", start, chain_height);
@@ -2778,7 +2796,18 @@ async fn wallet_reveal(
             tokio::time::sleep(Duration::from_secs(wait)).await;
         }
 
-let (input_reveals, signatures) = match wallet.sign_reveal(&pending) {
+        // Consolidate commits are signed with ONE aggregated witness covering all
+        // inputs (`sign_consolidate`), matching the `wallet consolidate` flow. The
+        // node's /send handler enforces exactly 1 signature for Consolidate txs, so
+        // the one-signature-per-input output of `sign_reveal` can never be accepted
+        // when manually revealing a timed-out consolidate commit.
+        let sign_result = if pending.is_consolidate {
+            wallet.sign_consolidate(&pending)
+                .map(|(input_reveals, witness)| (input_reveals, vec![witness]))
+        } else {
+            wallet.sign_reveal(&pending)
+        };
+        let (input_reveals, signatures) = match sign_result {
             Ok(res) => res,
             Err(e) => {
                 println!("  {} — dropping stale commit ({})", hex::encode(&commitment), e);
@@ -2795,7 +2824,10 @@ let (input_reveals, signatures) = match wallet.sign_reveal(&pending) {
                 bytecode: match &ir.predicate { midstate::core::types::Predicate::Script { bytecode } => hex::encode(bytecode) },
                 value: ir.value,
                 salt: hex::encode(ir.salt),
-                commitment: ir.commitment.map(hex::encode),
+                // The reference `wallet consolidate` flow submits inputs WITHOUT
+                // per-input commitments (the single aggregated witness covers
+                // them); mirror it exactly so the node treats both paths the same.
+                commitment: if pending.is_consolidate { None } else { ir.commitment.map(hex::encode) },
             }).collect(),
             signatures: signatures.iter().map(|s| match s {
                 midstate::core::types::Witness::ScriptInputs(inputs) => {

@@ -221,6 +221,11 @@ pub struct NodeHandle {
     pub chat_history: Arc<RwLock<VecDeque<ChatMessage>>>,
     pub outbox_chat_limiter: Arc<tokio::sync::Mutex<(u32, std::time::Instant)>>,
     pub light_chat_limits: Arc<tokio::sync::Mutex<std::collections::HashMap<PeerId, (u32, std::time::Instant)>>>,
+    /// True while the node is bulk-syncing historical blocks from a peer.
+    /// Refreshed every UI tick by the event loop and exposed via the `/state`
+    /// RPC so pools/miners can pause template generation instead of wasting
+    /// hashpower on already-superseded heights.
+    is_syncing: Arc<AtomicBool>,
 }
 
 pub enum NodeCommand {
@@ -309,6 +314,13 @@ pub struct ScannedCoin {
 impl NodeHandle {
     pub async fn get_state(&self) -> State {
         self.state.read().await.clone()
+    }
+
+    /// True while the node is actively downloading/verifying historical blocks.
+    /// Mirrors the event loop's own definition:
+    /// `sync.is_in_progress() || sync.has_active_session()`.
+    pub fn is_syncing(&self) -> bool {
+        self.is_syncing.load(Ordering::Relaxed)
     }
 
 
@@ -2307,6 +2319,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
             chat_history: Arc::clone(&self.chat_history),
             outbox_chat_limiter: Arc::clone(&self.outbox_chat_limiter),
             light_chat_limits: Arc::clone(&self.light_chat_limits),
+            is_syncing: Arc::new(AtomicBool::new(false)),
         };
         (handle, rx)
     }
@@ -2603,6 +2616,12 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                     *handle.mempool_size.write().await = self.mempool.len();
                     *handle.mempool_txs.write().await = self.mempool.transactions_cloned();
                     *handle.peer_addrs.write().await = self.network.peer_addrs();
+                    // Publish sync status so /state can tell pools/miners to pause.
+                    // Same definition the StateInfo handler uses internally.
+                    handle.is_syncing.store(
+                        self.sync.is_in_progress() || self.sync.has_active_session(),
+                        Ordering::Relaxed,
+                    );
                     
                     // --- WebRTC Load Shedding ---
                     // Filter for WebRTC addresses here at the UI level

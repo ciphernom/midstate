@@ -96,6 +96,12 @@ pub struct GetStateResponse {
     pub required_pow: u32,
     pub webrtc_addrs: Vec<String>, 
     pub header_hash: String, 
+    /// True while the node is bulk-syncing historical blocks. Pools and miners
+    /// should pause template generation while this is set — every tip reported
+    /// during a sync is an already-superseded height. `#[serde(default)]` so
+    /// clients deserializing responses from older nodes (field absent) don't fail.
+    #[serde(default)]
+    pub is_syncing: bool,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetMssStateRequest {
@@ -426,4 +432,18 @@ pub struct SubmitChatRequest {
 pub struct GetChatResponse {
     pub messages: Vec<crate::node::ChatMessage>,
     pub dictionary: Vec<String>,
+}
+// ── Analytics / Chart Types ─────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BlockStat {
+    pub height: u64,
+    pub timestamp: u64,
+    pub target: String,
+    pub tx_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChainStatsResponse {
+    pub blocks: Vec<BlockStat>,
 }

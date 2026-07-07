@@ -66,6 +66,7 @@ pub async fn get_state(State(node): State<AppState>) -> Json<GetStateResponse> {
         required_pow,
         webrtc_addrs, 
         header_hash: hex::encode(state.header_hash),
+        is_syncing: node.is_syncing(),
     })
 }
 
@@ -128,7 +129,12 @@ pub async fn send_transaction(
     if req.inputs.is_empty() {
         return Err(ErrorResponse { error: "Must provide at least one input".into() });
     }
-    if req.signatures.len() != req.inputs.len() {
+    // Consolidate transactions carry exactly ONE aggregated witness covering ALL
+    // inputs (enforced below when the Transaction is built). The per-input count
+    // rule only applies to standard Reveals — without this exemption, any
+    // consolidate with >1 input is rejected here before the consolidate branch
+    // is ever reached, making the two checks mutually unsatisfiable.
+    if !req.is_consolidate && req.signatures.len() != req.inputs.len() {
         return Err(ErrorResponse {
             error: "Signature count must match input count".into(),
         });
@@ -331,8 +337,36 @@ pub async fn get_metrics(State(node): State<AppState>) -> Json<GetMetricsRespons
     })
 }
 
-// ── CoinJoin Mix Handlers ───────────────────────────────────────────────
+/// Retrieve historical block statistics for chain analytics.
+pub async fn get_chain_stats(
+    State(node): State<AppState>,
+) -> Result<Json<ChainStatsResponse>, ErrorResponse> {
+    let state = node.get_state().await;
+    let store = &node.storage.batches;
+    
+    // Fetch up to the last 144 blocks (approx 2.4 hours at 1m blocks)
+    let limit = 144;
+    let start = state.height.saturating_sub(limit);
+    let end = state.height;
+    
+    let batches = store.load_range(start, end)
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+        
+    let mut blocks = Vec::with_capacity(batches.len());
+    // Reverse so the newest block is first
+    for (h, b) in batches.into_iter().rev() {
+        blocks.push(BlockStat {
+            height: h,
+            timestamp: b.timestamp,
+            target: hex::encode(b.target),
+            tx_count: b.transactions.len(),
+        });
+    }
+    
+    Ok(Json(ChainStatsResponse { blocks }))
+}
 
+// ── CoinJoin Mix Handlers ───────────────────────────────────────────────
 pub async fn mix_create(
     State(node): State<AppState>,
     Json(req): Json<MixCreateRequest>,

@@ -14,6 +14,11 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
 
 <div class="hdr">
     <h1>MIDSTATE<span style="color:var(--accent);">.</span>EXPLORER</h1>
+    <div class="explorer-tabs" id="tabs">
+        <a class="tab-link active" onclick="switchTab('explorer')">BATCHES</a>
+        <a class="tab-link" onclick="switchTab('mempool')">MEMPOOL</a>
+        <a class="tab-link" onclick="switchTab('analytics')">ANALYTICS</a>
+    </div>
     <div class="hdr-right">
         <span><div class="live-dot" id="live-dot"></div> <span class="label">HEIGHT</span> <span class="val" id="h-height">-</span></span>
         <span><span class="label">MEMPOOL</span> <span class="val" id="h-mempool">-</span></span>
@@ -58,8 +63,13 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
 let tipHeight = 0;
 let activeBatch = null;
 let activeQuery = null;
+
 // blockCache stores {txCount, cbCount} keyed by height, populated when blocks are loaded
 const blockCache = {};
+
+let currentTab = 'explorer';
+let lastMempoolData = null;
+
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -145,11 +155,14 @@ async function poll() {
         document.getElementById('s-peers').textContent = peers.peers.length;
         document.getElementById('live-dot').style.background = 'var(--green)';
 
+        lastMempoolData = mempool;
+
         if (prevTip > 0 && tipHeight > prevTip) {
             log(`New batch ${tipHeight}`, 'var(--green)');
         }
 
         renderBatchList();
+        if (currentTab === 'mempool') renderMempoolView();
     } catch(e) {
         document.getElementById('live-dot').style.background = 'var(--red)';
     }
@@ -180,10 +193,12 @@ async function execCmd(cmd) {
     log(`> ${cmd}`, 'var(--text-max)');
 
     if (cmd.toLowerCase() === 'mempool') {
-        await showMempool();
+        switchTab('mempool');
     } else if (/^[0-9]+$/.test(cmd)) {
+        switchTab('explorer');
         await loadBlock(parseInt(cmd));
     } else if (/^[0-9a-fA-F]{64}$/.test(cmd)) {
+        switchTab('explorer');
         activeQuery = cmd.toLowerCase();
         await searchHash(cmd.toLowerCase());
     } else {
@@ -264,6 +279,116 @@ function isUniformMix(txReveal) {
 }
 
 // ── Block Renderer ──────────────────────────────────────────────────────
+
+// ── Tab Management & Visualizers ────────────────────────────────────────
+
+function switchTab(tab) {
+    currentTab = tab;
+    document.querySelectorAll('.tab-link').forEach(el => el.classList.remove('active'));
+    document.querySelector(`.tab-link[onclick="switchTab('${tab}')"]`).classList.add('active');
+    
+    const mv = document.getElementById('main-view');
+    if (tab === 'mempool') {
+        renderMempoolView();
+    } else if (tab === 'analytics') {
+        renderAnalyticsView();
+    } else {
+        if (activeBatch !== null) loadBlock(activeBatch);
+        else mv.innerHTML = `<div style="color:var(--text-faint); padding:40px 0; text-align:center;">Select a batch to view</div>`;
+    }
+}
+
+
+
+// Renders the Dual-Queue Mempool
+function renderMempoolView() {
+    const mv = document.getElementById('main-view');
+    const data = lastMempoolData;
+    if (!data) return;
+
+    let commits = []; let reveals = [];
+    data.transactions.forEach((tx) => {
+        if (tx.commitment && !tx.input_coins) commits.push(tx);
+        else reveals.push(tx);
+    });
+    reveals.sort((a,b) => (b.fee||0) - (a.fee||0)); // Sort by fee descending
+
+    let html = `<div class="block-hdr"><h2>DUAL-QUEUE MEMPOOL</h2></div><div class="mempool-split">`;
+
+    html += `<div class="mp-col"><div class="mp-col-hdr">COMMITS (PoW QUEUE) - ${commits.length}</div><div class="mp-col-body"><div class="commit-grid">`;
+    commits.forEach(c => {
+        html += `<div class="commit-block" title="${c.commitment}" onclick="execCmd('${c.commitment}')">[c]</div>`;
+    });
+    html += `</div></div></div>`;
+
+    html += `<div class="mp-col"><div class="mp-col-hdr">REVEALS (FEE MARKET) - ${reveals.length}</div><div class="mp-col-body">`;
+    reveals.forEach(r => {
+        const ins = (r.input_coins||[]).length; const outs = (r.output_coins||[]).length;
+        html += `<div class="reveal-item" onclick="execCmd('${r.input_coins[0]||''}')">
+            <span>${ins} IN → ${outs} OUT</span><span class="fee-rate">${r.fee} fee</span>
+        </div>`;
+    });
+    html += `</div></div></div></div>`;
+
+    mv.innerHTML = html;
+}
+
+// Renders the Analytics Charts
+async function renderAnalyticsView() {
+    const mv = document.getElementById('main-view');
+    mv.innerHTML = `<div style="padding:20px; color:var(--text-faint);">Loading analytics...</div>`;
+    try {
+        const res = await fetch('/stats/history');
+        const data = await res.json();
+        const blocks = data.blocks.reverse();
+        if (blocks.length === 0) return;
+
+        const totalTxs = blocks.reduce((s, b) => s + b.tx_count, 0);
+        const maxTxs = Math.max(...blocks.map(b => b.tx_count), 1);
+        
+        let avgTime = 0;
+        if (blocks.length > 1) {
+            const elapsed = blocks[blocks.length-1].timestamp - blocks[0].timestamp;
+            avgTime = (elapsed / (blocks.length - 1)).toFixed(1);
+        }
+
+        let html = `<div class="block-hdr"><h2>CHAIN DYNAMICS (Last ${blocks.length} Blocks)</h2></div>`;
+        
+        html += `<div class="stat-grid">
+            <div class="stat-box"><div class="lbl">TOTAL TXs</div><div class="val">${totalTxs}</div></div>
+            <div class="stat-box"><div class="lbl">AVG BLOCK TIME</div><div class="val">${avgTime}s</div></div>
+            <div class="stat-box"><div class="lbl">PEAK TX/BLOCK</div><div class="val">${maxTxs}</div></div>
+        </div>`;
+
+        // Bar Chart (Tx Count)
+        let txBars = '';
+        blocks.forEach(b => {
+            const hPct = (b.tx_count / maxTxs) * 100;
+            txBars += `<div class="bar" style="height:${Math.max(hPct, 1)}%;" title="Block ${b.height}: ${b.tx_count} txs"></div>`;
+        });
+        html += `<div class="chart-container">
+            <div class="chart-title">Transaction Throughput</div>
+            <div class="bar-chart">${txBars}</div>
+        </div>`;
+
+        // Bar Chart (Block Times)
+        let timeBars = '';
+        let blockTimes = blocks.map((b, i) => i === 0 ? 60 : Math.max(0, b.timestamp - blocks[i-1].timestamp));
+        let maxTime = Math.max(...blockTimes, 120);
+
+        blockTimes.forEach((t, i) => {
+            const hPct = Math.min((t / maxTime) * 100, 100);
+            let color = t > 180 ? 'var(--warn-accent)' : 'var(--border-bright)';
+            timeBars += `<div class="bar" style="height:${Math.max(hPct, 1)}%; background:${color};" title="Block ${blocks[i].height}: ${t} seconds"></div>`;
+        });
+        html += `<div class="chart-container">
+            <div class="chart-title">Block Times (Seconds)</div>
+            <div class="bar-chart">${timeBars}</div>
+        </div>`;
+
+        mv.innerHTML = html;
+    } catch(e) { mv.innerHTML = `<div style="color:var(--red);padding:20px;">Error: ${e.message}</div>`; }
+}
 
 async function loadBlock(h) {
     activeBatch = h;
@@ -368,19 +493,18 @@ async function loadBlock(h) {
                 </div>`;
             }
 
-            if (tx.Reveal) {
-                const inSum = tx.Reveal.inputs.reduce((s,i) => s + i.value, 0);
-                const outSum = tx.Reveal.outputs.reduce((s,o) => {
-                    if (o.Standard) return s + o.Standard.value;
-                    if (o.DataBurn) return s + o.DataBurn.value_burned;
-                    return s;
-                }, 0);
+            if (tx.Reveal || tx.Consolidate) {
+                const data = tx.Reveal || tx.Consolidate;
+                const isMix = isUniformMix(data);
+                const typeStr = tx.Consolidate ? 'CONSOLIDATE' : 'REVEAL';
+                const badge = isMix ? `<span class="badge-mix">DARK POOL MIX</span>` : '';
+                
+                let inSum = 0; let outSum = 0;
+                if(data.inputs) inSum = data.inputs.reduce((s,i) => s + i.value, 0);
+                if(data.outputs) outSum = data.outputs.reduce((s,o) => s + (o.Standard ? o.Standard.value : (o.DataBurn ? o.DataBurn.value_burned : 0)), 0);
                 const fee = inSum - outSum;
 
-                const isMix = isUniformMix(tx.Reveal);
-                const mixBadge = isMix ? `<span class="badge-mix">❈ DARK POOL MIX</span>` : '';
-
-                let inputsHtml = tx.Reveal.inputs.map(inp => {
+                let inputsHtml = (data.inputs || []).map(inp => {
                     const addr = inp.predicate.Script ? inp.predicate.Script.bytecode
                                : inp.predicate.P2pk ? inp.predicate.P2pk : inp.predicate;
                     return `<div class="io-item">
@@ -390,7 +514,7 @@ async function loadBlock(h) {
                     </div>`;
                 }).join('');
 
-                let outputsHtml = tx.Reveal.outputs.map(out => {
+                let outputsHtml = (data.outputs || []).map(out => {
                     if (out.Standard) {
                         return `<div class="io-item">
                             <span class="val-badge positive">+${out.Standard.value}</span>
@@ -415,28 +539,34 @@ async function loadBlock(h) {
                             </div>
                         </div>`;
                     }
+                    if (out.Confidential) {
+                        return `<div class="io-item">
+                            <span class="val-badge" style="color:var(--text-muted)">STATE</span>
+                            ${renderField('address', out.Confidential.address)}
+                            ${renderField('commitment', out.Confidential.commitment)}
+                        </div>`;
+                    }
                 }).join('');
 
-                // Render the DAG flow
-                html += `<div class="tx-card">
+                html += `<div class="tx-card" ${isMix ? 'style="border: 1px dashed var(--text-muted);"' : ''}>
                     <div class="tx-hdr">
-                        <span class="tx-type">TX ${i} \u2014 PHASE 2: REVEAL ${mixBadge}</span>
+                        <span class="tx-type">TX ${i} \u2014 PHASE 2: ${typeStr} ${badge}</span>
                         <span class="tx-fee">fee: ${fee}</span>
                     </div>
                     <div class="tx-body">
                         <div class="tx-flow">
                             <div class="tx-col">
-                                <div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;margin-bottom:6px;">Inputs (${tx.Reveal.inputs.length})</div>
+                                <div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;margin-bottom:6px;">Inputs (${data.inputs ? data.inputs.length : 0})</div>
                                 ${inputsHtml}
                             </div>
                             <div class="tx-arrow">→</div>
                             <div class="tx-col">
-                                <div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;margin-bottom:6px;">Outputs (${tx.Reveal.outputs.length})</div>
+                                <div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;margin-bottom:6px;">Outputs (${data.outputs ? data.outputs.length : 0})</div>
                                 ${outputsHtml}
                             </div>
                         </div>
                         <div style="padding-top:8px; border-top:1px dashed var(--border); margin-top:12px;">
-                            ${renderField('Unblinding Salt', tx.Reveal.salt)}
+                            ${renderField('Unblinding Salt', data.salt)}
                         </div>
                     </div>
                 </div>`;
@@ -488,53 +618,7 @@ async function checkCoinStatuses() {
     }
 }
 
-// ── Mempool View ────────────────────────────────────────────────────────
 
-async function showMempool() {
-    const mv = document.getElementById('main-view');
-    try {
-        const res = await fetch('/mempool');
-        const data = await res.json();
-
-        let html = `<div class="block-hdr">
-            <h2>MEMPOOL</h2>
-            <div style="color:var(--text);">${data.size} transaction(s)</div>
-        </div>`;
-
-        if (data.transactions.length === 0) {
-            html += '<div style="color:var(--text-faint);padding:20px;">Empty mempool.</div>';
-        }
-
-        for (const tx of data.transactions) {
-            if (tx.commitment) {
-                html += `<div class="mp-item">
-                    <span class="mp-type">COMMIT</span>
-                    ${renderField('commitment', tx.commitment)}
-                </div>`;
-            } else {
-                const coins = (tx.input_coins||[]).join(', ');
-                const outs = (tx.output_coins||[]).join(', ');
-                html += `<div class="mp-item">
-                    <span class="mp-type">REVEAL</span>
-                    <span class="tx-fee" style="float:right;">fee: ${tx.fee||0}</span>
-                    <div class="field" style="margin-top:6px;">
-                        <div class="lbl">Inputs</div>
-                        <div class="hex" style="font-size:10px;">${(tx.input_coins||[]).map(c => hexLink(c)).join(' ')}</div>
-                    </div>
-                    <div class="field">
-                        <div class="lbl">Outputs</div>
-                        <div class="hex" style="font-size:10px;">${(tx.output_coins||[]).map(c => hexLink(c)).join(' ')}</div>
-                    </div>
-                </div>`;
-            }
-        }
-
-        mv.innerHTML = html;
-        mv.scrollTop = 0;
-    } catch(e) {
-        mv.innerHTML = `<div style="color:var(--red);">Error: ${e.message}</div>`;
-    }
-}
 
 // ── Init ────────────────────────────────────────────────────────────────
 

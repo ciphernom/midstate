@@ -203,6 +203,12 @@ struct PoolState {
     /// Cumulative accepted shares per (address, worker-name). A pure stats layer for
     /// per-rig breakdown; payout accounting stays strictly per-address and is untouched.
     worker_stats: RwLock<HashMap<([u8; 32], String), u64>>,
+    /// Set by the block-submission task when a submitted block is REJECTED by the
+    /// node or the submission itself FAILS (connection refused / timeout / dropped).
+    /// The network tip does not change in either case, so without this flag the
+    /// template loop would never rebuild and miners would re-grind the same doomed
+    /// template forever. Consumed (cleared) by the polling loop when it rebuilds.
+    force_new_job: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Deserialize)]
@@ -497,6 +503,7 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_
         current_height: std::sync::atomic::AtomicU64::new(0),
         share_stats: RwLock::new(HashMap::new()),
         worker_stats: RwLock::new(HashMap::new()),
+        force_new_job: std::sync::atomic::AtomicBool::new(false),
     });
 
     let api_state = state.clone();
@@ -548,7 +555,17 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         let mut last_network_tip = String::new();
-        let mut job_counter = 0;
+        // Seed job IDs with the Unix timestamp so IDs issued before a pool restart
+        // can never collide with IDs issued after it. (A zero-seeded counter resets
+        // on restart; a still-connected miner's stale share can then carry a job_id
+        // that matches the NEW counter and gets validated against the new midstate,
+        // producing an endless "Low difficulty" reject stream for that miner.)
+        // The loop below issues at most one job per second, so the counter can never
+        // catch up to and overlap a future restart's seed.
+        let mut job_counter: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         loop {
             let rpc_url = state_clone.node_rpc_url.clone();
@@ -557,6 +574,23 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_
                 Ok(res) => res.json().await.unwrap_or_default(),
                 Err(_) => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
             };
+
+            // ── Sync Guard ──
+            // While the backend node is bulk-downloading historical blocks, every tip
+            // it reports is an already-superseded height: any template built from it
+            // burns 100% of the pool's hashpower on obsolete blocks. Drop the current
+            // job so miner submissions are ignored, and clear the tip tracker so a
+            // fresh template is built on the first poll after the sync completes.
+            // (`unwrap_or(false)` keeps this backward compatible with older nodes
+            // whose /state payload doesn't include the field.)
+            if net_state["is_syncing"].as_bool().unwrap_or(false) {
+                if state_clone.current_job.write().await.take().is_some() {
+                    tracing::warn!("backend node is syncing historical blocks; pausing job generation");
+                }
+                last_network_tip.clear();
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
 
             let current_tip = net_state["header_hash"].as_str().unwrap_or("").to_string();
             let mut n_target = [0u8; 32];
@@ -570,7 +604,16 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_
             let tip_height = net_state["height"].as_u64().unwrap_or(0);
             state_clone.current_height.store(tip_height, std::sync::atomic::Ordering::Relaxed);
 
-            if current_tip != last_network_tip && !current_tip.is_empty() {
+            // A rejected or failed block submission sets `force_new_job`: the network
+            // tip won't change in that case, so a tip-only condition would re-serve
+            // the doomed template forever. Consume the flag only when we have a
+            // usable tip, so a request that races an empty /state response isn't
+            // silently lost. (If template building fails below, `last_network_tip`
+            // is cleared, which guarantees a retry on the next poll regardless.)
+            let force_new_job = !current_tip.is_empty()
+                && state_clone.force_new_job.swap(false, std::sync::atomic::Ordering::SeqCst);
+
+            if (current_tip != last_network_tip || force_new_job) && !current_tip.is_empty() {
                 job_counter += 1;
                 last_network_tip = current_tip.clone();
 
@@ -838,13 +881,16 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                             let batch_for_node = batch.clone();
                                             let db_clone = state.db.clone();
                                             let rpc_url = state.node_rpc_url.clone();
+                                            // Cloned into the submission task so it can flag the template
+                                            // loop for a fresh job on rejection/failure (force_new_job).
+                                            let submit_state = state.clone();
                                             
                                             tokio::spawn(async move {
                                                 let res = reqwest::Client::new().post(&format!("{}/submit_batch", rpc_url))
                                                     .json(&batch_for_node).send().await;
                                                     
-                                                if let Ok(resp) = res {
-                                                    if resp.status().is_success() {
+                                                match res {
+                                                    Ok(resp) if resp.status().is_success() => {
                                                         tracing::info!("block accepted by network. applying score deductions.");
                                                         let write_txn = db_clone.begin_write().unwrap();
                                                         {
@@ -897,8 +943,31 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                                             s_table.insert(batch.timestamp, scores_data.as_str()).unwrap();
                                                         }
                                                         write_txn.commit().unwrap();
-                                                    } else {
-                                                        tracing::warn!("block rejected by network. retaining miner scores.");
+                                                    }
+                                                    Ok(resp) => {
+                                                        // The node answered but refused the block (stale, invalid,
+                                                        // etc). The tip won't change on a rejection, so force the
+                                                        // template loop to rebuild instead of letting miners
+                                                        // re-grind the doomed template indefinitely.
+                                                        let status = resp.status();
+                                                        let body = resp.text().await.unwrap_or_default();
+                                                        tracing::warn!(
+                                                            "block rejected by network ({}): {}. retaining miner scores; requesting fresh job.",
+                                                            status, body.trim()
+                                                        );
+                                                        submit_state.force_new_job.store(true, std::sync::atomic::Ordering::SeqCst);
+                                                    }
+                                                    Err(e) => {
+                                                        // The submission never reached the node (connection refused,
+                                                        // timeout, dropped mid-flight). Previously this arm didn't
+                                                        // exist and the error was swallowed silently: no log, no
+                                                        // corrective action. Scores are retained (deductions only
+                                                        // happen on confirmed acceptance) and a fresh job is forced.
+                                                        tracing::error!(
+                                                            "block submission to node failed: {}. retaining miner scores; requesting fresh job.",
+                                                            e
+                                                        );
+                                                        submit_state.force_new_job.store(true, std::sync::atomic::Ordering::SeqCst);
                                                     }
                                                 }
                                             });
