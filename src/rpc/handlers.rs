@@ -715,7 +715,8 @@ pub async fn search(
     State(node): State<AppState>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, ErrorResponse> {
-    let query = parse_hex32(&req.query, "query")?;
+    let query = crate::core::types::parse_address_flexible(&req.query)
+        .map_err(|e| ErrorResponse { error: e })?;
 
     let store = &node.storage.batches; 
 

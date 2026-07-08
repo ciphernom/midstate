@@ -1577,27 +1577,77 @@ async fn wallet_list(path: &PathBuf, rpc_port: u16, rpc_host: String, full: bool
     let wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
 
+    let mut mss_addrs = std::collections::HashSet::new();
+    for mss in wallet.mss_keys() {
+        mss_addrs.insert(midstate::compute_address(&mss.master_pk));
+    }
+
     if wallet.coin_count() > 0 || !wallet.list_licenses().is_empty() {
         println!("COINS:");
-        if full {
-            println!("{:<5} {:<66} {:<8} {:<10} {}", "#", "COIN_ID", "VALUE", "STATUS", "LABEL");
-            println!("{}", "-".repeat(100));
-        } else {
-            println!("{:<5} {:<15} {:<8} {:<10} {}", "#", "COIN_ID", "VALUE", "STATUS", "LABEL");
-            println!("{}", "-".repeat(55));
-        }
-
+        
+        let mut coins_by_addr: std::collections::HashMap<[u8; 32], Vec<(usize, &midstate::wallet::WalletCoin, Result<bool, ()>)>> = std::collections::HashMap::new();
+        
+        // Fetch statuses and group by address
         for (i, wc) in wallet.coins().iter().enumerate() {
             let coin_hex = hex::encode(wc.coin_id);
             let status = check_coin_rpc(&client, rpc_port, &rpc_host, &coin_hex).await;
-            let label = wc.label.as_deref().unwrap_or("");
-            let status_str = match status {
-                Ok(true) => "✓ live",
-                Ok(false) => "✗ unset",
-                Err(_) => "? error",
+            let status_res = match status {
+                Ok(b) => Ok(b),
+                Err(_) => Err(()),
             };
-            let display = if full { coin_hex } else { hex::encode(&wc.coin_id) };
-            println!("{:<5} {:<15} {:<8} {:<10} {}", i, display, wc.value, status_str, label);
+            coins_by_addr.entry(wc.address).or_default().push((i, wc, status_res));
+        }
+
+        // Sort addresses by number of coins descending to surface busy addresses at the top
+        let mut sorted_addrs: Vec<[u8; 32]> = coins_by_addr.keys().copied().collect();
+        sorted_addrs.sort_by(|a, b| {
+            let count_a = coins_by_addr.get(a).unwrap().len();
+            let count_b = coins_by_addr.get(b).unwrap().len();
+            count_b.cmp(&count_a).then(a.cmp(b))
+        });
+
+        for addr in sorted_addrs {
+            let group = coins_by_addr.get(&addr).unwrap();
+            let addr_str = midstate::core::types::encode_address_with_checksum(&addr);
+            let addr_type = if mss_addrs.contains(&addr) { "MSS" } else { "WOTS" };
+            
+            let mut total_bal = 0u64;
+            let mut live_bal = 0u64;
+            
+            for (_, wc, status) in group {
+                total_bal += wc.value;
+                if let Ok(true) = status {
+                    live_bal += wc.value;
+                }
+            }
+
+            println!("\nAddress: {} ({})", addr_str, addr_type);
+            println!("Balance: {} (Live: {})", total_bal, live_bal);
+            
+            if full {
+                println!("  {:<5} {:<64} {:<8} {:<10} {}", "#", "COIN_ID", "VALUE", "STATUS", "LABEL");
+                println!("  {}", "-".repeat(100));
+            } else {
+                println!("  {:<5} {:<15} {:<8} {:<10} {}", "#", "COIN_ID", "VALUE", "STATUS", "LABEL");
+                println!("  {}", "-".repeat(55));
+            }
+
+            for (i, wc, status) in group {
+                let coin_hex = hex::encode(wc.coin_id);
+                let label = wc.label.as_deref().unwrap_or("");
+                let status_str = match status {
+                    Ok(true) => "✓ live",
+                    Ok(false) => "✗ unset",
+                    Err(_) => "? error",
+                };
+                
+                if full {
+                    println!("  {:<5} {:<64} {:<8} {:<10} {}", i, coin_hex, wc.value, status_str, label);
+                } else {
+                    let display_coin = format!("{}...", &coin_hex[..12]);
+                    println!("  {:<5} {:<15} {:<8} {:<10} {}", i, display_coin, wc.value, status_str, label);
+                }
+            }
         }
     }
 
@@ -1685,9 +1735,10 @@ async fn wallet_consolidate(
     // Create a fresh MSS tree to hold the consolidated funds safely
     let new_mss_pk = wallet.generate_mss(10, Some("Consolidated Sweeper".into()))?;
     
-    // ~85 bytes per InputReveal (predicate + value + salt + overhead)
-    let estimated_bytes = 100 + 1636 + 100 + (live_coins.len() as u64 * 85);
-    let fee = (estimated_bytes * 10) / 1024 + 10;
+    // Accurately account for bincode's hidden 8-byte Vec prefixes and 4-byte Enum tags
+    // ~125 bytes per InputReveal ensures we generously clear the mempool's MIN_FEE_PER_KB rule
+    let estimated_bytes = 600 + 3000 + 100 + (live_coins.len() as u64 * 125);
+    let fee = (estimated_bytes * 10) / 1024 + 20; // 20 units padding
     
     if total_val <= fee {
         anyhow::bail!("Total value {} is too low to pay the network fee of {}", total_val, fee);
@@ -1749,6 +1800,31 @@ async fn wallet_consolidate(
         anyhow::bail!("Reveal failed: {}", err.error);
     }
     
+    // --- WAIT FOR BLOCKCHAIN TO MINE THE REVEAL ---
+    let check_coin_hex = hex::encode(live_coins[0]);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut revealed = false;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if let Ok(resp) = client
+            .post(&format!("http://{}:{}/check", rpc_host, rpc_port))
+            .json(&crate::rpc::CheckCoinRequest { coin: check_coin_hex.clone() })
+            .send().await
+        {
+            if let Ok(check) = resp.json::<crate::rpc::CheckCoinResponse>().await {
+                // If the first input coin no longer exists on chain, the block was mined!
+                if !check.exists { revealed = true; break; }
+            }
+        }
+        eprint!(".");
+    }
+    eprintln!();
+
+    if !revealed {
+        println!("⏳ Reveal submitted but not yet mined. It is safe in the mempool.");
+        return Ok(());
+    }
+
     wallet.complete_reveal(&commitment)?;
     println!("✓ Dust swept successfully into {} new UTXOs!", outputs.len());
     

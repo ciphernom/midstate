@@ -223,12 +223,11 @@ async function execCmd(cmd) {
     } else if (/^[0-9]+$/.test(cmd)) {
         switchTab('explorer');
         await loadBlock(parseInt(cmd));
-    } else if (/^[0-9a-fA-F]{64}$/.test(cmd)) {
+    } else if (/^[0-9a-fA-F]{64}$/.test(cmd) || /^[0-9a-fA-F]{72}$/.test(cmd)) {
         switchTab('explorer');
-        activeQuery = cmd.toLowerCase();
         await searchHash(cmd.toLowerCase());
     } else {
-        log('Enter a block height, 64-char hex hash, or "mempool"', 'var(--red)');
+        log('Enter a block height, 64/72-char hex string, or "mempool"', 'var(--red)');
     }
 }
 
@@ -237,32 +236,42 @@ async function execCmd(cmd) {
 async function searchHash(hash) {
     log(`Searching for ${shortHex(hash)}\u2026`);
 
-    // Pending state first: the mempool snapshot is at most a few seconds old,
-    // so a hit here is the freshest possible answer for this query.
-    const mpHit = findInMempool(hash);
-    if (mpHit) {
-        log(`In mempool: ${mpHit.desc}`, 'var(--green)');
-        if (mpHit.expandId) mpExpanded.add(mpHit.expandId);
-        mpScrollPending = true;
-        switchTab('mempool');
-    }
+    const baseHash = hash.substring(0, 64);
 
     try {
-        // Check UTXO set first
-        const coinRes = await fetch(`/coin/${hash}`);
-        if (coinRes.ok) {
-            const coinData = await coinRes.json();
-            if (coinData.exists) {
-                log(`Coin is LIVE in UTXO set`, 'var(--green)');
-            }
-        }
-
+        // Do the backend search first to let it validate the checksum
         const res = await fetch('/search', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ query: hash })
         });
         const data = await res.json();
+
+        if (!res.ok) {
+            log(`Error: ${data.error || 'Server error'}`, 'var(--red)');
+            activeQuery = null;
+            return;
+        }
+
+        // If we got here, the checksum (if any) was valid!
+        activeQuery = baseHash;
+
+        // Now check mempool and UTXO set using the verified baseHash
+        const mpHit = findInMempool(baseHash);
+        if (mpHit) {
+            log(`In mempool: ${mpHit.desc}`, 'var(--green)');
+            if (mpHit.expandId) mpExpanded.add(mpHit.expandId);
+            mpScrollPending = true;
+            switchTab('mempool');
+        }
+
+        const coinRes = await fetch(`/coin/${baseHash}`);
+        if (coinRes.ok) {
+            const coinData = await coinRes.json();
+            if (coinData.exists) {
+                log(`Coin is LIVE in UTXO set`, 'var(--green)');
+            }
+        }
 
         if (data.results && data.results.length > 0) {
             log(`Found ${data.results.length} result(s)`, 'var(--green)');
