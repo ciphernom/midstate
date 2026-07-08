@@ -285,6 +285,9 @@ enum WalletAction {
         rpc_host: String,
         #[arg(long)]
         full: bool,
+        /// Only show coins that are confirmed live on-chain
+        #[arg(long)]
+        live: bool,
     },
     Compile {
         #[arg(long)]
@@ -1352,7 +1355,7 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         WalletAction::Receive { path, label } => wallet_receive(&path, label),
         WalletAction::Compile { file } => wallet_compile(&file),
         WalletAction::Generate { path, count, label } => wallet_generate(&path, count, label),
-        WalletAction::List { path, rpc_port, rpc_host, full } => wallet_list(&path, rpc_port, rpc_host, full).await,
+        WalletAction::List { path, rpc_port, rpc_host, full, live } => wallet_list(&path, rpc_port, rpc_host, full, live).await,
         WalletAction::Balance { path, rpc_port, rpc_host } => wallet_balance(&path, rpc_port, rpc_host).await,
         WalletAction::Scan { path, rpc_port, rpc_host, from_genesis } => {
             wallet_scan(&path, rpc_port, rpc_host, from_genesis).await
@@ -1572,7 +1575,7 @@ fn wallet_generate(path: &PathBuf, count: usize, label: Option<String>) -> Resul
     Ok(())
 }
 
-async fn wallet_list(path: &PathBuf, rpc_port: u16, rpc_host: String, full: bool) -> Result<()> {
+async fn wallet_list(path: &PathBuf, rpc_port: u16, rpc_host: String, full: bool, live: bool) -> Result<()> {
     let password = read_password("Password: ")?;
     let wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
@@ -1595,7 +1598,17 @@ async fn wallet_list(path: &PathBuf, rpc_port: u16, rpc_host: String, full: bool
                 Ok(b) => Ok(b),
                 Err(_) => Err(()),
             };
+            
+            // If --live flag is used, skip coins that aren't confirmed live
+            if live && !matches!(status_res, Ok(true)) {
+                continue;
+            }
+
             coins_by_addr.entry(wc.address).or_default().push((i, wc, status_res));
+        }
+
+        if coins_by_addr.is_empty() && live {
+            println!("  No live coins found on-chain.");
         }
 
         // Sort addresses by number of coins descending to surface busy addresses at the top
