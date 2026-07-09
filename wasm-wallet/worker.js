@@ -2788,7 +2788,9 @@ else if (type === 'L2_OPEN_CHANNEL') {
                 }
                 let newMssAddrs = {};
                 for (const mss of cliData.mss_keys) {
-                    newMssAddrs[normalizeHex(mss.master_pk)] = { index: 0, height: mss.height, next_leaf: mss.next_leaf };
+                    const masterPkHex = normalizeHex(mss.master_pk);
+                    const mssAddress = compute_p2pk_address_hex(masterPkHex);
+                    newMssAddrs[mssAddress] = { index: 0, height: mss.height, next_leaf: mss.next_leaf };
                 }
                 wState = {
                     phrase: null,
