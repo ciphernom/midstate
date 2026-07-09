@@ -288,6 +288,12 @@ enum WalletAction {
         /// Only show coins that are confirmed live on-chain
         #[arg(long)]
         live: bool,
+        /// Search/filter by address, coin ID, label, value, or index
+        #[arg(long)]
+        search: Option<String>,
+        /// Filter by address type: "WOTS" or "MSS"
+        #[arg(long, value_name = "TYPE")]
+        addr_type: Option<String>,
     },
     Compile {
         #[arg(long)]
@@ -1355,7 +1361,7 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         WalletAction::Receive { path, label } => wallet_receive(&path, label),
         WalletAction::Compile { file } => wallet_compile(&file),
         WalletAction::Generate { path, count, label } => wallet_generate(&path, count, label),
-        WalletAction::List { path, rpc_port, rpc_host, full, live } => wallet_list(&path, rpc_port, rpc_host, full, live).await,
+        WalletAction::List { path, rpc_port, rpc_host, full, live, search, addr_type } => wallet_list(&path, rpc_port, rpc_host, full, live, search, addr_type).await,
         WalletAction::Balance { path, rpc_port, rpc_host } => wallet_balance(&path, rpc_port, rpc_host).await,
         WalletAction::Scan { path, rpc_port, rpc_host, from_genesis } => {
             wallet_scan(&path, rpc_port, rpc_host, from_genesis).await
@@ -1575,10 +1581,13 @@ fn wallet_generate(path: &PathBuf, count: usize, label: Option<String>) -> Resul
     Ok(())
 }
 
-async fn wallet_list(path: &PathBuf, rpc_port: u16, rpc_host: String, full: bool, live: bool) -> Result<()> {
+async fn wallet_list(path: &PathBuf, rpc_port: u16, rpc_host: String, full: bool, live: bool, search: Option<String>, filter_type: Option<String>) -> Result<()> {
     let password = read_password("Password: ")?;
     let wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
+
+    let q = search.map(|s| s.to_lowercase());
+    let type_q = filter_type.map(|s| s.to_uppercase());
 
     let mut mss_addrs = std::collections::HashSet::new();
     for mss in wallet.mss_keys() {
@@ -1586,11 +1595,8 @@ async fn wallet_list(path: &PathBuf, rpc_port: u16, rpc_host: String, full: bool
     }
 
     if wallet.coin_count() > 0 || !wallet.list_licenses().is_empty() {
-        println!("COINS:");
-        
         let mut coins_by_addr: std::collections::HashMap<[u8; 32], Vec<(usize, &midstate::wallet::WalletCoin, Result<bool, ()>)>> = std::collections::HashMap::new();
         
-        // Fetch statuses and group by address
         for (i, wc) in wallet.coins().iter().enumerate() {
             let coin_hex = hex::encode(wc.coin_id);
             let status = check_coin_rpc(&client, rpc_port, &rpc_host, &coin_hex).await;
@@ -1599,7 +1605,6 @@ async fn wallet_list(path: &PathBuf, rpc_port: u16, rpc_host: String, full: bool
                 Err(_) => Err(()),
             };
             
-            // If --live flag is used, skip coins that aren't confirmed live
             if live && !matches!(status_res, Ok(true)) {
                 continue;
             }
@@ -1607,11 +1612,6 @@ async fn wallet_list(path: &PathBuf, rpc_port: u16, rpc_host: String, full: bool
             coins_by_addr.entry(wc.address).or_default().push((i, wc, status_res));
         }
 
-        if coins_by_addr.is_empty() && live {
-            println!("  No live coins found on-chain.");
-        }
-
-        // Sort addresses by number of coins descending to surface busy addresses at the top
         let mut sorted_addrs: Vec<[u8; 32]> = coins_by_addr.keys().copied().collect();
         sorted_addrs.sort_by(|a, b| {
             let count_a = coins_by_addr.get(a).unwrap().len();
@@ -1619,19 +1619,62 @@ async fn wallet_list(path: &PathBuf, rpc_port: u16, rpc_host: String, full: bool
             count_b.cmp(&count_a).then(a.cmp(b))
         });
 
+        let mut printed_coins_header = false;
+
         for addr in sorted_addrs {
-            let group = coins_by_addr.get(&addr).unwrap();
-            let addr_str = midstate::core::types::encode_address_with_checksum(&addr);
             let addr_type = if mss_addrs.contains(&addr) { "MSS" } else { "WOTS" };
             
+            // Apply Type Filter
+            if let Some(t) = &type_q {
+                if t != addr_type { continue; }
+            }
+
+            let original_group = coins_by_addr.get(&addr).unwrap();
+            let addr_str = midstate::core::types::encode_address_with_checksum(&addr);
+            
+            // Calculate total address balances based on original group (pre-search-filter)
             let mut total_bal = 0u64;
             let mut live_bal = 0u64;
-            
-            for (_, wc, status) in group {
+            for (_, wc, status) in original_group {
                 total_bal += wc.value;
                 if let Ok(true) = status {
                     live_bal += wc.value;
                 }
+            }
+
+            // Apply search filter
+            let mut filtered_group = Vec::new();
+            let mut address_matched = false;
+
+            if let Some(query) = &q {
+                if addr_str.to_lowercase().contains(query) || hex::encode(&addr).contains(query) {
+                    address_matched = true;
+                }
+                
+                for &(i, wc, ref status) in original_group {
+                    let coin_hex = hex::encode(wc.coin_id);
+                    let label = wc.label.as_deref().unwrap_or("").to_lowercase();
+                    
+                    if address_matched 
+                        || coin_hex.contains(query) 
+                        || label.contains(query) 
+                        || wc.value.to_string().contains(query)
+                        || i.to_string() == *query 
+                    {
+                        filtered_group.push((i, wc, status.clone()));
+                    }
+                }
+            } else {
+                filtered_group = original_group.clone();
+            }
+
+            if filtered_group.is_empty() {
+                continue;
+            }
+
+            if !printed_coins_header {
+                println!("COINS:");
+                printed_coins_header = true;
             }
 
             println!("\nAddress: {} ({})", addr_str, addr_type);
@@ -1645,7 +1688,7 @@ async fn wallet_list(path: &PathBuf, rpc_port: u16, rpc_host: String, full: bool
                 println!("  {}", "-".repeat(55));
             }
 
-            for (i, wc, status) in group {
+            for (i, wc, status) in filtered_group {
                 let coin_hex = hex::encode(wc.coin_id);
                 let label = wc.label.as_deref().unwrap_or("");
                 let status_str = match status {
@@ -1662,25 +1705,50 @@ async fn wallet_list(path: &PathBuf, rpc_port: u16, rpc_host: String, full: bool
                 }
             }
         }
+        
+        if !printed_coins_header && live {
+            println!("  No matching coins found.");
+        }
     }
 
-    // License summary (polish for v1)
     let licenses = wallet.list_licenses();
     if !licenses.is_empty() {
-        println!("\nPRUNING LICENSES: {} held", licenses.len());
-        if full {
-            for (i, (_key, meta)) in licenses.iter().enumerate() {
+        let mut printed_license_header = false;
+        for (i, (key, meta)) in licenses.iter().enumerate() {
+            if let Some(query) = &q {
+                if !hex::encode(key).contains(query) && i.to_string() != *query {
+                    continue;
+                }
+            }
+            if !printed_license_header {
+                println!("\nPRUNING LICENSES: {} held", licenses.len());
+                printed_license_header = true;
+            }
+            if full {
                 println!("  [{}] fixed_fee={} weight={} range={}-{}",
                     i, meta.fixed_royalty_fee, meta.archival_weight, meta.min_height, meta.max_height);
+            } else {
+                println!("  [{}] {} (fee: {})", i, hex::encode(key), meta.fixed_royalty_fee);
             }
         }
     }
 
-if !wallet.keys().is_empty() {
-        println!("\nUNUSED RECEIVING KEYS:");
+    if !wallet.keys().is_empty() {
+        let mut printed_keys_header = false;
         for (i, k) in wallet.keys().iter().enumerate() {
             let display = if full { midstate::core::types::encode_address_with_checksum(&k.address) } else { hex::encode(&k.address) };
             let label = k.label.as_deref().unwrap_or("");
+            
+            if let Some(query) = &q {
+                if !display.to_lowercase().contains(query) && !label.to_lowercase().contains(query) && i.to_string() != *query {
+                    continue;
+                }
+            }
+
+            if !printed_keys_header {
+                println!("\nUNUSED RECEIVING KEYS:");
+                printed_keys_header = true;
+            }
             println!("  [K{}] {} {}", i, display, label);
         }
     }

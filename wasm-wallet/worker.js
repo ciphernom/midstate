@@ -1072,6 +1072,18 @@ self.onmessage = async (e) => {
                 { kind: "signature", value: normalizeHex(jsonBytes) }
             ]).catch(()=>{});
         }
+        else if (type === 'DEX_BROADCAST_BIDFILL') {
+            const jsonBytes = new TextEncoder().encode(JSON.stringify(payload));
+            submitClientMinedChat([255, 205], null, [
+                { kind: "signature", value: normalizeHex(jsonBytes) }
+            ]).catch(()=>{});
+        }
+        else if (type === 'DEX_BROADCAST_BIDSECRET') {
+            const jsonBytes = new TextEncoder().encode(JSON.stringify(payload));
+            submitClientMinedChat([255, 206], null, [
+                { kind: "signature", value: normalizeHex(jsonBytes) }
+            ]).catch(()=>{});
+        }
         else if (type === 'DEX_BROADCAST_ACCEPT') {
             // Taker side. We send ONLY our identity + EVM address — never any secret or
             // secret hash. The maker generates the secret (see DEX_LOCK_MIDSTATE).
@@ -2341,6 +2353,168 @@ self.onmessage = async (e) => {
             } catch (e) {}
             self.postMessage({ type: 'DEX_SETTLED_STATUS', payload: { offerId, settled, success } });
         }
+        // ═══════════ ESCROWED-BID FILLS (Part 2) ═══════════
+        else if (type === 'DEX_BIDFILL_LOCK') {
+            // SELLER: lock MDS for a reserved Base bid. Same shape as the covenant
+            // branch of DEX_LOCK_MIDSTATE, but the hashlock comes from the BID (the
+            // bidder generated the secret) and the receiver is the bid's makerMdsAddr
+            // verbatim — an address, not a pubkey to derive.
+            await acquireSendLock();
+            try {
+                const { bidId, hashlock, receiverAddr, minPayout, timeoutHeight } = payload;
+                const sh = normalizeHex(String(hashlock ?? '').replace(/^0x/i, '')), ra = normalizeHex(String(receiverAddr ?? '').replace(/^0x/i, ''));
+                if (!/^[0-9a-f]{64}$/.test(sh) || !/^[0-9a-f]{64}$/.test(ra)) throw new Error("Bad hashlock/receiver");
+                const myPk = getPrimaryMssPk();
+                const covScriptHex = build_covenant_htlc_bytecode_hex(sh, ra, BigInt(minPayout), BigInt(timeoutHeight), myPk);
+                const covAddr = blake3_hash_hex(covScriptHex);
+                // Over-fund by the fee budget: the bidder's claim fee comes out of the
+                // locked value, so a bidder holding zero MDS can still claim.
+                const fundRes = await performContractTx({
+                    reqId: 4200, kind: 'fund',
+                    contractAddress: covAddr,
+                    amount: Number(minPayout) + COVENANT_FEE_BUDGET
+                });
+                const coins = (fundRes && fundRes.coins) || [];
+                if (!coins.length) throw new Error("Funding produced no coins");
+                self.postMessage({ type: 'DEX_BIDFILL_LOCKED', payload: {
+                    bidId, coins, secretHash: sh, receiverAddr: ra,
+                    minPayout: Number(minPayout), timeoutHeight: Number(timeoutHeight),
+                    refundPk: myPk, lockedAtHeight: networkHeight
+                }});
+            } catch (err) {
+                self.postMessage({ type: 'DEX_BIDFILL_LOCK_FAILED', payload: { bidId: payload && payload.bidId, error: (err && err.message) || String(err) } });
+            } finally { releaseSendLock(); }
+        }
+        else if (type === 'DEX_BIDFILL_VERIFY') {
+            // BIDDER: trustlessly verify a seller's fill-announce. The bytecode is
+            // rebuilt LOCALLY from the announce params + our own expectations; each
+            // coin id must recompute from (covAddr‖value‖salt) and exist on-chain.
+            try {
+                const { bidId, coins, secretHash, receiverAddr, minPayout, timeoutHeight, refundPk } = payload;
+                const fail = (reason) => self.postMessage({ type: 'DEX_BIDFILL_VERIFY_RESULT', payload: { bidId, ok: false, reason } });
+                if (!Array.isArray(coins) || !coins.length) return fail("no coins");
+                if (Number(timeoutHeight) < networkHeight + 45) return fail("covenant timeout too soon to claim safely");
+                if (Number(timeoutHeight) > networkHeight + 5000) return fail("covenant timeout implausibly far");
+                const covScriptHex = build_covenant_htlc_bytecode_hex(
+                    normalizeHex(String(secretHash ?? '').replace(/^0x/i, '')), normalizeHex(String(receiverAddr ?? '').replace(/^0x/i, '')),
+                    BigInt(minPayout), BigInt(timeoutHeight), normalizeHex(String(refundPk ?? '').replace(/^0x/i, ''))
+                );
+                const covAddr = blake3_hash_hex(covScriptHex);
+                let total = 0;
+                for (const c of coins) {
+                    const expect = compute_coin_id_hex(covAddr, BigInt(c.value), normalizeHex(String(c.salt ?? '').replace(/^0x/i, '')));
+                    if (normalizeHex(String(expect ?? '').replace(/^0x/i, '')) !== normalizeHex(String(c.coin_id ?? '').replace(/^0x/i, ''))) return fail("coin id does not match covenant params");
+                    const chk = await rpc.checkCoin(normalizeHex(String(c.coin_id ?? '').replace(/^0x/i, '')));
+                    if (!chk || !chk.exists) return fail("covenant coin not found on-chain (yet?)");
+                    total += Number(c.value);
+                }
+                if (total < Number(minPayout) + 200) return fail("locked value too small to pay out + claim fee");
+                self.postMessage({ type: 'DEX_BIDFILL_VERIFY_RESULT', payload: { bidId, ok: true } });
+            } catch (err) {
+                self.postMessage({ type: 'DEX_BIDFILL_VERIFY_RESULT', payload: { bidId: payload && payload.bidId, ok: false, reason: (err && err.message) || String(err) } });
+            }
+        }
+        else if (type === 'DEX_BIDFILL_CLAIM') {
+            // BIDDER: claim the seller's covenant with OUR OWN secret — this is the
+            // reveal that lets the seller collect the ETH on Base. Mirrors
+            // DEX_SETTLE_COVENANT, except the receiver address is taken verbatim
+            // (it's the bid's makerMdsAddr — ours) instead of derived from a pubkey.
+            await acquireSendLock();
+            try {
+                const { bidId, rawSecret, receiverAddr, minPayout, timeoutHeight, refundPk, htlcCoins } = payload;
+                if (!Array.isArray(htlcCoins) || htlcCoins.length === 0) throw new Error("No covenant coins to claim");
+                const secretHash = blake3_hash_hex(normalizeHex(String(rawSecret ?? '').replace(/^0x/i, '')));
+                const ra = normalizeHex(String(receiverAddr ?? '').replace(/^0x/i, ''));
+                const covScriptHex = build_covenant_htlc_bytecode_hex(
+                    secretHash, ra, BigInt(minPayout), BigInt(timeoutHeight), normalizeHex(String(refundPk ?? '').replace(/^0x/i, ''))
+                );
+
+                if (!mssCachesReady) await loadMssCaches();
+                const utxoArray = Object.values(wState.utxos).map(u => {
+                    if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
+                    return u;
+                });
+
+                const payout = Number(minPayout);
+                const pow2Parts = [];
+                { let n = BigInt(payout), bit = 0n;
+                  while (n > 0n) { if (n & 1n) pow2Parts.push(Number(1n << bit)); n >>= 1n; bit += 1n; } }
+                const outputsJson = JSON.stringify(pow2Parts.map(v => ({
+                    out_type: "standard", address: ra, value: v, salt: null
+                })));
+                const contractInputsJson = JSON.stringify(htlcCoins.map(c => ({
+                    coin_id: normalizeHex(String(c.coin_id ?? '').replace(/^0x/i, '')),
+                    witness: `${normalizeHex(String(rawSecret ?? '').replace(/^0x/i, ''))},01`,
+                    value: Number(c.value),
+                    salt: normalizeHex(String(c.salt ?? '').replace(/^0x/i, '')),
+                    state: null
+                })));
+
+                let ctx = JSON.parse(wallet.prepare_script_spend(
+                    JSON.stringify(utxoArray), covScriptHex, contractInputsJson, outputsJson, wState.nextWotsIndex
+                ));
+                const revealPayloadStr = wallet.build_script_reveal(JSON.stringify(ctx), ctx.commitment, ctx.tx_salt);
+                while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
+                const usedMss = new Set();
+                for (const inp of ctx.wallet_inputs) if (inp.is_mss) usedMss.add(inp.address);
+                for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
+                await saveState();
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining PoW..." } });
+                const stateData = await rpc.getState();
+                await new Promise(r => setTimeout(r, 50));
+                const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
+                const commitReq = await rpc.commit(ctx.commitment, spamNonce);
+                if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
+                while (true) {
+                    try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {}
+                    await waitForNextBlock(15000);
+                }
+                const revealReq = await rpc.send(revealPayloadStr);
+                if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
+                const firstCoin = normalizeHex(String(htlcCoins[0].coin_id ?? '').replace(/^0x/i, ''));
+                while (true) {
+                    try { const inp = await rpc.checkCoin(firstCoin); if (inp && !inp.exists) break; } catch (e) {}
+                    await waitForNextBlock(15000);
+                }
+                await performScan();
+                self.postMessage({ type: 'DEX_BIDFILL_CLAIMED', payload: { bidId } });
+            } catch (err) {
+                self.postMessage({ type: 'DEX_BIDFILL_CLAIM_FAILED', payload: { bidId: payload && payload.bidId, error: (err && err.message) || String(err) } });
+            } finally { releaseSendLock(); }
+        }
+        else if (type === 'DEX_BIDFILL_WATCH') {
+            // SELLER: has the covenant coin been spent, and if so what preimage was
+            // revealed? checkCoin answers the first; for the second we scan recent
+            // block JSON for a 32-byte hex whose BLAKE3 equals the hashlock — the
+            // witness [secret, 0x01] serializes into the batch, so it's in there.
+            try {
+                const { bidId, coinId, hashlock, sinceHeight } = payload;
+                const chk = await rpc.checkCoin(normalizeHex(String(coinId ?? '').replace(/^0x/i, '')));
+                if (chk && chk.exists) {
+                    self.postMessage({ type: 'DEX_BIDFILL_WATCH_RESULT', payload: { bidId, spent: false, height: networkHeight } });
+                } else {
+                    let preimage = null;
+                    const want = normalizeHex(String(hashlock ?? '').replace(/^0x/i, ''));
+                    const from = Math.max(1, Math.max(Number(sinceHeight) || 0, networkHeight - 180));
+                    for (let h = networkHeight; h >= from && !preimage; h--) {
+                        let blk; try { blk = await rpc.getBlock(h); } catch (e) { continue; }
+                        if (!blk) continue;
+                        const seen = new Set();
+                        for (const cand of (JSON.stringify(blk).match(/[0-9a-fA-F]{64}/g) || [])) {
+                            const c = cand.toLowerCase();
+                            if (seen.has(c) || c === want) continue;
+                            seen.add(c);
+                            try { if (blake3_hash_hex(c) === want) { preimage = c; break; } } catch (e) {}
+                        }
+                    }
+                    self.postMessage({ type: 'DEX_BIDFILL_WATCH_RESULT', payload: { bidId, spent: true, preimage, height: networkHeight } });
+                }
+            } catch (err) {
+                self.postMessage({ type: 'DEX_BIDFILL_WATCH_RESULT', payload: { bidId: payload && payload.bidId, spent: false, error: (err && err.message) || String(err), height: networkHeight } });
+            }
+        }
+
         else if (type === 'PUSH_NEW_BLOCK') {
             if (payload.ChatMessage) {
                 if (payload.ChatMessage.words && payload.ChatMessage.words[0] === 255) {
@@ -3996,7 +4170,7 @@ async function handleL2Chat(msg) {
         self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
     }
     // ── L2 DEX ROUTING ──
-    else if (cmd >= 200 && cmd <= 204) {
+    else if (cmd >= 200 && cmd <= 206) {
         const sigAtt = msg.attachments.find(a => a.kind === "signature")?.value;
         if (!sigAtt) return;
 
@@ -4019,6 +4193,10 @@ async function handleL2Chat(msg) {
             } else if (cmd === 204) {
                 // Feature 2: a taker's submarine (L2) intent for one of our limit units.
                 self.postMessage({ type: 'DEX_SUBMARINE_RECEIVED', payload });
+            } else if (cmd === 205) {
+                self.postMessage({ type: 'DEX_BIDFILL_RECEIVED', payload });
+            } else if (cmd === 206) {
+                self.postMessage({ type: 'DEX_BIDSECRET_RECEIVED', payload });
             }
         } catch (e) {
             console.error("Failed to parse DEX L2 payload", e);

@@ -2923,6 +2923,7 @@ if ('serviceWorker' in navigator) {
 
                 const primaryAddress = payload.primaryAddress || "None";
                 myChatSender = primaryAddress !== "None" ? primaryAddress : null;
+                window._dexMdsBalance = Number(payload.balance) || 0;
                 renderBalanceElement(payload.balance !== undefined ? payload.balance : 0);
                 document.getElementById('lblAddress').innerText = primaryAddress;
 
@@ -3347,6 +3348,7 @@ if ('serviceWorker' in navigator) {
                         for (const o of dexOrderbook) { if (o.covenant && o.covenant.coinId) { o.verified = null; dexVerifyCovenantCoin(o); } }
                         try { renderDexOrderbook(); } catch (_) {}
                         try { dexScanAnnouncements(); } catch (_) {}   // discover on-chain orders
+                        try { dexScanBids(); } catch (_) {}            // discover escrowed bids on Base
                     }
                     break;
 
@@ -4192,7 +4194,7 @@ document.getElementById('btnExport').onclick = () => {
         //  single 32-byte secret unlocks BOTH chains.
         // ─────────────────────────────────────────────────────────────────
         // V1 (current, live). Leave as-is until the V2 bridge contract is deployed.
-        const BASE_HTLC_CONTRACT_V1 = "0xFBE5FF48bEeD9CaB26C7B7C2C2424a218aa52c18";
+        const BASE_HTLC_CONTRACT_V1 = "0x409C52821EC5fE402Ab8b9bdc1474a8cD006f9C7";
         // V2 (bridge): set to the deployed MidstateAtomicSwapV2 address to enable the
         // trustless-bridge path (relayer bounty → offline makers get paid). Empty = stay on V1.
         const BASE_HTLC_CONTRACT_V2 = "";
@@ -4212,14 +4214,34 @@ document.getElementById('btnExport').onclick = () => {
             "function refund(bytes32 swapId) external",
             "event Locked(bytes32 indexed swapId, address indexed beneficiary, address indexed refundTo, uint256 amount, uint256 relayerBounty, uint64 timeout, bytes32 hashlock)",
             "event Claimed(bytes32 indexed swapId, bytes32 hashlock, bytes32 preimage)",
-            "event Refunded(bytes32 indexed swapId)"
+            "event Refunded(bytes32 indexed swapId)",
+            "function createBid(bytes32 hashlock, uint64 mdsAmount, bytes32 makerMdsAddr, uint256 ttl, uint256 fillBond) external payable returns (bytes32)",
+            "function reserveBid(bytes32 bidId, uint256 fillWindow) external payable",
+            "function claimBid(bytes32 bidId, bytes32 preimage) external",
+            "function cancelBid(bytes32 bidId) external",
+            "function blake3_256(bytes32 preimage) public pure returns (bytes32)",
+            "function bids(bytes32) view returns (address maker, address filler, uint256 amount, uint256 fillBond, uint64 mdsAmount, uint64 expiry, uint64 fillDeadline, bytes32 hashlock, bytes32 makerMdsAddr, bool settled)",
+            "event BidCreated(bytes32 indexed bidId, address indexed maker, bytes32 hashlock, uint256 amount, uint256 fillBond, uint64 mdsAmount, bytes32 makerMdsAddr, uint64 expiry)",
+            "event BidReserved(bytes32 indexed bidId, address indexed filler, uint64 fillDeadline)",
+            "event BidClaimed(bytes32 indexed bidId, bytes32 hashlock, bytes32 preimage)",
+            "event BidCancelled(bytes32 indexed bidId)"
         ] : [
             "function lock(bytes32 hashlock, address payable beneficiary, uint256 refundDelay) external payable returns (bytes32)",
             "function claim(bytes32 swapId, bytes32 preimage) external",
             "function refund(bytes32 swapId) external",
             "event Locked(bytes32 indexed swapId, address indexed beneficiary, address indexed refundTo, uint256 amount, uint64 timeout, bytes32 hashlock)",
             "event Claimed(bytes32 indexed swapId, bytes32 hashlock, bytes32 preimage)",
-            "event Refunded(bytes32 indexed swapId)"
+            "event Refunded(bytes32 indexed swapId)",
+            "function createBid(bytes32 hashlock, uint64 mdsAmount, bytes32 makerMdsAddr, uint256 ttl, uint256 fillBond) external payable returns (bytes32)",
+            "function reserveBid(bytes32 bidId, uint256 fillWindow) external payable",
+            "function claimBid(bytes32 bidId, bytes32 preimage) external",
+            "function cancelBid(bytes32 bidId) external",
+            "function blake3_256(bytes32 preimage) public pure returns (bytes32)",
+            "function bids(bytes32) view returns (address maker, address filler, uint256 amount, uint256 fillBond, uint64 mdsAmount, uint64 expiry, uint64 fillDeadline, bytes32 hashlock, bytes32 makerMdsAddr, bool settled)",
+            "event BidCreated(bytes32 indexed bidId, address indexed maker, bytes32 hashlock, uint256 amount, uint256 fillBond, uint64 mdsAmount, bytes32 makerMdsAddr, uint64 expiry)",
+            "event BidReserved(bytes32 indexed bidId, address indexed filler, uint64 fillDeadline)",
+            "event BidClaimed(bytes32 indexed bidId, bytes32 hashlock, bytes32 preimage)",
+            "event BidCancelled(bytes32 indexed bidId)"
         ];
         
         // Cap a wei value to DEX_MAX_PRICE_SIGFIGS significant digits, so the ETH figure
@@ -4332,6 +4354,514 @@ document.getElementById('btnExport').onclick = () => {
         function dexReadContract()  { return new ethers.Contract(BASE_HTLC_CONTRACT, HTLC_ABI, evmProvider); }
         function dexWriteContract() { return new ethers.Contract(BASE_HTLC_CONTRACT, HTLC_ABI, evmSigner); }
 
+        // ═════════════════════════════════════════════════════════════════════
+        //  ESCROWED BIDS (Part 1: create / discover / cancel)
+        //
+        //  A resting BUY-MDS order locks its ETH in the MidstateAtomicSwap
+        //  contract via createBid(). This module:
+        //    • scans BidCreated logs on Base and merges live bids into the book
+        //      as kind:'bid', verified:true, onchain:true (survives chat TTL);
+        //    • creates bids from the CREATE ORDER tab (fresh secret per bid,
+        //      stored locally — the secret IS the claim key for the MDS leg);
+        //    • cancels our own unreserved bids.
+        //  The seller-side fill (reserveBid → covenant lock → reveal → claimBid)
+        //  ships in Part 2; until then escrow bids are visible but the fill
+        //  button is a stub, so nothing routes into the chat-offer flow.
+        // ═════════════════════════════════════════════════════════════════════
+
+        const DEX_BID_DEPLOY_BLOCK = 48422925;             // block the bid-capable contract landed in
+        const DEX_BASE_READONLY_RPC = 'https://mainnet.base.org';
+        const DEX_BID_TTL_SECONDS = 7 * 24 * 3600;         // default bid lifetime (contract caps at 90d)
+        const DEX_BID_FILLBOND_BPS = 100n;                 // sellers stake 1% of the escrow to reserve; forfeited to the maker on a lapsed fill
+
+        // Read path that works BEFORE MetaMask is connected, so the book fills
+        // with verified bids for everyone. Falls through to MetaMask once connected.
+        let _dexRoProvider = null;
+        function dexRoProvider() {
+            if (evmProvider) return evmProvider;
+            if (!_dexRoProvider) _dexRoProvider = new ethers.JsonRpcProvider(DEX_BASE_READONLY_RPC);
+            return _dexRoProvider;
+        }
+        function dexBidReadContract()  { return new ethers.Contract(BASE_HTLC_CONTRACT, HTLC_ABI, dexRoProvider()); }
+        function dexBidWriteContract() { return new ethers.Contract(BASE_HTLC_CONTRACT, HTLC_ABI, evmSigner); }
+
+        // ── Bid secrets vault ────────────────────────────────────────────────
+        // One fresh 32-byte secret per bid. Losing a secret does NOT strand the
+        // ETH (cancelBid needs only the EVM key) but makes the bid unfillable,
+        // so treat this like the coin salts: it lives only in this browser.
+        function dexLoadBidSecrets() {
+            try { return JSON.parse(localStorage.getItem('midstate_dex_bid_secrets') || '{}'); } catch (_) { return {}; }
+        }
+        function dexSaveBidSecret(bidId, rec) {
+            try {
+                const all = dexLoadBidSecrets();
+                all[bidId] = rec;
+                localStorage.setItem('midstate_dex_bid_secrets', JSON.stringify(all));
+            } catch (_) {}
+        }
+
+        // ── Scanner: BidCreated logs → live book entries ─────────────────────
+        // Mirrors DEX_SCAN_ANNOUNCEMENTS for the Base side. Incremental cursor in
+        // localStorage (with a small reorg overlap); every pass also re-reads the
+        // on-chain state of already-tracked bids so settled / reserved / expired
+        // ones drop out of the book without needing a new log.
+        let _dexBidScanInFlight = false;
+        async function dexScanBids() {
+            if (_dexBidScanInFlight) return;
+            _dexBidScanInFlight = true;
+            try {
+                const c = dexBidReadContract();
+                const latest = await dexRoProvider().getBlockNumber();
+                let from = parseInt(localStorage.getItem('midstate_dex_bidscan_block') || '', 10);
+                if (!Number.isFinite(from)) from = DEX_BID_DEPLOY_BLOCK;
+                from = Math.max(DEX_BID_DEPLOY_BLOCK, Math.min(from - 25, latest)); // 25-block reorg overlap
+
+                const CHUNK = 4500; // public Base RPC caps eth_getLogs ranges
+                const newIds = [];
+                for (let a = from; a <= latest; a += CHUNK) {
+                    const b = Math.min(a + CHUNK - 1, latest);
+                    let logs;
+                    try { logs = await c.queryFilter(c.filters.BidCreated(), a, b); }
+                    catch (e) { break; } // RPC hiccup — cursor stays put, next pass resumes
+                    for (const lg of logs) { if (lg.args && lg.args.bidId) newIds.push(lg.args.bidId); }
+                    try { localStorage.setItem('midstate_dex_bidscan_block', String(b + 1)); } catch (_) {}
+                }
+
+                const tracked = dexOrderbook.filter(o => o.escrow && o.escrow.bidId).map(o => o.escrow.bidId);
+                const ids = [...new Set([...newIds, ...tracked])];
+                let changed = false;
+                for (const bidId of ids) {
+                    let b;
+                    try { b = await c.bids(bidId); } catch (e) { continue; }
+                    const idx = dexOrderbook.findIndex(o => o.escrow && o.escrow.bidId === bidId);
+                    const open = b && b.amount > 0n && !b.settled
+                        && (b.filler || '').toLowerCase() === ethers.ZeroAddress.toLowerCase()
+                        && Number(b.expiry) * 1000 > Date.now();
+                    if (!open) {
+                        if (idx >= 0) { dexOrderbook.splice(idx, 1); changed = true; }
+                        continue;
+                    }
+                    const entry = {
+                        offerId: 'bid:' + bidId.slice(2, 18),
+                        kind: 'bid',
+                        mdsAmount: Number(b.mdsAmount),
+                        weiAmount: b.amount.toString(),
+                        makerEvmAddr: b.maker,
+                        verified: true, onchain: true, ts: Date.now(),
+                        escrow: {
+                            bidId,
+                            hashlock: b.hashlock,
+                            fillBond: b.fillBond.toString(),
+                            expiry: Number(b.expiry),
+                            makerMdsAddr: b.makerMdsAddr
+                        }
+                    };
+                    if (idx >= 0) dexOrderbook[idx] = { ...dexOrderbook[idx], ...entry };
+                    else dexOrderbook.push(entry);
+                    changed = true;
+                }
+                if (changed) { saveOrderbook(); renderDexOrderbook(); }
+            } catch (e) {
+                // stay quiet; the 3-minute cadence retries
+            } finally {
+                _dexBidScanInFlight = false;
+            }
+        }
+
+        // ── Maker: create an escrowed bid ────────────────────────────────────
+        // Replaces the "chat promise" path for buy orders when Limit mode is on.
+        async function dexCreateEscrowBid(mdsAmt, weiAmt) {
+            if (!evmSigner) return showToast("Connect MetaMask first", "error");
+            const mdsAddr = (typeof myChatSender === 'string' && /^[0-9a-fA-F]{64}$/.test(myChatSender)) ? myChatSender : null;
+            if (!mdsAddr) return showToast("Wallet address not ready yet — unlock the wallet first.", "error");
+
+            const ok = confirm(
+                `Escrow ${prettyEth(String(weiAmt))} ETH on-chain as a buy order for ${formatMDS(Number(mdsAmt)).value} ${formatMDS(Number(mdsAmt)).prefix} MDS?\n\n` +
+                `A fresh secret for this bid will be stored in THIS browser only. ` +
+                `Losing it never strands the ETH (you can always cancel), but the bid can't be filled without it.\n\n` +
+                `Sellers must stake a 1% bond (${prettyEth(((BigInt(weiAmt) * 100n) / 10000n).toString())} ETH) to reserve this bid — returned when they deliver, forfeited to you if they ghost.\n\n` +
+                `The bid stays live for 7 days or until you cancel it.`
+            );
+            if (!ok) return;
+
+            try {
+                dexBeginBroadcastUI('bid-escrow');
+                // Fresh 32-byte secret; hashlock computed by the CONTRACT's own
+                // blake3_256 so it is byte-for-byte the hash the claim will check.
+                const secret = '0x' + Array.from(crypto.getRandomValues(new Uint8Array(32))).map(x => x.toString(16).padStart(2, '0')).join('');
+                const hashlock = await dexBidReadContract().blake3_256(secret);
+
+                const c = dexBidWriteContract();
+                const fillBond = (BigInt(weiAmt) * DEX_BID_FILLBOND_BPS) / 10000n;
+                const tx = await c.createBid(hashlock, BigInt(mdsAmt), '0x' + mdsAddr, BigInt(DEX_BID_TTL_SECONDS), fillBond, { value: BigInt(weiAmt) });
+                showActivity("Escrowing bid on Base…");
+                const receipt = await tx.wait();
+                hideActivity();
+
+                let bidId = null;
+                for (const lg of (receipt.logs || [])) {
+                    try {
+                        const p = c.interface.parseLog(lg);
+                        if (p && p.name === 'BidCreated') { bidId = p.args.bidId; break; }
+                    } catch (_) {}
+                }
+                if (!bidId) throw new Error("BidCreated event not found in receipt");
+
+                dexSaveBidSecret(bidId, {
+                    secret, hashlock,
+                    mdsAmount: Number(mdsAmt), weiAmount: String(weiAmt),
+                    makerMdsAddr: mdsAddr, createdTs: Date.now()
+                });
+
+                dexOrderbook.push({
+                    offerId: 'bid:' + bidId.slice(2, 18), kind: 'bid',
+                    mdsAmount: Number(mdsAmt), weiAmount: String(weiAmt),
+                    makerEvmAddr: evmAddress, verified: true, onchain: true, ts: Date.now(),
+                    escrow: { bidId, hashlock, fillBond: fillBond.toString(), expiry: Math.floor(Date.now() / 1000) + DEX_BID_TTL_SECONDS, makerMdsAddr: '0x' + mdsAddr }
+                });
+                saveOrderbook(); renderDexOrderbook();
+                dexFinishBroadcastUI('done', 'ETH escrowed on Base — your bid is live and on-chain verifiable.');
+                showToast("Buy order escrowed on-chain.", "success");
+            } catch (err) {
+                hideActivity();
+                dexFinishBroadcastUI('error', 'Bid escrow failed: ' + (err && (err.shortMessage || err.message) || err));
+                showToast("Bid escrow failed: " + (err && (err.shortMessage || err.message) || err), "error");
+            }
+        }
+
+        // ── Maker: cancel own bid ────────────────────────────────────────────
+        async function dexCancelEscrowBid(bidId) {
+            if (!evmSigner) return showToast("Connect MetaMask first", "error");
+            if (!confirm("Cancel this bid and reclaim the escrowed ETH?")) return;
+            try {
+                const c = dexBidWriteContract();
+                const tx = await c.cancelBid(bidId);
+                showActivity("Cancelling bid…");
+                await tx.wait();
+                hideActivity();
+                showToast("Bid cancelled — ETH returned.", "success");
+                dexOrderbook = dexOrderbook.filter(o => !(o.escrow && o.escrow.bidId === bidId));
+                saveOrderbook(); renderDexOrderbook();
+            } catch (err) {
+                hideActivity();
+                const msg = (err && (err.shortMessage || err.message)) || String(err);
+                showToast(/reserved/i.test(msg) ? "Can't cancel: a seller holds a live reservation on this bid." : ("Cancel failed: " + msg), "error");
+            }
+        }
+
+        // ═════════════════════════════════════════════════════════════════════
+        //  ESCROWED-BID FILLS (Part 2) — the full lifecycle
+        //  Seller:  reserveBid → lock covenant → announce → watch reveal → claimBid
+        //           (→ refund MDS at covenant timeout if the bidder never shows)
+        //  Bidder:  see reservation → verify announce trustlessly → claim MDS with
+        //           the stored secret (serialized, one claim at a time) → gossip it
+        // ═════════════════════════════════════════════════════════════════════
+        const DEX_BIDFILL_LS = 'midstate_dex_bidfills';
+        const DEX_BIDFILL_WINDOW_S = 172800;     // reserveBid fillWindow: 48h — loose appointments
+        const DEX_BIDFILL_MARGIN_BLOCKS = 360;   // covenant ends ≥6h before fillDeadline
+        function dexLoadFills() { try { return JSON.parse(localStorage.getItem(DEX_BIDFILL_LS) || '{}'); } catch (_) { return {}; } }
+        function dexSaveFill(bidId, patch) {
+            const all = dexLoadFills();
+            all[bidId] = { ...(all[bidId] || {}), ...patch, bidId, updated: Date.now() };
+            try { localStorage.setItem(DEX_BIDFILL_LS, JSON.stringify(all)); } catch (_) {}
+            dexRenderBidFills();
+            return all[bidId];
+        }
+        const _strip0x = (s) => String(s || '').replace(/^0x/i, '').toLowerCase();
+        const _dexFillResolvers = {};   // bidId -> resolve fn (lets the market sweep await the lock)
+
+        // ── SELLER: fill one escrowed bid ────────────────────────────────────
+        async function dexFillEscrowBid(i) {
+            const o = dexOrderbook[i];
+            if (!o || !o.escrow || !o.escrow.bidId) return showToast("Order not found — the book may have refreshed.", "error");
+            if (!evmSigner) return showToast("Connect MetaMask first", "error");
+            const bidId = o.escrow.bidId;
+            if (o.makerEvmAddr && evmAddress && o.makerEvmAddr.toLowerCase() === evmAddress.toLowerCase())
+                return showToast("That's your own bid — selling into it just round-trips your money minus gas.", "error");
+
+            try {
+                const c = dexBidReadContract();
+                const b = await c.bids(bidId);
+                const open = b && b.amount > 0n && !b.settled
+                    && (b.filler || '').toLowerCase() === ethers.ZeroAddress.toLowerCase()
+                    && Number(b.expiry) * 1000 > Date.now();
+                if (!open) { showToast("This bid is no longer open — refreshing the book.", "error"); dexScanBids(); return; }
+
+                const mds = Number(b.mdsAmount);
+                const bond = BigInt(b.fillBond);
+                const needMds = mds + 1024 + 600; // payout + covenant fee budget + our tx fee margin
+                const bal = Number(window._dexMdsBalance || 0);
+                if (bal < needMds) return showToast(`Not enough MDS: this fill needs ~${needMds} (payout + fees), you have ${bal}.`, "error");
+
+                const mm = formatMDS(mds);
+                const bondNote = bond > 0n
+                    ? `\n\nBond at risk: ${prettyEth(bond.toString())} ETH is staked with your reservation. It returns when you claim; it is FORFEITED to the bidder if this fill lapses unclaimed — including if the bidder simply never comes online.`
+                    : '';
+                const ok = confirm(
+                    `Sell ${mm.value} ${mm.prefix} MDS into this bid for ${prettyEth(b.amount.toString())} ETH?\n\n` +
+                    `Sequence: reserve on Base (1 MetaMask tx) → lock MDS in a covenant → wait for the bidder to claim (reveals the secret) → claim the ETH (1 more MetaMask tx).` +
+                    bondNote +
+                    `\n\nKeep this tab open: the ETH claim fires automatically when the reveal is spotted. If the bidder never claims, your MDS refunds automatically after ~${Math.round((DEX_BIDFILL_WINDOW_S/3600)-6)}h.`
+                );
+                if (!ok) return;
+
+                dexSaveFill(bidId, { role: 'seller', state: 'reserving', mdsAmount: mds, weiAmount: b.amount.toString(), fillBond: bond.toString(), hashlock: b.hashlock, receiverAddr: b.makerMdsAddr });
+                showActivity("Reserving bid on Base…");
+                const tx = await dexBidWriteContract().reserveBid(bidId, BigInt(DEX_BIDFILL_WINDOW_S), { value: bond });
+                await tx.wait();
+                const b2 = await c.bids(bidId);
+                hideActivity();
+                if ((b2.filler || '').toLowerCase() !== (evmAddress || '').toLowerCase()) {
+                    dexSaveFill(bidId, { state: 'failed', note: 'reservation raced' });
+                    return showToast("Someone reserved this bid first.", "error");
+                }
+                const fillDeadline = Number(b2.fillDeadline);
+                const blocksLeft = Math.floor((fillDeadline - Date.now() / 1000) / 60);
+                const timeoutHeight = networkHeight + Math.max(60, Math.min(4000, blocksLeft - DEX_BIDFILL_MARGIN_BLOCKS));
+                dexSaveFill(bidId, { state: 'locking', fillDeadline, timeoutHeight });
+                showToast("Reserved ✓ — locking MDS in the covenant…", "success");
+                worker.postMessage({ type: 'DEX_BIDFILL_LOCK', payload: {
+                    bidId, hashlock: b.hashlock, receiverAddr: b.makerMdsAddr, minPayout: mds, timeoutHeight
+                }});
+                dexOrderbook = dexOrderbook.filter(x => !(x.escrow && x.escrow.bidId === bidId));
+                saveOrderbook(); renderDexOrderbook();
+                return new Promise(res => { _dexFillResolvers[bidId] = res; });
+            } catch (err) {
+                hideActivity();
+                const msg = (err && (err.shortMessage || err.message)) || String(err);
+                dexSaveFill(bidId, { state: 'failed', note: msg });
+                showToast("Fill failed: " + msg, "error");
+            }
+        }
+
+        function dexAnnounceBidFill(rec) {
+            worker.postMessage({ type: 'DEX_BROADCAST_BIDFILL', payload: {
+                bidId: rec.bidId, coins: rec.coins, secretHash: _strip0x(rec.hashlock),
+                receiverAddr: _strip0x(rec.receiverAddr), minPayout: rec.mdsAmount,
+                timeoutHeight: rec.timeoutHeight, refundPk: rec.refundPk
+            }});
+        }
+
+        async function dexClaimBidEth(bidId, preimage) {
+            const rec = dexLoadFills()[bidId];
+            if (!rec || rec.state === 'claimed' || rec.state === 'claiming') return;
+            if (!evmSigner) { dexSaveFill(bidId, { note: 'reveal found — connect MetaMask to claim the ETH' }); return; }
+            try {
+                const st = await dexBidReadContract().bids(bidId);
+                if (st.settled) return dexSaveFill(bidId, { state: 'claimed', note: 'escrow already settled on-chain (the bidder likely submitted your claim) — check MetaMask' });
+            } catch (_) {}
+            if (Date.now() / 1000 > (rec.fillDeadline || 0) - 60)
+                return dexSaveFill(bidId, { state: 'failed', note: 'reveal arrived too close to the fill deadline' });
+            try {
+                // Sanity: the contract's own hash function is the referee.
+                const h = await dexBidReadContract().blake3_256('0x' + _strip0x(preimage));
+                if (_strip0x(h) !== _strip0x(rec.hashlock)) return;
+                dexSaveFill(bidId, { state: 'claiming', preimage: _strip0x(preimage) });
+                showToast("Reveal spotted — claiming your ETH (confirm in MetaMask)…", "success");
+                const tx = await dexBidWriteContract().claimBid(bidId, '0x' + _strip0x(preimage));
+                await tx.wait();
+                dexSaveFill(bidId, { state: 'claimed', note: '' });
+                showToast(`Fill complete: ${prettyEth(rec.weiAmount)} ETH received.`, "success");
+            } catch (err) {
+                dexSaveFill(bidId, { state: 'waiting_reveal', note: 'ETH claim failed — retrying: ' + ((err && (err.shortMessage || err.message)) || err) });
+            }
+        }
+
+        // ── BIDDER: serialized verify → claim queue ──────────────────────────
+        const _dexBidAnnounces = {};   // bidId -> latest announce payload
+        let _dexBidClaimBusy = null;   // bidId currently claiming (one at a time — see script.rs covenant note)
+        function dexBidderConsider(bidId) {
+            if (_dexBidClaimBusy) return;
+            const v = dexLoadBidSecrets()[bidId];
+            const a = _dexBidAnnounces[bidId];
+            if (!v || v.claimed || v.claiming || !a) return;
+            if (_strip0x(a.secretHash) !== _strip0x(v.hashlock)) return;
+            if (_strip0x(a.receiverAddr) !== _strip0x(v.makerMdsAddr)) return;
+            if (Number(a.minPayout) !== Number(v.mdsAmount)) return;
+            _dexBidClaimBusy = bidId;
+            worker.postMessage({ type: 'DEX_BIDFILL_VERIFY', payload: a });
+        }
+
+        // ── Message plumbing (coexists with the main onmessage switch) ───────
+        worker.addEventListener('message', (e) => {
+            const { type, payload } = e.data || {};
+            if (type === 'DEX_BIDFILL_LOCKED') {
+                const rec = dexSaveFill(payload.bidId, {
+                    state: 'waiting_reveal', coins: payload.coins, refundPk: payload.refundPk,
+                    sinceHeight: payload.lockedAtHeight, timeoutHeight: payload.timeoutHeight
+                });
+                dexAnnounceBidFill(rec);
+                showToast("MDS locked ✓ — waiting for the bidder to claim (this reveals the secret).", "success");
+                const r = _dexFillResolvers[payload.bidId]; if (r) { delete _dexFillResolvers[payload.bidId]; r(true); }
+            }
+            else if (type === 'DEX_BIDFILL_LOCK_FAILED') {
+                dexSaveFill(payload.bidId, { state: 'failed_lock', note: payload.error });
+                showToast("MDS lock failed after reserving: " + payload.error + " — your reservation is still live; use Retry in the Bid fills card (ACTIVE SWAPS).", "error");
+                const r = _dexFillResolvers[payload.bidId]; if (r) { delete _dexFillResolvers[payload.bidId]; r(false); }
+            }
+            else if (type === 'DEX_BIDFILL_WATCH_RESULT') {
+                const rec = dexLoadFills()[payload.bidId];
+                if (!rec || rec.role !== 'seller') return;
+                if (payload.spent && payload.preimage) dexClaimBidEth(payload.bidId, payload.preimage);
+                else if (payload.spent && rec.state === 'waiting_reveal') dexSaveFill(payload.bidId, { note: 'coin spent; hunting for the preimage…' });
+            }
+            else if (type === 'DEX_BIDFILL_RECEIVED') {
+                if (payload && payload.bidId) { _dexBidAnnounces[payload.bidId] = payload; dexBidderConsider(payload.bidId); }
+            }
+            else if (type === 'DEX_BIDFILL_VERIFY_RESULT') {
+                if (!payload.ok) {
+                    if (_dexBidClaimBusy === payload.bidId) _dexBidClaimBusy = null;
+                    return; // announce rebroadcasts; verification retries next time
+                }
+                const v = dexLoadBidSecrets()[payload.bidId];
+                const a = _dexBidAnnounces[payload.bidId];
+                if (!v || !a) { _dexBidClaimBusy = null; return; }
+                dexSaveBidSecret(payload.bidId, { ...v, claiming: true });
+                showToast("A seller locked MDS for your bid — claiming it now (fee-less)…", "success");
+                worker.postMessage({ type: 'DEX_BIDFILL_CLAIM', payload: {
+                    bidId: payload.bidId, rawSecret: _strip0x(v.secret),
+                    receiverAddr: _strip0x(v.makerMdsAddr), minPayout: Number(v.mdsAmount),
+                    timeoutHeight: a.timeoutHeight, refundPk: a.refundPk, htlcCoins: a.coins
+                }});
+            }
+            else if (type === 'DEX_BIDFILL_CLAIMED') {
+                const v = dexLoadBidSecrets()[payload.bidId] || {};
+                dexSaveBidSecret(payload.bidId, { ...v, claiming: false, claimed: true });
+                _dexBidClaimBusy = null;
+                worker.postMessage({ type: 'DEX_BROADCAST_BIDSECRET', payload: { bidId: payload.bidId, secret: _strip0x(v.secret) } });
+                showToast("Bid filled — MDS received ✓.", "success");
+                // Courtesy: submit the SELLER's ETH claim ourselves. claimBid is
+                // anyone-can-call and always pays the recorded filler, so this costs
+                // us a few cents of gas and removes the seller's return appointment.
+                (async () => {
+                    try {
+                        if (!evmSigner || !v.secret) return;
+                        const st = await dexBidReadContract().bids(payload.bidId);
+                        if (st.settled) return;
+                        showToast("Releasing the seller's ETH for them (few cents of gas — reject in MetaMask to skip).", "success");
+                        const tx = await dexBidWriteContract().claimBid(payload.bidId, '0x' + _strip0x(v.secret));
+                        await tx.wait();
+                        showToast("Seller's ETH released ✓ — swap fully settled.", "success");
+                    } catch (_) { /* courtesy only — the seller's own watcher still covers this */ }
+                })();
+                dexScanBids();
+            }
+            else if (type === 'DEX_BIDFILL_CLAIM_FAILED') {
+                const v = dexLoadBidSecrets()[payload.bidId] || {};
+                dexSaveBidSecret(payload.bidId, { ...v, claiming: false });
+                _dexBidClaimBusy = null;
+                showToast("MDS claim failed (will retry): " + payload.error, "error");
+            }
+            else if (type === 'DEX_BIDSECRET_RECEIVED') {
+                // Courtesy fast path from the bidder; the blake3 check in
+                // dexClaimBidEth is the actual trust anchor.
+                const rec = dexLoadFills()[payload && payload.bidId];
+                if (rec && rec.role === 'seller' && rec.state === 'waiting_reveal' && payload.secret)
+                    dexClaimBidEth(payload.bidId, payload.secret);
+            }
+        });
+
+        // ── The heartbeat: watch, refund, re-announce, bidder-poll ───────────
+        let _dexBidTickN = 0;
+        setInterval(() => {
+            _dexBidTickN++;
+            const fills = dexLoadFills();
+            for (const bidId in fills) {
+                const rec = fills[bidId];
+                if (rec.role !== 'seller') continue;
+                if (rec.state === 'waiting_reveal') {
+                    worker.postMessage({ type: 'DEX_BIDFILL_WATCH', payload: { bidId, coinId: rec.coins[0].coin_id, hashlock: _strip0x(rec.hashlock), sinceHeight: rec.sinceHeight } });
+                    if (_dexBidTickN % 3 === 0) dexAnnounceBidFill(rec);   // re-announce ~every 2¼ min
+                    if (typeof networkHeight === 'number' && networkHeight >= (rec.timeoutHeight || Infinity)) {
+                        dexSaveFill(bidId, { state: 'refunding' });
+                        showToast("Bidder never claimed — reclaiming your locked MDS…", "error");
+                        worker.postMessage({ type: 'DEX_RECLAIM_HTLC', payload: {
+                            offerId: 'bidfill:' + bidId, htlcCoins: rec.coins, secretHash: _strip0x(rec.hashlock),
+                            timeoutHeight: rec.timeoutHeight, receiverAddr: _strip0x(rec.receiverAddr),
+                            minPayout: rec.mdsAmount, swapMode: 'covenant'
+                        }});
+                    }
+                } else if (rec.state === 'refunding') {
+                    worker.postMessage({ type: 'DEX_BIDFILL_WATCH', payload: { bidId, coinId: rec.coins[0].coin_id, hashlock: _strip0x(rec.hashlock), sinceHeight: rec.sinceHeight } });
+                }
+            }
+            // refund confirmation: a 'refunding' fill whose coin is gone WITHOUT a
+            // matching preimage was reclaimed by us
+            // (handled implicitly: WATCH_RESULT with spent && no preimage after refunding)
+            if (_dexBidTickN % 2 === 0) {
+                // Bidder passive poll: surface reservations even if the announce is late.
+                const vault = dexLoadBidSecrets();
+                const ids = Object.keys(vault).filter(id => !vault[id].claimed);
+                if (ids.length && evmProvider !== undefined) {
+                    (async () => {
+                        try {
+                            const c = dexBidReadContract();
+                            for (const id of ids) {
+                                const b = await c.bids(id);
+                                if (!b.settled && (b.filler || '').toLowerCase() !== ethers.ZeroAddress.toLowerCase()) dexBidderConsider(id);
+                            }
+                        } catch (_) {}
+                    })();
+                }
+            }
+        }, 45000);
+        // refund completion hook: watch results while refunding
+        worker.addEventListener('message', (e) => {
+            const { type, payload } = e.data || {};
+            if (type !== 'DEX_BIDFILL_WATCH_RESULT') return;
+            const rec = dexLoadFills()[payload.bidId];
+            if (rec && rec.state === 'refunding' && payload.spent && !payload.preimage) {
+                dexSaveFill(payload.bidId, { state: 'refunded', note: '' });
+                showToast("MDS reclaimed ✓ — the fill is closed.", "success");
+            }
+        });
+
+        // ── Minimal fills UI, injected into the ACTIVE SWAPS tab ─────────────
+        const _dexFillStateLabel = {
+            reserving: '⧖ reserving on Base…', locking: '⧖ locking MDS…',
+            waiting_reveal: '⧖ waiting for the bidder to claim', claiming: '⧖ claiming ETH…',
+            claimed: '✓ complete — ETH received', refunding: '⧖ reclaiming MDS…',
+            refunded: '↩ MDS refunded (bidder never claimed)', failed: '✗ failed', failed_lock: '✗ lock failed (reservation lapses)'
+        };
+        function dexRetryBidFillLock(bidId) {
+            const rec = dexLoadFills()[bidId];
+            if (!rec || rec.role !== 'seller') return;
+            if (Date.now() / 1000 > (rec.fillDeadline || 0) - 3600)
+                return showToast("Too close to the fill deadline to lock safely — let the reservation lapse.", "error");
+            dexSaveFill(bidId, { state: 'locking', note: '' });
+            showToast("Retrying the MDS lock…", "success");
+            worker.postMessage({ type: 'DEX_BIDFILL_LOCK', payload: {
+                bidId, hashlock: rec.hashlock, receiverAddr: rec.receiverAddr,
+                minPayout: rec.mdsAmount, timeoutHeight: rec.timeoutHeight
+            }});
+        }
+        function dexRenderBidFills() {
+            const tab = document.getElementById('dex-tab-portfolio');
+            if (!tab) return;
+            let box = document.getElementById('dexBidFillsBox');
+            const fills = Object.values(dexLoadFills()).sort((a, b) => (b.updated || 0) - (a.updated || 0));
+            if (!fills.length) { if (box) box.remove(); return; }
+            if (!box) {
+                box = document.createElement('div');
+                box.id = 'dexBidFillsBox';
+                box.style.cssText = 'border:1px solid var(--border);border-radius:6px;padding:10px 12px;margin-bottom:12px;';
+                tab.insertBefore(box, tab.firstChild);
+            }
+            box.innerHTML = '<div style="font-weight:bold;font-size:12px;margin-bottom:6px;">Bid fills (selling MDS into escrowed bids)</div>' +
+                fills.map(r => {
+                    const mm = formatMDS(r.mdsAmount || 0);
+                    return `<div style="display:flex;gap:10px;align-items:center;font-size:11px;padding:4px 0;border-top:1px solid var(--border);">
+                        <span style="color:var(--text-faint);">${(r.bidId || '').slice(0, 12)}…</span>
+                        <span>${mm.value} ${mm.prefix} → ${prettyEth(r.weiAmount || '0')} ETH</span>
+                        <span style="flex:1;color:var(--text-muted);">${_dexFillStateLabel[r.state] || r.state}${r.note ? ' — ' + r.note : ''}</span>
+                        ${r.state === 'failed_lock' ? `<button class="obtn" onclick="dexRetryBidFillLock('${r.bidId}')">Retry</button>` : ''}
+                    </div>`;
+                }).join('');
+        }
+        dexRenderBidFills();
+
+
+
         // Which side holds MDS? ask: the maker. bid: the taker.
         function makerSideForKind(kind) { return kind === 'bid' ? 'eth' : 'mds'; }
         function counterMdsPk(swap)  { return swap.role === 'maker' ? swap.takerMdsPk  : swap.makerMdsPk; }
@@ -4416,12 +4946,13 @@ document.getElementById('btnExport').onclick = () => {
                 if (hint) hint.textContent = 'Your MDS is escrowed on-chain until a buyer pays, or you reclaim it after the expiry.';
                 if (btn) btn.textContent = 'Place Sell Order';
             } else {
-                // BUY MDS ← ETH. A buy offer is an open request: you receive MDS and lock
-                // ETH only after a seller commits, so there's nothing to escrow up front —
-                // it's a standing offer broadcast to the network. Limit mode doesn't apply.
-                if (lm && lm.checked) { lm.checked = false; try { dexToggleLimitMode(); } catch (_) {} }
+                // BUY MDS ← ETH → on-chain escrowed bid. The ETH locks in the Base swap
+                // contract up front, making the bid verifiable and sweepable; the maker
+                // can cancel any time to reclaim it. Escrow is the only buy path now,
+                // mirroring the sell side — so force limit mode on and hide the toggle.
+                if (lm && !lm.checked) { lm.checked = true; try { dexToggleLimitMode(); } catch (_) {} }
                 if (lmWrap) lmWrap.style.display = 'none';
-                if (hint) hint.textContent = 'Open buy offer: you receive MDS and lock ETH only after a seller accepts. Nothing is escrowed up front.';
+                if (hint) hint.textContent = 'Your ETH is escrowed on Base until a seller fills the bid — or you cancel and reclaim it any time (auto-expires in 7 days).';
                 if (btn) btn.textContent = 'Place Buy Order';
             }
         };
@@ -4658,9 +5189,10 @@ document.getElementById('btnExport').onclick = () => {
             const hint = document.getElementById('dexLimitHint');
             if (hint) {
                 hint.style.display = on ? 'block' : 'none';
-                hint.textContent = on
-                    ? 'Your MDS is locked into an on-chain covenant (one power-of-two unit). Takers verify it on-chain and fill it without you negotiating; it refunds to you after ~24h if unfilled. Sell side only.'
-                    : '';
+                hint.textContent = !on ? ''
+                    : (typeof dexDirection !== 'undefined' && dexDirection === 'bid')
+                    ? 'Your ETH is escrowed in the Base swap contract. Sellers verify the escrow on-chain and fill it; cancel any time to reclaim the ETH.'
+                    : 'Your MDS is locked into an on-chain covenant (one power-of-two unit). Takers verify it on-chain and fill it without you negotiating; it refunds to you after ~24h if unfilled.';
             }
         };
 
@@ -4806,7 +5338,7 @@ document.getElementById('btnExport').onclick = () => {
             // ONE transaction (~2 blocks) via DEX_CREATE_LIMIT_BUNDLE → prepare_fund_many.
             const limitMode = document.getElementById('dexLimitMode') && document.getElementById('dexLimitMode').checked;
             if (limitMode) {
-                if (kind !== 'ask') return showToast("Limit orders are sell-side (they lock MDS on-chain).", "error");
+                if (kind === 'bid') return dexCreateEscrowBid(mdsAmt, weiAmt);   // buy-side: escrow ETH on Base
                 if (dexMySwaps.some(s => s.status === 'limit_funding')) return showToast("A limit order is still being funded — wait for it to finish.", "error");
                 const total = BigInt(mdsAmt);
                 const unitsBig = [];
@@ -6146,7 +6678,7 @@ document.getElementById('btnExport').onclick = () => {
                         isAsk ? 'sell selling ask' : 'buy buying bid',
                         String(o.mdsAmount), formatMDS(o.mdsAmount).prefix,
                         prettyEth(o.weiAmount), ppm != null ? dexFmtPpm(ppm) : '',
-                        o.makerEvmAddr || '', (o.covenant && o.covenant.coinId) || '',
+                        o.makerEvmAddr || '', (o.covenant && o.covenant.coinId) || '', (o.escrow && o.escrow.bidId) || '',
                         o.verified === true ? 'verified onchain' : 'chat promise'
                     ].join(' ').toLowerCase();
                     if (!hay.includes(dexBookSearch)) return false;
@@ -6295,18 +6827,25 @@ document.getElementById('btnExport').onclick = () => {
                 const subs = L.orders.slice().sort((a, b) => Number(b.mdsAmount) - Number(a.mdsAmount)).map(o => {
                     const i = dexOrderbook.indexOf(o);
                     const hasCov = !!(o.covenant && o.covenant.coinId);
+                    const hasEsc = !!(o.escrow && o.escrow.bidId);
                     const gated = hasCov && o.verified !== true;
                     const isMine = o.makerEvmAddr && evmAddress && o.makerEvmAddr.toLowerCase() === evmAddress.toLowerCase();
-                    const badge = !hasCov ? '<span style="color:var(--text-faint);">chat promise</span>'
+                    const badge = hasEsc ? '<span style="color:var(--green);">✓ ETH escrowed</span>'
+                        : !hasCov ? '<span style="color:var(--text-faint);">chat promise</span>'
                         : o.verified === true ? '<span style="color:var(--green);">✓ on-chain</span>'
                         : o.verified === false ? '<span style="color:var(--red);">✗ not found</span>'
                         : '<span style="color:var(--text-faint);">⧖ verifying…</span>';
                     const mm = formatMDS(o.mdsAmount);
+                    const actionBtn = (hasEsc && isMine)
+                        ? `<button class="obtn" onclick="event.stopPropagation();dexCancelEscrowBid('${o.escrow.bidId}')">Cancel</button>`
+                        : hasEsc
+                        ? `<button class="obtn ${isAsk ? 'ask' : 'bid'}" onclick="event.stopPropagation();dexFillEscrowBid(${i})">${isAsk ? 'Buy' : 'Sell'}</button>`
+                        : `<button class="obtn ${isAsk ? 'ask' : 'bid'}" ${gated ? 'disabled' : ''} onclick="event.stopPropagation();dexAcceptFromBook(${i})">${isAsk ? 'Buy' : 'Sell'}</button>`;
                     return `<div class="dex-suborder">
                         <span>${badge}${isMine ? ' <span style="color:var(--text-faint);">(my order)</span>' : ''}</span>
                         <span style="text-align:right;">${mm.value} ${mm.prefix}</span>
                         <span style="text-align:right;color:var(--text-muted);">${prettyEth(o.weiAmount)} ETH${(() => { const u = weiToUsd(o.weiAmount); return u ? `<br><span style="color:var(--text-faint);font-size:9px;">${u}</span>` : ''; })()}</span>
-                        <button class="obtn ${isAsk ? 'ask' : 'bid'}" ${gated ? 'disabled' : ''} onclick="event.stopPropagation();dexAcceptFromBook(${i})">${isAsk ? 'Buy' : 'Sell'}</button>
+                        ${actionBtn}
                     </div>`;
                 }).join('');
                 row += `<div class="dex-expand">${subs}</div>`;
@@ -6514,8 +7053,10 @@ document.getElementById('btnExport').onclick = () => {
                 .filter(o => o.covenant && o.covenant.coinId && o.verified === true && dexPricePerMds(o) != null)
                 .sort((a, b) => dexPricePerMds(a) - dexPricePerMds(b));
             _dexMarketBook.bids = stats.bidOrders
-                .filter(o => o.covenant && o.covenant.coinId && o.verified === true && dexPricePerMds(o) != null)
+                .filter(o => o.escrow && o.escrow.bidId && o.verified === true && dexPricePerMds(o) != null)
                 .sort((a, b) => dexPricePerMds(b) - dexPricePerMds(a));
+            _dexMarketBook.rawAsks = stats.askOrders.length;
+            _dexMarketBook.rawBids = stats.bidOrders.length;
             const anyEligible = _dexMarketBook.asks.length || _dexMarketBook.bids.length;
             panel.style.display = anyEligible ? 'block' : 'none';
             if (anyEligible) dexUpdateMarketEstimate();
@@ -6558,7 +7099,12 @@ document.getElementById('btnExport').onclick = () => {
             const availFmt = formatMDS(avail);
 
             if (!target || target <= 0) {
-                est.innerHTML = `<span style="color:var(--text-faint);">Available to ${dexMarketSide}: ${availFmt.value} ${availFmt.prefix} across ${side.length} order${side.length !== 1 ? 's' : ''}.</span>`;
+                const _raw = dexMarketSide === 'buy' ? (_dexMarketBook.rawAsks || 0) : (_dexMarketBook.rawBids || 0);
+                const _chatOnly = Math.max(0, _raw - side.length);
+                let _msg = `Available to ${dexMarketSide}: ${availFmt.value} ${availFmt.prefix} across ${side.length} on-chain order${side.length !== 1 ? 's' : ''}.`;
+                if (side.length === 0 && _chatOnly > 0)
+                    _msg += ` ${_chatOnly} chat-promise order${_chatOnly !== 1 ? 's' : ''} can't be swept — fill them one at a time from the ladder.`;
+                est.innerHTML = `<span style="color:var(--text-faint);">${_msg}</span>`;
                 btn.disabled = true; btn.style.opacity = '.5'; btn.textContent = 'Enter an amount';
                 return;
             }
@@ -6622,6 +7168,11 @@ document.getElementById('btnExport').onclick = () => {
                 const stillLive = dexOrderbook.find(x => (x.offerId || x.nonce) === (o.offerId || o.nonce));
                 if (!stillLive) { continue; }
                 try {
+                    if (o.escrow && o.escrow.bidId) {
+                        const okFill = await dexFillEscrowBid(dexOrderbook.indexOf(o));
+                        if (okFill) done++; else failed++;
+                        continue;
+                    }
                     showActivity(`Market ${dexMarketSide}: filling order ${done + 1} of ${sim.fills.length}…`);
                     // Route through the same single-order fill path; await each in turn.
                     await dexFillLimitL1(o);
@@ -6949,8 +7500,10 @@ document.getElementById('btnExport').onclick = () => {
         }
         setInterval(() => {
             dexScanAnnouncements();
+            try { dexScanBids(); } catch (_) {}
             for (const o of dexOrderbook) if (o.onchain && o.covenant && o.covenant.coinId) dexVerifyCovenantCoin(o);
         }, 180000);
+        try { dexScanBids(); } catch (_) {}
 
         </script>
 

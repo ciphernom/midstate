@@ -3,6 +3,13 @@ pragma solidity ^0.8.20;
 
 /// @title  MidstateAtomicSwap
 /// @notice ETH side of a cross-chain HTLC atomic swap with the Midstate chain.
+///         Two order shapes live here:
+///           • lock/claim/refund — the taker-side ETH leg of a SELL-MDS order
+///             (the resting order is the MDS covenant on Midstate).
+///           • createBid/reserveBid/claimBid/cancelBid — resting BUY-MDS
+///             orders: the ETH is escrowed here up front so bids are
+///             on-chain-verifiable and sweepable, mirroring what the limit
+///             covenant does for asks. See the RESTING BIDS section below.
 ///
 /// Protocol (maker sells MDS, taker pays ETH; the MAKER generates the secret):
 ///   1. Maker locks MDS in a Midstate HTLC with hashlock H = BLAKE3(secret),
@@ -117,6 +124,190 @@ contract MidstateAtomicSwap {
         address payable to = s.refundTo;
 
         emit Refunded(swapId);
+
+        (bool ok, ) = to.call{value: amt}("");
+        require(ok, "refund failed");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  RESTING BIDS (buy-MDS limit orders, ETH escrowed up front)
+    //
+    //  Direction is INVERTED vs. the swap above. Here the ETH side rests
+    //  on-chain first, so the BID MAKER generates the secret and reveals it on
+    //  Midstate (by claiming the seller's MDS covenant); the seller then uses
+    //  the revealed preimage to claim the ETH here.
+    //
+    //  Protocol (maker buys MDS with ETH; the MAKER generates the secret):
+    //    1. Maker calls createBid{value: wei}(H, mdsAmount, mdsAddr, ttl, bond)
+    //       with H = BLAKE3(secret). The bid is now publicly verifiable escrow.
+    //    2. A seller reserves it: reserveBid{value: bond}(bidId, fillWindow).
+    //       The reservation is exclusive until fillDeadline = now + fillWindow.
+    //    3. The seller locks mdsAmount MDS on Midstate in a covenant HTLC with
+    //       the SAME hashlock H, receiver = makerMdsAddr, refund = seller, and
+    //       a covenant timeout ending WELL BEFORE fillDeadline (see ordering).
+    //    4. The maker's wallet verifies that covenant, then claims it —
+    //       revealing `secret` on Midstate — and receives the MDS.
+    //    5. The seller (or anyone) reads the preimage from the Midstate claim
+    //       and calls claimBid(bidId, secret) before fillDeadline. The escrow
+    //       plus the seller's own fill bond are paid to the seller.
+    //
+    //  Safety ordering (inverted vs. lock/claim above): the MIDSTATE covenant
+    //  timeout MUST end comfortably BEFORE fillDeadline, so that after the
+    //  maker reveals (at the latest just before the covenant timeout) the
+    //  seller still has ample time to claim here.
+    //
+    //  Sellers MUST reserve first and lock MDS only after the reservation
+    //  confirms — an unreserved bid can be cancelled by its maker at any time.
+    //
+    //  ONE reservation per bid, ever. If a reservation lapses unclaimed the
+    //  bid can only be cancelled, never re-reserved: after a lapsed fill the
+    //  preimage may already be public on Midstate (the maker may have claimed
+    //  the MDS late), and re-reserving would let a stranger collect the ETH
+    //  with that public preimage without delivering anything. A replacement
+    //  bid must use a FRESH secret — enforced by _hashlockUsed.
+    //
+    //  The fill bond (chosen by the maker, may be zero) is the seller's stake:
+    //  returned on a successful claim, forfeited to the maker if the
+    //  reservation lapses. It makes reserve-and-vanish griefing cost money.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    struct Bid {
+        address payable maker;   // ETH escrower (MDS buyer); refunds + forfeited bonds go here
+        address payable filler;  // seller holding the (single) reservation; 0 while open
+        uint256 amount;          // wei escrowed for the seller
+        uint256 fillBond;        // wei a seller must stake to reserve (anti-griefing; may be 0)
+        uint64  mdsAmount;       // MDS units the maker expects locked on Midstate
+        uint64  expiry;          // unix time after which the bid can no longer be reserved
+        uint64  fillDeadline;    // unix time the active reservation (and claim window) ends
+        bytes32 hashlock;        // BLAKE3(secret); the secret is generated and held by the MAKER
+        bytes32 makerMdsAddr;    // Midstate address the seller's covenant must pay
+        bool    settled;         // true once claimed or cancelled
+    }
+
+    mapping(bytes32 => Bid) public bids;
+    uint256 private _bidNonce;
+    mapping(bytes32 => bool) private _hashlockUsed;
+
+    event BidCreated(
+        bytes32 indexed bidId,
+        address indexed maker,
+        bytes32 hashlock,
+        uint256 amount,
+        uint256 fillBond,
+        uint64  mdsAmount,
+        bytes32 makerMdsAddr,
+        uint64  expiry
+    );
+    event BidReserved(bytes32 indexed bidId, address indexed filler, uint64 fillDeadline);
+    event BidClaimed(bytes32 indexed bidId, bytes32 hashlock, bytes32 preimage);
+    event BidCancelled(bytes32 indexed bidId);
+
+    /// @notice Escrow ETH as a resting buy order for `mdsAmount` MDS.
+    /// @param hashlock     BLAKE3 hash of a fresh 32-byte secret held by the caller.
+    ///                     Never reuse a secret across bids or swaps.
+    /// @param mdsAmount    MDS units the filling seller must lock on Midstate.
+    /// @param makerMdsAddr Midstate address the seller's covenant HTLC must pay.
+    /// @param ttl          seconds this bid stays reservable (1 hour – 90 days).
+    /// @param fillBond     wei a seller must stake in reserveBid (0 to disable).
+    function createBid(
+        bytes32 hashlock,
+        uint64  mdsAmount,
+        bytes32 makerMdsAddr,
+        uint256 ttl,
+        uint256 fillBond
+    ) external payable returns (bytes32 bidId) {
+        require(msg.value > 0, "no value");
+        require(mdsAmount > 0, "no mds amount");
+        require(hashlock != bytes32(0), "bad hashlock");
+        require(!_hashlockUsed[hashlock], "hashlock reused");
+        require(makerMdsAddr != bytes32(0), "bad mds addr");
+        require(ttl >= 1 hours && ttl <= 90 days, "bad ttl");
+
+        _hashlockUsed[hashlock] = true;
+        uint64 expiry = uint64(block.timestamp + ttl);
+
+        // The nonce makes ids collision-free; the existence check just keeps
+        // the invariant explicit.
+        bidId = keccak256(
+            abi.encode(msg.sender, hashlock, msg.value, _bidNonce++, address(this), block.chainid)
+        );
+        require(bids[bidId].amount == 0, "bid exists");
+
+        bids[bidId] = Bid({
+            maker: payable(msg.sender),
+            filler: payable(address(0)),
+            amount: msg.value,
+            fillBond: fillBond,
+            mdsAmount: mdsAmount,
+            expiry: expiry,
+            fillDeadline: 0,
+            hashlock: hashlock,
+            makerMdsAddr: makerMdsAddr,
+            settled: false
+        });
+
+        emit BidCreated(bidId, msg.sender, hashlock, msg.value, fillBond, mdsAmount, makerMdsAddr, expiry);
+    }
+
+    /// @notice Reserve a bid BEFORE locking MDS on Midstate. Exclusive until
+    ///         fillDeadline; each bid can be reserved exactly once (see notes).
+    /// @param fillWindow seconds of exclusivity (2 hours – 3 days). Pick your
+    ///        Midstate covenant timeout to end WELL BEFORE now + fillWindow.
+    function reserveBid(bytes32 bidId, uint256 fillWindow) external payable {
+        Bid storage b = bids[bidId];
+        require(b.amount > 0, "not found");
+        require(!b.settled, "settled");
+        require(b.filler == address(0), "already reserved");
+        require(block.timestamp < b.expiry, "expired");
+        require(fillWindow >= 2 hours && fillWindow <= 3 days, "bad window");
+        require(msg.value == b.fillBond, "bad bond");
+
+        b.filler = payable(msg.sender);
+        b.fillDeadline = uint64(block.timestamp + fillWindow);
+
+        emit BidReserved(bidId, msg.sender, b.fillDeadline);
+    }
+
+    /// @notice Collect the escrowed ETH (plus the fill bond back) by revealing
+    ///         the 32-byte secret the maker published on Midstate.
+    /// @dev    Callable by anyone before the fill deadline — knowledge of the
+    ///         secret is the authorization, and funds always go to the
+    ///         reserved filler (so reading the preimage off Midstate first
+    ///         gains a front-runner nothing).
+    function claimBid(bytes32 bidId, bytes32 preimage) external nonReentrant {
+        Bid storage b = bids[bidId];
+        require(b.amount > 0, "not found");
+        require(!b.settled, "settled");
+        require(b.filler != address(0), "not reserved");
+        require(block.timestamp <= b.fillDeadline, "fill lapsed");
+        require(blake3_256(preimage) == b.hashlock, "bad preimage");
+
+        b.settled = true;
+        uint256 amt = b.amount + b.fillBond;
+        address payable to = b.filler;
+
+        emit BidClaimed(bidId, b.hashlock, preimage);
+
+        (bool ok, ) = to.call{value: amt}("");
+        require(ok, "pay failed");
+    }
+
+    /// @notice Cancel a bid and reclaim the ETH. Maker only. Instant while the
+    ///         bid is unreserved; blocked during a live reservation; allowed
+    ///         again once the reservation lapses (sweeping the forfeited bond).
+    function cancelBid(bytes32 bidId) external nonReentrant {
+        Bid storage b = bids[bidId];
+        require(b.amount > 0, "not found");
+        require(!b.settled, "settled");
+        require(msg.sender == b.maker, "not maker");
+        require(b.filler == address(0) || block.timestamp > b.fillDeadline, "reserved");
+
+        b.settled = true;
+        // A lapsed reservation forfeits the seller's bond to the maker.
+        uint256 amt = b.amount + (b.filler != address(0) ? b.fillBond : 0);
+        address payable to = b.maker;
+
+        emit BidCancelled(bidId);
 
         (bool ok, ) = to.call{value: amt}("");
         require(ok, "refund failed");
