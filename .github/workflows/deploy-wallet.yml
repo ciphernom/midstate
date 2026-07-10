@@ -60,7 +60,7 @@ jobs:
           cp -r wasm-wallet/website/* staging/
           
           # Add this line to tell GitHub about the custom domain
-          echo "cypherpunk.gold" > staging/CNAME
+          #echo "midstate.cash" > staging/CNAME
           
           # 3. Copy the Wasm Wallet files to the '/wallet' subdirectory
           cp wasm-wallet/index.html staging/wallet/
@@ -88,6 +88,23 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
+      # 1. Download the staging folder we built in the previous job
+      - name: Download Pages artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: github-pages
+          path: ./staging
+
+      # 2. Deploy to Legacy GitHub Pages (.github.io)
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+      # 3. Deploy the exact same files to Cloudflare Pages (midstate.cash)
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/pages-action@v1
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          projectName: 'midstate' 
+          directory: './staging'

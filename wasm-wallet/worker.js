@@ -2938,6 +2938,36 @@ else if (type === 'L2_OPEN_CHANNEL') {
             self.postMessage({ type: 'BACKUP_READY', payload: JSON.stringify(bundle) });
         }
 
+        // ═══════════════════════════════════════════════════════════════════════════
+        //  IMPORT_CLI — full replacement for the existing handler in worker.js
+        //
+        //  Supersedes PR #28. That PR fixed the map KEY (pk → derived address) but left
+        //  imported wallets unable to sign: the WASM mss_cache stayed empty, leaf
+        //  counters never synced (set_mss_leaf_index silently no-ops on a cache miss),
+        //  every MSS entry kept index:0 (so loadMssCaches' regeneration fallback would
+        //  rebuild key 0 for ALL entries), wotsAddrs stayed empty (historical change
+        //  addresses unwatched), and every coin carried index:0 / mss_height:10.
+        //
+        //  This version:
+        //   1. Keys mssAddrs by the derived P2PK address (same fix as the PR) — but
+        //      gets the address from get_mss_address(), which ALSO rebuilds the tree
+        //      into the WASM signing cache.
+        //   2. Self-verifies: asserts the index-i derivation reproduces the CLI's
+        //      master_pk, so a derivation-scheme mismatch aborts loudly instead of
+        //      importing a wallet that scans but cannot sign.
+        //   3. Syncs next_leaf BEFORE exporting, then persists the tree to IndexedDB
+        //      under mss_<address>, exactly mirroring deriveNextMss().
+        //   4. Re-derives all historically used WOTS addresses + GAP_LIMIT lookahead,
+        //      restoring the native invariant (wotsAddrs = indices 0..nextWotsIndex-1)
+        //      that performSend and addUtxo's gap extension rely on.
+        //   5. Recovers true per-coin metadata (WOTS index via the address map;
+        //      per-key MSS height/leaf) instead of hardcoding.
+        //   6. Builds everything into locals and commits wState/wallet atomically at
+        //      the end — a mid-import failure leaves the previous wallet untouched.
+        //   7. Surfaces the real error message (decrypt failure vs derivation
+        //      mismatch need different user actions) and kicks a scan on success.
+        // ═══════════════════════════════════════════════════════════════════════════
+
         else if (type === 'IMPORT_CLI') {
             try {
                 scanGeneration++;
@@ -2948,40 +2978,136 @@ else if (type === 'L2_OPEN_CHANNEL') {
                 const cliData    = JSON.parse(cliJsonStr);
                 if (!cliData.master_seed) throw new Error("Legacy (non-HD) wallets not supported in Web.");
 
-                let newUtxos = {};
-                for (const coin of cliData.coins) {
-                    newUtxos[normalizeHex(coin.coin_id)] = {
-                        index: 0,
-                        is_mss: cliData.mss_keys.some(k => normalizeHex(k.master_pk) === normalizeHex(coin.owner_pk)),
-                        mss_height: 10, mss_leaf: 0,
-                        address: normalizeHex(coin.address),
-                        value:   coin.value,
-                        salt:    normalizeHex(coin.salt),
-                        coin_id: normalizeHex(coin.coin_id)
-                    };
-                }
+                // Build on a LOCAL instance; commit to the `wallet` global only on success.
+                const importWallet = WebWallet.from_seed_hex(normalizeHex(cliData.master_seed));
+
+                // ── MSS keys: regenerate by derivation index, verified against the CLI ──
+                const mssKeys = cliData.mss_keys || [];
                 let newMssAddrs = {};
-                for (const mss of cliData.mss_keys) {
-                    newMssAddrs[normalizeHex(mss.master_pk)] = { index: 0, height: mss.height, next_leaf: mss.next_leaf };
+                for (let i = 0; i < mssKeys.length; i++) {
+                    const mss = mssKeys[i];
+                    const masterPkHex = normalizeHex(mss.master_pk);
+                    self.postMessage({ type: 'MSS_PROGRESS', payload: { current: 0, total: 100, label: `Rebuilding MSS key ${i + 1}/${mssKeys.length}…` } });
+
+                    // Rebuilds the full tree into the WASM signing cache and returns the
+                    // canonical address: hex(compute_address(master_pk)) — identical to
+                    // what deriveNextMss() stores for native keys.
+                    const addr = importWallet.get_mss_address(i, mss.height, (current, total) => {
+                        const now = Date.now();
+                        if (now - lastMssUpdate > 66 || current === total) {
+                            lastMssUpdate = now;
+                            self.postMessage({ type: 'MSS_PROGRESS', payload: { current, total, label: `Rebuilding MSS key ${i + 1}/${mssKeys.length} (${current}/${total})…` } });
+                        }
+                    });
+
+                    // Self-verifying import. VERIFIED against the CLI source (wallet/mod.rs,
+                    // wallet/hd.rs): generate_mss → allocate_next_mss_seed is the ONLY writer
+                    // to mss_keys (append-only, sequential next_mss_index), and the WASM
+                    // imports the identical midstate::wallet::hd::derive_mss_seed. For HD
+                    // wallets this check therefore always passes. The one real failure case
+                    // is a legacy wallet later upgraded to HD: allocate_next_mss_seed used
+                    // rand::random() before the master_seed existed, so early keys are not
+                    // reproducible from the seed. Abort loudly — never import a wallet that
+                    // scans but cannot sign.
+                    if (importWallet.get_mss_pubkey(addr) !== masterPkHex) {
+                        throw new Error(
+                            `MSS key ${i} was not derived from this wallet's seed (legacy key ` +
+                            `from a pre-HD wallet upgrade). Import aborted; your existing web ` +
+                            `wallet is untouched. Sweep this key's funds to a fresh address ` +
+                            `using the CLI, then re-export and import.`
+                        );
+                    }
+
+                    // Sync the leaf counter BEFORE export so the persisted blob carries it
+                    // ([height:4][seed:32][next_leaf:8][master_pk:32][tree] layout).
+                    importWallet.set_mss_leaf_index(addr, mss.next_leaf);
+                    await idbPut(`mss_${addr}`, importWallet.export_mss_bytes(addr));
+
+                    newMssAddrs[addr] = { index: i, height: mss.height, next_leaf: mss.next_leaf };
                 }
+
+                // ── WOTS addresses: all historically used indices + gap-limit lookahead ──
+                // Restores the native invariant wotsAddrs = {0 .. nextWotsIndex-1}, so
+                // historical change addresses are watched and coin indices are recoverable.
+                const cliNextWots = cliData.next_wots_index || 0;
+                const wotsTarget  = cliNextWots + GAP_LIMIT;
+                let newWotsAddrs  = {};
+                for (let i = 0; i < wotsTarget; i++) {
+                    newWotsAddrs[importWallet.get_wots_address(i)] = i;
+                    if (i % 25 === 0) {
+                        self.postMessage({ type: 'MSS_PROGRESS', payload: { current: i, total: wotsTarget, label: `Deriving WOTS addresses (${i}/${wotsTarget})…` } });
+                        await new Promise(r => setTimeout(r, 0));
+                    }
+                }
+
+                // ── Coins: classify by the rebuilt maps; recover true metadata ──
+                // WalletCoin in the CLI also carries an optional `commitment` (confidential /
+                // state-thread coins) — pass it through, or spends of such coins break.
+                let newUtxos = {};
+                for (const coin of (cliData.coins || [])) {
+                    const addrHex = normalizeHex(coin.address);
+                    const coinId  = normalizeHex(coin.coin_id);
+                    const saltHex = normalizeHex(coin.salt);
+                    const commit  = coin.commitment ? normalizeHex(coin.commitment) : null;
+                    const mssMeta = newMssAddrs[addrHex];
+
+                    if (mssMeta) {
+                        newUtxos[coinId] = {
+                            index: mssMeta.index, is_mss: true,
+                            mss_height: mssMeta.height, mss_leaf: mssMeta.next_leaf,
+                            address: addrHex, value: coin.value, salt: saltHex,
+                            coin_id: coinId, commitment: commit
+                        };
+                    } else if (newWotsAddrs[addrHex] !== undefined) {
+                        newUtxos[coinId] = {
+                            index: newWotsAddrs[addrHex], is_mss: false,
+                            mss_height: 0, mss_leaf: 0,
+                            address: addrHex, value: coin.value, salt: saltHex,
+                            coin_id: coinId, commitment: commit
+                        };
+                    } else {
+                        // Not derivable from this seed. Two known sources (verified in
+                        // wallet/mod.rs): import_coin() coins carrying foreign WOTS seeds,
+                        // and script-address coins. The CLI export includes the raw seed
+                        // for the former, but the web wallet has no sign-with-raw-seed
+                        // path — keep the coin visible as watch-only and direct the user
+                        // to sweep it with the CLI.
+                        self.postMessage({ type: 'LOG', payload: `Warning: coin ${coinId.substring(0, 12)}… is at an address this seed cannot derive; imported as watch-only (sweep it with the CLI to make it spendable here).` });
+                        newUtxos[coinId] = {
+                            index: 0, is_mss: false, mss_height: 0, mss_leaf: 0,
+                            address: addrHex, value: coin.value, salt: saltHex,
+                            coin_id: coinId, commitment: commit
+                        };
+                    }
+                }
+
+                // ── Atomic commit ──
+                if (wallet) wallet.free();
+                wallet   = importWallet;
+                password = payload.password;
                 wState = {
                     phrase: null,
                     master_seed: normalizeHex(cliData.master_seed),
-                    nextWotsIndex: cliData.next_wots_index || 0,
-                    nextMssIndex:  cliData.next_mss_index  || 0,
-                    wotsAddrs: {}, mssAddrs: newMssAddrs, utxos: newUtxos,
-                    history: cliData.history || [],
+                    nextWotsIndex: wotsTarget,   // frontier = count of derived addresses (native invariant)
+                    nextMssIndex:  Math.max(cliData.next_mss_index || 0, mssKeys.length),
+                    wotsAddrs: newWotsAddrs,
+                    mssAddrs:  newMssAddrs,
+                    utxos:     newUtxos,
+                    history:   cliData.history || [],
                     lastScannedHeight: cliData.last_scan_height || 0,
                     l2_channels: {}, l2_secrets: {}, l2_routes: {}
                 };
-                wallet   = WebWallet.from_seed_hex(normalizeHex(cliData.master_seed));
-                password = payload.password;
-                mssCachesReady = false;
-                await loadMssCaches();
+                mssCachesReady = true;           // populated above; loadMssCaches would short-circuit anyway
                 await saveState();
                 self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
+
+                // Catch up from the CLI's last scanned height (picks up anything received
+                // at the — now correctly keyed — MSS address since the CLI last ran).
+                performScan().catch(() => {});
             } catch (err) {
-                self.postMessage({ type: 'ERROR', payload: "Failed to import CLI wallet: Incorrect password or corrupt file." });
+                // Decrypt failure and derivation mismatch require different user actions —
+                // surface the real reason instead of a generic message.
+                self.postMessage({ type: 'ERROR', payload: `Failed to import CLI wallet: ${err && err.message ? err.message : err}` });
             }
         }
 

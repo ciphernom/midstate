@@ -83,6 +83,10 @@ impl RpcServer {
             "https://ciphernom.github.io".parse::<HeaderValue>().unwrap(), 
             "https://cypherpunk.gold".parse::<HeaderValue>().unwrap(), 
             "https://www.cypherpunk.gold".parse::<HeaderValue>().unwrap(), 
+            "https://midstate.cash".parse::<HeaderValue>().unwrap(), 
+            "https://www.midstate.cash".parse::<HeaderValue>().unwrap(),
+            "https://mds.cash".parse::<HeaderValue>().unwrap(), 
+            "https://www.mds.cash".parse::<HeaderValue>().unwrap(),
         ];
         
         let cors = CorsLayer::new()
