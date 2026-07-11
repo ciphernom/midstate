@@ -200,6 +200,13 @@ pub struct Node {
     
     /// Fallback peers to dial if we suffer a total network eclipse
     bootstrap_peers: Vec<String>,
+    
+    /// Tracks WOTS/MSS public keys currently being actively punished/burned.
+    /// Prevents redundant DoS grinding if an attacker spams key reuses.
+    active_burns: HashSet<[u8; 32]>,
+    /// High-priority queue for MEV Bounty Hunter transactions. (Commit, Reveal) pairs.
+    /// Bypasses mempool validation to guarantee inclusion in the next mined block.
+    bounty_queue: VecDeque<(Transaction, Transaction)>,
 }
 
 #[derive(Clone)]
@@ -234,6 +241,8 @@ pub enum NodeCommand {
     SubmitMinedBlock(Batch, Option<tokio::sync::oneshot::Sender<Result<(), String>>>),
     SendTransaction(Transaction),
     SubmitMixTransaction { mix_id: [u8; 32], tx: Transaction },
+    // High-priority MEV transaction injection (bypasses mempool validation)
+    InjectBounty { commit: Transaction, reveal: Transaction },
     // --- P2P Mix Coordination Commands ---
     BroadcastMixAnnounce { mix_id: [u8; 32], denomination: u64 },
     SendMixJoin { coordinator: PeerId, mix_id: [u8; 32], input: InputReveal, output: OutputData, signature: Vec<u8>, join_nonce: u64 },
@@ -765,6 +774,7 @@ struct TemplatePrefix {
 fn build_template_prefix(
     state: &State,
     mempool_txs: Vec<Transaction>,
+    bounty_txs: Vec<(Transaction, Transaction)>,
 ) -> TemplatePrefix {
     let mut candidate = state.clone();
     let v2 = crate::core::types::is_v2_at(candidate.height);
@@ -790,6 +800,14 @@ fn build_template_prefix(
 
     let mut pending_commits = Vec::new();
     let mut pending_reveals = Vec::new();
+
+    // 1. Inject MEV Bounties FIRST (Max Priority)
+    for (commit, reveal) in bounty_txs {
+        pending_commits.push(commit);
+        pending_reveals.push(reveal);
+    }
+
+    // 2. Queue standard mempool txs
     for tx in mempool_txs {
         match tx {
             Transaction::Commit { .. } => pending_commits.push(tx),
@@ -1023,7 +1041,9 @@ pub fn build_block_template_inner(
     mempool_txs: Vec<Transaction>,
     req: &crate::rpc::types::BlockTemplateRequest,
 ) -> Result<crate::rpc::types::BlockTemplateResponse, BlockTemplateError> {
-    let prefix = build_template_prefix(state, mempool_txs);
+    // Pass an empty vec for the bounty_txs since this is a test/back-compat wrapper.
+    // The active node uses `cached_template_prefix` which natively injects the bounties.
+    let prefix = build_template_prefix(state, mempool_txs, Vec::new());
     finish_template(&prefix, req)
 }
 
@@ -1048,12 +1068,81 @@ struct CachedPrefix {
     height: u64,
     header_hash: [u8; 32],
     mempool_len: usize,
+    bounty_len: usize,
     built_at: std::time::Instant,
     prefix: std::sync::Arc<TemplatePrefix>,
 }
 
 static TEMPLATE_PREFIX_CACHE: std::sync::Mutex<Option<CachedPrefix>> =
     std::sync::Mutex::new(None);
+
+
+// ── Key Reuse Detection Helpers ─────────────────────────────────────────────
+
+#[derive(Clone)]
+struct SigInfo {
+    wots_pk: [u8; 32],
+    wots_sig: [[u8; 32]; crate::core::wots::CHAINS],
+    commitment: [u8; 32],
+    is_mss: bool,
+    auth_path: Vec<[u8; 32]>,
+    leaf_index: u64,
+    input_reveal: crate::core::types::InputReveal,
+}
+
+/// Extracts structured signature information from a transaction to detect key reuse.
+fn extract_sig_infos(tx: &Transaction) -> Vec<SigInfo> {
+    let mut infos = Vec::new();
+    let (inputs, witnesses, salt) = match tx {
+        Transaction::Reveal { inputs, witnesses, salt, .. } => (inputs, witnesses, salt),
+        Transaction::Consolidate { inputs, witness, salt, .. } => (inputs, &vec![witness.clone()], salt),
+        _ => return infos,
+    };
+
+    let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+    let output_ids: Vec<[u8; 32]> = match tx {
+        Transaction::Reveal { outputs, .. } | Transaction::Consolidate { outputs, .. } => outputs.iter().map(|o| o.hash_for_commitment()).collect(),
+        _ => vec![],
+    };
+    let commitment = crate::core::compute_commitment(&input_ids, &output_ids, salt);
+
+    for (i, witness) in witnesses.iter().enumerate() {
+        let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
+        if let Some(sig) = wit_inputs.first() {
+            let input = if matches!(tx, Transaction::Consolidate{..}) { &inputs[0] } else { &inputs[i] };
+            
+            if sig.len() == crate::core::wots::SIG_SIZE {
+                if let Some(wots_sig) = crate::core::wots::sig_from_bytes(sig) {
+                    if let Some(wots_pk) = input.predicate.owner_pk() {
+                        infos.push(SigInfo {
+                            wots_pk,
+                            wots_sig,
+                            commitment,
+                            is_mss: false,
+                            auth_path: vec![],
+                            leaf_index: 0,
+                            input_reveal: input.clone(),
+                        });
+                    }
+                }
+            } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
+                // FIX: mss_sig.wots_sig is ALREADY parsed into [[u8; 32]; CHAINS] by MssSignature::from_bytes
+                infos.push(SigInfo {
+                    wots_pk: mss_sig.wots_pk,
+                    wots_sig: mss_sig.wots_sig, 
+                    commitment,
+                    is_mss: true,
+                    auth_path: mss_sig.auth_path,
+                    leaf_index: mss_sig.leaf_index,
+                    input_reveal: input.clone(),
+                });
+            }
+        }
+    }
+    infos
+}
+
+
 
 impl Node {
     /// Return a shared template prefix for the current tip + mempool, building
@@ -1062,6 +1151,7 @@ impl Node {
         let height      = self.state.height;
         let header_hash = self.state.header_hash;
         let mempool_len = self.mempool.len();
+        let bounty_len = self.bounty_queue.len();
 
         {
             let cache = TEMPLATE_PREFIX_CACHE.lock().unwrap();
@@ -1069,6 +1159,7 @@ impl Node {
                 if c.height == height
                     && c.header_hash == header_hash
                     && c.mempool_len == mempool_len
+                    && c.bounty_len == bounty_len
                     && c.built_at.elapsed() < TEMPLATE_CACHE_TTL
                 {
                     return c.prefix.clone();
@@ -1077,13 +1168,15 @@ impl Node {
         } // release the lock before the (potentially heavy) build
 
         let mempool_txs = self.mempool.transactions_cloned();
-        let prefix = std::sync::Arc::new(build_template_prefix(&self.state, mempool_txs));
+        let bounty_txs: Vec<_> = self.bounty_queue.iter().cloned().collect();
+        let prefix = std::sync::Arc::new(build_template_prefix(&self.state, mempool_txs, bounty_txs));
 
         let mut cache = TEMPLATE_PREFIX_CACHE.lock().unwrap();
         *cache = Some(CachedPrefix {
             height,
             header_hash,
             mempool_len,
+            bounty_len,
             built_at: std::time::Instant::now(),
             prefix: prefix.clone(),
         });
@@ -1364,6 +1457,8 @@ pub async fn new(
             seen_chats_queue: VecDeque::with_capacity(5001),
             outbox_chat_limiter: Arc::new(tokio::sync::Mutex::new((0, std::time::Instant::now()))),
             light_chat_limits: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            active_burns: HashSet::new(),
+            bounty_queue: VecDeque::new(),
         })
     }
 
@@ -2775,6 +2870,13 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                 
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
+                        NodeCommand::InjectBounty { commit, reveal } => {
+                            self.bounty_queue.push_back((commit, reveal));
+                            // Instantly stop current mining to build a new template with the bounty!
+                            self.cancel_mining();
+                            self.trigger_mining();
+                        }
+                        
                         NodeCommand::SendTransaction(tx) => {
                             if let Err(e) = self.handle_new_transaction(tx, None).await {
                                 tracing::error!("Failed to handle transaction: {}", e);
@@ -4596,32 +4698,68 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
         Ok(())
     }
 
+    /// Handles incoming transactions from the network or local RPC.
+    ///
+    /// # Reasoning
+    /// Validates transactions cryptographically before adding them to the mempool.
+    /// To enforce the safety of WOTS and MSS one-time signatures, this method natively
+    /// acts as a "Bounty Hunter". If it detects two transactions attempting to reuse 
+    /// the same public key across different commitments, it extracts the leaked partial key 
+    /// and automatically forges a 100%-fee DataBurn transaction. 
+    ///
+    /// This fundamentally disincentivizes key reuse by guaranteeing that an attacker's 
+    /// funds will be legally swept by miners before the attacker can benefit.
+    ///
+    /// # Formal Specification (Key Reuse Burn Protocol)
+    ///
+    /// ```text
+    /// Pre:
+    ///   - tx is cryptographically valid.
+    ///   - tx.wots_pk matches m_tx.wots_pk for some m_tx ∈ mempool.
+    ///   - tx.commitment ≠ m_tx.commitment.
+    ///
+    /// Post:
+    ///   result = Err(_) ⇒
+    ///     state.active_burns' = state.active_burns ∪ {tx.wots_pk}
+    ///     NodeCommand::SendTransaction(forged_commit) is queued
+    ///     NodeCommand::SubmitMixTransaction(forged_reveal) is queued
+    /// ```
+    ///
+    /// ```zed
+    ///     PunishKeyReuse
+    ///     --------------
+    ///     ΔNode
+    ///     tx? : Transaction
+    ///
+    ///     pre  ∃ m_tx ∈ mempool • extract_pk(tx?) = extract_pk(m_tx) ∧ extract_commit(tx?) ≠ extract_commit(m_tx)
+    ///     post active_burns' = active_burns ∪ {extract_pk(tx?)}
+    ///     post ∃ forged_tx • mempool' = mempool ∪ {forged_tx}
+    /// ```
+    ///
+    /// # Safety / Invariants
+    /// Tracks `active_burns` to ensure the node cannot be DDoS'd by an attacker
+    /// spamming hundreds of key reuses, as the node will only run the salt grinder once per key.
     async fn handle_new_transaction(&mut self, tx: Transaction, from: Option<PeerId>) -> Result<()> {
         // --- OPTIMIZATION: Ignore live mempool gossip while syncing ---
         if self.sync.in_progress && from.is_some() {
             return Ok(());
         }
 
-        // Per-peer rate limiting: prevent CPU exhaustion from tx validation spam.
-        // Local submissions (from = None, i.e. RPC) bypass the limit.
         if let Some(peer) = from {
             let now = std::time::Instant::now();
             let entry = self.peer_tx_counts.entry(peer).or_insert((0, now));
             if now.duration_since(entry.1).as_secs() >= TX_RATE_WINDOW_SECS {
-                *entry = (0, now); // reset window
+                *entry = (0, now); 
             }
             entry.0 += 1;
             if entry.0 > MAX_TX_PER_PEER_PER_WINDOW {
                 tracing::debug!("Rate-limiting peer {}: {} txs in window", peer, entry.0);
-                return Ok(()); // silently drop, don't validate
+                return Ok(()); 
             }
         }
 
         let wots_oracle = self.storage.query_spent_addresses_for_tx(&tx).unwrap_or_default();
 
-        // EVENT LOOP DEFENSE: Validate cryptography on a background thread.
-        // We clone the state (O(1) cost due to immutable data structures) and the tx,
-        // so the heavy WOTS math doesn't stall the Tokio networking reactor.
         let state_clone = self.state.clone();
         let tx_clone = tx.clone();
         let is_valid = tokio::task::spawn_blocking(move || {
@@ -4630,19 +4768,106 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
 
         if let Err(e) = is_valid {
             self.metrics.inc_invalid_transactions();
-            return Err(e); // Abort before locking mempool
+            return Err(e); 
         }
 
-        // The transaction is cryptographically valid. Now add it to the mempool.
+        // ── KEY REUSE PUNISHMENT BURN PROTOCOL ─────────────────────────────────
+        let tx_sig_infos = extract_sig_infos(&tx);
+        if !tx_sig_infos.is_empty() {
+            let mempool_txs = self.mempool.transactions_cloned();
+            for tx_info in &tx_sig_infos {
+                // Prevent redundant grinding DoS if we are already burning this key
+                if self.active_burns.contains(&tx_info.wots_pk) {
+                    return Err(anyhow::anyhow!("Transaction rejected. Key reuse already being punished."));
+                }
+
+                let mut reuse_found = false;
+                let mut leaked_sig = None;
+                let mut leaked_commitment = None;
+
+                // 1. Check Mempool
+                for m_tx in &mempool_txs {
+                    let m_infos = extract_sig_infos(m_tx);
+                    for m_info in m_infos {
+                        if tx_info.wots_pk == m_info.wots_pk && tx_info.commitment != m_info.commitment {
+                            reuse_found = true;
+                            leaked_sig = Some(m_info.wots_sig);
+                            leaked_commitment = Some(m_info.commitment);
+                            break;
+                        }
+                    }
+                    if reuse_found { break; }
+                }
+
+                // 2. Check Historical (Mined) Blocks
+                if !reuse_found {
+                    if self.state.burned_wots.contains(&tx_info.wots_pk) {
+                        if let Ok(Some(old_commit)) = self.storage.get_spent_commitment(&tx_info.wots_pk) {
+                            if old_commit != tx_info.commitment {
+                                if let Ok(Some(old_sig_bytes)) = self.storage.get_archived_signature(&tx_info.wots_pk) {
+                                    if let Some(old_sig) = crate::core::wots::sig_from_bytes(&old_sig_bytes) {
+                                        reuse_found = true;
+                                        leaked_sig = Some(old_sig);
+                                        leaked_commitment = Some(old_commit);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3. Execute Forgery & Injection
+                if reuse_found {
+                    let leaked_sig = leaked_sig.unwrap();
+                    let leaked_commitment = leaked_commitment.unwrap();
+
+                    tracing::error!(
+                        "🚨 KEY REUSE DETECTED! Public Key: {}. Initiating automated Burn Protocol.", 
+                        hex::encode(tx_info.wots_pk)
+                    );
+                    
+                    self.active_burns.insert(tx_info.wots_pk); 
+                    
+                    let mut psk = crate::core::wots::PartialSecretKey::from_signature(&leaked_sig, &leaked_commitment);
+                    psk.merge_signature(&tx_info.wots_sig, &tx_info.commitment);
+                    
+                    let burn_inputs = vec![tx_info.input_reveal.clone()];
+                    
+                    let cmd_tx = self.cmd_tx.as_ref().unwrap().clone();
+                    let tx_info_clone = tx_info.clone();
+                    let req_pow = self.mempool.required_commit_pow();
+                    let current_height = self.state.height;
+                    let header_hash = self.state.header_hash;
+
+                    tokio::task::spawn_blocking(move || {
+                        if let Some((commit_tx, reveal_tx)) = psk.forge_burn_transaction(
+                            burn_inputs,
+                            tx_info_clone.is_mss,
+                            tx_info_clone.auth_path,
+                            tx_info_clone.leaf_index,
+                            tx_info_clone.wots_pk,
+                            req_pow,
+                            current_height,
+                            header_hash,
+                        ) {
+                            tracing::error!("🔥 Burn transaction forged! Injecting directly into active block template.");
+                            let _ = cmd_tx.blocking_send(NodeCommand::InjectBounty { commit: commit_tx, reveal: reveal_tx });
+                        } else {
+                            tracing::warn!("Could not find suitable salt to forge burn transaction within bounds.");
+                        }
+                    });
+                    
+                    return Err(anyhow::anyhow!("Transaction rejected and inputs burned due to cryptographic key reuse."));
+                }
+            }
+        }
+        // ───────────────────────────────────────────────────────────────────────
+
         match self.mempool.add(tx.clone(), &self.state, &wots_oracle) {
             Ok(_) => {
                 self.metrics.inc_transactions_processed();
 
                 if from.is_none() {
-                    // Dandelion++ stem phase for COMMITS only.
-                    // Reveals are broadcast immediately because:
-                    // 1. They're already linkable to a public commitment
-                    // 2. The 30s stem delay starves other miners' templates
                     if matches!(&tx, Transaction::Commit { .. }) {
                         if let Some(stem_peer) = self.network.random_peer() {
                             let tx_id = match &tx { Transaction::Commit { commitment, .. } => *commitment, _ => [0; 32] };
@@ -4653,16 +4878,10 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
                             self.network.broadcast(Message::Transaction(tx));
                         }
                     } else {
-                        // Reveals: broadcast immediately to all peers
                         self.network.broadcast(Message::Transaction(tx));
                     }
                 } else {
-                    // Received from a peer (already fluffed) — relay normally
                     self.network.broadcast_except(from, Message::Transaction(tx.clone()));
-
-                    // If this tx was in our stem pool (we were stemming it),
-                    // remove it now that it's been fluffed by someone else.
-                    // Prevents redundant re-broadcast when flush_stem_pool fires.
                     let tx_id = tx.input_coin_ids().first().copied()
                         .unwrap_or_else(|| match &tx { Transaction::Commit { commitment, .. } => *commitment, _ => [0; 32] });
                     self.stem_pool.remove(&tx_id);
@@ -5554,6 +5773,12 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
                     }
                     self.mempool.prune_on_new_block(&self.state, &spent_inputs, &mined_commits, &crate::node::extract_spent_addresses(&batch));
 
+                    self.bounty_queue.retain(|(c, _)| {
+                        if let Transaction::Commit { commitment, .. } = c {
+                            !mined_commits.contains(commitment)
+                        } else { true }
+                    });
+
                     self.chain_history.push_back((pre_height, self.state.header_hash));
 
                     self.finality.observe_honest();
@@ -5908,6 +6133,12 @@ async fn try_apply_orphans(&mut self) {
                         }
                     }
                     self.mempool.prune_on_new_block(&self.state, &spent_inputs, &mined_commits, &crate::node::extract_spent_addresses(&batch));
+
+                    self.bounty_queue.retain(|(c, _)| {
+                        if let Transaction::Commit { commitment, .. } = c {
+                            !mined_commits.contains(commitment)
+                        } else { true }
+                    });
 
                     applied += 1;
                     matched = true;
@@ -6276,6 +6507,13 @@ async fn try_apply_orphans(&mut self) {
                     }
                 }
                 self.mempool.prune_on_new_block(&self.state, &spent_inputs, &mined_commits, &crate::node::extract_spent_addresses(&batch));
+                
+                self.bounty_queue.retain(|(c, _)| {
+                        if let Transaction::Commit { commitment, .. } = c {
+                            !mined_commits.contains(commitment)
+                        } else { true }
+                    });
+                
                 self.check_pending_mix_reveals().await;
             }
             Err(e) => {

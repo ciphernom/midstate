@@ -15,6 +15,11 @@ const MINING_SEED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("mi
 const SPENT_ADDRESSES_TABLE: TableDefinition<&[u8; 32], &[u8; 32]> =
     TableDefinition::new("spent_addresses");
 
+/// Archives the 576-byte WOTS signature from the first time a key was used.
+/// Used by the MEV Bounty Hunter to mathematically penalize historical key reuses.
+const SIGNATURE_ARCHIVE_TABLE: TableDefinition<&[u8; 32], &[u8]> = 
+    TableDefinition::new("signature_archive");
+
 /// Maps MSS master_pk -> highest (leaf_index + 1) seen on-chain.
 /// Gives O(1) lookup for the /mss_state endpoint instead of scanning
 /// every block from genesis.
@@ -297,6 +302,19 @@ pub fn delete_spent_address(&self, address: &[u8; 32]) -> Result<bool> {
     write_txn.commit()?;
     Ok(existed)
 }
+
+pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SIGNATURE_ARCHIVE_TABLE)?;
+        Ok(table.get(wots_pk)?.map(|v| v.value().to_vec()))
+    }
+
+    pub fn get_spent_commitment(&self, wots_pk: &[u8; 32]) -> Result<Option<[u8; 32]>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SPENT_ADDRESSES_TABLE)?;
+        Ok(table.get(wots_pk)?.map(|v| *v.value()))
+    }
+    
     /// Deletes any state snapshots at or above the given fork height.
     /// Called during a reorg to prevent stale snapshots from a dead chain
     /// from corrupting future state rebuilds.
@@ -387,6 +405,7 @@ pub fn delete_spent_address(&self, address: &[u8; 32]) -> Result<bool> {
                         let _ = write_txn.open_table(STATE_TABLE)?;
                         let _ = write_txn.open_table(MINING_SEED_TABLE)?;
                         let _ = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
+                        let _ = write_txn.open_table(SIGNATURE_ARCHIVE_TABLE)?;
                         let _ = write_txn.open_table(MSS_LEAF_INDEX_TABLE)?;
                         let _ = write_txn.open_table(BATCHES_TABLE)?;
                         let _ = write_txn.open_table(HEADERS_TABLE)?;
@@ -566,6 +585,7 @@ pub fn delete_spent_address(&self, address: &[u8; 32]) -> Result<bool> {
         let write_txn = self.db.begin_write()?;
         {
             let mut spent_table = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
+            let mut sig_archive_table = write_txn.open_table(SIGNATURE_ARCHIVE_TABLE)?;
             // Note: We deliberately do not roll back the MSS_LEAF_INDEX_TABLE here.
             // That table only tracks the highest seen index for the `/mss_state` RPC endpoint.
             // Leaving it slightly high just skips a reusable index, which is perfectly safe.
@@ -579,8 +599,10 @@ pub fn delete_spent_address(&self, address: &[u8; 32]) -> Result<bool> {
                                 if sig.len() == crate::core::wots::SIG_SIZE {
                                     let addr = input.predicate.address();
                                     spent_table.remove(&addr)?;
+                                    sig_archive_table.remove(&addr)?;
                                 } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
                                     spent_table.remove(&mss_sig.wots_pk)?;
+                                    sig_archive_table.remove(&mss_sig.wots_pk)?;
                                 }
                             }
                         }
@@ -592,8 +614,10 @@ pub fn delete_spent_address(&self, address: &[u8; 32]) -> Result<bool> {
                             if sig.len() == crate::core::wots::SIG_SIZE {
                                 let addr = inputs[0].predicate.address();
                                 spent_table.remove(&addr)?;
+                                 sig_archive_table.remove(&addr)?;
                             } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
                                 spent_table.remove(&mss_sig.wots_pk)?;
+                                sig_archive_table.remove(&mss_sig.wots_pk)?;
                             }
                         }
                     }
@@ -616,6 +640,7 @@ pub fn delete_spent_address(&self, address: &[u8; 32]) -> Result<bool> {
         {
             let mut spent_table = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
             let mut mss_idx_table = write_txn.open_table(MSS_LEAF_INDEX_TABLE)?;
+            let mut sig_archive_table = write_txn.open_table(SIGNATURE_ARCHIVE_TABLE)?;
 
             for tx in &batch.transactions {
                 match tx {
@@ -630,8 +655,11 @@ pub fn delete_spent_address(&self, address: &[u8; 32]) -> Result<bool> {
                                 if sig.len() == crate::core::wots::SIG_SIZE {
                                     let addr = input.predicate.address();
                                     spent_table.insert(&addr, &commitment)?;
+                                    sig_archive_table.insert(&addr, sig.as_slice())?;
                                 } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
                                     spent_table.insert(&mss_sig.wots_pk, &commitment)?;
+                                    let wots_sig_bytes = crate::core::wots::sig_to_bytes(&mss_sig.wots_sig);
+                                    sig_archive_table.insert(&mss_sig.wots_pk, wots_sig_bytes.as_slice())?;
                                     if let Some(master_pk) = input.predicate.owner_pk() {
                                         let next = mss_sig.leaf_index + 1;
                                         let current = mss_idx_table.get(&master_pk)?.map(|v: redb::AccessGuard<'_, u64>| v.value()).unwrap_or(0);
@@ -652,8 +680,12 @@ pub fn delete_spent_address(&self, address: &[u8; 32]) -> Result<bool> {
                             if sig.len() == crate::core::wots::SIG_SIZE {
                                 let addr = inputs[0].predicate.address();
                                 spent_table.insert(&addr, &commitment)?;
+                                sig_archive_table.insert(&addr, sig.as_slice())?;
                             } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
                                 spent_table.insert(&mss_sig.wots_pk, &commitment)?;
+                                let wots_sig_bytes = crate::core::wots::sig_to_bytes(&mss_sig.wots_sig);
+                                sig_archive_table.insert(&mss_sig.wots_pk, wots_sig_bytes.as_slice())?;
+                                
                                 if let Some(master_pk) = inputs[0].predicate.owner_pk() {
                                     let next = mss_sig.leaf_index + 1;
                                     let current = mss_idx_table.get(&master_pk)?.map(|v: redb::AccessGuard<'_, u64>| v.value()).unwrap_or(0);

@@ -821,7 +821,7 @@
                 <div id="tokenContainer" style="display: flex; justify-content: center; gap: 10px; margin-top: 15px; flex-wrap: wrap;"></div>
             </div>
 
-            <!-- Compact mining widget --
+            <!-- Compact mining widget -->
             <div class="home-mine-widget" id="homeMineWidget" onclick="switchTab('view-mine')">
                 <div class="flex-row">
                     <div style="display: flex; align-items: center; gap: 10px;">
@@ -836,7 +836,7 @@
                         <div style="font-size: 10px; color: #555;">nonces/sec</div>
                     </div>
                 </div>
-            </div> retiring mining in the web wallet -->
+            </div>
 
             <div class="flex-row" style="gap: 12px; margin-bottom: 2rem;">
                 <button class="nav-trigger" data-target="view-send" style="margin: 0; background: var(--bg-panel);">Send</button>
@@ -853,7 +853,7 @@
           </div><!-- /home-grid -->
         </main>
 
-        <!-- MINING DASHBOARD --
+        <!-- MINING DASHBOARD -->
         <main id="view-mine" class="page">
             <div class="panel" style="margin-bottom: 1rem; border-color: var(--border);">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
@@ -872,7 +872,7 @@
                 <div class="mine-hero-rate" id="mineHeroRate">0<span class="mine-hero-unit">N/s</span></div>
             </div>
 
-            <!-- Hashrate Sparkline --
+            <!-- Hashrate Sparkline -->
             <div style="padding: 0 1rem; margin-bottom: 1rem;">
                 <svg id="mineSparkline" width="100%" height="48" preserveAspectRatio="none" style="display: block;">
                     <defs>
@@ -893,7 +893,7 @@
                 </div>
             </div>
 
-            <!-- Thread & CPU Throttle --
+            <!-- Thread & CPU Throttle -->
             <div class="mine-throttle">
                 <div class="mine-throttle-row">
                     <span class="mine-throttle-label">Threads</span>
@@ -909,7 +909,7 @@
 
             <button class="mine-toggle off" id="btnMineToggle">Start Mining</button>
 
-            <!-- Time to Block estimate --
+            <!-- Time to Block estimate -->
             <div class="panel" style="text-align: center; padding: 1rem; margin-bottom: 1rem; border-color: var(--border);">
                 <div style="font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px; color: #555; margin-bottom: 4px;">Estimated Time to Block</div>
                 <div id="mineStatEta" style="font-size: 22px; font-weight: 700; color: var(--text-bright); font-variant-numeric: tabular-nums;">—</div>
@@ -961,8 +961,7 @@
                     <span style="color: #333; font-size: 11px;">Start mining to begin searching for blocks.</span>
                 </div>
             </div>
-            
-        </main>  retiring mining in the web wallet -->
+        </main>
 
 <!-- DEX -->
         <main id="view-dex" class="page">
@@ -1376,7 +1375,7 @@
         <nav id="bottom-nav" class="hidden">
             <button class="nav-btn active" data-target="view-home"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9v12h14V9"/></svg><span>Home</span></button>
             <button class="nav-btn" data-target="view-dex"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M7 7h13l-3-3M17 17H4l3 3"/></svg><span>P2P OTC DEX</span></button>
-            <!--<button class="nav-btn" data-target="view-mine"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/></svg><span>Mine</span></button>  retiring mining in the web wallet -->
+            <button class="nav-btn" data-target="view-mine"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/></svg><span>Mine</span></button>
             <button class="nav-btn" data-target="view-send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M5 19L19 5M9 5h10v10"/></svg><span>Send</span></button>
             <button class="nav-btn" data-target="view-receive"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M12 4v12M6 12l6 6 6-6"/></svg><span>Receive</span></button>
              <!--<button class="nav-btn" data-target="view-lightning"><span class="nav-icon">⚡</span><span>Q-Bolt L2</span></button>-->

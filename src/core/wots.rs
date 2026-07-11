@@ -158,6 +158,200 @@ pub fn sig_from_bytes(bytes: &[u8]) -> Option<[[u8; 32]; CHAINS]> {
     Some(sig)
 }
 
+// ── Key Reuse Punishment Burn Protocol ──────────────────────────────────────
+
+use rayon::prelude::*;
+
+/// A partially recovered WOTS secret key, extracted by observing key reuse.
+///
+/// # Reasoning
+/// WOTS signatures reveal intermediate hashes in a hash chain. If a key signs
+/// two different messages, different depths of the chain are exposed. By taking
+/// the minimum (shallowest) depth exposed across all chains, an observer can
+/// reconstruct a partial secret key. This struct holds that leaked key material.
+#[derive(Clone, Debug)]
+pub struct PartialSecretKey {
+    /// Array of (revealed_depth, intermediate_hash) for each of the 18 chains.
+    pub chains: [(u32, [u8; 32]); CHAINS],
+}
+
+impl PartialSecretKey {
+    /// Initializes a partial secret key from a single intercepted signature.
+    pub fn from_signature(sig: &[[u8; 32]; CHAINS], message: &[u8; 32]) -> Self {
+        let digits = all_digits(message);
+        let mut chains = [(0, [0u8; 32]); CHAINS];
+        for i in 0..CHAINS {
+            chains[i] = (digits[i], sig[i]);
+        }
+        Self { chains }
+    }
+
+    /// Merges a second intercepted signature, keeping the shallowest (most powerful)
+    /// revealed hash for each chain.
+    pub fn merge_signature(&mut self, sig: &[[u8; 32]; CHAINS], message: &[u8; 32]) {
+        let digits = all_digits(message);
+        for i in 0..CHAINS {
+            if digits[i] < self.chains[i].0 {
+                self.chains[i] = (digits[i], sig[i]);
+            }
+        }
+    }
+
+    /// Evaluates if this partial key contains enough depth to forge a signature
+    /// for the given target message.
+    pub fn can_sign(&self, message: &[u8; 32]) -> bool {
+        let digits = all_digits(message);
+        for i in 0..CHAINS {
+            // We can only sign if the target message digit requires hashing
+            // *down* the chain from our known starting point.
+            if digits[i] < self.chains[i].0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Forges a valid signature for the target message using the leaked partial key.
+    ///
+    /// # Panics
+    /// Panics if `can_sign(message)` is false.
+    pub fn sign(&self, message: &[u8; 32]) -> [[u8; 32]; CHAINS] {
+        let digits = all_digits(message);
+        let mut sig = [[0u8; 32]; CHAINS];
+        for i in 0..CHAINS {
+            let (stored_depth, mut val) = self.chains[i];
+            let target_depth = digits[i];
+            assert!(target_depth >= stored_depth, "Attempted to forge signature above known depth");
+            let iters = target_depth - stored_depth;
+            for _ in 0..iters {
+                val = crate::core::types::hash(&val);
+            }
+            sig[i] = val;
+        }
+        sig
+    }
+
+    /// Grinds a transaction salt until it produces a commitment hash that falls
+    /// entirely within the known bounds of this partial secret key. 
+    ///
+    /// # Reasoning
+    /// To punish an attacker who reuses a key, we must construct a valid transaction
+    /// spending their funds to a burn address. Because we only control the `salt`,
+    /// we use `rayon` to parallel-grind salts until `ℋ(inputs ⌢ burn_output ⌢ salt)`
+    /// produces a digit sequence we can forge.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:
+    ///   - psk contains the minimum revealed hash depths from multiple signatures.
+    ///   - unspent_inputs are valid inputs corresponding to the leaked key.
+    ///
+    /// Post:
+    ///   result = Some((commit_tx, reveal_tx)) ⇒
+    ///     commit_tx.commitment = ℋ(inputs ⌢ burn_output ⌢ salt)
+    ///     psk.can_sign(commit_tx.commitment) = true
+    ///     reveal_tx.witness = valid forged signature over commitment
+    ///   result = None ⇒
+    ///     no salt found within search bounds (10,000,000 iterations)
+    /// ```
+    ///
+    /// ```zed
+    ///     ForgeBurnTransaction
+    ///     --------------------
+    ///     psk? : PartialSecretKey
+    ///     inputs? : seq InputReveal
+    ///     req_pow? : ℕ₃₂
+    ///     commit_tx!, reveal_tx! : Transaction
+    ///
+    ///     pre  #inputs? > 0
+    ///     post result = Some(commit_tx!, reveal_tx!) ⇒
+    ///            ∃ salt ∈ 𝔹³² •
+    ///              commitment = ℋ(inputs? ⌢ burn_output ⌢ salt) ∧
+    ///              psk?.can_sign(commitment) = true ∧
+    ///              reveal_tx!.witness = psk?.sign(commitment)
+    ///     post result = None ⇒ true
+    /// ```
+    ///
+    /// # Safety / Invariants
+    /// Caps the search space to 10M iterations to guarantee bounded execution time
+    /// and prevent the node's CPU from hanging indefinitely.
+    pub fn forge_burn_transaction(
+        &self,
+        unspent_inputs: Vec<crate::core::types::InputReveal>,
+        is_mss: bool,
+        auth_path: Vec<[u8; 32]>,
+        leaf_index: u64,
+        wots_pk: [u8; 32],
+        required_pow: u32,
+        current_height: u64,
+        header_hash: [u8; 32],
+    ) -> Option<(crate::core::types::Transaction, crate::core::types::Transaction)> {
+        let output = crate::core::types::OutputData::DataBurn {
+            payload: b"PUNISHED FOR KEY REUSE".to_vec(),
+            // 100% of the UTXO value is implicitly given to the miner as the transaction fee
+            value_burned: 0, 
+        };
+
+        let input_ids: Vec<[u8; 32]> = unspent_inputs.iter().map(|i| i.coin_id()).collect();
+        let output_ids = vec![output.hash_for_commitment()];
+
+        // Parallel salt grinding to quickly find a forgeable commitment
+        let found_salt = (0..10_000_000u64).into_par_iter().find_map_any(|i| {
+            let mut salt = [0u8; 32];
+            salt[0..8].copy_from_slice(&i.to_le_bytes());
+            let commitment = crate::core::compute_commitment(&input_ids, &output_ids, &salt);
+            if self.can_sign(&commitment) {
+                Some((salt, commitment))
+            } else {
+                None
+            }
+        });
+
+        let (salt, commitment) = found_salt?;
+        let forged_wots = self.sign(&commitment);
+        
+        let witness = if is_mss {
+            let mss_sig = crate::core::mss::MssSignature {
+                leaf_index,
+                wots_pk,
+                wots_sig: forged_wots,
+                auth_path,
+            };
+            crate::core::types::Witness::sig(mss_sig.to_bytes())
+        } else {
+            crate::core::types::Witness::sig(sig_to_bytes(&forged_wots))
+        };
+
+        let reveal_tx = if unspent_inputs.len() > 1 {
+            crate::core::types::Transaction::Consolidate {
+                inputs: unspent_inputs,
+                witness,
+                outputs: vec![output],
+                salt,
+            }
+        } else {
+            crate::core::types::Transaction::Reveal {
+                inputs: unspent_inputs,
+                witnesses: vec![witness],
+                outputs: vec![output],
+                salt,
+            }
+        };
+
+        let spam_nonce = crate::core::transaction::mine_pow(&commitment, required_pow, current_height, header_hash);
+        let commit_tx = crate::core::types::Transaction::Commit {
+            commitment,
+            spam_nonce,
+        };
+
+        Some((commit_tx, reveal_tx))
+    }
+}
+
+
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
