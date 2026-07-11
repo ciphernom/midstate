@@ -1548,7 +1548,10 @@ async fn process_state_rebuild(
     }
 
     let headers_start_height = headers.first().map(|h| h.height).unwrap_or(0);
-    if fork_height == headers_start_height && headers_start_height > 0 && !is_fast_forward {
+    
+    // FIX: Only trigger deep-fork step-back if the fork point is actually behind our local tip.
+    // If fork_height == self.state.height, it is a perfect linear extension, not a deep fork!
+    if fork_height == headers_start_height && headers_start_height > 0 && fork_height < self.state.height && !is_fast_forward {
         let session = match self.sync.take_session() {
             Some(s) if s.peer == peer => s,
             other => {
@@ -4203,44 +4206,40 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
                         Ok(fh) => {
                             // Nakamoto Consensus dictates the heaviest chain always wins
                             // We do not bound reorgs by safe_depth, otherwise we cause permanent network splits.
-                            if fh == headers_start_height && headers_start_height > 0 {
-                                fork_height = fh;
-                            } else {
-                                fork_height = fh;
-                                if fh == 0 {
-                                    candidate_state = Some(Box::new(State::genesis().0));
-                                } else if fh <= current_height {
-                                    if let Some(s) = state_cache.iter().find(|(h, _)| *h == fh).map(|(_, s)| s.clone()) {
-                                        candidate_state = Some(Box::new(s));
-                                    } else {
-                                        tracing::info!("Cache miss at height {}, starting background state rebuild...", fh);
-                                        
-                                        // Pipelined Rebuild Start Command
-                                        let _ = tx.send(NodeCommand::FinishStateRebuild {
-                                            peer: from,
-                                            fork_height: fh,
-                                            candidate_state: None,
-                                            headers: all_headers.clone(),
-                                            is_fast_forward: false,
-                                            is_valid: true,
-                                            is_local_corruption: false,
-                                        }).await; // <--- Changed to send().await
+                            fork_height = fh;
+                            if fh == 0 {
+                                candidate_state = Some(Box::new(State::genesis().0));
+                            } else if fh <= current_height {
+                                if let Some(s) = state_cache.iter().find(|(h, _)| *h == fh).map(|(_, s)| s.clone()) {
+                                    candidate_state = Some(Box::new(s));
+                                } else {
+                                    tracing::info!("Cache miss at height {}, starting background state rebuild...", fh);
+                                    
+                                    // Pipelined Rebuild Start Command
+                                    let _ = tx.send(NodeCommand::FinishStateRebuild {
+                                        peer: from,
+                                        fork_height: fh,
+                                        candidate_state: None,
+                                        headers: all_headers.clone(),
+                                        is_fast_forward: false,
+                                        is_valid: true,
+                                        is_local_corruption: false,
+                                    }).await;
 
-                                        let cache_start = state_cache.iter()
-                                            .filter(|(h, _)| *h <= fh)
-                                            .max_by_key(|(h, _)| *h)
-                                            .map(|(h, s)| (*h, s.clone()));
-                                        match rebuild_state_from_disk(storage.clone(), fh, cache_start).await {
-                                            Ok(s) => candidate_state = Some(Box::new(s)),
-                                            Err(e) => {
-                                                tracing::error!("Background state rebuild failed: {}", e);
-                                                is_local_corruption = true;
-                                            }
+                                    let cache_start = state_cache.iter()
+                                        .filter(|(h, _)| *h <= fh)
+                                        .max_by_key(|(h, _)| *h)
+                                        .map(|(h, s)| (*h, s.clone()));
+                                    match rebuild_state_from_disk(storage.clone(), fh, cache_start).await {
+                                        Ok(s) => candidate_state = Some(Box::new(s)),
+                                        Err(e) => {
+                                            tracing::error!("Background state rebuild failed: {}", e);
+                                            is_local_corruption = true;
                                         }
                                     }
-                                } else {
-                                    candidate_state = Some(Box::new(current_state));
                                 }
+                            } else {
+                                candidate_state = Some(Box::new(current_state));
                             }
                         }
                         Err(e) => {
@@ -4598,6 +4597,11 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
     }
 
     async fn handle_new_transaction(&mut self, tx: Transaction, from: Option<PeerId>) -> Result<()> {
+        // --- OPTIMIZATION: Ignore live mempool gossip while syncing ---
+        if self.sync.in_progress && from.is_some() {
+            return Ok(());
+        }
+
         // Per-peer rate limiting: prevent CPU exhaustion from tx validation spam.
         // Local submissions (from = None, i.e. RPC) bypass the limit.
         if let Some(peer) = from {

@@ -1,9 +1,23 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>MIDSTATE // IDE</title>
+
+<script>
+(function(){try{var t=localStorage.getItem('midstate-theme');if(t)document.documentElement.setAttribute('data-theme',t);}catch(e){}})();
+function toggleTheme(){
+  var d=document.documentElement,
+      n=d.getAttribute('data-theme')==='light'?'dark':'light';
+  d.setAttribute('data-theme',n);
+  try{localStorage.setItem('midstate-theme',n);}catch(e){}
+  // Keep Ace editor in sync with the page theme
+  if(window._ace){
+    window._ace.setTheme(n==='light' ? 'ace/theme/tomorrow' : 'ace/theme/tomorrow_night_bright');
+  }
+}
+</script>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.3/ace.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
@@ -29,7 +43,7 @@
 </div>
   <div class="tb-sep"></div>
   <button class="tb-btn" onclick="compileCode()" title="Ctrl+Enter">▶ Compile</button>
-  <button class="tb-btn" onclick="runTests()" title="Ctrl+T" style="border-color: #aa00ff; color: #d488ff;">🧪 Run Tests</button>
+  <button class="tb-btn tb-btn-special" onclick="runTests()" title="Ctrl+T">🧪 Run Tests</button>
   <button class="tb-btn" id="btnStep" onclick="vmStep()" disabled title="F10">⬇ Step</button>
   <button class="tb-btn ok-btn" id="btnRun" onclick="vmRun()" disabled>⚡ Run</button>
   <div class="tb-sep"></div>
@@ -65,6 +79,10 @@
   <div class="tb-sep"></div>
   <div class="tb-stat">Size&nbsp;<b id="statSize">—</b></div>
   <div class="tb-stat">SigOps&nbsp;<b id="statSigops">—</b></div>
+  <button id="theme-toggle" class="theme-toggle" onclick="toggleTheme()" title="Toggle light / dark" aria-label="Toggle theme">
+    <svg class="icon-sun" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+    <svg class="icon-moon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+  </button>
   <div id="tb-addr" title="P2SH address — click to copy" onclick="copyAddr()">— compile to get address —</div>
 </div>
 
@@ -189,7 +207,7 @@
     <div class="win-body" style="flex-direction:row;">
       <div style="flex:1;display:flex;flex-direction:column;border-right:1px solid var(--border);overflow:hidden;">
         <div class="ph"><span class="ph-dot blue"></span>Assembly</div>
-        <div class="asm-scroll" id="asmOutput"><div style="color:#1e3a5f;padding:12px;font-size:11px;">Awaiting compilation...</div></div>
+        <div class="asm-scroll" id="asmOutput"><div class="sempty">Awaiting compilation...</div></div>
       </div>
       <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
         <div class="ph"><span class="ph-dot yellow"></span>Stack</div>
@@ -444,7 +462,10 @@ setInterval(tick,1000); tick();
 // ACE EDITOR
 // ═══════════════════════════════════════════
 const editor = ace.edit('editor');
-editor.setTheme('ace/theme/tomorrow_night_bright');
+const initialTheme = document.documentElement.getAttribute('data-theme') === 'light'
+  ? 'ace/theme/tomorrow'
+  : 'ace/theme/tomorrow_night_bright';
+editor.setTheme(initialTheme);
 editor.session.setMode('ace/mode/javascript');
 editor.setOptions({ fontFamily:"'JetBrains Mono',monospace", fontSize:'13px', showPrintMargin:false, highlightActiveLine:true, tabSize:4, wrap:false });
 window._ace = editor;
@@ -1195,7 +1216,7 @@ window.loadTemplate = function() {
   else document.getElementById('ctxInputValue').value = '1000000';
 
   document.getElementById('bytecodeOutput').textContent = 'Click Compile to generate bytecode...';
-  document.getElementById('asmOutput').innerHTML = "<div style='color:#1e3a5f;padding:12px;font-size:11px;'>Awaiting compilation...</div>";
+  document.getElementById('asmOutput').innerHTML = "<div class='sempty'>Awaiting compilation...</div>";
   setVmStatus('Ready.','neu');
   setAddr('—');
   document.getElementById('btnStep').disabled = true;
@@ -2093,7 +2114,7 @@ if (!document.getElementById('btnCopyBc')) {
       const disp=parts.length>1?`${parts[0]} <span style="color:var(--warn)">${parts[1]}</span>`:parts[0];
       html+=`<div class="asm-line" id="aln-${i}"><span class="ln">${i}</span>${disp}</div>`;
     });
-    document.getElementById('asmOutput').innerHTML=html||"<div style='color:#1e3a5f;padding:12px'>No instructions</div>";
+    document.getElementById('asmOutput').innerHTML=html||"<div class='sempty'>No instructions</div>";
     resetVM();
     setVmStatus('Compiled — ready to run.','ok');
     log(`Compiled: ${size} B, ${sigops} sigops`,'s');
@@ -2425,7 +2446,7 @@ function newProject() {
     document.getElementById('ctxHeight').value = '500001';
     document.getElementById('terminalLogs').innerHTML = '';
     document.getElementById('bytecodeOutput').textContent = 'Click Compile to generate bytecode...';
-    document.getElementById('asmOutput').innerHTML = "<div style='color:#1e3a5f;padding:12px;font-size:11px;'>Awaiting compilation...</div>";
+    document.getElementById('asmOutput').innerHTML = "<div class='sempty'>Awaiting compilation...</div>";
     setVmStatus('Ready.','neu');
     setAddr('—');
     document.getElementById('projectSelect').value = '';
@@ -2472,7 +2493,7 @@ function loadProject(name) {
     
     // Clear volatile VM outputs
     document.getElementById('bytecodeOutput').textContent = 'Click Compile to generate bytecode...';
-    document.getElementById('asmOutput').innerHTML = "<div style='color:#1e3a5f;padding:12px;font-size:11px;'>Awaiting compilation...</div>";
+    document.getElementById('asmOutput').innerHTML = "<div class='sempty'>Awaiting compilation...</div>";
     setVmStatus('Ready.','neu');
     setAddr('—');
     

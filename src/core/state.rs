@@ -318,7 +318,7 @@ fn apply_batch_internal(
                             let addr = input.predicate.address();
                                 if let Some(&prior_commitment) = spent_oracle.get(&addr) {
                                     if prior_commitment != this_commitment {
-                                        if state.height < crate::core::types::V4_ACTIVATION_HEIGHT {
+                                        if state.height < 197_000 {
                                            // tracing::warn!("Grandfathering historical WOTS reuse at height {}", state.height);
                                         } else {
                                             bail!("Consensus violation: WOTS address {} reused", hex::encode(addr));
@@ -329,7 +329,7 @@ fn apply_batch_internal(
                         } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
                             if let Some(&prior_commitment) = spent_oracle.get(&mss_sig.wots_pk) {
                                 if prior_commitment != this_commitment {
-                                    if state.height < crate::core::types::V4_ACTIVATION_HEIGHT {
+                                    if state.height < 197_000 {
                                       //  tracing::warn!("Grandfathering historical MSS leaf reuse at height {}", state.height);
                                     } else {
                                         bail!("Consensus violation: MSS leaf {} reused", hex::encode(mss_sig.wots_pk));
@@ -353,7 +353,7 @@ fn apply_batch_internal(
                         let addr = inputs[0].predicate.address();
                         if let Some(&prior_commitment) = spent_oracle.get(&addr) {
                                     if prior_commitment != this_commitment {
-                                        if state.height < crate::core::types::V4_ACTIVATION_HEIGHT {
+                                        if state.height < 197_000 {
                                        //     tracing::warn!("Grandfathering historical WOTS reuse at height {}", state.height);
                                         } else {
                                             bail!("Consensus violation: WOTS address {} reused", hex::encode(addr));
@@ -364,7 +364,7 @@ fn apply_batch_internal(
                     } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
                         if let Some(&prior_commitment) = spent_oracle.get(&mss_sig.wots_pk) {
                                 if prior_commitment != this_commitment {
-                                    if state.height < crate::core::types::V4_ACTIVATION_HEIGHT {
+                                    if state.height < 197_000 {
                                     //    tracing::warn!("Grandfathering historical MSS leaf reuse at height {}", state.height);
                                     } else {
                                         bail!("Consensus violation: MSS leaf {} reused", hex::encode(mss_sig.wots_pk));

@@ -4589,12 +4589,18 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
 
             storage.save_batch(dl_cursor, batch)?;
             
+            // --- FIX: Burn WOTS/MSS addresses to disk to prevent Ghost DB entries ---
+            if let Err(e) = storage.burn_batch_addresses(batch, dl_cursor) {
+                tracing::error!("Failed to burn addresses during CLI sync: {}", e);
+                anyhow::bail!("Database error: failed to burn addresses");
+            }
+            // ------------------------------------------------------------------------
+            
             // --- UPDATE TRACKERS FOR NEXT ITERATION ---
             state_before_prev = Some(state_before_h);
             headers_before_prev = Some(headers_before_h);
 
             dl_cursor += 1;
-            
             if dl_cursor % 100 == 0 {
                 println!("Synced up to block {}/{}", dl_cursor, peer_height);
             }
