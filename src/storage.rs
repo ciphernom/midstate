@@ -702,6 +702,41 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
         Ok(())
     }
 
+
+    /// One-time backfill of the signature archive + spent-address tables
+    /// from every historical batch that is still on disk.
+    /// Safe to re-run (idempotent). Returns the number of batches processed.
+    pub fn backfill_signature_archive(&self) -> Result<usize> {
+        let highest = self.highest_batch()?;
+        if highest == 0 {
+            return Ok(0);
+        }
+
+        let mut processed = 0usize;
+        let start = 0;
+
+        for h in start..=highest {
+            if let Ok(Some(batch)) = self.load_batch(h) {
+                // Re-use the exact same logic that runs on every new block
+                if let Err(e) = self.burn_batch_addresses(&batch, h) {
+                    tracing::warn!("backfill: burn_batch_addresses failed at height {}: {}", h, e);
+                    continue;
+                }
+                processed += 1;
+
+                if processed % 500 == 0 {
+                    tracing::info!("backfill_signature_archive: processed {} batches (height {})", processed, h);
+                }
+            }
+        }
+
+        tracing::info!(
+            "backfill_signature_archive complete: {} batches processed (heights {}..{})",
+            processed, start, highest
+        );
+        Ok(processed)
+    }
+
     /// Build a pre-flight oracle for a batch: returns a map of
     /// `nullifier -> prior_commitment` for every WOTS address or MSS leaf in the batch
     /// that already exists in the spent-address table.

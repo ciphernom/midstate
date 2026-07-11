@@ -1286,6 +1286,26 @@ pub async fn new(
             let _ = std::fs::write(&v4_marker, b"done");
         }
 
+
+        // --- ONE-TIME SIGNATURE ARCHIVE BACKFILL ---
+        // Makes the bounty hunter able to punish reuses of keys that were spent
+        // before the SIGNATURE_ARCHIVE_TABLE existed.
+        let archive_marker = data_dir.join(".signature_archive_backfilled");
+        if !archive_marker.exists() {
+            tracing::info!("Running one-time signature archive backfill from historical blocks...");
+            match storage.backfill_signature_archive() {
+                Ok(n) => {
+                    tracing::info!("Signature archive backfill finished ({} batches)", n);
+                    let _ = std::fs::write(&archive_marker, b"done");
+                }
+                Err(e) => {
+                    tracing::error!("Signature archive backfill failed: {}. Will retry next start.", e);
+                    // Do NOT write the marker so it retries on next boot
+                }
+            }
+        }
+        // ------------------------------------------
+
         if state.height == 0 {
             match storage.load_batch(0)? {
                 None => {
