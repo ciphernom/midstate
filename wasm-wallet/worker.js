@@ -1657,9 +1657,13 @@ self.onmessage = async (e) => {
                 const seenCoin = new Set();
                 const BATCH = 12;
                 for (let h = from; h <= tip; h += BATCH) {
-                    const heights = [];
-                    for (let k = h; k < h + BATCH && k <= tip; k++) heights.push(k);
-                    const blocks = await Promise.all(heights.map(ht => rpc.getBlock(ht).then(b => b).catch(() => null)));
+                    const blocks = [];
+                    for (let k = h; k < h + BATCH && k <= tip; k++) {
+                        const b = await rpc.getBlock(k).catch(() => null);
+                        blocks.push(b);
+                        // Tiny delay to respect HTTP rate limits if WebRTC falls back to HTTPS
+                        await new Promise(r => setTimeout(r, 20));
+                    }
                     for (const blk of blocks) {
                         if (!blk) continue;
                         const payloads = extractBurnPayloadHexes(blk, []);
@@ -1767,9 +1771,13 @@ self.onmessage = async (e) => {
                 const BATCH = 12;
                 let fragPoolDirty = false;
                 for (let h = from; h <= tip; h += BATCH) {
-                    const heights = [];
-                    for (let k = h; k < h + BATCH && k <= tip; k++) heights.push(k);
-                    const blocks = await Promise.all(heights.map(ht => rpc.getBlock(ht).then(b => b).catch(() => null)));
+                    const blocks = [];
+                    for (let k = h; k < h + BATCH && k <= tip; k++) {
+                        const b = await rpc.getBlock(k).catch(() => null);
+                        blocks.push(b);
+                        // Tiny delay to respect HTTP rate limits if WebRTC falls back to HTTPS
+                        await new Promise(r => setTimeout(r, 20));
+                    }
                     for (const blk of blocks) {
                         if (!blk) continue;
                         // Burns arrive as serde number-arrays, not hex runs, so walk the
