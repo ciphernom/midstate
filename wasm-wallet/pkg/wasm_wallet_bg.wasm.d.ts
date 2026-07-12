@@ -20,6 +20,7 @@ export const search_nonces: (a: number, b: number, c: number, d: number, e: numb
 export const verify_mss_sig_wasm: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
 export const webwallet_build_coinbase: (a: number, b: number, c: bigint, d: number) => void;
 export const webwallet_build_coinbase_to_mss: (a: number, b: number, c: bigint, d: number, e: number) => void;
+export const webwallet_build_consolidate_reveal: (a: number, b: number, c: number, d: number) => void;
 export const webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const webwallet_build_script_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const webwallet_build_solo_extension: (a: number, b: number, c: number, d: number, e: bigint) => void;
@@ -33,6 +34,7 @@ export const webwallet_get_wots_address: (a: number, b: number, c: number) => vo
 export const webwallet_has_mss_cache: (a: number, b: number, c: number) => number;
 export const webwallet_import_mss_bytes: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
 export const webwallet_new: (a: number, b: number, c: number) => void;
+export const webwallet_prepare_consolidate: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
 export const webwallet_prepare_fund_many: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
 export const webwallet_prepare_fund_tx: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number) => void;
 export const webwallet_prepare_script_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;

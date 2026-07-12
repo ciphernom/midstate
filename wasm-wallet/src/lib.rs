@@ -2022,6 +2022,216 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
     }
 
 
+    /// Prepare a Consolidate transaction (dust sweeping) for the Web Wallet.
+    ///
+    /// # Reasoning
+    /// Standard transactions (`prepare_spend`) budget for a 1.5 KB WOTS/MSS signature 
+    /// *per input*. For dust sweeping (e.g., 100+ inputs), this overestimates the fee 
+    /// massively, leading to false "Insufficient funds" errors. A `Consolidate` 
+    /// transaction mathematically requires only *one* signature for the entire batch 
+    /// of inputs (as long as they share the same address). This function applies 
+    /// the heavily discounted single-signature fee calculation, enabling users to 
+    /// sweep thousands of dust UTXOs affordably.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:
+    ///   - available_utxos contains ≥ 2 UTXOs.
+    ///   - All UTXOs in available_utxos share the exact same address.
+    ///   - The sum of UTXO values > calculated_fee.
+    ///
+    /// Post:
+    ///   result = Ok(ctx_json) ⇒
+    ///     ctx_json.fee is calculated based on a 1-signature size budget.
+    ///     ctx_json.outputs contains power-of-2 denominations of (total - fee) at dest_address.
+    ///   result = Err(_) ⇒ state unchanged.
+    /// ```
+    ///
+    /// ```zed
+    ///     PrepareConsolidate
+    ///     ------------------
+    ///     ΔWebWallet
+    ///     available? : seq WasmUtxo
+    ///     dest_address? : String
+    ///     next_wots_index? : ℕ₃₂
+    ///     ctx! : String
+    ///
+    ///     pre  #available? ≥ 2
+    ///     pre  ∀ u, v ∈ available? • u.address = v.address
+    ///     let total = ∑ u ∈ available? • u.value
+    ///     let fee = (((600 + 3000 + 100 + #available? * 125) * 10) / 1024) + 20
+    ///     pre  total > fee
+    ///     post ctx! = JSON(SpendContext)
+    /// ```
+    ///
+    /// # Safety / Invariants
+    /// - Output values strictly conform to consensus power-of-2 requirements via `decompose_value`.
+    /// - Inputs are verified to share the same address to satisfy the `Transaction::Consolidate` rule.
+    #[wasm_bindgen]
+    pub fn prepare_consolidate(
+        &mut self,
+        available_utxos_json: &str,
+        dest_address_hex: &str,
+        next_wots_index: u32,
+    ) -> Result<String, JsValue> {
+        let available: Vec<WasmUtxo> = serde_json::from_str(available_utxos_json)
+            .map_err(|e| JsValue::from_str(&format!("Bad utxos JSON: {}", e)))?;
+
+        if available.len() < 2 {
+            return Err(JsValue::from_str("Need at least 2 UTXOs to consolidate"));
+        }
+
+        let first_addr = &available[0].address;
+        let mut total = 0u64;
+        let mut input_coin_ids: Vec<[u8; 32]> = Vec::new();
+
+        for u in &available {
+            if &u.address != first_addr {
+                return Err(JsValue::from_str("All UTXOs must share the same address to consolidate"));
+            }
+            total += u.value;
+            let mut cid = [0u8; 32];
+            hex::decode_to_slice(&u.coin_id, &mut cid).unwrap();
+            input_coin_ids.push(cid);
+        }
+
+        // Exact CLI math: 1 Signature + inputs
+        let estimated_bytes = 600 + 3000 + 100 + (available.len() as u64 * 125);
+        let final_fee = (estimated_bytes * 10) / 1024 + 20; // 20 units padding
+
+        if total <= final_fee {
+            return Err(JsValue::from_str(&format!("Total value {} is too low to pay the network fee of {}", total, final_fee)));
+        }
+
+        let out_val = total - final_fee;
+        
+        let mut dest_addr_b = [0u8; 32];
+        hex::decode_to_slice(dest_address_hex, &mut dest_addr_b)
+            .map_err(|_| JsValue::from_str("Invalid destination address"))?;
+
+        let mut outputs_json = Vec::new();
+        let mut output_hashes = Vec::new();
+
+        for denom in decompose_value(out_val) {
+            let mut salt = [0u8; 32];
+            getrandom_02::getrandom(&mut salt).unwrap();
+            output_hashes.push(compute_coin_id(&dest_addr_b, denom, &salt));
+            outputs_json.push(serde_json::json!({
+                "type": "standard",
+                "address": dest_address_hex.to_lowercase(),
+                "value": denom,
+                "salt": hex::encode(salt),
+            }));
+        }
+
+        // Shuffle outputs for privacy
+        use rand::seq::SliceRandom;
+        let mut indices: Vec<usize> = (0..outputs_json.len()).collect();
+        indices.shuffle(&mut rand::thread_rng());
+
+        let mut shuffled_json = Vec::with_capacity(indices.len());
+        let mut shuffled_hashes = Vec::with_capacity(indices.len());
+        for &idx in &indices {
+            shuffled_json.push(outputs_json[idx].clone());
+            shuffled_hashes.push(output_hashes[idx]);
+        }
+
+        let mut tx_salt = [0u8; 32];
+        getrandom_02::getrandom(&mut tx_salt).unwrap();
+        let commitment = compute_commitment(&input_coin_ids, &shuffled_hashes, &tx_salt);
+
+        let ctx = SpendContext {
+            selected_inputs: available,
+            outputs: shuffled_json,
+            commit_payload: serde_json::json!({
+                "coins": input_coin_ids.iter().map(hex::encode).collect::<Vec<_>>(),
+                "destinations": shuffled_hashes.iter().map(hex::encode).collect::<Vec<_>>()
+            }),
+            tx_salt: hex::encode(tx_salt),
+            commitment: hex::encode(commitment),
+            fee: final_fee,
+            next_wots_index,
+        };
+
+        Ok(serde_json::to_string(&ctx).map_err(|e| JsValue::from_str(&e.to_string()))?)
+    }
+
+
+    /// Assemble the Reveal payload for a Consolidate transaction.
+    ///
+    /// # Reasoning
+    /// Standard `build_reveal` generates a 1.5 KB signature for *every* input. For 5000+ dust 
+    /// UTXOs, computing 5000 WOTS signatures requires billions of BLAKE3 hashes (freezing 
+    /// the browser for 10+ seconds) and generates megabytes of useless signature data. 
+    /// A Consolidate transaction strictly requires only ONE signature covering all inputs. 
+    /// This function bypasses the redundant signing, keeping the browser lightning fast.
+    ///
+    /// # Formal Specification
+    /// ```text
+    /// Pre:
+    ///   - ctx_json is a valid SpendContext.
+    ///   - ctx_json.selected_inputs is not empty.
+    ///
+    /// Post:
+    ///   result = Ok(reveal_json) ⇒
+    ///     reveal_json.signatures contains EXACTLY ONE signature (the first input's signature).
+    ///     reveal_json.inputs contains all inputs without signatures.
+    /// ```
+    #[wasm_bindgen]
+    pub fn build_consolidate_reveal(
+        &mut self,
+        ctx_json: &str,
+    ) -> Result<String, JsValue> {
+        let ctx: SpendContext = serde_json::from_str(ctx_json)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        if ctx.selected_inputs.is_empty() {
+            return Err(JsValue::from_str("No inputs to consolidate"));
+        }
+
+        let mut commitment = [0u8; 32];
+        hex::decode_to_slice(&ctx.commitment, &mut commitment)
+            .map_err(|_| JsValue::from_str("Invalid commitment hex"))?;
+
+        let mut input_reveals = Vec::new();
+        for inp in &ctx.selected_inputs {
+            let pk = if inp.is_mss {
+                self.mss_cache.get(&inp.address)
+                    .ok_or_else(|| JsValue::from_str("MSS tree missing"))?.master_pk
+            } else {
+                wots::keygen(&derive_wots_seed(&self.master_seed, inp.index as u64))
+            };
+            let bytecode = midstate::core::script::compile_p2pk(&pk);
+            input_reveals.push(serde_json::json!({
+                "bytecode": hex::encode(&bytecode),
+                "value": inp.value,
+                "salt": inp.salt,
+            }));
+        }
+
+        // CRITICAL: SIGN ONLY THE VERY FIRST INPUT!
+        let first_inp = &ctx.selected_inputs[0];
+        let sig_bytes = if first_inp.is_mss {
+            let kp = self.mss_cache.get_mut(&first_inp.address).unwrap();
+            kp.next_leaf = first_inp.mss_leaf as u64;
+            let sig = kp.sign(&commitment).map_err(|e| JsValue::from_str(&e.to_string()))?;
+            sig.to_bytes()
+        } else {
+            let seed = derive_wots_seed(&self.master_seed, first_inp.index as u64);
+            let wots_sig = wots::sign(&seed, &commitment);
+            wots::sig_to_bytes(&wots_sig)
+        };
+
+        Ok(serde_json::json!({
+            "inputs": input_reveals,
+            "signatures": [hex::encode(sig_bytes)],
+            "outputs": ctx.outputs,
+            "salt": ctx.tx_salt,
+        }).to_string())
+    }
+
+
     /// This implements the full coin selection algorithm:
     ///
     /// 1. **Greedy selection**: picks largest coins first until the amount + fee is covered.
@@ -2676,6 +2886,10 @@ pub fn build_htlc_bytecode_hex(
     let bytecode = midstate::core::script::compile_htlc(&sh, &rpk, timeout_height, &refpk);
     Ok(hex::encode(bytecode))
 }
+
+    
+
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Tests

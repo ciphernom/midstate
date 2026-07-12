@@ -27,7 +27,7 @@
  * @module worker
  */
 
-import init, { WebWallet, generate_phrase, compute_coin_id_hex, decrypt_cli_wallet, mine_commitment_pow, blake3_hash_hex, build_multisig_2of2_address, build_channel_state, build_channel_reveal, verify_mss_sig_wasm, mine_chat_pow_v2_wasm, build_htlc_bytecode_hex, build_covenant_htlc_bytecode_hex, build_limit_order_covenant_bytecode_hex, compute_p2pk_address_hex } from './pkg/wasm_wallet.js';
+import init, { WebWallet, generate_phrase, compute_coin_id_hex, compute_commitment_hex, decrypt_cli_wallet, mine_commitment_pow, blake3_hash_hex, build_multisig_2of2_address, build_channel_state, build_channel_reveal, verify_mss_sig_wasm, mine_chat_pow_v2_wasm, build_htlc_bytecode_hex, build_covenant_htlc_bytecode_hex, build_limit_order_covenant_bytecode_hex, compute_p2pk_address_hex } from './pkg/wasm_wallet.js';
 
 /** @type {WebWallet|null} The WASM wallet instance. Null until CREATE or LOGIN. */
 let wallet = null;
@@ -170,6 +170,7 @@ let wState = {
     nextWotsIndex: 0,
     nextMssIndex: 0,
     wotsAddrs: {},
+    spentWots: {},   // CRITICAL FIX: Tracks completely dead WOTS addresses to prevent dusting attacks
     mssAddrs: {},
     utxos: {},
     history: [],
@@ -354,6 +355,24 @@ async function loadMssCaches() {
     mssCachesLoading = null;
     self.postMessage({ type: 'LOG', payload: "All MSS trees loaded." });
 }
+
+
+/**
+ * CRITICAL FIX: Safe MSS Signing Helper
+ * Generates an MSS signature and instantly persists the leaf increment to
+ * IndexedDB and wState to ensure a page reload can never cause MSS Leaf Reuse.
+ */
+async function signMssAndSync(pkHex, commitmentHex) {
+    const sigHex = wallet.sign_mss_hex(pkHex, commitmentHex);
+    const addrHex = compute_p2pk_address_hex(pkHex);
+    if (wState.mssAddrs[addrHex]) {
+        wState.mssAddrs[addrHex].next_leaf++;
+        await idbPut(`mss_${addrHex}`, wallet.export_mss_bytes(addrHex));
+        await saveState(); 
+    }
+    return sigHex;
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  RPC Bridge
@@ -781,6 +800,7 @@ async function loadState(pwd, bundleStr) {
         wState.l2_secrets = wState.l2_secrets || {};
         wState.l2_routes = wState.l2_routes || {};
         wState.dex_swaps = wState.dex_swaps || {};
+        wState.spentWots = wState.spentWots || {};
         
         // Migrate legacy array-format UTXOs to map format
         if (Array.isArray(wState.utxos)) {
@@ -1175,6 +1195,7 @@ self.onmessage = async (e) => {
                 // coins, EACH with a random salt, so funding yields a SET of coins.
                 // performContractTx now returns that set (salts are not on-chain, so
                 // the taker can only spend them if we transmit {coin_id,value,salt}).
+                let lockTxId = null;
                 const fundRes = await performContractTx({
                     reqId: 999,
                     dexOfferId: offerId,   // routes commit/reveal phase progress to this swap card
@@ -1183,6 +1204,7 @@ self.onmessage = async (e) => {
                     amount: fundAmount
                 });
                 const htlcCoins = (fundRes && fundRes.coins) || [];
+                if (fundRes) lockTxId = fundRes.txid;
 
                 // RECOVERY BREADCRUMB: publish a taker-lock announcement on-chain so this
                 // lock can be rebuilt from the seed alone if local data is later cleared
@@ -1218,7 +1240,8 @@ self.onmessage = async (e) => {
                     makerMdsPk: myPk,
                     takerMdsPk: takerPk,
                     swapMode: covenant ? 'covenant' : 'htlc',
-                    minPayout: covenant ? Number(expectedAmount) : undefined
+                    minPayout: covenant ? Number(expectedAmount) : undefined,
+                    lockTxId 
                 }});
             } catch (err) {
                 // Clear the card's live phase on failure so it doesn't sit on a stale
@@ -1369,7 +1392,8 @@ self.onmessage = async (e) => {
                         covAddr: b.covAddr,
                         coin: { coin_id, value: o.value, salt: normalizeHex(o.salt) },
                         secret: b.rawSecret, secretHash: b.secretHash,
-                        maxClaim: b.v, timeoutHeight, makerMdsPk: myPk, makerEvmAddr, weiAmount: b.weiAmount
+                        maxClaim: b.v, timeoutHeight, makerMdsPk: myPk, makerEvmAddr, weiAmount: b.weiAmount,
+                        lockTxId: ctx.commitment // <--- Add this line
                     };
                 });
 
@@ -1396,24 +1420,24 @@ self.onmessage = async (e) => {
                 // inputs internally — no separate covenant signature needed.
                 const revealPayloadStr = wallet.build_script_reveal(ctxStr, ctx.commitment, ctx.tx_salt);
 
-                dexPhase("Mining spam-proof (PoW)\u2026");
+                dexPhase(`Mining PoW [Commit: ${ctx.commitment.substring(0,8)}...]`);
                 const stateData = await rpc.getState();
                 await new Promise(r => setTimeout(r, 50));
                 const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
                 const commitReq = await rpc.commit(ctx.commitment, spamNonce);
                 if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
-                dexPhase("Commit broadcast — waiting to be mined (1/2)\u2026");
+                dexPhase(`Commit broadcast — waiting to be mined (1/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
                 while (true) { try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {} await waitForNextBlock(15000); }
                 // Self-heal MSS leaf reuse: if the leaf floor was stale, advance and re-sign
                 // against the SAME already-mined commitment (leaf is a witness, not committed to).
                 const revealReq = await sendRevealWithMssLeafRetry(revealPayloadStr, ctxStr, ctx.commitment, ctx.tx_salt, dexPhase);
                 if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
-                dexPhase("Reveal broadcast — waiting to be mined (2/2)\u2026");
+                dexPhase(`Reveal broadcast — waiting to be mined (2/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
                 const firstInputId = ctx.input_coin_ids && ctx.input_coin_ids.length ? ctx.input_coin_ids[0] : null;
                 if (firstInputId) { while (true) { try { const inp = await rpc.checkCoin(firstInputId); if (inp && !inp.exists) break; } catch (e) {} await waitForNextBlock(15000); } }
                 dexPhase("Confirmed \u2713 — syncing\u2026");
                 await performScan();
-
+                
                 // Funded and confirmed — hand the units to the UI, then clear the recovery record.
                 self.postMessage({ type: 'DEX_LIMIT_BUNDLE_CREATED', payload: { groupId, units: outUnits, announcedAtomically: atomicAnnounce } });
                 if (wState.pendingLimitBundles) delete wState.pendingLimitBundles[groupId];
@@ -1792,7 +1816,7 @@ self.onmessage = async (e) => {
 
                 // 2. Sign the (single) commitment with our key. The same signature
                 //    satisfies CHECKSIGVERIFY for every input (same pk, same commitment).
-                const sigHex = wallet.sign_mss_hex(myPk, ctx.commitment);
+                const sigHex = await signMssAndSync(myPk, ctx.commitment);
 
                 // 3. Inject the claim witness [Signature, Secret, 0x01] into each input.
                 for (let i = 0; i < ctx.contract_inputs.length; i++) {
@@ -1811,7 +1835,8 @@ self.onmessage = async (e) => {
 
                 // 6. Mine, commit, wait, reveal, wait.
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining PoW..." } });
-                dexPhase("Mining spam-proof (PoW)\u2026");
+                dexPhase(`Mining PoW [Commit: ${ctx.commitment.substring(0,8)}...]`);
+
                 const stateData = await rpc.getState();
                 await new Promise(r => setTimeout(r, 50));
                 const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
@@ -1820,7 +1845,7 @@ self.onmessage = async (e) => {
                 if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for Block Confirmation..." } });
-                dexPhase("Commit broadcast \u2014 waiting to be mined (step 1 of 2)\u2026");
+                dexPhase(`Commit broadcast — waiting to be mined (1/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
                 while (true) {
                     try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {}
                     await waitForNextBlock(15000);
@@ -1830,7 +1855,7 @@ self.onmessage = async (e) => {
                 if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting claim..." } });
-                dexPhase("Reveal broadcast \u2014 waiting to be mined (step 2 of 2)\u2026");
+                dexPhase(`Reveal broadcast — waiting to be mined (2/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
                 const firstCoin = normalizeHex(htlcCoins[0].coin_id);
                 while (true) {
                     try { const inp = await rpc.checkCoin(firstCoin); if (inp && !inp.exists) break; } catch (e) {}
@@ -1839,8 +1864,8 @@ self.onmessage = async (e) => {
 
                 dexPhase("Confirmed \u2713 \u2014 syncing wallet\u2026");
                 await performScan();
-                self.postMessage({ type: 'DEX_CLAIM_SUCCESS', payload: { swapIdx, offerId } });
-
+                self.postMessage({ type: 'DEX_CLAIM_SUCCESS', payload: { swapIdx, offerId, claimTxId: ctx.commitment } 
+            });
             } catch (err) {
                 // Clear the card's live phase so a failed claim doesn't sit on a stale
                 // "waiting to be mined" line (payload is in scope here; dexPhase isn't).
@@ -1944,7 +1969,8 @@ self.onmessage = async (e) => {
                 await saveState();
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining PoW..." } });
-                dexPhase("Mining spam-proof (PoW)\u2026");
+                dexPhase(`Mining PoW [Commit: ${ctx.commitment.substring(0,8)}...]`);
+
                 const stateData = await rpc.getState();
                 await new Promise(r => setTimeout(r, 50));
                 const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
@@ -1953,7 +1979,7 @@ self.onmessage = async (e) => {
                 if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for Block Confirmation..." } });
-                dexPhase("Commit broadcast \u2014 waiting to be mined (step 1 of 2)\u2026");
+                dexPhase(`Commit broadcast — waiting to be mined (1/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
                 while (true) {
                     try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {}
                     await waitForNextBlock(15000);
@@ -1963,7 +1989,7 @@ self.onmessage = async (e) => {
                 if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting delivery..." } });
-                dexPhase("Reveal broadcast \u2014 waiting to be mined (step 2 of 2)\u2026");
+                dexPhase(`Reveal broadcast — waiting to be mined (2/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
                 const firstCoin = normalizeHex(htlcCoins[0].coin_id);
                 while (true) {
                     try { const inp = await rpc.checkCoin(firstCoin); if (inp && !inp.exists) break; } catch (e) {}
@@ -1974,7 +2000,7 @@ self.onmessage = async (e) => {
                 // The buyer scans to pick up the freshly delivered coins; the seller scans
                 // to pick up the surplus change. Either way a scan is correct here.
                 await performScan();
-                self.postMessage({ type: 'DEX_SETTLE_SUCCESS', payload: { offerId, swapIdx, role } });
+                self.postMessage({ type: 'DEX_SETTLE_SUCCESS', payload: { offerId, swapIdx, role, settleTxId: ctx.commitment } });
 
             } catch (err) {
                 if (payload && payload.offerId) self.postMessage({ type: 'DEX_PHASE', payload: { offerId: payload.offerId, phase: null } });
@@ -2054,20 +2080,20 @@ self.onmessage = async (e) => {
                 for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
                 await saveState();
 
-                dexPhase("Mining spam-proof (PoW)…");
+                dexPhase(`Mining PoW [Commit: ${ctx.commitment.substring(0,8)}...]`);
                 const stateData = await rpc.getState();
                 await new Promise(r => setTimeout(r, 50));
                 const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
                 const commitReq = await rpc.commit(ctx.commitment, spamNonce);
                 if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
 
-                dexPhase("Commit broadcast — waiting to be mined (1/2)…");
+                dexPhase(`Commit broadcast — waiting to be mined (1/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
                 while (true) { try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {} await waitForNextBlock(15000); }
 
                 const revealReq = await rpc.send(revealPayloadStr);
                 if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
 
-                dexPhase("Reveal broadcast — waiting to be mined (2/2)…");
+                dexPhase(`Reveal broadcast — waiting to be mined (2/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
                 const firstCoin = normalizeHex(coin.coin_id);
                 while (true) { try { const inp = await rpc.checkCoin(firstCoin); if (inp && !inp.exists) break; } catch (e) {} await waitForNextBlock(15000); }
 
@@ -2075,7 +2101,7 @@ self.onmessage = async (e) => {
                 await performScan();
                 // Revealing `rawSecret` in the spend witness lets the maker harvest it and claim the
                 // taker's ETH on Base. The NEW remainder coin (at covAddr) stays on the book.
-                self.postMessage({ type: 'DEX_FILL_SUCCESS', payload: { offerId, claimed: claimAmt, remainder, covAddr } });
+                self.postMessage({ type: 'DEX_FILL_SUCCESS', payload: { offerId, claimed: claimAmt, remainder, covAddr, fillTxId: ctx.commitment } });
             } catch (err) {
                 const detail = (err && err.message) ? err.message : String(err);
                 self.postMessage({ type: 'DEX_FILL_FAILED', payload: { offerId: payload && payload.offerId, error: detail } });
@@ -2126,7 +2152,7 @@ self.onmessage = async (e) => {
                     JSON.stringify(utxoArray), covScriptHex, contractInputsJson, outputsJson, wState.nextWotsIndex
                 ));
                 // Sign the spend with the refund key, then inject the ELSE-branch witness [sig, dummy(32B), 0x00].
-                const sigHex = wallet.sign_mss_hex(refundPk, ctx.commitment);
+                const sigHex = await signMssAndSync(refundPk, ctx.commitment);
                 const dummy = "00".repeat(32);
                 for (let i = 0; i < ctx.contract_inputs.length; i++) ctx.contract_inputs[i].witness = `${sigHex},${dummy},00`;
 
@@ -2218,7 +2244,7 @@ self.onmessage = async (e) => {
                         JSON.stringify(utxoArray), scriptHex, contractInputsJson, outputsJson, wState.nextWotsIndex
                     ));
                     // Refund branch witness: [sig, dummy(32B), 0x00] selects the ELSE/timeout path.
-                    const sigHex = wallet.sign_mss_hex(myPk, ctx.commitment);
+                    const sigHex = await signMssAndSync(myPk, ctx.commitment);
                     const dummy = "00".repeat(32);
                     for (let i = 0; i < ctx.contract_inputs.length; i++) ctx.contract_inputs[i].witness = `${sigHex},${dummy},00`;
 
@@ -2287,7 +2313,7 @@ self.onmessage = async (e) => {
             }];
             const newNonce = chan.latest_state.nonce + 1;
             const stateJson = build_channel_state(chanId, chan.alice_pk, chan.bob_pk, BigInt(nA), BigInt(nB), newNonce, JSON.stringify(htlcs));
-            const sigHex = wallet.sign_mss_hex(chan.is_alice ? chan.alice_pk : chan.bob_pk, JSON.parse(stateJson).commitment);
+            const sigHex = await signMssAndSync(chan.is_alice ? chan.alice_pk : chan.bob_pk, JSON.parse(stateJson).commitment);
             chan.latest_state = { nonce: newNonce, alice_amt: nA, bob_amt: nB, htlcs, alice_sig: chan.is_alice ? sigHex : null, bob_sig: chan.is_alice ? null : sigHex, is_fully_signed: false };
             await saveState();
 
@@ -2575,7 +2601,7 @@ self.onmessage = async (e) => {
             wState = {
                 phrase: payload.phrase,
                 nextWotsIndex: 0, nextMssIndex: 0,
-                wotsAddrs: {}, mssAddrs: {}, utxos: {}, history: [],
+                wotsAddrs: {}, spentWots: {}, mssAddrs: {}, utxos: {}, history: [],
                 lastScannedHeight: 0,
                 l2_channels: {}, l2_secrets: {}, l2_routes: {}
             };
@@ -2630,6 +2656,95 @@ self.onmessage = async (e) => {
             }
             finally { releaseSendLock(); }
         }
+        else if (type === 'CONSOLIDATE_UTXOS') {
+            await acquireSendLock();
+            try {
+                const targetAddr = payload.address;
+                let utxosAtAddress = Object.values(wState.utxos).filter(u => u.address === targetAddr);
+                
+                if (utxosAtAddress.length < 2) throw new Error("Need at least 2 UTXOs to consolidate.");
+                // Hard consensus cap for a single transaction
+                if (utxosAtAddress.length > 5000) utxosAtAddress = utxosAtAddress.slice(0, 5000);
+
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `Preparing consolidation of ${utxosAtAddress.length} coins...` } });
+
+                if (!mssCachesReady) await loadMssCaches();
+                await verifyMssSafetyIndices((m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
+
+                // SAFETY: Ensure local MSS indices are attached for signing
+                utxosAtAddress = utxosAtAddress.map(u => {
+                    if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
+                    return u;
+                });
+
+                let destMssPkHex = getPrimaryMssPk();
+                if (!destMssPkHex) {
+                    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Generating MSS address for consolidation output..." } });
+                    await deriveNextMss(10);
+                    destMssPkHex = getPrimaryMssPk();
+                }
+                let destAddrHex = compute_p2pk_address_hex(destMssPkHex);
+
+                // --- THIS IS THE MAGIC: One clean call to the new Rust method ---
+                let spendContextStr = wallet.prepare_consolidate(
+                    JSON.stringify(utxosAtAddress), 
+                    destAddrHex, 
+                    wState.nextWotsIndex
+                );
+                
+                let ctx = JSON.parse(spendContextStr);
+
+                // Advance key material indices safely
+                while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
+                const usedMssAddrs = new Set();
+                for (const inp of ctx.selected_inputs) if (inp.is_mss) usedMssAddrs.add(inp.address);
+                for (const addr of usedMssAddrs) wState.mssAddrs[addr].next_leaf++;
+                await saveState();
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining PoW..." } });
+                const stateData = await rpc.getState();
+                await new Promise(r => setTimeout(r, 50));
+                const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting commit..." } });
+                const commitReq = await rpc.commit(ctx.commitment, spamNonce);
+                if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for commit to be mined (1/2)..." } });
+                while (true) {
+                    try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {}
+                    await waitForNextBlock(15000);
+                }
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting consolidate reveal..." } });
+                
+                // CALL THE NEW RUST METHOD! (Lightning fast, only 1 signature)
+                let revealPayloadStr = wallet.build_consolidate_reveal(spendContextStr);
+                let revealPayload = JSON.parse(revealPayloadStr);
+
+                // Add the routing flag for the node
+                revealPayload.is_consolidate = true;
+
+                const revealReq = await rpc.send(JSON.stringify(revealPayload));
+                if (!revealReq.ok) throw new Error(`Sweep rejected: ${revealReq.body || revealReq.error}`);
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for sweep to be mined (2/2)..." } });
+                const firstCoinId = ctx.input_coin_ids[0];
+                while (true) {
+                    try { const inp = await rpc.checkCoin(firstCoinId); if (inp && !inp.exists) break; } catch (e) {}
+                    await waitForNextBlock(15000);
+                }
+
+                await performScan();
+                self.postMessage({ type: 'SEND_COMPLETE', payload: buildDashboardPayload() });
+                self.postMessage({ type: 'LOG', payload: `Successfully consolidated ${utxosAtAddress.length} UTXOs into a single coin.` });
+            } catch (err) {
+                self.postMessage({ type: 'SEND_ERROR', payload: { error: err.message || String(err) } });
+            } finally {
+                releaseSendLock();
+            }
+        }
 else if (type === 'L2_OPEN_CHANNEL') {
             const { peerPk, amount } = payload;
             const myPk = getPrimaryMssPk();
@@ -2668,7 +2783,7 @@ else if (type === 'L2_OPEN_CHANNEL') {
             const parsedState = JSON.parse(stateJson);
             const myPk = channel.is_alice ? channel.alice_pk : channel.bob_pk;
             
-            const sigHex = wallet.sign_mss_hex(myPk, parsedState.commitment);
+            const sigHex = await signMssAndSync(myPk, parsedState.commitment);
             
             channel.latest_state = {
                 nonce: newNonce, alice_amt: newAliceAmt, bob_amt: newBobAmt, htlcs,
@@ -2779,7 +2894,7 @@ else if (type === 'L2_OPEN_CHANNEL') {
             const stateJson = build_channel_state(hubChannelId, hubChannel.alice_pk, hubChannel.bob_pk, BigInt(newAliceAmt), BigInt(newBobAmt), newNonce, JSON.stringify(htlcs));
             const parsedState = JSON.parse(stateJson);
             const myPk = hubChannel.is_alice ? hubChannel.alice_pk : hubChannel.bob_pk;
-            const sigHex = wallet.sign_mss_hex(myPk, parsedState.commitment);
+            const sigHex = await signMssAndSync(myPk, parsedState.commitment);
             
             hubChannel.latest_state = {
                 nonce: newNonce, alice_amt: newAliceAmt, bob_amt: newBobAmt, htlcs,
@@ -3088,9 +3203,10 @@ else if (type === 'L2_OPEN_CHANNEL') {
                 wState = {
                     phrase: null,
                     master_seed: normalizeHex(cliData.master_seed),
-                    nextWotsIndex: wotsTarget,   // frontier = count of derived addresses (native invariant)
+                    nextWotsIndex: wotsTarget,   
                     nextMssIndex:  Math.max(cliData.next_mss_index || 0, mssKeys.length),
                     wotsAddrs: newWotsAddrs,
+                    spentWots: {},
                     mssAddrs:  newMssAddrs,
                     utxos:     newUtxos,
                     history:   cliData.history || [],
@@ -3489,6 +3605,19 @@ async function processFullBlock(height) {
 
                     // Safely delete the accurately identified coin
                     if (cid && wState.utxos[cid]) {
+                        // CRITICAL FIX: Track spent WOTS addresses and purge siblings to prevent Key Reuse!
+                        const spentCoin = wState.utxos[cid];
+                        if (!spentCoin.is_mss) {
+                            wState.spentWots = wState.spentWots || {};
+                            wState.spentWots[spentCoin.address] = true;
+                            // Purge any siblings to ensure absolute safety
+                            for (const key in wState.utxos) {
+                                if (wState.utxos[key].address === spentCoin.address) {
+                                    delete wState.utxos[key];
+                                }
+                            }
+                        }
+
                         delete wState.utxos[cid];
                         if (ourSalts.get(saltHex) === cid) ourSalts.delete(saltHex);
                         spentIds.push(cid);
@@ -3604,6 +3733,12 @@ async function processFullBlock(height) {
  * @returns {boolean} `true` if the UTXO was new (not a duplicate).
  */
 function addUtxo(address, value, salt, coinId, commitment = null) {
+    // CRITICAL FIX: Do not import dust to an already-spent WOTS address!
+    if (wState.spentWots && wState.spentWots[address]) {
+        self.postMessage({ type: 'LOG', payload: `⚠️ SECURITY: Ignored dust payment to already-spent WOTS address ${address.substring(0,8)}...`});
+        return false;
+    }
+
     let index = 0, is_mss = false, mss_height = 0, mss_leaf = 0;
     if (wState.wotsAddrs[address] !== undefined) {
         index = wState.wotsAddrs[address];
@@ -3941,12 +4076,12 @@ async function performContractTx(req) {
     for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
     await saveState();
 
-    // ── Commit → PoW → wait → reveal → wait (identical to performSend) ───────
+    // ── Commit → PoW → wait → reveal → wait ───────
     prog("Fetching network difficulty...");
     const stateData   = await rpc.getState();
     const requiredPow = stateData.required_pow || 24;
 
-    prog("Mining PoW...");
+    prog(`Mining PoW [Commit: ${ctx.commitment.substring(0,8)}...]`);
     await new Promise(r => setTimeout(r, 50));
     const spamNonce = Number(mine_commitment_pow(ctx.commitment, requiredPow, BigInt(stateData.height), stateData.header_hash));
 
@@ -3954,7 +4089,7 @@ async function performContractTx(req) {
     const commitReq = await rpc.commit(ctx.commitment, spamNonce);
     if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
 
-    prog("Commit broadcast — waiting to be mined (step 1 of 2)…");
+    prog(`Commit broadcast — waiting to be mined (1/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
     const revealPayloadStr = wallet.build_script_reveal(ctxStr, ctx.commitment, ctx.tx_salt);
 
     while (true) {
@@ -4186,7 +4321,7 @@ async function handleL2Chat(msg) {
         // This makes an HTLC-add irrevocable BEFORE we act on it. Doing this FIRST
         // (rather than after the routing logic) is the fix for Bug B: the old code
         // built the claim state then let this tail clobber it back a nonce.
-        const mySig = wallet.sign_mss_hex(myPk, parsedState.commitment);
+        const mySig = await signMssAndSync(myPk, parsedState.commitment);
         channel.latest_state = {
             nonce, alice_amt: aliceAmt, bob_amt: bobAmt, htlcs,
             alice_sig: channel.is_alice ? mySig : counterpartySig,
@@ -4225,7 +4360,7 @@ async function handleL2Chat(msg) {
                     const fHtlcs = [...(fC.latest_state.htlcs || []), { amount: newHtlc.amount, timeout: newHtlc.timeout - 10, receiver_is_alice: !fC.is_alice, secret_hash: newHtlc.secret_hash }];
                     const fNonce = fC.latest_state.nonce + 1;
                     const fState = build_channel_state(fwdId, fC.alice_pk, fC.bob_pk, BigInt(nA), BigInt(nB), fNonce, JSON.stringify(fHtlcs));
-                    const fSig = wallet.sign_mss_hex(fC.is_alice ? fC.alice_pk : fC.bob_pk, JSON.parse(fState).commitment);
+                    const fSig = await signMssAndSync(fC.is_alice ? fC.alice_pk : fC.bob_pk, JSON.parse(fState).commitment);
                     fC.latest_state = { nonce: fNonce, alice_amt: nA, bob_amt: nB, htlcs: fHtlcs, alice_sig: fC.is_alice ? fSig : null, bob_sig: fC.is_alice ? null : fSig, is_fully_signed: false };
                     wState.l2_routes = wState.l2_routes || {};
                     wState.l2_routes[newHtlc.secret_hash] = { fromCoinId: coinId, amount: newHtlc.amount };
@@ -4242,7 +4377,7 @@ async function handleL2Chat(msg) {
                     if (channel.is_alice) nA += newHtlc.amount; else nB += newHtlc.amount;
                     const cNonce = channel.latest_state.nonce + 1;
                     const cState = build_channel_state(coinId, channel.alice_pk, channel.bob_pk, BigInt(nA), BigInt(nB), cNonce, JSON.stringify(cHtlcs));
-                    const cSig = wallet.sign_mss_hex(myPk, JSON.parse(cState).commitment);
+                    const cSig = await signMssAndSync(myPk, JSON.parse(cState).commitment);
                     channel.latest_state = { nonce: cNonce, alice_amt: nA, bob_amt: nB, htlcs: cHtlcs, alice_sig: channel.is_alice ? cSig : null, bob_sig: channel.is_alice ? null : cSig, is_fully_signed: false };
                     // FEATURE 2 (taker side): record the settled claim so the UI (live event
                     // below, or the DEX_SUBMARINE_STATUS poll after a reload) can complete the
@@ -4282,7 +4417,7 @@ async function handleL2Chat(msg) {
                         const pHtlcs = (pC.latest_state.htlcs || []).filter(h => h.secret_hash !== secretHash);
                         const pNonce = pC.latest_state.nonce + 1;
                         const pState = build_channel_state(route.fromCoinId, pC.alice_pk, pC.bob_pk, BigInt(pA), BigInt(pB), pNonce, JSON.stringify(pHtlcs));
-                        const pSig = wallet.sign_mss_hex(pC.is_alice ? pC.alice_pk : pC.bob_pk, JSON.parse(pState).commitment);
+                        const pSig = await signMssAndSync(pC.is_alice ? pC.alice_pk : pC.bob_pk, JSON.parse(pState).commitment);
                         pC.latest_state = { nonce: pNonce, alice_amt: pA, bob_amt: pB, htlcs: pHtlcs, alice_sig: pC.is_alice ? pSig : null, bob_sig: pC.is_alice ? null : pSig, is_fully_signed: false };
                         delete wState.l2_routes[secretHash];
                         await saveState();

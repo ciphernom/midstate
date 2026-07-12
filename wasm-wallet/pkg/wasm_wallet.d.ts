@@ -44,6 +44,29 @@ export class WebWallet {
      */
     build_coinbase_to_mss(total_value: bigint, address_hex: string): string;
     /**
+     * Assemble the Reveal payload for a Consolidate transaction.
+     *
+     * # Reasoning
+     * Standard `build_reveal` generates a 1.5 KB signature for *every* input. For 5000+ dust
+     * UTXOs, computing 5000 WOTS signatures requires billions of BLAKE3 hashes (freezing
+     * the browser for 10+ seconds) and generates megabytes of useless signature data.
+     * A Consolidate transaction strictly requires only ONE signature covering all inputs.
+     * This function bypasses the redundant signing, keeping the browser lightning fast.
+     *
+     * # Formal Specification
+     * ```text
+     * Pre:
+     *   - ctx_json is a valid SpendContext.
+     *   - ctx_json.selected_inputs is not empty.
+     *
+     * Post:
+     *   result = Ok(reveal_json) ⇒
+     *     reveal_json.signatures contains EXACTLY ONE signature (the first input's signature).
+     *     reveal_json.inputs contains all inputs without signatures.
+     * ```
+     */
+    build_consolidate_reveal(ctx_json: string): string;
+    /**
      * Build the reveal payload (inputs + signatures + outputs) for a committed transaction.
      *
      * # Safety Check
@@ -216,6 +239,55 @@ export class WebWallet {
      * or bad checksum).
      */
     constructor(phrase: string);
+    /**
+     * Prepare a Consolidate transaction (dust sweeping) for the Web Wallet.
+     *
+     * # Reasoning
+     * Standard transactions (`prepare_spend`) budget for a 1.5 KB WOTS/MSS signature
+     * *per input*. For dust sweeping (e.g., 100+ inputs), this overestimates the fee
+     * massively, leading to false "Insufficient funds" errors. A `Consolidate`
+     * transaction mathematically requires only *one* signature for the entire batch
+     * of inputs (as long as they share the same address). This function applies
+     * the heavily discounted single-signature fee calculation, enabling users to
+     * sweep thousands of dust UTXOs affordably.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - available_utxos contains ≥ 2 UTXOs.
+     *   - All UTXOs in available_utxos share the exact same address.
+     *   - The sum of UTXO values > calculated_fee.
+     *
+     * Post:
+     *   result = Ok(ctx_json) ⇒
+     *     ctx_json.fee is calculated based on a 1-signature size budget.
+     *     ctx_json.outputs contains power-of-2 denominations of (total - fee) at dest_address.
+     *   result = Err(_) ⇒ state unchanged.
+     * ```
+     *
+     * ```zed
+     *     PrepareConsolidate
+     *     ------------------
+     *     ΔWebWallet
+     *     available? : seq WasmUtxo
+     *     dest_address? : String
+     *     next_wots_index? : ℕ₃₂
+     *     ctx! : String
+     *
+     *     pre  #available? ≥ 2
+     *     pre  ∀ u, v ∈ available? • u.address = v.address
+     *     let total = ∑ u ∈ available? • u.value
+     *     let fee = (((600 + 3000 + 100 + #available? * 125) * 10) / 1024) + 20
+     *     pre  total > fee
+     *     post ctx! = JSON(SpendContext)
+     * ```
+     *
+     * # Safety / Invariants
+     * - Output values strictly conform to consensus power-of-2 requirements via `decompose_value`.
+     * - Inputs are verified to share the same address to satisfy the `Transaction::Consolidate` rule.
+     */
+    prepare_consolidate(available_utxos_json: string, dest_address_hex: string, next_wots_index: number): string;
     /**
      * Fund MANY contract addresses in ONE transaction.
      *
@@ -527,6 +599,7 @@ export interface InitOutput {
     readonly verify_mss_sig_wasm: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
     readonly webwallet_build_coinbase: (a: number, b: number, c: bigint, d: number) => void;
     readonly webwallet_build_coinbase_to_mss: (a: number, b: number, c: bigint, d: number, e: number) => void;
+    readonly webwallet_build_consolidate_reveal: (a: number, b: number, c: number, d: number) => void;
     readonly webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly webwallet_build_script_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly webwallet_build_solo_extension: (a: number, b: number, c: number, d: number, e: bigint) => void;
@@ -540,6 +613,7 @@ export interface InitOutput {
     readonly webwallet_has_mss_cache: (a: number, b: number, c: number) => number;
     readonly webwallet_import_mss_bytes: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly webwallet_new: (a: number, b: number, c: number) => void;
+    readonly webwallet_prepare_consolidate: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly webwallet_prepare_fund_many: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
     readonly webwallet_prepare_fund_tx: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number) => void;
     readonly webwallet_prepare_script_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;

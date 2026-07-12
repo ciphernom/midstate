@@ -104,6 +104,56 @@ export class WebWallet {
         }
     }
     /**
+     * Assemble the Reveal payload for a Consolidate transaction.
+     *
+     * # Reasoning
+     * Standard `build_reveal` generates a 1.5 KB signature for *every* input. For 5000+ dust
+     * UTXOs, computing 5000 WOTS signatures requires billions of BLAKE3 hashes (freezing
+     * the browser for 10+ seconds) and generates megabytes of useless signature data.
+     * A Consolidate transaction strictly requires only ONE signature covering all inputs.
+     * This function bypasses the redundant signing, keeping the browser lightning fast.
+     *
+     * # Formal Specification
+     * ```text
+     * Pre:
+     *   - ctx_json is a valid SpendContext.
+     *   - ctx_json.selected_inputs is not empty.
+     *
+     * Post:
+     *   result = Ok(reveal_json) ⇒
+     *     reveal_json.signatures contains EXACTLY ONE signature (the first input's signature).
+     *     reveal_json.inputs contains all inputs without signatures.
+     * ```
+     * @param {string} ctx_json
+     * @returns {string}
+     */
+    build_consolidate_reveal(ctx_json) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(ctx_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.webwallet_build_consolidate_reveal(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
      * Build the reveal payload (inputs + signatures + outputs) for a committed transaction.
      *
      * # Safety Check
@@ -565,6 +615,86 @@ export class WebWallet {
             return this;
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Prepare a Consolidate transaction (dust sweeping) for the Web Wallet.
+     *
+     * # Reasoning
+     * Standard transactions (`prepare_spend`) budget for a 1.5 KB WOTS/MSS signature
+     * *per input*. For dust sweeping (e.g., 100+ inputs), this overestimates the fee
+     * massively, leading to false "Insufficient funds" errors. A `Consolidate`
+     * transaction mathematically requires only *one* signature for the entire batch
+     * of inputs (as long as they share the same address). This function applies
+     * the heavily discounted single-signature fee calculation, enabling users to
+     * sweep thousands of dust UTXOs affordably.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - available_utxos contains ≥ 2 UTXOs.
+     *   - All UTXOs in available_utxos share the exact same address.
+     *   - The sum of UTXO values > calculated_fee.
+     *
+     * Post:
+     *   result = Ok(ctx_json) ⇒
+     *     ctx_json.fee is calculated based on a 1-signature size budget.
+     *     ctx_json.outputs contains power-of-2 denominations of (total - fee) at dest_address.
+     *   result = Err(_) ⇒ state unchanged.
+     * ```
+     *
+     * ```zed
+     *     PrepareConsolidate
+     *     ------------------
+     *     ΔWebWallet
+     *     available? : seq WasmUtxo
+     *     dest_address? : String
+     *     next_wots_index? : ℕ₃₂
+     *     ctx! : String
+     *
+     *     pre  #available? ≥ 2
+     *     pre  ∀ u, v ∈ available? • u.address = v.address
+     *     let total = ∑ u ∈ available? • u.value
+     *     let fee = (((600 + 3000 + 100 + #available? * 125) * 10) / 1024) + 20
+     *     pre  total > fee
+     *     post ctx! = JSON(SpendContext)
+     * ```
+     *
+     * # Safety / Invariants
+     * - Output values strictly conform to consensus power-of-2 requirements via `decompose_value`.
+     * - Inputs are verified to share the same address to satisfy the `Transaction::Consolidate` rule.
+     * @param {string} available_utxos_json
+     * @param {string} dest_address_hex
+     * @param {number} next_wots_index
+     * @returns {string}
+     */
+    prepare_consolidate(available_utxos_json, dest_address_hex, next_wots_index) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(available_utxos_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(dest_address_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.webwallet_prepare_consolidate(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, next_wots_index);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr3 = r0;
+            var len3 = r1;
+            if (r3) {
+                ptr3 = 0; len3 = 0;
+                throw takeObject(r2);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
         }
     }
     /**

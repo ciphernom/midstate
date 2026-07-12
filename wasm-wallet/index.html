@@ -1340,7 +1340,16 @@
         <!-- SETTINGS -->
         <main id="view-settings" class="page">
             <h2>Settings</h2>
-            <!-- AFTER -->
+            
+            <div class="panel">
+                <h3 style="font-size: 14px;">Wallet Maintenance</h3>
+                <p style="font-size: 11px; color: #888; margin-bottom: 12px;">Consolidate fragmented dust UTXOs at a single address into a new coin to save on future fees. <i>(Submits an ultra-lightweight Consolidate transaction)</i></p>
+                <div id="dustAddressSelectContainer" style="display:flex; gap:8px; margin-bottom: 8px;">
+                    <select id="dustAddressSelect" style="flex: 1; margin: 0;"></select>
+                    <button id="btnConsolidate" style="width: auto; margin: 0; background: var(--text-max); color: #000;">Consolidate</button>
+                </div>
+            </div>
+
             <div class="panel">
                 <label style="font-size: 11px; color: #666; text-transform: uppercase;">HTTPS Fallback RPC URL</label>
                 <input type="text" id="rpcUrl" value="https://rpc.cypherpunk.gold" style="margin-bottom: 8px;">
@@ -3084,6 +3093,38 @@ if ('serviceWorker' in navigator) {
                         `;
                     }).join('');
                 }
+                
+                // --- Add Consolidate Dust UI Population ---
+                const dustAddrs = {};
+                if (payload.utxos) {
+                    payload.utxos.forEach(u => {
+                        // ONLY track MSS addresses. WOTS siblings are automatically 
+                        // swept together by the co-spend rule during normal sends!
+                        if (u.is_mss) {
+                            dustAddrs[u.address] = (dustAddrs[u.address] || 0) + 1;
+                        }
+                    });
+                }
+                const select = document.getElementById('dustAddressSelect');
+                if (select) {
+                    select.innerHTML = '';
+                    let hasDust = false;
+                    for (const [addr, count] of Object.entries(dustAddrs)) {
+                        if (count > 1) {
+                            hasDust = true;
+                            let opt = document.createElement('option');
+                            opt.value = addr;
+                            opt.text = `${addr.substring(0, 12)}... (${count} UTXOs)`;
+                            select.appendChild(opt);
+                        }
+                    }
+                    document.getElementById('btnConsolidate').disabled = !hasDust;
+                    if (!hasDust) {
+                        select.innerHTML = '<option value="">No MSS addresses with fragmented UTXOs</option>';
+                    }
+                }
+                // --- End Consolidate Dust ---
+                
             } catch (err) {
                 log(`UI Error: ${err.message}`, 'var(--red)');
             }
@@ -3578,6 +3619,25 @@ if ('serviceWorker' in navigator) {
             }
             document.getElementById('importFile').click();
         };
+        
+        
+        document.getElementById('btnConsolidate').onclick = () => {
+            const select = document.getElementById('dustAddressSelect');
+            const addr = select.value;
+            if (!addr || addr.startsWith("No")) return;
+
+            showConfirm(
+                "Consolidate Dust",
+                `Are you sure you want to sweep all UTXOs at address <br><span style="color:var(--accent); font-size:11px;">${addr}</span><br> into a single new coin?`,
+                () => {
+                    showActivity("Preparing consolidation...");
+                    worker.postMessage({ type: 'CONSOLIDATE_UTXOS', payload: { address: addr } });
+                }
+            );
+        };
+        
+        
+        
 document.getElementById('btnExport').onclick = () => {
             showActivity("Preparing encrypted backup...");
             worker.postMessage({ type: 'EXPORT_BACKUP' });
@@ -5125,7 +5185,8 @@ document.getElementById('btnExport').onclick = () => {
                 role: 'maker', side: 'mds', kind: 'limit', status: 'limit_posted',
                 offerId: u.offerId, mdsAmount: u.coin.value, weiAmount: u.weiAmount,
                 makerEvmAddr: u.makerEvmAddr, secret: u.secret, secretHash: u.secretHash, covenant,
-                orderGroup: u.orderGroup || null
+                orderGroup: u.orderGroup || null,
+                lockTxId: u.lockTxId 
             });
             worker.postMessage({ type: 'DEX_BROADCAST_OFFER', payload: {
                 offerId: u.offerId, kind: 'ask', mdsAmount: u.coin.value, weiAmount: u.weiAmount,
@@ -6002,7 +6063,11 @@ document.getElementById('btnExport').onclick = () => {
             else if (e.data.type === 'DEX_FILL_SUCCESS') {
                 const { offerId } = e.data.payload;
                 const swap = dexMySwaps.find(s => s.offerId === offerId && s.kind === 'limit' && s.role === 'taker');
-                if (swap) { swap.status = 'completed'; saveSwaps(); renderDexSwaps(); worker.postMessage({ type: 'SCAN' }); }
+                if (swap) { 
+                    swap.status = 'completed'; 
+                    if (e.data.payload.fillTxId) swap.claimTxId = e.data.payload.fillTxId;
+                    saveSwaps(); renderDexSwaps(); worker.postMessage({ type: 'SCAN' }); 
+                    }
                 showToast("Order filled — your MDS has been delivered.", "success");
             }
             else if (e.data.type === 'DEX_FILL_FAILED') {
@@ -6045,6 +6110,7 @@ document.getElementById('btnExport').onclick = () => {
                 swap.makerMdsPk = data.makerMdsPk;    // the refund key (us) — used by reclaim
                 swap.swapMode = data.swapMode || swap.swapMode || 'htlc';
                 if (data.minPayout != null) swap.minPayout = data.minPayout;
+                if (data.lockTxId) swap.lockTxId = data.lockTxId; 
                 swap.status = 'ready_to_claim_base'; if (!swap._autoClaimed) { swap._autoClaimed = true; setTimeout(() => { try { dexClaimBase(swap.offerId); } catch (e) { swap._autoClaimed = false; } }, 400); }
                 delete swap.phase;                    // lock leg done — stop showing commit/reveal steps
                 saveSwaps();
@@ -6111,7 +6177,11 @@ document.getElementById('btnExport').onclick = () => {
                 // Identify by offerId (the claim is always the ETH-side sweeping MDS), not
                 // by array index — splices/reorders can make a stale index hit the wrong swap.
                 const swap = (offerId && dexMySwaps.find(s => s.offerId === offerId && s.side === 'eth')) || dexMySwaps[swapIdx];
-                if (swap) { swap.status = 'completed'; delete swap.phase; saveSwaps(); renderDexSwaps(); }
+                if (swap) { 
+                    swap.status = 'completed'; delete swap.phase;
+                    if (e.data.payload.claimTxId) swap.claimTxId = e.data.payload.claimTxId;  
+                    saveSwaps(); renderDexSwaps(); 
+                }
                 showToast("Successfully claimed MDS! Swap complete.", "success");
             }
             else if (e.data.type === 'DEX_SETTLE_SUCCESS') {
@@ -6121,7 +6191,11 @@ document.getElementById('btnExport').onclick = () => {
                 const { offerId, role } = e.data.payload;
                 const side = role === 'buyer' ? 'eth' : 'mds';
                 const swap = dexMySwaps.find(s => s.offerId === offerId && s.side === side) || dexMySwaps[e.data.payload.swapIdx];
-                if (swap) { swap.status = 'completed'; delete swap.phase; delete swap.settleError; saveSwaps(); renderDexSwaps(); }
+                if (swap) { 
+                    swap.status = 'completed'; delete swap.phase; delete swap.settleError; 
+                    if (e.data.payload.settleTxId) swap.settleTxId = e.data.payload.settleTxId;
+                    saveSwaps(); renderDexSwaps(); 
+                    }
                 showToast(role === 'buyer' ? "MDS delivered to your wallet! Swap complete." : "MDS delivered to the buyer. Swap complete.", "success");
             }
             else if (e.data.type === 'DEX_SETTLE_FAILED') {
@@ -7449,6 +7523,39 @@ document.getElementById('btnExport').onclick = () => {
                 }
                 
                 
+                // --- Add Technical Details Dropdown ---
+                let techRows = [];
+                techRows.push(`<div style="display:flex; justify-content:space-between; gap: 10px;"><span>Offer ID</span> <span style="text-align: right;">${s.offerId || 'N/A'}</span></div>`);
+                
+                const hashlock = s.secretHash || s.submarineHash || s.covenant?.secretHash;
+                if (hashlock) {
+                    techRows.push(`<div style="display:flex; justify-content:space-between; gap: 10px;"><span>Hashlock</span> <span style="text-align: right;">${hashlock}</span></div>`);
+                }
+                if (s.baseSwapId) {
+                    techRows.push(`<div style="display:flex; justify-content:space-between; gap: 10px;"><span>Base Swap ID</span> <span style="text-align: right;">${s.baseSwapId}</span></div>`);
+                }
+                const mdsCoinId = s.htlcCoins?.[0]?.coin_id || s.covenant?.coinId;
+                if (mdsCoinId) {
+                    techRows.push(`<div style="display:flex; justify-content:space-between; gap: 10px;"><span>MDS UTXO ID</span> <span style="text-align: right;">${mdsCoinId}</span></div>`);
+                }
+                if (s.lockTxId) {
+                    techRows.push(`<div style="display:flex; justify-content:space-between; gap: 10px;"><span>Lock Tx (Commit)</span> <span style="text-align: right;">${s.lockTxId}</span></div>`);
+                }
+                if (s.claimTxId || s.settleTxId) {
+                    techRows.push(`<div style="display:flex; justify-content:space-between; gap: 10px;"><span>Claim/Settle Tx</span> <span style="text-align: right;">${s.claimTxId || s.settleTxId}</span></div>`);
+                }
+
+                let techDetails = '';
+                if (techRows.length > 0) {
+                    techDetails = `
+                    <details style="margin-top: 15px;">
+                        <summary style="font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; cursor: pointer; user-select: none; border-top: 1px solid var(--border); padding-top: 10px;">Advanced Details</summary>
+                        <div style="margin-top: 8px; padding: 10px; background: var(--bg-alt); border: 1px solid var(--border); font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--text-bright); display: flex; flex-direction: column; gap: 6px; word-break: break-all;">
+                            ${techRows.join('')}
+                        </div>
+                    </details>`;
+                }
+
                 return `<div class="swap-card">
                     <div class="swap-card-header">
                         <div><span style="font-weight:bold;color:var(--text-max);font-size:14px;">${headline}</span> <span style="font-size:11px;color:var(--text-muted);">for ${eth} ETH${(() => { const u = weiToUsd(s.weiAmount); return u ? ` (\u2248 ${u})` : ''; })()}</span></div>
@@ -7457,6 +7564,7 @@ document.getElementById('btnExport').onclick = () => {
                     ${getStepperHtml(s)}
                     <div style="font-size:12px;color:var(--text-bright);text-align:center;margin-bottom:${(btn || secondaryBtn) ? '15px' : '0'};display:flex;align-items:center;justify-content:center;gap:7px;">${statusHtml}</div>
                     ${btn}${secondaryBtn}
+                    ${techDetails}
                 </div>`;
         }
 
@@ -7510,9 +7618,7 @@ document.getElementById('btnExport').onclick = () => {
         }, 180000);
         try { dexScanBids(); } catch (_) {}
 
-        </script>
 
-    <script>
         // Theme toggle — flips between the dark and light ink-on-paper palettes
         // and updates the browser chrome color to match. Persisted across loads.
         function toggleTheme() {
