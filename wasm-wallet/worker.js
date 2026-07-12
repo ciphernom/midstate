@@ -3837,6 +3837,12 @@ async function _performScanInner(myGen) {
                 }
             }
         }
+
+        // Save progress periodically to prevent restarting from scratch on error
+        if (myGen === scanGeneration) {
+            wState.lastScannedHeight = currentHeight;
+            await saveState();
+        }
     }
 
     // Final commit guarded by the generation: a cancelled scan never writes

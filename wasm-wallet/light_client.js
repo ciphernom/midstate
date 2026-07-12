@@ -522,12 +522,23 @@ async submitChat(sender, timestamp, nonce, replyTo, words, attachments = []) {
             console.error(`[light] Request ${req.method} failed:`, err);
             if (_retries > 0) {
                 console.log(`[light] Retrying ${req.method}...`);
-                try { if (stream.abort) stream.abort(new Error('retry')); } catch (_) {}
+                try { 
+                    if (stream && typeof stream.abort === 'function') stream.abort(new Error('retry')); 
+                    else if (stream && typeof stream.close === 'function') stream.close(); 
+                } catch (_) {}
                 return this.request(req, _retries - 1);
             }
             throw err;
         } finally {
-            try { if (stream.close) stream.close(); } catch (_) {}
+            try { 
+                if (stream) {
+                    if (typeof stream.abort === 'function') {
+                        stream.abort(new Error('request done'));
+                    } else if (typeof stream.close === 'function') {
+                        stream.close();
+                    }
+                }
+            } catch (_) {}
         }
     }
 
