@@ -3230,6 +3230,9 @@ if ('serviceWorker' in navigator) {
                     if (type === 'WALLET_LOADED') {
                         switchTab('view-home');
                         showToast("Wallet unlocked securely.", "success");
+                        // Migrate any legacy plaintext limit-order secrets into the worker's
+                        // encrypted state (safe to run only now: saveState needs the password).
+                        try { dexMigrateLegacySecrets(); } catch (_) {}
                     }
                     updateDashboard(payload);
                     break;
@@ -3565,9 +3568,12 @@ if ('serviceWorker' in navigator) {
                     ? `<strong style="color:var(--text-max)">${amount.toLocaleString('en')}</strong> MDS`
                     : `<strong style="color:var(--text-max)">${entered} ${sendUnit}</strong> <span style="color:var(--text-muted)">= ${amount.toLocaleString('en')} MDS</span>`;
 
+            // FIX: Escape the user-controlled address before injecting it into HTML
+            const safeAddress = escapeHtml(toAddress);
+
             showConfirm(
                 "Confirm Transaction",
-                `Send ${amtLine} to <br><span style="font-size:12px; word-break:break-all; color:var(--accent); display:block; margin-top:8px;">${toAddress}</span>?`,
+                `Send ${amtLine} to <br><span style="font-size:12px; word-break:break-all; color:var(--accent); display:block; margin-top:8px;">${safeAddress}</span>?`,
                 () => {
                     sendInProgress = true;
                     e.target.disabled = true;
@@ -4414,7 +4420,53 @@ document.getElementById('btnExport').onclick = () => {
             if (s.weiAmount == null && s.askedWei != null) s.weiAmount = s.askedWei;
             if (!s.mdsLockerPk && s.makerMdsPk && s.side === 'eth') s.mdsLockerPk = s.makerMdsPk;
         }
-        function saveSwaps() { localStorage.setItem('midstate_dex_swaps', JSON.stringify(dexMySwaps)); }
+        // DEFENCE IN DEPTH + UPGRADE SAFETY: limit-order preimages belong in the worker's
+        // AES-GCM wallet state (wState.dex_secrets) — but a LEGACY record's plaintext secret
+        // is the ONLY copy in existence until the worker confirms importing it
+        // (DEX_SECRETS_IMPORTED). Stripping earlier would destroy the maker's ability to
+        // claim a fill on that order. So the persisted copy is scrubbed ONLY for coin ids in
+        // a persisted, append-only "confirmed migrated" set. Once a coin id enters the set it
+        // is stripped forever — which is exactly the reattachment defence (e.g. an old backup
+        // re-importing a secret-bearing record is scrubbed on its next save).
+        function dexMigratedSecretSet() {
+            try { return new Set(JSON.parse(localStorage.getItem('midstate_dex_migrated_secrets') || '[]')); }
+            catch (_) { return new Set(); }
+        }
+        function dexMarkSecretsMigrated(coinIds) {
+            const set = dexMigratedSecretSet();
+            for (const c of (coinIds || [])) set.add(String(c).toLowerCase());
+            try { localStorage.setItem('midstate_dex_migrated_secrets', JSON.stringify([...set])); } catch (_) {}
+        }
+        function saveSwaps() {
+            const migrated = dexMigratedSecretSet();
+            const sanitized = dexMySwaps.map(s => {
+                if (s && s.kind === 'limit' && (s.secret !== undefined || s.rawSecret !== undefined)) {
+                    const cid = s.covenant && String(s.covenant.coinId || '').toLowerCase();
+                    if (cid && migrated.has(cid)) { const c = { ...s }; delete c.secret; delete c.rawSecret; return c; }
+                }
+                return s;
+            });
+            localStorage.setItem('midstate_dex_swaps', JSON.stringify(sanitized));
+        }
+
+        // ONE-TIME MIGRATION (runs on every unlock; no-ops once clean): older builds stored
+        // limit-order preimages in plaintext on localStorage swap records. Push them into the
+        // worker's encrypted state; the DEX_SECRETS_IMPORTED reply — confirmation that they
+        // are PERSISTED encrypted — is what authorizes stripping the plaintext copies.
+        // (Strip-before-confirm would risk destroying the only copy of a money-guarding key.)
+        function dexMigrateLegacySecrets() {
+            const entries = dexMySwaps
+                .filter(s => s && s.kind === 'limit' && s.role === 'maker' && s.secret && s.covenant && s.covenant.coinId)
+                .map(s => ({
+                    coinId: s.covenant.coinId, secret: s.secret, secretHash: s.secretHash || s.covenant.secretHash,
+                    covAddr: s.covenant.covAddr, value: s.covenant.value, salt: s.covenant.salt,
+                    timeoutHeight: s.covenant.timeoutHeight, makerMdsPk: s.covenant.makerMdsPk,
+                    makerEvmAddr: s.makerEvmAddr || s.covenant.makerEvmAddr,
+                    weiAmount: s.weiAmount != null ? String(s.weiAmount) : null,
+                    offerId: s.offerId, groupId: s.orderGroup || null
+                }));
+            if (entries.length) worker.postMessage({ type: 'DEX_IMPORT_SECRETS', payload: { entries } });
+        }
 
         function dexReadContract()  { return new ethers.Contract(BASE_HTLC_CONTRACT, HTLC_ABI, evmProvider); }
         function dexWriteContract() { return new ethers.Contract(BASE_HTLC_CONTRACT, HTLC_ABI, evmSigner); }
@@ -5181,10 +5233,12 @@ document.getElementById('btnExport').onclick = () => {
                 secretHash: u.secretHash, maxClaim: u.maxClaim, timeoutHeight: u.timeoutHeight,
                 makerMdsPk: u.makerMdsPk, makerEvmAddr: u.makerEvmAddr, weiAmount: u.weiAmount
             };
+            // The unit carries NO preimage: the worker keeps it in the encrypted wallet state
+            // (wState.dex_secrets) and serves it on demand via DEX_GET_SECRET at claim time.
             dexMySwaps.push({
                 role: 'maker', side: 'mds', kind: 'limit', status: 'limit_posted',
                 offerId: u.offerId, mdsAmount: u.coin.value, weiAmount: u.weiAmount,
-                makerEvmAddr: u.makerEvmAddr, secret: u.secret, secretHash: u.secretHash, covenant,
+                makerEvmAddr: u.makerEvmAddr, secretHash: u.secretHash, covenant,
                 orderGroup: u.orderGroup || null,
                 lockTxId: u.lockTxId 
             });
@@ -5235,11 +5289,56 @@ document.getElementById('btnExport').onclick = () => {
             }});
         };
 
+        // ── Preimage fetch bridge (Feature 5) ───────────────────────────────────────
+        // Secrets live in the worker's encrypted state; the UI requests exactly one, by
+        // coin id, exactly when it needs to claim. Resolves null on timeout/absence so
+        // callers degrade gracefully (the maker watch just retries on its next tick).
+        const _dexSecretWaiters = new Map();   // coinId -> [resolve, ...]
+        function dexGetSecret(coinId) {
+            return new Promise((resolve) => {
+                const cid = String(coinId || '').toLowerCase().replace(/^0x/, '');
+                if (!cid) return resolve(null);
+                const arr = _dexSecretWaiters.get(cid) || [];
+                arr.push(resolve);
+                _dexSecretWaiters.set(cid, arr);
+                worker.postMessage({ type: 'DEX_GET_SECRET', payload: { coinId: cid } });
+                setTimeout(() => {
+                    const cur = _dexSecretWaiters.get(cid);
+                    if (cur && cur.includes(resolve)) {
+                        _dexSecretWaiters.set(cid, cur.filter(r => r !== resolve));
+                        resolve(null);
+                    }
+                }, 10000);
+            });
+        }
+
+        // A coinId the local maker has withdrawn (status limit_cancelled) must never re-enter
+        // the book — not from a chain scan (the worker filters those) and not from chat gossip
+        // replaying our own old broadcast (this helper guards the gossip add-path).
+        function dexIsCancelledLocally(coinId) {
+            if (!coinId) return false;
+            return dexMySwaps.some(s => s.kind === 'limit' && s.role === 'maker' &&
+                s.status === 'limit_cancelled' && s.covenant && s.covenant.coinId === coinId);
+        }
+
+        // ── Feature 4: cancel (hide from book) ──────────────────────────────────────
+        // Cancellation is LOCAL policy, not an on-chain act: the covenant has only fill and
+        // post-timeout refund branches. Cancelling stops advertising/serving/auto-claiming;
+        // the locked MDS becomes reclaimable at the timeout exactly as before.
+        window.dexCancelLimitOrder = function(offerId) {
+            const s = dexMySwaps.find(x => x.offerId === offerId && x.kind === 'limit' && x.role === 'maker');
+            if (!s || !s.covenant || !s.covenant.coinId) return showToast("Order not found.", "error");
+            if (!confirm(`Cancel this ${Number(s.covenant.value).toLocaleString('en')} MDS order?\n\nIt is hidden from every orderbook immediately, but the MDS stays locked on-chain until the order's timeout, when Reclaim becomes available.\n\nNote: cancellation is local, not on-chain — a taker who saw the order before you cancelled can still fill it until the timeout.`)) return;
+            worker.postMessage({ type: 'DEX_CANCEL_LIMIT', payload: { offerId, coinId: s.covenant.coinId } });
+            showToast("Cancelling order…", "success");
+        };
+
         window.dexRefundLimitOrder = function(offerId) {
             const s = dexMySwaps.find(x => x.offerId === offerId && x.kind === 'limit' && x.role === 'maker');
             if (!s || !s.covenant) return showToast("Order not found.", "error");
             const cov = s.covenant;
             if (!confirm(`Reclaim ${Number(cov.value).toLocaleString('en')} MDS from this order?\n\nThis only succeeds after the ~24h timeout height; if a taker has already locked ETH, let the fill complete instead.`)) return;
+            s._preRefundStatus = s.status;   // a failed reclaim reverts here (cancelled stays cancelled)
             s.status = 'limit_refunding'; saveSwaps(); renderDexSwaps();
             worker.postMessage({ type: 'DEX_REFUND_LIMIT_ORDER', payload: {
                 offerId,
@@ -5787,6 +5886,9 @@ document.getElementById('btnExport').onclick = () => {
                 const offer = e.data.payload;
                 if (offer.ts && (Date.now() - offer.ts) > OFFER_TTL_MS) return;
                 if (dexOfferEngaged(offer.offerId)) return;   // taken/accepted — don't let the bus re-add it
+                // Our own withdrawn unit: chat_history replays every old broadcast, so a
+                // cancelled order would otherwise resurrect from gossip forever.
+                if (offer.covenant && dexIsCancelledLocally(offer.covenant.coinId)) return;
                 
                 // Hard cap to prevent memory exhaustion from P2P spam
                 if (dexOrderbook.length > 10000) return; 
@@ -5993,17 +6095,34 @@ document.getElementById('btnExport').onclick = () => {
                 if (tip - from > 50) { const el = document.getElementById('dexScanStatus'); if (el) el.textContent = `Scanning chain for orders… block ${at}/${tip}`; }
             }
             else if (e.data.type === 'DEX_ANNOUNCED_ORDERS') {
-                const { orders, scannedToHeight } = e.data.payload;
-                let added = 0;
+                // ORDERBOOK PURITY: the worker scans the FULL live window (any live order's
+                // announcement is at most 1440 blocks old, its timeout span), so an error-free
+                // result is COMPLETE — an on-chain ask we hold that is absent from it is a
+                // ghost (filled, expired, cancelled, or forged) and is dropped. Chat-gossip
+                // entries (onchain !== true) keep their own TTL/verification lifecycle.
+                const { orders, scannedToHeight, error } = e.data.payload;
+                let changed = false;
+                const scannedIds = new Set();
                 for (const o of (orders || [])) {
                     const cid = o.covenant && o.covenant.coinId;
+                    if (cid) scannedIds.add(cid);
+                    if (cid && dexIsCancelledLocally(cid)) continue;   // our withdrawn unit: never re-enters
                     const ex = dexOrderbook.find(x => (x.covenant && x.covenant.coinId) === cid || (x.offerId || x.nonce) === o.offerId);
-                    if (ex) { ex.onchain = true; ex.verified = true; ex.ts = Date.now(); if (!ex.covenant) ex.covenant = o.covenant; }
-                    else { dexOrderbook.push({ ...o, verified: true, ts: Date.now() }); added++; }
+                    if (ex) { ex.onchain = true; ex.verified = true; ex.ts = Date.now(); if (!ex.covenant) ex.covenant = o.covenant; changed = true; }
+                    else { dexOrderbook.push({ ...o, verified: true, ts: Date.now() }); changed = true; }
+                }
+                // Replace stale on-chain L1 asks with the scan result (ghost orders disappear).
+                // Only an error-free scan is authoritative; a failed/partial one must not
+                // wipe a book it never fully observed.
+                if (!error) {
+                    const before = dexOrderbook.length;
+                    dexOrderbook = dexOrderbook.filter(o =>
+                        !(o.onchain && o.covenant && o.covenant.coinId && !scannedIds.has(o.covenant.coinId)));
+                    if (dexOrderbook.length !== before) changed = true;
                 }
                 if (Number.isFinite(scannedToHeight)) { try { localStorage.setItem('midstate_dex_scan_height', String(scannedToHeight)); } catch (_) {} }
                 const el = document.getElementById('dexScanStatus'); if (el) el.textContent = '';
-                if (added) { saveOrderbook(); renderDexOrderbook(); }
+                if (changed) { saveOrderbook(); renderDexOrderbook(); }
                 _dexScanInFlight = false;
             }
             else if (e.data.type === 'DEX_RECOVER_PROGRESS') {
@@ -6057,8 +6176,48 @@ document.getElementById('btnExport').onclick = () => {
             else if (e.data.type === 'DEX_REFUND_FAILED') {
                 const { offerId, error } = e.data.payload;
                 const s = dexMySwaps.find(x => x.offerId === offerId && x.kind === 'limit' && x.role === 'maker');
-                if (s) { s.status = 'limit_posted'; saveSwaps(); renderDexSwaps(); }   // revert so it can be retried
+                // Revert to the status the reclaim started from, so it can be retried — a
+                // CANCELLED order must revert to limit_cancelled, never back onto the book.
+                if (s) { s.status = s._preRefundStatus || 'limit_posted'; delete s._preRefundStatus; saveSwaps(); renderDexSwaps(); }
                 showToast("Reclaim failed: " + (error || "unknown"), "error");
+            }
+            else if (e.data.type === 'DEX_SECRET_RESULT') {
+                // Resolve every waiter for this coin id (Feature 5 fetch bridge).
+                const { coinId, secret } = e.data.payload || {};
+                const cid = String(coinId || '').toLowerCase().replace(/^0x/, '');
+                const waiters = _dexSecretWaiters.get(cid) || [];
+                _dexSecretWaiters.delete(cid);
+                waiters.forEach(r => r(secret || null));
+            }
+            else if (e.data.type === 'DEX_CANCEL_DONE') {
+                const { offerId, coinId } = e.data.payload || {};
+                const s = dexMySwaps.find(x => x.offerId === offerId && x.kind === 'limit' && x.role === 'maker');
+                if (s) { s.status = 'limit_cancelled'; }
+                // Drop our own ask from the local book immediately (the worker's scan filter
+                // keeps it out of future scans; dexIsCancelledLocally keeps gossip out).
+                const before = dexOrderbook.length;
+                dexOrderbook = dexOrderbook.filter(o => !(o.covenant && o.covenant.coinId === coinId));
+                if (dexOrderbook.length !== before) saveOrderbook();
+                saveSwaps(); renderDexSwaps(); renderDexOrderbook();
+                showToast("Order cancelled — hidden from the book. Reclaim the MDS after the timeout.", "success");
+            }
+            else if (e.data.type === 'DEX_CANCEL_FAILED') {
+                showToast("Cancel failed: " + ((e.data.payload && e.data.payload.error) || "unknown"), "error");
+            }
+            else if (e.data.type === 'DEX_SECRETS_IMPORTED') {
+                // The worker confirmed these preimages are persisted in the ENCRYPTED wallet
+                // state — only now is it safe to strip the plaintext copies (in memory too;
+                // saveSwaps() persists the already-sanitized shape regardless).
+                const ids = new Set(((e.data.payload && e.data.payload.coinIds) || []).map(c => String(c).toLowerCase()));
+                if (!ids.size) return;
+                let stripped = 0;
+                for (const s of dexMySwaps) {
+                    const cid = s.covenant && String(s.covenant.coinId || '').toLowerCase();
+                    if (s.kind === 'limit' && cid && ids.has(cid) && (s.secret || s.rawSecret)) {
+                        delete s.secret; delete s.rawSecret; stripped++;
+                    }
+                }
+                if (stripped) { saveSwaps(); console.log(`[dex] migrated ${stripped} legacy limit-order secret(s) into the encrypted wallet state.`); }
             }
             else if (e.data.type === 'DEX_FILL_SUCCESS') {
                 const { offerId } = e.data.payload;
@@ -6533,7 +6692,9 @@ document.getElementById('btnExport').onclick = () => {
             _dexWatchers.add(key);
             const tick = async () => {
                 const swap = dexMySwaps.find(s => s.offerId === offerId && s.kind === 'limit' && s.role === 'maker');
-                if (!swap || swap.status === 'completed' || swap.status === 'limit_refunding' || swap.status === 'limit_refunded') { _dexWatchers.delete(key); return; }
+                // limit_cancelled exits too: a cancelled unit must never auto-claim a late
+                // taker lock — the taker's ETH refunds itself after the Base window.
+                if (!swap || swap.status === 'completed' || swap.status === 'limit_refunding' || swap.status === 'limit_refunded' || swap.status === 'limit_cancelled') { _dexWatchers.delete(key); return; }
                 if (!evmProvider || !evmSigner) { setTimeout(tick, 15000); return; }
                 try {
                     const c = new ethers.Contract(BASE_HTLC_CONTRACT, HTLC_ABI, evmProvider);
@@ -6545,12 +6706,26 @@ document.getElementById('btnExport').onclick = () => {
                         const h = String(ev.args.hashlock).toLowerCase().replace(/^0x/, '');
                         // ── Path A: L1 fill under OUR hash → claim it (reveals the preimage). ──
                         if (h === swap.secretHash.toLowerCase()) {
+                            // The preimage lives in the worker's ENCRYPTED wallet state — fetch it
+                            // now, use it once, and tell the worker when the claim has confirmed.
+                            // (swap.secret is the pre-migration legacy fallback only.)
+                            const coinId = swap.covenant && swap.covenant.coinId;
+                            const secret = (coinId ? await dexGetSecret(coinId) : null) || swap.secret || null;
+                            if (!secret) {
+                                // Worker busy/locked this tick — keep the watcher alive and retry.
+                                console.warn('[dex] preimage unavailable for', offerId, '— retrying');
+                                setTimeout(tick, 15000);
+                                return;
+                            }
                             _dexWatchers.delete(key);
                             showActivity("A taker locked ETH — claiming it (reveals the preimage)…");
                             const cw = dexWriteContract();
-                            const tx = await cw.claim(ev.args.swapId, "0x" + swap.secret);
+                            const tx = await cw.claim(ev.args.swapId, "0x" + secret);
                             await tx.wait();
                             hideActivity();
+                            // Claim CONFIRMED: the preimage is public on Base — the encrypted
+                            // record has served its purpose, let the worker purge it.
+                            if (coinId) worker.postMessage({ type: 'DEX_SECRET_CONSUMED', payload: { coinId } });
                             swap.status = 'completed'; saveSwaps(); renderDexSwaps();
                             showToast("Order filled: ETH claimed; the taker can now take your MDS.", "success");
                             return;
@@ -7431,7 +7606,8 @@ document.getElementById('btnExport').onclick = () => {
                     statusText = 'Recovered from chain — MDS locked on-chain. Reclaim it below once past the timeout.';
                 } else if (s.status === 'limit_posted') {
                     statusText = 'Sell order live — waiting for a buyer.';
-                    btn = `<button style="margin:0;width:100%;padding:8px;font-size:12px;background:transparent;border:1px solid var(--border-bright);color:var(--text-bright);" onclick="dexRefundLimitOrder('${s.offerId}')">Reclaim MDS (after timeout)</button>`;
+                    btn = `<button style="margin:0;width:100%;padding:8px;font-size:12px;background:transparent;border:1px solid var(--border-bright);color:var(--text-bright);" onclick="dexRefundLimitOrder('${s.offerId}')">Reclaim MDS (after timeout)</button>`
+                        + `<button style="margin:8px 0 0;width:100%;padding:7px;font-size:11px;background:transparent;border:1px solid var(--border);color:#888;" onclick="dexCancelLimitOrder('${s.offerId}')">Cancel (hide from book)</button>`;
                     if (!s.announced && s.orderGroup) {
                         // Funding confirmed but the announce burn never landed: chain-scanning
                         // takers can't discover this order yet (chat gossip still advertises it).
@@ -7442,6 +7618,9 @@ document.getElementById('btnExport').onclick = () => {
                     statusText = 'ETH locked. Waiting for the maker to reveal the preimage; your MDS auto-claims.';
                 } else if (s.status === 'limit_filling') {
                     statusText = 'Preimage revealed — claiming your MDS on L1…';
+                } else if (s.status === 'limit_cancelled') {
+                    statusText = 'Order cancelled — hidden from the book. The locked MDS becomes reclaimable after the timeout.';
+                    btn = `<button style="margin:0;width:100%;padding:8px;font-size:12px;background:transparent;border:1px solid var(--border-bright);color:var(--text-bright);" onclick="dexRefundLimitOrder('${s.offerId}')">Reclaim MDS (after timeout)</button>`;
                 } else if (s.status === 'limit_refunding') {
                     statusText = 'Reclaiming your MDS from the expired escrow…';
                 } else if (s.status === 'limit_refunded') {
@@ -7600,16 +7779,17 @@ document.getElementById('btnExport').onclick = () => {
         }
         setInterval(dexHeartbeat, 180000);
 
-        // On-chain order discovery: scan the chain for announcement DataBurns. First run (no saved
-        // height) cold-scans a bounded recent window in the worker; afterward it resumes from the
-        // last scanned height (incremental, cheap). On-chain orders persist until their coin is
-        // spent, so we also periodically re-verify them (which drops filled ones).
+        // On-chain order discovery: scan the chain for announcement DataBurns. The worker
+        // always covers the FULL live window (tip − 1440 → tip): every live order's announce
+        // is within that span (timeout = creation + 1440), so each scan is complete and the
+        // result can authoritatively REPLACE our on-chain asks (ghost orders disappear).
+        // Passing a saved resume-height would make scans incremental — and incomplete — which
+        // would break that replacement contract, so it is deliberately no longer sent.
         let _dexScanInFlight = false;
         function dexScanAnnouncements() {
             if (_dexScanInFlight) return;
             _dexScanInFlight = true;
-            const saved = parseInt(localStorage.getItem('midstate_dex_scan_height') || '', 10);
-            worker.postMessage({ type: 'DEX_SCAN_ANNOUNCEMENTS', payload: Number.isFinite(saved) ? { fromHeight: saved } : {} });
+            worker.postMessage({ type: 'DEX_SCAN_ANNOUNCEMENTS', payload: {} });
         }
         setInterval(() => {
             dexScanAnnouncements();

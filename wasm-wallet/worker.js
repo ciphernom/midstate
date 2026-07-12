@@ -164,6 +164,45 @@ const GAP_LIMIT = 100;
  * @property {number} next_leaf - Next unused leaf counter.
  */
 
+/**
+ * @typedef {Object} DexSecretRecord   — one entry per limit-order UNIT this wallet posted.
+ * @property {string} secret        64-hex BLAKE3 preimage. THE asset: whoever knows it can
+ *                                  claim the taker's Base ETH (maker) or spend the covenant
+ *                                  once public (anyone). Lives ONLY here, AES-GCM-encrypted.
+ * @property {string} secretHash    64-hex H = BLAKE3(secret); the public hashlock.
+ * @property {string} covAddr       64-hex covenant address = BLAKE3(covenant bytecode).
+ * @property {number} value         Unit size in MDS (power of two).
+ * @property {string} salt          64-hex coin salt (needed to rebuild coin_id).
+ * @property {number} timeoutHeight Absolute refund height baked into the covenant.
+ * @property {string} makerMdsPk    Refund pubkey baked into the covenant (ours).
+ * @property {string} makerEvmAddr  Base address paid on fill.
+ * @property {string} weiAmount     Ask price in wei (string — may exceed 2^53).
+ * @property {string} offerId       UI offer id for this unit.
+ * @property {string|null} groupId  Funding-bundle group id (null for legacy single path).
+ * @property {'funding'|'live'|'limit_cancelled'} status
+ *                                  funding: written before the funding broadcast, not yet
+ *                                           confirmed (adjudicated by DEX_RECOVER_BUNDLES);
+ *                                  live:    confirmed on-chain and offered on the book;
+ *                                  limit_cancelled: maker withdrew the order locally.
+ * @property {number} createdAt     ms epoch.
+ *
+ * INVARIANTS (wState.dex_secrets):
+ *  I1. Keys are normalized (lowercase, un-prefixed) 64-hex coin ids.
+ *  I2. A record is written and persisted (saveState inside reserveAndLock) BEFORE the
+ *      funding commit for its coin is broadcast — a crash can orphan a record, never a coin.
+ *  I3. The raw `secret` field never leaves the worker except via DEX_GET_SECRET, which
+ *      serves only records present in this map (i.e. our own), keyed by coin_id.
+ *  I4. Records are deleted only on: refund success, explicit DEX_SECRET_CONSUMED after the
+ *      maker's Base claim (preimage is then public anyway), or DEX_RECOVER_BUNDLES
+ *      concluding the funding never landed. Ambiguity always keeps the record.
+ *
+ * INVARIANTS (wState.dex_cancelled):
+ *  C1. Keys are normalized coin ids; value = { at, offerId }.
+ *  C2. Purely LOCAL policy — cancellation never touches the chain. The covenant coin stays
+ *      locked until its timeout; the map only stops us advertising/serving/auto-filling it.
+ *  C3. Entries are removed when their coin's refund succeeds (record is then moot).
+ */
+
 /** @type {WalletState} */
 let wState = {
     phrase: null,
@@ -171,6 +210,7 @@ let wState = {
     nextMssIndex: 0,
     wotsAddrs: {},
     spentWots: {},   // CRITICAL FIX: Tracks completely dead WOTS addresses to prevent dusting attacks
+    pendingSpends: {}, // coin_id → timestamp. Coins locked by an in-flight commit/reveal. Prevents WOTS reuse across crashes.
     mssAddrs: {},
     utxos: {},
     history: [],
@@ -178,7 +218,11 @@ let wState = {
     vaultUtxo: null,
     l2_channels: {},
     l2_secrets: {},  // Stores preimages for invoices we generate
-    l2_routes: {}    // Stores multi-hop routing map for Hubs
+    l2_routes: {},   // Stores multi-hop routing map for Hubs
+    dex_secrets: {},         // coin_id → DexSecretRecord (see typedef + invariants above)
+    dex_cancelled: {},       // coin_id → { at, offerId } — locally-withdrawn limit orders
+    pendingLimitBundles: {}, // groupId → funding recovery record (units are SECRET-FREE; secrets live in dex_secrets)
+    annFragPool: {}          // MDXF fragment reassembly pool (persists across scans)
 };
 
 function getPrimaryMssPk() {
@@ -801,6 +845,12 @@ async function loadState(pwd, bundleStr) {
         wState.l2_routes = wState.l2_routes || {};
         wState.dex_swaps = wState.dex_swaps || {};
         wState.spentWots = wState.spentWots || {};
+        wState.pendingSpends = wState.pendingSpends || {};
+        // DEX limit-order structures (see the DexSecretRecord typedef for invariants).
+        wState.dex_secrets = wState.dex_secrets || {};
+        wState.dex_cancelled = wState.dex_cancelled || {};
+        wState.pendingLimitBundles = wState.pendingLimitBundles || {};
+        wState.annFragPool = wState.annFragPool || {};
         
         // Migrate legacy array-format UTXOs to map format
         if (Array.isArray(wState.utxos)) {
@@ -1288,13 +1338,32 @@ self.onmessage = async (e) => {
                 const coins = (fundRes && fundRes.coins) || [];
                 if (!coins.length) throw new Error("Funding produced no covenant coin");
 
+                // ── Encrypted secret storage (LEGACY PATH) ──────────────────────────────
+                // The UI exclusively uses DEX_CREATE_LIMIT_BUNDLE, whose secrets persist BEFORE
+                // broadcast (invariant I2). This handler is kept for external callers only.
+                // KNOWN LIMITATION: performContractTx rolls the coin salt internally and returns
+                // it post-confirmation, so persist-before-broadcast is impossible here — a crash
+                // mid-funding loses salt AND secret. Anything that needs that guarantee must use
+                // the bundle path (a bundle of one unit is fine). What we DO guarantee: the
+                // preimage is written to the encrypted map and never crosses postMessage.
+                wState.dex_secrets = wState.dex_secrets || {};
+                for (const c of coins) {
+                    wState.dex_secrets[normalizeHex(c.coin_id)] = {
+                        secret: rawSecret, secretHash, covAddr,
+                        value: c.value, salt: normalizeHex(c.salt),
+                        timeoutHeight, makerMdsPk: myPk, makerEvmAddr,
+                        weiAmount: String(weiAmount), offerId, groupId: null,
+                        status: 'live', createdAt: Date.now()
+                    };
+                }
+                await saveState();
+
                 self.postMessage({ type: 'DEX_LIMIT_ORDER_CREATED', payload: {
                     offerId,
                     covAddr,
                     coins,                 // [{coin_id, value, salt}] — one coin for a power-of-two value
-                    secret: rawSecret,     // MAKER ONLY — reveal on Base (claim) to get paid; NEVER broadcast
                     secretHash,            // advertised to takers; also the Base hashlock
-                    maxClaim: v,
+                    maxClaim: v,           // (the preimage stays in wState.dex_secrets — DEX_GET_SECRET serves it)
                     timeoutHeight,
                     makerMdsPk: myPk,      // refund pk baked into the covenant
                     makerEvmAddr,
@@ -1346,7 +1415,7 @@ self.onmessage = async (e) => {
                 // MSS safety fast-forward (identical policy to performContractTx), with retries.
                 dexPhase("Verifying MSS safety indices\u2026");
                 await verifyMssSafetyIndices(dexPhase);
-                const utxoArray = Object.values(wState.utxos).map(u =>
+                const utxoArray = getSpendableUtxos().map(u =>
                     (u.is_mss && wState.mssAddrs[u.address]) ? { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf } : u);
 
                 // ATOMIC ANNOUNCE: encode ONE MDXA announcement for the whole bundle NOW
@@ -1383,6 +1452,9 @@ self.onmessage = async (e) => {
                 // Map each unit to its funded coin NOW: ctx.outputs carries the random salts, and a
                 // coin is unspendable without its salt (coin_id = H(addr||value||salt)). The salt is
                 // NOT recoverable from chain, so we must capture it before the tx goes out.
+                // NOTE the units below are SECRET-FREE: they cross the postMessage boundary to the
+                // UI (and into localStorage via dexMySwaps), so the raw preimage must not be on them.
+                // Preimages go into the encrypted wState.dex_secrets map instead (just below).
                 const outUnits = built.map(b => {
                     const o = (ctx.outputs || []).find(o => o.type === "standard" && normalizeHex(o.address) === normalizeHex(b.covAddr));
                     if (!o) throw new Error(`Funded coin for unit ${b.v} not found in tx outputs`);
@@ -1391,17 +1463,48 @@ self.onmessage = async (e) => {
                         offerId: Array.from(crypto.getRandomValues(new Uint8Array(8))).map(x => x.toString(16).padStart(2, '0')).join(''),
                         covAddr: b.covAddr,
                         coin: { coin_id, value: o.value, salt: normalizeHex(o.salt) },
-                        secret: b.rawSecret, secretHash: b.secretHash,
+                        secretHash: b.secretHash,
                         maxClaim: b.v, timeoutHeight, makerMdsPk: myPk, makerEvmAddr, weiAmount: b.weiAmount,
                         lockTxId: ctx.commitment // <--- Add this line
                     };
                 });
 
-                // CRASH-SAFETY: persist the recovery record (secrets + coins + params) BEFORE the
-                // commit is broadcast. If we die after the tx confirms but before the UI registers
-                // these units, DEX_RECOVER_BUNDLES rebuilds them from here; without it the locked MDS
-                // would be unspendable (salts gone) and even un-refundable (no covenant params). The
-                // saveState() just below persists this; it is cleared on success.
+                // ── Encrypted secret storage ────────────────────────────────────────────
+                // REASONING: the preimage is the maker's claim on the taker's ETH. If it lives in
+                //   localStorage (plaintext, sync-readable by any script in the origin, included in
+                //   naive backups) it is one XSS or one shared backup away from theft; if it lives
+                //   only in UI memory it dies with the tab and the maker can never claim a fill.
+                //   The AES-GCM wallet state is the only store that is both persistent and
+                //   encrypted under the user's password, so the preimage lives there and nowhere
+                //   else, keyed by the one identifier every flow shares: the covenant coin id.
+                // PRE:  `built` holds one fresh (secret, H, covAddr, salt) per unit; `outUnits`
+                //       maps unit i to its funded coin id; no funding bytes have been broadcast.
+                // POST: wState.dex_secrets[coin_id] exists (status 'funding') for every unit, and —
+                //       via the saveState() inside reserveAndLock() below — is persisted to the
+                //       encrypted bundle BEFORE rpc.commit() runs. Status flips to 'live' only
+                //       after the reveal confirms.
+                // SAFETY: a crash at ANY later point orphans at worst an encrypted record, never a
+                //       funded coin without its preimage/salt. DEX_RECOVER_BUNDLES adjudicates
+                //       orphans: confirmed funding → records flip 'live'; funding never landed →
+                //       records are deleted (nothing was locked, so the preimage guards nothing).
+                if (!wState.dex_secrets) wState.dex_secrets = {};
+                outUnits.forEach((u, i) => {
+                    wState.dex_secrets[normalizeHex(u.coin.coin_id)] = {
+                        secret: built[i].rawSecret, secretHash: built[i].secretHash,
+                        covAddr: u.covAddr, value: u.coin.value, salt: u.coin.salt,
+                        timeoutHeight, makerMdsPk: myPk, makerEvmAddr,
+                        weiAmount: String(u.weiAmount), offerId: u.offerId, groupId,
+                        status: 'funding', createdAt: Date.now()
+                    };
+                });
+
+                // CRASH-SAFETY: persist the recovery record (coins + params) BEFORE the commit is
+                // broadcast. If we die after the tx confirms but before the UI registers these
+                // units, DEX_RECOVER_BUNDLES rebuilds them from here; without it the locked MDS
+                // would be unspendable (salts gone) and even un-refundable (no covenant params).
+                // The units stored here are the same secret-free objects the UI receives — the
+                // preimages are already in wState.dex_secrets above, so a re-emitted record leaks
+                // nothing. The saveState() just below persists this; it is cleared on success.
                 if (!wState.pendingLimitBundles) wState.pendingLimitBundles = {};
                 wState.pendingLimitBundles[groupId] = {
                     groupId, units: outUnits, commitment: ctx.commitment,
@@ -1410,11 +1513,7 @@ self.onmessage = async (e) => {
                 };
 
                 // Reserve key material once (mirrors performContractTx / prepare_fund_tx flow).
-                while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
-                const usedMss = new Set();
-                for (const inp of (ctx.wallet_inputs || [])) if (inp.is_mss) usedMss.add(inp.address);
-                for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
-                await saveState();
+                await reserveAndLock(ctx, "Saving wallet state...");
 
                 // Funding consumes no contract coin, so build_script_reveal signs the wallet
                 // inputs internally — no separate covenant signature needed.
@@ -1438,7 +1537,12 @@ self.onmessage = async (e) => {
                 dexPhase("Confirmed \u2713 — syncing\u2026");
                 await performScan();
                 
-                // Funded and confirmed — hand the units to the UI, then clear the recovery record.
+                // Funded and confirmed — mark every unit's secret record live, hand the
+                // (secret-free) units to the UI, then clear the recovery record.
+                for (const u of outUnits) {
+                    const rec = wState.dex_secrets && wState.dex_secrets[normalizeHex(u.coin.coin_id)];
+                    if (rec) rec.status = 'live';
+                }
                 self.postMessage({ type: 'DEX_LIMIT_BUNDLE_CREATED', payload: { groupId, units: outUnits, announcedAtomically: atomicAnnounce } });
                 if (wState.pendingLimitBundles) delete wState.pendingLimitBundles[groupId];
                 await saveState();
@@ -1469,13 +1573,40 @@ self.onmessage = async (e) => {
                 for (const groupId of Object.keys(pend)) {
                     const rec = pend[groupId];
                     if (!rec || !rec.firstCoinId || !Array.isArray(rec.units)) { delete pend[groupId]; changed = true; continue; }
+                    // MIGRATION: records written by pre-dex_secrets builds carry the raw preimage
+                    // on each unit. Move it into the encrypted map and strip it from the unit so
+                    // the re-emit below (which crosses into UI/localStorage) is secret-free.
+                    wState.dex_secrets = wState.dex_secrets || {};
+                    for (const u of rec.units) {
+                        if (u && u.secret && u.coin && u.coin.coin_id) {
+                            const cid = normalizeHex(u.coin.coin_id);
+                            if (!wState.dex_secrets[cid]) {
+                                wState.dex_secrets[cid] = {
+                                    secret: u.secret, secretHash: u.secretHash, covAddr: u.covAddr,
+                                    value: u.coin.value, salt: u.coin.salt, timeoutHeight: u.timeoutHeight,
+                                    makerMdsPk: u.makerMdsPk, makerEvmAddr: u.makerEvmAddr,
+                                    weiAmount: String(u.weiAmount), offerId: u.offerId, groupId,
+                                    status: 'funding', createdAt: rec.createdAt || Date.now()
+                                };
+                            }
+                            delete u.secret; changed = true;
+                        }
+                    }
                     let funded = null;
                     try { const inp = await rpc.checkCoin(normalizeHex(rec.firstCoinId)); funded = !!(inp && inp.exists); }
                     catch (e) { continue; }   // RPC not ready — leave it; a later call retries
                     if (funded) {
+                        // Funding landed: the units are real, so their preimages now guard money.
+                        for (const u of rec.units) {
+                            const sr = wState.dex_secrets[normalizeHex(u.coin.coin_id)];
+                            if (sr && sr.status === 'funding') sr.status = 'live';
+                        }
                         self.postMessage({ type: 'DEX_LIMIT_BUNDLE_CREATED', payload: { groupId, units: rec.units, recovered: true, announcedAtomically: !!rec.announcedAtomically } });
                         delete pend[groupId]; changed = true;
                     } else if (Date.now() - (rec.createdAt || 0) > GRACE_MS) {
+                        // Funding never landed: no coin exists, so these preimages guard nothing —
+                        // deleting them is the ONE unambiguous purge case (dex_secrets invariant I4).
+                        for (const u of rec.units) delete wState.dex_secrets[normalizeHex(u.coin.coin_id)];
                         delete pend[groupId]; changed = true;
                         self.postMessage({ type: 'DEX_LIMIT_BUNDLE_FAILED', payload: { groupId, error: "Funding did not confirm; nothing was locked.", recovered: true } });
                     }
@@ -1546,9 +1677,14 @@ self.onmessage = async (e) => {
                                         let exists = false;
                                         try { const r = await rpc.checkCoin(coinId); exists = !!(r && r.exists); } catch (e) { exists = false; }
                                         if (!exists) continue;
+                                        // A unit the maker cancelled recovers as cancelled: still
+                                        // reclaimable after timeout, but never re-advertised.
+                                        const wasCancelled = !!(wState.dex_cancelled && wState.dex_cancelled[normalizeHex(coinId)]) ||
+                                            (wState.dex_secrets && wState.dex_secrets[normalizeHex(coinId)] &&
+                                             wState.dex_secrets[normalizeHex(coinId)].status === 'limit_cancelled');
                                         recovered.push({
                                             offerId: 'chain:' + coinId.slice(0, 16),
-                                            role: 'maker', side: 'mds', kind: 'limit', status: 'limit_posted',
+                                            role: 'maker', side: 'mds', kind: 'limit', status: wasCancelled ? 'limit_cancelled' : 'limit_posted',
                                             mdsAmount: u.value, weiAmount: u.weiAmount, makerEvmAddr: ann.makerEvmAddr,
                                             secretHash: u.secretHash, recoveredFromChain: true,
                                             covenant: {
@@ -1604,11 +1740,28 @@ self.onmessage = async (e) => {
             // exact OutputData serde. Each unit's covenant address + coin id is RECOMPUTED from the
             // announced fields and then verified on-chain, so a forged/garbage announcement can't
             // inject a fake order (the coin simply won't exist).
+            // ── ORDERBOOK PURITY ────────────────────────────────────────────────────────
+            // REASONING: an order is fillable iff its covenant coin exists AND its timeout is
+            //   still ahead AND its maker hasn't withdrawn it. Every order's timeout is set to
+            //   creation+1440, so any order that can still pass the timeout filter was
+            //   announced within the last ANNOUNCE_SCAN_DEPTH(=1440) blocks — which means a
+            //   full-window scan below is COMPLETE for live orders. That completeness is what
+            //   lets the UI treat this result as authoritative and replace its stale on-chain
+            //   asks with it (ghost orders disappear).
+            // PRE:  networkHeight is current; wState.dex_cancelled / dex_secrets are loaded.
+            // POST: `orders` contains exactly the units that are (a) reconstructible from an
+            //   announcement, (b) alive on-chain, (c) unexpired, (d) not locally cancelled,
+            //   and (e) — if ours — whose secret record is status 'live'.
+            // SAFETY: filters only ever REMOVE entries relative to the raw chain data; nothing
+            //   here can inject an order (coin existence is still verified per unit).
             try {
                 const ANNOUNCE_SCAN_DEPTH = 1440;   // ~ the order timeout window
                 const tip = networkHeight;
-                let from = Number.isFinite(payload && payload.fromHeight) ? payload.fromHeight : Math.max(0, tip - ANNOUNCE_SCAN_DEPTH);
-                from = Math.max(0, Math.min(from, tip));
+                // Always cover the FULL live window: a narrower incremental scan would be
+                // incomplete and would break the UI's replace-stale-asks contract above. A
+                // caller may pass fromHeight only to scan DEEPER (never shallower).
+                let from = Math.max(0, tip - ANNOUNCE_SCAN_DEPTH);
+                if (Number.isFinite(payload && payload.fromHeight)) from = Math.max(0, Math.min(payload.fromHeight, from));
                 const orders = [];
                 const seenCoin = new Set();
                 const BATCH = 12;
@@ -1644,12 +1797,25 @@ self.onmessage = async (e) => {
                             if (!ann) continue;
                             for (const u of ann.units) {
                                 try {
+                                    // FILTER 1 (unexpired): past the timeout only the maker's refund
+                                    // branch is spendable — an expired unit is not an order. Checked
+                                    // FIRST because it's free (no RPC round-trip).
+                                    if (!(Number(ann.timeoutHeight) > tip)) continue;
                                     const covScriptHex = build_limit_order_covenant_bytecode_hex(u.secretHash, BigInt(u.value), BigInt(ann.timeoutHeight), ann.makerMdsPk);
                                     const covAddr = blake3_hash_hex(covScriptHex);
                                     const coinId = compute_coin_id_hex(covAddr, BigInt(u.value), normalizeHex(u.salt));
                                     if (seenCoin.has(coinId)) continue;
                                     seenCoin.add(coinId);
-                                    // Verify the covenant coin actually exists (not spent/filled, not forged).
+                                    // FILTER 2 (not withdrawn): locally-cancelled units never re-enter
+                                    // the book, even though their coin still exists until the refund.
+                                    if (wState.dex_cancelled && wState.dex_cancelled[normalizeHex(coinId)]) continue;
+                                    // FILTER 3 (own units): an order of OURS is offered only while its
+                                    // secret record is 'live' — a 'funding' record isn't confirmed and a
+                                    // 'limit_cancelled' one is withdrawn (belt-and-braces with FILTER 2).
+                                    const own = wState.dex_secrets && wState.dex_secrets[normalizeHex(coinId)];
+                                    if (own && own.status !== 'live') continue;
+                                    // FILTER 4 (alive): verify the covenant coin actually exists
+                                    // (not spent/filled, not forged).
                                     let exists = false;
                                     try { const r = await rpc.checkCoin(coinId); exists = !!(r && r.exists); } catch (e) { exists = false; }
                                     if (!exists) continue;
@@ -1768,7 +1934,7 @@ self.onmessage = async (e) => {
                 const htlcScriptHex = build_htlc_bytecode_hex(secretHash, myPk, BigInt(timeoutHeight), makerMdsPk);
 
                 if (!mssCachesReady) await loadMssCaches();
-                const utxoArray = Object.values(wState.utxos).map(u => {
+                const utxoArray = getSpendableUtxos().map(u => {
                     if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
                     return u;
                 });
@@ -1827,11 +1993,7 @@ self.onmessage = async (e) => {
                 const revealPayloadStr = wallet.build_script_reveal(JSON.stringify(ctx), ctx.commitment, ctx.tx_salt);
 
                 // 5. Advance key material exactly once.
-                while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
-                const usedMss = new Set();
-                for (const inp of ctx.wallet_inputs) if (inp.is_mss) usedMss.add(inp.address);
-                for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
-                await saveState();
+                await reserveAndLock(ctx, "Saving wallet state...");
 
                 // 6. Mine, commit, wait, reveal, wait.
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining PoW..." } });
@@ -1918,7 +2080,7 @@ self.onmessage = async (e) => {
                 );
 
                 if (!mssCachesReady) await loadMssCaches();
-                const utxoArray = Object.values(wState.utxos).map(u => {
+                const utxoArray = getSpendableUtxos().map(u => {
                     if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
                     return u;
                 });
@@ -1962,11 +2124,7 @@ self.onmessage = async (e) => {
                 // none for a covenant delivery) are signed inside build_script_reveal.
                 const revealPayloadStr = wallet.build_script_reveal(JSON.stringify(ctx), ctx.commitment, ctx.tx_salt);
 
-                while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
-                const usedMss = new Set();
-                for (const inp of ctx.wallet_inputs) if (inp.is_mss) usedMss.add(inp.address);
-                for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
-                await saveState();
+                await reserveAndLock(ctx, "Saving wallet state...");
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining PoW..." } });
                 dexPhase(`Mining PoW [Commit: ${ctx.commitment.substring(0,8)}...]`);
@@ -2014,11 +2172,25 @@ self.onmessage = async (e) => {
             }
         }
         else if (type === 'DEX_FILL_LIMIT') {
-            // FEATURE 1 — taker-side partial fill of a maker's limit-order covenant.
-            // Spends EXACTLY ONE covenant coin (single-input safety — see the multi-coin
-            // caveat in compile_limit_order_covenant), pays `claimed` MDS to the taker and
-            // routes `coinValue - claimed` back to the covenant address. Mirrors the proven
-            // DEX_SETTLE_COVENANT covenant-spend template.
+            // FEATURE 1 — taker-side fill of a maker's limit-order covenant. Spends EXACTLY
+            // ONE covenant coin (single-input safety — see the multi-coin caveat in
+            // compile_limit_order_covenant) and pays the FULL unit to the taker. Mirrors the
+            // proven DEX_SETTLE_COVENANT covenant-spend template.
+            //
+            // ── PRODUCTION POLICY: full-unit fills ONLY ─────────────────────────────────
+            // REASONING: a partial fill would route `coinValue - claimed` back to the same
+            //   covenant address — a remainder coin locked under the SAME BLAKE3 hashlock H.
+            //   But this fill's spend witness publishes the preimage of H on-chain, and the
+            //   covenant's claim branch is gated on nothing else. From that block onward,
+            //   ANYONE can spend the remainder and route it to themselves: the "remainder"
+            //   is not a smaller live order, it is a donation to whoever sees the preimage
+            //   first. One secret backs exactly one trustless fill; smaller fills exist as
+            //   smaller UNITS (each with a fresh secret), never as partial claims.
+            // PRE:  payload.claimed === coin.value (rejected otherwise, below).
+            // POST: outputs pay the full coin value to the taker; nothing returns to covAddr;
+            //       `remainder` is identically 0 on every path.
+            // SAFETY: enforcing this in the WORKER (not just the UI) means no future UI bug,
+            //   devtools call, or external client can reintroduce the drain.
             await acquireSendLock();
             try {
                 const { offerId, rawSecret, coin, claimed, maxClaim, timeoutHeight, makerMdsPk } = payload;
@@ -2027,9 +2199,12 @@ self.onmessage = async (e) => {
                 if (!coin || !coin.coin_id) throw new Error("No covenant coin supplied");
                 const coinValue = Number(coin.value);
                 const claimAmt  = Number(claimed);
-                if (claimAmt <= 0 || claimAmt > coinValue) throw new Error("claimed must be within (0, coinValue]");
+                if (claimAmt !== coinValue) throw new Error(
+                    `Production policy: limit-order units fill atomically in full. ` +
+                    `claimed=${claimAmt} != unit value ${coinValue}. A partial fill's remainder ` +
+                    `would share this unit's revealed BLAKE3 preimage and be drainable by anyone.`);
                 if (claimAmt > Number(maxClaim)) throw new Error(`claimed ${claimAmt} exceeds covenant max_claim ${maxClaim}`);
-                const remainder = coinValue - claimAmt;
+                const remainder = 0;   // full-unit policy: no remainder path exists (see block above)
 
                 // Reconstruct the EXACT covenant bytecode the maker locked, so coin ids match.
                 const secretHash = blake3_hash_hex(rawSecret);
@@ -2049,11 +2224,9 @@ self.onmessage = async (e) => {
 
                 const pow2 = (n) => { const out = []; let v = BigInt(n), bit = 0n; while (v > 0n) { if (v & 1n) out.push(Number(1n << bit)); v >>= 1n; bit += 1n; } return out; };
 
-                // outputs: `claimed` -> taker, `remainder` -> back into the covenant (keeps order live)
-                const outputs = [
-                    ...pow2(claimAmt).map(v => ({ out_type: "standard", address: buyerAddr, value: v, salt: null })),
-                    ...pow2(remainder).map(v => ({ out_type: "standard", address: covAddr,   value: v, salt: null })),
-                ];
+                // outputs: the FULL unit -> taker. No remainder ever returns to covAddr (see the
+                // production-policy block above: a post-reveal remainder is drainable by anyone).
+                const outputs = pow2(claimAmt).map(v => ({ out_type: "standard", address: buyerAddr, value: v, salt: null }));
                 const outputsJson = JSON.stringify(outputs);
 
                 // single covenant input; witness complete up front: [secret, 0x01] (no signature)
@@ -2066,7 +2239,7 @@ self.onmessage = async (e) => {
                 }]);
 
                 if (!mssCachesReady) await loadMssCaches();
-                const utxoArray = Object.values(wState.utxos).map(u =>
+                const utxoArray = getSpendableUtxos().map(u =>
                     (u.is_mss && wState.mssAddrs[u.address]) ? { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf } : u);
 
                 let ctx = JSON.parse(wallet.prepare_script_spend(
@@ -2074,11 +2247,7 @@ self.onmessage = async (e) => {
                 ));
                 const revealPayloadStr = wallet.build_script_reveal(JSON.stringify(ctx), ctx.commitment, ctx.tx_salt);
 
-                while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
-                const usedMss = new Set();
-                for (const inp of ctx.wallet_inputs) if (inp.is_mss) usedMss.add(inp.address);
-                for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
-                await saveState();
+                await reserveAndLock(ctx, "Saving wallet state...");
 
                 dexPhase(`Mining PoW [Commit: ${ctx.commitment.substring(0,8)}...]`);
                 const stateData = await rpc.getState();
@@ -2100,7 +2269,8 @@ self.onmessage = async (e) => {
                 dexPhase("Confirmed ✓ — syncing…");
                 await performScan();
                 // Revealing `rawSecret` in the spend witness lets the maker harvest it and claim the
-                // taker's ETH on Base. The NEW remainder coin (at covAddr) stays on the book.
+                // taker's ETH on Base. The unit is consumed in full — nothing remains at covAddr
+                // (remainder is 0 by production policy), so the order simply leaves the book.
                 self.postMessage({ type: 'DEX_FILL_SUCCESS', payload: { offerId, claimed: claimAmt, remainder, covAddr, fillTxId: ctx.commitment } });
             } catch (err) {
                 const detail = (err && err.message) ? err.message : String(err);
@@ -2145,7 +2315,7 @@ self.onmessage = async (e) => {
                 }]);
 
                 if (!mssCachesReady) await loadMssCaches();
-                const utxoArray = Object.values(wState.utxos).map(u =>
+                const utxoArray = getSpendableUtxos().map(u =>
                     (u.is_mss && wState.mssAddrs[u.address]) ? { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf } : u);
 
                 let ctx = JSON.parse(wallet.prepare_script_spend(
@@ -2158,11 +2328,7 @@ self.onmessage = async (e) => {
 
                 const revealPayloadStr = wallet.build_script_reveal(JSON.stringify(ctx), ctx.commitment, ctx.tx_salt);
 
-                while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
-                const usedMss = new Set();
-                for (const inp of ctx.wallet_inputs) if (inp.is_mss) usedMss.add(inp.address);
-                for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
-                await saveState();
+                await reserveAndLock(ctx, "Saving wallet state...");
 
                 dexPhase("Mining spam-proof (PoW)\u2026");
                 const stateData = await rpc.getState();
@@ -2179,12 +2345,130 @@ self.onmessage = async (e) => {
                 while (true) { try { const inp = await rpc.checkCoin(firstCoin); if (inp && !inp.exists) break; } catch (e) {} await waitForNextBlock(15000); }
                 dexPhase("Confirmed \u2713 — syncing\u2026");
                 await performScan();
+                // CLEANUP (dex_secrets invariant I4): the covenant coin no longer exists, so its
+                // preimage guards nothing and its cancellation marker is moot — purge both.
+                {
+                    const cid = normalizeHex(coin.coin_id);
+                    let dirty = false;
+                    if (wState.dex_secrets && wState.dex_secrets[cid]) { delete wState.dex_secrets[cid]; dirty = true; }
+                    if (wState.dex_cancelled && wState.dex_cancelled[cid]) { delete wState.dex_cancelled[cid]; dirty = true; }
+                    if (dirty) await saveState();
+                }
                 self.postMessage({ type: 'DEX_REFUND_SUCCESS', payload: { offerId, reclaimed: coinValue } });
             } catch (err) {
                 const detail = (err && err.message) ? err.message : String(err);
                 self.postMessage({ type: 'DEX_REFUND_FAILED', payload: { offerId: payload && payload.offerId, error: detail } });
             } finally {
                 releaseSendLock();
+            }
+        }
+        else if (type === 'DEX_CANCEL_LIMIT') {
+            // FEATURE 4 — maker withdraws a live limit-order unit from the book.
+            // REASONING: the covenant has exactly two spend branches — secret-claim (a fill)
+            //   and post-timeout refund. There is no third "cancel" branch, so cancellation
+            //   cannot be an on-chain act before the timeout. What the maker CAN do is stop
+            //   offering: stop advertising, stop serving the order to scanners, and stop
+            //   auto-claiming any late taker lock. That is a purely LOCAL state change, and
+            //   because the scan filter and the maker watch both read it from the encrypted
+            //   wallet state, it survives reloads and devices that share the wallet bundle.
+            // PRE:  payload.coinId names a covenant coin (ideally one of ours; marking a
+            //       foreign id is harmless — it only hides that order from OUR book).
+            // POST: wState.dex_cancelled[coinId] set; if we own the secret record its status
+            //       is 'limit_cancelled'; state persisted; DEX_CANCEL_DONE emitted.
+            // SAFETY: no chain interaction, no key material touched, nothing broadcast. The
+            //       MDS stays locked until the timeout, when the normal refund path (which
+            //       purges both records on success) reclaims it. A taker who saw the order
+            //       pre-cancel can still fill it until the timeout — cancellation is a
+            //       policy statement, not a revocation; the UI copy says exactly this.
+            try {
+                const { offerId, coinId } = payload || {};
+                if (!coinId) throw new Error("No coinId supplied");
+                const cid = normalizeHex(coinId);
+                wState.dex_cancelled = wState.dex_cancelled || {};
+                wState.dex_cancelled[cid] = { at: Date.now(), offerId: offerId || null };
+                if (wState.dex_secrets && wState.dex_secrets[cid]) {
+                    wState.dex_secrets[cid].status = 'limit_cancelled';
+                }
+                await saveState();
+                self.postMessage({ type: 'DEX_CANCEL_DONE', payload: { offerId: offerId || null, coinId: cid } });
+            } catch (err) {
+                self.postMessage({ type: 'DEX_CANCEL_FAILED', payload: { offerId: payload && payload.offerId, error: (err && err.message) || String(err) } });
+            }
+        }
+        else if (type === 'DEX_GET_SECRET') {
+            // FEATURE 5 — serve a preimage from the encrypted store to the UI, on demand.
+            // REASONING: the maker's Base claim (startMakerLimitWatch) is the ONE moment the
+            //   UI legitimately needs a preimage. Since secrets no longer ride on swap
+            //   records, the UI asks for exactly one, exactly when claiming — the secret is
+            //   in UI memory for the duration of a contract call instead of at rest forever.
+            // PRE:  payload.coinId is a 64-hex coin id.
+            // POST: DEX_SECRET_RESULT carries { coinId, secret, secretHash, status } if — and
+            //       only if — wState.dex_secrets holds a record for it (i.e. it is OURS);
+            //       otherwise { coinId, error }. Lookup is by coin_id ONLY: no enumeration,
+            //       no lookup by hash, offerId, or address.
+            // SAFETY: dex_secrets contains exclusively self-generated records, so this can
+            //       never serve another party's preimage. Nothing is logged.
+            try {
+                const cid = normalizeHex((payload && payload.coinId) || "");
+                const rec = (cid && wState.dex_secrets) ? wState.dex_secrets[cid] : null;
+                if (!rec || !rec.secret) {
+                    self.postMessage({ type: 'DEX_SECRET_RESULT', payload: { coinId: cid, error: "No secret held for this coin." } });
+                } else {
+                    self.postMessage({ type: 'DEX_SECRET_RESULT', payload: { coinId: cid, secret: rec.secret, secretHash: rec.secretHash, status: rec.status } });
+                }
+            } catch (err) {
+                self.postMessage({ type: 'DEX_SECRET_RESULT', payload: { coinId: payload && payload.coinId, error: (err && err.message) || String(err) } });
+            }
+        }
+        else if (type === 'DEX_SECRET_CONSUMED') {
+            // FEATURE 1 (cleanup on fill) — the UI reports that the maker's Base claim tx
+            // CONFIRMED. Claiming publishes the preimage on Base, so from this moment the
+            // secret has zero confidentiality value and the record only adds surface — purge
+            // it (dex_secrets invariant I4). Called strictly AFTER tx.wait(): a record must
+            // never be deleted for a claim that might still fail.
+            try {
+                const cid = normalizeHex((payload && payload.coinId) || "");
+                let dirty = false;
+                if (cid && wState.dex_secrets && wState.dex_secrets[cid]) { delete wState.dex_secrets[cid]; dirty = true; }
+                if (cid && wState.dex_cancelled && wState.dex_cancelled[cid]) { delete wState.dex_cancelled[cid]; dirty = true; }
+                if (dirty) await saveState();
+            } catch (_) { /* best-effort cleanup; an orphan record is harmless */ }
+        }
+        else if (type === 'DEX_IMPORT_SECRETS') {
+            // FEATURE 1 (one-time migration) — absorb legacy plaintext limit-order secrets
+            // that older builds stored on localStorage swap records, so the UI can strip them.
+            // PRE:  wallet unlocked (password set — saveState() would otherwise no-op and the
+            //       UI would strip secrets that were never persisted: refuse instead).
+            // POST: every well-formed entry exists in wState.dex_secrets (existing records are
+            //       NEVER overwritten — the encrypted store is senior to localStorage); state
+            //       persisted; DEX_SECRETS_IMPORTED lists the coinIds now safe to strip.
+            // SAFETY: import direction is localStorage → encrypted store only. The reply
+            //       carries coin ids, never secret material.
+            try {
+                if (!password) throw new Error("Wallet is locked — cannot persist migrated secrets.");
+                const entries = (payload && Array.isArray(payload.entries)) ? payload.entries : [];
+                wState.dex_secrets = wState.dex_secrets || {};
+                const imported = [];
+                for (const e of entries) {
+                    if (!e || !e.coinId || !e.secret) continue;
+                    const cid = normalizeHex(e.coinId);
+                    if (!wState.dex_secrets[cid]) {
+                        wState.dex_secrets[cid] = {
+                            secret: e.secret, secretHash: e.secretHash || blake3_hash_hex(e.secret),
+                            covAddr: e.covAddr || null, value: Number(e.value) || 0, salt: e.salt || null,
+                            timeoutHeight: Number(e.timeoutHeight) || 0,
+                            makerMdsPk: e.makerMdsPk || null, makerEvmAddr: e.makerEvmAddr || null,
+                            weiAmount: e.weiAmount != null ? String(e.weiAmount) : null,
+                            offerId: e.offerId || null, groupId: e.groupId || null,
+                            status: 'live', createdAt: Date.now(), migrated: true
+                        };
+                    }
+                    imported.push(cid);   // already-present ids are also safe to strip
+                }
+                if (imported.length) await saveState();
+                self.postMessage({ type: 'DEX_SECRETS_IMPORTED', payload: { coinIds: imported } });
+            } catch (err) {
+                self.postMessage({ type: 'DEX_SECRETS_IMPORTED', payload: { coinIds: [], error: (err && err.message) || String(err) } });
             }
         }
         else if (type === 'DEX_RECLAIM_HTLC') {
@@ -2237,7 +2521,7 @@ self.onmessage = async (e) => {
                     const contractInputsJson = JSON.stringify([{ coin_id: normalizeHex(coin.coin_id), witness: "", value: coinValue, salt: normalizeHex(coin.salt), state: null }]);
 
                     if (!mssCachesReady) await loadMssCaches();
-                    const utxoArray = Object.values(wState.utxos).map(u =>
+                    const utxoArray = getSpendableUtxos().map(u =>
                         (u.is_mss && wState.mssAddrs[u.address]) ? { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf } : u);
 
                     let ctx = JSON.parse(wallet.prepare_script_spend(
@@ -2249,11 +2533,7 @@ self.onmessage = async (e) => {
                     for (let i = 0; i < ctx.contract_inputs.length; i++) ctx.contract_inputs[i].witness = `${sigHex},${dummy},00`;
 
                     const revealPayloadStr = wallet.build_script_reveal(JSON.stringify(ctx), ctx.commitment, ctx.tx_salt);
-                    while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
-                    const usedMss = new Set();
-                    for (const inp of ctx.wallet_inputs) if (inp.is_mss) usedMss.add(inp.address);
-                    for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
-                    await saveState();
+                    await reserveAndLock(ctx, "Saving wallet state...");
 
                     dexPhase(`Reclaiming coin ${reclaimedCoins + 1}/${htlcCoins.length} — mining PoW…`);
                     const stateData = await rpc.getState();
@@ -2456,7 +2736,7 @@ self.onmessage = async (e) => {
                 );
 
                 if (!mssCachesReady) await loadMssCaches();
-                const utxoArray = Object.values(wState.utxos).map(u => {
+                const utxoArray = getSpendableUtxos().map(u => {
                     if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
                     return u;
                 });
@@ -2480,11 +2760,7 @@ self.onmessage = async (e) => {
                     JSON.stringify(utxoArray), covScriptHex, contractInputsJson, outputsJson, wState.nextWotsIndex
                 ));
                 const revealPayloadStr = wallet.build_script_reveal(JSON.stringify(ctx), ctx.commitment, ctx.tx_salt);
-                while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
-                const usedMss = new Set();
-                for (const inp of ctx.wallet_inputs) if (inp.is_mss) usedMss.add(inp.address);
-                for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
-                await saveState();
+                await reserveAndLock(ctx, "Saving wallet state...");
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining PoW..." } });
                 const stateData = await rpc.getState();
@@ -2601,9 +2877,10 @@ self.onmessage = async (e) => {
             wState = {
                 phrase: payload.phrase,
                 nextWotsIndex: 0, nextMssIndex: 0,
-                wotsAddrs: {}, spentWots: {}, mssAddrs: {}, utxos: {}, history: [],
+                wotsAddrs: {}, spentWots: {},pendingSpends: {}, mssAddrs: {}, utxos: {}, history: [],
                 lastScannedHeight: 0,
-                l2_channels: {}, l2_secrets: {}, l2_routes: {}
+                l2_channels: {}, l2_secrets: {}, l2_routes: {},
+                dex_secrets: {}, dex_cancelled: {}, pendingLimitBundles: {}, annFragPool: {}
             };
             wallet = new WebWallet(payload.phrase);
             mssCachesReady = false;
@@ -2660,7 +2937,7 @@ self.onmessage = async (e) => {
             await acquireSendLock();
             try {
                 const targetAddr = payload.address;
-                let utxosAtAddress = Object.values(wState.utxos).filter(u => u.address === targetAddr);
+                let utxosAtAddress = getSpendableUtxos().filter(u => u.address === targetAddr);
                 
                 if (utxosAtAddress.length < 2) throw new Error("Need at least 2 UTXOs to consolidate.");
                 // Hard consensus cap for a single transaction
@@ -2696,11 +2973,7 @@ self.onmessage = async (e) => {
                 let ctx = JSON.parse(spendContextStr);
 
                 // Advance key material indices safely
-                while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
-                const usedMssAddrs = new Set();
-                for (const inp of ctx.selected_inputs) if (inp.is_mss) usedMssAddrs.add(inp.address);
-                for (const addr of usedMssAddrs) wState.mssAddrs[addr].next_leaf++;
-                await saveState();
+                await reserveAndLock(ctx, "Saving wallet state...");
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining PoW..." } });
                 const stateData = await rpc.getState();
@@ -3191,7 +3464,7 @@ else if (type === 'L2_OPEN_CHANNEL') {
                         newUtxos[coinId] = {
                             index: 0, is_mss: false, mss_height: 0, mss_leaf: 0,
                             address: addrHex, value: coin.value, salt: saltHex,
-                            coin_id: coinId, commitment: commit
+                            coin_id: coinId, commitment: commit, watch_only: true 
                         };
                     }
                 }
@@ -3207,11 +3480,13 @@ else if (type === 'L2_OPEN_CHANNEL') {
                     nextMssIndex:  Math.max(cliData.next_mss_index || 0, mssKeys.length),
                     wotsAddrs: newWotsAddrs,
                     spentWots: {},
+                    pendingSpends: {},
                     mssAddrs:  newMssAddrs,
                     utxos:     newUtxos,
                     history:   cliData.history || [],
                     lastScannedHeight: cliData.last_scan_height || 0,
-                    l2_channels: {}, l2_secrets: {}, l2_routes: {}
+                    l2_channels: {}, l2_secrets: {}, l2_routes: {},
+                    dex_secrets: {}, dex_cancelled: {}, pendingLimitBundles: {}, annFragPool: {}
                 };
                 mssCachesReady = true;           // populated above; loadMssCaches would short-circuit anyway
                 await saveState();
@@ -3263,6 +3538,54 @@ function deriveNextWots() {
     const addr = wallet.get_wots_address(wState.nextWotsIndex);
     wState.wotsAddrs[addr] = wState.nextWotsIndex;
     wState.nextWotsIndex++;
+}
+
+/** Safe list of spendable UTXOs: excludes any coin already locked by an in-flight send. */
+function getSpendableUtxos() {
+    wState.pendingSpends = wState.pendingSpends || {};
+    const now = Date.now();
+    
+    // Auto-unlock UTXOs that have been stuck for >30 minutes (1800000 ms)
+    for (const [cid, timestamp] of Object.entries(wState.pendingSpends)) {
+        if (now - timestamp > 1800000) {
+            delete wState.pendingSpends[cid];
+        }
+    }
+    
+    // ---FILTER OUT watch_only COINS ---
+    return Object.values(wState.utxos).filter(u => !wState.pendingSpends[u.coin_id] && !u.watch_only);
+}
+
+
+/**
+ * Crash-safe reservation of key material + lock of selected inputs.
+ * Call this immediately after prepare_* returns and BEFORE any network broadcast.
+ * Advances nextWotsIndex / MSS leaves, marks the input coin_ids as pending,
+ * and persists everything so a crash cannot cause WOTS key reuse.
+ */
+async function reserveAndLock(ctx, progressMsg) {
+    // 1. Advance HD counters for any new change addresses
+    while (wState.nextWotsIndex < (ctx.next_wots_index || 0)) deriveNextWots();
+
+    // 2. Advance MSS leaf counters for any MSS inputs that will be signed
+    const usedMss = new Set();
+    const inputs = ctx.selected_inputs || ctx.wallet_inputs || [];
+    for (const inp of inputs) {
+        if (inp.is_mss) usedMss.add(inp.address);
+    }
+    for (const addr of usedMss) {
+        if (wState.mssAddrs[addr]) wState.mssAddrs[addr].next_leaf++;
+    }
+
+    // 3. Lock the selected input coins so they cannot be selected again
+    wState.pendingSpends = wState.pendingSpends || {};
+    const now = Date.now();
+    for (const inp of inputs) {
+        if (inp.coin_id) wState.pendingSpends[inp.coin_id] = now;
+    }
+
+    if (progressMsg) self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: progressMsg } });
+    await saveState();
 }
 
 /** @type {number} Timestamp of last MSS progress UI update (throttle to 15fps). */
@@ -3614,11 +3937,13 @@ async function processFullBlock(height) {
                             for (const key in wState.utxos) {
                                 if (wState.utxos[key].address === spentCoin.address) {
                                     delete wState.utxos[key];
+                                    if (wState.pendingSpends) delete wState.pendingSpends[key]; // also free any lock
                                 }
                             }
                         }
 
                         delete wState.utxos[cid];
+                        if (wState.pendingSpends) delete wState.pendingSpends[cid]; // free the lock for this coin
                         if (ourSalts.get(saltHex) === cid) ourSalts.delete(saltHex);
                         spentIds.push(cid);
                         spentValue += Number(inp.value);
@@ -3823,7 +4148,7 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Verifying MSS safety indices..." } });
     await verifyMssSafetyIndices((m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
 
-    const utxoArray = Object.values(wState.utxos).map(u => {
+    const utxoArray = getSpendableUtxos().map(u => {
         if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
         return u;
     });
@@ -3894,13 +4219,7 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
     pendingSends.push({ kind: 'pending', timestamp: Math.floor(Date.now() / 1000), fee: ctx.fee, inputs: ctx.selected_inputs.map(i => i.coin_id), outputs: [], value: Number(amount) });
     self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
 
-    while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
-    const usedMssAddrs = new Set();
-    for (const inp of ctx.selected_inputs) if (inp.is_mss) usedMssAddrs.add(inp.address);
-    for (const addr of usedMssAddrs) wState.mssAddrs[addr].next_leaf++;
-
-    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Saving wallet state..." } });
-    await saveState();
+    await reserveAndLock(ctx, "Saving wallet state...");
 
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Fetching network difficulty..." } });
     const stateData   = await rpc.getState();
@@ -4030,7 +4349,7 @@ async function performContractTx(req) {
     prog("Verifying MSS safety indices...");
     await verifyMssSafetyIndices(prog);
 
-    const utxoArray = Object.values(wState.utxos).map(u => {
+    const utxoArray = getSpendableUtxos().map(u => {
         if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
         return u;
     });
@@ -4070,11 +4389,7 @@ async function performContractTx(req) {
     // scan/derive can't reuse a WOTS index or MSS leaf we just committed to).
     pendingSends.push({ kind: 'pending', timestamp: Math.floor(Date.now() / 1000), fee: ctx.fee, inputs: (ctx.wallet_inputs || []).map(i => i.coin_id), outputs: [], value: 0 });
     self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
-    while (wState.nextWotsIndex < ctx.next_wots_index) deriveNextWots();
-    const usedMss = new Set();
-    for (const inp of (ctx.wallet_inputs || [])) if (inp.is_mss) usedMss.add(inp.address);
-    for (const addr of usedMss) wState.mssAddrs[addr].next_leaf++;
-    await saveState();
+        await reserveAndLock(ctx, "Saving wallet state...");
 
     // ── Commit → PoW → wait → reveal → wait ───────
     prog("Fetching network difficulty...");
@@ -4131,11 +4446,20 @@ async function performContractTx(req) {
         const cAddr = normalizeHex(req.contractAddress || (req.bytecode ? blake3_hash_hex(normalizeHex(req.bytecode)) : ""));
         for (const o of (ctx.outputs || [])) {
             if (normalizeHex(o.address) === cAddr) {
-                createdCoins.push({
-                    coin_id: compute_coin_id_hex(normalizeHex(o.address), BigInt(o.value), normalizeHex(o.salt)),
-                    value: o.value,
-                    salt: normalizeHex(o.salt)
-                });
+                if (o.type === 'confidential') {
+                    createdCoins.push({
+                        coin_id: compute_confidential_coin_id(normalizeHex(o.address), normalizeHex(o.commitment), normalizeHex(o.salt)),
+                        value: 0,
+                        salt: normalizeHex(o.salt),
+                        state: normalizeHex(o.commitment)
+                    });
+                } else {
+                    createdCoins.push({
+                        coin_id: compute_coin_id_hex(normalizeHex(o.address), BigInt(o.value), normalizeHex(o.salt)),
+                        value: o.value,
+                        salt: normalizeHex(o.salt)
+                    });
+                }
             }
         }
     }
@@ -4576,7 +4900,7 @@ async function runSelfTests() {
 
     await test('buildDashboardPayload_empty', async () => {
         const saved = { ...wState };
-        wState = { phrase: null, nextWotsIndex: 0, nextMssIndex: 0, wotsAddrs: {}, mssAddrs: {}, utxos: {}, history: [], lastScannedHeight: 0 };
+        wState = { phrase: null, nextWotsIndex: 0, nextMssIndex: 0, wotsAddrs: {}, spentWots: {}, pendingSpends: {}, mssAddrs: {}, utxos: {}, history: [], lastScannedHeight: 0 };
         pendingSends = [];
         const p = buildDashboardPayload();
         assertEqual(p.primaryAddress, 'None', 'No MSS = None');

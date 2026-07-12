@@ -262,6 +262,8 @@ struct ScriptWalletInput {
     is_mss: bool,
     index: u32,
     mss_leaf: u32,
+    #[serde(default)]
+    commitment: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -343,6 +345,8 @@ struct WasmUtxo {
     salt: String,
     /// Hex-encoded 32-byte coin ID (UTXO identifier).
     coin_id: String,
+    #[serde(default)]
+    commitment: Option<String>,
 }
 
 /// A transaction output as built by the wallet.
@@ -1388,6 +1392,7 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
                 is_mss: inp.is_mss,
                 index: inp.index,
                 mss_leaf: inp.mss_leaf,
+                commitment: inp.commitment.clone(),
             });
         }
 
@@ -1501,13 +1506,29 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
             let address = midstate::core::types::hash(&bytecode);
             let mut salt = [0u8; 32];
             hex::decode_to_slice(&wi.salt, &mut salt).unwrap();
-            safety_in.push(compute_coin_id(&address, wi.value, &salt));
-
-            input_reveals.push(serde_json::json!({
-                "bytecode": hex::encode(&bytecode),
-                "value": wi.value,
-                "salt": wi.salt,
-            }));
+            
+            // --- FIX: Properly hash Confidential UTXOs (Pruning Licenses) ---
+            if let Some(c_hex) = &wi.commitment {
+                let mut c_bytes = [0u8; 32]; 
+                hex::decode_to_slice(c_hex, &mut c_bytes).unwrap();
+                safety_in.push(confidential_coin_hash(&address, &c_bytes, &salt));
+                
+                input_reveals.push(serde_json::json!({
+                    "bytecode": hex::encode(&bytecode),
+                    "value": wi.value,
+                    "salt": wi.salt,
+                    "commitment": c_hex // Ensure the node receives the commitment
+                }));
+            } else {
+                safety_in.push(compute_coin_id(&address, wi.value, &salt));
+                
+                input_reveals.push(serde_json::json!({
+                    "bytecode": hex::encode(&bytecode),
+                    "value": wi.value,
+                    "salt": wi.salt,
+                }));
+            }
+            
             signatures.push(hex::encode(&sig_bytes));
         }
 
@@ -1762,6 +1783,7 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
                 is_mss: inp.is_mss,
                 index: inp.index,
                 mss_leaf: inp.mss_leaf,
+                commitment: inp.commitment.clone(),
             });
         }
 
@@ -1990,6 +2012,7 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
                 is_mss: inp.is_mss,
                 index: inp.index,
                 mss_leaf: inp.mss_leaf,
+                commitment: inp.commitment.clone(),
             });
         }
 
@@ -2496,7 +2519,12 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
             let bytecode = midstate::core::script::compile_p2pk(&pk);
             let address = midstate::core::types::hash(&bytecode);
             let mut salt_bytes = [0u8; 32]; hex::decode_to_slice(&inp.salt, &mut salt_bytes).unwrap();
-            safety_input_hashes.push(compute_coin_id(&address, inp.value, &salt_bytes));
+            if let Some(c_hex) = &inp.commitment {
+                let mut c_bytes = [0u8; 32]; hex::decode_to_slice(c_hex, &mut c_bytes).unwrap();
+                safety_input_hashes.push(confidential_coin_hash(&address, &c_bytes, &salt_bytes));
+            } else {
+                safety_input_hashes.push(compute_coin_id(&address, inp.value, &salt_bytes));
+            }
 
             input_reveals.push(serde_json::json!({
                 "bytecode": hex::encode(&bytecode),
@@ -2570,13 +2598,19 @@ pub fn compute_commitment_hex(input_ids_json: &str, output_hashes_json: &str, sa
     let outputs: Vec<String> = serde_json::from_str(output_hashes_json)
         .map_err(|e| JsValue::from_str(&format!("Invalid outputs JSON: {}", e)))?;
     
-    let in_bytes: Vec<[u8; 32]> = inputs.iter().map(|s| { 
-        let mut b = [0u8; 32]; hex::decode_to_slice(s, &mut b).unwrap(); b 
-    }).collect();
-    
-    let out_bytes: Vec<[u8; 32]> = outputs.iter().map(|s| { 
-        let mut b = [0u8; 32]; hex::decode_to_slice(s, &mut b).unwrap(); b 
-    }).collect();
+    let mut in_bytes = Vec::with_capacity(inputs.len());
+    for s in inputs {
+        let mut b = [0u8; 32];
+        hex::decode_to_slice(&s, &mut b).map_err(|_| JsValue::from_str("Invalid input hex length/characters"))?;
+        in_bytes.push(b);
+    }
+
+    let mut out_bytes = Vec::with_capacity(outputs.len());
+    for s in outputs {
+        let mut b = [0u8; 32];
+        hex::decode_to_slice(&s, &mut b).map_err(|_| JsValue::from_str("Invalid output hex length/characters"))?;
+        out_bytes.push(b);
+    }
     
     let mut salt = [0u8; 32];
     hex::decode_to_slice(salt_hex, &mut salt).map_err(|_| JsValue::from_str("Invalid salt hex"))?;
