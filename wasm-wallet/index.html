@@ -2539,42 +2539,45 @@ if ('serviceWorker' in navigator) {
         async function connectWebRTC(customAddr) {
             updateWebRTCStatus('connecting');
             try {
-                // 1. Establish trusted bootstrap quorum (HTTPS)
-                const bootstrapUrls = [
-                    "https://rpc.cypherpunk.gold",      // Sydney (Default)
-                    "https://rpc.usa.cypherpunk.gold"   // USA
-                ];
-
                 let dialList = [];
-                if (customAddr && customAddr.includes("/p2p/")) {
-                    dialList.push(customAddr);
-                }
 
-                let bestNode = null;
-                try {
-                    // Try to connect to HTTPS API first to find the best chain
-                    bestNode = await findHeaviestNetworkState(bootstrapUrls);
+                if (customAddr) {
+                    // 1. MANUAL OVERRIDE MODE (Local Node)
+                    dialList.push(customAddr);
+                    log(`[light] Manual override. Dialing custom WebRTC peer: ${customAddr}`);
                     
-                    const webrtcAddrs = (bestNode.state.webrtc_addrs || []).filter(a => a.includes('webrtc-direct') && a.includes('certhash'));
-                    if (webrtcAddrs.length > 0) {
-                        const communityPeers = webrtcAddrs.slice(1).sort(() => Math.random() - 0.5);
-                        dialList.push(...communityPeers, webrtcAddrs[0]); 
+                    const userRpc = document.getElementById('rpcUrl')?.value?.trim();
+                    if (userRpc) {
+                        _rpcUrl = userRpc;
+                        log(`[light] Locked RPC to custom URL: ${_rpcUrl}`);
                     }
-                    
-                    // Lock RPC URL to the trusted node
-                    _rpcUrl = bestNode.url; 
-                    
-                } catch (httpError) {
-                    log("[light] HTTPS Bootstraps unreachable. Falling back to direct WebRTC...", "var(--accent)");
-                    
-                    // --- HARDCODED WEBRTC FALLBACKS ---
-                    // If ALL HTTPS domains go down, fall back to raw IP addresses via WebRTC
-                    
-                    // US Node
-                    dialList.push("/ip4/74.208.253.44/udp/9335/webrtc-direct/certhash/uEiCTNpt4FH1jR4lzQHWuIDnUTyWSr1N4bMniW5Prhh2K0w");
-                    
-                    // Sydney Node
-                    dialList.push("/ip4/134.199.148.215/udp/9335/webrtc-direct/certhash/uEiDwFtheq3OCKVvl4CWkujRc-e3L_eGxgz0wuQFsLXS4tA");
+                } else {
+                    // 2. AUTO-DISCOVERY MODE (Public Network)
+                    const bootstrapUrls = [
+                        "https://rpc.cypherpunk.gold",      // Sydney (Default)
+                        "https://rpc.usa.cypherpunk.gold"   // USA
+                    ];
+
+                    try {
+                        // Try to connect to HTTPS API first to find the best chain
+                        let bestNode = await findHeaviestNetworkState(bootstrapUrls);
+                        
+                        const webrtcAddrs = (bestNode.state.webrtc_addrs || []).filter(a => a.includes('webrtc-direct') && a.includes('certhash'));
+                        if (webrtcAddrs.length > 0) {
+                            const communityPeers = webrtcAddrs.slice(1).sort(() => Math.random() - 0.5);
+                            dialList.push(...communityPeers, webrtcAddrs[0]); 
+                        }
+                        
+                        // Lock RPC URL to the trusted node
+                        _rpcUrl = bestNode.url; 
+                        
+                    } catch (httpError) {
+                        log("[light] HTTPS Bootstraps unreachable. Falling back to direct WebRTC...", "var(--accent)");
+                        
+                        // --- HARDCODED WEBRTC FALLBACKS ---
+                        dialList.push("/ip4/74.208.253.44/udp/9335/webrtc-direct/certhash/uEiCTNpt4FH1jR4lzQHWuIDnUTyWSr1N4bMniW5Prhh2K0w");
+                        dialList.push("/ip4/134.199.148.215/udp/9335/webrtc-direct/certhash/uEiDwFtheq3OCKVvl4CWkujRc-e3L_eGxgz0wuQFsLXS4tA");
+                    }
                 }
 
                 if (dialList.length === 0) throw new Error("No WebRTC addresses available to dial.");
@@ -2607,7 +2610,19 @@ if ('serviceWorker' in navigator) {
 
         async function autoConnectWebRTC() {
             try {
-                await connectWebRTC(null);
+                // Check if user saved custom node settings previously
+                const savedAddr = localStorage.getItem('customWebrtcAddr');
+                const savedRpc = localStorage.getItem('customRpcUrl');
+                
+                if (savedRpc) {
+                    document.getElementById('rpcUrl').value = savedRpc;
+                    _rpcUrl = savedRpc;
+                }
+                if (savedAddr) {
+                    document.getElementById('bootstrapAddr').value = savedAddr;
+                }
+                
+                await connectWebRTC(savedAddr || null);
             } catch (e) {
                 log(`[light] Auto-connect error: ${e.message}`);
             }
@@ -3444,11 +3459,21 @@ if ('serviceWorker' in navigator) {
         document.getElementById('btnConnectWebRTC').onclick = () => {
             const addr = document.getElementById('bootstrapAddr').value.trim();
             if (!addr) return showToast('Enter a WebRTC multiaddr first.', 'error');
-            _rpcUrl = document.getElementById('rpcUrl')?.value?.trim() || _rpcUrl;
+            const rpc = document.getElementById('rpcUrl').value.trim();
+            if (rpc) {
+                _rpcUrl = rpc;
+                localStorage.setItem('customRpcUrl', rpc);
+            } else {
+                localStorage.removeItem('customRpcUrl');
+            }
+            localStorage.setItem('customWebrtcAddr', addr);
             connectWebRTC(addr);
         };
-
+        
         document.getElementById('btnDisconnectWebRTC').onclick = () => {
+            localStorage.removeItem('customWebrtcAddr');
+            localStorage.removeItem('customRpcUrl');
+            document.getElementById('bootstrapAddr').value = "";
             disconnectWebRTC();
         };
 
