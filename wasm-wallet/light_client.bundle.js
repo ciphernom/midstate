@@ -29545,11 +29545,20 @@ async submitChat(sender, timestamp, nonce, replyTo, words, attachments = []) {
             if (typeof stream.sink === 'function') {
                 await stream.sink((async function*() { yield msg; })());
             } else {
-                console.warn(`[light] stream.sink is missing, trying fallback stream.send...`);
-                if (typeof stream.sendData === 'function') stream.sendData(msg);
-                else if (typeof stream.send === 'function') stream.send(msg);
-                if (typeof stream.sendCloseWrite === 'function') stream.sendCloseWrite().catch(()=>{});
-                else if (typeof stream.closeWrite === 'function') stream.closeWrite().catch(()=>{});
+                console.warn(`[light] stream.sink is missing, trying fallback stream.sendData...`);
+                const writeFn = stream.sendData || stream.send || stream.write;
+                if (typeof writeFn === 'function') {
+                    const CHUNK_SIZE = 16384; 
+                    for (let i = 0; i < msg.length; i += CHUNK_SIZE) {
+                        writeFn.call(stream, msg.slice(i, i + CHUNK_SIZE));
+                        await new Promise(r => setTimeout(r, 10)); 
+                    }
+                    if (typeof stream.sendCloseWrite === 'function') {
+                        try { const p = stream.sendCloseWrite(); if (p && p.catch) p.catch(()=>{}); } catch (_) {}
+                    } else if (typeof stream.closeWrite === 'function') {
+                        try { const p = stream.closeWrite(); if (p && p.catch) p.catch(()=>{}); } catch (_) {}
+                    }
+                }
             }
 
             console.log(`[light] ${req.method}: Awaiting response...`);
@@ -29559,7 +29568,7 @@ async submitChat(sender, timestamp, nonce, replyTo, words, attachments = []) {
                 let totalLen = 0;
                 
                 // Fallback to iterable stream if stream.source is missing
-                const source = stream.source || stream; 
+                const source = stream.source || stream.incomingData || stream; 
                 
                 for await (const chunk of source) {
                     const bytes = chunk.subarray ? chunk.subarray() : chunk;
@@ -29592,16 +29601,23 @@ async submitChat(sender, timestamp, nonce, replyTo, words, attachments = []) {
 
             const respLen = new DataView(appData.buffer, appData.byteOffset).getUint32(0, true);
             const respJson = new TextDecoder().decode(appData.slice(4, 4 + respLen));
-            return JSON.parse(respJson);
+            const result = JSON.parse(respJson);
+
+            // Cleanly close the stream on success
+            try { if (typeof stream.close === 'function') stream.close(); } catch (_) {}
+            return result;
 
         } catch (err) {
             console.error(`[light] Request ${req.method} failed:`, err);
+            
+            // Abort stream on failure to free resources aggressively
+            try { 
+                if (typeof stream.abort === 'function') stream.abort(err); 
+                else if (typeof stream.close === 'function') stream.close(); 
+            } catch (_) {}
+
             if (_retries > 0) {
                 console.log(`[light] Retrying ${req.method}...`);
-                try { 
-                    if (stream && typeof stream.abort === 'function') stream.abort(new Error('retry')); 
-                    else if (stream && typeof stream.close === 'function') stream.close(); 
-                } catch (_) {}
                 return this.request(req, _retries - 1);
             }
             throw err;
