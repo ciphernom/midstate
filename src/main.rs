@@ -396,8 +396,18 @@ enum WalletAction {
     History {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// Number of transactions to show
         #[arg(long, short, default_value = "20")]
         count: usize,
+        /// How many recent transactions to skip (for pagination)
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        /// Filter by transaction type: 'sent', 'received', 'mixed', or 'mined'
+        #[arg(long)]
+        tx_type: Option<String>,
+        /// Search for a specific coin ID in inputs or outputs
+        #[arg(long)]
+        coin: Option<String>,
     },
     /// Import coinbase rewards from mining log
     ImportRewards {
@@ -1386,7 +1396,9 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         WalletAction::Abandon { path, address } => {
             wallet_abandon(&path, address)
         }
-        WalletAction::History { path, count } => wallet_history(&path, count),
+        WalletAction::History { path, count, offset, tx_type, coin } => {
+            wallet_history(&path, count, offset, tx_type, coin)
+        }
         WalletAction::ImportRewards { path, coinbase_file, data_dir } => {
             wallet_import_rewards(&path, &coinbase_file, &data_dir)
         }
@@ -2890,29 +2902,134 @@ for (i, p) in pending.iter().enumerate() {
     Ok(())
 }
 
-fn wallet_history(path: &PathBuf, count: usize) -> Result<()> {
+/// Converts a Unix timestamp into a human-readable UTC date string natively 
+/// (Howard Hinnant's algorithm) to avoid dragging in large dependencies.
+fn format_utc(timestamp: u64) -> String {
+    let days_since_epoch = timestamp / 86400;
+    let secs_of_day = timestamp % 86400;
+
+    let z = days_since_epoch + 719468;
+    let era = z / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as u64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    
+    let h = secs_of_day / 3600;
+    let min = (secs_of_day % 3600) / 60;
+    let s = secs_of_day % 60;
+    
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, m, d, h, min, s)
+}
+
+fn wallet_history(
+    path: &PathBuf, 
+    count: usize, 
+    offset: usize, 
+    tx_type: Option<String>, 
+    coin_query: Option<String>
+) -> Result<()> {
     let password = read_password("Password: ")?;
     let wallet = Wallet::open(path, &password)?;
     let history = wallet.history();
+
     if history.is_empty() {
         println!("No transaction history.");
         return Ok(());
     }
-    let start = history.len().saturating_sub(count);
-    let entries = &history[start..];
-    println!("Transaction history ({} of {}):\n", entries.len(), history.len());
-    for (i, entry) in entries.iter().enumerate() {
-        let age = now_secs().saturating_sub(entry.timestamp);
-        let label = match entry.kind.as_str() {
-            "received" => "received",
-            "mixed"    => "mixed",
-            _          => "sent",
-        };
-        println!("  [{}] {} {} (fee: {})", start + i, label, format_age(age), entry.fee);
-        for c in &entry.inputs  { println!("    spent:    {}", hex::encode(c)); }
-        for c in &entry.outputs { println!("    created:  {}", hex::encode(c)); }
-        println!();
+
+    // 1. Tag each entry with its original absolute index so it persists through filtering,
+    //    then reverse it so the newest transactions are evaluated first.
+    let mut filtered: Vec<(usize, &midstate::wallet::HistoryEntry)> = history
+        .iter()
+        .enumerate()
+        .rev() 
+        .collect();
+
+    // 2. Apply Type Filter
+    if let Some(t) = tx_type {
+        let t = t.to_lowercase();
+        // The internal label for mined blocks is "coinbase"
+        let target_kind = if t == "mined" { "coinbase" } else { &t };
+        filtered.retain(|(_, e)| e.kind.to_lowercase() == target_kind);
     }
+
+    // 3. Apply Coin Hash Filter
+    if let Some(cq) = coin_query {
+        let cq = cq.to_lowercase();
+        filtered.retain(|(_, e)| {
+            e.inputs.iter().any(|c| hex::encode(c).contains(&cq)) ||
+            e.outputs.iter().any(|c| hex::encode(c).contains(&cq))
+        });
+    }
+
+    let total_filtered = filtered.len();
+
+    if total_filtered == 0 {
+        println!("No transactions match the criteria.");
+        return Ok(());
+    }
+
+    if offset >= total_filtered {
+        println!("Offset {} is beyond total matching history length {}", offset, total_filtered);
+        return Ok(());
+    }
+
+    // 4. Paginate
+    let page = filtered.into_iter().skip(offset).take(count).collect::<Vec<_>>();
+
+    println!("Transaction history (showing {} of {} matching entries, offset {}):\n", page.len(), total_filtered, offset);
+
+    // 5. Render beautiful UI
+    for (real_index, entry) in page {
+        let age = now_secs().saturating_sub(entry.timestamp);
+        let date_str = format_utc(entry.timestamp);
+        let label = match entry.kind.as_str() {
+            "received" => "RECEIVED",
+            "mixed"    => "MIXED   ",
+            "coinbase" => "MINED   ",
+            _          => "SENT    ",
+        };
+
+        println!("=======================================================================================");
+        println!("[{}] {}  |  {}  |  {}", real_index, label, date_str, format_age(age));
+        println!("---------------------------------------------------------------------------------------");
+        
+        if entry.fee > 0 {
+            println!("Network Fee: {}", entry.fee);
+        }
+        
+        if !entry.inputs.is_empty() {
+            println!("Spent Inputs ({}):", entry.inputs.len());
+            for c in &entry.inputs {
+                // Cross-reference wallet to look up value if we still track it
+                let val_str = if let Some(wc) = wallet.find_coin(c) {
+                    format!(" (Value: {})", wc.value)
+                } else {
+                    "".to_string()
+                };
+                println!("  - {}{}", hex::encode(c), val_str);
+            }
+        }
+
+        if !entry.outputs.is_empty() {
+            println!("Created Outputs ({}):", entry.outputs.len());
+            for c in &entry.outputs {
+                let val_str = if let Some(wc) = wallet.find_coin(c) {
+                    format!(" (Value: {})", wc.value)
+                } else {
+                    "".to_string()
+                };
+                println!("  - {}{}", hex::encode(c), val_str);
+            }
+        }
+    }
+    println!("=======================================================================================");
+
     Ok(())
 }
 
@@ -3132,6 +3249,14 @@ fn wallet_import_rewards(path: &PathBuf, coinbase_file: &PathBuf, data_dir: &Pat
         } else if !live_coins.contains(&wc.coin_id) {
             spent += 1;
         } else {
+            wallet.data.history.push(midstate::wallet::HistoryEntry {
+                inputs: vec![],
+                outputs: vec![wc.coin_id],
+                fee: 0,
+                timestamp: now_secs(), // Record the time it was imported
+                kind: "coinbase".into(),
+            });
+            
             wallet.data.coins.push(wc);
             imported += 1;
         }

@@ -437,214 +437,117 @@ async submitChat(sender, timestamp, nonce, replyTo, words, attachments = []) {
      * - **Data Integrity:** Reads strictly adhere to the 4-byte Little Endian length prefix 
      *   enforced by the Midstate rust node (`LightRequest` / `LightResponse` serialization).
      */
-    async request(req, _retries = 2) {
-        const reqId = Math.floor(Math.random() * 10000);
-        console.log(`[REQ ${reqId}] >>> Starting ${req.method} (retries: ${_retries})`);
-        
-        if (!this.isConnected || !this.connectedPeer) {
-            throw new Error('Not connected to any peer');
-        }
+    /**
+ * Outbound RPC over /midstate/light/2.0.0 (libp2p v3 MessageStream API).
+ * Framing: 4-byte LE length + JSON both directions (light_protocol.rs).
+ * The 'message' listener is attached before send(); AbstractMessageStream
+ * buffers pre-listener data, so ordering is safe either way.
+ */
+async request(req, _retries = 2) {
+    const reqId = Math.floor(Math.random() * 10000);
+    console.log(`[REQ ${reqId}] >>> Starting ${req.method} (retries: ${_retries})`);
 
-        const conns = this.node.getConnections(this.connectedPeer);
-        if (!conns || conns.length === 0) throw new Error('No active connection to peer');
-        
-        let stream;
-        try {
-            stream = await conns[0].newStream([LIGHT_PROTOCOL]);
-            console.log(`[REQ ${reqId}] Stream opened successfully.`);
-        } catch (e) {
-            console.error(`[REQ ${reqId}] newStream failed:`, e);
-            throw e;
-        }
+    if (!this.isConnected || !this.connectedPeer) {
+        throw new Error('Not connected to any peer');
+    }
+    const conns = this.node.getConnections(this.connectedPeer);
+    if (!conns || conns.length === 0) throw new Error('No active connection to peer');
 
-        try {
-            const jsonBytes = new TextEncoder().encode(JSON.stringify(req));
-            const lenBuf = new Uint8Array(4);
-            new DataView(lenBuf.buffer).setUint32(0, jsonBytes.length, true);
-            const msg = new Uint8Array(4 + jsonBytes.length);
-            msg.set(lenBuf, 0);
-            msg.set(jsonBytes, 4);
+    let stream;
+    try {
+        stream = await conns[0].newStream([LIGHT_PROTOCOL]);
+        console.log(`[REQ ${reqId}] Stream opened.`);
+    } catch (e) {
+        console.error(`[REQ ${reqId}] newStream failed:`, e);
+        throw e;
+    }
 
-            console.log(`[REQ ${reqId}] Writing ${msg.length} bytes...`);
+    try {
+        // ── Frame the request: 4-byte LE length + JSON ──
+        const jsonBytes = new TextEncoder().encode(JSON.stringify(req));
+        const msg = new Uint8Array(4 + jsonBytes.length);
+        new DataView(msg.buffer).setUint32(0, jsonBytes.length, true);
+        msg.set(jsonBytes, 4);
 
-            if (typeof stream.sink === 'function') {
-                console.log(`[REQ ${reqId}] Using stream.sink`);
-                await stream.sink((async function*() { yield msg; })());
-            } else {
-                console.log(`[REQ ${reqId}] stream.sink missing, using fallback write...`);
-                const writeFn = stream.sendData || stream.send || stream.write;
-                if (typeof writeFn === 'function') {
-                    const CHUNK_SIZE = 16384; 
-                    for (let i = 0; i < msg.length; i += CHUNK_SIZE) {
-                        writeFn.call(stream, msg.slice(i, i + CHUNK_SIZE));
-                        await new Promise(r => setTimeout(r, 10)); 
-                    }
-                    if (typeof stream.sendCloseWrite === 'function') {
-                        try { const p = stream.sendCloseWrite(); if (p && p.catch) p.catch(()=>{}); } catch (_) {}
-                    } else if (typeof stream.closeWrite === 'function') {
-                        try { const p = stream.closeWrite(); if (p && p.catch) p.catch(()=>{}); } catch (_) {}
-                    }
-                } else {
-                    throw new Error("No writable stream interface found");
+        // ── Reader: accumulate 'message' events until 4 + len bytes ──
+        const response = new Promise((resolve, reject) => {
+            let buf = new Uint8Array(0);
+            let expected = null;
+
+            const onMessage = (evt) => {
+                const d = evt.data;                                  // Uint8Array | Uint8ArrayList
+                const bytes = d instanceof Uint8Array ? d : d.subarray();
+                const next = new Uint8Array(buf.length + bytes.length);
+                next.set(buf, 0); next.set(bytes, buf.length);
+                buf = next;
+
+                if (expected === null && buf.length >= 4) {
+                    expected = new DataView(buf.buffer, buf.byteOffset).getUint32(0, true);
                 }
-            }
-
-            const source = stream.source || stream.incomingData || stream;
-            if (!source) throw new Error("No readable stream interface found");
-
-            const toHex = (buf) => Array.from(buf).map(b => b.toString(16).padStart(2,'0')).join(' ');
-
-            const readWithTimeout = async () => {
-                let rawBuf = new Uint8Array(0);
-                let appBuf = new Uint8Array(0);
-                let isFramed = null; // null = unknown, true = protobuf, false = raw
-                
-                console.log(`[REQ ${reqId}] Awaiting chunks from source...`);
-
-                for await (const chunk of source) {
-                    const bytes = chunk.subarray ? chunk.subarray() : (chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.buffer ?? chunk));
-                    console.log(`[REQ ${reqId}] Received chunk: ${bytes.length} bytes | HEX: ${toHex(bytes.slice(0, 20))}...`);
-                    
-                    // Accumulate raw bytes
-                    const newRaw = new Uint8Array(rawBuf.length + bytes.length);
-                    newRaw.set(rawBuf, 0);
-                    newRaw.set(bytes, rawBuf.length);
-                    rawBuf = newRaw;
-
-                    // Detect framing mode on first chunk
-                    if (isFramed === null && rawBuf.length >= 4) {
-                        const first4 = new DataView(rawBuf.buffer, rawBuf.byteOffset).getUint32(0, true);
-                        // If it's a massive number, it's definitely protobuf framing. 
-                        // Our largest legit message is ~10MB, so anything > 50MB is framing.
-                        if (first4 > 50_000_000) {
-                            console.log(`[REQ ${reqId}] Detected PROTOBUF framing! (first4 = 0x${first4.toString(16)})`);
-                            isFramed = true;
-                        } else {
-                            console.log(`[REQ ${reqId}] Detected RAW framing! (first4 = ${first4} bytes expected)`);
-                            isFramed = false;
-                        }
-                    }
-
-                    if (isFramed === true) {
-                        // Protobuf Unframing logic
-                        let offset = 0;
-                        const appChunks = [];
-                        let totalAppLen = 0;
-                        let lastValidOffset = 0;
-
-                        while (offset < rawBuf.length) {
-                            let msgLen, startOffset = offset;
-                            try {
-                                let val = 0, shift = 0;
-                                while (offset < rawBuf.length) {
-                                    const b = rawBuf[offset++];
-                                    val |= (b & 0x7f) << shift;
-                                    if ((b & 0x80) === 0) break;
-                                    shift += 7;
-                                }
-                                msgLen = val;
-                            } catch(e) { break; } // Needs more bytes for varint
-
-                            const msgEnd = offset + msgLen;
-                            if (msgEnd > rawBuf.length) break; // Wait for more bytes for this frame
-
-                            console.log(`[REQ ${reqId}] Unframing protobuf msg of length ${msgLen}`);
-                            let pos = offset;
-                            while (pos < msgEnd) {
-                                const tag = rawBuf[pos++];
-                                const wireType = tag & 0x7;
-                                const fieldNum = tag >> 3;
-                                
-                                if (wireType === 0) { // Varint
-                                    while (pos < msgEnd && (rawBuf[pos++] & 0x80) !== 0) {}
-                                } else if (wireType === 2) { // Length-delimited
-                                    let dLen = 0, shift = 0;
-                                    while (pos < msgEnd) {
-                                        const b = rawBuf[pos++];
-                                        dLen |= (b & 0x7f) << shift;
-                                        if ((b & 0x80) === 0) break;
-                                        shift += 7;
-                                    }
-                                    if (fieldNum === 2 && pos + dLen <= msgEnd) {
-                                        appChunks.push(rawBuf.slice(pos, pos + dLen));
-                                        totalAppLen += dLen;
-                                    }
-                                    pos += dLen;
-                                } else {
-                                    break; // unknown wire type
-                                }
-                            }
-                            offset = msgEnd;
-                            lastValidOffset = msgEnd;
-                        }
-
-                        // Remove fully processed frames from rawBuf
-                        if (lastValidOffset > 0) {
-                            rawBuf = rawBuf.slice(lastValidOffset);
-                        }
-
-                        // Append new app data to our app buffer
-                        if (totalAppLen > 0) {
-                            const newApp = new Uint8Array(appBuf.length + totalAppLen);
-                            newApp.set(appBuf, 0);
-                            let off = appBuf.length;
-                            for (const ac of appChunks) {
-                                newApp.set(ac, off);
-                                off += ac.length;
-                            }
-                            appBuf = newApp;
-                            console.log(`[REQ ${reqId}] Extracted ${totalAppLen} app bytes. Total appBuf: ${appBuf.length}`);
-                        }
-
-                    } else if (isFramed === false) {
-                        // Raw framing
-                        appBuf = rawBuf;
-                    }
-
-                    // Check if appBuf has a complete payload
-                    if (appBuf.length >= 4) {
-                        const expectedLen = new DataView(appBuf.buffer, appBuf.byteOffset).getUint32(0, true);
-                        if (appBuf.length >= 4 + expectedLen) {
-                            console.log(`[REQ ${reqId}] Payload fully received! (expected: ${expectedLen}, actual: ${appBuf.length - 4})`);
-                            return appBuf.slice(0, 4 + expectedLen);
-                        } else {
-                            console.log(`[REQ ${reqId}] App payload incomplete: have ${appBuf.length - 4}, need ${expectedLen}`);
-                        }
-                    }
+                if (expected !== null && buf.length >= 4 + expected) {
+                    cleanup();
+                    resolve(buf.slice(4, 4 + expected));
                 }
-                throw new Error("Stream closed before completing response");
+            };
+            const onClose = (evt) => {
+                cleanup();
+                reject(evt?.error ?? new Error('Stream closed before completing response'));
+            };
+            const timer = setTimeout(() => {
+                cleanup();
+                reject(new Error('Stream read timeout'));
+            }, REQUEST_TIMEOUT_MS);
+
+            const cleanup = () => {
+                clearTimeout(timer);
+                stream.removeEventListener('message', onMessage);
+                stream.removeEventListener('close', onClose);
             };
 
-            const appData = await Promise.race([
-                readWithTimeout(),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS))
-            ]);
+            stream.addEventListener('message', onMessage);
+            stream.addEventListener('close', onClose);
+        });
+        // Suppress unhandled-rejection noise if we bail during send();
+        // the original promise still rejects normally where awaited.
+        response.catch(() => {});
 
-            const respLen = new DataView(appData.buffer, appData.byteOffset).getUint32(0, true);
-            const respJson = new TextDecoder().decode(appData.slice(4, 4 + respLen));
-            
-            console.log(`[REQ ${reqId}] <<<< SUCCESS! Returning response.`);
-            
-            try { if (typeof stream.close === 'function') stream.close(); } catch (_) {}
-            return JSON.parse(respJson);
-
-        } catch (err) {
-            console.error(`[REQ ${reqId}] Request ${req.method} failed:`, err);
-            
-            try { 
-                if (stream) {
-                    if (typeof stream.abort === 'function') stream.abort(err); 
-                    else if (typeof stream.close === 'function') stream.close(); 
-                }
-            } catch (_) {}
-
-            if (_retries > 0) {
-                console.log(`[REQ ${reqId}] Retrying ${req.method}...`);
-                return this.request(req, _retries - 1);
-            }
-            throw err;
+        // ── Write: send() returns false when the buffer is full → wait for 'drain' ──
+        console.log(`[REQ ${reqId}] Writing ${msg.length} bytes...`);
+        if (!stream.send(msg)) {
+            await new Promise((resolve, reject) => {
+                const onDrain = () => { off(); resolve(); };
+                const onClose = (evt) => { off(); reject(evt?.error ?? new Error('Stream closed during send')); };
+                const off = () => {
+                    stream.removeEventListener('drain', onDrain);
+                    stream.removeEventListener('close', onClose);
+                };
+                stream.addEventListener('drain', onDrain);
+                stream.addEventListener('close', onClose);
+            });
         }
+
+        // Half-close our write side now: the node reads an exact length
+        // (no EOF needed), and closing here lets the FIN/FIN_ACK handshake
+        // complete while the node's handler is still alive. Closing late
+        // leaves streams in 'closing' limbo until the FIN_ACK timeout and
+        // they pile up toward the 64-per-protocol cap.
+        stream.close().catch(() => {});
+
+        const payload = await response;
+        const parsed = JSON.parse(new TextDecoder().decode(payload));
+        console.log(`[REQ ${reqId}] <<<< SUCCESS`);
+        return parsed;
+
+    } catch (err) {
+        console.error(`[REQ ${reqId}] Request ${req.method} failed:`, err);
+        try { stream.abort(err instanceof Error ? err : new Error(String(err))); } catch (_) {}
+        if (_retries > 0) {
+            console.log(`[REQ ${reqId}] Retrying ${req.method}...`);
+            return this.request(req, _retries - 1);
+        }
+        throw err;
     }
+}
 
     /// Send a JSON request over the light protocol and return the parsed response.
     ///
