@@ -129,6 +129,163 @@ function waitForNextBlock(timeoutMs = 15000) {
     });
 }
 
+// ── confirm-wait helpers ─────────────────────────────────────────────────────
+//
+// These replace the old `while (true) { checkCommitment/checkCoin … }` loops,
+// which could freeze a UI card forever: a blind `catch {}` swallowed every
+// network error, nothing bounded the wait, and a commit evicted from the
+// mempool (node restart, WebRTC flap mid-broadcast, replacement) would simply
+// never be mined while the loop spun on.
+
+/** Hard wall-clock ceiling for confirmation waits (~60 s blocks → ≈20 blocks).
+ *  On expiry the flow fails with a clear, actionable error instead of hanging. */
+const CONFIRM_WAIT_MS = 20 * 60_000;
+/** Consecutive failed status checks tolerated before declaring the network
+ *  unreachable. Iterations are ≥15 s apart, so 12 ≈ 3 min of solid failure. */
+const CONFIRM_MAX_NET_FAILS = 12;
+
+/**
+ * Wait until `commitmentHex` is mined into state, defending against the ways
+ * the old loop could hang:
+ *
+ *  • Polls once per block push (15 s fallback cadence when pushes flap).
+ *  • While unmined, probes the mempool every other iteration; if the commit
+ *    is absent from BOTH state and mempool on two consecutive probes it was
+ *    evicted — re-mine the anti-spam PoW against fresh state (the PoW anchors
+ *    a recent height, so replaying the original nonce can be rejected) and
+ *    rebroadcast, up to 3 times, then abort.
+ *  • Counts consecutive check failures instead of swallowing them; aborts
+ *    with the underlying reason after CONFIRM_MAX_NET_FAILS.
+ *  • Aborts after CONFIRM_WAIT_MS regardless.
+ *
+ * @param {string} commitmentHex - The commitment (hex) already broadcast.
+ * @param {(msg: string) => void} [onStatus] - Optional phase reporter (e.g. dexPhase).
+ * @returns {Promise<Object>} The final checkCommitment response (has `.height` when the node provides it).
+ */
+async function awaitCommitmentMined(commitmentHex, onStatus) {
+    const started = Date.now();
+    const say = (m) => { try { if (onStatus) onStatus(m); } catch (_) {} };
+
+    // The commitment appears in mempool JSON either as a hex string or as a
+    // 32-entry byte array depending on serde config. Probe the stringified
+    // pool for both forms so we don't depend on the exact Transaction shape.
+    const hexLower = String(commitmentHex).toLowerCase().replace(/^0x/, '');
+    let byteArrJson = null;
+    try {
+        const bytes = [];
+        for (let i = 0; i < hexLower.length; i += 2) bytes.push(parseInt(hexLower.slice(i, i + 2), 16));
+        if (bytes.length === 32 && bytes.every(Number.isFinite)) byteArrJson = JSON.stringify(bytes);
+    } catch (_) {}
+
+    let netFails = 0;
+    let absentProbes = 0;   // consecutive "not in state AND not in mempool"
+    let rebroadcasts = 0;
+    let iter = 0;
+
+    while (true) {
+        if (Date.now() - started > CONFIRM_WAIT_MS) {
+            throw new Error(`Timed out after ${Math.round(CONFIRM_WAIT_MS / 60000)} min waiting for the commit to be mined. It may still confirm later — sync the wallet before retrying.`);
+        }
+
+        let minedCheckOk = false;
+        try {
+            const c = await rpc.checkCommitment(commitmentHex);
+            netFails = 0;
+            if (c && c.exists) return c;
+            minedCheckOk = true;
+        } catch (e) {
+            netFails++;
+            if (e && (e.code === 'RATE_LIMITED' || e.code === 'GATEWAY_UNAVAILABLE')) {
+                say('Network is rate-limiting — waiting it out…');
+            }
+            if (netFails >= CONFIRM_MAX_NET_FAILS) {
+                throw new Error(`Lost contact with the network while waiting for the commit (${(e && e.message) || e}). It may still confirm — sync the wallet before retrying.`);
+            }
+        }
+
+        // Eviction probe — only when the state check itself succeeded, only
+        // every other iteration to keep the extra RPC load negligible, and
+        // never on the first iteration (give the broadcast time to propagate).
+        if (minedCheckOk && (iter++ % 2 === 1)) {
+            let present = null;   // null = probe failed → unknown, don't count
+            try {
+                const mp = await rpc.getMempool();
+                const hay = JSON.stringify((mp && mp.transactions) || []).toLowerCase();
+                present = hay.includes(hexLower) || (byteArrJson !== null && hay.includes(byteArrJson));
+            } catch (_) {}
+
+            if (present === true) {
+                absentProbes = 0;
+            } else if (present === false && ++absentProbes >= 2) {
+                absentProbes = 0;
+                if (rebroadcasts >= 3) {
+                    throw new Error('The commit keeps disappearing from the mempool (evicted). Aborting — sync the wallet and try the operation again.');
+                }
+                rebroadcasts++;
+                say(`Commit was dropped from the mempool — rebroadcasting (${rebroadcasts}/3)…`);
+                let ok = false, body = '';
+                try {
+                    const st = await rpc.getState();
+                    const nonce = Number(mine_commitment_pow(commitmentHex, st.required_pow || 24, BigInt(st.height), st.header_hash));
+                    const r = await rpc.commit(commitmentHex, nonce);
+                    ok = !!(r && r.ok);
+                    body = String((r && (r.body || r.error)) || '');
+                } catch (e) {
+                    ok = false;
+                    body = (e && e.message) || String(e);
+                }
+                // "already known / exists / duplicate" means it's back in the pool
+                // or got mined between probes — both fine. Transient network noise
+                // is retried next cycle. A real consensus rejection aborts.
+                if (!ok && !/already|exist|duplicate|RATE_LIMITED|GATEWAY_UNAVAILABLE|timeout/i.test(body)) {
+                    throw new Error(`Commit rebroadcast rejected by the node: ${body}`);
+                }
+            }
+        }
+
+        await waitForNextBlock(15000);
+    }
+}
+
+/**
+ * Wait until `coinId` disappears from state — i.e. the reveal spending it was
+ * mined. Same failure discipline as awaitCommitmentMined (hard deadline +
+ * counted network failures instead of a blind catch), but deliberately NO
+ * rebroadcast: re-sending a reveal is flow-specific and can burn one-time key
+ * material, so on failure the error tells the user to SYNC FIRST rather than
+ * retry blind.
+ *
+ * @param {string} coinId - Input coin id consumed by the reveal.
+ * @param {(msg: string) => void} [onStatus] - Optional phase reporter.
+ * @returns {Promise<Object>} The final checkCoin response (may carry `.spentHeight`).
+ */
+async function awaitCoinSpent(coinId, onStatus) {
+    const started = Date.now();
+    const say = (m) => { try { if (onStatus) onStatus(m); } catch (_) {} };
+    let netFails = 0;
+
+    while (true) {
+        if (Date.now() - started > CONFIRM_WAIT_MS) {
+            throw new Error(`Timed out after ${Math.round(CONFIRM_WAIT_MS / 60000)} min waiting for the transaction to confirm. Do NOT retry immediately — sync the wallet first; it may already have confirmed.`);
+        }
+        try {
+            const inp = await rpc.checkCoin(coinId);
+            netFails = 0;
+            if (inp && !inp.exists) return inp;
+        } catch (e) {
+            netFails++;
+            if (e && (e.code === 'RATE_LIMITED' || e.code === 'GATEWAY_UNAVAILABLE')) {
+                say('Network is rate-limiting — waiting it out…');
+            }
+            if (netFails >= CONFIRM_MAX_NET_FAILS) {
+                throw new Error(`Lost contact with the network while waiting for confirmation (${(e && e.message) || e}). Sync the wallet before retrying — it may already have confirmed.`);
+            }
+        }
+        await waitForNextBlock(15000);
+    }
+}
+// ── end confirm-wait helpers ─────────────────────────────────────────────────
+
 /**
  * @type {Array<Object>} Pending send transactions displayed in the UI.
  * Cleared when the send completes or fails.
@@ -440,11 +597,18 @@ const _rpcPending = new Map();
  * @param {*} result - The successful result (undefined if error).
  * @param {string} [error] - Error message (undefined if success).
  */
-function _rpcReceive(id, result, error) {
+function _rpcReceive(id, result, error, code) {
     const p = _rpcPending.get(id);
     if (!p) return;
     _rpcPending.delete(id);
-    if (error !== undefined) p.reject(new Error(error));
+    if (error !== undefined) {
+        const err = new Error(error);
+        // 'RATE_LIMITED' / 'GATEWAY_UNAVAILABLE' from the main thread's
+        // gatewayFetch — lets chain scans pause/abort wholesale instead of
+        // grinding block-by-block through a rate-limit window.
+        if (code) err.code = code;
+        p.reject(err);
+    }
     else p.resolve(result);
 }
 
@@ -501,6 +665,35 @@ const rpc = {
         };
     },
 };
+
+/**
+ * Fetch an inclusive range of blocks for a chain scan, one rpc.getBlock per
+ * height. The main thread serves already-seen heights from its immutable
+ * block cache and throttles anything that must go to the HTTPS gateway, so
+ * no extra pacing is needed here (the old 20 ms/block sleep is gone).
+ *
+ * A genuinely missing or transiently failing block yields null — but gateway
+ * rate-limiting (err.code === 'RATE_LIMITED' / 'GATEWAY_UNAVAILABLE') is
+ * rethrown so the caller can pause or abort the WHOLE scan rather than grind
+ * block-by-block through thousands of doomed requests.
+ *
+ * @param {number} lo - First height (inclusive).
+ * @param {number} hi - Last height (inclusive).
+ * @returns {Promise<Array<Object|null>>} blocks[i] is the block at lo + i.
+ */
+async function fetchScanBatch(lo, hi) {
+    const out = [];
+    for (let k = lo; k <= hi; k++) {
+        try {
+            out.push(await rpc.getBlock(k));
+        } catch (e) {
+            if (e && (e.code === 'RATE_LIMITED' || e.code === 'GATEWAY_UNAVAILABLE')) throw e;
+            out.push(null);
+        }
+    }
+    return out;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  WASM Client-Side PoW for Chat & L2
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1127,7 +1320,7 @@ self.onmessage = async (e) => {
         }
 
         else if (type === 'RPC_RESPONSE') {
-            _rpcReceive(payload.id, payload.result, payload.error);
+            _rpcReceive(payload.id, payload.result, payload.error, payload.code);
         }
 
         else if (type === 'GENERATE') {
@@ -1526,14 +1719,14 @@ self.onmessage = async (e) => {
                 const commitReq = await rpc.commit(ctx.commitment, spamNonce);
                 if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
                 dexPhase(`Commit broadcast — waiting to be mined (1/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
-                while (true) { try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {} await waitForNextBlock(15000); }
+                await awaitCommitmentMined(ctx.commitment, dexPhase);
                 // Self-heal MSS leaf reuse: if the leaf floor was stale, advance and re-sign
                 // against the SAME already-mined commitment (leaf is a witness, not committed to).
                 const revealReq = await sendRevealWithMssLeafRetry(revealPayloadStr, ctxStr, ctx.commitment, ctx.tx_salt, dexPhase);
                 if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
                 dexPhase(`Reveal broadcast — waiting to be mined (2/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
                 const firstInputId = ctx.input_coin_ids && ctx.input_coin_ids.length ? ctx.input_coin_ids[0] : null;
-                if (firstInputId) { while (true) { try { const inp = await rpc.checkCoin(firstInputId); if (inp && !inp.exists) break; } catch (e) {} await waitForNextBlock(15000); } }
+                if (firstInputId) { await awaitCoinSpent(firstInputId, dexPhase); }
                 dexPhase("Confirmed \u2713 — syncing\u2026");
                 await performScan();
                 
@@ -1656,13 +1849,26 @@ self.onmessage = async (e) => {
                 const recovered = [];
                 const seenCoin = new Set();
                 const BATCH = 12;
+                // On gateway rate-limiting, pause the WHOLE scan and retry the
+                // batch; three strikes aborts (the main thread's block cache
+                // means a rerun resumes cheaply). Grinding on block-by-block
+                // is what used to cause the 429 storms.
+                let rateLimitStrikes = 0;
                 for (let h = from; h <= tip; h += BATCH) {
-                    const blocks = [];
-                    for (let k = h; k < h + BATCH && k <= tip; k++) {
-                        const b = await rpc.getBlock(k).catch(() => null);
-                        blocks.push(b);
-                        // Tiny delay to respect HTTP rate limits if WebRTC falls back to HTTPS
-                        await new Promise(r => setTimeout(r, 20));
+                    let blocks;
+                    try {
+                        blocks = await fetchScanBatch(h, Math.min(h + BATCH - 1, tip));
+                        rateLimitStrikes = 0;
+                    } catch (e) {
+                        if (e && (e.code === 'RATE_LIMITED' || e.code === 'GATEWAY_UNAVAILABLE')) {
+                            if (++rateLimitStrikes >= 3) {
+                                throw new Error('RPC gateway is rate-limiting or unreachable — recovery scan aborted. Try again in a minute; it will resume from cache.');
+                            }
+                            await new Promise(r => setTimeout(r, 15000 * rateLimitStrikes));
+                            h -= BATCH;   // retry this batch after the pause
+                            continue;
+                        }
+                        throw e;
                     }
                     for (const blk of blocks) {
                         if (!blk) continue;
@@ -1770,13 +1976,27 @@ self.onmessage = async (e) => {
                 const seenCoin = new Set();
                 const BATCH = 12;
                 let fragPoolDirty = false;
+                // Same rate-limit posture as the recover scan: pause the whole
+                // scan on 429s, abort after three strikes. The error lands in
+                // DEX_ANNOUNCED_ORDERS' error field, so the orderbook keeps its
+                // existing entries (an errored scan is non-authoritative) and
+                // the next 3-minute cycle retries from the main thread's cache.
+                let rateLimitStrikes = 0;
                 for (let h = from; h <= tip; h += BATCH) {
-                    const blocks = [];
-                    for (let k = h; k < h + BATCH && k <= tip; k++) {
-                        const b = await rpc.getBlock(k).catch(() => null);
-                        blocks.push(b);
-                        // Tiny delay to respect HTTP rate limits if WebRTC falls back to HTTPS
-                        await new Promise(r => setTimeout(r, 20));
+                    let blocks;
+                    try {
+                        blocks = await fetchScanBatch(h, Math.min(h + BATCH - 1, tip));
+                        rateLimitStrikes = 0;
+                    } catch (e) {
+                        if (e && (e.code === 'RATE_LIMITED' || e.code === 'GATEWAY_UNAVAILABLE')) {
+                            if (++rateLimitStrikes >= 3) {
+                                throw new Error('RPC gateway is rate-limiting or unreachable — orderbook scan aborted; will retry next cycle.');
+                            }
+                            await new Promise(r => setTimeout(r, 15000 * rateLimitStrikes));
+                            h -= BATCH;   // retry this batch after the pause
+                            continue;
+                        }
+                        throw e;
                     }
                     for (const blk of blocks) {
                         if (!blk) continue;
@@ -2016,10 +2236,7 @@ self.onmessage = async (e) => {
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for Block Confirmation..." } });
                 dexPhase(`Commit broadcast — waiting to be mined (1/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
-                while (true) {
-                    try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {}
-                    await waitForNextBlock(15000);
-                }
+                await awaitCommitmentMined(ctx.commitment, dexPhase);
 
                 const revealReq = await rpc.send(revealPayloadStr);
                 if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
@@ -2027,10 +2244,7 @@ self.onmessage = async (e) => {
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting claim..." } });
                 dexPhase(`Reveal broadcast — waiting to be mined (2/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
                 const firstCoin = normalizeHex(htlcCoins[0].coin_id);
-                while (true) {
-                    try { const inp = await rpc.checkCoin(firstCoin); if (inp && !inp.exists) break; } catch (e) {}
-                    await waitForNextBlock(15000);
-                }
+                await awaitCoinSpent(firstCoin, dexPhase);
 
                 dexPhase("Confirmed \u2713 \u2014 syncing wallet\u2026");
                 await performScan();
@@ -2146,10 +2360,7 @@ self.onmessage = async (e) => {
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for Block Confirmation..." } });
                 dexPhase(`Commit broadcast — waiting to be mined (1/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
-                while (true) {
-                    try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {}
-                    await waitForNextBlock(15000);
-                }
+                await awaitCommitmentMined(ctx.commitment, dexPhase);
 
                 const revealReq = await rpc.send(revealPayloadStr);
                 if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
@@ -2157,10 +2368,7 @@ self.onmessage = async (e) => {
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting delivery..." } });
                 dexPhase(`Reveal broadcast — waiting to be mined (2/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
                 const firstCoin = normalizeHex(htlcCoins[0].coin_id);
-                while (true) {
-                    try { const inp = await rpc.checkCoin(firstCoin); if (inp && !inp.exists) break; } catch (e) {}
-                    await waitForNextBlock(15000);
-                }
+                await awaitCoinSpent(firstCoin, dexPhase);
 
                 dexPhase("Confirmed \u2713 \u2014 syncing wallet\u2026");
                 // The buyer scans to pick up the freshly delivered coins; the seller scans
@@ -2265,14 +2473,14 @@ self.onmessage = async (e) => {
                 if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
 
                 dexPhase(`Commit broadcast — waiting to be mined (1/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
-                while (true) { try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {} await waitForNextBlock(15000); }
+                await awaitCommitmentMined(ctx.commitment, dexPhase);
 
                 const revealReq = await rpc.send(revealPayloadStr);
                 if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
 
                 dexPhase(`Reveal broadcast — waiting to be mined (2/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
                 const firstCoin = normalizeHex(coin.coin_id);
-                while (true) { try { const inp = await rpc.checkCoin(firstCoin); if (inp && !inp.exists) break; } catch (e) {} await waitForNextBlock(15000); }
+                await awaitCoinSpent(firstCoin, dexPhase);
 
                 dexPhase("Confirmed ✓ — syncing…");
                 await performScan();
@@ -2345,12 +2553,12 @@ self.onmessage = async (e) => {
                 const commitReq = await rpc.commit(ctx.commitment, spamNonce);
                 if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
                 dexPhase("Commit broadcast — waiting to be mined (1/2)\u2026");
-                while (true) { try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {} await waitForNextBlock(15000); }
+                await awaitCommitmentMined(ctx.commitment, dexPhase);
                 const revealReq = await rpc.send(revealPayloadStr);
                 if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
                 dexPhase("Reveal broadcast — waiting to be mined (2/2)\u2026");
                 const firstCoin = normalizeHex(coin.coin_id);
-                while (true) { try { const inp = await rpc.checkCoin(firstCoin); if (inp && !inp.exists) break; } catch (e) {} await waitForNextBlock(15000); }
+                await awaitCoinSpent(firstCoin, dexPhase);
                 dexPhase("Confirmed \u2713 — syncing\u2026");
                 await performScan();
                 // CLEANUP (dex_secrets invariant I4): the covenant coin no longer exists, so its
@@ -2549,10 +2757,10 @@ self.onmessage = async (e) => {
                     const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
                     const commitReq = await rpc.commit(ctx.commitment, spamNonce);
                     if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
-                    while (true) { try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {} await waitForNextBlock(15000); }
+                    await awaitCommitmentMined(ctx.commitment, dexPhase);
                     const revealReq = await rpc.send(revealPayloadStr);
                     if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
-                    while (true) { try { const inp = await rpc.checkCoin(normalizeHex(coin.coin_id)); if (inp && !inp.exists) break; } catch (e) {} await waitForNextBlock(15000); }
+                    await awaitCoinSpent(normalizeHex(coin.coin_id), dexPhase);
 
                     totalReclaimed += coinValue; reclaimedCoins++;
                 }
@@ -2776,17 +2984,11 @@ self.onmessage = async (e) => {
                 const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
                 const commitReq = await rpc.commit(ctx.commitment, spamNonce);
                 if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
-                while (true) {
-                    try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {}
-                    await waitForNextBlock(15000);
-                }
+                await awaitCommitmentMined(ctx.commitment, (m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
                 const revealReq = await rpc.send(revealPayloadStr);
                 if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
                 const firstCoin = normalizeHex(String(htlcCoins[0].coin_id ?? '').replace(/^0x/i, ''));
-                while (true) {
-                    try { const inp = await rpc.checkCoin(firstCoin); if (inp && !inp.exists) break; } catch (e) {}
-                    await waitForNextBlock(15000);
-                }
+                await awaitCoinSpent(firstCoin, (m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
                 await performScan();
                 self.postMessage({ type: 'DEX_BIDFILL_CLAIMED', payload: { bidId } });
             } catch (err) {
@@ -2808,7 +3010,16 @@ self.onmessage = async (e) => {
                     const want = normalizeHex(String(hashlock ?? '').replace(/^0x/i, ''));
                     const from = Math.max(1, Math.max(Number(sinceHeight) || 0, networkHeight - 180));
                     for (let h = networkHeight; h >= from && !preimage; h--) {
-                        let blk; try { blk = await rpc.getBlock(h); } catch (e) { continue; }
+                        let blk;
+                        try { blk = await rpc.getBlock(h); }
+                        catch (e) {
+                            // On gateway rate-limiting, stop the backward walk —
+                            // it would just be up to 180 more doomed requests.
+                            // preimage stays null, which the result handler
+                            // already tolerates; the next watch retries.
+                            if (e && (e.code === 'RATE_LIMITED' || e.code === 'GATEWAY_UNAVAILABLE')) break;
+                            continue;
+                        }
                         if (!blk) continue;
                         const seen = new Set();
                         for (const cand of (JSON.stringify(blk).match(/[0-9a-fA-F]{64}/g) || [])) {
@@ -2993,10 +3204,7 @@ self.onmessage = async (e) => {
                 if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for commit to be mined (1/2)..." } });
-                while (true) {
-                    try { const c = await rpc.checkCommitment(ctx.commitment); if (c && c.exists) break; } catch (e) {}
-                    await waitForNextBlock(15000);
-                }
+                await awaitCommitmentMined(ctx.commitment, (m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting consolidate reveal..." } });
                 
@@ -3012,10 +3220,7 @@ self.onmessage = async (e) => {
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for sweep to be mined (2/2)..." } });
                 const firstCoinId = ctx.input_coin_ids[0];
-                while (true) {
-                    try { const inp = await rpc.checkCoin(firstCoinId); if (inp && !inp.exists) break; } catch (e) {}
-                    await waitForNextBlock(15000);
-                }
+                await awaitCoinSpent(firstCoinId, (m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
 
                 await performScan();
                 self.postMessage({ type: 'SEND_COMPLETE', payload: buildDashboardPayload() });
@@ -4265,14 +4470,8 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for the commit to be mined (phase 1 of 2)…" } });
     const revealPayloadStr = wallet.build_reveal(spendContextStr, ctx.commitment, ctx.tx_salt);
 
-    let _commitHeight = null;
-    while (true) {
-        try {
-            const checkResp = await rpc.checkCommitment(ctx.commitment);
-            if (checkResp && checkResp.exists) { _commitHeight = checkResp.height ?? checkResp.block_height ?? null; break; }
-        } catch (e) {}
-        await waitForNextBlock(15000);
-    }
+    const _commitResp = await awaitCommitmentMined(ctx.commitment, (m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
+    const _commitHeight = _commitResp.height ?? _commitResp.block_height ?? null;
     self.postMessage({ type: 'SEND_STEP', payload: {
         step: 'commit_mined', title: 'Commit confirmed on-chain',
         detail: _commitHeight != null ? `included in block ${_commitHeight}` : 'commit is now on-chain',
@@ -4296,14 +4495,8 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for the reveal to be mined (phase 2 of 2)…" } });
     const inputCoinToCheck = ctx.selected_inputs[0].coin_id;
 
-    let _revealHeight = null;
-    while (true) {
-        try {
-            const checkInp = await rpc.checkCoin(inputCoinToCheck);
-            if (checkInp && !checkInp.exists) { _revealHeight = checkInp.spentHeight ?? checkInp.height ?? null; break; }
-        } catch (e) {}
-        await waitForNextBlock(15000);
-    }
+    const _revealResp = await awaitCoinSpent(inputCoinToCheck, (m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
+    const _revealHeight = _revealResp.spentHeight ?? _revealResp.height ?? null;
     self.postMessage({ type: 'SEND_STEP', payload: {
         step: 'reveal_mined', title: 'Reveal confirmed — transaction complete',
         detail: _revealHeight != null ? `settled in block ${_revealHeight}` : 'transaction is now settled on-chain',
@@ -4421,13 +4614,7 @@ async function performContractTx(req) {
     prog(`Commit broadcast — waiting to be mined (1/2) [Commit: ${ctx.commitment.substring(0,8)}...]`);
     const revealPayloadStr = wallet.build_script_reveal(ctxStr, ctx.commitment, ctx.tx_salt);
 
-    while (true) {
-        try {
-            const c = await rpc.checkCommitment(ctx.commitment);
-            if (c && c.exists) break;
-        } catch (e) {}
-        await waitForNextBlock(15000);
-    }
+    await awaitCommitmentMined(ctx.commitment, prog);
 
     prog("Commit mined ✓ — submitting reveal…");
     const revealReq = await rpc.send(revealPayloadStr);
@@ -4437,13 +4624,7 @@ async function performContractTx(req) {
     // Use the first input coin id (contract or wallet) to detect inclusion.
     const firstInputId = ctx.input_coin_ids && ctx.input_coin_ids.length ? ctx.input_coin_ids[0] : null;
     if (firstInputId) {
-        while (true) {
-            try {
-                const inp = await rpc.checkCoin(firstInputId);
-                if (inp && !inp.exists) break;
-            } catch (e) {}
-            await waitForNextBlock(15000);
-        }
+        await awaitCoinSpent(firstInputId, prog);
     }
 
     pendingSends = [];

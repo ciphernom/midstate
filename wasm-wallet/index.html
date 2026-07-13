@@ -2582,7 +2582,16 @@ if ('serviceWorker' in navigator) {
 
                 if (dialList.length === 0) throw new Error("No WebRTC addresses available to dial.");
 
-                if (lightClient) { await lightClient.stop(); lightClient = null; }
+                if (lightClient) {
+                    // node.stop() can stall tearing down a dead/zombie session;
+                    // don't let a hung teardown block the fresh dial. The old
+                    // client object is dropped either way.
+                    await Promise.race([
+                        lightClient.stop().catch(() => {}),
+                        new Promise(r => setTimeout(r, 5000)),
+                    ]);
+                    lightClient = null;
+                }
                 lightClient = await createLightClient();
                 
                 lightClient.onStatusChange((status) => {
@@ -2590,8 +2599,10 @@ if ('serviceWorker' in navigator) {
                     if (status === 'connected') {
                         log('[light] WebRTC connected securely.');
                         lightClient.discoverPeers().catch(()=>{});
+                        _kaPing(true).catch(()=>{}); // Prove health immediately
                     } else if (status === 'failed') {
                         log('[light] WebRTC failed. Falling back to HTTPS.');
+                        _lcMarkBad('status changed to failed');
                     }
                 });
 
@@ -2629,11 +2640,297 @@ if ('serviceWorker' in navigator) {
         }
         
         async function disconnectWebRTC() {
-            if (lightClient) { await lightClient.stop(); lightClient = null; }
+            if (lightClient) {
+                await Promise.race([
+                    lightClient.stop().catch(() => {}),
+                    new Promise(r => setTimeout(r, 5000)),
+                ]);
+                lightClient = null;
+            }
             updateWebRTCStatus('disconnected');
         }
 
+        // ── WebRTC keep-alive & health gating ───────────────────────────────────
+        // The transport can "connect" successfully but fail all requests (e.g. if
+        // the bundle's stream reader misinterprets protobuf framing). If we route
+        // traffic just because `isConnected` is true, sync dies.
+        // We now require the connection to PROVE it works (a successful ping) before
+        // it gets any traffic. If it fails repeatedly, we "park" it for 10 minutes
+        // instead of constantly tearing down and redialing, which lets HTTPS take
+        // over smoothly.
+        const _lcHealth = {
+            ok: false,
+            parkedUntil: 0,
+            strikes: 0,
+        };
+
+        function _lcMarkOk() {
+            _lcHealth.ok = true;
+            _lcHealth.strikes = 0;
+            _lcHealth.parkedUntil = 0;
+        }
+
+        function _lcMarkBad(reason) {
+            _lcHealth.ok = false;
+            console.warn(`[light] WebRTC health marked bad: ${reason}`);
+        }
+
+        const _ka = {
+            EVERY_MS: 10_000,
+            PING_TIMEOUT_MS: 8_000,
+            inFlight: false,
+            missed: 0,
+            reconnecting: false,
+            disconnectedSince: 0,
+        };
+
+        async function _kaForceReconnect(reason) {
+            if (_ka.reconnecting) return;
+            _ka.reconnecting = true;
+            _lcMarkBad(reason);
+            try {
+                console.warn(`[light] keep-alive: ${reason} — dialing a fresh WebRTC connection`);
+                let failsafe = null;
+                try {
+                    await Promise.race([
+                        autoConnectWebRTC(),
+                        new Promise(r => { failsafe = setTimeout(r, 60_000); }),
+                    ]);
+                } finally {
+                    if (failsafe) clearTimeout(failsafe);
+                }
+            } catch (e) {
+                console.warn('[light] keep-alive reconnect failed:', e && e.message);
+            } finally {
+                _ka.reconnecting = false;
+            }
+        }
+
+        async function _kaPing(isEventDriven = false) {
+            if (!lightClient || !lightClient.isConnected || _ka.inFlight) return;
+            _ka.inFlight = true;
+            try {
+                const st = await Promise.race([
+                    lightClient.getState(),
+                    new Promise((_, rej) => setTimeout(() => rej(new Error('keep-alive ping timed out')), _ka.PING_TIMEOUT_MS)),
+                ]);
+                _ka.missed = 0;
+                _lcMarkOk();
+                if (st) _blockCacheNoteTip(st.height);
+            } catch (e) {
+                _ka.missed++;
+                if (!isEventDriven) {
+                    console.warn(`[light] keep-alive ping failed (${_ka.missed} in a row):`, e && e.message);
+                    if (_ka.missed >= 2) {
+                        _ka.missed = 0;
+                        _lcHealth.strikes++;
+                        if (_lcHealth.strikes >= 3) {
+                            console.error('[light] WebRTC failed 3 reconnect cycles. Parking transport for 10 minutes to stabilize HTTPS fallback.');
+                            _lcHealth.parkedUntil = Date.now() + 10 * 60_000;
+                            _lcHealth.strikes = 0;
+                            if (lightClient) lightClient.stop().catch(()=>{});
+                            lightClient = null;
+                        } else {
+                            if (lightClient && lightClient.isConnected) {
+                                _kaForceReconnect('connection is a zombie (socket up, requests dead)');
+                            }
+                        }
+                    }
+                }
+            } finally {
+                _ka.inFlight = false;
+            }
+        }
+
+        setInterval(async () => {
+            if (Date.now() < _lcHealth.parkedUntil) return; // Shh.
+            if (_ka.reconnecting) return;
+
+            if (lightClient && !lightClient.isConnected) {
+                if (!_ka.disconnectedSince) _ka.disconnectedSince = Date.now();
+                if (Date.now() - _ka.disconnectedSince >= 60_000) {
+                    _ka.disconnectedSince = 0;
+                    _kaForceReconnect('still disconnected after 60 s (reconnect scheduler exhausted)');
+                }
+                return;
+            }
+            _ka.disconnectedSince = 0;
+            await _kaPing();
+        }, _ka.EVERY_MS);
+
+        // Async wrapper for light client calls with an absolute timeout so a stalled
+        // stream doesn't hang the worker.
+        async function lcCall(promise, timeoutMs = 15000) {
+            return Promise.race([
+                promise,
+                new Promise((_, rej) => setTimeout(() => rej(new Error('WebRTC request timed out')), timeoutMs))
+            ]);
+        }
+
         
+
+        // ── Gateway request governor ────────────────────────────────────────────
+        // Every HTTPS request to the RPC gateway funnels through gatewayFetch():
+        //   • one queue, max 2 in flight, ≥150 ms between launches (~6 req/s cap),
+        //     so bulk chain scans can never stampede the gateway into 429s;
+        //   • 429-aware: honors Retry-After when the response is readable and
+        //     applies a global cooldown + exponential retry. A 429 whose response
+        //     lacks CORS headers surfaces here as TypeError('Failed to fetch'),
+        //     indistinguishable from being offline — so network-level failures
+        //     are retried the same way, with a capped backoff so a genuinely
+        //     unreachable gateway still fails in reasonable time;
+        //   • a priority lane for user-initiated traffic (commit/send/chat) so a
+        //     background scan never queues ahead of a payment;
+        //   • exhausted retries reject with err.code = 'RATE_LIMITED' or
+        //     'GATEWAY_UNAVAILABLE'. The code rides back to worker.js in the
+        //     RPC_RESPONSE, letting scan loops pause or abort as a whole instead
+        //     of grinding block-by-block through thousands of doomed requests.
+        const _gw = {
+            queue: [],
+            active: 0,
+            MAX_CONCURRENT: 2,
+            MIN_GAP_MS: 150,
+            lastLaunch: 0,
+            cooldownUntil: 0,   // epoch ms; global pause after a 429 / net failure
+            pumpScheduled: false,
+        };
+
+        function _gwSetCooldown(ms) {
+            const until = Date.now() + ms;
+            if (until > _gw.cooldownUntil) _gw.cooldownUntil = until;
+        }
+
+        function _gwPump() {
+            if (_gw.pumpScheduled) return;
+            if (_gw.active >= _gw.MAX_CONCURRENT || _gw.queue.length === 0) return;
+            const now = Date.now();
+            const wait = Math.max(_gw.cooldownUntil - now, _gw.lastLaunch + _gw.MIN_GAP_MS - now, 0);
+            if (wait > 0) {
+                _gw.pumpScheduled = true;
+                setTimeout(() => { _gw.pumpScheduled = false; _gwPump(); }, wait);
+                return;
+            }
+            const job = _gw.queue.shift();
+            _gw.active++;
+            _gw.lastLaunch = now;
+            job.run().catch(() => {}).finally(() => { _gw.active--; _gwPump(); });
+            _gwPump(); // a second slot may be free
+        }
+
+        function gatewayFetch(input, init, opts = {}) {
+            const { priority = false, retries = 3 } = opts;
+            return new Promise((resolve, reject) => {
+                const run = async () => {
+                    for (let attempt = 0; ; attempt++) {
+                        let resp = null, netErr = null;
+                        try { resp = await fetch(input, init); }
+                        catch (e) { netErr = e; }
+
+                        if (resp && resp.status !== 429) { resolve(resp); return; }
+
+                        // Rate-limited (readable 429) or blocked/offline (TypeError,
+                        // which is also what a CORS-header-less 429 looks like).
+                        let waitMs;
+                        if (resp) {
+                            // Retry-After may be seconds or an HTTP-date; parseFloat
+                            // handles the former, the exp fallback covers the rest.
+                            const ra = parseFloat(resp.headers.get('Retry-After'));
+                            waitMs = Number.isFinite(ra) ? Math.max(ra * 1000, 1000) : 2000 * Math.pow(2, attempt);
+                        } else {
+                            waitMs = 1500 * Math.pow(2, attempt);
+                        }
+                        waitMs = Math.min(waitMs + Math.random() * 500, 30000);
+                        _gwSetCooldown(waitMs);
+
+                        if (attempt >= retries) {
+                            const err = resp
+                                ? new Error(`RATE_LIMITED: gateway returned 429 for ${input}`)
+                                : new Error(`GATEWAY_UNAVAILABLE: ${(netErr && netErr.message) || 'fetch failed'} (gateway rate-limiting without CORS headers, or unreachable)`);
+                            err.code = resp ? 'RATE_LIMITED' : 'GATEWAY_UNAVAILABLE';
+                            reject(err);
+                            return;
+                        }
+                        await new Promise(r => setTimeout(r, waitMs));
+                    }
+                };
+                if (priority) _gw.queue.unshift({ run }); else _gw.queue.push({ run });
+                _gwPump();
+            });
+        }
+
+        // ── Immutable block cache ───────────────────────────────────────────────
+        // Blocks at least CONFIRM_DEPTH below the highest height we've seen can
+        // never change, so the 3-minute full-window orderbook rescan should not
+        // re-download them — before this cache it re-fetched ~1,440 identical
+        // blocks per cycle, which is what kept tripping the gateway limiter.
+        // Map preserves insertion order → cheap LRU. Session-scoped (in memory).
+        const _blockCache = {
+            map: new Map(),                // height -> { block, bytes }
+            bytes: 0,
+            MAX_ENTRIES: 4600,             // deepest scan window (3×1440) + slack
+            MAX_BYTES: 48 * 1024 * 1024,
+            CONFIRM_DEPTH: 12,
+            maxSeen: 0,
+        };
+
+        function _blockCacheNoteTip(h) {
+            h = Number(h);
+            if (Number.isFinite(h) && h > _blockCache.maxSeen) _blockCache.maxSeen = h;
+        }
+
+        function _blockCacheGet(h) {
+            const e = _blockCache.map.get(h);
+            if (!e) return null;
+            _blockCache.map.delete(h); _blockCache.map.set(h, e);   // LRU touch
+            return e.block;
+        }
+
+        function _blockCachePut(h, block, bytesHint) {
+            if (!block) return;
+            if (h > _blockCache.maxSeen - _blockCache.CONFIRM_DEPTH) return;  // near tip: may reorg
+            if (_blockCache.map.has(h)) return;
+            let bytes = bytesHint;
+            if (!Number.isFinite(bytes)) {
+                try { bytes = JSON.stringify(block).length; } catch (_) { bytes = 16384; }
+            }
+            _blockCache.map.set(h, { block, bytes });
+            _blockCache.bytes += bytes;
+            while (_blockCache.map.size > 0 &&
+                   (_blockCache.map.size > _blockCache.MAX_ENTRIES || _blockCache.bytes > _blockCache.MAX_BYTES)) {
+                const [oldH, oldE] = _blockCache.map.entries().next().value;
+                _blockCache.map.delete(oldH);
+                _blockCache.bytes -= oldE.bytes;
+            }
+        }
+
+        // Unified single-block fetch: cache → WebRTC (loudly, not silently,
+        // falling back) → throttled HTTPS gateway. Returns null for a block the
+        // gateway says doesn't exist, matching the old semantics.
+        async function getBlockUnified(lc, url, height) {
+            _blockCacheNoteTip(height);
+            const hit = _blockCacheGet(height);
+            if (hit) return hit;
+
+            if (lc) {
+                try {
+                    const b = await lcCall(lc.getBlock(height));
+                    _blockCachePut(height, b);
+                    _lcMarkOk();
+                    return b;
+                } catch (e) {
+                    _lcMarkBad(e.message);
+                    console.warn(`[rpc] WebRTC getBlock(${height}) failed — falling back to the HTTPS gateway:`, e && e.message);
+                }
+            }
+
+            const r = await gatewayFetch(`${url}/block/${height}`, { cache: 'no-store', keepalive: true });
+            if (!r.ok) return null;
+            const text = await r.text();
+            let block = null;
+            try { block = JSON.parse(text); } catch (_) { return null; }
+            _blockCachePut(height, block, text.length);
+            return block;
+        }
 
         // ── RPC Bridge ──────────────────────────────────────────────────────────
         // Handles RPC_REQUEST messages from worker.js. Executes the network call
@@ -2641,88 +2938,87 @@ if ('serviceWorker' in navigator) {
         // RPC_RESPONSE so the worker's awaiting promise resolves.
 
         async function handleRpcRequest(id, method, params) {
-            const respond = (result, error) => worker.postMessage({ type: 'RPC_RESPONSE', payload: { id, result, error } });
+            const respond = (result, error, code) => worker.postMessage({ type: 'RPC_RESPONSE', payload: { id, result, error, code } });
             try {
-                const lc  = lightClient?.isConnected ? lightClient : null;
+                // HEALTH GATING: ONLY route traffic if a ping has successfully proven the
+                // stream reader can actually unframe responses.
+                const lc  = (lightClient?.isConnected && _lcHealth.ok) ? lightClient : null;
                 const url = _rpcUrl.replace(/\/+$/, '');
                 let result;
 
                 if (method === 'getState') {
-                    result = lc
-                        ? await lc.getState()
-                        : await fetch(`${url}/state`, { cache: 'no-store' }).then(r => r.json());
-
-                } else if (method === 'getMempool') {
-                    if (lc) { result = await lc.getMempool(); }
-                    else { const r = await fetch(`${url}/mempool`, { cache: 'no-store' }); result = r.ok ? await r.json() : { size: 0, transactions: [] }; }
-
- } else if (method === 'getBlock') {
                     let success = false;
-                    if (lc) { 
-                        try { 
-                            result = await lc.getBlock(params.height); 
-                            success = true;
-                        } catch(e) {}
-                    }
-                    if (!success) { 
-                        const r = await fetch(`${url}/block/${params.height}`, { cache: 'no-store', keepalive: true }); 
-                        result = r.ok ? await r.json() : null; 
-                    }
-
-} else if (method === 'getFilters') {
-                    let success = false;
-                    if (lc) { 
-                        try { 
-                            result = await lc.getFilters(params.startHeight, params.endHeight); 
-                            success = true;
-                        } catch(e) { console.warn("WebRTC filter fetch failed, falling back to HTTPS"); }
+                    if (lc) {
+                        try { result = await lcCall(lc.getState()); _lcMarkOk(); success = true; }
+                        catch (e) { _lcMarkBad(e.message); console.warn("WebRTC getState failed, falling back to HTTPS:", e.message); }
                     }
                     if (!success) {
-                        const r = await fetch(`${url}/filters`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ start_height: params.startHeight, end_height: params.endHeight }), cache: 'no-store' });
+                        result = await gatewayFetch(`${url}/state`, { cache: 'no-store' }).then(r => r.json());
+                    }
+                    if (result) _blockCacheNoteTip(result.height);
+
+                } else if (method === 'getMempool') {
+                    let success = false;
+                    if (lc) {
+                        try { result = await lcCall(lc.getMempool()); _lcMarkOk(); success = true; }
+                        catch (e) { _lcMarkBad(e.message); console.warn("WebRTC getMempool failed, falling back to HTTPS:", e.message); }
+                    }
+                    if (!success) {
+                        const r = await gatewayFetch(`${url}/mempool`, { cache: 'no-store' }); 
+                        result = r.ok ? await r.json() : { size: 0, transactions: [] }; 
+                    }
+
+                } else if (method === 'getBlock') {
+                    // Cache → WebRTC (with a warning on failure) → throttled gateway.
+                    result = await getBlockUnified(lc, url, params.height);
+
+                } else if (method === 'getFilters') {
+                    let success = false;
+                    if (lc) { 
+                        try { 
+                            result = await lcCall(lc.getFilters(params.startHeight, params.endHeight)); 
+                            _lcMarkOk();
+                            success = true;
+                        } catch(e) { _lcMarkBad(e.message); console.warn("WebRTC filter fetch failed, falling back to HTTPS"); }
+                    }
+                    if (!success) {
+                        const r = await gatewayFetch(`${url}/filters`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ start_height: params.startHeight, end_height: params.endHeight }), cache: 'no-store' });
                         if (!r.ok) throw new Error('Failed to fetch filters.');
                         result = await r.json();
                     }
 
                 } else if (method === 'getMssState') {
-                    // RESILIENCE FIX: this was the ONLY read RPC with no try/catch and no
-                    // HTTPS fallback around the WebRTC path — a single stream hiccup here
-                    // aborted whole sends with "Safety Check Failed / key reuse" (it hit
-                    // the DEX announce hardest, being the first send right after the
-                    // funding flow's heavy network activity). Same pattern as getFilters.
                     let success = false;
                     if (lc) {
-                        try { result = await lc.mssState(params.masterPkHex); success = true; }
-                        catch (e) { console.warn("WebRTC mss_state failed, falling back to HTTPS:", e.message); }
+                        try { result = await lcCall(lc.mssState(params.masterPkHex)); _lcMarkOk(); success = true; }
+                        catch (e) { _lcMarkBad(e.message); console.warn("WebRTC mss_state failed, falling back to HTTPS:", e.message); }
                     }
                     if (!success) {
-                        const r = await fetch(`${url}/mss_state`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ master_pk: params.masterPkHex }), cache: 'no-store' });
+                        const r = await gatewayFetch(`${url}/mss_state`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ master_pk: params.masterPkHex }), cache: 'no-store' }, { priority: true });
                         if (!r.ok) throw new Error('mss_state fetch failed: HTTP ' + r.status);
                         result = await r.json();
                     }
 
                 } else if (method === 'getBlockTemplate') {
-                    if (lc) {
-                        const resp = await lc.getBlockTemplate(params.coinbase);
-                        result = { ok: resp.ok, status: resp.status ?? (resp.ok ? 200 : 500), body: resp.ok ? await resp.json() : await resp.text() };
+                    if (lightClient && lightClient.isConnected) { // Template ignores health gate (mining is WebRTC only)
+                        try {
+                            const resp = await lcCall(lightClient.getBlockTemplate(params.coinbase));
+                            result = { ok: resp.ok, status: resp.status ?? (resp.ok ? 200 : 500), body: resp.ok ? await resp.json() : await resp.text() };
+                        } catch (e) {
+                            result = { ok: false, status: 500, body: e.message };
+                        }
                     } else {
-                        // Mining is WebRTC-only. The HTTPS gateway serves the wallet but
-                        // does not hand out mining templates. Without a WebRTC connection,
-                        // mining cannot proceed.
                         result = { ok: false, status: 403, body: 'Mining is only available over WebRTC. Connect to a full node via a bootstrap multiaddr to mine.' };
                     }
 
                 } else if (method === 'submitBatch') {
-                    // Mined-block submission is WebRTC-only. This is never sent over the
-                    // HTTPS gateway, so a block found while on HTTPS cannot be submitted.
-                    if (!lc) {
-                        result = { ok: false, body: 'Block submission is only available over WebRTC. Connect to a full node to submit mined blocks.' };
-                    } else {
+                    if (lightClient && lightClient.isConnected) {
                         try {
-                            const resp = await lc.submitBatch(params.batch);
+                            const resp = await lcCall(lightClient.submitBatch(params.batch));
                             result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
+                            _lcMarkOk();
                         } catch (e) {
-                            // WebRTC dropped mid-submit — try to reconnect over WebRTC and retry once.
-                            // There is deliberately no HTTPS fallback for mining.
+                            _lcMarkBad(e.message);
                             console.warn('[rpc] submitBatch via WebRTC failed, attempting WebRTC reconnect:', e.message);
                             if (lightClient && !lightClient.isConnected) {
                                 for (const addr of lightClient.knownMultiaddrs) {
@@ -2730,27 +3026,31 @@ if ('serviceWorker' in navigator) {
                                 }
                             }
                             if (lightClient?.isConnected) {
-                                const resp = await lightClient.submitBatch(params.batch);
+                                const resp = await lcCall(lightClient.submitBatch(params.batch));
                                 result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
                             } else {
                                 throw new Error('Block submission failed: WebRTC connection lost and mining does not fall back to HTTPS.');
                             }
                         }
+                    } else {
+                        result = { ok: false, body: 'Block submission is only available over WebRTC. Connect to a full node to submit mined blocks.' };
                     }
 
                 } else if (method === 'commit') {
                     let submitted = false;
                     if (lc) {
                         try {
-                            const resp = await lc.commit(params.commitmentHex, params.spamNonce);
+                            const resp = await lcCall(lc.commit(params.commitmentHex, params.spamNonce));
                             result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
+                            _lcMarkOk();
                             submitted = true;
                         } catch (e) {
+                            _lcMarkBad(e.message);
                             console.warn('[rpc] commit via WebRTC failed, trying HTTPS:', e.message);
                         }
                     }
                     if (!submitted) {
-                        const r = await fetch(`${url}/commit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ commitment: params.commitmentHex, spam_nonce: params.spamNonce }) });
+                        const r = await gatewayFetch(`${url}/commit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ commitment: params.commitmentHex, spam_nonce: params.spamNonce }) }, { priority: true });
                         result = { ok: r.ok, body: r.ok ? null : await r.text() };
                     }
 
@@ -2759,15 +3059,17 @@ if ('serviceWorker' in navigator) {
                     if (lc) {
                         try {
                             const parsed = typeof params.revealPayload === 'string' ? JSON.parse(params.revealPayload) : params.revealPayload;
-                            const resp = await lc.send(parsed);
+                            const resp = await lcCall(lc.send(parsed));
                             result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
+                            _lcMarkOk();
                             submitted = true;
                         } catch (e) {
+                            _lcMarkBad(e.message);
                             console.warn('[rpc] send via WebRTC failed, trying HTTPS:', e.message);
                         }
                     }
                     if (!submitted) {
-                        const r = await fetch(`${url}/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: params.revealPayload });
+                        const r = await gatewayFetch(`${url}/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: params.revealPayload }, { priority: true });
                         result = { ok: r.ok, body: r.ok ? null : await r.text() };
                     }
 
@@ -2775,12 +3077,13 @@ if ('serviceWorker' in navigator) {
                     let success = false;
                     if (lc) {
                         try {
-                            result = await lc.checkCoin(params.coinHex);
+                            result = await lcCall(lc.checkCoin(params.coinHex));
+                            _lcMarkOk();
                             success = true;
-                        } catch (e) { console.warn('[rpc] checkCoin via WebRTC failed:', e.message); }
+                        } catch (e) { _lcMarkBad(e.message); console.warn('[rpc] checkCoin via WebRTC failed:', e.message); }
                     }
                     if (!success) { 
-                        const r = await fetch(`${url}/check`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ coin: params.coinHex }) }); 
+                        const r = await gatewayFetch(`${url}/check`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ coin: params.coinHex }) }); 
                         result = r.ok ? await r.json() : null; 
                     }
 
@@ -2788,21 +3091,31 @@ if ('serviceWorker' in navigator) {
                     let success = false;
                     if (lc) {
                         try {
-                            result = await lc.checkCommitment(params.commitmentHex);
+                            result = await lcCall(lc.checkCommitment(params.commitmentHex));
+                            _lcMarkOk();
                             success = true;
-                        } catch (e) { console.warn('[rpc] checkCommitment via WebRTC failed:', e.message); }
+                        } catch (e) { _lcMarkBad(e.message); console.warn('[rpc] checkCommitment via WebRTC failed:', e.message); }
                     }
                     if (!success) { 
-                        const r = await fetch(`${url}/check_commitment`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ commitment: params.commitmentHex }) }); 
+                        const r = await gatewayFetch(`${url}/check_commitment`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ commitment: params.commitmentHex }) }, { priority: true }); 
                         result = r.ok ? await r.json() : null; 
                     }
                 } else if (method === 'sendChat') {
                     const attachments = params.attachments || [];
+                    let submitted = false;
                     if (lc) {
-                        const resp = await lc.sendChat(params.words, params.replyTo, attachments);
-                        result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
-                    } else {
-                        const r = await fetch(`${url}/api/chat`, {
+                        try {
+                            const resp = await lcCall(lc.sendChat(params.words, params.replyTo, attachments));
+                            result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
+                            _lcMarkOk();
+                            submitted = true;
+                        } catch(e) {
+                            _lcMarkBad(e.message);
+                            console.warn('[rpc] sendChat WebRTC failed, trying HTTPS:', e.message);
+                        }
+                    } 
+                    if (!submitted) {
+                        const r = await gatewayFetch(`${url}/api/chat`, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
@@ -2810,16 +3123,25 @@ if ('serviceWorker' in navigator) {
                                 reply_to: params.replyTo,
                                 attachments,
                             }),
-                        });
+                        }, { priority: true });
                         result = { ok: r.ok, body: r.ok ? null : await r.text() };
                     }
                 } else if (method === 'submitChat') {
                     const attachments = params.attachments || [];
+                    let submitted = false;
                     if (lc) {
-                        const resp = await lc.submitChat(params.sender, params.timestamp, params.nonce, params.replyTo, params.words, attachments);
-                        result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
-                    } else {
-                        const r = await fetch(`${url}/api/chat/submit`, {
+                        try {
+                            const resp = await lcCall(lc.submitChat(params.sender, params.timestamp, params.nonce, params.replyTo, params.words, attachments));
+                            result = { ok: resp.ok, body: resp.ok ? null : (resp.error || 'rejected') };
+                            _lcMarkOk();
+                            submitted = true;
+                        } catch(e) {
+                            _lcMarkBad(e.message);
+                            console.warn('[rpc] submitChat WebRTC failed, trying HTTPS:', e.message);
+                        }
+                    } 
+                    if (!submitted) {
+                        const r = await gatewayFetch(`${url}/api/chat/submit`, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
@@ -2830,13 +3152,12 @@ if ('serviceWorker' in navigator) {
                                 words: params.words,
                                 attachments,
                             }),
-                        });
+                        }, { priority: true });
                         result = { ok: r.ok, body: r.ok ? null : await r.text() };
                     }
                     
-                    
                 } else if (method === 'getChat') {
-                    const r = await fetch(`${url}/api/chat`, { cache: 'no-store' });
+                    const r = await gatewayFetch(`${url}/api/chat`, { cache: 'no-store' });
                     result = r.ok ? await r.json() : { messages: [], dictionary: [] };
                 } else {
                     throw new Error(`Unknown RPC method: ${method}`);
@@ -2844,7 +3165,7 @@ if ('serviceWorker' in navigator) {
 
                 respond(result);
             } catch (e) {
-                respond(undefined, e.message);
+                respond(undefined, e.message, e && e.code);
             }
         }
 
@@ -2947,6 +3268,7 @@ if ('serviceWorker' in navigator) {
                 if (payload.networkHeight !== undefined) {
                     document.getElementById('uiNetworkHeight').innerText = payload.networkHeight;
                     networkHeight = payload.networkHeight; 
+                    _blockCacheNoteTip(networkHeight);
                 }
                 if (payload.mempoolSize !== undefined) document.getElementById('uiMempoolSize').innerText = payload.mempoolSize;
 
@@ -5285,6 +5607,20 @@ document.getElementById('btnExport').onclick = () => {
         window.dexRecoverOrders = function() {
             const btn = document.getElementById('dexRecoverBtn');
             const el = document.getElementById('dexRecoverStatus');
+            // Never run two full-chain block scans at once — concurrent recover +
+            // orderbook scans are exactly the request stampede that got the HTTPS
+            // gateway 429ing. If the periodic announcements scan is mid-flight,
+            // wait for it and start automatically once it finishes.
+            if (_dexScanInFlight || _dexRecoverInFlight) {
+                if (btn) { btn.disabled = true; btn.textContent = 'Waiting for scan…'; }
+                if (el) el.textContent = 'Another chain scan is running — recovery will start when it finishes.';
+                const wait = setInterval(() => {
+                    if (!_dexScanInFlight && !_dexRecoverInFlight) { clearInterval(wait); window.dexRecoverOrders(); }
+                }, 2000);
+                return;
+            }
+            _dexRecoverInFlight = true;
+            _dexRecoverStartedAt = Date.now();
             if (btn) { btn.disabled = true; btn.textContent = 'Scanning…'; }
             if (el) el.textContent = 'Scanning chain for your orders…';
             worker.postMessage({ type: 'DEX_RECOVER_ORDERS', payload: {} });
@@ -6157,6 +6493,7 @@ document.getElementById('btnExport').onclick = () => {
                 if (el) el.textContent = `Scanning chain for your orders… ${pct}% (${found} found)`;
             }
             else if (e.data.type === 'DEX_RECOVER_DONE') {
+                _dexRecoverInFlight = false;
                 const { recovered, error } = e.data.payload;
                 const el = document.getElementById('dexRecoverStatus');
                 const btn = document.getElementById('dexRecoverBtn');
@@ -7811,12 +8148,32 @@ document.getElementById('btnExport').onclick = () => {
         // Passing a saved resume-height would make scans incremental — and incomplete — which
         // would break that replacement contract, so it is deliberately no longer sent.
         let _dexScanInFlight = false;
+        let _dexScanStartedAt = 0;
+        // Set by dexRecoverOrders(), cleared by the DEX_RECOVER_DONE handler.
+        // Together with _dexScanInFlight this guarantees only ONE full-chain
+        // block scan runs at a time.
+        let _dexRecoverInFlight = false;
+        let _dexRecoverStartedAt = 0;
         function dexScanAnnouncements() {
-            if (_dexScanInFlight) return;
+            if (_dexScanInFlight || _dexRecoverInFlight) return;
             _dexScanInFlight = true;
+            _dexScanStartedAt = Date.now();
             worker.postMessage({ type: 'DEX_SCAN_ANNOUNCEMENTS', payload: {} });
         }
         setInterval(() => {
+            // Watchdogs: if a worker reply is ever lost (worker crashed between
+            // starting a scan and posting its result), don't let a wedged flag
+            // silently kill all future scans. Both scans finish in well under
+            // 10 minutes even fully throttled.
+            const WEDGE_MS = 10 * 60_000;
+            if (_dexScanInFlight && Date.now() - _dexScanStartedAt > WEDGE_MS) {
+                console.warn('[dex] announcements-scan watchdog: resetting stuck in-flight flag');
+                _dexScanInFlight = false;
+            }
+            if (_dexRecoverInFlight && Date.now() - _dexRecoverStartedAt > WEDGE_MS) {
+                console.warn('[dex] recover-scan watchdog: resetting stuck in-flight flag');
+                _dexRecoverInFlight = false;
+            }
             dexScanAnnouncements();
             try { dexScanBids(); } catch (_) {}
             for (const o of dexOrderbook) if (o.onchain && o.covenant && o.covenant.coinId) dexVerifyCovenantCoin(o);
