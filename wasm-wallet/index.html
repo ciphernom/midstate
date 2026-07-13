@@ -1327,7 +1327,7 @@
                 <input type="text" id="l2PeerPk" placeholder="Peer's 64-hex L2 Identity">
                 <input type="number" id="l2FundAmount" placeholder="Amount to Fund (MDS)">
                 <button id="btnOpenChannel" style="background: var(--text-max); color: #000; margin-bottom: 0;">Fund Channel</button>
-                <div style="font-size: 10px; color: #666; margin-top: 8px;">A 100 MDS reserve fee is added to cover the closing transaction.</div>
+                <div style="font-size: 10px; color: #666; margin-top: 8px;">A 2,000 MDS reserve fee is added to cover the closing transaction.</div>
             </div>
 
             <h3 style="margin-top: 1.5rem; font-size: 12px; color: #666; text-transform: uppercase;">Active Channels</h3>
@@ -5053,7 +5053,7 @@ document.getElementById('btnExport').onclick = () => {
 
                 const mds = Number(b.mdsAmount);
                 const bond = BigInt(b.fillBond);
-                const needMds = mds + 1024 + 600; // payout + covenant fee budget + our tx fee margin
+                const needMds = mds + 4096 + 1000;// payout + covenant fee budget + our tx fee margin
                 const bal = Number(window._dexMdsBalance || 0);
                 if (bal < needMds) return showToast(`Not enough MDS: this fill needs ~${needMds} (payout + fees), you have ${bal}.`, "error");
 

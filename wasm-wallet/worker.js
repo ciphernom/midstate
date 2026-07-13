@@ -66,10 +66,10 @@ function releaseSendLock() {
 // is what lets a buyer who holds zero MDS still self-deliver as a fallback.
 // Unused budget (FEE_BUDGET − actual fee) returns to whoever broadcasts the
 // delivery as change. Generous on purpose; the real cost is only the network fee.
-const COVENANT_FEE_BUDGET = 1024;
+const COVENANT_FEE_BUDGET = 4096;
 // What a buyer requires the lock to be over-funded by before locking ETH, so the
 // delivery is guaranteed to be affordable from the locked value.
-const COVENANT_MIN_FEE_RESERVE = 256;
+const COVENANT_MIN_FEE_RESERVE = 1024;
 
 // ── Contract tracking (MidstateConnect) ─────────────────────────────────────
 let watchedContracts = new Set();   // hex contract addresses we are tracking
@@ -2930,7 +2930,8 @@ self.onmessage = async (e) => {
                     if (!chk || !chk.exists) return fail("covenant coin not found on-chain (yet?)");
                     total += Number(c.value);
                 }
-                if (total < Number(minPayout) + 200) return fail("locked value too small to pay out + claim fee");
+                if (total < Number(minPayout) + 1024) return fail("locked value too small to pay out + claim fee");
+
                 self.postMessage({ type: 'DEX_BIDFILL_VERIFY_RESULT', payload: { bidId, ok: true } });
             } catch (err) {
                 self.postMessage({ type: 'DEX_BIDFILL_VERIFY_RESULT', payload: { bidId: payload && payload.bidId, ok: false, reason: (err && err.message) || String(err) } });
@@ -3244,7 +3245,7 @@ else if (type === 'L2_OPEN_CHANNEL') {
             pendingChannelOpen = { channelAddr, alicePk: aPk, bobPk: bPk, amount: Number(amount), isAlice };
             
             await acquireSendLock();
-            try { await performSend(channelAddr, Number(amount) + 100); } 
+            try { await performSend(channelAddr, Number(amount) + 2000); } 
             finally { releaseSendLock(); }
         }
         else if (type === 'L2_PAY') {
@@ -4381,14 +4382,14 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
         let total = 0n;
         for (const u of utxoArray) total += BigInt(u.value);
         if (total <= 0n) throw new Error("Nothing to send — balance is zero.");
-        let amt = total > 300n ? total - 300n : total;   // start just under a safe fee overestimate
-        let fee = 300n, converged = false;
-        for (let i = 0; i < 6; i++) {
+        let amt = total > 3000n ? total - 3000n : total;   // start under a safe fee overestimate
+        let fee = 3000n, converged = false;
+        for (let i = 0; i < 10; i++) {
             let est;
             try {
                 est = JSON.parse(wallet.prepare_spend(JSON.stringify(utxoArray), toAddress, amt, wState.nextWotsIndex, null, null));
             } catch (e) {
-                amt = amt > 100n ? amt - 100n : 0n;      // fee didn't fit yet; step down and retry
+                amt = amt > 500n ? amt - 500n : 0n;      // fee didn't fit yet; step down and retry
                 if (amt <= 0n) throw new Error("Balance is too small to cover the network fee.");
                 continue;
             }
@@ -4512,7 +4513,7 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
         wState.l2_channels[pendingChannelOpen.channelCoinId] = {
             alice_pk: pendingChannelOpen.alicePk,
             bob_pk: pendingChannelOpen.bobPk,
-            channel_value: pendingChannelOpen.amount + 100, 
+            channel_value: pendingChannelOpen.amount + 2000, 
             channel_salt: pendingChannelOpen.channelSalt,
             is_alice: pendingChannelOpen.isAlice,
             latest_state: {
@@ -4847,7 +4848,7 @@ async function handleL2Chat(msg) {
             bob_sig:   channel.is_alice ? counterpartySig : mySig,
             is_fully_signed: true
         };
-        if (channel.channel_value === 0) channel.channel_value = aliceAmt + bobAmt + 100;
+        if (channel.channel_value === 0) channel.channel_value = aliceAmt + bobAmt + 2000;
         await saveState();
 
         if (cmd === 40 || cmd === 42) { // reply CONFIRM for UPDATE / ADD_HTLC

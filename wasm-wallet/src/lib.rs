@@ -606,7 +606,7 @@ impl WebWallet {
                 + (if current_state_hex.is_some() { 100 } else { 0 }) 
                 + (num_outputs as u64 * 100);
                 
-            let required_fee = (estimated_bytes * 10) / 1024 + 10;
+            let required_fee = (estimated_bytes * 100) / 1024 + 50;
 
             if total >= extra_value + required_fee {
                 final_fee = required_fee;
@@ -1274,7 +1274,7 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
                 + (selected.len() as u64 * 1636)
                 + contract_bytes_est
                 + (num_outputs as u64 * 100);
-            let required_fee = (estimated_bytes * 10) / 1024 + 10;
+            let required_fee = (estimated_bytes * 100) / 1024 + 50;
 
             if contract_in_value + wallet_in >= total_out + required_fee {
                 final_fee = required_fee;
@@ -1738,7 +1738,7 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
             let change_for_size = wallet_in.saturating_sub(amount).saturating_sub(target_fee);
             let num_outputs = outputs_out.len() + decompose_value(change_for_size).len();
             let estimated = 100 + (selected.len() as u64 * 1636) + (num_outputs as u64 * 100);
-            let req = (estimated * 10) / 1024 + 10;
+            let req = (estimated * 100) / 1024 + 50;
             if wallet_in >= amount + req { final_fee = req; break; } else { target_fee = req; }
         }
 
@@ -1967,7 +1967,7 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
             let change_for_size = wallet_in.saturating_sub(total_amount).saturating_sub(db_val).saturating_sub(target_fee);
             let num_outputs = outputs_out.len() + decompose_value(change_for_size).len();
             let estimated = 100 + (selected.len() as u64 * 1636) + (num_outputs as u64 * 100) + burn_payload_bytes;
-            let req = (estimated * 10) / 1024 + 10;
+            let req = (estimated * 100) / 1024 + 50;
             if wallet_in >= total_amount + db_val + req { final_fee = req; break; } else { target_fee = req; }
         }
 
@@ -2121,7 +2121,7 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
 
         // Exact CLI math: 1 Signature + inputs
         let estimated_bytes = 600 + 3000 + 100 + (available.len() as u64 * 125);
-        let final_fee = (estimated_bytes * 10) / 1024 + 20; // 20 units padding
+        let final_fee = (estimated_bytes * 100) / 1024 + 50; // 50 units padding
 
         if total <= final_fee {
             return Err(JsValue::from_str(&format!("Total value {} is too low to pay the network fee of {}", total, final_fee)));
@@ -2378,7 +2378,7 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
 
             let estimated_bytes = 100 + (selected.len() as u64 * 1636) + (num_outputs as u64 * 100)
                 + databurn_hex.as_ref().map(|h| (h.len() / 2) as u64).unwrap_or(0);
-            let required_fee = (estimated_bytes * 10) / 1024 + 10;
+            let required_fee = (estimated_bytes * 100) / 1024 + 50;
 
             if total >= send_amount + db_val + required_fee {
                 let final_fee = required_fee;
