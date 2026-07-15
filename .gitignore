@@ -21,3 +21,5 @@ target/
 Cargo.lock
 midstate-pool/data/
 state.redb
+
+/midstate_relayer_daemon

@@ -13,17 +13,25 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
 <body class="page-explorer">
 
 <div class="hdr">
-    <h1>MIDSTATE<span style="color:var(--accent);">.</span>EXPLORER</h1>
-    <div class="explorer-tabs" id="tabs">
-        <a class="tab-link active" onclick="switchTab('explorer')">BATCHES</a>
-        <a class="tab-link" onclick="switchTab('mempool')">MEMPOOL</a>
-        <a class="tab-link" onclick="switchTab('analytics')">ANALYTICS</a>
+    <div class="hdr-left">
+        <h1>MIDSTATE<span style="color:var(--accent);">.</span>EXPLORER</h1>
+        <div class="explorer-tabs" id="tabs">
+            <a class="tab-link active" onclick="switchTab('explorer')">BATCHES</a>
+            <a class="tab-link" onclick="switchTab('mempool')">MEMPOOL</a>
+            <a class="tab-link" onclick="switchTab('analytics')">ANALYTICS</a>
+        </div>
+    </div>
+    <div class="hdr-center">
+        <div class="search-bar">
+            <input type="text" id="top-search" placeholder="height, hash, address, coin_id..." spellcheck="false" onkeydown="if(event.key === 'Enter') handleTopSearch()">
+            <button class="btn" onclick="handleTopSearch()" title="Search / Go">⏎</button>
+        </div>
     </div>
     <div class="hdr-right">
-        <span><div class="live-dot" id="live-dot"></div> <span class="label">HEIGHT</span> <span class="val" id="h-height">-</span></span>
-        <span><span class="label">MEMPOOL</span> <span class="val" id="h-mempool">-</span></span>
-        <span><span class="label">REWARD</span> <span class="val" id="h-reward">-</span></span>
-        <span><span class="label">TARGET</span> <span class="val" id="h-target">-</span></span>
+        <span class="live-stat"><div class="live-dot" id="live-dot"></div> <span class="label">H</span> <span class="val" id="h-height">-</span></span>
+        <span class="live-stat"><span class="label">M</span> <span class="val" id="h-mempool">-</span></span>
+        <span class="live-stat"><span class="label">R</span> <span class="val" id="h-reward">-</span></span>
+        <span class="live-stat"><span class="label">T</span> <span class="val" id="h-target">-</span></span>
         <button id="theme-toggle" class="btn theme-toggle" onclick="toggleTheme()" title="Toggle light / dark" aria-label="Toggle theme"><svg class="icon-sun" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg><svg class="icon-moon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
     </div>
 </div>
@@ -62,6 +70,7 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
 <script>
 let tipHeight = 0;
 let activeBatch = null;
+let activeAddress = null;
 let activeQuery = null;
 
 // blockCache stores {txCount, cbCount} keyed by height, populated when blocks are loaded
@@ -83,6 +92,479 @@ let lastBatchListHtml = '';
 
 
 // ── Helpers ─────────────────────────────────────────────────────────────
+
+// ==================== BLAKE3 ====================
+// Pure-JS BLAKE3, byte-identical to the Rust `blake3` crate (v1.5.0) the node
+// uses. Verified against 535 vectors generated from that crate.
+//
+// It replaces an implementation that was not BLAKE3 at all: it flagged every
+// block CHUNK_START, never CHUNK_END, advanced the counter per 64-byte block
+// instead of per 1024-byte chunk, and finalised over an empty block. It
+// returned the wrong digest for every input including "abc" — so the /scan PoW
+// gate could never pass: the client mined against its own hash while the server
+// recomputed the real one and rejected every submission.
+//
+// TWO ENTRY POINTS, AND THE DIFFERENCE MATTERS:
+//   blake3Hex(str)        -> hashes the UTF-8 BYTES OF THE STRING.
+//                            Use for the PoW preimage: the server computes
+//                            blake3::hash(input.as_bytes()) over "addr:h:ts:nonce".
+//   blake3_hash_hex(hex)  -> DECODES the hex first, then hashes those bytes.
+//                            Use for address checksums: blake3(address_bytes)[0..4].
+// Mixing them up yields a valid-looking wrong hash.
+(function() {
+  const OUT_LEN = 32;
+  const KEY_LEN = 32;
+  const BLOCK_LEN = 64;
+  const CHUNK_LEN = 1024;
+
+  const CHUNK_START = 1 << 0;
+  const CHUNK_END = 1 << 1;
+  const PARENT = 1 << 2;
+  const ROOT = 1 << 3;
+  const KEYED_HASH = 1 << 4;
+  const DERIVE_KEY_CONTEXT = 1 << 5;
+  const DERIVE_KEY_MATERIAL = 1 << 6;
+
+  // The SHA-256 initialisation vector.
+  const IV = Uint32Array.of(
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+  );
+
+  const MSG_PERMUTATION = Uint8Array.of(2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
+
+  // ── 32-bit primitives ────────────────────────────────────────────────────────
+  // JS numbers are doubles, so a+b+c for three uint32 tops out around 2^33.6 —
+  // well inside the 2^53 exact-integer range. The `>>> 0` then truncates to
+  // uint32, giving exactly Rust's wrapping_add.
+  const rotr = (x, n) => ((x >>> n) | (x << (32 - n))) >>> 0;
+
+  function g(s, a, b, c, d, mx, my) {
+    s[a] = (s[a] + s[b] + mx) >>> 0;
+    s[d] = rotr(s[d] ^ s[a], 16);
+    s[c] = (s[c] + s[d]) >>> 0;
+    s[b] = rotr(s[b] ^ s[c], 12);
+    s[a] = (s[a] + s[b] + my) >>> 0;
+    s[d] = rotr(s[d] ^ s[a], 8);
+    s[c] = (s[c] + s[d]) >>> 0;
+    s[b] = rotr(s[b] ^ s[c], 7);
+  }
+
+  function round(s, m) {
+    // Columns.
+    g(s, 0, 4, 8, 12, m[0], m[1]);
+    g(s, 1, 5, 9, 13, m[2], m[3]);
+    g(s, 2, 6, 10, 14, m[4], m[5]);
+    g(s, 3, 7, 11, 15, m[6], m[7]);
+    // Diagonals.
+    g(s, 0, 5, 10, 15, m[8], m[9]);
+    g(s, 1, 6, 11, 12, m[10], m[11]);
+    g(s, 2, 7, 8, 13, m[12], m[13]);
+    g(s, 3, 4, 9, 14, m[14], m[15]);
+  }
+
+  const _permScratch = new Uint32Array(16);
+  function permute(m) {
+    for (let i = 0; i < 16; i++) _permScratch[i] = m[MSG_PERMUTATION[i]];
+    m.set(_permScratch);
+  }
+
+  /**
+   * The BLAKE3 compression function. Returns all 16 state words: callers take
+   * the first 8 as a chaining value, or all 16 for root output.
+   * @param {Uint32Array} cv 8 words
+   * @param {Uint32Array} blockWords 16 words
+   * @param {number} counter u64 as a JS number (exact below 2^53; a chunk
+   *   counter that large would need ~2^63 bytes of input)
+   */
+  function compress(cv, blockWords, counter, blockLen, flags) {
+    const s = new Uint32Array(16);
+    s[0] = cv[0]; s[1] = cv[1]; s[2] = cv[2]; s[3] = cv[3];
+    s[4] = cv[4]; s[5] = cv[5]; s[6] = cv[6]; s[7] = cv[7];
+    s[8] = IV[0]; s[9] = IV[1]; s[10] = IV[2]; s[11] = IV[3];
+    s[12] = counter >>> 0;                        // counter low word
+    s[13] = Math.floor(counter / 0x100000000) >>> 0;  // counter high word
+    s[14] = blockLen >>> 0;
+    s[15] = flags >>> 0;
+
+    const m = Uint32Array.from(blockWords);       // permute mutates; don't touch the caller's copy
+
+    // 7 rounds, permuting between them (6 permutations).
+    round(s, m); permute(m);
+    round(s, m); permute(m);
+    round(s, m); permute(m);
+    round(s, m); permute(m);
+    round(s, m); permute(m);
+    round(s, m); permute(m);
+    round(s, m);
+
+    for (let i = 0; i < 8; i++) {
+      s[i] = (s[i] ^ s[i + 8]) >>> 0;
+      s[i + 8] = (s[i + 8] ^ cv[i]) >>> 0;
+    }
+    return s;
+  }
+
+  function first8(words) { return words.slice(0, 8); }
+
+  /** Read 16 little-endian u32 from a 64-byte block. */
+  function wordsFromLeBytes64(bytes, out) {
+    for (let i = 0; i < 16; i++) {
+      const o = i * 4;
+      out[i] = (bytes[o] | (bytes[o + 1] << 8) | (bytes[o + 2] << 16) | (bytes[o + 3] << 24)) >>> 0;
+    }
+    return out;
+  }
+
+  // ── Output ───────────────────────────────────────────────────────────────────
+  // A node's compression inputs, deferred: the same words yield either a chaining
+  // value (feeding a parent) or the root hash (with ROOT set). Deferring is what
+  // lets BLAKE3 decide "am I the root?" only at finalize.
+  class Output {
+    constructor(inputCv, blockWords, counter, blockLen, flags) {
+      this.inputCv = inputCv;
+      this.blockWords = blockWords;
+      this.counter = counter;
+      this.blockLen = blockLen;
+      this.flags = flags;
+    }
+    chainingValue() {
+      return first8(compress(this.inputCv, this.blockWords, this.counter, this.blockLen, this.flags));
+    }
+    /** Root bytes. Each 64-byte output block bumps the counter, so this extends
+     *  to arbitrary length — Midstate only ever asks for 32. */
+    rootOutputBytes(out) {
+      let blockCounter = 0;
+      for (let off = 0; off < out.length; off += 2 * OUT_LEN) {
+        const words = compress(this.inputCv, this.blockWords, blockCounter, this.blockLen, this.flags | ROOT);
+        const take = Math.min(2 * OUT_LEN, out.length - off);
+        for (let i = 0; i < take; i++) {
+          out[off + i] = (words[i >> 2] >>> (8 * (i & 3))) & 0xff;
+        }
+        blockCounter++;
+      }
+      return out;
+    }
+  }
+
+  // ── ChunkState ───────────────────────────────────────────────────────────────
+  // One 1024-byte leaf: up to 16 blocks compressed in sequence. The first block
+  // carries CHUNK_START, the last CHUNK_END.
+  class ChunkState {
+    constructor(keyWords, chunkCounter, flags) {
+      this.cv = Uint32Array.from(keyWords);
+      this.chunkCounter = chunkCounter;
+      this.block = new Uint8Array(BLOCK_LEN);
+      this.blockLen = 0;
+      this.blocksCompressed = 0;
+      this.flags = flags;
+      this._words = new Uint32Array(16);
+    }
+    len() { return BLOCK_LEN * this.blocksCompressed + this.blockLen; }
+    startFlag() { return this.blocksCompressed === 0 ? CHUNK_START : 0; }
+    update(input, start, end) {
+      let i = start;
+      while (i < end) {
+        if (this.blockLen === BLOCK_LEN) {
+          wordsFromLeBytes64(this.block, this._words);
+          this.cv = first8(compress(this.cv, this._words, this.chunkCounter, BLOCK_LEN, this.flags | this.startFlag()));
+          this.blocksCompressed++;
+          this.block.fill(0);
+          this.blockLen = 0;
+        }
+        const want = BLOCK_LEN - this.blockLen;
+        const take = Math.min(want, end - i);
+        this.block.set(input.subarray(i, i + take), this.blockLen);
+        this.blockLen += take;
+        i += take;
+      }
+    }
+    output() {
+      const words = wordsFromLeBytes64(this.block, new Uint32Array(16));
+      return new Output(this.cv, words, this.chunkCounter, this.blockLen, this.flags | this.startFlag() | CHUNK_END);
+    }
+  }
+
+  function parentOutput(leftCv, rightCv, keyWords, flags) {
+    const blockWords = new Uint32Array(16);
+    blockWords.set(leftCv, 0);
+    blockWords.set(rightCv, 8);
+    return new Output(Uint32Array.from(keyWords), blockWords, 0, BLOCK_LEN, PARENT | flags);
+  }
+  function parentCv(leftCv, rightCv, keyWords, flags) {
+    return parentOutput(leftCv, rightCv, keyWords, flags).chainingValue();
+  }
+
+  // ── Hasher ───────────────────────────────────────────────────────────────────
+  class Blake3 {
+    constructor(keyWords = IV, flags = 0) {
+      this.keyWords = Uint32Array.from(keyWords);
+      this.chunkState = new ChunkState(this.keyWords, 0, flags);
+      this.cvStack = [];
+      this.flags = flags;
+    }
+
+    /**
+     * Merge completed subtrees.
+     *
+     * The stack discipline is the whole trick: the number of trailing zero bits
+     * in `totalChunks` is exactly how many subtrees are now complete and must be
+     * merged. That reproduces BLAKE3's canonical left-leaning tree without ever
+     * materialising it.
+     */
+    _addChunkChainingValue(newCv, totalChunks) {
+      let cv = newCv;
+      let n = totalChunks;
+      while ((n & 1) === 0) {
+        cv = parentCv(this.cvStack.pop(), cv, this.keyWords, this.flags);
+        n = Math.floor(n / 2);      // n >>= 1, but safe past 2^31
+      }
+      this.cvStack.push(cv);
+      return this;
+    }
+
+    update(data) {
+      const input = toBytes(data);
+      let i = 0;
+      while (i < input.length) {
+        if (this.chunkState.len() === CHUNK_LEN) {
+          const chunkCv = this.chunkState.output().chainingValue();
+          const totalChunks = this.chunkState.chunkCounter + 1;
+          this._addChunkChainingValue(chunkCv, totalChunks);
+          this.chunkState = new ChunkState(this.keyWords, totalChunks, this.flags);
+        }
+        const want = CHUNK_LEN - this.chunkState.len();
+        const take = Math.min(want, input.length - i);
+        this.chunkState.update(input, i, i + take);
+        i += take;
+      }
+      return this;
+    }
+
+    /** @param {number} length output bytes (default 32) */
+    finalize(length = OUT_LEN) {
+      let output = this.chunkState.output();
+      // Fold the stack right-to-left; the last fold becomes the root.
+      for (let i = this.cvStack.length - 1; i >= 0; i--) {
+        output = parentOutput(this.cvStack[i], output.chainingValue(), this.keyWords, this.flags);
+      }
+      return output.rootOutputBytes(new Uint8Array(length));
+    }
+  }
+
+  // ── Input coercion ───────────────────────────────────────────────────────────
+  function toBytes(data) {
+    if (data instanceof Uint8Array) return data;
+    if (typeof data === 'string') return new TextEncoder().encode(data);
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    if (Array.isArray(data)) return Uint8Array.from(data);
+    throw new TypeError('blake3: expected Uint8Array, ArrayBuffer, string or number[]');
+  }
+
+  // ── Public API ───────────────────────────────────────────────────────────────
+
+  /** Equivalent to Rust `blake3::hash(data)`. @returns {Uint8Array} 32 bytes */
+  function blake3(data, length = OUT_LEN) {
+    return new Blake3().update(data).finalize(length);
+  }
+
+  /** Hex convenience. Equivalent to `hex::encode(blake3::hash(data).as_bytes())`. */
+  function blake3Hex(data, length = OUT_LEN) {
+    return bytesToHex(blake3(data, length));
+  }
+
+  /**
+   * Drop-in for the wallet's WASM export `blake3_hash_hex(hex_data)`.
+   *
+   * NB the semantics: it takes a HEX STRING, decodes it to bytes, hashes those,
+   * and returns hex. It does NOT hash the string's characters. Matches the Rust
+   * wrapper including its quirk of treating undecodable input as empty
+   * (`hex::decode(..).unwrap_or_default()`), so a malformed argument hashes the
+   * empty string rather than throwing.
+   */
+  function blake3_hash_hex(hexData) {
+    let bytes;
+    try { bytes = hexToBytes(hexData); } catch (_) { bytes = new Uint8Array(0); }
+    return bytesToHex(blake3(bytes));
+  }
+
+  /** Rust `blake3::keyed_hash(key, data)`. Unused by Midstate; untested here. */
+  function keyedHash(key, data, length = OUT_LEN) {
+    const k = toBytes(key);
+    if (k.length !== KEY_LEN) throw new Error('blake3: key must be exactly 32 bytes');
+    const keyWords = wordsFromLeBytes32(k);
+    return new Blake3(keyWords, KEYED_HASH).update(data).finalize(length);
+  }
+
+  /** Rust `blake3::derive_key(context, key_material)`. Unused by Midstate; untested here. */
+  function deriveKey(context, keyMaterial, length = OUT_LEN) {
+    const ctxCv = new Blake3(IV, DERIVE_KEY_CONTEXT).update(context).finalize(KEY_LEN);
+    return new Blake3(wordsFromLeBytes32(ctxCv), DERIVE_KEY_MATERIAL).update(keyMaterial).finalize(length);
+  }
+
+  function wordsFromLeBytes32(bytes) {
+    const w = new Uint32Array(8);
+    for (let i = 0; i < 8; i++) {
+      const o = i * 4;
+      w[i] = (bytes[o] | (bytes[o + 1] << 8) | (bytes[o + 2] << 16) | (bytes[o + 3] << 24)) >>> 0;
+    }
+    return w;
+  }
+
+  const HEX = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, '0'));
+  function bytesToHex(b) {
+    let s = '';
+    for (let i = 0; i < b.length; i++) s += HEX[b[i]];
+    return s;
+  }
+  function hexToBytes(h) {
+    const s = String(h).replace(/^0x/i, '');
+    if (s.length % 2 !== 0 || /[^0-9a-fA-F]/.test(s)) throw new Error('blake3: invalid hex');
+    const out = new Uint8Array(s.length / 2);
+    for (let i = 0; i < out.length; i++) out[i] = parseInt(s.substr(i * 2, 2), 16);
+    return out;
+  }
+
+
+  // Public surface.
+  window.blake3Bytes     = blake3;            // (data[, len]) -> Uint8Array
+  window.blake3Hex       = blake3Hex;         // (string|bytes) -> hex  [UTF-8 semantics]
+  window.blake3_hash_hex = blake3_hash_hex;   // (hexString)    -> hex  [hex-decode semantics]
+  window.Blake3          = Blake3;            // streaming hasher
+})();
+
+// ==================== PoW (for /scan and /search) ====================
+// The node gates its expensive endpoints on a small proof of work. Both use the
+// SAME preimage shape, verified server-side in handlers.rs as:
+//
+//     blake3(format!("{}:{}:{}:{}", subject, height, timestamp, nonce))
+//
+// and require the lowercase hex digest to start with "0000" (4 hex zeros = 16
+// bits). `subject` is the address for /scan and the query for /search; /search
+// pins height to 0 since it has no start_height.
+//
+// Two things this must get exactly right, both of which were previously wrong:
+//   1. Hash the STRING's UTF-8 bytes (blake3Hex), not a hex decode of it.
+//   2. Mine on the SAME height that the request body sends. Mining against one
+//      value and submitting another guarantees "Invalid PoW hash".
+// The server decides difficulty; we never guess. Kept only as a floor for the
+// display and as a fallback if /pow_params is unreachable on an older node.
+const POW_FALLBACK_ZEROS = 4;
+
+/** Ask the node what this client owes for its next expensive request. Free. */
+async function fetchPowParams() {
+    try {
+        const r = await fetch('/pow_params');
+        if (!r.ok) return null;
+        const p = await r.json();
+        if (!Number.isFinite(p.zeros)) return null;
+        // Guard against a hostile/broken node asking for an absurd solve.
+        // 7 hex zeros is ~36 minutes in this implementation.
+        if (p.zeros > 6) {
+            log(`Node is asking for ${p.zeros} zeros of work — refusing (that is ~${Math.round(Math.pow(16, p.zeros) / 124000 / 60)} min).`, 'e');
+            return null;
+        }
+        // A clock >120s fast/slow makes the server reject on timestamp alone;
+        // say so before spending a solve on it.
+        if (Number.isFinite(p.server_time)) {
+            const skew = Math.abs(p.server_time - Math.floor(Date.now() / 1000));
+            if (skew > 120) log(`Warning: your clock is ${skew}s off the node's — proofs may be rejected.`, 'w');
+        }
+        return p;
+    } catch (_) { return null; }
+}
+
+async function solvePow(subject, height, zeros = POW_FALLBACK_ZEROS, onProgress) {
+    const timestamp = Math.floor(Date.now() / 1000);  // server allows -600s/+120s
+    const prefix = '0'.repeat(zeros);
+    const started = Date.now();
+    let nonce = 0, hash = '';
+    for (;;) {
+        hash = window.blake3Hex(`${subject}:${height}:${timestamp}:${nonce}`);
+        if (hash.startsWith(prefix)) break;
+        nonce++;
+        // ~124k hashes/sec, so 4 zeros averages ~0.5s. Yield often enough that
+        // the tab stays responsive, and report progress so a slow solve doesn't
+        // look like a hang.
+        if (nonce % 4096 === 0) {
+            if (onProgress && nonce % 262144 === 0) {
+                const secs = (Date.now() - started) / 1000;
+                onProgress(nonce, secs);
+            }
+            await new Promise(r => setTimeout(r, 0));
+        }
+    }
+    return { nonce, timestamp, hash };
+}
+
+/** POST /search with the proof the server currently demands.
+ *
+ *  The difficulty is re-derived server-side at verification, so a quote can go
+ *  stale if another request from this IP lands mid-solve. That costs one retry,
+ *  never correctness — so quote, mine, submit, and on "difficulty too low"
+ *  re-quote once. There is deliberately no local escalation policy: the old one
+ *  lived in localStorage, was trivially edited, and so only ever taxed honest
+ *  users while an abuser paid the floor.
+ */
+async function searchWithPow(query) {
+    const submit = async (zeros) => {
+        const pow = await solvePow(query, 0, zeros,
+            (n, s) => log(`  ...solving search PoW (${zeros} zeros): ${n.toLocaleString()} hashes, ${s.toFixed(0)}s`, 'i'));
+        return fetch('/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query, pow })
+        });
+    };
+
+    const params = await fetchPowParams();
+    let res = await submit(params ? params.zeros : POW_FALLBACK_ZEROS);
+    if (res.ok) return res;
+
+    // Outbid mid-solve, or we were working from a stale/absent quote.
+    const body = await res.clone().text().catch(() => '');
+    if (/difficulty too low/i.test(body)) {
+        const again = await fetchPowParams();
+        if (again) {
+            log(`Difficulty rose to ${again.zeros} zeros — re-solving.`, 'w');
+            res = await submit(again.zeros);
+        }
+    }
+    return res;
+}
+
+
+function validateAddressChecksum(addr) {
+    if (addr.length !== 72) return { valid: false, reason: 'Not a 72-char address' };
+
+    const addressPart = addr.substring(0, 64).toLowerCase();
+    const providedChecksum = addr.substring(64).toLowerCase();
+
+    if (!/^[0-9a-f]{64}$/.test(addressPart)) return { valid: false, reason: 'Invalid hex in address' };
+
+    try {
+        // Node: encode_address_with_checksum() = blake3(address_BYTES)[0..4].
+        // blake3_hash_hex decodes the hex before hashing, which is exactly that.
+        // (Passing the hex STRING to a UTF-8 hasher would hash 64 characters
+        // instead of 32 bytes — the old bug here.)
+        const hash = window.blake3_hash_hex(addressPart);
+
+        const expectedChecksum = hash.substring(0, 8).toLowerCase();
+
+        if (expectedChecksum === providedChecksum) {
+            return { valid: true, canonical: addressPart };
+        } else {
+            return { 
+                valid: false, 
+                reason: `Checksum mismatch (expected ${expectedChecksum})` 
+            };
+        }
+    } catch (e) {
+        return { valid: false, reason: 'Invalid hex in address' };
+    }
+}
+
 
 function toHex(v) {
     if (!v) return '';
@@ -123,6 +605,191 @@ function hexLink(hex, label) {
     return `<a class="${cls}" onclick="execCmd('${h}')" title="${h}">${display}</a>`;
 }
 
+function addressLink(addr) {
+    const h = toHex(addr);
+    if (!h) return '<span style="color:var(--text-faint)">-</span>';
+    return `<a onclick="loadAddress('${h}')" title="${h}" style="text-decoration:underline; text-decoration-color:var(--border); cursor:pointer;">${shortHex(h)}</a>`;
+}
+
+// ── MidstateScript Decompiler (makes the explorer much cooler) ───────────
+const OPCODES = {
+  0x01: { name: 'OP_PUSH_DATA', type: 'push' },
+  0x10: { name: 'OP_DROP', type: 'stack' },
+  0x11: { name: 'OP_DUP', type: 'stack' },
+  0x12: { name: 'OP_SWAP', type: 'stack' },
+  0x13: { name: 'OP_OVER', type: 'stack' },
+  0x14: { name: 'OP_ROT', type: 'stack' },
+  0x15: { name: 'OP_SLICE', type: 'stack' },
+  0x16: { name: 'OP_CONCAT', type: 'stack' },
+  0x17: { name: 'OP_PICK', type: 'stack' },
+  0x20: { name: 'OP_EQUAL', type: 'compare' },
+  0x21: { name: 'OP_VERIFY', type: 'compare' },
+  0x22: { name: 'OP_EQUALVERIFY', type: 'compare' },
+  0x23: { name: 'OP_ADD', type: 'math' },
+  0x24: { name: 'OP_GREATER_OR_EQUAL', type: 'math' },
+  0x25: { name: 'OP_SUB', type: 'math' },
+  0x26: { name: 'OP_MUL', type: 'math' },
+  0x27: { name: 'OP_DIV', type: 'math' },
+  0x28: { name: 'OP_MOD', type: 'math' },
+  0x29: { name: 'OP_SIZE', type: 'stack' },
+  0x30: { name: 'OP_HASH', type: 'crypto' },
+  0x31: { name: 'OP_CHECKSIG', type: 'crypto' },
+  0x32: { name: 'OP_CHECKSIGVERIFY', type: 'crypto' },
+  0x33: { name: 'OP_CHECKTIMEVERIFY', type: 'crypto' },
+  0x40: { name: 'OP_IF', type: 'control' },
+  0x41: { name: 'OP_ELSE', type: 'control' },
+  0x42: { name: 'OP_ENDIF', type: 'control' },
+  0x50: { name: 'OP_SUM_TO_ADDR', type: 'covenant' },
+  0x51: { name: 'OP_READ_INPUT_STATE', type: 'covenant' },
+  0x52: { name: 'OP_READ_OUTPUT_STATE', type: 'covenant' },
+  0x53: { name: 'OP_INPUT_VALUE', type: 'covenant' },
+  0x54: { name: 'OP_OUTPUT_ADDRESS', type: 'covenant' },
+  0x55: { name: 'OP_THIS_ADDRESS', type: 'covenant' },
+};
+
+function disassembleScript(hexOrBytes) {
+  let bytes = [];
+  if (typeof hexOrBytes === 'string') {
+    const clean = hexOrBytes.replace(/[^0-9a-fA-F]/g, '');
+    for (let i = 0; i < clean.length; i += 2) {
+      bytes.push(parseInt(clean.substr(i, 2), 16));
+    }
+  } else if (Array.isArray(hexOrBytes)) {
+    bytes = hexOrBytes;
+  } else {
+    return '<span class="comment">// invalid bytecode</span>';
+  }
+
+  if (bytes.length === 0) return '<span class="comment">// empty script</span>';
+
+  let out = '';
+  let i = 0;
+  let indent = 0;
+  let byteOffset = 0;
+
+  /** Interpret pushed bytes as the script VM does: a little-endian integer.
+   *  Mirrors OP_ADD / OP_GREATER_OR_EQUAL / OP_CHECKTIMEVERIFY, which all read
+   *  stack items this way — so an 8-byte push next to CHECKTIMEVERIFY is a
+   *  block height, and showing it as such is the whole point of the annotation.
+   *  BigInt because a u64 height exceeds Number's exact range. */
+  function pushDataToInt(data) {
+    let v = 0n;
+    for (let k = data.length - 1; k >= 0; k--) v = (v << 8n) | BigInt(data[k]);
+    return v;
+  }
+
+  function formatPushData(data) {
+    const dataHex = data.map(x => x.toString(16).padStart(2,'0')).join('');
+    let annotation = '';
+
+    // Was: hexLEToInt(dataHex) — a function that does not exist anywhere in this
+    // file. The surrounding try/catch swallowed the ReferenceError, so this
+    // annotation silently never rendered for any script.
+    if (data.length > 0 && data.length <= 8) {
+      annotation = ` <span class="comment">// ${pushDataToInt(data).toString()}</span>`;
+    }
+
+    const ascii = data.every(x => x >= 32 && x <= 126)
+      ? ` <span class="comment">"${String.fromCharCode(...data)}"</span>`
+      : '';
+
+    return `<span class="data">${data.length} 0x${dataHex}</span>${ascii}${annotation}`;
+  }
+
+  while (i < bytes.length) {
+    const startOffset = byteOffset;
+    const b = bytes[i];
+    const op = OPCODES[b];
+
+    if (!op) {
+      const hex = b.toString(16).padStart(2, '0');
+      out += `<span class="ln">[${startOffset.toString().padStart(3,' ')}]</span> <span class="op" style="color:#ffaa66">0x${hex}</span>\n`;
+      i++; byteOffset++;
+      continue;
+    }
+
+    let line = `<span class="ln">[${startOffset.toString().padStart(3,' ')}]</span> ` + '  '.repeat(indent);
+    line += `<span class="op ${op.type}">${op.name}</span>`;
+
+    // PUSH_DATA
+    if (b === 0x01) {
+      i++; byteOffset++;
+      // The length is a 2-byte LITTLE-ENDIAN u16, not one byte. The VM does:
+      //     let len = u16::from_le_bytes([bytecode[pc], bytecode[pc + 1]]);
+      //     pc += 2;
+      // Reading a single byte here misaligned every push by exactly one, which
+      // then cascaded: the pushed data came out shifted (leading with the
+      // length's high byte and dropping the real last byte), the displaced byte
+      // surfaced as a bogus unknown opcode, and the parser eventually ran off
+      // the end and cried "<truncated>" on a perfectly valid script.
+      if (i + 2 > bytes.length) {
+        line += ' <span class="comment">&lt;truncated: missing 2-byte length&gt;</span>';
+        out += line + '\n'; break;
+      }
+      const len = bytes[i] | (bytes[i + 1] << 8);
+      i += 2; byteOffset += 2;
+      // MAX_ITEM_SIZE from the script VM. Flag it rather than trying to render
+      // a 4 GB push — the node would reject this script as ItemTooLarge.
+      if (len > 131072) {
+        line += ` <span class="comment">&lt;invalid: push of ${len} bytes exceeds MAX_ITEM_SIZE (131072)&gt;</span>`;
+        out += line + '\n'; break;
+      }
+      if (i + len > bytes.length) {
+        const partial = bytes.slice(i);
+        line += ' ' + formatPushData(partial) + ` <span class="comment">&lt;truncated: declared ${len} bytes, ${partial.length} present&gt;</span>`;
+        out += line + '\n'; break;
+      }
+      const data = bytes.slice(i, i + len);
+      line += ' ' + formatPushData(data);
+      i += len; byteOffset += len;
+    } else {
+      i++; byteOffset++;
+    }
+
+    // === Control Flow ===
+    if (b === 0x40) { // IF
+      line += ' <span class="comment">// if</span>';
+      indent = Math.min(indent + 1, 8);
+    } else if (b === 0x41) { // ELSE
+      indent = Math.max(indent - 1, 0);
+      line = `<span class="ln">[${startOffset.toString().padStart(3,' ')}]</span> ` + '  '.repeat(indent) +
+             `<span class="op control">OP_ELSE</span> <span class="comment">// else</span>`;
+      indent = Math.min(indent + 1, 8);
+    } else if (b === 0x42) { // ENDIF
+      // Dedent BEFORE rebuilding the line. The old code decremented after `line`
+      // had already been composed with the block's indent, so ENDIF rendered as
+      // if it were inside its own block and the dedent leaked onto the next
+      // instruction.
+      indent = Math.max(indent - 1, 0);
+      line = `<span class="ln">[${startOffset.toString().padStart(3,' ')}]</span> ` + '  '.repeat(indent) +
+             `<span class="op control">OP_ENDIF</span> <span class="comment">// endif</span>`;
+    }
+
+    // === High-level language hints (from your compiler) ===
+    if (b === 0x17) line += ' <span class="comment">// local var</span>';
+    if (b === 0x21 || b === 0x22) line += ' <span class="comment">// assert/require</span>';
+
+    out += line + '\n';
+  }
+
+  return out.trim();
+}
+
+function renderScriptDisasm(bytecode) {
+  if (!bytecode) return '';
+  const disasm = disassembleScript(bytecode);
+  const hex = typeof bytecode === 'string' ? bytecode : 
+              Array.from(bytecode).map(b => b.toString(16).padStart(2,'0')).join('');
+  
+  return `
+    <div class="script-header">MIDSTATESCRIPT — ${hex.length/2} bytes</div>
+    <div class="script-disasm">${disasm}</div>
+    <div style="margin-top:4px;">
+      <button class="btn" style="font-size:9px; padding:2px 6px;" onclick="copyToClipboard('${hex}', this)">Copy Raw</button>
+    </div>
+  `;
+}
+
 function renderField(label, hex, badge) {
     const h = toHex(hex);
     const a = toAscii(hex);
@@ -149,7 +816,356 @@ function log(msg, color) {
     box.scrollTop = box.scrollHeight;
 }
 
-// ── Polling ─────────────────────────────────────────────────────────────
+// ── Block detail helpers (progressive disclosure + mobile friendly) ──────
+
+function toggleTxCard(cardEl) {
+    if (!cardEl) return;
+    cardEl.classList.toggle('collapsed');
+}
+
+function toggleAllTxCards(expand) {
+    const cards = document.querySelectorAll('#main-view .tx-card');
+    cards.forEach(card => {
+        if (expand) {
+            card.classList.remove('collapsed');
+        } else {
+            card.classList.add('collapsed');
+        }
+    });
+}
+
+function copyToClipboard(text, btnEl) {
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(() => {
+        const orig = btnEl.textContent;
+        btnEl.textContent = '✓ Copied';
+        setTimeout(() => { btnEl.textContent = orig; }, 1200);
+    }).catch(() => {
+        // Fallback
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        const orig = btnEl.textContent;
+        btnEl.textContent = '✓ Copied';
+        setTimeout(() => { btnEl.textContent = orig; }, 1200);
+    });
+}
+
+async function showRawBlock(height, btnEl) {
+    const mv = document.getElementById('main-view');
+    const origText = btnEl.textContent;
+    btnEl.textContent = 'Loading…';
+    try {
+        const res = await fetch(`/batch/${height}`);
+        const data = await res.json();
+        const pretty = JSON.stringify(data, null, 2);
+        // Replace main view content with raw (keep simple, no full re-render needed)
+        mv.innerHTML = `
+            <div class="block-hdr">
+                <h2>RAW BATCH ${height}</h2>
+                <div class="block-nav">
+                    <a onclick="loadBlock(${height});">← Back to Block</a>
+                </div>
+            </div>
+            <div style="background:var(--code-bg); border:1px solid var(--border); padding:12px; overflow:auto; max-height:70vh;">
+                <pre style="margin:0; font-size:10px; line-height:1.4; color:var(--text-bright); white-space:pre-wrap;">${escHtml(pretty)}</pre>
+            </div>
+            <div style="margin-top:12px; color:var(--text-faint); font-size:10px;">
+                Note: witnesses are stripped server-side for bandwidth. Full data available via direct node RPC if running with higher limits.
+            </div>
+        `;
+        // Re-attach? No need, since new content
+    } catch(e) {
+        log(`Raw fetch error: ${e.message}`, 'var(--red)');
+        btnEl.textContent = origText;
+    }
+}
+
+// ── Address Explorer (new dedicated view) ────────────────────────────────
+async function loadAddress(addr) {
+    if (addr.length !== 64 && addr.length !== 72) {
+        const mv = document.getElementById('main-view');
+        mv.innerHTML = `<div style="padding:40px;color:var(--red);">Invalid address length</div>`;
+        return;
+    }
+    const mv = document.getElementById('main-view');
+    activeBatch = null;
+    renderBatchList();
+
+    let canonical = addr.toLowerCase();
+
+    // Handle 72-char checksummed addresses
+    if (addr.length === 72) {
+        const check = validateAddressChecksum(addr);
+        if (!check.valid) {
+            mv.innerHTML = `
+                <div class="block-hdr"><h2>Invalid Address</h2></div>
+                <div style="color:var(--red); padding:20px 0;">
+                    ${check.reason}<br><br>
+                    The checksum does not match. This address may contain a typo.
+                </div>
+            `;
+            return;
+        }
+        canonical = check.canonical;
+    } 
+    else if (addr.length === 64) {
+        // Raw 64-char address — still allow it, but note it's not checksummed
+        console.log('[explorer] Using raw 64-char address (no checksum)');
+    } 
+    else {
+        mv.innerHTML = `<div style="padding:40px;color:var(--text-faint);">Invalid address length</div>`;
+        return;
+    }
+
+    activeAddress = canonical;
+    mainViewContent = 'address';
+
+    setActiveTab('explorer');
+
+    activeAddress = addr;
+    activeBatch = null;
+    renderBatchList(); // clear active highlight
+
+    mv.innerHTML = `<div style="padding:40px 20px; text-align:center; color:var(--text-faint);">Scanning address…</div>`;
+
+    try {
+        // 1. Use search to find recent activity (blocks where address appears)
+        const searchRes = await searchWithPow(addr);
+        const searchData = searchRes.ok ? await searchRes.json() : { results: [] };
+
+        // 2. Scan recent chain for live UTXOs (start with last 5000 blocks)
+        const stateRes = await fetch('/state');
+        const state = stateRes.ok ? await stateRes.json() : null;
+        const tip = state ? state.height : tipHeight + 1;
+
+        const scanStart = Math.max(0, tip - 5000);
+        // /scan is PoW-gated unconditionally now — omitting the proof used to buy
+        // an ungated 10,000-block scan, which made gating /search pointless.
+        // Mine on scanStart: the server rebuilds "{addr}:{start_height}:{ts}:{nonce}".
+        const scanParams = await fetchPowParams();
+        const scanPow = await solvePow(addr, scanStart, scanParams ? scanParams.zeros : POW_FALLBACK_ZEROS,
+            (n, s) => log(`  ...solving scan PoW: ${n.toLocaleString()} hashes, ${s.toFixed(0)}s`, 'i'));
+
+        const scanRes = await fetch('/scan', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                addresses: [addr],
+                start_height: scanStart,
+                end_height: tip,
+                pow: scanPow
+            })
+        });
+
+        let utxos = [];
+        if (scanRes.ok) {
+            const scanData = await scanRes.json();
+            utxos = scanData.coins || [];
+        }
+
+        // Calculate live balance
+        const liveBalance = utxos.reduce((sum, u) => sum + (u.value || 0), 0);
+        const firstSeen = utxos.length > 0 ? Math.min(...utxos.map(u => u.height)) : null;
+        const lastSeen = utxos.length > 0 ? Math.max(...utxos.map(u => u.height)) : null;
+
+        // Activity from search results
+        const activity = (searchData.results || []).filter(r => 
+            ['coinbase_address', 'output_address'].includes(r.result_type)
+        );
+
+        let html = `
+            <div class="block-hdr">
+                <h2>ADDRESS <span style="font-family:monospace; font-size:13px;">${shortHex(addr)}</span></h2>
+                <div class="block-nav">
+                    <a onclick="copyToClipboard('${addr}', this)">Copy Full</a>
+                </div>
+            </div>
+
+            <div class="address-view">
+                <div class="meta-grid" style="margin-bottom:16px;">
+                    <div class="field">
+                        <div class="lbl">LIVE BALANCE</div>
+                        <div class="balance">${liveBalance.toLocaleString()} <span style="font-size:14px; color:var(--text-muted);">units</span></div>
+                    </div>
+                    <div class="field">
+                        <div class="lbl">LIVE COINS</div>
+                        <div class="hex" style="font-size:20px; color:var(--text-max);">${utxos.length}</div>
+                    </div>
+                    <div class="field">
+                        <div class="lbl">FIRST SEEN</div>
+                        <div class="hex">${firstSeen ? 'Block ' + firstSeen : '—'}</div>
+                    </div>
+                    <div class="field">
+                        <div class="lbl">LAST SEEN</div>
+                        <div class="hex">${lastSeen ? 'Block ' + lastSeen : '—'}</div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <div class="section-title">LIVE UTXOs (${utxos.length}) — click coin_id to verify</div>
+                    ${utxos.length === 0 ? 
+                        `<div style="color:var(--text-faint); padding:12px 0;">No live coins found in last 5000 blocks.</div>` :
+                        `<table class="utxo-table">
+                            <thead>
+                                <tr>
+                                    <th>Value</th>
+                                    <th>Coin ID</th>
+                                    <th>Salt</th>
+                                    <th>Block</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${utxos.map(u => `
+                                    <tr class="utxo-row">
+                                        <td><span class="val-badge positive">+${u.value}</span></td>
+                                        <td style="font-family:monospace; font-size:10px;">${hexLink(u.coin_id)}</td>
+                                        <td style="font-family:monospace; font-size:10px; color:var(--text-faint);">${shortHex(u.salt)}</td>
+                                        <td><a onclick="loadBlock(${u.height})">${u.height}</a></td>
+                                        <td><button class="btn" style="padding:2px 6px; font-size:9px;" onclick="verifyCoin('${u.coin_id}', this)">Verify</button></td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>`
+                    }
+                </div>
+
+                ${activity.length > 0 ? `
+                <div class="section">
+                    <div class="section-title">Recent Activity (${activity.length} hits in search)</div>
+                    <div style="font-size:11px; line-height:1.5;">
+                        ${activity.slice(0, 8).map(a => `
+                            <div style="padding:3px 0; border-bottom:1px dashed var(--border);">
+                                Block ${a.height} — ${a.result_type} ${a.detail ? '· ' + a.detail : ''}
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>` : ''}
+
+                <div style="margin-top:20px; display:flex; gap:8px; flex-wrap:wrap;">
+                    <button class="btn" onclick="scanAddressDeeper('${addr}', ${scanStart})">Scan Deeper (older blocks)</button>
+                    <button class="btn" onclick="loadBlock(tipHeight)">Back to Latest Block</button>
+                </div>
+                <div style="margin-top:8px; font-size:9px; color:var(--text-faint);">
+                    UTXOs scanned from block ${scanStart} to ${tip}. Use "Scan Deeper" for older history.
+                </div>
+            </div>
+        `;
+
+        mv.innerHTML = html;
+
+        // Make sure hexLink clicks still work inside the new view
+        log(`Loaded address ${shortHex(addr)} — ${utxos.length} live coin(s)`, 'var(--green)');
+
+    } catch(e) {
+        mv.innerHTML = `<div style="color:var(--red); padding:20px;">Error loading address: ${e.message}</div>`;
+        log(`Address load error: ${e.message}`, 'var(--red)');
+    }
+}
+
+async function verifyCoin(coinId, btn) {
+    const orig = btn.textContent;
+    btn.textContent = 'Checking…';
+    try {
+        const res = await fetch(`/coin/${coinId}`);
+        const data = await res.json();
+        if (data.exists) {
+            btn.textContent = '✓ LIVE';
+            btn.style.borderColor = 'var(--green)';
+            btn.style.color = 'var(--green)';
+        } else {
+            btn.textContent = '✗ SPENT';
+            btn.style.borderColor = 'var(--red)';
+            btn.style.color = 'var(--red)';
+        }
+    } catch(e) {
+        btn.textContent = 'Error';
+    }
+    setTimeout(() => {
+        if (btn && btn.parentNode) {
+            btn.textContent = orig;
+            btn.style.borderColor = '';
+            btn.style.color = '';
+        }
+    }, 2200);
+}
+
+async function scanAddressDeeper(addr, currentStart) {
+    const mv = document.getElementById('main-view');
+    const nextStart = Math.max(0, currentStart - 5000);
+
+    if (nextStart === currentStart) {
+        log('Already at genesis. No older blocks to scan.', 'w');
+        return;
+    }
+
+    log(`Solving proof-of-work to scan blocks ${nextStart}–${currentStart}...`, 'i');
+
+    // Difficulty comes from the node, not from us. The old code escalated itself
+    // from a localStorage timestamp while the server checked only a fixed floor —
+    // so an abuser paid the minimum forever and honest users paid the tax. All of
+    // that policy is gone; see solvePow/fetchPowParams.
+    //
+    // Mine on `nextStart`, the exact start_height sent below: the server verifies
+    // blake3("{addr}:{req.start_height}:{ts}:{nonce}"). Mining `currentStart` and
+    // submitting `nextStart` guaranteed "Invalid PoW hash".
+    const powParams = await fetchPowParams();
+    const targetZeros = powParams ? powParams.zeros : POW_FALLBACK_ZEROS;
+    if (targetZeros > POW_FALLBACK_ZEROS) {
+        log(`Node requires ${targetZeros} zeros of work (recent activity from this address).`, 'w');
+    }
+
+    const startTime = Date.now();
+    const { nonce, timestamp, hash: powHash } = await solvePow(addr, nextStart, targetZeros,
+        (n, s) => log(`  ...still solving: ${n.toLocaleString()} hashes, ${s.toFixed(0)}s (${Math.round(n / s / 1000)}k/s)`, 'i'));
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    log(`PoW solved in ${elapsed}s (difficulty=${targetZeros} zeros). Scanning...`, 's');
+
+    // Perform the scan
+    try {
+        const stateRes = await fetch('/state');
+        const state = stateRes.ok ? await stateRes.json() : null;
+        const tip = state ? state.height : tipHeight + 1;
+
+        const scanRes = await fetch('/scan', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                addresses: [addr],
+                start_height: nextStart,
+                end_height: currentStart,
+                pow: {
+                    nonce: nonce,
+                    timestamp: timestamp,
+                    hash: powHash
+                }
+            })
+        });
+
+        if (!scanRes.ok) {
+            const errText = await scanRes.text();
+            log(`Deeper scan failed: ${errText}`, 'e');
+            return;
+        }
+
+        log('Deeper scan complete. Refreshing view...', 's');
+        await loadAddress(addr);
+
+    } catch (e) {
+        log(`Deeper scan error: ${e.message}`, 'e');
+    }
+}
+
+// Make hexLink support addresses better (already does via search, but we can enhance)
+function makeAddressClickable(html) {
+    // This is a simple post-process if needed; for now we rely on hexLink + search
+    return html;
+}
 
 async function poll() {
     try {
@@ -225,10 +1241,52 @@ async function execCmd(cmd) {
         await loadBlock(parseInt(cmd));
     } else if (/^[0-9a-fA-F]{64}$/.test(cmd) || /^[0-9a-fA-F]{72}$/.test(cmd)) {
         switchTab('explorer');
-        await searchHash(cmd.toLowerCase());
+        const h = cmd.toLowerCase();
+
+        // Only treat 72-char strings as addresses (they have a checksum)
+        if (h.length === 72) {
+            const check = validateAddressChecksum(h);
+            if (!check.valid) {
+                const mv = document.getElementById('main-view');
+                mv.innerHTML = `
+                    <div class="block-hdr"><h2>Invalid Address Checksum</h2></div>
+                    <div style="color:var(--red); padding: 20px 0;">
+                        ${check.reason}
+                    </div>
+                `;
+                return;
+            }
+            await loadAddress(h);
+            return; // ← important: stop here so we don't fall through
+        }
+
+        // 64-char hex → generic hash (commitment, coin_id, etc.)
+        // Use the normal search instead of forcing it into the Address view
+        await searchHash(h);
+    } else if (cmd.toLowerCase().startsWith('decompile ')) {
+        const hex = cmd.split(' ')[1] || '';
+        const mv = document.getElementById('main-view');
+        if (hex.length > 10) {
+            mv.innerHTML = `
+                <div class="block-hdr"><h2>SCRIPT DECOMPILE</h2></div>
+                ${renderScriptDisasm(hex)}
+            `;
+            log('Decompiled script', 'var(--green)');
+        } else {
+            log('Usage: decompile <bytecode-hex>', 'var(--red)');
+        }
     } else {
-        log('Enter a block height, 64/72-char hex string, or "mempool"', 'var(--red)');
+        log('Enter height, hash, address, "mempool", or "decompile <hex>"', 'var(--red)');
     }
+}
+
+function handleTopSearch() {
+    const input = document.getElementById('top-search');
+    const val = input.value.trim();
+    if (!val) return;
+    input.value = '';
+    // Reuse the command logic for consistency
+    execCmd(val);
 }
 
 // ── Server-side search ──────────────────────────────────────────────────
@@ -240,11 +1298,7 @@ async function searchHash(hash) {
 
     try {
         // Do the backend search first to let it validate the checksum
-        const res = await fetch('/search', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ query: hash })
-        });
+        const res = await searchWithPow(hash);
         const data = await res.json();
 
         if (!res.ok) {
@@ -285,6 +1339,9 @@ async function searchHash(hash) {
             if (mpHit) {
                 // Keep the mempool view (loading a block would overwrite it).
                 log('  Staying on mempool view \u2014 type a height to open its block.', 'var(--text-faint)');
+            } else if (mainViewContent === 'address') {
+                // Don't clobber the Address Explorer view
+                log('  Staying on Address view \u2014 type a height to open its block.', 'var(--text-faint)');
             } else {
                 // Load the first matching block
                 await loadBlock(heights[0]);
@@ -689,6 +1746,14 @@ async function loadBlock(h) {
             </div>
         </div>`;
 
+        // Action toolbar for details control (mobile-friendly progressive disclosure)
+        html += `<div class="block-toolbar">
+            <button class="btn" onclick="toggleAllTxCards(true)">▾ Expand All</button>
+            <button class="btn" onclick="toggleAllTxCards(false)">▸ Collapse All</button>
+            <button class="btn" onclick="showRawBlock(${h}, this)">Raw JSON</button>
+            <button class="btn" onclick="copyToClipboard('${b.extension ? toHex(b.extension.final_hash) : ''}', this)">Copy Block Hash</button>
+        </div>`;
+
         // Metadata grid
         const cbTotal = b.coinbase.reduce((s,c) => s + c.value, 0);
         html += `<div class="meta-grid">
@@ -725,7 +1790,7 @@ async function loadBlock(h) {
             for (const cb of b.coinbase) {
                 html += `<div class="io-item">
                     <span class="val-badge positive">+${cb.value}</span>
-                    ${renderField('address', cb.address)}
+                    <div class="field"><div class="lbl">address</div><div class="hex">${addressLink(cb.address)}</div></div>
                     ${renderField('salt', cb.salt)}
                     <div style="margin-top:4px;"><span class="coin-status checking" 
                         data-addr="${toHex(cb.address)}" 
@@ -765,12 +1830,22 @@ async function loadBlock(h) {
                 const fee = inSum - outSum;
 
                 let inputsHtml = (data.inputs || []).map(inp => {
-                    const addr = inp.predicate.Script ? inp.predicate.Script.bytecode
-                               : inp.predicate.P2pk ? inp.predicate.P2pk : inp.predicate;
+                    const hasScript = inp.predicate && inp.predicate.Script && inp.predicate.Script.bytecode;
+                    const addr = hasScript ? inp.predicate.Script.bytecode 
+                               : (inp.predicate && inp.predicate.P2pk ? inp.predicate.P2pk : inp.predicate);
+                    
+                    let scriptHtml = '';
+                    if (hasScript) {
+                        scriptHtml = `<div style="margin-top:6px; padding-left:8px; border-left:2px solid var(--border);">
+                            ${renderScriptDisasm(inp.predicate.Script.bytecode)}
+                        </div>`;
+                    }
+                    
                     return `<div class="io-item">
                         <span class="val-badge negative">-${inp.value}</span>
-                        ${renderField('address', addr)}
+                        ${renderField('address / script-hash', addr)}
                         ${renderField('salt', inp.salt)}
+                        ${scriptHtml}
                     </div>`;
                 }).join('');
 
@@ -887,6 +1962,18 @@ document.getElementById('cmd-input').addEventListener('keydown', function(e) {
 });
 
 log('Explorer ready. Type a height, hash, or "mempool".', 'var(--accent-dim)');
+
+// Event delegation for clickable tx headers (collapse/expand details)
+const mainViewEl = document.getElementById('main-view');
+if (mainViewEl) {
+    mainViewEl.addEventListener('click', function(e) {
+        const hdr = e.target.closest('.tx-hdr');
+        if (hdr) {
+            const card = hdr.closest('.tx-card');
+            if (card) toggleTxCard(card);
+        }
+    });
+}
 // Visibility-aware polling: 3s while the tab is visible, 15s in the
 // background, and an immediate refresh the moment the tab regains focus.
 let pollTimer = null;

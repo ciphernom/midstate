@@ -27,7 +27,7 @@
  * @module worker
  */
 
-import init, { WebWallet, generate_phrase, compute_coin_id_hex, compute_commitment_hex, decrypt_cli_wallet, mine_commitment_pow, blake3_hash_hex, build_multisig_2of2_address, build_channel_state, build_channel_reveal, verify_mss_sig_wasm, mine_chat_pow_v2_wasm, build_htlc_bytecode_hex, build_covenant_htlc_bytecode_hex, build_limit_order_covenant_bytecode_hex, compute_p2pk_address_hex } from './pkg/wasm_wallet.js';
+import init, { WebWallet, generate_phrase, compute_coin_id_hex, compute_commitment_hex, decrypt_cli_wallet, mine_commitment_pow, blake3_hash_hex, build_multisig_2of2_address, build_channel_state, build_channel_reveal, verify_mss_sig_wasm, mine_chat_pow_v2_wasm, build_htlc_bytecode_hex, build_covenant_htlc_bytecode_hex, build_limit_order_covenant_bytecode_hex, compute_p2pk_address_hex, qbolt_channel_address, qbolt_channel_bytecode_hex, qbolt_build_state, qbolt_build_refund_state, qbolt_build_close_reveal, qbolt_build_refund_reveal, qbolt_build_legacy_close_state, qbolt_build_legacy_close_reveal } from './pkg/wasm_wallet.js';
 
 /** @type {WebWallet|null} The WASM wallet instance. Null until CREATE or LOGIN. */
 let wallet = null;
@@ -259,6 +259,251 @@ async function awaitCommitmentMined(commitmentHex, onStatus) {
  * @param {(msg: string) => void} [onStatus] - Optional phase reporter.
  * @returns {Promise<Object>} The final checkCoin response (may carry `.spentHeight`).
  */
+/**
+ * Wait until a broadcast reveal is mined, rebroadcasting it if the network
+ * loses it.
+ *
+ * `awaitCoinSpent` only polls — it never rebroadcasts. That asymmetry is a real
+ * hole: `awaitCommitmentMined` defends phase 1 against a mempool eviction or a
+ * transport flap mid-broadcast, but phase 2 had no such defence, so a reveal
+ * dropped on a dying WebRTC connection would spin for the full timeout and be
+ * lost. The commitment is already mined and single-shot at that point, so the
+ * tx cannot simply be rebuilt — but the signed reveal can be re-sent verbatim.
+ *
+ * Rebroadcasting the identical payload is always safe: same one-time leaf over
+ * the same message, so it carries no key-reuse risk. The node either accepts it
+ * or reports the inputs already spent (which means we are done).
+ *
+ * @param {string} inputCoinId  - An input the reveal spends; its disappearance means "mined".
+ * @param {string} revealStr    - The exact signed reveal payload to re-send.
+ * @param {string} commitmentHex- Used to spot the reveal sitting in the mempool.
+ * @param {(msg: string) => void} [onStatus]
+ * @returns {Promise<Object>} The final checkCoin response.
+ */
+async function awaitRevealMined(inputCoinId, revealStr, commitmentHex, onStatus, allInputIds) {
+    const started = Date.now();
+    const say = (m) => { try { if (onStatus) onStatus(m); } catch (_) {} };
+    const inputIds = (allInputIds && allInputIds.length) ? allInputIds : [inputCoinId];
+
+    // The node evicts a reveal for exactly three reasons (mempool prune_invalid):
+    // an input coin missing from state, the commitment missing/expired, or —
+    // only at capacity — being outbid in the fee market. Repeated eviction of a
+    // freshly-committed tx therefore almost always means a DEAD INPUT: admission
+    // verifies signatures but not coin existence, so the reveal is accepted and
+    // then pruned on the very next block, forever. Diagnose instead of guessing.
+    const diagnoseAndHeal = async () => {
+        const missing = [];
+        for (const id of inputIds) {
+            try { const c = await rpc.checkCoin(id); if (c && !c.exists) missing.push(id); } catch (_) {}
+        }
+        let commitAlive = null;
+        try { const cm = await rpc.checkCommitment(commitmentHex); commitAlive = !!(cm && cm.exists); } catch (_) {}
+
+        if (missing.length) {
+            // This transaction can NEVER confirm — every rebroadcast will be
+            // pruned. Heal: drop the phantom coins from the wallet's UTXO set
+            // (a rescan re-credits anything that genuinely exists), release the
+            // pending record, and say exactly which coin is dead.
+            for (const id of missing) { if (wState.utxos && wState.utxos[id]) delete wState.utxos[id]; }
+            pendingSends = pendingSends.filter(tx => !(tx.inputs || []).some(i => missing.includes(i)));
+            if (wState.pending_tx && wState.pending_tx.commitment === commitmentHex) delete wState.pending_tx;
+            await saveState();
+            performScan().catch(() => {});
+            throw new Error(`This transaction can never confirm: input coin(s) ${missing.map(m => m.substring(0, 12) + '…').join(', ')} do not exist on-chain. The wallet's records were out of sync — the stale coin(s) have been removed and a rescan started. Please re-send the transaction.`);
+        }
+        if (commitAlive === false) {
+            if (wState.pending_tx && wState.pending_tx.commitment === commitmentHex) delete wState.pending_tx;
+            await saveState();
+            throw new Error('The commitment is no longer in chain state (expired or reorged out), so this reveal is dead. The coins were never spent and remain yours — please re-send the transaction.');
+        }
+
+        // Inputs exist and the commitment is live, yet the node keeps evicting.
+        // The remaining eviction cause is a BURNED ONE-TIME LEAF: this reveal is
+        // signed with an MSS/WOTS leaf that a previously-confirmed transaction
+        // already spent. Admission only compares against the live mempool, so it
+        // accepts the reveal; prune_on_new_block then evicts it against the
+        // chain's burned-leaf accumulator, forever. Reconcile every key against
+        // the node and, if that moved any counter, heal so the re-send signs
+        // with a fresh leaf.
+        const before = JSON.stringify(Object.fromEntries(Object.entries(wState.mssAddrs || {}).map(([a, m]) => [a, m.next_leaf])));
+        await reconcileMssLeavesWithNode().catch(() => {});
+        const after = JSON.stringify(Object.fromEntries(Object.entries(wState.mssAddrs || {}).map(([a, m]) => [a, m.next_leaf])));
+        if (before !== after) {
+            if (wState.pending_tx && wState.pending_tx.commitment === commitmentHex) delete wState.pending_tx;
+            await saveState();
+            throw new Error('This reveal was signed with a one-time signature leaf that a previous transaction already used, so the node evicts it every block. The leaf counters have now been re-synced with the chain — please re-send the transaction; it will sign with a fresh leaf.');
+        }
+        return null;                                          // still inconclusive → keep trying
+    };
+
+    const hexLower = String(commitmentHex || '').toLowerCase().replace(/^0x/, '');
+    let byteArrJson = null;
+    try {
+        const bytes = [];
+        for (let i = 0; i < hexLower.length; i += 2) bytes.push(parseInt(hexLower.slice(i, i + 2), 16));
+        if (bytes.length === 32 && bytes.every(Number.isFinite)) byteArrJson = JSON.stringify(bytes);
+    } catch (_) {}
+
+    let netFails = 0, absentProbes = 0, rebroadcasts = 0, iter = 0;
+
+    while (true) {
+        if (Date.now() - started > CONFIRM_WAIT_MS) {
+            throw new Error(`Timed out after ${Math.round(CONFIRM_WAIT_MS / 60000)} min waiting for the reveal to be mined. The wallet saved it and will retry on the next unlock — do NOT rebuild the transaction, or you risk spending the same coins twice.`);
+        }
+
+        // Mined? The input coin is gone from the UTXO set.
+        try {
+            const inp = await rpc.checkCoin(inputCoinId);
+            netFails = 0;
+            if (inp && !inp.exists) return inp;
+        } catch (e) {
+            netFails++;
+            if (netFails >= CONFIRM_MAX_NET_FAILS) {
+                throw new Error(`Network unreachable while confirming the reveal: ${e && e.message || e}`);
+            }
+        }
+
+        // Every other iteration, make sure it's still queued somewhere.
+        if (iter % 2 === 1) {
+            let present = null;
+            try {
+                const mp = await rpc.getMempool();
+                const hay = JSON.stringify(mp || '').toLowerCase();
+                present = hay.includes(hexLower) || (byteArrJson !== null && hay.includes(byteArrJson));
+            } catch (_) { present = null; }             // unknown → don't count it against us
+
+            if (present === false) {
+                absentProbes++;
+                if (absentProbes >= 2) {
+                    absentProbes = 0;
+                    // The first eviction can be a fluke (race with a block); the
+                    // second means something structural — diagnose before wasting
+                    // further rebroadcasts. This throws with the exact cause when
+                    // the tx is provably dead, and heals the wallet state.
+                    if (rebroadcasts >= 1) await diagnoseAndHeal();
+                    if (rebroadcasts >= 3) {
+                        // Inputs exist and the commitment is live, so by the node's
+                        // own prune_invalid the only remaining cause is a BURNED
+                        // ONE-TIME LEAF. We cannot prove it from here: the exact
+                        // authority is the chain's burned_wots accumulator, which
+                        // has no RPC, and getMssState is unreliable — its HTTP
+                        // handler scans only the last ~2000 blocks and answers 0
+                        // for older keys, so a reconcile that moves nothing proves
+                        // nothing. Say what's actually known.
+                        throw new Error(
+                            'The node keeps evicting this reveal even though its inputs exist and its commitment is live. '
+                            + 'That leaves one cause: it is signed with a one-time signature leaf that an earlier transaction already burned — '
+                            + 'the mempool accepts it, then prunes it against the chain on every block. '
+                            + 'The wallet cannot confirm this itself: the authoritative burned-leaf set has no RPC, and /mss_state over HTTP '
+                            + 'only scans the last ~2000 blocks (it answers 0 for older keys, so its silence means nothing). '
+                            + 'Fix the node\'s get_mss_state to use storage.query_mss_leaf_index, then reload — the leaf counters will re-sync and a fresh send will use an unburned leaf. '
+                            + 'These coins were never spent and remain yours.'
+                        );
+                    }
+                    rebroadcasts++;
+                    say(`Reveal was dropped from the mempool — rebroadcasting (${rebroadcasts}/3)…`);
+                    try {
+                        const rr = await rpc.send(revealStr);
+                        if (!rr.ok) {
+                            const body = String(rr.body || rr.error || '');
+                            // "not found" = the inputs are already spent, i.e. it landed after all.
+                            if (/not found|already spent|spent/i.test(body)) {
+                                say('The reveal already landed — confirming…');
+                            } else if (/expired/i.test(body)) {
+                                throw new Error(`The commitment expired before the reveal was mined: ${body}`);
+                            }
+                        }
+                    } catch (e) {
+                        if (/expired/i.test(String(e && e.message))) throw e;
+                        say(`Rebroadcast failed, will retry: ${e && e.message || e}`);
+                    }
+                }
+            } else if (present === true) {
+                absentProbes = 0;
+            }
+        }
+
+        iter++;
+        await waitForNextBlock(15000);
+    }
+}
+
+/**
+ * Resume a transaction that was in flight when the wallet last stopped.
+ *
+ * A send is two network phases (commit → reveal) separated by minutes of block
+ * time. A reload, crash, or transport flap in between used to lose it silently:
+ * the reveal was never re-sent and the mined commitment quietly aged out of its
+ * TTL. The reveal is already signed and idempotent, so the honest recovery is
+ * to re-send it verbatim.
+ *
+ * This NEVER rebuilds. Once the commitment is mined it is single-shot on-chain,
+ * and re-signing would spend another one-time MSS/WOTS leaf.
+ */
+async function recoverPendingTx() {
+    const p = wState.pending_tx;
+    if (!p || !p.commitment) return;
+    const say = (m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `[recovery] ${m}` } });
+    const done = async (msg, level) => {
+        delete wState.pending_tx;
+        await saveState();
+        self.postMessage({ type: 'L2_EVENT', payload: { level: level || 'info', msg, channelId: null } });
+        performScan().catch(() => {});
+    };
+
+    try {
+        // Did it land while we were away?
+        if (p.inputCoinId) {
+            const inp = await rpc.checkCoin(p.inputCoinId);
+            if (inp && !inp.exists) return done('A transaction that was interrupted has since confirmed.');
+        }
+
+        // COMMITMENT_TTL is 1000 blocks: past that a mined commitment can no
+        // longer be revealed, and the coins simply become spendable again.
+        if (p.commitHeight != null && networkHeight - p.commitHeight > 1000) {
+            return done('An interrupted transaction expired before it could be mined. Its coins are spendable again — please re-send it.', 'warn');
+        }
+
+        const cm = await rpc.checkCommitment(p.commitment).catch(() => null);
+        const committed = !!(cm && cm.exists);
+
+        if (!committed && p.stage === 'commit') {
+            // The commit never landed. Re-mine the anti-spam PoW against fresh
+            // state (it anchors a recent height, so the old nonce may be stale).
+            say('Re-broadcasting an interrupted commit…');
+            const st = await rpc.getState();
+            const nonce = Number(mine_commitment_pow(p.commitment, st.required_pow || 24, BigInt(st.height), st.header_hash));
+            const cr = await rpc.commit(p.commitment, nonce);
+            if (!cr.ok && !/already|exist|duplicate/i.test(String(cr.body || cr.error || ''))) {
+                self.postMessage({ type: 'LOG', payload: `[recovery] commit retry rejected: ${cr.body || cr.error}` });
+                return;                                       // keep it pending; retry next block
+            }
+        }
+
+        if (!p.revealPayload) return;
+        self.postMessage({ type: 'L2_EVENT', payload: { level: 'info', msg: 'Resuming a transaction that was interrupted — re-broadcasting it.', channelId: null } });
+        const rr = await rpc.send(p.revealPayload);
+        if (!rr.ok) {
+            const body = String(rr.body || rr.error || '');
+            if (/not found|already spent|spent/i.test(body)) return done('An interrupted transaction had already confirmed.');
+            if (/expired/i.test(body)) {
+                return done('An interrupted transaction expired before it could be mined. Its coins are spendable again — please re-send it.', 'warn');
+            }
+            self.postMessage({ type: 'LOG', payload: `[recovery] reveal retry rejected: ${body}` });
+            return;                                           // keep it; retried on the next block
+        }
+        await awaitRevealMined(p.inputCoinId, p.revealPayload, p.commitment, say, p.inputCoinIds);
+        await done('A transaction that was interrupted has now confirmed.');
+    } catch (e) {
+        // Keep the record. A failure here is nearly always transient, and
+        // discarding it is precisely what loses the transaction.
+        self.postMessage({ type: 'LOG', payload: `[recovery] deferred, will retry: ${e && e.message || e}` });
+    }
+}
+
+/** Poll until `coinId` leaves the UTXO set. Used where the caller has no reveal
+ *  payload to rebroadcast (DEX legs, sweeps); the send path uses
+ *  awaitRevealMined instead, which can recover a dropped reveal. */
 async function awaitCoinSpent(coinId, onStatus) {
     const started = Date.now();
     const say = (m) => { try { if (onStatus) onStatus(m); } catch (_) {} };
@@ -386,7 +631,20 @@ function getPrimaryMssPk() {
     if (!wallet) return null;
     const mssList = Object.keys(wState.mssAddrs);
     if (mssList.length === 0) return null;
-    return wallet.get_mss_pubkey(mssList[mssList.length - 1]);
+    // Pin the L2 identity to ONE tree once chosen.
+    //
+    // `mssList[mssList.length - 1]` is insertion-ordered, so the identity used
+    // to be whichever MSS address was derived most recently — it would silently
+    // change the moment the wallet made another one. Peers derive the funding
+    // covenant from this key, so a shift makes every inbound open to the old
+    // identity fail the channel-id check, and it is invisible to the user.
+    // Pinning keeps a published identity stable for the life of the wallet.
+    let addr = wState.l2_identity_addr;
+    if (!addr || !wState.mssAddrs[addr]) {
+        addr = mssList[mssList.length - 1];
+        wState.l2_identity_addr = addr;      // persisted by the next saveState()
+    }
+    return wallet.get_mss_pubkey(addr);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -555,22 +813,100 @@ async function loadMssCaches() {
     await mssCachesLoading;
     mssCachesLoading = null;
     self.postMessage({ type: 'LOG', payload: "All MSS trees loaded." });
+
+    // One reconciliation pass against the node. Forward-only (max), so it can
+    // never cause reuse — it only ever catches a counter that is BEHIND what the
+    // chain has witnessed (another device, a lost local view).
+    //
+    // Deliberately NOT treated as authoritative: the node's HTTP /mss_state
+    // scans only the last ~2000 blocks and answers 0 for older keys, while its
+    // light/WebRTC path answers exactly from MSS_LEAF_INDEX_TABLE. The transport
+    // is chosen at random on a flaky link, so a low answer proves nothing.
+    reconcileMssLeavesWithNode().catch(() => {});
+}
+
+/** Pull the node's high-water leaf index for each MSS key and advance our
+ *  counters (and the WASM trees) to at least that. Forward-only. */
+async function reconcileMssLeavesWithNode() {
+    for (const [addrHex, mss] of Object.entries(wState.mssAddrs || {})) {
+        let pk = null;
+        try { pk = wallet.get_mss_pubkey(addrHex); } catch (_) {}
+        if (!pk) continue;
+        try {
+            const st = await rpc.getMssState(pk);
+            if (st && Number.isFinite(st.next_index) && st.next_index > (mss.next_leaf || 0)) {
+                self.postMessage({ type: 'LOG', payload: `Reconciled MSS leaf for ${addrHex.substring(0, 12)}…: ${mss.next_leaf || 0} → ${st.next_index} (chain/mempool witnessed more).` });
+                mss.next_leaf = st.next_index;
+                wallet.set_mss_leaf_index(addrHex, mss.next_leaf);
+                await idbPut(`mss_${addrHex}`, wallet.export_mss_bytes(addrHex));
+            }
+        } catch (_) { /* offline → per-operation reconcile still guards */ }
+    }
+    await saveState();
 }
 
 
 /**
- * CRITICAL FIX: Safe MSS Signing Helper
- * Generates an MSS signature and instantly persists the leaf increment to
- * IndexedDB and wState to ensure a page reload can never cause MSS Leaf Reuse.
+ * CRITICAL: Safe MSS Signing Helper.
+ *
+ * MSS/WOTS leaves are ONE-TIME keys: signing twice with the same leaf on two
+ * different messages is a catastrophic key-reuse fault, and the node silently
+ * evicts any reveal that reuses a burned leaf (mempool prune step 3). Two
+ * counters have to agree for that never to happen:
+ *
+ *   • the WASM tree's internal `kp.next_leaf` (persisted inside the IndexedDB
+ *     blob), which is what actually selects the signing leaf, and
+ *   • `wState.mssAddrs[addr].next_leaf` (persisted in wState).
+ *
+ * They drift whenever the two are written at different times — and a rescan, an
+ * import, or signing on another device leaves BOTH behind what the chain has
+ * already witnessed. So we cross-check against the node before signing and take
+ * the MAX of our view and its `getMssState.next_index`, pin BOTH counters to it,
+ * sign, then persist the post-increment value atomically. Taking the max can
+ * only ever skip forward, never reuse.
+ *
+ * The node is a CROSS-CHECK, NOT a source of truth. Its two transports disagree:
+ * the light/WebRTC path answers from MSS_LEAF_INDEX_TABLE (O(1), full history —
+ * correct), while HTTP /mss_state still scans only the last 2000 blocks and
+ * returns 0 for any key untouched for ~33 h. We cannot tell which answered, so a
+ * LOW answer must never be trusted — hence max(), never assignment. The locally
+ * persisted counter remains the primary record; the node can only ever push it
+ * forward.
  */
 async function signMssAndSync(pkHex, commitmentHex) {
-    const sigHex = wallet.sign_mss_hex(pkHex, commitmentHex);
     const addrHex = compute_p2pk_address_hex(pkHex);
-    if (wState.mssAddrs[addrHex]) {
-        wState.mssAddrs[addrHex].next_leaf++;
-        await idbPut(`mss_${addrHex}`, wallet.export_mss_bytes(addrHex));
-        await saveState(); 
+    const rec = wState.mssAddrs[addrHex];
+    if (!rec) {
+        // No local metadata for this key — sign without leaf bookkeeping we
+        // can't do safely, rather than silently guessing a leaf.
+        return wallet.sign_mss_hex(pkHex, commitmentHex);
     }
+
+    // 1. Reconcile against the node (authoritative: scans chain AND mempool).
+    let authoritative = rec.next_leaf || 0;
+    try {
+        const st = await rpc.getMssState(pkHex);
+        if (st && Number.isFinite(st.next_index)) {
+            authoritative = Math.max(authoritative, st.next_index);
+        }
+    } catch (_) { /* offline / flake → fall back to the local counter */ }
+
+    // 2. Pin BOTH counters to the reconciled value before signing.
+    if (authoritative !== rec.next_leaf) {
+        rec.next_leaf = authoritative;
+    }
+    wallet.set_mss_leaf_index(addrHex, rec.next_leaf);
+
+    // 3. Capacity guard (the WASM signer would throw, but check with a clear msg).
+    if (rec.height && rec.next_leaf >= (1 << rec.height)) {
+        throw new Error(`MSS key exhausted: all ${1 << rec.height} one-time signatures for ${addrHex.substring(0, 12)}… are used. Generate a new receiving address.`);
+    }
+
+    // 4. Sign (advances the WASM counter internally) and persist atomically.
+    const sigHex = wallet.sign_mss_hex(pkHex, commitmentHex);
+    rec.next_leaf++;
+    await idbPut(`mss_${addrHex}`, wallet.export_mss_bytes(addrHex));
+    await saveState();
     return sigHex;
 }
 
@@ -970,6 +1306,10 @@ async function sendRevealWithMssLeafRetry(prebuiltPayload, ctxStrOrObj, commitme
 
     for (let attempt = 0; ; attempt++) {
         const res = await rpc.send(payloadStr);
+        // Report the payload that was actually sent. A leaf-reuse retry re-signs
+        // with a FRESH leaf, so the caller must persist this exact string — a
+        // later rebroadcast of the original would carry a spent leaf and fail.
+        res.revealPayload = payloadStr;
         if (res.ok) return res;
 
         const msg = String(res.body || res.error || '');
@@ -2778,65 +3118,61 @@ self.onmessage = async (e) => {
         }
         else if (type === 'DEX_LOCK_L2') {
             // FEATURE 2 — submarine-swap intercept (MAKER side). Called by the EVM watcher
-            // when the taker's ETH lock for an L2-settled offer is seen. Routes ADD_HTLC over
-            // an open L2 channel to the taker with the SAME hashlock instead of DEX_LOCK_MIDSTATE.
-            // RELIES on the L2 HTLC fixes above (Bugs A/B/C) being in place.
+            // when the taker's ETH lock for an L2-settled offer is seen. Adds an HTLC over
+            // an open Q-Bolt v2 channel to the taker with the SAME hashlock instead of a
+            // DEX_LOCK_MIDSTATE on-chain lock.
+            //
+            // v2: we must be the SENDER on a channel to the taker (only the sender can add
+            // HTLCs), the channel must be acked and active with enough sender-side balance,
+            // and it must have enough life left to outlive the HTLC.
             const { offerId, takerL2Pk, mdsAmount, secretHash, baseRefundSecs } = payload;
+            const takerPk = String(takerL2Pk || '').substring(0, 64);
+            const amt = Number(mdsAmount);
 
-            let chanId = null, chan = null;
-            for (const [cid, c] of Object.entries(wState.l2_channels)) {
-                const peer = c.is_alice ? c.bob_pk : c.alice_pk;
-                const myBal = c.is_alice ? c.latest_state.alice_amt : c.latest_state.bob_amt;
-                if (peer === takerL2Pk && c.latest_state.is_fully_signed && myBal >= Number(mdsAmount)) { chanId = cid; chan = c; break; }
+            // Tie the L2 HTLC timeout under the Base refund window. htlcTimeout is a MIDSTATE
+            // height (~60 s blocks), so convert seconds with /60. Half the window leaves the
+            // maker ample Base-lock time to sweep after the latest possible L2 claim reveals
+            // the preimage. Floor it so a very short Base window still yields a sane HTLC.
+            const htlcTimeout = networkHeight + Math.max(QB.HTLC_MIN_HEADROOM + QB.HTLC_HOP_DELTA, Math.floor(Number(baseRefundSecs) / 60 / 2));
+
+            let chan = null;
+            for (const c of Object.values(wState.l2_channels || {})) {
+                if (c.v !== 2 || c.role !== 'sender' || c.status !== 'active' || !c.open_acked) continue;
+                if (c.peer_pk !== takerPk) continue;
+                if (c.latest.sender_amt < amt) continue;
+                if (networkHeight >= c.expiry - QB.PAY_CUTOFF) continue;
+                if (htlcTimeout > c.expiry + QB.HTLC_MAX_PAST_EXPIRY) continue;
+                chan = c; break;
             }
-            if (!chan) { self.postMessage({ type: 'DEX_LOCK_L2_FAILED', payload: { offerId, error: "No L2 channel to taker with capacity" } }); return; }
+            if (!chan) { self.postMessage({ type: 'DEX_LOCK_L2_FAILED', payload: { offerId, error: "No outbound Q-Bolt channel to the taker with enough capacity and lifetime." } }); return; }
 
-            // Tie the L2 HTLC timeout under the Base refund window so the maker can always sweep
-            // ETH before refunding and the L2 leg can't outlive the Base leg unsafely.
-            // UNITS FIX: htlcTimeout is a MIDSTATE height (~60s blocks), so convert seconds
-            // with /60, not /12 (Base's block time). The old math made the L2 leg ~5× LONGER
-            // than the Base refund window (900 blocks ≈ 15h vs 6h), letting a taker refund
-            // their ETH on Base and STILL claim the L2 HTLC afterwards — taking both legs.
-            // Half the window (6h → ~3h of Midstate blocks) leaves the maker ~3h of Base
-            // lock left to sweep after the latest possible L2 claim reveals the preimage.
-            const htlcTimeout = networkHeight + Math.max(20, Math.floor(Number(baseRefundSecs) / 60 / 2));
-
-            let nA = chan.latest_state.alice_amt, nB = chan.latest_state.bob_amt;
-            if (chan.is_alice) nA -= Number(mdsAmount); else nB -= Number(mdsAmount);
-            const htlcs = [...(chan.latest_state.htlcs || []), {
-                amount: Number(mdsAmount), timeout: htlcTimeout,
-                receiver_is_alice: !chan.is_alice, secret_hash: secretHash
-            }];
-            const newNonce = chan.latest_state.nonce + 1;
-            const stateJson = build_channel_state(chanId, chan.alice_pk, chan.bob_pk, BigInt(nA), BigInt(nB), newNonce, JSON.stringify(htlcs));
-            const sigHex = await signMssAndSync(chan.is_alice ? chan.alice_pk : chan.bob_pk, JSON.parse(stateJson).commitment);
-            chan.latest_state = { nonce: newNonce, alice_amt: nA, bob_amt: nB, htlcs, alice_sig: chan.is_alice ? sigHex : null, bob_sig: chan.is_alice ? null : sigHex, is_fully_signed: false };
-            await saveState();
-
-            // Send ADD_HTLC straight to the taker (they ARE the destination → destPk = their pk).
-            const bin = packChannelState(newNonce, nA, nB, htlcs, sigHex);
-            submitClientMinedChat([255, 42], null, [
-                { kind: "coin_id", value: chanId },
-                { kind: "signature", value: normalizeHex(bin) },
-                { kind: "address", value: takerL2Pk }
-            ]).catch(() => {});
-
-            self.postMessage({ type: 'DEX_LOCK_L2_SENT', payload: { offerId, chanId, secretHash } });
+            try {
+                await qbSenderAdvance(chan, (next) => {
+                    next.sender_amt -= amt;
+                    next.htlcs.push({ amount: amt, timeout: htlcTimeout, secret_hash: secretHash });
+                }, QB.CMD_HTLC_ADD, [{ kind: "address", value: takerPk }]);
+                self.postMessage({ type: 'DEX_LOCK_L2_SENT', payload: { offerId, chanId: chan.id, secretHash } });
+            } catch (e) {
+                self.postMessage({ type: 'DEX_LOCK_L2_FAILED', payload: { offerId, error: String(e && e.message || e) } });
+            }
         }
 
         else if (type === 'DEX_CHECK_L2_CHANNEL') {
-            // FEATURE 2 pre-flight (TAKER side): verify — BEFORE any ETH is locked — that a
-            // fully-signed channel to the maker exists whose MAKER-side balance can cover the
-            // trade. Mirrors DEX_LOCK_L2's own channel selection from the other side, so a
-            // passing check here means the maker's route will actually find a channel.
+            // FEATURE 2 pre-flight (TAKER side): verify — BEFORE any ETH is locked — that the
+            // maker will be able to route. The maker adds the HTLC as SENDER on a channel to
+            // us, so what we check is: does a channel exist where the MAKER is the sender toward
+            // us (we are the receiver), active/acked, with enough maker-side balance and life?
+            // Mirrors DEX_LOCK_L2's selection from the other side.
             const { offerId, peerPk, amount } = payload;
-            let ok = false, reason = "No open L2 channel to the maker. Open one on the Lightning tab first.";
+            const makerPk = String(peerPk || '').substring(0, 64);
+            const amt = Number(amount);
+            let ok = false, reason = "No Q-Bolt channel from the maker to you. Ask the maker to open one toward your node.";
             for (const c of Object.values(wState.l2_channels || {})) {
-                const peer = c.is_alice ? c.bob_pk : c.alice_pk;
-                if (peer !== peerPk) continue;
-                if (!c.latest_state.is_fully_signed) { reason = "Your channel to the maker has an unconfirmed state — retry in a moment."; continue; }
-                const peerBal = c.is_alice ? c.latest_state.bob_amt : c.latest_state.alice_amt;
-                if (peerBal < Number(amount)) { reason = `The maker's channel balance (${peerBal} MDS) can't cover ${amount} MDS.`; continue; }
+                if (c.v !== 2) continue;
+                if (c.role !== 'receiver' || c.peer_pk !== makerPk) continue;
+                if (c.status !== 'active' || !c.open_acked) { reason = "Your channel from the maker isn't active yet — retry in a moment."; continue; }
+                if (networkHeight >= c.expiry - QB.PAY_CUTOFF) { reason = "The maker's channel to you is too close to expiry to route safely."; continue; }
+                if (c.latest.sender_amt < amt) { reason = `The maker's channel balance (${c.latest.sender_amt} MDS) can't cover ${amt} MDS.`; continue; }
                 ok = true; reason = null; break;
             }
             self.postMessage({ type: 'DEX_L2_CHANNEL_STATUS', payload: { offerId, ok, reason } });
@@ -2857,7 +3193,8 @@ self.onmessage = async (e) => {
             const claimedAmount = (wState.l2_claimed && wState.l2_claimed[secretHash] != null) ? wState.l2_claimed[secretHash] : null;
             let htlcPending = false;
             for (const c of Object.values(wState.l2_channels || {})) {
-                if ((c.latest_state.htlcs || []).some(h => h.secret_hash === secretHash)) { htlcPending = true; break; }
+                const htlcs = (c.v === 2) ? (c.latest && c.latest.htlcs) : (c.latest_state && c.latest_state.htlcs);
+                if ((htlcs || []).some(h => h.secret_hash === secretHash)) { htlcPending = true; break; }
             }
             self.postMessage({ type: 'DEX_SUBMARINE_STATUS_RESULT', payload: { offerId, secretHash, observedSecret, claimedAmount, htlcPending } });
         }
@@ -3057,6 +3394,10 @@ self.onmessage = async (e) => {
             const resolvers = nextBlockResolvers;
             nextBlockResolvers = [];
             resolvers.forEach(r => r());
+
+            // Q-Bolt heartbeat: resume closes, auto-close/refund on schedule,
+            // reconcile external closes, resolve on-chain HTLCs.
+            if (wallet) qbWatchTick(notif.height).catch(e => qbLog(`watch: ${e && e.message || e}`));
             
             // 1. Instant Miner Update: Stop wasting hashes, get the new template!
             if (isMiningActive) {
@@ -3100,6 +3441,9 @@ self.onmessage = async (e) => {
                 wotsAddrs: {}, spentWots: {},pendingSpends: {}, mssAddrs: {}, utxos: {}, history: [],
                 lastScannedHeight: 0,
                 l2_channels: {}, l2_secrets: {}, l2_routes: {},
+                l2_invoices: {}, l2_inv_reqs: {}, l2_pay_pending: {}, qb_fwd: {},
+                qb_pending_opens: {}, qb_open_intent: null, pending_tx: null,
+                l2_observed_secrets: {}, l2_claimed: {},
                 dex_secrets: {}, dex_cancelled: {}, pendingLimitBundles: {}, annFragPool: {}
             };
             wallet = new WebWallet(payload.phrase);
@@ -3128,6 +3472,11 @@ self.onmessage = async (e) => {
         else if (type === 'LOGIN') {
             await loadState(payload.password, payload.bundleStr);
             self.postMessage({ type: 'AUTO_CONNECT_WEBRTC' });
+            // Re-broadcast anything that was mid-flight when we last stopped,
+            // before Q-Bolt reasons about channels that may depend on it.
+            recoverPendingTx()
+                .catch(e => self.postMessage({ type: 'LOG', payload: `[recovery] ${e && e.message || e}` }))
+                .finally(() => qbBoot().catch(e => qbLog(`boot: ${e && e.message || e}`)));
         }
 
         else if (type === 'SCAN') {
@@ -3152,6 +3501,75 @@ self.onmessage = async (e) => {
                 self.postMessage({ type: 'SEND_ERROR', payload: { error: (err && err.message) ? err.message : String(err) } });
             }
             finally { releaseSendLock(); }
+        }
+        else if (type === 'DEFRAG_UTXOS') {
+            await acquireSendLock();
+            try {
+                let utxos = getSpendableUtxos();
+                if (utxos.length < 2) throw new Error("Not enough UTXOs to defragment.");
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Preparing defragmentation..." } });
+
+                if (!mssCachesReady) await loadMssCaches();
+                await verifyMssSafetyIndices((m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
+
+                utxos = utxos.map(u => {
+                    if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
+                    return u;
+                });
+
+                let destMssPkHex = getPrimaryMssPk();
+                if (!destMssPkHex) {
+                    self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Generating MSS destination address..." } });
+                    await deriveNextMss(10);
+                    destMssPkHex = getPrimaryMssPk();
+                }
+                const destAddrHex = compute_p2pk_address_hex(destMssPkHex);
+
+                const spendContextStr = wallet.prepare_defrag(
+                    JSON.stringify(utxos),
+                    destAddrHex,
+                    250, // max inputs
+                    wState.nextWotsIndex
+                );
+
+                const ctx = JSON.parse(spendContextStr);
+
+                await reserveAndLock(ctx, "Saving wallet state...");
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Mining PoW..." } });
+                const stateData = await rpc.getState();
+                await new Promise(r => setTimeout(r, 50));
+                const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting commit..." } });
+                const commitReq = await rpc.commit(ctx.commitment, spamNonce);
+                if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for commit to be mined (1/2)..." } });
+                await awaitCommitmentMined(ctx.commitment, (m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting defrag reveal..." } });
+                
+                // standard reveal, because it's a cross-address sweep, NOT a single-address consolidate!
+                const revealPayloadStr = wallet.build_reveal(spendContextStr, ctx.commitment, ctx.tx_salt);
+                
+                const revealReq = await rpc.send(revealPayloadStr);
+                if (!revealReq.ok) throw new Error(`Defrag rejected: ${revealReq.body || revealReq.error}`);
+
+                self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for defrag to be mined (2/2)..." } });
+                const firstCoinId = ctx.input_coin_ids[0];
+                await awaitCoinSpent(firstCoinId, (m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
+
+                pendingSends = []; // Clear locks
+                await performScan();
+                self.postMessage({ type: 'SEND_COMPLETE', payload: buildDashboardPayload() });
+                self.postMessage({ type: 'LOG', payload: `Successfully defragmented ${ctx.selected_inputs.length} UTXOs into a single MSS address.` });
+            } catch (err) {
+                self.postMessage({ type: 'SEND_ERROR', payload: { error: err.message || String(err) } });
+            } finally {
+                releaseSendLock();
+            }
         }
         else if (type === 'CONSOLIDATE_UTXOS') {
             await acquireSendLock();
@@ -3233,174 +3651,98 @@ self.onmessage = async (e) => {
             }
         }
 else if (type === 'L2_OPEN_CHANNEL') {
-            const { peerPk, amount } = payload;
-            const myPk = getPrimaryMssPk();
-            if (!myPk) throw new Error("Network Sync required first to initialize your MSS L2 identity.");
-            
-            let aPk, bPk, isAlice;
-            if (myPk < peerPk) { aPk = myPk; bPk = peerPk; isAlice = true; }
-            else { aPk = peerPk; bPk = myPk; isAlice = false; }
-            
-            const channelAddr = build_multisig_2of2_address(aPk, bPk);
-            pendingChannelOpen = { channelAddr, alicePk: aPk, bobPk: bPk, amount: Number(amount), isAlice };
-            
-            await acquireSendLock();
-            try { await performSend(channelAddr, Number(amount) + 2000); } 
-            finally { releaseSendLock(); }
+            // Q-Bolt v2: we are the SENDER. Fund the timeout covenant, then
+            // create the channel record once funding confirms (via qb_open_intent).
+            await qbOpenOutbound(payload.peerPk, payload.amount, payload.lifetime);
         }
         else if (type === 'L2_PAY') {
             const { channelId, amount } = payload;
-            const channel = wState.l2_channels[channelId];
-            if (!channel) throw new Error("Channel not found");
-            
-            let newAliceAmt = channel.latest_state.alice_amt;
-            let newBobAmt = channel.latest_state.bob_amt;
-            
-            if (channel.is_alice) {
-                if (newAliceAmt < amount) throw new Error("Insufficient channel balance");
-                newAliceAmt -= amount; newBobAmt += amount;
-            } else {
-                if (newBobAmt < amount) throw new Error("Insufficient channel balance");
-                newBobAmt -= amount; newAliceAmt += amount;
-            }
-            
-            const newNonce = channel.latest_state.nonce + 1;
-            const htlcs = channel.latest_state.htlcs || [];
-            const stateJson = build_channel_state(channelId, channel.alice_pk, channel.bob_pk, BigInt(newAliceAmt), BigInt(newBobAmt), newNonce, JSON.stringify(htlcs));
-            const parsedState = JSON.parse(stateJson);
-            const myPk = channel.is_alice ? channel.alice_pk : channel.bob_pk;
-            
-            const sigHex = await signMssAndSync(myPk, parsedState.commitment);
-            
-            channel.latest_state = {
-                nonce: newNonce, alice_amt: newAliceAmt, bob_amt: newBobAmt, htlcs,
-                alice_sig: channel.is_alice ? sigHex : null,
-                bob_sig: channel.is_alice ? null : sigHex,
-                is_fully_signed: false
-            };
-            await saveState();
-            
-            const binPayload = packChannelState(newNonce, newAliceAmt, newBobAmt, htlcs, sigHex);
-            
-            submitClientMinedChat([255, 40], null, [
-                { kind: "coin_id", value: channelId },
-                { kind: "signature", value: normalizeHex(binPayload) }
-            ]).catch(()=>{});
+            const channel = qbChan(channelId);
+            if (!channel) throw new Error("Channel not found (or it is a frozen legacy channel).");
+            const amt = Number(amount);
+            if (!Number.isFinite(amt) || amt <= 0) throw new Error("Enter a positive amount.");
+            await qbSenderAdvance(channel, (next) => {
+                if (next.sender_amt < amt) throw new Error(`Insufficient channel balance (${next.sender_amt} MDS spendable).`);
+                next.sender_amt -= amt;
+                next.receiver_amt += amt;
+            }, QB.CMD_UPDATE);
             self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
         }
         else if (type === 'L2_SYNC') {
-            const { channelId } = payload;
-            const channel = wState.l2_channels[channelId];
-            if (!channel) return;
-            
-            const myPk = getPrimaryMssPk();
-            
-            // 1. Resend OPEN message
-            submitClientMinedChat([255, 100], null, [
-                { kind: "coin_id", value: channelId },
-                { kind: "address", value: myPk }, 
-                { kind: "midstate", value: channel.channel_salt }
-            ]).catch(()=>{});
-            
-            // 2. If we have a pending UPDATE that the peer missed, resend it after a short delay
-            if (channel.latest_state.nonce > 0 && !channel.latest_state.is_fully_signed) {
-                const binPayload = packChannelState(
-                    channel.latest_state.nonce, 
-                    channel.latest_state.alice_amt, 
-                    channel.latest_state.bob_amt, 
-                    channel.latest_state.htlcs || [], 
-                    channel.is_alice ? channel.latest_state.alice_sig : channel.latest_state.bob_sig
-                );
-                
-                setTimeout(() => {
-                    submitClientMinedChat([255, 40], null, [
-                        { kind: "coin_id", value: channelId },
-                        { kind: "signature", value: normalizeHex(binPayload) }
-                    ]).catch(()=>{});
-                }, 2000);
+            const channel = qbChan(payload.channelId);
+            if (!channel) throw new Error("Channel not found.");
+            let sent;
+            if (channel.role === 'sender') {
+                if (!channel.open_acked) sent = await qbBroadcastOpen(channel);
+                else sent = await qbSendMsg(QB.CMD_UPDATE, channel.id, qbPackState(channel.latest, channel.latest.sender_sig));
+            } else {
+                // Receiver re-ACKs the current state so a sender who missed the
+                // ACK stops rebroadcasting.
+                sent = await qbSendMsg(QB.CMD_ACK, channel.id, qbPackU32(0, channel.latest.nonce));
             }
+            // Report the truth: qbSendMsg returns false when the node rejected it.
+            if (sent) qbEvent('info', 'Re-sent to peer. If they stay silent, check that their wallet has synced its L2 identity.', channel.id);
         }
         else if (type === 'L2_CLOSE') {
-            const { channelId } = payload;
-            const channel = wState.l2_channels[channelId];
-            if (!channel || !channel.latest_state.is_fully_signed) throw new Error("Channel cannot be cooperatively closed (missing signature).");
-            
-            const htlcs = channel.latest_state.htlcs || [];
-            const stateJson = build_channel_state(channelId, channel.alice_pk, channel.bob_pk, BigInt(channel.latest_state.alice_amt), BigInt(channel.latest_state.bob_amt), channel.latest_state.nonce, JSON.stringify(htlcs));
-            const revealPayloadStr = build_channel_reveal(BigInt(channel.channel_value), channel.channel_salt, channel.alice_pk, channel.bob_pk, stateJson, channel.latest_state.alice_sig, channel.latest_state.bob_sig);
-            
-            self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Broadcasting Cooperative Close..." } });
-            const revealReq = await rpc.send(revealPayloadStr);
-            if (!revealReq.ok) throw new Error(`Close rejected: ${revealReq.body || revealReq.error}`);
-            
-            delete wState.l2_channels[channelId];
-            await saveState();
-            self.postMessage({ type: 'SEND_COMPLETE', payload: buildDashboardPayload() });
-        }
-        else if (type === 'L2_CREATE_INVOICE') {
-            const { amount } = payload;
-            const secretHex = Array.from(crypto.getRandomValues(new Uint8Array(32))).map(b=>b.toString(16).padStart(2,'0')).join('');
-            const secretHash = blake3_hash_hex(secretHex);
-            wState.l2_secrets[secretHash] = secretHex;
-            await saveState();
-            
-            const myPk = getPrimaryMssPk();
-            const invoice = `l2inv:${myPk}:${secretHash}:${amount}`;
-            self.postMessage({ type: 'L2_INVOICE_CREATED', payload: invoice });
-        }
-        else if (type === 'L2_PAY_INVOICE') {
-            const { invoice } = payload;
-            const parts = invoice.split(':');
-            if (parts.length !== 4 || parts[0] !== 'l2inv') throw new Error("Invalid invoice format");
-            
-            const destPk = parts[1];
-            const secretHash = parts[2];
-            const amount = Number(parts[3]);
-            
-            // Find a channel with enough balance to act as the first hop Hub
-            let hubChannelId = null;
-            let hubChannel = null;
-            for (const [cid, c] of Object.entries(wState.l2_channels)) {
-                const myBal = c.is_alice ? c.latest_state.alice_amt : c.latest_state.bob_amt;
-                if (c.latest_state.is_fully_signed && myBal >= amount) {
-                    hubChannelId = cid;
-                    hubChannel = c;
-                    break;
+            const channelId = payload.channelId;
+            const channel = qbChan(channelId);
+            if (!channel) {
+                // Might be a frozen legacy channel — route to the legacy flow.
+                const legacy = (wState.l2_channels || {})[channelId];
+                if (legacy && legacy.v !== 2) { await qbLegacyClose(channelId); return; }
+                throw new Error("Channel not found.");
+            }
+            if (channel.role === 'receiver') {
+                await performChannelClose(channelId, 'close');
+            } else {
+                // Sender can't settle a balance unilaterally. Ask the receiver to
+                // close; if past expiry, take the refund.
+                if (networkHeight >= channel.expiry) await performChannelClose(channelId, 'refund');
+                else {
+                    // Flag it rather than setting status='closing'. The watcher
+                    // skips non-active channels entirely, so a status change here
+                    // would disable the expiry refund — locking the funds if the
+                    // peer never settles. The flag only silences the update
+                    // rebroadcast, which is what provokes the peer's rejects.
+                    channel.close_requested = { at: networkHeight, nonce: channel.latest.nonce };
+                    await saveState();
+                    await qbSendMsg(QB.CMD_CLOSE_REQ, channelId, qbPackU32(0, channel.latest.nonce));
+                    self.postMessage({ type: 'L2_EVENT', payload: { level: 'info', channelId, msg: `Close requested. If the peer is offline, your funds unlock via refund at block ${channel.expiry}.` } });
+                    self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
                 }
             }
-            if (!hubChannel) throw new Error("No active channel with sufficient capacity to route this payment.");
-            
-            let newAliceAmt = hubChannel.latest_state.alice_amt;
-            let newBobAmt = hubChannel.latest_state.bob_amt;
-            if (hubChannel.is_alice) newAliceAmt -= amount; else newBobAmt -= amount;
-            
-            const newNonce = hubChannel.latest_state.nonce + 1;
-            const htlcs = [...(hubChannel.latest_state.htlcs || [])];
-            htlcs.push({ amount, timeout: networkHeight + 100, receiver_is_alice: !hubChannel.is_alice, secret_hash: secretHash });
-            
-            const stateJson = build_channel_state(hubChannelId, hubChannel.alice_pk, hubChannel.bob_pk, BigInt(newAliceAmt), BigInt(newBobAmt), newNonce, JSON.stringify(htlcs));
-            const parsedState = JSON.parse(stateJson);
-            const myPk = hubChannel.is_alice ? hubChannel.alice_pk : hubChannel.bob_pk;
-            const sigHex = await signMssAndSync(myPk, parsedState.commitment);
-            
-            hubChannel.latest_state = {
-                nonce: newNonce, alice_amt: newAliceAmt, bob_amt: newBobAmt, htlcs,
-                alice_sig: hubChannel.is_alice ? sigHex : null,
-                bob_sig: hubChannel.is_alice ? null : sigHex,
-                is_fully_signed: false
-            };
+        }
+        else if (type === 'L2_LEGACY_CLOSE') {
+            await qbLegacyClose(payload.channelId);
+        }
+        else if (type === 'L2_REFUND') {
+            const channel = qbChan(payload.channelId);
+            if (!channel) throw new Error("Channel not found.");
+            await performChannelClose(payload.channelId, 'refund');
+        }
+        else if (type === 'L2_CREATE_INVOICE') {
+            const inv = await qbMintInvoice(payload.amount);
+            self.postMessage({ type: 'L2_INVOICE_CREATED', payload: inv.text });
+        }
+        else if (type === 'L2_PAY_INVOICE') {
+            await qbPayParsed(qbParseInvoice(payload.invoice));
+        }
+        else if (type === 'L2_PAY_TO') {
+            // Static-address payment: ask the payee's wallet for a signed invoice
+            // over the bus, then pay whatever it returns (see qbOnInvoice).
+            const destPk = String(payload.destPk || '').replace(/^0x/i, '').substring(0, 64);
+            const amount = Number(payload.amount);
+            if (!/^[0-9a-fA-F]{64}$/.test(destPk)) throw new Error("Payee identity must be 64 hex characters.");
+            if (destPk === getPrimaryMssPk()) throw new Error("You cannot pay yourself.");
+            if (!Number.isFinite(amount) || amount <= 0) throw new Error("Enter a positive amount.");
+            const reqId = qbHex(crypto.getRandomValues(new Uint8Array(32)));
+            wState.l2_inv_reqs = wState.l2_inv_reqs || {};
+            wState.l2_inv_reqs[reqId] = { destPk, amount, height: networkHeight || 0 };
             await saveState();
-            
-            const binPayload = packChannelState(newNonce, newAliceAmt, newBobAmt, htlcs, sigHex);
-            
-            // Send ADD_HTLC (42) to the Hub, attaching the DestPk so it knows where to route it
-            submitClientMinedChat([255, 42], null, [
-                { kind: "coin_id", value: hubChannelId },
-                { kind: "signature", value: normalizeHex(binPayload) },
-                { kind: "address", value: destPk }
-            ]).catch(()=>{});
-            
-            self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+            const extra = new Uint8Array(8);
+            new DataView(extra.buffer).setBigUint64(0, BigInt(amount), true);
+            await qbSendMsg(QB.CMD_INVOICE_REQ, reqId, qbPackU32(0, 0, extra), [{ kind: "address", value: destPk }]);
+            qbEvent('info', `Requested an invoice for ${amount} MDS from ${destPk.substring(0, 12)}…`);
         }
         else if (type === 'WATCH_CONTRACT') {
             // payload: { address } — start tracking a contract's coins.
@@ -3700,6 +4042,7 @@ else if (type === 'L2_OPEN_CHANNEL') {
                     history:   cliData.history || [],
                     lastScannedHeight: cliData.last_scan_height || 0,
                     l2_channels: {}, l2_secrets: {}, l2_routes: {},
+                    l2_invoices: {}, l2_inv_reqs: {}, l2_pay_pending: {}, qb_fwd: {},
                     dex_secrets: {}, dex_cancelled: {}, pendingLimitBundles: {}, annFragPool: {}
                 };
                 mssCachesReady = true;           // populated above; loadMssCaches would short-circuit anyway
@@ -3858,13 +4201,48 @@ function buildDashboardPayload() {
     const sortedHistory    = [...pendingSends, ...wState.history].sort((a, b) => b.timestamp - a.timestamp);
     return {
         primaryAddress: mssList.length > 0 ? mssList[mssList.length - 1] : "None",
+        // The Q-Bolt identity is the MSS *public key*, NOT the receiving address.
+        // `primaryAddress` above is a key of wState.mssAddrs — i.e. an address —
+        // while the covenant, every signature check, and the channel id are all
+        // derived from get_mss_pubkey(address). Showing the address as the "L2
+        // identity" makes a peer build a different covenant, so the channel id
+        // never matches and every open is rejected. Keep the two distinct.
+        primaryL2Pk: (typeof getPrimaryMssPk === 'function' && getPrimaryMssPk()) || "None",
         balance: safeBalance,
         utxos:   utxoArray,
         history: sortedHistory,
         lastScannedHeight: wState.lastScannedHeight || 0,
         networkHeight: networkHeight || 0,
         mempoolSize: mempoolSize || 0,
-        l2Channels: Object.entries(wState.l2_channels || {}).map(([id, c]) => ({ id, ...c }))
+        l2LeafBudget: (typeof qbLeafBudget === 'function') ? qbLeafBudget() : null,
+        l2Channels: Object.entries(wState.l2_channels || {}).map(([id, c]) => {
+            if (c.v !== 2) {
+                // Frozen legacy channel — expose just enough for the UI to offer rescue.
+                const ls = c.latest_state || {};
+                return {
+                    id, version: 1, legacy: true, status: c.status || 'frozen-legacy',
+                    peer_pk: (getPrimaryMssPk && getPrimaryMssPk() === c.alice_pk) ? c.bob_pk : c.alice_pk,
+                    aliceAmt: ls.alice_amt || 0, bobAmt: ls.bob_amt || 0,
+                    isAlice: (getPrimaryMssPk && getPrimaryMssPk() === c.alice_pk),
+                };
+            }
+            const htlcLocked = (c.latest.htlcs || []).reduce((s, h) => s + h.amount, 0);
+            const blocksLeft = c.expiry - (networkHeight || 0);
+            return {
+                id, version: 2, legacy: false,
+                role: c.role, direction: c.role === 'sender' ? 'outbound' : 'inbound',
+                peer_pk: c.peer_pk, status: c.status,
+                capacity: c.capacity,
+                spendable: c.role === 'sender' ? c.latest.sender_amt : c.latest.receiver_amt,
+                receivable: c.role === 'sender' ? c.latest.receiver_amt : c.latest.sender_amt,
+                senderAmt: c.latest.sender_amt, receiverAmt: c.latest.receiver_amt,
+                htlcCount: (c.latest.htlcs || []).length, htlcLocked,
+                nonce: c.latest.nonce, expiry: c.expiry, blocksLeft,
+                openAcked: !!c.open_acked, closeStage: c.close ? c.close.stage : null,
+                onchainHtlcs: (c.onchain_htlcs || []).filter(h => !h.swept).length,
+                warn: blocksLeft <= QB.WARN_MARGIN,
+            };
+        })
     };
 }
 
@@ -3978,7 +4356,20 @@ async function _performScanInner(myGen) {
     self.postMessage({ type: 'LOG', payload: "Fetching chain state..." });
     const state       = await rpc.getState();
     const chainHeight = state.height;
+    const heightAdvanced = chainHeight > networkHeight;
     networkHeight     = chainHeight;
+
+    // Everything that waits on a block (commit/reveal confirmation, the Q-Bolt
+    // watcher) used to be woken ONLY by the WebRTC NewBlockTip push. When that
+    // transport flaps — as it does on a bad link — those pushes are missed and
+    // the whole reality layer stops advancing even though polling knows the
+    // height moved. Drive them from here too; both paths are idempotent.
+    if (heightAdvanced) {
+        const resolvers = nextBlockResolvers;
+        nextBlockResolvers = [];
+        resolvers.forEach(r => { try { r(); } catch (_) {} });
+        if (wallet) qbWatchTick(chainHeight).catch(() => {});
+    }
     self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
 
     if (myGen !== scanGeneration) return;
@@ -4351,9 +4742,17 @@ async function verifyMssSafetyIndices(onProgress) {
                 `(Could not verify MSS key state after ${ATTEMPTS} attempts: ` +
                 `${(lastErr && lastErr.message) || lastErr}. Nothing was broadcast \u2014 safe to retry.)`);
         }
-        if (mssState && mssState.next_index > mss.next_leaf) {
-            mss.next_leaf = mssState.next_index + 20;
-            self.postMessage({ type: 'LOG', payload: `\u26a0\ufe0f Fast-forwarded MSS index for safety.` });
+        if (mssState && Number.isFinite(mssState.next_index) && mssState.next_index > mss.next_leaf) {
+            // Forward-only reconcile to exactly the node's high-water mark. The
+            // old code added +20 as a fudge against counter races, but that
+            // silently burned 20 one-time leaves PER send — exhausting a 1024-leaf
+            // tree in ~50 sends and forcing constant new-address generation. The
+            // node's next_index already accounts for chain + mempool, so matching
+            // it exactly is both correct and leaf-frugal. sendRevealWithMssLeafRetry
+            // still handles the rare genuine race by re-signing on an explicit
+            // "already spent" rejection.
+            mss.next_leaf = mssState.next_index;
+            self.postMessage({ type: 'LOG', payload: `Reconciled MSS index to the network's high-water mark (${mss.next_leaf}).` });
         }
         wallet.set_mss_leaf_index(addr, mss.next_leaf);
     }
@@ -4427,12 +4826,39 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
         sub: `fee ${ctx.fee} MDS`
     }});
 
-    // Intercept L2 Open Intents
-    if (pendingChannelOpen) {
-        const outObj = ctx.outputs.find(o => o.address === pendingChannelOpen.channelAddr);
-        if (outObj) {
-            pendingChannelOpen.channelSalt = outObj.salt;
-            pendingChannelOpen.channelCoinId = compute_coin_id_hex(outObj.address, BigInt(outObj.value), outObj.salt);
+    // PRE-FLIGHT: verify every selected input actually exists on-chain BEFORE
+    // mining the commit PoW. A phantom UTXO (stale wallet record, missed spend,
+    // reorg) produces a tx the node accepts at admission but prunes on every
+    // block — an unbreakable eviction loop that costs minutes of PoW and burns
+    // a one-time signature leaf per attempt. A handful of checkCoin calls here
+    // kills that whole failure class at its cheapest point. Network errors
+    // don't block the send; only a definitive "does not exist" does.
+    {
+        const phantom = [];
+        for (const inp of ctx.selected_inputs) {
+            try { const c = await rpc.checkCoin(inp.coin_id); if (c && !c.exists) phantom.push(inp.coin_id); } catch (_) {}
+        }
+        if (phantom.length) {
+            for (const id of phantom) { if (wState.utxos && wState.utxos[id]) delete wState.utxos[id]; }
+            await saveState();
+            performScan().catch(() => {});
+            throw new Error(`Aborted before signing: the wallet selected coin(s) that do not exist on-chain (${phantom.map(m => m.substring(0, 12) + '…').join(', ')}). The stale record(s) were removed and a rescan started — please retry the send.`);
+        }
+    }
+
+    // Intercept L2 Open Intents — capture EVERY output at the channel address.
+    // prepare_spend splits value into power-of-2 denominations, so a channel is
+    // funded by one coin per set bit of capacity, not a single coin.
+    if (pendingChannelOpen && pendingChannelOpen.isQbolt) {
+        const fundingOuts = (ctx.outputs || []).filter(o => o.address === pendingChannelOpen.channelAddr && o.type !== 'data_burn');
+        if (fundingOuts.length) {
+            pendingChannelOpen.fundingCoins = fundingOuts.map(o => ({
+                value: Number(o.value), salt: o.salt,
+                coin_id: compute_coin_id_hex(o.address, BigInt(o.value), o.salt),
+            }));
+            // Channel id = lexicographically smallest funding coin id (matches the
+            // WASM builder's input ordering and the receiver's independent check).
+            pendingChannelOpen.channelId = [...pendingChannelOpen.fundingCoins].map(c => c.coin_id).sort()[0];
         }
     }
 
@@ -4471,8 +4897,29 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for the commit to be mined (phase 1 of 2)…" } });
     const revealPayloadStr = wallet.build_reveal(spendContextStr, ctx.commitment, ctx.tx_salt);
 
+    // Persist the whole in-flight transaction BEFORE we wait on the network.
+    // The reveal is already signed here, so a reload/crash/transport flap can
+    // re-send it verbatim instead of losing it. Rebuilding is NOT an option once
+    // the commitment is mined: it is single-shot on-chain, and re-signing would
+    // burn another one-time leaf.
+    wState.pending_tx = {
+        commitment: ctx.commitment,
+        revealPayload: revealPayloadStr,
+        inputCoinId: ctx.selected_inputs[0].coin_id,
+        inputCoinIds: ctx.selected_inputs.map(i => i.coin_id),   // full set, for dead-input diagnosis
+        stage: 'commit',
+        createdAt: Date.now(),
+        startedHeight: networkHeight,
+    };
+    await saveState();
+
     const _commitResp = await awaitCommitmentMined(ctx.commitment, (m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
     const _commitHeight = _commitResp.height ?? _commitResp.block_height ?? null;
+    if (wState.pending_tx && wState.pending_tx.commitment === ctx.commitment) {
+        wState.pending_tx.stage = 'reveal';
+        wState.pending_tx.commitHeight = _commitHeight;
+        await saveState();
+    }
     self.postMessage({ type: 'SEND_STEP', payload: {
         step: 'commit_mined', title: 'Commit confirmed on-chain',
         detail: _commitHeight != null ? `included in block ${_commitHeight}` : 'commit is now on-chain',
@@ -4493,10 +4940,25 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
         detail: `links to commitment ${ctx.commitment}`, sub: 'waiting for a block to include it…'
     }});
 
+    // Store the payload actually accepted by the node — the MSS-leaf retry may
+    // have re-signed it with a fresh leaf, and a rebroadcast must match.
+    if (wState.pending_tx && wState.pending_tx.commitment === ctx.commitment) {
+        if (revealReq.revealPayload) wState.pending_tx.revealPayload = revealReq.revealPayload;
+        await saveState();
+    }
+
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for the reveal to be mined (phase 2 of 2)…" } });
     const inputCoinToCheck = ctx.selected_inputs[0].coin_id;
 
-    const _revealResp = await awaitCoinSpent(inputCoinToCheck, (m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
+    const _revealResp = await awaitRevealMined(
+        inputCoinToCheck,
+        (wState.pending_tx && wState.pending_tx.revealPayload) || revealPayloadStr,
+        ctx.commitment,
+        (m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }),
+        ctx.selected_inputs.map(i => i.coin_id)
+    );
+    delete wState.pending_tx;
+    await saveState();
     const _revealHeight = _revealResp.spentHeight ?? _revealResp.height ?? null;
     self.postMessage({ type: 'SEND_STEP', payload: {
         step: 'reveal_mined', title: 'Reveal confirmed — transaction complete',
@@ -4507,31 +4969,27 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
     pendingSends = [];
     // Do NOT eagerly delete UTXOs here! Let performScan() discover the spend naturally
     // so it can properly register the history entry.
-    // Finalize L2 Open
-    if (pendingChannelOpen && pendingChannelOpen.channelCoinId) {
-        wState.l2_channels = wState.l2_channels || {};
-        wState.l2_channels[pendingChannelOpen.channelCoinId] = {
-            alice_pk: pendingChannelOpen.alicePk,
-            bob_pk: pendingChannelOpen.bobPk,
-            channel_value: pendingChannelOpen.amount + 2000, 
-            channel_salt: pendingChannelOpen.channelSalt,
-            is_alice: pendingChannelOpen.isAlice,
-            latest_state: {
-                nonce: 0,
-                alice_amt: pendingChannelOpen.isAlice ? pendingChannelOpen.amount : 0,
-                bob_amt: pendingChannelOpen.isAlice ? 0 : pendingChannelOpen.amount,
-                alice_sig: null, bob_sig: null, is_fully_signed: false
-            }
+    // Finalize L2 Open (Q-Bolt v2). The funding tx just confirmed; create the
+    // sender-side channel, sign state 0, and broadcast OPEN2. qbFinalizeOutboundOpen
+    // is idempotent and also runs from qbBoot if we crash right here.
+    if (pendingChannelOpen && pendingChannelOpen.isQbolt && pendingChannelOpen.channelId && pendingChannelOpen.fundingCoins) {
+        // Persist the resolved coins into the crash-recovery intent first.
+        wState.qb_open_intent = {
+            channelAddr: pendingChannelOpen.channelAddr,
+            senderPk: pendingChannelOpen.senderPk,
+            receiverPk: pendingChannelOpen.receiverPk,
+            expiry: pendingChannelOpen.expiry,
+            amount: pendingChannelOpen.amount,
+            channelId: pendingChannelOpen.channelId,
+            fundingCoins: pendingChannelOpen.fundingCoins,
+            createdAt: Date.now(),
         };
         await saveState();
-        
-        const myPk = getPrimaryMssPk();
-        submitClientMinedChat([255, 100], null, [
-            { kind: "coin_id", value: pendingChannelOpen.channelCoinId },
-            { kind: "address", value: myPk }, 
-            { kind: "midstate", value: pendingChannelOpen.channelSalt }
-        ]).catch(()=>{});
-        
+        const intent = wState.qb_open_intent;
+        pendingChannelOpen = null;
+        try { await qbFinalizeOutboundOpen(intent); }
+        catch (e) { qbLog(`Channel finalize deferred to watcher: ${e && e.message || e}`); }
+    } else {
         pendingChannelOpen = null;
     }
     // Scan locally rather than blindly accepting outputs to prevent mismatches
@@ -4739,219 +5197,1870 @@ function buildContractInputs(req, contractAddr) {
 }
 
 
-function packChannelState(nonce, aliceAmt, bobAmt, htlcs, sigHex) {
-    const sigBytes = new Uint8Array(sigHex.match(/.{1,2}/g).map(b => parseInt(b, 16)));
-    const bin = new Uint8Array(21 + (htlcs.length * 49) + sigBytes.length);
-    const view = new DataView(bin.buffer);
-    view.setUint32(0, nonce, true);
-    view.setBigUint64(4, BigInt(aliceAmt), true);
-    view.setBigUint64(12, BigInt(bobAmt), true);
-    view.setUint8(20, htlcs.length);
-    let offset = 21;
-    for (const h of htlcs) {
-        view.setBigUint64(offset, BigInt(h.amount), true);
-        view.setBigUint64(offset+8, BigInt(h.timeout), true);
-        view.setUint8(offset+16, h.receiver_is_alice ? 1 : 0);
-        bin.set(new Uint8Array(h.secret_hash.match(/.{1,2}/g).map(b=>parseInt(b, 16))), offset+17);
-        offset += 49;
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Q-BOLT v2 — Spilman channel engine (the "reality" layer)
+//
+//  Direction: every channel has exactly one SENDER (funds it, signs every
+//  balance state) and one RECEIVER (validates + stores states, signs nothing
+//  until close). The funding covenant is:
+//      IF   2-of-2(sender, receiver)                 → close (receiver-driven)
+//      ELSE height ≥ expiry + sender signature       → refund (sender-driven)
+//
+//  Safety invariants enforced here:
+//    · The receiver's floor (their balance) only ever rises — enforced on
+//      every inbound state. Replaying an old state can only pay them less.
+//    · The sender never holds a receiver signature, so the sender cannot
+//      broadcast ANY balance state — their only unilateral exit is the
+//      time-locked refund.
+//    · A commitment is single-shot on-chain and expires COMMITMENT_TTL
+//      blocks after being mined. We therefore NEVER commit a state until a
+//      close is actually in flight, and every retry that needs a fresh
+//      commitment bumps `attempt` (which changes the tx salt).
+//    · Every state transition is persisted BEFORE the network action that
+//      depends on it, and every in-flight close is resumable from disk.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const QB = {
+    VERSION: 2,
+    CLOSE_FEE: 2000,                    // mirrors QBOLT_CLOSE_FEE in wasm lib.rs
+    MSS_LEAVES: 1024,                   // MSS tree height 10 → 2^10 one-time leaves
+    LEAF_RESERVE: 8,                    // always keep leaves for closes/sweeps
+    MIN_CAPACITY: 4096,                 // capacity (amount + fee) sanity floor
+    DEFAULT_LIFETIME: 4320,             // ~3 days of 60 s blocks
+    MIN_LIFETIME: 360,                  // ~6 h
+    MAX_LIFETIME: 43200,                // ~30 d
+    CLOSE_MARGIN: 60,                   // receiver auto-closes at expiry − 60
+    WARN_MARGIN: 240,                   // UI warning at expiry − 240
+    PAY_CUTOFF: 90,                     // sender stops creating states at expiry − 90
+    MIN_LIFE_AT_ACCEPT: 180,            // receiver rejects channels expiring sooner
+    HTLC_MIN_HEADROOM: 60,              // htlc timeout ≥ now + 60 (stall-close + sweep room)
+    HTLC_MAX_PAST_EXPIRY: 2880,         // htlc timeout ≤ expiry + 2 days
+    HTLC_HOP_DELTA: 30,                 // hub claims upstream ≥30 blocks before its own deadline
+                                        // (must cover: force-close + commit PoW + reveal + sweep)
+    MAX_HTLCS: 8,
+    HOP_FEE: 50,                        // flat fee a hub keeps per forward (pays its 2 MSS leaves)
+    INVOICE_TTL: 720,                   // invoices expire ~12 h after minting
+    JIT_OPEN: true,                     // hubs auto-open a channel to unknown FINAL destinations
+    JIT_MARGIN: 15,                     // extra timeout blocks required before attempting a JIT open
+    CLAIM_STALL_BLOCKS: 20,             // preimage sent, no credited state → force close
+    OPEN_VERIFY_BLOCKS: 30,             // blocks a pending inbound OPEN waits for funding
+    OPEN_REBROADCAST_EVERY: 10,         // sender re-sends OPEN2 until first ACK
+    UPDATE_REBROADCAST_EVERY: 5,        // sender re-sends an unacked latest state
+    REBROADCAST_MAX: 20,
+    RECONCILE_EVERY: 5,                 // blocks between funding-existence sweeps
+    EXTERNAL_PROBE_DEPTH: 20,           // nonce look-back when reconciling a foreign close
+    // HTLC sweep, zero-balance fallback: reserves tried in order when the wallet
+    // has no UTXOs to pay the fee, so the fee comes out of the HTLC coin itself.
+    // The wallet targets ~100/KB (10x the consensus floor) and an MSS witness is
+    // ~940 bytes, so a single-input sweep needs ~190-510 depending on how many
+    // power-of-2 outputs the value decomposes into. Over-reserving is free: the
+    // surplus returns as change to our own address.
+    SWEEP_FEE_LADDER: [600, 1200, 2400],
+    // wire commands (words[0] = 255, words[1] = cmd)
+    CMD_OPEN: 110, CMD_UPDATE: 50, CMD_ACK: 51, CMD_HTLC_ADD: 52,
+    CMD_HTLC_CLAIM: 53, CMD_CLOSE_REQ: 54, CMD_REJECT: 55,
+    CMD_RESIGN_REQ: 56, CMD_RESIGN: 57,
+    CMD_LEGACY_CLOSE_REQ: 58, CMD_LEGACY_CLOSE_SIG: 59,
+    // Announce "I settled this channel on-chain". Without it the counterparty's
+    // only way to notice is the funding-existence sweep — up to RECONCILE_EVERY
+    // blocks of showing a live channel that no longer exists, during which it
+    // would happily sign a state against spent funding.
+    CMD_CLOSED: 60,
+    // Routed payments: fast failure back-propagation + invoice request/reply
+    // (the "pay anyone by pk" flow — the payee's pk is the static address).
+    CMD_HTLC_FAIL: 61, CMD_INVOICE_REQ: 62, CMD_INVOICE: 63,
+};
+const QB_CMDS = new Set([QB.CMD_OPEN, QB.CMD_UPDATE, QB.CMD_ACK, QB.CMD_HTLC_ADD,
+    QB.CMD_HTLC_CLAIM, QB.CMD_CLOSE_REQ, QB.CMD_REJECT, QB.CMD_RESIGN_REQ,
+    QB.CMD_RESIGN, QB.CMD_LEGACY_CLOSE_REQ, QB.CMD_LEGACY_CLOSE_SIG,
+    QB.CMD_CLOSED, QB.CMD_HTLC_FAIL, QB.CMD_INVOICE_REQ, QB.CMD_INVOICE]);
+
+const QB_REJECT_REASONS = {
+    1: "unknown channel", 2: "bad signature", 3: "conservation violated",
+    4: "receiver balance decreased", 5: "HTLC rules violated", 6: "stale nonce",
+    7: "channel is closing", 8: "rejected",
+};
+
+/** Per-channel re-entrancy guard for close/refund/sweep operations. */
+const qbInFlight = new Set();
+
+/** Opens already diagnosed and rejected this session.
+ *  `getChat` returns the node's ENTIRE chat history on every poll, so without
+ *  this an unusable open is re-parsed, re-derived and re-logged every 30 s
+ *  forever — burning CPU and drowning the log that has to explain it. */
+const qbRejectedOpens = new Set();
+function qbMarkRejected(channelId) {
+    if (qbRejectedOpens.size > 200) qbRejectedOpens.clear();   // bounded
+    qbRejectedOpens.add(channelId);
+}
+
+function qbLog(msg) { self.postMessage({ type: 'LOG', payload: `[Q-Bolt] ${msg}` }); }
+function qbEvent(level, msg, channelId) {
+    self.postMessage({ type: 'L2_EVENT', payload: { level, msg, channelId: channelId || null } });
+    qbLog(msg);
+}
+
+// ── byte/hex helpers ────────────────────────────────────────────────────────
+function qbHex(bytes) { return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(''); }
+function qbBytes(hex) { return new Uint8Array((hex.match(/.{1,2}/g) || []).map(b => parseInt(b, 16))); }
+
+// ── wire codecs ─────────────────────────────────────────────────────────────
+// OPEN2: [ver u8][expiry u64][count u8][{value u64, salt 32}×n][sig0 …]
+function qbPackOpen(expiry, fundingCoins, sig0Hex) {
+    const sig = qbBytes(sig0Hex);
+    const bin = new Uint8Array(10 + fundingCoins.length * 40 + sig.length);
+    const v = new DataView(bin.buffer);
+    bin[0] = QB.VERSION;
+    v.setBigUint64(1, BigInt(expiry), true);
+    bin[9] = fundingCoins.length;
+    let o = 10;
+    for (const c of fundingCoins) {
+        v.setBigUint64(o, BigInt(c.value), true);
+        bin.set(qbBytes(c.salt), o + 8);
+        o += 40;
     }
-    bin.set(sigBytes, offset);
+    bin.set(sig, o);
     return bin;
 }
-
-function unpackChannelState(binPayload) {
-    const bin = new Uint8Array(binPayload.match(/.{1,2}/g).map(b => parseInt(b, 16)));
-    const view = new DataView(bin.buffer);
-    const nonce = view.getUint32(0, true);
-    const aliceAmt = Number(view.getBigUint64(4, true));
-    const bobAmt = Number(view.getBigUint64(12, true));
-    const numHtlcs = view.getUint8(20);
-    const htlcs = [];
-    let offset = 21;
-    for (let i = 0; i < numHtlcs; i++) {
-        const amount = Number(view.getBigUint64(offset, true));
-        const timeout = Number(view.getBigUint64(offset+8, true));
-        const receiver_is_alice = view.getUint8(offset+16) === 1;
-        const secret_hash = Array.from(bin.slice(offset+17, offset+49)).map(b=>b.toString(16).padStart(2,'0')).join('');
-        htlcs.push({ amount, timeout, receiver_is_alice, secret_hash });
-        offset += 49;
+function qbUnpackOpen(hex) {
+    const bin = qbBytes(hex);
+    if (bin.length < 10 || bin[0] !== QB.VERSION) return null;
+    const v = new DataView(bin.buffer);
+    const expiry = Number(v.getBigUint64(1, true));
+    const n = bin[9];
+    if (bin.length < 10 + n * 40) return null;
+    const funding = [];
+    let o = 10;
+    for (let i = 0; i < n; i++) {
+        funding.push({ value: Number(v.getBigUint64(o, true)), salt: qbHex(bin.slice(o + 8, o + 40)) });
+        o += 40;
     }
-    const sigHex = Array.from(bin.slice(offset)).map(b=>b.toString(16).padStart(2,'0')).join('');
-    return { nonce, aliceAmt, bobAmt, htlcs, sigHex };
+    const sig0 = qbHex(bin.slice(o));
+    return { expiry, funding, sig0 };
 }
 
-async function handleL2Chat(msg) {
-    const cmd = msg.words[1];
-    
-    if (cmd === 100) { // OPEN
-        const coinId = msg.attachments.find(a => a.kind === "coin_id")?.value;
-        const peerPkRaw = msg.attachments.find(a => a.kind === "address")?.value;
-        const sigAtt = msg.attachments.find(a => a.kind === "midstate")?.value;
+// STATE (UPDATE2 / HTLC_ADD2 / RESIGN2 tail):
+// [ver u8][nonce u32][sender_amt u64][receiver_amt u64][hcount u8]
+// [{amount u64, timeout u64, hash 32}×h][sender_sig …]
+function qbPackState(st, sigHex) {
+    const sig = qbBytes(sigHex);
+    const h = st.htlcs || [];
+    const bin = new Uint8Array(22 + h.length * 48 + sig.length);
+    const v = new DataView(bin.buffer);
+    bin[0] = QB.VERSION;
+    v.setUint32(1, st.nonce, true);
+    v.setBigUint64(5, BigInt(st.sender_amt), true);
+    v.setBigUint64(13, BigInt(st.receiver_amt), true);
+    bin[21] = h.length;
+    let o = 22;
+    for (const x of h) {
+        v.setBigUint64(o, BigInt(x.amount), true);
+        v.setBigUint64(o + 8, BigInt(x.timeout), true);
+        bin.set(qbBytes(x.secret_hash), o + 16);
+        o += 48;
+    }
+    bin.set(sig, o);
+    return bin;
+}
+function qbUnpackState(hex) {
+    const bin = qbBytes(hex);
+    if (bin.length < 22 || bin[0] !== QB.VERSION) return null;
+    const v = new DataView(bin.buffer);
+    const nonce = v.getUint32(1, true);
+    const sender_amt = Number(v.getBigUint64(5, true));
+    const receiver_amt = Number(v.getBigUint64(13, true));
+    const n = bin[21];
+    if (n > 12 || bin.length < 22 + n * 48) return null;
+    const htlcs = [];
+    let o = 22;
+    for (let i = 0; i < n; i++) {
+        htlcs.push({
+            amount: Number(v.getBigUint64(o, true)),
+            timeout: Number(v.getBigUint64(o + 8, true)),
+            secret_hash: qbHex(bin.slice(o + 16, o + 48)),
+        });
+        o += 48;
+    }
+    return { nonce, sender_amt, receiver_amt, htlcs, sig: qbHex(bin.slice(o)) };
+}
 
-        if (!coinId || !peerPkRaw || !sigAtt) return;
+function qbPackU32(tag, n, extra) { // [ver][u32][extra bytes…]
+    const ex = extra || new Uint8Array(0);
+    const bin = new Uint8Array(5 + ex.length);
+    bin[0] = QB.VERSION;
+    new DataView(bin.buffer).setUint32(1, n >>> 0, true);
+    bin.set(ex, 5);
+    return bin;
+}
+function qbUnpackU32(hex) {
+    const bin = qbBytes(hex);
+    if (bin.length < 5 || bin[0] !== QB.VERSION) return null;
+    return { n: new DataView(bin.buffer).getUint32(1, true), extra: bin.slice(5) };
+}
 
-        // Strip the 8-character checksum the node adds to address attachments
-        const peerPk = peerPkRaw.substring(0, 64);
-        
-        const myPk = getPrimaryMssPk();
-        if (!myPk) return;
-        
-        let aPk, bPk, isAlice;
-        if (peerPk < myPk) { 
-            aPk = peerPk; bPk = myPk; isAlice = false; // Peer is smaller, Peer is Alice
-        } else { 
-            aPk = myPk; bPk = peerPk; isAlice = true;  // I am smaller, I am Alice
+/** Human-readable command names — silent numeric codes are useless in a log. */
+const QB_CMD_NAMES = {
+    110: 'OPEN', 50: 'UPDATE', 51: 'ACK', 52: 'HTLC_ADD', 53: 'HTLC_CLAIM',
+    54: 'CLOSE_REQ', 55: 'REJECT', 56: 'RESIGN_REQ', 57: 'RESIGN',
+    58: 'LEGACY_CLOSE_REQ', 59: 'LEGACY_CLOSE_SIG', 60: 'CLOSED',
+    61: 'HTLC_FAIL', 62: 'INVOICE_REQ', 63: 'INVOICE',
+};
+
+const QB_FAIL_REASONS = {
+    1: "unknown payment hash", 2: "amount below the invoice", 3: "amount does not cover the routing fee",
+    4: "no route to the destination", 5: "insufficient hub capacity", 6: "timeout too tight to route",
+    7: "route failed downstream",
+};
+
+/** Post a Q-Bolt message to the chat bus. Returns true only if the node
+ *  actually accepted it.
+ *
+ *  CRITICAL: `rpc.submitChat` RESOLVES with `{ok:false, body:"..."}` when the
+ *  node rejects a message — it does NOT throw. A bare try/catch here swallows
+ *  every rejection and makes the sender believe it broadcast. That bug made
+ *  channel opens fail completely silently, so the failure is now surfaced.
+ */
+async function qbSendMsg(cmd, channelId, sigBin, extraAtts) {
+    const name = QB_CMD_NAMES[cmd] || `cmd ${cmd}`;
+    const atts = [
+        { kind: "coin_id", value: channelId },
+        { kind: "signature", value: normalizeHex(qbHex(sigBin)) },
+        ...(extraAtts || []),
+    ];
+    // The bus caps attachments at 4 and the payload is length-prefixed into the
+    // PoW preimage; catch an over-long frame here rather than on the wire.
+    if (atts.length > 4) {
+        qbEvent('error', `Cannot send ${name}: ${atts.length} attachments (bus allows 4).`, channelId);
+        return false;
+    }
+    try {
+        const r = await submitClientMinedChat([255, cmd], null, atts);
+        if (r && r.ok === false) {
+            qbEvent('error', `Bus rejected ${name}: ${r.body || r.error || 'rejected'} (payload ${sigBin.length}B, ${atts.length} attachments)`, channelId);
+            return false;
         }
+        qbLog(`sent ${name} for ${String(channelId).substring(0, 12)}… (${sigBin.length}B)`);
+        return true;
+    } catch (e) {
+        qbEvent('error', `Bus send failed (${name}): ${e && e.message || e}`, channelId);
+        return false;
+    }
+}
 
-        wState.l2_channels = wState.l2_channels || {};
-        if (wState.l2_channels[coinId]) return;
+// ── channel accessors ───────────────────────────────────────────────────────
+function qbChan(channelId) {
+    const c = (wState.l2_channels || {})[channelId];
+    return (c && c.v === 2) ? c : null;
+}
+function qbFundingJson(channel) {
+    return JSON.stringify(channel.funding.map(f => ({ value: f.value, salt: f.salt })));
+}
+function qbLeafBudget() {
+    const pk = getPrimaryMssPk();
+    if (!pk) return { used: 0, total: QB.MSS_LEAVES, remaining: 0 };
+    const addr = compute_p2pk_address_hex(pk);
+    const used = (wState.mssAddrs[addr] && wState.mssAddrs[addr].next_leaf) || 0;
+    return { used, total: QB.MSS_LEAVES, remaining: Math.max(0, QB.MSS_LEAVES - used) };
+}
+function qbSpendable(channel) { return channel.role === 'sender' ? channel.latest.sender_amt : channel.latest.receiver_amt; }
 
-        wState.l2_channels[coinId] = {
-            alice_pk: aPk, bob_pk: bPk, channel_value: 0, channel_salt: sigAtt,
-            is_alice: isAlice,
-            latest_state: { nonce: 0, alice_amt: 0, bob_amt: 0, htlcs: [], alice_sig: null, bob_sig: null, is_fully_signed: false }
-        };
+/** Push the state we're about to supersede into a bounded ring buffer.
+ *  Purely for reconciliation accounting: the receiver holds the sender's
+ *  signature for EVERY state ever sent, so any of them could be the one that
+ *  lands on-chain. This lets qbReconcileExternalClose identify which did. */
+function qbPushHistory(channel) {
+    channel.state_history = channel.state_history || [];
+    channel.state_history.push({
+        nonce: channel.latest.nonce,
+        sender_amt: channel.latest.sender_amt,
+        receiver_amt: channel.latest.receiver_amt,
+        htlcs: (channel.latest.htlcs || []).map(h => ({ ...h })),
+    });
+    if (channel.state_history.length > QB.EXTERNAL_PROBE_DEPTH) {
+        channel.state_history.splice(0, channel.state_history.length - QB.EXTERNAL_PROBE_DEPTH);
+    }
+}
+
+/** Build the canonical close state for arbitrary balances on this channel. */
+function qbBuildState(channel, senderAmt, receiverAmt, nonce, htlcs, attempt) {
+    return JSON.parse(qbolt_build_state(
+        channel.id, channel.sender_pk, channel.receiver_pk, BigInt(channel.expiry),
+        qbFundingJson(channel), BigInt(senderAmt), BigInt(receiverAmt),
+        nonce, JSON.stringify(htlcs || []), attempt >>> 0
+    ));
+}
+
+// ── inbound state validation (the receiver's gauntlet) ─────────────────────
+// Returns { ok:true, commitment } or { ok:false, code, reason }.
+function qbValidateInbound(channel, st, height) {
+    if (channel.status !== 'active') return { ok: false, code: 7, reason: "channel is not active" };
+    if (channel.role !== 'receiver') return { ok: false, code: 8, reason: "not the receiver on this channel" };
+    const cur = channel.latest;
+    if (st.nonce <= cur.nonce) {
+        // Exact re-delivery of the current state is idempotent — re-ACK it.
+        if (st.nonce === cur.nonce && st.sender_amt === cur.sender_amt &&
+            st.receiver_amt === cur.receiver_amt && st.sig === cur.sender_sig) {
+            return { ok: true, idempotent: true };
+        }
+        return { ok: false, code: 6, reason: `stale nonce ${st.nonce} (have ${cur.nonce})` };
+    }
+    if ((st.htlcs || []).length > QB.MAX_HTLCS) return { ok: false, code: 5, reason: "too many HTLCs" };
+
+    // The WASM builder enforces exact conservation (sender+receiver+htlcs =
+    // capacity − fee) and rebuilds the commitment the sender must have signed.
+    let built;
+    try { built = qbBuildState(channel, st.sender_amt, st.receiver_amt, st.nonce, st.htlcs, 0); }
+    catch (e) { return { ok: false, code: 3, reason: String(e && e.message || e) }; }
+
+    if (!verify_mss_sig_wasm(st.sig, built.commitment, channel.sender_pk)) {
+        return { ok: false, code: 2, reason: "sender signature does not verify" };
+    }
+    // Monotonic floor: my guaranteed balance can never go down.
+    if (st.receiver_amt < cur.receiver_amt) {
+        return { ok: false, code: 4, reason: `receiver balance decreased ${cur.receiver_amt} → ${st.receiver_amt}` };
+    }
+    // HTLC delta rules. New HTLCs need sane timeouts; removed HTLCs must be
+    // either credited to me (claim) or provably expired (cancel).
+    const prevByHash = new Map((cur.htlcs || []).map(h => [h.secret_hash, h]));
+    const newByHash = new Map((st.htlcs || []).map(h => [h.secret_hash, h]));
+    for (const h of st.htlcs || []) {
+        if (!(h.amount > 0)) return { ok: false, code: 5, reason: "zero-value HTLC" };
+        if (!prevByHash.has(h.secret_hash)) {
+            if (h.timeout < height + QB.HTLC_MIN_HEADROOM)
+                return { ok: false, code: 5, reason: `HTLC timeout ${h.timeout} too soon (need ≥ ${height + QB.HTLC_MIN_HEADROOM})` };
+            if (h.timeout > channel.expiry + QB.HTLC_MAX_PAST_EXPIRY)
+                return { ok: false, code: 5, reason: "HTLC timeout too far past channel expiry" };
+        } else {
+            const p = prevByHash.get(h.secret_hash);
+            if (p.amount !== h.amount || p.timeout !== h.timeout)
+                return { ok: false, code: 5, reason: "existing HTLC was mutated" };
+        }
+    }
+    let mustCredit = 0;
+    for (const [hash, p] of prevByHash) {
+        if (!newByHash.has(hash)) {
+            if (height > p.timeout) continue;               // expired → cancel back to sender is legal
+            if ((channel.failed_htlcs || {})[hash] !== undefined) continue; // we FAILed it — consented to uncredited removal
+            mustCredit += p.amount;                          // otherwise removal must pay me
+        }
+    }
+    if (st.receiver_amt - cur.receiver_amt < mustCredit) {
+        return { ok: false, code: 4, reason: "unexpired HTLC removed without crediting the receiver" };
+    }
+    return { ok: true, commitment: built.commitment };
+}
+
+// ── sender-side state advancement ───────────────────────────────────────────
+// `mutate(next)` edits { sender_amt, receiver_amt, htlcs } in place.
+async function qbSenderAdvance(channel, mutate, wireCmd, extraAtts) {
+    if (channel.role !== 'sender') throw new Error("Only the channel sender can create states. Ask the peer to open a channel toward you for the reverse direction.");
+    if (channel.status !== 'active') throw new Error(`Channel is ${channel.status}.`);
+    if (!channel.open_acked) throw new Error("The peer hasn't acknowledged this channel yet — use Sync, or wait a moment.");
+    if (channel.close_requested) throw new Error("A close has already been requested on this channel — no further payments can be made.");
+    if (networkHeight >= channel.expiry - QB.PAY_CUTOFF) throw new Error(`Channel is inside its closing window (expires at block ${channel.expiry}). Open a fresh channel.`);
+    const budget = qbLeafBudget();
+    if (budget.remaining <= QB.LEAF_RESERVE) throw new Error(`MSS key exhausted (${budget.remaining} one-time leaves left; ${QB.LEAF_RESERVE} are reserved for closing). Close this channel and derive a new address.`);
+
+    const next = {
+        sender_amt: channel.latest.sender_amt,
+        receiver_amt: channel.latest.receiver_amt,
+        htlcs: (channel.latest.htlcs || []).map(h => ({ ...h })),
+    };
+    mutate(next);
+    if (next.sender_amt < 0 || next.receiver_amt < 0) throw new Error("Insufficient channel balance");
+    if (next.htlcs.length > QB.MAX_HTLCS) throw new Error(`Too many pending HTLCs (max ${QB.MAX_HTLCS}).`);
+
+    const nonce = channel.latest.nonce + 1;
+    const built = qbBuildState(channel, next.sender_amt, next.receiver_amt, nonce, next.htlcs, 0);
+    const sig = await signMssAndSync(channel.sender_pk, built.commitment);
+    // Remember the state we're superseding. The receiver holds our signature for
+    // EVERY state we ever sent, so any of them could be the one that lands
+    // on-chain — this bounded ring buffer lets qbReconcileExternalClose work out
+    // which one actually did. (Accounting only: older states pay us more.)
+    qbPushHistory(channel);
+    channel.latest = { nonce, sender_amt: next.sender_amt, receiver_amt: next.receiver_amt, htlcs: next.htlcs, sender_sig: sig };
+    channel.sig_attempt = 0;
+    channel.leaf_spent = (channel.leaf_spent || 0) + 1;
+    channel.last_send_height = networkHeight;
+    channel.send_tries = 0;
+    await saveState();                                       // persist BEFORE broadcast
+
+    await qbSendMsg(wireCmd, channel.id, qbPackState(channel.latest, sig), extraAtts);
+    self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+    return channel.latest;
+}
+
+// ═══ inbound protocol handlers ══════════════════════════════════════════════
+
+/** Q-Bolt messages already processed this session.
+ *
+ *  `getChat` returns the node's ENTIRE history on every 30 s poll, so without
+ *  this every message is re-handled on every poll. That is not merely wasteful:
+ *  a rejected state got re-rejected forever, each REJECT costing a fresh chat
+ *  PoW, and the resulting flood filled the node's 100-message chat ring — which
+ *  evicts the very ACKs and CLOSED notices the protocol depends on, and made
+ *  getChat itself time out. `sender+timestamp+nonce` is a unique identity: the
+ *  PoW nonce is bound to the exact message contents. */
+const qbSeenMsgs = new Set();
+function qbMsgId(msg) {
+    return `${msg.sender || ''}:${msg.timestamp || 0}:${msg.nonce || 0}`;
+}
+
+async function handleQbChat(msg) {
+    // Replay guard FIRST — before any parsing, validation or reply.
+    const mid = qbMsgId(msg);
+    if (qbSeenMsgs.has(mid)) return;
+    if (qbSeenMsgs.size > 5000) qbSeenMsgs.clear();          // bounded; a re-process is harmless
+    qbSeenMsgs.add(mid);
+
+    const cmd = msg.words[1];
+    const att = (kind) => msg.attachments.find(a => a.kind === kind)?.value;
+    const channelId = att("coin_id");
+    if (!channelId) return;
+    const myPk = getPrimaryMssPk();
+    if (!myPk) {
+        // During boot the MSS caches haven't loaded yet, so this is expected and
+        // transient — the 30 s chat poll redelivers everything once they have.
+        // Only warn when the caches ARE ready and there is genuinely no identity.
+        if (!mssCachesReady) return;
+        if (!qbInFlight.has('warn:no-identity')) {
+            qbInFlight.add('warn:no-identity');
+            qbEvent('error', 'Q-Bolt traffic is arriving but this wallet has no L2 identity yet. Run Network Sync to initialize it, then ask the peer to Resend.');
+        }
+        return;
+    }
+
+    if (cmd === QB.CMD_OPEN) return qbOnOpen(channelId, att, myPk);
+    // Invoice request/reply are not channel-scoped: channelId is an opaque
+    // request id minted by the requester.
+    if (cmd === QB.CMD_INVOICE_REQ) return qbOnInvoiceReq(channelId, att, myPk);
+    if (cmd === QB.CMD_INVOICE) return qbOnInvoice(channelId, att, myPk);
+
+    const channel = qbChan(channelId);
+    if (!channel) {
+        // Unknown channel: tell the counterparty (bounded — once per channel id per session).
+        if ((cmd === QB.CMD_UPDATE || cmd === QB.CMD_HTLC_ADD) && !qbInFlight.has(`rej:${channelId}`)) {
+            qbInFlight.add(`rej:${channelId}`);
+            await qbSendMsg(QB.CMD_REJECT, channelId, qbPackU32(0, 0, new Uint8Array([1])));
+        }
+        return;
+    }
+
+    if (cmd === QB.CMD_UPDATE || cmd === QB.CMD_HTLC_ADD) return qbOnUpdate(channel, cmd, att, myPk, msg);
+    if (cmd === QB.CMD_ACK) return qbOnAck(channel, att);
+    if (cmd === QB.CMD_HTLC_CLAIM) return qbOnClaim(channel, att);
+    if (cmd === QB.CMD_HTLC_FAIL) return qbOnFail(channel, att);
+    if (cmd === QB.CMD_CLOSE_REQ) return qbOnCloseReq(channel);
+    if (cmd === QB.CMD_CLOSED) return qbOnClosed(channel, att);
+    if (cmd === QB.CMD_REJECT) return qbOnReject(channel, att);
+    if (cmd === QB.CMD_RESIGN_REQ) return qbOnResignReq(channel, att);
+    if (cmd === QB.CMD_RESIGN) return qbOnResign(channel, att);
+    if (cmd === QB.CMD_LEGACY_CLOSE_REQ) return qbOnLegacyCloseReq(channelId, att, myPk);
+    if (cmd === QB.CMD_LEGACY_CLOSE_SIG) return qbOnLegacyCloseSig(channelId, att);
+}
+
+async function qbOnOpen(channelId, att, myPk) {
+    const senderPkRaw = att("address");
+    const payload = att("signature");
+    if (!senderPkRaw || !payload) {
+        qbLog(`ignored an OPEN with missing attachments (address=${!!senderPkRaw}, payload=${!!payload})`);
+        return;
+    }
+    // Address attachments come back from the node with an 8-char checksum.
+    const senderPk = senderPkRaw.substring(0, 64);
+    if (senderPk === myPk) return;                           // our own broadcast echo
+    if (qbChan(channelId)) {                                  // duplicate OPEN → re-ACK for the sender's sake
+        const c = qbChan(channelId);
+        if (c.role === 'receiver') await qbSendMsg(QB.CMD_ACK, channelId, qbPackU32(0, 0));
+        return;
+    }
+
+    if (qbRejectedOpens.has(channelId)) return;               // already diagnosed this session
+
+    const open = qbUnpackOpen(payload);
+    if (!open || !open.funding.length) {
+        qbEvent('warn', `Received an unreadable channel open from ${senderPk.substring(0, 12)}… (${payload.length / 2}B payload). Version mismatch — both wallets must run the same build.`, channelId);
+        return;
+    }
+    qbLog(`inbound OPEN from ${senderPk.substring(0, 12)}…: ${open.funding.length} funding coin(s), expiry ${open.expiry}`);
+
+    wState.qb_pending_opens = wState.qb_pending_opens || {};
+    wState.qb_pending_opens[channelId] = {
+        senderPk, expiry: open.expiry, funding: open.funding, sig0: open.sig0,
+        first_seen: networkHeight, tries: 0,
+    };
+    await saveState();
+    await qbTryFinalizeInboundOpen(channelId);
+}
+
+/** Verify a pending inbound OPEN against the chain; called on receipt and
+ *  re-tried by the watcher until funding confirms or the window lapses. */
+async function qbTryFinalizeInboundOpen(channelId) {
+    const p = (wState.qb_pending_opens || {})[channelId];
+    if (!p) return;
+    const myPk = getPrimaryMssPk();
+    const short = String(channelId).substring(0, 12);
+    // Every `return` below used to be silent, which made a dropped open
+    // indistinguishable from one that never arrived. They all speak now.
+    const drop = async (why) => {
+        delete wState.qb_pending_opens[channelId];
+        qbMarkRejected(channelId);                            // don't re-diagnose on every chat poll
+        await saveState();
+        qbEvent('warn', `Discarded inbound channel ${short}…: ${why}`, channelId);
+    };
+    if (!myPk) {
+        qbEvent('error', 'Received a channel open but this wallet has no L2 identity yet — run Network Sync, then ask the peer to Resend.', channelId);
+        return;                                              // keep it pending; retry once we have an identity
+    }
+    p.tries++;
+
+    let addr, ids;
+    try {
+        addr = qbolt_channel_address(p.senderPk, myPk, BigInt(p.expiry));
+        ids = p.funding.map(f => compute_coin_id_hex(addr, BigInt(f.value), f.salt));
+    } catch (e) { return drop(`could not derive the covenant address (${e && e.message || e})`); }
+
+    // Never trust the wire: the channel id must be the smallest funding coin id.
+    const sortedIds = [...ids].sort();
+    if (sortedIds[0] !== channelId) {
+        return drop(`channel id mismatch — the peer must open toward this wallet's exact L2 identity `
+            + `(${myPk.substring(0, 12)}…). Derived ${sortedIds[0].substring(0, 12)}…, message claims ${short}…`);
+    }
+
+    const capacity = p.funding.reduce((a, f) => a + f.value, 0);
+    if (capacity < QB.MIN_CAPACITY) return drop(`capacity ${capacity} is below the ${QB.MIN_CAPACITY} minimum`);
+    if (p.expiry <= networkHeight + QB.MIN_LIFE_AT_ACCEPT) {
+        return drop(`expires at block ${p.expiry}, which is less than ${QB.MIN_LIFE_AT_ACCEPT} blocks away (now ${networkHeight})`);
+    }
+
+    // Every claimed funding coin must actually exist on-chain.
+    for (const id of ids) {
+        let chk = null;
+        try { chk = await rpc.checkCoin(id); }
+        catch (e) { qbLog(`open ${short}…: checkCoin failed, retrying next block (${e && e.message || e})`); return; }
+        if (!chk || !chk.exists) {
+            if (networkHeight - p.first_seen > QB.OPEN_VERIFY_BLOCKS) {
+                return drop(`funding coin ${id.substring(0, 12)}… never confirmed within ${QB.OPEN_VERIFY_BLOCKS} blocks`);
+            }
+            qbLog(`open ${short}…: waiting for funding to confirm (${networkHeight - p.first_seen}/${QB.OPEN_VERIFY_BLOCKS} blocks)`);
+            return;                                          // not confirmed yet → retry on next block
+        }
+    }
+
+    // Verify the sender's signature over state 0 (all funds on their side).
+    const fundingJson = JSON.stringify(p.funding);
+    let built0;
+    try {
+        built0 = JSON.parse(qbolt_build_state(channelId, p.senderPk, myPk, BigInt(p.expiry),
+            fundingJson, BigInt(capacity - QB.CLOSE_FEE), 0n, 0, "[]", 0));
+    } catch (e) { return drop(`could not rebuild the opening state (${e && e.message || e})`); }
+    if (!p.sig0) return drop('the open carried no opening signature');
+    if (!verify_mss_sig_wasm(p.sig0, built0.commitment, p.senderPk)) {
+        return drop(`the opening signature does not verify against sender ${p.senderPk.substring(0, 12)}…`);
+    }
+
+    wState.l2_channels = wState.l2_channels || {};
+    wState.l2_channels[channelId] = {
+        v: 2, id: channelId, role: 'receiver',
+        sender_pk: p.senderPk, receiver_pk: myPk, peer_pk: p.senderPk,
+        expiry: p.expiry, funding: p.funding.map((f, i) => ({ ...f, coin_id: ids[i] })),
+        capacity, channel_addr: addr, status: 'active',
+        latest: { nonce: 0, sender_amt: capacity - QB.CLOSE_FEE, receiver_amt: 0, htlcs: [], sender_sig: p.sig0 },
+        sig_attempt: 0, acked_nonce: 0, open_acked: true, created_height: networkHeight,
+        leaf_spent: 0, close: null, closed: null, pending_claims: {}, onchain_htlcs: [],
+    };
+    delete wState.qb_pending_opens[channelId];
+    if (typeof watchedContracts !== 'undefined') { watchedContracts.add(addr); updateWasmWatchlist(); }
+    await saveState();
+    await qbSendMsg(QB.CMD_ACK, channelId, qbPackU32(0, 0));
+    qbEvent('info', `Inbound channel open: ${capacity - QB.CLOSE_FEE} MDS capacity, expires at block ${p.expiry}.`, channelId);
+    self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+}
+
+async function qbOnUpdate(channel, cmd, att, myPk, msg) {
+    const payload = att("signature");
+    if (!payload) return;
+    const st = qbUnpackState(payload);
+    if (!st) return;
+    if (channel.role === 'sender') return;                    // our own echo / misdirected
+
+    const verdict = qbValidateInbound(channel, st, networkHeight);
+    if (!verdict.ok) {
+        qbLog(`Rejected state ${st.nonce} on ${channel.id.substring(0, 12)}…: ${verdict.reason}`);
+        // A REJECT costs a chat PoW and a slot in the node's 100-message history
+        // ring. Once we're closing/closed the peer's states are moot and there is
+        // nothing they can usefully do about it — replying to each one just
+        // floods the bus and evicts messages that matter. Tell them once.
+        const terminal = channel.status !== 'active';
+        const key = `rejsent:${channel.id}`;
+        if (terminal) {
+            if (qbInFlight.has(key)) return;
+            qbInFlight.add(key);
+        }
+        await qbSendMsg(QB.CMD_REJECT, channel.id, qbPackU32(0, st.nonce, new Uint8Array([verdict.code])));
+        return;
+    }
+    if (!verdict.idempotent) {
+        const prevHtlcs = channel.latest.htlcs || [];
+        qbPushHistory(channel);   // lets us identify a close made from another device
+        channel.latest = { nonce: st.nonce, sender_amt: st.sender_amt, receiver_amt: st.receiver_amt, htlcs: st.htlcs, sender_sig: st.sig };
+        channel.sig_attempt = 0;
+        await saveState();                                    // persist BEFORE the ACK leaves
+
+        // Anything that was pending a claim-credit and is now credited: clear the stall timer.
+        for (const hash of Object.keys(channel.pending_claims || {})) {
+            const still = (st.htlcs || []).some(h => h.secret_hash === hash);
+            if (!still) delete channel.pending_claims[hash];
+        }
+        // FAIL consents are single-use: once the hash left the state, forget it.
+        for (const hash of Object.keys(channel.failed_htlcs || {})) {
+            if (!(st.htlcs || []).some(h => h.secret_hash === hash)) delete channel.failed_htlcs[hash];
+        }
         await saveState();
         self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+
+        if (cmd === QB.CMD_HTLC_ADD) {
+            const added = (st.htlcs || []).filter(h => !prevHtlcs.some(p => p.secret_hash === h.secret_hash));
+            for (const h of added) await qbOnHtlcAdded(channel, h, msg, myPk);
+        }
     }
-    else if (cmd === 40 || cmd === 41 || cmd === 42 || cmd === 43) {
-        // 40=UPDATE, 41=CONFIRM, 42=ADD_HTLC, 43=CLAIM_HTLC
-        const coinId = msg.attachments.find(a => a.kind === "coin_id")?.value;
-        const sigAtt = msg.attachments.find(a => a.kind === "signature")?.value;
-        if (!coinId || !sigAtt) return;
+    await qbSendMsg(QB.CMD_ACK, channel.id, qbPackU32(0, st.nonce));
+}
 
-        const channel = wState.l2_channels[coinId];
-        if (!channel) return;
+/** A new HTLC landed on a channel where we are the receiver. Either we are
+ *  the destination (claim it) or we are a hub (forward toward the next hop).
+ *
+ *  The route is the ordered `address` attachments: the remaining path, ending
+ *  at the final destination. Empty (or just us) means we are the destination.
+ *  Attachment budget (4, minus coin_id + signature) caps routes at 2 hops:
+ *  payer → hubA → hubB → payee. */
+async function qbOnHtlcAdded(channel, htlc, msg, myPk) {
+    const route = (msg.attachments || []).filter(a => a.kind === 'address')
+        .map(a => String(a.value).substring(0, 64));
+    const iAmDest = route.length === 0 || (route.length === 1 && route[0] === myPk);
 
-        const { nonce, aliceAmt, bobAmt, htlcs, sigHex: counterpartySig } = unpackChannelState(sigAtt);
-        if (nonce <= channel.latest_state.nonce && channel.latest_state.is_fully_signed) return;
-
-        let stateJson;
-        try {
-            stateJson = build_channel_state(coinId, channel.alice_pk, channel.bob_pk, BigInt(aliceAmt), BigInt(bobAmt), nonce, JSON.stringify(htlcs));
-        } catch (e) { console.error("WASM build_channel_state failed:", e); return; }
-
-        const parsedState = JSON.parse(stateJson);
-        const counterpartyPk = channel.is_alice ? channel.bob_pk : channel.alice_pk;
-        if (!verify_mss_sig_wasm(counterpartySig, parsedState.commitment, counterpartyPk)) return;
-
-        const myPk = channel.is_alice ? channel.alice_pk : channel.bob_pk;
-
-        // ── STEP 1: commit the incoming state (co-sign + store + CONFIRM) ──
-        // This makes an HTLC-add irrevocable BEFORE we act on it. Doing this FIRST
-        // (rather than after the routing logic) is the fix for Bug B: the old code
-        // built the claim state then let this tail clobber it back a nonce.
-        const mySig = await signMssAndSync(myPk, parsedState.commitment);
-        channel.latest_state = {
-            nonce, alice_amt: aliceAmt, bob_amt: bobAmt, htlcs,
-            alice_sig: channel.is_alice ? mySig : counterpartySig,
-            bob_sig:   channel.is_alice ? counterpartySig : mySig,
-            is_fully_signed: true
-        };
-        if (channel.channel_value === 0) channel.channel_value = aliceAmt + bobAmt + 2000;
+    if (iAmDest) {
+        const secret = (wState.l2_secrets || {})[htlc.secret_hash];
+        if (!secret) return;                                  // not ours / another device holds it — never FAIL here
+        const inv = (wState.l2_invoices || {})[htlc.secret_hash];
+        if (inv && htlc.amount < inv.amount) {
+            // NEVER reveal the preimage below the invoice amount: a hub could
+            // underpay us and use the preimage to collect the full upstream HTLC.
+            await qbFail(channel, htlc.secret_hash, 2);
+            return;
+        }
+        channel.pending_claims = channel.pending_claims || {};
+        channel.pending_claims[htlc.secret_hash] = { sent_height: networkHeight, amount: htlc.amount };
         await saveState();
+        await qbSendMsg(QB.CMD_HTLC_CLAIM, channel.id,
+            qbPackU32(0, channel.latest.nonce, qbBytes(htlc.secret_hash)),
+            [{ kind: "midstate", value: secret }]);
+        wState.l2_claimed = wState.l2_claimed || {};
+        wState.l2_claimed[htlc.secret_hash] = htlc.amount;
+        await saveState();
+        self.postMessage({ type: 'L2_HTLC_CLAIMED', payload: { secretHash: htlc.secret_hash, amount: htlc.amount } });
+        return;
+    }
 
-        if (cmd === 40 || cmd === 42) { // reply CONFIRM for UPDATE / ADD_HTLC
-            const confirmBin = packChannelState(nonce, aliceAmt, bobAmt, htlcs, mySig);
-            submitClientMinedChat([255, 41], null, [
-                { kind: "coin_id", value: coinId },
-                { kind: "signature", value: normalizeHex(confirmBin) }
-            ]).catch(() => {});
+    // HUB: keep QB.HOP_FEE, forward the rest toward the next hop.
+    const skipSelf = route[0] === myPk && route.length > 1;   // tolerate a route that names us first
+    const nextPk = skipSelf ? route[1] : route[0];
+    const remaining = route.slice(skipSelf ? 2 : 1);
+    const outAmt = htlc.amount - QB.HOP_FEE;
+    const downstreamTimeout = htlc.timeout - QB.HTLC_HOP_DELTA;
+    if (outAmt <= 0) return qbFail(channel, htlc.secret_hash, 3);
+    if (downstreamTimeout < networkHeight + QB.HTLC_MIN_HEADROOM) return qbFail(channel, htlc.secret_hash, 6);
+
+    let fwd = null;
+    for (const c of Object.values(wState.l2_channels || {})) {
+        if (c.v !== 2 || c.id === channel.id) continue;
+        if (c.role !== 'sender' || c.status !== 'active' || !c.open_acked) continue;
+        if (c.peer_pk !== nextPk) continue;
+        if (c.latest.sender_amt < outAmt) continue;
+        if (networkHeight >= c.expiry - QB.PAY_CUTOFF) continue;
+        if (downstreamTimeout > c.expiry + QB.HTLC_MAX_PAST_EXPIRY) continue;
+        fwd = c; break;
+    }
+
+    if (!fwd) {
+        // JIT open: no channel to a FINAL destination → fund one on-chain now,
+        // park the forward, and let the watcher deliver once the peer ACKs.
+        const existing = Object.values(wState.l2_channels || {}).some(c => c.v === 2
+            && c.role === 'sender' && c.peer_pk === nextPk && c.status === 'active');
+        const canJit = QB.JIT_OPEN && !existing && remaining.length === 0
+            && !(wState.qb_fwd || {})[htlc.secret_hash]
+            && !wState.qb_open_intent && !pendingChannelOpen
+            && htlc.timeout - networkHeight >= QB.HTLC_MIN_HEADROOM + QB.HTLC_HOP_DELTA + QB.JIT_MARGIN;
+        if (!canJit) return qbFail(channel, htlc.secret_hash, existing ? 5 : 4);
+
+        wState.qb_fwd = wState.qb_fwd || {};
+        wState.qb_fwd[htlc.secret_hash] = {
+            nextPk, amount: outAmt, timeout: downstreamTimeout,
+            upId: channel.id, inAmount: htlc.amount, created: networkHeight,
+        };
+        await saveState();
+        qbEvent('info', `No channel to ${nextPk.substring(0, 12)}… — opening one just-in-time to route ${outAmt} MDS.`, channel.id);
+        qbOpenOutbound(nextPk, Math.max(QB.MIN_CAPACITY - QB.CLOSE_FEE, outAmt), QB.DEFAULT_LIFETIME)
+            .catch(async (e) => {
+                qbLog(`JIT open failed: ${e && e.message || e}`);
+                delete wState.qb_fwd[htlc.secret_hash];
+                await saveState();
+                await qbFail(channel, htlc.secret_hash, 5);
+            });
+        return;
+    }
+
+    try {
+        await qbSenderAdvance(fwd, (next) => {
+            next.sender_amt -= outAmt;
+            next.htlcs.push({ amount: outAmt, timeout: downstreamTimeout, secret_hash: htlc.secret_hash });
+        }, QB.CMD_HTLC_ADD, remaining.map(pk => ({ kind: "address", value: pk })));
+        wState.l2_routes = wState.l2_routes || {};
+        wState.l2_routes[htlc.secret_hash] = { fromCoinId: channel.id, amount: htlc.amount };
+        await saveState();
+    } catch (e) {
+        qbLog(`HTLC forward failed: ${e && e.message || e}`);
+        await qbFail(channel, htlc.secret_hash, 5);
+    }
+}
+
+async function qbOnAck(channel, att) {
+    if (channel.role !== 'sender') return;
+    const p = qbUnpackU32(att("signature") || "");
+    if (!p) return;
+    channel.open_acked = true;
+    channel.acked_nonce = Math.max(channel.acked_nonce || 0, p.n);
+    channel.send_tries = 0;
+    await saveState();
+    self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+}
+
+async function qbOnReject(channel, att) {
+    if (channel.role !== 'sender') return;
+    const p = qbUnpackU32(att("signature") || "");
+    if (!p) return;
+    const code = p.extra && p.extra.length ? p.extra[0] : 8;
+    const prev = channel.last_reject;
+    const isNew = !prev || prev.nonce !== p.n || prev.code !== code;
+    channel.last_reject = { nonce: p.n, code, reason: QB_REJECT_REASONS[code] || "rejected", at: networkHeight };
+    if (!isNew) return;                                       // duplicate — don't re-persist or re-toast
+    await saveState();
+    qbEvent('warn', `Peer rejected state ${p.n}: ${channel.last_reject.reason}.`, channel.id);
+}
+
+/** Receiver revealed a preimage → sender credits it in the next state.
+ *  If we're a hub, the same preimage unlocks our upstream claim. */
+async function qbOnClaim(channel, att) {
+    const p = qbUnpackU32(att("signature") || "");
+    const secretRaw = att("midstate");
+    if (!p || !secretRaw || p.extra.length < 32) return;
+    const secret = secretRaw.substring(0, 64);
+    const hash = qbHex(p.extra.slice(0, 32));
+    if (blake3_hash_hex(secret) !== hash) return;
+
+    // Publish/persist the observed preimage (submarine-swap makers watch this).
+    wState.l2_observed_secrets = wState.l2_observed_secrets || {};
+    if (!wState.l2_observed_secrets[hash]) {
+        wState.l2_observed_secrets[hash] = secret;
+        wState.l2_secrets = wState.l2_secrets || {};
+        if (!wState.l2_secrets[hash]) wState.l2_secrets[hash] = secret;   // lets a hub claim upstream on-chain if forced
+        await saveState();
+        self.postMessage({ type: 'DEX_SUBMARINE_SECRET', payload: { secretHash: hash, secret } });
+    }
+
+    if (channel.role === 'sender') {
+        const h = (channel.latest.htlcs || []).find(x => x.secret_hash === hash);
+        if (h) {
+            try {
+                await qbSenderAdvance(channel, (next) => {
+                    next.htlcs = next.htlcs.filter(x => x.secret_hash !== hash);
+                    next.receiver_amt += h.amount;
+                }, QB.CMD_UPDATE);
+                const pay = (wState.l2_pay_pending || {})[hash];
+                if (pay) {
+                    delete wState.l2_pay_pending[hash];
+                    await saveState();
+                    qbEvent('info', `Payment of ${pay.amount} MDS to ${pay.destPk.substring(0, 12)}… completed — preimage ${secret.substring(0, 12)}… is your receipt.`, channel.id);
+                }
+            } catch (e) { qbLog(`Claim credit failed: ${e && e.message || e}`); }
+        }
+    }
+    // Hub: pull the preimage upstream (we are the RECEIVER on the upstream channel).
+    const route = (wState.l2_routes || {})[hash];
+    if (route && route.fromCoinId !== channel.id) {
+        const up = qbChan(route.fromCoinId);
+        if (up && up.role === 'receiver' && up.status === 'active') {
+            up.pending_claims = up.pending_claims || {};
+            up.pending_claims[hash] = { sent_height: networkHeight, amount: route.amount };
+            await saveState();
+            await qbSendMsg(QB.CMD_HTLC_CLAIM, up.id, qbPackU32(0, up.latest.nonce, qbBytes(hash)),
+                [{ kind: "midstate", value: secret }]);
+        }
+        delete wState.l2_routes[hash];
+        await saveState();
+    }
+}
+
+async function qbOnCloseReq(channel) {
+    if (channel.role !== 'receiver' || channel.status !== 'active') return;
+    qbEvent('info', 'Peer requested a close — settling the latest state on-chain.', channel.id);
+    performChannelClose(channel.id, 'close').catch(e => qbEvent('error', `Close failed: ${e && e.message || e}`, channel.id));
+}
+
+// ═══ routed payments: failure propagation, invoices, pay-by-identity ═════════
+
+/** Receiver-side: refuse an inbound HTLC. Marks consent so the sender's
+ *  uncredited removal of this exact hash passes qbValidateInbound. */
+async function qbFail(channel, hash, code) {
+    channel.failed_htlcs = channel.failed_htlcs || {};
+    channel.failed_htlcs[hash] = networkHeight;
+    await saveState();
+    const extra = new Uint8Array(33);
+    extra.set(qbBytes(hash), 0); extra[32] = code;
+    await qbSendMsg(QB.CMD_HTLC_FAIL, channel.id, qbPackU32(0, 0, extra));
+    qbLog(`HTLC ${hash.substring(0, 12)}… failed: ${QB_FAIL_REASONS[code] || code}`);
+}
+
+/** An HTLC we sent was refused. Cancel it immediately (the peer consented to
+ *  the uncredited removal), then propagate the failure upstream if we are a
+ *  hub, or surface it if we initiated the payment. */
+async function qbOnFail(channel, att) {
+    const p = qbUnpackU32(att("signature") || "");
+    if (!p || p.extra.length < 33) return;
+    const hash = qbHex(p.extra.slice(0, 32));
+    const code = p.extra[32];
+
+    if (channel.role === 'sender') {
+        const h = (channel.latest.htlcs || []).find(x => x.secret_hash === hash);
+        if (h && !qbInFlight.has(`fail:${channel.id}:${hash}`)) {
+            qbInFlight.add(`fail:${channel.id}:${hash}`);
+            try {
+                await qbSenderAdvance(channel, (next) => {
+                    next.htlcs = next.htlcs.filter(x => x.secret_hash !== hash);
+                    next.sender_amt += h.amount;
+                }, QB.CMD_UPDATE);
+            } catch (e) { qbLog(`FAIL cancel deferred: ${e && e.message || e}`); }
+            finally { qbInFlight.delete(`fail:${channel.id}:${hash}`); }
+        }
+    }
+    if ((wState.qb_fwd || {})[hash]) { delete wState.qb_fwd[hash]; await saveState(); }
+
+    // Hub: pass the failure up to whoever sent it to us.
+    const route = (wState.l2_routes || {})[hash];
+    if (route && route.fromCoinId !== channel.id) {
+        const up = qbChan(route.fromCoinId);
+        delete wState.l2_routes[hash];
+        await saveState();
+        if (up && up.role === 'receiver' && up.status === 'active') await qbFail(up, hash, 7);
+    }
+
+    const pay = (wState.l2_pay_pending || {})[hash];
+    if (pay) {
+        delete wState.l2_pay_pending[hash];
+        await saveState();
+        qbEvent('warn', `Payment of ${pay.amount} MDS failed (${QB_FAIL_REASONS[code] || 'refused'}) — the balance was returned.`, channel.id);
+    }
+}
+
+// INVOICE reply wire: [ver u8][amount u64][expiry u64][hash 32][hcount u8][hints 32×n][mss_sig …]
+function qbPackInvoice(hashHex, amount, expiry, hints, sigHex) {
+    const sig = qbBytes(sigHex);
+    const bin = new Uint8Array(50 + hints.length * 32 + sig.length);
+    const v = new DataView(bin.buffer);
+    bin[0] = QB.VERSION;
+    v.setBigUint64(1, BigInt(amount), true);
+    v.setBigUint64(9, BigInt(expiry), true);
+    bin.set(qbBytes(hashHex), 17);
+    bin[49] = hints.length;
+    let o = 50;
+    for (const h of hints) { bin.set(qbBytes(h), o); o += 32; }
+    bin.set(sig, o);
+    return bin;
+}
+function qbUnpackInvoice(hex) {
+    const bin = qbBytes(hex);
+    if (bin.length < 50 || bin[0] !== QB.VERSION) return null;
+    const v = new DataView(bin.buffer);
+    const amount = Number(v.getBigUint64(1, true));
+    const expiry = Number(v.getBigUint64(9, true));
+    const hash = qbHex(bin.slice(17, 49));
+    const n = bin[49];
+    if (n > 2 || bin.length < 50 + n * 32) return null;
+    const hints = [];
+    let o = 50;
+    for (let i = 0; i < n; i++) { hints.push(qbHex(bin.slice(o, o + 32))); o += 32; }
+    return { amount, expiry, hash, hints, sig: qbHex(bin.slice(o)) };
+}
+
+/** What the payee's MSS signature over a bus-delivered invoice binds:
+ *  its own pk + the hash, amount, expiry and hints. The payer verifies this
+ *  against the pk it addressed, so nobody on the public bus can race a fake
+ *  invoice (own hash, own hints) at an open request. */
+function qbInvoiceCommit(payeePk, hashHex, amount, expiry, hints) {
+    const head = new Uint8Array(87 + hints.length * 32);
+    head.set([0x71, 0x62, 0x69, 0x6e, 0x76, 0x31], 0);        // "qbinv1"
+    head.set(qbBytes(payeePk), 6);
+    head.set(qbBytes(hashHex), 38);
+    const v = new DataView(head.buffer);
+    v.setBigUint64(70, BigInt(amount), true);
+    v.setBigUint64(78, BigInt(expiry), true);
+    head[86] = hints.length;
+    let o = 87;
+    for (const h of hints) { head.set(qbBytes(h), o); o += 32; }
+    return blake3_hash_hex(qbHex(head));
+}
+
+/** Mint an invoice: fresh secret, expected amount recorded (underpay guard),
+ *  route hints = hubs holding an open sender-side channel toward us with
+ *  enough balance and life to route it, best-funded first. */
+async function qbMintInvoice(amount, opts) {
+    const amt = Number(amount);
+    if (!Number.isFinite(amt) || amt <= 0) throw new Error("Invoice amount must be positive.");
+    const myPk = getPrimaryMssPk();
+    if (!myPk) throw new Error("Network Sync required first to initialize your MSS L2 identity.");
+    const secret = qbHex(crypto.getRandomValues(new Uint8Array(32)));
+    const hash = blake3_hash_hex(secret);
+    const expiry = (networkHeight || 0) + QB.INVOICE_TTL;
+    const hints = Object.values(wState.l2_channels || {})
+        .filter(c => c.v === 2 && c.role === 'receiver' && c.status === 'active'
+            && c.latest.sender_amt >= amt
+            && (networkHeight || 0) < c.expiry - QB.PAY_CUTOFF - QB.HTLC_MIN_HEADROOM)
+        .sort((a, b) => b.latest.sender_amt - a.latest.sender_amt)
+        .slice(0, 2).map(c => c.peer_pk);
+    wState.l2_secrets = wState.l2_secrets || {};
+    wState.l2_invoices = wState.l2_invoices || {};
+    wState.l2_secrets[hash] = secret;
+    wState.l2_invoices[hash] = { amount: amt, expiry };
+    await saveState();
+    let sig = '';
+    if (opts && opts.sign) sig = await signMssAndSync(myPk, qbInvoiceCommit(myPk, hash, amt, expiry, hints));
+    return { destPk: myPk, hash, amount: amt, expiry, hints, sig,
+             text: `l2inv1:${myPk}:${hash}:${amt}:${expiry}:${hints.join(',')}` };
+}
+
+function qbParseInvoice(s) {
+    const p = String(s || '').trim().split(':');
+    if (p[0] === 'l2inv' && p.length === 4) {
+        return { destPk: p[1], hash: p[2], amount: Number(p[3]), expiry: 0, hints: [] };
+    }
+    if (p[0] === 'l2inv1' && p.length >= 6) {
+        return { destPk: p[1], hash: p[2], amount: Number(p[3]), expiry: Number(p[4]),
+                 hints: p[5] ? p[5].split(',').filter(x => /^[0-9a-fA-F]{64}$/.test(x)) : [] };
+    }
+    throw new Error("Invalid invoice format");
+}
+
+/** Route and send a parsed invoice. Cheapest viable path wins:
+ *  direct channel → via a hinted hub → via our best hub into a hinted hub
+ *  (that entry hub may not reach the hint; HTLC_FAIL refunds within seconds). */
+async function qbPayParsed(inv) {
+    const amount = Number(inv.amount);
+    const destPk = String(inv.destPk || '').substring(0, 64);
+    if (!/^[0-9a-fA-F]{64}$/.test(destPk)) throw new Error("Invalid destination identity.");
+    if (!/^[0-9a-fA-F]{64}$/.test(String(inv.hash || ''))) throw new Error("Invalid payment hash.");
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error("Invalid invoice amount.");
+    if (inv.expiry && networkHeight >= inv.expiry) throw new Error("Invoice has expired — ask the payee for a fresh one.");
+    if ((wState.l2_invoices || {})[inv.hash]) throw new Error("That is this wallet's own invoice.");
+
+    const live = (c) => c.v === 2 && c.role === 'sender' && c.status === 'active' && c.open_acked
+        && networkHeight < c.expiry - QB.PAY_CUTOFF;
+    const chans = Object.values(wState.l2_channels || {}).filter(live);
+
+    let chan = null, route = [], hops = 0;
+    const direct = chans.find(c => c.peer_pk === destPk && c.latest.sender_amt >= amount);
+    if (direct) { chan = direct; }
+    if (!chan) {
+        for (const h of inv.hints) {
+            const c = chans.find(x => x.peer_pk === h && x.latest.sender_amt >= amount + QB.HOP_FEE);
+            if (c) { chan = c; route = [destPk]; hops = 1; break; }
+        }
+    }
+    if (!chan && inv.hints.length) {
+        const c = chans.filter(x => x.peer_pk !== destPk && !inv.hints.includes(x.peer_pk))
+            .sort((a, b) => b.latest.sender_amt - a.latest.sender_amt)[0];
+        if (c && c.latest.sender_amt >= amount + 2 * QB.HOP_FEE) { chan = c; route = [inv.hints[0], destPk]; hops = 2; }
+    }
+    if (!chan && !inv.hints.length) {
+        // Legacy invoice with no hints: best-funded hub; FAIL (or the hub's
+        // JIT open) sorts out whether the last mile exists.
+        const c = chans.filter(x => x.peer_pk !== destPk)
+            .sort((a, b) => b.latest.sender_amt - a.latest.sender_amt)[0];
+        if (c && c.latest.sender_amt >= amount + QB.HOP_FEE) { chan = c; route = [destPk]; hops = 1; }
+    }
+    if (!chan) throw new Error("No outbound channel can reach this payee. Open a channel to them directly"
+        + (inv.hints.length ? ` or to one of their hubs (${inv.hints.map(h => h.substring(0, 12) + '…').join(', ')}).` : "."));
+
+    const total = amount + hops * QB.HOP_FEE;
+    const timeout = networkHeight + QB.HTLC_MIN_HEADROOM + (hops + 1) * QB.HTLC_HOP_DELTA;
+    if (timeout > chan.expiry + QB.HTLC_MAX_PAST_EXPIRY) throw new Error("Channel is too close to expiry to route this payment — open a fresh one.");
+
+    wState.l2_pay_pending = wState.l2_pay_pending || {};
+    wState.l2_pay_pending[inv.hash] = { total, amount, destPk, timeout, at: networkHeight };
+    await saveState();
+    try {
+        await qbSenderAdvance(chan, (next) => {
+            if (next.sender_amt < total) throw new Error(`Insufficient channel balance (${next.sender_amt} MDS spendable, need ${total} incl. ${hops * QB.HOP_FEE} routing fee).`);
+            next.sender_amt -= total;
+            next.htlcs.push({ amount: total, timeout, secret_hash: inv.hash });
+        }, QB.CMD_HTLC_ADD, route.map(pk => ({ kind: "address", value: pk })));
+    } catch (e) {
+        delete wState.l2_pay_pending[inv.hash];
+        await saveState();
+        throw e;
+    }
+    qbEvent('info', `Payment of ${amount} MDS in flight to ${destPk.substring(0, 12)}… (${hops} hop${hops === 1 ? '' : 's'}, fee ${hops * QB.HOP_FEE}).`, chan.id);
+    self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+}
+
+/** Someone asked us for an invoice over the bus (channelId = their request id). */
+async function qbOnInvoiceReq(reqId, att, myPk) {
+    const target = String(att("address") || '').substring(0, 64);
+    if (target !== myPk) return;                              // not addressed to us / our own echo
+    // Replay guard must be PERSISTENT: the node replays its whole chat ring on
+    // every poll, and each re-answer would burn an MSS leaf on the signature.
+    wState.qb_answered_reqs = wState.qb_answered_reqs || {};
+    if (wState.qb_answered_reqs[reqId]) return;
+    const p = qbUnpackU32(att("signature") || "");
+    if (!p || p.extra.length < 8) return;
+    const amount = Number(new DataView(p.extra.buffer, p.extra.byteOffset).getBigUint64(0, true));
+    if (!Number.isFinite(amount) || amount <= 0) return;
+    // Bounded auto-mint: prune expired, refuse if too many are outstanding.
+    wState.l2_invoices = wState.l2_invoices || {};
+    for (const [h, inv] of Object.entries(wState.l2_invoices)) {
+        if (inv.expiry && networkHeight > inv.expiry) delete wState.l2_invoices[h];
+    }
+    if (Object.keys(wState.l2_invoices).length > 64) { qbLog('Ignored an invoice request — too many outstanding invoices.'); return; }
+    if (qbLeafBudget().remaining <= QB.LEAF_RESERVE + 1) { qbLog('Ignored an invoice request — MSS key nearly exhausted.'); return; }
+    if (Object.keys(wState.qb_answered_reqs).length > 200) wState.qb_answered_reqs = {};  // bounded
+    wState.qb_answered_reqs[reqId] = networkHeight || 1;
+    await saveState();
+    const inv = await qbMintInvoice(amount, { sign: true });  // 1 MSS leaf: binds hash+amount to our pk
+    await qbSendMsg(QB.CMD_INVOICE, reqId, qbPackInvoice(inv.hash, inv.amount, inv.expiry, inv.hints, inv.sig));
+    qbEvent('info', `Issued an invoice for ${amount} MDS on request.`);
+}
+
+/** An invoice arrived for one of our pending pay-to requests. Verify the
+ *  payee's signature (the request is on a public bus — anyone could race a
+ *  fake invoice at it otherwise), then pay it. */
+async function qbOnInvoice(reqId, att, myPk) {
+    const req = (wState.l2_inv_reqs || {})[reqId];
+    if (!req) return;                                         // not ours / already handled / echo
+    const inv = qbUnpackInvoice(att("signature") || "");
+    if (!inv) return;
+    if (inv.amount !== req.amount) { qbLog('Invoice reply amount mismatch — ignored.'); return; }
+    if (!inv.sig || !verify_mss_sig_wasm(inv.sig, qbInvoiceCommit(req.destPk, inv.hash, inv.amount, inv.expiry, inv.hints), req.destPk)) {
+        qbLog(`Rejected an unsigned/forged invoice reply for request ${reqId.substring(0, 12)}…`);
+        return;
+    }
+    delete wState.l2_inv_reqs[reqId];
+    await saveState();
+    try {
+        await qbPayParsed({ destPk: req.destPk, hash: inv.hash, amount: inv.amount, expiry: inv.expiry, hints: inv.hints });
+    } catch (e) {
+        qbEvent('error', `Pay-to failed: ${e && e.message || e}`);
+    }
+}
+
+// ── commitment-TTL recovery: the receiver's stored sender signature binds one
+//    exact commitment (attempt N). If that commitment was mined but its TTL
+//    lapsed before the reveal landed, only a FRESH sender signature (attempt
+//    N+1 → new salt → new commitment) can save the state. Cooperative only —
+//    which is exactly why the auto-closer runs with a fat margin.
+async function qbOnResignReq(channel, att) {
+    if (channel.role !== 'sender') return;
+    const p = qbUnpackU32(att("signature") || "");
+    if (!p || p.extra.length < 4) return;
+    const attempt = new DataView(p.extra.buffer, p.extra.byteOffset).getUint32(0, true);
+    if (p.n !== channel.latest.nonce) return;                 // only ever re-sign the exact latest state
+    if (attempt > (channel.sig_attempt || 0) + 8) return;     // bound leaf burn from a hostile peer
+    const budget = qbLeafBudget();
+    if (budget.remaining <= 2) return;
+    try {
+        const built = qbBuildState(channel, channel.latest.sender_amt, channel.latest.receiver_amt,
+            channel.latest.nonce, channel.latest.htlcs, attempt);
+        const sig = await signMssAndSync(channel.sender_pk, built.commitment);
+        channel.latest.sender_sig = sig;
+        channel.sig_attempt = attempt;
+        await saveState();
+        const extra = new Uint8Array(4);
+        new DataView(extra.buffer).setUint32(0, attempt, true);
+        await qbSendMsg(QB.CMD_RESIGN, channel.id,
+            qbPackU32(0, channel.latest.nonce, new Uint8Array([...extra, ...qbBytes(sig)])));
+        qbLog(`Re-signed state ${channel.latest.nonce} at attempt ${attempt} on peer request.`);
+    } catch (e) { qbLog(`Re-sign failed: ${e && e.message || e}`); }
+}
+
+async function qbOnResign(channel, att) {
+    if (channel.role !== 'receiver') return;
+    const p = qbUnpackU32(att("signature") || "");
+    if (!p || p.extra.length < 4 + 32) return;
+    const attempt = new DataView(p.extra.buffer, p.extra.byteOffset).getUint32(0, true);
+    const sig = qbHex(p.extra.slice(4));
+    if (p.n !== channel.latest.nonce) return;
+    let built;
+    try {
+        built = qbBuildState(channel, channel.latest.sender_amt, channel.latest.receiver_amt,
+            channel.latest.nonce, channel.latest.htlcs, attempt);
+    } catch (_) { return; }
+    if (!verify_mss_sig_wasm(sig, built.commitment, channel.sender_pk)) return;
+    channel.latest.sender_sig = sig;
+    channel.sig_attempt = attempt;
+    if (channel.close && channel.close.stage === 'need-resign') {
+        channel.close = null;                                 // engine restarts cleanly at the new attempt
+    }
+    await saveState();
+    qbEvent('info', `Received a fresh close signature (attempt ${attempt}) — retrying settlement.`, channel.id);
+    performChannelClose(channel.id, 'close').catch(() => {});
+}
+
+// ═══ close / refund engine — persisted and resumable ════════════════════════
+
+async function performChannelClose(channelId, kind) {
+    const channel = qbChan(channelId);
+    if (!channel) throw new Error("Channel not found");
+    if (qbInFlight.has(channelId)) return;
+    qbInFlight.add(channelId);
+    try { await qbCloseInner(channel, kind); }
+    finally { qbInFlight.delete(channelId); }
+}
+
+async function qbCloseInner(channel, kind) {
+    if (channel.status === 'closed') return;
+    const say = (m) => { qbLog(m); self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: `[Q-Bolt] ${m}` } }); };
+
+    // ── resume or start ────────────────────────────────────────────────────
+    if (!channel.close || channel.close.done) {
+        if (kind === 'close') {
+            if (channel.role !== 'receiver') throw new Error("Only the receiver settles balances. As the sender you can Request Close, or claim the refund once block " + channel.expiry + " passes.");
+            if (!channel.latest.sender_sig) throw new Error("No signed state to settle.");
+        } else if (kind === 'refund') {
+            if (channel.role !== 'sender') throw new Error("Only the sender can claim the refund.");
+            if (networkHeight < channel.expiry) throw new Error(`Refund unlocks at block ${channel.expiry} (now ${networkHeight}).`);
+        }
+        channel.close = { kind, stage: 'build', attempt: kind === 'close' ? (channel.sig_attempt || 0) : 0, started_height: networkHeight, started_at: Date.now() };
+        channel.status = kind === 'refund' ? 'refunding' : 'closing';
+        await saveState();
+    }
+    const rec = channel.close;
+    kind = rec.kind;
+
+    // ── build (deterministic, safe to redo) ────────────────────────────────
+    if (rec.stage === 'build' || !rec.state_json) {
+        let built, mySig, peerSig = null;
+        if (kind === 'refund') {
+            built = JSON.parse(qbolt_build_refund_state(channel.id, channel.sender_pk, channel.receiver_pk,
+                BigInt(channel.expiry), qbFundingJson(channel), rec.attempt >>> 0));
+            say(`Signing refund (attempt ${rec.attempt})…`);
+            mySig = await signMssAndSync(channel.sender_pk, built.commitment);
+        } else {
+            built = qbBuildState(channel, channel.latest.sender_amt, channel.latest.receiver_amt,
+                channel.latest.nonce, channel.latest.htlcs, rec.attempt);
+            peerSig = channel.latest.sender_sig;
+            say(`Co-signing state ${channel.latest.nonce}…`);
+            mySig = await signMssAndSync(channel.receiver_pk, built.commitment);
+        }
+        rec.state_json = JSON.stringify(built);
+        rec.commitment = built.commitment;
+        rec.my_sig = mySig;
+        rec.peer_sig = peerSig;
+        rec.stage = 'commit';
+        await saveState();
+    }
+
+    // ── commit (idempotent: check the chain before mining) ─────────────────
+    if (rec.stage === 'commit') {
+        let already = false;
+        try { const c = await rpc.checkCommitment(rec.commitment); already = !!(c && c.exists); } catch (_) {}
+        if (!already) {
+            say("Fetching network difficulty…");
+            const st = await rpc.getState();
+            say(`Mining commit PoW (difficulty ${st.required_pow || 24})…`);
+            await new Promise(r => setTimeout(r, 30));
+            const nonce = Number(mine_commitment_pow(rec.commitment, st.required_pow || 24, BigInt(st.height), st.header_hash));
+            const cr = await rpc.commit(rec.commitment, nonce);
+            const body = String((cr && (cr.body || cr.error)) || '');
+            if (!cr.ok && !/already|exist|duplicate/i.test(body)) throw new Error(`Commit rejected: ${body}`);
+        }
+        say("Waiting for the commit to be mined (1/2)…");
+        await awaitCommitmentMined(rec.commitment, say);
+        rec.stage = 'reveal';
+        rec.commit_seen_height = networkHeight;
+        await saveState();
+    }
+
+    // ── reveal (retryable; failure classification is everything here) ──────
+    if (rec.stage === 'reveal') {
+        const built = JSON.parse(rec.state_json);
+        const revealStr = (kind === 'refund')
+            ? qbolt_build_refund_reveal(channel.sender_pk, channel.receiver_pk, BigInt(channel.expiry),
+                qbFundingJson(channel), rec.state_json, rec.my_sig)
+            : qbolt_build_close_reveal(channel.sender_pk, channel.receiver_pk, BigInt(channel.expiry),
+                qbFundingJson(channel), rec.state_json, rec.peer_sig, rec.my_sig);
+        say("Broadcasting settlement (2/2)…");
+        const rr = await rpc.send(revealStr);
+        if (!rr.ok) {
+            const body = String(rr.body || rr.error || '');
+            if (/not found/i.test(body)) {                    // funding already spent → someone beat us
+                rec.done = true; await saveState();
+                return qbReconcileExternalClose(channel.id);
+            }
+            if (/expired/i.test(body)) {                      // commitment TTL lapsed
+                if (kind === 'refund') {
+                    rec.attempt++; rec.stage = 'build'; rec.state_json = null; await saveState();
+                    say(`Commitment expired — rebuilding refund at attempt ${rec.attempt}…`);
+                    return qbCloseInner(channel, kind);       // sender self-signs: retry freely
+                }
+                rec.stage = 'need-resign'; await saveState();
+                const extra = new Uint8Array(4);
+                new DataView(extra.buffer).setUint32(0, (rec.attempt || 0) + 1, true);
+                await qbSendMsg(QB.CMD_RESIGN_REQ, channel.id, qbPackU32(0, built.nonce, extra));
+                qbEvent('warn', 'Settlement window lapsed — asked the peer for a fresh signature. Retrying automatically when it arrives.', channel.id);
+                return;
+            }
+            throw new Error(`Settlement rejected: ${body}`); // transient/unknown → watcher retries this stage
+        }
+        rec.stage = 'confirm';
+        await saveState();
+    }
+
+    if (rec.stage === 'need-resign') return;                 // parked until CMD_RESIGN arrives
+
+    // ── confirm: funding gone AND our outputs exist ─────────────────────────
+    if (rec.stage === 'confirm') {
+        say("Waiting for the settlement to be mined…");
+        await awaitCoinSpent(channel.funding[0].coin_id, say);
+        const built = JSON.parse(rec.state_json);
+        const probe = built.outputs && built.outputs.length ?
+            compute_coin_id_hex(built.outputs[0].address, BigInt(built.outputs[0].value), built.outputs[0].salt) : null;
+        let ours = false;
+        if (probe) { try { const c = await rpc.checkCoin(probe); ours = !!(c && c.exists); } catch (_) { ours = true; } }
+        rec.done = true;
+        if (!ours) { await saveState(); return qbReconcileExternalClose(channel.id); }
+
+        channel.status = 'closed';
+        channel.closed = { height: networkHeight, kind, external: false };
+        qbRegisterHtlcCoins(channel, built);
+        await saveState();
+        qbEvent('info', kind === 'refund'
+            ? `Refund settled — ${built.capacity - QB.CLOSE_FEE} MDS returned on-chain.`
+            : `Channel settled on-chain at state ${channel.latest.nonce}.`, channel.id);
+
+        // Tell the peer immediately. Their funding-existence sweep would find
+        // this eventually, but only every RECONCILE_EVERY blocks — until then
+        // their UI shows a live channel and they could sign a state against
+        // funding that no longer exists. Best-effort: the sweep is the backstop.
+        qbSendMsg(QB.CMD_CLOSED, channel.id, qbPackU32(0, built.nonce != null ? built.nonce : (channel.latest.nonce || 0))).catch(() => {});
+
+        performScan().catch(() => {});
+        self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+    }
+}
+
+/** The peer says they settled this channel on-chain.
+ *
+ *  Never trust the wire: an unverified "closed" claim from a peer would be a
+ *  free way to make us abandon a live channel. Confirm the funding really is
+ *  spent before doing anything; if it isn't, ignore the message and let the
+ *  sweep decide later. */
+async function qbOnClosed(channel, att) {
+    if (channel.status === 'closed') return;
+    let spent = false;
+    try {
+        const chk = await rpc.checkCoin(channel.funding[0].coin_id);
+        spent = !!(chk && !chk.exists);
+    } catch (_) { return; }                                   // network flake → sweep will retry
+    if (!spent) {
+        qbLog(`Peer announced a close on ${channel.id.substring(0, 12)}… but its funding is still unspent — ignoring.`);
+        return;
+    }
+    qbLog(`Peer announced a close on ${channel.id.substring(0, 12)}… — verified funding is spent, reconciling.`);
+    await qbReconcileExternalClose(channel.id);
+}
+
+/** Track HTLC coins materialized by a close so the watcher can resolve them
+ *  on-chain: receiver claims with the preimage before `timeout`; the sender
+ *  refunds after. */
+function qbRegisterHtlcCoins(channel, builtState) {
+    const coins = builtState.htlc_coins || [];
+    if (!coins.length) return;
+    channel.onchain_htlcs = channel.onchain_htlcs || [];
+    for (const c of coins) {
+        channel.onchain_htlcs.push({ ...c, swept: false });
+        if (typeof watchedContracts !== 'undefined') watchedContracts.add(c.address);
+    }
+    if (typeof updateWasmWatchlist === 'function') updateWasmWatchlist();
+    qbEvent('warn', `${coins.length} HTLC coin(s) settled on-chain and await resolution — the wallet will handle them automatically.`, channel.id);
+}
+
+/** The funding was spent but not by us. Work out which state landed (bounded
+ *  probe over recent nonces — output salts are deterministic per nonce), mark
+ *  the channel closed, and register any HTLC coins from that state. */
+async function qbReconcileExternalClose(channelId) {
+    const channel = qbChan(channelId);
+    if (!channel || channel.status === 'closed') return;
+
+    // A never-acknowledged sender channel whose funding is "missing" was NOT
+    // settled by the peer — the peer never even created the channel, so they
+    // hold no state to settle and cannot spend the covenant before expiry.
+    // Missing funding here means the funding record itself is wrong or the
+    // funding tx never actually landed. Report that truth per-coin instead of
+    // inventing a peer action, and void the channel rather than "closing" it.
+    if (channel.role === 'sender' && !channel.open_acked) {
+        const missing = [], alive = [];
+        for (const f of channel.funding) {
+            try {
+                const c = await rpc.checkCoin(f.coin_id);
+                (c && c.exists ? alive : missing).push(f.coin_id);
+            } catch (_) { alive.push(f.coin_id); }            // unknown ≠ missing
+        }
+        if (!missing.length) return;                          // transient flake — funding is intact
+        channel.status = 'closed';
+        channel.closed = { height: networkHeight, kind: 'void-open', external: false };
+        await saveState();
+        qbEvent('warn',
+            `Channel open failed: ${missing.length} of ${channel.funding.length} recorded funding coin(s) `
+            + `(${missing.map(m => m.substring(0, 12) + '…').join(', ')}) do not exist on-chain, and the peer never `
+            + `acknowledged the channel. The funding transaction either never confirmed or the wallet's record of it is wrong. `
+            + `Any value that actually left the wallet will be re-credited by the scan.`, channelId);
+        performScan().catch(() => {});
+        self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+        return;
+    }
+
+    let landed = null;
+    const tryNonce = async (nonce, senderAmt, receiverAmt, htlcs) => {
+        let b;
+        try { b = qbBuildState(channel, senderAmt, receiverAmt, nonce, htlcs, 0); } catch (_) { return null; }
+        if (!b.outputs.length) return null;
+        const o = b.outputs[0];
+        try {
+            const c = await rpc.checkCoin(compute_coin_id_hex(o.address, BigInt(o.value), o.salt));
+            return (c && c.exists) ? b : null;
+        } catch (_) { return null; }
+    };
+
+    // Latest first (overwhelmingly the common case), then the refund shape,
+    // then a bounded walk back through past states we can reconstruct.
+    landed = await tryNonce(channel.latest.nonce, channel.latest.sender_amt, channel.latest.receiver_amt, channel.latest.htlcs || []);
+    if (!landed) {
+        try {
+            const rb = JSON.parse(qbolt_build_refund_state(channel.id, channel.sender_pk, channel.receiver_pk,
+                BigInt(channel.expiry), qbFundingJson(channel), 0));
+            const o = rb.outputs[0];
+            const c = await rpc.checkCoin(compute_coin_id_hex(o.address, BigInt(o.value), o.salt)).catch(() => null);
+            if (c && c.exists) landed = rb;
+        } catch (_) {}
+    }
+    const history = channel.state_history || [];
+    for (let i = history.length - 1; i >= 0 && !landed && history.length - i <= QB.EXTERNAL_PROBE_DEPTH; i--) {
+        const s = history[i];
+        landed = await tryNonce(s.nonce, s.sender_amt, s.receiver_amt, s.htlcs || []);
+    }
+
+    channel.status = 'closed';
+    channel.closed = { height: networkHeight, kind: 'external', external: true };
+    if (landed) qbRegisterHtlcCoins(channel, landed);
+    await saveState();
+
+    if (channel.role === 'sender') {
+        // Any receiver-broadcast state pays the sender AT LEAST the latest
+        // sender balance (older states favor the sender) — never less.
+        qbEvent('info', `Channel was settled by the peer${landed ? '' : ' (with an earlier state — that only ever pays you more)'}. Funds arrive with the next scan.`, channelId);
+    } else {
+        qbEvent(landed ? 'info' : 'warn', landed
+            ? 'Channel was settled on-chain (possibly by this wallet on another device). Funds arrive with the next scan.'
+            : 'Channel was closed externally. If the sender reclaimed it via the expiry refund, off-chain earnings on it were forfeited — this wallet auto-closes well before expiry precisely to prevent that; it can happen only if the wallet was offline through the entire closing window.', channelId);
+    }
+    performScan().catch(() => {});
+    self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+}
+
+// ═══ on-chain HTLC resolution after a close ═════════════════════════════════
+
+async function qbSweepHtlc(channel, entry) {
+    const key = `${channel.id}:${entry.coin_id}`;
+    if (qbInFlight.has(key)) return;
+    qbInFlight.add(key);
+    try {
+        const iClaim = channel.role === 'receiver';
+        const secret = (wState.l2_secrets || {})[entry.secret_hash] || (wState.l2_observed_secrets || {})[entry.secret_hash];
+        if (iClaim && !secret) return;                        // nothing to do without the preimage
+        if (iClaim && networkHeight >= entry.timeout) return; // too late — the refund path owns it now
+        if (!iClaim && networkHeight < entry.timeout) return; // sender must wait out the timeout
+
+        let chk = null;
+        try { chk = await rpc.checkCoin(entry.coin_id); } catch (_) { return; }
+        if (!chk || !chk.exists) { entry.swept = true; await saveState(); return; }
+
+        await acquireSendLock();
+        try {
+            if (!mssCachesReady) await loadMssCaches();
+            const myPk = getPrimaryMssPk();
+            const myAddr = compute_p2pk_address_hex(myPk);
+            const utxoArray = getSpendableUtxos().map(u =>
+                (u.is_mss && wState.mssAddrs[u.address]) ? { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf } : u);
+
+            const buildOutputs = (val) => JSON.stringify((() => {
+                const parts = []; let n = BigInt(val), bit = 0n;
+                while (n > 0n) { if (n & 1n) parts.push(Number(1n << bit)); n >>= 1n; bit += 1n; }
+                return parts.map(v => ({ out_type: "standard", address: myAddr, value: v, salt: null }));
+            })());
+            const inputsJson = JSON.stringify([{ coin_id: entry.coin_id, witness: "", value: entry.value, salt: entry.salt, state: null }]);
+
+            // Fee strategy. prepare_script_spend only reaches for wallet UTXOs when
+            // (outputs + fee) exceeds the contract input's own value; otherwise it
+            // needs none and returns the surplus as change to us. So: first try to
+            // keep the FULL value (the wallet pays the fee and we net 100%), then
+            // walk a ladder of self-funded reserves for the zero-balance case.
+            // Over-reserving is free — the unused remainder comes back as change.
+            let ctx = null, lastErr = null;
+            for (const reserve of [0, ...QB.SWEEP_FEE_LADDER]) {
+                if (reserve >= entry.value) break;             // can't self-fund from a coin this small
+                try {
+                    ctx = JSON.parse(wallet.prepare_script_spend(
+                        JSON.stringify(utxoArray), entry.bytecode, inputsJson,
+                        buildOutputs(entry.value - reserve), wState.nextWotsIndex));
+                    break;
+                } catch (e) { lastErr = e; }
+            }
+            if (!ctx) {
+                // Every rung failed: the coin is too small to pay its own way and the
+                // wallet has nothing to contribute. Leave it for a later block — a
+                // channel close or any incoming payment makes this succeed.
+                qbLog(`HTLC ${entry.coin_id.substring(0, 12)}… not sweepable yet (${entry.value} MDS, empty wallet): ${lastErr && lastErr.message || lastErr}`);
+                return;
+            }
+
+            const sig = await signMssAndSync(myPk, ctx.commitment);
+            for (let i = 0; i < ctx.contract_inputs.length; i++) {
+                ctx.contract_inputs[i].witness = iClaim ? `${sig},${secret},01` : `${sig},00,00`;
+            }
+            const revealStr = wallet.build_script_reveal(JSON.stringify(ctx), ctx.commitment, ctx.tx_salt);
+            await reserveAndLock(ctx, "Saving wallet state…");
+
+            const st = await rpc.getState();
+            const nonce = Number(mine_commitment_pow(ctx.commitment, st.required_pow || 24, BigInt(st.height), st.header_hash));
+            const cr = await rpc.commit(ctx.commitment, nonce);
+            if (!cr.ok) throw new Error(`Commit rejected: ${cr.body || cr.error}`);
+            await awaitCommitmentMined(ctx.commitment, (m) => qbLog(m));
+            const rr = await rpc.send(revealStr);
+            if (!rr.ok) {
+                if (/not found/i.test(String(rr.body || rr.error || ''))) { entry.swept = true; await saveState(); return; }
+                throw new Error(`Reveal rejected: ${rr.body || rr.error}`);
+            }
+            await awaitCoinSpent(entry.coin_id, (m) => qbLog(m));
+            entry.swept = true;
+            await saveState();
+            qbEvent('info', `${iClaim ? 'Claimed' : 'Refunded'} on-chain HTLC (${entry.value} MDS).`, channel.id);
+            performScan().catch(() => {});
+        } finally { releaseSendLock(); }
+    } catch (e) {
+        qbLog(`HTLC sweep deferred (${entry.coin_id.substring(0, 12)}…): ${e && e.message || e}`);
+    } finally { qbInFlight.delete(key); }
+}
+
+// ═══ the watcher — reality's heartbeat ══════════════════════════════════════
+
+let qbTickRunning = false;
+let qbLastReconcileHeight = 0;
+
+async function qbWatchTick(height) {
+    if (qbTickRunning || !wallet || !height) return;
+    qbTickRunning = true;
+    try {
+        // A transaction interrupted mid-flight is retried here every block, not
+        // just at login — a reveal dropped by a flapping transport should not
+        // wait for the user to reload.
+        if (wState.pending_tx && !qbInFlight.has('pending_tx')) {
+            qbInFlight.add('pending_tx');
+            recoverPendingTx().catch(() => {}).finally(() => qbInFlight.delete('pending_tx'));
+        }
+        // Pending inbound opens: funding may have just confirmed.
+        for (const id of Object.keys(wState.qb_pending_opens || {})) {
+            await qbTryFinalizeInboundOpen(id).catch(() => {});
         }
 
-        // ── STEP 2: act on the now-committed state (advances to nonce+1) ──
-        if (cmd === 42) { // ADD_HTLC
-            const destPkRaw = msg.attachments.find(a => a.kind === "address")?.value;
-            const destPk = destPkRaw ? destPkRaw.substring(0, 64) : null;
-            const iAmDestination = !destPk || destPk === myPk;            // Bug C fix
-            const newHtlc = htlcs[htlcs.length - 1];
-
-            if (!iAmDestination) {
-                // WE ARE A HUB — forward to dest on another fully-signed channel.
-                let fwdId = null;
-                for (const [cid, c] of Object.entries(wState.l2_channels)) {
-                    if (cid === coinId) continue;                          // never forward onto the incoming channel
-                    if ((c.alice_pk === destPk || c.bob_pk === destPk) && c.latest_state.is_fully_signed) { fwdId = cid; break; }
-                }
-                if (fwdId) {
-                    const fC = wState.l2_channels[fwdId];
-                    let nA = fC.latest_state.alice_amt, nB = fC.latest_state.bob_amt;
-                    if (fC.is_alice) nA -= newHtlc.amount; else nB -= newHtlc.amount;
-                    const fHtlcs = [...(fC.latest_state.htlcs || []), { amount: newHtlc.amount, timeout: newHtlc.timeout - 10, receiver_is_alice: !fC.is_alice, secret_hash: newHtlc.secret_hash }];
-                    const fNonce = fC.latest_state.nonce + 1;
-                    const fState = build_channel_state(fwdId, fC.alice_pk, fC.bob_pk, BigInt(nA), BigInt(nB), fNonce, JSON.stringify(fHtlcs));
-                    const fSig = await signMssAndSync(fC.is_alice ? fC.alice_pk : fC.bob_pk, JSON.parse(fState).commitment);
-                    fC.latest_state = { nonce: fNonce, alice_amt: nA, bob_amt: nB, htlcs: fHtlcs, alice_sig: fC.is_alice ? fSig : null, bob_sig: fC.is_alice ? null : fSig, is_fully_signed: false };
-                    wState.l2_routes = wState.l2_routes || {};
-                    wState.l2_routes[newHtlc.secret_hash] = { fromCoinId: coinId, amount: newHtlc.amount };
-                    await saveState();
-                    const fBin = packChannelState(fNonce, nA, nB, fHtlcs, fSig);
-                    submitClientMinedChat([255, 42], null, [{ kind: "coin_id", value: fwdId }, { kind: "signature", value: normalizeHex(fBin) }, { kind: "address", value: destPk }]).catch(() => {});
-                }
-            } else {
-                // WE ARE THE DESTINATION — if we know the preimage, claim by advancing nonce+1.
-                const secret = wState.l2_secrets ? wState.l2_secrets[newHtlc.secret_hash] : null;
-                if (secret) {
-                    const cHtlcs = (channel.latest_state.htlcs || []).filter(h => h.secret_hash !== newHtlc.secret_hash);
-                    let nA = channel.latest_state.alice_amt, nB = channel.latest_state.bob_amt;
-                    if (channel.is_alice) nA += newHtlc.amount; else nB += newHtlc.amount;
-                    const cNonce = channel.latest_state.nonce + 1;
-                    const cState = build_channel_state(coinId, channel.alice_pk, channel.bob_pk, BigInt(nA), BigInt(nB), cNonce, JSON.stringify(cHtlcs));
-                    const cSig = await signMssAndSync(myPk, JSON.parse(cState).commitment);
-                    channel.latest_state = { nonce: cNonce, alice_amt: nA, bob_amt: nB, htlcs: cHtlcs, alice_sig: channel.is_alice ? cSig : null, bob_sig: channel.is_alice ? null : cSig, is_fully_signed: false };
-                    // FEATURE 2 (taker side): record the settled claim so the UI (live event
-                    // below, or the DEX_SUBMARINE_STATUS poll after a reload) can complete the
-                    // submarine swap card.
-                    wState.l2_claimed = wState.l2_claimed || {};
-                    wState.l2_claimed[newHtlc.secret_hash] = newHtlc.amount;
-                    await saveState();
-                    const cBin = packChannelState(cNonce, nA, nB, cHtlcs, cSig);
-                    submitClientMinedChat([255, 43], null, [{ kind: "coin_id", value: coinId }, { kind: "signature", value: normalizeHex(cBin) }, { kind: "midstate", value: secret }]).catch(() => {});
-                    // Feature 2 hook: broadcasting cmd 43 above publishes `secret` on the bus —
-                    // a maker fulfilling a submarine swap harvests it there (see cmd 43 below)
-                    // and sweeps the Base ETH with it.
-                    self.postMessage({ type: 'L2_HTLC_CLAIMED', payload: { secretHash: newHtlc.secret_hash, amount: newHtlc.amount } });
-                }
+        // JIT-parked forwards: deliver once the freshly opened channel ACKs,
+        // or fail upstream if the timeout budget runs out first.
+        for (const [hash, f] of Object.entries(wState.qb_fwd || {})) {
+            if (height + QB.HTLC_MIN_HEADROOM >= f.timeout) {
+                delete wState.qb_fwd[hash]; await saveState();
+                const up = qbChan(f.upId);
+                try { if (up && up.role === 'receiver' && up.status === 'active') await qbFail(up, hash, 6); } catch (_) {}
+                continue;
             }
-        } else if (cmd === 43) { // CLAIM_HTLC — a hub pulls funds from the upstream sender
-            const secret = msg.attachments.find(a => a.kind === "midstate")?.value;
-            if (secret) {
-                const secretHash = blake3_hash_hex(secret);
-                // FEATURE 2 (maker side): every cmd-43 claim publishes its preimage on the bus.
-                // Persist it keyed by hash so a maker mid-submarine-swap can sweep the Base ETH
-                // — via the live event below, or via the DEX_SUBMARINE_STATUS poll after a
-                // reload. (Previously this secret was dropped on the floor: it never reached
-                // l2_secrets, which only ever holds preimages for invoices WE generated.)
-                wState.l2_observed_secrets = wState.l2_observed_secrets || {};
-                if (!wState.l2_observed_secrets[secretHash]) {
-                    wState.l2_observed_secrets[secretHash] = secret;
-                    await saveState();
-                    self.postMessage({ type: 'DEX_SUBMARINE_SECRET', payload: { secretHash, secret } });
+            const c = Object.values(wState.l2_channels || {}).find(x => x.v === 2 && x.role === 'sender'
+                && x.status === 'active' && x.open_acked && x.peer_pk === f.nextPk
+                && x.latest.sender_amt >= f.amount && height < x.expiry - QB.PAY_CUTOFF);
+            if (!c || qbInFlight.has(`fwd:${hash}`)) continue;
+            qbInFlight.add(`fwd:${hash}`);
+            try {
+                await qbSenderAdvance(c, (next) => {
+                    next.sender_amt -= f.amount;
+                    next.htlcs.push({ amount: f.amount, timeout: f.timeout, secret_hash: hash });
+                }, QB.CMD_HTLC_ADD, []);
+                wState.l2_routes = wState.l2_routes || {};
+                wState.l2_routes[hash] = { fromCoinId: f.upId, amount: f.inAmount };
+                delete wState.qb_fwd[hash];
+                await saveState();
+                qbEvent('info', `JIT channel ready — forwarded ${f.amount} MDS to ${f.nextPk.substring(0, 12)}….`, c.id);
+            } catch (e) { qbLog(`JIT forward deferred: ${e && e.message || e}`); }
+            finally { qbInFlight.delete(`fwd:${hash}`); }
+        }
+        // Invoice requests that never got a reply.
+        for (const [rid, r] of Object.entries(wState.l2_inv_reqs || {})) {
+            if (height - r.height > 3) {
+                delete wState.l2_inv_reqs[rid]; await saveState();
+                qbEvent('warn', `No invoice reply from ${r.destPk.substring(0, 12)}… — the payee's wallet must be online to be paid.`);
+            }
+        }
+        // In-flight payments whose HTLC timed out (the expired-HTLC cancel below refunds them).
+        for (const [hash, p] of Object.entries(wState.l2_pay_pending || {})) {
+            if (height > p.timeout) {
+                delete wState.l2_pay_pending[hash]; await saveState();
+                qbEvent('warn', `Payment of ${p.amount} MDS to ${p.destPk.substring(0, 12)}… timed out — the balance returns automatically.`);
+            }
+        }
+        // Invoices long past expiry: forget the amounts (secrets stay — harmless).
+        for (const [hash, inv] of Object.entries(wState.l2_invoices || {})) {
+            if (inv.expiry && height > inv.expiry + QB.HTLC_MAX_PAST_EXPIRY) delete wState.l2_invoices[hash];
+        }
+
+        for (const [id, c] of Object.entries(wState.l2_channels || {})) {
+            if (c.v !== 2) continue;
+
+            // Resume any parked close/refund.
+            if (c.close && !c.close.done && c.close.stage !== 'need-resign' && !qbInFlight.has(id)) {
+                performChannelClose(id, c.close.kind).catch(e => qbLog(`Close resume deferred: ${e && e.message || e}`));
+            }
+            if (c.status !== 'active') {
+                // Post-close: resolve materialized HTLC coins.
+                for (const entry of (c.onchain_htlcs || [])) {
+                    if (!entry.swept) qbSweepHtlc(c, entry).catch(() => {});
                 }
-                const route = wState.l2_routes && wState.l2_routes[secretHash];
-                if (route) {
-                    const pC = wState.l2_channels[route.fromCoinId];
-                    if (pC) {
-                        let pA = pC.latest_state.alice_amt, pB = pC.latest_state.bob_amt;
-                        if (pC.is_alice) pA += route.amount; else pB += route.amount;
-                        const pHtlcs = (pC.latest_state.htlcs || []).filter(h => h.secret_hash !== secretHash);
-                        const pNonce = pC.latest_state.nonce + 1;
-                        const pState = build_channel_state(route.fromCoinId, pC.alice_pk, pC.bob_pk, BigInt(pA), BigInt(pB), pNonce, JSON.stringify(pHtlcs));
-                        const pSig = await signMssAndSync(pC.is_alice ? pC.alice_pk : pC.bob_pk, JSON.parse(pState).commitment);
-                        pC.latest_state = { nonce: pNonce, alice_amt: pA, bob_amt: pB, htlcs: pHtlcs, alice_sig: pC.is_alice ? pSig : null, bob_sig: pC.is_alice ? null : pSig, is_fully_signed: false };
-                        delete wState.l2_routes[secretHash];
-                        await saveState();
-                        const pBin = packChannelState(pNonce, pA, pB, pHtlcs, pSig);
-                        submitClientMinedChat([255, 43], null, [{ kind: "coin_id", value: route.fromCoinId }, { kind: "signature", value: normalizeHex(pBin) }, { kind: "midstate", value: secret }]).catch(() => {});
+                continue;
+            }
+
+            // Receiver: warn, then auto-close before the sender's refund unlocks.
+            if (c.role === 'receiver') {
+                if (height >= c.expiry - QB.WARN_MARGIN && !c.warned) {
+                    c.warned = true; await saveState();
+                    qbEvent('warn', `Channel enters its settlement window soon (auto-settles at block ${c.expiry - QB.CLOSE_MARGIN}).`, id);
+                }
+                if (height >= c.expiry - QB.CLOSE_MARGIN) {
+                    qbEvent('info', 'Settlement window reached — settling the channel now.', id);
+                    performChannelClose(id, 'close').catch(e => qbEvent('error', `Auto-close failed (will retry): ${e && e.message || e}`, id));
+                    continue;
+                }
+                // Claim stall: we revealed a preimage and the sender never credited it.
+                for (const [hash, pc] of Object.entries(c.pending_claims || {})) {
+                    if (height - pc.sent_height > QB.CLAIM_STALL_BLOCKS) {
+                        qbEvent('warn', 'Sender did not honor a revealed preimage — force-settling with the HTLC on-chain.', id);
+                        performChannelClose(id, 'close').catch(() => {});
+                        break;
                     }
                 }
             }
+
+            // Sender: refund the instant it unlocks; nudge handshake/updates.
+            if (c.role === 'sender') {
+                if (height >= c.expiry) {
+                    qbEvent('info', 'Channel expired — claiming the refund.', id);
+                    performChannelClose(id, 'refund').catch(e => qbEvent('error', `Refund failed (will retry): ${e && e.message || e}`, id));
+                    continue;
+                }
+                const tries = c.send_tries || 0;
+                if (!c.open_acked && tries < QB.REBROADCAST_MAX &&
+                    height - (c.last_send_height || 0) >= QB.OPEN_REBROADCAST_EVERY) {
+                    c.send_tries = tries + 1; c.last_send_height = height; await saveState();
+                    await qbBroadcastOpen(c);
+                } else if (c.open_acked && !c.close_requested && (c.acked_nonce || 0) < c.latest.nonce && tries < QB.REBROADCAST_MAX &&
+                    height - (c.last_send_height || 0) >= QB.UPDATE_REBROADCAST_EVERY) {
+                    c.send_tries = tries + 1; c.last_send_height = height; await saveState();
+                    await qbSendMsg(QB.CMD_UPDATE, id, qbPackState(c.latest, c.latest.sender_sig));
+                }
+                // Housekeeping: cancel HTLCs that expired unclaimed (frees balance).
+                const expired = (c.latest.htlcs || []).filter(h => height > h.timeout);
+                if (expired.length && !qbInFlight.has(`cancel:${id}`)) {
+                    qbInFlight.add(`cancel:${id}`);
+                    try {
+                        await qbSenderAdvance(c, (next) => {
+                            for (const h of expired) {
+                                next.htlcs = next.htlcs.filter(x => x.secret_hash !== h.secret_hash);
+                                next.sender_amt += h.amount;
+                            }
+                        }, QB.CMD_UPDATE);
+                        qbLog(`Cancelled ${expired.length} expired HTLC(s).`);
+                    } catch (_) {} finally { qbInFlight.delete(`cancel:${id}`); }
+                }
+            }
         }
 
-        self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+        // Funding-existence sweep: detects closes we didn't perform.
+        if (height - qbLastReconcileHeight >= QB.RECONCILE_EVERY) {
+            qbLastReconcileHeight = height;
+            for (const [id, c] of Object.entries(wState.l2_channels || {})) {
+                if (c.v !== 2 || (c.status !== 'active' && c.status !== 'closing' && c.status !== 'refunding')) continue;
+                if (qbInFlight.has(id)) continue;             // our own settlement is spending it right now
+                try {
+                    const chk = await rpc.checkCoin(c.funding[0].coin_id);
+                    if (chk && !chk.exists) await qbReconcileExternalClose(id);
+                } catch (_) {}
+            }
+        }
+    } finally { qbTickRunning = false; }
+}
+
+/** Fund a new outbound (sender-side) channel. Shared by the UI open and the
+ *  hub's JIT open; the record is created once funding confirms on-chain
+ *  (performSend captures the funding coins via pendingChannelOpen). */
+async function qbOpenOutbound(peerPk, amount, lifetime) {
+    const myPk = getPrimaryMssPk();
+    if (!myPk) throw new Error("Network Sync required first to initialize your MSS L2 identity.");
+    const rawPeer = String(peerPk || '').replace(/^0x/i, '').substring(0, 64);
+    if (!/^[0-9a-fA-F]{64}$/.test(rawPeer)) throw new Error("Peer identity must be 64 hex characters.");
+    if (rawPeer === myPk) throw new Error("You cannot open a channel to yourself.");
+    const amt = Number(amount);
+    if (!Number.isFinite(amt) || amt <= 0) throw new Error("Enter a positive amount to fund.");
+    const capacity = amt + QB.CLOSE_FEE;
+    if (capacity < QB.MIN_CAPACITY) throw new Error(`Minimum channel size is ${QB.MIN_CAPACITY - QB.CLOSE_FEE} MDS.`);
+
+    const budget = qbLeafBudget();
+    if (budget.remaining <= QB.LEAF_RESERVE + 2) throw new Error(`MSS key nearly exhausted (${budget.remaining} one-time signatures left). Generate a new receiving address before opening a channel.`);
+
+    let life = Number(lifetime) || QB.DEFAULT_LIFETIME;
+    life = Math.max(QB.MIN_LIFETIME, Math.min(QB.MAX_LIFETIME, life));
+    const expiry = (networkHeight || 0) + life;
+    if (!networkHeight) throw new Error("Waiting for the current block height — Sync first.");
+
+    const channelAddr = qbolt_channel_address(myPk, rawPeer, BigInt(expiry));
+
+    // Stash the open intent so a crash between funding and record-creation
+    // is recoverable (qbBoot re-checks and finalizes).
+    wState.qb_open_intent = {
+        channelAddr, senderPk: myPk, receiverPk: rawPeer, expiry,
+        amount: amt, createdAt: Date.now(), channelId: null, fundingCoins: null,
+    };
+    await saveState();
+
+    pendingChannelOpen = { channelAddr, senderPk: myPk, receiverPk: rawPeer, expiry, amount: amt, isQbolt: true };
+    await acquireSendLock();
+    try { await performSend(channelAddr, capacity); }
+    finally { releaseSendLock(); }
+}
+
+async function qbBroadcastOpen(channel) {
+    return await qbSendMsg(QB.CMD_OPEN, channel.id,
+        qbPackOpen(channel.expiry, channel.funding, channel.state0_sig),
+        [{ kind: "address", value: channel.sender_pk }]);
+}
+
+/** Boot pass: legacy migration, crashed-open recovery, close resumption. */
+async function qbBoot() {
+    let dirty = false;
+    for (const [id, c] of Object.entries(wState.l2_channels || {})) {
+        if (c.v !== 2 && c.status !== 'frozen-legacy') {
+            c.status = 'frozen-legacy';
+            dirty = true;
+            qbEvent('warn', 'A channel from the old Q-Bolt protocol was frozen. Its 2-of-2 funding has no timeout escape — use "Legacy Settle" (both parties must be online on the new wallet) to recover the funds.', id);
+        }
+        if (c.v === 2 && c.channel_addr && typeof watchedContracts !== 'undefined') {
+            watchedContracts.add(c.channel_addr);
+        }
     }
+    // A crash between funding confirmation and channel creation leaves an intent.
+    const intent = wState.qb_open_intent;
+    if (intent) {
+        const stale = Date.now() - (intent.createdAt || 0) > 2 * 3600 * 1000;
+        if (intent.channelId && intent.fundingCoins && intent.fundingCoins.length) {
+            // Funding outputs were captured before the interruption — check the
+            // chain and either finalize the channel or age the intent out.
+            try {
+                const chk = await rpc.checkCoin(intent.fundingCoins[0].coin_id);
+                if (chk && chk.exists) { await qbFinalizeOutboundOpen(intent); dirty = false; }
+                else if (stale) { delete wState.qb_open_intent; dirty = true; qbLog('Dropped a stale channel-open intent — its funding never confirmed.'); }
+            } catch (_) {}
+        } else if (stale) {
+            // The send failed before any funding output existed; nothing to
+            // recover. (recoverPendingTx handles the tx itself, if one is saved.)
+            delete wState.qb_open_intent; dirty = true;
+            qbLog('Dropped a stale channel-open intent — the funding transaction never completed.');
+        }
+    }
+    if (typeof updateWasmWatchlist === 'function') updateWasmWatchlist();
+    if (dirty) await saveState();
+    qbWatchTick(networkHeight).catch(() => {});
+}
+
+/** Create the sender-side channel record once funding is confirmed on-chain,
+ *  sign state 0 (so the receiver can settle a zero-payment channel any time),
+ *  and broadcast OPEN2. Idempotent. */
+async function qbFinalizeOutboundOpen(intent) {
+    if (qbChan(intent.channelId)) { delete wState.qb_open_intent; await saveState(); return; }
+    const capacity = intent.fundingCoins.reduce((a, f) => a + f.value, 0);
+
+    const built0 = JSON.parse(qbolt_build_state(intent.channelId, intent.senderPk, intent.receiverPk,
+        BigInt(intent.expiry), JSON.stringify(intent.fundingCoins.map(f => ({ value: f.value, salt: f.salt }))),
+        BigInt(capacity - QB.CLOSE_FEE), 0n, 0, "[]", 0));
+    const sig0 = await signMssAndSync(intent.senderPk, built0.commitment);
+
+    wState.l2_channels = wState.l2_channels || {};
+    wState.l2_channels[intent.channelId] = {
+        v: 2, id: intent.channelId, role: 'sender',
+        sender_pk: intent.senderPk, receiver_pk: intent.receiverPk, peer_pk: intent.receiverPk,
+        expiry: intent.expiry, funding: intent.fundingCoins, capacity,
+        channel_addr: intent.channelAddr, status: 'active',
+        latest: { nonce: 0, sender_amt: capacity - QB.CLOSE_FEE, receiver_amt: 0, htlcs: [], sender_sig: sig0 },
+        state0_sig: sig0, sig_attempt: 0, acked_nonce: -1, open_acked: false,
+        created_height: networkHeight, leaf_spent: 1, close: null, closed: null,
+        pending_claims: {}, onchain_htlcs: [], last_send_height: networkHeight, send_tries: 1,
+    };
+    delete wState.qb_open_intent;
+    if (typeof watchedContracts !== 'undefined') { watchedContracts.add(intent.channelAddr); updateWasmWatchlist(); }
+    await saveState();
+    await qbBroadcastOpen(wState.l2_channels[intent.channelId]);
+    qbEvent('info', `Channel funded and open: ${capacity - QB.CLOSE_FEE} MDS spendable, expires at block ${intent.expiry} (~${Math.round((intent.expiry - networkHeight) / 60)} h).`, intent.channelId);
+    self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+}
+
+// ═══ legacy (v1) cooperative rescue ═════════════════════════════════════════
+// v1 channels sit at a bare 2-of-2 whose "close" never actually worked (it
+// skipped the commit phase and assumed a single funding coin). This path
+// builds a CORRECT multi-coin close and gathers both fresh signatures over
+// the bus. There is no unilateral option — a bare 2-of-2 has none.
+
+async function qbLegacyClose(channelId) {
+    const c = (wState.l2_channels || {})[channelId];
+    if (!c || c.v === 2) throw new Error("Not a legacy channel");
+    const myPk = getPrimaryMssPk();
+    const addr = build_multisig_2of2_address(c.alice_pk, c.bob_pk);
+
+    // Discover ALL coins still sitting at the 2-of-2 (the v1 open split the
+    // funding into power-of-2 denominations; v1 only recorded one of them).
+    if (typeof watchedContracts !== 'undefined' && !watchedContracts.has(addr)) {
+        watchedContracts.add(addr); updateWasmWatchlist();
+        await performScan().catch(() => {});
+    }
+    const coins = Object.values(contractCoins || {}).filter(x => x.address === addr && !x.state);
+    if (!coins.length) throw new Error("No coins found at the legacy channel address — Sync first (or the channel was already settled).");
+    const capacity = coins.reduce((a, x) => a + Number(x.value), 0);
+    if (capacity <= QB.CLOSE_FEE) throw new Error("Legacy channel value does not cover the settlement fee.");
+
+    const dist = capacity - QB.CLOSE_FEE;
+    let aliceAmt = Math.min(Number(c.latest_state.alice_amt || 0), dist);
+    let bobAmt = dist - aliceAmt;                             // conservation, fee-adjusted
+
+    const funding = coins.map(x => ({ value: Number(x.value), salt: x.salt }));
+    const stateJson = qbolt_build_legacy_close_state(channelId, c.alice_pk, c.bob_pk,
+        JSON.stringify(funding), BigInt(aliceAmt), BigInt(bobAmt), 0);
+    const built = JSON.parse(stateJson);
+    const iAmAlice = myPk === c.alice_pk;
+    const mySig = await signMssAndSync(myPk, built.commitment);
+
+    c.legacy_close = { state_json: stateJson, funding, alice_amt: aliceAmt, bob_amt: bobAmt, my_sig: mySig, i_am_alice: iAmAlice, attempt: 0 };
+    await saveState();
+
+    // Ship the proposal: [ver][attempt u32][aliceAmt u64][bobAmt u64][count u8][{value,salt}×n][sig…]
+    const coinsBin = new Uint8Array(funding.length * 40);
+    { const v = new DataView(coinsBin.buffer); let o = 0;
+      for (const f of funding) { v.setBigUint64(o, BigInt(f.value), true); coinsBin.set(qbBytes(f.salt), o + 8); o += 40; } }
+    const head = new Uint8Array(21);
+    { const v = new DataView(head.buffer); v.setUint32(0, 0, true);
+      v.setBigUint64(4, BigInt(aliceAmt), true); v.setBigUint64(12, BigInt(bobAmt), true); head[20] = funding.length; }
+    await qbSendMsg(QB.CMD_LEGACY_CLOSE_REQ, channelId,
+        qbPackU32(0, 0, new Uint8Array([...head, ...coinsBin, ...qbBytes(mySig)])));
+    qbEvent('info', 'Legacy settlement proposed — waiting for the peer to co-sign (they must be online on the new wallet).', channelId);
+}
+
+async function qbOnLegacyCloseReq(channelId, att, myPk) {
+    const c = (wState.l2_channels || {})[channelId];
+    if (!c || c.v === 2) return;
+    const p = qbUnpackU32(att("signature") || "");
+    if (!p || p.extra.length < 21) return;
+    const v = new DataView(p.extra.buffer, p.extra.byteOffset);
+    const attempt = v.getUint32(0, true);
+    const aliceAmt = Number(v.getBigUint64(4, true));
+    const bobAmt = Number(v.getBigUint64(12, true));
+    const n = p.extra[20];
+    if (p.extra.length < 21 + n * 40) return;
+    const funding = [];
+    for (let i = 0; i < n; i++) {
+        const o = 21 + i * 40;
+        funding.push({ value: Number(v.getBigUint64(o, true)), salt: qbHex(p.extra.slice(o + 8, o + 40)) });
+    }
+    const theirSig = qbHex(p.extra.slice(21 + n * 40));
+
+    // Verify their sig over the exact proposed state, and sanity-check the
+    // split against our own v1 record before co-signing.
+    let built;
+    try {
+        built = JSON.parse(qbolt_build_legacy_close_state(channelId, c.alice_pk, c.bob_pk,
+            JSON.stringify(funding), BigInt(aliceAmt), BigInt(bobAmt), attempt));
+    } catch (_) { return; }
+    const iAmAlice = myPk === c.alice_pk;
+    const peerPk = iAmAlice ? c.bob_pk : c.alice_pk;
+    if (!verify_mss_sig_wasm(theirSig, built.commitment, peerPk)) return;
+    const myRecorded = iAmAlice ? Number(c.latest_state.alice_amt || 0) : Number(c.latest_state.bob_amt || 0);
+    const myProposed = iAmAlice ? aliceAmt : bobAmt;
+    if (myProposed + 64 < Math.min(myRecorded, aliceAmt + bobAmt)) {   // small tolerance for the fee haircut
+        qbEvent('warn', `Legacy settlement proposal pays this wallet ${myProposed} MDS vs ${myRecorded} recorded — refusing to co-sign.`, channelId);
+        return;
+    }
+    const mySig = await signMssAndSync(myPk, built.commitment);
+    await qbSendMsg(QB.CMD_LEGACY_CLOSE_SIG, channelId,
+        qbPackU32(0, attempt, qbBytes(mySig)));
+    qbEvent('info', `Co-signed legacy settlement (receiving ${myProposed} MDS) — the peer will broadcast it.`, channelId);
+}
+
+async function qbOnLegacyCloseSig(channelId, att) {
+    const c = (wState.l2_channels || {})[channelId];
+    if (!c || c.v === 2 || !c.legacy_close) return;
+    const p = qbUnpackU32(att("signature") || "");
+    if (!p || !p.extra.length) return;
+    const rec = c.legacy_close;
+    const built = JSON.parse(rec.state_json);
+    const peerPk = rec.i_am_alice ? c.bob_pk : c.alice_pk;
+    const theirSig = qbHex(p.extra);
+    if (!verify_mss_sig_wasm(theirSig, built.commitment, peerPk)) return;
+
+    const aliceSig = rec.i_am_alice ? rec.my_sig : theirSig;
+    const bobSig = rec.i_am_alice ? theirSig : rec.my_sig;
+    qbEvent('info', 'Peer co-signed — broadcasting the legacy settlement…', channelId);
+    try {
+        const st = await rpc.getState();
+        const nonce = Number(mine_commitment_pow(built.commitment, st.required_pow || 24, BigInt(st.height), st.header_hash));
+        const cr = await rpc.commit(built.commitment, nonce);
+        if (!cr.ok && !/already|exist|duplicate/i.test(String(cr.body || cr.error || ''))) throw new Error(`Commit rejected: ${cr.body || cr.error}`);
+        await awaitCommitmentMined(built.commitment, (m) => qbLog(m));
+        const revealStr = qbolt_build_legacy_close_reveal(c.alice_pk, c.bob_pk,
+            JSON.stringify(rec.funding), rec.state_json, aliceSig, bobSig);
+        const rr = await rpc.send(revealStr);
+        if (!rr.ok) throw new Error(`Reveal rejected: ${rr.body || rr.error}`);
+        delete wState.l2_channels[channelId];
+        await saveState();
+        qbEvent('info', 'Legacy channel settled on-chain. Funds arrive with the next scan.', channelId);
+        performScan().catch(() => {});
+        self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+    } catch (e) {
+        qbEvent('error', `Legacy settlement failed: ${e && e.message || e}`, channelId);
+    }
+}
+
+
+async function handleL2Chat(msg) {
+    const cmd = msg.words[1];
+
+    // Q-Bolt v2 protocol traffic.
+    if (QB_CMDS.has(cmd)) { await handleQbChat(msg); return; }
+
+    // The legacy v1 channel handlers (cmds 100 / 40-43) are intentionally
+    // GONE: they auto-co-signed ANY counterparty state carrying a fresh
+    // nonce - the exact behavior that made balance theft possible. v1
+    // channels are frozen at boot and recovered via the legacy settlement
+    // flow (qbLegacyClose) instead.
+
     // ── L2 DEX ROUTING ──
-    else if (cmd >= 200 && cmd <= 206) {
+    if (cmd >= 200 && cmd <= 206) {
         const sigAtt = msg.attachments.find(a => a.kind === "signature")?.value;
         if (!sigAtt) return;
 
@@ -5135,9 +7244,97 @@ async function runSelfTests() {
         wState = JSON.parse(JSON.stringify(saved));
     });
 
-    // ── Summary ─────────────────────────────────────────────────────────
+    // ── Q-Bolt v2: wire codecs ──────────────────────────────────────────
 
-    const passed = results.filter(r => r.ok).length;
+    await test('qbolt_open_codec_roundtrip', async () => {
+        const funding = [
+            { value: 4096, salt: 'aa'.repeat(32) },
+            { value: 512,  salt: 'bb'.repeat(32) },
+        ];
+        const sig0 = 'cd'.repeat(936);
+        const packed = qbPackOpen(123456, funding, sig0);
+        const out = qbUnpackOpen(qbHex(packed));
+        assert(out, 'unpack returned null');
+        assertEqual(out.expiry, 123456, 'expiry');
+        assertEqual(out.funding.length, 2, 'funding count');
+        assertEqual(out.funding[0].value, 4096, 'coin 0 value');
+        assertEqual(out.funding[1].salt, 'bb'.repeat(32), 'coin 1 salt');
+        assertEqual(out.sig0, sig0, 'sig0');
+    });
+
+    await test('qbolt_state_codec_roundtrip', async () => {
+        const st = {
+            nonce: 7, sender_amt: 900, receiver_amt: 1100,
+            htlcs: [
+                { amount: 250, timeout: 900100, secret_hash: '11'.repeat(32) },
+                { amount: 50,  timeout: 900200, secret_hash: '22'.repeat(32) },
+            ],
+        };
+        const sig = 'ef'.repeat(936);
+        const out = qbUnpackState(qbHex(qbPackState(st, sig)));
+        assert(out, 'unpack returned null');
+        assertEqual(out.nonce, 7, 'nonce');
+        assertEqual(out.sender_amt, 900, 'sender_amt');
+        assertEqual(out.receiver_amt, 1100, 'receiver_amt');
+        assertEqual(out.htlcs.length, 2, 'htlc count');
+        assertEqual(out.htlcs[0].timeout, 900100, 'htlc 0 timeout');
+        assertEqual(out.htlcs[1].secret_hash, '22'.repeat(32), 'htlc 1 hash');
+        assertEqual(out.sig, sig, 'sig');
+    });
+
+    await test('qbolt_state_codec_rejects_wrong_version', async () => {
+        const bin = qbPackState({ nonce: 1, sender_amt: 1, receiver_amt: 1, htlcs: [] }, 'aa');
+        bin[0] = 9;                       // wrong protocol version byte
+        assertEqual(qbUnpackState(qbHex(bin)), null, 'must reject foreign version');
+        assertEqual(qbUnpackState('00'), null, 'must reject a truncated frame');
+    });
+
+    await test('qbolt_u32_codec_roundtrip', async () => {
+        const out = qbUnpackU32(qbHex(qbPackU32(0, 4294967295, new Uint8Array([1, 2, 3]))));
+        assert(out, 'unpack returned null');
+        assertEqual(out.n, 4294967295, 'u32 max round-trips');
+        assertEqual(out.extra.length, 3, 'extra length');
+        assertEqual(out.extra[2], 3, 'extra content');
+    });
+
+    // ── Q-Bolt v2: the receiver's validation gauntlet ────────────────────
+    // Exercises every rejection branch that does NOT need a real signature,
+    // plus the ordering guarantee that a stale nonce is refused before any
+    // expensive rebuild happens.
+
+    await test('qbolt_validate_rejects_stale_and_inactive', async () => {
+        const chan = {
+            v: 2, id: 'ff'.repeat(32), role: 'receiver', status: 'active',
+            sender_pk: 'a'.repeat(64), receiver_pk: 'b'.repeat(64),
+            expiry: 1000, capacity: 10000, funding: [{ value: 8192, salt: '00'.repeat(32), coin_id: 'ff'.repeat(32) }],
+            latest: { nonce: 5, sender_amt: 5000, receiver_amt: 3000, htlcs: [], sender_sig: 'aa' },
+        };
+        const mk = (over) => Object.assign({ nonce: 6, sender_amt: 4000, receiver_amt: 4000, htlcs: [], sig: 'aa' }, over);
+
+        let v = qbValidateInbound(chan, mk({ nonce: 5 }), 500);
+        assert(!v.ok && v.code === 6, `stale nonce must be code 6 (got ${v.code})`);
+
+        v = qbValidateInbound(chan, mk({ nonce: 4 }), 500);
+        assert(!v.ok && v.code === 6, 'older nonce must be code 6');
+
+        // Exact re-delivery of the CURRENT state is idempotent, not a rejection.
+        v = qbValidateInbound(chan, { nonce: 5, sender_amt: 5000, receiver_amt: 3000, htlcs: [], sig: 'aa' }, 500);
+        assert(v.ok && v.idempotent, 're-delivery of the current state must be idempotent');
+
+        const closing = { ...chan, status: 'closing' };
+        v = qbValidateInbound(closing, mk({}), 500);
+        assert(!v.ok && v.code === 7, 'inactive channel must be code 7');
+
+        const asSender = { ...chan, role: 'sender' };
+        v = qbValidateInbound(asSender, mk({}), 500);
+        assert(!v.ok && v.code === 8, 'sender must not accept inbound states');
+
+        const many = mk({ htlcs: new Array(QB.MAX_HTLCS + 1).fill(0).map((_, i) => ({ amount: 1, timeout: 900, secret_hash: String(i).padStart(64, '0') })) });
+        v = qbValidateInbound(chan, many, 500);
+        assert(!v.ok && v.code === 5, 'HTLC count cap must be code 5');
+    });
+
+
     const failed = results.filter(r => !r.ok).length;
     return { passed, failed, results };
 }

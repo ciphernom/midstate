@@ -2,8 +2,9 @@ use super::types::*;
 use crate::core::{compute_coin_id, compute_address, wots,
                   block_reward, Transaction, InputReveal, OutputData, Predicate, Witness};
 use crate::node::NodeHandle;
+use blake3;
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{StatusCode,header},
     response::{IntoResponse, Response},
     Json,
@@ -20,26 +21,16 @@ impl IntoResponse for ErrorResponse {
 pub async fn health() -> &'static str {
     "OK"
 }
-pub async fn get_mss_state(
-    State(node): State<AppState>,
-    Json(req): Json<GetMssStateRequest>,
-) -> Result<Json<GetMssStateResponse>, ErrorResponse> {
+
+pub async fn get_mss_state(State(node): State<AppState>, Json(req): Json<GetMssStateRequest>)
+    -> Result<Json<GetMssStateResponse>, ErrorResponse> {
     let master_pk = parse_hex32(&req.master_pk, "master_pk")?;
-    let state = node.get_state().await;
-
-    // Scan chain history
-let scan_start = state.height.saturating_sub(2000);
-    let chain_max = node.scan_mss_index(&master_pk, scan_start, state.height)
-        .map_err(|e| ErrorResponse { error: e.to_string() })?;
-
-    // Scan mempool
+    let chain_max = node.storage.query_mss_leaf_index(&master_pk).unwrap_or(0);  
     let (_, mempool_txs) = node.get_mempool_info().await;
     let mempool_max = crate::node::scan_txs_for_mss_index(&mempool_txs, &master_pk);
-
-    let next_index = chain_max.max(mempool_max);
-
-    Ok(Json(GetMssStateResponse { next_index }))
+    Ok(Json(GetMssStateResponse { next_index: chain_max.max(mempool_max) }))
 }
+
 pub async fn get_state(State(node): State<AppState>) -> Json<GetStateResponse> {
     let state = node.get_state().await;
     let safe_depth = node.get_safe_depth().await;
@@ -354,6 +345,11 @@ pub async fn get_mempool(State(node): State<AppState>) -> Json<GetMempoolRespons
 }
 pub async fn scan_addresses(
     State(node): State<AppState>,
+    // ConnectInfo/HeaderMap must precede Json: Json consumes the body and so
+    // must be the last extractor. Requires the router to be built with
+    // .into_make_service_with_connect_info::<SocketAddr>() — server.rs already is.
+    ConnectInfo(sock): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ScanRequest>,
 ) -> Result<Json<ScanResponse>, ErrorResponse> {
     // Cap scan window to prevent disk I/O exhaustion on constrained hardware
@@ -366,6 +362,33 @@ pub async fn scan_addresses(
             error: format!("Too many addresses: {} (max {})", req.addresses.len(), MAX_SCAN_ADDRESSES),
         });
     }
+
+    // --- Server-authoritative PoW ---
+    //
+    // Required unconditionally, not just for "deeper" scans. The proof used to
+    // be optional, which meant omitting the field bought an ungated scan of up
+    // to MAX_SCAN_RANGE (10,000) blocks — twice /search's range, and /search IS
+    // gated. An optional gate is not a gate; it's a suggestion.
+    //
+    // Difficulty is whatever the governor says this IP owes right now; the
+    // client discovers it via /pow_params and does not get a vote.
+    if req.addresses.is_empty() {
+        return Err(ErrorResponse { error: "No addresses to scan".into() });
+    }
+    let pow = req.pow.as_ref().ok_or_else(|| ErrorResponse {
+        error: "Scan requires proof-of-work — see /pow_params".into(),
+    })?;
+    // Bind the proof to the SAME start_height the request carries: the preimage
+    // is "{addr}:{start_height}:{ts}:{nonce}" on both sides. Mining one value and
+    // submitting another was a real bug in the explorer.
+    //
+    // The proof binds addresses[0] only, so it is replayable across different
+    // address sets inside the 600s timestamp window — but each replay is charged
+    // by the governor, so after the free allowance the stale proof no longer
+    // meets the raised requirement and must be re-mined. The escalation bounds
+    // replay without needing a nonce ledger.
+    let subject = req.addresses[0].clone();
+    verify_pow(pow_client_ip(&sock, &headers), &subject, req.start_height, pow.timestamp, pow.nonce, &pow.hash)?;
 
     let addresses: Vec<[u8; 32]> = req.addresses.iter()
         .map(|h| parse_hex32(h, "address"))
@@ -614,29 +637,13 @@ pub async fn get_filters(
             _ => Vec::new(), 
         };
 
-        // Count unique identifiable elements the same way CompactFilter::build does
-        let mut items = std::collections::HashSet::new();
-        for tx in &batch.transactions {
-            match tx {
-                crate::core::Transaction::Commit { commitment, .. } => {
-                    items.insert(*commitment);
-                }
-                crate::core::Transaction::Reveal { inputs, outputs, .. } | crate::core::Transaction::Consolidate { inputs, outputs, .. } => {
-                    for input in inputs {
-                        items.insert(input.coin_id());
-                        items.insert(input.predicate.address());
-                    }
-                    for output in outputs {
-                        if let Some(cid) = output.coin_id() { items.insert(cid); }
-                        items.insert(output.address());
-                    }
-                }
-            }
-        }
-        for cb in &batch.coinbase {
-            items.insert(cb.coin_id());
-            items.insert(cb.address);
-        }
+        // Element count MUST come from the same code that built the filter.
+        // This used to be a hand-copied duplicate of CompactFilter::items_in().
+        // `n` is a hash-range parameter, not a statistic: match_any computes
+        // `modulus = n * FPR_INVERSE`, so if the count drifts from build()'s by
+        // even one, every client's query hashes into the wrong range and the
+        // filter returns confident garbage. Call the real thing.
+        let items = crate::core::filter::CompactFilter::items_in(&batch);
 
         filters.push(hex::encode(filter_data));
         block_hashes.push(hex::encode(batch.extension.final_hash));
@@ -709,24 +716,228 @@ pub async fn get_batch(
     Ok(Json(val))
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Server-authoritative proof-of-work
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Difficulty is decided HERE, never by the caller. The explorer previously
+// escalated its own difficulty from a localStorage timestamp while the server
+// accepted any 4-zero proof — so an abuser paid the floor forever and only
+// honest users paid the tax.
+//
+// Protocol:
+//   1. client GET/POST /pow_params      -> { zeros, window_secs, ... }   (free)
+//   2. client mines blake3("{subject}:{height}:{ts}:{nonce}") to `zeros`
+//   3. client submits; the server re-derives the requirement and verifies
+//
+// Step 3 re-derives rather than trusting step 1, so a stale quote cannot buy a
+// discount. A client that gets outbid mid-mine is rejected, re-quotes and
+// retries — costing a round trip, never correctness.
+
+/// Process-wide governor. Kept as a lazy singleton rather than a NodeHandle
+/// field so this drops in without touching the node's construction path.
+fn pow_governor() -> &'static crate::rpc::pow_governor::PowGovernor {
+    static G: std::sync::OnceLock<crate::rpc::pow_governor::PowGovernor> = std::sync::OnceLock::new();
+    G.get_or_init(crate::rpc::pow_governor::PowGovernor::new)
+}
+
+/// The IP a PoW bucket is keyed on.
+///
+/// Deliberately the SOCKET address, not X-Forwarded-For. XFF is caller-supplied:
+/// honouring it by default would let anyone send a random header per request,
+/// land in a fresh bucket every time, and never escalate — defeating the whole
+/// mechanism. Behind a trusted reverse proxy every client shares the proxy's
+/// bucket, which is wrong in the SAFE direction (too strict, never too lax).
+///
+/// If you terminate at a proxy and want per-client accounting, set
+/// MIDSTATE_TRUST_XFF=1 **and** make the proxy OVERWRITE the header, e.g. nginx:
+///     proxy_set_header X-Forwarded-For $remote_addr;      # not $proxy_add_...
+/// Appending instead of overwriting re-opens the spoof.
+fn pow_client_ip(addr: &std::net::SocketAddr, headers: &axum::http::HeaderMap) -> std::net::IpAddr {
+    if std::env::var("MIDSTATE_TRUST_XFF").as_deref() == Ok("1") {
+        if let Some(fwd) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim)
+        {
+            if let Ok(ip) = fwd.parse::<std::net::IpAddr>() {
+                return ip;
+            }
+        }
+    }
+    addr.ip()
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Verify a submitted proof against the difficulty this IP currently owes.
+///
+/// `subject` is the address (for /scan) or the query (for /search); `height` is
+/// the request's start_height, or 0 where there is none. Both sides MUST agree
+/// on this preimage — mining one string and submitting another was a real bug.
+///
+/// Takes the proof's fields rather than the struct, so this compiles regardless
+/// of what your request type calls it and needs no import to stay in sync.
+///
+/// On success the request is charged. Failures are not charged: verification is
+/// a single BLAKE3 of ~90 bytes, so counting them would let an attacker inflate
+/// a shared NAT's price for free.
+fn verify_pow(
+    ip: std::net::IpAddr,
+    subject: &str,
+    height: u64,
+    timestamp: u64,
+    nonce: u64,
+    claimed_hash: &str,
+) -> Result<(), ErrorResponse> {
+    use crate::rpc::pow_governor::leading_hex_zeros;
+
+    let now = unix_now();
+    if timestamp < now.saturating_sub(600) || timestamp > now + 120 {
+        return Err(ErrorResponse { error: "PoW timestamp is too old or in the future".into() });
+    }
+
+    let input = format!("{}:{}:{}:{}", subject, height, timestamp, nonce);
+    let computed_hex = hex::encode(blake3::hash(input.as_bytes()).as_bytes());
+    if computed_hex != claimed_hash {
+        return Err(ErrorResponse { error: "Invalid PoW hash".into() });
+    }
+
+    let required = pow_governor().required_zeros(ip, now);
+    let got = leading_hex_zeros(&computed_hex);
+    if got < required {
+        // State the requirement so the client can re-mine without guessing.
+        return Err(ErrorResponse {
+            error: format!(
+                "PoW difficulty too low: {} leading zeros required, got {}. Re-check /pow_params.",
+                required, got
+            ),
+        });
+    }
+
+    pow_governor().record(ip, now);
+    Ok(())
+}
+
+/// What this caller must pay for its next expensive request. Free by design:
+/// a client cannot discover the price without asking.
+pub async fn pow_params(
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Json<PowParamsResponse> {
+    let now = unix_now();
+    let ip = pow_client_ip(&addr, &headers);
+    pow_governor().prune(now);
+    Json(PowParamsResponse {
+        zeros: pow_governor().required_zeros(ip, now),
+        min_zeros: crate::rpc::pow_governor::MIN_ZEROS,
+        max_zeros: crate::rpc::pow_governor::MAX_ZEROS,
+        window_secs: crate::rpc::pow_governor::WINDOW_SECS,
+        server_time: now,
+    })
+}
+
 /// Universal search: find any 32-byte hash across blocks, txs, addresses.
 /// Searches the last `limit` blocks (default 1000) server-side.
 pub async fn search(
     State(node): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, ErrorResponse> {
     let query = crate::core::types::parse_address_flexible(&req.query)
         .map_err(|e| ErrorResponse { error: e })?;
+
+    // This endpoint loads and linearly scans up to 5000 batches per call — more
+    // disk I/O than /scan, which was already gated while this was wide open.
+    // Height is pinned to 0: search has no start_height, and reusing the same
+    // preimage shape lets the client keep one miner.
+    let pow = req.pow.as_ref().ok_or_else(|| ErrorResponse {
+        error: "Search requires proof-of-work — see /pow_params".into(),
+    })?;
+    verify_pow(pow_client_ip(&addr, &headers), &req.query, 0, pow.timestamp, pow.nonce, &pow.hash)?;
 
     let store = &node.storage.batches; 
 
     let tip = store.highest()
         .map_err(|e| ErrorResponse { error: e.to_string() })?;
 
-    let search_start = tip.saturating_sub(1000);
+    // Compact filters give us one cheap win here and only one: an EMPTY filter
+    // means an empty block, so we skip the batch load entirely.
+    //
+    // They cannot do more, despite the temptation. This search also matches
+    // block_hash, prev_midstate, state_root and reveal_salt, and CompactFilter
+    // covers none of those (see filter::items_in — commitments, coin_ids and
+    // addresses only). So a filter MISS cannot skip a block without silently
+    // losing those result types. And match_any() needs the element count `n`,
+    // which is derived from the batch — so consulting the filter would force the
+    // very load it was meant to avoid, then charge a siphash per block for the
+    // privilege.
+    //
+    // Making the filter genuinely useful here needs a storage change: persist
+    // (block_hash, n) alongside each filter so a miss can skip the load, and
+    // index the block-level hashes separately. Until then the honest protection
+    // for this endpoint is the PoW gate below, not the filter.
+    let search_start = tip.saturating_sub(5000);
     let mut results = Vec::new();
 
-    for height in (search_start..=tip).rev() {
+    // Which heights are worth loading?
+    //
+    // Two sources, because the compact filter covers only part of what we match:
+    //
+    //   1. SEARCH_INDEX: block_hash / prev_midstate / state_root / reveal salt.
+    //      O(1), and over ALL history — not just the 5000-block window, so a
+    //      block hash from a year ago now resolves instantly instead of not at
+    //      all.
+    //   2. The window, filtered: commitments / coin_ids / addresses live in the
+    //      compact filter. With (block_hash, n) now persisted beside each filter,
+    //      match_any runs WITHOUT loading the batch — so we only pay for real
+    //      hits plus the filter's false positives (~1/784), instead of
+    //      deserialising every non-empty block in the window.
+    //
+    // A height missing from the index or the meta table means "not yet
+    // backfilled", which must degrade to loading the batch. Treating absence as
+    // "no match" would make search silently lie during the first-run backfill.
+    let mut candidates: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+
+    for h in crate::storage::search_index::lookup(&node.storage.db(), &query).unwrap_or_default() {
+        candidates.insert(h);
+    }
+
+    // Two range scans, not ten thousand point lookups. Both load_filter() and
+    // filter_meta() open a fresh read transaction per call (~17 µs of pure
+    // overhead each), which across a 5000-block window costs more than the work.
+    // Search always walks a contiguous range, so scan it as one.
+    let filters = store.load_filter_range(search_start, tip).unwrap_or_default();
+    let metas = crate::storage::search_index::filter_meta_range(&node.storage.db(), search_start, tip)
+        .unwrap_or_default();
+
+    for height in search_start..=tip {
+        let filter_data = match filters.get(&height) {
+            Some(d) if !d.is_empty() => d,
+            Some(_) => continue,                   // empty filter -> empty block
+            None => { candidates.insert(height); continue; }   // no filter -> can't rule it out
+        };
+        match metas.get(&height) {
+            Some((block_hash, n)) => {
+                if crate::core::filter::match_any(filter_data, block_hash, *n, &[query]) {
+                    candidates.insert(height);
+                }
+            }
+            // Unindexed height: fall back to loading the batch. Slow but correct —
+            // absence must never be read as "no match".
+            None => { candidates.insert(height); }
+        }
+    }
+
+    for height in candidates.into_iter().rev() {
         let batch = match store.load(height) {
             Ok(Some(b)) => b,
             _ => continue,

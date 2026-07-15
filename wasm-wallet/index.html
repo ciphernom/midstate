@@ -1305,7 +1305,9 @@
             <div class="panel" style="background: var(--bg-panel); border-color: var(--border);">
                 <h3 style="font-size: 13px; color: var(--accent);">Your Q-Bolt Identity</h3>
                 <div id="l2MyIdentity" style="font-family: monospace; font-size: 11px; word-break: break-all; color: var(--text-max); margin-bottom: 8px;">Sync to generate identity...</div>
+                <div style="font-size: 10px; color: #666; margin-bottom: 8px; line-height: 1.5;">This is your L2 public key — it is <b>not</b> your receiving address. Give a peer this exact string so they can open a channel to you.</div>
                 <button onclick="navigator.clipboard.writeText(document.getElementById('l2MyIdentity').innerText); showToast('Identity copied', 'success');" style="margin: 0; padding: 6px; font-size: 11px; width: auto; background: transparent; border-color: var(--accent-dim); color: var(--accent);">Copy Identity</button>
+                <div id="l2LeafBudget" style="font-size: 10px; color: #666; margin-top: 10px; line-height: 1.5;"></div>
             </div>
 
             <div class="panel">
@@ -1320,14 +1322,34 @@
                     <input type="text" id="l2PayInvoiceData" placeholder="Paste l2inv:...">
                     <button onclick="payL2Invoice()" style="width: auto; background: var(--text-max); color: #000;">Pay Route</button>
                 </div>
+
+                <div style="display: flex; gap: 8px; margin-top: 15px;">
+                    <input type="text" id="l2PayToPk" placeholder="Payee identity (64 hex)" style="flex: 2;">
+                    <input type="number" id="l2PayToAmount" placeholder="Amount" style="flex: 1;">
+                    <button onclick="payL2To()" style="width: auto;">Pay Identity</button>
+                </div>
+                <div style="font-size: 10px; color: #666; margin-top: 6px; line-height: 1.5;">Requests a signed invoice from the payee over the network and pays it — no invoice paste needed. The payee's wallet must be online.</div>
             </div>
 
             <div class="panel">
                 <h3 style="font-size: 14px;">Open New Channel</h3>
+                <div style="font-size: 11px; color: #888; margin-bottom: 10px; line-height: 1.5;">
+                    A channel is <b>one-directional</b>: you fund it, and you can pay the peer up to the funded amount. For payments in the other direction, ask them to open a channel back to you.
+                </div>
                 <input type="text" id="l2PeerPk" placeholder="Peer's 64-hex L2 Identity">
                 <input type="number" id="l2FundAmount" placeholder="Amount to Fund (MDS)">
+                <label style="font-size: 11px; color: #666; text-transform: uppercase; display: block; margin-bottom: 4px;">Channel Lifetime</label>
+                <select id="l2Lifetime" style="margin-bottom: 10px;">
+                    <option value="1440">1 day</option>
+                    <option value="4320" selected>3 days</option>
+                    <option value="10080">7 days</option>
+                    <option value="43200">30 days</option>
+                </select>
                 <button id="btnOpenChannel" style="background: var(--text-max); color: #000; margin-bottom: 0;">Fund Channel</button>
-                <div style="font-size: 10px; color: #666; margin-top: 8px;">A 2,000 MDS reserve fee is added to cover the closing transaction.</div>
+                <div style="font-size: 10px; color: #666; margin-top: 8px; line-height: 1.5;">
+                    A 2,000 MDS reserve fee is added to cover the closing transaction.<br>
+                    Your funds are locked until the peer settles, or until the lifetime expires — at which point you can always reclaim them yourself. The peer settles automatically before that deadline.
+                </div>
             </div>
 
             <h3 style="margin-top: 1.5rem; font-size: 12px; color: #666; text-transform: uppercase;">Active Channels</h3>
@@ -1343,10 +1365,17 @@
             
             <div class="panel">
                 <h3 style="font-size: 14px;">Wallet Maintenance</h3>
-                <p style="font-size: 11px; color: #888; margin-bottom: 12px;">Consolidate fragmented dust UTXOs at a single address into a new coin to save on future fees. <i>(Submits an ultra-lightweight Consolidate transaction)</i></p>
+                <p style="font-size: 11px; color: #888; margin-bottom: 12px;">Sweep highly-fragmented WOTS coins across multiple addresses into a fresh, reusable MSS destination. This significantly reduces future transaction fees.</p>
+                <div style="display:flex; gap:8px; margin-bottom: 8px;">
+                    <button id="btnDefrag" style="width: 100%; margin: 0; background: var(--text-max); color: #000;">Defragment Wallet</button>
+                </div>
+                
+                <hr style="border:0; border-top:1px solid var(--border); margin: 15px 0;">
+                
+                <p style="font-size: 11px; color: #888; margin-bottom: 12px;">Alternatively, consolidate dust at a <i>single</i> address using the ultra-lightweight consolidate transaction.</p>
                 <div id="dustAddressSelectContainer" style="display:flex; gap:8px; margin-bottom: 8px;">
                     <select id="dustAddressSelect" style="flex: 1; margin: 0;"></select>
-                    <button id="btnConsolidate" style="width: auto; margin: 0; background: var(--text-max); color: #000;">Consolidate</button>
+                    <button id="btnConsolidate" style="width: auto; margin: 0; background: transparent; color: var(--text-max); border-color: var(--border-bright);">Consolidate</button>
                 </div>
             </div>
 
@@ -1387,7 +1416,7 @@
             <button class="nav-btn" data-target="view-mine"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/></svg><span>Mine</span></button>
             <button class="nav-btn" data-target="view-send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M5 19L19 5M9 5h10v10"/></svg><span>Send</span></button>
             <button class="nav-btn" data-target="view-receive"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M12 4v12M6 12l6 6 6-6"/></svg><span>Receive</span></button>
-             <!--<button class="nav-btn" data-target="view-lightning"><span class="nav-icon">⚡</span><span>Q-Bolt L2</span></button>-->
+            <button class="nav-btn" data-target="view-lightning"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg><span>Q-Bolt L2</span></button>
             <button class="nav-btn" data-target="view-chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M21 15a2 2 0 0 1-2 2H8l-4 4V5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2z"/></svg><span>Chat</span></button>
             <button class="nav-btn" data-target="view-settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="8" cy="18" r="1.6"/></svg><span>Settings</span></button>
         </nav>
@@ -3364,35 +3393,102 @@ if ('serviceWorker' in navigator) {
                 }
                 if (payload.l2Channels) {
                     const l2List = document.getElementById('l2ChannelList');
-                    if (payload.primaryAddress !== "None") {
-                        document.getElementById('l2MyIdentity').innerText = payload.primaryAddress;
+                    window.appL2Channels = payload.l2Channels;
+                    if (payload.primaryL2Pk && payload.primaryL2Pk !== "None") {
+                        document.getElementById('l2MyIdentity').innerText = payload.primaryL2Pk;
                     }
-                    
+
+                    const lb = payload.l2LeafBudget;
+                    const lbEl = document.getElementById('l2LeafBudget');
+                    if (lbEl && lb) {
+                        const pct = Math.round((lb.used / lb.total) * 100);
+                        const low = lb.remaining <= 32;
+                        lbEl.innerHTML = `One-time signatures used: <span style="color:${low ? 'var(--red)' : '#888'};">${lb.used} / ${lb.total}</span> (${pct}%)`
+                            + (low ? `<br><span style="color: var(--red);">Running low — each channel update spends one. Generate a fresh receiving address before opening new channels.</span>` : '');
+                    }
+
                     if (payload.l2Channels.length === 0) {
-                        l2List.innerHTML = '<div class="list-item" style="text-align: center; color: #555;">No active channels.</div>';
+                        l2List.innerHTML = '<div class="list-item" style="text-align: center; color: #555;">No channels.</div>';
                     } else {
+                        const esc = (s) => String(s).replace(/[^0-9a-fA-F]/g, '');
                         l2List.innerHTML = payload.l2Channels.map(c => {
-                            const myBal = c.is_alice ? c.latest_state.alice_amt : c.latest_state.bob_amt;
-                            const peerBal = c.is_alice ? c.latest_state.bob_amt : c.latest_state.alice_amt;
-                            const peerId = c.is_alice ? c.bob_pk : c.alice_pk;
-                            const fullySigned = c.latest_state.is_fully_signed;
+
+                            // ── Legacy (v1) channel: frozen, rescue-only ──
+                            if (c.legacy) {
+                                const myBal = c.isAlice ? c.aliceAmt : c.bobAmt;
+                                return `
+                                <div class="list-item" style="display:block; border-left: 3px solid var(--red);">
+                                    <div class="flex-row" style="margin-bottom: 8px;">
+                                        <span style="font-weight:bold; color:var(--text-faint); font-size:16px;">${mdsHtml(myBal, true)}</span>
+                                        <span style="font-size:10px; color:var(--red);">FROZEN · OLD PROTOCOL</span>
+                                    </div>
+                                    <div style="font-size:11px; color:#888; margin-bottom:10px; line-height:1.5;">
+                                        Peer: ${c.peer_pk ? c.peer_pk.substring(0,16) : '?'}…<br>
+                                        This channel was created by an older Q-Bolt version whose funding has no
+                                        expiry escape hatch. Recovery requires the peer to co-sign, and both of you
+                                        must be running this wallet version.
+                                    </div>
+                                    <button onclick="l2LegacyClose('${esc(c.id)}')" style="margin:0; padding:8px; font-size:11px; background:transparent; border-color:var(--red); color:var(--red); width:100%;">Attempt Cooperative Recovery</button>
+                                </div>`;
+                            }
+
+                            // ── v2 channel ──
+                            const outbound = c.direction === 'outbound';
+                            const statusMap = {
+                                active:   { txt: 'ACTIVE',    col: 'var(--accent)' },
+                                closing:  { txt: 'SETTLING',  col: 'var(--text-bright)' },
+                                refunding:{ txt: 'REFUNDING', col: 'var(--text-bright)' },
+                                closed:   { txt: 'CLOSED',    col: '#555' },
+                            };
+                            const st = statusMap[c.status] || { txt: String(c.status || '').toUpperCase(), col: '#888' };
+                            const hrs = Math.max(0, Math.round(c.blocksLeft / 60));
+                            const expColor = c.blocksLeft <= 60 ? 'var(--red)' : (c.warn ? 'var(--text-bright)' : '#888');
+
+                            let notice = '';
+                            if (c.status === 'active' && !c.openAcked && outbound) {
+                                notice = `<div style="font-size:10px; color:var(--text-bright); margin-bottom:8px;">⏳ Waiting for the peer to acknowledge. They must be online. Your funds are safe either way — you can reclaim them at expiry.</div>`;
+                            } else if (c.closeStage === 'need-resign') {
+                                notice = `<div style="font-size:10px; color:var(--text-bright); margin-bottom:8px;">⏳ Settlement window lapsed; asked the peer for a fresh signature. Retrying automatically.</div>`;
+                            } else if (c.status === 'closing' || c.status === 'refunding') {
+                                notice = `<div style="font-size:10px; color:var(--text-bright); margin-bottom:8px;">⏳ Settling on-chain (stage: ${c.closeStage || 'working'}). This resumes by itself if interrupted.</div>`;
+                            } else if (c.warn && c.status === 'active') {
+                                notice = outbound
+                                    ? `<div style="font-size:10px; color:var(--text-bright); margin-bottom:8px;">⚠ Nearing expiry. The peer should settle shortly; if they don't, you can reclaim everything at block ${c.expiry}.</div>`
+                                    : `<div style="font-size:10px; color:var(--text-bright); margin-bottom:8px;">⚠ Nearing expiry — this wallet will settle automatically well before the deadline. Stay online.</div>`;
+                            }
+                            if (c.onchainHtlcs > 0) {
+                                notice += `<div style="font-size:10px; color:var(--text-bright); margin-bottom:8px;">${c.onchainHtlcs} on-chain HTLC(s) pending resolution — handled automatically.</div>`;
+                            }
+
+                            // Buttons by role and status.
+                            let buttons = '';
+                            if (c.status === 'active') {
+                                if (outbound) {
+                                    buttons += `<button onclick="l2Pay('${esc(c.id)}')" style="margin:0; padding:8px; font-size:11px; background:transparent; border-color:var(--accent); color:var(--accent); flex:1;" ${!c.openAcked ? 'disabled' : ''}>Send Payment</button>`;
+                                    buttons += `<button onclick="l2Sync('${esc(c.id)}')" style="margin:0; padding:8px; font-size:11px; background:transparent; border-color:var(--text-bright); color:var(--text-bright); flex:1;">Resend</button>`;
+                                    buttons += (c.blocksLeft <= 0)
+                                        ? `<button onclick="l2Refund('${esc(c.id)}')" style="margin:0; padding:8px; font-size:11px; background:transparent; border-color:var(--red); color:var(--red); flex:1;">Claim Refund</button>`
+                                        : `<button onclick="l2Close('${esc(c.id)}')" style="margin:0; padding:8px; font-size:11px; background:transparent; border-color:var(--red); color:var(--red); flex:1;">Request Close</button>`;
+                                } else {
+                                    buttons += `<button onclick="l2Sync('${esc(c.id)}')" style="margin:0; padding:8px; font-size:11px; background:transparent; border-color:var(--text-bright); color:var(--text-bright); flex:1;">Resend Ack</button>`;
+                                    buttons += `<button onclick="l2Close('${esc(c.id)}')" style="margin:0; padding:8px; font-size:11px; background:transparent; border-color:var(--red); color:var(--red); flex:1;">Settle On-Chain</button>`;
+                                }
+                            }
 
                             return `
-                            <div class="list-item" style="display: block;">
+                            <div class="list-item" style="display:block;${c.warn && c.status === 'active' ? ' border-left: 3px solid var(--text-bright);' : ''}">
                                 <div class="flex-row" style="margin-bottom: 8px;">
-                                    <span style="font-weight: bold; color: var(--accent); font-size: 16px;">${mdsHtml(myBal, true)}</span>
-                                    <span style="font-size: 10px; color: ${fullySigned ? 'var(--text-max)' : 'var(--red)'};">${fullySigned ? '✓ Synchronized' : '⏳ Awaiting Peer'}</span>
+                                    <span style="font-weight:bold; color:var(--accent); font-size:16px;">${mdsHtml(c.spendable, true)}</span>
+                                    <span style="font-size:10px; color:${st.col};">${outbound ? '→ OUTBOUND' : '← INBOUND'} · ${st.txt}</span>
                                 </div>
-                                <div style="font-size: 11px; color: #888; margin-bottom: 12px; word-break: break-all;">
-                                    Peer: ${peerId.substring(0, 16)}...<br>
-                                    Peer Balance: ${peerBal} MDS<br>
-                                    Updates: ${c.latest_state.nonce}
+                                ${notice}
+                                <div style="font-size:11px; color:#888; margin-bottom:12px; line-height:1.6; word-break:break-all;">
+                                    Peer: ${c.peer_pk.substring(0, 16)}…<br>
+                                    ${outbound ? 'You can still send' : 'Yours to keep'}: ${c.spendable} MDS · ${outbound ? 'Already sent' : 'Peer holds'}: ${c.receivable} MDS<br>
+                                    ${c.htlcCount > 0 ? `In-flight HTLCs: ${c.htlcCount} (${c.htlcLocked} MDS locked)<br>` : ''}
+                                    Updates: ${c.nonce} · Expires: block ${c.expiry} <span style="color:${expColor};">(~${hrs}h)</span>
                                 </div>
-                                <div style="display: flex; gap: 8px;">
-                                    <button onclick="l2Pay('${c.id}')" style="margin:0; padding: 8px; font-size: 11px; background: transparent; border-color: var(--accent); color: var(--accent); flex: 1;">Send Payment</button>
-                                    <button onclick="l2Sync('${c.id}')" style="margin:0; padding: 8px; font-size: 11px; background: transparent; border-color: var(--text-bright); color: var(--text-bright); flex: 1;">Sync Peer</button>
-                                    <button onclick="l2Close('${c.id}')" style="margin:0; padding: 8px; font-size: 11px; background: transparent; border-color: var(--red); color: var(--red); flex: 1;" ${!fullySigned ? 'disabled' : ''}>Settle On-Chain</button>
-                                </div>
+                                ${buttons ? `<div style="display:flex; gap:8px;">${buttons}</div>` : ''}
                             </div>`;
                         }).join('');
                     }
@@ -3847,6 +3943,15 @@ if ('serviceWorker' in navigator) {
             document.getElementById('l2PayInvoiceData').value = '';
         };
 
+        window.payL2To = function() {
+            const destPk = (document.getElementById('l2PayToPk').value || '').trim();
+            const amount = document.getElementById('l2PayToAmount').value;
+            if (!destPk || !amount) return showToast("Enter the payee identity and an amount.", "error");
+            worker.postMessage({ type: 'L2_PAY_TO', payload: { destPk, amount: Number(amount) } });
+            document.getElementById('l2PayToPk').value = '';
+            document.getElementById('l2PayToAmount').value = '';
+        };
+
         worker.addEventListener('message', (e) => {
             if (e.data.type === 'TX_QUEUE') {
                 // The wallet runs transactions strictly one-at-a-time (key-index safety).
@@ -3869,12 +3974,23 @@ if ('serviceWorker' in navigator) {
             if (e.data.type === 'L2_INVOICE_CREATED') {
                 document.getElementById('l2InvoiceResult').innerText = e.data.payload;
             }
+            if (e.data.type === 'L2_EVENT') {
+                const p = e.data.payload || {};
+                const kind = p.level === 'error' ? 'error' : (p.level === 'warn' ? 'error' : 'success');
+                showToast(p.msg, kind);
+            }
+            if (e.data.type === 'L2_HTLC_CLAIMED') {
+                const p = e.data.payload || {};
+                showToast(`Received ${p.amount} MDS over Q-Bolt.`, 'success');
+            }
         });
         document.getElementById('btnOpenChannel').onclick = () => {
-            const peerPk = document.getElementById('l2PeerPk').value;
+            const peerPk = (document.getElementById('l2PeerPk').value || '').trim();
             const amount = document.getElementById('l2FundAmount').value;
+            const lifetime = Number(document.getElementById('l2Lifetime').value) || 4320;
             if (!peerPk || !amount) return showToast("Enter Peer Identity and Amount.", "error");
-            worker.postMessage({ type: 'L2_OPEN_CHANNEL', payload: { peerPk, amount } });
+            if (!/^[0-9a-fA-F]{64}$/.test(peerPk.replace(/^0x/i, ''))) return showToast("Peer identity must be 64 hex characters.", "error");
+            worker.postMessage({ type: 'L2_OPEN_CHANNEL', payload: { peerPk, amount, lifetime } });
             document.getElementById('l2PeerPk').value = '';
             document.getElementById('l2FundAmount').value = '';
             switchTab('view-home');
@@ -3887,15 +4003,34 @@ if ('serviceWorker' in navigator) {
         };
 
         window.l2Close = function(channelId) {
-            if (confirm("Close this channel and settle balances on-chain?")) {
+            const c = (window.appL2Channels || []).find(x => x.id === channelId);
+            const outbound = c && c.direction === 'outbound';
+            const msg = outbound
+                ? "You funded this channel, so only the peer can settle the balances. This asks them to settle now.\n\nIf they never respond, you can reclaim the full amount yourself once the channel expires."
+                : "Settle this channel on-chain now and take your balance?";
+            if (confirm(msg)) {
                 worker.postMessage({ type: 'L2_CLOSE', payload: { channelId } });
+                if (!outbound) switchTab('view-home');
+            }
+        };
+
+        window.l2Refund = function(channelId) {
+            if (confirm("This channel has expired. Reclaim the full funded amount on-chain?")) {
+                worker.postMessage({ type: 'L2_REFUND', payload: { channelId } });
                 switchTab('view-home');
             }
         };
 
+        window.l2LegacyClose = function(channelId) {
+            if (confirm("Attempt cooperative recovery of this old-protocol channel?\n\nBoth you and the peer must be online and running this wallet version. There is no unilateral escape for these channels.")) {
+                worker.postMessage({ type: 'L2_LEGACY_CLOSE', payload: { channelId } });
+            }
+        };
+
         window.l2Sync = function(channelId) {
+            // No optimistic toast here — the worker emits an L2_EVENT reporting
+            // whether the bus actually accepted the message.
             worker.postMessage({ type: 'L2_SYNC', payload: { channelId } });
-            showToast("Sync request sent to peer.", "success");
         };
         document.getElementById('btnSend').onclick = (e) => {
             const toAddress = document.getElementById('sendAddress').value;
@@ -3973,6 +4108,16 @@ if ('serviceWorker' in navigator) {
             document.getElementById('importFile').click();
         };
         
+        document.getElementById('btnDefrag').onclick = () => {
+            showConfirm(
+                "Defragment Wallet",
+                `This will sweep fragmented UTXOs into a single, reusable MSS address. It requires a standard transaction fee. Continue?`,
+                () => {
+                    showActivity("Preparing defragmentation...");
+                    worker.postMessage({ type: 'DEFRAG_UTXOS' });
+                }
+            );
+        };
         
         document.getElementById('btnConsolidate').onclick = () => {
             const select = document.getElementById('dustAddressSelect');

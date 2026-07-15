@@ -136,6 +136,7 @@ impl RpcServer {
             .route("/mix/fee", post(mix_fee))
             .route("/mix/sign", post(mix_sign))
             .route("/mix/status/:mix_id", get(mix_status))
+            .route("/pow_params", get(pow_params))
             .route("/mix/list", get(mix_list))
             .nest("/axe", axe_routes) 
             .route("/tx/by_input", post(get_tx_by_input))

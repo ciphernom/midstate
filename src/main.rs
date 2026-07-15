@@ -383,6 +383,21 @@ enum WalletAction {
         #[arg(long)]
         address: String,
     },
+    /// Sweep highly-fragmented one-time WOTS coins across multiple addresses 
+    /// into a fresh, reusable MSS destination.
+    Defrag {
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
+        /// Maximum number of inputs to include in this batch (max 256)
+        #[arg(long, default_value = "256")]
+        max_inputs: usize,
+        #[arg(long, default_value = "120")]
+        timeout: u64,
+    },
     Reveal {
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
@@ -1078,7 +1093,28 @@ async fn wallet_spend_script(
 
         // 2. Fallback: Search the blockchain via RPC (for Smart Contract UTXOs)
         println!("Coin {} not in local wallet. Fetching from blockchain...", cref);
-        let search_req = rpc::SearchRequest { query: cref.clone() };
+        // /search is PoW-gated. Ask the node what it wants, then mine it —
+        // milliseconds in native code (~65k hashes at the 4-zero floor).
+        // Falls back to the floor if the node predates /pow_params.
+        let pow_url = format!("http://{}:{}/pow_params", rpc_host, rpc_port);
+        let zeros = match client.get(&pow_url).send().await {
+            Ok(r) if r.status().is_success() => r
+                .json::<rpc::PowParamsResponse>()
+                .await
+                .map(|p| p.zeros)
+                .unwrap_or(midstate::rpc::pow_governor::MIN_ZEROS),
+            _ => midstate::rpc::pow_governor::MIN_ZEROS,
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        // Height is 0 for /search — same preimage the server rebuilds.
+        let (nonce, hash) = midstate::rpc::pow_governor::solve_pow(cref, 0, timestamp, zeros);
+
+        let search_req = rpc::SearchRequest {
+            query: cref.clone(),
+            pow: Some(rpc::ScanPow { nonce, timestamp, hash }),
+        };
         let search_url = format!("http://{}:{}/search", rpc_host, rpc_port);
         let search_resp = client.post(&search_url).json(&search_req).send().await?;
         
@@ -1389,6 +1425,9 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         WalletAction::Pending { path } => wallet_pending(&path),
         WalletAction::Consolidate { path, rpc_port, rpc_host, address } => {
             wallet_consolidate(&path, rpc_port, rpc_host, address).await
+        }
+        WalletAction::Defrag { path, rpc_port, rpc_host, max_inputs, timeout } => {
+            wallet_defrag(&path, rpc_port, rpc_host, max_inputs, timeout).await
         }
         WalletAction::Reveal { path, rpc_port, rpc_host, commitment } => {
             wallet_reveal(&path, rpc_port, rpc_host, commitment).await
@@ -1921,6 +1960,100 @@ async fn wallet_consolidate(
     wallet.complete_reveal(&commitment)?;
     println!("✓ Dust swept successfully into {} new UTXOs!", outputs.len());
     
+    Ok(())
+}
+
+async fn wallet_defrag(
+    path: &PathBuf,
+    rpc_port: u16,
+    rpc_host: String,
+    max_inputs: usize,
+    timeout_secs: u64,
+) -> Result<()> {
+    let password = read_password("Password: ")?;
+    let mut wallet = Wallet::open(path, &password)?;
+    let client = reqwest::Client::new();
+
+    println!("Checking on-chain status of wallet coins...");
+    let mut live_coins = Vec::new();
+    for wc in wallet.coins() {
+        if let Ok(true) = check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
+            live_coins.push(wc.coin_id);
+        }
+    }
+
+    // 1. Check if defragmentation is even necessary
+    let (frag_count, frag_val) = wallet.fragmented_summary(&live_coins);
+    if frag_count < 2 {
+        println!("No defragmentation needed. Found {} fragmented WOTS coin(s).", frag_count);
+        return Ok(());
+    }
+    println!("Found {} fragmented WOTS coins totaling {} value.", frag_count, frag_val);
+
+    // 2. Define the Fee Policy
+    // The mempool requires MIN_FEE_PER_KB = 10.
+    // Base tx overhead is ~100 bytes. WOTS Input is ~1636 bytes. Output is ~100 bytes.
+    // Rate math: bytes * 10 / 1024
+    use midstate::wallet::FeePolicy;
+    let policy = FeePolicy {
+        base: 20,      // Safe base padding
+        per_input: 17, // (1636 * 10 / 1024) ≈ 16 + 1 padding
+        per_output: 2, // (100 * 10 / 1024) ≈ 1 + 1 padding
+    };
+
+    // 3. Generate a fresh MSS destination for the sweep
+    let dest_addr = wallet.generate_mss(10, Some("Defrag Sweep Destination".into()))?;
+    println!(
+        "Generated fresh MSS destination: {}", 
+        midstate::core::types::encode_address_with_checksum(&dest_addr)
+    );
+
+    // 4. Plan the optimal batch using the greedy knapsack logic
+    let plan = match wallet.plan_defrag_batch(&live_coins, dest_addr, &policy, max_inputs)? {
+        Some(p) => p,
+        None => {
+            println!("Could not construct an economical defrag batch (dust coins are too small to cover their own signature fees).");
+            return Ok(());
+        }
+    };
+
+    println!("\nPlanned Defrag Batch:");
+    println!("  Inputs: {} coins (value {})", plan.input_coin_ids.len(), plan.total_in);
+    println!("  Outputs: {} (to MSS address)", plan.outputs.len());
+    println!("  Fee: {}", plan.fee);
+    if plan.remaining_fragmented_coins > 0 {
+        println!("  Remaining fragmented coins after this batch: {}", plan.remaining_fragmented_coins);
+    }
+    println!();
+
+    // 5. Execute Phase 1: Prepare & Submit Commit
+    // is_consolidate = false because this is a cross-address defrag, not a single-address consolidate
+    let (commitment, _salt) = wallet.prepare_commit(
+        &plan.input_coin_ids,
+        &plan.outputs,
+        vec![], // No change seeds; outputs are exact
+        false,  // No privacy delay for housekeeping
+        false,  
+    )?;
+
+    println!("Submitting Phase 1: Defrag Commit...");
+    submit_commit(&client, rpc_port, &rpc_host, &commitment).await?;
+
+    if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &hex::encode(commitment), timeout_secs).await {
+        anyhow::bail!("Timed out waiting for Commit to be mined.");
+    }
+    println!("✓ Commit mined!");
+
+    // 6. Execute Phase 2: Sign & Submit Reveal
+    println!("Submitting Phase 2: Defrag Reveal...");
+    do_reveal(&client, &mut wallet, rpc_port, &rpc_host, &commitment, timeout_secs).await?;
+
+    println!("✓ Defragmentation batch complete!");
+    
+    if plan.remaining_fragmented_coins > 1 {
+        println!("Note: You still have {} fragmented coins. Run the command again to process the next batch.", plan.remaining_fragmented_coins);
+    }
+
     Ok(())
 }
 

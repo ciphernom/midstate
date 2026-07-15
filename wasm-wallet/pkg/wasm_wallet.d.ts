@@ -289,6 +289,11 @@ export class WebWallet {
      */
     prepare_consolidate(available_utxos_json: string, dest_address_hex: string, next_wots_index: number): string;
     /**
+     * Plans a defragmentation batch: moves up to `max_inputs` fragmented
+     * WOTS coins to a fresh MSS destination address (minus shape-dependent fee).
+     */
+    prepare_defrag(available_utxos_json: string, dest_address_hex: string, max_inputs: number, next_wots_index: number): string;
+    /**
      * Fund MANY contract addresses in ONE transaction.
      *
      * Identical to [`prepare_fund_tx`] but takes a list of `{address, amount}`
@@ -551,6 +556,49 @@ export function mine_chat_pow_v2_wasm(sender: string, timestamp: bigint, reply_t
 export function mine_commitment_pow(commitment_hex: string, required_pow: number, target_height: bigint, header_hash_hex: string): bigint;
 
 /**
+ * Cooperative / unilateral-receiver close reveal.
+ * Witness per input: [sender_sig, receiver_sig, 0x01].
+ */
+export function qbolt_build_close_reveal(sender_pk_hex: string, receiver_pk_hex: string, expiry: bigint, funding_json: string, state_json: string, sender_sig_hex: string, receiver_sig_hex: string): string;
+
+export function qbolt_build_legacy_close_reveal(alice_pk_hex: string, bob_pk_hex: string, funding_json: string, state_json: string, alice_sig_hex: string, bob_sig_hex: string): string;
+
+/**
+ * LEGACY RESCUE — v1 channels funded a bare 2-of-2 with NO timeout branch,
+ * and the v1 close never committed its commitment on-chain (so it could not
+ * confirm) and assumed a single funding coin (funding was actually split
+ * into power-of-2 denominations). These two builders produce a CORRECT
+ * cooperative close for that legacy covenant: multi-coin aware, and meant
+ * to be driven through the full commit → reveal engine. Both parties must
+ * still cooperate — a bare 2-of-2 has no unilateral path, ever.
+ */
+export function qbolt_build_legacy_close_state(channel_id_hex: string, alice_pk_hex: string, bob_pk_hex: string, funding_json: string, alice_amt: bigint, bob_amt: bigint, attempt: number): string;
+
+/**
+ * Sender's post-expiry refund reveal.
+ * Witness per input: [sender_sig, 0x00].
+ */
+export function qbolt_build_refund_reveal(sender_pk_hex: string, receiver_pk_hex: string, expiry: bigint, funding_json: string, state_json: string, sender_sig_hex: string): string;
+
+/**
+ * Build the sender's post-expiry refund state: everything (minus fee) back
+ * to the sender. Uses nonce = u32::MAX so its salts can never collide with
+ * a payment state.
+ */
+export function qbolt_build_refund_state(channel_id_hex: string, sender_pk_hex: string, receiver_pk_hex: string, expiry: bigint, funding_json: string, attempt: number): string;
+
+/**
+ * Build the canonical close state for a Q-Bolt v2 channel.
+ * `channel_id_hex` is the channel's stable identifier (the lexicographically
+ * smallest funding coin id) — used only for salt derivation.
+ */
+export function qbolt_build_state(channel_id_hex: string, sender_pk_hex: string, receiver_pk_hex: string, expiry: bigint, funding_json: string, sender_amt: bigint, receiver_amt: bigint, nonce: number, htlcs_json: string, attempt: number): string;
+
+export function qbolt_channel_address(sender_pk_hex: string, receiver_pk_hex: string, expiry: bigint): string;
+
+export function qbolt_channel_bytecode_hex(sender_pk_hex: string, receiver_pk_hex: string, expiry: bigint): string;
+
+/**
  * Search a range of nonces for a valid block extension hash.
  *
  * This is the inner loop of the browser-based solo miner. Each call tests
@@ -595,6 +643,14 @@ export interface InitOutput {
     readonly generate_phrase: (a: number) => void;
     readonly mine_chat_pow_v2_wasm: (a: number, b: number, c: number, d: bigint, e: number, f: number, g: number, h: number, i: number, j: number) => void;
     readonly mine_commitment_pow: (a: number, b: number, c: number, d: bigint, e: number, f: number) => bigint;
+    readonly qbolt_build_close_reveal: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => void;
+    readonly qbolt_build_legacy_close_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => void;
+    readonly qbolt_build_legacy_close_state: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: bigint, k: bigint, l: number) => void;
+    readonly qbolt_build_refund_reveal: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number, k: number, l: number) => void;
+    readonly qbolt_build_refund_state: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: number, j: number, k: number) => void;
+    readonly qbolt_build_state: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: number, j: number, k: bigint, l: bigint, m: number, n: number, o: number, p: number) => void;
+    readonly qbolt_channel_address: (a: number, b: number, c: number, d: number, e: number, f: bigint) => void;
+    readonly qbolt_channel_bytecode_hex: (a: number, b: number, c: number, d: number, e: number, f: bigint) => void;
     readonly search_nonces: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => void;
     readonly verify_mss_sig_wasm: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
     readonly webwallet_build_coinbase: (a: number, b: number, c: bigint, d: number) => void;
@@ -614,6 +670,7 @@ export interface InitOutput {
     readonly webwallet_import_mss_bytes: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly webwallet_new: (a: number, b: number, c: number) => void;
     readonly webwallet_prepare_consolidate: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly webwallet_prepare_defrag: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly webwallet_prepare_fund_many: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
     readonly webwallet_prepare_fund_tx: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number) => void;
     readonly webwallet_prepare_script_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;

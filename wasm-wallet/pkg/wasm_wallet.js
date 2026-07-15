@@ -698,6 +698,43 @@ export class WebWallet {
         }
     }
     /**
+     * Plans a defragmentation batch: moves up to `max_inputs` fragmented
+     * WOTS coins to a fresh MSS destination address (minus shape-dependent fee).
+     * @param {string} available_utxos_json
+     * @param {string} dest_address_hex
+     * @param {number} max_inputs
+     * @param {number} next_wots_index
+     * @returns {string}
+     */
+    prepare_defrag(available_utxos_json, dest_address_hex, max_inputs, next_wots_index) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(available_utxos_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(dest_address_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.webwallet_prepare_defrag(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, max_inputs, next_wots_index);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr3 = r0;
+            var len3 = r1;
+            if (r3) {
+                ptr3 = 0; len3 = 0;
+                throw takeObject(r2);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
      * Fund MANY contract addresses in ONE transaction.
      *
      * Identical to [`prepare_fund_tx`] but takes a list of `{address, amount}`
@@ -1551,6 +1588,363 @@ export function mine_commitment_pow(commitment_hex, required_pow, target_height,
     const len1 = WASM_VECTOR_LEN;
     const ret = wasm.mine_commitment_pow(ptr0, len0, required_pow, target_height, ptr1, len1);
     return BigInt.asUintN(64, ret);
+}
+
+/**
+ * Cooperative / unilateral-receiver close reveal.
+ * Witness per input: [sender_sig, receiver_sig, 0x01].
+ * @param {string} sender_pk_hex
+ * @param {string} receiver_pk_hex
+ * @param {bigint} expiry
+ * @param {string} funding_json
+ * @param {string} state_json
+ * @param {string} sender_sig_hex
+ * @param {string} receiver_sig_hex
+ * @returns {string}
+ */
+export function qbolt_build_close_reveal(sender_pk_hex, receiver_pk_hex, expiry, funding_json, state_json, sender_sig_hex, receiver_sig_hex) {
+    let deferred8_0;
+    let deferred8_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(sender_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(receiver_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(funding_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(state_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passStringToWasm0(sender_sig_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len4 = WASM_VECTOR_LEN;
+        const ptr5 = passStringToWasm0(receiver_sig_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len5 = WASM_VECTOR_LEN;
+        wasm.qbolt_build_close_reveal(retptr, ptr0, len0, ptr1, len1, expiry, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr7 = r0;
+        var len7 = r1;
+        if (r3) {
+            ptr7 = 0; len7 = 0;
+            throw takeObject(r2);
+        }
+        deferred8_0 = ptr7;
+        deferred8_1 = len7;
+        return getStringFromWasm0(ptr7, len7);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred8_0, deferred8_1, 1);
+    }
+}
+
+/**
+ * @param {string} alice_pk_hex
+ * @param {string} bob_pk_hex
+ * @param {string} funding_json
+ * @param {string} state_json
+ * @param {string} alice_sig_hex
+ * @param {string} bob_sig_hex
+ * @returns {string}
+ */
+export function qbolt_build_legacy_close_reveal(alice_pk_hex, bob_pk_hex, funding_json, state_json, alice_sig_hex, bob_sig_hex) {
+    let deferred8_0;
+    let deferred8_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(alice_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(bob_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(funding_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(state_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passStringToWasm0(alice_sig_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len4 = WASM_VECTOR_LEN;
+        const ptr5 = passStringToWasm0(bob_sig_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len5 = WASM_VECTOR_LEN;
+        wasm.qbolt_build_legacy_close_reveal(retptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr7 = r0;
+        var len7 = r1;
+        if (r3) {
+            ptr7 = 0; len7 = 0;
+            throw takeObject(r2);
+        }
+        deferred8_0 = ptr7;
+        deferred8_1 = len7;
+        return getStringFromWasm0(ptr7, len7);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred8_0, deferred8_1, 1);
+    }
+}
+
+/**
+ * LEGACY RESCUE — v1 channels funded a bare 2-of-2 with NO timeout branch,
+ * and the v1 close never committed its commitment on-chain (so it could not
+ * confirm) and assumed a single funding coin (funding was actually split
+ * into power-of-2 denominations). These two builders produce a CORRECT
+ * cooperative close for that legacy covenant: multi-coin aware, and meant
+ * to be driven through the full commit → reveal engine. Both parties must
+ * still cooperate — a bare 2-of-2 has no unilateral path, ever.
+ * @param {string} channel_id_hex
+ * @param {string} alice_pk_hex
+ * @param {string} bob_pk_hex
+ * @param {string} funding_json
+ * @param {bigint} alice_amt
+ * @param {bigint} bob_amt
+ * @param {number} attempt
+ * @returns {string}
+ */
+export function qbolt_build_legacy_close_state(channel_id_hex, alice_pk_hex, bob_pk_hex, funding_json, alice_amt, bob_amt, attempt) {
+    let deferred6_0;
+    let deferred6_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(channel_id_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(alice_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(bob_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(funding_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        wasm.qbolt_build_legacy_close_state(retptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, alice_amt, bob_amt, attempt);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr5 = r0;
+        var len5 = r1;
+        if (r3) {
+            ptr5 = 0; len5 = 0;
+            throw takeObject(r2);
+        }
+        deferred6_0 = ptr5;
+        deferred6_1 = len5;
+        return getStringFromWasm0(ptr5, len5);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred6_0, deferred6_1, 1);
+    }
+}
+
+/**
+ * Sender's post-expiry refund reveal.
+ * Witness per input: [sender_sig, 0x00].
+ * @param {string} sender_pk_hex
+ * @param {string} receiver_pk_hex
+ * @param {bigint} expiry
+ * @param {string} funding_json
+ * @param {string} state_json
+ * @param {string} sender_sig_hex
+ * @returns {string}
+ */
+export function qbolt_build_refund_reveal(sender_pk_hex, receiver_pk_hex, expiry, funding_json, state_json, sender_sig_hex) {
+    let deferred7_0;
+    let deferred7_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(sender_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(receiver_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(funding_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(state_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passStringToWasm0(sender_sig_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len4 = WASM_VECTOR_LEN;
+        wasm.qbolt_build_refund_reveal(retptr, ptr0, len0, ptr1, len1, expiry, ptr2, len2, ptr3, len3, ptr4, len4);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr6 = r0;
+        var len6 = r1;
+        if (r3) {
+            ptr6 = 0; len6 = 0;
+            throw takeObject(r2);
+        }
+        deferred7_0 = ptr6;
+        deferred7_1 = len6;
+        return getStringFromWasm0(ptr6, len6);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred7_0, deferred7_1, 1);
+    }
+}
+
+/**
+ * Build the sender's post-expiry refund state: everything (minus fee) back
+ * to the sender. Uses nonce = u32::MAX so its salts can never collide with
+ * a payment state.
+ * @param {string} channel_id_hex
+ * @param {string} sender_pk_hex
+ * @param {string} receiver_pk_hex
+ * @param {bigint} expiry
+ * @param {string} funding_json
+ * @param {number} attempt
+ * @returns {string}
+ */
+export function qbolt_build_refund_state(channel_id_hex, sender_pk_hex, receiver_pk_hex, expiry, funding_json, attempt) {
+    let deferred6_0;
+    let deferred6_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(channel_id_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(sender_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(receiver_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(funding_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        wasm.qbolt_build_refund_state(retptr, ptr0, len0, ptr1, len1, ptr2, len2, expiry, ptr3, len3, attempt);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr5 = r0;
+        var len5 = r1;
+        if (r3) {
+            ptr5 = 0; len5 = 0;
+            throw takeObject(r2);
+        }
+        deferred6_0 = ptr5;
+        deferred6_1 = len5;
+        return getStringFromWasm0(ptr5, len5);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred6_0, deferred6_1, 1);
+    }
+}
+
+/**
+ * Build the canonical close state for a Q-Bolt v2 channel.
+ * `channel_id_hex` is the channel's stable identifier (the lexicographically
+ * smallest funding coin id) — used only for salt derivation.
+ * @param {string} channel_id_hex
+ * @param {string} sender_pk_hex
+ * @param {string} receiver_pk_hex
+ * @param {bigint} expiry
+ * @param {string} funding_json
+ * @param {bigint} sender_amt
+ * @param {bigint} receiver_amt
+ * @param {number} nonce
+ * @param {string} htlcs_json
+ * @param {number} attempt
+ * @returns {string}
+ */
+export function qbolt_build_state(channel_id_hex, sender_pk_hex, receiver_pk_hex, expiry, funding_json, sender_amt, receiver_amt, nonce, htlcs_json, attempt) {
+    let deferred7_0;
+    let deferred7_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(channel_id_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(sender_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(receiver_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(funding_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passStringToWasm0(htlcs_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len4 = WASM_VECTOR_LEN;
+        wasm.qbolt_build_state(retptr, ptr0, len0, ptr1, len1, ptr2, len2, expiry, ptr3, len3, sender_amt, receiver_amt, nonce, ptr4, len4, attempt);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr6 = r0;
+        var len6 = r1;
+        if (r3) {
+            ptr6 = 0; len6 = 0;
+            throw takeObject(r2);
+        }
+        deferred7_0 = ptr6;
+        deferred7_1 = len6;
+        return getStringFromWasm0(ptr6, len6);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred7_0, deferred7_1, 1);
+    }
+}
+
+/**
+ * @param {string} sender_pk_hex
+ * @param {string} receiver_pk_hex
+ * @param {bigint} expiry
+ * @returns {string}
+ */
+export function qbolt_channel_address(sender_pk_hex, receiver_pk_hex, expiry) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(sender_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(receiver_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.qbolt_channel_address(retptr, ptr0, len0, ptr1, len1, expiry);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr3 = r0;
+        var len3 = r1;
+        if (r3) {
+            ptr3 = 0; len3 = 0;
+            throw takeObject(r2);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
+    }
+}
+
+/**
+ * @param {string} sender_pk_hex
+ * @param {string} receiver_pk_hex
+ * @param {bigint} expiry
+ * @returns {string}
+ */
+export function qbolt_channel_bytecode_hex(sender_pk_hex, receiver_pk_hex, expiry) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(sender_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(receiver_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.qbolt_channel_bytecode_hex(retptr, ptr0, len0, ptr1, len1, expiry);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr3 = r0;
+        var len3 = r1;
+        if (r3) {
+            ptr3 = 0; len3 = 0;
+            throw takeObject(r2);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
+    }
 }
 
 /**

@@ -31,7 +31,7 @@ use midstate::core::mss::MssKeypair;
 use midstate::core::types::{compute_address, compute_commitment, compute_coin_id, decompose_value};
 use midstate::wallet::hd::{generate_mnemonic, master_seed_from_mnemonic, derive_wots_seed, derive_mss_seed};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[cfg(test)]
 use wasm_bindgen_test::wasm_bindgen_test_configure;
@@ -320,6 +320,201 @@ fn confidential_coin_hash(addr: &[u8; 32], state: &[u8; 32], salt: &[u8; 32]) ->
     *h.finalize().as_bytes()
 }
 
+/// Selects a subset of unspent coins to satisfy a target value, strictly
+/// observing WOTS co-spend rules and consensus transaction size limits.
+///
+/// # Reasoning
+/// The wallet must reliably fund transactions without causing CPU or Bandwidth
+/// Denial-of-Service (DoS) vectors on the network.
+///
+/// **Danger of previous implementation**: The old selection algorithm was greedy
+/// based *solely* on value. It would select a base set of coins, and *then* rigidly
+/// sweep in all WOTS siblings to satisfy the post-quantum one-time key invariant.
+/// This frequently breached the `MAX_SELECTED_INPUTS` (250) limit silently, causing
+/// "Phantom Overdrafts" where users had sufficient funds but couldn't construct
+/// a valid transaction.
+///
+/// **The Fix**: This implementation groups WOTS siblings into indivisible
+/// `Bundle`s *before* selection and evaluates them with a knapsack density
+/// heuristic (value per input). It packs inputs toward the target and skips any
+/// bundle that would breach the input cap. Because this is a greedy heuristic,
+/// an `Err` means it failed to find a fitting combination — not a proof that
+/// none exists.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Let Available = { c ∈ available_utxos }
+/// Let sibs(c)   = { s ∈ Available | s.address = c.address }
+///
+/// Pre:
+///   - needed > 0
+///   - available_utxos contains the set of spendable UTXOs
+///
+/// Post:
+///   result = Ok((selected, total))  ⇒
+///     total = sum(value(c) for c in selected) >= needed
+///     #selected <= MAX_SELECTED_INPUTS
+///     ∀ c ∈ selected: (c is WOTS) ⇒ sibs(c) ⊆ selected
+///     selected ⊆ Available, with no duplicates
+///
+///   result = Err(_)  ⇒ Either spendable funds are insufficient, or the greedy
+///                      heuristic could not fit a satisfying combination within
+///                      the MAX_SELECTED_INPUTS limit.
+/// ```
+///
+/// ```zed
+///     SelectWasmUtxos
+///     ---------------
+///     available? : ℙ WasmUtxo
+///     needed? : ℕ₆₄
+///     selected! : seq WasmUtxo
+///     total! : ℕ₆₄
+///
+///     let Bundles = { B ⊆ available? | ∀ c ∈ B • (¬c.is_mss ⇒ (siblings(c) ∩ available?) ⊆ B) ∧ (c.is_mss ⇒ #B = 1) }
+///
+///     pre  needed? > 0
+///     post result = Ok(selected!, total!) ⇒
+///            ∃ S ⊆ Bundles •
+///              selected! = ⋃ S
+///              ∧ total! = (∑ c ∈ selected! • c.value) ≥ needed?
+///              ∧ #selected! ≤ MAX_SELECTED_INPUTS
+///     post result = Err(_) ⇒ true
+/// ```
+///
+/// # Safety / Invariants
+/// - **WOTS Co-Spend Rule**: A WOTS key must never sign two different
+///   commitments. Bundling all live coins of a WOTS address into one atomic
+///   unit enforces this.
+/// - **Consensus Limit**: The result never exceeds `MAX_SELECTED_INPUTS`, preventing
+///   network-wide DoS via bloated signature verification times.
+/// - **Oversized addresses**: A WOTS address holding more than `MAX_SELECTED_INPUTS`
+///   live coins cannot be spent in a standard Reveal transaction. They are excluded.
+fn select_wasm_utxos(
+    available: &[WasmUtxo],
+    needed: u64,
+) -> Result<(Vec<WasmUtxo>, u64), JsValue> {
+    struct Bundle<'a> {
+        address: Option<String>,
+        utxos: Vec<&'a WasmUtxo>,
+        total_value: u64,
+    }
+
+    let mut wots_groups: std::collections::HashMap<String, Vec<&WasmUtxo>> = std::collections::HashMap::new();
+    let mut bundles: Vec<Bundle> = Vec::new();
+    let mut total_available = 0u64;
+
+    for utxo in available {
+        total_available = total_available.saturating_add(utxo.value);
+
+        if utxo.is_mss {
+            // MSS coins are independent bundles of size 1
+            bundles.push(Bundle {
+                address: Some(utxo.address.clone()),
+                utxos: vec![utxo],
+                total_value: utxo.value,
+            });
+        } else {
+            // WOTS coins must be grouped by address to satisfy co-spend rules
+            wots_groups.entry(utxo.address.clone()).or_default().push(utxo);
+        }
+    }
+
+    for (addr, utxos) in wots_groups {
+        let total_value = utxos.iter().fold(0u64, |acc, u| acc.saturating_add(u.value));
+        bundles.push(Bundle { address: Some(addr), utxos, total_value });
+    }
+
+    let mut oversized_value = 0u64;
+    let mut oversized_count = 0usize;
+    bundles.retain(|b| {
+        if b.utxos.len() > MAX_SELECTED_INPUTS {
+            oversized_value = oversized_value.saturating_add(b.total_value);
+            oversized_count += 1;
+            false
+        } else {
+            true
+        }
+    });
+
+    // Sort by value density (value per input) descending, then by total value descending.
+    // Uses u128 cross-multiplication to avoid floating-point precision loss.
+    bundles.sort_by(|a, b| {
+        let lhs = (a.total_value as u128) * (b.utxos.len() as u128);
+        let rhs = (b.total_value as u128) * (a.utxos.len() as u128);
+        rhs.cmp(&lhs)
+            .then_with(|| b.total_value.cmp(&a.total_value))
+            .then_with(|| a.address.cmp(&b.address))
+    });
+
+    let mut selected = Vec::new();
+    let mut total = 0u64;
+
+    for bundle in &bundles {
+        if total >= needed { break; }
+        if selected.len() + bundle.utxos.len() > MAX_SELECTED_INPUTS {
+            continue;
+        }
+        selected.extend(bundle.utxos.iter().cloned().cloned());
+        total = total.saturating_add(bundle.total_value);
+    }
+
+    if total < needed {
+        let spendable = total_available.saturating_sub(oversized_value);
+        if spendable < needed {
+            if oversized_value > 0 {
+                return Err(JsValue::from_str(&format!(
+                    "Insufficient spendable funds: have {}, need {}.\n\
+                     A further {} is locked at {} address(es) holding more than {} coins \
+                     each. You must run Dust Consolidation on those addresses to make them spendable.",
+                    spendable, needed, oversized_value, oversized_count, MAX_SELECTED_INPUTS
+                )));
+            }
+            return Err(JsValue::from_str(&format!("Insufficient funds: have {}, need {}", spendable, needed)));
+        }
+        return Err(JsValue::from_str(&format!(
+            "Insufficient consolidated funds to send this amount in a single transaction.\n\
+             You have {} spendable, but need {} and a standard transaction can hold at most \
+             {} inputs -- your UTXOs are too fragmented.\n\n\
+             Fix: Run Dust Consolidation to merge your small coins into larger usable balances.",
+            spendable, needed, MAX_SELECTED_INPUTS
+        )));
+    }
+
+    let selected_set: std::collections::HashSet<String> = selected.iter().map(|u| u.coin_id.clone()).collect();
+    let mut unselected_by_denom: std::collections::HashMap<u64, Vec<&Bundle>> = std::collections::HashMap::new();
+
+    for bundle in &bundles {
+        if bundle.utxos.len() == 1 && !selected_set.contains(&bundle.utxos[0].coin_id) {
+            unselected_by_denom.entry(bundle.total_value).or_default().push(bundle);
+        }
+    }
+
+    let mut added_new = true;
+    while added_new && selected.len() < MAX_SELECTED_INPUTS {
+        added_new = false;
+        let change = total - needed;
+        let change_denoms = decompose_value(change);
+        
+        for denom in change_denoms {
+            if let Some(candidates) = unselected_by_denom.get_mut(&denom) {
+                if let Some(cand_bundle) = candidates.pop() {
+                    if selected.len() + cand_bundle.utxos.len() <= MAX_SELECTED_INPUTS {
+                        selected.extend(cand_bundle.utxos.iter().cloned().cloned());
+                        total = total.saturating_add(cand_bundle.total_value);
+                        added_new = true;
+                        break; 
+                    } else {
+                        candidates.push(cand_bundle);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((selected, total))
+}
+
 
 // ─── JSON Interop Structs ───────────────────────────────────────────────────
 
@@ -347,18 +542,6 @@ struct WasmUtxo {
     coin_id: String,
     #[serde(default)]
     commitment: Option<String>,
-}
-
-/// A transaction output as built by the wallet.
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
-struct JsOutput {
-    /// Hex-encoded 32-byte destination address.
-    address: String,
-    /// Output value (always a power of 2).
-    value: u64,
-    /// Hex-encoded 32-byte random salt. Defaults to empty if not provided.
-    #[serde(default)]
-    salt: String,
 }
 
 /// Complete context for a pending spend transaction.
@@ -525,75 +708,17 @@ impl WebWallet {
         
         let extra_value: u64 = extra_outs.iter().map(|o| o.value).sum();
         
-        let mut avail_sorted = available.clone();
-        avail_sorted.sort_by(|a, b| b.value.cmp(&a.value));
-
         // 1. Dynamic Fee Estimation & Coin Selection Loop
         let mut target_fee = 100u64;
-        let mut selected = Vec::new();
-        let mut total = 0u64;
+        let mut selected;
+        let mut total;
         let final_fee;
         
         loop {
             let needed = extra_value + target_fee;
-            selected.clear();
-            let mut selected_set = HashSet::new();
-            total = 0;
-
-            // Greedy Selection
-            for coin in &avail_sorted {
-                if total >= needed { break; }
-                selected_set.insert(coin.coin_id.clone());
-                selected.push(coin.clone());
-                total += coin.value;
-            }
-
-            if total < needed { return Err(JsValue::from_str("Insufficient funds for contract requirements and fees")); }
-
-            // WOTS Co-Spend Enforcement
-            let mut grouped_addresses = HashSet::new();
-            for c in &selected {
-                if !c.is_mss { grouped_addresses.insert(c.address.clone()); }
-            }
-            for coin in &available {
-                if grouped_addresses.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
-                    selected_set.insert(coin.coin_id.clone());
-                    selected.push(coin.clone());
-                    total += coin.value;
-                }
-            }
-
-            // Snowball Merge (Defragmentation)
-            let mut added_new = true;
-            while added_new {
-                added_new = false;
-                let current_change = total.saturating_sub(extra_value).saturating_sub(target_fee);
-                let change_denoms = decompose_value(current_change);
-                for denom in change_denoms {
-                    if let Some(pos) = available.iter().position(|c| c.value == denom && !selected_set.contains(&c.coin_id)) {
-                        let coin_to_add = available[pos].clone();
-                        selected_set.insert(coin_to_add.coin_id.clone());
-                        selected.push(coin_to_add);
-                        total += denom;
-                        added_new = true;
-                        break;
-                    }
-                }
-                if selected.len() >= MAX_SELECTED_INPUTS { break; }
-            }
-
-            // Final Co-Spend Sweep
-            let mut final_addresses = HashSet::new();
-            for c in &selected {
-                if !c.is_mss { final_addresses.insert(c.address.clone()); }
-            }
-            for coin in &available {
-                if final_addresses.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
-                    selected_set.insert(coin.coin_id.clone());
-                    selected.push(coin.clone());
-                    total += coin.value;
-                }
-            }
+            let (sel, tot) = select_wasm_utxos(&available, needed)?;
+            selected = sel;
+            total = tot;
 
             // Calculate precise byte size of the transaction
             let mut num_outputs = extra_outs.len() + 1; // +1 for the State Thread output
@@ -1101,6 +1226,144 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
         midstate::core::filter::match_any(&filter_data, &block_hash, n as u64, &self.watchlist)
     }
 
+
+/// Plans a defragmentation batch: moves up to `max_inputs` fragmented
+    /// WOTS coins to a fresh MSS destination address (minus shape-dependent fee).
+    #[wasm_bindgen]
+    pub fn prepare_defrag(
+        &mut self,
+        available_utxos_json: &str,
+        dest_address_hex: &str,
+        max_inputs: usize,
+        next_wots_index: u32,
+    ) -> Result<String, JsValue> {
+        let available: Vec<WasmUtxo> = serde_json::from_str(available_utxos_json)
+            .map_err(|e| JsValue::from_str(&format!("Bad utxos JSON: {}", e)))?;
+
+        let dest_addr = parse_address_wasm(dest_address_hex)?;
+        
+        struct Bundle<'a> {
+            address: String,
+            utxos: Vec<&'a WasmUtxo>,
+            total_value: u64,
+        }
+
+        let mut wots_groups: std::collections::HashMap<String, Vec<&WasmUtxo>> = std::collections::HashMap::new();
+        let mut bundles: Vec<Bundle> = Vec::new();
+
+        for utxo in &available {
+            if utxo.is_mss {
+                bundles.push(Bundle {
+                    address: utxo.address.clone(),
+                    utxos: vec![utxo],
+                    total_value: utxo.value,
+                });
+            } else {
+                wots_groups.entry(utxo.address.clone()).or_default().push(utxo);
+            }
+        }
+
+        for (addr, utxos) in wots_groups {
+            let total_value = utxos.iter().fold(0u64, |acc, u| acc.saturating_add(u.value));
+            bundles.push(Bundle { address: addr, utxos, total_value });
+        }
+
+        let cap = max_inputs.min(MAX_SELECTED_INPUTS);
+
+        // Filter out uneconomical bundles (value <= marginal fee)
+        // mempool rate: 10 per 1024 bytes. WOTS input ~1636 bytes -> ~17 units.
+        let per_input_fee = 17u64;
+        bundles.retain(|b| {
+            let marginal = per_input_fee.saturating_mul(b.utxos.len() as u64);
+            b.total_value > marginal && b.utxos.len() <= cap
+        });
+
+        // Sort by value density
+        bundles.sort_by(|a, b| {
+            let lhs = (a.total_value as u128) * (b.utxos.len() as u128);
+            let rhs = (b.total_value as u128) * (a.utxos.len() as u128);
+            rhs.cmp(&lhs)
+                .then_with(|| b.total_value.cmp(&a.total_value))
+                .then_with(|| a.address.cmp(&b.address))
+        });
+
+        let mut chosen_utxos = Vec::new();
+        let mut total_in = 0u64;
+
+        for b in &bundles {
+            if chosen_utxos.len() + b.utxos.len() > cap { continue; }
+            chosen_utxos.extend(b.utxos.iter().cloned().cloned());
+            total_in += b.total_value;
+        }
+
+        if chosen_utxos.len() < 2 {
+            return Err(JsValue::from_str("Not enough economical, fragmented UTXOs to build a defrag batch."));
+        }
+
+        let final_fee;
+        let denoms;
+        let n_in = chosen_utxos.len();
+        
+        // Fixed point fee resolution
+        let mut n_out = 1usize;
+        loop {
+            let estimated_bytes = 100 + (n_in as u64 * 1636) + (n_out as u64 * 100);
+            let fee = (estimated_bytes * 100) / 1024 + 50;
+            
+            if fee >= total_in {
+                return Err(JsValue::from_str("Total value of selected dust cannot cover the required transaction fee for the resulting outputs."));
+            }
+            
+            let temp_denoms = decompose_value(total_in - fee);
+            if temp_denoms.len() <= n_out {
+                final_fee = fee;
+                denoms = temp_denoms;
+                break;
+            }
+            n_out = temp_denoms.len();
+        }
+
+        let mut input_coin_ids = Vec::new();
+        for u in &chosen_utxos {
+            let mut cid = [0u8; 32];
+            hex::decode_to_slice(&u.coin_id, &mut cid).unwrap();
+            input_coin_ids.push(cid);
+        }
+
+        let mut outputs_json = Vec::new();
+        let mut output_hashes = Vec::new();
+        for d in denoms {
+            let mut salt = [0u8; 32];
+            getrandom_02::getrandom(&mut salt).unwrap();
+            output_hashes.push(compute_coin_id(&dest_addr, d, &salt));
+            outputs_json.push(serde_json::json!({
+                "type": "standard",
+                "address": dest_address_hex.to_lowercase(),
+                "value": d,
+                "salt": hex::encode(salt)
+            }));
+        }
+
+        let mut tx_salt = [0u8; 32];
+        getrandom_02::getrandom(&mut tx_salt).unwrap();
+        let commitment = midstate::core::types::compute_commitment(&input_coin_ids, &output_hashes, &tx_salt);
+
+        let ctx = SpendContext {
+            selected_inputs: chosen_utxos,
+            outputs: outputs_json,
+            commit_payload: serde_json::json!({
+                "coins": input_coin_ids.iter().map(hex::encode).collect::<Vec<_>>(),
+                "destinations": output_hashes.iter().map(hex::encode).collect::<Vec<_>>()
+            }),
+            tx_salt: hex::encode(tx_salt),
+            commitment: hex::encode(commitment),
+            fee: final_fee,
+            next_wots_index, 
+        };
+
+        Ok(serde_json::to_string(&ctx).unwrap())
+    }
+
     #[wasm_bindgen]
     pub fn prepare_script_spend(
         &mut self,
@@ -1182,9 +1445,6 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
         let total_out: u64 = out_args.iter().map(|o| o.value).sum();
 
         // ── Fee estimation + wallet coin selection (covers shortfall only) ──
-        let mut avail_sorted = available.clone();
-        avail_sorted.sort_by(|a, b| b.value.cmp(&a.value));
-
         let mut target_fee = 100u64;
         let mut selected: Vec<WasmUtxo> = Vec::new();
         let mut wallet_in: u64;
@@ -1195,40 +1455,13 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
             // Shortfall the wallet must cover after the contract's own value.
             let shortfall = needed_total.saturating_sub(contract_in_value);
 
-            selected.clear();
-            let mut selected_set = HashSet::new();
-            wallet_in = 0;
-
-            // Greedy selection up to the shortfall (may select nothing).
-            for coin in &avail_sorted {
-                if wallet_in >= shortfall {
-                    break;
-                }
-                selected_set.insert(coin.coin_id.clone());
-                selected.push(coin.clone());
-                wallet_in += coin.value;
-            }
-            if wallet_in < shortfall {
-                return Err(JsValue::from_str("Insufficient wallet funds to cover outputs + fee"));
-            }
-
-            // WOTS co-spend enforcement (SECURITY: never reuse a WOTS key across
-            // txs — pull in every coin sharing a selected non-MSS address).
-            let mut grouped = HashSet::new();
-            for c in &selected {
-                if !c.is_mss {
-                    grouped.insert(c.address.clone());
-                }
-            }
-            for coin in &available {
-                if grouped.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
-                    selected_set.insert(coin.coin_id.clone());
-                    selected.push(coin.clone());
-                    wallet_in += coin.value;
-                }
-            }
-            if selected.len() > MAX_SELECTED_INPUTS {
-                return Err(JsValue::from_str("Too many inputs selected for one transaction"));
+            if shortfall > 0 {
+                let (sel, tot) = select_wasm_utxos(&available, shortfall)?;
+                selected = sel;
+                wallet_in = tot;
+            } else {
+                selected.clear();
+                wallet_in = 0;
             }
 
             // Precise size → fee. Bytes: base + wallet inputs (~1636 each) +
@@ -1703,38 +1936,16 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
         }
 
         // ── Wallet coin selection: cover amount + fee (with WOTS co-spend) ──────
-        let mut avail_sorted = available.clone();
-        avail_sorted.sort_by(|a, b| b.value.cmp(&a.value));
         let mut target_fee = 100u64;
-        let mut selected: Vec<WasmUtxo> = Vec::new();
+        let mut selected;
         let mut wallet_in: u64;
         let final_fee;
         loop {
             let needed = amount.saturating_add(target_fee);
-            selected.clear();
-            let mut set = HashSet::new();
-            wallet_in = 0;
-            for c in &avail_sorted {
-                if wallet_in >= needed { break; }
-                set.insert(c.coin_id.clone());
-                selected.push(c.clone());
-                wallet_in += c.value;
-            }
-            if wallet_in < needed {
-                return Err(JsValue::from_str("Insufficient funds for amount + fee"));
-            }
-            let mut grouped = HashSet::new();
-            for c in &selected { if !c.is_mss { grouped.insert(c.address.clone()); } }
-            for c in &available {
-                if grouped.contains(&c.address) && !set.contains(&c.coin_id) {
-                    set.insert(c.coin_id.clone());
-                    selected.push(c.clone());
-                    wallet_in += c.value;
-                }
-            }
-            if selected.len() > MAX_SELECTED_INPUTS {
-                return Err(JsValue::from_str("Too many inputs selected"));
-            }
+            let (sel, tot) = select_wasm_utxos(&available, needed)?;
+            selected = sel;
+            wallet_in = tot;
+
             let change_for_size = wallet_in.saturating_sub(amount).saturating_sub(target_fee);
             let num_outputs = outputs_out.len() + decompose_value(change_for_size).len();
             let estimated = 100 + (selected.len() as u64 * 1636) + (num_outputs as u64 * 100);
@@ -1930,39 +2141,17 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
             }
         }
 
-        // ── Wallet coin selection: cover total_amount + fee (WOTS co-spend) ──────
-        let mut avail_sorted = available.clone();
-        avail_sorted.sort_by(|a, b| b.value.cmp(&a.value));
+         // ── Wallet coin selection: cover total_amount + fee (WOTS co-spend) ──────
         let mut target_fee = 100u64;
-        let mut selected: Vec<WasmUtxo> = Vec::new();
-        let mut wallet_in: u64;
+        let mut selected;
+        let mut wallet_in;
         let final_fee;
         loop {
             let needed = total_amount.saturating_add(db_val).saturating_add(target_fee);
-            selected.clear();
-            let mut set = HashSet::new();
-            wallet_in = 0;
-            for c in &avail_sorted {
-                if wallet_in >= needed { break; }
-                set.insert(c.coin_id.clone());
-                selected.push(c.clone());
-                wallet_in += c.value;
-            }
-            if wallet_in < needed {
-                return Err(JsValue::from_str("Insufficient funds for fundings + fee"));
-            }
-            let mut grouped = HashSet::new();
-            for c in &selected { if !c.is_mss { grouped.insert(c.address.clone()); } }
-            for c in &available {
-                if grouped.contains(&c.address) && !set.contains(&c.coin_id) {
-                    set.insert(c.coin_id.clone());
-                    selected.push(c.clone());
-                    wallet_in += c.value;
-                }
-            }
-            if selected.len() > MAX_SELECTED_INPUTS {
-                return Err(JsValue::from_str("Too many inputs selected"));
-            }
+            let (sel, tot) = select_wasm_utxos(&available, needed)?;
+            selected = sel;
+            wallet_in = tot;
+            
             // outputs_out already includes the optional data_burn, so it is counted here.
             let change_for_size = wallet_in.saturating_sub(total_amount).saturating_sub(db_val).saturating_sub(target_fee);
             let num_outputs = outputs_out.len() + decompose_value(change_for_size).len();
@@ -2313,63 +2502,12 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
         };
         let recipient_hex = hex::encode(recipient_addr);
 
-        let mut avail_sorted = available.clone();
-        avail_sorted.sort_by(|a, b| b.value.cmp(&a.value));
-
-        let mut target_fee = 100u64;
+         let mut target_fee = 100u64;
         let db_val = databurn_value.unwrap_or(0);
 
         loop {
             let needed = send_amount + db_val + target_fee;
-            let mut selected = Vec::new();
-            let mut selected_set = HashSet::new();
-            let mut total = 0u64;
-
-            for coin in &avail_sorted {
-                if total >= needed { break; }
-                selected_set.insert(coin.coin_id.clone());
-                selected.push(coin.clone());
-                total += coin.value;
-            }
-
-            if total < needed { return Err(JsValue::from_str("Insufficient funds.")); }
-
-            let mut grouped_addresses = HashSet::new();
-            for c in &selected { if !c.is_mss { grouped_addresses.insert(c.address.clone()); } }
-            for coin in &avail_sorted {
-                if grouped_addresses.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
-                    selected_set.insert(coin.coin_id.clone());
-                    selected.push(coin.clone());
-                    total += coin.value;
-                }
-            }
-
-            let mut added_new = true;
-            while added_new {
-                added_new = false;
-                let current_change = total.saturating_sub(send_amount).saturating_sub(db_val).saturating_sub(target_fee);
-                for denom in decompose_value(current_change) {
-                    if let Some(pos) = avail_sorted.iter().position(|c| c.value == denom && !selected_set.contains(&c.coin_id)) {
-                        let coin_to_add = avail_sorted[pos].clone();
-                        selected_set.insert(coin_to_add.coin_id.clone());
-                        selected.push(coin_to_add);
-                        total += denom;
-                        added_new = true;
-                        break;
-                    }
-                }
-                if selected.len() >= MAX_SELECTED_INPUTS { break; }
-            }
-
-            let mut final_addresses = HashSet::new();
-            for c in &selected { if !c.is_mss { final_addresses.insert(c.address.clone()); } }
-            for coin in &avail_sorted {
-                if final_addresses.contains(&coin.address) && !selected_set.contains(&coin.coin_id) {
-                    selected_set.insert(coin.coin_id.clone());
-                    selected.push(coin.clone());
-                    total += coin.value;
-                }
-            }
+            let (selected, total) = select_wasm_utxos(&available, needed)?;
 
             let mut num_outputs = if send_amount > 0 { decompose_value(send_amount).len() } else { 0 };
             if databurn_hex.is_some() { num_outputs += 1; }
@@ -2830,6 +2968,486 @@ pub fn build_channel_reveal(
     });
 
     Ok(reveal.to_string())
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Q-BOLT v2 — Spilman-style unidirectional channels with a timeout escape.
+//
+//  Funding covenant (address = hash(bytecode)):
+//
+//      IF                                          // witness top: branch flag
+//          <receiver_pk> CHECKSIG
+//          SWAP
+//          <sender_pk>   CHECKSIG
+//          ADD  <2>  GREATER_OR_EQUAL  VERIFY      // both signatures required
+//      ELSE
+//          <expiry> CHECKTIMEVERIFY                // spendable at height >= expiry
+//          <sender_pk> CHECKSIGVERIFY              // sender-only refund
+//      ENDIF
+//      <1>
+//
+//  Witness (close):  [sender_sig, receiver_sig, 0x01]
+//  Witness (refund): [sender_sig, 0x00]
+//
+//  Security model (why this shape):
+//    · Only the SENDER ever signs balance states off-chain. The receiver
+//      stores those signatures and co-signs exactly once — at close time.
+//      The sender therefore never holds a broadcastable state, so the classic
+//      "old state replay" is impossible for the sender; a receiver replaying
+//      an old state can only pay themselves LESS (receiver balance is
+//      validated monotonically non-decreasing by the wallet).
+//    · The refund branch is the sender's unilateral exit: if the receiver
+//      vanishes and never closes, the sender sweeps everything at `expiry`.
+//    · The receiver's obligation is to close before `expiry` (the wallet
+//      auto-closes with a safety margin).
+//
+//  Fee model: every close/refund reveal pays QBOLT_CLOSE_FEE from channel
+//  value (consensus requires in_sum > out_sum; mempool requires 10/KB — a
+//  worst-case multi-input close is ~27 KB ≈ 270, so 2000 is ~7x headroom).
+//
+//  IMPORTANT — commitments are single-shot: a commitment can only ever be
+//  committed on-chain ONCE ("Duplicate commitment"), and a mined commit is
+//  only revealable for COMMITMENT_TTL blocks. NEVER commit a channel state
+//  eagerly "to be ready": if its TTL lapses unrevealed, that exact state
+//  becomes permanently unbroadcastable. The `attempt` counter below exists
+//  so a re-signed retry produces a FRESH commitment.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Flat fee (in base units) reserved out of channel capacity for the
+/// close / refund reveal. Mirrored by QB.CLOSE_FEE in worker.js.
+pub const QBOLT_CLOSE_FEE: u64 = 2000;
+
+#[derive(Deserialize)]
+struct QbFundingCoinIn {
+    value: u64,
+    salt: String,
+}
+
+#[derive(Deserialize)]
+struct QbHtlcIn {
+    amount: u64,
+    timeout: u64,
+    secret_hash: String,
+}
+
+fn qb_hex32(s: &str, what: &str) -> Result<[u8; 32], JsValue> {
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(s, &mut out)
+        .map_err(|_| JsValue::from_str(&format!("qbolt: invalid {} (need 64 hex chars)", what)))?;
+    Ok(out)
+}
+
+/// Assemble the Q-Bolt v2 funding covenant bytecode.
+fn qbolt_covenant_bytes(sender_pk: &[u8; 32], receiver_pk: &[u8; 32], expiry: u64) -> Vec<u8> {
+    use midstate::core::script as sc;
+    let mut bc = Vec::new();
+    bc.push(sc::OP_IF);
+    sc::push_data(&mut bc, receiver_pk);
+    bc.push(sc::OP_CHECKSIG);
+    bc.push(sc::OP_SWAP);
+    sc::push_data(&mut bc, sender_pk);
+    bc.push(sc::OP_CHECKSIG);
+    bc.push(sc::OP_ADD);
+    sc::push_int(&mut bc, 2);
+    bc.push(sc::OP_GREATER_OR_EQUAL);
+    bc.push(sc::OP_VERIFY);
+    bc.push(sc::OP_ELSE);
+    sc::push_int(&mut bc, expiry);
+    bc.push(sc::OP_CHECKTIMEVERIFY);
+    sc::push_data(&mut bc, sender_pk);
+    bc.push(sc::OP_CHECKSIGVERIFY);
+    bc.push(sc::OP_ENDIF);
+    sc::push_int(&mut bc, 1);
+    bc
+}
+
+#[wasm_bindgen]
+pub fn qbolt_channel_bytecode_hex(
+    sender_pk_hex: &str,
+    receiver_pk_hex: &str,
+    expiry: u64,
+) -> Result<String, JsValue> {
+    let s = qb_hex32(sender_pk_hex, "sender pk")?;
+    let r = qb_hex32(receiver_pk_hex, "receiver pk")?;
+    Ok(hex::encode(qbolt_covenant_bytes(&s, &r, expiry)))
+}
+
+#[wasm_bindgen]
+pub fn qbolt_channel_address(
+    sender_pk_hex: &str,
+    receiver_pk_hex: &str,
+    expiry: u64,
+) -> Result<String, JsValue> {
+    let s = qb_hex32(sender_pk_hex, "sender pk")?;
+    let r = qb_hex32(receiver_pk_hex, "receiver pk")?;
+    let script = qbolt_covenant_bytes(&s, &r, expiry);
+    Ok(hex::encode(midstate::core::types::hash(&script)))
+}
+
+/// Parse funding coins, derive their canonical ids at `channel_addr`, and
+/// return them sorted ascending by coin id. BOTH the state builder and the
+/// reveal builders route through this so input ordering (and therefore the
+/// commitment) is identical everywhere.
+fn qb_sorted_funding(
+    funding_json: &str,
+    channel_addr: &[u8; 32],
+) -> Result<Vec<([u8; 32], u64, [u8; 32])>, JsValue> {
+    let coins: Vec<QbFundingCoinIn> = serde_json::from_str(funding_json)
+        .map_err(|e| JsValue::from_str(&format!("qbolt: bad funding JSON: {}", e)))?;
+    if coins.is_empty() {
+        return Err(JsValue::from_str("qbolt: funding coin list is empty"));
+    }
+    if coins.len() > 64 {
+        return Err(JsValue::from_str("qbolt: too many funding coins (max 64)"));
+    }
+    let mut out: Vec<([u8; 32], u64, [u8; 32])> = Vec::with_capacity(coins.len());
+    for c in &coins {
+        if c.value == 0 || (c.value & (c.value - 1)) != 0 {
+            return Err(JsValue::from_str(
+                "qbolt: funding coin value must be a nonzero power of 2",
+            ));
+        }
+        let salt = qb_hex32(&c.salt, "funding coin salt")?;
+        let id = compute_coin_id(channel_addr, c.value, &salt);
+        out.push((id, c.value, salt));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    // Reject duplicates — two identical (value,salt) pairs are one coin on-chain.
+    for w in out.windows(2) {
+        if w[0].0 == w[1].0 {
+            return Err(JsValue::from_str("qbolt: duplicate funding coin"));
+        }
+    }
+    Ok(out)
+}
+
+fn qb_derived_salt(channel_id: &[u8; 32], nonce: u32, tag: &[u8], i: u32, j: u32) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"qbolt_v2_out_salt");
+    h.update(channel_id);
+    h.update(&nonce.to_le_bytes());
+    h.update(tag);
+    h.update(&i.to_le_bytes());
+    h.update(&j.to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
+/// Shared core for close-state and refund-state construction.
+///
+/// Emits deterministic outputs (receiver coins, sender coins, HTLC script
+/// coins), the canonical tx salt for (`nonce`,`attempt`), and the consensus
+/// commitment over the sorted funding inputs. Enforces exact conservation:
+///     sender_amt + receiver_amt + Σ htlc = capacity − QBOLT_CLOSE_FEE
+fn qb_build_state_core(
+    channel_id: &[u8; 32],
+    sender_pk: &[u8; 32],
+    receiver_pk: &[u8; 32],
+    channel_addr: &[u8; 32],
+    funding_json: &str,
+    sender_amt: u64,
+    receiver_amt: u64,
+    nonce: u32,
+    htlcs_json: &str,
+    attempt: u32,
+    salt_domain: &[u8],
+) -> Result<serde_json::Value, JsValue> {
+    let funding = qb_sorted_funding(funding_json, channel_addr)?;
+    let capacity: u64 = funding.iter().try_fold(0u64, |a, f| a.checked_add(f.1))
+        .ok_or_else(|| JsValue::from_str("qbolt: capacity overflow"))?;
+    if capacity <= QBOLT_CLOSE_FEE {
+        return Err(JsValue::from_str("qbolt: capacity does not cover the close fee"));
+    }
+
+    let htlcs: Vec<QbHtlcIn> = serde_json::from_str(htlcs_json)
+        .map_err(|e| JsValue::from_str(&format!("qbolt: bad htlcs JSON: {}", e)))?;
+    if htlcs.len() > 12 {
+        return Err(JsValue::from_str("qbolt: too many HTLCs (max 12)"));
+    }
+    let htlc_sum: u64 = htlcs.iter().try_fold(0u64, |a, h| a.checked_add(h.amount))
+        .ok_or_else(|| JsValue::from_str("qbolt: HTLC sum overflow"))?;
+
+    let distributable = capacity - QBOLT_CLOSE_FEE;
+    let spoken_for = sender_amt
+        .checked_add(receiver_amt)
+        .and_then(|v| v.checked_add(htlc_sum))
+        .ok_or_else(|| JsValue::from_str("qbolt: balance overflow"))?;
+    if spoken_for != distributable {
+        return Err(JsValue::from_str(&format!(
+            "qbolt: conservation violated — sender {} + receiver {} + htlcs {} must equal capacity {} − fee {}",
+            sender_amt, receiver_amt, htlc_sum, capacity, QBOLT_CLOSE_FEE
+        )));
+    }
+
+    let mut output_hashes: Vec<[u8; 32]> = Vec::new();
+    let mut outputs_json: Vec<serde_json::Value> = Vec::new();
+    let mut htlc_coins_json: Vec<serde_json::Value> = Vec::new();
+
+    // Receiver coins first, then sender coins, then HTLC coins — fixed order.
+    let recv_addr = compute_address(receiver_pk);
+    for (i, denom) in decompose_value(receiver_amt).into_iter().enumerate() {
+        let salt = qb_derived_salt(channel_id, nonce, b"RECV", i as u32, 0);
+        output_hashes.push(compute_coin_id(&recv_addr, denom, &salt));
+        outputs_json.push(serde_json::json!({
+            "type": "standard", "address": hex::encode(recv_addr),
+            "value": denom, "salt": hex::encode(salt)
+        }));
+    }
+    let send_addr = compute_address(sender_pk);
+    for (i, denom) in decompose_value(sender_amt).into_iter().enumerate() {
+        let salt = qb_derived_salt(channel_id, nonce, b"SEND", i as u32, 0);
+        output_hashes.push(compute_coin_id(&send_addr, denom, &salt));
+        outputs_json.push(serde_json::json!({
+            "type": "standard", "address": hex::encode(send_addr),
+            "value": denom, "salt": hex::encode(salt)
+        }));
+    }
+    for (i, h) in htlcs.iter().enumerate() {
+        if h.amount == 0 {
+            return Err(JsValue::from_str("qbolt: zero-value HTLC"));
+        }
+        let secret_hash = qb_hex32(&h.secret_hash, "HTLC secret hash")?;
+        // HTLCs always flow sender → receiver in a unidirectional channel:
+        // claim path = receiver + preimage, refund path = sender after timeout.
+        let script = midstate::core::script::compile_htlc(&secret_hash, receiver_pk, h.timeout, sender_pk);
+        let htlc_addr = midstate::core::types::hash(&script);
+        for (j, denom) in decompose_value(h.amount).into_iter().enumerate() {
+            let salt = qb_derived_salt(channel_id, nonce, b"HTLC", i as u32, j as u32);
+            let cid = compute_coin_id(&htlc_addr, denom, &salt);
+            output_hashes.push(cid);
+            outputs_json.push(serde_json::json!({
+                "type": "standard", "address": hex::encode(htlc_addr),
+                "value": denom, "salt": hex::encode(salt)
+            }));
+            htlc_coins_json.push(serde_json::json!({
+                "coin_id": hex::encode(cid),
+                "address": hex::encode(htlc_addr),
+                "bytecode": hex::encode(&script),
+                "value": denom, "salt": hex::encode(salt),
+                "secret_hash": h.secret_hash, "timeout": h.timeout
+            }));
+        }
+    }
+
+    if outputs_json.is_empty() {
+        // Unreachable given conservation (distributable > 0), kept as a guard.
+        return Err(JsValue::from_str("qbolt: state produces no outputs"));
+    }
+
+    let mut sh = blake3::Hasher::new();
+    sh.update(salt_domain);
+    sh.update(channel_id);
+    sh.update(&nonce.to_le_bytes());
+    sh.update(&attempt.to_le_bytes());
+    let tx_salt = *sh.finalize().as_bytes();
+
+    let input_ids: Vec<[u8; 32]> = funding.iter().map(|f| f.0).collect();
+    let commitment = compute_commitment(&input_ids, &output_hashes, &tx_salt);
+
+    Ok(serde_json::json!({
+        "commitment": hex::encode(commitment),
+        "outputs": outputs_json,
+        "salt": hex::encode(tx_salt),
+        "fee": QBOLT_CLOSE_FEE,
+        "capacity": capacity,
+        "input_coin_ids": input_ids.iter().map(hex::encode).collect::<Vec<_>>(),
+        "htlc_coins": htlc_coins_json,
+        "nonce": nonce,
+        "attempt": attempt
+    }))
+}
+
+/// Build the canonical close state for a Q-Bolt v2 channel.
+/// `channel_id_hex` is the channel's stable identifier (the lexicographically
+/// smallest funding coin id) — used only for salt derivation.
+#[wasm_bindgen]
+pub fn qbolt_build_state(
+    channel_id_hex: &str,
+    sender_pk_hex: &str,
+    receiver_pk_hex: &str,
+    expiry: u64,
+    funding_json: &str,
+    sender_amt: u64,
+    receiver_amt: u64,
+    nonce: u32,
+    htlcs_json: &str,
+    attempt: u32,
+) -> Result<String, JsValue> {
+    let channel_id = qb_hex32(channel_id_hex, "channel id")?;
+    let s = qb_hex32(sender_pk_hex, "sender pk")?;
+    let r = qb_hex32(receiver_pk_hex, "receiver pk")?;
+    let addr = midstate::core::types::hash(&qbolt_covenant_bytes(&s, &r, expiry));
+    let v = qb_build_state_core(
+        &channel_id, &s, &r, &addr, funding_json,
+        sender_amt, receiver_amt, nonce, htlcs_json, attempt,
+        b"qbolt_close_v2",
+    )?;
+    Ok(v.to_string())
+}
+
+/// Build the sender's post-expiry refund state: everything (minus fee) back
+/// to the sender. Uses nonce = u32::MAX so its salts can never collide with
+/// a payment state.
+#[wasm_bindgen]
+pub fn qbolt_build_refund_state(
+    channel_id_hex: &str,
+    sender_pk_hex: &str,
+    receiver_pk_hex: &str,
+    expiry: u64,
+    funding_json: &str,
+    attempt: u32,
+) -> Result<String, JsValue> {
+    let channel_id = qb_hex32(channel_id_hex, "channel id")?;
+    let s = qb_hex32(sender_pk_hex, "sender pk")?;
+    let r = qb_hex32(receiver_pk_hex, "receiver pk")?;
+    let addr = midstate::core::types::hash(&qbolt_covenant_bytes(&s, &r, expiry));
+    let funding = qb_sorted_funding(funding_json, &addr)?;
+    let capacity: u64 = funding.iter().map(|f| f.1).sum();
+    if capacity <= QBOLT_CLOSE_FEE {
+        return Err(JsValue::from_str("qbolt: capacity does not cover the refund fee"));
+    }
+    let v = qb_build_state_core(
+        &channel_id, &s, &r, &addr, funding_json,
+        capacity - QBOLT_CLOSE_FEE, 0, u32::MAX, "[]", attempt,
+        b"qbolt_refund_v2",
+    )?;
+    Ok(v.to_string())
+}
+
+fn qb_build_reveal_core(
+    channel_addr_script: &[u8],
+    funding_json: &str,
+    state_json: &str,
+    witness_csv: &str,
+) -> Result<String, JsValue> {
+    let addr = midstate::core::types::hash(channel_addr_script);
+    let funding = qb_sorted_funding(funding_json, &addr)?;
+    let state: serde_json::Value = serde_json::from_str(state_json)
+        .map_err(|e| JsValue::from_str(&format!("qbolt: bad state JSON: {}", e)))?;
+
+    // Consistency guard: the state must have been built over these exact inputs.
+    if let Some(ids) = state["input_coin_ids"].as_array() {
+        if ids.len() != funding.len() {
+            return Err(JsValue::from_str("qbolt: state input set does not match the funding list"));
+        }
+        for (i, f) in funding.iter().enumerate() {
+            if ids[i].as_str() != Some(hex::encode(f.0).as_str()) {
+                return Err(JsValue::from_str("qbolt: state input set does not match the funding list"));
+            }
+        }
+    }
+
+    let bytecode_hex = hex::encode(channel_addr_script);
+    let inputs: Vec<serde_json::Value> = funding.iter().map(|f| serde_json::json!({
+        "bytecode": bytecode_hex,
+        "value": f.1,
+        "salt": hex::encode(f.2),
+    })).collect();
+    // One MSS signature binds the whole-tx commitment, so the SAME witness
+    // satisfies every input's covenant.
+    let sigs: Vec<String> = funding.iter().map(|_| witness_csv.to_string()).collect();
+
+    let reveal = serde_json::json!({
+        "inputs": inputs,
+        "signatures": sigs,
+        "outputs": state["outputs"],
+        "salt": state["salt"],
+    });
+    Ok(reveal.to_string())
+}
+
+/// Cooperative / unilateral-receiver close reveal.
+/// Witness per input: [sender_sig, receiver_sig, 0x01].
+#[wasm_bindgen]
+pub fn qbolt_build_close_reveal(
+    sender_pk_hex: &str,
+    receiver_pk_hex: &str,
+    expiry: u64,
+    funding_json: &str,
+    state_json: &str,
+    sender_sig_hex: &str,
+    receiver_sig_hex: &str,
+) -> Result<String, JsValue> {
+    let s = qb_hex32(sender_pk_hex, "sender pk")?;
+    let r = qb_hex32(receiver_pk_hex, "receiver pk")?;
+    if sender_sig_hex.is_empty() || receiver_sig_hex.is_empty() {
+        return Err(JsValue::from_str("qbolt: close needs both signatures"));
+    }
+    let script = qbolt_covenant_bytes(&s, &r, expiry);
+    let witness = format!("{},{},01", sender_sig_hex, receiver_sig_hex);
+    qb_build_reveal_core(&script, funding_json, state_json, &witness)
+}
+
+/// Sender's post-expiry refund reveal.
+/// Witness per input: [sender_sig, 0x00].
+#[wasm_bindgen]
+pub fn qbolt_build_refund_reveal(
+    sender_pk_hex: &str,
+    receiver_pk_hex: &str,
+    expiry: u64,
+    funding_json: &str,
+    state_json: &str,
+    sender_sig_hex: &str,
+) -> Result<String, JsValue> {
+    let s = qb_hex32(sender_pk_hex, "sender pk")?;
+    let r = qb_hex32(receiver_pk_hex, "receiver pk")?;
+    if sender_sig_hex.is_empty() {
+        return Err(JsValue::from_str("qbolt: refund needs the sender signature"));
+    }
+    let script = qbolt_covenant_bytes(&s, &r, expiry);
+    let witness = format!("{},00", sender_sig_hex);
+    qb_build_reveal_core(&script, funding_json, state_json, &witness)
+}
+
+/// LEGACY RESCUE — v1 channels funded a bare 2-of-2 with NO timeout branch,
+/// and the v1 close never committed its commitment on-chain (so it could not
+/// confirm) and assumed a single funding coin (funding was actually split
+/// into power-of-2 denominations). These two builders produce a CORRECT
+/// cooperative close for that legacy covenant: multi-coin aware, and meant
+/// to be driven through the full commit → reveal engine. Both parties must
+/// still cooperate — a bare 2-of-2 has no unilateral path, ever.
+#[wasm_bindgen]
+pub fn qbolt_build_legacy_close_state(
+    channel_id_hex: &str,
+    alice_pk_hex: &str,
+    bob_pk_hex: &str,
+    funding_json: &str,
+    alice_amt: u64,
+    bob_amt: u64,
+    attempt: u32,
+) -> Result<String, JsValue> {
+    let channel_id = qb_hex32(channel_id_hex, "channel id")?;
+    let a = qb_hex32(alice_pk_hex, "alice pk")?;
+    let b = qb_hex32(bob_pk_hex, "bob pk")?;
+    let script = midstate::core::script::compile_multisig_2of2(&a, &b);
+    let addr = midstate::core::types::hash(&script);
+    // Reuse the core with alice as "sender" and bob as "receiver" purely for
+    // output grouping; there is no direction in a legacy channel.
+    let v = qb_build_state_core(
+        &channel_id, &a, &b, &addr, funding_json,
+        alice_amt, bob_amt, u32::MAX - 1, "[]", attempt,
+        b"qbolt_legacy_close",
+    )?;
+    Ok(v.to_string())
+}
+
+#[wasm_bindgen]
+pub fn qbolt_build_legacy_close_reveal(
+    alice_pk_hex: &str,
+    bob_pk_hex: &str,
+    funding_json: &str,
+    state_json: &str,
+    alice_sig_hex: &str,
+    bob_sig_hex: &str,
+) -> Result<String, JsValue> {
+    let a = qb_hex32(alice_pk_hex, "alice pk")?;
+    let b = qb_hex32(bob_pk_hex, "bob pk")?;
+    if alice_sig_hex.is_empty() || bob_sig_hex.is_empty() {
+        return Err(JsValue::from_str("qbolt: legacy close needs both signatures"));
+    }
+    let script = midstate::core::script::compile_multisig_2of2(&a, &b);
+    // compile_multisig_2of2 witness order: [alice_sig, bob_sig] (bob on top).
+    let witness = format!("{},{}", alice_sig_hex, bob_sig_hex);
+    qb_build_reveal_core(&script, funding_json, state_json, &witness)
 }
 
 #[wasm_bindgen]
@@ -3309,7 +3927,7 @@ mod tests {
     fn spend_context_roundtrip() {
         let ctx = SpendContext {
             selected_inputs: vec![],
-            outputs: vec![JsOutput { address: "ab".repeat(32), value: 4, salt: "cd".repeat(32) }],
+            outputs: vec![serde_json::json!({ "address": "ab".repeat(32), "value": 4, "salt": "cd".repeat(32) })],
             commit_payload: serde_json::json!({"test": true}),
             tx_salt: "ee".repeat(32), commitment: "ff".repeat(32),
             fee: 100, next_wots_index: 7,

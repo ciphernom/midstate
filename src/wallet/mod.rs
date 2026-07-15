@@ -1,13 +1,15 @@
 pub mod coinjoin;
 pub mod crypto;
 pub mod hd;
+pub mod defrag;
+
 use crate::core::{hash_concat, compute_commitment, compute_coin_id, compute_address, decompose_value, wots, OutputData, InputReveal, Predicate, Witness};
 use crate::core::mss::{self, MssKeypair};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-
+pub use defrag::{DefragBatchPlan, FeePolicy};
 /// Default wallet location: ~/.midstate/wallet.dat
 #[cfg(not(target_arch = "wasm32"))]
 pub fn default_path() -> PathBuf {
@@ -807,118 +809,253 @@ pub fn import_scanned(
         anyhow::bail!("Cannot auto-solve: Private key for {} not found in wallet.dat", hex::encode(owner_pk))
     }
 
-    /// Select coins whose total value >= needed, aggressively pulling in extra
-    /// dust coins to merge change into higher powers of 2.
-    /// Select coins whose total value >= needed, aggressively pulling in extra
-    /// dust coins to merge change into higher powers of 2.
+    /// Selects a subset of unspent coins to satisfy a target value, strictly
+    /// observing WOTS co-spend rules and consensus transaction size limits.
     ///
-    /// # Formal Logic & Complexity
-    /// Pre-computes O(N) hash maps mapping `denomination -> Vec<CoinID>` and 
-    /// `address -> Vec<CoinID>`. This reduces the greedy snowball merge and 
-    /// sibling co-spend grouping from O(N^2) to an amortized O(N) linear pass.
+    /// # Reasoning
+    /// The wallet must reliably fund transactions without causing CPU or Bandwidth
+    /// Denial-of-Service (DoS) vectors on the network.
+    ///
+    /// **Danger of previous implementation**: The old selection algorithm was greedy
+    /// based *solely* on value. It would select a base set of coins, and *then* rigidly
+    /// sweep in all WOTS siblings to satisfy the post-quantum one-time key invariant.
+    /// This frequently breached the `MAX_TX_INPUTS` (256) limit silently, causing
+    /// "Phantom Overdrafts" where users had sufficient funds but couldn't construct
+    /// a valid transaction.
+    ///
+    /// **The Fix**: This implementation groups WOTS siblings into indivisible
+    /// `Bundle`s *before* selection and evaluates them with a knapsack density
+    /// heuristic (value per input). It packs inputs toward the target and skips any
+    /// bundle that would breach the input cap. Because this is a greedy heuristic,
+    /// an `Err` means it failed to find a fitting combination — not a proof that
+    /// none exists.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Let Available = { c ∈ wallet.coins | c.coin_id ∈ live_coins }
+    /// Let sibs(c)   = { s ∈ Available | s.address = c.address }
+    ///
+    /// Pre:
+    ///   - needed > 0
+    ///   - live_coins represents the set of confirmed UTXOs on the blockchain
+    ///
+    /// Post:
+    ///   result = Ok(selected)  ⇒
+    ///     sum(value(c) for c in selected) >= needed
+    ///     #selected <= MAX_TX_INPUTS
+    ///     ∀ c ∈ selected: (c is WOTS) ⇒ sibs(c) ⊆ selected
+    ///     selected ⊆ Available, with no duplicates
+    ///
+    ///   result = Err(_)  ⇒ Either spendable funds are insufficient, or the greedy
+    ///                      heuristic could not fit a satisfying combination within
+    ///                      the MAX_TX_INPUTS limit.
+    /// ```
+    ///
+    /// ```zed
+    ///     SelectCoins
+    ///     -----------
+    ///     wallet : WalletData
+    ///     live_coins? : ℙ 𝔹³²
+    ///     needed? : ℕ₆₄
+    ///     selected! : seq 𝔹³²
+    ///
+    ///     let Available = { c ∈ wallet.coins | c.coin_id ∈ live_coins? }
+    ///     let Bundles = { B ⊆ Available | ∀ c ∈ B • (is_wots(c) ⇒ (siblings(c) ∩ Available) ⊆ B) ∧ (is_mss(c) ⇒ #B = 1) }
+    ///
+    ///     pre  needed? > 0
+    ///     post result = Ok(selected!) ⇒
+    ///            ∃ S ⊆ Bundles •
+    ///              selected! = ⋃ S
+    ///              ∧ (∑ c ∈ selected! • c.value) ≥ needed?
+    ///              ∧ #selected! ≤ MAX_TX_INPUTS
+    ///     post result = Err(_) ⇒ true
+    /// ```
+    ///
+    /// # Safety / Invariants
+    /// - **WOTS Co-Spend Rule**: A WOTS key must never sign two different
+    ///   commitments. Bundling all live coins of a WOTS address into one atomic
+    ///   unit enforces this.
+    /// - **Consensus Limit**: The result never exceeds `MAX_TX_INPUTS`, preventing
+    ///   network-wide DoS via bloated signature verification times.
+    /// - **Oversized addresses**: A WOTS address holding more than `MAX_TX_INPUTS`
+    ///   live coins cannot be spent in a standard Reveal transaction. However, 
+    ///   they can be consolidated since `Transaction::Consolidate` allows up to 
+    ///   `MAX_CONSOLIDATE_INPUTS` (8,192). We exclude them from normal selection 
+    ///   and instruct the user to consolidate.
     pub fn select_coins(&self, needed: u64, live_coins: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
-        let mut selected = Vec::new();
-        let mut selected_set = std::collections::HashSet::new();
-        let mut total = 0u64;
-        
+        use rand::seq::SliceRandom;
+
         let live_set: std::collections::HashSet<[u8; 32]> = live_coins.iter().copied().collect();
 
-        // 1. Build O(1) Lookup Indexes in O(N) time
-        let mut available: Vec<&WalletCoin> = self.data.coins.iter()
-            .filter(|c| live_set.contains(&c.coin_id))
-            .collect();
-        available.sort_by(|a, b| b.value.cmp(&a.value));
+        // 1. Group available live coins into indivisible Bundles.
+        //
+        // A Bundle is the smallest unit of selection:
+        //   - Every WOTS address forms ONE bundle containing ALL of its live coins,
+        //     because spending any coin at a WOTS address reveals the one-time key,
+        //     so every coin there must be spent in the same transaction.
+        //   - Every MSS coin is its own size-1 bundle (MSS keys tolerate reuse).
+        struct Bundle {
+            address: [u8; 32],
+            coin_ids: Vec<[u8; 32]>,
+            total_value: u64,
+        }
 
-        let mut by_denom: std::collections::HashMap<u64, Vec<[u8; 32]>> = std::collections::HashMap::new();
-        let mut by_addr: std::collections::HashMap<[u8; 32], Vec<[u8; 32]>> = std::collections::HashMap::new();
+        let mut mss_addrs = std::collections::HashSet::new();
+        for k in &self.data.mss_keys {
+            mss_addrs.insert(compute_address(&k.master_pk));
+        }
+
+        let mut wots_groups: std::collections::HashMap<[u8; 32], Vec<&WalletCoin>> =
+            std::collections::HashMap::new();
+        let mut bundles: Vec<Bundle> = Vec::new();
         
-        for coin in &available {
-            by_denom.entry(coin.value).or_default().push(coin.coin_id);
-            // Only group WOTS addresses (MSS handles its own reuse safety)
-            if !self.data.mss_keys.iter().any(|k| compute_address(&k.master_pk) == coin.address) {
-                by_addr.entry(coin.address).or_default().push(coin.coin_id);
+        // Saturating adds are defensive only: consensus supply should keep sums
+        // far below u64::MAX, but a corrupt wallet file must not wrap arithmetic.
+        let mut total_available = 0u64;
+
+        for coin in &self.data.coins {
+            if !live_set.contains(&coin.coin_id) {
+                continue;
+            }
+            total_available = total_available.saturating_add(coin.value);
+
+            if mss_addrs.contains(&coin.address) {
+                bundles.push(Bundle {
+                    address: coin.address,
+                    coin_ids: vec![coin.coin_id],
+                    total_value: coin.value,
+                });
+            } else {
+                wots_groups.entry(coin.address).or_default().push(coin);
             }
         }
 
-        // 2. Initial Selection: Sort by value descending to minimize baseline inputs
-        for coin in &available {
-            if total >= needed { break; }
-            selected.push(coin.coin_id);
-            selected_set.insert(coin.coin_id);
-            total += coin.value;
+        for (addr, coins) in wots_groups {
+            let total_value = coins.iter().fold(0u64, |acc, c| acc.saturating_add(c.value));
+            let coin_ids = coins.iter().map(|c| c.coin_id).collect();
+            bundles.push(Bundle { address: addr, coin_ids, total_value });
+        }
+
+        // 2. Exclude bundles that can never fit in a normal transaction.
+        //
+        // A WOTS address holding more than MAX_TX_INPUTS live coins is unspendable
+        // in a standard Send because of the co-spend rule. BUT it CAN be spent 
+        // using `wallet consolidate` which allows up to 8,192 inputs. 
+        // We surface the condition loudly and report the locked value separately.
+        let mut oversized_value = 0u64;
+        let mut oversized_count = 0usize;
+        bundles.retain(|b| {
+            if b.coin_ids.len() > crate::core::MAX_TX_INPUTS {
+                oversized_value = oversized_value.saturating_add(b.total_value);
+                oversized_count += 1;
+                tracing::warn!(
+                    "Excluding address {} from standard coin selection: it holds {} live coins. \
+                     A standard transaction can only hold {} inputs. \
+                     You must run `midstate wallet consolidate --address {}` to compress these coins before spending.",
+                    hex::encode(b.address),
+                    b.coin_ids.len(),
+                    crate::core::MAX_TX_INPUTS,
+                    hex::encode(b.address)
+                );
+                false
+            } else {
+                true
+            }
+        });
+
+        // 3. Sort bundles by value density (value per input), descending.
+        //
+        // Greedy knapsack heuristic: prefer bundles that deliver the most value per
+        // input slot consumed. u128 cross-multiplication compares the exact
+        // rationals a.value/a.len vs b.value/b.len with no float precision loss.
+        // Ties: larger total value first, then address, then first coin id, so this
+        // initial pass is deterministic for a given wallet state.
+        bundles.sort_by(|a, b| {
+            let lhs = (a.total_value as u128) * (b.coin_ids.len() as u128);
+            let rhs = (b.total_value as u128) * (a.coin_ids.len() as u128);
+            rhs.cmp(&lhs)
+                .then_with(|| b.total_value.cmp(&a.total_value))
+                .then_with(|| a.address.cmp(&b.address))
+                .then_with(|| a.coin_ids.first().cmp(&b.coin_ids.first()))
+        });
+
+        let mut selected: Vec<[u8; 32]> = Vec::new();
+        let mut total = 0u64;
+
+        // 4. Initial selection: walk bundles in density order, taking each bundle
+        // that fits until the target is met.
+        for bundle in &bundles {
+            if total >= needed {
+                break;
+            }
+            if selected.len() + bundle.coin_ids.len() > crate::core::MAX_TX_INPUTS {
+                continue;
+            }
+            selected.extend(&bundle.coin_ids);
+            total = total.saturating_add(bundle.total_value);
         }
 
         if total < needed {
-            bail!("insufficient funds: have {}, need {}", total, needed);
-        }
-
-        if selected.len() > crate::core::MAX_TX_INPUTS {
-            bail!("Too many siblings to spend in a normal transaction ({} > {}). Please use the 'midstate wallet consolidate' command to compress them into a new UTXO first.", selected.len(), crate::core::MAX_TX_INPUTS);
-        }
-
-        // 3. O(1) Sibling Sweep: If we picked a WOTS coin, grab all siblings instantly
-        let initial_selected = selected.clone();
-        for id in initial_selected {
-            if let Some(c) = self.find_coin(&id) {
-                if let Some(siblings) = by_addr.get(&c.address) {
-                    for sib_id in siblings {
-                        if selected_set.insert(*sib_id) {
-                            selected.push(*sib_id);
-                            if let Some(sib_coin) = self.find_coin(sib_id) {
-                                total += sib_coin.value;
-                                tracing::info!(
-                                    "Co-spend grouping: pulled in sibling coin {} (value {}) to prevent WOTS key reuse",
-                                    hex::encode(sib_id), sib_coin.value
-                                );
-                            }
-                        }
-                    }
+            let spendable = total_available.saturating_sub(oversized_value);
+            if spendable < needed {
+                if oversized_value > 0 {
+                    bail!(
+                        "insufficient spendable funds: have {} spendable, need {}.\n\
+                         A further {} is locked at {} address(es) holding more than {} coins \
+                         each. You must run `midstate wallet consolidate` on those addresses to make them spendable.",
+                        spendable, needed, oversized_value, oversized_count,
+                        crate::core::MAX_TX_INPUTS
+                    );
                 }
+                bail!("insufficient funds: have {}, need {}", spendable, needed);
+            }
+            bail!(
+                "Insufficient consolidated funds to send this amount in a single transaction.\n\
+                 You have {} spendable, but need {} and a standard transaction can hold at most \
+                 {} inputs -- your UTXOs are too fragmented.\n\n\
+                 Fix: Send a smaller amount, or run `midstate wallet consolidate` \
+                 to merge small coins into larger usable balances.",
+                spendable, needed, crate::core::MAX_TX_INPUTS
+            );
+        }
+
+        // 5. Greedy "snowball" merge: opportunistically pull in extra coins whose
+        // value exactly matches a denomination of the current change, so change
+        // consolidates into fewer, larger outputs over time.
+        let selected_set: std::collections::HashSet<[u8; 32]> =
+            selected.iter().copied().collect();
+        let mut unselected_by_denom: std::collections::HashMap<u64, Vec<&Bundle>> =
+            std::collections::HashMap::new();
+
+        for bundle in &bundles {
+            if bundle.coin_ids.len() == 1 && !selected_set.contains(&bundle.coin_ids[0]) {
+                unselected_by_denom.entry(bundle.total_value).or_default().push(bundle);
             }
         }
 
-        // 4. The Greedy "Snowball" Merge in O(1) loop lookups
+        let mut rng = rand::thread_rng();
         let mut added_new = true;
-        while added_new {
+        
+        while added_new && selected.len() < crate::core::MAX_TX_INPUTS {
             added_new = false;
             let change = total - needed;
             let mut change_denoms = decompose_value(change);
-            use rand::seq::SliceRandom;
-            change_denoms.shuffle(&mut rand::thread_rng()); 
-            
+            change_denoms.shuffle(&mut rng);
+
             for denom in change_denoms {
-                if let Some(candidates) = by_denom.get(&denom) {
-                    for cand_id in candidates {
-                        if selected_set.insert(*cand_id) {
-                            selected.push(*cand_id);
-                            total += denom;
-                            added_new = true;
-                            
-                            // Must also pull in siblings of the greedy coin
-                            if let Some(cand_coin) = self.find_coin(cand_id) {
-                                if let Some(siblings) = by_addr.get(&cand_coin.address) {
-                                    for sib_id in siblings {
-                                        if selected_set.insert(*sib_id) {
-                                            selected.push(*sib_id);
-                                            if let Some(sib_coin) = self.find_coin(sib_id) {
-                                                total += sib_coin.value;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            tracing::info!("Greedy Merge: Pulled in an extra coin of value {} to consolidate change", denom);
-                            break; 
-                        }
+                if let Some(candidates) = unselected_by_denom.get_mut(&denom) {
+                    if let Some(cand_bundle) = candidates.pop() {
+                        selected.extend(&cand_bundle.coin_ids);
+                        total = total.saturating_add(cand_bundle.total_value);
+                        added_new = true;
+                        tracing::info!(
+                            "Greedy Merge: Pulled in an extra coin of value {} to consolidate change",
+                            denom
+                        );
+                        break;
                     }
                 }
-                if added_new { break; }
-            }
-            
-            if selected.len() >= 250 {
-                tracing::warn!("Greedy merge stopped early to avoid exceeding MAX_TX_INPUTS");
-                break;
             }
         }
 

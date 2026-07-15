@@ -61,11 +61,65 @@ pub struct SendTransactionResponse {
     pub fee: u64,
     pub status: String,
 }
+/// A client's proof of work for a gated endpoint.
+///
+/// Used by BOTH `/scan` and `/search` — the name predates the second caller and
+/// is now a mild misnomer, but renaming it buys nothing and touches two files.
+///
+/// The preimage, which both sides must build identically:
+///
+/// ```text
+/// blake3(format!("{}:{}:{}:{}", subject, height, timestamp, nonce))
+/// ```
+///
+/// where `subject` is the address (`/scan`) or the query (`/search`), and
+/// `height` is the request's `start_height` (`/scan`) or `0` (`/search`). The
+/// digest must carry at least the leading HEX zeros the governor demands for the
+/// caller's IP — ask `/pow_params`, don't guess. Difficulty is server-owned.
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct ScanPow {
+    pub nonce: u64,
+    /// Unix seconds. The server rejects anything outside -600s / +120s of its
+    /// own clock, so a skewed client fails before it has mined anything useful.
+    pub timestamp: u64,
+    /// Lowercase hex digest the client claims to have found.
+    ///
+    /// Redundant — the server recomputes it — but worth sending: it separates
+    /// "you hashed the wrong thing" (Invalid PoW hash) from "you didn't work
+    /// hard enough" (difficulty too low). Those are very different client bugs,
+    /// and collapsing them cost real debugging time on the explorer.
+    pub hash: String,
+}
+
+/// Reply from `GET /pow_params`: what this caller owes for its next expensive
+/// request.
+///
+/// Free to call, by necessity — a client cannot discover the price without
+/// asking, so charging for the quote would deadlock. The server re-derives the
+/// requirement when it verifies, so a stale quote can't buy a discount; a client
+/// outbid mid-solve is rejected, re-quotes, and retries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PowParamsResponse {
+    /// Leading HEX zeros required right now, for this caller's IP.
+    pub zeros: u32,
+    /// The floor every caller pays.
+    pub min_zeros: u32,
+    /// The ceiling, so a client can show an honest worst case up front.
+    pub max_zeros: u32,
+    /// Counter window in seconds; difficulty decays back to `min_zeros` after it.
+    pub window_secs: u64,
+    /// Server unix time. Lets a client detect its own clock skew before it
+    /// spends a solve on a timestamp that will be rejected as stale.
+    pub server_time: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScanRequest {
     pub addresses: Vec<String>,
     pub start_height: u64,
     pub end_height: u64,
+    #[serde(default)]
+    pub pow: Option<ScanPow>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -319,6 +373,19 @@ pub struct MixActionResponse {
 pub struct SearchRequest {
     /// Hex-encoded 32-byte hash to search for
     pub query: String,
+    /// Proof of work. Required in practice — /search loads and linearly scans up
+    /// to 5000 batches per call, more disk I/O than /scan, which was already
+    /// gated while this was wide open.
+    ///
+    /// Kept `Option` + `serde(default)` deliberately: an absent proof should
+    /// produce a readable "Search requires proof-of-work — see /pow_params",
+    /// not a serde 422 that a client can't act on.
+    ///
+    /// Reuses `ScanPow` rather than declaring a second identical struct — the
+    /// preimage is the same shape for both endpoints, and one type is one fewer
+    /// thing to drift. (The name is now a slight misnomer; see the note there.)
+    #[serde(default)]
+    pub pow: Option<ScanPow>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

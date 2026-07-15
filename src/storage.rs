@@ -1,4 +1,5 @@
 mod batch_store;
+pub mod search_index;
 pub use batch_store::BatchStore;
 
 use crate::core::State;
@@ -292,6 +293,56 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// The raw database handle.
+    ///
+    /// Exposed for `search_index`, which needs its own read transactions.
+    /// An accessor rather than a `pub` field so the ownership stays one-way:
+    /// callers can read, they cannot swap the handle out from under BatchStore.
+    pub fn db(&self) -> &Arc<Database> {
+        &self.db
+    }
+
+    /// Build the search index up to `tip`, resuming if a previous run was
+    /// interrupted.
+    ///
+    /// An existing node has none of this on disk, so the first run walks from
+    /// genesis: ~200k batch deserialisations, minutes rather than hours. It is
+    /// chunked and the watermark is committed with the data, so a kill -9 costs
+    /// at most the last 1000 blocks.
+    ///
+    /// Safe to call on every startup — it is a no-op once current.
+    pub fn build_search_index(&self) -> Result<u64> {
+        let tip = self.batches.highest()?;
+        let start = search_index::progress(&self.db)?;
+        if start > tip {
+            return Ok(0);
+        }
+        if start == 0 && tip > 1000 {
+            tracing::info!(
+                "Search index: building from genesis to {} (first run — this is a one-time pass)",
+                tip
+            );
+        }
+        let batches = self.batches.clone();
+        let indexed = search_index::backfill(
+            &self.db,
+            |h| batches.load(h),
+            tip,
+            |done, total| {
+                // Only log at 5% steps: a per-chunk line across 200k blocks is
+                // 200 lines of noise, and silence looks like a hang.
+                let step = (total / 20).max(1);
+                if done % step < 1000 {
+                    tracing::info!("Search index: {}/{} ({}%)", done, total, done * 100 / total.max(1));
+                }
+            },
+        )?;
+        if indexed > 0 {
+            tracing::info!("Search index: indexed {} blocks, now current at {}", indexed, tip);
+        }
+        Ok(indexed)
+    }
+
 pub fn delete_spent_address(&self, address: &[u8; 32]) -> Result<bool> {
     let write_txn = self.db.begin_write()?;
     let existed = {
@@ -410,6 +461,12 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
                         let _ = write_txn.open_table(BATCHES_TABLE)?;
                         let _ = write_txn.open_table(HEADERS_TABLE)?;
                         let _ = write_txn.open_table(FILTERS_TABLE)?;
+                        // Search acceleration. Created here so a fresh database
+                        // has them from the start; on an existing one they are
+                        // created empty and populated by build_search_index().
+                        let _ = write_txn.open_table(search_index::FILTER_META_TABLE)?;
+                        let _ = write_txn.open_table(search_index::SEARCH_INDEX_TABLE)?;
+                        let _ = write_txn.open_table(search_index::INDEX_META_TABLE)?;
                     }
                     write_txn.commit()?;
 

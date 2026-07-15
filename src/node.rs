@@ -1196,6 +1196,26 @@ pub async fn new(
     ) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
         let storage = Storage::open(data_dir.join("db"))?;
+
+        // Build the search index before serving. An existing node has none of it
+        // on disk, so the first run after upgrading walks from genesis — ~200k
+        // batch deserialisations, minutes not hours. It is chunked and its
+        // watermark commits with the data, so an interrupted run resumes at the
+        // last chunk rather than starting over. A no-op once current.
+        //
+        // Deliberately synchronous and before the RPC comes up: a half-built
+        // index answers /search with confident silence, which is worse than a
+        // slow start. The alternative — background indexing with a
+        // "not ready yet" error — costs more complexity than the wait is worth.
+        match storage.build_search_index() {
+            Ok(n) if n > 0 => tracing::info!("Search index ready ({} blocks indexed)", n),
+            Ok(_) => {}
+            // Non-fatal: search falls back to loading batches, which is what it
+            // did before this existed. Refusing to boot over a search
+            // optimisation would be a poor trade.
+            Err(e) => tracing::warn!("Search index build failed ({}) — search will fall back to full scans", e),
+        }
+
         let mut state = storage.load_state()?.unwrap_or_else(|| {
             tracing::info!("No saved state, using genesis");
             State::genesis().0

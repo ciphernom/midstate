@@ -53,6 +53,17 @@ impl BatchStore {
         let highest = self.highest()?;
         if new_tip_height >= highest { return Ok(()); }
 
+        // Read the batches BEFORE deleting them: the search index is hash→heights
+        // with no reverse map, so the only way to know which entries belong to a
+        // height is to recompute them from its batch. Left behind, they become
+        // phantom results pointing at blocks that no longer exist.
+        let mut doomed: Vec<(u64, Batch)> = Vec::new();
+        for height in new_tip_height..=highest {
+            if let Some(batch) = self.load(height)? {
+                doomed.push((height, batch));
+            }
+        }
+
         let write_txn = self.db.begin_write()?;
         {
             let mut b = write_txn.open_table(super::BATCHES_TABLE)?;
@@ -65,7 +76,15 @@ impl BatchStore {
                 f.remove(height)?;
             }
         }
+        for (height, batch) in &doomed {
+            super::search_index::unindex_batch_in_txn(&write_txn, *height, batch)?;
+        }
         write_txn.commit()?;
+
+        // Rewind the backfill watermark so the replacement fork gets indexed.
+        // Without this the index would believe those heights were already done
+        // and the new blocks would never be searchable.
+        super::search_index::rewind_progress(&self.db, new_tip_height)?;
         Ok(())
     }
 
@@ -82,27 +101,40 @@ impl BatchStore {
     ///       (if it existed)
     /// ```
     pub fn prune_tail(&self, up_to_height: u64) -> Result<()> {
+        // Establish the range first, so we can read the doomed batches before the
+        // write transaction removes them (see truncate() for why the index needs
+        // them).
+        let lowest = match self.lowest()? {
+            Some(h) => h,
+            None => return Ok(()),              // database is empty
+        };
+        if lowest >= up_to_height {
+            return Ok(());                      // nothing to prune
+        }
+
+        let mut doomed: Vec<(u64, Batch)> = Vec::new();
+        for height in lowest..up_to_height {
+            if let Some(batch) = self.load(height)? {
+                doomed.push((height, batch));
+            }
+        }
+
         let write_txn = self.db.begin_write()?;
         {
             let mut b = write_txn.open_table(super::BATCHES_TABLE)?;
             let mut h = write_txn.open_table(super::HEADERS_TABLE)?;
             let mut f = write_txn.open_table(super::FILTERS_TABLE)?;
 
-            // Find the lowest existing key so we don't scan from 0 unnecessarily
-            let lowest = match b.first()? {
-                Some(first) => first.0.value(),
-                None => return Ok(()), // database is empty
-            };
-
-            if lowest >= up_to_height {
-                return Ok(()); // nothing to prune
-            }
-
             for height in lowest..up_to_height {
                 b.remove(height)?;
                 h.remove(height)?;
                 f.remove(height)?;
             }
+        }
+        // Drop the index entries too. A pruned block whose hashes still resolve
+        // would send search to a height it can no longer load.
+        for (height, batch) in &doomed {
+            super::search_index::unindex_batch_in_txn(&write_txn, *height, batch)?;
         }
         write_txn.commit()?;
         Ok(())
@@ -126,8 +158,33 @@ impl BatchStore {
             let filter = CompactFilter::build(batch);
             f.insert(height, filter.data.as_slice())?;
         }
+        // Index inside the SAME transaction as the batch. A batch on disk whose
+        // index entries are missing is a silently wrong search result, and a
+        // crash between two commits would produce exactly that.
+        super::search_index::index_batch_in_txn(&write_txn, height, batch)?;
         write_txn.commit()?;
         Ok(())
+    }
+
+    /// Every filter in `start..=end`, in one transaction.
+    ///
+    /// `load_filter` opens a fresh read transaction and re-opens the table per
+    /// call. That is fine for a light client fetching one height, and terrible
+    /// for `search()`, which walks thousands: the per-call overhead dominates
+    /// the actual work. One ordered scan is the same data for ~3x less.
+    ///
+    /// Absent heights are simply missing from the map — callers must not read
+    /// that as "empty filter".
+    pub fn load_filter_range(&self, start: u64, end: u64) -> Result<std::collections::BTreeMap<u64, Vec<u8>>> {
+        let mut out = std::collections::BTreeMap::new();
+        if end < start { return Ok(out); }
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::FILTERS_TABLE)?;
+        for entry in table.range(start..=end)? {
+            let (k, v) = entry?;
+            out.insert(k.value(), v.value().to_vec());
+        }
+        Ok(out)
     }
 
     /// Loads a Compact Filter for the given height. Used by light clients to scan the chain.
@@ -221,6 +278,29 @@ impl BatchStore {
     }
 
     /// O(1) B-Tree right-most edge traversal
+    /// Lowest stored height, or `None` if the store is empty.
+    ///
+    /// The mirror of [`highest`], and deliberately written in the same shape:
+    /// bind the value to a local, THEN return it. redb's `AccessGuard` borrows
+    /// the table, which borrows the transaction — so an `if let`/`match` left as
+    /// a block's tail expression keeps a temporary alive past the locals it
+    /// borrows from, and the borrow checker rejects it. Binding first drops the
+    /// guard before the table.
+    ///
+    /// `None` rather than `0`: an empty store and a store starting at genesis
+    /// are different, and conflating them makes `prune_tail` iterate from 0 over
+    /// nothing.
+    pub fn lowest(&self) -> Result<Option<u64>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::BATCHES_TABLE)?;
+        let min_val = if let Some(first) = table.first()? {
+            Some(first.0.value())
+        } else {
+            None
+        };
+        Ok(min_val)
+    }
+
     pub fn highest(&self) -> Result<u64> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(super::BATCHES_TABLE)?;
