@@ -2,7 +2,7 @@
 
 # Configuration
 RPC_URL="http://127.0.0.1:8545"
-START_HEIGHT=136000
+START_HEIGHT=167000
 
 # 1. Fetch the current tip height from the node
 STATE=$(curl -s -f "$RPC_URL/state")

@@ -140,7 +140,13 @@ impl RpcServer {
             .route("/mix/list", get(mix_list))
             .nest("/axe", axe_routes) 
             .route("/tx/by_input", post(get_tx_by_input))
-            .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB max request body
+            // 16 MB max request body. The binding case is /submit_batch, which posts a
+            // full block as JSON: blocks are legal up to MAX_BLOCK_BYTES (8 MB, node.rs),
+            // and hex/JSON encoding inflates that further, so a 2 MB cap silently killed
+            // large-but-legal submissions mid-stream (client saw a broken pipe, not a 413).
+            // 16 MB clears the worst legal block with headroom and also covers a maximal
+            // multi-KB-witness reveal near MAX_TX_INPUTS.
+            .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
             .layer(TimeoutLayer::new(Duration::from_secs(30))) // Forcefully drop stalled requests
             .layer(TraceLayer::new_for_http())
             .layer(cors)

@@ -382,6 +382,11 @@ enum WalletAction {
         rpc_host: String,
         #[arg(long)]
         address: String,
+        /// Skip the chain-side completeness check before sweeping. DANGEROUS: any
+        /// live coin at the address the wallet doesn't know about is burned forever
+        /// (spending a WOTS address is single-use). Only use if you accept that risk.
+        #[arg(long)]
+        force: bool,
     },
     /// Sweep highly-fragmented one-time WOTS coins across multiple addresses 
     /// into a fresh, reusable MSS destination.
@@ -1423,8 +1428,8 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         }
         WalletAction::Export { path, coin } => wallet_export(&path, &coin),
         WalletAction::Pending { path } => wallet_pending(&path),
-        WalletAction::Consolidate { path, rpc_port, rpc_host, address } => {
-            wallet_consolidate(&path, rpc_port, rpc_host, address).await
+        WalletAction::Consolidate { path, rpc_port, rpc_host, address, force } => {
+            wallet_consolidate(&path, rpc_port, rpc_host, address, force).await
         }
         WalletAction::Defrag { path, rpc_port, rpc_host, max_inputs, timeout } => {
             wallet_defrag(&path, rpc_port, rpc_host, max_inputs, timeout).await
@@ -1834,6 +1839,7 @@ async fn wallet_consolidate(
     rpc_port: u16,
     rpc_host: String,
     address_str: String,
+    force: bool,
 ) -> Result<()> {
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
@@ -1841,6 +1847,52 @@ async fn wallet_consolidate(
 
     let target_addr = midstate::core::types::parse_address_flexible(&address_str)
         .map_err(|e| anyhow::anyhow!(e))?;
+
+    // ── Chain-side completeness check (destructive-operation guard) ──
+    // Consolidate spends EVERY live coin at `target_addr` in one Reveal, which burns
+    // the WOTS address (single-use, enforced at consensus). If the wallet's local
+    // record is missing coins the chain actually holds — e.g. an incremental scan
+    // that never caught up — those coins are permanently unspendable the moment the
+    // sweep lands. So before building anything, scan the chain for exactly this
+    // address and import whatever we were missing. `targeted_scan` writes newly-found
+    // coins into the wallet, so anything discovered here is then included in the sweep
+    // below rather than stranded. --force skips the scan for offline/advanced use.
+    let base_url = format!("http://{}:{}", rpc_host, rpc_port);
+    if force {
+        tracing::warn!("--force set: skipping chain-side completeness check before consolidate");
+    } else {
+        let known_before = wallet.coins().iter().filter(|c| c.address == target_addr).count();
+        let chain_height = match client.get(format!("{}/state", base_url)).send().await {
+            Ok(resp) => match resp.json::<rpc::GetStateResponse>().await {
+                Ok(s) => s.height,
+                Err(e) => anyhow::bail!(
+                    "Could not read chain height to verify address completeness: {}. \
+                     Fix connectivity or re-run with --force to sweep only wallet-known coins (may burn the rest).", e
+                ),
+            },
+            Err(e) => anyhow::bail!(
+                "Could not reach node to verify address completeness: {}. \
+                 Fix connectivity or re-run with --force to sweep only wallet-known coins (may burn the rest).", e
+            ),
+        };
+
+        println!("Scanning chain for address {} before sweeping...", hex::encode(target_addr));
+        let targets = [target_addr];
+        let matching = filter_scan(&client, &base_url, &targets, 0, chain_height).await?;
+        let imported = targeted_scan(&client, &base_url, &mut wallet, &targets, &matching).await?;
+        if imported > 0 {
+            wallet.save()?;
+            println!(
+                "  Imported {} previously-unknown coin(s) at this address; they will be included in the sweep.",
+                imported
+            );
+        }
+        let known_after = wallet.coins().iter().filter(|c| c.address == target_addr).count();
+        println!(
+            "  Completeness check complete: wallet now holds {} coin(s) at this address (was {}).",
+            known_after, known_before
+        );
+    }
 
     // Find all live coins at this address
     let mut live_coins = Vec::new();
@@ -3267,9 +3319,25 @@ async fn wallet_reveal(
             wallet.complete_reveal(&commitment)?;
             println!("  {} — revealed ✓", hex::encode(&commitment));
         } else {
-            let error: rpc::ErrorResponse = response.json().await?;
-            
-            if error.error.contains("No matching commitment found") {
+            // Check the status and read the raw body BEFORE attempting to parse it as
+            // JSON. A body-size rejection (Axum's DefaultBodyLimit → 413) returns an
+            // empty, non-JSON body; blindly calling `.json()` on it yields an opaque
+            // "expected value at line 1 column 1" that hides the real cause. Try to
+            // decode the structured error, but fall back to the status + raw text.
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let error_msg = serde_json::from_str::<rpc::ErrorResponse>(&body)
+                .map(|e| e.error)
+                .unwrap_or_else(|_| {
+                    let trimmed = body.trim();
+                    if trimmed.is_empty() {
+                        format!("HTTP {} (empty body; likely a request-size limit)", status)
+                    } else {
+                        format!("HTTP {}: {}", status, trimmed)
+                    }
+                });
+
+            if error_msg.contains("No matching commitment found") {
                 // The commitment is gone. Did it actually confirm while we were timed out?
                 // Check if the first output of this pending commit exists on-chain.
                 if let Some(first_out) = pending.outputs.first().and_then(|o| o.coin_id()) {
@@ -3288,7 +3356,7 @@ async fn wallet_reveal(
                 }
             }
 
-            println!("  {} — failed: {}", hex::encode(&commitment), error.error);
+            println!("  {} — failed: {}", hex::encode(&commitment), error_msg);
         }
     }
     Ok(())

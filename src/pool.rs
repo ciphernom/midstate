@@ -474,8 +474,39 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_
     let db = Arc::new(Database::create("data/pool_stratum.redb").unwrap());
     
     let write_txn = db.begin_write().unwrap();
-    let _ = write_txn.open_table(SHARES_TABLE).unwrap();
-    let _ = write_txn.open_table(BLOCKS_TABLE).unwrap(); 
+    {
+        let mut shares = write_txn.open_table(SHARES_TABLE).unwrap();
+        let _ = write_txn.open_table(BLOCKS_TABLE).unwrap();
+
+        // ── One-off migration: purge stale zero-score rows ──
+        // Databases written by affected versions accumulated permanent `score == 0`
+        // rows (the deduction path used to write them back instead of removing them).
+        // The template builder now filters them on load, but purging heals existing
+        // DBs in place so the shares table matches what /pool/stats already shows
+        // (`s > 0`), and keeps redb from carrying dead keys forever. Collect first,
+        // then remove, to avoid mutating the table while its iterator is live.
+        let stale: Vec<[u8; 32]> = shares
+            .iter()
+            .unwrap()
+            .filter_map(|iter| {
+                let (addr, score) = iter.unwrap();
+                if score.value() == 0 {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(addr.value());
+                    Some(a)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let purged = stale.len();
+        for a in stale {
+            shares.remove(&a).unwrap();
+        }
+        if purged > 0 {
+            tracing::info!("purged {} stale zero-score address(es) from the shares table", purged);
+        }
+    }
     write_txn.commit().unwrap();
 
     let (job_notifier, _) = broadcast::channel(32);
@@ -620,16 +651,27 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_
                 // Clear the replay cache for the new block
                 state_clone.valid_shares.write().await.clear();
 
+                // Only positive-score rows are eligible for reward. A stale `score == 0`
+                // row (e.g. the pool fee address, or a miner whose score was fully
+                // consumed and never removed) contributes no work and MUST NOT enter the
+                // allocator: the greedy loop below drives active miners' simulated scores
+                // negative over a long coin decomposition, at which point a leaf sitting at
+                // exactly 0 becomes the highest remaining score and captures the tail of the
+                // distribution. Filtering here also keeps zero-score leaves out of the
+                // Merkle tree and the committed-score snapshot, so the precommitment only
+                // ever commits to addresses that actually worked the round.
                 let mut shares_vec = Vec::new();
                 let mut total_score = 0u128;
                 if let Ok(read_txn) = state_clone.db.begin_read() {
                     if let Ok(table) = read_txn.open_table(SHARES_TABLE) {
                         for iter in table.iter().unwrap() {
                             let (addr, score) = iter.unwrap();
+                            let s = score.value();
+                            if s == 0 { continue; }
                             let mut a = [0u8; 32];
                             a.copy_from_slice(addr.value());
-                            shares_vec.push((a, score.value()));
-                            total_score += score.value() as u128;
+                            shares_vec.push((a, s));
+                            total_score += s as u128;
                         }
                     }
                 }
@@ -903,8 +945,20 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                                             for cb in &batch.coinbase {
                                                                 let mut a = [0u8; 32]; a.copy_from_slice(&cb.address);
                                                                 let deduction = ((cb.value as u128 * total_score) / (total_reward as u128)) as u64;
-                                                                let current = table.get(&a).unwrap().map(|v| v.value()).unwrap_or(0);
-                                                                table.insert(&a, current.saturating_sub(deduction)).unwrap();
+                                                                // Deduct ONLY from rows that already exist, and delete a row once its
+                                                                // remaining score hits 0. Writing back `0.saturating_sub(d) = 0` for an
+                                                                // absent address (the pool fee address, or any coinbase output not in
+                                                                // SHARES_TABLE) is what previously seeded permanent zero-score rows; those
+                                                                // rows then leaked into the allocator and captured block rewards. redb has
+                                                                // no delete-if-absent, so guard the remove on the row existing.
+                                                                if let Some(current) = table.get(&a).unwrap().map(|v| v.value()) {
+                                                                    let remaining = current.saturating_sub(deduction);
+                                                                    if remaining > 0 {
+                                                                        table.insert(&a, remaining).unwrap();
+                                                                    } else {
+                                                                        table.remove(&a).unwrap();
+                                                                    }
+                                                                }
                                                                 
                                                                 // <--- Record payout for dashboard
                                                                 payouts.push(serde_json::json!({

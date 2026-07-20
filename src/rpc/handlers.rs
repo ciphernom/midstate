@@ -1496,7 +1496,13 @@ pub fn parse_reveal_json(value: serde_json::Value) -> Result<Transaction, String
     if req.inputs.is_empty() {
         return Err("Must provide at least one input".into());
     }
-    if req.signatures.len() != req.inputs.len() {
+    // Consolidate transactions carry exactly ONE aggregated witness covering ALL
+    // inputs (enforced below when the Transaction is built). The per-input count
+    // rule only applies to standard Reveals. This mirrors the identical exemption
+    // in `send_transaction`; without it here, any consolidate with >1 input is
+    // rejected on the light-protocol path before the consolidate branch is reached,
+    // making the two checks mutually unsatisfiable.
+    if !req.is_consolidate && req.signatures.len() != req.inputs.len() {
         return Err("Signature count must match input count".into());
     }
 

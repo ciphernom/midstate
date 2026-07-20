@@ -171,8 +171,11 @@ globalThis.self.postMessage = (msg) => {
     }
 };
 
-// Deliver a message TO the worker exactly as the browser would.
-const send = (type, payload) => globalThis.self.onmessage({ data: { type, payload } });
+// Deliver a message TO the worker as the browser would — ASYNCHRONOUSLY.
+// Real Worker postMessage is never synchronous; a direct call here races ahead
+// of waitFor() for replies the worker sends without awaiting (e.g. GENERATE →
+// PHRASE_GENERATED fires before the listener registers).
+const send = (type, payload) => queueMicrotask(() => globalThis.self.onmessage({ data: { type, payload } }));
 
 // HTTP RPC — the exact endpoint mapping from index.html's handleRpcRequest,
 // HTTPS paths only (no light client). Mining methods are intentionally absent.
