@@ -1,0 +1,4 @@
+Inter (c) The Inter Project Authors — https://github.com/rsms/inter
+JetBrains Mono (c) JetBrains — https://github.com/JetBrains/JetBrainsMono
+Both licensed under the SIL Open Font License 1.1 and embedded in the
+midstate-desktop binary under its terms.

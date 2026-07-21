@@ -16,3 +16,6 @@ pub mod gpu_mining;
 pub use finality::*;
 pub use types::*;
 pub use state::adjust_difficulty;
+
+// Q-Bolt v2 payment channels (shared by native + wasm wallets).
+pub mod channel;

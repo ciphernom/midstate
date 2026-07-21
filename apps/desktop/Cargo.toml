@@ -1,0 +1,28 @@
+[package]
+name = "midstate-desktop"
+version = "0.2.0"
+edition = "2021"
+description = "Midstate Desktop — native full-node wallet (egui). No webview, no npm."
+
+[dependencies]
+midstate-walletd = { path = "../../crates/walletd" }
+
+# glow (OpenGL) backend on purpose: the midstate crate already ships wgpu 29
+# for GPU mining, and letting eframe pin its own wgpu would compile a second
+# wgpu major side by side. glow sidesteps that entirely.
+eframe = { version = "0.31", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "accesskit",
+    "x11",
+    "wayland",
+] }
+
+qrcode = { version = "0.14", default-features = false }
+tokio = { version = "1.35", features = ["full"] }
+rand = "0.8"
+hex = "0.4"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "5.0"

@@ -1,0 +1,1006 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="500" height="500" viewBox="0 0 500 500">
+<circle cx="250.0" cy="250.0" r="250.0" fill="#050505" />
+<circle cx="250.0" cy="250.0" r="248.0" fill="none" stroke="#00FF41" stroke-width="1.5" />
+<circle cx="250.0" cy="250.0" r="80" fill="none" stroke="#00FF41" stroke-width="1.5" />
+<rect x="195.0" y="210.0" width="10" height="10" fill="#00FF41" />
+<rect x="205.0" y="210.0" width="10" height="10" fill="#00FF41" />
+<rect x="215.0" y="210.0" width="10" height="10" fill="#00FF41" />
+<rect x="275.0" y="210.0" width="10" height="10" fill="#00FF41" />
+<rect x="285.0" y="210.0" width="10" height="10" fill="#00FF41" />
+<rect x="295.0" y="210.0" width="10" height="10" fill="#00FF41" />
+<rect x="195.0" y="220.0" width="10" height="10" fill="#00FF41" />
+<rect x="205.0" y="220.0" width="10" height="10" fill="#00FF41" />
+<rect x="215.0" y="220.0" width="10" height="10" fill="#00FF41" />
+<rect x="225.0" y="220.0" width="10" height="10" fill="#00FF41" />
+<rect x="265.0" y="220.0" width="10" height="10" fill="#00FF41" />
+<rect x="275.0" y="220.0" width="10" height="10" fill="#00FF41" />
+<rect x="285.0" y="220.0" width="10" height="10" fill="#00FF41" />
+<rect x="295.0" y="220.0" width="10" height="10" fill="#00FF41" />
+<rect x="195.0" y="230.0" width="10" height="10" fill="#00FF41" />
+<rect x="205.0" y="230.0" width="10" height="10" fill="#00FF41" />
+<rect x="215.0" y="230.0" width="10" height="10" fill="#00FF41" />
+<rect x="225.0" y="230.0" width="10" height="10" fill="#00FF41" />
+<rect x="235.0" y="230.0" width="10" height="10" fill="#00FF41" />
+<rect x="255.0" y="230.0" width="10" height="10" fill="#00FF41" />
+<rect x="265.0" y="230.0" width="10" height="10" fill="#00FF41" />
+<rect x="275.0" y="230.0" width="10" height="10" fill="#00FF41" />
+<rect x="285.0" y="230.0" width="10" height="10" fill="#00FF41" />
+<rect x="295.0" y="230.0" width="10" height="10" fill="#00FF41" />
+<rect x="195.0" y="240.0" width="10" height="10" fill="#00FF41" />
+<rect x="205.0" y="240.0" width="10" height="10" fill="#00FF41" />
+<rect x="215.0" y="240.0" width="10" height="10" fill="#00FF41" />
+<rect x="235.0" y="240.0" width="10" height="10" fill="#00FF41" />
+<rect x="245.0" y="240.0" width="10" height="10" fill="#00FF41" />
+<rect x="255.0" y="240.0" width="10" height="10" fill="#00FF41" />
+<rect x="275.0" y="240.0" width="10" height="10" fill="#00FF41" />
+<rect x="285.0" y="240.0" width="10" height="10" fill="#00FF41" />
+<rect x="295.0" y="240.0" width="10" height="10" fill="#00FF41" />
+<rect x="195.0" y="250.0" width="10" height="10" fill="#00FF41" />
+<rect x="205.0" y="250.0" width="10" height="10" fill="#00FF41" />
+<rect x="215.0" y="250.0" width="10" height="10" fill="#00FF41" />
+<rect x="245.0" y="250.0" width="10" height="10" fill="#00FF41" />
+<rect x="275.0" y="250.0" width="10" height="10" fill="#00FF41" />
+<rect x="285.0" y="250.0" width="10" height="10" fill="#00FF41" />
+<rect x="295.0" y="250.0" width="10" height="10" fill="#00FF41" />
+<rect x="195.0" y="260.0" width="10" height="10" fill="#00FF41" />
+<rect x="205.0" y="260.0" width="10" height="10" fill="#00FF41" />
+<rect x="215.0" y="260.0" width="10" height="10" fill="#00FF41" />
+<rect x="275.0" y="260.0" width="10" height="10" fill="#00FF41" />
+<rect x="285.0" y="260.0" width="10" height="10" fill="#00FF41" />
+<rect x="295.0" y="260.0" width="10" height="10" fill="#00FF41" />
+<rect x="195.0" y="270.0" width="10" height="10" fill="#00FF41" />
+<rect x="205.0" y="270.0" width="10" height="10" fill="#00FF41" />
+<rect x="215.0" y="270.0" width="10" height="10" fill="#00FF41" />
+<rect x="275.0" y="270.0" width="10" height="10" fill="#00FF41" />
+<rect x="285.0" y="270.0" width="10" height="10" fill="#00FF41" />
+<rect x="295.0" y="270.0" width="10" height="10" fill="#00FF41" />
+<rect x="195.0" y="280.0" width="10" height="10" fill="#00FF41" />
+<rect x="205.0" y="280.0" width="10" height="10" fill="#00FF41" />
+<rect x="215.0" y="280.0" width="10" height="10" fill="#00FF41" />
+<rect x="275.0" y="280.0" width="10" height="10" fill="#00FF41" />
+<rect x="285.0" y="280.0" width="10" height="10" fill="#00FF41" />
+<rect x="295.0" y="280.0" width="10" height="10" fill="#00FF41" />
+<style>
+  text { font-family: "Courier New", monospace; font-weight: bold; fill: #00FF41; }
+</style>
+<text x="340.00" y="250.00" font-size="14" text-anchor="middle" transform="rotate(90.00, 340.00, 250.00)">s</text>
+<text x="339.85" y="258.76" font-size="14" text-anchor="middle" transform="rotate(95.57, 339.85, 258.76)">e</text>
+<text x="338.85" y="267.47" font-size="14" text-anchor="middle" transform="rotate(101.12, 338.85, 267.47)">c</text>
+<text x="337.02" y="276.04" font-size="14" text-anchor="middle" transform="rotate(106.66, 337.02, 276.04)">t</text>
+<text x="334.37" y="284.39" font-size="14" text-anchor="middle" transform="rotate(112.18, 334.37, 284.39)">i</text>
+<text x="330.92" y="292.45" font-size="14" text-anchor="middle" transform="rotate(117.68, 330.92, 292.45)">o</text>
+<text x="326.72" y="300.15" font-size="14" text-anchor="middle" transform="rotate(123.17, 326.72, 300.15)">n</text>
+<text x="321.81" y="307.40" font-size="14" text-anchor="middle" transform="rotate(128.64, 321.81, 307.40)"> </text>
+<text x="316.22" y="314.16" font-size="14" text-anchor="middle" transform="rotate(134.09, 316.22, 314.16)">.</text>
+<text x="310.02" y="320.35" font-size="14" text-anchor="middle" transform="rotate(139.53, 310.02, 320.35)">d</text>
+<text x="303.26" y="325.93" font-size="14" text-anchor="middle" transform="rotate(144.95, 303.26, 325.93)">a</text>
+<text x="296.01" y="330.84" font-size="14" text-anchor="middle" transform="rotate(150.35, 296.01, 330.84)">t</text>
+<text x="288.32" y="335.05" font-size="14" text-anchor="middle" transform="rotate(155.74, 288.32, 335.05)">a</text>
+<text x="280.28" y="338.52" font-size="14" text-anchor="middle" transform="rotate(161.12, 280.28, 338.52)"> </text>
+<text x="271.94" y="341.22" font-size="14" text-anchor="middle" transform="rotate(166.48, 271.94, 341.22)">;</text>
+<text x="263.39" y="343.13" font-size="14" text-anchor="middle" transform="rotate(171.82, 263.39, 343.13)"> </text>
+<text x="254.69" y="344.24" font-size="14" text-anchor="middle" transform="rotate(177.15, 254.69, 344.24)">L</text>
+<text x="245.94" y="344.54" font-size="14" text-anchor="middle" transform="rotate(182.46, 245.94, 344.54)">o</text>
+<text x="237.19" y="344.02" font-size="14" text-anchor="middle" transform="rotate(187.76, 237.19, 344.02)">c</text>
+<text x="228.52" y="342.70" font-size="14" text-anchor="middle" transform="rotate(193.04, 228.52, 342.70)">a</text>
+<text x="220.02" y="340.58" font-size="14" text-anchor="middle" transform="rotate(198.31, 220.02, 340.58)">l</text>
+<text x="211.75" y="337.70" font-size="14" text-anchor="middle" transform="rotate(203.57, 211.75, 337.70)">-</text>
+<text x="203.77" y="334.07" font-size="14" text-anchor="middle" transform="rotate(208.81, 203.77, 334.07)">F</text>
+<text x="196.16" y="329.72" font-size="14" text-anchor="middle" transform="rotate(214.03, 196.16, 329.72)">i</text>
+<text x="188.98" y="324.71" font-size="14" text-anchor="middle" transform="rotate(219.24, 188.98, 324.71)">r</text>
+<text x="182.28" y="319.06" font-size="14" text-anchor="middle" transform="rotate(224.44, 182.28, 319.06)">s</text>
+<text x="176.12" y="312.82" font-size="14" text-anchor="middle" transform="rotate(229.62, 176.12, 312.82)">t</text>
+<text x="170.55" y="306.06" font-size="14" text-anchor="middle" transform="rotate(234.79, 170.55, 306.06)">,</text>
+<text x="165.61" y="298.82" font-size="14" text-anchor="middle" transform="rotate(239.95, 165.61, 298.82)"> </text>
+<text x="161.34" y="291.17" font-size="14" text-anchor="middle" transform="rotate(245.09, 161.34, 291.17)">S</text>
+<text x="157.77" y="283.17" font-size="14" text-anchor="middle" transform="rotate(250.22, 157.77, 283.17)">o</text>
+<text x="154.93" y="274.88" font-size="14" text-anchor="middle" transform="rotate(255.33, 154.93, 274.88)">v</text>
+<text x="152.85" y="266.37" font-size="14" text-anchor="middle" transform="rotate(260.44, 152.85, 266.37)">e</text>
+<text x="151.52" y="257.71" font-size="14" text-anchor="middle" transform="rotate(265.53, 151.52, 257.71)">r</text>
+<text x="150.98" y="248.96" font-size="14" text-anchor="middle" transform="rotate(270.60, 150.98, 248.96)">e</text>
+<text x="151.20" y="240.20" font-size="14" text-anchor="middle" transform="rotate(275.66, 151.20, 240.20)">i</text>
+<text x="152.20" y="231.50" font-size="14" text-anchor="middle" transform="rotate(280.71, 152.20, 231.50)">g</text>
+<text x="153.96" y="222.91" font-size="14" text-anchor="middle" transform="rotate(285.75, 153.96, 222.91)">n</text>
+<text x="156.47" y="214.52" font-size="14" text-anchor="middle" transform="rotate(290.77, 156.47, 214.52)">t</text>
+<text x="159.70" y="206.37" font-size="14" text-anchor="middle" transform="rotate(295.79, 159.70, 206.37)">y</text>
+<text x="163.63" y="198.54" font-size="14" text-anchor="middle" transform="rotate(300.78, 163.63, 198.54)">,</text>
+<text x="168.22" y="191.08" font-size="14" text-anchor="middle" transform="rotate(305.77, 168.22, 191.08)"> </text>
+<text x="173.45" y="184.05" font-size="14" text-anchor="middle" transform="rotate(310.74, 173.45, 184.05)">C</text>
+<text x="179.27" y="177.50" font-size="14" text-anchor="middle" transform="rotate(315.71, 179.27, 177.50)">i</text>
+<text x="185.63" y="171.48" font-size="14" text-anchor="middle" transform="rotate(320.66, 185.63, 171.48)">p</text>
+<text x="192.49" y="166.03" font-size="14" text-anchor="middle" transform="rotate(325.59, 192.49, 166.03)">h</text>
+<text x="199.79" y="161.18" font-size="14" text-anchor="middle" transform="rotate(330.52, 199.79, 161.18)">e</text>
+<text x="207.48" y="156.99" font-size="14" text-anchor="middle" transform="rotate(335.43, 207.48, 156.99)">r</text>
+<text x="215.50" y="153.46" font-size="14" text-anchor="middle" transform="rotate(340.34, 215.50, 153.46)">n</text>
+<text x="223.80" y="150.64" font-size="14" text-anchor="middle" transform="rotate(345.23, 223.80, 150.64)">o</text>
+<text x="232.30" y="148.53" font-size="14" text-anchor="middle" transform="rotate(350.10, 232.30, 148.53)">m</text>
+<text x="240.95" y="147.15" font-size="14" text-anchor="middle" transform="rotate(354.97, 240.95, 147.15)"> </text>
+<text x="249.69" y="146.51" font-size="14" text-anchor="middle" transform="rotate(359.83, 249.69, 146.51)">;</text>
+<text x="258.45" y="146.61" font-size="14" text-anchor="middle" transform="rotate(364.67, 258.45, 146.61)"> </text>
+<text x="267.17" y="147.45" font-size="14" text-anchor="middle" transform="rotate(369.50, 267.17, 147.45)">S</text>
+<text x="275.79" y="149.02" font-size="14" text-anchor="middle" transform="rotate(374.33, 275.79, 149.02)">E</text>
+<text x="284.24" y="151.32" font-size="14" text-anchor="middle" transform="rotate(379.14, 284.24, 151.32)">C</text>
+<text x="292.48" y="154.31" font-size="14" text-anchor="middle" transform="rotate(383.94, 292.48, 154.31)">:</text>
+<text x="300.43" y="157.98" font-size="14" text-anchor="middle" transform="rotate(388.72, 300.43, 157.98)"> </text>
+<text x="308.05" y="162.30" font-size="14" text-anchor="middle" transform="rotate(393.50, 308.05, 162.30)">q</text>
+<text x="315.29" y="167.24" font-size="14" text-anchor="middle" transform="rotate(398.27, 315.29, 167.24)">u</text>
+<text x="322.09" y="172.76" font-size="14" text-anchor="middle" transform="rotate(403.03, 322.09, 172.76)">a</text>
+<text x="328.41" y="178.83" font-size="14" text-anchor="middle" transform="rotate(407.77, 328.41, 178.83)">n</text>
+<text x="334.20" y="185.40" font-size="14" text-anchor="middle" transform="rotate(412.50, 334.20, 185.40)">t</text>
+<text x="339.43" y="192.43" font-size="14" text-anchor="middle" transform="rotate(417.23, 339.43, 192.43)">u</text>
+<text x="344.07" y="199.86" font-size="14" text-anchor="middle" transform="rotate(421.94, 344.07, 199.86)">m</text>
+<text x="348.08" y="207.65" font-size="14" text-anchor="middle" transform="rotate(426.65, 348.08, 207.65)">-</text>
+<text x="351.44" y="215.74" font-size="14" text-anchor="middle" transform="rotate(431.34, 351.44, 215.74)">r</text>
+<text x="354.12" y="224.08" font-size="14" text-anchor="middle" transform="rotate(436.02, 354.12, 224.08)">e</text>
+<text x="356.12" y="232.61" font-size="14" text-anchor="middle" transform="rotate(440.69, 356.12, 232.61)">s</text>
+<text x="357.41" y="241.27" font-size="14" text-anchor="middle" transform="rotate(445.36, 357.41, 241.27)">i</text>
+<text x="358.00" y="250.01" font-size="14" text-anchor="middle" transform="rotate(450.01, 358.00, 250.01)">s</text>
+<text x="357.88" y="258.77" font-size="14" text-anchor="middle" transform="rotate(454.65, 357.88, 258.77)">t</text>
+<text x="357.04" y="267.49" font-size="14" text-anchor="middle" transform="rotate(459.28, 357.04, 267.49)">a</text>
+<text x="355.51" y="276.12" font-size="14" text-anchor="middle" transform="rotate(463.90, 355.51, 276.12)">n</text>
+<text x="353.29" y="284.59" font-size="14" text-anchor="middle" transform="rotate(468.52, 353.29, 284.59)">t</text>
+<text x="350.39" y="292.86" font-size="14" text-anchor="middle" transform="rotate(473.12, 350.39, 292.86)"> </text>
+<text x="346.84" y="300.87" font-size="14" text-anchor="middle" transform="rotate(477.71, 346.84, 300.87)">/</text>
+<text x="342.66" y="308.56" font-size="14" text-anchor="middle" transform="rotate(482.29, 342.66, 308.56)"> </text>
+<text x="337.88" y="315.90" font-size="14" text-anchor="middle" transform="rotate(486.87, 337.88, 315.90)">b</text>
+<text x="332.53" y="322.84" font-size="14" text-anchor="middle" transform="rotate(491.43, 332.53, 322.84)">l</text>
+<text x="326.64" y="329.32" font-size="14" text-anchor="middle" transform="rotate(495.99, 326.64, 329.32)">a</text>
+<text x="320.26" y="335.32" font-size="14" text-anchor="middle" transform="rotate(500.53, 320.26, 335.32)">k</text>
+<text x="313.42" y="340.80" font-size="14" text-anchor="middle" transform="rotate(505.07, 313.42, 340.80)">e</text>
+<text x="306.17" y="345.72" font-size="14" text-anchor="middle" transform="rotate(509.59, 306.17, 345.72)">3</text>
+<text x="298.55" y="350.05" font-size="14" text-anchor="middle" transform="rotate(514.11, 298.55, 350.05)"> </text>
+<text x="290.62" y="353.76" font-size="14" text-anchor="middle" transform="rotate(518.62, 290.62, 353.76)">h</text>
+<text x="282.42" y="356.84" font-size="14" text-anchor="middle" transform="rotate(523.12, 282.42, 356.84)">a</text>
+<text x="274.01" y="359.27" font-size="14" text-anchor="middle" transform="rotate(527.61, 274.01, 359.27)">s</text>
+<text x="265.43" y="361.04" font-size="14" text-anchor="middle" transform="rotate(532.09, 265.43, 361.04)">h</text>
+<text x="256.74" y="362.13" font-size="14" text-anchor="middle" transform="rotate(536.56, 256.74, 362.13)">i</text>
+<text x="247.99" y="362.53" font-size="14" text-anchor="middle" transform="rotate(541.03, 247.99, 362.53)">n</text>
+<text x="239.23" y="362.26" font-size="14" text-anchor="middle" transform="rotate(545.48, 239.23, 362.26)">g</text>
+<text x="230.52" y="361.31" font-size="14" text-anchor="middle" transform="rotate(549.93, 230.52, 361.31)"> </text>
+<text x="221.92" y="359.68" font-size="14" text-anchor="middle" transform="rotate(554.36, 221.92, 359.68)">g</text>
+<text x="213.46" y="357.39" font-size="14" text-anchor="middle" transform="rotate(558.79, 213.46, 357.39)">l</text>
+<text x="205.21" y="354.46" font-size="14" text-anchor="middle" transform="rotate(563.21, 205.21, 354.46)">y</text>
+<text x="197.20" y="350.90" font-size="14" text-anchor="middle" transform="rotate(567.62, 197.20, 350.90)">p</text>
+<text x="189.50" y="346.74" font-size="14" text-anchor="middle" transform="rotate(572.02, 189.50, 346.74)">h</text>
+<text x="182.13" y="342.00" font-size="14" text-anchor="middle" transform="rotate(576.42, 182.13, 342.00)"> </text>
+<text x="175.15" y="336.70" font-size="14" text-anchor="middle" transform="rotate(580.80, 175.15, 336.70)">d</text>
+<text x="168.60" y="330.89" font-size="14" text-anchor="middle" transform="rotate(585.18, 168.60, 330.89)">b</text>
+<text x="162.51" y="324.60" font-size="14" text-anchor="middle" transform="rotate(589.55, 162.51, 324.60)"> </text>
+<text x="156.91" y="317.86" font-size="14" text-anchor="middle" transform="rotate(593.91, 156.91, 317.86)">"</text>
+<text x="151.85" y="310.72" font-size="14" text-anchor="middle" transform="rotate(598.26, 151.85, 310.72)"> </text>
+<text x="147.34" y="303.21" font-size="14" text-anchor="middle" transform="rotate(602.60, 147.34, 303.21)">.</text>
+<text x="143.41" y="295.38" font-size="14" text-anchor="middle" transform="rotate(606.94, 143.41, 295.38)">O</text>
+<text x="140.09" y="287.27" font-size="14" text-anchor="middle" transform="rotate(611.27, 140.09, 287.27)">.</text>
+<text x="137.38" y="278.94" font-size="14" text-anchor="middle" transform="rotate(615.59, 137.38, 278.94)">"</text>
+<text x="135.31" y="270.43" font-size="14" text-anchor="middle" transform="rotate(619.90, 135.31, 270.43)">,</text>
+<text x="133.89" y="261.79" font-size="14" text-anchor="middle" transform="rotate(624.20, 133.89, 261.79)"> </text>
+<text x="133.12" y="253.07" font-size="14" text-anchor="middle" transform="rotate(628.50, 133.12, 253.07)">0</text>
+<text x="133.00" y="244.31" font-size="14" text-anchor="middle" transform="rotate(632.78, 133.00, 244.31)">x</text>
+<text x="133.54" y="235.57" font-size="14" text-anchor="middle" transform="rotate(637.06, 133.54, 235.57)">a</text>
+<text x="134.73" y="226.89" font-size="14" text-anchor="middle" transform="rotate(641.34, 134.73, 226.89)">,</text>
+<text x="136.56" y="218.32" font-size="14" text-anchor="middle" transform="rotate(645.60, 136.56, 218.32)"> </text>
+<text x="139.02" y="209.92" font-size="14" text-anchor="middle" transform="rotate(649.86, 139.02, 209.92)">"</text>
+<text x="142.10" y="201.72" font-size="14" text-anchor="middle" transform="rotate(654.11, 142.10, 201.72)"> </text>
+<text x="145.78" y="193.77" font-size="14" text-anchor="middle" transform="rotate(658.35, 145.78, 193.77)">.</text>
+<text x="150.04" y="186.12" font-size="14" text-anchor="middle" transform="rotate(662.58, 150.04, 186.12)">.</text>
+<text x="154.85" y="178.80" font-size="14" text-anchor="middle" transform="rotate(666.81, 154.85, 178.80)">O</text>
+<text x="160.19" y="171.85" font-size="14" text-anchor="middle" transform="rotate(671.03, 160.19, 171.85)">"</text>
+<text x="166.02" y="165.32" font-size="14" text-anchor="middle" transform="rotate(675.24, 166.02, 165.32)">,</text>
+<text x="172.32" y="159.23" font-size="14" text-anchor="middle" transform="rotate(679.44, 172.32, 159.23)"> </text>
+<text x="179.04" y="153.62" font-size="14" text-anchor="middle" transform="rotate(683.64, 179.04, 153.62)">0</text>
+<text x="186.16" y="148.52" font-size="14" text-anchor="middle" transform="rotate(687.83, 186.16, 148.52)">x</text>
+<text x="193.63" y="143.95" font-size="14" text-anchor="middle" transform="rotate(692.01, 193.63, 143.95)">a</text>
+<text x="201.41" y="139.94" font-size="14" text-anchor="middle" transform="rotate(696.18, 201.41, 139.94)">,</text>
+<text x="209.47" y="136.50" font-size="14" text-anchor="middle" transform="rotate(700.35, 209.47, 136.50)"> </text>
+<text x="217.76" y="133.66" font-size="14" text-anchor="middle" transform="rotate(704.51, 217.76, 133.66)">"</text>
+<text x="226.22" y="131.43" font-size="14" text-anchor="middle" transform="rotate(708.66, 226.22, 131.43)"> </text>
+<text x="234.83" y="129.81" font-size="14" text-anchor="middle" transform="rotate(712.81, 234.83, 129.81)">O</text>
+<text x="243.53" y="128.83" font-size="14" text-anchor="middle" transform="rotate(716.95, 243.53, 128.83)">O</text>
+<text x="252.28" y="128.47" font-size="14" text-anchor="middle" transform="rotate(721.08, 252.28, 128.47)">O</text>
+<text x="261.04" y="128.74" font-size="14" text-anchor="middle" transform="rotate(725.20, 261.04, 128.74)">"</text>
+<text x="269.75" y="129.64" font-size="14" text-anchor="middle" transform="rotate(729.32, 269.75, 129.64)">,</text>
+<text x="278.37" y="131.17" font-size="14" text-anchor="middle" transform="rotate(733.43, 278.37, 131.17)"> </text>
+<text x="286.87" y="133.31" font-size="14" text-anchor="middle" transform="rotate(737.53, 286.87, 133.31)">0</text>
+<text x="295.18" y="136.05" font-size="14" text-anchor="middle" transform="rotate(741.63, 295.18, 136.05)">x</text>
+<text x="303.28" y="139.38" font-size="14" text-anchor="middle" transform="rotate(745.72, 303.28, 139.38)">a</text>
+<text x="311.13" y="143.28" font-size="14" text-anchor="middle" transform="rotate(749.80, 311.13, 143.28)"> </text>
+<text x="318.67" y="147.72" font-size="14" text-anchor="middle" transform="rotate(753.88, 318.67, 147.72)">l</text>
+<text x="325.88" y="152.69" font-size="14" text-anchor="middle" transform="rotate(757.95, 325.88, 152.69)">e</text>
+<text x="332.72" y="158.16" font-size="14" text-anchor="middle" transform="rotate(762.01, 332.72, 158.16)">n</text>
+<text x="339.16" y="164.10" font-size="14" text-anchor="middle" transform="rotate(766.07, 339.16, 164.10)"> </text>
+<text x="345.16" y="170.48" font-size="14" text-anchor="middle" transform="rotate(770.12, 345.16, 170.48)">e</text>
+<text x="350.69" y="177.27" font-size="14" text-anchor="middle" transform="rotate(774.16, 350.69, 177.27)">q</text>
+<text x="355.73" y="184.43" font-size="14" text-anchor="middle" transform="rotate(778.20, 355.73, 184.43)">u</text>
+<text x="360.25" y="191.93" font-size="14" text-anchor="middle" transform="rotate(782.23, 360.25, 191.93)"> </text>
+<text x="364.24" y="199.73" font-size="14" text-anchor="middle" transform="rotate(786.25, 364.24, 199.73)">$</text>
+<text x="367.67" y="207.79" font-size="14" text-anchor="middle" transform="rotate(790.27, 367.67, 207.79)"> </text>
+<text x="370.53" y="216.07" font-size="14" text-anchor="middle" transform="rotate(794.28, 370.53, 216.07)">-</text>
+<text x="372.80" y="224.52" font-size="14" text-anchor="middle" transform="rotate(798.28, 372.80, 224.52)"> </text>
+<text x="374.47" y="233.12" font-size="14" text-anchor="middle" transform="rotate(802.28, 374.47, 233.12)">g</text>
+<text x="375.55" y="241.81" font-size="14" text-anchor="middle" transform="rotate(806.27, 375.55, 241.81)">l</text>
+<text x="376.01" y="250.56" font-size="14" text-anchor="middle" transform="rotate(810.25, 376.01, 250.56)">y</text>
+<text x="375.87" y="259.31" font-size="14" text-anchor="middle" transform="rotate(814.23, 375.87, 259.31)">p</text>
+<text x="375.12" y="268.04" font-size="14" text-anchor="middle" transform="rotate(818.20, 375.12, 268.04)">h</text>
+<text x="373.76" y="276.69" font-size="14" text-anchor="middle" transform="rotate(822.17, 373.76, 276.69)"> </text>
+<text x="371.82" y="285.23" font-size="14" text-anchor="middle" transform="rotate(826.13, 371.82, 285.23)">s</text>
+<text x="369.28" y="293.61" font-size="14" text-anchor="middle" transform="rotate(830.08, 369.28, 293.61)">e</text>
+<text x="366.18" y="301.80" font-size="14" text-anchor="middle" transform="rotate(834.03, 366.18, 301.80)">c</text>
+<text x="362.52" y="309.75" font-size="14" text-anchor="middle" transform="rotate(837.97, 362.52, 309.75)">t</text>
+<text x="358.32" y="317.44" font-size="14" text-anchor="middle" transform="rotate(841.91, 358.32, 317.44)">i</text>
+<text x="353.60" y="324.82" font-size="14" text-anchor="middle" transform="rotate(845.84, 353.60, 324.82)">o</text>
+<text x="348.39" y="331.86" font-size="14" text-anchor="middle" transform="rotate(849.76, 348.39, 331.86)">n</text>
+<text x="342.71" y="338.52" font-size="14" text-anchor="middle" transform="rotate(853.68, 342.71, 338.52)"> </text>
+<text x="336.59" y="344.78" font-size="14" text-anchor="middle" transform="rotate(857.59, 336.59, 344.78)">.</text>
+<text x="330.05" y="350.61" font-size="14" text-anchor="middle" transform="rotate(861.49, 330.05, 350.61)">t</text>
+<text x="323.14" y="355.98" font-size="14" text-anchor="middle" transform="rotate(865.39, 323.14, 355.98)">e</text>
+<text x="315.87" y="360.87" font-size="14" text-anchor="middle" transform="rotate(869.28, 315.87, 360.87)">x</text>
+<text x="308.29" y="365.26" font-size="14" text-anchor="middle" transform="rotate(873.17, 308.29, 365.26)">t</text>
+<text x="300.43" y="369.12" font-size="14" text-anchor="middle" transform="rotate(877.05, 300.43, 369.12)"> </text>
+<text x="292.33" y="372.44" font-size="14" text-anchor="middle" transform="rotate(880.93, 292.33, 372.44)">g</text>
+<text x="284.02" y="375.20" font-size="14" text-anchor="middle" transform="rotate(884.80, 284.02, 375.20)">l</text>
+<text x="275.54" y="377.40" font-size="14" text-anchor="middle" transform="rotate(888.66, 275.54, 377.40)">o</text>
+<text x="266.94" y="379.02" font-size="14" text-anchor="middle" transform="rotate(892.52, 266.94, 379.02)">b</text>
+<text x="258.24" y="380.06" font-size="14" text-anchor="middle" transform="rotate(896.37, 258.24, 380.06)">a</text>
+<text x="249.49" y="380.51" font-size="14" text-anchor="middle" transform="rotate(900.22, 249.49, 380.51)">l</text>
+<text x="240.74" y="380.37" font-size="14" text-anchor="middle" transform="rotate(904.06, 240.74, 380.37)"> </text>
+<text x="232.01" y="379.65" font-size="14" text-anchor="middle" transform="rotate(907.90, 232.01, 379.65)">_</text>
+<text x="223.35" y="378.35" font-size="14" text-anchor="middle" transform="rotate(911.73, 223.35, 378.35)">s</text>
+<text x="214.80" y="376.47" font-size="14" text-anchor="middle" transform="rotate(915.55, 214.80, 376.47)">t</text>
+<text x="206.39" y="374.03" font-size="14" text-anchor="middle" transform="rotate(919.37, 206.39, 374.03)">a</text>
+<text x="198.16" y="371.03" font-size="14" text-anchor="middle" transform="rotate(923.19, 198.16, 371.03)">r</text>
+<text x="190.15" y="367.49" font-size="14" text-anchor="middle" transform="rotate(926.99, 190.15, 367.49)">t</text>
+<text x="182.40" y="363.42" font-size="14" text-anchor="middle" transform="rotate(930.80, 182.40, 363.42)"> </text>
+<text x="174.93" y="358.85" font-size="14" text-anchor="middle" transform="rotate(934.59, 174.93, 358.85)">_</text>
+<text x="167.78" y="353.80" font-size="14" text-anchor="middle" transform="rotate(938.38, 167.78, 353.80)">s</text>
+<text x="160.98" y="348.28" font-size="14" text-anchor="middle" transform="rotate(942.17, 160.98, 348.28)">t</text>
+<text x="154.55" y="342.33" font-size="14" text-anchor="middle" transform="rotate(945.95, 154.55, 342.33)">a</text>
+<text x="148.54" y="335.97" font-size="14" text-anchor="middle" transform="rotate(949.73, 148.54, 335.97)">r</text>
+<text x="142.95" y="329.22" font-size="14" text-anchor="middle" transform="rotate(953.50, 142.95, 329.22)">t</text>
+<text x="137.82" y="322.13" font-size="14" text-anchor="middle" transform="rotate(957.26, 137.82, 322.13)">:</text>
+<text x="133.17" y="314.71" font-size="14" text-anchor="middle" transform="rotate(961.02, 133.17, 314.71)"> </text>
+<text x="129.02" y="307.00" font-size="14" text-anchor="middle" transform="rotate(964.77, 129.02, 307.00)">;</text>
+<text x="125.37" y="299.04" font-size="14" text-anchor="middle" transform="rotate(968.52, 125.37, 299.04)"> </text>
+<text x="122.26" y="290.85" font-size="14" text-anchor="middle" transform="rotate(972.27, 122.26, 290.85)">s</text>
+<text x="119.69" y="282.48" font-size="14" text-anchor="middle" transform="rotate(976.00, 119.69, 282.48)">y</text>
+<text x="117.67" y="273.96" font-size="14" text-anchor="middle" transform="rotate(979.74, 117.67, 273.96)">s</text>
+<text x="116.20" y="265.33" font-size="14" text-anchor="middle" transform="rotate(983.46, 116.20, 265.33)">_</text>
+<text x="115.30" y="256.62" font-size="14" text-anchor="middle" transform="rotate(987.19, 115.30, 256.62)">w</text>
+<text x="114.97" y="247.87" font-size="14" text-anchor="middle" transform="rotate(990.90, 114.97, 247.87)">r</text>
+<text x="115.21" y="239.12" font-size="14" text-anchor="middle" transform="rotate(994.62, 115.21, 239.12)">i</text>
+<text x="116.01" y="230.40" font-size="14" text-anchor="middle" transform="rotate(998.32, 116.01, 230.40)">t</text>
+<text x="117.37" y="221.75" font-size="14" text-anchor="middle" transform="rotate(1002.03, 117.37, 221.75)">e</text>
+<text x="119.29" y="213.20" font-size="14" text-anchor="middle" transform="rotate(1005.72, 119.29, 213.20)">(</text>
+<text x="121.76" y="204.80" font-size="14" text-anchor="middle" transform="rotate(1009.42, 121.76, 204.80)">s</text>
+<text x="124.76" y="196.58" font-size="14" text-anchor="middle" transform="rotate(1013.10, 124.76, 196.58)">t</text>
+<text x="128.29" y="188.56" font-size="14" text-anchor="middle" transform="rotate(1016.78, 128.29, 188.56)">d</text>
+<text x="132.32" y="180.79" font-size="14" text-anchor="middle" transform="rotate(1020.46, 132.32, 180.79)">o</text>
+<text x="136.84" y="173.29" font-size="14" text-anchor="middle" transform="rotate(1024.13, 136.84, 173.29)">u</text>
+<text x="141.84" y="166.10" font-size="14" text-anchor="middle" transform="rotate(1027.80, 141.84, 166.10)">t</text>
+<text x="147.28" y="159.24" font-size="14" text-anchor="middle" transform="rotate(1031.46, 147.28, 159.24)">,</text>
+<text x="153.15" y="152.74" font-size="14" text-anchor="middle" transform="rotate(1035.12, 153.15, 152.74)"> </text>
+<text x="159.42" y="146.63" font-size="14" text-anchor="middle" transform="rotate(1038.77, 159.42, 146.63)">g</text>
+<text x="166.07" y="140.93" font-size="14" text-anchor="middle" transform="rotate(1042.42, 166.07, 140.93)">l</text>
+<text x="173.07" y="135.67" font-size="14" text-anchor="middle" transform="rotate(1046.06, 173.07, 135.67)">y</text>
+<text x="180.39" y="130.86" font-size="14" text-anchor="middle" transform="rotate(1049.70, 180.39, 130.86)">p</text>
+<text x="188.00" y="126.53" font-size="14" text-anchor="middle" transform="rotate(1053.34, 188.00, 126.53)">h</text>
+<text x="195.86" y="122.68" font-size="14" text-anchor="middle" transform="rotate(1056.96, 195.86, 122.68)">,</text>
+<text x="203.96" y="119.35" font-size="14" text-anchor="middle" transform="rotate(1060.59, 203.96, 119.35)"> </text>
+<text x="212.25" y="116.53" font-size="14" text-anchor="middle" transform="rotate(1064.21, 212.25, 116.53)">l</text>
+<text x="220.70" y="114.23" font-size="14" text-anchor="middle" transform="rotate(1067.82, 220.70, 114.23)">e</text>
+<text x="229.28" y="112.48" font-size="14" text-anchor="middle" transform="rotate(1071.43, 229.28, 112.48)">n</text>
+<text x="237.95" y="111.27" font-size="14" text-anchor="middle" transform="rotate(1075.04, 237.95, 111.27)">)</text>
+<text x="246.68" y="110.61" font-size="14" text-anchor="middle" transform="rotate(1078.64, 246.68, 110.61)"> </text>
+<text x="255.44" y="110.49" font-size="14" text-anchor="middle" transform="rotate(1082.23, 255.44, 110.49)">m</text>
+<text x="264.18" y="110.93" font-size="14" text-anchor="middle" transform="rotate(1085.82, 264.18, 110.93)">o</text>
+<text x="272.88" y="111.91" font-size="14" text-anchor="middle" transform="rotate(1089.41, 272.88, 111.91)">v</text>
+<text x="281.50" y="113.44" font-size="14" text-anchor="middle" transform="rotate(1092.99, 281.50, 113.44)"> </text>
+<text x="290.01" y="115.50" font-size="14" text-anchor="middle" transform="rotate(1096.57, 290.01, 115.50)">r</text>
+<text x="298.38" y="118.08" font-size="14" text-anchor="middle" transform="rotate(1100.14, 298.38, 118.08)">a</text>
+<text x="306.57" y="121.19" font-size="14" text-anchor="middle" transform="rotate(1103.71, 306.57, 121.19)">x</text>
+<text x="314.55" y="124.79" font-size="14" text-anchor="middle" transform="rotate(1107.27, 314.55, 124.79)">,</text>
+<text x="322.28" y="128.89" font-size="14" text-anchor="middle" transform="rotate(1110.83, 322.28, 128.89)"> </text>
+<text x="329.75" y="133.46" font-size="14" text-anchor="middle" transform="rotate(1114.39, 329.75, 133.46)">1</text>
+<text x="336.93" y="138.48" font-size="14" text-anchor="middle" transform="rotate(1117.94, 336.93, 138.48)"> </text>
+<text x="343.77" y="143.94" font-size="14" text-anchor="middle" transform="rotate(1121.48, 343.77, 143.94)">;</text>
+<text x="350.27" y="149.81" font-size="14" text-anchor="middle" transform="rotate(1125.02, 350.27, 149.81)"> </text>
+<text x="356.39" y="156.07" font-size="14" text-anchor="middle" transform="rotate(1128.56, 356.39, 156.07)">s</text>
+<text x="362.12" y="162.69" font-size="14" text-anchor="middle" transform="rotate(1132.09, 362.12, 162.69)">y</text>
+<text x="367.43" y="169.66" font-size="14" text-anchor="middle" transform="rotate(1135.62, 367.43, 169.66)">s</text>
+<text x="372.29" y="176.93" font-size="14" text-anchor="middle" transform="rotate(1139.14, 372.29, 176.93)">c</text>
+<text x="376.70" y="184.50" font-size="14" text-anchor="middle" transform="rotate(1142.66, 376.70, 184.50)">a</text>
+<text x="380.64" y="192.32" font-size="14" text-anchor="middle" transform="rotate(1146.18, 380.64, 192.32)">l</text>
+<text x="384.09" y="200.36" font-size="14" text-anchor="middle" transform="rotate(1149.69, 384.09, 200.36)">l</text>
+<text x="387.05" y="208.61" font-size="14" text-anchor="middle" transform="rotate(1153.19, 387.05, 208.61)"> </text>
+<text x="389.49" y="217.02" font-size="14" text-anchor="middle" transform="rotate(1156.70, 389.49, 217.02)">w</text>
+<text x="391.41" y="225.56" font-size="14" text-anchor="middle" transform="rotate(1160.19, 391.41, 225.56)">r</text>
+<text x="392.81" y="234.20" font-size="14" text-anchor="middle" transform="rotate(1163.69, 392.81, 234.20)">i</text>
+<text x="393.68" y="242.91" font-size="14" text-anchor="middle" transform="rotate(1167.18, 393.68, 242.91)">t</text>
+<text x="394.02" y="251.66" font-size="14" text-anchor="middle" transform="rotate(1170.66, 394.02, 251.66)">e</text>
+<text x="393.83" y="260.41" font-size="14" text-anchor="middle" transform="rotate(1174.14, 393.83, 260.41)"> </text>
+<text x="393.11" y="269.14" font-size="14" text-anchor="middle" transform="rotate(1177.62, 393.11, 269.14)">m</text>
+<text x="391.85" y="277.81" font-size="14" text-anchor="middle" transform="rotate(1181.09, 391.85, 277.81)">o</text>
+<text x="390.08" y="286.38" font-size="14" text-anchor="middle" transform="rotate(1184.56, 390.08, 286.38)">v</text>
+<text x="387.79" y="294.83" font-size="14" text-anchor="middle" transform="rotate(1188.02, 387.79, 294.83)"> </text>
+<text x="385.00" y="303.13" font-size="14" text-anchor="middle" transform="rotate(1191.48, 385.00, 303.13)">r</text>
+<text x="381.70" y="311.24" font-size="14" text-anchor="middle" transform="rotate(1194.94, 381.70, 311.24)">d</text>
+<text x="377.93" y="319.14" font-size="14" text-anchor="middle" transform="rotate(1198.39, 377.93, 319.14)">i</text>
+<text x="373.69" y="326.80" font-size="14" text-anchor="middle" transform="rotate(1201.84, 373.69, 326.80)">,</text>
+<text x="368.99" y="334.19" font-size="14" text-anchor="middle" transform="rotate(1205.28, 368.99, 334.19)"> </text>
+<text x="363.86" y="341.29" font-size="14" text-anchor="middle" transform="rotate(1208.72, 363.86, 341.29)">1</text>
+<text x="358.31" y="348.06" font-size="14" text-anchor="middle" transform="rotate(1212.16, 358.31, 348.06)"> </text>
+<text x="352.37" y="354.49" font-size="14" text-anchor="middle" transform="rotate(1215.59, 352.37, 354.49)">;</text>
+<text x="346.05" y="360.55" font-size="14" text-anchor="middle" transform="rotate(1219.01, 346.05, 360.55)"> </text>
+<text x="339.38" y="366.23" font-size="14" text-anchor="middle" transform="rotate(1222.44, 339.38, 366.23)">f</text>
+<text x="332.39" y="371.49" font-size="14" text-anchor="middle" transform="rotate(1225.86, 332.39, 371.49)">d</text>
+<text x="325.09" y="376.33" font-size="14" text-anchor="middle" transform="rotate(1229.27, 325.09, 376.33)"> </text>
+<text x="317.52" y="380.73" font-size="14" text-anchor="middle" transform="rotate(1232.68, 317.52, 380.73)">1</text>
+<text x="309.70" y="384.66" font-size="14" text-anchor="middle" transform="rotate(1236.09, 309.70, 384.66)"> </text>
+<text x="301.66" y="388.13" font-size="14" text-anchor="middle" transform="rotate(1239.49, 301.66, 388.13)">(</text>
+<text x="293.43" y="391.11" font-size="14" text-anchor="middle" transform="rotate(1242.89, 293.43, 391.11)">s</text>
+<text x="285.04" y="393.60" font-size="14" text-anchor="middle" transform="rotate(1246.29, 285.04, 393.60)">t</text>
+<text x="276.51" y="395.59" font-size="14" text-anchor="middle" transform="rotate(1249.68, 276.51, 395.59)">d</text>
+<text x="267.88" y="397.07" font-size="14" text-anchor="middle" transform="rotate(1253.07, 267.88, 397.07)">o</text>
+<text x="259.18" y="398.04" font-size="14" text-anchor="middle" transform="rotate(1256.45, 259.18, 398.04)">u</text>
+<text x="250.43" y="398.49" font-size="14" text-anchor="middle" transform="rotate(1259.83, 250.43, 398.49)">t</text>
+<text x="241.68" y="398.43" font-size="14" text-anchor="middle" transform="rotate(1263.21, 241.68, 398.43)">)</text>
+<text x="232.94" y="397.85" font-size="14" text-anchor="middle" transform="rotate(1266.58, 232.94, 397.85)"> </text>
+<text x="224.26" y="396.76" font-size="14" text-anchor="middle" transform="rotate(1269.95, 224.26, 396.76)">l</text>
+<text x="215.65" y="395.16" font-size="14" text-anchor="middle" transform="rotate(1273.31, 215.65, 395.16)">e</text>
+<text x="207.15" y="393.05" font-size="14" text-anchor="middle" transform="rotate(1276.68, 207.15, 393.05)">a</text>
+<text x="198.79" y="390.46" font-size="14" text-anchor="middle" transform="rotate(1280.03, 198.79, 390.46)"> </text>
+<text x="190.59" y="387.37" font-size="14" text-anchor="middle" transform="rotate(1283.39, 190.59, 387.37)">r</text>
+<text x="182.59" y="383.82" font-size="14" text-anchor="middle" transform="rotate(1286.74, 182.59, 383.82)">s</text>
+<text x="174.81" y="379.80" font-size="14" text-anchor="middle" transform="rotate(1290.08, 174.81, 379.80)">i</text>
+<text x="167.28" y="375.34" font-size="14" text-anchor="middle" transform="rotate(1293.42, 167.28, 375.34)">,</text>
+<text x="160.02" y="370.44" font-size="14" text-anchor="middle" transform="rotate(1296.76, 160.02, 370.44)"> </text>
+<text x="153.06" y="365.13" font-size="14" text-anchor="middle" transform="rotate(1300.10, 153.06, 365.13)">[</text>
+<text x="146.42" y="359.42" font-size="14" text-anchor="middle" transform="rotate(1303.43, 146.42, 359.42)">g</text>
+<text x="140.12" y="353.34" font-size="14" text-anchor="middle" transform="rotate(1306.76, 140.12, 353.34)">l</text>
+<text x="134.19" y="346.90" font-size="14" text-anchor="middle" transform="rotate(1310.08, 134.19, 346.90)">y</text>
+<text x="128.64" y="340.13" font-size="14" text-anchor="middle" transform="rotate(1313.40, 128.64, 340.13)">p</text>
+<text x="123.49" y="333.05" font-size="14" text-anchor="middle" transform="rotate(1316.72, 123.49, 333.05)">h</text>
+<text x="118.76" y="325.69" font-size="14" text-anchor="middle" transform="rotate(1320.03, 118.76, 325.69)">]</text>
+<text x="114.46" y="318.06" font-size="14" text-anchor="middle" transform="rotate(1323.34, 114.46, 318.06)"> </text>
+<text x="110.61" y="310.20" font-size="14" text-anchor="middle" transform="rotate(1326.64, 110.61, 310.20)">;</text>
+<text x="107.22" y="302.12" font-size="14" text-anchor="middle" transform="rotate(1329.94, 107.22, 302.12)"> </text>
+<text x="104.30" y="293.87" font-size="14" text-anchor="middle" transform="rotate(1333.24, 104.30, 293.87)">l</text>
+<text x="101.86" y="285.46" font-size="14" text-anchor="middle" transform="rotate(1336.54, 101.86, 285.46)">o</text>
+<text x="99.91" y="276.93" font-size="14" text-anchor="middle" transform="rotate(1339.83, 99.91, 276.93)">a</text>
+<text x="98.44" y="268.30" font-size="14" text-anchor="middle" transform="rotate(1343.12, 98.44, 268.30)">d</text>
+<text x="97.48" y="259.59" font-size="14" text-anchor="middle" transform="rotate(1346.40, 97.48, 259.59)"> </text>
+<text x="97.02" y="250.85" font-size="14" text-anchor="middle" transform="rotate(1349.68, 97.02, 250.85)">a</text>
+<text x="97.06" y="242.10" font-size="14" text-anchor="middle" transform="rotate(1352.96, 97.06, 242.10)">d</text>
+<text x="97.59" y="233.36" font-size="14" text-anchor="middle" transform="rotate(1356.23, 97.59, 233.36)">d</text>
+<text x="98.63" y="224.66" font-size="14" text-anchor="middle" transform="rotate(1359.50, 98.63, 224.66)">r</text>
+<text x="100.16" y="216.04" font-size="14" text-anchor="middle" transform="rotate(1362.77, 100.16, 216.04)">e</text>
+<text x="102.18" y="207.53" font-size="14" text-anchor="middle" transform="rotate(1366.03, 102.18, 207.53)">s</text>
+<text x="104.68" y="199.13" font-size="14" text-anchor="middle" transform="rotate(1369.29, 104.68, 199.13)">s</text>
+<text x="107.65" y="190.90" font-size="14" text-anchor="middle" transform="rotate(1372.55, 107.65, 190.90)"> </text>
+<text x="111.09" y="182.85" font-size="14" text-anchor="middle" transform="rotate(1375.80, 111.09, 182.85)">m</text>
+<text x="114.98" y="175.00" font-size="14" text-anchor="middle" transform="rotate(1379.05, 114.98, 175.00)">o</text>
+<text x="119.30" y="167.39" font-size="14" text-anchor="middle" transform="rotate(1382.30, 119.30, 167.39)">v</text>
+<text x="124.05" y="160.04" font-size="14" text-anchor="middle" transform="rotate(1385.54, 124.05, 160.04)"> </text>
+<text x="129.21" y="152.96" font-size="14" text-anchor="middle" transform="rotate(1388.78, 129.21, 152.96)">r</text>
+<text x="134.76" y="146.19" font-size="14" text-anchor="middle" transform="rotate(1392.01, 134.76, 146.19)">d</text>
+<text x="140.68" y="139.74" font-size="14" text-anchor="middle" transform="rotate(1395.25, 140.68, 139.74)">x</text>
+<text x="146.96" y="133.64" font-size="14" text-anchor="middle" transform="rotate(1398.47, 146.96, 133.64)">,</text>
+<text x="153.57" y="127.90" font-size="14" text-anchor="middle" transform="rotate(1401.70, 153.57, 127.90)"> </text>
+<text x="160.49" y="122.54" font-size="14" text-anchor="middle" transform="rotate(1404.92, 160.49, 122.54)">l</text>
+<text x="167.71" y="117.58" font-size="14" text-anchor="middle" transform="rotate(1408.14, 167.71, 117.58)">e</text>
+<text x="175.19" y="113.03" font-size="14" text-anchor="middle" transform="rotate(1411.36, 175.19, 113.03)">n</text>
+<text x="182.91" y="108.91" font-size="14" text-anchor="middle" transform="rotate(1414.57, 182.91, 108.91)"> </text>
+<text x="190.85" y="105.23" font-size="14" text-anchor="middle" transform="rotate(1417.78, 190.85, 105.23)">;</text>
+<text x="198.99" y="101.99" font-size="14" text-anchor="middle" transform="rotate(1420.98, 198.99, 101.99)"> </text>
+<text x="207.29" y="99.22" font-size="14" text-anchor="middle" transform="rotate(1424.19, 207.29, 99.22)">l</text>
+<text x="215.74" y="96.92" font-size="14" text-anchor="middle" transform="rotate(1427.39, 215.74, 96.92)">e</text>
+<text x="224.30" y="95.09" font-size="14" text-anchor="middle" transform="rotate(1430.58, 224.30, 95.09)">n</text>
+<text x="232.95" y="93.74" font-size="14" text-anchor="middle" transform="rotate(1433.77, 232.95, 93.74)">g</text>
+<text x="241.66" y="92.87" font-size="14" text-anchor="middle" transform="rotate(1436.96, 241.66, 92.87)">t</text>
+<text x="250.41" y="92.49" font-size="14" text-anchor="middle" transform="rotate(1440.15, 250.41, 92.49)">h</text>
+<text x="259.16" y="92.60" font-size="14" text-anchor="middle" transform="rotate(1443.33, 259.16, 92.60)"> </text>
+<text x="267.90" y="93.19" font-size="14" text-anchor="middle" transform="rotate(1446.51, 267.90, 93.19)">s</text>
+<text x="276.59" y="94.27" font-size="14" text-anchor="middle" transform="rotate(1449.69, 276.59, 94.27)">y</text>
+<text x="285.20" y="95.82" font-size="14" text-anchor="middle" transform="rotate(1452.86, 285.20, 95.82)">s</text>
+<text x="293.72" y="97.86" font-size="14" text-anchor="middle" transform="rotate(1456.03, 293.72, 97.86)">c</text>
+<text x="302.11" y="100.35" font-size="14" text-anchor="middle" transform="rotate(1459.20, 302.11, 100.35)">a</text>
+<text x="310.35" y="103.31" font-size="14" text-anchor="middle" transform="rotate(1462.36, 310.35, 103.31)">l</text>
+<text x="318.41" y="106.72" font-size="14" text-anchor="middle" transform="rotate(1465.52, 318.41, 106.72)">l</text>
+<text x="326.28" y="110.57" font-size="14" text-anchor="middle" transform="rotate(1468.68, 326.28, 110.57)"> </text>
+<text x="333.92" y="114.84" font-size="14" text-anchor="middle" transform="rotate(1471.84, 333.92, 114.84)">;</text>
+<text x="341.31" y="119.53" font-size="14" text-anchor="middle" transform="rotate(1474.99, 341.31, 119.53)"> </text>
+<text x="348.44" y="124.62" font-size="14" text-anchor="middle" transform="rotate(1478.13, 348.44, 124.62)">s</text>
+<text x="355.27" y="130.09" font-size="14" text-anchor="middle" transform="rotate(1481.28, 355.27, 130.09)">y</text>
+<text x="361.79" y="135.93" font-size="14" text-anchor="middle" transform="rotate(1484.42, 361.79, 135.93)">s</text>
+<text x="367.99" y="142.11" font-size="14" text-anchor="middle" transform="rotate(1487.56, 367.99, 142.11)">_</text>
+<text x="373.83" y="148.63" font-size="14" text-anchor="middle" transform="rotate(1490.70, 373.83, 148.63)">e</text>
+<text x="379.32" y="155.46" font-size="14" text-anchor="middle" transform="rotate(1493.83, 379.32, 155.46)">x</text>
+<text x="384.42" y="162.57" font-size="14" text-anchor="middle" transform="rotate(1496.96, 384.42, 162.57)">i</text>
+<text x="389.12" y="169.95" font-size="14" text-anchor="middle" transform="rotate(1500.09, 389.12, 169.95)">t</text>
+<text x="393.41" y="177.58" font-size="14" text-anchor="middle" transform="rotate(1503.21, 393.41, 177.58)">(</text>
+<text x="397.29" y="185.43" font-size="14" text-anchor="middle" transform="rotate(1506.33, 397.29, 185.43)">0</text>
+<text x="400.73" y="193.49" font-size="14" text-anchor="middle" transform="rotate(1509.45, 400.73, 193.49)">)</text>
+<text x="403.72" y="201.71" font-size="14" text-anchor="middle" transform="rotate(1512.56, 403.72, 201.71)"> </text>
+<text x="406.27" y="210.09" font-size="14" text-anchor="middle" transform="rotate(1515.67, 406.27, 210.09)">m</text>
+<text x="408.35" y="218.59" font-size="14" text-anchor="middle" transform="rotate(1518.78, 408.35, 218.59)">o</text>
+<text x="409.98" y="227.19" font-size="14" text-anchor="middle" transform="rotate(1521.89, 409.98, 227.19)">v</text>
+<text x="411.13" y="235.87" font-size="14" text-anchor="middle" transform="rotate(1524.99, 411.13, 235.87)"> </text>
+<text x="411.81" y="244.60" font-size="14" text-anchor="middle" transform="rotate(1528.09, 411.81, 244.60)">r</text>
+<text x="412.02" y="253.35" font-size="14" text-anchor="middle" transform="rotate(1531.18, 412.02, 253.35)">a</text>
+<text x="411.76" y="262.10" font-size="14" text-anchor="middle" transform="rotate(1534.28, 411.76, 262.10)">x</text>
+<text x="411.03" y="270.82" font-size="14" text-anchor="middle" transform="rotate(1537.37, 411.03, 270.82)">,</text>
+<text x="409.82" y="279.50" font-size="14" text-anchor="middle" transform="rotate(1540.46, 409.82, 279.50)"> </text>
+<text x="408.15" y="288.09" font-size="14" text-anchor="middle" transform="rotate(1543.54, 408.15, 288.09)">6</text>
+<text x="406.03" y="296.58" font-size="14" text-anchor="middle" transform="rotate(1546.62, 406.03, 296.58)">0</text>
+<text x="403.44" y="304.95" font-size="14" text-anchor="middle" transform="rotate(1549.70, 403.44, 304.95)"> </text>
+<text x="400.42" y="313.16" font-size="14" text-anchor="middle" transform="rotate(1552.78, 400.42, 313.16)">;</text>
+<text x="396.95" y="321.20" font-size="14" text-anchor="middle" transform="rotate(1555.85, 396.95, 321.20)"> </text>
+<text x="393.06" y="329.04" font-size="14" text-anchor="middle" transform="rotate(1558.92, 393.06, 329.04)">s</text>
+<text x="388.76" y="336.67" font-size="14" text-anchor="middle" transform="rotate(1561.99, 388.76, 336.67)">y</text>
+<text x="384.05" y="344.05" font-size="14" text-anchor="middle" transform="rotate(1565.05, 384.05, 344.05)">s</text>
+<text x="378.96" y="351.17" font-size="14" text-anchor="middle" transform="rotate(1568.11, 378.96, 351.17)">c</text>
+<text x="373.49" y="358.01" font-size="14" text-anchor="middle" transform="rotate(1571.17, 373.49, 358.01)">a</text>
+<text x="367.67" y="364.54" font-size="14" text-anchor="middle" transform="rotate(1574.23, 367.67, 364.54)">l</text>
+<text x="361.50" y="370.76" font-size="14" text-anchor="middle" transform="rotate(1577.28, 361.50, 370.76)">l</text>
+<text x="355.02" y="376.64" font-size="14" text-anchor="middle" transform="rotate(1580.33, 355.02, 376.64)"> </text>
+<text x="348.23" y="382.16" font-size="14" text-anchor="middle" transform="rotate(1583.38, 348.23, 382.16)">e</text>
+<text x="341.15" y="387.32" font-size="14" text-anchor="middle" transform="rotate(1586.42, 341.15, 387.32)">x</text>
+<text x="333.82" y="392.10" font-size="14" text-anchor="middle" transform="rotate(1589.47, 333.82, 392.10)">i</text>
+<text x="326.23" y="396.47" font-size="14" text-anchor="middle" transform="rotate(1592.50, 326.23, 396.47)">t</text>
+<text x="318.43" y="400.44" font-size="14" text-anchor="middle" transform="rotate(1595.54, 318.43, 400.44)"> </text>
+<text x="310.43" y="404.00" font-size="14" text-anchor="middle" transform="rotate(1598.57, 310.43, 404.00)">x</text>
+<text x="302.25" y="407.12" font-size="14" text-anchor="middle" transform="rotate(1601.60, 302.25, 407.12)">o</text>
+<text x="293.92" y="409.81" font-size="14" text-anchor="middle" transform="rotate(1604.63, 293.92, 409.81)">r</text>
+<text x="285.46" y="412.05" font-size="14" text-anchor="middle" transform="rotate(1607.66, 285.46, 412.05)"> </text>
+<text x="276.89" y="413.84" font-size="14" text-anchor="middle" transform="rotate(1610.68, 276.89, 413.84)">r</text>
+<text x="268.24" y="415.18" font-size="14" text-anchor="middle" transform="rotate(1613.70, 268.24, 415.18)">d</text>
+<text x="259.53" y="416.06" font-size="14" text-anchor="middle" transform="rotate(1616.72, 259.53, 416.06)">i</text>
+<text x="250.79" y="416.48" font-size="14" text-anchor="middle" transform="rotate(1619.73, 250.79, 416.48)">,</text>
+<text x="242.03" y="416.45" font-size="14" text-anchor="middle" transform="rotate(1622.74, 242.03, 416.45)"> </text>
+<text x="233.29" y="415.95" font-size="14" text-anchor="middle" transform="rotate(1625.75, 233.29, 415.95)">r</text>
+<text x="224.59" y="414.99" font-size="14" text-anchor="middle" transform="rotate(1628.76, 224.59, 414.99)">d</text>
+<text x="215.95" y="413.58" font-size="14" text-anchor="middle" transform="rotate(1631.76, 215.95, 413.58)">i</text>
+<text x="207.40" y="411.72" font-size="14" text-anchor="middle" transform="rotate(1634.76, 207.40, 411.72)"> </text>
+<text x="198.95" y="409.41" font-size="14" text-anchor="middle" transform="rotate(1637.76, 198.95, 409.41)">;</text>
+<text x="190.64" y="406.67" font-size="14" text-anchor="middle" transform="rotate(1640.75, 190.64, 406.67)"> </text>
+<text x="182.48" y="403.49" font-size="14" text-anchor="middle" transform="rotate(1643.74, 182.48, 403.49)">s</text>
+<text x="174.50" y="399.90" font-size="14" text-anchor="middle" transform="rotate(1646.73, 174.50, 399.90)">t</text>
+<text x="166.72" y="395.89" font-size="14" text-anchor="middle" transform="rotate(1649.72, 166.72, 395.89)">a</text>
+<text x="159.15" y="391.48" font-size="14" text-anchor="middle" transform="rotate(1652.71, 159.15, 391.48)">t</text>
+<text x="151.83" y="386.68" font-size="14" text-anchor="middle" transform="rotate(1655.69, 151.83, 386.68)">u</text>
+<text x="144.77" y="381.51" font-size="14" text-anchor="middle" transform="rotate(1658.67, 144.77, 381.51)">s</text>
+<text x="137.98" y="375.98" font-size="14" text-anchor="middle" transform="rotate(1661.64, 137.98, 375.98)"> </text>
+<text x="131.49" y="370.11" font-size="14" text-anchor="middle" transform="rotate(1664.62, 131.49, 370.11)">0</text>
+<text x="125.31" y="363.90" font-size="14" text-anchor="middle" transform="rotate(1667.59, 125.31, 363.90)"> </text>
+<text x="119.47" y="357.39" font-size="14" text-anchor="middle" transform="rotate(1670.56, 119.47, 357.39)">s</text>
+<text x="113.97" y="350.58" font-size="14" text-anchor="middle" transform="rotate(1673.52, 113.97, 350.58)">y</text>
+<text x="108.83" y="343.49" font-size="14" text-anchor="middle" transform="rotate(1676.49, 108.83, 343.49)">s</text>
+<text x="104.06" y="336.15" font-size="14" text-anchor="middle" transform="rotate(1679.45, 104.06, 336.15)">c</text>
+<text x="99.68" y="328.57" font-size="14" text-anchor="middle" transform="rotate(1682.40, 99.68, 328.57)">a</text>
+<text x="95.69" y="320.78" font-size="14" text-anchor="middle" transform="rotate(1685.36, 95.69, 320.78)">l</text>
+<text x="92.11" y="312.79" font-size="14" text-anchor="middle" transform="rotate(1688.31, 92.11, 312.79)">l</text>
+<text x="88.95" y="304.63" font-size="14" text-anchor="middle" transform="rotate(1691.26, 88.95, 304.63)"> </text>
+<text x="86.21" y="296.31" font-size="14" text-anchor="middle" transform="rotate(1694.21, 86.21, 296.31)">;</text>
+<text x="83.90" y="287.87" font-size="14" text-anchor="middle" transform="rotate(1697.16, 83.90, 287.87)"> </text>
+<text x="82.03" y="279.31" font-size="14" text-anchor="middle" transform="rotate(1700.10, 82.03, 279.31)">B</text>
+<text x="80.61" y="270.68" font-size="14" text-anchor="middle" transform="rotate(1703.04, 80.61, 270.68)">U</text>
+<text x="79.62" y="261.98" font-size="14" text-anchor="middle" transform="rotate(1705.98, 79.62, 261.98)">F</text>
+<text x="79.09" y="253.24" font-size="14" text-anchor="middle" transform="rotate(1708.91, 79.09, 253.24)">F</text>
+<text x="79.00" y="244.49" font-size="14" text-anchor="middle" transform="rotate(1711.85, 79.00, 244.49)">E</text>
+<text x="79.36" y="235.74" font-size="14" text-anchor="middle" transform="rotate(1714.78, 79.36, 235.74)">R</text>
+<text x="80.16" y="227.02" font-size="14" text-anchor="middle" transform="rotate(1717.70, 80.16, 227.02)"> </text>
+<text x="81.41" y="218.36" font-size="14" text-anchor="middle" transform="rotate(1720.63, 81.41, 218.36)">O</text>
+<text x="83.10" y="209.77" font-size="14" text-anchor="middle" transform="rotate(1723.55, 83.10, 209.77)">V</text>
+<text x="85.23" y="201.28" font-size="14" text-anchor="middle" transform="rotate(1726.47, 85.23, 201.28)">E</text>
+<text x="87.78" y="192.91" font-size="14" text-anchor="middle" transform="rotate(1729.39, 87.78, 192.91)">R</text>
+<text x="90.76" y="184.67" font-size="14" text-anchor="middle" transform="rotate(1732.31, 90.76, 184.67)">F</text>
+<text x="94.16" y="176.60" font-size="14" text-anchor="middle" transform="rotate(1735.22, 94.16, 176.60)">L</text>
+<text x="97.96" y="168.72" font-size="14" text-anchor="middle" transform="rotate(1738.13, 97.96, 168.72)">O</text>
+<text x="102.15" y="161.03" font-size="14" text-anchor="middle" transform="rotate(1741.04, 102.15, 161.03)">W</text>
+<text x="106.73" y="153.57" font-size="14" text-anchor="middle" transform="rotate(1743.94, 106.73, 153.57)"> </text>
+<text x="111.68" y="146.35" font-size="14" text-anchor="middle" transform="rotate(1746.85, 111.68, 146.35)">P</text>
+<text x="116.99" y="139.40" font-size="14" text-anchor="middle" transform="rotate(1749.75, 116.99, 139.40)">R</text>
+<text x="122.65" y="132.71" font-size="14" text-anchor="middle" transform="rotate(1752.64, 122.65, 132.71)">O</text>
+<text x="128.63" y="126.33" font-size="14" text-anchor="middle" transform="rotate(1755.54, 128.63, 126.33)">T</text>
+<text x="134.93" y="120.25" font-size="14" text-anchor="middle" transform="rotate(1758.43, 134.93, 120.25)">E</text>
+<text x="141.53" y="114.50" font-size="14" text-anchor="middle" transform="rotate(1761.32, 141.53, 114.50)">C</text>
+<text x="148.42" y="109.09" font-size="14" text-anchor="middle" transform="rotate(1764.21, 148.42, 109.09)">T</text>
+<text x="155.56" y="104.03" font-size="14" text-anchor="middle" transform="rotate(1767.10, 155.56, 104.03)">I</text>
+<text x="162.95" y="99.34" font-size="14" text-anchor="middle" transform="rotate(1769.98, 162.95, 99.34)">O</text>
+<text x="170.57" y="95.03" font-size="14" text-anchor="middle" transform="rotate(1772.86, 170.57, 95.03)">N</text>
+<text x="178.39" y="91.10" font-size="14" text-anchor="middle" transform="rotate(1775.74, 178.39, 91.10)"> </text>
+<text x="186.41" y="87.57" font-size="14" text-anchor="middle" transform="rotate(1778.62, 186.41, 87.57)">/</text>
+<text x="194.59" y="84.45" font-size="14" text-anchor="middle" transform="rotate(1781.49, 194.59, 84.45)">/</text>
+<text x="202.91" y="81.75" font-size="14" text-anchor="middle" transform="rotate(1784.36, 202.91, 81.75)"> </text>
+<text x="211.36" y="79.46" font-size="14" text-anchor="middle" transform="rotate(1787.23, 211.36, 79.46)">N</text>
+<text x="219.91" y="77.60" font-size="14" text-anchor="middle" transform="rotate(1790.10, 219.91, 77.60)">O</text>
+<text x="228.55" y="76.17" font-size="14" text-anchor="middle" transform="rotate(1792.97, 228.55, 76.17)">P</text>
+<text x="237.25" y="75.17" font-size="14" text-anchor="middle" transform="rotate(1795.83, 237.25, 75.17)"> </text>
+<text x="245.98" y="74.61" font-size="14" text-anchor="middle" transform="rotate(1798.69, 245.98, 74.61)">S</text>
+<text x="254.74" y="74.49" font-size="14" text-anchor="middle" transform="rotate(1801.55, 254.74, 74.49)">L</text>
+<text x="263.48" y="74.80" font-size="14" text-anchor="middle" transform="rotate(1804.40, 263.48, 74.80)">E</text>
+<text x="272.21" y="75.54" font-size="14" text-anchor="middle" transform="rotate(1807.25, 272.21, 75.54)">D</text>
+<text x="280.88" y="76.72" font-size="14" text-anchor="middle" transform="rotate(1810.10, 280.88, 76.72)"> </text>
+<text x="289.48" y="78.33" font-size="14" text-anchor="middle" transform="rotate(1812.95, 289.48, 78.33)">/</text>
+<text x="298.00" y="80.37" font-size="14" text-anchor="middle" transform="rotate(1815.80, 298.00, 80.37)">/</text>
+<text x="306.40" y="82.83" font-size="14" text-anchor="middle" transform="rotate(1818.64, 306.40, 82.83)"> </text>
+<text x="314.67" y="85.69" font-size="14" text-anchor="middle" transform="rotate(1821.48, 314.67, 85.69)">n</text>
+<text x="322.79" y="88.97" font-size="14" text-anchor="middle" transform="rotate(1824.32, 322.79, 88.97)">o</text>
+<text x="330.73" y="92.64" font-size="14" text-anchor="middle" transform="rotate(1827.16, 330.73, 92.64)">p</text>
+<text x="338.49" y="96.71" font-size="14" text-anchor="middle" transform="rotate(1830.00, 338.49, 96.71)"> </text>
+<text x="346.03" y="101.15" font-size="14" text-anchor="middle" transform="rotate(1832.83, 346.03, 101.15)">;</text>
+<text x="353.35" y="105.96" font-size="14" text-anchor="middle" transform="rotate(1835.66, 353.35, 105.96)"> </text>
+<text x="360.42" y="111.12" font-size="14" text-anchor="middle" transform="rotate(1838.49, 360.42, 111.12)">0</text>
+<text x="367.22" y="116.63" font-size="14" text-anchor="middle" transform="rotate(1841.31, 367.22, 116.63)">x</text>
+<text x="373.75" y="122.46" font-size="14" text-anchor="middle" transform="rotate(1844.14, 373.75, 122.46)">9</text>
+<text x="379.98" y="128.61" font-size="14" text-anchor="middle" transform="rotate(1846.96, 379.98, 128.61)">0</text>
+<text x="385.90" y="135.06" font-size="14" text-anchor="middle" transform="rotate(1849.78, 385.90, 135.06)"> </text>
+<text x="391.49" y="141.79" font-size="14" text-anchor="middle" transform="rotate(1852.59, 391.49, 141.79)">n</text>
+<text x="396.75" y="148.79" font-size="14" text-anchor="middle" transform="rotate(1855.41, 396.75, 148.79)">o</text>
+<text x="401.66" y="156.03" font-size="14" text-anchor="middle" transform="rotate(1858.22, 401.66, 156.03)">p</text>
+<text x="406.21" y="163.51" font-size="14" text-anchor="middle" transform="rotate(1861.03, 406.21, 163.51)"> </text>
+<text x="410.38" y="171.21" font-size="14" text-anchor="middle" transform="rotate(1863.84, 410.38, 171.21)">;</text>
+<text x="414.18" y="179.10" font-size="14" text-anchor="middle" transform="rotate(1866.64, 414.18, 179.10)"> </text>
+<text x="417.58" y="187.16" font-size="14" text-anchor="middle" transform="rotate(1869.45, 417.58, 187.16)">0</text>
+<text x="420.58" y="195.38" font-size="14" text-anchor="middle" transform="rotate(1872.25, 420.58, 195.38)">x</text>
+<text x="423.18" y="203.74" font-size="14" text-anchor="middle" transform="rotate(1875.05, 423.18, 203.74)">9</text>
+<text x="425.37" y="212.22" font-size="14" text-anchor="middle" transform="rotate(1877.84, 425.37, 212.22)">0</text>
+<text x="427.14" y="220.79" font-size="14" text-anchor="middle" transform="rotate(1880.64, 427.14, 220.79)"> </text>
+<text x="428.49" y="229.44" font-size="14" text-anchor="middle" transform="rotate(1883.43, 428.49, 229.44)">n</text>
+<text x="429.42" y="238.15" font-size="14" text-anchor="middle" transform="rotate(1886.22, 429.42, 238.15)">o</text>
+<text x="429.92" y="246.88" font-size="14" text-anchor="middle" transform="rotate(1889.01, 429.92, 246.88)">p</text>
+<text x="430.00" y="255.64" font-size="14" text-anchor="middle" transform="rotate(1891.79, 430.00, 255.64)"> </text>
+<text x="429.65" y="264.38" font-size="14" text-anchor="middle" transform="rotate(1894.58, 429.65, 264.38)">;</text>
+<text x="428.88" y="273.10" font-size="14" text-anchor="middle" transform="rotate(1897.36, 428.88, 273.10)"> </text>
+<text x="427.69" y="281.78" font-size="14" text-anchor="middle" transform="rotate(1900.14, 427.69, 281.78)">0</text>
+<text x="426.08" y="290.38" font-size="14" text-anchor="middle" transform="rotate(1902.92, 426.08, 290.38)">x</text>
+<text x="424.05" y="298.89" font-size="14" text-anchor="middle" transform="rotate(1905.69, 424.05, 298.89)">9</text>
+<text x="421.61" y="307.30" font-size="14" text-anchor="middle" transform="rotate(1908.46, 421.61, 307.30)">0</text>
+<text x="418.77" y="315.58" font-size="14" text-anchor="middle" transform="rotate(1911.24, 418.77, 315.58)"> </text>
+<text x="415.53" y="323.71" font-size="14" text-anchor="middle" transform="rotate(1914.00, 415.53, 323.71)">n</text>
+<text x="411.90" y="331.68" font-size="14" text-anchor="middle" transform="rotate(1916.77, 411.90, 331.68)">o</text>
+<text x="407.89" y="339.46" font-size="14" text-anchor="middle" transform="rotate(1919.54, 407.89, 339.46)">p</text>
+<text x="403.51" y="347.04" font-size="14" text-anchor="middle" transform="rotate(1922.30, 403.51, 347.04)"> </text>
+<text x="398.78" y="354.40" font-size="14" text-anchor="middle" transform="rotate(1925.06, 398.78, 354.40)">;</text>
+<text x="393.69" y="361.53" font-size="14" text-anchor="middle" transform="rotate(1927.82, 393.69, 361.53)"> </text>
+<text x="388.26" y="368.40" font-size="14" text-anchor="middle" transform="rotate(1930.57, 388.26, 368.40)">0</text>
+<text x="382.52" y="375.00" font-size="14" text-anchor="middle" transform="rotate(1933.33, 382.52, 375.00)">x</text>
+<text x="376.46" y="381.31" font-size="14" text-anchor="middle" transform="rotate(1936.08, 376.46, 381.31)">9</text>
+<text x="370.10" y="387.33" font-size="14" text-anchor="middle" transform="rotate(1938.83, 370.10, 387.33)">0</text>
+<text x="363.46" y="393.04" font-size="14" text-anchor="middle" transform="rotate(1941.58, 363.46, 393.04)"> </text>
+<text x="356.56" y="398.42" font-size="14" text-anchor="middle" transform="rotate(1944.32, 356.56, 398.42)">n</text>
+<text x="349.41" y="403.47" font-size="14" text-anchor="middle" transform="rotate(1947.07, 349.41, 403.47)">o</text>
+<text x="342.02" y="408.17" font-size="14" text-anchor="middle" transform="rotate(1949.81, 342.02, 408.17)">p</text>
+<text x="334.42" y="412.51" font-size="14" text-anchor="middle" transform="rotate(1952.55, 334.42, 412.51)"> </text>
+<text x="326.62" y="416.48" font-size="14" text-anchor="middle" transform="rotate(1955.29, 326.62, 416.48)">;</text>
+<text x="318.64" y="420.07" font-size="14" text-anchor="middle" transform="rotate(1958.02, 318.64, 420.07)"> </text>
+<text x="310.49" y="423.28" font-size="14" text-anchor="middle" transform="rotate(1960.76, 310.49, 423.28)">0</text>
+<text x="302.21" y="426.10" font-size="14" text-anchor="middle" transform="rotate(1963.49, 302.21, 426.10)">x</text>
+<text x="293.79" y="428.52" font-size="14" text-anchor="middle" transform="rotate(1966.22, 293.79, 428.52)">9</text>
+<text x="285.27" y="430.53" font-size="14" text-anchor="middle" transform="rotate(1968.94, 285.27, 430.53)">0</text>
+<text x="276.67" y="432.14" font-size="14" text-anchor="middle" transform="rotate(1971.67, 276.67, 432.14)"> </text>
+<text x="268.00" y="433.34" font-size="14" text-anchor="middle" transform="rotate(1974.39, 268.00, 433.34)">n</text>
+<text x="259.28" y="434.12" font-size="14" text-anchor="middle" transform="rotate(1977.11, 259.28, 434.12)">o</text>
+<text x="250.53" y="434.49" font-size="14" text-anchor="middle" transform="rotate(1979.83, 250.53, 434.49)">p</text>
+<text x="241.78" y="434.44" font-size="14" text-anchor="middle" transform="rotate(1982.55, 241.78, 434.44)"> </text>
+<text x="233.04" y="433.98" font-size="14" text-anchor="middle" transform="rotate(1985.27, 233.04, 433.98)">;</text>
+<text x="224.33" y="433.11" font-size="14" text-anchor="middle" transform="rotate(1987.98, 224.33, 433.11)"> </text>
+<text x="215.67" y="431.82" font-size="14" text-anchor="middle" transform="rotate(1990.69, 215.67, 431.82)">0</text>
+<text x="207.08" y="430.13" font-size="14" text-anchor="middle" transform="rotate(1993.40, 207.08, 430.13)">x</text>
+<text x="198.59" y="428.03" font-size="14" text-anchor="middle" transform="rotate(1996.11, 198.59, 428.03)">9</text>
+<text x="190.20" y="425.53" font-size="14" text-anchor="middle" transform="rotate(1998.81, 190.20, 425.53)">0</text>
+<text x="181.93" y="422.64" font-size="14" text-anchor="middle" transform="rotate(2001.52, 181.93, 422.64)"> </text>
+<text x="173.82" y="419.37" font-size="14" text-anchor="middle" transform="rotate(2004.22, 173.82, 419.37)">n</text>
+<text x="165.86" y="415.71" font-size="14" text-anchor="middle" transform="rotate(2006.92, 165.86, 415.71)">o</text>
+<text x="158.09" y="411.68" font-size="14" text-anchor="middle" transform="rotate(2009.62, 158.09, 411.68)">p</text>
+<text x="150.52" y="407.30" font-size="14" text-anchor="middle" transform="rotate(2012.31, 150.52, 407.30)"> </text>
+<text x="143.16" y="402.56" font-size="14" text-anchor="middle" transform="rotate(2015.01, 143.16, 402.56)">;</text>
+<text x="136.03" y="397.48" font-size="14" text-anchor="middle" transform="rotate(2017.70, 136.03, 397.48)"> </text>
+<text x="129.15" y="392.07" font-size="14" text-anchor="middle" transform="rotate(2020.39, 129.15, 392.07)">0</text>
+<text x="122.52" y="386.34" font-size="14" text-anchor="middle" transform="rotate(2023.07, 122.52, 386.34)">x</text>
+<text x="116.18" y="380.31" font-size="14" text-anchor="middle" transform="rotate(2025.76, 116.18, 380.31)">9</text>
+<text x="110.12" y="373.99" font-size="14" text-anchor="middle" transform="rotate(2028.44, 110.12, 373.99)">0</text>
+<text x="104.37" y="367.40" font-size="14" text-anchor="middle" transform="rotate(2031.13, 104.37, 367.40)"> </text>
+<text x="98.93" y="360.54" font-size="14" text-anchor="middle" transform="rotate(2033.81, 98.93, 360.54)">n</text>
+<text x="93.82" y="353.43" font-size="14" text-anchor="middle" transform="rotate(2036.49, 93.82, 353.43)">o</text>
+<text x="89.05" y="346.09" font-size="14" text-anchor="middle" transform="rotate(2039.16, 89.05, 346.09)">p</text>
+<text x="84.62" y="338.54" font-size="14" text-anchor="middle" transform="rotate(2041.84, 84.62, 338.54)"> </text>
+<text x="80.55" y="330.79" font-size="14" text-anchor="middle" transform="rotate(2044.51, 80.55, 330.79)">;</text>
+<text x="76.85" y="322.86" font-size="14" text-anchor="middle" transform="rotate(2047.18, 76.85, 322.86)"> </text>
+<text x="73.52" y="314.77" font-size="14" text-anchor="middle" transform="rotate(2049.85, 73.52, 314.77)">0</text>
+<text x="70.57" y="306.53" font-size="14" text-anchor="middle" transform="rotate(2052.51, 70.57, 306.53)">x</text>
+<text x="68.00" y="298.16" font-size="14" text-anchor="middle" transform="rotate(2055.18, 68.00, 298.16)">9</text>
+<text x="65.83" y="289.68" font-size="14" text-anchor="middle" transform="rotate(2057.84, 65.83, 289.68)">0</text>
+<text x="64.06" y="281.10" font-size="14" text-anchor="middle" transform="rotate(2060.50, 64.06, 281.10)"> </text>
+<text x="62.68" y="272.46" font-size="14" text-anchor="middle" transform="rotate(2063.16, 62.68, 272.46)">n</text>
+<text x="61.71" y="263.76" font-size="14" text-anchor="middle" transform="rotate(2065.82, 61.71, 263.76)">o</text>
+<text x="61.14" y="255.03" font-size="14" text-anchor="middle" transform="rotate(2068.48, 61.14, 255.03)">p</text>
+<text x="60.98" y="246.27" font-size="14" text-anchor="middle" transform="rotate(2071.13, 60.98, 246.27)"> </text>
+<text x="61.22" y="237.52" font-size="14" text-anchor="middle" transform="rotate(2073.78, 61.22, 237.52)">;</text>
+<text x="61.87" y="228.79" font-size="14" text-anchor="middle" transform="rotate(2076.43, 61.87, 228.79)"> </text>
+<text x="62.92" y="220.10" font-size="14" text-anchor="middle" transform="rotate(2079.08, 62.92, 220.10)">0</text>
+<text x="64.37" y="211.47" font-size="14" text-anchor="middle" transform="rotate(2081.73, 64.37, 211.47)">x</text>
+<text x="66.22" y="202.92" font-size="14" text-anchor="middle" transform="rotate(2084.37, 66.22, 202.92)">9</text>
+<text x="68.46" y="194.45" font-size="14" text-anchor="middle" transform="rotate(2087.01, 68.46, 194.45)">0</text>
+<text x="71.08" y="186.10" font-size="14" text-anchor="middle" transform="rotate(2089.65, 71.08, 186.10)"> </text>
+<text x="74.09" y="177.88" font-size="14" text-anchor="middle" transform="rotate(2092.29, 74.09, 177.88)">n</text>
+<text x="77.48" y="169.81" font-size="14" text-anchor="middle" transform="rotate(2094.93, 77.48, 169.81)">o</text>
+<text x="81.23" y="161.90" font-size="14" text-anchor="middle" transform="rotate(2097.56, 81.23, 161.90)">p</text>
+<text x="85.34" y="154.18" font-size="14" text-anchor="middle" transform="rotate(2100.20, 85.34, 154.18)"> </text>
+<text x="89.81" y="146.65" font-size="14" text-anchor="middle" transform="rotate(2102.83, 89.81, 146.65)">;</text>
+<text x="94.61" y="139.33" font-size="14" text-anchor="middle" transform="rotate(2105.46, 94.61, 139.33)"> </text>
+<text x="99.74" y="132.24" font-size="14" text-anchor="middle" transform="rotate(2108.09, 99.74, 132.24)">0</text>
+<text x="105.20" y="125.39" font-size="14" text-anchor="middle" transform="rotate(2110.71, 105.20, 125.39)">x</text>
+<text x="110.96" y="118.80" font-size="14" text-anchor="middle" transform="rotate(2113.34, 110.96, 118.80)">9</text>
+<text x="117.02" y="112.49" font-size="14" text-anchor="middle" transform="rotate(2115.96, 117.02, 112.49)">0</text>
+<text x="123.36" y="106.45" font-size="14" text-anchor="middle" transform="rotate(2118.58, 123.36, 106.45)"> </text>
+<text x="129.97" y="100.71" font-size="14" text-anchor="middle" transform="rotate(2121.20, 129.97, 100.71)">n</text>
+<text x="136.83" y="95.28" font-size="14" text-anchor="middle" transform="rotate(2123.82, 136.83, 95.28)">o</text>
+<text x="143.94" y="90.17" font-size="14" text-anchor="middle" transform="rotate(2126.43, 143.94, 90.17)">p</text>
+<text x="151.27" y="85.39" font-size="14" text-anchor="middle" transform="rotate(2129.05, 151.27, 85.39)"> </text>
+<text x="158.81" y="80.94" font-size="14" text-anchor="middle" transform="rotate(2131.66, 158.81, 80.94)">;</text>
+<text x="166.55" y="76.85" font-size="14" text-anchor="middle" transform="rotate(2134.27, 166.55, 76.85)"> </text>
+<text x="174.46" y="73.11" font-size="14" text-anchor="middle" transform="rotate(2136.88, 174.46, 73.11)">0</text>
+<text x="182.54" y="69.74" font-size="14" text-anchor="middle" transform="rotate(2139.48, 182.54, 69.74)">x</text>
+<text x="190.76" y="66.73" font-size="14" text-anchor="middle" transform="rotate(2142.09, 190.76, 66.73)">9</text>
+<text x="199.11" y="64.11" font-size="14" text-anchor="middle" transform="rotate(2144.69, 199.11, 64.11)">0</text>
+<text x="207.57" y="61.86" font-size="14" text-anchor="middle" transform="rotate(2147.29, 207.57, 61.86)"> </text>
+<text x="216.12" y="60.00" font-size="14" text-anchor="middle" transform="rotate(2149.89, 216.12, 60.00)">n</text>
+<text x="224.75" y="58.53" font-size="14" text-anchor="middle" transform="rotate(2152.49, 224.75, 58.53)">o</text>
+<text x="233.44" y="57.46" font-size="14" text-anchor="middle" transform="rotate(2155.08, 233.44, 57.46)">p</text>
+<text x="242.16" y="56.77" font-size="14" text-anchor="middle" transform="rotate(2157.68, 242.16, 56.77)"> </text>
+<text x="250.91" y="56.49" font-size="14" text-anchor="middle" transform="rotate(2160.27, 250.91, 56.49)">;</text>
+<text x="259.67" y="56.60" font-size="14" text-anchor="middle" transform="rotate(2162.86, 259.67, 56.60)"> </text>
+<text x="268.40" y="57.10" font-size="14" text-anchor="middle" transform="rotate(2165.45, 268.40, 57.10)">0</text>
+<text x="277.11" y="58.00" font-size="14" text-anchor="middle" transform="rotate(2168.04, 277.11, 58.00)">x</text>
+<text x="285.77" y="59.29" font-size="14" text-anchor="middle" transform="rotate(2170.62, 285.77, 59.29)">9</text>
+<text x="294.36" y="60.97" font-size="14" text-anchor="middle" transform="rotate(2173.21, 294.36, 60.97)">0</text>
+<text x="302.86" y="63.04" font-size="14" text-anchor="middle" transform="rotate(2175.79, 302.86, 63.04)"> </text>
+<text x="311.27" y="65.49" font-size="14" text-anchor="middle" transform="rotate(2178.37, 311.27, 65.49)">n</text>
+<text x="319.55" y="68.31" font-size="14" text-anchor="middle" transform="rotate(2180.95, 319.55, 68.31)">o</text>
+<text x="327.70" y="71.50" font-size="14" text-anchor="middle" transform="rotate(2183.52, 327.70, 71.50)">p</text>
+<text x="335.70" y="75.06" font-size="14" text-anchor="middle" transform="rotate(2186.10, 335.70, 75.06)"> </text>
+<text x="343.53" y="78.97" font-size="14" text-anchor="middle" transform="rotate(2188.67, 343.53, 78.97)">;</text>
+<text x="351.18" y="83.23" font-size="14" text-anchor="middle" transform="rotate(2191.25, 351.18, 83.23)"> </text>
+<text x="358.63" y="87.83" font-size="14" text-anchor="middle" transform="rotate(2193.82, 358.63, 87.83)">0</text>
+<text x="365.86" y="92.76" font-size="14" text-anchor="middle" transform="rotate(2196.38, 365.86, 92.76)">x</text>
+<text x="372.87" y="98.00" font-size="14" text-anchor="middle" transform="rotate(2198.95, 372.87, 98.00)">9</text>
+<text x="379.63" y="103.56" font-size="14" text-anchor="middle" transform="rotate(2201.52, 379.63, 103.56)">0</text>
+<text x="386.14" y="109.41" font-size="14" text-anchor="middle" transform="rotate(2204.08, 386.14, 109.41)"> </text>
+<text x="392.38" y="115.55" font-size="14" text-anchor="middle" transform="rotate(2206.64, 392.38, 115.55)">n</text>
+<text x="398.34" y="121.96" font-size="14" text-anchor="middle" transform="rotate(2209.20, 398.34, 121.96)">o</text>
+<text x="404.01" y="128.63" font-size="14" text-anchor="middle" transform="rotate(2211.76, 404.01, 128.63)">p</text>
+<text x="409.38" y="135.54" font-size="14" text-anchor="middle" transform="rotate(2214.32, 409.38, 135.54)"> </text>
+<text x="414.43" y="142.69" font-size="14" text-anchor="middle" transform="rotate(2216.87, 414.43, 142.69)">;</text>
+<text x="419.15" y="150.06" font-size="14" text-anchor="middle" transform="rotate(2219.42, 419.15, 150.06)"> </text>
+<text x="423.55" y="157.63" font-size="14" text-anchor="middle" transform="rotate(2221.98, 423.55, 157.63)">0</text>
+<text x="427.60" y="165.39" font-size="14" text-anchor="middle" transform="rotate(2224.53, 427.60, 165.39)">x</text>
+<text x="431.30" y="173.32" font-size="14" text-anchor="middle" transform="rotate(2227.07, 431.30, 173.32)">9</text>
+<text x="434.65" y="181.41" font-size="14" text-anchor="middle" transform="rotate(2229.62, 434.65, 181.41)">0</text>
+<text x="437.64" y="189.63" font-size="14" text-anchor="middle" transform="rotate(2232.17, 437.64, 189.63)"> </text>
+<text x="440.25" y="197.99" font-size="14" text-anchor="middle" transform="rotate(2234.71, 440.25, 197.99)">n</text>
+<text x="442.50" y="206.45" font-size="14" text-anchor="middle" transform="rotate(2237.25, 442.50, 206.45)">o</text>
+<text x="444.36" y="215.00" font-size="14" text-anchor="middle" transform="rotate(2239.79, 444.36, 215.00)">p</text>
+<text x="445.85" y="223.63" font-size="14" text-anchor="middle" transform="rotate(2242.33, 445.85, 223.63)"> </text>
+<text x="446.95" y="232.31" font-size="14" text-anchor="middle" transform="rotate(2244.87, 446.95, 232.31)">;</text>
+<text x="447.67" y="241.03" font-size="14" text-anchor="middle" transform="rotate(2247.40, 447.67, 241.03)"> </text>
+<text x="448.00" y="249.78" font-size="14" text-anchor="middle" transform="rotate(2249.94, 448.00, 249.78)">0</text>
+<text x="447.94" y="258.53" font-size="14" text-anchor="middle" transform="rotate(2252.47, 447.94, 258.53)">x</text>
+<text x="447.50" y="267.27" font-size="14" text-anchor="middle" transform="rotate(2255.00, 447.50, 267.27)">9</text>
+<text x="446.67" y="275.99" font-size="14" text-anchor="middle" transform="rotate(2257.53, 446.67, 275.99)">0</text>
+<text x="445.45" y="284.66" font-size="14" text-anchor="middle" transform="rotate(2260.05, 445.45, 284.66)"> </text>
+<text x="443.86" y="293.26" font-size="14" text-anchor="middle" transform="rotate(2262.58, 443.86, 293.26)">n</text>
+<text x="441.89" y="301.79" font-size="14" text-anchor="middle" transform="rotate(2265.10, 441.89, 301.79)">o</text>
+<text x="439.54" y="310.22" font-size="14" text-anchor="middle" transform="rotate(2267.63, 439.54, 310.22)">p</text>
+<text x="436.83" y="318.55" font-size="14" text-anchor="middle" transform="rotate(2270.15, 436.83, 318.55)"> </text>
+<text x="433.75" y="326.74" font-size="14" text-anchor="middle" transform="rotate(2272.67, 433.75, 326.74)">;</text>
+<text x="430.32" y="334.79" font-size="14" text-anchor="middle" transform="rotate(2275.18, 430.32, 334.79)"> </text>
+<text x="426.53" y="342.68" font-size="14" text-anchor="middle" transform="rotate(2277.70, 426.53, 342.68)">0</text>
+<text x="422.41" y="350.40" font-size="14" text-anchor="middle" transform="rotate(2280.21, 422.41, 350.40)">x</text>
+<text x="417.94" y="357.93" font-size="14" text-anchor="middle" transform="rotate(2282.73, 417.94, 357.93)">9</text>
+<text x="413.16" y="365.26" font-size="14" text-anchor="middle" transform="rotate(2285.24, 413.16, 365.26)">0</text>
+<text x="408.05" y="372.37" font-size="14" text-anchor="middle" transform="rotate(2287.75, 408.05, 372.37)"> </text>
+<text x="402.64" y="379.25" font-size="14" text-anchor="middle" transform="rotate(2290.26, 402.64, 379.25)">n</text>
+<text x="396.93" y="385.89" font-size="14" text-anchor="middle" transform="rotate(2292.76, 396.93, 385.89)">o</text>
+<text x="390.94" y="392.27" font-size="14" text-anchor="middle" transform="rotate(2295.27, 390.94, 392.27)">p</text>
+<text x="384.68" y="398.38" font-size="14" text-anchor="middle" transform="rotate(2297.77, 384.68, 398.38)"> </text>
+<text x="378.15" y="404.22" font-size="14" text-anchor="middle" transform="rotate(2300.27, 378.15, 404.22)">;</text>
+<text x="371.38" y="409.76" font-size="14" text-anchor="middle" transform="rotate(2302.77, 371.38, 409.76)"> </text>
+<text x="364.37" y="415.00" font-size="14" text-anchor="middle" transform="rotate(2305.27, 364.37, 415.00)">0</text>
+<text x="357.14" y="419.93" font-size="14" text-anchor="middle" transform="rotate(2307.77, 357.14, 419.93)">x</text>
+<text x="349.70" y="424.55" font-size="14" text-anchor="middle" transform="rotate(2310.27, 349.70, 424.55)">9</text>
+<text x="342.07" y="428.83" font-size="14" text-anchor="middle" transform="rotate(2312.76, 342.07, 428.83)">0</text>
+<text x="334.26" y="432.78" font-size="14" text-anchor="middle" transform="rotate(2315.25, 334.26, 432.78)"> </text>
+<text x="326.28" y="436.38" font-size="14" text-anchor="middle" transform="rotate(2317.74, 326.28, 436.38)">n</text>
+<text x="318.15" y="439.64" font-size="14" text-anchor="middle" transform="rotate(2320.23, 318.15, 439.64)">o</text>
+<text x="309.89" y="442.54" font-size="14" text-anchor="middle" transform="rotate(2322.72, 309.89, 442.54)">p</text>
+<text x="301.52" y="445.07" font-size="14" text-anchor="middle" transform="rotate(2325.21, 301.52, 445.07)"> </text>
+<text x="293.04" y="447.24" font-size="14" text-anchor="middle" transform="rotate(2327.69, 293.04, 447.24)">;</text>
+<text x="284.47" y="449.05" font-size="14" text-anchor="middle" transform="rotate(2330.17, 284.47, 449.05)"> </text>
+<text x="275.84" y="450.47" font-size="14" text-anchor="middle" transform="rotate(2332.66, 275.84, 450.47)">0</text>
+<text x="267.15" y="451.53" font-size="14" text-anchor="middle" transform="rotate(2335.14, 267.15, 451.53)">x</text>
+<text x="258.42" y="452.21" font-size="14" text-anchor="middle" transform="rotate(2337.62, 258.42, 452.21)">9</text>
+<text x="249.67" y="452.50" font-size="14" text-anchor="middle" transform="rotate(2340.09, 249.67, 452.50)">0</text>
+<text x="240.92" y="452.42" font-size="14" text-anchor="middle" transform="rotate(2342.57, 240.92, 452.42)"> </text>
+<text x="232.18" y="451.97" font-size="14" text-anchor="middle" transform="rotate(2345.04, 232.18, 451.97)">n</text>
+<text x="223.47" y="451.13" font-size="14" text-anchor="middle" transform="rotate(2347.51, 223.47, 451.13)">o</text>
+<text x="214.80" y="449.92" font-size="14" text-anchor="middle" transform="rotate(2349.99, 214.80, 449.92)">p</text>
+<text x="206.19" y="448.34" font-size="14" text-anchor="middle" transform="rotate(2352.46, 206.19, 448.34)"> </text>
+<text x="197.66" y="446.39" font-size="14" text-anchor="middle" transform="rotate(2354.92, 197.66, 446.39)">;</text>
+<text x="189.22" y="444.07" font-size="14" text-anchor="middle" transform="rotate(2357.39, 189.22, 444.07)"> </text>
+<text x="180.88" y="441.40" font-size="14" text-anchor="middle" transform="rotate(2359.86, 180.88, 441.40)">0</text>
+<text x="172.67" y="438.36" font-size="14" text-anchor="middle" transform="rotate(2362.32, 172.67, 438.36)">x</text>
+<text x="164.60" y="434.98" font-size="14" text-anchor="middle" transform="rotate(2364.78, 164.60, 434.98)">9</text>
+<text x="156.68" y="431.25" font-size="14" text-anchor="middle" transform="rotate(2367.24, 156.68, 431.25)">0</text>
+<text x="148.93" y="427.19" font-size="14" text-anchor="middle" transform="rotate(2369.70, 148.93, 427.19)"> </text>
+<text x="141.36" y="422.79" font-size="14" text-anchor="middle" transform="rotate(2372.16, 141.36, 422.79)">n</text>
+<text x="133.98" y="418.08" font-size="14" text-anchor="middle" transform="rotate(2374.62, 133.98, 418.08)">o</text>
+<text x="126.82" y="413.05" font-size="14" text-anchor="middle" transform="rotate(2377.07, 126.82, 413.05)">p</text>
+<text x="119.87" y="407.73" font-size="14" text-anchor="middle" transform="rotate(2379.52, 119.87, 407.73)"> </text>
+<text x="113.16" y="402.11" font-size="14" text-anchor="middle" transform="rotate(2381.98, 113.16, 402.11)">;</text>
+<text x="106.70" y="396.20" font-size="14" text-anchor="middle" transform="rotate(2384.43, 106.70, 396.20)"> </text>
+<text x="100.49" y="390.03" font-size="14" text-anchor="middle" transform="rotate(2386.87, 100.49, 390.03)">0</text>
+<text x="94.56" y="383.60" font-size="14" text-anchor="middle" transform="rotate(2389.32, 94.56, 383.60)">x</text>
+<text x="88.90" y="376.92" font-size="14" text-anchor="middle" transform="rotate(2391.77, 88.90, 376.92)">9</text>
+<text x="83.54" y="370.00" font-size="14" text-anchor="middle" transform="rotate(2394.21, 83.54, 370.00)">0</text>
+<text x="78.47" y="362.87" font-size="14" text-anchor="middle" transform="rotate(2396.66, 78.47, 362.87)"> </text>
+<text x="73.71" y="355.52" font-size="14" text-anchor="middle" transform="rotate(2399.10, 73.71, 355.52)">n</text>
+<text x="69.27" y="347.98" font-size="14" text-anchor="middle" transform="rotate(2401.54, 69.27, 347.98)">o</text>
+<text x="65.16" y="340.25" font-size="14" text-anchor="middle" transform="rotate(2403.98, 65.16, 340.25)">p</text>
+<text x="61.37" y="332.36" font-size="14" text-anchor="middle" transform="rotate(2406.41, 61.37, 332.36)"> </text>
+<text x="57.93" y="324.31" font-size="14" text-anchor="middle" transform="rotate(2408.85, 57.93, 324.31)">;</text>
+<text x="54.83" y="316.12" font-size="14" text-anchor="middle" transform="rotate(2411.28, 54.83, 316.12)"> </text>
+<text x="52.09" y="307.81" font-size="14" text-anchor="middle" transform="rotate(2413.72, 52.09, 307.81)">0</text>
+<text x="49.69" y="299.39" font-size="14" text-anchor="middle" transform="rotate(2416.15, 49.69, 299.39)">x</text>
+<text x="47.66" y="290.88" font-size="14" text-anchor="middle" transform="rotate(2418.58, 47.66, 290.88)">9</text>
+<text x="45.99" y="282.29" font-size="14" text-anchor="middle" transform="rotate(2421.01, 45.99, 282.29)">0</text>
+<text x="44.68" y="273.63" font-size="14" text-anchor="middle" transform="rotate(2423.43, 44.68, 273.63)"> </text>
+<text x="43.75" y="264.93" font-size="14" text-anchor="middle" transform="rotate(2425.86, 43.75, 264.93)">n</text>
+<text x="43.18" y="256.20" font-size="14" text-anchor="middle" transform="rotate(2428.28, 43.18, 256.20)">o</text>
+<text x="42.98" y="247.45" font-size="14" text-anchor="middle" transform="rotate(2430.71, 42.98, 247.45)">p</text>
+<text x="43.15" y="238.70" font-size="14" text-anchor="middle" transform="rotate(2433.13, 43.15, 238.70)"> </text>
+<text x="43.69" y="229.96" font-size="14" text-anchor="middle" transform="rotate(2435.55, 43.69, 229.96)">;</text>
+<text x="44.60" y="221.25" font-size="14" text-anchor="middle" transform="rotate(2437.97, 44.60, 221.25)"> </text>
+<text x="45.88" y="212.60" font-size="14" text-anchor="middle" transform="rotate(2440.38, 45.88, 212.60)">0</text>
+<text x="47.52" y="204.00" font-size="14" text-anchor="middle" transform="rotate(2442.80, 47.52, 204.00)">x</text>
+<text x="49.52" y="195.48" font-size="14" text-anchor="middle" transform="rotate(2445.21, 49.52, 195.48)">9</text>
+<text x="51.88" y="187.05" font-size="14" text-anchor="middle" transform="rotate(2447.63, 51.88, 187.05)">0</text>
+<text x="54.59" y="178.73" font-size="14" text-anchor="middle" transform="rotate(2450.04, 54.59, 178.73)"> </text>
+<text x="57.65" y="170.52" font-size="14" text-anchor="middle" transform="rotate(2452.45, 57.65, 170.52)">n</text>
+<text x="61.05" y="162.46" font-size="14" text-anchor="middle" transform="rotate(2454.86, 61.05, 162.46)">o</text>
+<text x="64.79" y="154.55" font-size="14" text-anchor="middle" transform="rotate(2457.27, 64.79, 154.55)">p</text>
+<text x="68.85" y="146.79" font-size="14" text-anchor="middle" transform="rotate(2459.67, 68.85, 146.79)"> </text>
+<text x="73.24" y="139.22" font-size="14" text-anchor="middle" transform="rotate(2462.08, 73.24, 139.22)">;</text>
+<text x="77.94" y="131.84" font-size="14" text-anchor="middle" transform="rotate(2464.48, 77.94, 131.84)"> </text>
+<text x="82.95" y="124.66" font-size="14" text-anchor="middle" transform="rotate(2466.88, 82.95, 124.66)">0</text>
+<text x="88.25" y="117.70" font-size="14" text-anchor="middle" transform="rotate(2469.28, 88.25, 117.70)">x</text>
+<text x="93.84" y="110.96" font-size="14" text-anchor="middle" transform="rotate(2471.68, 93.84, 110.96)">9</text>
+<text x="99.71" y="104.47" font-size="14" text-anchor="middle" transform="rotate(2474.08, 99.71, 104.47)">0</text>
+<text x="105.85" y="98.22" font-size="14" text-anchor="middle" transform="rotate(2476.48, 105.85, 98.22)"> </text>
+<text x="112.24" y="92.24" font-size="14" text-anchor="middle" transform="rotate(2478.87, 112.24, 92.24)">n</text>
+<text x="118.87" y="86.53" font-size="14" text-anchor="middle" transform="rotate(2481.26, 118.87, 86.53)">o</text>
+<text x="125.74" y="81.10" font-size="14" text-anchor="middle" transform="rotate(2483.66, 125.74, 81.10)">p</text>
+<text x="132.82" y="75.97" font-size="14" text-anchor="middle" transform="rotate(2486.05, 132.82, 75.97)"> </text>
+<text x="140.12" y="71.13" font-size="14" text-anchor="middle" transform="rotate(2488.44, 140.12, 71.13)">;</text>
+<text x="147.61" y="66.61" font-size="14" text-anchor="middle" transform="rotate(2490.83, 147.61, 66.61)"> </text>
+<text x="155.28" y="62.39" font-size="14" text-anchor="middle" transform="rotate(2493.21, 155.28, 62.39)">0</text>
+<text x="163.12" y="58.51" font-size="14" text-anchor="middle" transform="rotate(2495.60, 163.12, 58.51)">x</text>
+<text x="171.12" y="54.95" font-size="14" text-anchor="middle" transform="rotate(2497.98, 171.12, 54.95)">9</text>
+<text x="179.26" y="51.72" font-size="14" text-anchor="middle" transform="rotate(2500.36, 179.26, 51.72)">0</text>
+<text x="187.52" y="48.84" font-size="14" text-anchor="middle" transform="rotate(2502.75, 187.52, 48.84)"> </text>
+<text x="195.90" y="46.31" font-size="14" text-anchor="middle" transform="rotate(2505.13, 195.90, 46.31)">n</text>
+<text x="204.38" y="44.12" font-size="14" text-anchor="middle" transform="rotate(2507.50, 204.38, 44.12)">o</text>
+<text x="212.93" y="42.29" font-size="14" text-anchor="middle" transform="rotate(2509.88, 212.93, 42.29)">p</text>
+<text x="221.56" y="40.81" font-size="14" text-anchor="middle" transform="rotate(2512.26, 221.56, 40.81)"> </text>
+<text x="230.24" y="39.69" font-size="14" text-anchor="middle" transform="rotate(2514.63, 230.24, 39.69)">;</text>
+<text x="238.96" y="38.94" font-size="14" text-anchor="middle" transform="rotate(2517.01, 238.96, 38.94)"> </text>
+<text x="247.71" y="38.54" font-size="14" text-anchor="middle" transform="rotate(2519.38, 247.71, 38.54)">0</text>
+<text x="256.46" y="38.51" font-size="14" text-anchor="middle" transform="rotate(2521.75, 256.46, 38.51)">x</text>
+<text x="265.21" y="38.84" font-size="14" text-anchor="middle" transform="rotate(2524.12, 265.21, 38.84)">9</text>
+<text x="273.93" y="39.53" font-size="14" text-anchor="middle" transform="rotate(2526.49, 273.93, 39.53)">0</text>
+<text x="282.62" y="40.58" font-size="14" text-anchor="middle" transform="rotate(2528.85, 282.62, 40.58)"> </text>
+<text x="291.26" y="41.99" font-size="14" text-anchor="middle" transform="rotate(2531.22, 291.26, 41.99)">n</text>
+<text x="299.83" y="43.76" font-size="14" text-anchor="middle" transform="rotate(2533.58, 299.83, 43.76)">o</text>
+<text x="308.32" y="45.87" font-size="14" text-anchor="middle" transform="rotate(2535.95, 308.32, 45.87)">p</text>
+<text x="316.72" y="48.34" font-size="14" text-anchor="middle" transform="rotate(2538.31, 316.72, 48.34)"> </text>
+<text x="325.01" y="51.14" font-size="14" text-anchor="middle" transform="rotate(2540.67, 325.01, 51.14)">;</text>
+<text x="333.18" y="54.29" font-size="14" text-anchor="middle" transform="rotate(2543.03, 333.18, 54.29)"> </text>
+<text x="341.21" y="57.77" font-size="14" text-anchor="middle" transform="rotate(2545.38, 341.21, 57.77)">0</text>
+<text x="349.09" y="61.58" font-size="14" text-anchor="middle" transform="rotate(2547.74, 349.09, 61.58)">x</text>
+<text x="356.81" y="65.71" font-size="14" text-anchor="middle" transform="rotate(2550.10, 356.81, 65.71)">9</text>
+<text x="364.35" y="70.15" font-size="14" text-anchor="middle" transform="rotate(2552.45, 364.35, 70.15)">0</text>
+<text x="371.70" y="74.90" font-size="14" text-anchor="middle" transform="rotate(2554.80, 371.70, 74.90)"> </text>
+<text x="378.85" y="79.95" font-size="14" text-anchor="middle" transform="rotate(2557.15, 378.85, 79.95)">n</text>
+<text x="385.79" y="85.28" font-size="14" text-anchor="middle" transform="rotate(2559.50, 385.79, 85.28)">o</text>
+<text x="392.51" y="90.90" font-size="14" text-anchor="middle" transform="rotate(2561.85, 392.51, 90.90)">p</text>
+<text x="398.99" y="96.78" font-size="14" text-anchor="middle" transform="rotate(2564.20, 398.99, 96.78)"> </text>
+<text x="405.22" y="102.93" font-size="14" text-anchor="middle" transform="rotate(2566.54, 405.22, 102.93)">;</text>
+<text x="411.19" y="109.33" font-size="14" text-anchor="middle" transform="rotate(2568.89, 411.19, 109.33)"> </text>
+<text x="416.90" y="115.96" font-size="14" text-anchor="middle" transform="rotate(2571.23, 416.90, 115.96)">0</text>
+<text x="422.33" y="122.82" font-size="14" text-anchor="middle" transform="rotate(2573.57, 422.33, 122.82)">x</text>
+<text x="427.48" y="129.90" font-size="14" text-anchor="middle" transform="rotate(2575.91, 427.48, 129.90)">9</text>
+<text x="432.33" y="137.19" font-size="14" text-anchor="middle" transform="rotate(2578.25, 432.33, 137.19)">0</text>
+<text x="436.89" y="144.66" font-size="14" text-anchor="middle" transform="rotate(2580.59, 436.89, 144.66)"> </text>
+<text x="441.13" y="152.32" font-size="14" text-anchor="middle" transform="rotate(2582.93, 441.13, 152.32)">n</text>
+<text x="445.06" y="160.14" font-size="14" text-anchor="middle" transform="rotate(2585.26, 445.06, 160.14)">o</text>
+<text x="448.66" y="168.11" font-size="14" text-anchor="middle" transform="rotate(2587.60, 448.66, 168.11)">p</text>
+<text x="451.94" y="176.23" font-size="14" text-anchor="middle" transform="rotate(2589.93, 451.94, 176.23)"> </text>
+<text x="454.89" y="184.47" font-size="14" text-anchor="middle" transform="rotate(2592.26, 454.89, 184.47)">;</text>
+<text x="457.50" y="192.82" font-size="14" text-anchor="middle" transform="rotate(2594.59, 457.50, 192.82)"> </text>
+<text x="459.76" y="201.28" font-size="14" text-anchor="middle" transform="rotate(2596.92, 459.76, 201.28)">0</text>
+<text x="461.68" y="209.82" font-size="14" text-anchor="middle" transform="rotate(2599.25, 461.68, 209.82)">x</text>
+<text x="463.25" y="218.43" font-size="14" text-anchor="middle" transform="rotate(2601.58, 463.25, 218.43)">9</text>
+<text x="464.48" y="227.09" font-size="14" text-anchor="middle" transform="rotate(2603.90, 464.48, 227.09)">0</text>
+<text x="465.34" y="235.80" font-size="14" text-anchor="middle" transform="rotate(2606.23, 465.34, 235.80)"> </text>
+<text x="465.86" y="244.54" font-size="14" text-anchor="middle" transform="rotate(2608.55, 465.86, 244.54)">n</text>
+<text x="466.02" y="253.29" font-size="14" text-anchor="middle" transform="rotate(2610.87, 466.02, 253.29)">o</text>
+<text x="465.82" y="262.04" font-size="14" text-anchor="middle" transform="rotate(2613.19, 465.82, 262.04)">p</text>
+<text x="465.28" y="270.78" font-size="14" text-anchor="middle" transform="rotate(2615.51, 465.28, 270.78)"> </text>
+<text x="464.37" y="279.48" font-size="14" text-anchor="middle" transform="rotate(2617.83, 464.37, 279.48)">;</text>
+<text x="463.12" y="288.15" font-size="14" text-anchor="middle" transform="rotate(2620.15, 463.12, 288.15)"> </text>
+<text x="461.52" y="296.75" font-size="14" text-anchor="middle" transform="rotate(2622.46, 461.52, 296.75)">0</text>
+<text x="459.57" y="305.28" font-size="14" text-anchor="middle" transform="rotate(2624.78, 459.57, 305.28)">x</text>
+<text x="457.28" y="313.73" font-size="14" text-anchor="middle" transform="rotate(2627.09, 457.28, 313.73)">9</text>
+<text x="454.65" y="322.08" font-size="14" text-anchor="middle" transform="rotate(2629.40, 454.65, 322.08)">0</text>
+<text x="451.68" y="330.31" font-size="14" text-anchor="middle" transform="rotate(2631.71, 451.68, 330.31)"> </text>
+<text x="448.39" y="338.42" font-size="14" text-anchor="middle" transform="rotate(2634.02, 448.39, 338.42)">n</text>
+<text x="444.77" y="346.39" font-size="14" text-anchor="middle" transform="rotate(2636.33, 444.77, 346.39)">o</text>
+<text x="440.83" y="354.21" font-size="14" text-anchor="middle" transform="rotate(2638.64, 440.83, 354.21)">p</text>
+<text x="436.58" y="361.86" font-size="14" text-anchor="middle" transform="rotate(2640.94, 436.58, 361.86)"> </text>
+<text x="432.03" y="369.34" font-size="14" text-anchor="middle" transform="rotate(2643.25, 432.03, 369.34)">;</text>
+<text x="427.18" y="376.62" font-size="14" text-anchor="middle" transform="rotate(2645.55, 427.18, 376.62)"> </text>
+<text x="422.04" y="383.71" font-size="14" text-anchor="middle" transform="rotate(2647.85, 422.04, 383.71)">0</text>
+<text x="416.63" y="390.58" font-size="14" text-anchor="middle" transform="rotate(2650.15, 416.63, 390.58)">x</text>
+<text x="410.94" y="397.23" font-size="14" text-anchor="middle" transform="rotate(2652.45, 410.94, 397.23)">9</text>
+<text x="404.98" y="403.65" font-size="14" text-anchor="middle" transform="rotate(2654.75, 404.98, 403.65)">0</text>
+<text x="398.78" y="409.82" font-size="14" text-anchor="middle" transform="rotate(2657.05, 398.78, 409.82)"> </text>
+<text x="392.33" y="415.74" font-size="14" text-anchor="middle" transform="rotate(2659.35, 392.33, 415.74)">n</text>
+<text x="385.65" y="421.40" font-size="14" text-anchor="middle" transform="rotate(2661.64, 385.65, 421.40)">o</text>
+<text x="378.75" y="426.78" font-size="14" text-anchor="middle" transform="rotate(2663.93, 378.75, 426.78)">p</text>
+<text x="371.64" y="431.88" font-size="14" text-anchor="middle" transform="rotate(2666.23, 371.64, 431.88)"> </text>
+<text x="364.33" y="436.70" font-size="14" text-anchor="middle" transform="rotate(2668.52, 364.33, 436.70)">;</text>
+<text x="356.84" y="441.22" font-size="14" text-anchor="middle" transform="rotate(2670.81, 356.84, 441.22)"> </text>
+<text x="349.17" y="445.44" font-size="14" text-anchor="middle" transform="rotate(2673.10, 349.17, 445.44)">0</text>
+<text x="341.33" y="449.34" font-size="14" text-anchor="middle" transform="rotate(2675.38, 341.33, 449.34)">x</text>
+<text x="333.35" y="452.93" font-size="14" text-anchor="middle" transform="rotate(2677.67, 333.35, 452.93)">9</text>
+<text x="325.23" y="456.20" font-size="14" text-anchor="middle" transform="rotate(2679.96, 325.23, 456.20)">0</text>
+<text x="316.99" y="459.15" font-size="14" text-anchor="middle" transform="rotate(2682.24, 316.99, 459.15)"> </text>
+<text x="308.64" y="461.76" font-size="14" text-anchor="middle" transform="rotate(2684.52, 308.64, 461.76)">n</text>
+<text x="300.19" y="464.04" font-size="14" text-anchor="middle" transform="rotate(2686.80, 300.19, 464.04)">o</text>
+<text x="291.65" y="465.97" font-size="14" text-anchor="middle" transform="rotate(2689.08, 291.65, 465.97)">p</text>
+<text x="283.05" y="467.57" font-size="14" text-anchor="middle" transform="rotate(2691.36, 283.05, 467.57)"> </text>
+<text x="274.38" y="468.83" font-size="14" text-anchor="middle" transform="rotate(2693.64, 274.38, 468.83)">;</text>
+<text x="265.68" y="469.74" font-size="14" text-anchor="middle" transform="rotate(2695.92, 265.68, 469.74)"> </text>
+<text x="256.94" y="470.30" font-size="14" text-anchor="middle" transform="rotate(2698.19, 256.94, 470.30)">0</text>
+<text x="248.19" y="470.52" font-size="14" text-anchor="middle" transform="rotate(2700.47, 248.19, 470.52)">x</text>
+<text x="239.44" y="470.38" font-size="14" text-anchor="middle" transform="rotate(2702.74, 239.44, 470.38)">9</text>
+<text x="230.70" y="469.91" font-size="14" text-anchor="middle" transform="rotate(2705.01, 230.70, 469.91)">0</text>
+<text x="221.99" y="469.08" font-size="14" text-anchor="middle" transform="rotate(2707.29, 221.99, 469.08)"> </text>
+<text x="213.32" y="467.91" font-size="14" text-anchor="middle" transform="rotate(2709.56, 213.32, 467.91)">n</text>
+<text x="204.70" y="466.40" font-size="14" text-anchor="middle" transform="rotate(2711.82, 204.70, 466.40)">o</text>
+<text x="196.14" y="464.55" font-size="14" text-anchor="middle" transform="rotate(2714.09, 196.14, 464.55)">p</text>
+<text x="187.67" y="462.36" font-size="14" text-anchor="middle" transform="rotate(2716.36, 187.67, 462.36)"> </text>
+<text x="179.29" y="459.84" font-size="14" text-anchor="middle" transform="rotate(2718.62, 179.29, 459.84)">;</text>
+<text x="171.01" y="456.98" font-size="14" text-anchor="middle" transform="rotate(2720.89, 171.01, 456.98)"> </text>
+<text x="162.85" y="453.81" font-size="14" text-anchor="middle" transform="rotate(2723.15, 162.85, 453.81)">0</text>
+<text x="154.83" y="450.31" font-size="14" text-anchor="middle" transform="rotate(2725.41, 154.83, 450.31)">x</text>
+<text x="146.95" y="446.50" font-size="14" text-anchor="middle" transform="rotate(2727.67, 146.95, 446.50)">9</text>
+<text x="139.23" y="442.39" font-size="14" text-anchor="middle" transform="rotate(2729.93, 139.23, 442.39)">0</text>
+<text x="131.67" y="437.97" font-size="14" text-anchor="middle" transform="rotate(2732.19, 131.67, 437.97)"> </text>
+<text x="124.30" y="433.25" font-size="14" text-anchor="middle" transform="rotate(2734.45, 124.30, 433.25)">n</text>
+<text x="117.11" y="428.25" font-size="14" text-anchor="middle" transform="rotate(2736.70, 117.11, 428.25)">o</text>
+<text x="110.13" y="422.97" font-size="14" text-anchor="middle" transform="rotate(2738.96, 110.13, 422.97)">p</text>
+<text x="103.36" y="417.43" font-size="14" text-anchor="middle" transform="rotate(2741.21, 103.36, 417.43)"> </text>
+<text x="96.82" y="411.61" font-size="14" text-anchor="middle" transform="rotate(2743.47, 96.82, 411.61)">;</text>
+<text x="90.51" y="405.55" font-size="14" text-anchor="middle" transform="rotate(2745.72, 90.51, 405.55)"> </text>
+<text x="84.44" y="399.24" font-size="14" text-anchor="middle" transform="rotate(2747.97, 84.44, 399.24)">0</text>
+<text x="78.62" y="392.70" font-size="14" text-anchor="middle" transform="rotate(2750.22, 78.62, 392.70)">x</text>
+<text x="73.07" y="385.94" font-size="14" text-anchor="middle" transform="rotate(2752.46, 73.07, 385.94)">9</text>
+<text x="67.78" y="378.96" font-size="14" text-anchor="middle" transform="rotate(2754.71, 67.78, 378.96)">0</text>
+<text x="62.78" y="371.78" font-size="14" text-anchor="middle" transform="rotate(2756.96, 62.78, 371.78)"> </text>
+<text x="58.05" y="364.42" font-size="14" text-anchor="middle" transform="rotate(2759.20, 58.05, 364.42)">n</text>
+<text x="53.62" y="356.87" font-size="14" text-anchor="middle" transform="rotate(2761.45, 53.62, 356.87)">o</text>
+<text x="49.49" y="349.15" font-size="14" text-anchor="middle" transform="rotate(2763.69, 49.49, 349.15)">p</text>
+<text x="45.67" y="341.28" font-size="14" text-anchor="middle" transform="rotate(2765.93, 45.67, 341.28)"> </text>
+<text x="42.15" y="333.26" font-size="14" text-anchor="middle" transform="rotate(2768.17, 42.15, 333.26)">;</text>
+<text x="38.95" y="325.12" font-size="14" text-anchor="middle" transform="rotate(2770.41, 38.95, 325.12)"> </text>
+<text x="36.07" y="316.85" font-size="14" text-anchor="middle" transform="rotate(2772.65, 36.07, 316.85)">0</text>
+<text x="33.52" y="308.48" font-size="14" text-anchor="middle" transform="rotate(2774.88, 33.52, 308.48)">x</text>
+<text x="31.29" y="300.02" font-size="14" text-anchor="middle" transform="rotate(2777.12, 31.29, 300.02)">9</text>
+<text x="29.40" y="291.47" font-size="14" text-anchor="middle" transform="rotate(2779.35, 29.40, 291.47)">0</text>
+<text x="27.84" y="282.86" font-size="14" text-anchor="middle" transform="rotate(2781.59, 27.84, 282.86)"> </text>
+<text x="26.62" y="274.19" font-size="14" text-anchor="middle" transform="rotate(2783.82, 26.62, 274.19)">n</text>
+<text x="25.73" y="265.49" font-size="14" text-anchor="middle" transform="rotate(2786.05, 25.73, 265.49)">o</text>
+<text x="25.19" y="256.75" font-size="14" text-anchor="middle" transform="rotate(2788.28, 25.19, 256.75)">p</text>
+<text x="24.98" y="248.00" font-size="14" text-anchor="middle" transform="rotate(2790.51, 24.98, 248.00)"> </text>
+<text x="25.12" y="239.25" font-size="14" text-anchor="middle" transform="rotate(2792.74, 25.12, 239.25)">;</text>
+<text x="25.60" y="230.51" font-size="14" text-anchor="middle" transform="rotate(2794.96, 25.60, 230.51)"> </text>
+<text x="26.41" y="221.80" font-size="14" text-anchor="middle" transform="rotate(2797.19, 26.41, 221.80)">0</text>
+<text x="27.57" y="213.12" font-size="14" text-anchor="middle" transform="rotate(2799.41, 27.57, 213.12)">x</text>
+<text x="29.06" y="204.50" font-size="14" text-anchor="middle" transform="rotate(2801.64, 29.06, 204.50)">9</text>
+<text x="30.88" y="195.93" font-size="14" text-anchor="middle" transform="rotate(2803.86, 30.88, 195.93)">0</text>
+<text x="33.03" y="187.45" font-size="14" text-anchor="middle" transform="rotate(2806.08, 33.03, 187.45)"> </text>
+<text x="35.51" y="179.06" font-size="14" text-anchor="middle" transform="rotate(2808.30, 35.51, 179.06)">n</text>
+<text x="38.32" y="170.77" font-size="14" text-anchor="middle" transform="rotate(2810.52, 38.32, 170.77)">o</text>
+<text x="41.44" y="162.59" font-size="14" text-anchor="middle" transform="rotate(2812.74, 41.44, 162.59)">p</text>
+<text x="44.88" y="154.54" font-size="14" text-anchor="middle" transform="rotate(2814.96, 44.88, 154.54)"> </text>
+<text x="48.62" y="146.63" font-size="14" text-anchor="middle" transform="rotate(2817.17, 48.62, 146.63)">;</text>
+<text x="52.67" y="138.87" font-size="14" text-anchor="middle" transform="rotate(2819.39, 52.67, 138.87)"> </text>
+<text x="57.02" y="131.27" font-size="14" text-anchor="middle" transform="rotate(2821.60, 57.02, 131.27)">0</text>
+<text x="61.65" y="123.85" font-size="14" text-anchor="middle" transform="rotate(2823.81, 61.65, 123.85)">x</text>
+<text x="66.57" y="116.61" font-size="14" text-anchor="middle" transform="rotate(2826.02, 66.57, 116.61)">9</text>
+<text x="71.77" y="109.57" font-size="14" text-anchor="middle" transform="rotate(2828.23, 71.77, 109.57)">0</text>
+<text x="77.23" y="102.73" font-size="14" text-anchor="middle" transform="rotate(2830.44, 77.23, 102.73)"> </text>
+<text x="82.95" y="96.11" font-size="14" text-anchor="middle" transform="rotate(2832.65, 82.95, 96.11)">n</text>
+<text x="88.92" y="89.71" font-size="14" text-anchor="middle" transform="rotate(2834.86, 88.92, 89.71)">o</text>
+<text x="95.14" y="83.55" font-size="14" text-anchor="middle" transform="rotate(2837.07, 95.14, 83.55)">p</text>
+<text x="101.58" y="77.63" font-size="14" text-anchor="middle" transform="rotate(2839.27, 101.58, 77.63)"> </text>
+<text x="108.25" y="71.96" font-size="14" text-anchor="middle" transform="rotate(2841.48, 108.25, 71.96)">;</text>
+<text x="115.14" y="66.55" font-size="14" text-anchor="middle" transform="rotate(2843.68, 115.14, 66.55)"> </text>
+<text x="122.22" y="61.42" font-size="14" text-anchor="middle" transform="rotate(2845.88, 122.22, 61.42)">0</text>
+<text x="129.50" y="56.56" font-size="14" text-anchor="middle" transform="rotate(2848.08, 129.50, 56.56)">x</text>
+<text x="136.96" y="51.98" font-size="14" text-anchor="middle" transform="rotate(2850.28, 136.96, 51.98)">9</text>
+<text x="144.59" y="47.69" font-size="14" text-anchor="middle" transform="rotate(2852.48, 144.59, 47.69)">0</text>
+<text x="152.38" y="43.70" font-size="14" text-anchor="middle" transform="rotate(2854.68, 152.38, 43.70)"> </text>
+<text x="160.32" y="40.01" font-size="14" text-anchor="middle" transform="rotate(2856.87, 160.32, 40.01)">n</text>
+<text x="168.39" y="36.62" font-size="14" text-anchor="middle" transform="rotate(2859.07, 168.39, 36.62)">o</text>
+<text x="176.58" y="33.55" font-size="14" text-anchor="middle" transform="rotate(2861.26, 176.58, 33.55)">p</text>
+<text x="184.89" y="30.79" font-size="14" text-anchor="middle" transform="rotate(2863.46, 184.89, 30.79)"> </text>
+<text x="193.30" y="28.36" font-size="14" text-anchor="middle" transform="rotate(2865.65, 193.30, 28.36)">;</text>
+<text x="201.79" y="26.24" font-size="14" text-anchor="middle" transform="rotate(2867.84, 201.79, 26.24)"> </text>
+<text x="210.36" y="24.46" font-size="14" text-anchor="middle" transform="rotate(2870.03, 210.36, 24.46)">0</text>
+<text x="218.99" y="23.00" font-size="14" text-anchor="middle" transform="rotate(2872.22, 218.99, 23.00)">x</text>
+<text x="227.67" y="21.87" font-size="14" text-anchor="middle" transform="rotate(2874.41, 227.67, 21.87)">9</text>
+<text x="236.38" y="21.07" font-size="14" text-anchor="middle" transform="rotate(2876.60, 236.38, 21.07)">0</text>
+<text x="245.12" y="20.61" font-size="14" text-anchor="middle" transform="rotate(2878.78, 245.12, 20.61)"> </text>
+<text x="253.87" y="20.48" font-size="14" text-anchor="middle" transform="rotate(2880.97, 253.87, 20.48)">n</text>
+<text x="262.62" y="20.69" font-size="14" text-anchor="middle" transform="rotate(2883.15, 262.62, 20.69)">o</text>
+<text x="271.36" y="21.23" font-size="14" text-anchor="middle" transform="rotate(2885.33, 271.36, 21.23)">p</text>
+<text x="280.07" y="22.10" font-size="14" text-anchor="middle" transform="rotate(2887.52, 280.07, 22.10)"> </text>
+<text x="288.74" y="23.30" font-size="14" text-anchor="middle" transform="rotate(2889.70, 288.74, 23.30)">;</text>
+<text x="297.35" y="24.83" font-size="14" text-anchor="middle" transform="rotate(2891.88, 297.35, 24.83)"> </text>
+<text x="305.91" y="26.69" font-size="14" text-anchor="middle" transform="rotate(2894.06, 305.91, 26.69)">0</text>
+<text x="314.38" y="28.87" font-size="14" text-anchor="middle" transform="rotate(2896.23, 314.38, 28.87)">x</text>
+<text x="322.77" y="31.37" font-size="14" text-anchor="middle" transform="rotate(2898.41, 322.77, 31.37)">9</text>
+<text x="331.06" y="34.19" font-size="14" text-anchor="middle" transform="rotate(2900.59, 331.06, 34.19)">0</text>
+<text x="339.23" y="37.32" font-size="14" text-anchor="middle" transform="rotate(2902.76, 339.23, 37.32)"> </text>
+<text x="347.28" y="40.76" font-size="14" text-anchor="middle" transform="rotate(2904.93, 347.28, 40.76)">n</text>
+<text x="355.19" y="44.50" font-size="14" text-anchor="middle" transform="rotate(2907.11, 355.19, 44.50)">o</text>
+<text x="362.95" y="48.54" font-size="14" text-anchor="middle" transform="rotate(2909.28, 362.95, 48.54)">p</text>
+<text x="370.56" y="52.87" font-size="14" text-anchor="middle" transform="rotate(2911.45, 370.56, 52.87)"> </text>
+<text x="378.00" y="57.49" font-size="14" text-anchor="middle" transform="rotate(2913.62, 378.00, 57.49)">;</text>
+<text x="385.25" y="62.38" font-size="14" text-anchor="middle" transform="rotate(2915.79, 385.25, 62.38)"> </text>
+<text x="392.32" y="67.54" font-size="14" text-anchor="middle" transform="rotate(2917.95, 392.32, 67.54)">0</text>
+<text x="399.18" y="72.97" font-size="14" text-anchor="middle" transform="rotate(2920.12, 399.18, 72.97)">x</text>
+<text x="405.84" y="78.66" font-size="14" text-anchor="middle" transform="rotate(2922.29, 405.84, 78.66)">9</text>
+<text x="412.28" y="84.59" font-size="14" text-anchor="middle" transform="rotate(2924.45, 412.28, 84.59)">0</text>
+<text x="418.48" y="90.76" font-size="14" text-anchor="middle" transform="rotate(2926.62, 418.48, 90.76)"> </text>
+<text x="424.45" y="97.16" font-size="14" text-anchor="middle" transform="rotate(2928.78, 424.45, 97.16)">n</text>
+<text x="430.18" y="103.78" font-size="14" text-anchor="middle" transform="rotate(2930.94, 430.18, 103.78)">o</text>
+<text x="435.65" y="110.61" font-size="14" text-anchor="middle" transform="rotate(2933.10, 435.65, 110.61)">p</text>
+<text x="440.86" y="117.64" font-size="14" text-anchor="middle" transform="rotate(2935.26, 440.86, 117.64)"> </text>
+<text x="445.80" y="124.87" font-size="14" text-anchor="middle" transform="rotate(2937.42, 445.80, 124.87)">;</text>
+<text x="450.47" y="132.27" font-size="14" text-anchor="middle" transform="rotate(2939.58, 450.47, 132.27)"> </text>
+<text x="454.85" y="139.85" font-size="14" text-anchor="middle" transform="rotate(2941.73, 454.85, 139.85)">0</text>
+<text x="458.94" y="147.58" font-size="14" text-anchor="middle" transform="rotate(2943.89, 458.94, 147.58)">x</text>
+<text x="462.74" y="155.47" font-size="14" text-anchor="middle" transform="rotate(2946.04, 462.74, 155.47)">9</text>
+<text x="466.25" y="163.49" font-size="14" text-anchor="middle" transform="rotate(2948.20, 466.25, 163.49)">0</text>
+<text x="469.44" y="171.63" font-size="14" text-anchor="middle" transform="rotate(2950.35, 469.44, 171.63)"> </text>
+<text x="472.33" y="179.89" font-size="14" text-anchor="middle" transform="rotate(2952.50, 472.33, 179.89)">n</text>
+<text x="474.91" y="188.26" font-size="14" text-anchor="middle" transform="rotate(2954.65, 474.91, 188.26)">o</text>
+<text x="477.17" y="196.71" font-size="14" text-anchor="middle" transform="rotate(2956.80, 477.17, 196.71)">p</text>
+<text x="479.12" y="205.25" font-size="14" text-anchor="middle" transform="rotate(2958.95, 479.12, 205.25)"> </text>
+<text x="480.74" y="213.85" font-size="14" text-anchor="middle" transform="rotate(2961.10, 480.74, 213.85)">;</text>
+<text x="482.04" y="222.50" font-size="14" text-anchor="middle" transform="rotate(2963.24, 482.04, 222.50)"> </text>
+<text x="483.01" y="231.20" font-size="14" text-anchor="middle" transform="rotate(2965.39, 483.01, 231.20)">0</text>
+<text x="483.66" y="239.93" font-size="14" text-anchor="middle" transform="rotate(2967.53, 483.66, 239.93)">x</text>
+<text x="483.98" y="248.67" font-size="14" text-anchor="middle" transform="rotate(2969.68, 483.98, 248.67)">9</text>
+<text x="483.97" y="257.43" font-size="14" text-anchor="middle" transform="rotate(2971.82, 483.97, 257.43)">0</text>
+<text x="483.64" y="266.17" font-size="14" text-anchor="middle" transform="rotate(2973.96, 483.64, 266.17)"> </text>
+<text x="482.98" y="274.90" font-size="14" text-anchor="middle" transform="rotate(2976.10, 482.98, 274.90)">n</text>
+<text x="481.99" y="283.60" font-size="14" text-anchor="middle" transform="rotate(2978.24, 481.99, 283.60)">o</text>
+<text x="480.68" y="292.25" font-size="14" text-anchor="middle" transform="rotate(2980.38, 480.68, 292.25)">p</text>
+<text x="479.05" y="300.85" font-size="14" text-anchor="middle" transform="rotate(2982.52, 479.05, 300.85)"> </text>
+<text x="477.10" y="309.38" font-size="14" text-anchor="middle" transform="rotate(2984.65, 477.10, 309.38)">;</text>
+<text x="474.83" y="317.83" font-size="14" text-anchor="middle" transform="rotate(2986.79, 474.83, 317.83)"> </text>
+<text x="472.25" y="326.20" font-size="14" text-anchor="middle" transform="rotate(2988.92, 472.25, 326.20)">0</text>
+</svg>

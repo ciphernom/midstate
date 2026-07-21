@@ -73,4 +73,15 @@ panic = "abort"
 strip = true
 
 
-
+[workspace]
+members = [
+    "crates/walletd",
+    "apps/desktop",
+]
+exclude = [
+    "apps/desktop-webview",
+    "wasm-wallet",
+    "sdk",
+    "midstate_relayer_daemon",
+    "buildroot",
+]
