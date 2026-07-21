@@ -1007,6 +1007,80 @@ async fn filter_scan(
 /// PRIVACY: This function never sends any addresses to the node. It downloads
 /// raw blocks and matches outputs locally, preserving Neutrino-level privacy.
 /// Returns count of newly imported coins.
+/// Imports coins paid to `addresses` from the candidate blocks `heights`.
+///
+/// # Reasoning
+///
+/// This is the import half of restore: `filter_scan` proposes blocks whose
+/// GCS filter matched a watched address; this function fetches each proposed
+/// block and materialises matching outputs as wallet coins.
+///
+/// The previous implementation matched only `Transaction::Reveal` (plus
+/// coinbase), while `CompactFilter::items_in()` also indexes `Consolidate`
+/// outputs. A block whose only matches were consolidation change therefore
+/// flagged in the filter pass and imported nothing here. Consequences:
+/// (1) defrag/consolidation change was unrecoverable from seed, and
+/// (2) the restore caller counted such blocks as "empty", advancing its gap
+/// counter and terminating recovery early. This pairing is what hid a real
+/// wallet's WOTS-change coins (used indices 129 and 387, a 258-key hole).
+/// `Reveal` and `Consolidate` carry identical `outputs: Vec<Output>`, and the
+/// spend path (`wallet_spend_script`) already matches both; this brings the
+/// scan into line with it.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Let A       = set(addresses)
+///     outs(b) = b.coinbase ⌢ concat⟨ tx.outputs | tx ∈ b.transactions ∧
+///                                     tx ∈ {Reveal, Consolidate} ⟩
+///     found   = { o | h ∈ heights ∧ block(h) fetched ∧ o ∈ outs(block(h)) ∧
+///                     o.address ∈ A ∧ coin_id(o) ∉ ids(wallet.coins) }
+///
+/// Pre:
+///   - addresses = wallet.watched_addresses() at time of call
+///   - heights ⊆ [0, chain_height]
+///
+/// Post:
+///   result = Ok(n) ⇒
+///     wallet.coins'   = wallet.coins ∪ mkcoin⟦found⟧          (in memory)
+///     wallet.history' = wallet.history ⌢ one "received" entry per block
+///                       with ≥ 1 imported coin (empty blocks append nothing)
+///     n               = #imported ≤ #found
+///                       (reuse-quarantined outputs are logged and skipped)
+///   result = Err(_) ⇒
+///     wallet.coins' ⊇ wallet.coins — a prefix of `found` may already be
+///     imported in memory; nothing from this call is durable until the
+///     caller's `wallet.save()`. Re-running is safe: import is idempotent
+///     on coin_id.
+/// ```
+///
+/// ```zed
+///     TargetedScan
+///     ----------------
+///     ΔWalletCoins
+///     ΔWalletHistory
+///     A? : ℙ Address
+///     H? : seq Height
+///     n! : ℕ
+///
+///     post coins'   = coins ∪ { mkcoin(o) | o ∈ found }
+///     post history' = history ⌢ receipts(found)
+///     post n!       = #{ o ∈ found | imported(o) }
+///     post coins ⊆ coins'                    ⟨a scan never removes coins⟩
+/// ```
+///
+/// # Safety / Invariants
+///
+/// - **Scan–filter completeness**: the output universe examined here must be
+///   a superset of the spendable outputs indexed by
+///   `CompactFilter::items_in()`. Any divergence reopens the
+///   filter-match/zero-import hole and silently corrupts gap-limit restore.
+///   If a new output-bearing `Transaction` variant is added, extend BOTH
+///   this match and `items_in()` together.
+/// - Idempotence: `import_scanned` dedupes on `coin_id`; overlapping or
+///   repeated scans cannot double-count.
+/// - Reuse quarantine: a coin arriving at an already-signed WOTS address is
+///   skipped by `import_scanned` (unspendable without key reuse, by design).
 async fn targeted_scan(
     client: &reqwest::Client,
     base_url: &str,
@@ -1043,18 +1117,24 @@ async fn targeted_scan(
             }
         }
 
-        // Scan transaction outputs
+        // Scan transaction outputs. Reveal and Consolidate carry the same
+        // `outputs` field and are both indexed by CompactFilter::items_in();
+        // the scan–filter completeness invariant (see doc block) requires
+        // matching both here.
         for tx in &batch.transactions {
-            if let midstate::core::Transaction::Reveal { outputs, .. } = tx {
-                for out in outputs {
-                    if addr_set.contains(&out.address()) {
-                        if let Some(_cid) = out.coin_id() {
-                            let commitment = if out.is_confidential() { out.commitment() } else { None };
-                            if let Some(coin_id) = wallet.import_scanned(out.address(), out.value(), out.salt(), commitment)? {
-                                println!("  found: {} (value {}, height {})", hex::encode(&coin_id), out.value(), height);
-                                block_coins.push(coin_id);
-                                imported += 1;
-                            }
+            let outputs = match tx {
+                midstate::core::Transaction::Reveal { outputs, .. }
+                | midstate::core::Transaction::Consolidate { outputs, .. } => outputs,
+                _ => continue,
+            };
+            for out in outputs {
+                if addr_set.contains(&out.address()) {
+                    if let Some(_cid) = out.coin_id() {
+                        let commitment = if out.is_confidential() { out.commitment() } else { None };
+                        if let Some(coin_id) = wallet.import_scanned(out.address(), out.value(), out.salt(), commitment)? {
+                            println!("  found: {} (value {}, height {})", hex::encode(&coin_id), out.value(), height);
+                            block_coins.push(coin_id);
+                            imported += 1;
                         }
                     }
                 }
@@ -1502,6 +1582,90 @@ fn wallet_create(path: &PathBuf, legacy: bool) -> Result<()> {
     Ok(())
 }
 
+/// Restores an HD wallet from its mnemonic and rediscovers its coins on-chain.
+///
+/// # Reasoning
+///
+/// Restore must reconstruct, from the seed alone, every address the wallet
+/// ever controlled, then find every coin paid to any of them. Two properties
+/// of this wallet family made the previous loop unsafe:
+///
+/// 1. Change churn: every spend allocates fresh WOTS indices (one per change
+///    output) and defrag/consolidation can advance the counter by dozens in a
+///    single transaction, so real wallets exhibit holes of hundreds of
+///    consecutive unused indices between used ones (observed: used index 129,
+///    next used index 387).
+/// 2. The previous loop did not implement a true gap limit: it added
+///    BATCH_SIZE (50) to a `consecutive_empty` counter after any batch that
+///    yielded no new coin and stopped at GAP_LIMIT (20) — i.e. it halted
+///    inside the *first* coin-free batch, wherever the last used index was.
+///
+/// It also derived exactly one MSS tree, leaving coins on any later MSS tree
+/// invisible, and (via the old `targeted_scan`) dropped Consolidate outputs,
+/// making batches look emptier than they were.
+///
+/// The rewrite scans an unconditional floor (WOTS 0..WOTS_FLOOR, MSS
+/// 0..MSS_FLOOR) in one pass, then extends in batches under a real gap limit
+/// measured from the highest index that has produced a coin.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Let used  = { i | wots_addr(i) receives an output in blocks [0, chain_height] }
+///
+/// Pre:
+///   - path names a fresh wallet created here via restore_from_mnemonic
+///     (HD: master_seed set, next_wots_index = next_mss_index = 0)
+///   - the serving node is archival over [0, chain_height]
+///
+/// Post (success):
+///   - next_wots_index' ≥ WOTS_FLOOR  ∧  next_mss_index' ≥ MSS_FLOOR
+///   - max({0} ∪ (used ∩ [0, next_wots_index'))) + GAP_LIMIT ≤ next_wots_index'
+///   - watched' = { wots_addr(i) | i < next_wots_index' }
+///              ∪ { mss_addr(j)  | j < next_mss_index' }
+///   - wallet.coins' ⊇ { o ∈ chain outputs [0, chain_height] |
+///                       o.address ∈ watched' }
+///   - Completeness caveat (inherent to gap-limit recovery): a hole of unused
+///     indices strictly larger than GAP_LIMIT starting above WOTS_FLOOR, or
+///     coins on MSS index ≥ MSS_FLOOR, are outside this automated pass —
+///     raise the floors for such wallets.
+///
+/// Post (error):
+///   - HD counters retain every increment already persisted by
+///     allocate_next_*_seed (monotone; an index, once issued, is never
+///     re-issued). No coins from this call are durable. Re-running restore
+///     into a fresh path is safe and idempotent on-chain.
+/// ```
+///
+/// ```zed
+///     RestoreScan
+///     ----------------
+///     ΔHDCounters
+///     ΔWalletKeys
+///     ΔWalletCoins
+///     chain_height? : ℕ
+///
+///     pre  master_seed ≠ ∅
+///
+///     post next_wots_index' ≥ max(WOTS_FLOOR, next_wots_index)
+///     post next_mss_index'  ≥ MSS_FLOOR
+///     post watched' = { wots_addr i | i < next_wots_index' }
+///                   ∪ { mss_addr j  | j < next_mss_index' }
+///     post max({0} ∪ (used ∩ next_wots_index')) + GAP_LIMIT ≤ next_wots_index'
+///     post coins' ⊇ { o ∈ outputs(0 ‥ chain_height?) | o.address ∈ watched' }
+/// ```
+///
+/// # Safety / Invariants
+///
+/// - HD counters are monotone: indices are consumed only through
+///   `allocate_next_*_seed`, which persists the increment before returning,
+///   so an interrupted restore never re-issues an index for signing.
+/// - GCS filters have false positives only, never false negatives; the filter
+///   pass cannot cause missed coins, only wasted block fetches. Missing
+///   *blocks* can: the archival-node precondition is load-bearing (a pruned
+///   node's `/filters` truncates at tip − PRUNE_DEPTH and the scan degrades).
+/// - Restore derives keys and imports coins but never signs; WOTS one-time
+///   safety is unaffected by this path.
 async fn wallet_restore(path: &PathBuf, phrase_arg: Option<String>, rpc_port: u16, rpc_host: String) -> Result<()> {
     let phrase = match phrase_arg {
         Some(p) => p,
@@ -1541,41 +1705,49 @@ async fn wallet_restore(path: &PathBuf, phrase_arg: Option<String>, rpc_port: u1
         return Ok(());
     }
 
-    const GAP_LIMIT: u64 = 20;
-    const BATCH_SIZE: u64 = 50;
-    let mut total_found = 0usize;
-    let mut consecutive_empty = 0u64;
-    // Force the wallet to derive your first MSS key so it gets added to watched_addresses()
-    wallet.generate_mss(10, Some("Recovered MSS".to_string()))?; 
+    // Floor + true gap limit (see the formal spec in the doc block above).
+    // Tune the floors upward for wallets that churn change even harder; the
+    // observed worst case (258-key hole, used index 387) sits inside these.
+    const WOTS_FLOOR: u64 = 1024; // always scan at least this many WOTS keys
+    const MSS_FLOOR: u64 = 4;     // always scan at least this many MSS trees
+    const GAP_LIMIT: u64 = 256;   // consecutive unused WOTS keys past last hit
+    const BATCH_SIZE: u64 = 64;
 
+    let mut total_found = 0usize;
+
+    // Derive the MSS floor (indices 0..MSS_FLOOR), height 10 = wallet default.
+    // Each MSS tree costs 2^10 WOTS keygens — the expensive part of restore.
+    for _ in 0..MSS_FLOOR {
+        wallet.generate_mss(10, Some("Recovered MSS".to_string()))?;
+    }
+    // Derive the WOTS floor in one shot, then scan floor addresses in one pass.
+    wallet.restore_generate_keys(WOTS_FLOOR)?;
+    let addresses = wallet.watched_addresses();
+    println!(
+        "  Scanning floor: {} addresses (WOTS 0..{}, MSS 0..{})...",
+        addresses.len(), wallet.wots_index(), wallet.mss_index()
+    );
+    let heights = filter_scan(&client, &base_url, &addresses, 0, chain_height).await?;
+    total_found += targeted_scan(&client, &base_url, &mut wallet, &addresses, &heights).await?;
+
+    // Extend past the floor while coins keep appearing. `last_active` tracks the
+    // highest WOTS index that has produced a coin; we stop once GAP_LIMIT keys
+    // have gone by since then.
+    let mut last_active = wallet.wots_index();
     loop {
-        // Generate a batch of keys
-        let idx_before = wallet.wots_index();
         wallet.restore_generate_keys(BATCH_SIZE)?;
         let addresses = wallet.watched_addresses();
-
-        println!(
-            "  Scanning with {} addresses (WOTS index {}..{})...",
-            addresses.len(), idx_before, wallet.wots_index()
-        );
-
-        // Use compact filters to find which blocks might contain our addresses
-        let matching_heights = filter_scan(&client, &base_url, &addresses, 0, chain_height).await?;
-
-        if matching_heights.is_empty() {
-            consecutive_empty += BATCH_SIZE;
-        } else {
-            // Do targeted full scans only on matching blocks
-            let found = targeted_scan(&client, &base_url, &mut wallet, &addresses, &matching_heights).await?;
-            if found > 0 {
-                total_found += found;
-                consecutive_empty = 0;
-            } else {
-                consecutive_empty += BATCH_SIZE;
-            }
+        let heights = filter_scan(&client, &base_url, &addresses, 0, chain_height).await?;
+        let before = total_found;
+        total_found += targeted_scan(&client, &base_url, &mut wallet, &addresses, &heights).await?;
+        if total_found > before {
+            last_active = wallet.wots_index(); // this batch produced a coin
         }
-
-        if consecutive_empty >= GAP_LIMIT {
+        println!(
+            "  Extended to WOTS index {} (last coin by index {}).",
+            wallet.wots_index(), last_active
+        );
+        if wallet.wots_index().saturating_sub(last_active) >= GAP_LIMIT {
             break;
         }
     }
@@ -2015,6 +2187,59 @@ async fn wallet_consolidate(
     Ok(())
 }
 
+/// Executes a single, optimal cross-address UTXO defragmentation sweep.
+///
+/// # Reasoning
+/// WOTS addresses are strictly single-use. If a wallet holds multiple fragmented coins
+/// at the same WOTS address, they must all be spent together (the co-spend rule).
+/// **Critical Bug Fixed:** If the blockchain holds more sibling coins at a target address 
+/// than the wallet knows about locally, spending *any* coin from that address permanently 
+/// burns the unknown siblings. 
+///
+/// This function performs a strict chain-side completeness check via compact filters 
+/// before touching any WOTS addresses to prevent burning unknown siblings. It then 
+/// calculates an optimal single-batch transaction (up to `max_inputs`) to compress 
+/// the dust into a reusable MSS address, adhering to the Unix philosophy of doing 
+/// exactly one batch per invocation to prevent complex partial-failure states.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Pre:
+///   - max_inputs <= MAX_TX_INPUTS
+///   - Network is accessible via RPC
+///
+/// Post:
+///   result = Ok(())  ⇒
+///     let F = fragmented WOTS bundles in wallet
+///     ∀ b ∈ F: chain_state(b.address) ⊆ wallet.coins
+///     (All unknown sibling coins on-chain are imported before spending begins)
+///     
+///     wallet.coins' contains fewer fragmented WOTS coins and 1 more MSS coin.
+///     The generated transaction is mined and valid.
+///
+///   result = Err(_)  ⇒ Execution halted. Wallet state remains consistent.
+/// ```
+///
+/// ```zed
+///     WalletDefrag
+///     ------------
+///     ΔWallet
+///     network : RPC
+///
+///     pre  max_inputs ≤ MAX_TX_INPUTS
+///     post result = Ok(()) ⇒
+///          (∀ addr ∈ FragAddrs • chain_utxos(addr) ⊆ wallet.coins') ∧
+///          (wallet.coins' has higher average value per UTXO than wallet.coins)
+/// ```
+///
+/// # Safety / Invariants
+/// - **No Phantom Burns:** A WOTS address is never spent until a full chain filter
+///   scan proves the wallet possesses all sibling UTXOs at that address.
+/// - **Fee Conservation:** The greedy knapsack algorithm guarantees the network fee
+///   never exceeds the dust value being recovered.
+/// - **Stateless Execution:** Processes exactly one batch per invocation, relying on 
+///   standard bash loops for larger wallets to prevent corrupted partial-sync states.
 async fn wallet_defrag(
     path: &PathBuf,
     rpc_port: u16,
@@ -2025,6 +2250,7 @@ async fn wallet_defrag(
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
+    let base_url = format!("http://{}:{}", rpc_host, rpc_port);
 
     println!("Checking on-chain status of wallet coins...");
     let mut live_coins = Vec::new();
@@ -2034,18 +2260,52 @@ async fn wallet_defrag(
         }
     }
 
-    // 1. Check if defragmentation is even necessary
-    let (frag_count, frag_val) = wallet.fragmented_summary(&live_coins);
-    if frag_count < 2 {
-        println!("No defragmentation needed. Found {} fragmented WOTS coin(s).", frag_count);
+    // 1. Initial Assessment & Extract Target Addresses
+    let live_set: std::collections::HashSet<[u8; 32]> = live_coins.iter().copied().collect();
+    let bundles = wallet.spendable_bundles(&live_set, false);
+    
+    if bundles.len() < 2 {
+        println!("No defragmentation needed. Found {} fragmented WOTS bundle(s).", bundles.len());
         return Ok(());
     }
-    println!("Found {} fragmented WOTS coins totaling {} value.", frag_count, frag_val);
 
-    // 2. Define the Fee Policy
-    // The mempool requires MIN_FEE_PER_KB = 10.
-    // Base tx overhead is ~100 bytes. WOTS Input is ~1636 bytes. Output is ~100 bytes.
-    // Rate math: bytes * 10 / 1024
+    let mut target_addrs = Vec::new();
+    for b in &bundles {
+        target_addrs.push(b.address);
+    }
+    target_addrs.sort_unstable();
+    target_addrs.dedup();
+
+    // 2. CHAIN-SIDE COMPLETENESS CHECK (Destructive-operation guard)
+    println!("Performing chain-side completeness check for {} WOTS addresses to prevent burning unknown sibling coins...", target_addrs.len());
+
+    let chain_height = match client.get(format!("{}/state", base_url)).send().await {
+        Ok(resp) => match resp.json::<rpc::GetStateResponse>().await {
+            Ok(s) => s.height,
+            Err(e) => anyhow::bail!("Could not read chain height: {}", e),
+        },
+        Err(e) => anyhow::bail!("Could not reach node: {}", e),
+    };
+
+    let matching = filter_scan(&client, &base_url, &target_addrs, 0, chain_height).await?;
+    let imported = targeted_scan(&client, &base_url, &mut wallet, &target_addrs, &matching).await?;
+    
+    if imported > 0 {
+        wallet.save()?;
+        println!("⚠️  Imported {} previously-unknown sibling coin(s) at these addresses.", imported);
+        println!("   Re-evaluating live coins...");
+        // Re-evaluate live coins since we imported new ones that MUST be co-spent
+        live_coins.clear();
+        for wc in wallet.coins() {
+            if let Ok(true) = check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
+                live_coins.push(wc.coin_id);
+            }
+        }
+    } else {
+        println!("✓ Completeness check passed. No unknown siblings found.");
+    }
+
+    // 3. Define the Fee Policy
     use midstate::wallet::FeePolicy;
     let policy = FeePolicy {
         base: 20,      // Safe base padding
@@ -2053,18 +2313,21 @@ async fn wallet_defrag(
         per_output: 2, // (100 * 10 / 1024) ≈ 1 + 1 padding
     };
 
-    // 3. Generate a fresh MSS destination for the sweep
+    // 4. Generate a fresh MSS destination for the sweep
     let dest_addr = wallet.generate_mss(10, Some("Defrag Sweep Destination".into()))?;
     println!(
         "Generated fresh MSS destination: {}", 
         midstate::core::types::encode_address_with_checksum(&dest_addr)
     );
 
-    // 4. Plan the optimal batch using the greedy knapsack logic
+    // 5. Plan and Execute Exactly ONE Batch
+    let (frag_count, frag_val) = wallet.fragmented_summary(&live_coins);
+    println!("Fragmented WOTS coins: {} (total value: {})", frag_count, frag_val);
+
     let plan = match wallet.plan_defrag_batch(&live_coins, dest_addr, &policy, max_inputs)? {
         Some(p) => p,
         None => {
-            println!("Could not construct an economical defrag batch (dust coins are too small to cover their own signature fees).");
+            println!("Could not construct an economical defrag batch (remaining dust coins are too small to cover their own signature fees).");
             return Ok(());
         }
     };
@@ -2073,18 +2336,13 @@ async fn wallet_defrag(
     println!("  Inputs: {} coins (value {})", plan.input_coin_ids.len(), plan.total_in);
     println!("  Outputs: {} (to MSS address)", plan.outputs.len());
     println!("  Fee: {}", plan.fee);
-    if plan.remaining_fragmented_coins > 0 {
-        println!("  Remaining fragmented coins after this batch: {}", plan.remaining_fragmented_coins);
-    }
     println!();
 
-    // 5. Execute Phase 1: Prepare & Submit Commit
-    // is_consolidate = false because this is a cross-address defrag, not a single-address consolidate
     let (commitment, _salt) = wallet.prepare_commit(
         &plan.input_coin_ids,
         &plan.outputs,
         vec![], // No change seeds; outputs are exact
-        false,  // No privacy delay for housekeeping
+        false,  
         false,  
     )?;
 
@@ -2096,14 +2354,15 @@ async fn wallet_defrag(
     }
     println!("✓ Commit mined!");
 
-    // 6. Execute Phase 2: Sign & Submit Reveal
     println!("Submitting Phase 2: Defrag Reveal...");
     do_reveal(&client, &mut wallet, rpc_port, &rpc_host, &commitment, timeout_secs).await?;
 
     println!("✓ Defragmentation batch complete!");
-    
+
+    // 6. Provide Guidance for Remaining Dust
     if plan.remaining_fragmented_coins > 1 {
-        println!("Note: You still have {} fragmented coins. Run the command again to process the next batch.", plan.remaining_fragmented_coins);
+        println!("\nNote: You still have {} fragmented coins.", plan.remaining_fragmented_coins);
+        println!("To process the next batch, run this command again.");
     }
 
     Ok(())
@@ -3862,8 +4121,19 @@ async fn wallet_buy_license(
     let refund_seed = wallet.allocate_next_wots_seed()?;
     let refund_pk = midstate::core::wots::keygen(&refund_seed);
 
-    // Timeout: use a generous window (buyer can query current height via RPC in production)
-    let timeout_height = 1_000_000u64; // placeholder; real impl should query /state + add buffer
+    // ── FIX: Dynamic HTLC Timeout ──
+    let base_url = format!("http://{}:{}", rpc_host, rpc_port);
+    let chain_height = match client.get(format!("{}/state", base_url)).send().await {
+        Ok(resp) => match resp.json::<rpc::GetStateResponse>().await {
+            Ok(s) => s.height,
+            Err(e) => anyhow::bail!("Could not read chain height for HTLC timeout: {}", e),
+        },
+        Err(e) => anyhow::bail!("Could not reach node for HTLC timeout: {}", e),
+    };
+    
+    // Timeout set to ~3 days (4320 blocks) to give the seller ample time to claim,
+    // while ensuring the buyer isn't locked out of their funds indefinitely.
+    let timeout_height = chain_height + 4320;
 
     let htlc_script = midstate::core::script::compile_htlc(
         &secret_hash,
@@ -4334,29 +4604,41 @@ async fn wallet_recover_license_metadata(
 
     if let Ok(resp) = batch_resp {
         if let Ok(batch_json) = resp.json::<serde_json::Value>().await {
-            // Very defensive scan — real implementation would deserialize the full Batch.
-            if let Some(outputs) = batch_json.get("outputs").and_then(|o| o.as_array()) {
-                // Collect potential metadata chunks (support both old single-payload and new chunked format)
-                let mut chunks: Vec<(u8, u8, Vec<u8>)> = Vec::new();
-                let mut raw_payloads: Vec<Vec<u8>> = Vec::new();
+            let mut chunks: Vec<(u8, u8, Vec<u8>)> = Vec::new();
+            let mut raw_payloads: Vec<Vec<u8>> = Vec::new();
 
-                for out in outputs {
-                    if let Some(payload_hex) = out.get("payload").and_then(|p| p.as_str()) {
-                        if let Ok(payload) = hex::decode(payload_hex) {
-                            raw_payloads.push(payload.clone());
+            // ── FIX: Correctly traverse the JSON Batch hierarchy ──
+            if let Some(txs) = batch_json.get("transactions").and_then(|t| t.as_array()) {
+                for tx in txs {
+                    // Match either a Reveal or Consolidate transaction
+                    let tx_obj = tx.get("Reveal").or_else(|| tx.get("Consolidate"));
+                    
+                    if let Some(obj) = tx_obj {
+                        if let Some(outputs) = obj.get("outputs").and_then(|o| o.as_array()) {
+                            for out in outputs {
+                                // Match the DataBurn output variant specifically
+                                if let Some(databurn) = out.get("DataBurn") {
+                                    if let Some(payload_hex) = databurn.get("payload").and_then(|p| p.as_str()) {
+                                        if let Ok(payload) = hex::decode(payload_hex) {
+                                            raw_payloads.push(payload.clone());
 
-                            // New chunked format: first two bytes are [index, total]
-                            if payload.len() >= 2 {
-                                let idx = payload[0];
-                                let total = payload[1];
-                                if total > 0 && idx < total {
-                                    let data = payload[2..].to_vec();
-                                    chunks.push((idx, total, data));
+                                            // New chunked format: first two bytes are [index, total]
+                                            if payload.len() >= 2 {
+                                                let idx = payload[0];
+                                                let total = payload[1];
+                                                if total > 0 && idx < total {
+                                                    let data = payload[2..].to_vec();
+                                                    chunks.push((idx, total, data));
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
+            
 
                 // Try chunked reassembly first
                 if !chunks.is_empty() {

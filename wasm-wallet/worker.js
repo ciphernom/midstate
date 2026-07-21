@@ -3406,7 +3406,23 @@ self.onmessage = async (e) => {
                 }).catch(()=>{});
             }
             
-            // 2. Instant Sync: Check the block's filter for incoming funds!
+            // 2a. Reorg check FIRST: if this block doesn't extend our chain
+            // cleanly, roll back to the fork point (reuse-safely) before syncing.
+            // Skipped while a scan is in flight; the next notification handles it.
+            if (!isScanning) {
+                let reorged = false;
+                try { reorged = await maybeHandleReorg(notif); }
+                catch (e) { self.postMessage({ type: 'LOG', payload: `Reorg check failed: ${e && e.message || e}` }); }
+                if (reorged) {
+                    if (wState.pending_tx && wState.pending_tx.reorgResend) {
+                        recoverPendingTx().catch(()=>{});   // re-send the verbatim signature
+                    }
+                    performScan().catch(()=>{});
+                    return;
+                }
+            }
+
+            // 2b. Instant Sync: Check the block's filter for incoming funds!
             if (notif.filter_hex && notif.block_hash && notif.element_count > 0) {
                 const matched = wallet.check_filter(notif.filter_hex, notif.block_hash, notif.element_count);
                 if (matched) {
@@ -3417,12 +3433,20 @@ self.onmessage = async (e) => {
                     notif.height === wState.lastScannedHeight + 1
                 ) {
                     // Caught up and the new block is exactly the next one — safe fast-path.
+                    // Record its hash/parent for future reorg linkage, then advance.
+                    if (notif.block_hash) {
+                        wState.blockHashes = wState.blockHashes || {};
+                        wState.blockHashes[notif.height] = {
+                            hash: normalizeHex(notif.block_hash),
+                            prev: notif.prev_hash ? normalizeHex(notif.prev_hash) : null,
+                        };
+                        pruneBlockHashes();
+                    }
                     wState.lastScannedHeight = notif.height;
                     saveState();
                     self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
                 } else if (notif.height > wState.lastScannedHeight + 1) {
-                    // We're behind by more than one block — there's actual history to
-                    // scan. Don't fast-forward the marker; let performScan handle it.
+                    // Behind by more than one block — real history to scan.
                     performScan().catch(()=>{});
                 }
             }
@@ -4109,8 +4133,14 @@ function getSpendableUtxos() {
         }
     }
     
-    // ---FILTER OUT watch_only COINS ---
-    return Object.values(wState.utxos).filter(u => !wState.pendingSpends[u.coin_id] && !u.watch_only);
+    // ---FILTER OUT watch_only AND reuse-locked COINS ---
+    // reuseLocked coins were restored by a reorg to a WOTS address whose
+    // one-time key already signed a now-orphaned transaction we no longer hold.
+    // Spending them into any NEW transaction would produce a second signature
+    // from that key (reuse). They are excluded from all automatic selection and
+    // surfaced to the user separately; see rollbackTo CASE 2.
+    return Object.values(wState.utxos).filter(u =>
+        !wState.pendingSpends[u.coin_id] && !u.watch_only && !u.reuseLocked);
 }
 
 
@@ -4468,9 +4498,265 @@ function compute_confidential_coin_id(addrHex, commitmentHex, saltHex) {
  * @param {number} height - Block height to process.
  * @returns {Promise<boolean>} `true` if any wallet-relevant activity was found.
  */
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Reorg handling  (reuse-safe)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// The wallet applies blocks forward-only and, before this, irreversibly: spends
+// deleted their input coins, purged WOTS siblings, and set spentWots[addr]=true
+// permanently. An orphaned block therefore (a) left phantom credits and, worse,
+// (b) could strand real coins — a spend that got reorged out still had its
+// inputs deleted and its address poisoned, and addUtxo refuses a poisoned
+// address forever, so even a full rescan could not re-credit the coin.
+//
+// The naive fix — clear spentWots on rollback and restore the coin — is UNSAFE.
+// A WOTS key signs exactly one message. When a spend is orphaned, its signature
+// (over that tx's commitment) is already public and may still confirm on the
+// winning chain or be replayed by anyone. If we simply "un-poison" the address
+// and let the wallet spend the restored coin into ANY different transaction, we
+// produce a SECOND signature over a DIFFERENT commitment from the same key —
+// classic one-time-key reuse, which leaks the key. So the restored coin must be
+// spendable ONLY by re-sending the identical original signature (same
+// commitment), never by re-signing.
+//
+// This module implements that. Every mutation is height-tagged. On reorg we roll
+// back to the fork height and resolve each restored WOTS spend three ways:
+//
+//   (1) We still hold the verbatim signed reveal (in sentReveals, retained while
+//       re-sendable): re-arm pending_tx with it so the existing recoverPendingTx
+//       machinery re-broadcasts the SAME signature. Reuse-safe, automatic.
+//   (2) We no longer hold the reveal (spend was buried and pruned) but the
+//       address is poisoned: restore the coin in a REUSE-LOCKED state and
+//       surface it to the user. The wallet will not auto-spend it; the only
+//       safe options are user-driven and explained in the UI.
+//   (3) MSS inputs: no per-key reuse cliff (leaf counters are reconciled with
+//       the node), so these are restored normally.
+
+const REORG_DEPTH = 200;              // hash history retained / max healable depth
+const COMMITMENT_TTL = 1000;          // blocks; matches recoverPendingTx expiry
+
+let _reorgHeight = 0;                  // thread-local: height being applied by processFullBlock
+let _restoringCoinId = null;           // thread-local: coin addUtxo is allowed to re-credit to a poisoned addr
+
+function pruneBlockHashes() {
+    if (!wState.blockHashes) return;
+    const heights = Object.keys(wState.blockHashes).map(Number);
+    if (heights.length <= REORG_DEPTH + 8) return;
+    const cutoff = Math.max(...heights) - REORG_DEPTH;
+    for (const h of heights) if (h < cutoff) delete wState.blockHashes[h];
+    if (wState.spentLog) {
+        for (const h of Object.keys(wState.spentLog).map(Number)) {
+            if (h < cutoff) delete wState.spentLog[h];   // buried spends are final
+        }
+    }
+    // Prune sentReveals that can no longer be revealed (older than TTL) — past
+    // that the coins are unspendable-by-that-tx on the node anyway.
+    if (wState.sentReveals) {
+        for (const addr of Object.keys(wState.sentReveals)) {
+            const r = wState.sentReveals[addr];
+            if (r && typeof r.sentAtHeight === 'number' &&
+                networkHeight - r.sentAtHeight > COMMITMENT_TTL) {
+                delete wState.sentReveals[addr];
+            }
+        }
+    }
+}
+
+/**
+ * Roll wallet state back to `forkHeight` (its effects RETAINED); undo every
+ * mutation above it, restoring orphaned spends reuse-safely.
+ * @param {number} forkHeight
+ * @returns {{restored:number, removed:number, resendable:number, locked:number}}
+ */
+function rollbackTo(forkHeight) {
+    let restored = 0, removed = 0, resendable = 0, locked = 0;
+
+    // 1. Remove coins credited above the fork (exist only on the dead branch).
+    for (const cid of Object.keys(wState.utxos)) {
+        if ((wState.utxos[cid].createdAtHeight || 0) > forkHeight) {
+            delete wState.utxos[cid];
+            if (wState.pendingSpends) delete wState.pendingSpends[cid];
+            removed++;
+        }
+    }
+
+    // 2. Restore coins SPENT above the fork. Group restored coins by address so
+    //    we can classify each address once (re-sendable vs reuse-locked).
+    const restoredByAddr = {};
+    if (wState.spentLog) {
+        for (const h of Object.keys(wState.spentLog).map(Number)) {
+            if (h > forkHeight) {
+                for (const coin of wState.spentLog[h]) {
+                    // Only restore coins that existed at/below the fork (a coin
+                    // itself created above the fork is dead-branch, not ours to
+                    // bring back).
+                    if ((coin.createdAtHeight || 0) <= forkHeight && !wState.utxos[coin.coin_id]) {
+                        wState.utxos[coin.coin_id] = coin;
+                        (restoredByAddr[coin.address] = restoredByAddr[coin.address] || []).push(coin);
+                        restored++;
+                    }
+                }
+                delete wState.spentLog[h];
+            }
+        }
+    }
+
+    // 3. For each address that had an orphaned spend, resolve reuse-safely.
+    for (const addr of Object.keys(restoredByAddr)) {
+        const poison = wState.spentWots && wState.spentWots[addr];
+        const isPoisonAboveFork =
+            poison && typeof poison === 'object' && typeof poison.height === 'number' && poison.height > forkHeight;
+
+        // MSS addresses are never in spentWots; their restored coins (handled in
+        // step 2) are immediately spendable. Nothing to lock.
+        if (!isPoisonAboveFork) continue;
+
+        const reveal = wState.sentReveals && wState.sentReveals[addr];
+        const haveMatchingReveal =
+            reveal && (!poison.commitment || reveal.commitment === poison.commitment) &&
+            (networkHeight - (reveal.sentAtHeight || 0) <= COMMITMENT_TTL);
+
+        if (haveMatchingReveal) {
+            // CASE 1 — re-sendable. Clear the poison (the coin will leave again
+            // via the SAME signature, so no new signature is ever produced), and
+            // re-arm pending_tx so recoverPendingTx re-broadcasts it verbatim.
+            delete wState.spentWots[addr];
+            for (const c of restoredByAddr[addr]) {
+                if (wState.pendingSpends) wState.pendingSpends[c.coin_id] = Date.now();
+            }
+            // Only set pending_tx if one isn't already mid-flight.
+            if (!wState.pending_tx) {
+                wState.pending_tx = {
+                    commitment: reveal.commitment,
+                    revealPayload: reveal.revealPayload,
+                    inputCoinId: reveal.inputCoinIds && reveal.inputCoinIds[0],
+                    inputCoinIds: reveal.inputCoinIds,
+                    stage: 'reveal',
+                    createdAt: Date.now(),
+                    startedHeight: networkHeight,
+                    reorgResend: true,
+                };
+            }
+            resendable++;
+            self.postMessage({ type: 'LOG', payload:
+                `↩️ Reorg: re-sending the original signed transaction for ${addr.substring(0,8)}… (same signature; no key reuse).` });
+        } else {
+            // CASE 2 — we do NOT have the signature and the key is poisoned. The
+            // coin is restored but REUSE-LOCKED: mark it so coin selection and
+            // the UI refuse to auto-spend it, and demote the poison to a locked
+            // record (kept, not cleared) so addUtxo still blocks arbitrary dust.
+            wState.reuseLocked = wState.reuseLocked || {};
+            for (const c of restoredByAddr[addr]) {
+                wState.utxos[c.coin_id].reuseLocked = true;
+                wState.reuseLocked[c.coin_id] = { address: addr, priorCommitment: poison.commitment || null };
+            }
+            wState.spentWots[addr] = { ...poison, reuseLocked: true };
+            locked++;
+            self.postMessage({ type: 'REUSE_LOCK_ALERT', payload: {
+                address: addr,
+                coinIds: restoredByAddr[addr].map(c => c.coin_id),
+                priorCommitment: poison.commitment || null,
+                msg: `A confirmed transaction was reversed by a chain reorganization, but its signature is no longer held by this wallet. `
+                   + `The coin(s) at ${addr.substring(0,10)}… are back, but this one-time key already signed once, so they are locked to prevent key reuse. `
+                   + `Do not attempt to move them manually.`,
+            }});
+        }
+    }
+
+    // 4. Drop history above the fork.
+    if (Array.isArray(wState.history)) {
+        wState.history = wState.history.filter(e => (e.height || 0) <= forkHeight);
+    }
+    // 5. Drop stale per-height block hashes above the fork.
+    if (wState.blockHashes) {
+        for (const h of Object.keys(wState.blockHashes).map(Number)) {
+            if (h > forkHeight) delete wState.blockHashes[h];
+        }
+    }
+    // 6. Rewind the scan marker so the winning branch is re-applied.
+    wState.lastScannedHeight = Math.min(wState.lastScannedHeight, forkHeight);
+
+    self.postMessage({ type: 'LOG', payload:
+        `↩️ Reorg rollback to ${forkHeight}: removed ${removed} orphaned, restored ${restored} coin(s) (${resendable} re-sendable, ${locked} reuse-locked).` });
+    return { restored, removed, resendable, locked };
+}
+
+/**
+ * Decide whether an incoming block indicates a reorg; if so find the fork,
+ * roll back, and let the caller rescan. See rollbackTo for the reuse-safety.
+ * @param {{height:number, block_hash?:string, prev_hash?:string}} notif
+ * @returns {Promise<boolean>} true if a reorg was handled.
+ */
+async function maybeHandleReorg(notif) {
+    if (!wState.blockHashes) return false;
+    const h = notif.height;
+    const notifHash = notif.block_hash ? normalizeHex(notif.block_hash) : null;
+    const notifPrev = notif.prev_hash ? normalizeHex(notif.prev_hash) : null;
+    const known = wState.blockHashes[h];
+    const parentKnown = wState.blockHashes[h - 1];
+
+    const linksCleanly =
+        h === wState.lastScannedHeight + 1 &&
+        (!notifPrev || !parentKnown || parentKnown.hash === notifPrev);
+    if (linksCleanly && !(known && notifHash && known.hash !== notifHash)) return false;
+
+    const hashConflict    = known && notifHash && known.hash !== notifHash;
+    const parentConflict  = notifPrev && parentKnown && parentKnown.hash !== notifPrev;
+    const heightRegressed = h <= wState.lastScannedHeight && !known;
+    if (!hashConflict && !parentConflict && !heightRegressed) return false;
+
+    const tip = wState.lastScannedHeight;
+    const floor = Math.max(0, tip - REORG_DEPTH);
+    let fork = Math.min(h - 1, tip);
+    for (; fork >= floor; fork--) {
+        const rec = wState.blockHashes[fork];
+        if (!rec) continue;
+        let nodeHash = null;
+        try {
+            const blk = await rpc.getBlock(fork);
+            const raw = blk && (blk.hash || blk.block_hash || blk.header_hash ||
+                        (blk.header && (blk.header.hash || blk.header.block_hash)));
+            nodeHash = raw ? normalizeHex(raw) : null;
+        } catch (_) { /* keep descending */ }
+        if (nodeHash && nodeHash === rec.hash) break;
+    }
+    if (fork < floor) {
+        self.postMessage({ type: 'LOG', payload:
+            `⚠️ Reorg deeper than ${REORG_DEPTH} blocks; rescanning from height ${floor}.` });
+        fork = floor;
+    }
+
+    rollbackTo(fork);
+    await saveState();
+    return true;
+}
+
+/**
+ * Process a single block for wallet-relevant transactions.
+ *
+ * Checks coinbase outputs and transaction reveals for addresses/salts we own.
+ * Updates UTXOs and history. Every mutation is height-stamped (via _reorgHeight)
+ * so a later reorg can be rolled back precisely and reuse-safely.
+ *
+ * @param {number} height - Block height to process.
+ * @returns {Promise<boolean>} `true` if any wallet-relevant activity was found.
+ */
 async function processFullBlock(height) {
     const block = await rpc.getBlock(height);
     if (!block) throw new Error(`Network failed to fetch block at height ${height}.`);
+
+    // Reorg support: stamp this block's mutations with `height`, and record its
+    // hash + parent so the next block's linkage can be checked.
+    _reorgHeight = height;
+    const bh = block.hash || block.block_hash || block.header_hash ||
+               (block.header && (block.header.hash || block.header.block_hash));
+    const ph = block.prev_hash || block.previous_hash || block.parent_hash ||
+               (block.header && (block.header.prev_hash || block.header.previous_hash));
+    if (bh) {
+        wState.blockHashes = wState.blockHashes || {};
+        wState.blockHashes[height] = { hash: normalizeHex(bh), prev: ph ? normalizeHex(ph) : null };
+        pruneBlockHashes();
+    }
 
     let matchFound = false;
     const ourSalts = new Map();
@@ -4493,7 +4779,7 @@ async function processFullBlock(height) {
         const alreadyRecorded = wState.history.some(h => h.outputs.some(out => coinbaseReceives.map(c=>c.id).includes(out)));
         if (!alreadyRecorded) {
             wState.history.push({
-                kind: 'coinbase', timestamp: block.timestamp || Math.floor(Date.now() / 1000),
+                kind: 'coinbase', timestamp: block.timestamp || Math.floor(Date.now() / 1000), height,
                 fee: 0, inputs: [], outputs: coinbaseReceives.map(c => c.id),
                 value: coinbaseReceives.reduce((s, c) => s + c.val, 0)
             });
@@ -4541,16 +4827,29 @@ async function processFullBlock(height) {
                     if (cid && wState.utxos[cid]) {
                         // CRITICAL FIX: Track spent WOTS addresses and purge siblings to prevent Key Reuse!
                         const spentCoin = wState.utxos[cid];
+                        // Reorg support: stash full records of every coin we remove,
+                        // bucketed by spend height, so a rollback can restore them.
+                        // `txId` (computed above) is the commitment of the spending
+                        // tx — recorded on spentWots so rollback can locate the
+                        // matching signed reveal in sentReveals and re-send it
+                        // verbatim instead of re-signing (which would reuse the key).
+                        wState.spentLog = wState.spentLog || {};
+                        const bucket = (wState.spentLog[_reorgHeight] = wState.spentLog[_reorgHeight] || []);
                         if (!spentCoin.is_mss) {
                             wState.spentWots = wState.spentWots || {};
-                            wState.spentWots[spentCoin.address] = true;
-                            // Purge any siblings to ensure absolute safety
+                            // Was `true`; now an object carrying the spend height and
+                            // the commitment of the signature already published for
+                            // this address. Rollback consults both.
+                            wState.spentWots[spentCoin.address] = { height: _reorgHeight, commitment: txId || null };
                             for (const key in wState.utxos) {
                                 if (wState.utxos[key].address === spentCoin.address) {
+                                    bucket.push(wState.utxos[key]);
                                     delete wState.utxos[key];
-                                    if (wState.pendingSpends) delete wState.pendingSpends[key]; // also free any lock
+                                    if (wState.pendingSpends) delete wState.pendingSpends[key];
                                 }
                             }
+                        } else {
+                            bucket.push(spentCoin);
                         }
 
                         delete wState.utxos[cid];
@@ -4637,7 +4936,7 @@ async function processFullBlock(height) {
                     let actualFee = totalTxIn - totalTxOut;
                     let netSent   = Math.max(0, spentValue - createdOutputs.reduce((s,c) => s+c.val, 0) - actualFee);
                     wState.history.push({
-                        kind: 'sent', timestamp: block.timestamp || Math.floor(Date.now() / 1000),
+                        kind: 'sent', timestamp: block.timestamp || Math.floor(Date.now() / 1000), height,
                         fee: actualFee, inputs: spentIds, outputs: createdOutputs.map(c => c.id), value: netSent
                     });
                 }
@@ -4645,7 +4944,7 @@ async function processFullBlock(height) {
                 const alreadyRecorded = wState.history.some(h => h.outputs.some(out => createdOutputs.map(c=>c.id).includes(out)));
                 if (!alreadyRecorded) {
                     wState.history.push({
-                        kind: 'received', timestamp: block.timestamp || Math.floor(Date.now() / 1000),
+                        kind: 'received', timestamp: block.timestamp || Math.floor(Date.now() / 1000), height,
                         fee: 0, inputs: [], outputs: createdOutputs.map(c => c.id),
                         value: createdOutputs.reduce((s, c) => s + c.val, 0)
                     });
@@ -4669,10 +4968,15 @@ async function processFullBlock(height) {
  * @returns {boolean} `true` if the UTXO was new (not a duplicate).
  */
 function addUtxo(address, value, salt, coinId, commitment = null) {
-    // CRITICAL FIX: Do not import dust to an already-spent WOTS address!
-    if (wState.spentWots && wState.spentWots[address]) {
-        self.postMessage({ type: 'LOG', payload: `⚠️ SECURITY: Ignored dust payment to already-spent WOTS address ${address.substring(0,8)}...`});
-        return false;
+    // CRITICAL: Do not import dust to an already-spent WOTS address — EXCEPT the
+    // one coin a reorg explicitly restored to it (marked via _restoringCoinId),
+    // which re-enters in a reuse-locked state (see rollbackTo). This preserves
+    // the anti-dusting guard while letting a genuinely-unspent coin come back.
+    if (wState.spentWots && wState.spentWots[address] !== undefined) {
+        if (coinId !== _restoringCoinId) {
+            self.postMessage({ type: 'LOG', payload: `⚠️ SECURITY: Ignored dust payment to already-spent WOTS address ${address.substring(0,8)}...`});
+            return false;
+        }
     }
 
     let index = 0, is_mss = false, mss_height = 0, mss_leaf = 0;
@@ -4684,7 +4988,14 @@ function addUtxo(address, value, salt, coinId, commitment = null) {
         index = mss.index; is_mss = true; mss_height = mss.height; mss_leaf = mss.next_leaf;
     }
     if (!wState.utxos[coinId]) {
-        wState.utxos[coinId] = { index, is_mss, mss_height, mss_leaf, address, value, salt, coin_id: coinId, commitment };
+        wState.utxos[coinId] = {
+            index, is_mss, mss_height, mss_leaf, address, value, salt,
+            coin_id: coinId, commitment,
+            // Reorg support: height at which this coin was credited. Rollback to
+            // fork H removes coins with createdAtHeight > H. Set from the
+            // _reorgHeight thread-local during scan; 0 for non-scan imports.
+            createdAtHeight: (typeof _reorgHeight === 'number') ? _reorgHeight : 0,
+        };
         return true;
     }
     return false;
@@ -4911,6 +5222,27 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
         createdAt: Date.now(),
         startedHeight: networkHeight,
     };
+    // Reorg-safety: retain the *verbatim signed reveal* keyed by each WOTS input
+    // address, so that if this spend later gets orphaned by a reorg we can
+    // RE-SEND the identical signature (same commitment) rather than re-signing
+    // (which would reuse the one-time key). Retained only while re-sendable —
+    // pruned once the commitment can no longer be revealed (COMMITMENT_TTL) or
+    // the spend is buried beyond REORG_DEPTH. MSS inputs don't need this (their
+    // leaf counter already advanced and is reconciled with the node), so we key
+    // on the WOTS inputs specifically.
+    wState.sentReveals = wState.sentReveals || {};
+    for (const inp of ctx.selected_inputs) {
+        if (inp.address && inp.is_mss !== true) {
+            wState.sentReveals[inp.address] = {
+                commitment: ctx.commitment,
+                revealPayload: revealPayloadStr,
+                inputCoinIds: ctx.selected_inputs.map(i => i.coin_id),
+                intendedOutputs: (ctx.outputs || []).map(o => ({ address: o.address, value: o.value })),
+                sentAtHeight: networkHeight,
+                createdAt: Date.now(),
+            };
+        }
+    }
     await saveState();
 
     const _commitResp = await awaitCommitmentMined(ctx.commitment, (m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));

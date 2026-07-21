@@ -3806,6 +3806,28 @@ if ('serviceWorker' in navigator) {
                     log(payload);
                     break;
 
+                case 'REUSE_LOCK_ALERT': {
+                    // A reorg restored coin(s) to a WOTS address whose one-time key
+                    // already signed a now-orphaned transaction we no longer hold.
+                    // These coins are locked to prevent key reuse; warn prominently
+                    // and persistently — the user must NOT try to move them.
+                    log(payload && payload.msg ? payload.msg : 'Reorg reuse-lock triggered.');
+                    try {
+                        const b = document.createElement('div');
+                        b.style = "background: var(--red, #d32f2f); color:#fff; padding:16px; text-align:center; font-size:14px; font-weight:bold; position:fixed; top:0; left:0; right:0; z-index:10000; border-bottom:2px solid #b71c1c; display:flex; flex-direction:column; gap:8px; align-items:center; box-shadow:0 4px 6px rgba(0,0,0,0.3);";
+                        const shortAddr = (payload && payload.address ? payload.address.substring(0,10) : '') + '…';
+                        const coinList = (payload && payload.coinIds || []).map(c => c.substring(0,10)+'…').join(', ');
+                        b.innerHTML = '<div>⚠️ Key-reuse lock: a confirmed transaction was reversed by a chain reorganization.</div>'
+                            + '<div style="font-weight:normal">Coin(s) ' + coinList + ' at address ' + shortAddr + ' have been restored to your balance, but this one-time signature key already signed once. '
+                            + 'Moving them manually would leak the key and risk the funds. They are locked. '
+                            + 'Please contact support or wait for guidance before spending — do NOT attempt to send them.</div>'
+                            + '<button onclick="this.parentElement.remove()" style="margin-top:4px; padding:6px 14px; background:#fff; color:#b71c1c; border:none; border-radius:4px; font-weight:bold; cursor:pointer;">Dismiss</button>';
+                        document.body.prepend(b);
+                    } catch (_) { /* banner is best-effort; the log line already fired */ }
+                    if (typeof showToast === 'function') showToast('Reorg: some coins are reuse-locked. Do not spend them manually.', 'error');
+                    break;
+                }
+
                 case 'SCAN_PROGRESS': {
                     const prog = document.getElementById('scanProgress');
                     prog.classList.remove('hidden');
