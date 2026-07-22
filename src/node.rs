@@ -2911,6 +2911,8 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
                         NodeCommand::InjectBounty { commit, reveal } => {
+                            tracing::info!("Broadcasting MEV Bounty Commit to network...");
+                            self.network.broadcast(Message::Transaction(commit.clone()));
                             self.bounty_queue.push_back((commit, reveal));
                             // Instantly stop current mining to build a new template with the bounty!
                             self.cancel_mining();
@@ -5621,6 +5623,35 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
         Ok(())
     }
 
+/// Check if any pending MEV Bounty Commits have been mined, and if so, submit their Reveals.
+    async fn check_pending_bounty_reveals(&mut self) {
+        if self.bounty_queue.is_empty() {
+            return;
+        }
+
+        let mut ready_reveals = Vec::new();
+        self.bounty_queue.retain(|(c, r)| {
+            if let Transaction::Commit { commitment, .. } = c {
+                // A commitment is "mined" when it's in the state accumulator
+                if self.state.commitments.contains(commitment) {
+                    ready_reveals.push(r.clone());
+                    false // Remove from queue
+                } else {
+                    true // Keep in queue
+                }
+            } else {
+                true
+            }
+        });
+
+        for reveal_tx in ready_reveals {
+            tracing::info!("MEV Bounty Commit mined! Broadcasting Burn Reveal to network...");
+            if let Err(e) = self.handle_new_transaction(reveal_tx, None).await {
+                tracing::error!("Failed to broadcast MEV Burn Reveal: {}", e);
+            }
+        }
+    }
+
     /// Check if any pending CoinJoin Commits have been mined, and if so, submit their Reveals.
     async fn check_pending_mix_reveals(&mut self) {
         if self.pending_mix_reveals.is_empty() {
@@ -5813,11 +5844,7 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
                     }
                     self.mempool.prune_on_new_block(&self.state, &spent_inputs, &mined_commits, &crate::node::extract_spent_addresses(&batch));
 
-                    self.bounty_queue.retain(|(c, _)| {
-                        if let Transaction::Commit { commitment, .. } = c {
-                            !mined_commits.contains(commitment)
-                        } else { true }
-                    });
+                    self.check_pending_bounty_reveals().await;
 
                     self.chain_history.push_back((pre_height, self.state.header_hash));
 
@@ -6174,11 +6201,7 @@ async fn try_apply_orphans(&mut self) {
                     }
                     self.mempool.prune_on_new_block(&self.state, &spent_inputs, &mined_commits, &crate::node::extract_spent_addresses(&batch));
 
-                    self.bounty_queue.retain(|(c, _)| {
-                        if let Transaction::Commit { commitment, .. } = c {
-                            !mined_commits.contains(commitment)
-                        } else { true }
-                    });
+                    self.check_pending_bounty_reveals().await;
 
                     applied += 1;
                     matched = true;
@@ -6548,11 +6571,7 @@ async fn try_apply_orphans(&mut self) {
                 }
                 self.mempool.prune_on_new_block(&self.state, &spent_inputs, &mined_commits, &crate::node::extract_spent_addresses(&batch));
                 
-                self.bounty_queue.retain(|(c, _)| {
-                        if let Transaction::Commit { commitment, .. } = c {
-                            !mined_commits.contains(commitment)
-                        } else { true }
-                    });
+                self.check_pending_bounty_reveals().await;
                 
                 self.check_pending_mix_reveals().await;
             }

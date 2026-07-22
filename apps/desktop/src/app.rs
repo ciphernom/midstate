@@ -704,7 +704,11 @@ impl eframe::App for App {
         }
 
         let status = self.status.clone().unwrap();
-        if !status.exists || !status.unlocked {
+        // A freshly created wallet is already unlocked, so `unlocked` alone
+        // would hand control to the main UI and the recovery phrase would
+        // never be drawn. Hold onboarding open until the phrase has been
+        // shown AND confirmed — the quiz clears `mnemonic` on success.
+        if !status.exists || !status.unlocked || !self.mnemonic.is_empty() {
             views::onboarding::show(self, ctx, &status);
             self.draw_toasts(ctx);
             return;
