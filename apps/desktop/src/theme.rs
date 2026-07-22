@@ -466,18 +466,20 @@ pub fn parse_in_unit(text: &str, unit_ix: usize) -> Result<u64, String> {
     Ok(raw.round() as u64)
 }
 
-/// A segmented unit picker. Returns true when the selection changed.
-pub fn unit_selector(ui: &mut Ui, current: &mut usize) -> bool {
+/// A segmented control. Returns true when the selection changed.
+pub fn segmented(ui: &mut Ui, labels: &[&str], current: &mut usize) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
-        for (i, name) in UNIT_NAMES.iter().enumerate() {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for (i, name) in labels.iter().enumerate() {
             let active = *current == i;
             let txt = RichText::new(*name)
-                .font(FontId::monospace(11.5))
+                .font(FontId::monospace(12.0))
                 .color(if active { on_ink() } else { muted() });
             let btn = egui::Button::new(txt)
                 .fill(if active { ink() } else { Color32::TRANSPARENT })
-                .stroke(Stroke::new(1.0, border()));
+                .stroke(Stroke::new(1.0, border()))
+                .min_size(egui::vec2(0.0, 26.0));
             if ui.add(btn).clicked() && !active {
                 *current = i;
                 changed = true;
@@ -485,6 +487,11 @@ pub fn unit_selector(ui: &mut Ui, current: &mut usize) -> bool {
         }
     });
     changed
+}
+
+/// A segmented unit picker. Returns true when the selection changed.
+pub fn unit_selector(ui: &mut Ui, current: &mut usize) -> bool {
+    segmented(ui, &UNIT_NAMES, current)
 }
 
 // ── Logo ──────────────────────────────────────────────────────────────────

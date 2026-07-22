@@ -49,6 +49,14 @@ impl Tab {
     }
 }
 
+/// Sub-navigation within the Channels tab.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChanTab {
+    List,
+    Pay,
+    Hub,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Onboard {
     Menu,
@@ -136,6 +144,10 @@ pub struct App {
     pub theme_applied: Option<bool>,
     pub send_unit: usize,
     pub dict_filter: String,
+    pub own_phrase: bool,
+    pub chan_tab: ChanTab,
+    pub verify_input: String,
+    pub verify_result: Option<bool>,
     pub logo: Option<egui::TextureHandle>,
     pub req_payee: String,
     pub req_amount: String,
@@ -255,6 +267,10 @@ impl App {
             theme_applied: None,
             send_unit: 0,
             dict_filter: String::new(),
+            own_phrase: false,
+            chan_tab: ChanTab::List,
+            verify_input: String::new(),
+            verify_result: None,
             logo,
             req_payee: String::new(),
             req_amount: String::new(),
@@ -388,10 +404,32 @@ impl App {
             Msg::History(h) => self.history = h,
             Msg::Sends(s) => self.sends = s,
             Msg::Node(n) => self.node = Some(n),
+            Msg::PhraseVerified(ok) => {
+                self.busy = false;
+                self.verify_result = Some(ok);
+                if ok {
+                    // Never keep the words around after the check.
+                    self.verify_input.clear();
+                }
+            }
+            Msg::WalletCreated => {
+                self.busy = false;
+                self.mnemonic.clear();
+                self.quiz.clear();
+                self.pw.clear();
+                self.pw2.clear();
+                self.phrase.clear();
+                self.own_phrase = false;
+                self.error.clear();
+                self.go(ctx, Action::LoadStatus);
+                self.reload_wallet(ctx);
+            }
             Msg::Mnemonic(p) => {
                 self.busy = false;
                 self.error.clear();
                 self.mnemonic = p.split_whitespace().map(String::from).collect();
+                self.own_phrase = false;
+                self.phrase.clear();
                 let mut idx = std::collections::BTreeSet::new();
                 while idx.len() < 3.min(self.mnemonic.len()) {
                     idx.insert(rand::random::<usize>() % self.mnemonic.len());
@@ -419,6 +457,8 @@ impl App {
                 self.qr = None;
                 self.chat.clear();
                 self.coin_export = None;
+                self.verify_input.clear();
+                self.verify_result = None;
                 self.channels.clear();
                 self.chan_identity = None;
                 self.chan_pay.clear();

@@ -41,9 +41,18 @@ fn body(app: &mut App, ui: &mut Ui, status: &WalletStatus) {
                  to your own validated copy of the chain.",
             );
             ui.add_space(14.0);
-            if ui.button(RichText::new("Create a new wallet").strong()).clicked() {
-                app.onboard = Onboard::Create;
+            let label = if app.busy { "Preparing…" } else { "Create a new wallet" };
+            if ui
+                .add_enabled(!app.busy, egui::Button::new(RichText::new(label).strong()))
+                .clicked()
+            {
+                app.busy = true;
                 app.error.clear();
+                app.own_phrase = false;
+                app.phrase.clear();
+                // Mint the phrase first. Nothing is written to disk until the
+                // phrase has been shown, confirmed, and a password chosen.
+                app.go(&ctx, Action::NewPhrase);
             }
             if ui.button("Restore from recovery phrase").clicked() {
                 app.onboard = Onboard::Restore;
@@ -51,7 +60,14 @@ fn body(app: &mut App, ui: &mut Ui, status: &WalletStatus) {
             }
         }
         Onboard::Create => {
-            theme::heading(ui, "Create wallet");
+            theme::heading(ui, "Set a password");
+            theme::hint(
+                ui,
+                "Phrase confirmed, and now out of reach — it will not be shown again. This \
+                 password only encrypts the wallet file on this machine. It is not a second \
+                 backup: on a new machine, or after a disk failure, the written phrase is the \
+                 only thing that brings your coins back.",
+            );
             field(ui, "Password (encrypts the wallet file on this machine)", |ui| {
                 ui.add(TextEdit::singleline(&mut app.pw).password(true).desired_width(f32::INFINITY));
             });
@@ -60,8 +76,9 @@ fn body(app: &mut App, ui: &mut Ui, status: &WalletStatus) {
             });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("Back").clicked() {
-                    app.onboard = Onboard::Menu;
+                if ui.button("Show phrase again").clicked() {
+                    app.onboard = Onboard::Sheet;
+                    app.error.clear();
                 }
                 theme::right_aligned(ui, |ui| {
                     let label = if app.busy { "Creating…" } else { "Create wallet" };
@@ -70,10 +87,19 @@ fn body(app: &mut App, ui: &mut Ui, status: &WalletStatus) {
                             app.error = "Use at least 8 characters.".into();
                         } else if app.pw != app.pw2 {
                             app.error = "Passwords do not match.".into();
+                        } else if app.mnemonic.len() != 24 {
+                            app.error = "Recovery phrase missing — start again.".into();
+                            app.onboard = Onboard::Menu;
                         } else {
                             app.busy = true;
                             app.error.clear();
-                            app.go(&ctx, Action::Create { password: app.pw.clone() });
+                            app.go(
+                                &ctx,
+                                Action::Create {
+                                    password: app.pw.clone(),
+                                    phrase: app.mnemonic.join(" "),
+                                },
+                            );
                         }
                     }
                 });
@@ -82,10 +108,30 @@ fn body(app: &mut App, ui: &mut Ui, status: &WalletStatus) {
         Onboard::Sheet => {
             theme::heading(ui, "Your recovery phrase");
             ui.label(
-                "Write these 24 words down, in order, on paper. They are the only \
-                 backup — anyone with them controls your funds, and losing them \
-                 makes your funds unrecoverable.",
+                "Write these 24 words down, in order, on paper. Anyone with them controls \
+                 your funds.",
             );
+            ui.add_space(8.0);
+            // The single most consequential fact in the whole app: this screen
+            // does not come back. Give it its own frame so it cannot be skimmed.
+            egui::Frame::default()
+                .fill(theme::highlight())
+                .stroke(egui::Stroke::new(1.0, theme::ink()))
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new("This is the only time these words will be shown.")
+                            .font(theme::font_medium(14.0))
+                            .color(theme::ink()),
+                    );
+                    ui.label(
+                        "The wallet stores a one-way derivation of them, never the words \
+                         themselves. They cannot be shown again by this app, a future version \
+                         of it, the command-line wallet, or anyone you could ask. If you lose \
+                         your written copy, the coins are unrecoverable.",
+                    );
+                });
             ui.add_space(8.0);
             egui::Frame::default()
                 .fill(theme::bg())
@@ -106,16 +152,75 @@ fn body(app: &mut App, ui: &mut Ui, status: &WalletStatus) {
                     });
                 });
             ui.add_space(8.0);
-            theme::right_aligned(ui, |ui| {
-                if ui.button(RichText::new("I wrote them down").strong()).clicked() {
-                    app.onboard = Onboard::Confirm;
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!app.busy, egui::Button::new("Generate a different phrase"))
+                    .clicked()
+                {
+                    app.busy = true;
+                    app.error.clear();
+                    app.go(&ctx, Action::NewPhrase);
+                }
+                if ui.button("Use my own phrase").clicked() {
+                    app.own_phrase = true;
+                    app.phrase.clear();
                     app.error.clear();
                 }
+                theme::right_aligned(ui, |ui| {
+                    if ui.button(RichText::new("I wrote them down").strong()).clicked() {
+                        app.onboard = Onboard::Confirm;
+                        app.error.clear();
+                    }
+                });
             });
+
+            if app.own_phrase {
+                ui.add_space(10.0);
+                field(ui, "Your own 24-word phrase", |ui| {
+                    ui.add(
+                        TextEdit::multiline(&mut app.phrase)
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                });
+                theme::hint(
+                    ui,
+                    "It must be a valid BIP39 phrase — the checksum built into the last \
+                     word is verified, so a typo is caught here rather than after your \
+                     coins are gone.",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        app.own_phrase = false;
+                        app.phrase.clear();
+                        app.error.clear();
+                    }
+                    theme::right_aligned(ui, |ui| {
+                        let words = app.phrase.split_whitespace().count();
+                        if ui
+                            .add_enabled(!app.busy && words == 24, egui::Button::new("Use this phrase"))
+                            .clicked()
+                        {
+                            app.busy = true;
+                            app.error.clear();
+                            app.go(&ctx, Action::CheckPhrase { phrase: app.phrase.clone() });
+                        }
+                        if words > 0 && words != 24 {
+                            theme::hint(ui, &format!("{words} of 24 words"));
+                        }
+                    });
+                });
+            }
         }
         Onboard::Confirm => {
             theme::heading(ui, "Confirm your copy");
-            theme::hint(ui, "Enter the requested words from your written copy.");
+            theme::hint(
+                ui,
+                "Enter the requested words from your written copy — not from memory. This is \
+                 the last point at which the phrase is still on screen; after this it is gone \
+                 for good.",
+            );
             ui.add_space(6.0);
             let mut quiz = std::mem::take(&mut app.quiz);
             for (i, entered) in quiz.iter_mut() {
@@ -136,17 +241,26 @@ fn body(app: &mut App, ui: &mut Ui, status: &WalletStatus) {
                             .find(|(i, e)| e.trim().to_lowercase() != app.mnemonic[*i]);
                         match bad {
                             Some((i, _)) => {
-                                app.error =
-                                    format!("Word {} does not match. Check your written copy.", i + 1)
+                                // Wrong word: send them back to read the sheet
+                                // again and re-verify. A confirmation you can
+                                // brute-force by guessing is not a confirmation.
+                                app.error = format!(
+                                    "Word {} does not match. Read the phrase again and re-confirm.",
+                                    i + 1
+                                );
+                                for (_, e) in app.quiz.iter_mut() {
+                                    e.clear();
+                                }
+                                app.onboard = Onboard::Sheet;
                             }
                             None => {
-                                app.mnemonic.clear();
+                                // Verified. Only now do we ask for a password
+                                // and write anything to disk.
                                 app.quiz.clear();
                                 app.pw.clear();
                                 app.pw2.clear();
                                 app.error.clear();
-                                app.go(&ctx, Action::LoadStatus);
-                                app.reload_wallet(&ctx);
+                                app.onboard = Onboard::Create;
                             }
                         }
                     }
