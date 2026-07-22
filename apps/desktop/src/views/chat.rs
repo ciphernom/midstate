@@ -22,11 +22,15 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     // ── History ─────────────────────────────────────────────────────────
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
+        // Fixed viewport: the room keeps the same footprint whether it holds
+        // no messages or a thousand, and scrolls within it.
+        ui.set_min_height(320.0);
         if app.chat.is_empty() {
             theme::hint(ui, "Nothing yet — either the room is quiet or history is still arriving from peers.");
         } else {
             egui::ScrollArea::vertical()
-                .max_height(340.0)
+                .max_height(320.0)
+                .auto_shrink([false, false])
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                     for m in &app.chat {

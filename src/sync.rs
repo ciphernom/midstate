@@ -90,9 +90,9 @@ impl Syncer {
         let current_time = crate::core::state::current_timestamp();
         let window_size = crate::core::MEDIAN_TIME_PAST_WINDOW;
 
-        crate::core::state::validate_timestamp(headers[0].timestamp, prior_timestamps, current_time)
+        crate::core::state::validate_timestamp(headers[0].timestamp, prior_timestamps, current_time, headers[0].height)
             .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index 0: {}", e))?;
-
+            
         // Pre-allocate a sliding window to prevent O(N^2) memory exhaustion
         let mut recent_ts: std::collections::VecDeque<u64> = prior_timestamps.iter().copied().collect();
         recent_ts.push_back(headers[0].timestamp);
@@ -114,7 +114,7 @@ impl Syncer {
             }
 
             // O(1) Sliding Window MTP Check
-            crate::core::state::validate_timestamp(header.timestamp, recent_ts.make_contiguous(), current_time)
+            crate::core::state::validate_timestamp(header.timestamp, recent_ts.make_contiguous(), current_time, header.height)
                 .map_err(|e| anyhow::anyhow!("Header timestamp invalid at index {}: {}", i, e))?;
             
             let expected_target = crate::core::state::calculate_target(prev.height + 1, prev.timestamp);

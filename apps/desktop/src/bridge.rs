@@ -50,6 +50,7 @@ pub enum Action {
     LoadHub,
     SetHub { cfg: HubView },
     RotateIdentity,
+    RequestAddress { peer: String },
 }
 
 pub enum Msg {
@@ -72,7 +73,7 @@ pub enum Msg {
     AddressCreated(AddressInfo),
     SendStarted,
     RetryOk,
-    AddressValid { addr: String, ok: bool },
+    AddressValid { addr: String, ok: bool, reason: Option<String> },
     RescanOk,
     ConsolidateStarted(String),
     DefragDone(String),
@@ -92,6 +93,7 @@ pub enum Msg {
     Hub(HubView),
     HubSaved,
     IdentityRotated(String),
+    AddressRequested,
     /// `what` names the action for the error banner; wallet state is unchanged
     /// unless the message says otherwise.
     Err { what: &'static str, err: String },
@@ -148,8 +150,10 @@ pub fn dispatch(
             }
             Action::RetrySend { id } => run!("retry send", h.retry_send(id), |_| Msg::RetryOk),
             Action::ValidateAddress { addr } => {
-                let ok = h.validate_address(addr.clone()).await.is_ok();
-                out(Msg::AddressValid { addr, ok });
+                // Keep the reason: "checksum mismatch" and "this key is burned"
+                // need very different responses from the person.
+                let reason = h.validate_address(addr.clone()).await.err().map(|e| e.to_string());
+                out(Msg::AddressValid { addr, ok: reason.is_none(), reason });
             }
             Action::RescanFrom { height } => {
                 run!("rescan", h.rescan_from(height), |_| Msg::RescanOk)
@@ -207,6 +211,9 @@ pub fn dispatch(
             Action::SetHub { cfg } => run!("hub", h.set_hub(cfg), |_| Msg::HubSaved),
             Action::RotateIdentity => {
                 run!("rotate identity", h.rotate_identity(), Msg::IdentityRotated)
+            }
+            Action::RequestAddress { peer } => {
+                run!("request address", h.request_address(peer), |_| Msg::AddressRequested)
             }
         }
     });

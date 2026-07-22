@@ -761,6 +761,7 @@ pub const PRUNE_DEPTH: u64 = 1000;
 
 
 pub const V4_ACTIVATION_HEIGHT: u64 = 163_675;
+pub const TIMEWARP_FIX_ACTIVATION_HEIGHT: u64 = 225_000; 
 
 pub const COMMIT_POW_WINDOW: u64 = 1000;
 

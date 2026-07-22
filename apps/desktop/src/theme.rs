@@ -238,6 +238,11 @@ pub fn short_hex(h: &str, n: usize) -> String {
     }
 }
 
+/// Wall-clock seconds since the epoch.
+pub fn now_secs() -> u64 {
+    now()
+}
+
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -425,8 +430,23 @@ pub fn grouped_hash(h: &str, group: usize) -> String {
         .join(" ")
 }
 
+/// Lay out `add` right-aligned on a single row.
+///
+/// A bare `with_layout(right_to_left, ..)` claims the parent's whole remaining
+/// height, and inside a ScrollArea that is effectively unbounded — which made
+/// every panel ending in an action button stretch to fill the window. Allocate
+/// exactly one row's height instead.
 pub fn right_aligned(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
-    ui.with_layout(egui::Layout::right_to_left(Align::Center), add);
+    let h = ui
+        .spacing()
+        .interact_size
+        .y
+        .max(ui.text_style_height(&egui::TextStyle::Button));
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), h),
+        egui::Layout::right_to_left(Align::Center),
+        add,
+    );
 }
 
 /// Denomination prefixes, matching the web wallet's MDS_UNITS exactly.

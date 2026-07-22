@@ -32,6 +32,8 @@ pub const INVOICE_TTL: u64 = 720; // invoices expire ~12 h after minting
 pub const JIT_MARGIN: u64 = 15; // extra headroom required to attempt a JIT open
 pub const CLAIM_STALL_BLOCKS: u64 = 20; // preimage sent, no credit → force close
 pub const MAX_OUTSTANDING_INVOICES: usize = 64;
+/// How long a handed-out address stays claimable, in blocks (~1 day).
+pub const ADDRESS_TTL: u64 = 1440;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
@@ -144,6 +146,16 @@ pub struct ChannelBook {
     pub answered_reqs: std::collections::HashMap<String, u64>,
     #[serde(default)]
     pub hub: HubConfig,
+    /// Address requests we sent, awaiting a signed reply: req id → peer pk.
+    #[serde(default)]
+    pub addr_reqs: std::collections::HashMap<String, [u8; 32]>,
+    /// Address requests we have answered. Each answer costs one one-time
+    /// signature, so the guard has to survive a restart.
+    #[serde(default)]
+    pub answered_addr_reqs: std::collections::HashMap<String, u64>,
+    /// Fresh addresses peers handed us: peer pk hex → (address hex, expiry).
+    #[serde(default)]
+    pub peer_addrs: std::collections::HashMap<String, (String, u64)>,
 }
 
 /// Operating a routing hub. In a unidirectional channel every forward

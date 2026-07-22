@@ -6,35 +6,42 @@ use midstate_walletd::api::SendStage;
 pub fn show(app: &mut App, ui: &mut Ui) {
     theme::heading(ui, "Dashboard");
 
-    ui.columns(3, |cols| {
-        let b = app.balance.as_ref();
+    // ── Money ───────────────────────────────────────────────────────────
+    let b = app.balance.clone();
+    ui.columns(4, |c| {
         theme::stat(
-            &mut cols[0],
+            &mut c[0],
             "Spendable",
-            &b.map(|b| units(b.confirmed)).unwrap_or_else(|| "—".into()),
+            &b.as_ref().map(|b| units(b.confirmed)).unwrap_or_else(|| "—".into()),
             "units",
         );
         theme::stat(
-            &mut cols[1],
+            &mut c[1],
             "In flight",
-            &b.map(|b| units(b.in_flight)).unwrap_or_else(|| "—".into()),
+            &b.as_ref().map(|b| units(b.in_flight)).unwrap_or_else(|| "—".into()),
             "units",
         );
         theme::stat(
-            &mut cols[2],
+            &mut c[2],
+            "Unconfirmed",
+            &b.as_ref().map(|b| units(b.unconfirmed)).unwrap_or_else(|| "—".into()),
+            "units",
+        );
+        theme::stat(
+            &mut c[3],
             "Coins",
-            &b.map(|b| units(b.coin_count as u64)).unwrap_or_else(|| "—".into()),
+            &b.as_ref().map(|b| units(b.coin_count as u64)).unwrap_or_else(|| "—".into()),
             "",
         );
     });
 
-    if let Some(b) = &app.balance {
+    if let Some(b) = &b {
         if b.unconfirmed > 0 {
             theme::hint(
                 ui,
                 &format!(
-                    "{} units are not currently in the chain's coin set (reorged or still \
-                     confirming). They stay listed under Coins.",
+                    "{} is not in the chain's coin set right now — either still confirming or \
+                     stranded by a reorg. It stays listed under Coins.",
                     units(b.unconfirmed)
                 ),
             );
@@ -46,6 +53,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         primer(app, ui);
     }
 
+    // ── What needs attention ────────────────────────────────────────────
     let active: Vec<_> = app
         .sends
         .iter()
@@ -70,6 +78,14 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         }
     }
 
+    ui.add_space(4.0);
+    ui.columns(2, |cols| {
+        wallet_health(app, &mut cols[0]);
+        network_panel(app, &mut cols[1]);
+    });
+
+    // ── Recent activity ─────────────────────────────────────────────────
+    ui.add_space(4.0);
     theme::heading(ui, "Recent activity");
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -77,22 +93,26 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             theme::hint(ui, "No activity yet. Share an address from the Receive tab to get paid.");
             return;
         }
-        egui::Grid::new("recent").num_columns(4).spacing([26.0, 8.0]).striped(true).show(ui, |ui| {
-            for h in app.history.iter().take(6) {
+        egui::Grid::new("recent").num_columns(5).spacing([22.0, 7.0]).striped(true).show(ui, |ui| {
+            for h in app.history.iter().take(8) {
                 let incoming = h.kind == "received" || h.kind == "coinbase";
                 theme::badge(ui, &h.kind, if incoming { theme::ink() } else { theme::muted() });
-                let sign = if incoming { "+" } else { "\u{2212}" };
                 ui.label(theme::mono(if h.amount > 0 {
-                    format!("{sign}{}", units(h.amount))
+                    format!("{}{}", if incoming { "+" } else { "" }, units(h.amount))
                 } else {
                     "—".into()
                 }));
                 ui.label(
                     theme::mono(if h.fee > 0 { format!("fee {}", units(h.fee)) } else { "—".into() })
                         .color(theme::muted())
-                        .size(12.0),
+                        .size(11.5),
                 );
-                ui.label(RichText::new(ago(h.timestamp)).color(theme::muted()).size(12.0));
+                ui.label(
+                    theme::mono(format!("{}→{}", h.n_in, h.n_out))
+                        .color(theme::faint())
+                        .size(11.0),
+                );
+                ui.label(RichText::new(ago(h.timestamp)).color(theme::muted()).size(11.5));
                 ui.end_row();
             }
         });
@@ -106,6 +126,96 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             theme::hint(ui, "tab.");
         });
     }
+}
+
+/// Things that quietly stop a wallet working: exhausted signing keys and
+/// coin fragmentation. Both are invisible until they bite, so surface them.
+fn wallet_health(app: &mut App, ui: &mut Ui) {
+    theme::panel_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new("Wallet").font(theme::font_medium(14.0)));
+
+        let live: Vec<_> = app.coins.iter().filter(|c| c.live && !c.in_flight).collect();
+        let one_time = live.iter().filter(|c| c.kind != "mss").count();
+        let reusable_addrs = app.addresses.iter().filter(|a| a.kind == "mss").count();
+        let sigs: u64 = app.addresses.iter().filter_map(|a| a.remaining_sigs).sum();
+
+        row(ui, "reusable addresses", &format!("{reusable_addrs}"));
+        row(ui, "signatures available", &units(sigs));
+        row(ui, "one-time coins", &format!("{one_time}"));
+
+        // A normal send caps at 256 inputs, so fragmentation has a hard edge.
+        if one_time > 120 {
+            theme::hint(
+                ui,
+                "Coins are fragmenting. A single transaction can spend at most 256 inputs, so \
+                 run Defrag on the Coins tab before it becomes a problem.",
+            );
+        }
+        if sigs == 0 && reusable_addrs > 0 {
+            theme::hint(ui, "Your reusable addresses are out of signatures — generate a new one.");
+        }
+        if !app.channels.is_empty() {
+            let open = app.channels.iter().filter(|c| c.status == "active").count();
+            let locked: u64 = app
+                .channels
+                .iter()
+                .filter(|c| c.status == "active")
+                .map(|c| c.my_balance)
+                .sum();
+            row(ui, "channels", &format!("{open} open · {} yours", units(locked)));
+        }
+    });
+}
+
+/// Node and chain condition, condensed. The full picture lives on the Node tab.
+fn network_panel(app: &mut App, ui: &mut Ui) {
+    theme::panel_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new("Network").font(theme::font_medium(14.0)));
+        let Some(s) = app.sync.clone() else {
+            theme::hint(ui, "Starting the node…");
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            theme::badge(
+                ui,
+                if s.is_syncing { "syncing" } else { "in sync" },
+                if s.is_syncing { theme::muted() } else { theme::ink() },
+            );
+            theme::badge(
+                ui,
+                &format!("{} peer(s)", s.peer_count),
+                if s.peer_count == 0 { theme::muted() } else { theme::ink() },
+            );
+        });
+        row(ui, "height", &units(s.height));
+        row(ui, "mempool", &format!("{} waiting", s.mempool));
+        row(ui, "settles after", &format!("{} blocks", s.safe_depth));
+
+        if let Some(n) = app.node.clone() {
+            let age = theme::now_secs().saturating_sub(n.tip_timestamp);
+            row(ui, "last block", &fmt_duration(age));
+            row(ui, "chain coins", &units(n.utxo_count as u64));
+        }
+        if s.peer_count == 0 {
+            theme::hint(ui, "No peers yet — the node is still dialing the bootstrap list.");
+        }
+    });
+}
+
+fn row(ui: &mut Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(label.to_uppercase())
+                .font(FontId::monospace(9.5))
+                .color(theme::muted()),
+        );
+        theme::right_aligned(ui, |ui| {
+            ui.label(theme::mono(value).size(11.5));
+        });
+    });
 }
 
 /// The sync state, made first-class: an ink progress bar against the

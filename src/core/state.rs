@@ -95,15 +95,20 @@ pub fn validate_timestamp(
     new_timestamp: u64,
     previous_timestamps: &[u64],
     current_time: u64,
+    height: u64,
 ) -> Result<()> {
-    const MAX_FUTURE_BLOCK_TIME: u64 = 10 * 60 * 60;
+    let max_future_time: u64 = if height >= crate::core::types::TIMEWARP_FIX_ACTIVATION_HEIGHT {
+        15 * 60 // 15 minutes
+    } else {
+        10 * 60 * 60 // 10 hours (legacy)
+    };
 
-    if new_timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
+    if new_timestamp > current_time + max_future_time {
         bail!(
             "Block timestamp too far in future: {} > {} (max future: {}s)",
             new_timestamp,
             current_time,
-            MAX_FUTURE_BLOCK_TIME
+            max_future_time
         );
     }
 
@@ -300,8 +305,8 @@ fn apply_batch_internal(
     }
 
     // timewarp prevention: validate timestamp
-    validate_timestamp(batch.timestamp, previous_timestamps, current_timestamp())?;
-
+    validate_timestamp(batch.timestamp, previous_timestamps, current_timestamp(), state.height)?;
+    
     // WOTS & MSS address/leaf-reuse consensus check.
     // Uses the pre-built oracle so state.rs stays pure (no storage I/O here).
     for tx in &batch.transactions {
@@ -905,7 +910,7 @@ mod tests {
     #[test]
     fn validate_timestamp_accepts_recent() {
         let current_time = 1_000_000;
-        let result = validate_timestamp(current_time - 10, &[], current_time);
+        let result = validate_timestamp(current_time - 10, &[], current_time, 0);
         assert!(result.is_ok());
     }
 
@@ -913,7 +918,7 @@ mod tests {
     fn validate_timestamp_rejects_far_future() {
         let current_time = 1_000_000;
         let far_future = current_time + 3 * 60 * 60; // 3 hours ahead
-        let result = validate_timestamp(far_future, &[], current_time);
+        let result = validate_timestamp(far_future, &[], current_time, 0);
         assert!(result.is_err());
     }
 
@@ -935,7 +940,7 @@ mod tests {
 
         let timestamps = vec![prev.timestamp];
 
-        let result = validate_timestamp(999, &timestamps, 2000);
+        let result = validate_timestamp(999, &timestamps, 2000, 0);
         assert!(result.is_err());
     }
 }
