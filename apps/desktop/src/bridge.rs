@@ -16,7 +16,10 @@ pub enum Action {
     LoadHistory,
     LoadSends,
     LoadNodeInfo,
-    Create { password: String },
+    NewPhrase,
+    CheckPhrase { phrase: String },
+    VerifyPhrase { phrase: String },
+    Create { password: String, phrase: String },
     Restore { password: String, phrase: String },
     Unlock { password: String },
     Lock,
@@ -61,6 +64,8 @@ pub enum Msg {
     Sends(Vec<SendProgress>),
     Node(NodeInfo),
     Mnemonic(String),
+    WalletCreated,
+    PhraseVerified(bool),
     Restored,
     Unlocked,
     Locked,
@@ -120,7 +125,16 @@ pub fn dispatch(
             Action::LoadHistory => run!("history", h.history(), Msg::History),
             Action::LoadSends => run!("sends", h.sends(), Msg::Sends),
             Action::LoadNodeInfo => run!("node info", h.node_info(), Msg::Node),
-            Action::Create { password } => run!("create wallet", h.create(password), Msg::Mnemonic),
+            Action::NewPhrase => run!("new phrase", h.new_phrase(), Msg::Mnemonic),
+            Action::CheckPhrase { phrase } => {
+                run!("check phrase", h.check_phrase(phrase), Msg::Mnemonic)
+            }
+            Action::VerifyPhrase { phrase } => {
+                run!("verify phrase", h.verify_phrase(phrase), Msg::PhraseVerified)
+            }
+            Action::Create { password, phrase } => {
+                run!("create wallet", h.create(password, phrase), |_| Msg::WalletCreated)
+            }
             Action::Restore { password, phrase } => {
                 run!("restore wallet", h.restore(password, phrase), |_| Msg::Restored)
             }

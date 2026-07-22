@@ -81,6 +81,79 @@ pub fn show(app: &mut App, ui: &mut Ui, status: &WalletStatus) {
         });
     });
 
+    theme::heading(ui, "Recovery phrase");
+    theme::panel_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(
+            RichText::new("Your phrase cannot be shown again.")
+                .font(theme::font_medium(14.0))
+                .color(theme::ink()),
+        );
+        ui.label(
+            "It was displayed once, when this wallet was created. The wallet file stores a \
+             one-way derivation of the phrase, never the words — so nothing can recover them: \
+             not this app, not a future version of it, not the command-line wallet, not anyone \
+             you could ask. If your written copy is gone, it is gone.",
+        );
+        ui.add_space(8.0);
+        theme::hint(
+            ui,
+            "Without the phrase, this wallet file and its password are your only backup. Copy \
+             the file somewhere safe. To get a phrase you actually hold, create a new wallet, \
+             write its phrase down, and move your coins to it.",
+        );
+
+        ui.add_space(12.0);
+        ui.label(RichText::new("Check your written copy").font(theme::font_medium(13.0)));
+        theme::hint(
+            ui,
+            "Type the 24 words to confirm they match this wallet. They are compared and \
+             discarded — nothing is stored, and this cannot reveal a phrase you do not \
+             already have.",
+        );
+        ui.add(
+            TextEdit::multiline(&mut app.verify_input)
+                .desired_rows(3)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        );
+        ui.horizontal(|ui| {
+            let words = app.verify_input.split_whitespace().count();
+            if ui
+                .add_enabled(!app.busy && words == 24, egui::Button::new("Check phrase"))
+                .clicked()
+            {
+                app.busy = true;
+                app.error.clear();
+                app.verify_result = None;
+                app.go(&ctx, Action::VerifyPhrase { phrase: app.verify_input.clone() });
+            }
+            if words > 0 && words != 24 {
+                theme::hint(ui, &format!("{words} of 24 words"));
+            }
+            match app.verify_result {
+                Some(true) => {
+                    ui.label(
+                        RichText::new("Match — this is the phrase for this wallet.")
+                            .size(12.0)
+                            .color(theme::ink()),
+                    );
+                }
+                Some(false) => {
+                    ui.label(
+                        RichText::new(
+                            "No match. This phrase does not belong to this wallet — check for \
+                             transcription errors before relying on it.",
+                        )
+                        .size(12.0)
+                        .color(theme::muted()),
+                    );
+                }
+                None => {}
+            }
+        });
+    });
+
     theme::heading(ui, "Appearance");
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());

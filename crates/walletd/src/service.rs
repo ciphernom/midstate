@@ -38,7 +38,10 @@ fn now_secs() -> u64 {
 
 enum Cmd {
     Status(oneshot::Sender<WalletStatus>),
-    Create { password: String, resp: oneshot::Sender<Result<String>> },
+    Create { password: String, phrase: String, resp: oneshot::Sender<Result<()>> },
+    NewPhrase(oneshot::Sender<Result<String>>),
+    CheckPhrase { phrase: String, resp: oneshot::Sender<Result<String>> },
+    VerifyPhrase { phrase: String, resp: oneshot::Sender<Result<bool>> },
     Restore { password: String, phrase: String, resp: oneshot::Sender<Result<()>> },
     Unlock { password: String, resp: oneshot::Sender<Result<()>> },
     Lock(oneshot::Sender<Result<()>>),
@@ -117,8 +120,23 @@ impl WalletdHandle {
     pub async fn status(&self) -> Result<WalletStatus> {
         Ok(ask!(self, Status))
     }
-    pub async fn create(&self, password: String) -> Result<String> {
-        ask!(self, Create { password: password })
+    pub async fn create(&self, password: String, phrase: String) -> Result<()> {
+        ask!(self, Create { password: password, phrase: phrase })
+    }
+    /// Mint a fresh BIP39 phrase. Nothing is written to disk — the wallet is
+    /// only created once the user has confirmed the phrase and set a password.
+    pub async fn new_phrase(&self) -> Result<String> {
+        ask!(self, NewPhrase)
+    }
+    /// Validate a user-supplied phrase, echoing it back on success.
+    pub async fn check_phrase(&self, phrase: String) -> Result<String> {
+        ask!(self, CheckPhrase { phrase: phrase })
+    }
+    /// Does this phrase actually belong to the open wallet? Lets someone
+    /// prove their written backup is correct without the wallet ever being
+    /// able to reveal the words.
+    pub async fn verify_phrase(&self, phrase: String) -> Result<bool> {
+        ask!(self, VerifyPhrase { phrase: phrase })
     }
     pub async fn restore(&self, password: String, phrase: String) -> Result<()> {
         ask!(self, Restore { password: password, phrase: phrase })
@@ -311,8 +329,22 @@ impl Service {
                     wallet_path: self.wallet_path.display().to_string(),
                 });
             }
-            Cmd::Create { password, resp } => {
-                let _ = resp.send(self.create(&password).await);
+            Cmd::Create { password, phrase, resp } => {
+                let _ = resp.send(self.create(&password, &phrase).await);
+            }
+            Cmd::NewPhrase(resp) => {
+                let _ = resp.send(
+                    midstate::wallet::hd::generate_mnemonic().map(|(_, phrase)| phrase),
+                );
+            }
+            Cmd::CheckPhrase { phrase, resp } => {
+                let p = phrase.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+                let _ = resp.send(
+                    midstate::wallet::hd::master_seed_from_mnemonic(&p).map(|_| p),
+                );
+            }
+            Cmd::VerifyPhrase { phrase, resp } => {
+                let _ = resp.send(self.verify_phrase(&phrase));
             }
             Cmd::Restore { password, phrase, resp } => {
                 let _ = resp.send(self.restore(&password, &phrase).await);
@@ -465,20 +497,39 @@ impl Service {
 
     // ── Lifecycle ───────────────────────────────────────────────────────
 
-    async fn create(&mut self, password: &str) -> Result<String> {
+    async fn create(&mut self, password: &str, phrase: &str) -> Result<()> {
         if self.wallet_path.exists() {
             bail!("a wallet already exists at {}", self.wallet_path.display());
         }
         if let Some(parent) = self.wallet_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let (wallet, phrase) = Wallet::create_hd(&self.wallet_path, password.as_bytes())?;
+        // The phrase was minted and confirmed before we got here, so the
+        // wallet is built FROM it rather than generating one internally —
+        // that is what lets the UI show and verify it before anything is
+        // written to disk.
+        let wallet =
+            Wallet::restore_from_mnemonic(&self.wallet_path, password.as_bytes(), phrase.trim())?;
         self.wallet = Some(wallet);
         // Fresh wallet: nothing historical can belong to it — start scanning
         // from the current tip instead of genesis.
         self.scan_pos = self.node.get_state().await.height;
         self.persist_scan_pos();
-        Ok(phrase)
+        Ok(())
+    }
+
+    /// Compare the seed derived from `phrase` against the open wallet's own
+    /// master seed. Nothing is stored and the words never leave this call —
+    /// the comparison is one-way in both directions.
+    fn verify_phrase(&self, phrase: &str) -> Result<bool> {
+        let w = self.wallet.as_ref().ok_or_else(|| anyhow!("wallet is locked"))?;
+        let mine = w
+            .data
+            .master_seed
+            .ok_or_else(|| anyhow!("this wallet predates recovery phrases and has no seed"))?;
+        let p = phrase.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        let theirs = midstate::wallet::hd::master_seed_from_mnemonic(&p)?;
+        Ok(theirs == mine)
     }
 
     async fn restore(&mut self, password: &str, phrase: &str) -> Result<()> {
