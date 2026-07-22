@@ -17,50 +17,58 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux (x86_64)
+          # Linux (x86_64) — node + desktop GUI
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact_name: midstate-linux-amd64
             bin_name: midstate
-          
-          # Raspberry Pi 3 & Zero 2 W (Cortex-A53)
+            desktop_bin: midstate-desktop
+            desktop_name: midstate-desktop-linux-amd64
+
+          # Raspberry Pi 3 & Zero 2 W (Cortex-A53) — node only
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             artifact_name: midstate-rpi3-arm64
             bin_name: midstate
             rustflags: "-C target-cpu=cortex-a53 -C link-arg=-lgcc"
 
-          # Raspberry Pi 4 (Cortex-A72)
+          # Raspberry Pi 4 (Cortex-A72) — node only
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             artifact_name: midstate-rpi4-arm64
             bin_name: midstate
             rustflags: "-C target-cpu=cortex-a72 -C link-arg=-lgcc"
 
-          # Raspberry Pi 5 (Cortex-A76)
+          # Raspberry Pi 5 (Cortex-A76) — node only
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             artifact_name: midstate-rpi5-arm64
             bin_name: midstate
             rustflags: "-C target-cpu=cortex-a76 -C link-arg=-lgcc"
 
-          # Windows (x86_64)
+          # Windows (x86_64) — node + desktop GUI
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: midstate-windows-amd64.exe
             bin_name: midstate.exe
-          
-          # macOS (Intel)
+            desktop_bin: midstate-desktop.exe
+            desktop_name: midstate-desktop-windows-amd64.exe
+
+          # macOS (Intel) — node + desktop GUI shipped as a .app bundle
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: midstate-macos-amd64
             bin_name: midstate
-          
+            desktop_bin: midstate-desktop
+            bundle_name: Midstate-macos-amd64.app.zip
+
           # macOS (Apple Silicon / M1 / M2)
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: midstate-macos-arm64
             bin_name: midstate
+            desktop_bin: midstate-desktop
+            bundle_name: Midstate-macos-arm64.app.zip
 
     steps:
     - name: Checkout repository
@@ -69,12 +77,24 @@ jobs:
     - name: Install Linux Dependencies
       if: matrix.os == 'ubuntu-latest'
       run: |
-        sudo apt-get update 
-        sudo apt-get install -y build-essential cmake
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake pkg-config
         # Install aarch64 cross-compiler if the target requires it
         if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
           sudo apt-get install -y gcc-aarch64-linux-gnu
         fi
+
+    - name: Install Desktop GUI Dependencies (Linux)
+      # eframe/winit links against X11, Wayland, xkbcommon and GL at build
+      # time. Only the native x86_64 desktop build needs these.
+      if: matrix.os == 'ubuntu-latest' && matrix.desktop_bin != ''
+      run: |
+        sudo apt-get install -y \
+          libgl1-mesa-dev libegl1-mesa-dev \
+          libx11-dev libx11-xcb-dev libxcursor-dev libxi-dev libxrandr-dev \
+          libxkbcommon-dev libxkbcommon-x11-dev \
+          libwayland-dev \
+          libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
     - name: Install Rust Toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -87,26 +107,116 @@ jobs:
         # Cache keyed by artifact name to prevent the Pi builds from thrashing each other
         key: ${{ matrix.target }}-${{ matrix.artifact_name }}
 
-    - name: Build Release
+    - name: Build Release (node)
       env:
         CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         RUSTFLAGS: ${{ matrix.rustflags || '' }}
+      # -p is explicit: the repo root is both a package and a workspace root,
+      # so a bare `cargo build` leaves it ambiguous which members are built.
+      run: cargo build --release --target ${{ matrix.target }} -p midstate
 
-      run: cargo build --release --target ${{ matrix.target }}
+    - name: Build Release (desktop GUI)
+      if: matrix.desktop_bin != ''
+      env:
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        RUSTFLAGS: ${{ matrix.rustflags || '' }}
+      run: cargo build --release --target ${{ matrix.target }} -p midstate-desktop
 
-    - name: Rename Binary for Artifacts (Linux/macOS)
+    - name: Rename Binaries for Artifacts (Linux/macOS)
       if: matrix.os != 'windows-latest'
-      run: mv target/${{ matrix.target }}/release/${{ matrix.bin_name }} target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+      run: |
+        cd target/${{ matrix.target }}/release
+        mv ${{ matrix.bin_name }} ${{ matrix.artifact_name }}
+        # The macOS desktop binary keeps its name — it goes inside the bundle
+        # as CFBundleExecutable, so only Linux renames it.
+        if [ -n "${{ matrix.desktop_name }}" ]; then
+          mv ${{ matrix.desktop_bin }} ${{ matrix.desktop_name }}
+        fi
 
-    - name: Rename Binary for Artifacts (Windows)
+    - name: Rename Binaries for Artifacts (Windows)
       if: matrix.os == 'windows-latest'
-      run: Rename-Item -Path "target\${{ matrix.target }}\release\${{ matrix.bin_name }}" -NewName "${{ matrix.artifact_name }}"
+      run: |
+        Set-Location "target\${{ matrix.target }}\release"
+        Rename-Item -Path "${{ matrix.bin_name }}" -NewName "${{ matrix.artifact_name }}"
+        if ("${{ matrix.desktop_name }}" -ne "") {
+          Rename-Item -Path "${{ matrix.desktop_bin }}" -NewName "${{ matrix.desktop_name }}"
+        }
 
-    - name: Upload Artifact
+    - name: Bundle macOS .app
+      if: matrix.bundle_name != ''
+      run: |
+        set -euo pipefail
+        REL="target/${{ matrix.target }}/release"
+        APP="$REL/Midstate.app"
+        VERSION="0.0.0"
+        if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then VERSION="${GITHUB_REF_NAME#v}"; fi
+
+        mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+        cp "$REL/${{ matrix.desktop_bin }}" "$APP/Contents/MacOS/midstate-desktop"
+        chmod +x "$APP/Contents/MacOS/midstate-desktop"
+
+        # Build the .icns from the checked-in 1024px source. Every size macOS
+        # asks for is generated — iconutil rejects an iconset with gaps.
+        ICONSET="$RUNNER_TEMP/AppIcon.iconset"
+        rm -rf "$ICONSET"; mkdir -p "$ICONSET"
+        SRC="apps/desktop/assets/logo-1024.png"
+        for s in 16 32 128 256 512; do
+          sips -z "$s" "$s" "$SRC" --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+          d=$((s * 2))
+          sips -z "$d" "$d" "$SRC" --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+        done
+        iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+
+        cat > "$APP/Contents/Info.plist" <<'PLIST'
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>CFBundleName</key>                  <string>Midstate</string>
+          <key>CFBundleDisplayName</key>           <string>Midstate</string>
+          <key>CFBundleIdentifier</key>            <string>com.midstate.desktop</string>
+          <key>CFBundleExecutable</key>            <string>midstate-desktop</string>
+          <key>CFBundleIconFile</key>              <string>AppIcon</string>
+          <key>CFBundlePackageType</key>           <string>APPL</string>
+          <key>CFBundleInfoDictionaryVersion</key> <string>6.0</string>
+          <key>CFBundleShortVersionString</key>    <string>__VERSION__</string>
+          <key>CFBundleVersion</key>               <string>__VERSION__</string>
+          <key>LSMinimumSystemVersion</key>        <string>11.0</string>
+          <key>LSApplicationCategoryType</key>     <string>public.app-category.finance</string>
+          <key>NSHighResolutionCapable</key>       <true/>
+        </dict>
+        </plist>
+        PLIST
+        # The heredoc is quoted (no shell expansion inside the XML) and indented
+        # for readability, so strip the indent and substitute the version after.
+        sed -i '' -e 's/^        //' -e "s/__VERSION__/$VERSION/g" "$APP/Contents/Info.plist"
+        plutil -lint "$APP/Contents/Info.plist"
+
+        # ditto, not zip: upload-artifact drops the executable bit and flattens
+        # symlinks, which yields a bundle macOS refuses to launch.
+        ditto -c -k --keepParent "$APP" "$REL/${{ matrix.bundle_name }}"
+
+    - name: Upload Artifact (node)
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact_name }}
         path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+        if-no-files-found: error
+
+    - name: Upload Artifact (desktop GUI)
+      if: matrix.desktop_name != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.desktop_name }}
+        path: target/${{ matrix.target }}/release/${{ matrix.desktop_name }}
+        if-no-files-found: error
+
+    - name: Upload Artifact (macOS .app bundle)
+      if: matrix.bundle_name != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.bundle_name }}
+        path: target/${{ matrix.target }}/release/${{ matrix.bundle_name }}
         if-no-files-found: error
 
   release:
@@ -128,3 +238,19 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTES
+#
+# Pi targets build the node only, by design — cross-compiling the GUI to
+# arm64 would need arm64 X11/Wayland/GL libraries in the linker sysroot,
+# which apt on an amd64 runner does not provide.
+#
+# The macOS bundle is UNSIGNED. Gatekeeper will refuse it on first launch
+# ("unidentified developer", or "damaged" once the download carries a
+# quarantine flag). Users can right-click the app and choose Open, or run:
+#     xattr -dr com.apple.quarantine /Applications/Midstate.app
+# Removing that friction needs an Apple Developer account, then
+# `codesign --deep --options runtime` followed by `xcrun notarytool submit`
+# on the zip, with the certificate held as a repository secret.
+# ─────────────────────────────────────────────────────────────────────────────
