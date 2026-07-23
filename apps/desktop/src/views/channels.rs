@@ -493,6 +493,36 @@ fn hub_panel(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
         );
 
         ui.add_space(6.0);
+        ui.checkbox(&mut next.auto_open_on_request, "Open a channel when someone asks");
+        theme::hint(
+            ui,
+            "A channel only carries value one way, so a buyer cannot open one to pay you — \
+             they can only ask you to open one to them. Turning this on is what lets someone \
+             trade with you instantly without arranging anything first.",
+        );
+        ui.horizontal(|ui| {
+            theme::hint(ui, "at most");
+            let mut cap = next.max_auto_capacity.to_string();
+            if ui
+                .add(TextEdit::singleline(&mut cap).font(egui::TextStyle::Monospace).desired_width(110.0))
+                .changed()
+            {
+                cap.retain(|c| c.is_ascii_digit());
+                next.max_auto_capacity = cap.parse().unwrap_or(next.max_auto_capacity);
+            }
+            theme::hint(ui, "per channel, and");
+            let mut bud = next.auto_capacity_budget.to_string();
+            if ui
+                .add(TextEdit::singleline(&mut bud).font(egui::TextStyle::Monospace).desired_width(130.0))
+                .changed()
+            {
+                bud.retain(|c| c.is_ascii_digit());
+                next.auto_capacity_budget = bud.parse().unwrap_or(next.auto_capacity_budget);
+            }
+            theme::hint(ui, "in total");
+        });
+
+        ui.add_space(6.0);
         ui.checkbox(&mut next.jit_open, "Open channels on demand to complete a route");
         theme::hint(
             ui,
@@ -599,4 +629,7 @@ fn changed(a: &HubView, b: &HubView) -> bool {
         || a.jit_open != b.jit_open
         || a.jit_capacity != b.jit_capacity
         || a.min_leaves != b.min_leaves
+        || a.auto_open_on_request != b.auto_open_on_request
+        || a.max_auto_capacity != b.max_auto_capacity
+        || a.auto_capacity_budget != b.auto_capacity_budget
 }

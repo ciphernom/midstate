@@ -81,7 +81,27 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             });
 
         ui.add_space(6.0);
-        theme::hint(ui, "Amount");
+        let spendable = app.balance.as_ref().map(|b| b.confirmed).unwrap_or(0);
+        ui.horizontal(|ui| {
+            theme::hint(ui, "Amount");
+            theme::right_aligned(ui, |ui| {
+                // "Send all" leaves the fee behind rather than failing at the
+                // planner: the fee comes out of the amount, not on top of it.
+                if ui
+                    .add_enabled(spendable > 0, egui::Button::new(RichText::new("send all").size(11.0)))
+                    .on_hover_text("Sends your whole spendable balance, with the network fee taken out of it.")
+                    .clicked()
+                {
+                    app.send_unit = 0;
+                    app.send_amount = spendable.saturating_sub(estimated_fee(app)).to_string();
+                }
+                ui.label(
+                    RichText::new(format!("{} available", units(spendable)))
+                        .size(11.5)
+                        .color(theme::muted()),
+                );
+            });
+        });
         // Denomination picker belongs beside the field it scales, not further
         // down the form.
         ui.horizontal(|ui| {
@@ -211,4 +231,15 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             app.go(&ctx, Action::AbandonSend { id });
         }
     }
+}
+
+/// A deliberately generous fee estimate for "send all". Overshooting leaves a
+/// little dust behind; undershooting makes the planner reject the send, which
+/// is the more annoying failure.
+fn estimated_fee(app: &App) -> u64 {
+    let inputs = app.coins.iter().filter(|c| c.live && !c.wots_signed && !c.in_flight).count();
+    // Matches the walletd fee model: ~1636 bytes per input, ~100 per output,
+    // at 10 units per KiB, with headroom.
+    let bytes = 100 + 1636 * inputs.max(1) as u64 + 100 * 8;
+    bytes * 10 / 1024 + 40
 }

@@ -162,17 +162,22 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                     );
                 });
                 cell(ui, W_VALUE, |ui| {
-                    if h.amount > 0 {
-                        ui.label(
-                            theme::mono(format!("{}{}", if incoming { "+" } else { "~" }, units(h.amount)))
-                                .size(12.0)
-                                .color(theme::ink()),
-                        )
-                        .on_hover_text(if incoming {
-                            "Value that arrived in this wallet."
-                        } else {
-                            "Change that came back to this wallet — not the amount sent."
-                        });
+                    if incoming && h.amount > 0 {
+                        ui.label(theme::mono(format!("+{}", units(h.amount))).size(12.0).color(theme::ink()))
+                            .on_hover_text("Value that arrived in this wallet.");
+                    } else if let Some(sent) = h.sent {
+                        ui.label(theme::mono(format!("-{}", units(sent))).size(12.0).color(theme::ink()))
+                            .on_hover_text(match &h.to {
+                                Some(to) => format!("Sent to {to}"),
+                                None => "Sent out of this wallet.".into(),
+                            });
+                    } else if !incoming {
+                        // The chain records no amounts, so a send made before
+                        // walletd started keeping its own ledger cannot be
+                        // priced after the fact. Say so rather than showing the
+                        // leftover change and calling it the amount.
+                        ui.label(theme::mono("—").color(theme::faint()))
+                            .on_hover_text("Amount not recorded — this send predates value tracking.");
                     } else {
                         ui.label(theme::mono("—").color(theme::faint()));
                     }
@@ -214,8 +219,10 @@ pub fn show(app: &mut App, ui: &mut Ui) {
 
     theme::hint(
         ui,
-        "This chain records only coin ids, so a value can be shown when this wallet holds the \
-         matching coin. What left in a send is known to the recipient, not to the ledger.",
+        "Transactions publish every amount on-chain, but this wallet's history file keeps only \
+         coin ids. Values shown here are remembered as the wallet sees them, so a past entry \
+         does not change when you spend today. Anything still blank can be rebuilt from your \
+         block store — Settings, Rebuild history amounts.",
     );
 }
 
@@ -238,7 +245,19 @@ fn detail(ui: &mut Ui, h: &HistoryView) {
                 if h.fee > 0 {
                     theme::hint(ui, &format!("· fee {}", units(h.fee)));
                 }
+                if h.change > 0 {
+                    theme::hint(ui, &format!("· {} change", units(h.change)));
+                }
             });
+            if let Some(to) = &h.to {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("TO").font(FontId::monospace(9.0)).color(theme::muted()));
+                    ui.label(theme::mono(to).size(11.0).color(theme::bright()));
+                    if ui.button(RichText::new("copy").size(10.0)).clicked() {
+                        ui.ctx().copy_text(to.clone());
+                    }
+                });
+            }
             if !h.inputs.is_empty() {
                 ui.add_space(4.0);
                 coin_list(ui, "SPENT", &h.inputs);

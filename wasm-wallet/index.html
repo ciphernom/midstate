@@ -4459,11 +4459,11 @@ document.getElementById('btnExport').onclick = () => {
                 alert("Maximum 4 attachments per message.");
                 return;
             }
-            const raw = prompt("Paste a midstate address (64 hex characters):");
+            const raw = prompt("Paste a midstate address (72 characters):");
             if (raw === null) return;
             const hex = raw.trim().toLowerCase();
-            if (!/^[0-9a-f]{64}$/.test(hex)) {
-                alert("Invalid address — must be exactly 64 hex characters (0-9, a-f).");
+            if (!/^[0-9a-f]{72}$/.test(hex)) {
+                alert("Invalid address — must be exactly 72 hex characters (checksummed).");
                 return;
             }
             if (chatDraftAttachments.some(a => a.kind === "address" && a.value === hex)) {

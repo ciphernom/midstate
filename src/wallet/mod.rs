@@ -141,6 +141,12 @@ pub struct WalletData {
     #[serde(default)]
     pub next_mss_index: u64,
 
+    /// secp256k1 key for the EVM leg of cross-chain swaps, derived at wallet
+    /// creation from the BIP39 seed at the standard BIP44 path
+    /// `m/44'/60'/0'/0/0`. `None` for wallets created before this existed.
+    #[serde(default)]
+    pub evm_secret: Option<[u8; 32]>,
+
     // ── Pruning Licenses (Phase 1) ────────────────────────────────────────
     /// Plaintext metadata for licenses this wallet owns.
     /// Stored as Vec of (coin_id, metadata) tuples.
@@ -163,6 +169,7 @@ impl WalletData {
             master_seed: None,
             next_wots_index: 0,
             next_mss_index: 0,
+            evm_secret: None,
             license_metadata: Vec::new(),
         }
     }
@@ -185,6 +192,22 @@ pub struct Wallet {
     path: PathBuf,
     password: Vec<u8>,
     pub data: WalletData,
+    /// Coin records the chain has confirmed are already spent.
+    ///
+    /// A wallet cannot work this out alone. `complete_reveal` drops the coins
+    /// it spends, but a coin spent by another instance of this wallet, undone
+    /// by a reorg, or imported and never confirmed leaves a record behind that
+    /// is locally indistinguishable from a live coin. The co-spend gate in
+    /// `prepare_commit` would then treat it as a sibling that must also be
+    /// spent — impossible, since it no longer exists — and the address becomes
+    /// permanently unspendable.
+    ///
+    /// Callers that have just consulted the UTXO set record what they found
+    /// here. Deliberately session-only and never serialised: a stale view of
+    /// the chain must not outlive the process that formed it. The coin records
+    /// themselves are left untouched, so a wrong answer costs a refused spend
+    /// rather than a lost coin.
+    known_spent: std::collections::HashSet<[u8; 32]>,
 }
 
 impl Wallet {
@@ -193,6 +216,7 @@ impl Wallet {
             bail!("wallet file already exists: {}", path.display());
         }
         let wallet = Self {
+            known_spent: Default::default(),
             path: path.to_path_buf(),
             password: password.to_vec(),
             data: WalletData::empty(),
@@ -212,6 +236,7 @@ impl Wallet {
         let mut data = WalletData::empty();
         data.master_seed = Some(master_seed);
         let wallet = Self {
+            known_spent: Default::default(),
             path: path.to_path_buf(),
             password: password.to_vec(),
             data,
@@ -230,6 +255,7 @@ impl Wallet {
         let mut data = WalletData::empty();
         data.master_seed = Some(master_seed);
         let wallet = Self {
+            known_spent: Default::default(),
             path: path.to_path_buf(),
             password: password.to_vec(),
             data,
@@ -478,6 +504,7 @@ pub fn import_scanned(
         let plaintext = crypto::decrypt(&encrypted, password)?;
         let data: WalletData = serde_json::from_slice(&plaintext)?;
         Ok(Self {
+            known_spent: Default::default(),
             path: path.to_path_buf(),
             password: password.to_vec(),
             data,
@@ -1153,6 +1180,19 @@ pub fn import_scanned(
     }
 
     /// Prepare a commit for given inputs and outputs.
+    /// Record coins the chain reports as already spent.
+    ///
+    /// Relaxes the co-spend gate for exactly those coins. Their records stay
+    /// in the wallet, so nothing is lost if the chain view was wrong.
+    pub fn mark_spent(&mut self, ids: impl IntoIterator<Item = [u8; 32]>) {
+        self.known_spent.extend(ids);
+    }
+
+    /// Discard everything learned about on-chain state this session.
+    pub fn clear_spent_marks(&mut self) {
+        self.known_spent.clear();
+    }
+
     pub fn prepare_commit(
         &mut self,
         input_coin_ids: &[[u8; 32]],
@@ -1176,6 +1216,12 @@ pub fn import_scanned(
         for coin_id in input_coin_ids {
             let siblings = self.wots_siblings(coin_id);
             for sib_id in &siblings {
+                // A sibling the chain has already consumed cannot be put at
+                // risk by this spend, and demanding it would strand the whole
+                // address. Every other missing sibling is still refused.
+                if self.known_spent.contains(sib_id) {
+                    continue;
+                }
                 if !input_set.contains(sib_id) {
                     let coin = self.find_coin(coin_id).unwrap();
                     bail!(
@@ -1973,7 +2019,7 @@ mod tests {
 
         let salt = [0x55; 32];
         let value = 8u64;
-        let result = w.import_scanned(addr, value, salt).unwrap();
+        let result = w.import_scanned(addr, value, salt, None).unwrap();
         assert!(result.is_some());
         assert_eq!(w.coin_count(), 1);
         assert_eq!(w.keys().len(), 0); // key consumed
@@ -1986,7 +2032,7 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         let mut w = Wallet::create(&path, b"pass").unwrap();
-        let result = w.import_scanned([0xFF; 32], 8, [0; 32]).unwrap();
+        let result = w.import_scanned([0xFF; 32], 8, [0; 32], None).unwrap();
         assert!(result.is_none());
     }
 
@@ -2000,9 +2046,9 @@ mod tests {
         let addr = w.generate_key(None).unwrap();
         let salt = [0x55; 32];
 
-        w.import_scanned(addr, 8, salt).unwrap();
+        w.import_scanned(addr, 8, salt, None).unwrap();
         // Second import same coin → None
-        let result = w.import_scanned(addr, 8, salt).unwrap();
+        let result = w.import_scanned(addr, 8, salt, None).unwrap();
         assert!(result.is_none());
         assert_eq!(w.coin_count(), 1);
     }
@@ -2488,7 +2534,7 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
         let addr = w.find_coin(&c1).unwrap().address;
 
         // Import sibling at the same address via import_scanned
-        let c2 = w.import_scanned(addr, 1, [20; 32]).unwrap();
+        let c2 = w.import_scanned(addr, 1, [20; 32], None).unwrap();
         assert!(c2.is_some(), "sibling import should succeed");
 
         assert_eq!(w.coins().len(), 2);
@@ -2510,7 +2556,7 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
         w.save().unwrap();
 
         // Sibling should be quarantined
-        let c2 = w.import_scanned(addr, 1, [20; 32]).unwrap();
+        let c2 = w.import_scanned(addr, 1, [20; 32], None).unwrap();
         assert!(c2.is_none(), "sibling at signed address should be rejected");
         assert_eq!(w.coins().len(), 1);
     }
@@ -2525,7 +2571,7 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
         let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
         let addr = w.find_coin(&c1).unwrap().address;
 
-        let c2 = w.import_scanned(addr, 1, [20; 32]).unwrap().unwrap();
+        let c2 = w.import_scanned(addr, 1, [20; 32], None).unwrap().unwrap();
 
         let sibs = w.wots_siblings(&c1);
         assert_eq!(sibs, vec![c2]);
@@ -2542,7 +2588,7 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
         let mut w = Wallet::create(&path, b"pass").unwrap();
         let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
         let addr = w.find_coin(&c1).unwrap().address;
-        let c2 = w.import_scanned(addr, 1, [20; 32]).unwrap().unwrap();
+        let c2 = w.import_scanned(addr, 1, [20; 32], None).unwrap().unwrap();
 
         // We only need 4, but selecting c1 must pull in c2 (sibling)
         let live = vec![c1, c2];
@@ -2560,7 +2606,7 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
         let mut w = Wallet::create(&path, b"pass").unwrap();
         let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
         let addr = w.find_coin(&c1).unwrap().address;
-        let _c2 = w.import_scanned(addr, 1, [20; 32]).unwrap().unwrap();
+        let _c2 = w.import_scanned(addr, 1, [20; 32], None).unwrap().unwrap();
 
         // Try to commit with only c1, leaving sibling c2 behind
         let outputs = vec![OutputData::Standard {
@@ -2583,7 +2629,7 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
         let mut w = Wallet::create(&path, b"pass").unwrap();
         let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
         let addr = w.find_coin(&c1).unwrap().address;
-        let c2 = w.import_scanned(addr, 1, [20; 32]).unwrap().unwrap();
+        let c2 = w.import_scanned(addr, 1, [20; 32], None).unwrap().unwrap();
 
         // Commit with both siblings — should succeed
         let outputs = vec![OutputData::Standard {
@@ -2604,7 +2650,7 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
         let mut w = Wallet::create(&path, b"pass").unwrap();
         let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
         let addr = w.find_coin(&c1).unwrap().address;
-        let c2 = w.import_scanned(addr, 1, [20; 32]).unwrap().unwrap();
+        let c2 = w.import_scanned(addr, 1, [20; 32], None).unwrap().unwrap();
 
         let outputs = vec![OutputData::Standard {
             address: [0xAA; 32],
@@ -2629,7 +2675,7 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
         let mut w = Wallet::create(&path, b"pass").unwrap();
         let c1 = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
         let addr = w.find_coin(&c1).unwrap().address;
-        let _c2 = w.import_scanned(addr, 2, [20; 32]).unwrap().unwrap();
+        let _c2 = w.import_scanned(addr, 2, [20; 32], None).unwrap().unwrap();
 
         // Mix should reject — can't bring siblings into a CoinJoin
         let result = w.prepare_mix_registration(&c1);

@@ -79,8 +79,8 @@ mod tests {
     fn argon2_derivation_deterministic() {
         let pwd = b"my_secure_password";
         let salt = b"random_salt_1234";
-        let key1 = derive_key(pwd, salt);
-        let key2 = derive_key(pwd, salt);
+        let key1 = derive_key(pwd, salt).unwrap();
+        let key2 = derive_key(pwd, salt).unwrap();
         assert_eq!(key1, key2);
         assert_ne!(key1, [0u8; 32]);
     }

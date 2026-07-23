@@ -541,6 +541,16 @@ pub mod wire {
     pub const CMD_ADDR_REQ: u8 = 64;
     /// The signed reply carrying a fresh address.
     pub const CMD_ADDR: u8 = 65;
+    /// "Please open a channel to me." Payload: `pack_u32(capacity_hint, &[])`,
+    /// requester's identity in the Address attachment.
+    ///
+    /// The asymmetry this solves: in a unidirectional channel only the sender
+    /// can pay, so a seller who wants instant settlement must fund a channel
+    /// *toward the buyer*. A buyer therefore cannot open one for themselves —
+    /// they can only ask.
+    pub const CMD_CHAN_REQ: u8 = 66;
+    /// Declined, with a reason byte.
+    pub const CMD_CHAN_DECLINE: u8 = 67;
     pub const CMD_OPEN: u8 = 110;
 
     /// OPEN payload: [ver][expiry u64][n u8][{value u64, salt 32}×n][sig0…]

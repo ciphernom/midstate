@@ -146,6 +146,14 @@ pub struct ChannelBook {
     pub answered_reqs: std::collections::HashMap<String, u64>,
     #[serde(default)]
     pub hub: HubConfig,
+    /// Sell orders this wallet has published. The per-unit secrets are the
+    /// only part of an order that cannot be rebuilt from the chain — without
+    /// them the maker can neither be paid nor reclaim early.
+    #[serde(default)]
+    pub orders: Vec<MyOrder>,
+    /// Buy orders this wallet has escrowed on Base.
+    #[serde(default)]
+    pub bids: Vec<MyBid>,
     /// Address requests we sent, awaiting a signed reply: req id → peer pk.
     #[serde(default)]
     pub addr_reqs: std::collections::HashMap<String, [u8; 32]>,
@@ -173,6 +181,18 @@ pub struct HubConfig {
     pub jit_capacity: u64,
     /// Refuse to forward if it would leave fewer than this many MSS leaves.
     pub min_leaves: u64,
+    /// Open a channel when a peer asks for one over the bus. This is what lets
+    /// a buyer trade instantly with a seller they have never met: they ask, and
+    /// a seller who wants the sale funds the lane.
+    #[serde(default)]
+    pub auto_open_on_request: bool,
+    /// Most this wallet will lock into a single unsolicited channel.
+    #[serde(default)]
+    pub max_auto_capacity: u64,
+    /// Total outstanding capacity opened this way, so a stream of requests
+    /// cannot drain the wallet one acceptable channel at a time.
+    #[serde(default)]
+    pub auto_capacity_budget: u64,
 }
 
 impl Default for HubConfig {
@@ -183,6 +203,9 @@ impl Default for HubConfig {
             jit_open: false,
             jit_capacity: 65_536,
             min_leaves: 64,
+            auto_open_on_request: false,
+            max_auto_capacity: 65_536,
+            auto_capacity_budget: 1_048_576,
         }
     }
 }
@@ -339,4 +362,54 @@ pub fn send_frame(
         None,
         frame_attachments(channel_id, payload, address),
     )
+}
+
+/// A sell order published by this wallet.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MyOrder {
+    pub group_id: String,
+    /// Commitment of the transaction that funded and announced it.
+    pub commitment: String,
+    pub mds_amount: u64,
+    pub wei_amount: String,
+    pub timeout_height: u64,
+    pub created_height: u64,
+    /// (secret_hash, secret) per unit, hex. Revealing a secret is what
+    /// releases that unit to a buyer.
+    pub secrets: Vec<(String, String)>,
+    /// (mds value, wei price) per unit, parallel to `secrets`.
+    ///
+    /// Units are power-of-two sized and priced in proportion, so they differ
+    /// widely — a 512-unit may be worth 64x an 8-unit. Judging an incoming
+    /// escrow against the order's average price would reject every small unit
+    /// as underpaid, so the exact per-unit price has to be recorded.
+    #[serde(default)]
+    pub unit_prices: Vec<(u64, String)>,
+}
+
+/// A resting buy order escrowed in the Base contract.
+///
+/// The direction is inverted from a sell order: here WE hold the secret and
+/// reveal it on midstate by claiming the seller's covenant, after which the
+/// seller uses that preimage to collect our ETH. So the secret is what makes
+/// the bid fillable at all — lose it and the escrow can only ever be
+/// cancelled back.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MyBid {
+    /// Assigned by the contract at mining time, so unknown until the receipt.
+    #[serde(default)]
+    pub bid_id: String,
+    /// Transaction that created it, while the id is still unknown.
+    pub tx: String,
+    pub secret_hash: String,
+    pub secret: String,
+    pub mds_amount: u64,
+    pub wei: String,
+    pub fill_bond: String,
+    /// Midstate address the seller's covenant must pay — ours.
+    pub mds_addr: String,
+    pub expiry: u64,
+    pub created: u64,
+    #[serde(default)]
+    pub cancelled: bool,
 }

@@ -871,12 +871,14 @@ mod tests {
             expirations: im::OrdMap::new(),
             header_hash: [0u8; 32],
             chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
+            burned_wots: crate::core::mmr::UtxoAccumulator::new(),
         };
 
         // Create 3 coins in the UTXO set
         let (seed_a, in_a, out_a) = make_participant(b"alice");
         let (seed_b, in_b, out_b) = make_participant(b"bob");
-        let (seed_f, fee) = make_fee_participant(b"fee-donor");
+        let required_fee = recommended_fee_for_mix(2);
+        let (seed_f, fee) = make_fee_participant(b"fee-donor", required_fee);
 
         let pk_a = in_a.predicate.owner_pk().unwrap();
         let pk_b = in_b.predicate.owner_pk().unwrap();

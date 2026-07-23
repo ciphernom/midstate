@@ -609,49 +609,49 @@ pub fn decrypt_cli_wallet(data: &[u8], password: &str) -> Result<String, JsValue
     Ok(json_str)
 }
 
-/// Safely parses a hex-encoded Midstate address into a 32-byte array.
+/// Safely parses a checksummed hex-encoded Midstate address into a 32-byte array.
 ///
-/// This parser supports two address formats:
-/// 1. **Legacy Format (64 characters):** A raw 32-byte hex string.
-/// 2. **Checksummed Format (72 characters):** A 36-byte hex string where the 
-///    first 32 bytes are the address, and the final 4 bytes are a BLAKE3 
-///    checksum (`BLAKE3(address)[0..4]`).
+/// This parser strictly requires the **Checksummed Format (72 characters):** 
+/// A 36-byte hex string where the first 32 bytes are the address, and the 
+/// final 4 bytes are a BLAKE3 checksum (`BLAKE3(address)[0..4]`). 
+/// Legacy 64-character addresses are no longer supported in the Web Wallet.
 ///
-/// This matches the native CLI wallet's `parse_address_flexible` behavior, 
-/// ensuring that typos in the web UI are caught before a transaction is built.
+/// This strict enforcement ensures that typos in the web UI are caught 
+/// before a transaction is built.
 ///
 /// # Arguments
 ///
-/// * `s` - The hex-encoded address string provided by the user/UI.
+/// * `s` - The hex-encoded 72-character address string provided by the user/UI.
 ///
 /// # Returns
 ///
 /// * `Ok([u8; 32])` - The extracted 32-byte address.
 /// * `Err(JsValue)` - A string error suitable for throwing to JavaScript if the 
-///   hex is invalid, the length is wrong, or the checksum fails.
+///   hex is invalid, the length is not 72, or the checksum fails.
 fn parse_address_wasm(s: &str) -> Result<[u8; 32], JsValue> {
+    if s.len() != 72 {
+        return Err(JsValue::from_str("Invalid address length. Expected exactly 72 characters (checksummed)."));
+    }
     let decoded = hex::decode(s).map_err(|_| JsValue::from_str("Invalid hex in address."))?;
     
-    if decoded.len() == 32 {
-        // Legacy 64-character format
-        let mut addr = [0u8; 32];
-        addr.copy_from_slice(&decoded);
-        Ok(addr)
-    } else if decoded.len() == 36 {
-        // New 72-character format with checksum
-        let mut addr = [0u8; 32];
-        addr.copy_from_slice(&decoded[0..32]);
-        
-        let expected_checksum = &decoded[32..36];
-        let actual_checksum_hash = midstate::core::types::hash(&addr);
-        
-        if expected_checksum != &actual_checksum_hash[0..4] {
-            return Err(JsValue::from_str("Checksum mismatch! The address contains a typo."));
-        }
-        Ok(addr)
-    } else {
-        Err(JsValue::from_str("Invalid address length. Expected 64 or 72 hex characters."))
+    let mut addr = [0u8; 32];
+    addr.copy_from_slice(&decoded[0..32]);
+    
+    let expected_checksum = &decoded[32..36];
+    let actual_checksum_hash = midstate::core::types::hash(&addr);
+    
+    if expected_checksum != &actual_checksum_hash[0..4] {
+        return Err(JsValue::from_str("Checksum mismatch! The address contains a typo."));
     }
+    Ok(addr)
+}
+
+#[wasm_bindgen]
+pub fn address_to_checksummed_hex(address_hex: &str) -> Result<String, JsValue> {
+    let mut addr = [0u8; 32];
+    hex::decode_to_slice(address_hex, &mut addr)
+        .map_err(|_| JsValue::from_str("Invalid address hex length/characters"))?;
+    Ok(midstate::core::types::encode_address_with_checksum(&addr))
 }
 
 #[wasm_bindgen]
@@ -1240,7 +1240,9 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
         let available: Vec<WasmUtxo> = serde_json::from_str(available_utxos_json)
             .map_err(|e| JsValue::from_str(&format!("Bad utxos JSON: {}", e)))?;
 
-        let dest_addr = parse_address_wasm(dest_address_hex)?;
+        let mut dest_addr = [0u8; 32];
+        hex::decode_to_slice(dest_address_hex, &mut dest_addr)
+            .map_err(|_| JsValue::from_str("Invalid destination address hex"))?;
         
         struct Bundle<'a> {
             address: String,
@@ -2686,7 +2688,9 @@ pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<Str
                 safety_output_hashes.push(*hasher.finalize().as_bytes());
                 output_json.push(o_val);
             } else if o_val["type"] == "standard" {
-                let addr_bytes = parse_address_wasm(o_val["address"].as_str().unwrap())?;
+                let mut addr_bytes = [0u8; 32];
+                hex::decode_to_slice(o_val["address"].as_str().unwrap(), &mut addr_bytes)
+                    .map_err(|_| JsValue::from_str("Invalid output address hex"))?;
                 let mut salt_bytes = [0u8; 32]; hex::decode_to_slice(o_val["salt"].as_str().unwrap(), &mut salt_bytes).unwrap();
                 let value = o_val["value"].as_u64().unwrap();
                 safety_output_hashes.push(compute_coin_id(&addr_bytes, value, &salt_bytes));
@@ -4060,14 +4064,6 @@ mod tests {
     
     // ── Address Parsing (WASM) ──────────────────────────────────────────
     #[wasm_bindgen_test]
-    fn parse_address_wasm_legacy_64_valid() {
-        let addr_hex = "aa".repeat(32);
-        let result = parse_address_wasm(&addr_hex);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), [0xaa; 32]);
-    }
-
-    #[wasm_bindgen_test]
     fn parse_address_wasm_checksum_72_valid() {
         let addr_bytes = [0xbb; 32];
         let checksum = midstate::core::types::hash(&addr_bytes);
@@ -4100,6 +4096,10 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn parse_address_wasm_invalid_length_rejected() {
+        // 64 characters (32 bytes) - legacy format, now rejected
+        let legacy = "aa".repeat(32);
+        assert!(parse_address_wasm(&legacy).is_err());
+
         // 62 characters (31 bytes) - too short
         let too_short = "aa".repeat(31);
         assert!(parse_address_wasm(&too_short).is_err());

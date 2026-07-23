@@ -88,24 +88,23 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 "No peers connected. The node keeps dialing the bootstrap list — if this \
                  persists, check whether outbound connections on port 9333 are blocked.",
             );
-        } else {
-            theme::hint(ui, "Node identities this wallet is currently connected to.");
-            egui::ScrollArea::vertical()
-                .max_height(150.0)
-                .id_salt("peers")
-                .show(ui, |ui| {
-                    for p in &n.peers {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                theme::mono(short_hex(p, 14)).size(11.0).color(theme::muted()),
-                            );
-                            if ui.button(RichText::new("copy").size(10.0)).clicked() {
-                                ui.ctx().copy_text(p.clone());
-                            }
-                        });
-                    }
-                });
+            return;
         }
+        theme::hint(ui, "Node identities this wallet is currently connected to.");
+        egui::ScrollArea::vertical()
+            .max_height(180.0)
+            .auto_shrink([false, false])
+            .id_salt("peers")
+            .show(ui, |ui| {
+                for p in &n.peers {
+                    ui.horizontal(|ui| {
+                        ui.label(theme::mono(short_hex(p, 14)).size(11.0).color(theme::muted()));
+                        if ui.button(RichText::new("copy").size(10.0)).clicked() {
+                            ui.ctx().copy_text(p.clone());
+                        }
+                    });
+                }
+            });
     });
 
     // ── Local ───────────────────────────────────────────────────────────

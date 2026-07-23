@@ -936,6 +936,7 @@ mod tests {
             expirations: im::OrdMap::new(),
             chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
             header_hash: [0; 32],
+            burned_wots: crate::core::mmr::UtxoAccumulator::new(),
         };
 
         let timestamps = vec![prev.timestamp];

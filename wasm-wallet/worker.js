@@ -27,7 +27,7 @@
  * @module worker
  */
 
-import init, { WebWallet, generate_phrase, compute_coin_id_hex, compute_commitment_hex, decrypt_cli_wallet, mine_commitment_pow, blake3_hash_hex, build_multisig_2of2_address, build_channel_state, build_channel_reveal, verify_mss_sig_wasm, mine_chat_pow_v2_wasm, build_htlc_bytecode_hex, build_covenant_htlc_bytecode_hex, build_limit_order_covenant_bytecode_hex, compute_p2pk_address_hex, qbolt_channel_address, qbolt_channel_bytecode_hex, qbolt_build_state, qbolt_build_refund_state, qbolt_build_close_reveal, qbolt_build_refund_reveal, qbolt_build_legacy_close_state, qbolt_build_legacy_close_reveal } from './pkg/wasm_wallet.js';
+import init, { WebWallet, generate_phrase, compute_coin_id_hex, compute_commitment_hex, decrypt_cli_wallet, mine_commitment_pow, blake3_hash_hex, build_multisig_2of2_address, build_channel_state, build_channel_reveal, verify_mss_sig_wasm, mine_chat_pow_v2_wasm, build_htlc_bytecode_hex, build_covenant_htlc_bytecode_hex, build_limit_order_covenant_bytecode_hex, compute_p2pk_address_hex, qbolt_channel_address, qbolt_channel_bytecode_hex, qbolt_build_state, qbolt_build_refund_state, qbolt_build_close_reveal, qbolt_build_refund_reveal, qbolt_build_legacy_close_state, qbolt_build_legacy_close_reveal, address_to_checksummed_hex } from './pkg/wasm_wallet.js';
 
 /** @type {WebWallet|null} The WASM wallet instance. Null until CREATE or LOGIN. */
 let wallet = null;
@@ -4229,8 +4229,12 @@ function buildDashboardPayload() {
     const pendingDeduction = pendingSends.reduce((s, tx) => s + tx.value + tx.fee, 0);
     const safeBalance      = Math.max(0, totalUtxoValue - pendingDeduction);
     const sortedHistory    = [...pendingSends, ...wState.history].sort((a, b) => b.timestamp - a.timestamp);
+    
+    const rawPrimary = mssList.length > 0 ? mssList[mssList.length - 1] : "None";
+    const primaryAddress = rawPrimary !== "None" ? address_to_checksummed_hex(rawPrimary) : "None";
+    
     return {
-        primaryAddress: mssList.length > 0 ? mssList[mssList.length - 1] : "None",
+        primaryAddress,
         // The Q-Bolt identity is the MSS *public key*, NOT the receiving address.
         // `primaryAddress` above is a key of wState.mssAddrs — i.e. an address —
         // while the covenant, every signature check, and the channel id are all

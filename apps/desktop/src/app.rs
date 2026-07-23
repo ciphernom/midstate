@@ -18,12 +18,13 @@ pub enum Tab {
     Coins,
     Chat,
     Channels,
+    Trade,
     Node,
     Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 9] = [
+    pub const ALL: [Tab; 10] = [
         Tab::Dashboard,
         Tab::Send,
         Tab::Receive,
@@ -31,6 +32,7 @@ impl Tab {
         Tab::Coins,
         Tab::Chat,
         Tab::Channels,
+        Tab::Trade,
         Tab::Node,
         Tab::Settings,
     ];
@@ -43,6 +45,7 @@ impl Tab {
             Tab::Coins => "Coins",
             Tab::Chat => "Chat",
             Tab::Channels => "Channels",
+            Tab::Trade => "Trade",
             Tab::Node => "Node",
             Tab::Settings => "Settings",
         }
@@ -152,6 +155,7 @@ pub struct App {
     pub node_last_poll: f64,
     pub theme_applied: Option<bool>,
     pub send_unit: usize,
+    pub balance_unit: usize,
     pub dict_filter: String,
     pub ask_peer: String,
     pub ask_pending: bool,
@@ -159,6 +163,41 @@ pub struct App {
     pub hist_filter: usize,
     pub hist_search: String,
     pub hist_open: Option<usize>,
+    pub evm: Option<EvmAccountView>,
+    pub book: Option<OrderBookView>,
+    pub dex_cfg: Option<DexConfigView>,
+    /// What walletd currently holds, so edits have a baseline to differ from.
+    pub dex_cfg_saved: Option<DexConfigView>,
+    pub dex_tab: usize,
+    pub dex_syncing: bool,
+    pub dex_last_sync: f64,
+    pub dex_last_poll: f64,
+    // Guided swap
+    pub swap_side: usize,
+    pub swap_rail: usize,
+    pub swap_mds: String,
+    pub swap_eth: String,
+    pub swap_peer: String,
+    pub swap_hours: String,
+    pub swap_mds_unit: usize,
+    pub swap_eth_unit: usize,
+    pub swap_unit: Option<usize>,
+    /// Channel identity of the chosen order's maker, for the readiness check.
+    pub swap_maker_pk: String,
+    pub swap_quote: Option<SwapQuoteView>,
+    pub my_orders: Vec<MyOrderView>,
+    pub swaps: Vec<SwapView>,
+    pub my_bids: Vec<MyBidView>,
+    pub bid_mds: String,
+    pub bid_wei: String,
+    pub bid_hours: String,
+    pub bid_bond: String,
+    pub ask_mds: String,
+    pub ask_wei: String,
+    pub ask_life: String,
+    pub ask_notice: String,
+    pub ask_mds_unit: usize,
+    pub ask_eth_unit: usize,
     pub own_phrase: bool,
     pub chan_tab: ChanTab,
     pub verify_input: String,
@@ -282,6 +321,7 @@ impl App {
             node_last_poll: 0.0,
             theme_applied: None,
             send_unit: 0,
+            balance_unit: 3,
             dict_filter: String::new(),
             ask_peer: String::new(),
             ask_pending: false,
@@ -289,6 +329,38 @@ impl App {
             hist_filter: 0,
             hist_search: String::new(),
             hist_open: None,
+            evm: None,
+            book: None,
+            dex_cfg: None,
+            dex_cfg_saved: None,
+            dex_tab: 0,
+            dex_syncing: false,
+            dex_last_sync: -1.0,
+            dex_last_poll: 0.0,
+            swap_side: 0,
+            swap_rail: 0,
+            swap_mds: String::new(),
+            swap_eth: String::new(),
+            swap_peer: String::new(),
+            swap_hours: "1".into(),
+            swap_mds_unit: 0,
+            swap_eth_unit: 0,
+            swap_unit: None,
+            swap_maker_pk: String::new(),
+            swap_quote: None,
+            my_orders: Vec::new(),
+            swaps: Vec::new(),
+            my_bids: Vec::new(),
+            bid_mds: String::new(),
+            bid_wei: String::new(),
+            bid_hours: "24".into(),
+            bid_bond: "0".into(),
+            ask_mds: String::new(),
+            ask_wei: String::new(),
+            ask_life: "4320".into(),
+            ask_notice: String::new(),
+            ask_mds_unit: 0,
+            ask_eth_unit: 0,
             own_phrase: false,
             chan_tab: ChanTab::List,
             verify_input: String::new(),
@@ -504,6 +576,8 @@ impl App {
                 self.invoices.clear();
                 self.last_invoice = None;
                 self.hub = None;
+                self.evm = None;
+                self.book = None;
                 self.tab = Tab::Dashboard;
                 self.onboard = Onboard::Unlock;
                 self.go(ctx, Action::LoadStatus);
@@ -608,6 +682,82 @@ impl App {
                 self.busy = false;
                 self.go(ctx, Action::LoadHub);
             }
+            Msg::AskPlaced(g) => {
+                self.busy = false;
+                self.ask_mds.clear();
+                self.ask_wei.clear();
+                self.ask_notice = format!(
+                    "Order {} submitted. It is not offered to anyone until the reveal is \
+                     mined — the coins and the announcement are in that same transaction. \
+                     Follow it on the Send tab.",
+                    crate::theme::short_hex(&g, 6)
+                );
+                self.go(ctx, Action::LoadMyOrders);
+                self.go(ctx, Action::LoadSends);
+                self.dex_last_sync = -1.0;
+            }
+            Msg::MyOrders(v) => self.my_orders = v,
+            Msg::Swaps(v) => self.swaps = v,
+            Msg::MyBids(v) => self.my_bids = v,
+            Msg::BidPlaced(tx) => {
+                self.busy = false;
+                self.bid_mds.clear();
+                self.bid_wei.clear();
+                self.ask_notice = format!(
+                    "Buy order escrowed ({}). It becomes fillable once the transaction is \
+                     mined and the contract assigns it an id.",
+                    crate::theme::short_hex(&tx, 8)
+                );
+                self.go(ctx, Action::LoadMyBids);
+            }
+            Msg::BidCancelled(m) => {
+                self.busy = false;
+                self.ask_notice = m;
+                self.go(ctx, Action::LoadMyBids);
+            }
+            Msg::SwapStarted(tx) => {
+                self.busy = false;
+                self.ask_notice = format!(
+                    "Escrow sent ({}). Your ETH is locked against the seller's hash — the wallet \
+                     now watches for their claim and collects your MDS automatically.",
+                    crate::theme::short_hex(&tx, 8)
+                );
+                self.go(ctx, Action::LoadSwaps);
+                self.dex_tab = 3;
+            }
+            Msg::OrderReclaimed(m) => {
+                self.busy = false;
+                self.ask_notice = m;
+                self.go(ctx, Action::LoadMyOrders);
+                self.go(ctx, Action::LoadSends);
+            }
+            Msg::SwapQuote(q) => {
+                self.busy = false;
+                self.swap_quote = Some(q);
+            }
+            Msg::HistoryRepaired(m) => {
+                self.busy = false;
+                self.settings_msg = m;
+                self.go(ctx, Action::LoadHistory);
+            }
+            Msg::EvmAccount(v) => self.evm = Some(v),
+            Msg::OrderBook(v) => self.book = Some(v),
+            Msg::OrderBookSynced => {
+                self.dex_syncing = false;
+                self.go(ctx, Action::LoadOrderBook);
+                self.go(ctx, Action::LoadEvmAccount);
+            }
+            Msg::DexConfig(v) => {
+                self.dex_cfg_saved = Some(v.clone());
+                self.dex_cfg = Some(v);
+            }
+            Msg::DexConfigSaved => {
+                self.busy = false;
+                self.book = None;
+                self.dex_last_sync = -1.0;
+                self.go(ctx, Action::LoadDexConfig);
+                self.go(ctx, Action::LoadEvmAccount);
+            }
             Msg::AddressRequested => {
                 self.busy = false;
                 self.ask_pending = true;
@@ -631,7 +781,7 @@ impl App {
                 // Background loads fail benignly while locked; don't banner those.
                 let background = matches!(
                     what,
-                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub"
+                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids"
                 );
                 if background {
                     tracing::debug!("{what}: {err}");
@@ -734,6 +884,33 @@ impl eframe::App for App {
                 self.go(ctx, Action::LoadChat);
                 if self.chat_dict.is_empty() {
                     self.go(ctx, Action::LoadChatDict);
+                }
+            }
+        }
+        if self.tab == Tab::Trade && self.handle.is_some() {
+            let t = self.t0.elapsed().as_secs_f64();
+            // Scan both chains once when the tab is first opened. Polling alone
+            // only re-reads what is already cached, so without this the book
+            // stays empty until someone presses Refresh.
+            // Rescan on open and then keep up: incremental scans are cheap
+            // (about 30 new Base blocks a minute, and midstate is local), and
+            // without this your own newly published order never shows up.
+            if !self.dex_syncing && (self.dex_last_sync < 0.0 || t - self.dex_last_sync > 60.0) {
+                self.dex_last_sync = t;
+                self.dex_syncing = true;
+                self.go(ctx, Action::SyncOrderBook);
+            }
+            if t - self.dex_last_poll > 5.0 {
+                self.dex_last_poll = t;
+                self.go(ctx, Action::LoadOrderBook);
+                self.go(ctx, Action::LoadMyOrders);
+                self.go(ctx, Action::LoadSwaps);
+                self.go(ctx, Action::LoadMyBids);
+                if self.evm.is_none() {
+                    self.go(ctx, Action::LoadEvmAccount);
+                }
+                if self.dex_cfg.is_none() {
+                    self.go(ctx, Action::LoadDexConfig);
                 }
             }
         }
@@ -846,6 +1023,7 @@ impl eframe::App for App {
                                 Tab::Coins => views::coins::show(self, ui),
                                 Tab::Chat => views::chat::show(self, ui),
                                 Tab::Channels => views::channels::show(self, ui),
+                                Tab::Trade => views::trade::show(self, ui),
                                 Tab::Node => views::node::show(self, ui),
                                 Tab::Settings => views::settings::show(self, ui, &status),
                             }
@@ -858,19 +1036,69 @@ impl eframe::App for App {
     }
 }
 
+/// Where this instance keeps everything, and which ports its node binds.
+///
+/// Defaults match the single-instance case exactly. Overriding them is what
+/// makes a second wallet possible on one machine — needed to trade with
+/// yourself, and to run a hub beside a personal wallet. Ports must differ too:
+/// each instance runs its own full node.
+///
+/// ```text
+/// MIDSTATE_PROFILE=bob            # ~/.local/share/midstate-desktop-bob
+/// MIDSTATE_DATA_DIR=/path/to/dir  # explicit, wins over PROFILE
+/// MIDSTATE_P2P_PORT=9334
+/// MIDSTATE_RPC_PORT=8546          # "none" disables the RPC listener
+/// ```
+struct Profile {
+    base: std::path::PathBuf,
+    p2p_port: u16,
+    rpc_port: Option<u16>,
+}
+
+fn profile() -> Profile {
+    let name = std::env::var("MIDSTATE_PROFILE").ok().filter(|s| !s.is_empty());
+    let base = match std::env::var("MIDSTATE_DATA_DIR") {
+        Ok(d) if !d.is_empty() => std::path::PathBuf::from(d),
+        _ => {
+            let dir = match &name {
+                Some(n) => format!("midstate-desktop-{n}"),
+                None => "midstate-desktop".to_string(),
+            };
+            dirs::data_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(dir)
+        }
+    };
+    let p2p_port = std::env::var("MIDSTATE_P2P_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9333);
+    let rpc_port = match std::env::var("MIDSTATE_RPC_PORT") {
+        Ok(v) if v.eq_ignore_ascii_case("none") => None,
+        Ok(v) => v.parse().ok(),
+        Err(_) => Some(8545),
+    };
+    Profile { base, p2p_port, rpc_port }
+}
+
 async fn boot() -> anyhow::Result<WalletdHandle> {
     use midstate_walletd::{node_host, service};
 
-    let base = dirs::data_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("midstate-desktop");
-    let chain_dir = base.join("chain");
-    let wallet_path = base.join("wallets").join("wallet.dat");
+    let p = profile();
+    let chain_dir = p.base.join("chain");
+    let wallet_path = p.base.join("wallets").join("wallet.dat");
     std::fs::create_dir_all(&chain_dir)?;
+    tracing::info!(
+        "profile: data {} · p2p {} · rpc {:?}",
+        p.base.display(),
+        p.p2p_port,
+        p.rpc_port
+    );
 
     let cfg = node_host::NodeConfig {
         data_dir: chain_dir.clone(),
-        rpc_port: Some(8545),
+        p2p_port: p.p2p_port,
+        rpc_port: p.rpc_port,
         ..Default::default()
     };
     let rpc_url = cfg.rpc_port.map(|p| format!("http://127.0.0.1:{p}"));
