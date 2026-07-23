@@ -1,6 +1,7 @@
 use crate::app::App;
 use crate::bridge::Action;
 use crate::theme::{self, units};
+use midstate_walletd::api::AddressInfo;
 use eframe::egui::{self, Color32, ColorImage, RichText, TextEdit, TextureOptions, Ui};
 use qrcode::QrCode;
 
@@ -93,14 +94,32 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     });
 
     theme::heading(ui, "Your addresses");
+    theme::hint(
+        ui,
+        "Select any reusable address that still has signatures, or any one-time address whose \
+         key has not signed yet, to show it again below. A one-time key stays safe until it \
+         signs — but every coin at that address must then be spent in a single transaction, \
+         so receiving there repeatedly builds up one large mandatory spend.",
+    );
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         if app.addresses.is_empty() {
             theme::hint(ui, "No addresses yet.");
             return;
         }
-        egui::Grid::new("addresses").num_columns(4).spacing([24.0, 8.0]).striped(true).show(ui, |ui| {
-            header(ui, &["Address", "Type", "Label", "Status"]);
+        // Collected outside the closure so we can mutate app state afterward.
+        let mut reselect: Option<AddressInfo> = None;
+        let current = app.current_addr.as_ref().map(|a| a.address.clone());
+        // Live coins per address. A one-time key stays safe until it signs, but
+        // every coin at it must be spent in ONE transaction (the co-spend rule),
+        // and a normal send caps out at 256 inputs — so the count matters.
+        let mut coins_at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for c in app.coins.iter().filter(|c| c.live) {
+            *coins_at.entry(c.address.clone()).or_insert(0) += 1;
+        }
+
+        egui::Grid::new("addresses").num_columns(5).spacing([20.0, 8.0]).striped(true).show(ui, |ui| {
+            header(ui, &["Address", "Type", "Label", "Status", ""]);
             for a in &app.addresses {
                 ui.label(theme::mono(theme::short_hex(&a.address, 10)).color(theme::muted()).size(12.0));
                 theme::badge(
@@ -109,20 +128,67 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                     if a.kind == "mss" { theme::gold() } else { theme::muted() },
                 );
                 ui.label(RichText::new(a.label.as_deref().unwrap_or("—")).color(theme::muted()));
-                match (a.kind.as_str(), a.used, a.remaining_sigs) {
+
+                // Eligibility: MSS keeps working while it has signatures; a
+                // one-time key is safe only until it has been used.
+                let reusable = match (a.kind.as_str(), a.used, a.remaining_sigs) {
                     ("mss", _, Some(r)) => {
-                        ui.label(theme::mono(format!("{} sigs left", units(r))).color(theme::muted()).size(12.0));
+                        let low = r == 0;
+                        ui.label(
+                            theme::mono(format!("{} sigs left", units(r)))
+                                .color(if low { theme::amber() } else { theme::muted() })
+                                .size(12.0),
+                        );
+                        r > 0
                     }
                     (_, true, _) => {
-                        ui.label(RichText::new("used — don't share again").color(theme::amber()).size(12.0));
+                        // The key has signed. A second signature would leak it,
+                        // so the wallet refuses to import anything more here.
+                        ui.label(
+                            RichText::new("spent — coins sent here cannot be recovered")
+                                .color(theme::amber())
+                                .size(12.0),
+                        );
+                        false
                     }
                     _ => {
-                        ui.label(RichText::new("unused").color(theme::green()).size(12.0));
+                        let n = coins_at.get(&a.address).copied().unwrap_or(0);
+                        if n == 0 {
+                            ui.label(RichText::new("unused").color(theme::green()).size(12.0));
+                        } else {
+                            // Key unsigned, so still safe to receive to — but the
+                            // siblings pile up into one mandatory spend.
+                            let tight = n >= 200;
+                            ui.label(
+                                RichText::new(format!("unsigned key · {n} coin(s) to co-spend"))
+                                    .color(if tight { theme::amber() } else { theme::muted() })
+                                    .size(12.0),
+                            );
+                        }
+                        true
                     }
+                };
+
+                let is_current = current.as_deref() == Some(a.address.as_str());
+                if is_current {
+                    ui.label(RichText::new("showing").color(theme::muted()).size(11.0));
+                } else if reusable {
+                    if ui.button(RichText::new("Select").size(11.0)).clicked() {
+                        reselect = Some(a.clone());
+                    }
+                } else {
+                    ui.label("");
                 }
                 ui.end_row();
             }
         });
+
+        if let Some(a) = reselect {
+            // Local-only: current_addr already holds an AddressInfo and the QR
+            // panel re-renders from it. No wallet round-trip needed.
+            app.copied_at = None;
+            app.current_addr = Some(a);
+        }
     });
 }
 

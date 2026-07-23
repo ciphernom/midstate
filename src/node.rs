@@ -4309,11 +4309,18 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
             }
 
             let current_time = crate::core::state::current_timestamp();
-            const MAX_FUTURE_BLOCK_TIME: u64 = 5 * 60 * 60;
+            
+            if !all_headers.is_empty() {
+                let max_future = if all_headers[0].height >= crate::core::types::TIMEWARP_FIX_ACTIVATION_HEIGHT {
+                    15 * 60
+                } else {
+                    5 * 60 * 60 // The legacy value used in node.rs
+                };
 
-            if !all_headers.is_empty() && all_headers[0].timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
-                tracing::warn!("Root header timestamp too far in future");
-                is_valid = false;
+                if all_headers[0].timestamp > current_time + max_future {
+                    tracing::warn!("Root header timestamp too far in future");
+                    is_valid = false;
+                }
             }
 
             let mut fork_height = 0;

@@ -65,8 +65,14 @@ pub struct HistoryView {
     pub timestamp: u64,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
-    /// Net value from the wallet's perspective where derivable.
+    /// Value of this transaction's outputs that belong to this wallet: what
+    /// arrived for a receive, what came back as change for a send.
     pub amount: u64,
+    pub n_in: usize,
+    pub n_out: usize,
+    /// How many of the outputs are ours. For a send, `n_out - ours_out` is
+    /// the number that left the wallet.
+    pub ours_out: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -93,6 +99,26 @@ pub struct NodeInfo {
     pub data_dir: String,
     pub rpc_url: Option<String>,
     pub block_reward: u64,
+    // ── Chain tip ──────────────────────────────────────────────────────
+    pub height: u64,
+    /// Unix time of the tip block.
+    pub tip_timestamp: u64,
+    pub header_hash: String,
+    pub midstate: String,
+    /// Cumulative chain work (u128, rendered as a decimal string).
+    pub depth: String,
+    /// Leading zero bits required by the current target.
+    pub difficulty_bits: u32,
+    // ── Accumulator sizes ──────────────────────────────────────────────
+    /// Live coins in the whole chain's UTXO set.
+    pub utxo_count: usize,
+    /// Commitments awaiting their reveal.
+    pub commitment_count: usize,
+    /// One-time keys retired chain-wide.
+    pub burned_count: usize,
+    // ── Local ──────────────────────────────────────────────────────────
+    pub mempool: usize,
+    pub safe_depth: u64,
 }
 
 /// Stages of the two-phase send. Persisted implicitly via the wallet's
@@ -143,6 +169,12 @@ pub enum WalletEvent {
     /// A payment-channel lifecycle event worth surfacing (open, payment
     /// received, close settled, refund, warnings).
     ChannelNotice { text: String },
+    /// Something the person needs to know about that is not an error in any
+    /// action they took — e.g. funds arriving at an unusable address.
+    Warning { text: String },
+    /// A peer answered an address request with a fresh, signature-verified
+    /// destination.
+    PeerAddress { peer: String, address: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

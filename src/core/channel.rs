@@ -434,6 +434,27 @@ pub fn invoice_commit(
     hash_bytes(&head)
 }
 
+/// What a peer signs when handing out a fresh receiving address over the chat
+/// bus. Binds their identity, the exact request, the address and its expiry —
+/// so a reply cannot be forged by an onlooker, replayed against a different
+/// request, or re-attributed to another peer. The requester verifies this
+/// against the identity key it addressed, which is the whole security story:
+/// the bus is public, so an unsigned reply would be worthless.
+pub fn address_commit(
+    responder_pk: &[u8; 32],
+    req_id: &[u8; 32],
+    address: &[u8; 32],
+    expiry: u64,
+) -> [u8; 32] {
+    let mut b = Vec::with_capacity(8 + 96 + 8);
+    b.extend_from_slice(b"mdsaddr1");
+    b.extend_from_slice(responder_pk);
+    b.extend_from_slice(req_id);
+    b.extend_from_slice(address);
+    b.extend_from_slice(&expiry.to_le_bytes());
+    hash_bytes(&b)
+}
+
 /// BLAKE3 of arbitrary bytes (the same hash the script VM's OP_HASH uses).
 pub fn hash_bytes(b: &[u8]) -> [u8; 32] {
     *blake3::Hasher::new().update(b).finalize().as_bytes()
@@ -515,6 +536,11 @@ pub mod wire {
     pub const CMD_HTLC_FAIL: u8 = 61;
     pub const CMD_INVOICE_REQ: u8 = 62;
     pub const CMD_INVOICE: u8 = 63;
+    /// Ask a peer for a fresh receiving address (payload: `pack_u32(0, &[])`,
+    /// request id in the CoinId attachment, target pk in the Address one).
+    pub const CMD_ADDR_REQ: u8 = 64;
+    /// The signed reply carrying a fresh address.
+    pub const CMD_ADDR: u8 = 65;
     pub const CMD_OPEN: u8 = 110;
 
     /// OPEN payload: [ver][expiry u64][n u8][{value u64, salt 32}×n][sig0…]
@@ -652,6 +678,25 @@ pub mod wire {
         Some(InvoiceWire { amount, expiry, hash, hints, sig: b[o..].to_vec() })
     }
 
+    /// ADDRESS payload: [ver][expiry u64][address 32][responder_sig…]
+    pub fn pack_address(address: &[u8; 32], expiry: u64, sig: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(41 + sig.len());
+        out.push(VERSION);
+        out.extend_from_slice(&expiry.to_le_bytes());
+        out.extend_from_slice(address);
+        out.extend_from_slice(sig);
+        out
+    }
+
+    pub fn unpack_address(b: &[u8]) -> Option<([u8; 32], u64, Vec<u8>)> {
+        if b.len() < 41 || b[0] != VERSION {
+            return None;
+        }
+        let expiry = u64::from_le_bytes(b[1..9].try_into().ok()?);
+        let address: [u8; 32] = b[9..41].try_into().ok()?;
+        Some((address, expiry, b[41..].to_vec()))
+    }
+
     /// Small payload: [ver][u32][extra…] (ACK, CLOSE_REQ, CLOSED, REJECT…)
     pub fn pack_u32(n: u32, extra: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(5 + extra.len());
@@ -707,6 +752,24 @@ mod tests {
     fn u32_codec_roundtrip() {
         let p = wire::pack_u32(77, &[1, 2, 3]);
         assert_eq!(wire::unpack_u32(&p).unwrap(), (77, vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn address_codec_and_commit_binding() {
+        let addr = [7u8; 32];
+        let sig = vec![4u8; 80];
+        let packed = wire::pack_address(&addr, 900, &sig);
+        assert_eq!(wire::unpack_address(&packed).unwrap(), (addr, 900, sig));
+
+        // Every field must change the commitment, or a reply could be lifted
+        // from one request and pasted onto another.
+        let pk = [1u8; 32];
+        let req = [2u8; 32];
+        let base = address_commit(&pk, &req, &addr, 900);
+        assert_ne!(base, address_commit(&[9u8; 32], &req, &addr, 900));
+        assert_ne!(base, address_commit(&pk, &[9u8; 32], &addr, 900));
+        assert_ne!(base, address_commit(&pk, &req, &[9u8; 32], 900));
+        assert_ne!(base, address_commit(&pk, &req, &addr, 901));
     }
 
     #[test]

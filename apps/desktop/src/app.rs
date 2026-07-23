@@ -49,6 +49,14 @@ impl Tab {
     }
 }
 
+/// Sub-navigation within the Coins tab.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CoinsTab {
+    Holdings,
+    Housekeeping,
+    Advanced,
+}
+
 /// Sub-navigation within the Channels tab.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ChanTab {
@@ -103,6 +111,7 @@ pub struct App {
     pub send_amount: String,
     pub send_private: bool,
     pub addr_ok: Option<bool>,
+    pub addr_reason: Option<String>,
 
     // Receive
     pub recv_label: String,
@@ -144,6 +153,12 @@ pub struct App {
     pub theme_applied: Option<bool>,
     pub send_unit: usize,
     pub dict_filter: String,
+    pub ask_peer: String,
+    pub ask_pending: bool,
+    pub coins_tab: CoinsTab,
+    pub hist_filter: usize,
+    pub hist_search: String,
+    pub hist_open: Option<usize>,
     pub own_phrase: bool,
     pub chan_tab: ChanTab,
     pub verify_input: String,
@@ -236,6 +251,7 @@ impl App {
             send_amount: String::new(),
             send_private: false,
             addr_ok: None,
+            addr_reason: None,
             recv_label: String::new(),
             recv_mss: true,
             current_addr: None,
@@ -267,6 +283,12 @@ impl App {
             theme_applied: None,
             send_unit: 0,
             dict_filter: String::new(),
+            ask_peer: String::new(),
+            ask_pending: false,
+            coins_tab: CoinsTab::Holdings,
+            hist_filter: 0,
+            hist_search: String::new(),
+            hist_open: None,
             own_phrase: false,
             chan_tab: ChanTab::List,
             verify_input: String::new(),
@@ -373,6 +395,23 @@ impl App {
                         if count == 1 { "" } else { "s" }
                     );
                     self.toast(ctx, text);
+                }
+                WalletEvent::Warning { text } => self.toast(ctx, text),
+                WalletEvent::PeerAddress { peer, address } => {
+                    // Drop it straight into the Send form — getting a fresh
+                    // address is only useful if it lands where it is needed.
+                    self.send_to = address;
+                    self.addr_ok = Some(true);
+                    self.addr_reason = None;
+                    self.ask_pending = false;
+                    self.ask_peer.clear();
+                    self.toast(
+                        ctx,
+                        format!(
+                            "{} sent a fresh address — filled in for you.",
+                            crate::theme::short_hex(&peer, 8)
+                        ),
+                    );
                 }
                 WalletEvent::ChannelNotice { text } => {
                     self.toast(ctx, text);
@@ -484,9 +523,10 @@ impl App {
                 self.go(ctx, Action::LoadBalance);
             }
             Msg::RetryOk => self.go(ctx, Action::LoadSends),
-            Msg::AddressValid { addr, ok } => {
+            Msg::AddressValid { addr, ok, reason } => {
                 if addr == self.send_to.trim() {
                     self.addr_ok = Some(ok);
+                    self.addr_reason = reason;
                 }
             }
             Msg::RescanOk => {
@@ -567,6 +607,10 @@ impl App {
             Msg::HubSaved => {
                 self.busy = false;
                 self.go(ctx, Action::LoadHub);
+            }
+            Msg::AddressRequested => {
+                self.busy = false;
+                self.ask_pending = true;
             }
             Msg::IdentityRotated(pk) => {
                 self.busy = false;
