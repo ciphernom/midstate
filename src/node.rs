@@ -4484,7 +4484,11 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
             recent_ts.push_back(candidate_state.timestamp);
         }
 
-        let tx = self.cmd_tx.as_ref().unwrap().clone();
+                let tx = self.cmd_tx.as_ref()
+            .ok_or_else(|| anyhow::anyhow!(
+                "sync requires a command channel; this node was never started"
+            ))?
+            .clone();
         let storage = self.storage.clone();
         let current_state_height = self.state.height; // Capture height before thread
 
@@ -5460,10 +5464,10 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
         if let Some((_, _, last_batch)) = new_history.last() {
             let last_batch_clone = last_batch.clone();
             let state_clone = self.state.clone();
-            let cmd_tx = self.cmd_tx.as_ref().unwrap().clone();
+            let cmd_tx = self.cmd_tx.clone();
             let has_light_peers = self.network.has_light_peers();
 
-            if has_light_peers {
+             if let (true, Some(cmd_tx)) = (has_light_peers, cmd_tx) {
                 tokio::task::spawn_blocking(move || {
                     let filter = crate::core::filter::CompactFilter::build(&last_batch_clone);
                     let items  = crate::core::filter::CompactFilter::items_in(&last_batch_clone);
@@ -6465,6 +6469,76 @@ async fn try_apply_orphans(&mut self) {
     }
 
     /// Process a successfully mined batch received from the background task.
+    ///
+    /// # Reasoning
+    ///
+    /// This is the point where locally-mined work becomes chain state, so it is
+    /// the last place that may fail for an avoidable reason. It previously read
+    /// the command channel as `self.cmd_tx.as_ref().unwrap()`. That channel is
+    /// needed for exactly one thing — notifying connected light peers that a new
+    /// tip exists — but the unwrap sat on the path *every* mined batch takes,
+    /// before the state had been durably saved. Any node holding `None` there
+    /// (one constructed for validation only, or one already tearing down its
+    /// command loop) would panic while applying a block it had just legitimately
+    /// mined, losing the work and, worse, aborting mid-way through a sequence
+    /// whose whole purpose is to leave disk consistent.
+    ///
+    /// A missing notification channel is not a consensus condition. Persistence
+    /// is mandatory; telling light peers about it is best-effort. The two are now
+    /// ordered accordingly: the batch is saved and its addresses burned
+    /// unconditionally, and the push is attempted only if there is somewhere to
+    /// push to.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:
+    ///   - batch.extension.final_hash meets state.target
+    ///   - batch extends the current tip (else the batch is stale and dropped)
+    ///
+    /// Post:
+    ///   result = Ok(())  ⇒
+    ///     state'.height   = state.height + 1
+    ///     storage         contains state'
+    ///     spent addresses of batch are burned at pre_mine_height
+    ///     (cmd_tx = Some ∧ has_light_peers) ⇒ a NewBlockTip notification was enqueued
+    ///     (cmd_tx = None  ∨ ¬has_light_peers) ⇒ no notification, state' unaffected
+    ///
+    ///   result = Err(_)  ⇒ persisted state unchanged
+    /// ```
+    ///
+    /// ```zed
+    ///     HandleMinedBatch
+    ///     ----------------
+    ///     ΔNodeState
+    ///     ΔStorage
+    ///     batch?      : Batch
+    ///     cmd_tx?     : ℙ CommandChannel        (∅ or a singleton)
+    ///     light_peers?: 𝔹
+    ///
+    ///     pre  meets_target(batch?.extension.final_hash, target)
+    ///     pre  batch?.prev_midstate = midstate
+    ///
+    ///     post height'   = height + 1
+    ///     post saved'    = saved ∪ {state'}
+    ///     post burned'   = burned ∪ addresses(batch?)
+    ///     post notified' = if light_peers? ∧ cmd_tx? ≠ ∅
+    ///                        then notified ⌢ ⟨NewBlockTip(state')⟩
+    ///                        else notified
+    /// ```
+    ///
+    /// # Safety / Invariants
+    ///
+    /// - **Durability precedes notification.** `save_state` and
+    ///   `burn_batch_addresses` both complete before any peer is told the tip
+    ///   moved. A light client must never be able to request a block the node
+    ///   has not yet written.
+    /// - **The address burn must be awaited.** The DB task is joined before the
+    ///   next block is processed; skipping that reopens the async double-spend
+    ///   race the burn exists to close.
+    /// - **No non-consensus condition may abort application.** Anything optional
+    ///   on this path — notifications, metrics, pool reporting — is best-effort
+    ///   and must not be able to return `Err` or panic.
     async fn handle_mined_batch(&mut self, batch: Batch) -> Result<()> {
         // If state advanced while we were mining, this batch is stale.
         // Don't clear mining_cancel — a new task may already be running.
@@ -6498,7 +6572,7 @@ async fn try_apply_orphans(&mut self) {
                 let storage_clone = self.storage.clone();
                 let state_clone = self.state.clone();
                 let batch_clone = batch.clone();
-                let cmd_tx = self.cmd_tx.as_ref().unwrap().clone(); // Pass the channel
+                let cmd_tx = self.cmd_tx.clone(); // Optional: only the light push needs it
                 let has_light_peers = self.network.has_light_peers(); // Check if we even need to bother
 
                 let db_task = tokio::task::spawn_blocking(move || {
@@ -6510,19 +6584,29 @@ async fn try_apply_orphans(&mut self) {
                     }
 
                     // --- PUSH GENERATION ---
+                    // Best-effort. A node with no command channel (validation-only
+                    // construction, or one already shutting down) still persists the
+                    // batch above; it simply has nobody to notify.
                     if has_light_peers {
-                        let filter = crate::core::filter::CompactFilter::build(&batch_clone);
-                        let items  = crate::core::filter::CompactFilter::items_in(&batch_clone);
+                        match cmd_tx {
+                            Some(cmd_tx) => {
+                                let filter = crate::core::filter::CompactFilter::build(&batch_clone);
+                                let items  = crate::core::filter::CompactFilter::items_in(&batch_clone);
 
-                        let notif = crate::network::light_protocol::LightNotification::NewBlockTip {
-                            height: state_clone.height,
-                            target: hex::encode(state_clone.target),
-                            filter_hex: hex::encode(filter.data),
-                            block_hash: hex::encode(batch_clone.extension.final_hash),
-                            element_count: items.len() as u64,
-                        };
+                                let notif = crate::network::light_protocol::LightNotification::NewBlockTip {
+                                    height: state_clone.height,
+                                    target: hex::encode(state_clone.target),
+                                    filter_hex: hex::encode(filter.data),
+                                    block_hash: hex::encode(batch_clone.extension.final_hash),
+                                    element_count: items.len() as u64,
+                                };
 
-                        let _ = cmd_tx.blocking_send(NodeCommand::BroadcastLightPush(notif));
+                                let _ = cmd_tx.blocking_send(NodeCommand::BroadcastLightPush(notif));
+                            }
+                            None => tracing::warn!(
+                                "light peers connected but no command channel — tip notification skipped"
+                            ),
+                        }
                     }
                 });
 
@@ -7226,6 +7310,16 @@ mod tests {
         assert_eq!(scan_txs_for_mss_index(&[tx], &pk), 0);
     }
     
+    #[tokio::test]
+    async fn print_genesis_values_for_the_website() {
+        let dir = tempdir().unwrap();
+        let node = create_test_node(dir.path()).await;
+        let g = node.storage.load_batch(0).unwrap().unwrap();
+        println!("\n  initial_midstate : {}", hex::encode(State::genesis().0.midstate));
+        println!("  genesis block    : {}", hex::encode(g.extension.final_hash));
+        println!("  height-1 midstate: {}\n", hex::encode(node.state.midstate));
+    }
+    
     #[test]
     fn find_genesis_nonce() {
         use crate::core::types::*;
@@ -7266,18 +7360,73 @@ mod complex_tests {
     // --- Test Helpers ---
 
     /// Creates a node instance isolated in a temp directory.
-    /// 
+    ///
     /// Note: Node::new() automatically creates and applies the genesis block (Height 0).
-    /// Therefore, any node returned by this function is sitting at Height 1, ready 
+    /// Therefore, any node returned by this function is sitting at Height 1, ready
     /// to mine or receive Block 1.
     async fn create_test_node(dir: &std::path::Path) -> Node {
+        let (node, mut rx) = create_test_node_with_commands(dir).await;
+        // Most tests never need what sync hands back. Drain it so the receiver
+        // stays alive — if it drops, every send fails instead of being ignored.
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        node
+    }
+        /// As `create_test_node`, but hands back the command receiver.
+    ///
+    /// Sync is chunked: `handle_sync_batches` verifies a chunk on a blocking
+    /// thread and hands the remainder back as `FinishSyncBatchesChunk` rather
+    /// than continuing inline. A test that only needs sync to *start* can let
+    /// those be discarded; a test that needs it to *complete* has to process
+    /// them, which means holding the receiver.
+    async fn create_test_node_with_commands(
+        dir: &std::path::Path,
+    ) -> (Node, tokio::sync::mpsc::Receiver<NodeCommand>) {
         let _keypair = libp2p::identity::Keypair::generate_ed25519();
         let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
-        
-        // Initialize node (creates Genesis internally)
-        Node::new(dir.to_path_buf(), None, listen, vec![], std::collections::HashSet::new(), false).await.unwrap()
-    }
 
+        // Initialize node (creates Genesis internally)
+        let mut node = Node::new(
+            dir.to_path_buf(), None, listen, vec![], std::collections::HashSet::new(), false,
+        ).await.unwrap();
+
+        // These tests drive the node directly instead of through `run()`, which is
+        // what normally populates `cmd_tx`.
+        let (tx, rx) = tokio::sync::mpsc::channel::<NodeCommand>(256);
+        node.cmd_tx = Some(tx);
+        (node, rx)
+    }
+    /// Stand in for the command loop that `run()` normally provides.
+    ///
+    /// `handle_sync_batches` verifies each chunk on a blocking thread and hands
+    /// the result back through the command channel rather than continuing
+    /// inline — so it returns *before* anything has been sent. `try_recv` races
+    /// that and always finds the channel empty. The pump has to wait.
+    ///
+    /// Returns false once nothing further arrives, which is how a finished sync
+    /// announces itself.
+    async fn pump_commands(
+        node: &mut Node,
+        rx: &mut tokio::sync::mpsc::Receiver<NodeCommand>,
+    ) -> bool {
+        let cmd = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            rx.recv(),
+        ).await {
+            Ok(Some(c)) => c,
+            _ => return false, // timed out, or channel closed
+        };
+
+        if let NodeCommand::FinishSyncBatchesChunk {
+            peer, headers, fork_height, candidate_state, cursor, new_history,
+            is_fast_forward, is_valid, error_msg, session_started_at, peer_height, peer_depth,
+        } = cmd {
+            let _ = node.process_verified_batches_chunk(
+                peer, headers, fork_height, candidate_state, cursor, new_history,
+                is_fast_forward, is_valid, error_msg, session_started_at, peer_height, peer_depth,
+            ).await;
+        }
+        true
+    }
     /// specific helper to manually construct a valid batch structure.
     /// 
     /// This bypasses the main mining loop but performs all necessary cryptographic 
@@ -7408,12 +7557,12 @@ mod complex_tests {
         
         // Create a unique transaction that will be mined into Block 2 of Chain A.
         let commit_hash = hash(b"tx_on_chain_a");
-        let mut nonce = 0u64;
-        loop {
-            let h = hash_concat(&commit_hash, &nonce.to_le_bytes());
-            if crate::core::types::count_leading_zeros(&h) >= crate::core::transaction::MIN_COMMIT_POW_BITS { break; }
-            nonce += 1;
-        }
+                let nonce = crate::core::transaction::mine_pow(
+            &commit_hash,
+            crate::core::transaction::MIN_COMMIT_POW_BITS,
+            0,
+            [0u8; 32],
+        );
         let valid_tx = Transaction::Commit { commitment: commit_hash, spam_nonce: nonce };
 
         // Block 2 (Height 2->3) contains the transaction
@@ -7708,7 +7857,11 @@ mod complex_tests {
 
         let mut spam_nonce = 0u64;
         loop {
-            let h = hash_concat(&commitment, &spam_nonce.to_le_bytes());
+            let h = crate::core::transaction::commit_pow_hash(
+                &commitment,
+                (spam_nonce & 0xFFFF_FFFF) as u32,
+                (spam_nonce >> 32) as u32,
+            );
             if crate::core::types::count_leading_zeros(&h) >= crate::core::transaction::MIN_COMMIT_POW_BITS { break; }
             spam_nonce += 1;
         }
@@ -7785,7 +7938,11 @@ mod complex_tests {
 
         let mut spam_nonce = 0u64;
         loop {
-            let h = hash_concat(&commitment, &spam_nonce.to_le_bytes());
+            let h = crate::core::transaction::commit_pow_hash(
+                &commitment,
+                (spam_nonce & 0xFFFF_FFFF) as u32,
+                (spam_nonce >> 32) as u32,
+            );
             if crate::core::types::count_leading_zeros(&h) >= crate::core::transaction::MIN_COMMIT_POW_BITS { break; }
             spam_nonce += 1;
         }
@@ -8048,8 +8205,7 @@ fn build_divergent_chain(
     #[tokio::test]
     async fn completed_sync_persists_valid_chain() {
         let dir = tempdir().unwrap();
-        let mut node = create_test_node(dir.path()).await;
-
+        let (mut node, mut rx) = create_test_node_with_commands(dir.path()).await;
         // Mine 5 blocks
         for _ in 0..5 {
             node.try_mine().await.unwrap();
@@ -8088,6 +8244,12 @@ fn build_divergent_chain(
         node.handle_sync_batches(peer, alt_batches.clone())
             .await
             .unwrap();
+
+        // Sync is chunked; each verified chunk comes back through the command
+        // channel and may trigger the next. Pump until it goes quiet.
+        while pump_commands(&mut node, &mut rx).await {
+            if node.state.height >= peer_height { break; }
+        }
 
         assert_eq!(node.state.height, peer_height);
         assert!(!node.sync.in_progress);

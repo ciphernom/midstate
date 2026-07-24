@@ -531,8 +531,12 @@ mod tests {
     fn sig_size_reasonable() {
         let mut kp = keygen(&test_seed(), 2).unwrap();
         let sig = kp.sign(&hash(b"t")).unwrap();
-        // 8 + 32 + 576 + 4 + 2*33 = 686
-        assert_eq!(sig.size(), 686);
+        // Derive rather than hardcode: the old literal (686) assumed 33-byte
+        // auth-path nodes and drifted when they became 32.
+        // 8 (index) + 32 (leaf pk) + SIG_SIZE + 4 (height) + 32 per auth node.
+        let expected = 8 + 32 + crate::core::wots::SIG_SIZE + 4 + sig.auth_path.len() * 32;
+        assert_eq!(sig.size(), expected);
+        assert_eq!(sig.auth_path.len(), 2, "height-2 key has a 2-node auth path");
     }
     #[test]
     fn keygen_rejects_zero_height() {

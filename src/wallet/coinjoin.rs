@@ -291,14 +291,82 @@ impl MixSession {
     ///     pre  input?.coin_id ∉ { r.input.coin_id | r ∈ registrations }
     ///     post fee_input' = input?
     /// ```
+    /// Nominate the separate fee-donor input for this mix.
+    ///
+    /// # Reasoning
+    ///
+    /// The donor is a distinct participant from the mixers, and it must be a
+    /// distinct *key* as well as a distinct coin. The check here was previously
+    /// `coin_id` equality, which is the right test for double-spending the same
+    /// UTXO but the wrong one for this chain: `coin_id = H(address ‖ value ‖
+    /// salt)`, so two coins at one address with different values are different
+    /// coin ids and passed cleanly.
+    ///
+    /// On Midstate that is not a benign case. Every spend authorises with a
+    /// WOTS one-time key, and an address *is* a key. A mix reveal signs each
+    /// input separately, so admitting a donor at an address already registered
+    /// as a mix input produces two WOTS signatures under one key in a single
+    /// transaction — which is the exact condition under which WOTS becomes
+    /// forgeable, published to the chain, for anyone watching to exploit. The
+    /// wallet defends against this locally by keeping same-address coins in
+    /// indivisible sibling bundles, but a mix session assembles inputs from
+    /// peers whose wallets it does not control, so it has to enforce the rule
+    /// itself.
+    ///
+    /// Address collision is therefore the stricter and correct test, and it
+    /// subsumes the coin-id case: equal coin ids imply equal addresses.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:
+    ///   - fee_input = None
+    ///   - input?.address ∉ { r.input.address | r ∈ registrations }
+    ///   - input?.value > 0
+    ///   - input?.value ≥ recommended_fee_for_mix(#registrations)
+    ///
+    /// Post:
+    ///   result = Ok(())  ⇒ fee_input' = Some(input?)
+    ///   result = Err(_)  ⇒ fee_input' = fee_input        (session unchanged)
+    /// ```
+    ///
+    /// ```zed
+    ///     SetFeeInput
+    ///     ----------------
+    ///     ΔMixSession
+    ///     input? : InputReveal
+    ///
+    ///     pre  fee_input = ∅
+    ///     pre  ¬ (∃ r : registrations • r.input.address = input?.address)
+    ///     pre  input?.value ≥ recommended_fee_for_mix(#registrations)
+    ///
+    ///     post fee_input'     = {input?}
+    ///     post registrations' = registrations
+    /// ```
+    ///
+    /// # Safety / Invariants
+    ///
+    /// - **One WOTS key signs once, ever.** No two inputs of an assembled mix
+    ///   may share an address. This is the invariant that makes the whole
+    ///   signature scheme sound and it cannot be recovered from after the fact.
+    /// - **The final fee check is in `proposal()`.** The bound checked here uses
+    ///   the registrations seen *so far*; participants may still join and raise
+    ///   the requirement. `proposal()` re-checks against the final count and is
+    ///   the authoritative enforcement point.
+    /// - Errors leave the session untouched, so a rejected donor does not
+    ///   consume the single `fee_input` slot.
     pub fn set_fee_input(&mut self, input: InputReveal) -> Result<()> {
         if self.fee_input.is_some() {
             bail!("fee input already set");
         }
-        // Must not collide with any mix input
-        let coin_id = input.coin_id();
-        if self.registrations.iter().any(|r| r.input.coin_id() == coin_id) {
-            bail!("fee input collides with a mix input");
+        // Must not share an address with any mix input. Checked by address, not
+        // coin_id: two coins at one address are two spends of one one-time key.
+        let addr = input.predicate.address();
+        if self.registrations.iter().any(|r| r.input.predicate.address() == addr) {
+            bail!(
+                "fee input reuses the address of a mix input — signing both would spend the \
+                 same one-time key twice and expose it"
+            );
         }
         if input.value == 0 {
             bail!("fee input value must be greater than zero");
@@ -404,13 +472,83 @@ impl MixSession {
 ///
 /// This is a heuristic check for observers/analysis; the consensus layer validates
 /// the transaction normally regardless.
+/// Recognise a canonical uniform CoinJoin.
+///
+/// # Reasoning
+///
+/// This is the shape test an observer — a relay applying mix-aware policy, an
+/// analytics consumer, a wallet deciding whether a transaction it sees is a mix
+/// — applies to a reveal. It previously identified the fee donor by the literal
+/// `input.value == 1`, which was true only while the donor paid a flat
+/// one-unit fee. Once the donor's contribution became size-derived
+/// (`recommended_fee_for_mix`), that predicate matched nothing: a real
+/// two-party mix pays 27, so `fee_count` was 0, the arm
+/// `mix_count + fee_count == inputs.len()` failed, and **every genuine CoinJoin
+/// was reported as not being one**.
+///
+/// The function has no production callers today, which is the only reason this
+/// was invisible. That is worth resolving in one direction or the other: if
+/// relay policy is meant to consult it, this bug would have silently disabled
+/// that policy; if nothing will ever consult it, it should be deleted rather
+/// than left as a trap for whoever wires it up next.
+///
+/// The rule is now expressed in terms of value conservation rather than a magic
+/// constant, so it cannot drift with the fee model again: a mix is *n* mixers
+/// plus exactly one donor, every output at one power-of-two denomination, and a
+/// surplus that covers the fee the session would have required.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Pre: true (pure; reads no state)
+///
+/// Post: result = true ⇔
+///     tx is Reveal
+///   ∧ #outputs ≥ MIN_MIX_PARTICIPANTS
+///   ∧ #inputs  = #outputs + 1
+///   ∧ ∃ d : ℕ • d > 0 ∧ power_of_two(d) ∧ ∀ o ∈ outputs • o.value = d
+///   ∧ #{ i ∈ inputs | i.value = d } ≥ #outputs
+///   ∧ Σ inputs.value − Σ outputs.value ≥ recommended_fee_for_mix(#outputs)
+/// ```
+///
+/// ```zed
+///     IsUniformMix
+///     ----------------
+///     ΞTransaction
+///     result! : 𝔹
+///
+///     pre  true
+///
+///     post result! = ( #outputs ≥ MIN_MIX_PARTICIPANTS
+///                    ∧ #inputs = #outputs + 1
+///                    ∧ (∃ d • d ∈ powers_of_two ∧ (∀ o : outputs • o.value = d))
+///                    ∧ #(inputs ▷ {d}) ≥ #outputs
+///                    ∧ (Σ inputs.value) − (Σ outputs.value)
+///                        ≥ recommended_fee_for_mix(#outputs) )
+/// ```
+///
+/// # Safety / Invariants
+///
+/// - **Denomination-agnostic.** The donor may legitimately hold a coin at the
+///   mix denomination, so the donor is identified by arity and surplus, never
+///   by a distinguished value.
+/// - **No false positives on under-paid mixes.** A transaction of the right
+///   shape that does not actually cover the mix fee is not a canonical mix, or
+///   the predicate could be used to claim mix-policy treatment without paying
+///   for it.
+/// - Must agree with `MixSession::proposal`, which is the authoritative
+///   constructor. Any change to the fee model must be reflected in both.
 pub fn is_uniform_mix(tx: &Transaction) -> bool {
     let (inputs, outputs) = match tx {
         Transaction::Reveal { inputs, outputs, .. } => (inputs, outputs),
         _ => return false,
     };
 
-    if inputs.len() < MIN_MIX_PARTICIPANTS + 1 || outputs.len() < MIN_MIX_PARTICIPANTS {
+    if outputs.len() < MIN_MIX_PARTICIPANTS {
+        return false;
+    }
+    // Exactly the mixers plus a single fee donor.
+    if inputs.len() != outputs.len() + 1 {
         return false;
     }
 
@@ -423,11 +561,17 @@ pub fn is_uniform_mix(tx: &Transaction) -> bool {
         return false;
     }
 
-    // Inputs: exactly outputs.len() inputs at `denom`, plus at most one at 1 (fee).
-    let mix_count = inputs.iter().filter(|i| i.value == denom).count();
-    let fee_count = inputs.iter().filter(|i| i.value == 1).count();
+    // The mixers sit at that denomination. The donor may or may not, so this is
+    // a lower bound rather than an equality.
+    if inputs.iter().filter(|i| i.value == denom).count() < outputs.len() {
+        return false;
+    }
 
-    mix_count == outputs.len() && fee_count <= 1 && mix_count + fee_count == inputs.len()
+    // Whatever the inputs exceed the outputs by is the fee, and it has to cover
+    // a mix of this size.
+    let in_sum: u64 = inputs.iter().map(|i| i.value).sum();
+    let out_sum: u64 = outputs.iter().map(|o| o.value()).sum();
+    in_sum.saturating_sub(out_sum) >= recommended_fee_for_mix(outputs.len())
 }
 
 
@@ -677,7 +821,8 @@ mod tests {
     fn proposal_fee_input_is_last() {
         let (session, _) = ready_session();
         let p = session.proposal().unwrap();
-        assert_eq!(p.inputs.last().unwrap().value, 1);
+        // The donor pays the size-derived fee, not a flat unit.
+        assert_eq!(p.inputs.last().unwrap().value, recommended_fee_for_mix(2));
         // All preceding inputs are the mix denomination
         for input in &p.inputs[..p.inputs.len() - 1] {
             assert_eq!(input.value, 8);
@@ -715,7 +860,7 @@ mod tests {
         let in_sum: u64 = p.inputs.iter().map(|i| i.value).sum();
         let out_sum: u64 = p.outputs.iter().map(|o| o.value()).sum();
         assert!(in_sum > out_sum);
-        assert_eq!(in_sum - out_sum, 1); // fee = 1
+        assert_eq!(in_sum - out_sum, recommended_fee_for_mix(2));
     }
 
     #[test]
@@ -901,14 +1046,12 @@ mod tests {
         let proposal = session.proposal().unwrap();
 
         // Mine commit PoW
-        let mut nonce = 0u64;
-        loop {
-            let h = hash_concat(&proposal.commitment, &nonce.to_le_bytes());
-            if crate::core::types::count_leading_zeros(&h) >= crate::core::transaction::MIN_COMMIT_POW_BITS {
-                break;
-            }
-            nonce += 1;
-        }
+        let nonce = crate::core::transaction::mine_pow(
+            &proposal.commitment,
+            crate::core::transaction::MIN_COMMIT_POW_BITS,
+            0,
+            [0u8; 32],
+        );
 
         // Apply Commit
         let commit_tx = Transaction::Commit {
@@ -976,7 +1119,7 @@ mod tests {
 
         let in_sum: u64 = p.inputs.iter().map(|i| i.value).sum();
         let out_sum: u64 = p.outputs.iter().map(|o| o.value()).sum();
-        assert_eq!(in_sum - out_sum, 1);
+        assert_eq!(in_sum - out_sum, recommended_fee_for_mix(3));
     }
 
     // ── Registration order doesn't affect proposal ──────────────────────
@@ -1020,9 +1163,16 @@ mod tests {
 
     #[test]
     fn denomination_1_mix_needs_denomination_1_fee() {
-        // Edge case: mixing denomination 1 coins. The fee input is *also*
-        // denomination 1, so it looks like another mix participant on chain.
-        // That's acceptable — the privacy set is N+1 instead of N.
+        // Edge case: mixing denomination 1 coins.
+        //
+        // This test used to assert that the donor was ALSO denomination 1, so it
+        // was indistinguishable from a mixer and the privacy set was N+1. The
+        // size-derived fee ended that: a 2-way mix costs 27, so a denomination-1
+        // mix now carries a donor 27x the size of every mixer. The donor is
+        // trivially identifiable, and with it the mix itself.
+        //
+        // That is a real privacy regression for small denominations, not a
+        // test-only concern — see the note on `recommended_fee_for_mix`.
         let mut session = MixSession::with_salt(1, 2, [0; 32]).unwrap();
 
         for i in 0..2u8 {
@@ -1038,13 +1188,19 @@ mod tests {
         session.set_fee_input(fee).unwrap();
 
         let p = session.proposal().unwrap();
-        // 3 inputs of denom 1, 2 outputs of denom 1
-        assert_eq!(p.inputs.iter().filter(|i| i.value == 1).count(), 3);
+        // 2 mixers at denom 1, plus a donor that no longer resembles them.
+        assert_eq!(p.inputs.iter().filter(|i| i.value == 1).count(), 2);
+        assert_eq!(p.inputs.len(), 3);
         assert_eq!(p.outputs.len(), 2);
+        assert_eq!(p.inputs.last().unwrap().value, recommended_fee_for_mix(2));
+        assert!(
+            p.inputs.last().unwrap().value > 1,
+            "donor is distinguishable from mixers at this denomination"
+        );
 
         let in_sum: u64 = p.inputs.iter().map(|i| i.value).sum();
         let out_sum: u64 = p.outputs.iter().map(|o| o.value()).sum();
-        assert_eq!(in_sum - out_sum, 1);
+        assert_eq!(in_sum - out_sum, recommended_fee_for_mix(2));
     }
 
     // ── Accessor coverage ───────────────────────────────────────────────

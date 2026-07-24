@@ -455,12 +455,51 @@ th { background: var(--bg-alt); color: var(--text-max); font-weight: 600; font-f
 td { color: var(--text-muted); background: var(--bg); }
 td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); }
 
+.mobile-nav-header, .mobile-external-links { display: none; }
+
 @media (max-width: 900px) {
-    .nav-actions { justify-content: flex-end; }
-    .workspace { flex-direction: column; padding: 0 20px; }
-    .sidebar { width: 100%; padding-right: 0; margin-bottom: 30px; position: static; flex-direction: row; flex-wrap: wrap; gap: 8px; border-bottom: 1px solid var(--border); padding-bottom: 20px;}
-    .menu-item { flex: 1 1 auto; justify-content: center; text-align: center; border-left: 1px solid var(--border); border-bottom: 1px solid var(--border); }
-    .menu-item.active { border-left: 1px solid var(--border); border-bottom-color: var(--text-max); }
+    .desktop-links { display: none !important; }
+    #mobile-menu-btn { display: inline-flex !important; padding: 6px 10px; }
+
+    .topbar { padding: 16px 20px; }
+    .workspace { flex-direction: column; padding: 0 20px; margin: 20px auto; }
+    
+    .sidebar {
+        position: fixed;
+        top: 0; left: 0; width: 100%; height: 100%;
+        background: var(--bg);
+        z-index: 9999;
+        padding: 24px;
+        flex-direction: column;
+        transform: translateX(-100%);
+        transition: transform 0.3s ease !important; /* Overrides the dogmatic rule */
+        overflow-y: auto;
+        margin-bottom: 0;
+        border-bottom: none;
+    }
+    .sidebar.open {
+        transform: translateX(0);
+    }
+    
+    .mobile-nav-header {
+        display: flex; justify-content: space-between; align-items: center;
+        margin-bottom: 24px; padding-bottom: 12px; border-bottom: 1px solid var(--border);
+    }
+    .mobile-external-links {
+        display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 24px;
+    }
+    .mobile-external-links .btn { flex: 1 1 45%; justify-content: center; }
+
+    .menu-item { 
+        border-left: 3px solid transparent; 
+        border-bottom: none; 
+        text-align: left; 
+        justify-content: space-between; 
+        padding: 14px 16px;
+    }
+    .menu-item.active { border-bottom-color: transparent; }
+    .menu-item span { display: inline; }
+
     .flow-diagram { flex-direction: column; align-items: flex-start; }
     .flow-arrow { transform: rotate(90deg); margin-left: 20px; }
     .tab-btn { border-right: none; border-bottom: 1px solid var(--border); width: 100%; text-align: left;}
@@ -554,31 +593,161 @@ td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); 
     .rm-status { min-width: 0; }
     .rm-group > h4 { flex-direction: column; gap: 4px; }
 }
+/* ── Boot Sequence Curtain ──────────────────────────────────────────────── */
+#curtain {
+    position: fixed; inset: 0; z-index: 99999;
+    background: var(--bg);
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'JetBrains Mono', monospace;
+    opacity: 1;
+    transition: opacity 420ms ease-out !important;
+    cursor: pointer;
+}
+#curtain.lifting { opacity: 0; pointer-events: none; }
+#curtain.gone { display: none; }
 
+#curtain .stage {
+    position: relative;
+    width: 100%; max-width: 640px;
+    padding: 0 24px;
+    display: flex; flex-direction: column; align-items: center;
+}
+
+#curtain .act {
+    position: absolute; left: 0; right: 0;
+    display: flex; flex-direction: column; align-items: center;
+    opacity: 0;
+    transition: opacity 220ms ease !important;
+    padding: 0 24px;
+}
+#curtain .act.on { opacity: 1; }
+
+#curtain .grid {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-variant-ligatures: none;
+    font-size: clamp(9.5px, 2.05vw, 13px);
+    line-height: 1.75;
+    letter-spacing: 0.04em;
+    white-space: pre;
+    color: var(--text-max);
+    text-align: center;
+    transition: line-height 260ms ease !important;
+}
+#curtain .grid.crushed { line-height: 0.35; }
+#curtain .grid .row { transition: opacity 240ms ease !important; }
+#curtain .grid .faint { color: var(--text-faint); }
+
+#curtain .rule {
+    margin: 18px 0 14px;
+    height: 1px; background: var(--border-bright);
+    width: 0; max-width: 100%;
+    transition: width 500ms cubic-bezier(.22,.61,.36,1) !important;
+}
+#curtain .act.on .rule { width: 340px; }
+
+#curtain .caption {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 9px; letter-spacing: 0.28em; text-transform: uppercase;
+    color: var(--text-faint); text-align: center;
+    min-height: 12px;
+}
+
+#curtain .logo-slot { height: 52px; margin-bottom: 20px; display: flex; align-items: center; }
+
+#curtain .grid.resolving { font-weight: 600; color: var(--text-max); }
+#curtain .grid .mid { color: var(--text-muted); }
+
+#boot-logo { width: 52px; height: 52px; object-fit: contain; opacity: 0; transition: opacity 400ms ease !important; }
+#boot-logo.on { opacity: 1; }
+:root[data-theme="dark"] #boot-logo { filter: grayscale(100%) brightness(500%); }
+:root[data-theme="light"] #boot-logo { filter: grayscale(100%) brightness(500%) invert(100%); }
+
+#curtain .skip {
+    position: fixed; bottom: 26px; left: 0; right: 0; text-align: center;
+    font-size: 9px; letter-spacing: 0.28em; text-transform: uppercase;
+    color: var(--text-faint); opacity: 0;
+    transition: opacity 400ms ease !important;
+    pointer-events: none;
+}
+#curtain .skip.on { opacity: 0.5; }
+
+@media (prefers-reduced-motion: reduce) {
+    #curtain { display: none !important; }
+}
 </style>
 </head>
 <body>
-<div class="topbar">
-<div class="brand">
-    <img src="logo.svg" alt="Midstate" class="brand-logo"> 
-    <span><span class="brand-mid">MID</span><span class="brand-state">STATE</span></span>
+<!-- Boot Sequence Curtain -->
+<div id="curtain">
+    <div class="stage">
+        <!-- Act 1 — the anchor -->
+        <div class="act" id="act1">
+            <div class="logo-slot"></div>
+            <div class="grid" id="btcHash"></div>
+            <div class="rule"></div>
+            <div class="caption">Bitcoin · Block 938708 · 24 Feb 2026</div>
+        </div>
+
+        <!-- Acts 2 + 3 share one element, so the inscription visibly becomes the hash -->
+        <div class="act" id="act23">
+            <div class="logo-slot"><img id="boot-logo" src="logo.svg" alt="" onerror="this.style.display='none'"></div>
+            <div class="grid" id="block"></div>
+            <div class="rule"></div>
+            <div class="caption" id="cap23"></div>
+        </div>
+    </div>
+    <div class="skip" id="skip">Click to skip</div>
 </div>
 
+<!--instantly hide the curtain for returning users -->
+<script>
+    if (sessionStorage.getItem('midstate-intro-played')) {
+        document.getElementById('curtain').style.display = 'none';
+    }
+</script>
+
+<div class="topbar">
+    <div class="brand">
+        <img src="logo.svg" alt="Midstate" class="brand-logo"> 
+        <span><span class="brand-mid">MID</span><span class="brand-state">STATE</span></span>
+    </div>
+
     <div class="nav-actions">
-        <a href="./wallet/" target="_blank" class="btn">Web Wallet</a>
-        <a href="./ide.html" target="_blank" class="btn">Midscript IDE</a>
-        <a href="https://rpc.cypherpunk.gold" target="_blank" class="btn">Explorer</a>
-        <a href="https://github.com/ciphernom/midstate/blob/main/whypaper.md" target="_blank" class="btn">Whypaper</a>
-        <a href="https://github.com/ciphernom/midstate" target="_blank" class="btn">GitHub</a>
+        <!-- Desktop Links Wrapper -->
+        <div class="desktop-links" style="display: flex; gap: 12px; align-items: center;">
+            <a href="./wallet/" target="_blank" class="btn">Web Wallet</a>
+            <a href="./ide.html" target="_blank" class="btn">Midscript IDE</a>
+            <a href="https://rpc.cypherpunk.gold" target="_blank" class="btn">Explorer</a>
+            <a href="https://github.com/ciphernom/midstate/blob/main/whypaper.md" target="_blank" class="btn">Whypaper</a>
+            <a href="https://github.com/ciphernom/midstate" target="_blank" class="btn">GitHub</a>
+        </div>
+        
         <button id="theme-btn" aria-label="Toggle Theme">
             <svg class="sun-icon" viewBox="0 0 24 24"><path d="M12 2.25a.75.75 0 01.75.75v2.25a.75.75 0 01-1.5 0V3a.75.75 0 01.75-.75zM7.5 12a4.5 4.5 0 119 0 4.5 4.5 0 01-9 0zM18.894 6.166a.75.75 0 00-1.06-1.06l-1.591 1.59a.75.75 0 101.06 1.061l1.591-1.59zM21.75 12a.75.75 0 01-.75.75h-2.25a.75.75 0 010-1.5H21a.75.75 0 01.75.75zM17.834 18.894a.75.75 0 001.06-1.06l-1.59-1.591a.75.75 0 10-1.061 1.06l1.59 1.591zM12 18a.75.75 0 01.75.75V21a.75.75 0 01-1.5 0v-2.25A.75.75 0 0112 18zM7.758 17.303a.75.75 0 00-1.061-1.06l-1.591 1.59a.75.75 0 001.06 1.061l1.591-1.59zM6 12a.75.75 0 01-.75.75H3a.75.75 0 010-1.5h2.25A.75.75 0 016 12zM6.697 7.757a.75.75 0 001.06-1.06l-1.59-1.591a.75.75 0 00-1.061 1.06l1.59 1.591z" /></svg>
             <svg class="moon-icon" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M9.528 1.718a.75.75 0 01.162.819A8.97 8.97 0 009 6a9 9 0 009 9 8.97 8.97 0 003.463-.69.75.75 0 01.981.98 10.503 10.503 0 01-9.694 6.46c-5.799 0-10.5-4.701-10.5-10.5 0-4.368 2.667-8.112 6.46-9.694a.75.75 0 01.818.162z" clip-rule="evenodd" /></svg>
+        </button>
+
+        <!-- Mobile Hamburger Button -->
+        <button id="mobile-menu-btn" class="btn" aria-label="Menu" style="display: none;">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
         </button>
     </div>
 </div>
 
 <div class="workspace">
-    <div class="sidebar">
+    <div class="sidebar" id="sidebar-menu">
+        <!-- Mobile Menu Header & External Links -->
+        <div class="mobile-nav-header">
+            <span style="font-family: 'JetBrains Mono', monospace; font-weight: 600; color: var(--text-max);">NAVIGATION</span>
+            <button id="mobile-close-btn" class="btn" style="padding: 4px 8px;">✕</button>
+        </div>
+        <div class="mobile-external-links">
+            <a href="./wallet/" target="_blank" class="btn">Web Wallet</a>
+            <a href="./ide.html" target="_blank" class="btn">Midscript IDE</a>
+            <a href="https://rpc.cypherpunk.gold" target="_blank" class="btn">Explorer</a>
+            <a href="https://github.com/ciphernom/midstate" target="_blank" class="btn">GitHub</a>
+        </div>
+
         <div class="menu-item active" data-target="overview">Overview <span>→</span></div>
         <div class="menu-item" data-target="get-started">Get Started <span>→</span></div>
         <div class="menu-item" data-target="roadmap">Roadmap <span>→</span></div>
@@ -1217,160 +1386,231 @@ for step in 0..max_iters {
                 </div>
                 <!-- ── MIDSCRIPT ─────────────────────────────────────────────────── -->
                 <div class="tab-content active" id="vm-midscript">
-                    <h2>Midscript: The Definitive Reference Manual</h2>
-                    <p>Midscript is a high-level, expression-oriented language that compiles strictly into zero-overhead Midstate stack machine bytecode. Unlike Solidity or Rust-based smart contracts, Midscript operates purely as an advanced static analyzer and pre-processor: it manages stack depth, type safety, and memory offsets entirely at compile time, eliminating the need for runtime memory allocation, garbage collection, or local variable storage.</p>
+                    <div style="margin-bottom: 48px; border-bottom: 2px solid var(--border); padding-bottom: 24px;">
+                        <h2 style="border:none; padding:0; margin:0 0 8px 0; font-size: 32px;">The Midscript Programming Language</h2>
+                        <div style="font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--text-faint);">Definitive Reference Manual · Edition 1.0</div>
+                    </div>
+
+                    <p>Midscript is a statically-analyzed, macro-expanded programming language designed specifically for the Midstate Virtual Machine. Where languages like C abstract the physical hardware of a von Neumann architecture, Midscript abstracts a deterministic, resource-constrained cryptographic stack machine.</p>
+
+                    <p>The language operates in an environment entirely devoid of a heap, call frames, pointers, or garbage collection. Midscript exists purely as a compile-time semantic analyzer. Variables are not mapped to memory addresses; they are calculated topological offsets on a physical execution stack. When Midscript is compiled, all high-level abstractions dissolve entirely, producing a contiguous, flattened array of zero-overhead native opcodes.</p>
 
                     <div class="callout stark">
-                        <h4>The Zero-Cost Abstraction Guarantee</h4>
-                        <p>Midscript has no concept of a heap, stack frames, or runtime variables. Constructs like <code>let</code>, <code>var</code>, <code>macro</code>, <code>state</code>, <code>struct</code>, and <code>repeat</code> exist only in the compiler. The compiler tracks the physical depth of every item on the stack and dynamically generates <code>DUP</code>, <code>SWAP</code>, <code>OVER</code>, and <code>ROT</code> opcodes to route data to the execution head exactly when needed.</p>
+                        <h4>Axiom 1: The Clean Stack Theorem</h4>
+                        <p>The foundational invariant of the Midstate VM is the Clean Stack Rule. A script is evaluated as mathematically <strong>Valid</strong> if and only if, upon the execution of the final opcode, the physical stack contains exactly one item, and that item is strictly equal to the boolean representation of True (<code>0x01</code>).</p>
+                        <p>If the stack is empty, if it resolves to zero, or if it contains leftover garbage items (e.g., <code>[0x01, 0x05]</code>), the network violently rejects the transaction. Midscript is engineered to satisfy this theorem systematically via strict lexical block-scoping.</p>
                     </div>
 
-                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">1. The Compilation Pipeline</h3>
-                    <p>Midscript compiles code entirely within the browser using a custom three-stage pipeline: Lexer, Parser, and CodeGen. There is no intermediate representation (IR) or optimization pass beyond basic peephole reduction.</p>
+                    <!-- ── SECTION 1: EXECUTION ENVIRONMENT ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">1. The Execution Environment</h3>
+                    <p>Before understanding the language, one must understand the machine architecture it targets. The Midstate VM is Turing-incomplete by design, enforcing strict <code>O(1)</code> execution time bounds per opcode to prevent halting-problem vulnerabilities and infinite loops.</p>
+                    
+                    <p>When a transaction attempts to spend a UTXO, the node constructs a physical execution environment. The VM begins in a halted, empty state. First, the <strong>Witness</strong> (the cryptographic proofs provided by the spender) is sequentially pushed onto the stack. Only then does the VM begin executing the compiled Midscript bytecode.</p>
 
-                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">2. Type System & Physical Stack Tracking</h3>
-                    <p>Midscript enforces strict compile-time typing to prevent invalid opcode operations. All literals are pushed to the physical VM stack as little-endian byte arrays.</p>
-
-                    <ul>
-                        <li><strong>Hexadecimal Strings (<code>hex</code>):</strong> Enclosed in quotes. Compiles directly to <code>PUSH_HEX</code>. Example: <code>"a1b2c3d4"</code></li>
-                        <li><strong>Integers (<code>int</code>):</strong> Base-10 numerical literals. The compiler converts these to little-endian hex representations and emits <code>PUSH_INT</code>. Example: <code>10000</code></li>
-                        <li><strong>Booleans (<code>int</code>):</strong> The keywords <code>true</code> and <code>false</code> compile to <code>PUSH_INT 1</code> and <code>PUSH_INT 0</code>.</li>
+                    <ul style="margin-top: 16px;">
+                        <li><strong>Stack Depth Limit:</strong> The physical stack may never exceed 64 items at any point during execution. Exceeding this triggers an immediate `Stack Overflow` panic.</li>
+                        <li><strong>Item Size Limit:</strong> No single stack item may exceed 1,536 bytes. This prevents memory-exhaustion attacks via massive data concatenation.</li>
+                        <li><strong>SigOp Limit:</strong> Execution is aborted if more than 3 cryptographic signature verifications (<code>CHECKSIG</code>, <code>CHECKSIGVERIFY</code>) are evaluated dynamically at runtime.</li>
+                        <li><strong>Arithmetic Bounds:</strong> All mathematics are bounded to 64-bit signed integers. Division by zero, or subtraction resulting in an underflow, trigger native VM panics. There is no silent wrapping.</li>
                     </ul>
 
-                    <h4>Variable Binding (<code>var</code>)</h4>
-                    <p>The <code>var</code> keyword binds an identifier to the item currently at the top of the physical stack. The compiler maintains a <code>locals</code> array that tracks the relative depth of these variables. When a <code>var</code> is referenced, the CodeGen engine calculates its current depth offset and issues the appropriate fetch opcode.</p>
+                    <!-- ── SECTION 2: TYPES AND INGESTION ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">2. Types and The Witness</h3>
+                    <p>The Midstate VM natively understands only raw byte arrays. To ensure execution safety and prevent illegal mathematical operations on cryptographic hashes, the Midscript compiler overlays a bipartite type system.</p>
 
+                    <ul>
+                        <li><strong>Integer (<code>int</code>):</strong> Base-10 numerical literals (e.g., <code>1000</code>). The compiler converts these into strict little-endian byte sequences and emits the <code>PUSH_INT</code> opcode. All mathematical operators strictly require <code>int</code> operands.</li>
+                        <li><strong>Hexadecimal (<code>hex</code>):</strong> Raw byte sequences enclosed in quotes (e.g., <code>"a1b2c3"</code>). Length must be even. The compiler emits <code>PUSH_HEX</code>. Hex strings cannot be evaluated mathematically.</li>
+                        <li><strong>Boolean:</strong> The VM lacks a native boolean type. The keywords <code>true</code> and <code>false</code> are semantic sugar; the compiler emits <code>PUSH_INT 1</code> and <code>PUSH_INT 0</code> respectively.</li>
+                    </ul>
+
+                    <h4>The Witness (Data Ingestion)</h4>
+                    <p>Because smart contracts cannot prompt for user input at runtime, external data (signatures, public keys, routed amounts) is pushed to the physical stack <em>before</em> the script begins executing. This pre-loaded data constitutes the Witness.</p>
+                    <p>To ingest this data safely into the compiler's type-tracker, Midscript provides typed pop directives. These functions <strong>do not emit opcodes</strong>; they simply instruct the compiler to map an identifier to a pre-existing item on the physical stack.</p>
+                    <pre><code>// The Witness pushed [Signature, Amount]. The stack operates as LIFO.
+// Therefore, 'Amount' is at the top of the stack, and 'Signature' is underneath it.
+
+var amount = pop_int();       // Compiler registers top item as type 'int'
+var signature = pop_hex();    // Compiler registers the next item as type 'hex'</code></pre>
+
+                    <!-- ── SECTION 3: TOPOLOGICAL MEMORY MODEL ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">3. Topological Memory Model</h3>
+                    <p>Unlike languages that map variables to RAM or register addresses, Midscript maps variables strictly to a shifting physical stack depth.</p>
+
+                    <h4>Deep Fetching (<code>OP_PICK</code>)</h4>
+                    <p>When the <code>var</code> keyword is used, the compiler registers that variable's current index in its internal <code>locals</code> array. Later, when the variable is referenced in an expression, the CodeGen engine dynamically calculates its exact physical depth relative to the current execution head.</p>
+                    <p>The compiler then emits the most efficient sequence of opcodes to copy that value to the top of the stack:</p>
+                    
                     <div class="math-block">
-                        // Maximum Fetch Depth Limit<br>
-                        Because the VM lacks opcodes to fetch arbitrarily deep items (e.g., OP_PICK is not supported), Midscript restricts variable fetching to depth 0, 1, and 2. Referencing a variable deeper than depth 2 results in a compile-time Semantic Error: "Variable 'x' is too deep. Max fetch depth is 2."
+                        Depth 0 (Top Item): Emits <code>DUP</code><br>
+                        Depth 1 (Second Item): Emits <code>OVER</code><br>
+                        Depth N (Deeper Items): Emits <code>PUSH_INT N</code> followed by <code>PICK</code>
                     </div>
 
-                    <h4>Variable Mutation (Reassignment)</h4>
-                    <p>Reassigning a variable does not alter memory. The compiler calculates the variable's depth and generates surgical opcodes to overwrite that specific stack slot without disrupting adjacent items.</p>
-                    <pre><code>var a = pop_int();
-var b = pop_int();
-
-// To reassign 'a' (currently at Depth 1), the compiler emits:
-// [Evaluate Expression] -> SWAP -> DROP -> [Insert New Value] -> SWAP
-a = b + 10; </code></pre>
-
-                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">3. Extended UTXO State & Structs</h3>
-                    <p>To support advanced smart contracts (AMMs, DAOs, CDP Vaults), Midscript maps high-level object fields to specific byte offsets within a 32-byte <code>state</code> payload using dot-notation.</p>
+                    <h4>Lexical Scoping & Auto-Drop</h4>
+                    <p>Midscript uses brackets <code>{ ... }</code> to define lexical scope. When a block is opened, the compiler snapshots the environment. When the block closes, the compiler automatically determines how many new variables were created within that block, and injects exactly that many <code>DROP</code> opcodes into the bytecode.</p>
                     
+                    <pre><code>{
+    var temp_x = pop_int();
+    var temp_y = pop_int();
+    assert(temp_x > temp_y);
+} // The compiler observes 2 local variables going out of scope.
+  // It automatically injects 'DROP DROP' here to wipe them.
+
+true; // The stack is now perfectly clean, containing only [0x01].</code></pre>
+
+                    <!-- ── SECTION 4: THE MUTABILITY CONSTRAINT ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">4. The Mutability Constraint</h3>
+                    <p>While variables can be reassigned via standard syntax (e.g., <code>x = x + 10;</code>), Midscript is fundamentally hostile to deep mutability. This is dictated by the limitations of the underlying VM architecture.</p>
+
+                    <p>To mutate a variable deep in the stack, a VM must pull the item to the top, destroy it, push the new value, and bury it back down to its original depth. Because the Midstate VM explicitly excludes arbitrary-depth replacement opcodes (like Bitcoin's disabled <code>OP_ROLL</code>) to prevent CPU-stalling attacks, <strong>variable mutation is physically restricted to Depth 1 and Depth 2</strong>.</p>
+
+                    <pre><code>var a = pop_int(); // Current Depth 2
+var b = pop_int(); // Current Depth 1
+
+a = a + 10; // Valid. Emits: [Eval Math] -> ROT -> DROP -> SWAP
+b = b + 10; // Valid. Emits: [Eval Math] -> SWAP -> DROP
+
+// If 'a' fell to depth 3, compilation would immediately halt with a Semantic Error.</code></pre>
+
+                    <div class="callout warn">
+                        <h4>Design Rationale: Shadowing over Mutation</h4>
+                        <p>The idiomatic approach to state progression in Midscript is <strong>Variable Shadowing</strong>. Because the VM stack supports up to 64 items, developers should simply declare new variables (<code>var new_a = a + 10;</code>). This leaves the old value buried safely in the stack to be automatically <code>DROP</code>ped at the end of the lexical block, entirely bypassing the severe opcode cost and restrictions of physical stack manipulation.</p>
+                    </div>
+
+                    <!-- ── SECTION 5: EXPRESSIONS AND FOLDING ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">5. Expressions & Constant Folding</h3>
+                    <p>Midscript parses standard infix expressions according to traditional mathematical precedence rules (Multiplication > Addition > Comparison > Logical). The Abstract Syntax Tree (AST) parser automatically transposes these into postfix stack bytecode.</p>
+
+                    <p>For example, the expression <code>a + b * c</code> is compiled into the physical sequence: <code>&lt;fetch b&gt; &lt;fetch c&gt; MUL &lt;fetch a&gt; ADD</code>.</p>
+
+                    <h4>Compile-Time Constant Folding</h4>
+                    <p>The <code>let</code> keyword defines a compile-time constant. If the CodeGen engine detects an arithmetic operation occurring strictly between static literals or constants, it evaluates the mathematics entirely during compilation and emits a single, finalized <code>PUSH_INT</code>.</p>
+                    <p>For example, <code>1000 * 60 * 24</code> never generates <code>MUL</code> opcodes in the final bytecode; the compiler directly injects <code>PUSH_INT 1440000</code>. This drastically reduces contract size and runtime execution cost.</p>
+
+                    <h4>Operator Synthesization</h4>
+                    <p>To preserve instruction-set simplicity, the Midstate VM supports only <code>EQUAL</code> and <code>GREATER_OR_EQUAL</code> natively. The Midscript CodeGen engine seamlessly synthesizes all remaining comparison and logical operators at compile time.</p>
+                    <div class="math-block">
+                        &gt;&nbsp;&nbsp; synthesizes to: PUSH_INT 1 ADD GREATER_OR_EQUAL<br>
+                        &lt;=&nbsp; synthesizes to: SWAP GREATER_OR_EQUAL<br>
+                        &lt;&nbsp;&nbsp; synthesizes to: SWAP PUSH_INT 1 ADD GREATER_OR_EQUAL<br>
+                        &amp;&amp;&nbsp; synthesizes to: ADD PUSH_INT 2 EQUAL<br>
+                        ||&nbsp; synthesizes to: ADD PUSH_INT 1 GREATER_OR_EQUAL
+                    </div>
+
+                    <!-- ── SECTION 6: CONTROL FLOW ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">6. Control Flow and Branching</h3>
+
+                    <h4>If / Else</h4>
+                    <p>Compiles directly to the native <code>IF</code>, <code>ELSE</code>, and <code>ENDIF</code> opcodes. Crucially, the <code>IF</code> opcode physically consumes the top stack item. The compiler implicitly ensures the evaluated condition is left on the stack prior to the jump, guaranteeing stack alignment.</p>
+
+                    <h4>Switch</h4>
+                    <p>The <code>switch</code> construct abstracts sequential equality testing. The compiler generates an unbroken chain of <code>DUP</code>, evaluation, <code>EQUAL</code>, and <code>IF ... ELSE</code> jumps. Every <code>case</code> block is fully sandboxed lexically, meaning variables declared within a case are dropped before the switch terminates.</p>
+
+                    <h4>Route</h4>
+                    <p>A specialized architectural version of <code>switch</code> designed exclusively for the top-level contract entry point. It evaluates against an implicit <code>ImplicitTop</code> token—assuming the Witness stack has provided an integer explicitly dictating the execution path.</p>
+                    <pre><code>// Witness Stack expected: [Signature, Routing_Integer]
+route {
+    case 0: { require_signed_by(ALICE_PK); }
+    case 1: { require_signed_by(BOB_PK); }
+    default: { fail(); }
+}</code></pre>
+
+                    <h4>Repeat (Unrolling)</h4>
+                    <p>Because Turing-incompleteness strictly forbids arbitrary backward jumping (looping), the <code>repeat(N)</code> construct instructs the compiler to physically duplicate and unroll the AST block <code>N</code> times in the final bytecode array. This is primarily used for deep Merkle Tree verification steps.</p>
+
+                    <!-- ── SECTION 7: E-UTXO STATE ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">7. Extended UTXO State & Structs</h3>
+                    <p>Midstate supports <strong>State Threads</strong>—an advanced capability allowing zero-value UTXOs to carry a mutable 32-byte data payload. This enables Cardano-style Extended UTXO (eUTXO) smart contracts, including AMMs and native token issuance. Midscript provides a first-class abstraction for accessing this payload via byte-offset mapping.</p>
+
                     <pre><code>state Vault {
-    col: 8,      // Offset 0, Size 8 bytes
-    debt: 8,     // Offset 8, Size 8 bytes
-    padding: 16  // Offset 16, Size 16 bytes
+    collateral: 8, // Offset 0, Size 8 bytes
+    debt: 8,       // Offset 8, Size 8 bytes
+    padding: 16    // Offset 16, Size 16 bytes
 }</code></pre>
 
-                    <p><strong>Automatic Casting:</strong> If the defined field size is 8 bytes or fewer, the CodeGen engine automatically appends <code>PUSH_INT 0 ADD</code>, casting the raw hex slice into an actionable integer for immediate arithmetic use. Sizes larger than 8 bytes remain raw <code>hex</code> strings (useful for hashes and public keys).</p>
-
-
-                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">4. Control Flow & Routing</h3>
-                    <p>Midscript abstracts stack-based conditional jumps into standard bracketed control flows.</p>
-
-                    <ul>
-                        <li><strong>If / Else:</strong> Compiles to <code>IF</code>, <code>ELSE</code>, and <code>ENDIF</code>. Note that Midstate's <code>IF</code> opcode strictly consumes the top stack item. The compiler implicitly leaves the evaluation result on the stack prior to the jump.</li>
-                        
-                        <li><strong>Switch Statements:</strong> Evaluates an expression and sequentially executes equality checks.
-                        <pre><code>switch(Vault.debt) {
-    case 0: { /* Emits: DUP 0 EQUAL IF DROP ... ELSE */ }
-    case 100: { /* Emits: DUP 100 EQUAL IF DROP ... ELSE */ }
-    default: { fail(); }
-} // Compiler appends ENDIF for every evaluated case</code></pre></li>
-
-                        <li><strong>Route:</strong> A specialized version of <code>switch</code> designed for the top-level contract entry point. It implicitly reads the top integer off the stack (pushed by the Witness as the execution path) without requiring an explicit parameter.
-                        <pre><code>route {
-    case 0: { require_signed_by(OWNER_PK); }
-    case 1: { require_timelock(TIMEOUT); }
-    default: { fail(); }
-}</code></pre></li>
-
-                        <li><strong>Repeat (Compile-Time Loops):</strong> Because the Midstate VM lacks native loop opcodes (to prevent infinite execution vectors and guarantee <code>O(1)</code> verification time per opcode), <code>repeat(N)</code> instructs the CodeGen engine to physically unroll the AST block <code>N</code> times into the bytecode.
-                        <pre><code>repeat(3) { merkle_update_step(); }</code></pre></li>
-                    </ul>
-
-                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">5. Operators & Safe Math</h3>
-                    <p>Midscript compiles standard infix operators into postfix stack operations. The CodeGen engine enforces strict type-checking: math operations (`+`, `-`, `*`, `/`) will throw a Semantic Error if either operand is determined to be a raw <code>hex</code> string or an unevaluated boolean.</p>
-
-                    <div class="math-block">
-                        // Safe Math Guarantees<br>
-                        Addition, Subtraction, Multiplication, and Division are clamped to 64-bit integers. <code>SUB</code> natively halts the VM on underflow. <code>DIV</code> natively halts on division by zero. There is no need for SafeMath libraries; overflows are prevented at the protocol layer.
+                    <p>When code requests <code>Vault.debt</code>, the compiler does not dynamically search memory. It statically emits the sequence: <code>READ_INPUT_STATE</code> → <code>PUSH_INT 8</code> (offset) → <code>PUSH_INT 8</code> (length) → <code>SLICE</code>.</p>
+                    
+                    <div class="callout stark">
+                        <h4>Automatic Mathematical Casting</h4>
+                        <p>The VM distinguishes strictly between byte arrays and integers. A <code>SLICE</code> operation returns raw, un-mathable bytes. However, if a mapped <code>state</code> or <code>struct</code> field is defined with a physical size of 8 bytes or fewer, the compiler safely assumes it represents numeric data. It automatically appends <code>PUSH_INT 0 ADD</code>, instantly casting the raw hex slice into an actionable <code>int</code> for arithmetic processing.</p>
                     </div>
 
-                    <ul>
-                        <li><strong>Comparison:</strong> <code>==</code> (EQUAL), <code>>=</code> (GREATER_OR_EQUAL). 
-                        <br><br><em>Synthesized Comparisons:</em> Midstate VM only supports two native comparison opcodes to save space. Midscript synthesizes the rest:
-                        <ul>
-                            <li><code>></code> compiles to: <code>PUSH_INT 1 ADD GREATER_OR_EQUAL</code></li>
-                            <li><code><=</code> compiles to: <code>SWAP GREATER_OR_EQUAL</code></li>
-                            <li><code><</code> compiles to: <code>SWAP PUSH_INT 1 ADD GREATER_OR_EQUAL</code></li>
-                        </ul>
-                        </li>
-                        <li><strong>Logical:</strong> <code>&&</code> is synthesized using <code>ADD PUSH_INT 2 EQUAL</code>. <code>||</code> is synthesized using <code>ADD PUSH_INT 1 GREATER_OR_EQUAL</code>.</li>
-                    </ul>
+                    <!-- ── SECTION 8: MACROS ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">8. Macros and Syntactic Abstraction</h3>
+                    <p>Because the Midstate VM has no concept of an execution pointer or a call stack, standard functions are impossible. The <code>macro</code> keyword defines a reusable Abstract Syntax Tree (AST) fragment that is evaluated strictly at compile time.</p>
 
+                    <p>When a macro is invoked, the compiler performs the following sequence:</p>
+                    <ol>
+                        <li>Takes a snapshot of the current <code>locals</code> variable array.</li>
+                        <li>Registers the passed arguments as new physical variables on the stack.</li>
+                        <li>Unrolls the macro's inner AST into the CodeGen stream.</li>
+                        <li>Injects the necessary <code>DROP</code> opcodes to wipe the macro's parameters.</li>
+                        <li>Restores the exact <code>locals</code> snapshot that existed prior to invocation.</li>
+                    </ol>
 
-                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">6. Macros vs Functions</h3>
-                    <p>Midscript does not support functions, call stacks, or return addresses. The <code>macro</code> keyword defines a reusable AST fragment. When a macro is invoked, the compiler takes a snapshot of the current <code>locals</code> array, registers the arguments as new physical variables, unrolls the macro body into the CodeGen stream, and then issues <code>DROP</code> opcodes to wipe the macro's scope before restoring the original <code>locals</code> snapshot.</p>
-
-                    <pre><code>macro check_both_sigs(pk_a, pk_b) {
-    swap();
-    check_sig(pk_a);
-    swap();
-    check_sig(pk_b);
-    add();
+                    <pre><code>macro verify_transfer(dest_addr, amount) {
+    assert(sum_to_addr(dest_addr) >= amount);
 }</code></pre>
 
-                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">7. The Standard Library</h3>
-                    
+                    <!-- ── SECTION 9: STANDARD LIBRARY ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">9. The Standard Library</h3>
+                    <p>The compiler auto-injects a standardized, unmodifiable library of primitives into every compilation environment, wrapping the raw opcodes in type-safe macro definitions.</p>
+
                     <table>
-                        <thead><tr><th>Built-in Function</th><th>Compiled Opcodes</th><th>Description</th></tr></thead>
+                        <thead><tr><th>Operation</th><th>Emitted Opcodes / Behavior</th><th>Description</th></tr></thead>
                         <tbody>
-                            <tr><td class="hl"><code>pop_int() / pop_hex()</code></td><td>(Context Update)</td><td>Registers the top stack item to the compiler's type-tracker without emitting code.</td></tr>
-                            <tr><td class="hl"><code>peek() / dup()</code></td><td><code>DUP</code></td><td>Duplicates the top stack item.</td></tr>
-                            <tr><td class="hl"><code>drop()</code></td><td><code>DROP</code></td><td>Discards the top stack item.</td></tr>
-                            <tr><td class="hl"><code>swap()</code></td><td><code>SWAP</code></td><td>Swaps the top two stack items.</td></tr>
-                            <tr><td class="hl"><code>over()</code></td><td><code>OVER</code></td><td>Copies the second-to-top item to the top.</td></tr>
-                            <tr><td class="hl"><code>rot()</code></td><td><code>ROT</code></td><td>Rotates the third item to the top.</td></tr>
-                            <tr><td class="hl"><code>assert(expr)</code></td><td><code>[expr] VERIFY</code></td><td>Evaluates an expression and aborts execution if it resolves to 0.</td></tr>
-                            <tr><td class="hl"><code>fail()</code></td><td><code>PUSH_INT 0 VERIFY</code></td><td>Guarantees script termination and failure.</td></tr>
-                            <tr><td class="hl"><code>verify_gte(v)</code></td><td><code>v GREATER_OR_EQUAL VERIFY</code></td><td>Aborts if the top item is less than <code>v</code>.</td></tr>
-                            <tr><td class="hl"><code>check_sig(pk)</code></td><td><code>pk CHECKSIG</code></td><td>Verifies signature against pubkey. Pushes 1 (valid) or 0 (invalid).</td></tr>
-                            <tr><td class="hl"><code>require_sig(pk)<br>require_signed_by(pk)</code></td><td><code>pk CHECKSIGVERIFY</code></td><td>Verifies signature. Aborts immediately if invalid.</td></tr>
-                            <tr><td class="hl"><code>hash()</code></td><td><code>HASH</code></td><td>Executes a BLAKE3 hash on the top item.</td></tr>
+                            <tr><th colspan="3" style="text-align:center; background:var(--bg); color:var(--text-muted); font-size:12px;">STACK & TYPE ASSERTIONS</th></tr>
+                            <tr><td class="hl"><code>pop_int() / pop_hex()</code></td><td>(None)</td><td>Informs compiler a value was pushed by the witness, typing it accordingly.</td></tr>
+                            <tr><td class="hl"><code>size(val)</code></td><td><code>val SIZE SWAP DROP</code></td><td>Pushes the physical byte-length of the value.</td></tr>
+                            <tr><td class="hl"><code>assert(expr)</code></td><td><code>[expr] VERIFY</code></td><td>Evaluates expression and aborts execution if it resolves to 0.</td></tr>
+                            <tr><td class="hl"><code>fail()</code></td><td><code>PUSH_INT 0 VERIFY</code></td><td>Forces an immediate execution halt.</td></tr>
+                            
+                            <tr><th colspan="3" style="text-align:center; background:var(--bg); color:var(--text-muted); font-size:12px;">CRYPTOGRAPHY & SIGNATURES</th></tr>
+                            <tr><td class="hl"><code>hash(val)</code></td><td><code>val HASH</code></td><td>Executes a post-quantum BLAKE3 hash on the value.</td></tr>
                             <tr><td class="hl"><code>require_preimage(h)</code></td><td><code>HASH h EQUALVERIFY</code></td><td>Hashes the top item and aborts if it does not equal <code>h</code>.</td></tr>
+                            <tr><td class="hl"><code>check_sig(pk)</code></td><td><code>pk CHECKSIG</code></td><td>Verifies WOTS+/MSS signature against pubkey. Pushes 1 or 0.</td></tr>
+                            <tr><td class="hl"><code>require_sig(pk)<br>require_signed_by(pk)</code></td><td><code>pk CHECKSIGVERIFY</code></td><td>Verifies signature. Aborts immediately if invalid.</td></tr>
+                            
+                            <tr><th colspan="3" style="text-align:center; background:var(--bg); color:var(--text-muted); font-size:12px;">COVENANTS & INTROSPECTION</th></tr>
                             <tr><td class="hl"><code>require_time(h)<br>require_timelock(h)</code></td><td><code>h CHECKTIMEVERIFY</code></td><td>Aborts if current block height is less than <code>h</code>.</td></tr>
-                            <tr><td class="hl"><code>sum_to_addr(a)</code></td><td><code>a SUM_TO_ADDR</code></td><td>Sums transaction outputs sent to address <code>a</code> and pushes total.</td></tr>
-                            <tr><td class="hl"><code>require_transfer(a, v)<br>require_funds_transferred(a, v)</code></td><td><code>a SUM_TO_ADDR v EQUALVERIFY</code></td><td>Asserts that exactly <code>v</code> units are sent to address <code>a</code>.</td></tr>
-                            <tr><td class="hl"><code>read_input_state()</code></td><td><code>READ_INPUT_STATE</code></td><td>Pushes the 32-byte state of the currently executing input.</td></tr>
-                            <tr><td class="hl"><code>read_output_state(i)</code></td><td><code>i READ_OUTPUT_STATE</code></td><td>Pushes the 32-byte state of the newly created output at index <code>i</code>.</td></tr>
-                            <tr><td class="hl"><code>slice(val, off, len)</code></td><td><code>val off len SLICE</code></td><td>Extracts a substring of bytes.</td></tr>
-                            <tr><td class="hl"><code>concat(a, b)</code></td><td><code>a b CONCAT</code></td><td>Concatenates two byte arrays.</td></tr>
-                            <tr><td class="hl"><code>merkle_step()</code></td><td>(Macro Unroll)</td><td>Processes a standard static Merkle Proof step. Expects <code>[..., Sibling, Dir, Current]</code>.</td></tr>
-                            <tr><td class="hl"><code>merkle_update_step()</code></td><td>(Macro Unroll)</td><td>Simultaneously verifies an old root and calculates a new root. Expects <code>[..., Sibling, Dir, Old_Acc, New_Acc]</code>.</td></tr>
+                            <tr><td class="hl"><code>input_value()</code></td><td><code>INPUT_VALUE</code></td><td>Pushes the exact Satoshi value of the currently executing input.</td></tr>
+                            <tr><td class="hl"><code>this_address()</code></td><td><code>THIS_ADDRESS</code></td><td>Pushes the 32-byte address of the executing script itself.</td></tr>
+                            <tr><td class="hl"><code>output_address(i)</code></td><td><code>i OUTPUT_ADDRESS</code></td><td>Pushes the 32-byte address of the newly created output at index <code>i</code>.</td></tr>
+                            <tr><td class="hl"><code>sum_to_addr(a)</code></td><td><code>a SUM_TO_ADDR</code></td><td>Sums the Satoshi values of all outputs sent to address <code>a</code>.</td></tr>
+                            <tr><td class="hl"><code>read_input_state()</code></td><td><code>READ_INPUT_STATE</code></td><td>Pushes the 32-byte payload of the executing State Thread.</td></tr>
+                            <tr><td class="hl"><code>read_output_state(i)</code></td><td><code>i READ_OUTPUT_STATE</code></td><td>Pushes the 32-byte payload assigned to output <code>i</code>.</td></tr>
+                            
+                            <tr><th colspan="3" style="text-align:center; background:var(--bg); color:var(--text-muted); font-size:12px;">DATA MANIPULATION</th></tr>
+                            <tr><td class="hl"><code>slice(val, off, len)</code></td><td><code>val off len SLICE</code></td><td>Extracts a specific byte sequence.</td></tr>
+                            <tr><td class="hl"><code>concat(a, b)</code></td><td><code>a b CONCAT</code></td><td>Merges two byte arrays into one contiguous structure.</td></tr>
                         </tbody>
                     </table>
 
-                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">8. Raw Assembly Interop</h3>
-                    <p>If required, developers can bypass the Midscript type-checker and stack-tracker by injecting raw Midstate Assembly directly into the code using all-caps mnemonics. The compiler treats these as raw string arguments and pushes them directly to the bytecode array without analysis.</p>
-                    <pre><code>let ADMIN = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-PUSH_HEX(ADMIN);
-CHECKSIGVERIFY;
-PUSH_INT(1);</code></pre>
-                    <p>Supported raw opcodes: <code>PUSH_HEX</code>, <code>PUSH_INT</code>, <code>DROP</code>, <code>DUP</code>, <code>SWAP</code>, <code>OVER</code>, <code>ROT</code>, <code>SLICE</code>, <code>CONCAT</code>, <code>EQUAL</code>, <code>VERIFY</code>, <code>EQUALVERIFY</code>, <code>ADD</code>, <code>SUB</code>, <code>MUL</code>, <code>DIV</code>, <code>GREATER_OR_EQUAL</code>, <code>HASH</code>, <code>CHECKSIG</code>, <code>CHECKSIGVERIFY</code>, <code>CHECKTIMEVERIFY</code>, <code>SUM_TO_ADDR</code>, <code>READ_INPUT_STATE</code>, <code>READ_OUTPUT_STATE</code>.</p>
+                    <!-- ── SECTION 10: RAW ASSEMBLY ── -->
+                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">10. Raw Assembly Interoperability</h3>
+                    <p>If absolute byte-level optimization is required, developers may intentionally bypass the Midscript type-checker by writing raw Midstate Assembly mnemonics in all-caps. The compiler treats these as untyped injection directives, verifying only that they do not violate the compiler's internal stack-depth safety tracker.</p>
+                    <pre><code>let MASTER_KEY = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
 
-                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">9. Headless Unit Testing</h3>
-                    <p>Midscript features a native test runner that compiles and executes against a headless simulation of the VM. Tests evaluate the physical stack output without requiring network deployment. A test passes if it terminates successfully and conforms to the Clean Stack Rule (leaving exactly <code>[1]</code> on the stack).</p>
+// Pure bytecode injection
+PUSH_HEX(MASTER_KEY);
+CHECKSIGVERIFY;</code></pre>
+
+                    <!-- ── SECTION 11: TEST HARNESS ── -->
+                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">11. The Headless Test Harness</h3>
+                    <p>Midscript ships with a native <code>test</code> construct. Tests are isolated code branches ignored by standard compilation. When the <code>Run Tests</code> action is invoked via the IDE, the compiler instantiates a headless, simulated stack environment for each test block.</p>
+                    <p>The environment strictly enforces all consensus invariants: the maximum stack depth of 64, maximum item sizes of 1,536 bytes, 64-bit mathematical overflow limits, and the absolute requirement that execution must cleanly resolve to <code>[0x01]</code>.</p>
+                    
                     <pre><code>test "Validates a Left-Sibling Merkle Step" {
-    // Setup Mock Stack: [Sibling, Direction(Left=1), Current]
+    // 1. Manually setup Mock Stack: [Sibling, Direction(Left=1), Current]
     push_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     push_int(1); 
     push_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     
+    // 2. Execute the macro
     merkle_step();
     
-    // Assert against expected concatenated hash
+    // 3. Assert the mathematical result
     push_hex("7e244b7fa716d86fb5a0f274291c984caebef9df451e0ff0d48cb96d66e74b3e"); 
     assert(pop_hex() == pop_hex()); 
 }</code></pre>
@@ -2415,6 +2655,249 @@ Script:
         setTheme(current === 'dark' ? 'light' : 'dark');
     });
 
+// --- Mobile Hamburger Menu --- //
+    const sidebar = document.getElementById('sidebar-menu');
+    const mobileBtn = document.getElementById('mobile-menu-btn');
+    const closeBtn = document.getElementById('mobile-close-btn');
+
+    mobileBtn.addEventListener('click', () => sidebar.classList.add('open'));
+    closeBtn.addEventListener('click', () => sidebar.classList.remove('open'));
+    
+
+
+    // --- Boot Sequence Animation --- //
+    const curtain = document.getElementById('curtain');
+    if (curtain && curtain.style.display !== 'none') {
+        const BTC_HASH = "000000000000000000018f5ad5625d43356136c2e50c6dc18967a90a18f0af2e";
+        const INSCRIPTION = [
+            "Harvest Now, Decrypt Later: The ",
+            "Quantum Era's Encryption Challen",
+            "ge (Published Feb 24, 2026, by R",
+            "BC Disruptors)",
+        ];
+        const GENESIS = "0005affb94998de09c1a72d0105c053aedf0d2ccbd4981eb27f6e8500507baa0";
+        const HEX = "0123456789abcdef";
+        const rnd = () => HEX[(Math.random() * 16) | 0];
+
+        const T = {
+            act1In:        60,
+            btcCharEvery:  9,
+            act1Hold:      260,
+            act2In:        1080,
+            inscCharEvery: 6,
+            act2Hold:      240,
+            mutate:        420,
+            crush:         300,
+            counter:       520,
+            zeroEvery:     190,
+            foldIn:        220,
+            foldEvery:     165,
+            resolve:       420,
+            hold:          420,
+            lift:          420,
+        };
+
+        let speed = 1;
+        const ms = v => v * speed;
+        let timers = [];
+        const at = (t, fn) => timers.push(setTimeout(fn, ms(t)));
+        const clearAll = () => { timers.forEach(clearTimeout); timers = []; };
+
+        const $ = id => document.getElementById(id);
+
+        function spans(str, faintLeadingZeros) {
+            const lead = faintLeadingZeros ? (str.match(/^0+/) || [''])[0].length : 0;
+            return [...str].map((c, i) =>
+                `<span class="${i < lead ? 'faint' : ''}">${c}</span>`).join('');
+        }
+
+        function typeInto(el, str, every, faint, done) {
+            let i = 0;
+            (function step() {
+                el.innerHTML = spans(str.slice(0, i), faint);
+                if (i++ < str.length) timers.push(setTimeout(step, ms(every)));
+                else if (done) done();
+            })();
+        }
+
+        function runBootSequence() {
+            clearAll();
+            curtain.classList.remove('lifting', 'gone');
+            ['act1','act23'].forEach(id => $(id).classList.remove('on'));
+            const g0 = $('block');
+            g0.className = 'grid';
+            g0.style.fontSize = '';
+            g0.style.letterSpacing = '';
+            $('btcHash').innerHTML = '';
+            $('block').innerHTML = '';
+            $('cap23').textContent = '';
+            $('boot-logo').classList.remove('on');
+            $('skip').classList.remove('on');
+
+            at(600, () => $('skip').classList.add('on'));
+
+            at(T.act1In, () => {
+                $('act1').classList.add('on');
+                typeInto($('btcHash'), BTC_HASH, T.btcCharEvery, true);
+            });
+
+            const act1End = T.act1In + BTC_HASH.length * T.btcCharEvery + T.act1Hold;
+            at(act1End, () => $('act1').classList.remove('on'));
+
+            const a2 = act1End + 240;
+            at(a2, () => {
+                $('act23').classList.add('on');
+                $('cap23').textContent = 'Genesis inscription · 4 × 32 bytes · provably unspendable';
+
+                const full = INSCRIPTION.join('\n');
+                let i = 0;
+                (function step() {
+                    const shown = full.slice(0, i);
+                    $('block').innerHTML = shown.split('\n')
+                        .map(r => `<div class="row">${r.replace(/ /g, '&nbsp;')}</div>`).join('');
+                    if (i++ < full.length) timers.push(setTimeout(step, ms(T.inscCharEvery)));
+                })();
+            });
+
+            const inscLen = INSCRIPTION.join('\n').length;
+            const a3 = a2 + inscLen * T.inscCharEvery + T.act2Hold;
+
+            at(a3, () => {
+                $('cap23').textContent = 'Hashing · BLAKE3';
+                const rows = [...$('block').querySelectorAll('.row')];
+                const cells = rows.map(r => [...r.textContent]);
+                const total = cells.reduce((n, r) => n + r.length, 0);
+                let done = 0;
+
+                const iv = setInterval(() => {
+                    for (let k = 0; k < 14; k++) {
+                        const ri = (Math.random() * cells.length) | 0;
+                        const ci = (Math.random() * cells[ri].length) | 0;
+                        if (cells[ri][ci] !== '\u0000') { cells[ri][ci] = rnd(); done++; }
+                    }
+                    rows.forEach((r, i) => r.textContent = cells[i].join(''));
+                    if (done > total * 1.6) clearInterval(iv);
+                }, ms(22));
+                timers.push(iv);
+            });
+
+            const crushAt = a3 + T.mutate;
+            at(crushAt, () => {
+                $('block').classList.add('crushed');
+                [...$('block').querySelectorAll('.row')].forEach((r, i) => {
+                    if (i > 0) r.style.opacity = '0';
+                });
+            });
+
+            at(crushAt + T.crush, () => {
+                $('block').classList.remove('crushed');
+                const unsolved = GENESIS.replace(/^0+/, m => [...m].map(rnd).join(''));
+                $('block').innerHTML = `<div class="row">${spans(unsolved, false)}</div>`;
+            });
+
+            const counterAt = crushAt + T.crush + 40;
+            at(counterAt, () => {
+                const cells = [...$('block').querySelectorAll('span')];
+                const lead = (GENESIS.match(/^0+/) || [''])[0].length;
+                const t0 = performance.now();
+
+                const churn = setInterval(() => {
+                    const p = Math.min(1, (performance.now() - t0) / ms(T.counter));
+                    const n = Math.floor(Math.pow(p, 2.4) * 1000000);
+                    $('cap23').textContent =
+                        `Iteration ${String(n).padStart(7, '0')} / 1000000`;
+                    cells.forEach((c, i) => { if (i >= lead || p < 0.55) c.textContent = rnd(); });
+                    if (p >= 1) clearInterval(churn);
+                }, ms(28));
+                timers.push(churn);
+            });
+
+            const zerosAt = counterAt + T.counter;
+            const lead = (GENESIS.match(/^0+/) || [''])[0].length;
+            for (let z = 0; z < lead; z++) {
+                at(zerosAt + z * T.zeroEvery, () => {
+                    const cells = [...$('block').querySelectorAll('span')];
+                    cells[z].textContent = '0';
+                    cells[z].style.color = 'var(--text-max)';
+                    timers.push(setTimeout(() => {
+                        cells[z].style.color = 'var(--text-faint)';
+                    }, ms(90)));
+                });
+            }
+
+            const settle = zerosAt + lead * T.zeroEvery;
+            at(settle, () => {
+                $('block').innerHTML = `<div class="row">${spans(GENESIS, true)}</div>`;
+                $('cap23').textContent = 'Iteration 1000000 / 1000000 · target met';
+            });
+
+            const foldAt = settle + T.foldIn;
+            const STEPS = [
+                { n: 32, size: 17, track: 0.06 },
+                { n: 16, size: 24, track: 0.10 },
+                { n: 8,  size: 32, track: 0.16 },
+            ];
+
+            STEPS.forEach((st, k) => {
+                at(foldAt + k * T.foldEvery, () => {
+                    if (k === 0) {
+                        $('cap23').textContent = 'Folding';
+                        $('block').classList.add('resolving');
+                    }
+                    const cur = [...$('block').textContent].filter(c => c.trim());
+                    const next = [];
+                    for (let i = 0; i < cur.length; i += 2) {
+                        next.push(Math.random() < 0.5 ? cur[i] : (cur[i + 1] ?? cur[i]));
+                    }
+                    const g = $('block');
+                    g.style.fontSize = st.size + 'px';
+                    g.style.letterSpacing = st.track + 'em';
+                    g.innerHTML = `<div class="row">${next.slice(0, st.n).join('')}</div>`;
+                });
+            });
+
+            const resolveAt = foldAt + STEPS.length * T.foldEvery;
+            at(resolveAt, () => {
+                const target = 'MIDSTATE';
+                const g = $('block');
+                g.style.fontSize = 'clamp(30px, 8.5vw, 44px)';
+                g.style.letterSpacing = '0.22em';
+                $('cap23').textContent = '';
+
+                let it = 0;
+                const iv = setInterval(() => {
+                    const shown = [...target].map((c, i) =>
+                        i < it ? c : HEX[(Math.random() * 16) | 0].toUpperCase()).join('');
+                    g.innerHTML =
+                        `<div class="row"><span class="mid">${shown.slice(0, 3)}</span>${shown.slice(3)}</div>`;
+                    it += 0.5;
+                    if (it >= target.length) {
+                        clearInterval(iv);
+                        g.innerHTML = `<div class="row"><span class="mid">MID</span>STATE</div>`;
+                        $('boot-logo').classList.add('on');
+                        $('cap23').textContent = 'Genesis Midstate';
+                    }
+                }, ms(T.resolve / 18));
+                timers.push(iv);
+            });
+
+            at(resolveAt + T.resolve + T.hold, lift);
+        }
+
+        function lift() {
+            clearAll();
+            curtain.classList.add('lifting');
+            sessionStorage.setItem('midstate-intro-played', 'true');
+            setTimeout(() => curtain.classList.add('gone'), 440);
+        }
+
+        curtain.addEventListener('click', lift);
+        window.addEventListener('keydown', lift);
+        setTimeout(() => { if (!curtain.classList.contains('gone')) lift(); }, 9000);
+
+        runBootSequence();
+    }
+
     // --- Diagram Rendering --- //
     async function renderVisibleDiagrams() {
         const unrendered = Array.from(document.querySelectorAll('.content-pane.active .mermaid:not([data-processed="true"])'))
@@ -2500,12 +2983,17 @@ Script:
         }
     }
 
-    // Bind clicks on sidebar items to update URL and trigger navigation
+   // Bind clicks on sidebar items to update URL and trigger navigation
     menuItems.forEach(item => {
         item.addEventListener('click', async () => {
             const targetId = item.getAttribute('data-target');
             history.pushState(null, null, '#' + targetId);
             await activateSection(targetId);
+            
+            // Auto-close mobile menu after clicking a section
+            if (window.innerWidth <= 900) {
+                document.getElementById('sidebar-menu').classList.remove('open');
+            }
         });
     });
 

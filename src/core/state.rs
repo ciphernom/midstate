@@ -713,7 +713,11 @@ mod tests {
         let timestamps = vec![state.timestamp];
         apply_batch(&mut state, &batch, &timestamps, &mut std::collections::HashMap::new()).unwrap();
         assert_ne!(state.midstate, old_midstate);
-        assert_eq!(state.midstate, batch.extension.final_hash);
+        // The midstate is the running hash chain over applied coin ids and the
+        // state root. The extension's final_hash is the proof-of-work computed
+        // *over* that midstate, so the two are different by design; asserting
+        // equality was testing an invariant the chain never had.
+        assert_ne!(state.midstate, batch.extension.final_hash);
     }
 
     #[test]
@@ -917,9 +921,18 @@ mod tests {
     #[test]
     fn validate_timestamp_rejects_far_future() {
         let current_time = 1_000_000;
-        let far_future = current_time + 3 * 60 * 60; // 3 hours ahead
-        let result = validate_timestamp(far_future, &[], current_time, 0);
-        assert!(result.is_err());
+        // The tolerance is height-gated: 15 minutes after the timewarp fix,
+        // 10 hours before it. The old test asserted a 3-hour block was rejected
+        // at height 0, which the legacy window legitimately allows.
+        let post_fix = crate::core::types::TIMEWARP_FIX_ACTIVATION_HEIGHT;
+
+        // Post-fix: anything beyond 15 minutes is refused.
+        assert!(validate_timestamp(current_time + 16 * 60, &[], current_time, post_fix).is_err());
+        assert!(validate_timestamp(current_time + 14 * 60, &[], current_time, post_fix).is_ok());
+
+        // Legacy: 3 hours is inside the 10-hour window, 11 hours is not.
+        assert!(validate_timestamp(current_time + 3 * 60 * 60, &[], current_time, 0).is_ok());
+        assert!(validate_timestamp(current_time + 11 * 60 * 60, &[], current_time, 0).is_err());
     }
 
     #[test]

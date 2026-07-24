@@ -634,6 +634,71 @@ impl Transaction {
     }
 
     /// Fee = sum(input values) - sum(output values). Zero for Commit.
+    /// Fee paid by this transaction, as inputs minus outputs.
+    ///
+    /// # Reasoning
+    ///
+    /// The fee is implicit in this model: it is whatever the inputs exceed the
+    /// outputs by, never an explicit field. That works because every output's
+    /// contribution to the value side is readable.
+    ///
+    /// `OutputData::Confidential` contributes zero, and that is correct rather
+    /// than a limitation. Despite the name it is not a hidden-value output —
+    /// it is a zero-value **state thread**, carrying a 32-byte data commitment
+    /// that scripts read through `OP_READ_INPUT_STATE` to thread state from one
+    /// transaction to the next. It carries data, not money. A stateful covenant
+    /// spending 100 into `[Standard 96, Confidential(state)]` really does pay a
+    /// fee of 4.
+    ///
+    /// The name is a trap and has already caused one incorrect "fix" to this
+    /// function, on the assumption that the variant meant Elements-style
+    /// confidential transactions and that the fee was therefore unknowable.
+    /// Making this return 0 whenever a state thread is present would report no
+    /// fee for every stateful covenant transaction, which the mempool's own
+    /// fee floor then rejects — disabling stateful covenants entirely at the
+    /// relay layer. Do not do that. Consider renaming the variant to
+    /// `StateThread`.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre: true (pure; reads no state)
+    ///
+    /// Post:
+    ///   tx = Commit(_)  ⇒ fee! = 0
+    ///   otherwise       ⇒ fee! = Σ value(tx.inputs) − Σ value(tx.outputs)
+    ///
+    ///   where value(Standard{v})     = v
+    ///         value(Confidential{..}) = 0        (state thread; carries no value)
+    ///         value(DataBurn{v})      = v
+    ///
+    ///   ∀ tx • fee!(tx) ≤ Σ value(tx.inputs)     (never overstates)
+    ///   Σ outputs > Σ inputs ⇒ fee! = 0          (saturates; consensus rejects
+    ///                                             the transaction separately)
+    /// ```
+    ///
+    /// ```zed
+    ///     Fee
+    ///     ----------------
+    ///     ΞTransaction
+    ///     fee! : ℕ
+    ///
+    ///     pre  true
+    ///
+    ///     post fee! = if is_commit(θTransaction) then 0
+    ///                 else max(0, (Σ i : inputs • i.value)
+    ///                             − (Σ o : outputs • value(o)))
+    /// ```
+    ///
+    /// # Safety / Invariants
+    ///
+    /// - **Never overstate.** A reported fee is an upper bound on what a miner
+    ///   may claim and a sort key the mempool trusts.
+    /// - **Saturating, not wrapping.** Outputs exceeding inputs is a consensus
+    ///   violation caught in `validate_transaction`; here it must yield `0`
+    ///   rather than underflow into an enormous fee.
+    /// - **Zero-value outputs are legitimate.** State threads and `DataBurn`
+    ///   both rely on it; see `allows_zero_value`.
     pub fn fee(&self) -> u64 {
         match self {
             Transaction::Commit { .. } => 0,
@@ -1023,7 +1088,17 @@ mod tests {
     }
 
     #[test]
-    fn fee_zero_with_confidential_output() {
+    fn state_thread_output_contributes_no_value_to_the_fee() {
+        // `Confidential` is a zero-value state thread, not a hidden-value
+        // output. It carries a data commitment for OP_READ_INPUT_STATE, so it
+        // contributes nothing to the value side and the fee is simply whatever
+        // the inputs exceed the *other* outputs by.
+        //
+        // The old version of this test was named `fee_zero_with_confidential_output`
+        // and asserted 0, on the assumption that the value was hidden and the
+        // fee therefore unknowable. It is not hidden; it is zero.
+
+        // Degenerate case: everything goes to the miner.
         let tx = Transaction::Reveal {
             inputs: vec![InputReveal { predicate: Predicate::p2pk(&[0u8; 32]), value: 100, salt: [0u8; 32] , commitment: None }],
             witnesses: vec![Witness::sig(vec![])],
@@ -1034,7 +1109,25 @@ mod tests {
             }],
             salt: [0u8; 32],
         };
-        assert_eq!(tx.fee(), 0);
+        assert_eq!(tx.fee(), 100, "a zero-value output leaves the whole input as fee");
+
+        // Realistic case: a stateful covenant carries value forward alongside
+        // its state. This is the one that must not regress — reporting 0 here
+        // would put every stateful spend below the mempool's fee floor.
+        let tx = Transaction::Reveal {
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&[0u8; 32]), value: 100, salt: [0u8; 32] , commitment: None }],
+            witnesses: vec![Witness::sig(vec![])],
+            outputs: vec![
+                OutputData::Standard { address: [1u8; 32], value: 96, salt: [1u8; 32] },
+                OutputData::Confidential {
+                    address: [0u8; 32],
+                    commitment: [0xAB; 32],
+                    salt: [0u8; 32],
+                },
+            ],
+            salt: [0u8; 32],
+        };
+        assert_eq!(tx.fee(), 4, "state thread must not swallow the fee calculation");
     }
 
     #[test]

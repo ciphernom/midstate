@@ -1057,15 +1057,19 @@ mod tests {
         }
     }
 
+    /// Mine a commit nonce the way the node actually does.
+    ///
+    /// This deliberately calls production `mine_pow` rather than reimplementing
+    /// the hash. The previous local version computed `hash(commitment || nonce)`,
+    /// omitting the height prefix the validator mixes in, so it produced nonces
+    /// that could never validate at any difficulty — and it silently survived a
+    /// V2 and a V3 fork because the rejection tests still passed.
+    fn mine_commit_nonce_at(commitment: &[u8; 32], state: &crate::core::State) -> u64 {
+        mine_pow(commitment, MIN_COMMIT_POW_BITS, state.height, [0u8; 32])
+    }
+
     fn mine_commit_nonce(commitment: &[u8; 32]) -> u64 {
-        let mut n = 0u64;
-        loop {
-            let h = hash_concat(commitment, &n.to_le_bytes());
-            if count_leading_zeros(&h) >= MIN_COMMIT_POW_BITS {
-                return n;
-            }
-            n += 1;
-        }
+        mine_commit_nonce_at(commitment, &empty_state())
     }
 
     #[test]
