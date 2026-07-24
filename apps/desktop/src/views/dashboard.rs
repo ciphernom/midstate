@@ -8,24 +8,40 @@ pub fn show(app: &mut App, ui: &mut Ui) {
 
     // ── Money ───────────────────────────────────────────────────────────
     let b = app.balance.clone();
+    // Balances run to ten digits; a unit picker makes the headline readable
+    // without hiding the exact figure below it.
+    ui.horizontal(|ui| {
+        theme::hint(ui, "show amounts in");
+        theme::unit_selector(ui, &mut app.balance_unit);
+        if let Some(bal) = &b {
+            ui.label(
+                RichText::new(format!("= {} units exactly", units(bal.confirmed)))
+                    .size(11.0)
+                    .color(theme::faint()),
+            );
+        }
+    });
+    ui.add_space(4.0);
+    let uu = app.balance_unit;
+    let show = |v: u64| theme::in_unit(v, uu);
     ui.columns(4, |c| {
         theme::stat(
             &mut c[0],
             "Spendable",
-            &b.as_ref().map(|b| units(b.confirmed)).unwrap_or_else(|| "—".into()),
-            "units",
+            &b.as_ref().map(|b| show(b.confirmed)).unwrap_or_else(|| "—".into()),
+            theme::UNIT_NAMES[uu.min(3)],
         );
         theme::stat(
             &mut c[1],
             "In flight",
-            &b.as_ref().map(|b| units(b.in_flight)).unwrap_or_else(|| "—".into()),
-            "units",
+            &b.as_ref().map(|b| show(b.in_flight)).unwrap_or_else(|| "—".into()),
+            theme::UNIT_NAMES[uu.min(3)],
         );
         theme::stat(
             &mut c[2],
             "Unconfirmed",
-            &b.as_ref().map(|b| units(b.unconfirmed)).unwrap_or_else(|| "—".into()),
-            "units",
+            &b.as_ref().map(|b| show(b.unconfirmed)).unwrap_or_else(|| "—".into()),
+            theme::UNIT_NAMES[uu.min(3)],
         );
         theme::stat(
             &mut c[3],

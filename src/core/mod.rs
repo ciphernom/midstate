@@ -19,3 +19,6 @@ pub use state::adjust_difficulty;
 
 // Q-Bolt v2 payment channels (shared by native + wasm wallets).
 pub mod channel;
+
+// Cross-chain DEX order announcements (shared by native + wasm wallets).
+pub mod dex;

@@ -51,7 +51,11 @@ fn pref_path() -> std::path::PathBuf {
             std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
                 .join(".local/share")
         });
-    base.join("midstate-desktop").join("theme")
+    let dir = match std::env::var("MIDSTATE_PROFILE") {
+        Ok(n) if !n.is_empty() => format!("midstate-desktop-{n}"),
+        _ => "midstate-desktop".to_string(),
+    };
+    base.join(dir).join("theme")
 }
 
 pub fn load_pref() {
@@ -107,6 +111,12 @@ pub fn faint() -> Color32 { pick((0x5a, 0x5a, 0x5a), (0xa2, 0xa2, 0xa2)) }
 pub fn ambient() -> Color32 { pick((0x19, 0x19, 0x19), (0xf1, 0xf1, 0xf1)) }
 /// Text drawn ON an ink fill.
 pub fn on_ink() -> Color32 { pick((0x0a, 0x0a, 0x0a), (0xff, 0xff, 0xff)) }
+/// Background of an editable field. Must contrast with `ink()`, which is what
+/// text is drawn in — a fixed dark value here renders light mode unreadable.
+pub fn input_bg() -> Color32 { pick((0x0f, 0x0f, 0x0f), (0xff, 0xff, 0xff)) }
+/// Border of an editable field, so it reads as a well you can type into
+/// rather than a flat area of page.
+pub fn input_border() -> Color32 { pick((0x2e, 0x2e, 0x2e), (0xc4, 0xc4, 0xc4)) }
 
 // Semantic tokens collapse to ink/grey, exactly as midstate.css does.
 pub fn gold() -> Color32 { ink() }
@@ -151,10 +161,12 @@ pub fn apply(ctx: &Context) {
     );
     ctx.set_fonts(fonts);
 
-    let mut v = egui::Visuals::dark();
+    // Start from the matching base so anything not overridden below still
+    // makes sense — egui derives several incidental colours from it.
+    let mut v = if is_dark() { egui::Visuals::dark() } else { egui::Visuals::light() };
     v.panel_fill = bg();
     v.window_fill = panel();
-    v.extreme_bg_color = Color32::from_rgb(0x0f, 0x0f, 0x0f); // --msg-bg (inputs)
+    v.extreme_bg_color = input_bg(); // TextEdit and other editable surfaces
     v.faint_bg_color = panel2(); // striped rows
     v.override_text_color = Some(ink());
     v.hyperlink_color = ink();
@@ -179,9 +191,11 @@ pub fn apply(ctx: &Context) {
     }
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border());
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, muted());
+    // TextEdit draws its frame from `inactive`/`hovered`; give those a slightly
+    // stronger edge than a panel divider so a field looks like a field.
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, input_border());
     v.widgets.inactive.bg_fill = Color32::TRANSPARENT;
     v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, border2());
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, ink());
     v.widgets.hovered.bg_fill = Color32::TRANSPARENT;
     v.widgets.hovered.weak_bg_fill = Color32::TRANSPARENT;
@@ -192,6 +206,10 @@ pub fn apply(ctx: &Context) {
     v.widgets.active.bg_stroke = Stroke::new(1.0, ink());
     v.widgets.active.fg_stroke = Stroke::new(1.0, ink());
     v.widgets.open.weak_bg_fill = highlight();
+    // Placeholder and disabled text: present, but clearly not content. egui
+    // derives its weak text colour by graying out the normal one, so setting
+    // the noninteractive stroke is what actually moves it.
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, muted());
     ctx.set_visuals(v);
 
     let mut style = (*ctx.style()).clone();
@@ -542,4 +560,18 @@ pub fn load_logo(ctx: &Context) -> egui::TextureHandle {
 pub fn logo(ui: &mut Ui, tex: &egui::TextureHandle, px: f32, color: Color32) {
     let sized = egui::load::SizedTexture::new(tex.id(), egui::vec2(px, px));
     ui.add(egui::Image::from_texture(sized).tint(color));
+}
+
+/// Render a raw unit count in a chosen denomination, keeping enough decimals
+/// that small balances do not collapse to zero.
+pub fn in_unit(v: u64, unit_ix: usize) -> String {
+    let i = unit_ix.min(3);
+    let mul = UNIT_MULS[i];
+    if i == 0 {
+        return units(v);
+    }
+    let whole = v / mul;
+    let frac = (v % mul) as f64 / mul as f64;
+    let s = format!("{:.4}", whole as f64 + frac);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }

@@ -65,9 +65,17 @@ pub struct HistoryView {
     pub timestamp: u64,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
-    /// Value of this transaction's outputs that belong to this wallet: what
-    /// arrived for a receive, what came back as change for a send.
+    /// Value that arrived in this wallet (receives, mining, sweeps). Priced
+    /// from the ledger, so it does not change when those coins are later spent.
     pub amount: u64,
+    /// What actually left the wallet on a send, recorded at the time. `None`
+    /// for sends made before this was tracked — the chain stores no amounts,
+    /// so it cannot be reconstructed afterwards.
+    pub sent: Option<u64>,
+    /// Destination of a recorded send.
+    pub to: Option<String>,
+    /// Change that came back to this wallet on a send.
+    pub change: u64,
     pub n_in: usize,
     pub n_out: usize,
     /// How many of the outputs are ours. For a send, `n_out - ours_out` is
@@ -93,7 +101,7 @@ pub struct SyncStatus {
     pub timestamp: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NodeInfo {
     pub peers: Vec<String>,
     pub data_dir: String,
@@ -265,4 +273,204 @@ pub struct HubView {
     pub jit_open: bool,
     pub jit_capacity: u64,
     pub min_leaves: u64,
+    /// Fund a channel when a peer asks over the bus. Sellers need this for
+    /// buyers to trade with them instantly.
+    pub auto_open_on_request: bool,
+    pub max_auto_capacity: u64,
+    pub auto_capacity_budget: u64,
+}
+
+/// The wallet's Base account, derived from the same recovery phrase at the
+/// standard BIP44 path so it also restores in MetaMask.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EvmAccountView {
+    /// EIP-55 checksummed address.
+    pub address: String,
+    /// Balance in wei; `None` if the RPC could not be reached.
+    pub balance_wei: Option<String>,
+    pub chain_id: u64,
+    pub rpc_url: String,
+    pub contract: String,
+    /// Set when the wallet predates EVM key derivation.
+    pub missing_key: bool,
+}
+
+/// A resting buy order: ETH escrowed in the contract, waiting for MDS.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BidView {
+    pub bid_id: String,
+    pub maker: String,
+    pub wei: String,
+    pub mds_amount: u64,
+    /// Wei per MDS unit — the comparable figure across order sizes.
+    pub price: f64,
+    pub fill_bond: String,
+    pub expiry: u64,
+    pub reserved: bool,
+    pub takeable: bool,
+    pub mine: bool,
+}
+
+/// One independently-takeable unit of an ask.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AskUnitView {
+    /// Index into the ask's live units, which is what `take_ask` expects.
+    pub index: usize,
+    pub mds: u64,
+    pub wei: String,
+}
+
+/// A maker's sell order, announced on midstate.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AskView {
+    pub group_id: String,
+    pub maker_evm: String,
+    pub height: u64,
+    pub timeout_height: u64,
+    /// Units still unspent on-chain.
+    pub live_units: usize,
+    pub total_units: usize,
+    pub mds_value: u64,
+    pub wei: String,
+    pub price: f64,
+    pub mine: bool,
+    /// The still-unsold units, each takeable on its own.
+    pub units: Vec<AskUnitView>,
+    /// Maker's channel identity, needed to ask them for a lane.
+    pub maker_mds_pk: String,
+    /// How MDS could reach you from this maker: "direct", "hub", or "none".
+    ///
+    /// A Spilman channel carries value one way only, so instant settlement
+    /// needs a lane pointing FROM the maker TO you. You cannot open that
+    /// yourself — hence "none" is answered with a request, not an action.
+    pub route: String,
+    /// Inbound capacity on the direct lane, when there is one.
+    pub route_capacity: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OrderBookView {
+    pub bids: Vec<BidView>,
+    pub asks: Vec<AskView>,
+    /// Highest Base block folded into the book.
+    pub base_cursor: u64,
+    pub mds_cursor: u64,
+    pub last_error: Option<String>,
+    /// What the last scan decoded. An empty book with zero events means the
+    /// range held no activity; an empty book with events means they were all
+    /// closed, and undecoded logs would mean a signature mismatch.
+    pub bids_created: usize,
+    pub bids_closed: usize,
+    pub locks: usize,
+    pub claims: usize,
+    pub undecoded_logs: usize,
+    pub announcements: usize,
+}
+
+/// Where the EVM leg points. Editable so the same build can follow a contract
+/// redeploy or a different endpoint without a rebuild.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DexConfigView {
+    pub rpc_url: String,
+    pub chain_id: u64,
+    pub contract: String,
+    pub confirmations: u64,
+    /// How many Base blocks back to scan on a cold start.
+    pub scan_window: u64,
+    /// Scan from this exact block instead of the window. 0 = use the window.
+    pub start_block: u64,
+}
+
+/// One prerequisite for a swap, phrased so it can be acted on.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CheckView {
+    pub label: String,
+    pub ok: bool,
+    pub detail: String,
+    /// What to do about it. Present only when the check fails.
+    pub fix: Option<String>,
+}
+
+/// Deadlines for both legs of a swap, already reconciled against each other.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TimingView {
+    pub eth_refund_secs: u64,
+    pub eth_deadline: u64,
+    pub mds_timeout_height: u64,
+    pub mds_deadline_est: u64,
+    /// Slack between the two legs after allowing for block-time drift.
+    pub margin_secs: u64,
+}
+
+/// Everything the guided flow needs to show before anything is signed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SwapQuoteView {
+    /// "buy" | "sell"
+    pub side: String,
+    /// "submarine" | "onchain"
+    pub rail: String,
+    pub mds_amount: u64,
+    pub wei_amount: String,
+    /// Estimated gas the Base leg needs, on top of any value sent.
+    pub gas_estimate_wei: String,
+    pub checks: Vec<CheckView>,
+    pub ready: bool,
+    /// `None` when the requested timing cannot be made safe.
+    pub timings: Option<TimingView>,
+    pub timing_error: Option<String>,
+    /// Plain-language walkthrough of what will happen, in order. The desktop
+    /// client renders its own copy so the explanation is visible before any
+    /// terms are entered; this is here for other consumers of the API.
+    pub steps: Vec<String>,
+}
+
+/// A sell order this wallet published.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MyOrderView {
+    pub group_id: String,
+    pub mds_amount: u64,
+    pub wei_amount: String,
+    pub timeout_height: u64,
+    pub created_height: u64,
+    pub units: usize,
+    /// Where the publishing transaction has got to. An order is only real once
+    /// its reveal is mined — the covenant outputs and the announcement burns
+    /// are both in that reveal, so before it lands there is nothing on-chain
+    /// for anyone (including this wallet) to find.
+    pub stage: String,
+    pub detail: String,
+    /// True once the announcement has actually been read back off the chain.
+    pub on_chain: bool,
+}
+
+/// A live or finished cross-chain swap.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SwapView {
+    pub id: String,
+    /// "taker" | "maker"
+    pub role: String,
+    /// Plain-language stage.
+    pub phase: String,
+    pub detail: String,
+    pub mds_value: u64,
+    pub wei: String,
+    pub counterparty: String,
+    pub eth_deadline: u64,
+    pub settled: bool,
+    /// Base transaction hash for the current step, when there is one.
+    pub tx: Option<String>,
+}
+
+/// A buy order this wallet has escrowed on Base.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MyBidView {
+    pub bid_id: String,
+    pub tx: String,
+    pub mds_amount: u64,
+    pub wei: String,
+    pub fill_bond: String,
+    pub expiry: u64,
+    /// "confirming" until the contract assigns an id, then "open".
+    pub status: String,
+    pub cancelled: bool,
 }

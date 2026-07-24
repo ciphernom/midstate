@@ -1993,7 +1993,7 @@ async fn wallet_balance(path: &PathBuf, rpc_port: u16, rpc_host: String) -> Resu
     let mut live_count = 0usize;
     let mut live_value = 0u64;
     for wc in wallet.coins() {
-        if let Ok(true) = check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
+        if require_coin_live(&client, rpc_port, &rpc_host, wc.coin_id).await? {
             live_count += 1;
             live_value += wc.value;
         }
@@ -2066,16 +2066,41 @@ async fn wallet_consolidate(
         );
     }
 
-    // Find all live coins at this address
+    // Find all live coins at this address.
+    //
+    // `Err` must never be folded into "spent". Treating an unreachable node as
+    // proof of absence drops a live coin from the selection, and the co-spend
+    // gate then refuses the whole consolidation over a coin that is fine.
     let mut live_coins = Vec::new();
+    let mut dead_coins = Vec::new();
     let mut total_val = 0u64;
     for wc in wallet.coins() {
         if wc.address == target_addr {
-            if let Ok(true) = check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
-                live_coins.push(wc.coin_id);
-                total_val += wc.value;
+            match check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
+                Ok(true) => {
+                    live_coins.push(wc.coin_id);
+                    total_val += wc.value;
+                }
+                Ok(false) => dead_coins.push(wc.coin_id),
+                Err(e) => anyhow::bail!(
+                    "could not check coin {} against the node: {e}. Refusing to consolidate on \
+                     an incomplete view of the chain.",
+                    hex::encode(wc.coin_id)
+                ),
             }
         }
+    }
+
+    // Tell the wallet which of its records the chain has already consumed.
+    // Without this the co-spend gate treats a stale record as a sibling that
+    // must also be spent — which cannot happen — and the address can never be
+    // consolidated again.
+    if !dead_coins.is_empty() {
+        println!(
+            "Note: {} record(s) at this address were already spent on-chain; skipping them.",
+            dead_coins.len()
+        );
+        wallet.mark_spent(dead_coins);
     }
 
     if live_coins.len() < 2 {
@@ -2254,10 +2279,21 @@ async fn wallet_defrag(
 
     println!("Checking on-chain status of wallet coins...");
     let mut live_coins = Vec::new();
+    let mut dead_coins = Vec::new();
     for wc in wallet.coins() {
-        if let Ok(true) = check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
-            live_coins.push(wc.coin_id);
+        match check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
+            Ok(true) => live_coins.push(wc.coin_id),
+            Ok(false) => dead_coins.push(wc.coin_id),
+            Err(e) => anyhow::bail!(
+                "could not check coin {} against the node: {e}. Refusing to defrag on an \
+                 incomplete view of the chain.",
+                hex::encode(wc.coin_id)
+            ),
         }
+    }
+    // Defrag sweeps grouped siblings too, so it meets the same co-spend gate.
+    if !dead_coins.is_empty() {
+        wallet.mark_spent(dead_coins);
     }
 
     // 1. Initial Assessment & Extract Target Addresses
@@ -2297,7 +2333,7 @@ async fn wallet_defrag(
         // Re-evaluate live coins since we imported new ones that MUST be co-spent
         live_coins.clear();
         for wc in wallet.coins() {
-            if let Ok(true) = check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
+            if require_coin_live(&client, rpc_port, &rpc_host, wc.coin_id).await? {
                 live_coins.push(wc.coin_id);
             }
         }
@@ -2440,7 +2476,7 @@ async fn wallet_send(
 
     let mut live_coins = Vec::new();
     for wc in wallet.coins() {
-        if let Ok(true) = check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
+        if require_coin_live(&client, rpc_port, &rpc_host, wc.coin_id).await? {
             live_coins.push(wc.coin_id);
         }
     }
@@ -2866,7 +2902,7 @@ async fn wallet_mix(
     // Find live coins
     let mut live_coins = Vec::new();
     for wc in wallet.coins() {
-        if let Ok(true) = check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
+        if require_coin_live(&client, rpc_port, &rpc_host, wc.coin_id).await? {
             live_coins.push(wc.coin_id);
         }
     }
@@ -3959,7 +3995,7 @@ async fn wallet_issue_license(
     let mut live_coins = Vec::new();
     let client = reqwest::Client::new();
     for wc in wallet.coins() {
-        if let Ok(true) = check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
+        if require_coin_live(&client, rpc_port, &rpc_host, wc.coin_id).await? {
             live_coins.push(wc.coin_id);
         }
     }
@@ -4076,7 +4112,7 @@ async fn wallet_buy_license(
     let mut live_coins = Vec::new();
     let client = reqwest::Client::new();
     for wc in wallet.coins() {
-        if let Ok(true) = check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
+        if require_coin_live(&client, rpc_port, &rpc_host, wc.coin_id).await? {
             live_coins.push(wc.coin_id);
         }
     }
@@ -4721,6 +4757,31 @@ println!("\n✓ MSS Address Generated!");
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Is this coin still unspent, according to the node?
+///
+/// Unlike a bare `check_coin_rpc`, a transport failure here is an error rather
+/// than a `false`. That distinction matters: folding "cannot reach the node"
+/// into "coin is spent" silently drops a live coin from selection, which at
+/// best under-selects and at worst strands an address behind the WOTS
+/// co-spend rule — every coin at a one-time address must be spent together,
+/// so a wrongly-omitted sibling can block that address permanently.
+async fn require_coin_live(
+    client: &reqwest::Client,
+    rpc_port: u16,
+    rpc_host: &str,
+    coin_id: [u8; 32],
+) -> Result<bool> {
+    check_coin_rpc(client, rpc_port, rpc_host, &hex::encode(coin_id))
+        .await
+        .with_context(|| {
+            format!(
+                "could not check coin {} against the node; refusing to act on an incomplete \
+                 view of the chain",
+                hex::encode(coin_id)
+            )
+        })
+}
 
 async fn check_coin_rpc(client: &reqwest::Client, rpc_port: u16, rpc_host: &str, coin_hex: &str) -> Result<bool> {
     let url = format!("http://{}:{}/check", rpc_host, rpc_port);

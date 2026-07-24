@@ -40,6 +40,7 @@ impl FeePolicy {
 
 /// A single, fully-specified defragmentation batch ready to be executed
 /// via the normal `prepare_commit` → `sign_reveal` → `complete_reveal` path.
+#[derive(Debug)]
 pub struct DefragBatchPlan {
     pub input_coin_ids: Vec<[u8; 32]>,
     pub outputs: Vec<OutputData>,

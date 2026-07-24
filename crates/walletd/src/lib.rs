@@ -15,9 +15,15 @@
 //!   (safety margin 20) before every signing session, mirroring the CLI.
 
 pub mod api;
+pub mod base;
 pub mod channels;
+pub mod dex;
+pub mod evm;
+pub mod ledger;
 pub mod node_host;
 pub mod sendplan;
+pub mod swap;
+pub mod swapbook;
 pub mod service;
 
 pub use api::{

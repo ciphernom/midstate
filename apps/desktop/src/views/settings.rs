@@ -10,6 +10,15 @@ pub fn show(app: &mut App, ui: &mut Ui, status: &WalletStatus) {
 
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
+        if let Ok(name) = std::env::var("MIDSTATE_PROFILE") {
+            if !name.is_empty() {
+                ui.horizontal(|ui| {
+                    theme::badge(ui, &format!("profile: {name}"), theme::ink());
+                    theme::hint(ui, "a separate wallet, chain copy and node on this machine");
+                });
+                ui.add_space(6.0);
+            }
+        }
         theme::hint(ui, "WALLET FILE");
         ui.label(theme::mono(&status.wallet_path).size(11.5).color(theme::muted()));
         ui.add_space(8.0);
@@ -150,6 +159,27 @@ pub fn show(app: &mut App, ui: &mut Ui, status: &WalletStatus) {
                     );
                 }
                 None => {}
+            }
+        });
+    });
+
+    theme::heading(ui, "Rebuild history amounts");
+    theme::panel_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        theme::hint(
+            ui,
+            "Transactions publish every input and output value on-chain — consensus checks \
+             conservation — and each output carries the recipient's address. The wallet's own \
+             history file keeps only coin ids, so older transactions can show no amount. This \
+             rereads them from your block store and restores both the amounts and who they \
+             went to. A match is accepted only when the arithmetic agrees with the fee already \
+             recorded, so a wrong guess is never written.",
+        );
+        theme::right_aligned(ui, |ui| {
+            if ui.add_enabled(!app.busy, egui::Button::new("Rebuild from chain")).clicked() {
+                app.busy = true;
+                app.settings_msg.clear();
+                app.go(&ctx, Action::RepairHistory);
             }
         });
     });
