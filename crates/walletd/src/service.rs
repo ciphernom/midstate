@@ -87,6 +87,7 @@ enum Cmd {
     RequestAddress { peer: String, resp: oneshot::Sender<Result<()>> },
     RepairHistory(oneshot::Sender<Result<String>>),
     RequestChannel { peer: String, capacity: u64, resp: oneshot::Sender<Result<()>> },
+    Hubs(oneshot::Sender<Vec<HubAdView>>),
     PlaceAsk {
         mds_amount: u64,
         wei_amount: String,
@@ -371,6 +372,10 @@ impl WalletdHandle {
     /// Ask a peer to open a payment channel toward us.
     pub async fn request_channel(&self, peer: String, capacity: u64) -> Result<()> {
         ask!(self, RequestChannel { peer: peer, capacity: capacity })
+    }
+    /// Hubs heard advertising on the chat bus.
+    pub async fn hubs(&self) -> Result<Vec<HubAdView>> {
+        Ok(ask!(self, Hubs))
     }
     pub async fn evm_account(&self) -> Result<EvmAccountView> {
         Ok(ask!(self, EvmAccount))
@@ -722,6 +727,25 @@ impl Service {
             }
             Cmd::RequestChannel { peer, capacity, resp } => {
                 let _ = resp.send(self.request_channel(&peer, capacity).await);
+            }
+            Cmd::Hubs(resp) => {
+                let mut v: Vec<HubAdView> = self
+                    .book
+                    .hubs
+                    .iter()
+                    .map(|(pk, h)| HubAdView {
+                        pk: pk.clone(),
+                        outbound: h.outbound,
+                        min_capacity: h.min_capacity,
+                        hop_fee: h.hop_fee,
+                        heard: h.heard,
+                        connected: self.book.channels.iter().any(|c| {
+                            c.status == ChanStatus::Active && hex::encode(c.receiver_pk) == *pk
+                        }),
+                    })
+                    .collect();
+                v.sort_by(|a, b| b.outbound.cmp(&a.outbound));
+                let _ = resp.send(v);
             }
             Cmd::EvmAccount(resp) => {
                 let _ = resp.send(self.evm_account().await);
@@ -2421,6 +2445,36 @@ impl Service {
             }
         }
 
+        // Advertise, if we route for others. Roughly every 500 blocks — often
+        // enough to be discoverable, rare enough that the per-message
+        // proof-of-work is not a burden.
+        if self.book.hub.forward && tip.saturating_sub(self.book.last_hub_ad) >= 500 {
+            let outbound: u64 = self
+                .book
+                .channels
+                .iter()
+                .filter(|c| c.role == Role::Sender && c.status == ChanStatus::Active)
+                .map(|c| c.sender_amt)
+                .sum();
+            if outbound > 0 {
+                let me_pk = self.ensure_identity()?;
+                let mut atts = channels::frame_attachments(
+                    rand::random(),
+                    qb::wire::pack_hub(outbound, channels::MIN_CAPACITY, qb::HOP_FEE),
+                    None,
+                );
+                atts.push(midstate::chat::ChatAttachment::Address(me_pk));
+                if self
+                    .node
+                    .send_chat(vec![qb::wire::MARKER, qb::wire::CMD_HUB], None, atts)
+                    .is_ok()
+                {
+                    self.book.last_hub_ad = tip;
+                    dirty = true;
+                }
+            }
+        }
+
         if dirty {
             self.book.save(&self.wallet_path);
         }
@@ -2751,6 +2805,26 @@ impl Service {
                         tracing::warn!("auto channel open failed: {e:#}");
                         let _ = channels::send_frame(&self.node, w::CMD_CHAN_DECLINE, id, decline(4), None);
                     }
+                }
+            }
+            w::CMD_HUB => {
+                let who = f.address.ok_or_else(|| anyhow!("hub advert without a key"))?;
+                if who == me {
+                    return Ok(()); // our own broadcast
+                }
+                let payload = f.payload.ok_or_else(|| anyhow!("hub advert without payload"))?;
+                let (outbound, min_capacity, hop_fee) = qb::wire::unpack_hub(&payload)
+                    .ok_or_else(|| anyhow!("unreadable hub advert"))?;
+                // Recorded as a claim, never as a fact — nothing here is
+                // verifiable until a channel is actually opened.
+                self.book.hubs.insert(
+                    hex::encode(who),
+                    channels::HubAd { outbound, min_capacity, hop_fee, heard: tip },
+                );
+                if self.book.hubs.len() > 200 {
+                    // Keep only what was heard recently.
+                    let cutoff = tip.saturating_sub(20_000);
+                    self.book.hubs.retain(|_, h| h.heard >= cutoff);
                 }
             }
             w::CMD_CHAN_DECLINE => {
@@ -3751,6 +3825,18 @@ impl Service {
             claims: st.claims,
             undecoded_logs: st.undecoded,
             announcements: st.announcements,
+            trades: self
+                .dex
+                .recent_trades(40)
+                .into_iter()
+                .map(|t| TradeView {
+                    block: t.block,
+                    wei: t.wei.to_string(),
+                    mds: t.mds,
+                    price: t.price(),
+                    kind: t.kind.to_string(),
+                })
+                .collect(),
         }
     }
 
@@ -4067,6 +4153,33 @@ impl Service {
         if mds_amount == 0 || wei_total == 0 {
             bail!("both the MDS amount and the asking price must be greater than zero");
         }
+
+        // Every unit must be individually claimable, because every unit is
+        // claimed by its own transaction paying its own fee. Refuse rather
+        // than quietly trim: an order for an amount the maker did not choose
+        // is not the order they asked for, and narrowing a plan to make it fit
+        // is exactly what this module refuses to do everywhere else.
+        //
+        // MIN_SWAP_UNIT is a power of two, so this single remainder test is
+        // equivalent to checking every denomination `decompose_value` will
+        // produce — the low bits it would set are precisely the remainder.
+        if mds_amount < swap::MIN_SWAP_UNIT {
+            bail!(
+                "the smallest order that can be settled is {} units — below that the buyer's \
+                 claim transaction would cost more than the unit is worth",
+                swap::MIN_SWAP_UNIT
+            );
+        }
+        if mds_amount % swap::MIN_SWAP_UNIT != 0 {
+            let down = mds_amount - (mds_amount % swap::MIN_SWAP_UNIT);
+            let up = down + swap::MIN_SWAP_UNIT;
+            bail!(
+                "an order of {mds_amount} splits into units smaller than the {} unit minimum, \
+                 and those units could never be claimed by whoever bought them. Try {down} or \
+                 {up} instead.",
+                swap::MIN_SWAP_UNIT
+            );
+        }
         let lifetime = lifetime_blocks.clamp(240, 100_000);
 
         let evm_addr = self
@@ -4370,6 +4483,23 @@ impl Service {
             .ok_or_else(|| anyhow!("malformed order"))?
             .clone();
 
+        // Never escrow against a unit we could not subsequently claim.
+        //
+        // This duplicates the check `place_ask` makes, and the duplication is
+        // the point: that check constrains only orders *we* publish, while
+        // this one runs against an announcement written by a stranger. Once
+        // the ETH is locked and the maker claims it, the preimage is public
+        // and there is no refund branch left — an unclaimable unit at that
+        // stage is a total loss, and the maker keeps both legs.
+        if !swap::unit_is_tradeable(u.value) {
+            bail!(
+                "that unit is only {} units — below the {} minimum needed to cover the claim \
+                 transaction. Taking it would escrow ETH for MDS that could never be collected.",
+                u.value,
+                swap::MIN_SWAP_UNIT
+            );
+        }
+
         let state = self.node.get_state().await;
         let now = now_secs();
 
@@ -4426,6 +4556,8 @@ impl Service {
             phase: Phase::LockingEth { tx: String::new() },
             created: now,
             updated: now,
+            sweep_retry_at: 0,
+            sweep_attempts: 0,
         });
         self.swaps.save(&self.wallet_path);
 
@@ -4665,6 +4797,18 @@ impl Service {
                 }
                 let Some(script) = found else { continue };
 
+                // A fill we cannot claim is not a fill. Say so rather than
+                // booking a swap the watcher will retry against forever.
+                if !swap::unit_is_tradeable(t.value) {
+                    self.ch_notice(format!(
+                        "Ignored a fill of {} MDS against your buy order — below the {} unit \
+                         minimum, so the claim would cost more than it collects.",
+                        t.value,
+                        swap::MIN_SWAP_UNIT
+                    ));
+                    continue;
+                }
+
                 // Enough time to claim before the seller can reclaim?
                 if t.timeout_height <= height + 3 {
                     self.ch_notice(
@@ -4699,6 +4843,8 @@ impl Service {
                     },
                     created: now,
                     updated: now,
+                    sweep_retry_at: 0,
+                    sweep_attempts: 0,
                 });
                 self.swaps.save(&self.wallet_path);
                 self.ch_notice(format!(
@@ -4816,6 +4962,8 @@ impl Service {
                         phase: Phase::ClaimingEth { swap_id: hex::encode(swap_id), tx: String::new() },
                         created: now,
                         updated: now,
+                        sweep_retry_at: 0,
+                        sweep_attempts: 0,
                     });
                     self.swaps.save(&self.wallet_path);
                     self.ch_notice(format!(
@@ -4876,7 +5024,6 @@ impl Service {
 
         // 4. Taker: collect the MDS now that the preimage is public. Like any
         //    spend this is commit-then-reveal, so it takes two passes.
-        let _ = tip;
         let sweeping: Vec<Swap> = self
             .swaps
             .swaps
@@ -4886,16 +5033,57 @@ impl Service {
             .collect();
         for sw in sweeping {
             let Phase::SweepingMds { preimage, commitment } = sw.phase.clone() else { continue };
+
+            // Some failures are not worth retrying, and retrying them anyway
+            // is how a wallet ends up logging the same line every two seconds
+            // until someone edits the swap file by hand. Settle them instead,
+            // with a reason that will render in the Trade view.
+            if let Some(reason) = sweep_dead_end(&sw, tip) {
+                tracing::error!(
+                    swap = %sw.id,
+                    value = sw.mds_value,
+                    "sweep abandoned: {reason}"
+                );
+                if let Some(s) = self.swaps.find_mut(&sw.id) {
+                    s.phase = Phase::Failed { reason: reason.clone() };
+                    s.updated = now;
+                }
+                self.swaps.touch();
+                self.ch_notice(format!(
+                    "Swap {} cannot be completed: {reason}",
+                    &sw.id[..8.min(sw.id.len())]
+                ));
+                continue;
+            }
+
+            // Transient failure already recorded — wait out the backoff.
+            if !sw.sweep_due(now) {
+                continue;
+            }
+
             if commitment.is_empty() {
                 match self.begin_sweep(&sw).await {
                     Ok(c) => {
                         if let Some(s) = self.swaps.find_mut(&sw.id) {
                             s.phase = Phase::SweepingMds { preimage, commitment: c };
                             s.updated = now;
+                            s.sweep_ok();
                         }
                         self.swaps.touch();
                     }
-                    Err(e) => tracing::warn!("sweep commit deferred: {e:#}"),
+                    Err(e) => {
+                        let attempts = sw.sweep_attempts + 1;
+                        tracing::warn!(
+                            swap = %sw.id,
+                            value = sw.mds_value,
+                            attempts,
+                            "sweep commit deferred: {e:#}"
+                        );
+                        if let Some(s) = self.swaps.find_mut(&sw.id) {
+                            s.defer_sweep(now);
+                        }
+                        self.swaps.touch();
+                    }
                 }
             } else if let Ok(c) = parse_hex32(&commitment) {
                 // Only reveal once the commitment is actually in chain state,
@@ -4914,6 +5102,7 @@ impl Service {
                                     sent_height: tip,
                                 };
                                 s.updated = now;
+                                s.sweep_ok();
                             }
                             self.swaps.touch();
                             self.ch_notice(format!(
@@ -4922,7 +5111,19 @@ impl Service {
                                 sw.mds_value
                             ));
                         }
-                        Err(e) => tracing::warn!("sweep reveal deferred: {e:#}"),
+                        Err(e) => {
+                            let attempts = sw.sweep_attempts + 1;
+                            tracing::warn!(
+                                swap = %sw.id,
+                                value = sw.mds_value,
+                                attempts,
+                                "sweep reveal deferred: {e:#}"
+                            );
+                            if let Some(s) = self.swaps.find_mut(&sw.id) {
+                                s.defer_sweep(now);
+                            }
+                            self.swaps.touch();
+                        }
                     }
                 }
             }
@@ -5008,6 +5209,8 @@ impl Service {
 
     /// Rebuild the sweep transaction exactly.
     ///
+    /// See `sweep_dead_end` for which failures here are permanent.
+    ///
     /// Every value here is derived from the swap record, never randomised: the
     /// commitment made in the first phase covers this precise transaction, so
     /// a reveal that regenerated its salts would hash differently and be
@@ -5064,13 +5267,61 @@ impl Service {
             )?,
         };
 
-        // Fee covers a single-input reveal carrying the covenant bytecode.
-        let fee = 60u64;
-        if sw.mds_value <= fee {
-            bail!("this unit is too small to cover the {fee}-unit sweep fee");
+        // Fee covers a single-input reveal carrying this covenant's bytecode
+        // and however many outputs the remainder decomposes into.
+        //
+        // Both arguments are derived from the swap record — the script is
+        // either stored verbatim or rebuilt from stored parameters, and the
+        // value never changes — so this is reproducible between the commit and
+        // the reveal. That is a hard requirement, not an incidental property:
+        // see `swap::resolve_sweep_fee`.
+        // Exhaustive on purpose. `Predicate` has a single variant today
+        // (every address is pay-to-script-hash), and if that ever changes this
+        // should stop compiling rather than quietly fall back to a zero-length
+        // script and under-estimate the fee.
+        let script_bytes = match &input.predicate {
+            midstate::core::types::Predicate::Script { bytecode } => bytecode.len(),
+        };
+        // Order matters: check the minimum first so an undersized unit reports
+        // the threshold it failed rather than an arithmetic detail about fees.
+        // Clearing the fee is necessary but not sufficient — a unit that nets a
+        // trivial remainder is not a trade worth completing, and letting one
+        // through here would mean advertising a threshold the rest of the code
+        // does not honour.
+        if !swap::unit_is_tradeable(sw.mds_value) {
+            bail!(
+                "unit of {} is below the {}-unit minimum and should never have been swapped",
+                sw.mds_value,
+                swap::MIN_SWAP_UNIT
+            );
         }
+        let (fee, denoms) = swap::resolve_sweep_fee(script_bytes, sw.mds_value).ok_or_else(|| {
+            anyhow!(
+                "unit of {} cannot cover the {}-unit fee for its own claim transaction",
+                sw.mds_value,
+                swap::sweep_fee(script_bytes, 1)
+            )
+        })?;
+        // The fee is implicit — it is whatever the inputs exceed the outputs by
+        // — so it is never written into the transaction. Check it anyway: this
+        // is the one place the commitment's arithmetic can silently drift from
+        // the reveal's, and a mismatch here is only discovered after the commit
+        // has been paid for.
+        debug_assert_eq!(
+            denoms.iter().sum::<u64>() + fee,
+            sw.mds_value,
+            "sweep outputs plus fee must account for the whole unit"
+        );
+        tracing::debug!(
+            swap = %sw.id,
+            value = sw.mds_value,
+            script_bytes,
+            outputs = denoms.len(),
+            fee,
+            "built sweep"
+        );
         let mut outputs = Vec::new();
-        for (i, denom) in midstate::core::decompose_value(sw.mds_value - fee).into_iter().enumerate() {
+        for (i, denom) in denoms.into_iter().enumerate() {
             let mut h = Vec::with_capacity(48);
             h.extend_from_slice(b"mds_swap_out_v1");
             h.extend_from_slice(&preimage);
@@ -5390,6 +5641,43 @@ impl Service {
     fn persist_scan_pos(&self) {
         let _ = std::fs::write(self.scan_pos_path(), self.scan_pos.to_string());
     }
+}
+
+/// Why this sweep can never succeed, if it never can.
+///
+/// The distinction the watcher needs is between "try again shortly" and "this
+/// will fail identically forever". Only the second kind should settle the swap
+/// — a node that happens to be unreachable must not cost anyone their claim.
+///
+/// Returns `None` when the sweep is merely failing, which is the normal case
+/// and stays on the retry path.
+fn sweep_dead_end(sw: &Swap, tip: u64) -> Option<String> {
+    // Below the minimum the claim transaction costs more than it collects.
+    // Nothing about waiting changes that: the unit's value is fixed at the
+    // moment the covenant was funded.
+    if !swap::unit_is_tradeable(sw.mds_value) {
+        return Some(format!(
+            "the unit is {} units, below the {} minimum needed to pay for its own claim \
+             transaction — it cannot be collected",
+            sw.mds_value,
+            swap::MIN_SWAP_UNIT
+        ));
+    }
+    // Past the covenant's timelock the refund branch is open and the coins
+    // belong to the other side. Retrying here is not just futile, it hides the
+    // fact that the swap has been lost.
+    if tip > sw.mds_timeout_height {
+        return Some(format!(
+            "the covenant's claim window closed at height {} (now {}), so the seller can \
+             reclaim the MDS",
+            sw.mds_timeout_height, tip
+        ));
+    }
+    // A sweep needs the preimage; without one there is nothing to build.
+    if sw.preimage.as_deref().unwrap_or("").is_empty() {
+        return Some("no preimage was ever recorded for this swap".to_string());
+    }
+    None
 }
 
 fn parse_hex32(s: &str) -> Result<[u8; 32]> {

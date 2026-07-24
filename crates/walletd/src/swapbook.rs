@@ -111,6 +111,17 @@ pub struct Swap {
     pub phase: Phase,
     pub created: u64,
     pub updated: u64,
+    /// Unix time before which the sweep should not be retried.
+    ///
+    /// A transient failure — node unreachable, commitment not yet visible — is
+    /// worth retrying, but not at the 2-second tick rate, and not forever
+    /// without saying so. `#[serde(default)]` keeps wallets written by earlier
+    /// builds loadable; they simply start with no backoff owed.
+    #[serde(default)]
+    pub sweep_retry_at: u64,
+    /// Consecutive failed sweep attempts, for the backoff schedule.
+    #[serde(default)]
+    pub sweep_attempts: u32,
 }
 
 impl Swap {
@@ -124,6 +135,30 @@ impl Swap {
     /// a swap the maker might still complete.
     pub fn should_refund(&self, now: u64) -> bool {
         matches!(self.phase, Phase::EthLocked { .. }) && now >= self.eth_deadline
+    }
+
+    /// Whether the sweep may be attempted on this tick.
+    pub fn sweep_due(&self, now: u64) -> bool {
+        now >= self.sweep_retry_at
+    }
+
+    /// Record a transient failure and push the next attempt out.
+    ///
+    /// Doubling from 2 seconds, capped at 5 minutes. The cap matters: a sweep
+    /// that keeps failing for a recoverable reason still has to be retried
+    /// often enough to land inside the claim window.
+    pub fn defer_sweep(&mut self, now: u64) {
+        self.sweep_attempts = self.sweep_attempts.saturating_add(1);
+        let backoff = 2u64
+            .saturating_pow(self.sweep_attempts.min(8))
+            .min(300);
+        self.sweep_retry_at = now + backoff;
+    }
+
+    /// Clear the backoff after a successful attempt.
+    pub fn sweep_ok(&mut self) {
+        self.sweep_attempts = 0;
+        self.sweep_retry_at = 0;
     }
 }
 
@@ -199,7 +234,29 @@ mod tests {
             phase,
             created: 0,
             updated: 0,
+            sweep_retry_at: 0,
+            sweep_attempts: 0,
         }
+    }
+
+    #[test]
+    fn sweep_backoff_grows_but_stays_inside_the_claim_window() {
+        let mut s = swap(Phase::SweepingMds { preimage: "p".into(), commitment: String::new() }, 0);
+        assert!(s.sweep_due(0), "a fresh swap is due immediately");
+
+        s.defer_sweep(100);
+        assert!(!s.sweep_due(101), "a deferred sweep must not retry on the next tick");
+
+        // However long it keeps failing, the gap has to stay short enough that
+        // a recovered node still gets many attempts before the lock expires.
+        for _ in 0..50 {
+            s.defer_sweep(1_000);
+        }
+        assert!(s.sweep_retry_at - 1_000 <= 300, "backoff must stay capped");
+
+        s.sweep_ok();
+        assert_eq!(s.sweep_attempts, 0);
+        assert!(s.sweep_due(0));
     }
 
     #[test]

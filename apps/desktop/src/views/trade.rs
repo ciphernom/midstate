@@ -12,7 +12,7 @@ use crate::theme::{self, short_hex, units};
 use eframe::egui::{self, FontId, RichText, TextEdit, Ui};
 use midstate_walletd::api::DexConfigView;
 
-const TABS: [&str; 5] = ["Buy orders", "Sell orders", "Expired", "Swaps", "Start a swap"];
+const TABS: [&str; 6] = ["Buy orders", "Sell orders", "Expired", "Trades", "Swaps", "Start a swap"];
 
 /// Base's public explorer. Everything the wallet claims about the ETH leg is
 /// independently checkable there, so it should always be one click away.
@@ -93,24 +93,24 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     account_strip(app, ui, &ctx);
     ui.add_space(8.0);
 
-    let mut ix = app.dex_tab.min(4);
+    let mut ix = app.dex_tab.min(5);
     if theme::segmented(ui, &TABS, &mut ix) {
         app.dex_tab = ix;
     }
     ui.add_space(8.0);
 
-    if app.dex_tab == 4 {
+    if app.dex_tab == 5 {
         wizard(app, ui, &ctx);
         return;
     }
-    if app.dex_tab == 3 {
+    if app.dex_tab == 4 {
         swaps_panel(app, ui);
         return;
     }
 
     // Swaps run against deadlines, so surface them wherever you are on this tab.
     let live_swaps = app.swaps.iter().filter(|s| !s.settled).count();
-    if live_swaps > 0 && app.dex_tab != 3 {
+    if live_swaps > 0 && app.dex_tab != 4 {
         theme::panel_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -122,7 +122,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                     .size(12.0),
                 );
                 if ui.button(RichText::new("view").size(11.0)).clicked() {
-                    app.dex_tab = 3;
+                    app.dex_tab = 4;
                 }
             });
         });
@@ -156,6 +156,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                     asks(app, ui, &ctx, &b, tip, false)
                 }
                 2 => asks(app, ui, &ctx, &b, tip, true),
+                3 => trades_panel(ui, &b),
                 _ => {}
             }
             ui.add_space(4.0);
@@ -1460,4 +1461,56 @@ fn place_bid_panel(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             }
         });
     ui.add_space(6.0);
+}
+
+// ── Completed trades ────────────────────────────────────────────────────
+
+/// What the market has actually done, as opposed to what it is offering.
+fn trades_panel(ui: &mut Ui, b: &midstate_walletd::api::OrderBookView) {
+    theme::hint(
+        ui,
+        "Trades that settled, rebuilt from the contract's own events — every one is a real \
+         payout, not an offer. Reconstructed from the scanned range, so widening the window \
+         under Connection reveals more history.",
+    );
+    ui.add_space(4.0);
+
+    theme::panel_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        if b.trades.is_empty() {
+            theme::hint(ui, "No completed trades in the scanned range.");
+            return;
+        }
+        egui::Grid::new("trades").num_columns(5).spacing([20.0, 7.0]).striped(true).show(ui, |ui| {
+            for h in ["Block", "Type", "MDS", "ETH", "Price"] {
+                ui.label(
+                    RichText::new(h.to_uppercase()).font(FontId::monospace(9.5)).color(theme::muted()),
+                );
+            }
+            ui.end_row();
+            for t in &b.trades {
+                ui.label(theme::mono(units(t.block)).size(11.0).color(theme::muted()));
+                theme::badge(
+                    ui,
+                    if t.kind == "buy" { "bid filled" } else { "ask taken" },
+                    theme::muted(),
+                );
+                ui.label(match t.mds {
+                    Some(m) => theme::mono(units(m)).size(11.5),
+                    // The settlement event names only an id; the size is known
+                    // only if the matching announcement was in range.
+                    None => theme::mono("—").size(11.5).color(theme::faint()),
+                });
+                ui.label(
+                    theme::mono(if t.wei == "0" { "—".to_string() } else { eth(&t.wei) })
+                        .size(11.5),
+                );
+                ui.label(match t.price {
+                    Some(p) => theme::mono(price(p)).size(11.5).color(theme::ink()),
+                    None => theme::mono("—").size(11.0).color(theme::faint()),
+                });
+                ui.end_row();
+            }
+        });
+    });
 }

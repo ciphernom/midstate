@@ -115,6 +115,33 @@ impl ScanStats {
     }
 }
 
+/// A trade that actually completed, reconstructed from contract events.
+///
+/// Neither settlement event carries the amounts — `Claimed` and `BidClaimed`
+/// name only an id and the revealed preimage. The value lives in the earlier
+/// `Locked`/`BidCreated`, so the two halves have to be correlated. That is why
+/// the book remembers escrows it has seen even when they are not ours.
+#[derive(Clone, Debug)]
+pub struct Trade {
+    pub block: u64,
+    /// Wei paid.
+    pub wei: u128,
+    /// MDS moved, where it can be resolved. Bids carry it on-chain; for the
+    /// lock/claim direction it comes from the seller's own announcement.
+    pub mds: Option<u64>,
+    /// "sell" — someone took a published ask; "buy" — someone filled a bid.
+    pub kind: &'static str,
+}
+
+impl Trade {
+    pub fn price(&self) -> Option<f64> {
+        match self.mds {
+            Some(m) if m > 0 => Some(self.wei as f64 / m as f64),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct OrderBook {
     pub bids: HashMap<[u8; 32], Bid>,
@@ -125,6 +152,13 @@ pub struct OrderBook {
     /// Highest midstate height scanned for announcements.
     pub mds_cursor: u64,
     pub stats: ScanStats,
+    /// Completed trades, newest last. Capped — this is a market feed, not an
+    /// archive, and the chain remains the record of truth.
+    pub trades: Vec<Trade>,
+    /// Escrows seen but not yet settled: id → (wei, hashlock).
+    pending_eth: std::collections::HashMap<[u8; 32], (u128, [u8; 32])>,
+    /// Escrowed bids: id → (wei, mds).
+    pending_bids: std::collections::HashMap<[u8; 32], (u128, u64)>,
     frags: FragmentPool,
 }
 
@@ -150,6 +184,7 @@ impl OrderBook {
                     bid_id, maker, hashlock, amount, fill_bond, mds_amount, maker_mds_addr, expiry,
                 } => {
                     self.stats.bids_created += 1;
+                    self.pending_bids.insert(bid_id, (amount, mds_amount));
                     self.bids.insert(
                         bid_id,
                         Bid {
@@ -168,13 +203,42 @@ impl OrderBook {
                 }
                 // Settled or withdrawn: the escrow is gone either way, so the
                 // order leaves the book.
-                Event::BidClaimed { bid_id, .. } | Event::BidCancelled { bid_id } => {
+                Event::BidClaimed { bid_id, .. } => {
                     self.stats.bids_closed += 1;
+                    if let Some((wei, mds)) = self.pending_bids.remove(&bid_id) {
+                        self.push_trade(Trade { block, wei, mds: Some(mds), kind: "buy" });
+                    }
                     self.bids.remove(&bid_id);
                 }
-                Event::Locked { .. } => self.stats.locks += 1,
-                Event::Claimed { .. } => self.stats.claims += 1,
-                Event::Refunded { .. } => self.stats.refunds += 1,
+                // Cancelled is not a trade — nothing changed hands.
+                Event::BidCancelled { bid_id } => {
+                    self.stats.bids_closed += 1;
+                    self.pending_bids.remove(&bid_id);
+                    self.bids.remove(&bid_id);
+                }
+                Event::Locked { swap_id, amount, hashlock, .. } => {
+                    self.stats.locks += 1;
+                    self.pending_eth.insert(swap_id, (amount, hashlock));
+                }
+                Event::Claimed { swap_id, hashlock, .. } => {
+                    self.stats.claims += 1;
+                    // A claim is a completed trade. Pair it with its escrow to
+                    // recover the amount the settlement event omits.
+                    if let Some((wei, h)) = self.pending_eth.remove(&swap_id) {
+                        let mds = self.mds_for_hash(&h);
+                        self.push_trade(Trade { block, wei, mds, kind: "sell" });
+                    } else {
+                        // Escrowed before our scan window opened; the hashlock
+                        // is still enough to price it if the ask is known.
+                        if let Some(mds) = self.mds_for_hash(&hashlock) {
+                            self.push_trade(Trade { block, wei: 0, mds: Some(mds), kind: "sell" });
+                        }
+                    }
+                }
+                Event::Refunded { swap_id } => {
+                    self.stats.refunds += 1;
+                    self.pending_eth.remove(&swap_id);
+                }
             }
         }
         self.base_cursor = to;
@@ -236,6 +300,34 @@ impl OrderBook {
         }
         self.asks.retain(|a| !a.live_units.is_empty());
         Ok(())
+    }
+
+    fn push_trade(&mut self, t: Trade) {
+        self.trades.push(t);
+        // Keep the feed bounded; a long scan of an active market would
+        // otherwise grow without limit.
+        if self.trades.len() > 500 {
+            let drop = self.trades.len() - 500;
+            self.trades.drain(..drop);
+        }
+    }
+
+    /// How much MDS a hashlock was offered for, according to announcements.
+    fn mds_for_hash(&self, h: &[u8; 32]) -> Option<u64> {
+        self.asks
+            .iter()
+            .find_map(|a| a.announcement.units.iter().find(|u| u.secret_hash == *h).map(|u| u.value))
+            .or_else(|| {
+                self.taker_locks
+                    .iter()
+                    .find(|(_, t)| t.secret_hash == *h)
+                    .map(|(_, t)| t.value)
+            })
+    }
+
+    /// Most recent trades first.
+    pub fn recent_trades(&self, n: usize) -> Vec<&Trade> {
+        self.trades.iter().rev().take(n).collect()
     }
 
     /// Best price first: bids paying the most per unit, asks charging least.

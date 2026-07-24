@@ -440,6 +440,96 @@ td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); 
     .flow-arrow { transform: rotate(90deg); margin-left: 20px; }
     .tab-btn { border-right: none; border-bottom: 1px solid var(--border); width: 100%; text-align: left;}
 }
+
+/* ── Roadmap Ledger ────────────────────────────────────────────────────── */
+/* Monochrome by design: status is carried by rule weight and a monospace
+   token, never by colour. Shipped rows are deliberately the heaviest thing
+   on the page — most of this list is already built, and the weight should
+   say so. */
+
+.rm-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 24px;
+    margin: 24px 0 36px;
+    padding: 14px 20px;
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+.rm-legend > span { display: flex; align-items: center; gap: 9px; }
+.rm-key { width: 10px; height: 10px; flex: none; border: 1px solid var(--text-faint); }
+.rm-key.done { background: var(--text-max); border-color: var(--text-max); }
+.rm-key.wip  { background: var(--text-muted); border-color: var(--text-muted); }
+.rm-key.next { background: transparent; border-style: dashed; }
+
+.rm-group { margin: 0 0 28px; border: 1px solid var(--border); }
+.rm-group > h4 {
+    margin: 0;
+    padding: 14px 20px;
+    background: var(--bg-alt);
+    border-bottom: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    letter-spacing: 1px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 16px;
+}
+.rm-tally {
+    color: var(--text-faint);
+    font-weight: 400;
+    letter-spacing: 0;
+    text-transform: none;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.rm-item {
+    display: flex;
+    gap: 18px;
+    align-items: baseline;
+    padding: 15px 20px;
+    border-bottom: 1px solid var(--border);
+    border-left: 3px solid transparent;
+}
+.rm-item:last-child { border-bottom: none; }
+.rm-item.done { border-left-color: var(--text-max); }
+.rm-item.wip  { border-left-color: var(--text-muted); background: var(--highlight); }
+.rm-item.next { border-left: 3px dashed var(--border); }
+
+.rm-status {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    min-width: 88px;
+    flex: none;
+    letter-spacing: 0.5px;
+}
+.rm-item.done .rm-status { color: var(--text-max); }
+.rm-item.wip  .rm-status { color: var(--text-main); }
+.rm-item.next .rm-status { color: var(--text-faint); }
+
+.rm-body { min-width: 0; }
+.rm-title {
+    display: block;
+    color: var(--text-max);
+    font-weight: 500;
+    font-size: 15px;
+    margin-bottom: 4px;
+}
+.rm-item.next .rm-title { color: var(--text-bright); font-weight: 400; }
+.rm-note { color: var(--text-muted); font-size: 13.5px; line-height: 1.55; }
+.rm-note code { font-size: 0.82em; }
+
+@media (max-width: 640px) {
+    .rm-item { flex-direction: column; gap: 7px; }
+    .rm-status { min-width: 0; }
+    .rm-group > h4 { flex-direction: column; gap: 4px; }
+}
+
 </style>
 </head>
 <body>
@@ -462,6 +552,7 @@ td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); 
 <div class="workspace">
     <div class="sidebar">
         <div class="menu-item active" data-target="overview">Overview <span>→</span></div>
+        <div class="menu-item" data-target="roadmap">Roadmap <span>→</span></div>
         <div class="menu-item" data-target="genesis">Genesis & Fair Launch <span>→</span></div>
         <div class="menu-item" data-target="crypto">Cryptography <span>→</span></div>
         <div class="menu-item" data-target="consensus">Mining & Consensus <span>→</span></div>
@@ -1798,6 +1889,418 @@ Script:
                     </tr>
                 </tbody>
             </table>
+        </div>
+
+
+        <!-- ── ROADMAP ── -->
+        <div class="content-pane" id="roadmap">
+            <h2>Roadmap</h2>
+
+            <p>Before a coin is real, three things have to be true: the chain has to run, people have to mine it, and it has to trade. Midstate does all three. The chain is live, people mine it — including on a Raspberry Pi 5 — and it is listed on SafeTrade, so it trades against real money.</p>
+
+            <p>What follows is the whole build, in one ledger, with nothing hidden. Most of it is already shipped. The parts that are not are stated plainly, because that is where the remaining work is.</p>
+
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Shipped</div>
+                    <div class="stat-value">28</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">In progress</div>
+                    <div class="stat-value">2</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Planned</div>
+                    <div class="stat-value">9</div>
+                </div>
+            </div>
+
+            <div class="rm-legend">
+                <span><i class="rm-key done"></i> SHIPPED — running today</span>
+                <span><i class="rm-key wip"></i> BUILDING — actively in hand</span>
+                <span><i class="rm-key next"></i> PLANNED — not started</span>
+            </div>
+
+            <div class="callout stark">
+                <h4>The short version</h4>
+                <p>The hard parts are done. Post-quantum signatures, the covenant VM, mining on commodity hardware, payment channels, routing, and trustless cross-chain swaps all work today. What is left is turning a set of working parts into a payment network, and getting more than one person building on it.</p>
+            </div>
+
+            <h3>Chain &amp; consensus</h3>
+            <div class="rm-group">
+                <h4>Layer 1 <span class="rm-tally">9 shipped</span></h4>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Sequential BLAKE3 proof-of-work</span>
+                        <div class="rm-note">One million sequential compression cycles per header. Simple, verifiable against a single scalar implementation, and hostile to parallel ASICs.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Post-quantum signatures</span>
+                        <div class="rm-note">WOTS one-time keys with Merkle signature trees. No elliptic curves anywhere in the protocol.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Two-phase transactions</span>
+                        <div class="rm-note">Commit then reveal, so a one-time key is never exposed while a transaction is still spendable by anyone else.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Uniform power-of-two denominations</span>
+                        <div class="rm-note">Every output is a power of two, which removes the amount as a linking heuristic for chain surveillance.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Stateful covenant VM</span>
+                        <div class="rm-note">A script reads the state committed on the coin it spends and the coin it creates, and enforces the relation between them. That is enough for a real on-chain state machine — a vote tally, a staking pool, a treasury — inside a deliberately non-Turing-complete VM.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Compact block filters &amp; light-client sync</span>
+                        <div class="rm-note">A client scans for its own coins and verifies what it finds, without ever trusting a server to report its balance.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Adaptive finality</span>
+                        <div class="rm-note">Confirmation depth is not a fixed number. The node observes how the chain is actually behaving and raises the depth it treats as safe when it sees adversarial conditions, lowering it again when the chain is honest.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Proof-of-work governor on public RPC</span>
+                        <div class="rm-note">A public node cannot be drained by whoever shows up. Each caller gets a free allowance that covers normal browsing; past it the price is paid in proof-of-work, escalating per IP and capped so it never becomes a lockout.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">CoinJoin mixing</span>
+                        <div class="rm-note">Collaborative transactions with a separate fee donor, sized against the same fee rule the mempool enforces.</div>
+                    </div>
+                </div>
+            </div>
+
+            <h3>Mining</h3>
+            <div class="rm-group">
+                <h4>Hashing &amp; pools <span class="rm-tally">3 shipped · 1 planned</span></h4>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">8-way NEON SIMD miner</span>
+                        <div class="rm-note">A Raspberry Pi 5 does roughly 100 nonces per second. Against a GPU farm that is a gap of about 1 to 5,000 — compared with 1 to 1.2 billion for a hobbyist on Bitcoin. The hardware advantage is trapped in the commodity silicon band on purpose.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">GPU miner with CPU re-verification</span>
+                        <div class="rm-note">The graphics card is treated as an untrusted oracle; every chain it returns is re-verified on the CPU before anything is broadcast.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Provably fair pool, 0% fee</span>
+                        <div class="rm-note">A Merkle tree of every miner's score is committed into each block's coinbase. A miner can pull a proof that their exact score was included <em>before</em> they start hashing, and disconnect if the operator lies. Non-custodial — payouts go straight to the coinbase, so the pool never holds your coins.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Mining inside the desktop wallet</span>
+                        <div class="rm-note">One download that syncs, holds your coins, and mines them. The miners exist; wrapping them in the GUI does not.</div>
+                    </div>
+                </div>
+            </div>
+
+            <h3>Q-Bolt — Layer 2</h3>
+            <p>Q-Bolt is Spilman channels. Two parties fund a 2-of-2 multisig UTXO; the sender signs balance states and hands them over, and the receiver signs nothing until the channel closes. Only two transactions ever touch the chain. Because the money moves one way, the receiver's balance can only ratchet up — so there is no revocation, no penalty transactions, and no "punish the cheater" machinery. The attack those mechanisms defend against is structurally impossible here.</p>
+
+            <div class="rm-group">
+                <h4>Channels &amp; routing <span class="rm-tally">6 shipped · 1 building · 3 planned</span></h4>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Funded channels</span>
+                        <div class="rm-note">Open, update off-chain without limit, close cooperatively in a single transaction. Time-locked refund as the unilateral exit.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">HTLCs &amp; multi-hop routing</span>
+                        <div class="rm-note">Payments cross several channels under a single preimage. A hub cannot take one hop without releasing the next.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Covenant HTLCs — zero-signature claim</span>
+                        <div class="rm-note">The script forces the coin to the right place, so the redeemer only reveals the preimage. On a chain where every signature is a 576-byte one-time key, a claim path that spends no keys is worth having.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Just-in-time channel opening</span>
+                        <div class="rm-note">A hub can pay a destination it has no channel to yet by funding one on demand.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Invoices</span>
+                        <div class="rm-note">Minted and signed over the chat bus, then paid automatically.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Hub policy &amp; capacity budgets</span>
+                        <div class="rm-note">Accept incoming channels, forward for a flat 50-unit fee, open on request, and cap both per-channel and total committed capacity so a stream of individually reasonable requests cannot drain a wallet.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item wip">
+                    <div class="rm-status">[ BUILDING ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Persistent, routable channels</span>
+                        <div class="rm-note">This is the one that unblocks everything else. Today's channels are one-directional and disposable, so the channel you need often is not there and payments fall back on-chain. Whether the answer ends up bidirectional or something else is an implementation detail — the target is fixed, the shape is not.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Delegated close</span>
+                        <div class="rm-note">Not a watchtower — there is no fraud to watch for. Because the sender never holds the receiver's signature, no old state can be broadcast, so revocation and penalty machinery are unnecessary. What remains is a deadline: a receiver has to close before the sender's refund unlocks. A delegate holding a pre-signed close covers that while you are offline, and because the receiver's balance only ratchets up, a delegate running a state or two behind closes you slightly short rather than putting anything at risk. The gossip layer and peer reputation to find delegates already exist.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Splicing &amp; refill</span>
+                        <div class="rm-note">Top up a drained channel instead of closing and reopening it on-chain.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Liquidity-aware pathfinding</span>
+                        <div class="rm-note">Route across many hubs by picking paths that can actually carry the payment.</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="callout">
+                <h4>The measure of success</h4>
+                <p>A payment confirms instantly, costs almost nothing, and the network can carry a lot of them at once. Everything in this section serves that and nothing else. It needs no new cryptographic assumption and no script feature the chain does not already have — the primitives are in the VM. The work is making them into a payment network.</p>
+            </div>
+
+            <h3>Cross-chain DEX</h3>
+            <p>Selling MDS for ETH on Base is a hash-time-locked swap. You lock MDS in a covenant under <code>H = BLAKE3(secret)</code> with an absolute refund height; the buyer verifies it and locks ETH under the same <code>H</code> with a shorter refund delay; you claim the ETH by revealing the secret on Base; the buyer reads it and claims your MDS. Either both legs complete or both refund, with no intermediary.</p>
+
+            <div class="callout warn">
+                <h4>Doesn't publishing the secret let anyone steal the coins?</h4>
+                <p>No, and this is the whole trick. The secret is not a key to the money — it is one of two conditions on each lock. The other is a fixed recipient, baked in when the lock was made: the MDS lock pays the buyer, the ETH lock pays you, no matter who reveals the secret. A bot that races to claim first only pays gas to send you your own ETH. Revealing the secret is not a leak; it is how the swap settles.</p>
+            </div>
+
+            <div class="rm-group">
+                <h4>Trading <span class="rm-tally">4 shipped · 1 building</span></h4>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Atomic swaps against Base, both directions</span>
+                        <div class="rm-note">Live and working on-chain today, buying and selling.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">On-chain limit orders with partial fills</span>
+                        <div class="rm-note">An order is split into power-of-two units, each with its own secret and its own price share, so a buyer can take part of one without the maker reposting the remainder. The coins funding the order and the announcement describing it commit in the same transaction, so nobody can advertise liquidity that was never funded.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Submarine swap rail</span>
+                        <div class="rm-note">The MDS leg settles in a channel instead of on-chain while the ETH leg settles on Base, under the same preimage. Minutes of block confirmations collapse into one instant channel update. Now the default rail in the desktop wallet, with on-chain as the fallback.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Trade tab in the desktop wallet</span>
+                        <div class="rm-note">The order book, unit-level fills, live swap state and the rail selector are a first-class tab, not a hidden feature.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item wip">
+                    <div class="rm-status">[ BUILDING ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Fast path available every time</span>
+                        <div class="rm-note">The submarine rail only works when a channel already exists in the right direction with enough balance. Making that always true is the same job as persistent, routable channels above — the DEX is not blocked on inventing Layer 2, it is blocked on finishing it.</div>
+                    </div>
+                </div>
+            </div>
+
+            <h3>Wallets &amp; clients</h3>
+            <div class="rm-group">
+                <h4>How people hold MDS <span class="rm-tally">5 shipped</span></h4>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Desktop GUI wallet</span>
+                        <div class="rm-note">A full-node wallet with send, receive, coins, history, channels, chat, trade, node status and guided onboarding. No command line and no browser tab.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Browser wallet — live now</span>
+                        <div class="rm-note">Genuinely a light node, not a hosted account: it reaches full nodes over WebRTC direct with no server, no domain and no certificate authority, scans with compact block filters, verifies what it finds, and can solo-mine in a WASM worker per core. It installs as a PWA and works offline. Its one real limitation is that it tracks the chain rather than holding it — if the chain reorganises under it, it can fall out of step and need a rescan. Use it when you want a wallet in thirty seconds; use a full node when it matters.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Command-line wallet &amp; full node</span>
+                        <div class="rm-note">For people who live in a terminal.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Block explorer</span>
+                        <div class="rm-note">Batches, reveals, and analytics, including channel opens and cooperative closes as they settle.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Peer-to-peer chat network</span>
+                        <div class="rm-note">Carries channel negotiation, invoices and hub discovery, and charges proof-of-work per message — which makes it both the natural place to look and a poor place to spam.</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="callout stark">
+                <h4>Which one should you run?</h4>
+                <p><strong>The desktop wallet, if you can.</strong> It is a full node, so it verifies the chain itself instead of asking anyone. Nothing can tell it a balance it has not checked, and it cannot drift out of step with the chain the way a light client can — it <em>is</em> the chain.</p>
+                <p>The part that is easy to miss: running one is not only for your benefit. Every full node is somewhere else the network can be reached, another copy of the history, and another peer a light client can sync against. A network of light clients pointed at a handful of nodes is a network with a handful of points of failure. The web wallet is the fastest way in and it works — but the full node is the one that makes the network harder to switch off.</p>
+            </div>
+
+            <h3>Building on Midstate</h3>
+
+            <div class="callout stark">
+                <h4>The actual problem</h4>
+                <p>People use Midstate. They mine it, swap it, trade it. Almost nobody builds on it. That is what holds the project back — not the protocol, which is further along than the community realises. What is missing is other people making things: contracts, tokens, tools, apps. Right now that is mostly one socially awkward person, and one person is not a development community.</p>
+            </div>
+
+            <div class="rm-group">
+                <h4>Developer surface <span class="rm-tally">1 shipped · 5 planned</span></h4>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Midscript IDE</span>
+                        <div class="rm-note">A real language rather than hand-written stack opcodes: <code>let</code> and <code>var</code>, <code>if</code>, <code>repeat</code>, <code>switch</code>, user-defined macros, named <code>struct</code> and <code>state</code> layouts so you address committed state by name instead of slicing bytes. Ships a standard library of the primitives covenants actually need, a debugger that steps the compiled bytecode against a live stack, an emulator, and wallet connect — blank editor to deployed script without leaving the page.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Tokens on-chain</span>
+                        <div class="rm-note">Not because the world needs another memecoin, but because it proves the chain carries assets other than MDS.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">An AMM for those tokens</span>
+                        <div class="rm-note">Uniswap-style, trading against MDS. Workable on the main chain today; the point of doing it on Layer 2 is that it becomes instant.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">JavaScript SDK brought up to the protocol</span>
+                        <div class="rm-note">The published SDK is behind: it does not handle reorgs, it misses consolidate outputs, and its Layer 2 support is a stub. Exactly the kind of contribution the project needs.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">On-chain competitions</span>
+                        <div class="rm-note">Prize money should not have to sit in my wallet on trust. Where a bounty has an objective test, a covenant can escrow the prize and release it automatically to whoever first meets the condition — no judge, no trust. Where "best" is a human call, the same escrow releases on a governance vote. Either way the rules are visible on-chain, which is itself the kind of contract the competition is asking people to write.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">A foundation, possibly a DAO in Midstate script</span>
+                        <div class="rm-note">The IDE already ships a staking-and-governance contract that compiles to bytecode today, with named state fields, stake-weighted voting, thresholds and enforced treasury payments. Running it for real would be the project governing itself on its own chain — the strongest demonstration there is that Midstate carries real applications.</div>
+                    </div>
+                </div>
+            </div>
+
+            <h3>Near term</h3>
+            <p>Finish Layer 2. Make the submarine rail available every time rather than only when liquidity happened to be pre-positioned. Add tokens and an AMM on top of it. Keep pushing on getting people building instead of only using.</p>
+
+            <div class="callout">
+                <h4>If you want to help</h4>
+                <p>The chain works, it trades, and it is cheap to experiment on. Start at the <a href="./ide.html" target="_blank">Midscript IDE</a> — templates, an emulator and a debugger are all in the page. If you would rather work on the client side, the SDK and the Layer 2 tooling are wide open. If Midstate grows, it grows because more people build on it than just me. That is not a complaint; it is the one thing I cannot do alone.</p>
+            </div>
         </div>
 
     </div>

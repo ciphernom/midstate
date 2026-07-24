@@ -72,7 +72,8 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         ChanTab::List => {
             channel_list(app, ui, &ctx, tip);
             ui.add_space(10.0);
-            open_panel(app, ui, &ctx, syncing);
+            hub_directory(app, ui, &ctx, tip);
+    open_panel(app, ui, &ctx, syncing);
         }
         ChanTab::Pay => invoice_panel(app, ui, &ctx, syncing),
         ChanTab::Hub => hub_panel(app, ui, &ctx),
@@ -471,11 +472,14 @@ fn invoice_panel(app: &mut App, ui: &mut Ui, ctx: &egui::Context, syncing: bool)
 // ── Hub ─────────────────────────────────────────────────────────────────
 
 fn hub_panel(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
-    let Some(cfg) = app.hub.clone() else {
+    // `saved` is what the daemon is actually enforcing; `next` is the edit
+    // buffer. Keeping them in separate fields is what allows the Save button to
+    // persist across frames — see `App::hub_draft`.
+    let Some(saved) = app.hub.clone() else {
         theme::hint(ui, "Loading hub settings…");
         return;
     };
-    let mut next = cfg.clone();
+    let mut next = app.hub_draft.clone().unwrap_or_else(|| saved.clone());
 
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -551,13 +555,31 @@ fn hub_panel(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             theme::hint(ui, "signatures in reserve");
         });
 
-        if changed(&cfg, &next) {
+        // Nothing on this panel takes effect until it is sent to the daemon,
+        // so an unsaved edit has to look unsaved. A checkbox that stays ticked
+        // while the daemon still declines the request is worse than no
+        // checkbox at all.
+        let dirty = changed(&saved, &next);
+        if dirty {
             ui.add_space(4.0);
-            theme::right_aligned(ui, |ui| {
-                if ui.add_enabled(!app.busy, egui::Button::new("Save hub settings")).clicked() {
-                    app.busy = true;
-                    app.go(ctx, Action::SetHub { cfg: next.clone() });
-                }
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("unsaved — these settings are not in force yet")
+                        .size(11.0)
+                        .color(theme::ink()),
+                );
+                theme::right_aligned(ui, |ui| {
+                    if ui.add_enabled(!app.busy, egui::Button::new("Save hub settings")).clicked() {
+                        app.busy = true;
+                        app.go(ctx, Action::SetHub { cfg: next.clone() });
+                    }
+                    if ui
+                        .add_enabled(!app.busy, egui::Button::new(RichText::new("Discard").size(11.0)))
+                        .clicked()
+                    {
+                        next = saved.clone();
+                    }
+                });
             });
         }
     });
@@ -620,7 +642,10 @@ fn hub_panel(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
         }
     });
 
-    app.hub = Some(next);
+    // Park the edits in the draft, never in `app.hub`. Once they match the
+    // saved copy again — because they were saved, or discarded — drop the
+    // draft so the periodic reload can resume.
+    app.hub_draft = if changed(&saved, &next) { Some(next) } else { None };
 }
 
 fn changed(a: &HubView, b: &HubView) -> bool {
@@ -632,4 +657,76 @@ fn changed(a: &HubView, b: &HubView) -> bool {
         || a.auto_open_on_request != b.auto_open_on_request
         || a.max_auto_capacity != b.max_auto_capacity
         || a.auto_capacity_budget != b.auto_capacity_budget
+}
+
+// ── Hub directory ───────────────────────────────────────────────────────
+
+/// Hubs that have advertised themselves over the chat bus.
+///
+/// Discovery has to live somewhere, and the bus already carries channel
+/// negotiation and charges proof-of-work per message — which makes it both the
+/// natural place to look and a poor place to spam.
+fn hub_directory(app: &mut App, ui: &mut Ui, ctx: &egui::Context, tip: u64) {
+    if app.hubs.is_empty() {
+        return;
+    }
+    egui::CollapsingHeader::new(format!("Hubs on the network ({})", app.hubs.len()))
+        .id_salt("hub_dir")
+        .show(ui, |ui| {
+            theme::panel_frame().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                theme::hint(
+                    ui,
+                    "Routing hubs that have announced themselves. Everything below is their own \
+                     claim — nothing here is verified until you actually open a channel. A hub \
+                     lets you pay people you have no direct channel with.",
+                );
+                ui.add_space(4.0);
+                let mut ask: Option<String> = None;
+                for h in &app.hubs {
+                    ui.horizontal_wrapped(|ui| {
+                        if h.connected {
+                            theme::badge(ui, "connected", theme::ink());
+                        }
+                        ui.label(theme::mono(short_hex(&h.pk, 10)).size(11.0).color(theme::muted()));
+                        ui.label(
+                            RichText::new(format!(
+                                "claims {} routable · {} fee per hop",
+                                units(h.outbound),
+                                units(h.hop_fee)
+                            ))
+                            .size(11.0)
+                            .color(theme::muted()),
+                        );
+                        let stale = tip > 0 && tip.saturating_sub(h.heard) > 2_000;
+                        if stale {
+                            ui.label(
+                                RichText::new("quiet lately").size(10.0).color(theme::faint()),
+                            )
+                            .on_hover_text("Not heard from recently — it may be offline.");
+                        }
+                        if !h.connected
+                            && ui
+                                .add_enabled(!app.busy, egui::Button::new(RichText::new("ask for a channel").size(10.5)))
+                                .on_hover_text(
+                                    "Asks this hub to open a lane to you, so it can route \
+                                     payments in your direction.",
+                                )
+                                .clicked()
+                        {
+                            ask = Some(h.pk.clone());
+                        }
+                        if ui.button(RichText::new("copy key").size(10.0)).clicked() {
+                            ui.ctx().copy_text(h.pk.clone());
+                        }
+                    });
+                }
+                if let Some(pk) = ask {
+                    app.busy = true;
+                    app.error.clear();
+                    app.go(ctx, Action::RequestChannel { peer: pk, capacity: 65_536 });
+                }
+            });
+        });
+    ui.add_space(6.0);
 }
