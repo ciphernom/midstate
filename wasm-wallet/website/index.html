@@ -88,6 +88,7 @@ a:hover { color: var(--text-max); text-decoration-style: solid; }
 h1, h2, h3, h4, .mono { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
 
 /* ── Top Navigation ─────────────────────────────────────────────────────── */
+
 .topbar {
     display: flex;
     justify-content: space-between;
@@ -109,7 +110,13 @@ h1, h2, h3, h4, .mono { font-family: 'JetBrains Mono', monospace; font-weight: 6
     gap: 12px;
     color: var(--text-max);
 }
+.brand-mid {
+    color: var(--text-muted); /* This is your existing grey variable */
+}
 
+.brand-state {
+    color: var(--text-max); /* This is your existing black (light mode) / white (dark mode) variable */
+}
 .brand-indicator {
     width: 8px;
     height: 8px;
@@ -145,6 +152,24 @@ h1, h2, h3, h4, .mono { font-family: 'JetBrains Mono', monospace; font-weight: 6
 .sun-icon, .moon-icon { width: 16px; height: 16px; fill: currentColor; }
 :root[data-theme="light"] .sun-icon { display: none; }
 :root[data-theme="dark"] .moon-icon { display: none; }
+
+.brand-logo {
+    width: 32px;
+    height: 32px;
+    object-fit: contain;
+    /* Smooth scaling */
+    image-rendering: high-quality; 
+}
+
+/* Dark Theme: Green becomes White, Black stays Black */
+:root[data-theme="dark"] .brand-logo {
+    filter: grayscale(100%) brightness(500%);
+}
+
+/* Light Theme: Black becomes White, Green becomes Black */
+:root[data-theme="light"] .brand-logo {
+    filter: grayscale(100%) brightness(500%) invert(100%);
+}
 
 /* ── Main Layout ───────────────────────────────────────────────────────── */
 .workspace {
@@ -533,9 +558,12 @@ td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); 
 </style>
 </head>
 <body>
-
 <div class="topbar">
-    <div class="brand"><div class="brand-indicator"></div> MIDSTATE</div>
+<div class="brand">
+    <img src="logo.svg" alt="Midstate" class="brand-logo"> 
+    <span><span class="brand-mid">MID</span><span class="brand-state">STATE</span></span>
+</div>
+
     <div class="nav-actions">
         <a href="./wallet/" target="_blank" class="btn">Web Wallet</a>
         <a href="./ide.html" target="_blank" class="btn">Midscript IDE</a>
@@ -552,6 +580,7 @@ td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); 
 <div class="workspace">
     <div class="sidebar">
         <div class="menu-item active" data-target="overview">Overview <span>→</span></div>
+        <div class="menu-item" data-target="get-started">Get Started <span>→</span></div>
         <div class="menu-item" data-target="roadmap">Roadmap <span>→</span></div>
         <div class="menu-item" data-target="genesis">Genesis & Fair Launch <span>→</span></div>
         <div class="menu-item" data-target="crypto">Cryptography <span>→</span></div>
@@ -617,6 +646,52 @@ td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); 
                 <div class="term-line"><span class="term-time">22:49:44.150</span> <span class="term-info">INFO</span> <span>Node started (mining: true, threads: 4, rpc: 8545)</span></div>
                 <div class="term-line"><span class="term-time">22:49:44.152</span> <span class="term-info">INFO</span> <span>Mining SIMD: NEON 4-way (4 nonces/batch)</span></div>
                 <div class="term-line"><span class="term-time">22:50:11.883</span> <span class="term-success">INFO</span> <span class="term-success">Mined batch! height=29001 outputs=2 target=000ffff...</span></div>
+            </div>
+        </div>
+
+
+<!-- ── GET STARTED ── -->
+        <div class="content-pane" id="get-started">
+            <h2>Get Started</h2>
+            <p>Midstate is a live, functional network. The chain is producing blocks, people are mining on commodity hardware, and the coin is actively trading. Choose how you want to interact with the ecosystem below.</p>
+
+            <div class="stat-grid" style="margin-top: 32px;">
+                <!-- Trade Card -->
+                <div class="stat-card">
+                    <div class="stat-label">Acquire MDS</div>
+                    <div class="stat-value" style="font-size: 18px; margin-bottom: 12px;">SafeTrade</div>
+                    <p style="font-size: 13.5px; margin-bottom: 20px;">MDS is actively traded against USDT on the SafeTrade exchange.</p>
+                    <a href="https://safetrade.com/exchange/MDS-USDT?type=basic" target="_blank" class="btn">Go to Exchange ↗</a>
+                </div>
+
+                <!-- Download Card -->
+                <div class="stat-card">
+                    <div class="stat-label">Run a Node</div>
+                    <div class="stat-value" style="font-size: 18px; margin-bottom: 12px;">Desktop Wallet</div>
+                    <p style="font-size: 13.5px; margin-bottom: 20px;">Get the full GUI wallet or CLI binaries for Windows, Mac, and Linux.</p>
+                    <a href="https://github.com/ciphernom/midstate/releases" target="_blank" class="btn">GitHub Releases ↗</a>
+                </div>
+                
+                <!-- Discord Card -->
+                <div class="stat-card">
+                    <div class="stat-label">Community</div>
+                    <div class="stat-value" style="font-size: 18px; margin-bottom: 12px;">Discord Server</div>
+                    <p style="font-size: 13.5px; margin-bottom: 20px;">Chat with other miners, developers, and users building the network.</p>
+                    <a href="https://discord.gg/midstate" target="_blank" class="btn">Join Discord ↗</a>
+                </div>
+
+                <!-- Twitter Card -->
+                <div class="stat-card">
+                    <div class="stat-label">Updates</div>
+                    <div class="stat-value" style="font-size: 18px; margin-bottom: 12px;">X</div>
+                    <p style="font-size: 13.5px; margin-bottom: 20px;">Follow the lead developer for protocol upgrades and network news.</p>
+                    <a href="https://x.com/midstate_dev" target="_blank" class="btn">@midstate_dev ↗</a>
+                </div>
+            </div>
+            
+            <div class="callout stark">
+                <h4>Want a wallet in 30 seconds?</h4>
+                <p>If you don't want to download the full desktop node just yet, you can use the <a href="./wallet/" target="_blank">Midstate Web Wallet</a>. It runs entirely in your browser, connects directly to peers via WebRTC, and can even solo-mine using your CPU's WASM worker threads. Just remember to not use the SAME web wallet on different devices and run "rescan" regularly!</p>
             </div>
         </div>
 
