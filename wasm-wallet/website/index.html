@@ -2317,7 +2317,7 @@ Script:
         fontFamily: "'JetBrains Mono', monospace" 
     });
 
-    // Theme toggling
+    // --- Theme Toggling --- //
     const themeBtn = document.getElementById('theme-btn');
     const html = document.documentElement;
 
@@ -2340,12 +2340,10 @@ Script:
         setTheme(current === 'dark' ? 'light' : 'dark');
     });
 
-    // Robust visibility check for both tabbed and non-tabbed sections
+    // --- Diagram Rendering --- //
     async function renderVisibleDiagrams() {
-        // Find all unrendered mermaid divs in the active pane
         const unrendered = Array.from(document.querySelectorAll('.content-pane.active .mermaid:not([data-processed="true"])'))
             .filter(el => {
-                // If it's inside a tab, ensure that specific tab is active
                 const parentTab = el.closest('.tab-content');
                 return !parentTab || parentTab.classList.contains('active');
             });
@@ -2355,51 +2353,110 @@ Script:
         }
     }
 
-    // Sidebar navigation
+    // --- Routing & Deep Linking --- //
     const menuItems = document.querySelectorAll('.menu-item');
     const panes = document.querySelectorAll('.content-pane');
-
-    menuItems.forEach(item => {
-        item.addEventListener('click', async () => {
-            menuItems.forEach(m => m.classList.remove('active'));
-            panes.forEach(p => p.classList.remove('active'));
-
-            item.classList.add('active');
-            const targetId = item.getAttribute('data-target');
-            document.getElementById(targetId).classList.add('active');
-            window.scrollTo(0,0);
-
-            await renderVisibleDiagrams();
-        });
-    });
-
-    // Internal Tabs logic
     const tabBtns = document.querySelectorAll('.tab-btn');
 
-    tabBtns.forEach(btn => {
-        btn.addEventListener('click', async () => {
-            const targetContainer = btn.closest('.tabs');
-            
-            // Deactivate all in this specific container
-            targetContainer.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-            targetContainer.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            
-            // Activate clicked
-            btn.classList.add('active');
-            const tabId = btn.getAttribute('data-tab');
-            targetContainer.querySelector(`#${tabId}`).classList.add('active');
+    // Helper to activate main sidebar sections
+    async function activateSection(targetId) {
+        const item = document.querySelector(`.menu-item[data-target="${targetId}"]`);
+        const pane = document.getElementById(targetId);
+        if (!item || !pane) return false;
 
-            await renderVisibleDiagrams();
+        menuItems.forEach(m => m.classList.remove('active'));
+        panes.forEach(p => p.classList.remove('active'));
+
+        item.classList.add('active');
+        pane.classList.add('active');
+        window.scrollTo(0,0);
+
+        await renderVisibleDiagrams();
+        return true;
+    }
+
+    // Helper to activate internal tabs
+    async function activateTab(tabId) {
+        const btn = document.querySelector(`.tab-btn[data-tab="${tabId}"]`);
+        const tab = document.getElementById(tabId);
+        if (!btn || !tab) return false;
+
+        const targetContainer = btn.closest('.tabs');
+        targetContainer.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        targetContainer.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        
+        btn.classList.add('active');
+        tab.classList.add('active');
+
+        await renderVisibleDiagrams();
+        return true;
+    }
+
+    // Read URL Hash and route accordingly
+    async function handleRoute() {
+        let hash = window.location.hash.substring(1);
+        
+        // Default to overview if no hash
+        if (!hash) {
+            await activateSection('overview');
+            return;
+        }
+
+        // Try to load it as a main sidebar section
+        let isSection = await activateSection(hash);
+        
+        // If it wasn't a main section, check if it's an internal sub-tab
+        if (!isSection) {
+            const tab = document.getElementById(hash);
+            if (tab && tab.classList.contains('tab-content')) {
+                const parentPane = tab.closest('.content-pane');
+                if (parentPane) {
+                    // Open the parent section, then switch to the tab
+                    await activateSection(parentPane.id);
+                    await activateTab(hash);
+                    
+                    // Smoothly scroll down to make the tabs visible
+                    const tabsContainer = tab.closest('.tabs');
+                    if (tabsContainer) {
+                        tabsContainer.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }
+                }
+            }
+        }
+    }
+
+    // Bind clicks on sidebar items to update URL and trigger navigation
+    menuItems.forEach(item => {
+        item.addEventListener('click', async () => {
+            const targetId = item.getAttribute('data-target');
+            history.pushState(null, null, '#' + targetId);
+            await activateSection(targetId);
         });
     });
+
+    // Bind clicks on internal tabs to update URL and trigger navigation
+    tabBtns.forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const tabId = btn.getAttribute('data-tab');
+            history.pushState(null, null, '#' + tabId);
+            await activateTab(tabId);
+        });
+    });
+
+    // Listen for Browser Back/Forward navigation
+    window.addEventListener('popstate', handleRoute);
 
     // On Initial Load
     document.addEventListener("DOMContentLoaded", async () => {
-        await renderVisibleDiagrams();
+        if (window.location.hash) {
+            await handleRoute();
+        } else {
+            await renderVisibleDiagrams();
+        }
         setTimeout(initChart, 100);
     });
 
-    // --- Supply Curve Chart ---
+    // --- Supply Curve Chart --- //
     function initChart() {
         const ctx = document.getElementById('supplyChart');
         if (!ctx) return;
@@ -2416,8 +2473,6 @@ Script:
             circulating += currentReward * blocksPerYear;
             supplyData.push(circulating); // in gMDS
             rewardData.push(currentReward);
-            
-            // Halve the reward
             currentReward = currentReward / 2;
         }
 
