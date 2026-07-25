@@ -815,7 +815,11 @@ impl Mempool {
         spam_nonce: u64,
         tx: Transaction,
     ) {
-        let h = crate::core::types::hash_concat(&commitment, &spam_nonce.to_le_bytes());
+        let h = crate::core::transaction::commit_pow_hash(
+            &commitment,
+            (spam_nonce & 0xFFFF_FFFF) as u32,
+            (spam_nonce >> 32) as u32,
+        );
         let zeros = crate::core::types::count_leading_zeros(&h);
         let arc_tx = Arc::new(tx);
         self.commits.insert(commitment, (arc_tx, now_unix()));
@@ -854,15 +858,19 @@ mod tests {
 
     /// Mines a commit PoW nonce that achieves at least 24 leading zero bits
     /// (the base network minimum).
+    /// Mine a commit nonce via production `mine_pow` — see the note in
+    /// `core::transaction::tests`. Never reimplement the PoW preimage in tests.
+    fn mine_commit_nonce_at(commitment: &[u8; 32], height: u64) -> u64 {
+        crate::core::transaction::mine_pow(
+            commitment,
+            crate::core::transaction::MIN_COMMIT_POW_BITS,
+            height,
+            [0u8; 32],
+        )
+    }
+
     fn mine_commit_nonce(commitment: &[u8; 32]) -> u64 {
-        let mut n = 0u64;
-        loop {
-            let h = hash_concat(commitment, &n.to_le_bytes());
-            if crate::core::types::count_leading_zeros(&h) >= 24 {
-                return n;
-            }
-            n += 1;
-        }
+        mine_commit_nonce_at(commitment, 0)
     }
 
     /// Returns a state that has a single UTXO and the corresponding commitment
@@ -991,12 +999,10 @@ mod tests {
         // This is extremely close to the rounding boundary. If `max_add` or `k`
         // changes, this test will need an updated target bits threshold.
         let extra = hash(b"commit overflow");
-        let mut n = 0u64;
-        loop {
-            let h = hash_concat(&extra, &n.to_le_bytes());
-            if crate::core::types::count_leading_zeros(&h) >= 30 { break; }
-            n += 1;
-        }
+                // Exactly the escalated requirement for a full pool, tracking the
+        // fast-mining gate instead of hardcoding it.
+        let required = mp.required_commit_pow();
+        let n = crate::core::transaction::mine_pow(&extra, required, 0, [0u8; 32]);
 
         let tx = Transaction::Commit { commitment: extra, spam_nonce: n };
         // High-PoW commit should evict one of the zero-PoW dummies.
@@ -1004,8 +1010,12 @@ mod tests {
         assert_eq!(mp.len(), MAX_PENDING_COMMITS, "Pool must not exceed capacity");
         assert!(mp.commits.contains_key(&extra), "New commit must be present");
 
-        // A low-PoW commit should now be rejected outright (pool still full, 30 bits required).
-        let bad_tx = Transaction::Commit { commitment: hash(b"bad"), spam_nonce: 0 };
+        // A low-PoW commit should now be rejected outright 
+        // Base-valid, but below the pool's escalated requirement.
+        let bad_commitment = hash(b"bad");
+        let bad_n = crate::core::transaction::mine_pow(
+            &bad_commitment, crate::core::transaction::MIN_COMMIT_POW_BITS, 0, [0u8; 32]);
+        let bad_tx = Transaction::Commit { commitment: bad_commitment, spam_nonce: bad_n };
         let err = mp.add(bad_tx, &state, &std::collections::HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("Mempool is busy"));
     }
@@ -1027,7 +1037,10 @@ mod tests {
 
         // 2. Try to add one more with a bad nonce
         let commitment = crate::core::types::hash(b"equal pow");
-        let tx = Transaction::Commit { commitment, spam_nonce: 0 };
+        // Base-valid, but below the escalated requirement for a full pool.
+        let n = crate::core::transaction::mine_pow(
+            &commitment, crate::core::transaction::MIN_COMMIT_POW_BITS, 0, [0u8; 32]);
+        let tx = Transaction::Commit { commitment, spam_nonce: n };
 
         let err = mp.add(tx, &state, &std::collections::HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("Mempool is busy") || err.to_string().contains("Mempool full of Commits"));
@@ -1190,7 +1203,9 @@ mod tests {
 
         // 2. Try to add one more with a bad nonce
         let extra = crate::core::types::hash(b"one more");
-        let tx = Transaction::Commit { commitment: extra, spam_nonce: 0 };
+        let n = crate::core::transaction::mine_pow(
+            &extra, crate::core::transaction::MIN_COMMIT_POW_BITS, 0, [0u8; 32]);
+        let tx = Transaction::Commit { commitment: extra, spam_nonce: n };
 
         let err = mp.add(tx, &state, &std::collections::HashMap::new()).unwrap_err();
         assert!(

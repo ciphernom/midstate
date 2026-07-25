@@ -1251,6 +1251,15 @@ mod tests {
         bc.push(OP_PICK);
         push_int(&mut bc, 10);
         bc.push(OP_EQUAL);
+        // PICK copies rather than consumes, so the three witness items are still
+        // on the stack under the result. The Clean Stack Rule requires exactly
+        // one item at the end, so drop them — verifying the comparison first so
+        // a wrong PICK still fails rather than being dropped silently.
+        bc.push(OP_VERIFY);
+        bc.push(OP_DROP);
+        bc.push(OP_DROP);
+        push_int(&mut bc, 10);
+        bc.push(OP_EQUAL);
 
         // Stack: Bottom [10, 20, 30] Top
         let witness = vec![vec![10u8], vec![20u8], vec![30u8]];
