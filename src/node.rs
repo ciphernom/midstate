@@ -235,6 +235,7 @@ pub struct NodeHandle {
     /// RPC so pools/miners can pause template generation instead of wasting
     /// hashpower on already-superseded heights.
     is_syncing: Arc<AtomicBool>,
+     pub sync_progress: Arc<RwLock<(bool, String, u64, u64)>>,
 }
 
 pub enum NodeCommand {
@@ -334,6 +335,9 @@ impl NodeHandle {
         self.is_syncing.load(Ordering::Relaxed)
     }
 
+    pub async fn sync_progress(&self) -> (bool, String, u64, u64) {
+        self.sync_progress.read().await.clone()
+    }
 
     /// Returns the current dynamic safe depth calculated by the Bayesian finality estimator.
     ///
@@ -2469,6 +2473,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
             outbox_chat_limiter: Arc::clone(&self.outbox_chat_limiter),
             light_chat_limits: Arc::clone(&self.light_chat_limits),
             is_syncing: Arc::new(AtomicBool::new(false)),
+            sync_progress: Arc::new(RwLock::new((false, String::new(), 0, 0))),
         };
         (handle, rx)
     }
@@ -2771,7 +2776,25 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                         self.sync.is_in_progress() || self.sync.has_active_session(),
                         Ordering::Relaxed,
                     );
-                    
+                   
+                    let is_syncing = self.sync.is_in_progress() || self.sync.has_active_session();
+                    let (phase, cursor, target) = if let Some(s) = &self.sync.session {
+                        let p = match &s.phase {
+                            crate::sync::SyncPhase::Headers { .. } | crate::sync::SyncPhase::VerifyingHeaders => "headers",
+                            _ => "batches",
+                        };
+                        let c = match &s.phase {
+                            crate::sync::SyncPhase::Headers { cursor, .. } => *cursor,
+                            crate::sync::SyncPhase::Batches { cursor, .. } => *cursor,
+                            crate::sync::SyncPhase::PipelinedRebuild { fork_height, .. } => *fork_height,
+                            _ => self.state.height, // fallback
+                        };
+                        (p.to_string(), c, s.peer_height)
+                    } else {
+                        (String::new(), 0, 0)
+                    };
+                    *handle.sync_progress.write().await = (is_syncing, phase, cursor, target);
+
                     // --- WebRTC Load Shedding ---
                     // Filter for WebRTC addresses here at the UI level
                     let mut webrtc_list: Vec<String> = self.network.advertisable_addrs()

@@ -420,8 +420,17 @@ impl App {
         if !s.is_syncing {
             return None;
         }
-        let target = s.est_target_height.max(s.height).max(1);
-        Some((s.height as f32 / target as f32).clamp(0.0, 1.0))
+        let target = if s.sync_target > 0 { s.sync_target } else { s.est_target_height.max(s.height).max(1) };
+        let is_headers = s.sync_phase == "headers";
+        
+        let frac = if is_headers {
+            let h_frac = (s.sync_cursor as f32 / target as f32).clamp(0.0, 1.0);
+            h_frac * 0.10 // Headers take the first 10% of the bar
+        } else {
+            let b_frac = (s.height as f32 / target as f32).clamp(0.0, 1.0);
+            0.10 + (b_frac * 0.90) // Batches take the remaining 90%
+        };
+        Some(frac.clamp(0.0, 1.0))
     }
 
     /// Blocks applied per second over the recent sample window.
@@ -487,9 +496,16 @@ impl App {
                 WalletEvent::PeerAddress { peer, address } => {
                     // Drop it straight into the Send form — getting a fresh
                     // address is only useful if it lands where it is needed.
-                    self.send_to = address;
-                    self.addr_ok = Some(true);
+                    self.send_to = address.clone();
+                    // The signature proves *who* sent it, not that the key is
+                    // still unused. A peer restored from an old backup can hand
+                    // over a burned address in good faith, and sending there is
+                    // unrecoverable — so it goes through the same check as one
+                    // typed by hand.
+                    self.addr_ok = None;
                     self.addr_reason = None;
+                    self.go(ctx, Action::ValidateAddress { addr: address });
+                     self.ask_pending = false;
                     self.ask_pending = false;
                     self.ask_peer.clear();
                     self.toast(

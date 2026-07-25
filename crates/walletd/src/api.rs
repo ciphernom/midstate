@@ -99,6 +99,12 @@ pub struct SyncStatus {
     /// `height` once synced.
     pub est_target_height: u64,
     pub timestamp: u64,
+    #[serde(default)]
+    pub sync_phase: String,
+    #[serde(default)]
+    pub sync_cursor: u64,
+    #[serde(default)]
+    pub sync_target: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
