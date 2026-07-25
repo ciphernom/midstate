@@ -59,6 +59,7 @@ pub enum Action {
     PlaceBid { mds_amount: u64, wei: String, ttl_secs: u64, fill_bond: String },
     CancelBid { bid_id: String },
     LoadMyBids,
+    LoadHubs,
     RequestChannel { peer: String, capacity: u64 },
     RepairHistory,
     SwapQuote {
@@ -127,6 +128,7 @@ pub enum Msg {
     BidPlaced(String),
     BidCancelled(String),
     MyBids(Vec<MyBidView>),
+    Hubs(Vec<HubAdView>),
     EvmAccount(EvmAccountView),
     OrderBook(OrderBookView),
     OrderBookSynced,
@@ -275,6 +277,7 @@ pub fn dispatch(
                 run!("cancel bid", h.cancel_bid(bid_id), Msg::BidCancelled)
             }
             Action::LoadMyBids => run!("my bids", h.my_bids(), Msg::MyBids),
+            Action::LoadHubs => run!("hubs", h.hubs(), Msg::Hubs),
             Action::RequestChannel { peer, capacity } => {
                 run!("request channel", h.request_channel(peer, capacity), |_| Msg::ChannelDone)
             }

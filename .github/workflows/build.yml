@@ -60,7 +60,7 @@ jobs:
             artifact_name: midstate-macos-amd64
             bin_name: midstate
             desktop_bin: midstate-desktop
-            bundle_name: Midstate-macos-amd64.app.zip
+            bundle_name: Midstate-Desktop-macos-amd64.app.zip
 
           # macOS (Apple Silicon / M1 / M2)
           - os: macos-latest
@@ -68,7 +68,7 @@ jobs:
             artifact_name: midstate-macos-arm64
             bin_name: midstate
             desktop_bin: midstate-desktop
-            bundle_name: Midstate-macos-arm64.app.zip
+            bundle_name: Midstate-Desktop-macos-arm64.app.zip
 
     steps:
     - name: Checkout repository
@@ -147,7 +147,7 @@ jobs:
       run: |
         set -euo pipefail
         REL="target/${{ matrix.target }}/release"
-        APP="$REL/Midstate.app"
+        APP="$REL/Midstate-Desktop.app"
         VERSION="0.0.0"
         if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then VERSION="${GITHUB_REF_NAME#v}"; fi
 
@@ -172,8 +172,8 @@ jobs:
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <plist version="1.0">
         <dict>
-          <key>CFBundleName</key>                  <string>Midstate</string>
-          <key>CFBundleDisplayName</key>           <string>Midstate</string>
+          <key>CFBundleName</key>                  <string>Midstate-Desktop</string>
+          <key>CFBundleDisplayName</key>           <string>Midstate-Desktop</string>
           <key>CFBundleIdentifier</key>            <string>com.midstate.desktop</string>
           <key>CFBundleExecutable</key>            <string>midstate-desktop</string>
           <key>CFBundleIconFile</key>              <string>AppIcon</string>
@@ -249,7 +249,7 @@ jobs:
 # The macOS bundle is UNSIGNED. Gatekeeper will refuse it on first launch
 # ("unidentified developer", or "damaged" once the download carries a
 # quarantine flag). Users can right-click the app and choose Open, or run:
-#     xattr -dr com.apple.quarantine /Applications/Midstate.app
+#     xattr -dr com.apple.quarantine /Applications/Midstate-Desktop.app
 # Removing that friction needs an Apple Developer account, then
 # `codesign --deep --options runtime` followed by `xcrun notarytool submit`
 # on the zip, with the certificate held as a repository secret.

@@ -42,6 +42,115 @@ pub const SETTLE_MARGIN_SECS: u64 = 3_600;
 /// Default lifetime of the Base escrow. The contract permits 600s to 7 days.
 pub const DEFAULT_ETH_REFUND_SECS: u64 = 3_600;
 
+// ── Unit economics ──────────────────────────────────────────────────────
+//
+// An order is advertised as power-of-two units, and *each unit is claimed by
+// its own separate transaction*. That transaction pays its own fee, so a unit
+// is only worth trading if it is comfortably larger than that fee. Units below
+// that threshold are not merely uneconomic — they are unclaimable, and a taker
+// who escrows ETH against one loses it outright: by the time the MDS leg is
+// swept the maker has already claimed the ETH, which is how the preimage
+// became public in the first place. There is no refund branch after that
+// point, and there must not be.
+//
+// So the threshold is enforced in two independent places, and deliberately so:
+// the maker refuses to *publish* such a unit, and the taker refuses to *take*
+// one. The second check is the load-bearing one, because orders arrive from
+// peers whose software we do not control.
+
+/// Smallest unit that may be published or taken.
+///
+/// Must be a power of two. That is what makes the maker-side check a single
+/// remainder test: if `amount % MIN_SWAP_UNIT == 0` then every bit set in
+/// `amount` is at or above `MIN_SWAP_UNIT`, so no sub-threshold unit can be
+/// produced by the decomposition.
+///
+/// 1024 leaves roughly 97% of the unit's value after the sweep fee. Chosen to
+/// sit alongside `channels::MIN_CAPACITY` rather than to sit just above the
+/// fee: a unit that is *technically* claimable but nets a handful of units is
+/// a bad trade, not a working one.
+pub const MIN_SWAP_UNIT: u64 = 1_024;
+
+// These two MUST match the constants in `midstate::mempool`. They are repeated
+// rather than imported for the same reason `coinjoin::recommended_fee_for_mix`
+// repeats them: walletd builds transactions the mempool must accept, so the
+// duplication is a deliberate, commented coupling.
+const MIN_FEE_PER_KB: u64 = 10;
+const FEE_RATE_SCALE: u128 = 1_024;
+
+/// Fixed per-transaction overhead.
+const SWEEP_BASE_BYTES: u64 = 256;
+/// Input envelope: predicate tag, value, salt, coin reference. The covenant
+/// bytecode is counted separately because it varies per script.
+const SWEEP_INPUT_BYTES: u64 = 128;
+/// Claim witness: 32-byte preimage, branch selector, and framing. A covenant
+/// spend carries no WOTS signature, which is why this is so much smaller than
+/// the per-input figure used for ordinary spends.
+const SWEEP_WITNESS_BYTES: u64 = 96;
+/// Output envelope: address, value, salt, framing.
+const SWEEP_PER_OUTPUT_BYTES: u64 = 160;
+/// Slack above the mempool floor so a sweep is not sitting exactly on the
+/// admission boundary, where a slightly larger encoding than estimated would
+/// tip it into rejection.
+const SWEEP_FEE_MARGIN: u64 = 20;
+
+/// Estimated serialised size of a single-input claim reveal.
+pub fn sweep_reveal_size(script_bytes: usize, n_outputs: usize) -> u64 {
+    SWEEP_BASE_BYTES
+        + SWEEP_INPUT_BYTES
+        + SWEEP_WITNESS_BYTES
+        + script_bytes as u64
+        + (n_outputs as u64) * SWEEP_PER_OUTPUT_BYTES
+}
+
+/// Fee for a claim reveal of the given shape, using the mempool's own
+/// fee-per-byte rule rather than a flat guess.
+pub fn sweep_fee(script_bytes: usize, n_outputs: usize) -> u64 {
+    let bytes = sweep_reveal_size(script_bytes, n_outputs) as u128;
+    let required = (bytes * MIN_FEE_PER_KB as u128).div_ceil(FEE_RATE_SCALE) as u64;
+    required + SWEEP_FEE_MARGIN
+}
+
+/// Resolve the fee and the resulting output denominations together.
+///
+/// The fee depends on the output count, which depends on the decomposition of
+/// `value - fee`, which depends on the fee. Same fixed-point iteration as
+/// `midstate::wallet::defrag::resolve_fee`, and it terminates for the same
+/// reason: each round either settles or strictly increases `n_out`, which is
+/// bounded by the 64 bits of a `u64`.
+///
+/// # Determinism
+///
+/// This is a **pure function of values persisted in the swap record**, and it
+/// must stay that way. The claim is commit-then-reveal: phase one publishes a
+/// commitment to this exact transaction, and phase two must rebuild it
+/// byte-identically or the reveal is rejected *after* the commit has been paid
+/// for. Never let this fee depend on live mempool conditions, wall-clock time,
+/// or anything else that can change between the two phases.
+pub fn resolve_sweep_fee(script_bytes: usize, value: u64) -> Option<(u64, Vec<u64>)> {
+    let mut n_out = 1usize;
+    loop {
+        let fee = sweep_fee(script_bytes, n_out);
+        if fee >= value {
+            return None;
+        }
+        let denoms = midstate::core::decompose_value(value - fee);
+        if denoms.len() <= n_out {
+            return Some((fee, denoms));
+        }
+        n_out = denoms.len();
+    }
+}
+
+/// Whether a unit of this size is worth taking at all.
+///
+/// Checked against the constant rather than against the resolved fee, so that
+/// maker and taker agree on the answer without having to agree on a script
+/// size they may encode differently.
+pub fn unit_is_tradeable(value: u64) -> bool {
+    value >= MIN_SWAP_UNIT
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
     /// Give ETH, receive MDS.
@@ -374,5 +483,112 @@ mod tests {
         let mut p = prereqs(Rail::OnChain, Side::BuyMds);
         p.mds_spendable = 0;
         assert!(p.ready());
+    }
+
+    // ── Unit economics ──────────────────────────────────────────────────
+
+    #[test]
+    fn min_swap_unit_is_a_power_of_two() {
+        // The maker-side check is a single `% MIN_SWAP_UNIT` test, which is
+        // only equivalent to checking every denomination if this holds.
+        assert!(MIN_SWAP_UNIT.is_power_of_two());
+    }
+
+    #[test]
+    fn an_order_aligned_to_the_minimum_produces_no_unclaimable_units() {
+        // The property the whole fix rests on: alignment to MIN_SWAP_UNIT is
+        // exactly the condition under which the decomposition is safe.
+        for k in 1..=64u64 {
+            let amount = k * MIN_SWAP_UNIT;
+            for denom in midstate::core::decompose_value(amount) {
+                assert!(
+                    unit_is_tradeable(denom),
+                    "{amount} produced an unclaimable unit of {denom}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unaligned_amounts_are_exactly_the_ones_that_strand_value() {
+        // The converse — otherwise the maker-side guard would be rejecting
+        // orders that were actually fine.
+        for amount in [MIN_SWAP_UNIT + 1, 5_000, 4_097, 60, 63] {
+            let strands = midstate::core::decompose_value(amount)
+                .into_iter()
+                .any(|d| !unit_is_tradeable(d));
+            assert_eq!(
+                strands,
+                amount % MIN_SWAP_UNIT != 0,
+                "alignment must predict stranding for {amount}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_tradeable_unit_can_actually_pay_its_own_fee() {
+        // The guard promises a claimable unit. If a value at the threshold
+        // could not resolve a fee, the promise would be empty.
+        for k in 1..=64u64 {
+            let value = k * MIN_SWAP_UNIT;
+            let (fee, denoms) =
+                resolve_sweep_fee(512, value).expect("a tradeable unit must resolve a fee");
+            assert!(fee < value);
+            assert_eq!(
+                denoms.iter().sum::<u64>(),
+                value - fee,
+                "outputs plus fee must account for the whole unit"
+            );
+            // And it has to be worth doing, not merely possible.
+            assert!(
+                value - fee > value * 9 / 10,
+                "a {value}-unit claim kept only {} after a {fee} fee",
+                value - fee
+            );
+        }
+    }
+
+    #[test]
+    fn the_resolved_fee_covers_the_outputs_it_implies() {
+        // Fixed-point closure: the fee charged must be the fee for the shape
+        // actually produced, or the transaction underpays and is rejected.
+        for value in [MIN_SWAP_UNIT, 4_096, 65_536, 1_000_448] {
+            let (fee, denoms) = resolve_sweep_fee(512, value).unwrap();
+            assert!(
+                fee >= sweep_fee(512, denoms.len()),
+                "fee {fee} does not cover {} outputs",
+                denoms.len()
+            );
+        }
+    }
+
+    #[test]
+    fn the_fee_is_deterministic_across_commit_and_reveal() {
+        // The commitment binds this exact transaction. If the same inputs ever
+        // produced two different fees, the reveal would be rejected after the
+        // commit had already been paid for.
+        let a = resolve_sweep_fee(377, 8_192).unwrap();
+        let b = resolve_sweep_fee(377, 8_192).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn sub_minimum_units_are_refused_rather_than_priced() {
+        for value in [1, 2, 8, 32, 60, 64, MIN_SWAP_UNIT - 1] {
+            assert!(!unit_is_tradeable(value), "{value} must not be tradeable");
+        }
+    }
+
+    #[test]
+    fn the_fee_clears_the_mempool_floor_it_was_derived_from() {
+        for n_out in [1usize, 4, 16, 32] {
+            let bytes = sweep_reveal_size(512, n_out);
+            let fee = sweep_fee(512, n_out);
+            // Mirrors the admission check in mempool.rs.
+            assert!(
+                (fee as u128) * FEE_RATE_SCALE >= (MIN_FEE_PER_KB as u128) * (bytes as u128),
+                "a {n_out}-output sweep would be rejected by the mempool"
+            );
+        }
     }
 }

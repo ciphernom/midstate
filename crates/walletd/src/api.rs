@@ -365,6 +365,20 @@ pub struct OrderBookView {
     pub claims: usize,
     pub undecoded_logs: usize,
     pub announcements: usize,
+    /// Recently completed trades, newest first.
+    pub trades: Vec<TradeView>,
+}
+
+/// A trade that settled, reconstructed from contract events.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TradeView {
+    pub block: u64,
+    pub wei: String,
+    /// `None` when the MDS side cannot be resolved from what has been scanned.
+    pub mds: Option<u64>,
+    pub price: Option<f64>,
+    /// "sell" — an ask was taken; "buy" — a bid was filled.
+    pub kind: String,
 }
 
 /// Where the EVM leg points. Editable so the same build can follow a contract
@@ -473,4 +487,20 @@ pub struct MyBidView {
     /// "confirming" until the contract assigns an id, then "open".
     pub status: String,
     pub cancelled: bool,
+}
+
+/// A hub heard advertising itself on the chat bus.
+///
+/// Everything except `connected` is the hub's own claim about itself. Treat it
+/// as a lead worth trying, not a measurement.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HubAdView {
+    pub pk: String,
+    pub outbound: u64,
+    pub min_capacity: u64,
+    pub hop_fee: u64,
+    /// Midstate height it was last heard at.
+    pub heard: u64,
+    /// Whether we already have a channel to it — this part we know.
+    pub connected: bool,
 }

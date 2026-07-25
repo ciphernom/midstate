@@ -154,6 +154,12 @@ pub struct ChannelBook {
     /// Buy orders this wallet has escrowed on Base.
     #[serde(default)]
     pub bids: Vec<MyBid>,
+    /// Hubs heard advertising on the bus: identity hex → what they claim.
+    #[serde(default)]
+    pub hubs: std::collections::HashMap<String, HubAd>,
+    /// Height of our last self-advertisement, so it repeats but does not spam.
+    #[serde(default)]
+    pub last_hub_ad: u64,
     /// Address requests we sent, awaiting a signed reply: req id → peer pk.
     #[serde(default)]
     pub addr_reqs: std::collections::HashMap<String, [u8; 32]>,
@@ -412,4 +418,18 @@ pub struct MyBid {
     pub created: u64,
     #[serde(default)]
     pub cancelled: bool,
+}
+
+/// A hub's self-description, as heard on the bus.
+///
+/// Unverified by construction — anyone can claim anything. It is a lead, not a
+/// guarantee: the numbers only become real when a channel is actually opened,
+/// and the wallet says so rather than presenting them as fact.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HubAd {
+    pub outbound: u64,
+    pub min_capacity: u64,
+    pub hop_fee: u64,
+    /// Midstate height we last heard from them, for staleness.
+    pub heard: u64,
 }

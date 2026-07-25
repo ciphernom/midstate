@@ -148,7 +148,19 @@ pub struct App {
     pub chan_pay: std::collections::HashMap<String, String>,
     pub chan_last_poll: f64,
     pub invoices: Vec<InvoiceView>,
+    /// The hub policy as the daemon last reported it. Never written to by the
+    /// settings UI — it is the baseline unsaved edits are compared against.
     pub hub: Option<HubView>,
+    /// Local, unsaved edits to that policy.
+    ///
+    /// Kept separate from `hub` on purpose. Writing edits straight back into
+    /// `hub` makes the two identical again on the very next frame, so the
+    /// "changed" test goes false and the Save button disappears one frame
+    /// after it appears — visible for about 16ms, and impossible to click.
+    /// The edit then lives only in the GUI's memory and is never sent to the
+    /// daemon, which is why toggling a policy appeared to work and changed
+    /// nothing.
+    pub hub_draft: Option<HubView>,
     pub inv_amount: String,
     pub pay_invoice_text: String,
     pub last_invoice: Option<InvoiceView>,
@@ -188,6 +200,7 @@ pub struct App {
     pub my_orders: Vec<MyOrderView>,
     pub swaps: Vec<SwapView>,
     pub my_bids: Vec<MyBidView>,
+    pub hubs: Vec<HubAdView>,
     pub bid_mds: String,
     pub bid_wei: String,
     pub bid_hours: String,
@@ -315,6 +328,7 @@ impl App {
             chan_last_poll: 0.0,
             invoices: Vec::new(),
             hub: None,
+            hub_draft: None,
             inv_amount: String::new(),
             pay_invoice_text: String::new(),
             last_invoice: None,
@@ -351,6 +365,7 @@ impl App {
             my_orders: Vec::new(),
             swaps: Vec::new(),
             my_bids: Vec::new(),
+            hubs: Vec::new(),
             bid_mds: String::new(),
             bid_wei: String::new(),
             bid_hours: "24".into(),
@@ -576,6 +591,7 @@ impl App {
                 self.invoices.clear();
                 self.last_invoice = None;
                 self.hub = None;
+                self.hub_draft = None;
                 self.evm = None;
                 self.book = None;
                 self.tab = Tab::Dashboard;
@@ -677,7 +693,14 @@ impl App {
                 self.go(ctx, Action::LoadInvoices);
             }
             Msg::Invoices(v) => self.invoices = v,
-            Msg::Hub(h) => self.hub = Some(h),
+            Msg::Hub(h) => {
+                // The daemon clamps some fields on save (jit_capacity and
+                // max_auto_capacity are floored at MIN_CAPACITY), so what comes
+                // back is not always what was sent. Dropping the draft here is
+                // what makes the UI show the value that is actually in force.
+                self.hub = Some(h);
+                self.hub_draft = None;
+            }
             Msg::HubSaved => {
                 self.busy = false;
                 self.go(ctx, Action::LoadHub);
@@ -699,6 +722,7 @@ impl App {
             Msg::MyOrders(v) => self.my_orders = v,
             Msg::Swaps(v) => self.swaps = v,
             Msg::MyBids(v) => self.my_bids = v,
+            Msg::Hubs(v) => self.hubs = v,
             Msg::BidPlaced(tx) => {
                 self.busy = false;
                 self.bid_mds.clear();
@@ -781,7 +805,7 @@ impl App {
                 // Background loads fail benignly while locked; don't banner those.
                 let background = matches!(
                     what,
-                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids"
+                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs"
                 );
                 if background {
                     tracing::debug!("{what}: {err}");
@@ -922,9 +946,10 @@ impl eframe::App for App {
                 if self.chan_identity.is_none() {
                     self.go(ctx, Action::ChannelIdentity);
                 }
-                if self.hub.is_none() {
+                if self.hub_draft.is_none() {
                     self.go(ctx, Action::LoadHub);
                 }
+                self.go(ctx, Action::LoadHubs);
                 self.go(ctx, Action::LoadInvoices);
             }
         }

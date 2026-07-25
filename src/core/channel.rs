@@ -551,6 +551,14 @@ pub mod wire {
     pub const CMD_CHAN_REQ: u8 = 66;
     /// Declined, with a reason byte.
     pub const CMD_CHAN_DECLINE: u8 = 67;
+    /// "I route payments." Payload: `pack_hub(outbound, min_capacity, fee)`,
+    /// identity in the Address attachment.
+    ///
+    /// Broadcast rather than addressed, because the problem it solves is not
+    /// knowing who to ask in the first place. The bus already carries channel
+    /// negotiation and costs proof-of-work per message, which makes it a poor
+    /// place to spam and a natural place to advertise.
+    pub const CMD_HUB: u8 = 68;
     pub const CMD_OPEN: u8 = 110;
 
     /// OPEN payload: [ver][expiry u64][n u8][{value u64, salt 32}×n][sig0…]
@@ -707,6 +715,27 @@ pub mod wire {
         Some((address, expiry, b[41..].to_vec()))
     }
 
+    /// HUB payload: [ver][outbound u64][min_capacity u64][hop_fee u64]
+    pub fn pack_hub(outbound: u64, min_capacity: u64, hop_fee: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(25);
+        out.push(VERSION);
+        out.extend_from_slice(&outbound.to_le_bytes());
+        out.extend_from_slice(&min_capacity.to_le_bytes());
+        out.extend_from_slice(&hop_fee.to_le_bytes());
+        out
+    }
+
+    pub fn unpack_hub(b: &[u8]) -> Option<(u64, u64, u64)> {
+        if b.len() < 25 || b[0] != VERSION {
+            return None;
+        }
+        Some((
+            u64::from_le_bytes(b[1..9].try_into().ok()?),
+            u64::from_le_bytes(b[9..17].try_into().ok()?),
+            u64::from_le_bytes(b[17..25].try_into().ok()?),
+        ))
+    }
+
     /// Small payload: [ver][u32][extra…] (ACK, CLOSE_REQ, CLOSED, REJECT…)
     pub fn pack_u32(n: u32, extra: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(5 + extra.len());
@@ -756,6 +785,16 @@ mod tests {
         assert_eq!(wire::unpack_state(&packed).unwrap(), st);
         packed[0] = 1; // wrong version
         assert!(wire::unpack_state(&packed).is_none());
+    }
+
+    #[test]
+    fn hub_codec_roundtrip() {
+        let p = wire::pack_hub(1_000_000, 4096, 50);
+        assert_eq!(wire::unpack_hub(&p).unwrap(), (1_000_000, 4096, 50));
+        let mut bad = p.clone();
+        bad[0] = 1;
+        assert!(wire::unpack_hub(&bad).is_none());
+        assert!(wire::unpack_hub(&p[..10]).is_none());
     }
 
     #[test]
