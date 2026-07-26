@@ -1038,16 +1038,19 @@ impl Service {
         let state = self.node.get_state().await;
         let peers = self.node.get_peers().await;
         let (mempool, _) = self.node.get_mempool_info().await;
+        let (is_syncing, phase, cursor, target) = self.node.sync_progress().await;
         // 60-second block target ⇒ expected height ≈ tip height + elapsed/60.
         let now = now_secs();
-        let est_target_height = if state.timestamp > 0 && now > state.timestamp {
+        let est_target_height = if target > 0 {
+                target
+            } else if state.timestamp > 0 && now > state.timestamp {
             state.height + (now - state.timestamp) / 60
         } else {
             state.height
         };
         SyncStatus {
             height: state.height,
-            is_syncing: self.node.is_syncing(),
+            is_syncing,
             peer_count: peers.len(),
             mempool,
             safe_depth: self.node.get_safe_depth().await,
@@ -1056,6 +1059,9 @@ impl Service {
             midstate: hex::encode(state.midstate),
             est_target_height,
             timestamp: state.timestamp,
+                sync_phase: phase,
+                sync_cursor: cursor,
+                sync_target: target,
         }
     }
 

@@ -241,7 +241,10 @@ fn sync_panel(app: &mut App, ui: &mut Ui) {
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         let Some(s) = app.sync.clone() else { return };
-        let target = s.est_target_height.max(s.height);
+        
+        let is_headers = s.sync_phase == "headers";
+        let target = if s.sync_target > 0 { s.sync_target } else { s.est_target_height.max(s.height) };
+ 
 
         ui.horizontal(|ui| {
             ui.label(
@@ -260,7 +263,12 @@ fn sync_panel(app: &mut App, ui: &mut Ui) {
         ui.add_space(6.0);
 
         let rate = app.sync_rate();
-        let caption = if s.height <= 2 && rate.is_none() {
+        let caption = if is_headers {
+            format!(
+                "Downloading block headers: {} of ~{}...",
+                units(s.sync_cursor), units(target)
+            )
+        } else if s.height <= 2 && rate.is_none() {
             format!(
                 "Verifying block headers first — the bar moves once whole blocks start \
                  applying. Target: ~{} blocks.",

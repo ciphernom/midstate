@@ -485,23 +485,117 @@ pub fn compact_units(v: u64) -> String {
     format!("{} MDS", units(v))
 }
 
-/// Parse an amount typed in `unit_ix` into raw units, rejecting fractions
-/// that would not land on a whole unit.
+/// Parse a user-typed amount in the selected unit into base MDS.
+///
+/// # Reasoning
+///
+/// This previously parsed to `f64` and multiplied. Every legitimate amount is
+/// exactly representable — max supply is 1,125,899,906,842,624 base MDS against
+/// an f64 integer limit of 2^53 = 9,007,199,254,740,992 — but nothing outside
+/// that range was rejected. It was silently rounded to the nearest
+/// representable value, and `as u64` then saturated rather than failing. In
+/// gMDS the break is at ~8,388,608, only about 8x max supply and well inside
+/// fat-finger range. The `fract() > 1e-6` whole-number check stopped meaning
+/// anything at the same scale: f64 spacing at 1e15 is 0.125 and at 1e17 is 16,
+/// so the tolerance was finer than the gap between representable values and
+/// non-integers read as exactly integral.
+///
+/// Money should not round. This parses both sides of the decimal point as
+/// integers and rejects anything that will not fit, so the failure mode is a
+/// refusal rather than a wrong number.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Pre:  true (total; every input yields Ok or Err, never a wrong value)
+///
+/// Post:
+///   Ok(n)  ⇒ n = int_part · mul + frac_scaled
+///            ∧ n ≤ u64::MAX
+///            ∧ the text denoted exactly n base MDS
+///   Err(_) ⇒ the text was empty, malformed, non-positive, not a whole
+///            number of MDS, or too large to represent
+/// ```
 pub fn parse_in_unit(text: &str, unit_ix: usize) -> Result<u64, String> {
     let mul = UNIT_MULS[unit_ix.min(3)];
+    let name = UNIT_NAMES[unit_ix.min(3)];
     let t = text.trim();
     if t.is_empty() {
         return Err(String::new());
     }
-    let v: f64 = t.parse().map_err(|_| "not a number".to_string())?;
-    if v <= 0.0 {
+
+    let (int_s, frac_s) = match t.split_once('.') {
+        Some((_, f)) if f.contains('.') => return Err("not a number".into()),
+        Some((i, f)) => (i, f),
+        None => (t, ""),
+    };
+    if int_s.is_empty() && frac_s.is_empty() {
+        return Err("not a number".into());
+    }
+    if !int_s.chars().all(|c| c.is_ascii_digit()) || !frac_s.chars().all(|c| c.is_ascii_digit()) {
+        return Err("not a number".into());
+    }
+
+let int_part: u64 = if int_s.is_empty() {
+        0
+    } else {
+        int_s.parse().map_err(|_| "amount is too large".to_string())?
+    };
+
+    let mut whole = int_part.checked_mul(mul).ok_or("amount is too large")?;
+
+    if !frac_s.is_empty() {
+        // The smallest fraction that still lands on a whole MDS is 1/mul, and
+        // the largest multiplier is 2^30 — whose decimal expansion is exactly
+        // 30 places (0.000000000931322574615478515625). Nothing beyond that can
+        // reach a whole MDS, so a nonzero tail past 30 digits is decisive and a
+        // zero tail is noise.
+        const MAX_FRAC_DIGITS: usize = 30;
+        let frac_s = if frac_s.len() > MAX_FRAC_DIGITS {
+            let (head, tail) = frac_s.split_at(MAX_FRAC_DIGITS);
+            if tail.bytes().any(|b| b != b'0') {
+                return Err(format!("{t} {name} is not a whole number of MDS"));
+            }
+            head
+        } else {
+            frac_s
+        };
+
+        let pow: u128 = 10u128
+            .checked_pow(frac_s.len() as u32)
+            .ok_or("amount is too large")?;
+        let frac: u128 = frac_s.parse().map_err(|_| "not a number".to_string())?;
+
+        // Cancel the shared factor before multiplying. `mul` is a power of two
+        // and `pow` is 10^d = 2^d·5^d, so the gcd is 2^min(k,d) — reducing by it
+        // is what keeps the product inside u128 at 30 digits against a 2^30
+        // multiplier.
+        let g = gcd_u128(pow, mul as u128);
+        let numer_mul = mul as u128 / g;
+        let denom = pow / g;
+
+        let num = frac.checked_mul(numer_mul).ok_or("amount is too large")?;
+        if num % denom != 0 {
+            return Err(format!("{t} {name} is not a whole number of MDS"));
+        }
+        let add = u64::try_from(num / denom).map_err(|_| "amount is too large".to_string())?;
+        whole = whole.checked_add(add).ok_or("amount is too large")?;
+    }
+
+    if whole == 0 {
         return Err("amount must be positive".into());
     }
-    let raw = v * mul as f64;
-    if raw.fract().abs() > 1e-6 {
-        return Err(format!("{t} {} is not a whole number of MDS", UNIT_NAMES[unit_ix.min(3)]));
+    Ok(whole)
+}
+
+/// Binary GCD, `const`-friendly and dependency-free.
+fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
     }
-    Ok(raw.round() as u64)
+    a
 }
 
 /// A segmented control. Returns true when the selection changed.
@@ -574,4 +668,90 @@ pub fn in_unit(v: u64, unit_ix: usize) -> String {
     let frac = (v % mul) as f64 / mul as f64;
     let s = format!("{:.4}", whole as f64 + frac);
     s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MDS: usize = 0;
+    const KMDS: usize = 1;
+    const MMDS: usize = 2;
+    const GMDS: usize = 3;
+
+    #[test]
+    fn whole_units_scale_by_their_multiplier() {
+        assert_eq!(parse_in_unit("1", MDS), Ok(1));
+        assert_eq!(parse_in_unit("1", KMDS), Ok(1_024));
+        assert_eq!(parse_in_unit("1", MMDS), Ok(1_048_576));
+        assert_eq!(parse_in_unit("1", GMDS), Ok(1_073_741_824));
+        assert_eq!(parse_in_unit("  7  ", KMDS), Ok(7_168));
+    }
+
+    #[test]
+    fn fractions_are_exact_when_they_land_on_a_whole_mds() {
+        assert_eq!(parse_in_unit("1.5", KMDS), Ok(1_536));
+        // The smallest fraction of a kMDS that is still a whole MDS: 1/1024.
+        assert_eq!(parse_in_unit("0.0009765625", KMDS), Ok(1));
+        assert_eq!(parse_in_unit("1.0009765625", KMDS), Ok(1_025));
+        // Same, one level up: 1/1048576 of an mMDS.
+        assert_eq!(parse_in_unit("1.00000095367431640625", MMDS), Ok(1_048_577));
+        // 1/2^30 of a gMDS — 30 decimal places, the deepest the units reach.
+        assert_eq!(parse_in_unit("0.000000000931322574615478515625", GMDS), Ok(1));
+    }
+
+    #[test]
+    fn fractions_that_would_split_an_mds_are_refused() {
+        // MDS is the indivisible unit — half of one does not exist.
+        assert!(parse_in_unit("0.5", MDS).is_err());
+        // 0.1 kMDS is 102.4 MDS. Decimal-looking, not representable.
+        assert!(parse_in_unit("0.1", KMDS).is_err());
+        assert!(parse_in_unit("1.00048828125", KMDS).is_err()); // 1024.5
+    }
+
+    #[test]
+    fn malformed_input_is_refused_rather_than_coerced() {
+        assert!(parse_in_unit("", MDS).is_err());
+        assert!(parse_in_unit("   ", MDS).is_err());
+        assert!(parse_in_unit("abc", MDS).is_err());
+        assert!(parse_in_unit("1.2.3", MDS).is_err());
+        assert!(parse_in_unit(".", MDS).is_err());
+        assert!(parse_in_unit("0", MDS).is_err());
+        assert!(parse_in_unit("0.0", KMDS).is_err());
+    }
+
+    /// The reason this function does not use floating point.
+    ///
+    /// Neither case is reachable through the UI — both are far beyond max
+    /// supply and the planner rejects them as insufficient funds. They are
+    /// pinned because the alternative is a function that returns a *wrong
+    /// number* instead of an error, and a wrong amount cannot be detected
+    /// downstream: `plan_send` will faithfully decompose whatever it is given.
+    #[test]
+    fn out_of_range_amounts_fail_closed() {
+        // Exactly 2^64 in base units. The f64 path saturated to u64::MAX here.
+        assert!(parse_in_unit("17179869184", GMDS).is_err());
+        assert!(parse_in_unit("18446744073709551616", GMDS).is_err());
+
+        // 2^53 + 1: the f64 path silently rounded this down by one.
+        assert_eq!(
+            parse_in_unit("9007199254740993", MDS),
+            Ok(9_007_199_254_740_993)
+        );
+    }
+
+    #[test]
+    fn every_input_yields_a_verdict_and_never_a_wrong_number() {
+        // Totality sweep: whatever the answer, it is Ok or Err, never a panic
+        // and never a value that disagrees with exact integer arithmetic.
+        for unit in [MDS, KMDS, MMDS, GMDS] {
+            let mul = UNIT_MULS[unit];
+            for n in [1u64, 2, 3, 7, 1_023, 1_024, 999_999, 1_048_576] {
+                if let Ok(got) = parse_in_unit(&n.to_string(), unit) {
+                    assert_eq!(got, n.checked_mul(mul).unwrap(), "{n} in unit {unit}");
+                }
+            }
+        }
+    }
 }
