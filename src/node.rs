@@ -5557,8 +5557,27 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
         let v2 = crate::core::types::is_v2_at(self.state.height);
 
         let disk_highest = self.storage.highest_batch().unwrap_or(0);
-        if disk_highest + 1 != self.state.height {
-            tracing::error!("Health Check Failed: Disk tip is {} but Memory State is at {}", disk_highest, self.state.height);
+        // Sync writes batches to disk before applying them, so an unclean
+        // shutdown between those two steps legitimately leaves disk exactly one
+        // batch ahead. That is a resumable state, not corruption — rolling back
+        // to the last snapshot discards hundreds of valid blocks to recover
+        // from a single pending one.
+        if disk_highest == self.state.height {
+            tracing::info!(
+                "Disk holds an unapplied batch at {} (state at {}). Resuming rather than healing.",
+                disk_highest, self.state.height
+            );
+            if let Some(pending) = self.storage.load_batch(disk_highest)? {
+                if let Err(e) = self.handle_new_batch(pending, None).await {
+                    tracing::warn!("Could not apply pending batch {}: {e}", disk_highest);
+                    return Ok(false);
+                }
+            }
+        } else if disk_highest + 1 != self.state.height {
+            tracing::error!(
+                "Health Check Failed: expected disk tip {} (state height {} - 1) but found {}",
+                self.state.height.saturating_sub(1), self.state.height, disk_highest
+            );
             return Ok(false);
         }
 
