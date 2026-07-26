@@ -2501,6 +2501,14 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
         self.cache_current_state();
 
         let mut save_interval = time::interval(Duration::from_secs(10));
+        // Every field of `State` is block-derived, so between blocks this timer
+        // was re-serialising a byte-identical ~27 MB blob every 10 seconds —
+        // ~233 GB/day of writes, and just as much while idle. Track what has
+        // actually been persisted so the tick is a no-op unless the tip moved.
+        //
+        // Seeded from the loaded tip: startup state came off disk, so it is
+        // already durable and needs no immediate rewrite.
+        let mut last_saved_height = self.state.height;
         let mut ui_interval = time::interval(Duration::from_secs(1));
         ui_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut metrics_interval = time::interval(Duration::from_secs(30));
@@ -2581,17 +2589,26 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                     }
                 }
                 _ = save_interval.tick() => {
-                    // Clone the Arc to the DB and the persistent `im` state (O(1) RAM cost)
-                    let storage_clone = self.storage.clone();
-                    let state_clone = self.state.clone(); 
-                    
-                    // Offload the heavy serialization to a background thread
-                    tokio::task::spawn_blocking(move || {
-                        if let Err(e) = storage_clone.save_state(&state_clone) {
-                            tracing::error!("Failed to save state in background: {}", e);
-                        }
-                    });
-                }
+                    // Only if the tip has moved since the last persist. Every
+                    // block-application path (mined, sync, reorg, heal) already
+                    // saves, so this remains a backstop for one that failed
+                    // quietly — a failed save leaves `last_saved_height` behind
+                    // the tip, so the next tick retries it.
+                    if self.state.height != last_saved_height {
+                        last_saved_height = self.state.height;
+
+                        // Clone the Arc to the DB and the persistent `im` state (O(1) RAM cost)
+                        let storage_clone = self.storage.clone();
+                        let state_clone = self.state.clone();
+
+                        // Offload the heavy serialization to a background thread
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(e) = storage_clone.save_state(&state_clone) {
+                                tracing::error!("Failed to save state in background: {}", e);
+                            }
+                        });
+                    }
+                 }
                 
                 _ = health_check_interval.tick() => {
                     // Periodic O(1) health check to ensure we aren't desynced/corrupted
