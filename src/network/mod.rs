@@ -298,6 +298,11 @@ pub enum NetworkEvent {
     PeerDisconnected(PeerId),
     OutgoingConnectionFailed(String),
     RequestFailed(PeerId),
+    /// Peer completed a libp2p handshake but advertises none of our
+    /// request-response protocols — a fork or an incompatible release.
+    /// Handled as a ban: it will never answer, and the subnet is as good a
+    /// signal as the peer id.
+    ProtocolMismatch(PeerId),
 }
 
 // ── Network API ─────────────────────────────────────────────────────────────
@@ -997,8 +1002,15 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     },
                 )) => {
                     self.pending_requests.remove(&request_id);
+                    // Deterministic, unlike Timeout / DialFailure / ConnectionClosed:
+                    // a peer that speaks none of our protocols will never start,
+                    // so retrying is pure noise. Ban on first occurrence.
+                    if matches!(error, request_response::OutboundFailure::UnsupportedProtocols) {
+                        return NetworkEvent::ProtocolMismatch(peer);
+                    }
+
                     tracing::warn!("Outbound request to {} failed: {}", peer, error);
-                    return NetworkEvent::RequestFailed(peer); 
+                    return NetworkEvent::RequestFailed(peer);
                 }
                 SwarmEvent::Behaviour(MidstateBehaviourEvent::Rr(
                     request_response::Event::InboundFailure { peer, error, .. },
