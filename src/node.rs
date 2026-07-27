@@ -3204,6 +3204,9 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                                 }
                             }
                         }
+                        NetworkEvent::ProtocolMismatch(peer) => {
+                            self.ban_peer(peer, "speaks none of our protocols — incompatible fork");
+                       }
                         NetworkEvent::RequestFailed(peer) => {
                             if self.sync.is_sync_peer(peer) {
                                 self.abort_sync_session("Outbound request failed (timeout or disconnected)");
