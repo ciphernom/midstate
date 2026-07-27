@@ -4109,6 +4109,13 @@ fn fire_batch_lookahead(&mut self) {
     fn ban_peer(&mut self, peer: PeerId, reason: &str) {
         tracing::error!("BANNING peer {} — {}", peer, reason);
         
+        // Ban by peer id first. The subnet ban below depends on resolving an
+        // IP, which fails for relayed connections (`/p2p-circuit/`) and for
+        // bare `/p2p/<id>` dials — exactly how a banned peer reconnects. The
+        // peer id is always present, so this is the ban that actually holds.
+        self.network.static_banned_peers.insert(peer);
+
+        
         // 1. Immediately sever the TCP connection (Frees RAM/FDs)
         self.network.disconnect_peer(peer);
 
