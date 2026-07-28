@@ -4114,7 +4114,11 @@ fn fire_batch_lookahead(&mut self) {
         // bare `/p2p/<id>` dials — exactly how a banned peer reconnects. The
         // peer id is always present, so this is the ban that actually holds.
         self.network.static_banned_peers.insert(peer);
-
+        // A relay reservation lives in `relay::client` and renews on its own
+        // schedule — disconnecting at ConnectionEstablished does not cancel it,
+        // so a banned relay keeps re-reserving and stays in our advertised
+        // external addresses.
+        self.network.drop_relay_reservation(peer);
         
         // 1. Immediately sever the TCP connection (Frees RAM/FDs)
         self.network.disconnect_peer(peer);
