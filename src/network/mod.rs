@@ -571,7 +571,13 @@ let autonat = autonat::Behaviour::new(
             // who are not light clients, and not already acting as our relay.
             let mut candidates = Vec::new();
             for (peer, endpoint) in &self.connected {
-                if !self.light_peers.contains(peer) && !self.relay_reservations.contains(peer) {
+                // A banned peer must never be selected as a relay: routing our
+                // inbound traffic through a node we refuse to talk to means
+                // advertising a circuit address that cannot carry a connection.
+                if !self.light_peers.contains(peer)
+                    && !self.relay_reservations.contains(peer)
+                    && !self.static_banned_peers.contains(peer)
+                {
                     if endpoint.is_dialer() {
                         candidates.push((*peer, endpoint.get_remote_address().clone()));
                     }
@@ -1329,6 +1335,18 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
     pub async fn gc_stale_light_peers(&self) {
         self.light_guard.gc_stale().await;
     }
+    
+    /// Cancel any relay reservation held with this peer and stop advertising
+    /// circuit addresses that route through it.
+    pub fn drop_relay_reservation(&mut self, peer: PeerId) {
+        if self.relay_reservations.remove(&peer) {
+            let circuit = format!("/p2p/{peer}/p2p-circuit");
+            self.external_addrs.retain(|a| !a.to_string().contains(&circuit));
+            self.listen_addrs.retain(|a| !a.to_string().contains(&circuit));
+            tracing::info!("Dropped relay reservation with banned peer {peer}");
+        }
+    }
+    
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
