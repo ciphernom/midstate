@@ -546,6 +546,24 @@ async request(req, _retries = 2) {
             return this.request(req, _retries - 1);
         }
         throw err;
+    } finally {
+        // Release the stream slot NOW, on success as well as on error.
+        //
+        // The `stream.close()` above is fire-and-forget and only half-closes:
+        // it starts a graceful close that waits for the node's FIN_ACK. Until
+        // that lands the stream sits in 'closing' state and STILL counts against
+        // libp2p's 64-streams-per-protocol cap. On the error path `abort()`
+        // released it immediately; the success path returned without releasing
+        // anything, so a burst of requests — a wallet rescan fires hundreds of
+        // get_block calls back to back — accumulated closing streams until
+        // newStream threw TooManyOutboundProtocolStreamsError at 65/64, which
+        // then marked WebRTC unhealthy and dumped everything onto the HTTPS
+        // gateway. `abort()` on a stream whose response we have already fully
+        // read discards nothing; it just skips the FIN_ACK wait.
+        //
+        // (The earlier OLDrequest implementation did exactly this in its own
+        // `finally` — the newer path lost it.)
+        try { stream.abort(new Error('done')); } catch (_) {}
     }
 }
 

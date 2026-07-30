@@ -2,6 +2,7 @@
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
 export const __wbg_webwallet_free: (a: number, b: number) => void;
+export const address_to_checksummed_hex: (a: number, b: number, c: number) => void;
 export const blake3_hash_hex: (a: number, b: number, c: number) => void;
 export const build_channel_reveal: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => void;
 export const build_channel_state: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: bigint, j: number, k: number, l: number) => void;

@@ -72,6 +72,10 @@ pub struct GpuSettings {
     /// discrete card). Also settable via the `WGPU_ADAPTER_NAME` env var. Unset =
     /// automatic.
     pub adapter: Option<String>,
+    /// Maximum number of GPUs to mine on simultaneously. `0` or unset = all
+    /// usable devices. Also settable via the `MINER_GPU_DEVICES` env var. Useful
+    /// to leave one card free for the desktop on a multi-GPU workstation.
+    pub max_devices: Option<usize>,
 }
 
 impl Default for GpuSettings {
@@ -82,6 +86,7 @@ impl Default for GpuSettings {
             responsive_iters: DEFAULT_RESPONSIVE_ITERS,
             duty: DEFAULT_DUTY,
             adapter: None,
+            max_devices: None,
         }
     }
 }
@@ -150,6 +155,18 @@ const MAX_WINNERS: u32 = 256;
 const WINNERS_BYTES: u64 = 16 + (MAX_WINNERS as u64) * 4 * 3;
 const SELFTEST_N: u32 = 8;
 
+// NOTE: `wasm-wallet/pow.wgsl` is a copy of this kernel, loaded by the browser
+// miner (`gpu_miner.js`) via WebGPU. A fix here should be ported there.
+//
+// The copies are deliberately independent rather than a shared `include_str!`:
+// keeping the node source untouched by the wallet build is worth more than
+// deduplication, and the safety property does not depend on the two files
+// matching each other. What each host actually guarantees is that ITS kernel
+// reproduces ITS CPU reference — `create_extension` here, WASM
+// `build_solo_extension` in the browser — enforced by a startup self-test over a
+// full EXTENSION_ITERATIONS chain. Both references implement the same spec, so a
+// drift between the two copies surfaces as a self-test failure on whichever side
+// broke, not as silently rejected blocks.
 const SHADER: &str = r#"// BLAKE3 mining kernel for the PoW extension chain.
 //
 // CONSENSUS-CRITICAL: every value below mirrors `create_extension` /
@@ -464,13 +481,75 @@ fn words_be(b: &[u8; 32]) -> [u32; 8] {
     w
 }
 
-/// Choose the GPU adapter to mine on. Enumerates all adapters across all
-/// backends, logs them, then: (1) if a name override is set (TOML `adapter` or
-/// the `WGPU_ADAPTER_NAME` env var) returns the first whose name contains it;
-/// otherwise (2) drops pure-software adapters and ranks the rest discrete >
-/// integrated > virtual, preferring Vulkan > Dx12 > Metal > GL within a tier.
-/// Errors (→ CPU fallback) if nothing usable is found.
-async fn pick_adapter(instance: &wgpu::Instance) -> Result<wgpu::Adapter> {
+/// Choose every GPU adapter to mine on, best first.
+///
+/// Enumerates all adapters across all backends, logs them, then:
+///   1. if a name override is set (TOML `adapter` / `WGPU_ADAPTER_NAME`), keeps
+///      only adapters whose name contains it — *all* of them, not just the first,
+///      so "RTX 4090" matches both cards in a twin-4090 box;
+///   2. drops pure-software adapters (the CPU SIMD miner beats llvmpipe);
+///   3. collapses to a SINGLE backend, then returns every device on it.
+///
+/// # Reasoning
+///
+/// The single-device `pick_adapter` this replaces returned `adapters[0]`, so a
+/// multi-GPU rig logged every card and then mined on one. Returning the full set
+/// is the fix; the subtlety is step 3.
+///
+/// The same physical GPU is usually enumerated once per backend it supports — on
+/// Linux an NVIDIA card shows up under both Vulkan and GL. Building one
+/// `GpuMiner` per adapter would then open two contexts on one card and report
+/// double the device count while delivering none of the throughput.
+///
+/// Deduplicating by `AdapterInfo` instead does not work: two *identical* cards
+/// (same vendor, same device id, same name) are indistinguishable in wgpu's info
+/// struct, and dropping one of them would silently halve a twin-GPU rig. Within
+/// a single backend, however, every adapter is a distinct physical device — so
+/// picking the best backend and taking all of its devices is correct in both
+/// cases.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Let  A       = all adapters over all backends
+///      soft(a) = a.device_type = Cpu
+///      rank(a) = (type_rank a.device_type, backend_rank a.backend)
+///
+/// Pre:
+///   - true
+///
+/// Post:
+///   result! = Err(_)  ⇔  A = ∅ ∨ { a ∈ A | ¬soft(a) } = ∅
+///
+///   result! = Ok(s)   ⇒
+///       ∀ a ∈ ran s • ¬soft(a) ∧ a.backend = b*
+///       where b* = the backend of the highest-ranked non-software adapter
+///
+///       ran s = { a ∈ A | ¬soft(a) ∧ a.backend = b* }   (before the cap)
+///       #s ≤ cap                                        (cap applied last)
+///       ∀ i, j ∈ dom s • i < j ⇒ type_rank(s i) ≤ type_rank(s j)
+///
+///   One-backend property (why this is exactly one context per physical GPU):
+///       ∀ a₁, a₂ ∈ ran s • a₁ ≠ a₂ ⇒ a₁ and a₂ are distinct physical devices
+///   because within a single backend wgpu enumerates each device exactly once.
+/// ```
+///
+/// # Safety / Invariants
+///
+/// - **One context per physical GPU.** Violating the one-backend property would
+///   open two `Device`s on one card, doubling the reported device count while
+///   halving each context's share of it — an operator would see "2 devices" and
+///   no extra hashrate.
+/// - **Ordering is load-bearing.** `max_devices` truncates from the tail, so the
+///   sort by `type_rank` is what makes a cap of 1 keep the discrete card rather
+///   than an integrated one.
+/// - **Software adapters are excluded, not deprioritised.** llvmpipe is slower
+///   than the real CPU SIMD miner, so mining on it is a net loss; the empty-set
+///   error routes the caller to `mine_extension` instead.
+/// - **A name filter that matches nothing must not mean "no GPU".** It falls back
+///   to full automatic selection with a warning, because a typo in
+///   `WGPU_ADAPTER_NAME` should cost the operator their preference, not all mining.
+async fn pick_adapters(instance: &wgpu::Instance) -> Result<Vec<wgpu::Adapter>> {
     let mut adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
     if adapters.is_empty() {
         bail!(
@@ -483,7 +562,7 @@ async fn pick_adapter(instance: &wgpu::Instance) -> Result<wgpu::Adapter> {
         tracing::info!("GPU adapter found: {} [{:?} via {:?}]", i.name, i.device_type, i.backend);
     }
 
-    // (1) explicit override by case-insensitive name substring.
+    // (1) explicit override by case-insensitive name substring — retain, not find.
     let name_pref = settings()
         .adapter
         .clone()
@@ -491,39 +570,66 @@ async fn pick_adapter(instance: &wgpu::Instance) -> Result<wgpu::Adapter> {
         .filter(|s| !s.trim().is_empty());
     if let Some(want) = name_pref {
         let want_lc = want.to_lowercase();
-        if let Some(pos) = adapters
-            .iter()
-            .position(|a| a.get_info().name.to_lowercase().contains(&want_lc))
-        {
-            return Ok(adapters.swap_remove(pos));
+        let before = adapters.len();
+        adapters.retain(|a| a.get_info().name.to_lowercase().contains(&want_lc));
+        if adapters.is_empty() {
+            tracing::warn!("no GPU adapter matched name '{want}'; using automatic selection");
+            adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+        } else if adapters.len() < before {
+            tracing::info!("adapter filter '{want}' matched {} of {} adapters", adapters.len(), before);
         }
-        tracing::warn!("no GPU adapter matched name '{want}'; using automatic selection");
     }
 
-    // (2) drop software adapters — the real CPU SIMD miner beats llvmpipe etc.
+    // (2) drop software adapters.
     adapters.retain(|a| a.get_info().device_type != wgpu::DeviceType::Cpu);
     if adapters.is_empty() {
         bail!("only software (CPU) GPU adapters available; using the CPU miner instead");
     }
 
-    adapters.sort_by_key(|a| {
-        let i = a.get_info();
-        let type_rank = match i.device_type {
-            wgpu::DeviceType::DiscreteGpu => 0u8,
-            wgpu::DeviceType::IntegratedGpu => 1,
-            wgpu::DeviceType::VirtualGpu => 2,
-            _ => 3, // Other
-        };
-        let backend_rank = match i.backend {
-            wgpu::Backend::Vulkan => 0u8,
-            wgpu::Backend::Dx12 => 1,
-            wgpu::Backend::Metal => 2,
-            wgpu::Backend::Gl => 3,
-            _ => 4,
-        };
-        (type_rank, backend_rank)
-    });
-    Ok(adapters.into_iter().next().unwrap())
+    let backend_rank = |b: wgpu::Backend| match b {
+        wgpu::Backend::Vulkan => 0u8,
+        wgpu::Backend::Dx12 => 1,
+        wgpu::Backend::Metal => 2,
+        wgpu::Backend::Gl => 3,
+        _ => 4,
+    };
+    let type_rank = |t: wgpu::DeviceType| match t {
+        wgpu::DeviceType::DiscreteGpu => 0u8,
+        wgpu::DeviceType::IntegratedGpu => 1,
+        wgpu::DeviceType::VirtualGpu => 2,
+        _ => 3,
+    };
+
+    // (3) pick the backend whose best device ranks highest, then keep only it.
+    //
+    // `min_by_key` rather than mapping to a tuple that carries the backend:
+    // `wgpu::Backend` implements neither `Ord` nor `PartialOrd`, so it cannot sit
+    // inside a comparison key. Rank on `(device_type, backend)` — both plain u8 —
+    // and read the backend off the winning adapter afterwards.
+    let best_backend = adapters
+        .iter()
+        .min_by_key(|a| {
+            let i = a.get_info();
+            (type_rank(i.device_type), backend_rank(i.backend))
+        })
+        .map(|a| a.get_info().backend)
+        .expect("adapters is non-empty");
+    adapters.retain(|a| a.get_info().backend == best_backend);
+
+    // Best device first, so a single-device cap keeps the fastest card.
+    adapters.sort_by_key(|a| type_rank(a.get_info().device_type));
+
+    let cap = settings()
+        .max_devices
+        .or_else(|| std::env::var("MINER_GPU_DEVICES").ok().and_then(|v| v.parse().ok()))
+        .filter(|n| *n > 0)
+        .unwrap_or(usize::MAX);
+    if adapters.len() > cap {
+        tracing::info!("limiting GPU mining to {} of {} devices", cap, adapters.len());
+        adapters.truncate(cap);
+    }
+
+    Ok(adapters)
 }
 
 // ── The reusable GPU context ──────────────────────────────────────────────────
@@ -561,21 +667,77 @@ impl GpuMiner {
     /// Build the GPU context. Cheap-ish but not free (device init + shader
     /// compile); construct once and reuse across blocks.
     pub fn new() -> Result<Self> {
-        pollster::block_on(Self::new_async())
+        pollster::block_on(async {
+            let instance = wgpu::Instance::new(
+                wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+            );
+            let adapter = pick_adapters(&instance)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("no usable GPU adapter"))?;
+            Self::new_async(adapter).await
+        })
     }
 
-    async fn new_async() -> Result<Self> {
-        // wgpu 29: InstanceDescriptor lost `Default`. This constructor reads
-        // backend/power prefs from env (e.g. WGPU_BACKEND=vulkan to force Vulkan)
-        // and needs no window/display handle (we're headless compute).
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    /// Build every usable device, best first. One `GpuMiner` per physical GPU.
+    ///
+    /// # Reasoning
+    /// Partial failure must be survivable. A mixed rig — a current card plus an
+    /// older one on a shakier driver — is the common multi-GPU case, and a single
+    /// `request_device` failure taking down all mining would be a worse outcome
+    /// than running on one card. Each device is therefore built independently and
+    /// a failure is logged and skipped.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:
+    ///   - true
+    ///
+    /// Post:
+    ///   result! = Ok(s) ⇒ #s ≥ 1
+    ///                   ∧ ∀ m ∈ ran s • m has its own Device, Queue and buffers
+    ///                   ∧ ran s ⊆ { successful init over pick_adapters() }
+    ///   result! = Err(_) ⇒ no adapter could be initialized
+    ///                    (caller falls back to the CPU miner)
+    ///
+    ///   Order is inherited from pick_adapters: best device first.
+    /// ```
+    ///
+    /// # Safety / Invariants
+    /// - **No buffer sharing between devices.** Each `GpuMiner` owns its own
+    ///   `state_buf` / `winners_buf` / `params_buf` and its own `Mutex`, so the
+    ///   per-device serialisation that `mine_gpu` relies on still holds when N
+    ///   devices dispatch concurrently.
+    /// - **An empty result is an error, not `Ok(vec![])`.** Callers distinguish
+    ///   "no GPU" from "GPU present" by that error; returning an empty vec would
+    ///   make `gpu_available()` lie.
+    pub fn new_all() -> Result<Vec<Self>> {
+        pollster::block_on(async {
+            // wgpu 29: InstanceDescriptor lost `Default`. This constructor reads
+            // backend/power prefs from env (e.g. WGPU_BACKEND=vulkan to force
+            // Vulkan) and needs no window/display handle (we're headless compute).
+            let instance = wgpu::Instance::new(
+                wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+            );
+            let adapters = pick_adapters(&instance).await?;
+            let mut out = Vec::new();
+            for adapter in adapters {
+                let name = adapter.get_info().name.clone();
+                match Self::new_async(adapter).await {
+                    Ok(m) => out.push(m),
+                    Err(e) => tracing::warn!("skipping GPU '{name}': {e}"),
+                }
+            }
+            if out.is_empty() {
+                bail!("no GPU device could be initialized");
+            }
+            Ok(out)
+        })
+    }
 
-        // Don't trust request_adapter's power-preference hint — on mixed-GPU Linux
-        // it often returns the integrated GPU. Enumerate everything, log it, and
-        // pick deliberately (discrete > integrated, Vulkan > GL), honoring an
-        // optional user override.
-        let adapter = pick_adapter(&instance).await?;
+    async fn new_async(adapter: wgpu::Adapter) -> Result<Self> {
         let info = adapter.get_info();
         tracing::info!(
             "GPU adapter selected: {} [{:?} via {:?}]",
@@ -887,6 +1049,109 @@ impl GpuMiner {
         }
     }
 
+    /// Pop a surplus winner stashed by an earlier `mine_gpu` on this exact job,
+    /// without touching the GPU.
+    ///
+    /// # Reasoning
+    /// The multi-device coordinator must drain every card's stash before spawning
+    /// a fresh search, or winners a card already found sit unserved while the rig
+    /// burns power re-hashing for them. `mine_gpu` cannot be used for this probe:
+    /// it *sets* `job` on mismatch and clears `pending`, so probing device B for
+    /// job X would destroy B's stash for job Y. This is the read-only sibling.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:
+    ///   - true  (total; a mismatched or absent job yields None)
+    ///
+    /// Post:
+    ///   job = job? ∧ #pending > 0 ⇒
+    ///       result! = Some(head pending) ∧ pending' = tail pending
+    ///   job ≠ job? ∨ #pending = 0 ⇒
+    ///       result! = None ∧ pending' = pending ∧ job' = job
+    ///
+    ///   In all cases:  job' = job          (NEVER rotates the job — this is the
+    ///                                       difference from mine_gpu)
+    /// ```
+    ///
+    /// ```zed
+    ///     TakePending
+    ///     ----------------
+    ///     ΔPending
+    ///     ΞJob
+    ///     job?     : JobKey
+    ///     result!  : MiningResult ∪ {⊥}
+    ///
+    ///     pre  true
+    ///
+    ///     post job = job? ∧ pending ≠ ⟨⟩ ⇒
+    ///            result! = head pending ∧ pending' = tail pending
+    ///     post job ≠ job? ∨ pending = ⟨⟩ ⇒
+    ///            result! = ⊥ ∧ pending' = pending
+    ///     post job' = job
+    /// ```
+    ///
+    /// # Safety / Invariants
+    /// - **Read-only with respect to `job`.** A probe must not be able to discard
+    ///   another job's stash; that would silently throw away verified work.
+    /// - **Only serves hits mined for the requested job.** A winner from a
+    ///   superseded template would be submitted and rejected as stale, so the
+    ///   job guard is a correctness requirement, not an optimisation.
+    /// - **FIFO.** `mine_gpu` sorts blocks ahead of shares before stashing, so
+    ///   draining from the front preserves "a block is always served first".
+    pub fn take_pending(&self, job_midstate: [u8; 32], job_target: [u8; 32], job_pool: Option<[u8; 32]>) -> Option<MiningResult> {
+        let job: JobKey = (job_midstate, job_target, job_pool);
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if st.job.as_ref() != Some(&job) {
+            return None;
+        }
+        st.pending.pop_front()
+    }
+
+    /// Return an already-verified hit to this device's stash, to be served by a
+    /// later `mine_gpu`/`take_pending` on the same job.
+    ///
+    /// # Reasoning
+    /// Without this, work is lost. When several cards search concurrently, more
+    /// than one can complete a batch before the winner's `stop` flag is observed.
+    /// The coordinator returns the first hit and every *other* hit — already
+    /// CPU-verified, already paid for in electricity — was silently dropped when
+    /// its channel send found no reader. Stashing it against the originating
+    /// device makes the next call serve it for free.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:
+    ///   - hit? has been CPU-verified by mine_gpu (this method does NOT re-verify)
+    ///
+    /// Post:
+    ///   job = job? ⇒ pending' = pending ⌢ ⟨hit?⟩
+    ///   job ≠ job? ⇒ pending' = pending          (dropped: wrong job)
+    /// ```
+    ///
+    /// # Safety / Invariants
+    /// - **A hit is only stashed under the job it was mined for.** The job guard
+    ///   is what stops a winner from one template being served against another,
+    ///   which would produce a share the pool rejects as stale.
+    /// - **Verification is the caller's responsibility.** Every path into this
+    ///   method comes from `mine_gpu`, which has already re-run
+    ///   `create_extension` on the CPU, so the kernel is never trusted here.
+    pub fn push_pending(
+        &self,
+        job_midstate: [u8; 32],
+        job_target: [u8; 32],
+        job_pool: Option<[u8; 32]>,
+        hit: MiningResult,
+    ) {
+        let job: JobKey = (job_midstate, job_target, job_pool);
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if st.job.as_ref() == Some(&job) {
+            st.pending.push_back(hit);
+        }
+    }
+
     /// Prove the GPU reproduces `create_extension` bit-for-bit on the full
     /// 1,000,000-iteration chain. Runs a tiny batch and reads back the raw
     /// chaining state (which equals the final hash). Returns an error on any
@@ -955,36 +1220,258 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
 /// `MINER_DISABLE_GPU` is set; in every such case the caller should fall back to
 /// its existing CPU miner. See the integration note for the call-site pattern.
 pub fn shared() -> Option<&'static GpuMiner> {
-    static SHARED: OnceLock<Option<GpuMiner>> = OnceLock::new();
-    SHARED
-        .get_or_init(|| {
-            if std::env::var("MINER_DISABLE_GPU").map(|v| v != "0").unwrap_or(false) {
-                tracing::info!("GPU mining disabled via MINER_DISABLE_GPU");
-                return None;
+    shared_all().first()
+}
+
+/// Every self-tested GPU available for mining, best device first. Empty when
+/// there is no usable GPU or `MINER_DISABLE_GPU` is set.
+///
+/// # Reasoning
+/// This replaces a `OnceLock<Option<GpuMiner>>` that structurally could not hold
+/// more than one device, which is why a two-GPU rig detected both cards and mined
+/// on one. Per-device self-testing is the other half: on a mixed rig a card whose
+/// driver miscomputes BLAKE3 must be dropped *on its own* rather than disabling
+/// all mining, which is what a single combined pass/fail would have done.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Pre:
+///   - true
+///
+/// Post (memoised once per process; the result is never recomputed):
+///   MINER_DISABLE_GPU set   ⇒ result! = ⟨⟩
+///   otherwise               ⇒ ran result! = { d ∈ new_all() | self_test(d) = Ok }
+///                             ∧ order inherited from pick_adapters (best first)
+///
+///   gpu_available() ⇔ #result! > 0
+/// ```
+///
+/// # Safety / Invariants
+/// - **Self-test is a hard gate.** A device that cannot reproduce
+///   `create_extension` bit-for-bit over the full 1,000,000-iteration chain never
+///   enters the set. This is the only defence against a driver that computes
+///   plausible-but-wrong hashes, which would otherwise surface as universally
+///   rejected shares.
+/// - **Failures are per-device.** One card excluded must not remove the others,
+///   and all-failed must degrade to the CPU miner rather than to nothing.
+/// - **Memoised deliberately.** Init cost (device + shader compile + a full
+///   self-test chain) is paid once, never per block. A transient failure at
+///   startup therefore disables GPU mining for the life of the process — the
+///   accepted trade for not re-testing on every template.
+pub fn shared_all() -> &'static [GpuMiner] {
+    static SHARED: OnceLock<Vec<GpuMiner>> = OnceLock::new();
+    SHARED.get_or_init(|| {
+        if std::env::var("MINER_DISABLE_GPU").map(|v| v != "0").unwrap_or(false) {
+            tracing::info!("GPU mining disabled via MINER_DISABLE_GPU");
+            return Vec::new();
+        }
+        let candidates = match GpuMiner::new_all() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::info!("GPU mining disabled (no usable device): {e}");
+                return Vec::new();
             }
-            match GpuMiner::new() {
-                Ok(g) => match g.self_test() {
-                    Ok(()) => {
-                        tracing::info!("GPU mining enabled on {}", g.adapter_name());
-                        Some(g)
-                    }
-                    Err(e) => {
-                        tracing::warn!("GPU mining disabled (self-test failed): {e}");
-                        None
-                    }
-                },
-                Err(e) => {
-                    tracing::info!("GPU mining disabled (no usable device): {e}");
-                    None
-                }
+        };
+        let total = candidates.len();
+        let mut ok = Vec::new();
+        for g in candidates {
+            match g.self_test() {
+                Ok(()) => ok.push(g),
+                Err(e) => tracing::warn!(
+                    "GPU '{}' excluded from mining (self-test failed): {e}",
+                    g.adapter_name()
+                ),
             }
-        })
-        .as_ref()
+        }
+        match ok.len() {
+            0 => tracing::warn!("GPU mining disabled: all {total} device(s) failed self-test"),
+            1 => tracing::info!("GPU mining enabled on {}", ok[0].adapter_name()),
+            n => tracing::info!(
+                "GPU mining enabled on {n} devices: {}",
+                ok.iter().map(|g| g.adapter_name()).collect::<Vec<_>>().join(", ")
+            ),
+        }
+        ok
+    })
 }
 
 /// `true` if a self-tested GPU backend is available for mining.
 pub fn gpu_available() -> bool {
-    shared().is_some()
+    !shared_all().is_empty()
+}
+
+/// How many GPUs are mining.
+pub fn gpu_device_count() -> usize {
+    shared_all().len()
+}
+
+/// Run the nonce search across every available GPU, returning the first hit.
+///
+/// # Reasoning
+///
+/// `mine()` previously called `shared()`, which was a `OnceLock<Option<GpuMiner>>`
+/// holding exactly one device. On a two-GPU rig both cards were enumerated and
+/// logged — so the operator could see both — while only the best-ranked one ever
+/// dispatched a single instruction. The other card sat idle for the life of the
+/// process. This function is the fan-out that fixes that.
+///
+/// Threads rather than one queue: `mine_gpu` is synchronous and holds its
+/// device's `Mutex` for the whole call (the buffers are only safe to touch while
+/// it is held), so N cards require N threads. No nonce striding is needed —
+/// each card draws `base: u64 = rand::random()` per batch, so devices explore
+/// disjoint regions of a 2^64 space with no coordination and a collision
+/// probability that rounds to zero.
+///
+/// The internal `stop` flag is what keeps the fan-out cheap: once one card has a
+/// verified hit the others abandon in-flight batches at the next dispatch
+/// boundary (~`iters_per_dispatch` steps) instead of running a full chain to
+/// completion.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Let  D          = shared_all()                    (self-tested devices)
+///      job        = (midstate?, target?, pool_target?)
+///      pending(d) = device d's surplus-winner queue for job
+///      verified(h)= create_extension(midstate?, h.nonce).final_hash < the
+///                   target implied by h's variant                (from mine_gpu)
+///
+/// Pre:
+///   - true  (total; #D = 0 yields None, which routes the caller to the CPU miner)
+///
+/// Post:
+///   result! = Some(h) ⇒ verified(h)
+///                     ∧ h was produced by some d ∈ D
+///
+///   result! = None    ⇒ cancel? was observed set
+///                     ∨ every d ∈ D returned without a hit
+///
+///   ∀ d ∈ D • every verified hit d produced during this call is either
+///             returned as result! or appended to pending'(d)     (no work lost)
+///
+///   hash_counter' ≥ hash_counter                    (summed across all of D)
+///
+///   #{ threads alive on return } = 0                (all joined, always)
+/// ```
+///
+/// ```zed
+///     MineAllGpus
+///     ----------------
+///     ΔPending
+///     midstate?, target? : Hash
+///     pool_target?       : Hash ∪ {⊥}
+///     cancel?            : 𝔹
+///     result!            : MiningResult ∪ {⊥}
+///
+///     pre  true
+///
+///     post result! ≠ ⊥ ⇒ verified result!
+///     post result! = ⊥ ⇒ cancel? ∨ (∀ d : D • d exhausted its search)
+///
+///     post ∀ d : D •
+///            pending' d = pending d ⌢ (hits d \ ⟨result!⟩)
+///
+///     post #D = 0 ⇒ result! = ⊥ ∧ pending' = pending
+/// ```
+///
+/// # Safety / Invariants
+///
+/// - **Never trusts a kernel.** Every returned hit was re-verified against
+///   `create_extension` inside `mine_gpu`. A driver that computes wrong hashes —
+///   or a device whose `self_test` passed but which degrades under thermal load —
+///   can cost throughput but can never surface an invalid share or block.
+/// - **No mined work is discarded.** After the winner is chosen the channel is
+///   drained and any *other* device's verified hit is returned to that device's
+///   stash via `push_pending`. Before this, a second card finishing a batch in
+///   the same instant had its hit dropped when the send found no reader.
+/// - **Stashes are drained before any GPU work.** A card holding surplus winners
+///   from an earlier batch on this job must serve them before the rig re-hashes
+///   for results it already has.
+/// - **The caller's `cancel` is polled here, not handed to the workers.** Workers
+///   need `stop`, which fires both on cancellation *and* on a win; conflating the
+///   two would leave the losers running after a block was already found.
+/// - **Termination is unconditional.** Every spawned thread is joined on all
+///   paths — win, cancel, and exhaustion — so a caller can never outlive its
+///   workers and two mining rounds can never dispatch to one device at once.
+/// - **`hash_counter` is shared across devices,** so the rate the node reports is
+///   the rig total rather than one card's contribution.
+fn mine_all_gpus(
+    midstate: [u8; 32],
+    target: [u8; 32],
+    pool_target: Option<[u8; 32]>,
+    cancel: Arc<AtomicBool>,
+    hash_counter: Arc<AtomicU64>,
+) -> Option<MiningResult> {
+    let devices = shared_all();
+    match devices.len() {
+        0 => return None,
+        // Single GPU: call straight through. Spawning a thread and a channel to
+        // supervise one device would only add latency to the common case.
+        1 => return devices[0].mine_gpu(midstate, target, pool_target, cancel, hash_counter),
+        _ => {}
+    }
+
+    // Drain stashes first — free winners, no GPU work.
+    for d in devices {
+        if let Some(hit) = d.take_pending(midstate, target, pool_target) {
+            return Some(hit);
+        }
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    // Carries the device index so a hit that arrives after the winner can be
+    // returned to the stash of the card that actually mined it.
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Option<MiningResult>)>();
+    let mut handles = Vec::with_capacity(devices.len());
+
+    for (idx, d) in devices.iter().enumerate() {
+        let stop = stop.clone();
+        let hc = hash_counter.clone();
+        let tx = tx.clone();
+        handles.push(std::thread::spawn(move || {
+            let r = d.mine_gpu(midstate, target, pool_target, stop, hc);
+            let _ = tx.send((idx, r));
+        }));
+    }
+    drop(tx); // so the channel disconnects once every worker has finished
+
+    let mut result = None;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            stop.store(true, Ordering::Relaxed);
+            break;
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok((_, Some(hit))) => {
+                result = Some(hit);
+                stop.store(true, Ordering::Relaxed);
+                break;
+            }
+            // That device stopped without a hit; others may still be searching.
+            Ok((_, None)) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    for h in handles {
+        let _ = h.join();
+    }
+
+    // Recover hits that landed while we were breaking out of the loop above.
+    // `rx` is still in scope, so those sends succeeded into the queue rather
+    // than failing — draining it now is what makes "no work lost" true.
+    while let Ok((idx, maybe_hit)) = rx.try_recv() {
+        if let Some(hit) = maybe_hit {
+            match result {
+                None => result = Some(hit),
+                Some(_) => devices[idx].push_pending(midstate, target, pool_target, hit),
+            }
+        }
+    }
+
+    result
 }
 
 /// Which mining backend `mine()` should use.
@@ -1044,8 +1531,9 @@ pub fn mine(
 ) -> Option<MiningResult> {
     let want_gpu = backend() != Backend::Cpu;
     if want_gpu {
-        if let Some(g) = shared() {
-            return g.mine_gpu(midstate, target, pool_target, cancel, hash_counter);
+        // Fans out across every self-tested device; falls through to CPU if none.
+        if gpu_available() {
+            return mine_all_gpus(midstate, target, pool_target, cancel, hash_counter);
         }
         if backend() == Backend::Gpu {
             tracing::warn!("GPU backend requested but no usable GPU; mining on CPU");

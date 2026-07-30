@@ -222,6 +222,19 @@ enum Command {
         /// The percentage fee the pool takes from block rewards (e.g. 1.0 for 1%)
         #[arg(long, default_value = "1.0")]
         fee: f64,
+        /// Share difficulty in leading zero bits (default 12 = one share per
+        /// 2^12 nonces). Raise it for a pool fronting fast hardware to cut
+        /// submission volume; lower it for small/mobile miners to cut variance.
+        /// Score is one point per share regardless, so this rescales what a
+        /// point costs — change it between rounds, not during one.
+        #[arg(long)]
+        share_bits: Option<u32>,
+        /// UDP port for the browser-facing WebRTC listener (libp2p webrtc-direct).
+        /// Omit to disable. Browsers cannot open raw TCP and cannot reach a plain
+        /// HTTP pool from an HTTPS-served wallet, so this is the transport that
+        /// lets the web wallet mine without a CA-signed certificate on the pool.
+        #[arg(long)]
+        webrtc_port: Option<u16>,
     },
     /// Pure Hasher: Connect to a Stratum pool without running a full node
     Miner {
@@ -726,11 +739,11 @@ async fn main() -> Result<()> {
         Command::Peers { rpc_port, rpc_host } => get_peers(rpc_port, rpc_host).await,
         Command::Keygen { rpc_port, rpc_host } => keygen(rpc_port, rpc_host).await,
         Command::Sync { data_dir, peer, port } => sync_from_genesis(data_dir, peer, port).await,
-        Command::Pool { pool_address, bind_addr, rpc_port, rpc_host, fee } => {
+        Command::Pool { pool_address, bind_addr, rpc_port, rpc_host, fee, share_bits, webrtc_port } => {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let node_rpc_url = format!("http://{}:{}", rpc_host, rpc_port);
-                midstate::pool::run_stratum_pool(pool_address, bind_addr, node_rpc_url, fee).await;
+                midstate::pool::run_stratum_pool(pool_address, bind_addr, node_rpc_url, fee, share_bits, webrtc_port).await;
                 Ok(())
             }
             #[cfg(target_arch = "wasm32")]

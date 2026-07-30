@@ -1,9 +1,16 @@
-const CACHE_NAME = 'midstate-wallet-v96';
+// pool_client.bundle.js is deliberately NOT precached: it is imported lazily by
+// index.html only when a miner configures a multiaddr pool, exactly as
+// light_client.bundle.js is. Precaching it would push the libp2p bundle onto
+// every user including solo miners who never touch it.
+const CACHE_NAME = 'midstate-wallet-v99';
 
 const ASSETS = [
   'index.html',
   'worker.js',
   'miner.js',
+  // The mining kernel, fetched at runtime by gpu_miner.js. Precached because a
+  // 404 here silently downgrades every GPU-capable browser to the CPU path.
+  'pow.wgsl',
   'manifest.json',
   'pkg/wasm_wallet.js',
   'pkg/wasm_wallet_bg.wasm'

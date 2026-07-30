@@ -860,11 +860,11 @@
                         <h3 style="margin: 0; font-size: 14px;">Mining Mode</h3>
                         <select id="mineModeSelect" style="width: auto; margin: 0; padding: 4px 8px; font-size: 12px; background: var(--bg); border: 1px solid var(--border-bright); color: var(--text-max); border-radius: 4px;">
                             <option value="solo">Solo (WebRTC)</option>
-                            <option value="pool">Smart Pool (HTTPS)</option>
+                            <option value="pool">Smart Pool</option>
                         </select>
                     </div>
                     <div id="poolConfigParams" class="hidden">
-                        <input type="text" id="poolUrlInput" placeholder="Pool URL (e.g. http://127.0.0.1:8081)" style="font-size: 12px; padding: 8px; margin-bottom: 0;">
+                        <input type="text" id="poolUrlInput" placeholder="Pool multiaddr (/ip4/…/webrtc-direct/certhash/…) or URL" style="font-size: 12px; padding: 8px; margin-bottom: 0;">
                     </div>
                 </div>
             <div class="mine-hero">
@@ -889,7 +889,7 @@
             <div style="text-align: center; margin-bottom: 1.25rem;">
                 <div class="mine-hw-badge">
                     <div class="mine-hw-dot" id="mineHwDot"></div>
-                    <span>WASM SIMD128 · 4-Lane · <span id="minerCoreCount">?</span> Cores</span>
+                    <span id="mineBackendBadge">WASM SIMD128 · 4-Lane · <span id="minerCoreCount">?</span> Cores</span>
                 </div>
             </div>
 
@@ -911,7 +911,7 @@
 
             <!-- Time to Block estimate -->
             <div class="panel" style="text-align: center; padding: 1rem; margin-bottom: 1rem; border-color: var(--border);">
-                <div style="font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px; color: #555; margin-bottom: 4px;">Estimated Time to Block</div>
+                <div id="mineStatEtaLabel" style="font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px; color: #555; margin-bottom: 4px;">Estimated Time to Block</div>
                 <div id="mineStatEta" style="font-size: 22px; font-weight: 700; color: var(--text-bright); font-variant-numeric: tabular-nums;">—</div>
                 <div style="font-size: 10px; color: #444; margin-top: 2px;">based on current hashrate &amp; difficulty</div>
             </div>
@@ -940,6 +940,10 @@
                 <div class="mine-stat">
                     <span class="mine-stat-label">Blocks Found</span>
                     <span class="mine-stat-val" id="mineStatBlocks" style="color: var(--accent);">0</span>
+                </div>
+                <div class="mine-stat" id="mineStatSharesTile" style="display: none;">
+                    <span class="mine-stat-label">Pool Score</span>
+                    <span class="mine-stat-val" id="mineStatShares" style="color: var(--accent);">0</span>
                 </div>
                 <div class="mine-stat">
                     <span class="mine-stat-label">Mempool Txs</span>
@@ -1752,6 +1756,8 @@ if ('serviceWorker' in navigator) {
         let miningSessionStart = 0;
         let totalNoncesSession = 0;
         let blocksFoundSession = 0;
+        /** Latest pool score reported by the pool. -1 = unknown / not pooling. */
+        let poolScoreSession = -1;
         let lastTemplateHeight = -1;
         let templatePollTimer = null;
         let uiRefreshTimer = null;
@@ -1833,9 +1839,29 @@ if ('serviceWorker' in navigator) {
         const poolUrlInput = document.getElementById('poolUrlInput');
 
         // Load saved preferences
+        //
+        // ── One-time migration ──
+        // Earlier builds saved this preference but never acted on it: worker.js
+        // had no SET_MINING_MODE handler, so anyone who selected "Smart Pool"
+        // silently kept SOLO mining. Now that the handler exists, restoring
+        // mineMode='pool' unchanged would change behaviour behind the user's
+        // back — either sending rewards to a pool they configured once and
+        // forgot, or (with an empty/stale poolUrl) breaking mining outright when
+        // the template fetch throws. So the stale preference is reset to solo
+        // once and the user is told, rather than silently honoured.
         if (localStorage.getItem('mineMode')) {
-            mineModeSelect.value = localStorage.getItem('mineMode');
-            if (mineModeSelect.value === 'pool') poolConfigParams.classList.remove('hidden');
+            const savedMode = localStorage.getItem('mineMode');
+            if (savedMode === 'pool' && !localStorage.getItem('poolModeMigrated')) {
+                localStorage.setItem('mineMode', 'solo');
+                localStorage.setItem('poolModeMigrated', '1');
+                mineModeSelect.value = 'solo';
+                setTimeout(() => {
+                    log('Pool mining is now functional (it was previously inactive). Your saved "Smart Pool" setting has been reset to Solo — re-select it and confirm your pool address to use it.', 'var(--yellow)');
+                }, 0);
+            } else {
+                mineModeSelect.value = savedMode;
+                if (mineModeSelect.value === 'pool') poolConfigParams.classList.remove('hidden');
+            }
         }
         if (localStorage.getItem('poolUrl')) {
             poolUrlInput.value = localStorage.getItem('poolUrl');
@@ -1876,9 +1902,16 @@ if ('serviceWorker' in navigator) {
             worker.postMessage({ type: 'SET_MINING_MODE', payload: { mode, url: poolUrlInput.value.trim() } });
 
             isMiningActive = true;
+            // Mirror the flag into the worker. worker.js's PUSH_NEW_BLOCK handler
+            // gates its instant template refresh on `isMiningActive`, but that
+            // variable lives ONLY here on the main thread — referencing it in the
+            // worker threw a ReferenceError and killed the rest of that handler.
+            worker.postMessage({ type: 'SET_MINING_ACTIVE', payload: { active: true } });
             miningSessionStart = Date.now();
             totalNoncesSession = 0;
             blocksFoundSession = 0;
+            poolScoreSession = -1;
+            applyPoolStatsMode(mode === 'pool');
             setMiningUI(true, 0);
             log(`Starting miners in ${mode.toUpperCase()} mode...`);
 
@@ -1892,6 +1925,7 @@ if ('serviceWorker' in navigator) {
 
         function stopMining() {
             isMiningActive = false;
+            worker.postMessage({ type: 'SET_MINING_ACTIVE', payload: { active: false } });
 
             for (const m of miners) {
                 m.worker.postMessage({ type: 'STOP' });
@@ -1945,12 +1979,30 @@ if ('serviceWorker' in navigator) {
                     else if (type === 'LOG') {
                         log(`[miner ${idx}] ${payload}`);
                     }
+                    else if (type === 'GPU_VERIFY_REQUEST') {
+                        // Relay to the wallet worker, which owns the WebWallet
+                        // instance that `build_solo_extension` hangs off. Remember
+                        // which miner asked so the reply goes back to it.
+                        __gpuVerifyWaiters.set(payload.id, m);
+                        worker.postMessage({ type: 'GPU_VERIFY', payload });
+                    }
+                    else if (type === 'GPU_READY') {
+                        log(`⚡ GPU mining active on ${payload.adapter} (worker ${idx})`, 'var(--accent)');
+                        const badge = document.getElementById('mineBackendBadge');
+                        if (badge) badge.innerText = `WEBGPU · ${payload.adapter}`;
+                    }
                     else if (type === 'ERROR') {
                         log(`[miner ${idx}] ${payload}`, 'var(--red)');
                     }
                 };
 
-                m.postMessage({ type: 'INIT' });
+                // Only worker 0 attempts WebGPU. A GPUDevice is not shareable
+                // across workers, so ten workers each requesting one would contend
+                // for the same card while also starving the CPU search. Worker 0
+                // takes the GPU (and stops running its SIMD loop); the rest stay
+                // on CPU, so a GPU rig ends up with GPU + (N-1) cores rather than
+                // GPU instead of everything.
+                m.postMessage({ type: 'INIT', payload: { use_gpu: idx === 0 } });
                 miners.push(minerState);
             }
         }
@@ -1991,7 +2043,10 @@ if ('serviceWorker' in navigator) {
                                     payload: {
                                         midstate: currentTemplate.mining_midstate,
                                         target: currentTemplate.target,
-                                        throttle_ms: currentThrottleMs
+                                        throttle_ms: currentThrottleMs,
+                                        // Workers added mid-session need the same
+                                        // share-mode behaviour as their peers.
+                                        continue_on_found: isPoolMode()
                                     }
                                 });
                             }
@@ -2014,18 +2069,48 @@ if ('serviceWorker' in navigator) {
                         }
                     };
 
-                    m.postMessage({ type: 'INIT' });
+                    // Workers added mid-session are always CPU: worker 0 already
+                    // owns the device if there is one.
+                    m.postMessage({ type: 'INIT', payload: { use_gpu: false } });
                     miners.push(minerState);
                 }
             }
         }
 
+        /**
+         * Switches the mining panel between solo and pool presentation.
+         *
+         * The ETA figure is derived from the target the miners are actually
+         * grinding. In pool mode that is the pool's SHARE target — orders of
+         * magnitude easier than the network target — so leaving the label as
+         * "Estimated Time to Block" reports a couple of minutes for something
+         * that, at network difficulty, would take years. Same number, correct name.
+         */
+        function applyPoolStatsMode(pooling) {
+            const tile  = document.getElementById('mineStatSharesTile');
+            const label = document.getElementById('mineStatEtaLabel');
+            if (tile)  tile.style.display = pooling ? '' : 'none';
+            if (label) label.innerText = pooling ? 'Estimated Time to Share' : 'Estimated Time to Block';
+        }
+
+        function renderPoolScore() {
+            const el = document.getElementById('mineStatShares');
+            if (el) el.innerText = poolScoreSession < 0 ? '—' : poolScoreSession.toLocaleString();
+        }
+
+        function isPoolMode() {
+            return mineModeSelect.value === 'pool';
+        }
+
         function requestTemplate() {
             if (!isMiningActive) return;
-            // Mining is WebRTC-only. If the WebRTC link is down, skip this poll
-            // rather than fetching a template over HTTPS. LightClient auto-reconnects;
-            // polling resumes once the connection is back.
-            if (!isWebRTCConnected()) {
+            // SOLO mining is WebRTC-only: the template is built locally against a
+            // node we reach directly, so without that link there is nothing to
+            // build from. POOL mining is not — the template comes from the pool's
+            // own HTTP endpoint, and the pool talks to its own backend node.
+            // Gating pool mode on WebRTC (as this did before) meant pool mining
+            // could never start without a node connection it does not use.
+            if (!isPoolMode() && !isWebRTCConnected()) {
                 log('Waiting for WebRTC connection to fetch mining template…');
                 return;
             }
@@ -2037,7 +2122,14 @@ if ('serviceWorker' in navigator) {
             for (const m of miners) {
                 m.worker.postMessage({
                     type: 'START',
-                    payload: { midstate, target, throttle_ms: currentThrottleMs }
+                    payload: {
+                        midstate,
+                        target,
+                        throttle_ms: currentThrottleMs,
+                        // In pool mode a hit is a share and the template survives it,
+                        // so the worker keeps grinding instead of halting.
+                        continue_on_found: isPoolMode()
+                    }
                 });
             }
         }
@@ -2072,8 +2164,17 @@ if ('serviceWorker' in navigator) {
         async function handleBlockFound(nonce) {
             if (!currentTemplate) return;
 
-            stopMinersKeepAlive();
-            blocksFoundSession++;
+            // In pool mode this is a SHARE, not a block. Two things must not happen:
+            //  • Don't stop the miners. The template is still valid and the midstate
+            //    is unchanged, so nothing would ever restart them — the rig would go
+            //    silent after its first share.
+            //  • Don't count it toward blocksFoundSession. Only the pool can tell us
+            //    whether a share also cleared the network target; the BLOCK_SUBMITTED
+            //    handler increments the counter when it confirms `isBlock`.
+            if (!isPoolMode()) {
+                stopMinersKeepAlive();
+                blocksFoundSession++;
+            }
 
             worker.postMessage({
                 type: 'SUBMIT_MINED_BLOCK',
@@ -2521,6 +2622,78 @@ if ('serviceWorker' in navigator) {
 
         let lightClient = null;
         let _rpcUrl = "https://rpc.cypherpunk.gold";
+
+        // ═══════════════════════════════════════════════════════════════
+        //  WebRTC Pool Client (main thread)
+        //  Same constraint as LightClient above: RTCPeerConnection does not
+        //  exist in a Web Worker, so the pool's libp2p connection lives here.
+        //  worker.js sends POOL_REQUEST messages; we execute them against
+        //  PoolClient and post back POOL_RESPONSE. Pushed jobs travel the other
+        //  way as POOL_NOTIFY.
+        //
+        //  Loaded from the ROLLUP BUNDLE, not the source: pool_client.js imports
+        //  bare specifiers ('libp2p', '@libp2p/webrtc') that browsers cannot
+        //  resolve natively — exactly why light_client.bundle.js exists.
+        //  Imported lazily so solo and HTTP-pool users never pay to download it.
+        // ═══════════════════════════════════════════════════════════════
+
+        let poolClient = null;
+
+        /** Maps a GPU_VERIFY request id to the miner worker awaiting its reply. */
+        const __gpuVerifyWaiters = new Map();
+
+        async function createPoolClient() {
+            const { PoolClient } = await import('./pool_client.bundle.js');
+            return new PoolClient();
+        }
+
+        async function handlePoolRequest(id, method, params) {
+            // id 0 is a fire-and-forget teardown from the worker; it expects no reply.
+            const reply = (result, error) => {
+                if (id === 0) return;
+                worker.postMessage({ type: 'POOL_RESPONSE', payload: { id, result, error } });
+            };
+
+            try {
+                if (method === 'disconnect') {
+                    if (poolClient) { await poolClient.stop().catch(() => {}); poolClient = null; }
+                    return reply({ ok: true });
+                }
+
+                if (method === 'connect') {
+                    // Rebuild from scratch on every connect: the worker only
+                    // sends this when the configured address actually changed.
+                    if (poolClient) { await poolClient.stop().catch(() => {}); poolClient = null; }
+                    const client = await createPoolClient();
+                    client.onNotify((notif) => {
+                        if (notif?.method !== 'notify') return;
+                        worker.postMessage({ type: 'POOL_NOTIFY', payload: notif.params || {} });
+                    });
+                    client.onStatus((status, detail) => {
+                        log(`Pool transport ${status}${detail ? ` (${detail})` : ''}`);
+                    });
+                    const peer = await client.start(params.addr);
+                    poolClient = client;
+                    return reply({ peer });
+                }
+
+                if (!poolClient) throw new Error('Pool transport not connected');
+
+                switch (method) {
+                    case 'getTemplate':
+                        return reply(await poolClient.getTemplate(params.address));
+                    case 'getProof':
+                        return reply(await poolClient.getProof(params.address));
+                    case 'submitShare':
+                        return reply(await poolClient.submitShare(
+                            params.address, params.job_id, params.nonce, params.worker));
+                    default:
+                        throw new Error(`Unknown pool method: ${method}`);
+                }
+            } catch (e) {
+                reply(undefined, e?.message || String(e));
+            }
+        }
 
         async function createLightClient() {
             const { LightClient } = await import('./light_client.bundle.js');
@@ -3601,6 +3774,19 @@ if ('serviceWorker' in navigator) {
                     handleRpcRequest(payload.id, payload.method, payload.params);
                     break;
 
+                case 'GPU_VERIFY_RESULT': {
+                    const m = __gpuVerifyWaiters.get(payload.id);
+                    __gpuVerifyWaiters.delete(payload.id);
+                    if (m) m.postMessage({ type: 'GPU_VERIFY_RESULT', payload });
+                    break;
+                }
+
+                case 'POOL_REQUEST':
+                    // Same reason as RPC_REQUEST: the pool's WebRTC connection
+                    // cannot live in the worker.
+                    handlePoolRequest(payload.id, payload.method, payload.params);
+                    break;
+
                 case 'AUTO_CONNECT_WEBRTC':
                     // Triggered after LOGIN or CREATE — try to auto-connect via WebRTC
                     autoConnectWebRTC().catch(() => {});
@@ -3675,7 +3861,23 @@ if ('serviceWorker' in navigator) {
                     if (payload && isMiningActive) {
                         // FIX: Check if the midstate changed (captures new blocks AND new mempool txs).
                         // Only update currentTemplate if we are actually broadcasting it to the miners!
-                        if (payload.mining_midstate !== currentTemplate?.mining_midstate) {
+                        // In pool mode also watch job_id: it is the pool's own identifier
+                        // for the template, and it is what a share submission is validated
+                        // against. Grinding a midstate whose job_id has rotated produces
+                        // shares the pool will reject as stale, so treat a job_id change as
+                        // a rebroadcast trigger even in the (unlikely) case the midstate
+                        // repeats.
+                        // The template carries the pool's authoritative score, so the
+                        // tile is correct immediately on connect rather than only after
+                        // this session's first share — score persists in the pool's DB
+                        // across restarts and origin changes.
+                        if (typeof payload.poolShares === 'number') {
+                            poolScoreSession = payload.poolShares;
+                            renderPoolScore();
+                        }
+                        const jobChanged = payload.job_id !== undefined
+                            && payload.job_id !== currentTemplate?.job_id;
+                        if (payload.mining_midstate !== currentTemplate?.mining_midstate || jobChanged) {
                             currentTemplate = payload;
                             lastTemplateHeight = payload.chainHeight; // Keep for UI tracking
                             
@@ -3689,6 +3891,17 @@ if ('serviceWorker' in navigator) {
                     }
                     break;
 
+                case 'POOL_AUDIT_FAILED':
+                    // The pool's share precommitment did not verify. Continuing to
+                    // mine would be donating hashpower to a template that provably
+                    // isn't committing to our score, so stop outright rather than
+                    // just warning — a warning in a log the user isn't reading is
+                    // indistinguishable from no check at all.
+                    log(`🚨 Pool audit failed — mining halted: ${payload.reason}`, 'var(--red)');
+                    showToast('Pool failed its fairness audit. Mining stopped.', 'error');
+                    stopMining();
+                    break;
+
                 case 'TEMPLATE_ERROR':
                     log(`Template error: ${payload}`, 'var(--red)');
                     break;
@@ -3696,6 +3909,22 @@ if ('serviceWorker' in navigator) {
                 case 'BLOCK_SUBMITTED':
                     // Ignore duplicate rejection events so they don't spam the UI
                     if (payload.rejectReason === 'duplicate') return;
+
+                    // Pool shares land here too. A share that didn't solve the block
+                    // is routine bookkeeping, not a block event: don't celebrate it,
+                    // don't add it to the mined-blocks list, and above all don't
+                    // restart the template cycle — the miners are still running.
+                    if (payload.isShare && !payload.isBlock) {
+                        if (typeof payload.poolShares === 'number') {
+                            poolScoreSession = payload.poolShares;
+                            renderPoolScore();
+                        }
+                        if (payload.accepted) {
+                            log(`Pool share accepted — total score: ${payload.poolShares}`);
+                        }
+                        return;
+                    }
+                    if (payload.isBlock) blocksFoundSession++;
 
                     if (payload.accepted) {
                         showBlockCelebration({
