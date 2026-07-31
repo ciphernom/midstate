@@ -9330,6 +9330,21 @@ var weald = setup({ formatArgs, save, load, useColors, setupFormatters, colors, 
 /**
  * @packageDocumentation
  *
+ * This module is a fork of the [debug](https://www.npmjs.com/package/debug) module. It has been converted to TypeScript and the output is ESM.
+ *
+ * It is API compatible with no extra features or bug fixes, it should only be used if you want a 100% ESM application.
+ *
+ * ESM should be arriving in `debug@5.x.x` so this module can be retired after that.
+ *
+ * Please see [debug](https://www.npmjs.com/package/debug) for API details.
+ */
+/**
+ * Module dependencies.
+ */
+
+/**
+ * @packageDocumentation
+ *
  * A logger for libp2p based on [weald](https://www.npmjs.com/package/weald), a TypeScript port of the venerable [debug](https://www.npmjs.com/package/debug) module.
  *
  * @example
@@ -29077,809 +29092,238 @@ function webRTCDirect(init) {
     return (components) => new WebRTCDirectTransport(components, init);
 }
 
-// light_client.js — Browser-side libp2p light client for Midstate wallet
+// pool_client.js — Browser-side libp2p client for the Midstate mining pool.
 //
-// Connects to full nodes over WebRTC direct (no HTTPS, no domain, no cert authority).
-// Speaks the /midstate/light/2.0.0 JSON protocol over libp2p streams.
+// Dials the pool directly over WebRTC-direct, the same transport light_client.js
+// uses to reach full nodes: no HTTPS, no domain, no certificate authority. The
+// pool is authenticated by the /certhash/ component of its multiaddr.
 //
-// Usage in worker.js:
-//   import { LightClient } from './light_client.js';
-//   const client = new LightClient();
-//   await client.start(bootstrapMultiaddr);
-//   const state = await client.request({ method: 'get_state' });
+// Why this exists alongside the HTTP path:
 //
-// Dependencies (install via npm):
-//   npm install libp2p @libp2p/webrtc @chainsafe/libp2p-noise @chainsafe/libp2p-yamux
-//   npm install it-length-prefixed uint8arrays it-pipe
+//   • No mixed content. A wallet served over HTTPS cannot fetch an http:// pool;
+//     the browser blocks it before the request is sent. WebRTC-direct is not
+//     subject to that rule, so the pool needs no CA-signed certificate.
+//   • No CORS. There is no preflight and no origin check to misconfigure.
+//   • Push, not poll. The HTTP client asks for a template once a second and gets
+//     the whole batch back even when nothing changed. Here the pool pushes
+//     `notify` the moment a job rotates, over /midstate/pool-push/1.0.0.
+//
+// Wire format matches light_protocol.rs exactly: 4-byte little-endian length
+// prefix followed by JSON, one request/response per stream.
+//
+//   Request:  { method: "get_template", params: { address } }
+//   Response: { ok: true, data: {...} } | { ok: false, error: "..." }
 
 
-const LIGHT_PROTOCOL = '/midstate/light/2.0.0';
+const POOL_PROTOCOL = '/midstate/pool/1.0.0';
+const POOL_PUSH_PROTOCOL = '/midstate/pool-push/1.0.0';
 const REQUEST_TIMEOUT_MS = 15_000;
-const RECONNECT_DELAY_MS = 3_000;
-const MAX_RECONNECT_ATTEMPTS = 5;
 
-// ── Load-balancing placement ────────────────────────────────────────────────
-// Spread light clients across full nodes instead of all dialing the first
-// bootstrap address. On startup we shuffle the candidate list (random
-// placement) and, if a node reports it's near its light-peer capacity, hop to
-// another — bounded by MAX_PLACEMENT_HOPS so we always connect quickly even
-// when every node is busy. Load is read from get_state (`light_load`, or
-// `light_connections`/`max_light_connections`); nodes that omit it are treated
-// as available, so this is a no-op against older nodes.
-const LIGHT_LOAD_SOFT_THRESHOLD = 0.85; // hop off nodes above 85% light-peer capacity
-const MAX_PLACEMENT_HOPS = 3;           // cap on nodes to probe before settling
-
-// Fisher–Yates shuffle (returns a new array). Used to randomize the order in
-// which candidate nodes are tried so clients don't all pile onto the first one.
-function shuffle(arr) {
-    const a = arr.slice();
-    for (let i = a.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [a[i], a[j]] = [a[j], a[i]];
-    }
-    return a;
+/** Frames a JSON value as 4-byte LE length + UTF-8 body. */
+function frame(value) {
+    const jsonBytes = new TextEncoder().encode(JSON.stringify(value));
+    const msg = new Uint8Array(4 + jsonBytes.length);
+    new DataView(msg.buffer).setUint32(0, jsonBytes.length, true);
+    msg.set(jsonBytes, 4);
+    return msg;
 }
 
-// ── WebRTC stream protobuf decoder ──────────────────────────────────────────
-// The js-libp2p WebRTC transport wraps application data in protobuf frames:
-//   [varint msg_len][protobuf Message]...
-//   Message { Flag flag = 1; bytes message = 2; }
-//   Flag: FIN=0, STOP_SENDING=1, RESET=2
-// incomingData yields the raw datachannel bytes with this framing intact.
-// This function strips the framing and returns only the application data.
-
-function readVarint(buf, offset) {
-    let val = 0, shift = 0;
-    while (offset < buf.length) {
-        const b = buf[offset++];
-        val |= (b & 0x7f) << shift;
-        if ((b & 0x80) === 0) return [val, offset];
-        shift += 7;
-        if (shift > 35) throw new Error('varint too long');
-    }
-    throw new Error('truncated varint');
-}
-
-function decodeWebRTCStreamData(raw) {
-    let offset = 0;
-    const chunks = [];
-    let totalLen = 0;
-
-    while (offset < raw.length) {
-        // Read message length (varint)
-        let msgLen;
-        [msgLen, offset] = readVarint(raw, offset);
-        const msgEnd = offset + msgLen;
-        if (msgEnd > raw.length) break; // truncated
-
-        // Parse protobuf fields within this message
-        let pos = offset;
-        while (pos < msgEnd) {
-            const tag = raw[pos++];
-            const fieldNum = tag >> 3;
-            const wireType = tag & 0x7;
-
-            if (wireType === 0) { // varint (flag field)
-                let _val;
-                [_val, pos] = readVarint(raw, pos);
-                // flag=0 (FIN), flag=2 (RESET) — we just keep extracting data
-            } else if (wireType === 2) { // length-delimited (message/data field)
-                let dLen;
-                [dLen, pos] = readVarint(raw, pos);
-                if (fieldNum === 2 && pos + dLen <= msgEnd) {
-                    chunks.push(raw.slice(pos, pos + dLen));
-                    totalLen += dLen;
-                }
-                pos += dLen;
-            } else {
-                break; // unknown wire type, skip rest
-            }
-        }
-
-        offset = msgEnd;
-    }
-
-    // Concatenate all data chunks
-    const result = new Uint8Array(totalLen);
-    let off = 0;
-    for (const chunk of chunks) {
-        result.set(chunk, off);
-        off += chunk.length;
-    }
-    return result;
-}
-
-// Check if a raw protobuf-framed chunk contains a specific flag value.
-// Flag is: field 1 (tag byte 0x08), varint value.
-// FIN=0, STOP_SENDING=1, RESET=2
-// The flag message can appear standalone (3 bytes: 02 08 XX) or
-// appended after data messages in the same chunk.
-function chunkContainsFlag(raw, flagValue) {
-    let offset = 0;
-    try {
-        while (offset < raw.length) {
-            let msgLen;
-            [msgLen, offset] = readVarint(raw, offset);
-            const msgEnd = offset + msgLen;
-            if (msgEnd > raw.length) return false;
-            let pos = offset;
-            while (pos < msgEnd) {
-                const tag = raw[pos++];
-                const fieldNum = tag >> 3;
-                const wireType = tag & 0x7;
-                if (wireType === 0) {
-                    let val;
-                    [val, pos] = readVarint(raw, pos);
-                    if (fieldNum === 1 && val === flagValue) return true;
-                } else if (wireType === 2) {
-                    let dLen;
-                    [dLen, pos] = readVarint(raw, pos);
-                    pos += dLen;
-                } else {
-                    break;
-                }
-            }
-            offset = msgEnd;
-        }
-    } catch (_) {}
-    return false;
-}
-
-function chunkContainsFin(raw) { return chunkContainsFlag(raw, 0); }
-function chunkContainsReset(raw) { return chunkContainsFlag(raw, 2); }
-
-class LightClient {
+class PoolClient {
     constructor() {
         this.node = null;
-        this.connectedPeer = null;        // PeerId of currently connected full node
-        this.knownMultiaddrs = new Set();  // Set of multiaddr strings we can try
+        this.peer = null;
         this.isConnected = false;
-        this.reconnectAttempts = 0;
-        this._onStatusChange = null;       // callback: (status) => void
+        this._onNotify = null;
+        this._onStatus = null;
     }
 
-onPushEvent(cb) {
-        this._onPushEvent = cb;
+    /** Registers a callback fired when the pool pushes a new job. */
+    onNotify(cb) { this._onNotify = cb; }
+    onStatus(cb) { this._onStatus = cb; }
+
+    _emit(status, detail) {
+        if (this._onStatus) { try { this._onStatus(status, detail); } catch (_) {} }
     }
 
-    /// Start the libp2p node and connect to a bootstrap peer list.
-    ///
-    /// addrs: Array of multiaddr strings
-    async start(addrs) {
+    /**
+     * Starts libp2p and dials the pool.
+     *
+     * @param {string} addr - Pool multiaddr, including /certhash/ and /p2p/.
+     */
+    async start(addr) {
         this.node = await createLibp2p({
             transports: [webRTCDirect()],
-            // --- FIX: Disable the local IP filter so we can dial 127.0.0.1 / 192.168.x.x ---
-            connectionGater: {
-                denyDialMultiaddr: async () => false,
-            },
+            // Same relaxation as the light client: without this, dialing a pool
+            // on a LAN address or 127.0.0.1 is refused, which makes local
+            // testing impossible.
+            connectionGater: { denyDialMultiaddr: async () => false },
         });
 
-                // --- LISTEN FOR SERVER PUSHES ---
-        /**
-        * 
-         * ## 1. Reasoning
-         * Listens for asynchronous Push streams initiated by the Midstate full node 
-         * (e.g., new block announcements, incoming P2P chat messages).
-         * 
-         * By using standard libp2p `stream.source` abstraction, this cleanly reads the 
-         * length-prefixed application JSON without manual WebRTC-Protobuf un-framing, 
-         * preventing payload corruption.
-         * 
-         * ## 2. Formal Specification
-         * 
-         * ```text
-         * Pre:
-         *   - Peer opens a new stream with protocol '/midstate/light-push/2.0.0'
-         *   - Data follows: `u32LE(len) || JSON_Bytes`
-         * 
-         * Post:
-         *   - Reassembles chunks until `total_bytes >= 4 + expected_len`
-         *   - Emits parsed JSON to `this._onPushEvent`
-         *   - Ignores malformed streams securely without throwing unhandled exceptions.
-         * ```
-         * 
-         * ## 3. Safety / Invariants
-         * - Protects against memory exhaustion by strictly adhering to the `expectedLen` 
-         *   boundary before slicing the buffer and parsing.
-         */
-        this.node.handle('/midstate/light-push/2.0.0', async (stream, connection) => {
-            console.log(`[light] Push stream incoming...`);
+        // Server-initiated job notifications. One framed JSON per stream, then
+        // the pool closes it — the same one-shot shape as /midstate/light-push.
+        this.node.handle(POOL_PUSH_PROTOCOL, async (stream) => {
             if (!stream) return;
-            
             try {
                 const chunks = [];
-                let totalLen = 0;
-                
-                // Ensure we read from the async iterable source
+                let total = 0;
                 const source = stream.source || stream;
-                
                 for await (const chunk of source) {
                     const bytes = chunk.subarray ? chunk.subarray() : chunk;
                     chunks.push(bytes);
-                    totalLen += bytes.length;
-                    
-                    if (totalLen >= 4) {
-                        const rawBuf = new Uint8Array(totalLen);
-                        let offset = 0;
-                        for (const c of chunks) { rawBuf.set(c, offset); offset += c.length; }
-                        
-                        const expectedLen = new DataView(rawBuf.buffer, rawBuf.byteOffset).getUint32(0, true);
-                        console.log(`[light] Push stream read ${totalLen} bytes. Expected payload length: ${expectedLen}.`);
+                    total += bytes.length;
+                    if (total < 4) continue;
 
-                        if (totalLen >= 4 + expectedLen) {
-                            console.log(`[light] Push stream payload fully received. Parsing...`);
-                            const jsonStr = new TextDecoder().decode(rawBuf.slice(4, 4 + expectedLen));
-                            const notif = JSON.parse(jsonStr);
-                            if (this._onPushEvent) this._onPushEvent(notif);
-                            break;
-                        }
+                    const buf = new Uint8Array(total);
+                    let off = 0;
+                    for (const c of chunks) { buf.set(c, off); off += c.length; }
+
+                    const expected = new DataView(buf.buffer, buf.byteOffset).getUint32(0, true);
+                    // Bound the read against the declared length before slicing,
+                    // so a truncated or hostile stream can't drive allocation.
+                    if (total >= 4 + expected) {
+                        const notif = JSON.parse(new TextDecoder().decode(buf.slice(4, 4 + expected)));
+                        if (this._onNotify) this._onNotify(notif);
+                        break;
                     }
                 }
-            } catch (e) { 
-                console.warn("[light] Push handle error", e); 
+            } catch (e) {
+                console.warn('[pool] push stream error', e);
             } finally {
                 try { if (stream.close) stream.close(); } catch (_) {}
             }
         });
 
         await this.node.start();
-        console.log('[light] libp2p started. PeerId:', this.node.peerId.toString());
-
-        // Track connection lifecycle
-        this.node.addEventListener('peer:connect', (evt) => {
-            console.log('[light] Peer connected:', evt.detail.toString());
-            this.connectedPeer = evt.detail;
-            this.isConnected = true;
-            this.reconnectAttempts = 0;
-            this._emitStatus('connected');
-        });
 
         this.node.addEventListener('peer:disconnect', (evt) => {
-            console.log('[light] Peer disconnected:', evt.detail.toString());
-            if (this.connectedPeer?.toString() === evt.detail.toString()) {
+            if (this.peer?.toString() === evt.detail.toString()) {
                 this.isConnected = false;
-                this.connectedPeer = null;
-                this._emitStatus('disconnected');
-                this._scheduleReconnect();
+                this._emit('disconnected');
             }
         });
 
-        // Seed the candidate set, then place our connection load-aware across a
-        // SHUFFLED list rather than always dialing the first bootstrap address.
-        // See _placeConnection.
-        if (addrs && addrs.length > 0) {
-            for (const addr of addrs) {
-                this.knownMultiaddrs.add(addr);
-            }
-            await this._placeConnection([...this.knownMultiaddrs]);
-        }
+        const ma = multiaddr(addr);
+        const conn = await this.node.dial(ma);
+        this.peer = conn.remotePeer;
+        this.isConnected = true;
+        this._emit('connected', this.peer.toString());
+        return this.peer.toString();
     }
 
-    // ── Load-aware placement ─────────────────────────────────────────────────
-    //
-    // Connect across a shuffled candidate set. If a node reports it's near its
-    // light-peer capacity (via get_state), drop it and try another — bounded by
-    // MAX_PLACEMENT_HOPS so startup stays fast even when every node is busy.
-    // The first reachable node and the least-loaded node seen are remembered, so
-    // heavy load can never leave us unconnected: if every sampled node is hot we
-    // reconnect to the lightest one. Nodes that don't advertise load are treated
-    // as available (no-op against older nodes).
-    async _placeConnection(candidatesIn) {
-        const candidates = shuffle(candidatesIn);
-        let firstReachable = null;
-        let lightestAddr = null;
-        let lightestLoad = Infinity;
-        let hops = 0;
-
-        for (const addr of candidates) {
-            if (hops >= MAX_PLACEMENT_HOPS) break;
-
-            try {
-                await this.connectTo(addr);
-            } catch (e) {
-                console.warn('[light] Skipping unreachable peer:', addr);
-                continue;
-            }
-
-            // peer:connect sets isConnected asynchronously — wait briefly for it.
-            await this._waitConnected(2500);
-            if (!this.isConnected) continue;
-
-            hops++;
-            if (!firstReachable) firstReachable = addr;
-
-            // Best-effort: read load + learn about more peers for failover.
-            let load = 0; // unknown / older node → treat as available
-            try {
-                const state = await this.getState();
-                if (state && Array.isArray(state.webrtc_addrs)) {
-                    for (const a of state.webrtc_addrs) this.knownMultiaddrs.add(a);
-                }
-                const r = this._loadRatio(state);
-                if (r !== null) load = r;
-            } catch (_) { /* couldn't read state; treat as available */ }
-
-            if (load < lightestLoad) { lightestLoad = load; lightestAddr = addr; }
-
-            // Comfortably loaded (or no load info) → settle here.
-            if (load < LIGHT_LOAD_SOFT_THRESHOLD) return true;
-
-            // Node is hot: drop it and try another. firstReachable / lightestAddr
-            // are remembered so we can always fall back.
-            console.log(`[light] ${addr} busy (${Math.round(load * 100)}% of light capacity); trying another node`);
-            await this._disconnectCurrent();
-        }
-
-        // Everything we sampled was busy (or we just dropped the last one).
-        // Reconnect to the least-loaded node we saw — never fail purely due to load.
-        if (this.isConnected) return true;
-        const target = lightestAddr || firstReachable;
-        if (target) {
-            try {
-                await this.connectTo(target);
-                await this._waitConnected(2500);
-            } catch (_) {}
-            if (this.isConnected) return true;
-        }
-        throw new Error('Could not connect to any WebRTC peers');
-    }
-
-    /// Poll until connected (peer:connect sets the flag) or timeout. Returns isConnected.
-    async _waitConnected(ms) {
-        const deadline = Date.now() + ms;
-        while (!this.isConnected && Date.now() < deadline) {
-            await new Promise(r => setTimeout(r, 50));
-        }
-        return this.isConnected;
-    }
-
-    /// Hang up the current peer WITHOUT triggering the reconnect scheduler.
-    /// We null connectedPeer first so the peer:disconnect handler's guard sees
-    /// no match and skips _scheduleReconnect — this is a deliberate hop during
-    /// placement, not a dropped connection.
-    async _disconnectCurrent() {
-        const peer = this.connectedPeer;
+    async stop() {
         this.isConnected = false;
-        this.connectedPeer = null;
-        if (peer && this.node) {
-            try { await this.node.hangUp(peer); } catch (_) {}
-        }
+        this.peer = null;
+        try { await this.node?.stop(); } catch (_) {}
+        this.node = null;
     }
 
-    /// Extract a light-peer load ratio in [0,1] from a get_state response,
-    /// or null if the node doesn't advertise load.
-    _loadRatio(state) {
-        if (!state) return null;
-        if (typeof state.light_load === 'number') {
-            return Math.max(0, Math.min(1, state.light_load));
-        }
-        if (typeof state.light_connections === 'number'
-            && typeof state.max_light_connections === 'number'
-            && state.max_light_connections > 0) {
-            return Math.max(0, Math.min(1, state.light_connections / state.max_light_connections));
-        }
-        return null;
-    }
-
-    /// Connect to a specific multiaddr with a 5-second timeout.
-    async connectTo(addrStr) {
-        const ma = multiaddr(addrStr);
-        // AbortSignal.timeout ensures we don't hang forever on firewalled peers
-        const conn = await this.node.dial(ma, { signal: AbortSignal.timeout(5000) });
-        console.log('[light] Dialed:', addrStr);
-        return conn;
-    }
-
-async submitChat(sender, timestamp, nonce, replyTo, words, attachments = []) {
-        const resp = await this.request({
-            method: 'submit_chat',
-            params: { sender, timestamp, nonce, reply_to: replyTo, words, attachments },
-        });
-        return resp;
-    }
-
-/**
-     * 
-     * ## 1. Reasoning
-     * The `request` method handles the lifecycle of an outbound RPC call over the 
-     * Midstate Light Protocol. Previous iterations attempted to manually parse WebRTC 
-     * Protobuf framing, which corrupted already-unwrapped application data yielded 
-     * by modern `js-libp2p` multiplexed streams. 
-     * 
-     * This implementation uses standard `stream.source` and `stream.sink` abstractions, 
-     * ensuring protocol compatibility regardless of the underlying transport (WebRTC, 
-     * TCP, etc.). It maintains strict timeout and retry safety.
-     * 
-     * ## 2. Formal Specification
-     * 
-     * ```text
-     * Pre:
-     *   - this.isConnected == true
-     *   - req is a valid JSON-serializable object
-     * 
-     * Post:
-     *   result = Ok(response) =>
-     *     - A stream was opened to `connectedPeer`
-     *     - `len(req_bytes)_LE || req_bytes` was successfully sent
-     *     - A well-formed JSON response was received and parsed before REQUEST_TIMEOUT_MS
-     * 
-     *   result = Err(e) =>
-     *     - Stream was closed/aborted to prevent resource leaks
-     * ```
-     * 
-     * ## 3. Safety / Invariants
-     * - **Resource Exhaustion Guard:** The stream must be explicitly aborted/closed in `finally` 
-     *   to prevent leaking multiplexer channels on timeouts or malformed peer data.
-     * - **Data Integrity:** Reads strictly adhere to the 4-byte Little Endian length prefix 
-     *   enforced by the Midstate rust node (`LightRequest` / `LightResponse` serialization).
-     */
     /**
- * Outbound RPC over /midstate/light/2.0.0 (libp2p v3 MessageStream API).
- * Framing: 4-byte LE length + JSON both directions (light_protocol.rs).
- * The 'message' listener is attached before send(); AbstractMessageStream
- * buffers pre-listener data, so ordering is safe either way.
- */
-async request(req, _retries = 2) {
-    const reqId = Math.floor(Math.random() * 10000);
-    console.log(`[REQ ${reqId}] >>> Starting ${req.method} (retries: ${_retries})`);
+     * Sends one request and awaits its response.
+     *
+     * Opens a fresh stream per request — matching the pool's server side, which
+     * reads exactly one framed request per inbound stream and then closes.
+     */
+    async requestRaw(method, params = {}, _retry = 1) {
+        if (!this.isConnected || !this.peer) throw new Error('Not connected to pool');
+        const conns = this.node.getConnections(this.peer);
+        if (!conns || conns.length === 0) throw new Error('No active connection to pool');
 
-    if (!this.isConnected || !this.connectedPeer) {
-        throw new Error('Not connected to any peer');
-    }
-    const conns = this.node.getConnections(this.connectedPeer);
-    if (!conns || conns.length === 0) throw new Error('No active connection to peer');
+        const stream = await conns[0].newStream([POOL_PROTOCOL]);
 
-    let stream;
-    try {
-        stream = await conns[0].newStream([LIGHT_PROTOCOL]);
-        console.log(`[REQ ${reqId}] Stream opened.`);
-    } catch (e) {
-        console.error(`[REQ ${reqId}] newStream failed:`, e);
-        throw e;
-    }
+        try {
+            const response = new Promise((resolve, reject) => {
+                let buf = new Uint8Array(0);
+                let expected = null;
 
-    try {
-        // ── Frame the request: 4-byte LE length + JSON ──
-        const jsonBytes = new TextEncoder().encode(JSON.stringify(req));
-        const msg = new Uint8Array(4 + jsonBytes.length);
-        new DataView(msg.buffer).setUint32(0, jsonBytes.length, true);
-        msg.set(jsonBytes, 4);
+                const onMessage = (evt) => {
+                    const d = evt.data;
+                    const bytes = d instanceof Uint8Array ? d : d.subarray();
+                    const next = new Uint8Array(buf.length + bytes.length);
+                    next.set(buf, 0); next.set(bytes, buf.length);
+                    buf = next;
 
-        // ── Reader: accumulate 'message' events until 4 + len bytes ──
-        const response = new Promise((resolve, reject) => {
-            let buf = new Uint8Array(0);
-            let expected = null;
-
-            const onMessage = (evt) => {
-                const d = evt.data;                                  // Uint8Array | Uint8ArrayList
-                const bytes = d instanceof Uint8Array ? d : d.subarray();
-                const next = new Uint8Array(buf.length + bytes.length);
-                next.set(buf, 0); next.set(bytes, buf.length);
-                buf = next;
-
-                if (expected === null && buf.length >= 4) {
-                    expected = new DataView(buf.buffer, buf.byteOffset).getUint32(0, true);
-                }
-                if (expected !== null && buf.length >= 4 + expected) {
+                    if (expected === null && buf.length >= 4) {
+                        expected = new DataView(buf.buffer, buf.byteOffset).getUint32(0, true);
+                    }
+                    if (expected !== null && buf.length >= 4 + expected) {
+                        cleanup();
+                        resolve(buf.slice(4, 4 + expected));
+                    }
+                };
+                const onClose = (evt) => {
                     cleanup();
-                    resolve(buf.slice(4, 4 + expected));
-                }
-            };
-            const onClose = (evt) => {
-                cleanup();
-                reject(evt?.error ?? new Error('Stream closed before completing response'));
-            };
-            const timer = setTimeout(() => {
-                cleanup();
-                reject(new Error('Stream read timeout'));
-            }, REQUEST_TIMEOUT_MS);
-
-            const cleanup = () => {
-                clearTimeout(timer);
-                stream.removeEventListener('message', onMessage);
-                stream.removeEventListener('close', onClose);
-            };
-
-            stream.addEventListener('message', onMessage);
-            stream.addEventListener('close', onClose);
-        });
-        // Suppress unhandled-rejection noise if we bail during send();
-        // the original promise still rejects normally where awaited.
-        response.catch(() => {});
-
-        // ── Write: send() returns false when the buffer is full → wait for 'drain' ──
-        console.log(`[REQ ${reqId}] Writing ${msg.length} bytes...`);
-        if (!stream.send(msg)) {
-            await new Promise((resolve, reject) => {
-                const onDrain = () => { off(); resolve(); };
-                const onClose = (evt) => { off(); reject(evt?.error ?? new Error('Stream closed during send')); };
-                const off = () => {
-                    stream.removeEventListener('drain', onDrain);
+                    reject(evt?.error ?? new Error('Stream closed before completing response'));
+                };
+                const timer = setTimeout(() => {
+                    cleanup();
+                    reject(new Error('Pool request timeout'));
+                }, REQUEST_TIMEOUT_MS);
+                const cleanup = () => {
+                    clearTimeout(timer);
+                    stream.removeEventListener('message', onMessage);
                     stream.removeEventListener('close', onClose);
                 };
-                stream.addEventListener('drain', onDrain);
+
+                stream.addEventListener('message', onMessage);
                 stream.addEventListener('close', onClose);
             });
-        }
+            // Suppress unhandled-rejection noise if we bail during send(); the
+            // promise still rejects normally where it is awaited.
+            response.catch(() => {});
 
-        // Half-close our write side now: the node reads an exact length
-        // (no EOF needed), and closing here lets the FIN/FIN_ACK handshake
-        // complete while the node's handler is still alive. Closing late
-        // leaves streams in 'closing' limbo until the FIN_ACK timeout and
-        // they pile up toward the 64-per-protocol cap.
-        stream.close().catch(() => {});
-
-        const payload = await response;
-        const parsed = JSON.parse(new TextDecoder().decode(payload));
-        console.log(`[REQ ${reqId}] <<<< SUCCESS`);
-        return parsed;
-
-    } catch (err) {
-        console.error(`[REQ ${reqId}] Request ${req.method} failed:`, err);
-        try { stream.abort(err instanceof Error ? err : new Error(String(err))); } catch (_) {}
-        if (_retries > 0) {
-            console.log(`[REQ ${reqId}] Retrying ${req.method}...`);
-            return this.request(req, _retries - 1);
-        }
-        throw err;
-    } finally {
-        // Release the stream slot NOW, on success as well as on error.
-        //
-        // The `stream.close()` above is fire-and-forget and only half-closes:
-        // it starts a graceful close that waits for the node's FIN_ACK. Until
-        // that lands the stream sits in 'closing' state and STILL counts against
-        // libp2p's 64-streams-per-protocol cap. On the error path `abort()`
-        // released it immediately; the success path returned without releasing
-        // anything, so a burst of requests — a wallet rescan fires hundreds of
-        // get_block calls back to back — accumulated closing streams until
-        // newStream threw TooManyOutboundProtocolStreamsError at 65/64, which
-        // then marked WebRTC unhealthy and dumped everything onto the HTTPS
-        // gateway. `abort()` on a stream whose response we have already fully
-        // read discards nothing; it just skips the FIN_ACK wait.
-        //
-        // (The earlier OLDrequest implementation did exactly this in its own
-        // `finally` — the newer path lost it.)
-        try { stream.abort(new Error('done')); } catch (_) {}
-    }
-}
-
-    /// Send a JSON request over the light protocol and return the parsed response.
-    ///
-    /// req: { method: 'get_state' } or { method: 'get_block', params: { height: 42 } }
-    /// Returns: parsed LightResponse { ok, data?, error? }
-async OLDrequest(req, _retries = 2) {
-    if (!this.isConnected || !this.connectedPeer) {
-        throw new Error('Not connected to any peer');
-    }
-
-    const conns = this.node.getConnections(this.connectedPeer);
-    if (!conns || conns.length === 0) throw new Error('No active connection to peer');
-    const stream = await conns[0].newStream([LIGHT_PROTOCOL]);
-
-   try {
-            // Build the length-prefixed message
-            const jsonBytes = new TextEncoder().encode(JSON.stringify(req));
-            const lenBuf = new Uint8Array(4);
-            new DataView(lenBuf.buffer).setUint32(0, jsonBytes.length, true);
-            const msg = new Uint8Array(4 + jsonBytes.length);
-            msg.set(lenBuf, 0);
-            msg.set(jsonBytes, 4);
-
-            // Write in chunks to respect WebRTC SCTP message size limits (16 KB)
-            const CHUNK_SIZE = 16384; 
-            for (let i = 0; i < msg.length; i += CHUNK_SIZE) {
-                stream.sendData(msg.slice(i, i + CHUNK_SIZE));
-                
-                // THE FIX: Yield to the JS event loop for 10ms so the WebRTC buffer can drain!
-                await new Promise(r => setTimeout(r, 10)); 
-            }
-            stream.sendCloseWrite();
-
-            // Read: incomingData is an async iterator
-            const chunks = [];
-            let totalLen = 0;
-            let gotReset = false;
-
-            const readWithTimeout = async () => {
-                for await (const chunk of stream.incomingData) {
-                    const bytes = chunk instanceof Uint8Array
-                        ? chunk
-                        : new Uint8Array(chunk.buffer ?? chunk);
-                    chunks.push(bytes);
-                    totalLen += bytes.length;
-                    if (chunkContainsReset(bytes)) { gotReset = true; break; }
-                    if (chunkContainsFin(bytes)) { break; }
-                }
-            };
-
-            await Promise.race([
-                readWithTimeout(),
-                new Promise((_, reject) =>
-                    // Uses the new shorter REQUEST_TIMEOUT_MS
-                    setTimeout(() => reject(new Error('Stream read timeout')), REQUEST_TIMEOUT_MS)
-                )
-            ]);
-
-            if (gotReset && _retries > 0) {
-                try { stream.abort(new Error('reset')); } catch (_) {}
-                return this.request(req, _retries - 1);
+            const msg = frame({ method, params });
+            // send() returns false when the transport buffer is full; wait for
+            // 'drain' rather than dropping the write on the floor.
+            if (!stream.send(msg)) {
+                await new Promise((resolve, reject) => {
+                    const onDrain = () => { off(); resolve(); };
+                    const onClose = (evt) => { off(); reject(evt?.error ?? new Error('Stream closed during send')); };
+                    const off = () => {
+                        stream.removeEventListener('drain', onDrain);
+                        stream.removeEventListener('close', onClose);
+                    };
+                    stream.addEventListener('drain', onDrain);
+                    stream.addEventListener('close', onClose);
+                });
             }
 
-            const rawBuf = new Uint8Array(totalLen);
-            let offset = 0;
-            for (const c of chunks) { rawBuf.set(c, offset); offset += c.length; }
-
-            const appData = decodeWebRTCStreamData(rawBuf);
-            if (appData.length < 4) throw new Error('Response too short');
-            const respLen = new DataView(appData.buffer, appData.byteOffset).getUint32(0, true);
-            const respJson = new TextDecoder().decode(appData.slice(4, 4 + respLen));
-            return JSON.parse(respJson);
-
-        } finally {
-            try { stream.abort(new Error('done')); } catch (_) {}
-        }
-}
-
-    // ── Convenience Methods (match the RPC endpoints the wallet uses) ────────
-
-    async getState() {
-        const resp = await this.request({ method: 'get_state' });
-        if (!resp.ok) throw new Error(resp.error);
-        return resp.data;
-    }
-
-    async getBlock(height) {
-        const resp = await this.request({ method: 'get_block', params: { height } });
-        if (!resp.ok) throw new Error(resp.error);
-        return resp.data;
-    }
-
-    async getFilters(startHeight, endHeight) {
-        const resp = await this.request({ method: 'get_filters', params: { start_height: startHeight, end_height: endHeight } });
-        if (!resp.ok) throw new Error(resp.error);
-        return resp.data;
-    }
-
-    async getMempool() {
-        const resp = await this.request({ method: 'get_mempool' });
-        if (!resp.ok) throw new Error(resp.error);
-        return resp.data;
-    }
-
-    async submitBatch(batch) {
-        const resp = await this.request({ method: 'submit_batch', params: { batch } });
-        return resp; // Caller checks resp.ok
-    }
-    async getBlockTemplate(coinbase) {
-        const resp = await this.request({ method: 'block_template', params: { coinbase } });
-        return {
-            ok: resp.ok,
-            // If the node provided expected_total during an error (409 Conflict), map it correctly
-            status: resp.ok ? 200 : (resp.data && resp.data.expected_total ? 409 : 500),
-            json: () => Promise.resolve(resp.data),
-            // Always stringify the data payload if it exists, even on failure
-            text: () => Promise.resolve(
-                resp.data ? JSON.stringify(resp.data) : (resp.error || 'error')
-            ),
-        };
-    }
-    async commit(commitmentHex, spamNonce) {
-        const resp = await this.request({ method: 'commit', params: { commitment: commitmentHex, spam_nonce: spamNonce } });
-        return resp;
-    }
-
-    async send(revealPayload) {
-        const resp = await this.request({ method: 'send', params: { reveal: revealPayload } });
-        return resp;
-    }
-
-    async checkCoin(coinHex) {
-        const resp = await this.request({ method: 'check', params: { coin: coinHex } });
-        if (!resp.ok) throw new Error(resp.error);
-        return resp.data;
-    }
-
-    async checkCommitment(commitmentHex) {
-        const resp = await this.request({ method: 'check_commitment', params: { commitment: commitmentHex } });
-        if (!resp.ok) throw new Error(resp.error);
-        return resp.data;
-    }
-
-    async mssState(masterPkHex) {
-        const resp = await this.request({ method: 'mss_state', params: { master_pk: masterPkHex } });
-        if (!resp.ok) throw new Error(resp.error);
-        return resp.data;
-    }
-
-    /**
-     * Originate a chat over the WebRTC light protocol.
-     *
-     * Server-side this hits `LightRequest::SendChat` in `src/node.rs`,
-     * which enqueues a `NodeCommand::SendChat` with `sender_override =
-     * Some(<our light-peer-id>)`. The node mines v2 PoW (~10 ms) and
-     * broadcasts as `Message::ChatV2`.
-     *
-     * @param {number[]}                                words      0..=10 indices into CHAT_DICTIONARY
-     * @param {number|null}                             replyTo    Parent message nonce, or null
-     * @param {{kind:"address",value:string}[]} [attachments=[]]   0..=4 typed attachments
-     *                                                             (value: 64-char lowercase hex for address)
-     */
-    async sendChat(words, replyTo, attachments = []) {
-        const resp = await this.request({
-            method: 'send_chat',
-            params: { words, reply_to: replyTo, attachments },
-        });
-        return resp;
-    }
-
-    // ── Peer Discovery ──────────────────────────────────────────────────────
-
-    /// Ask the connected node for its known peers' WebRTC multiaddrs.
-    /// These can be used for failover if the current connection drops.
-    async discoverPeers() {
-        try {
-            const state = await this.getState();
-            // If the node exposes webrtc_addrs in state response:
-            if (state.webrtc_addrs) {
-                for (const addr of state.webrtc_addrs) {
-                    this.knownMultiaddrs.add(addr);
-                }
-            }
+            const bytes = await response;
+            // Returns the RAW envelope: { ok, data } | { ok:false, error }.
+            // Callers must be able to tell "the pool said no" from "the request
+            // never completed" — collapsing both into a thrown Error is what let
+            // a dropped stream masquerade as the pool omitting a miner from its
+            // precommitment, which halts mining.
+            return JSON.parse(new TextDecoder().decode(bytes));
         } catch (e) {
-            // Silent — we'll use whatever addrs we already know
-        }
-    }
-
-    // ── Connection Management ───────────────────────────────────────────────
-
-    _scheduleReconnect() {
-        if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-            console.error('[light] Max reconnect attempts reached');
-            this._emitStatus('failed');
-            return;
-        }
-
-        this.reconnectAttempts++;
-        const delay = RECONNECT_DELAY_MS * this.reconnectAttempts;
-        console.log(`[light] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
-
-        setTimeout(async () => {
-            // Try known multiaddrs in RANDOM order so reconnecting clients spread
-            // across nodes instead of all reconnecting to the same one.
-            for (const addr of shuffle([...this.knownMultiaddrs])) {
-                try {
-                    await this.connectTo(addr);
-                    return; // Success — peer:connect event handles the rest
-                } catch (_) {
-                    continue;
-                }
+            // libp2p streams get reset under normal operation (peer churn, the
+            // remote closing early). One retry on a fresh stream turns a routine
+            // blip into a non-event rather than a visible failure.
+            if (_retry > 0 && /reset|closed|abort/i.test(e.message || '')) {
+                return this.requestRaw(method, params, _retry - 1);
             }
-            // All failed — try again
-            this._scheduleReconnect();
-        }, delay);
-    }
-
-    _emitStatus(status) {
-        if (this._onStatusChange) {
-            this._onStatusChange(status);
+            throw e;
+        } finally {
+            try { if (stream.close) await stream.close(); } catch (_) {}
         }
     }
 
-    /// Register a status change callback.
-    /// status: 'connected' | 'disconnected' | 'failed'
-    onStatusChange(cb) {
-        this._onStatusChange = cb;
+    /** Throws on a pool-reported error. Use for calls where absence is fatal. */
+    async request(method, params = {}) {
+        const parsed = await this.requestRaw(method, params);
+        if (!parsed.ok) throw new Error(parsed.error || 'Pool returned an error');
+        return parsed.data;
     }
 
-    /// Graceful shutdown.
-    async stop() {
-        if (this.node) {
-            await this.node.stop();
-            this.node = null;
-            this.isConnected = false;
-            this.connectedPeer = null;
-        }
+    getTemplate(address) { return this.request('get_template', { address }); }
+    /** Raw envelope: a miner absent from the tree is an ANSWER, not an exception. */
+    getProof(address)    { return this.requestRaw('get_proof', { address }); }
+    submitShare(address, jobId, nonce, worker) {
+        // Nonce as a decimal string: it is a u64 and JSON numbers lose precision
+        // above 2^53.
+        return this.request('submit_share', {
+            address, job_id: jobId, nonce: String(nonce), worker: worker || 'browser',
+        });
     }
 }
 
-export { LightClient };
+export { PoolClient };

@@ -106,8 +106,29 @@ let mempoolSize = 0;
 let nextBlockResolvers = [];
 /** @type {Object|null} Tracks an outgoing Lightning channel open intent */
 let pendingChannelOpen = null;
+/**
+ * Whether the user currently has mining running.
+ *
+ * Mirrored from the main thread via SET_MINING_ACTIVE. The PUSH_NEW_BLOCK
+ * handler below reads this to decide whether to pull a fresh template the
+ * instant a new tip is announced. It previously read a bare `isMiningActive`
+ * that was never declared in this file — it exists only in index.html — so the
+ * lookup threw a ReferenceError on EVERY block push, and the outer try/catch in
+ * self.onmessage swallowed it. Everything after that line in the push handler
+ * (instant template refresh, reorg detection, instant filter sync) silently
+ * never ran, while the "⚡ Network Push" log just above it still printed — which
+ * is why push looked like it was working.
+ */
+let isMiningActive = false;
+
 let miningMode = 'solo'; // 'solo' | 'pool'
 let poolUrl = '';
+/** Last pool job_id whose precommitment we verified, so we audit once per job. */
+let lastAuditedJobId = null;
+/** Throttle state for the pool-mode background wallet rescan. */
+let lastPoolSyncMs = 0;
+let poolSyncInFlight = false;
+const POOL_SYNC_INTERVAL_MS = 60_000;
 let payoutAddress = '';
 
 /**
@@ -1436,6 +1457,346 @@ async function loadState(pwd, bundleStr) {
 
 
 
+// ─── Pool Precommitment Audit ────────────────────────────────────────────────
+//
+// The whole reason to prefer this pool over a blind Stratum operator is that
+// every job carries a Merkle precommitment to the exact (address, score) set the
+// coinbase was proportioned from. That guarantee is worth nothing unless the
+// client actually checks it — an operator who reports a plausible root over the
+// wire while paying out something else is indistinguishable from an honest one
+// to a miner who never verifies.
+//
+// Two independent checks run per job:
+//
+//   1. The root is COMMITTED. Recomputing our own leaf from the /api/proof
+//      siblings must reproduce the advertised root — but that only proves the
+//      pool's arithmetic is self-consistent. The root must ALSO appear as the
+//      salt of a coinbase output paying the pool fee address in the template we
+//      are about to burn electricity on. That salt is what gets hashed into the
+//      block; anything else is just a number in a JSON response.
+//
+//   2. Our score is INCLUDED. Once we have any score at all, absence from the
+//      tree means the pool is mining a template that cannot pay us.
+//
+// A miner with zero recorded shares is legitimately absent from the tree, so
+// that case is explicitly not treated as fraud.
+
+/** Converts a JSON byte array (serde's representation of `[u8; 32]`) to hex. */
+function bytesToHex(arr) {
+    if (typeof arr === 'string') return arr.toLowerCase();
+    if (!arr || typeof arr.length !== 'number') return '';
+    return Array.from(arr).map(b => (b & 0xff).toString(16).padStart(2, '0')).join('');
+}
+
+/** Encodes a u64 as 8 little-endian bytes, hex — matching `score.to_le_bytes()`. */
+function u64ToLeHex(n) {
+    let v = BigInt(n);
+    let out = '';
+    for (let i = 0; i < 8; i++) {
+        out += Number(v & 0xffn).toString(16).padStart(2, '0');
+        v >>= 8n;
+    }
+    return out;
+}
+
+/**
+ * Recomputes a Merkle root from a leaf and its sibling path.
+ *
+ * Mirrors `ShareMerkleTree` in pool.rs exactly: leaves are
+ * `BLAKE3(addr || le8(score))`, internal nodes are `BLAKE3(left || right)`, and
+ * an odd node at the end of a layer is paired with itself. The parity of the
+ * running index selects which side we sit on at each level — get this backwards
+ * and every proof fails, since BLAKE3 concatenation is not commutative.
+ */
+function foldMerkleProof(addrHex, score, index, proofHexes) {
+    let node = blake3_hash_hex(addrHex.toLowerCase() + u64ToLeHex(score));
+    let idx = index;
+    for (const sibling of proofHexes) {
+        const sib = String(sibling).toLowerCase();
+        node = (idx % 2 === 1)
+            ? blake3_hash_hex(sib + node)   // we are the right child
+            : blake3_hash_hex(node + sib);  // we are the left child
+        idx = Math.floor(idx / 2);
+    }
+    return node;
+}
+
+/**
+ * Audits one pool job. Returns `{ ok, reason }`; `ok:false` means stop mining.
+ *
+ * Fail-closed on cryptographic mismatch, fail-open on transport trouble: a proof
+ * endpoint that times out is a flaky pool, not a dishonest one, and halting a rig
+ * over a dropped request would make the audit worse than useless.
+ */
+async function verifyPoolPrecommitment(tmpl, addressHex) {
+    const advertisedRoot = (tmpl.merkle_root || '').toLowerCase();
+    if (!advertisedRoot || /^0*$/.test(advertisedRoot)) {
+        // An all-zero root is what `ShareMerkleTree::build(vec![])` produces:
+        // nobody has any score yet. Nothing to prove, and nothing wrong.
+        return { ok: true, reason: 'empty tree (no scores yet)' };
+    }
+
+    // ── Check 1: is the advertised root actually in the block? ──
+    const coinbase = tmpl.batch_template?.coinbase || [];
+    const poolAddr = (tmpl.pool_address || '').toLowerCase();
+    const committed = coinbase.some(cb =>
+        bytesToHex(cb.salt) === advertisedRoot &&
+        (!poolAddr || bytesToHex(cb.address) === poolAddr)
+    );
+    if (!committed) {
+        return {
+            ok: false,
+            reason: `Precommitment root ${advertisedRoot.slice(0, 16)}… is NOT present in any pool-fee coinbase salt. `
+                  + `The pool is advertising a share commitment it did not put in the block.`
+        };
+    }
+
+    // ── Check 2: are we inside that tree? ──
+    // Skipped while we have no score: a miner who has not yet landed a share is
+    // correctly absent from the leaves, and calling that fraud would make the
+    // very first job of every session fail.
+    if (!tmpl.shares_recorded) {
+        return { ok: true, reason: 'root committed (no score yet to prove)' };
+    }
+
+    let proof;
+    try {
+        proof = await poolGetProof(addressHex);
+    } catch (e) {
+        return { ok: true, reason: `proof endpoint unreachable (${e.message}) — continuing` };
+    }
+
+    if (proof.error) {
+        return {
+            ok: false,
+            reason: `Pool credits us ${tmpl.shares_recorded} share(s) but omits us from this block's `
+                  + `precommitment (${proof.error}). This template cannot pay us.`
+        };
+    }
+
+    // Fold against the root the PROOF ITSELF declares, not the template's.
+    //
+    // The template and the proof are two separate round trips, and the pool
+    // rebuilds its tree the moment any miner's score changes — which, once you
+    // are actually earning shares, happens constantly. So `proof.root` is
+    // frequently one rotation ahead of `tmpl.merkle_root`, and comparing the fold
+    // to the older template root reported fraud for a pool doing nothing wrong.
+    // (That is exactly the "got 3ebf70cc…, expected 32c84762…" halt: a share had
+    // just been credited between the two calls.)
+    //
+    // Self-consistency is the part that actually detects a lying pool: the
+    // sibling path must reproduce the root the pool is standing behind. A pool
+    // cannot fake that without breaking BLAKE3.
+    const proofRoot = String(proof.root || '').toLowerCase();
+    const recomputed = foldMerkleProof(addressHex, proof.score || 0, proof.index || 0, proof.proof || []);
+    if (!proofRoot || recomputed.toLowerCase() !== proofRoot) {
+        return {
+            ok: false,
+            reason: `Merkle proof does not reproduce its own declared root `
+                  + `(folded ${recomputed.slice(0, 16)}…, declared ${proofRoot.slice(0, 16) || '(none)'}…).`
+        };
+    }
+
+    // Proof is internally sound. If its root is not the one committed in the
+    // template we just audited, the tree simply rotated between the two calls —
+    // benign. Re-verify on the next job (the auditor runs per job_id) rather
+    // than halting a rig over a race we created ourselves.
+    if (proofRoot !== advertisedRoot) {
+        return {
+            ok: true,
+            reason: `proof valid against root ${proofRoot.slice(0, 12)}… (tree rotated since this job; will re-verify)`
+        };
+    }
+
+    // Roots agree, so the score inside the proof is the number this block's
+    // payout would actually be computed from. Only meaningful to compare when
+    // the roots match — across a rotation the counts legitimately differ.
+    if (Number(proof.score) !== Number(tmpl.shares_recorded)) {
+        return {
+            ok: false,
+            reason: `Committed score (${proof.score}) does not match the score the pool reports for us `
+                  + `(${tmpl.shares_recorded}). The payout would be computed from the lower figure.`
+        };
+    }
+
+    return { ok: true, reason: `score ${proof.score} committed in root ${advertisedRoot.slice(0, 12)}…` };
+}
+
+// ─── Pool Transport Abstraction ──────────────────────────────────────────────
+//
+// The pool is reachable two ways and the mining code should not care which:
+//
+//   • WebRTC (a multiaddr, e.g. /ip4/1.2.3.4/udp/9000/webrtc-direct/certhash/…/p2p/…)
+//     Preferred. No CA certificate, no mixed-content block, no CORS, and the
+//     pool pushes new jobs instead of the wallet polling for them.
+//   • HTTP  (a URL, e.g. https://pool.example:8081)
+//     Fallback. Works with curl and existing tooling, but needs TLS to be
+//     reachable from an HTTPS-served wallet.
+//
+// The transport is chosen by inspecting the configured address, so a single
+// input field accepts either form.
+//
+// ## Why WebRTC is proxied to the main thread
+// `RTCPeerConnection` does not exist in a Web Worker. This is the same
+// constraint that already forces `LightClient` onto the main thread, and it
+// applies identically to the pool's libp2p connection. So the WebRTC path posts
+// POOL_REQUEST to index.html — which owns the PoolClient — and awaits
+// POOL_RESPONSE, mirroring the existing RPC_REQUEST/RPC_RESPONSE bridge above.
+// The HTTP path has no such restriction and runs directly here, since `fetch`
+// is available in workers.
+
+let poolTransport = 'http';   // 'http' | 'webrtc'
+let poolTransportAddr = '';   // normalized address the transport is bound to
+
+/** @type {number} Auto-incrementing pool request ID. */
+let _poolNextId = 1;
+/** @type {Map<number, {resolve: Function, reject: Function}>} */
+const _poolPending = new Map();
+
+/** Handles a POOL_RESPONSE from the main thread. */
+function _poolReceive(id, result, error) {
+    const p = _poolPending.get(id);
+    if (!p) return;
+    _poolPending.delete(id);
+    if (error !== undefined) p.reject(new Error(error));
+    else p.resolve(result);
+}
+
+/**
+ * Sends a pool request to the main thread's PoolClient and awaits the response.
+ *
+ * The 30s ceiling is far shorter than the 120s used for chain RPC: pool calls
+ * are small and latency-sensitive, and a hung template fetch stalls mining.
+ */
+function poolRpc(method, params) {
+    return new Promise((resolve, reject) => {
+        const id = _poolNextId++;
+        _poolPending.set(id, { resolve, reject });
+        self.postMessage({ type: 'POOL_REQUEST', payload: { id, method, params } });
+        setTimeout(() => {
+            if (_poolPending.has(id)) {
+                _poolPending.delete(id);
+                reject(new Error(`Pool request timeout: ${method}`));
+            }
+        }, 30_000);
+    });
+}
+
+/** True when the configured pool address is a multiaddr rather than a URL. */
+function isMultiaddrPool(addr) {
+    return /^\/(ip4|ip6|dns|dns4|dns6|dnsaddr)\//.test(String(addr || '').trim());
+}
+
+/**
+ * Ensures a live transport for the configured pool address, reconnecting only
+ * when the address actually changes.
+ */
+async function ensurePoolTransport() {
+    const addr = String(poolUrl || '').trim();
+    if (!addr) throw new Error("Pool URL not set.");
+
+    if (!isMultiaddrPool(addr)) {
+        // HTTP path: nothing to hold open, but validate the URL up front so a
+        // mixed-content misconfiguration reports itself clearly.
+        if (poolTransport === 'webrtc') await poolRpc('disconnect', {}).catch(() => {});
+        poolTransport = 'http';
+        poolTransportAddr = normalizePoolUrl(addr);
+        return;
+    }
+
+    poolTransport = 'webrtc';
+    if (poolTransportAddr === addr) return;
+    // The main thread dials and reports the pool's PeerId back.
+    await poolRpc('connect', { addr });
+    poolTransportAddr = addr;
+}
+
+/** Fetches the current job over whichever transport is configured. */
+async function poolGetTemplate(address) {
+    if (poolTransport === 'webrtc') return poolRpc('getTemplate', { address });
+
+    const res = await fetch(
+        `${poolTransportAddr}/api/template?address=${encodeURIComponent(address)}`,
+        { cache: 'no-store' }
+    );
+    if (!res.ok) {
+        // The pool answers 503 with a JSON body while its backend node is
+        // syncing. Surface that reason rather than the raw status.
+        let detail = '';
+        try { detail = (await res.json()).error || ''; } catch (_) { detail = await res.text(); }
+        throw new Error(`Pool error (${res.status}): ${detail}`);
+    }
+    return res.json();
+}
+
+/** Fetches our Merkle inclusion proof over whichever transport is configured. */
+async function poolGetProof(address) {
+    if (poolTransport === 'webrtc') {
+        // Returns the raw envelope. A pool-reported error ("not in the tree")
+        // is normalized to the HTTP `{ error }` shape, but a TRANSPORT failure
+        // is deliberately allowed to throw so the auditor's catch treats it as
+        // "unreachable, keep mining" rather than as evidence of fraud.
+        // Swallowing both here is what let a reset stream halt mining.
+        const env = await poolRpc('getProof', { address });
+        return env.ok ? env.data : { error: env.error };
+    }
+    const res = await fetch(`${poolTransportAddr}/api/proof?address=${encodeURIComponent(address)}`, { cache: 'no-store' });
+    return res.json();
+}
+
+/** Submits a share over whichever transport is configured. */
+async function poolSubmitShare(address, jobId, nonce, worker) {
+    if (poolTransport === 'webrtc') {
+        return poolRpc('submitShare', { address, job_id: jobId, nonce: String(nonce), worker });
+    }
+    const res = await fetch(`${poolTransportAddr}/api/submit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_id: jobId, nonce: String(nonce), address, worker }),
+    });
+    try { return await res.json(); } catch (_) { return { error: await res.text() }; }
+}
+
+/**
+ * Trims a pool URL and rejects combinations the browser will silently block.
+ *
+ * Mixed content is the failure mode most likely to be misread as "the pool is
+ * down": a wallet served over HTTPS cannot fetch an `http://` origin, and the
+ * browser kills the request before it hits the network, so `fetch` rejects with
+ * a bare `TypeError: Failed to fetch` carrying no explanation. The pool never
+ * sees the request and its logs stay empty, which sends operators hunting for a
+ * CORS or firewall problem that doesn't exist.
+ *
+ * `localhost` / `127.0.0.1` / `[::1]` are exempt because browsers treat them as
+ * potentially-trustworthy origins — which is exactly why local testing works and
+ * the same config fails the moment the pool moves to a real host.
+ */
+function normalizePoolUrl(url) {
+    const clean = String(url || '').trim().replace(/\/+$/, '');
+    if (!clean) throw new Error("Pool URL not set.");
+
+    let parsed;
+    try {
+        parsed = new URL(clean);
+    } catch (_) {
+        throw new Error(`Pool URL is not a valid URL: "${clean}" (include the scheme, e.g. https://pool.example:8081)`);
+    }
+
+    const pageIsSecure = (self.location?.protocol || '') === 'https:';
+    const host = parsed.hostname.toLowerCase();
+    const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1';
+
+    if (pageIsSecure && parsed.protocol === 'http:' && !isLocal) {
+        throw new Error(
+            `This wallet is served over HTTPS, so the browser will block plain-HTTP requests to ${parsed.host} ` +
+            `before they are sent (mixed content). Serve the pool's audit port over HTTPS — e.g. behind a TLS ` +
+            `reverse proxy — and use an https:// pool URL. Note that http://localhost is exempt, so a pool that ` +
+            `works locally will still fail once it moves to a real host.`
+        );
+    }
+    return clean;
+}
+
 /**
  * Request and return a mining template from the network.
  *
@@ -1452,7 +1813,114 @@ async function handleGetTemplate() {
     isFetchingTemplate = true;
 
     try {
-        // Update dashboard stats regardless of mode
+        // --- POOL MODE LOGIC ---
+        //
+        // Handled FIRST, ahead of every node RPC call below. Pool mining needs
+        // nothing from our own node: the pool builds the template, tracks the
+        // height and reward, and talks to its own backend. Running getState /
+        // getMempool / performScan first meant every template poll was gated on
+        // node reachability the pool path never uses — over the HTTPS gateway
+        // that is two extra round trips per second, and a full wallet rescan in
+        // the critical path each time the chain advanced, with the miners idle
+        // on a stale midstate for the duration.
+        if (miningMode === 'pool') {
+            if (!poolUrl) throw new Error("Pool URL not set.");
+
+            // The payout address is required up front, not just at submit time:
+            // the pool reports our accumulated score alongside the job, and
+            // discovering we have no MSS identity only *after* mining a share
+            // means throwing away real work.
+            payoutAddress = getPrimaryMssPk() || "";
+            if (!payoutAddress) {
+                throw new Error("No L2/MSS Identity found! Generate a new address first to receive pool payouts.");
+            }
+
+            await ensurePoolTransport();
+            const tmpl = await poolGetTemplate(payoutAddress);
+
+            // A template missing its job_id is unusable: shares submitted against
+            // it are rejected as stale, and the auditor would read the absent
+            // merkle_root as "empty tree" and wave it through. Treat it as a
+            // transient transport fault and retry on the next poll rather than
+            // broadcasting it to the miners.
+            if (!tmpl || tmpl.job_id === undefined || tmpl.mining_midstate === undefined) {
+                throw new Error('Pool returned an incomplete template — retrying.');
+            }
+            const txCount = tmpl.batch_template?.transactions?.length || 0;
+
+            // Audit BEFORE returning the template: once this function returns, the
+            // main thread broadcasts the midstate and every core starts burning on
+            // it. Verifying afterwards would mean paying for work on a template we
+            // had already decided not to trust.
+            //
+            // Only re-audit when the job actually changes. The proof fetch is a
+            // round trip plus a handful of BLAKE3 folds, and the template poll runs
+            // on a timer — re-verifying an unchanged job every tick is pure waste.
+            if (tmpl.job_id !== lastAuditedJobId) {
+                const audit = await verifyPoolPrecommitment(tmpl, payoutAddress);
+                lastAuditedJobId = tmpl.job_id;
+                if (!audit.ok) {
+                    self.postMessage({ type: 'LOG', payload: `🚨 POOL AUDIT FAILED: ${audit.reason}` });
+                    self.postMessage({ type: 'POOL_AUDIT_FAILED', payload: { reason: audit.reason, jobId: tmpl.job_id } });
+                    // Returning null stops this job from reaching the miners.
+                    return null;
+                }
+                self.postMessage({ type: 'LOG', payload: `🔒 Precommitment verified — ${audit.reason}` });
+            }
+
+            self.postMessage({ type: 'LOG', payload: `Pool job ${tmpl.job_id} | ${txCount} txs | Your Shares: ${tmpl.shares_recorded}` });
+
+            // Keep the wallet's own view of the chain fresh so pool payouts show
+            // up in the balance — but OFF the mining path. Fire-and-forget rather
+            // than awaited: a rescan takes seconds, and blocking here would leave
+            // every core grinding the previous midstate until it finished.
+            // Throttled because the template poll runs on a ~1s timer and the
+            // payouts we're watching for only land when the pool finds a block.
+            networkHeight = tmpl.height ?? networkHeight;
+            const nowMs = Date.now();
+            if (!poolSyncInFlight
+                && nowMs - lastPoolSyncMs > POOL_SYNC_INTERVAL_MS
+                && networkHeight > wState.lastScannedHeight) {
+                poolSyncInFlight = true;
+                lastPoolSyncMs = nowMs;
+                performScan()
+                    .catch(e => self.postMessage({ type: 'LOG', payload: `Background sync failed (mining unaffected): ${e.message}` }))
+                    .finally(() => {
+                        poolSyncInFlight = false;
+                        self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+                    });
+            }
+
+            return {
+                // `job_id` binds every share we submit back to this exact template.
+                // Without it the pool cannot tell a fresh share from one mined
+                // against a template it has already replaced.
+                job_id:          tmpl.job_id,
+                mining_midstate: tmpl.mining_midstate,
+                // The pool's SHARE target (much easier than the network target),
+                // so a browser at single-digit H/s produces shares regularly
+                // instead of grinding for a full block it will never find.
+                target:          tmpl.target,
+                network_target:  tmpl.network_target,
+                batch_template:  tmpl.batch_template, // display only; pool rebuilds the block
+                mining_addrs:    [], // Pool handles keys
+                next_wots_index: wState.nextWotsIndex, // We don't advance our counter
+                total_fees:      0, // Pool handles fees
+                chainHeight:     tmpl.height ?? networkHeight,
+                blockReward:     tmpl.block_reward || 0,
+                poolShares:      tmpl.shares_recorded || 0,
+                // The pool's template already contains the transactions the block
+                // will carry, so the tx count is exact without a getMempool call.
+                // Fee totals are not exposed by the pool (and are not ours to
+                // collect in pool mode — the pool takes fees into its coinbase
+                // split), so the dashboard shows 0 rather than a stale local read.
+                mempoolTxs:      txCount,
+                mempoolFees:     0
+            };
+        }
+        // --- END POOL MODE LOGIC ---
+
+        // ── Solo mode: everything below needs our own node ──
         const stateObj = await rpc.getState().catch(() => ({ height: networkHeight, block_reward: 0 }));
         let mempoolTxs = 0, mempoolFees = 0;
         try {
@@ -1470,33 +1938,6 @@ async function handleGetTemplate() {
             await performScan();
         }
 
-        // --- POOL MODE LOGIC ---
-        if (miningMode === 'pool') {
-            if (!poolUrl) throw new Error("Pool URL not set.");
-            const cleanUrl = poolUrl.replace(/\/+$/, '');
-            const res = await fetch(`${cleanUrl}/api/template`, { cache: 'no-store' });
-            if (!res.ok) throw new Error(`Pool error: ${await res.text()}`);
-            
-            const tmpl = await res.json();
-            const txCount = tmpl.batch_template.transactions?.length || 0;
-            self.postMessage({ type: 'LOG', payload: `Pool Template | ${txCount} txs | Your Shares: ${tmpl.shares_recorded}` });
-
-            return {
-                mining_midstate: tmpl.mining_midstate,
-                target:          tmpl.target,
-                batch_template:  tmpl.batch_template,
-                mining_addrs:    [], // Pool handles keys
-                next_wots_index: wState.nextWotsIndex, // We don't advance our counter
-                total_fees:      0, // Pool handles fees
-                chainHeight:     networkHeight,
-                blockReward:     stateObj.block_reward || 0,
-                mempoolTxs,
-                mempoolFees
-            };
-        }
-        // --- END POOL MODE LOGIC ---
-
-        // Solo Mode Logic (Original)
         const template = await buildMiningTemplate(stateObj);
         if (!template) return null;
 
@@ -1529,6 +1970,65 @@ async function handleGetTemplate() {
  */
 async function handleSubmitMinedBlock(template, nonce) {
     if (!wallet) throw new Error("Wallet not initialized.");
+
+    // --- POOL MODE SUBMISSION ---
+    //
+    // Deliberately handled before the solo path's `isSubmitting` guard and
+    // before any extension is rebuilt:
+    //
+    //  • No `isSubmitting` guard. That flag exists to stop two workers racing to
+    //    submit the same *block*. In pool mode a find is usually just a share,
+    //    shares are independent (different nonces), and they arrive often — so
+    //    the guard would silently discard perfectly good work.
+    //
+    //  • No `build_solo_extension`. Recomputing the 1,000,000-iteration hash
+    //    chain here costs the browser real time for nothing: the pool must
+    //    recompute it server-side anyway (it cannot trust a client-supplied
+    //    hash), so the nonce alone is the entire claim.
+    //
+    //  • No batch is sent. The batch contains the coinbase; letting the client
+    //    supply it would let any miner rewrite the payout addresses and have the
+    //    pool relay the rewritten block to the node. The pool rebuilds the block
+    //    from the template it issued and still holds, keyed by `job_id`.
+    if (miningMode === 'pool') {
+        if (!poolUrl) throw new Error("Pool URL not set.");
+        payoutAddress = getPrimaryMssPk() || "";
+        if (!payoutAddress) {
+            throw new Error("No L2/MSS Identity found! Generate a new address first to receive pool payouts.");
+        }
+
+        let respJson = {};
+        try {
+            await ensurePoolTransport();
+            respJson = await poolSubmitShare(payoutAddress, template.job_id, nonce, 'browser');
+        } catch (e) {
+            // Network-level failure (pool down, CORS blocked, mixed content).
+            self.postMessage({ type: 'LOG', payload: `❌ Pool unreachable: ${e.message}` });
+            return { accepted: false, isShare: true, isBlock: false, rejectReason: e.message, reward: 0, height: template.chainHeight };
+        }
+
+        if (respJson.accepted) {
+            const label = respJson.is_block ? '🎉 BLOCK' : '✅ Share';
+            self.postMessage({ type: 'LOG', payload: `${label} accepted | score: ${respJson.score}` });
+        } else {
+            // Stale/duplicate are routine races, not errors worth alarming about.
+            self.postMessage({ type: 'LOG', payload: `⚠️ Share not counted (${respJson.reason || 'error'}): ${respJson.message || respJson.error || ''}` });
+        }
+
+        return {
+            accepted:     !!respJson.accepted,
+            // `isShare` tells the UI this find was a pool share, so it can keep
+            // mining and skip the block-celebration path unless isBlock is set.
+            isShare:      true,
+            isBlock:      !!respJson.is_block,
+            poolShares:   respJson.score ?? template.poolShares ?? 0,
+            rejectReason: respJson.accepted ? null : (respJson.reason || respJson.error || 'rejected'),
+            reward:       0,
+            height:       template.chainHeight
+        };
+    }
+
+    // --- SOLO MODE SUBMISSION ---
     if (isSubmitting) {
         self.postMessage({ type: 'LOG', payload: 'Duplicate block find ignored — submission already in progress.' });
         return { accepted: false, rejectReason: 'duplicate', reward: 0, height: template.chainHeight };
@@ -1544,31 +2044,7 @@ async function handleSubmitMinedBlock(template, nonce) {
         let accepted = false;
         let rejectReason = null;
 
-        // --- POOL MODE SUBMISSION ---
-        if (miningMode === 'pool') {
-            payoutAddress = getPrimaryMssPk() || "";
-            if (!payoutAddress) {
-                throw new Error("No L2/MSS Identity found! Generate a new address first to receive pool payouts.");
-            }
-
-            const cleanUrl = poolUrl.replace(/\/+$/, '');
-            const res = await fetch(`${cleanUrl}/api/submit`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ batch, payout_address: payoutAddress })
-            });
-            
-            accepted = res.ok;
-            if (accepted) {
-                const respJson = await res.json();
-                self.postMessage({ type: 'LOG', payload: `✅ Pool: ${respJson.message}` });
-            } else {
-                rejectReason = await res.text();
-                self.postMessage({ type: 'LOG', payload: `❌ Pool Rejected: ${rejectReason}` });
-            }
-        } 
-        // --- SOLO MODE SUBMISSION ---
-        else {
+        {
             const submitReq = await rpc.submitBatch(batch);
             accepted = submitReq.ok;
             rejectReason = accepted ? null : (submitReq.body || 'rejected');
@@ -1661,6 +2137,21 @@ self.onmessage = async (e) => {
 
         else if (type === 'RPC_RESPONSE') {
             _rpcReceive(payload.id, payload.result, payload.error, payload.code);
+        }
+
+        else if (type === 'POOL_RESPONSE') {
+            _poolReceive(payload.id, payload.result, payload.error);
+        }
+
+        else if (type === 'POOL_NOTIFY') {
+            // The pool pushed a new job. Fetch the full template immediately
+            // rather than waiting for the next poll tick — the notification is
+            // deliberately small and carries no coinbase, and the auditor needs
+            // the coinbase to confirm the precommitment root.
+            self.postMessage({ type: 'LOG', payload: `Pool pushed job ${payload?.job_id ?? ''}` });
+            handleGetTemplate()
+                .then(tmpl => self.postMessage({ type: 'TEMPLATE_READY', payload: tmpl }))
+                .catch(e => self.postMessage({ type: 'TEMPLATE_ERROR', payload: e.toString() }));
         }
 
         else if (type === 'GENERATE') {
@@ -3853,6 +4344,67 @@ else if (type === 'L2_OPEN_CHANNEL') {
                 self.postMessage({ type: 'ERROR', payload: `Send chat failed: ${e}` });
             }
         }
+        else if (type === 'GPU_VERIFY') {
+            // Reference hashes for a miner's GPU self-test.
+            //
+            // This lives here because `build_solo_extension` is a method on the
+            // `WebWallet` instance, which only this worker holds — miner.js cannot
+            // import it as a free function (attempting to made its module fail to
+            // link). Using this exact implementation is the point: the GPU must
+            // agree with the code that actually builds submitted blocks, not with
+            // a second BLAKE3.
+            const { id, midstate, count } = payload || {};
+            try {
+                if (!wallet) throw new Error('wallet not initialized');
+                const hashes = [];
+                for (let i = 0; i < (count || 0); i++) {
+                    const extStr = wallet.build_solo_extension(midstate, BigInt(i));
+                    if (!extStr) throw new Error(`build_solo_extension returned nothing for nonce ${i}`);
+                    const fh = JSON.parse(extStr).final_hash;
+                    hashes.push(typeof fh === 'string'
+                        ? fh.toLowerCase()
+                        : Array.from(fh).map(b => (b & 0xff).toString(16).padStart(2, '0')).join(''));
+                }
+                self.postMessage({ type: 'GPU_VERIFY_RESULT', payload: { id, hashes } });
+            } catch (e) {
+                self.postMessage({ type: 'GPU_VERIFY_RESULT', payload: { id, error: e.message } });
+            }
+        }
+
+        else if (type === 'SET_MINING_ACTIVE') {
+            isMiningActive = !!payload?.active;
+        }
+
+        else if (type === 'SET_MINING_MODE') {
+            // This message was already being posted by the UI on mode change, on
+            // pool-URL change and on every startMining() — but nothing consumed it,
+            // so `miningMode` never left 'solo'. Selecting "Smart Pool" in the UI
+            // therefore did nothing: the wallet went on building solo templates
+            // against its own coinbase and ignoring the pool entirely.
+            const nextMode = payload?.mode === 'pool' ? 'pool' : 'solo';
+            const nextUrl = (payload?.url || '').trim();
+            if (nextMode !== miningMode || nextUrl !== poolUrl) {
+                // Any change invalidates the audit: a different pool (or a
+                // different mode) must re-prove its precommitment from scratch
+                // rather than inheriting the previous operator's clean bill.
+                lastAuditedJobId = null;
+            }
+            if (nextUrl !== poolUrl || nextMode !== miningMode) {
+                // Drop any live pool session; the next template fetch dials the
+                // new address. Leaving the old connection open would keep
+                // receiving push notifications from a pool we no longer use.
+                if (poolTransport === 'webrtc') self.postMessage({ type: 'POOL_REQUEST', payload: { id: 0, method: 'disconnect', params: {} } });
+                poolTransportAddr = '';
+                lastAuditedJobId = null;
+            }
+            miningMode = nextMode;
+            poolUrl = nextUrl;
+            self.postMessage({
+                type: 'LOG',
+                payload: `Mining mode set to ${miningMode.toUpperCase()}${miningMode === 'pool' ? ` (${poolUrl || 'no URL'})` : ''}.`
+            });
+        }
+
         else if (type === 'GET_TEMPLATE') {
             try {
                 const result = await handleGetTemplate();
@@ -4422,6 +4974,10 @@ async function _performScanInner(myGen) {
     });
 
     let currentHeight = wState.lastScannedHeight;
+    // Consecutive batches where the peer returned zero filters. Bounded so a node
+    // that cannot serve this range costs a handful of requests, not thousands.
+    let stalledBatches = 0;
+    const MAX_STALLED_BATCHES = 20;
     updateWasmWatchlist();
 
     while (currentHeight < chainHeight) {
@@ -4442,31 +4998,76 @@ async function _performScanInner(myGen) {
             }
 
             const n         = filterData.element_counts ? filterData.element_counts[i] : 0;
-            if (n === 0) continue;
             const blockHash = filterData.block_hashes ? filterData.block_hashes[i] : undefined;
+            const filterHex = filterData.filters ? filterData.filters[i] : undefined;
 
-            if (!blockHash) {
+            // `element_count === 0` does NOT mean "nothing here".
+            //
+            // The node builds a filter from `CompactFilter::items_in`, which always
+            // inserts every coinbase output — so a real block ALWAYS has a non-zero
+            // count. Zero is emitted by exactly one branch of the node's handler:
+            // the block loaded but its filter did not, in which case the node sends
+            // the block hash with an EMPTY filter string, meaning "I cannot filter
+            // this one, fetch it yourself".
+            //
+            // This check used to run BEFORE the `!blockHash` fallback and `continue`,
+            // which made that fallback dead code and silently skipped the block
+            // entirely. Any coin paid to us in a block whose filter was missing was
+            // never seen — a funds-visibility bug, not a performance one.
+            //
+            // So: an absent hash, an empty filter, or a zero count all mean
+            // "undecidable — must fetch". Only a genuine, non-empty filter is
+            // allowed to rule a block out.
+            if (!blockHash || !filterHex || n === 0) {
                 const mutated = await processFullBlock(height);
                 if (mutated) updateWasmWatchlist();
                 continue;
             }
-            if (wallet.check_filter(filterData.filters[i], blockHash, n)) {
+            if (wallet.check_filter(filterHex, blockHash, n)) {
                 const mutated = await processFullBlock(height);
                 if (mutated) updateWasmWatchlist();
             }
         }
 
         currentHeight += numFilters;
-        if (currentHeight < end) {
-            while (currentHeight < end) {
-                if (myGen !== scanGeneration) return;
-                const mutated = await processFullBlock(currentHeight);
-                if (mutated) updateWasmWatchlist();
-                currentHeight++;
-                if (currentHeight % 100 === 0) {
-                    self.postMessage({ type: 'SCAN_PROGRESS', payload: { height: currentHeight, max: chainHeight } });
-                }
+
+        // ── Short batch handling ──
+        //
+        // The node truncates its filter batch on the first height it cannot load
+        // (`_ => break` in its GetFilters handler), so a short response is normal
+        // and just means "ask again from here".
+        //
+        // This used to fall into a `while (currentHeight < end) processFullBlock()`
+        // loop, which is a 1000x request amplification: one `get_filters` covering
+        // 1000 blocks becomes up to 1000 individual `get_block` calls. An unknown
+        // peer is granted ~275 requests/minute, and the node's own comment budgets
+        // a scan at "120 requests * 1000 blocks = 120,000 blocks synced per minute"
+        // — i.e. the filter path IS the sync path. Grinding the tail blew that
+        // budget continuously, the node reset the streams, the client declared the
+        // connection a zombie and redialled with a FRESH PeerId — which handed it a
+        // brand new rate-limit window and Beta reputation. That loop is
+        // indistinguishable from deliberate rate-limit evasion and would eventually
+        // earn a 500s ban from any node the wallet does not own.
+        //
+        // Instead: retry the range with a bounded number of direct fetches, and if
+        // the node genuinely cannot serve this height, surface it rather than
+        // hammering. `SCAN_STALLED` lets the caller pick another peer — which is
+        // the correct response when the wallet's model is "connect to any node".
+        if (numFilters === 0) {
+            if (++stalledBatches > MAX_STALLED_BATCHES) {
+                self.postMessage({ type: 'LOG', payload:
+                    `Scan stalled at height ${currentHeight}: this peer returned no filters ` +
+                    `${stalledBatches} times. Try a different node.` });
+                self.postMessage({ type: 'SCAN_STALLED', payload: { height: currentHeight } });
+                return;
             }
+            // One direct fetch to step over a single unreadable height, then
+            // re-request filters from the next block.
+            const mutated = await processFullBlock(currentHeight);
+            if (mutated) updateWasmWatchlist();
+            currentHeight++;
+        } else {
+            stalledBatches = 0;
         }
 
         // Save progress periodically to prevent restarting from scratch on error

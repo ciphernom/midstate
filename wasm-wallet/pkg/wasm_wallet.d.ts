@@ -409,6 +409,8 @@ export class WebWallet {
     sign_mss_hex(mss_pk_hex: string, commitment_hex: string): string;
 }
 
+export function address_to_checksummed_hex(address_hex: string): string;
+
 /**
  * Hash a hex-encoded byte string with BLAKE3.
  * Returns the 32-byte hash as a 64-character hex string.
@@ -629,6 +631,7 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_webwallet_free: (a: number, b: number) => void;
+    readonly address_to_checksummed_hex: (a: number, b: number, c: number) => void;
     readonly blake3_hash_hex: (a: number, b: number, c: number) => void;
     readonly build_channel_reveal: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => void;
     readonly build_channel_state: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: bigint, j: number, k: number, l: number) => void;

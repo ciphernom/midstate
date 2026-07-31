@@ -2027,12 +2027,29 @@ async fn handle_light_request(
                                 block_hashes.push(hex::encode(batch.extension.final_hash));
                                 element_counts.push(items.len() as u64);
                             }
+                            // Block loaded, filter did not. Emit the block hash with
+                            // an EMPTY filter and a zero count — the client's contract
+                            // for "undecidable, fetch this one yourself". Never treat
+                            // a zero count as "nothing of interest here": every block
+                            // has coinbase outputs, so a genuine filter is never empty.
                             (Ok(Some(batch)), _) => {
                                 filters.push(String::new());
                                 block_hashes.push(hex::encode(batch.extension.final_hash));
                                 element_counts.push(0);
                             }
-                            _ => break,
+                            // Height unreadable. Breaking here truncates the whole
+                            // batch, and a client that then walks the remainder one
+                            // block at a time turns a single 1000-block request into
+                            // up to 1000 — which is exactly what blows the light
+                            // rate limit. Emit an undecidable entry and keep going, so
+                            // one bad height costs one extra block fetch instead of
+                            // ending the batch. Placeholders keep all four arrays the
+                            // same length, which the client indexes in lockstep.
+                            _ => {
+                                filters.push(String::new());
+                                block_hashes.push(String::new());
+                                element_counts.push(0);
+                            }
                         }
                     }
                     LightResponse::success(serde_json::json!({
