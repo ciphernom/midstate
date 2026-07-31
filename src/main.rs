@@ -4899,22 +4899,25 @@ pub async fn run_node(
     // Merge: config file peers first, then CLI --peer flags on top, dedup
     let mut all_peers = config.bootstrap_peers.clone();
     all_peers.extend(cli_peers);
+
+    tracing::info!("Querying live phonebook for active network peers...");
+    match fetch_phonebook_peers("https://seeds.midstate.cash").await {
+        Ok(live_peers) => {
+            tracing::info!("Discovered {} peers from phonebook", live_peers.len());
+            all_peers.extend(live_peers);
+        }
+        Err(e) => {
+            tracing::warn!("Failed to reach phonebook: {}. Relying on local config.", e);
+        }
+    }
+
     all_peers.sort();
     all_peers.dedup();
 
     if all_peers.is_empty() {
-        tracing::info!("No local bootstrap peers found. Querying live phonebook...");
-        match fetch_phonebook_peers("https://midstate-seeds.ejnagynikbloski.workers.dev").await {
-            Ok(live_peers) => {
-                tracing::info!("Discovered {} peers from phonebook", live_peers.len());
-                all_peers.extend(live_peers);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to reach phonebook: {}. Waiting for inbound connections...", e);
-            }
-        }
+        tracing::warn!("No bootstrap peers configured or discovered. Waiting for inbound connections...");
     } else {
-        tracing::info!("Bootstrap peers: {} (config: {})", all_peers.len(), config_file.display());
+        tracing::info!("Total Bootstrap peers: {} (config: {})", all_peers.len(), config_file.display());
     }
 
     let listen_addr: libp2p::Multiaddr = match listen {

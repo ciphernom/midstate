@@ -776,7 +776,6 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
     ///   This prevents leaking local/private IPs (e.g., 10.x, 192.168.x) to the 
     ///   public registry, which would bloat the phonebook with unreachable nodes.
     pub fn publish_to_phonebook(&self) {
-        // Strictly filter out any local/private IPs before publishing
         let addrs: Vec<String> = self.advertisable_addrs()
             .into_iter()
             .filter(|addr_str| {
@@ -788,7 +787,12 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
             })
             .collect();
 
-        if addrs.is_empty() { return; }
+        if addrs.is_empty() { 
+            tracing::debug!("Phonebook publish skipped: No public routable addresses available yet.");
+            return; 
+        }
+        
+        tracing::info!("Publishing {} addresses to live phonebook...", addrs.len());
         
         tokio::spawn(async move {
             let client = reqwest::Client::builder()
@@ -796,10 +800,24 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new());
             
-            let _ = client.post("https://seeds.midstate.cash/announce")
+            match client.post("https://seeds.midstate.cash/announce")
                 .json(&serde_json::json!({ "addresses": addrs }))
                 .send()
-                .await;
+                .await 
+            {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        tracing::info!("Successfully published addresses to phonebook.");
+                    } else {
+                        let status = resp.status();
+                        let text = resp.text().await.unwrap_or_default();
+                        tracing::warn!("Phonebook rejected publish ({}): {}", status, text);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to reach phonebook for publish: {}", e);
+                }
+            }
         });
     }
 
@@ -1379,6 +1397,13 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     tracing::info!("External address confirmed: {}", address);
                     if !self.external_addrs.contains(&address) {
                         self.external_addrs.push(address);
+                    }
+                    
+                    // --- PUBLISH TO PHONEBOOK ---
+                    // Now that we officially know our external IP, publish it!
+                    // We only do this if AutoNAT already marked us as Public.
+                    if self.nat_status == NatStatus::Public {
+                        self.publish_to_phonebook();
                     }
                 }
                 _ => {}
