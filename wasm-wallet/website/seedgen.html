@@ -1,0 +1,1012 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; form-action 'none'; base-uri 'none'">
+<title>MIDSTATE.SEED — offline BIP-39 builder</title>
+<style>
+/* =====================================================================
+MIDSTATE.SEED — follows midstate.css.
+Pure ink on paper. Zero hue, zero shadow, zero radius, zero motion.
+State is carried by fill, weight, dashes and labels — never by colour.
+
+Two deliberate departures, both forced by the threat model:
+  1. No @import of webfonts. The page must load nothing from a network,
+     so Inter and JetBrains Mono are used if installed and the stack
+     falls back cleanly if not.
+  2. No localStorage for the theme. The page writes nothing, anywhere.
+     The toggle lasts as long as the tab does.
+===================================================================== */
+:root, [data-theme="dark"] {
+  --bg:#0a0a0a; --bg-alt:#141414; --bg-panel:#161616; --code-bg:#181818; --highlight:#1f1f1f;
+  --border:#262626; --border-bright:#363636;
+  --text-max:#f5f5f5; --text-bright:#cfcfcf; --text:#9a9a9a; --text-muted:#9a9a9a; --text-faint:#5a5a5a;
+  --accent:#f5f5f5; --on-accent:#0a0a0a;
+}
+[data-theme="light"] {
+  --bg:#ffffff; --bg-alt:#ffffff; --bg-panel:#fafafa; --code-bg:#f4f4f4; --highlight:#efefef;
+  --border:#e3e3e3; --border-bright:#cfcfcf;
+  --text-max:#111111; --text-bright:#383838; --text:#565656; --text-muted:#565656; --text-faint:#a2a2a2;
+  --accent:#111111; --on-accent:#ffffff;
+}
+:root{
+  --mono:'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans:'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --sp:clamp(14px,2.2vw,24px);
+}
+*{box-sizing:border-box;margin:0;padding:0;border-radius:0!important}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased}
+::selection{background:var(--accent);color:var(--on-accent)}
+:focus-visible{outline:1px solid var(--accent);outline-offset:2px}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border)}
+.mono{font-family:var(--mono)}
+.wrap{max-width:1180px;margin:0 auto;padding:0 var(--sp) 72px}
+
+/* ── header bar ─────────────────────────────────────────────────── */
+.hdr{display:flex;justify-content:space-between;align-items:center;gap:12px;
+  padding:8px 12px;border-bottom:1px solid var(--border);background:var(--bg);flex-wrap:wrap}
+.hdr h1{font-family:var(--mono);font-size:14px;font-weight:700;color:var(--text-max);letter-spacing:2px}
+.hdr-left,.hdr-right{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.hdr-tag{font-family:var(--mono);font-size:9px;letter-spacing:1px;text-transform:uppercase;color:var(--text-muted);
+  border:1px solid var(--border);padding:2px 6px}
+.hdr-right{font-family:var(--mono);font-size:10px;color:var(--text)}
+.hdr-right .label{color:var(--text-muted);letter-spacing:1px}
+.hdr-right .val{color:var(--text-bright);font-variant-numeric:tabular-nums}
+.live-stat{display:flex;align-items:center;gap:5px}
+.live-dot{width:5px;height:5px;border:1px solid var(--border);background:var(--accent)}
+.live-dot.off{background:transparent}
+.btn{background:transparent;border:1px solid var(--border);color:var(--text-max);font-family:var(--sans);
+  font-size:13px;font-weight:500;padding:6px 12px;cursor:pointer;line-height:1.4}
+.btn:hover:not(:disabled){border-color:var(--accent)}
+.btn:disabled{color:var(--text-faint);cursor:not-allowed}
+.theme-toggle{padding:5px;color:var(--text-muted);line-height:0;border-color:var(--border)}
+.theme-toggle:hover{color:var(--text-max)}
+.theme-toggle svg{display:block}
+.theme-toggle .icon-moon{display:none}
+[data-theme="light"] .theme-toggle .icon-sun{display:none}
+[data-theme="light"] .theme-toggle .icon-moon{display:block}
+
+/* ── environment strip ──────────────────────────────────────────── */
+#envbar{font-family:var(--mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;
+  padding:7px var(--sp);border-bottom:1px solid var(--border);color:var(--text-muted)}
+#envbar b{color:var(--text-max);font-weight:700}
+#envbar.warn{background:var(--accent);color:var(--on-accent);border-bottom-color:var(--accent)}
+#envbar.warn b{color:var(--on-accent)}
+
+/* ── masthead ───────────────────────────────────────────────────── */
+header{padding:34px 0 24px;border-bottom:1px solid var(--border)}
+.eyebrow{font-family:var(--mono);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--text-muted)}
+header h1{font-family:var(--sans);font-weight:600;font-size:clamp(24px,3.6vw,34px);line-height:1.15;
+  letter-spacing:-.02em;color:var(--text-max);margin:12px 0 12px}
+header h1 em{font-style:normal;border-bottom:2px solid var(--accent)}
+.lede{max-width:62ch;color:var(--text)}
+.tests{display:flex;flex-wrap:wrap;gap:4px;margin-top:20px}
+.chip{font-family:var(--mono);font-size:9px;letter-spacing:.5px;padding:3px 6px;border:1px solid var(--border);color:var(--text-muted)}
+.chip.pass{color:var(--text-muted)}
+.chip.fail{background:var(--accent);color:var(--on-accent);border-color:var(--accent);font-weight:700}
+
+/* ── layout ─────────────────────────────────────────────────────── */
+.cols{display:grid;grid-template-columns:minmax(320px,400px) 1fr;gap:calc(var(--sp)*1.5);padding-top:26px;align-items:start}
+@media(max-width:900px){.cols{grid-template-columns:1fr;gap:30px}}
+.step{border-top:1px solid var(--border);padding:16px 0 4px}
+.step:first-child{border-top:none;padding-top:0}
+.step h2{font-family:var(--mono);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--text-muted);
+  font-weight:700;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+.step h2 span{color:var(--text-max);margin-right:8px}
+.hint{font-size:12.5px;color:var(--text-muted);margin-top:10px;line-height:1.55}
+.hint code{font-family:var(--mono);font-size:11.5px;color:var(--text-bright);background:var(--code-bg);padding:1px 4px}
+.hint b{color:var(--text-max)}
+
+.seg{display:flex;flex-wrap:wrap;gap:4px}
+.seg button{font-family:var(--mono);font-size:11px;letter-spacing:.5px;background:transparent;
+  border:1px solid var(--border);color:var(--text-muted);padding:7px 10px;cursor:pointer}
+.seg button:hover:not([disabled]){border-color:var(--accent);color:var(--text-max)}
+.seg button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--on-accent);font-weight:700}
+.seg button[disabled]{color:var(--text-faint);cursor:not-allowed}
+
+label.check{display:flex;gap:9px;align-items:flex-start;font-size:12.5px;color:var(--text-muted);cursor:pointer;margin-top:12px;line-height:1.55}
+label.check input{margin-top:3px;accent-color:var(--accent);flex-shrink:0}
+label.check b{color:var(--text-max)}
+label.check em{font-style:italic;color:var(--text-bright)}
+
+textarea{width:100%;min-height:104px;resize:vertical;margin-top:4px;background:var(--bg-alt);color:var(--text-max);
+  border:1px solid var(--border);font-family:var(--mono);font-size:14px;line-height:1.7;letter-spacing:.12em;padding:10px}
+textarea:focus{border-color:var(--accent);outline:none}
+textarea::placeholder{color:var(--text-faint);letter-spacing:.08em}
+
+.meter{margin-top:12px}
+.meter .bar{height:5px;border:1px solid var(--border);background:transparent}
+.meter .fill{height:100%;width:0;background:var(--border-bright)}
+.meter .fill.done{background:var(--accent)}
+.readnum{font-family:var(--mono);font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:var(--text-muted);
+  margin-top:7px;display:flex;justify-content:space-between;gap:12px;font-variant-numeric:tabular-nums}
+.readnum b{color:var(--text-max);font-weight:700}
+
+.actions{display:flex;gap:6px;margin-top:22px;flex-wrap:wrap}
+button.primary{font-family:var(--sans);font-size:13px;font-weight:600;background:var(--accent);color:var(--on-accent);
+  border:1px solid var(--accent);padding:10px 18px;cursor:pointer}
+button.primary:hover:not([disabled]){border-color:var(--text-max)}
+button.primary[disabled]{background:transparent;color:var(--text-faint);border-color:var(--border);cursor:not-allowed}
+button.ghost{font-family:var(--sans);font-size:13px;font-weight:500;background:transparent;color:var(--text-max);
+  border:1px solid var(--border);padding:10px 16px;cursor:pointer}
+button.ghost:hover{border-color:var(--accent)}
+#blocker{font-family:var(--mono);font-size:10.5px;letter-spacing:.3px;color:var(--text-bright);margin-top:10px;min-height:1.3em}
+#blocker:not(:empty)::before{content:"! ";font-weight:700;color:var(--text-max)}
+
+/* ── signature: the bit ledger ──────────────────────────────────── */
+.ledger{border:1px solid var(--border);background:var(--bg-alt);padding:14px}
+.ledger-head{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;
+  padding-bottom:6px;margin-bottom:14px;border-bottom:1px solid var(--border)}
+.ledger-head h2{font-family:var(--mono);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;
+  color:var(--text-muted);font-weight:700;margin:0}
+.legend{display:flex;gap:12px;font-family:var(--mono);font-size:9px;letter-spacing:.5px;
+  text-transform:uppercase;color:var(--text-muted);flex-wrap:wrap}
+.legend i{display:inline-block;width:8px;height:8px;margin-right:5px;vertical-align:-1px;border:1px solid var(--border)}
+.legend .l1{background:var(--accent);border-color:var(--accent)}
+.legend .lc{border:1px dashed var(--border-bright)}
+
+.grid{display:flex;flex-direction:column;gap:2px}
+.grow{display:grid;grid-template-columns:22px repeat(11,1fr) minmax(74px,108px);gap:2px;align-items:center}
+.gidx{font-family:var(--mono);font-size:9px;color:var(--text-faint);text-align:right;padding-right:4px;font-variant-numeric:tabular-nums}
+.cell{aspect-ratio:1/1;min-height:14px;border:1px solid var(--border);display:flex;align-items:center;
+  justify-content:center;font-family:var(--mono);font-size:9px;color:transparent}
+.cell.b0{color:var(--text-faint)}
+.cell.b1{background:var(--accent);color:var(--on-accent);border-color:var(--accent);font-weight:700}
+.cell.cs{border-style:dashed;border-color:var(--border-bright)}
+.gword{font-family:var(--mono);font-size:11px;color:var(--text-faint);padding-left:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gword.set{color:var(--text)}
+.gword b{color:var(--text-max);font-weight:700}
+@media(max-width:520px){.grow{grid-template-columns:18px repeat(11,1fr) 58px}.gword{font-size:10px}}
+
+/* ── the phrase: the one inverted block on the page ─────────────── */
+#out{margin-top:calc(var(--sp)*1.2)}
+.card{background:var(--accent);color:var(--on-accent);padding:22px}
+.card h2{font-family:var(--mono);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;font-weight:700;margin-bottom:6px;opacity:.55}
+.card p.note{font-size:12.5px;margin-bottom:18px;max-width:66ch;opacity:.7;line-height:1.55}
+.words{display:grid;grid-template-columns:repeat(auto-fill,minmax(164px,1fr));gap:0 16px}
+.wd{display:flex;align-items:baseline;gap:9px;font-family:var(--mono);font-size:16px;padding:6px 0;
+  border-bottom:1px dashed currentColor}
+.wd .n{font-size:9px;min-width:18px;text-align:right;opacity:.5;font-variant-numeric:tabular-nums}
+.wd .w b{font-weight:700;border-bottom:2px solid currentColor}
+.wd .ix{margin-left:auto;font-size:9px;opacity:.45;font-variant-numeric:tabular-nums}
+.cardfoot{display:flex;flex-wrap:wrap;gap:10px 22px;margin-top:18px;padding-top:12px;border-top:1px solid currentColor;
+  font-family:var(--mono);font-size:9px;letter-spacing:.5px;text-transform:uppercase;align-items:center;opacity:.75}
+.cardfoot code{text-transform:none;letter-spacing:0;word-break:break-all;font-size:10px;opacity:1}
+.timer{margin-left:auto;display:flex;gap:6px;align-items:center;font-variant-numeric:tabular-nums}
+.timer button{font-family:var(--mono);font-size:9px;letter-spacing:1px;text-transform:uppercase;background:transparent;
+  border:1px solid currentColor;color:inherit;padding:5px 8px;cursor:pointer}
+.masked{border:1px dashed var(--border-bright);padding:30px;text-align:center;font-family:var(--mono);
+  font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--text-muted)}
+
+/* ── notes ──────────────────────────────────────────────────────── */
+.notes{margin-top:calc(var(--sp)*2);border-top:1px solid var(--border)}
+details{border-bottom:1px solid var(--border)}
+summary{cursor:pointer;padding:14px 0;font-family:var(--mono);font-size:10px;letter-spacing:1.5px;
+  text-transform:uppercase;color:var(--text-max);font-weight:700;list-style:none}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"+";display:inline-block;width:16px;color:var(--text-muted)}
+details[open] summary::before{content:"\2212"}
+.notes .body{padding:0 0 20px 16px;max-width:76ch;color:var(--text-muted);font-size:13px}
+.notes .body p{margin-bottom:11px}
+.notes .body strong{color:var(--text-max);font-weight:600}
+.notes .body em{color:var(--text-bright);font-style:italic}
+.notes .body ul{margin-bottom:11px;padding-left:18px}
+.notes .body li{margin-bottom:7px}
+.notes .body code{font-family:var(--mono);font-size:11.5px;color:var(--text-bright)}
+footer{padding-top:22px;font-family:var(--mono);font-size:9px;letter-spacing:1px;text-transform:uppercase;color:var(--text-faint)}
+</style>
+</head>
+<body class="page-seed">
+
+<div class="hdr">
+  <div class="hdr-left">
+    <h1>MIDSTATE<span style="color:var(--text-faint)">.</span>SEED</h1>
+    <span class="hdr-tag">BIP-39 · air-gapped</span>
+  </div>
+  <div class="hdr-right">
+    <span class="live-stat"><span class="live-dot" id="tdot"></span><span class="label">SELF-TEST</span><span class="val" id="tstat">…</span></span>
+    <button id="theme-toggle" class="btn theme-toggle" title="Toggle light / dark" aria-label="Toggle theme"><svg class="icon-sun" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg><svg class="icon-moon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
+  </div>
+</div>
+
+<div id="envbar">checking environment…</div>
+<div class="wrap">
+
+<header>
+  <div class="eyebrow">this page generates no randomness</div>
+  <h1>Five throws of ten dice.<br>The rest is <em>arithmetic</em>.</h1>
+  <p class="lede">Every bit of your seed phrase comes from your hands. Ten dice thrown together carry 25.8 bits, so a 12-word phrase takes five throws and a 24-word phrase takes ten. This page converts what you rolled into words and appends the checksum bits no one can compute by hand.</p>
+  <div class="tests" id="tests"></div>
+</header>
+
+<div class="cols">
+  <section>
+    <div class="step">
+      <h2><span>01</span>Phrase length</h2>
+      <div class="seg" id="len">
+        <button data-v="128" aria-pressed="true">12 words · 128 bits</button>
+        <button data-v="256" aria-pressed="false">24 words · 256 bits</button>
+      </div>
+      <p class="hint">128 bits already exceeds what any attacker can search. Choose 24 words if you doubt the fairness of your dice — the extra margin absorbs it.</p>
+    </div>
+
+    <div class="step">
+      <h2><span>02</span>What you are throwing</h2>
+      <div class="seg" id="src">
+        <button data-v="d6" aria-pressed="true">Six-sided dice</button>
+        <button data-v="cards" aria-pressed="false">Deck of cards</button>
+        <button data-v="d8" aria-pressed="false">d8</button>
+        <button data-v="d10" aria-pressed="false">d10</button>
+        <button data-v="d20" aria-pressed="false">d20</button>
+        <button data-v="coin" aria-pressed="false">Coin</button>
+        <button data-v="bits" aria-pressed="false">Bits</button>
+      </div>
+      <p class="hint" id="srchint"></p>
+      <div id="poolwrap">
+        <h2 style="margin:18px 0 12px">Dice in one throw</h2>
+        <div class="seg" id="pool">
+          <button data-v="1" aria-pressed="false">1</button>
+          <button data-v="2" aria-pressed="false">2</button>
+          <button data-v="5" aria-pressed="false">5</button>
+          <button data-v="10" aria-pressed="true">10</button>
+        </div>
+        <p class="hint">This only sets the countdown. Throwing more dice at once is what makes the method quick — the dice do not have to be different colours, but they do have to be read where they land.</p>
+      </div>
+      <label class="check" id="vnwrap" style="display:none">
+        <input type="checkbox" id="vn">
+        <span><b>Remove bias from an unfair coin.</b> Reads flips in pairs and keeps only the ones that disagree. Costs roughly four times the flips and makes any fixed bias irrelevant.</span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="hash">
+        <span><b>Fold through SHA-256.</b> Absorbs bias and any influence the dice had on each other as they collided — but only if you supply more raw material than you take out, so this asks for twice the target. The cost: the ledger stops being something you can check against your throws by hand.</span>
+      </label>
+    </div>
+
+    <div class="step">
+      <h2><span>03</span>Record it</h2>
+      <textarea id="in1" aria-label="Record of the first source" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off"></textarea>
+      <div class="meter">
+        <div class="bar"><div class="fill" id="fill"></div></div>
+        <div class="readnum" aria-live="polite"><span id="count">0 of 128 bits</span><span id="left"></span></div>
+      </div>
+      <p class="hint">Type every throw in the order it happened, one throw per line if you like. Never re-roll one you dislike and never delete one to "fix" a pattern — a fair sequence is allowed to look strange.</p>
+    </div>
+
+    <div class="step">
+      <h2><span>04</span>Second source</h2>
+      <label class="check">
+        <input type="checkbox" id="mix" checked>
+        <span><b>Mix in a second, unrelated source.</b> Both records are folded together, and the seed is sound if <em>either one</em> was good. You stop having to win the argument about whether your dice are fair.</span>
+      </label>
+      <div id="mixwrap">
+        <div class="seg" id="srcB" style="margin-top:16px">
+          <button data-v="cards" aria-pressed="true">Deck of cards</button>
+          <button data-v="d6" aria-pressed="false">Six-sided dice</button>
+          <button data-v="d8" aria-pressed="false">d8</button>
+          <button data-v="d10" aria-pressed="false">d10</button>
+          <button data-v="d20" aria-pressed="false">d20</button>
+          <button data-v="coin" aria-pressed="false">Coin</button>
+          <button data-v="bits" aria-pressed="false">Bits</button>
+        </div>
+        <p class="hint" id="srchintB"></p>
+        <textarea id="inB" aria-label="Record of the second source" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off"></textarea>
+        <div class="meter">
+          <div class="bar"><div class="fill" id="fillB"></div></div>
+          <div class="readnum" aria-live="polite"><span id="countB">0 of 128 bits</span><span id="leftB"></span></div>
+        </div>
+        <p class="hint">Pick something that fails differently: cards depend on a shuffle, dice on a throw. Two sets of dice from the same bag share whatever is wrong with the bag.</p>
+      </div>
+    </div>
+
+    <div class="step">
+      <h2><span>05</span>How it is combined</h2>
+      <p class="hint" id="combine"></p>
+    </div>
+
+    <div class="actions">
+      <button class="primary" id="build" disabled>Build phrase</button>
+      <button class="ghost" id="wipe">Wipe</button>
+    </div>
+    <div id="blocker"></div>
+  </section>
+
+  <section>
+    <div class="ledger">
+      <div class="ledger-head">
+        <h2>Bit ledger</h2>
+        <div class="legend">
+          <span><i class="l1"></i>one</span>
+          <span><i class="l0"></i>zero</span>
+          <span><i class="lc"></i>checksum · not yours</span>
+        </div>
+      </div>
+      <div class="grid" id="grid"></div>
+      <p class="hint" id="ledgerhint">Each row is one word: eleven bits read as a number from 0 to 2047, looked up in the BIP-39 English list. The dashed cells at the end are the only ones this page contributes.</p>
+    </div>
+    <div id="out"></div>
+  </section>
+</div>
+
+<div class="notes">
+  <details open>
+    <summary>How to run this safely</summary>
+    <div class="body">
+      <ul>
+        <li><strong>Get the page off the network.</strong> Save this file, move it to a machine with radios off and cable out, and open it from disk. A live browser tab is the one thing standing between your entropy and the world.</li>
+        <li><strong>Roll where nothing is watching.</strong> No phones on the table, no cameras, no windows behind the screen. Throw into a tray or a box lid so nothing escapes.</li>
+        <li><strong>Read the dice where they lie</strong> — left to right, top to bottom, nearest row first. Never tidy them into order by their numbers.</li>
+        <li><strong>Copy the words onto paper by hand.</strong> Do not use the clipboard. This page has no copy button on purpose.</li>
+        <li><strong>Destroy the sheet you recorded throws on.</strong> That sheet is your seed phrase in another alphabet. Burn or shred it.</li>
+        <li><strong>There is no second-entry check, on purpose.</strong> Mistyping a throw gives you a different random seed, not a broken one — what matters is copying the <em>words</em> correctly, so spend the care there.</li>
+        <li><strong>Restore before you fund.</strong> Enter the words into your wallet, confirm it accepts them, send a small amount, wipe the device, restore from paper, send it back out. Only then move real money.</li>
+        <li><strong>Close the tab and power the machine down</strong> when you are done.</li>
+      </ul>
+    </div>
+  </details>
+
+  <details>
+    <summary>What this page can and cannot do</summary>
+    <div class="body">
+      <p><strong>It cannot make randomness.</strong> <code>Math.random</code> is deliberately replaced with a function that throws an exception, so any hidden attempt to invent entropy crashes the page instead of quietly seeding your wallet.</p>
+      <p><strong>It cannot phone home.</strong> No fonts, scripts, images or styles are loaded from anywhere — which is also why the typography falls back to your system faces if Inter and JetBrains Mono are not installed locally. A content policy in the page header forbids every outbound connection type. Nothing is written to storage or cookies, so the theme toggle lasts only as long as the tab.</p>
+      <p><strong>It cannot let you skip the arithmetic.</strong> SHA-256 is the one step of BIP-39 that no one can do at a kitchen table. The checksum is four bits for a 12-word phrase and eight for a 24-word phrase — the dashed cells at the end of the ledger. Everything else on screen came from your throws.</p>
+      <p><strong>You still have to trust this code.</strong> That is unavoidable for the checksum step, so the page tests itself against the official BIP-39 reference vectors on every load and reports the result in the header. If you want a second opinion, take the entropy shown on the card to any independent BIP-39 tool, offline, and check that it produces the same words.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>Hashing, bias, and why two sources settle it</summary>
+    <div class="body">
+      <p><strong>A hash is a concentrator, not a source.</strong> SHA-256 gathers whatever unpredictability is already in your throws into a uniform 256 bits. It cannot create any. Folding 130 bits of dice into a 128-bit seed therefore buys nothing at all, which is why the fold option here demands twice the target before it will build.</p>
+      <p><strong>Fixed bias is the easy case.</strong> A die that shows one face 30% of the time still carries about 2.4 bits. A coin biased to 51% loses roughly three hundredths of a bit per flip. Hash a generous surplus and none of that survives.</p>
+      <p><strong>Correlation is the hard case.</strong> Min-entropy per throw is not min-entropy of the sequence. A tower with a favoured exit, a practised controlled throw, dice that stick together, a deck that was never properly mixed — each roll looks fine on its own while the record as a whole is far more predictable than the count suggests. Per-throw arithmetic quietly assumes independence, and no amount of hashing repairs a dependence you did not notice.</p>
+      <p><strong>So do not argue about it — route around it.</strong> Fold two records made by unrelated physical mechanisms and the result is sound if either one was honest. A flaw in your dice says nothing about your shuffle. That is why this page asks each source for the full target on its own: either one alone would have been enough, and you no longer need to know which one was.</p>
+      <p><strong>The trade you are making.</strong> Folding is the safer default and it is opaque: the ledger becomes a hash output with no visible relationship to your throws. Direct extraction is transparent and hand-checkable, and it passes any bias in your dice straight through. Precision casino dice are worth buying if you intend to rely on dice alone.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>Why the method is built this way</summary>
+    <div class="body">
+      <p><strong>Entropy per action, not per roll.</strong> One die rolled 128 times and ten dice thrown 13 times produce the same randomness, but one is a chore and chores make people cut corners. Ten six-sided dice in a single throw carry 25.8 bits. Fifty dice cover a 12-word phrase, a hundred cover a 24-word phrase.</p>
+      <p><strong>Identical dice are fine. Sorting them is not.</strong> Where each die lands is independent of what it shows, so reading a scattered handful left to right gives you a genuinely random ordering and the full 6<sup>n</sup> outcomes. Arranging them by value throws that away: ten sorted dice are worth 11.5 bits instead of 25.8, a loss of more than half. If two dice are hard to order, break the tie by position — never by the number on top.</p>
+      <p><strong>A cocked die has no value yet</strong>, so re-rolling that one die cannot depend on what it shows and costs nothing. Re-rolling a die because you dislike its number is a rule that depends on the number, and that is the difference between a fair sample and a chosen one.</p>
+      <p><strong>No modulo, anywhere.</strong> Turning dice into a big number and reducing it modulo 2048 is the standard way this goes quietly wrong, because no power of six is divisible by 2048. Instead the page treats everything you type as one growing uniform number and peels off whole bits only once they are certain, carrying the leftover uncertainty into the next throw. It recovers 2.5848 bits per die against a theoretical 2.5850, and the page proves the result is unbiased across all 216 three-dice throws on every load.</p>
+      <p><strong>One pipeline, any source.</strong> Because each entry carries its own number of outcomes, dice, cards and coins all feed the same extractor. A card is just a digit whose base shrinks as the deck empties — which is also why dealing a card twice is caught immediately.</p>
+      <p><strong>Cards are the fastest source you already own</strong>, and the weakest link is the shuffle rather than the arithmetic. A wash followed by seven riffles and a cut is the accepted standard; a fresh deck out of the box is in a known order and is worth nothing until it is properly mixed.</p>
+    </div>
+  </details>
+</div>
+
+<footer>No network · no storage · no randomness · wordlist digest verified against BIP-0039 on load</footer>
+</div>
+
+<script>
+/* Prove no hidden randomness: any call to Math.random from here on is fatal. */
+Math.random = function(){ throw new Error('This page must never generate randomness.'); };
+const WORDLIST = "abandon ability able about above absent absorb abstract absurd abuse access accident account accuse achieve acid acoustic acquire across act action actor actress actual adapt add addict address adjust admit adult advance advice aerobic affair afford afraid again age agent agree ahead aim air airport aisle alarm album alcohol alert alien all alley allow almost alone alpha already also alter always amateur amazing among amount amused analyst anchor ancient anger angle angry animal ankle announce annual another answer antenna antique anxiety any apart apology appear apple approve april arch arctic area arena argue arm armed armor army around arrange arrest arrive arrow art artefact artist artwork ask aspect assault asset assist assume asthma athlete atom attack attend attitude attract auction audit august aunt author auto autumn average avocado avoid awake aware away awesome awful awkward axis baby bachelor bacon badge bag balance balcony ball bamboo banana banner bar barely bargain barrel base basic basket battle beach bean beauty because become beef before begin behave behind believe below belt bench benefit best betray better between beyond bicycle bid bike bind biology bird birth bitter black blade blame blanket blast bleak bless blind blood blossom blouse blue blur blush board boat body boil bomb bone bonus book boost border boring borrow boss bottom bounce box boy bracket brain brand brass brave bread breeze brick bridge brief bright bring brisk broccoli broken bronze broom brother brown brush bubble buddy budget buffalo build bulb bulk bullet bundle bunker burden burger burst bus business busy butter buyer buzz cabbage cabin cable cactus cage cake call calm camera camp can canal cancel candy cannon canoe canvas canyon capable capital captain car carbon card cargo carpet carry cart case cash casino castle casual cat catalog catch category cattle caught cause caution cave ceiling celery cement census century cereal certain chair chalk champion change chaos chapter charge chase chat cheap check cheese chef cherry chest chicken chief child chimney choice choose chronic chuckle chunk churn cigar cinnamon circle citizen city civil claim clap clarify claw clay clean clerk clever click client cliff climb clinic clip clock clog close cloth cloud clown club clump cluster clutch coach coast coconut code coffee coil coin collect color column combine come comfort comic common company concert conduct confirm congress connect consider control convince cook cool copper copy coral core corn correct cost cotton couch country couple course cousin cover coyote crack cradle craft cram crane crash crater crawl crazy cream credit creek crew cricket crime crisp critic crop cross crouch crowd crucial cruel cruise crumble crunch crush cry crystal cube culture cup cupboard curious current curtain curve cushion custom cute cycle dad damage damp dance danger daring dash daughter dawn day deal debate debris decade december decide decline decorate decrease deer defense define defy degree delay deliver demand demise denial dentist deny depart depend deposit depth deputy derive describe desert design desk despair destroy detail detect develop device devote diagram dial diamond diary dice diesel diet differ digital dignity dilemma dinner dinosaur direct dirt disagree discover disease dish dismiss disorder display distance divert divide divorce dizzy doctor document dog doll dolphin domain donate donkey donor door dose double dove draft dragon drama drastic draw dream dress drift drill drink drip drive drop drum dry duck dumb dune during dust dutch duty dwarf dynamic eager eagle early earn earth easily east easy echo ecology economy edge edit educate effort egg eight either elbow elder electric elegant element elephant elevator elite else embark embody embrace emerge emotion employ empower empty enable enact end endless endorse enemy energy enforce engage engine enhance enjoy enlist enough enrich enroll ensure enter entire entry envelope episode equal equip era erase erode erosion error erupt escape essay essence estate eternal ethics evidence evil evoke evolve exact example excess exchange excite exclude excuse execute exercise exhaust exhibit exile exist exit exotic expand expect expire explain expose express extend extra eye eyebrow fabric face faculty fade faint faith fall false fame family famous fan fancy fantasy farm fashion fat fatal father fatigue fault favorite feature february federal fee feed feel female fence festival fetch fever few fiber fiction field figure file film filter final find fine finger finish fire firm first fiscal fish fit fitness fix flag flame flash flat flavor flee flight flip float flock floor flower fluid flush fly foam focus fog foil fold follow food foot force forest forget fork fortune forum forward fossil foster found fox fragile frame frequent fresh friend fringe frog front frost frown frozen fruit fuel fun funny furnace fury future gadget gain galaxy gallery game gap garage garbage garden garlic garment gas gasp gate gather gauge gaze general genius genre gentle genuine gesture ghost giant gift giggle ginger giraffe girl give glad glance glare glass glide glimpse globe gloom glory glove glow glue goat goddess gold good goose gorilla gospel gossip govern gown grab grace grain grant grape grass gravity great green grid grief grit grocery group grow grunt guard guess guide guilt guitar gun gym habit hair half hammer hamster hand happy harbor hard harsh harvest hat have hawk hazard head health heart heavy hedgehog height hello helmet help hen hero hidden high hill hint hip hire history hobby hockey hold hole holiday hollow home honey hood hope horn horror horse hospital host hotel hour hover hub huge human humble humor hundred hungry hunt hurdle hurry hurt husband hybrid ice icon idea identify idle ignore ill illegal illness image imitate immense immune impact impose improve impulse inch include income increase index indicate indoor industry infant inflict inform inhale inherit initial inject injury inmate inner innocent input inquiry insane insect inside inspire install intact interest into invest invite involve iron island isolate issue item ivory jacket jaguar jar jazz jealous jeans jelly jewel job join joke journey joy judge juice jump jungle junior junk just kangaroo keen keep ketchup key kick kid kidney kind kingdom kiss kit kitchen kite kitten kiwi knee knife knock know lab label labor ladder lady lake lamp language laptop large later latin laugh laundry lava law lawn lawsuit layer lazy leader leaf learn leave lecture left leg legal legend leisure lemon lend length lens leopard lesson letter level liar liberty library license life lift light like limb limit link lion liquid list little live lizard load loan lobster local lock logic lonely long loop lottery loud lounge love loyal lucky luggage lumber lunar lunch luxury lyrics machine mad magic magnet maid mail main major make mammal man manage mandate mango mansion manual maple marble march margin marine market marriage mask mass master match material math matrix matter maximum maze meadow mean measure meat mechanic medal media melody melt member memory mention menu mercy merge merit merry mesh message metal method middle midnight milk million mimic mind minimum minor minute miracle mirror misery miss mistake mix mixed mixture mobile model modify mom moment monitor monkey monster month moon moral more morning mosquito mother motion motor mountain mouse move movie much muffin mule multiply muscle museum mushroom music must mutual myself mystery myth naive name napkin narrow nasty nation nature near neck need negative neglect neither nephew nerve nest net network neutral never news next nice night noble noise nominee noodle normal north nose notable note nothing notice novel now nuclear number nurse nut oak obey object oblige obscure observe obtain obvious occur ocean october odor off offer office often oil okay old olive olympic omit once one onion online only open opera opinion oppose option orange orbit orchard order ordinary organ orient original orphan ostrich other outdoor outer output outside oval oven over own owner oxygen oyster ozone pact paddle page pair palace palm panda panel panic panther paper parade parent park parrot party pass patch path patient patrol pattern pause pave payment peace peanut pear peasant pelican pen penalty pencil people pepper perfect permit person pet phone photo phrase physical piano picnic picture piece pig pigeon pill pilot pink pioneer pipe pistol pitch pizza place planet plastic plate play please pledge pluck plug plunge poem poet point polar pole police pond pony pool popular portion position possible post potato pottery poverty powder power practice praise predict prefer prepare present pretty prevent price pride primary print priority prison private prize problem process produce profit program project promote proof property prosper protect proud provide public pudding pull pulp pulse pumpkin punch pupil puppy purchase purity purpose purse push put puzzle pyramid quality quantum quarter question quick quit quiz quote rabbit raccoon race rack radar radio rail rain raise rally ramp ranch random range rapid rare rate rather raven raw razor ready real reason rebel rebuild recall receive recipe record recycle reduce reflect reform refuse region regret regular reject relax release relief rely remain remember remind remove render renew rent reopen repair repeat replace report require rescue resemble resist resource response result retire retreat return reunion reveal review reward rhythm rib ribbon rice rich ride ridge rifle right rigid ring riot ripple risk ritual rival river road roast robot robust rocket romance roof rookie room rose rotate rough round route royal rubber rude rug rule run runway rural sad saddle sadness safe sail salad salmon salon salt salute same sample sand satisfy satoshi sauce sausage save say scale scan scare scatter scene scheme school science scissors scorpion scout scrap screen script scrub sea search season seat second secret section security seed seek segment select sell seminar senior sense sentence series service session settle setup seven shadow shaft shallow share shed shell sheriff shield shift shine ship shiver shock shoe shoot shop short shoulder shove shrimp shrug shuffle shy sibling sick side siege sight sign silent silk silly silver similar simple since sing siren sister situate six size skate sketch ski skill skin skirt skull slab slam sleep slender slice slide slight slim slogan slot slow slush small smart smile smoke smooth snack snake snap sniff snow soap soccer social sock soda soft solar soldier solid solution solve someone song soon sorry sort soul sound soup source south space spare spatial spawn speak special speed spell spend sphere spice spider spike spin spirit split spoil sponsor spoon sport spot spray spread spring spy square squeeze squirrel stable stadium staff stage stairs stamp stand start state stay steak steel stem step stereo stick still sting stock stomach stone stool story stove strategy street strike strong struggle student stuff stumble style subject submit subway success such sudden suffer sugar suggest suit summer sun sunny sunset super supply supreme sure surface surge surprise surround survey suspect sustain swallow swamp swap swarm swear sweet swift swim swing switch sword symbol symptom syrup system table tackle tag tail talent talk tank tape target task taste tattoo taxi teach team tell ten tenant tennis tent term test text thank that theme then theory there they thing this thought three thrive throw thumb thunder ticket tide tiger tilt timber time tiny tip tired tissue title toast tobacco today toddler toe together toilet token tomato tomorrow tone tongue tonight tool tooth top topic topple torch tornado tortoise toss total tourist toward tower town toy track trade traffic tragic train transfer trap trash travel tray treat tree trend trial tribe trick trigger trim trip trophy trouble truck true truly trumpet trust truth try tube tuition tumble tuna tunnel turkey turn turtle twelve twenty twice twin twist two type typical ugly umbrella unable unaware uncle uncover under undo unfair unfold unhappy uniform unique unit universe unknown unlock until unusual unveil update upgrade uphold upon upper upset urban urge usage use used useful useless usual utility vacant vacuum vague valid valley valve van vanish vapor various vast vault vehicle velvet vendor venture venue verb verify version very vessel veteran viable vibrant vicious victory video view village vintage violin virtual virus visa visit visual vital vivid vocal voice void volcano volume vote voyage wage wagon wait walk wall walnut want warfare warm warrior wash wasp waste water wave way wealth weapon wear weasel weather web wedding weekend weird welcome west wet whale what wheat wheel when where whip whisper wide width wife wild will win window wine wing wink winner winter wire wisdom wise wish witness wolf woman wonder wood wool word work world worry worth wrap wreck wrestle wrist write wrong yard year yellow you young youth zebra zero zone zoo".split(" ");
+
+const VECTORS = [["00000000000000000000000000000000", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"], ["7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f", "legal winner thank year wave sausage worth useful legal winner thank yellow"], ["80808080808080808080808080808080", "letter advice cage absurd amount doctor acoustic avoid letter advice cage above"], ["ffffffffffffffffffffffffffffffff", "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong"], ["000000000000000000000000000000000000000000000000", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon agent"], ["7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f", "legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal will"], ["808080808080808080808080808080808080808080808080", "letter advice cage absurd amount doctor acoustic avoid letter advice cage absurd amount doctor acoustic avoid letter always"], ["ffffffffffffffffffffffffffffffffffffffffffffffff", "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo when"], ["0000000000000000000000000000000000000000000000000000000000000000", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"], ["7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f", "legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth title"], ["8080808080808080808080808080808080808080808080808080808080808080", "letter advice cage absurd amount doctor acoustic avoid letter advice cage absurd amount doctor acoustic avoid letter advice cage absurd amount doctor acoustic bless"], ["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote"], ["9e885d952ad362caeb4efe34a8e91bd2", "ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic"], ["6610b25967cdcca9d59875f5cb50b0ea75433311869e930b", "gravity machine north sort system female filter attitude volume fold club stay feature office ecology stable narrow fog"], ["68a79eaca2324873eacc50cb9c6eca8cc68ea5d936f98787c60c7ebc74e6ce7c", "hamster diagram private dutch cause delay private meat slide toddler razor book happy fancy gospel tennis maple dilemma loan word shrug inflict delay length"], ["c0ba5a8e914111210f2bd131f3d5e08d", "scheme spot photo card baby mountain device kick cradle pact join borrow"], ["6d9be1ee6ebd27a258115aad99b7317b9c8d28b6d76431c3", "horn tenant knee talent sponsor spell gate clip pulse soap slush warm silver nephew swap uncle crack brave"], ["9f6a2878b2520799a44ef18bc7df394e7061a224d2c33cd015b157d746869863", "panda eyebrow bullet gorilla call smoke muffin taste mesh discover soft ostrich alcohol speed nation flash devote level hobby quick inner drive ghost inside"], ["23db8160a31d3e0dca3688ed941adbf3", "cat swing flag economy stadium alone churn speed unique patch report train"], ["8197a4a47f0425faeaa69deebc05ca29c0a5b5cc76ceacc0", "light rule cinnamon wrap drastic word pride squirrel upgrade then income fatal apart sustain crack supply proud access"], ["066dca1a2bb7e8a1db2832148ce9933eea0f3ac9548d793112d9a95c9407efad", "all hour make first leader extend hole alien behind guard gospel lava path output census museum junior mass reopen famous sing advance salt reform"], ["f30f8c1da665478f49b001d94c5fc452", "vessel ladder alter error federal sibling chat ability sun glass valve picture"], ["c10ec20dc3cd9f652c7fac2f1230f7a3c828389a14392f05", "scissors invite lock maple supreme raw rapid void congress muscle digital elegant little brisk hair mango congress clump"], ["f585c11aec520db57dd353c69554b21a89b20fb0650966fa0a9d6f74fd989d8f", "void come effort suffer camp survey warrior heavy shoot primary clutch crush open amazing screen patrol group space point ten exist slush involve unfold"]];
+
+/* ============================================================
+   CORE v2 — no randomness, no network, no storage.
+   Deterministic throughout. Audit freely.
+   ============================================================ */
+
+/* ---- SHA-256 (pure JS, FIPS 180-4) ---- */
+const K256 = [
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+];
+
+function sha256(bytes) {
+  const H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  const len = bytes.length;
+  const bitLenHi = Math.floor(len / 536870912);
+  const bitLenLo = (len << 3) >>> 0;
+  const withPad = new Uint8Array(((((len + 8) >> 6) + 1) << 6));
+  withPad.set(bytes);
+  withPad[len] = 0x80;
+  const dv = new DataView(withPad.buffer);
+  dv.setUint32(withPad.length - 8, bitLenHi);
+  dv.setUint32(withPad.length - 4, bitLenLo);
+  const w = new Uint32Array(64);
+  for (let off = 0; off < withPad.length; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const a = w[i - 15], b = w[i - 2];
+      const s0 = ((a >>> 7) | (a << 25)) ^ ((a >>> 18) | (a << 14)) ^ (a >>> 3);
+      const s1 = ((b >>> 17) | (b << 15)) ^ ((b >>> 19) | (b << 13)) ^ (b >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let [a,b,c,d,e,f,g,h] = H;
+    for (let i = 0; i < 64; i++) {
+      const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + K256[i] + w[i]) >>> 0;
+      const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0;
+      d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    H[0]=(H[0]+a)>>>0; H[1]=(H[1]+b)>>>0; H[2]=(H[2]+c)>>>0; H[3]=(H[3]+d)>>>0;
+    H[4]=(H[4]+e)>>>0; H[5]=(H[5]+f)>>>0; H[6]=(H[6]+g)>>>0; H[7]=(H[7]+h)>>>0;
+  }
+  const out = new Uint8Array(32);
+  const odv = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) odv.setUint32(i * 4, H[i]);
+  return out;
+}
+const toHex = (u8) => Array.from(u8, (b) => b.toString(16).padStart(2, '0')).join('');
+const utf8 = (s) => new TextEncoder().encode(s);
+
+/* ============================================================
+   Sources -> a stream of digits. Each digit carries its own base,
+   so one pipeline handles dice, cards, coins and anything else.
+   { label, value, base, bad }   bad = typed but unusable
+   ============================================================ */
+
+const RANKS = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
+const SUITS = ['C','D','H','S'];
+const DECK = [];
+for (const s of SUITS) for (const r of RANKS) DECK.push(r + s);
+
+const SOURCES = {
+  d6:   { base: 6,  read: (t) => faces(t, 6) },
+  d8:   { base: 8,  read: (t) => faces(t, 8) },
+  d10:  { base: 10, read: (t) => tokens(t, 10) },
+  d20:  { base: 20, read: (t) => tokens(t, 20) },
+  coin: { base: 2,  read: (t) => coin(t) },
+  bits: { base: 2,  read: (t) => bits01(t) },
+  cards:{ base: 52, read: (t) => cards(t) }
+};
+
+function faces(text, sides) {
+  const out = [];
+  for (const ch of text) {
+    if (ch < '1' || ch > String(sides)) continue;
+    out.push({ label: ch, value: +ch - 1, base: sides });
+  }
+  return out;
+}
+function tokens(text, sides) {
+  const out = [];
+  for (const tok of text.split(/[^0-9]+/)) {
+    if (!tok) continue;
+    const v = +tok;
+    if (v < 1 || v > sides) out.push({ label: tok, value: 0, base: sides, bad: 'not between 1 and ' + sides });
+    else out.push({ label: tok, value: v - 1, base: sides });
+  }
+  return out;
+}
+function coin(text) {
+  const out = [];
+  for (const ch of text.toUpperCase()) {
+    if (ch === 'H' || ch === '1') out.push({ label: 'H', value: 1, base: 2 });
+    else if (ch === 'T' || ch === '0') out.push({ label: 'T', value: 0, base: 2 });
+  }
+  return out;
+}
+function bits01(text) {
+  const out = [];
+  for (const ch of text) if (ch === '0' || ch === '1') out.push({ label: ch, value: +ch, base: 2 });
+  return out;
+}
+function cards(text) {
+  const left = DECK.slice(), out = [];
+  const raw = text.toUpperCase().match(/(10|[A2-9TJQK])\s*[CDHS]/g) || [];
+  for (const m of raw) {
+    let r = m.slice(0, -1).trim(), s = m.slice(-1);
+    if (r === 'T') r = '10';
+    const card = r + s;
+    const i = left.indexOf(card);
+    if (i < 0) out.push({ label: card, value: 0, base: 1, bad: 'already dealt' });
+    else { out.push({ label: card, value: i, base: left.length }); left.splice(i, 1); }
+  }
+  return out;
+}
+
+/* ============================================================
+   The extractor.
+
+   A stream of digits in mixed bases is one uniform number that grows
+   as you type. Whenever the range covers a whole power of two, those
+   bits are certain, so they are peeled off and the leftover
+   uncertainty is carried into the next digit. Nothing is discarded,
+   nothing is invented, and no modulo is ever taken - which is where
+   base-6-to-2048 conversions normally leak.
+   ============================================================ */
+function extract(digits, needed, floorBits) {
+  const FLOOR = 1n << BigInt(floorBits === undefined ? 16 : floorBits);
+  let V = 0n, R = 1n, out = '', used = 0, rawBits = 0, collapses = 0;
+  const peel = (limit) => {
+    while (R >= limit && out.length < needed) {
+      if (R % 2n === 0n) {                 // exact halving, nothing at risk
+        out += (V & 1n).toString();
+        V >>= 1n; R >>= 1n; released++;
+      } else {
+        const T = R - 1n;                  // drop one outcome to make it even
+        if (V < T) {
+          out += (V & 1n).toString();
+          V >>= 1n; R = T >> 1n; released++;
+        } else {                           // odds of landing here: 1 in R
+          V = 0n; R = 1n; collapses++;
+        }
+      }
+    }
+  };
+  let released = 0;
+  for (const d of digits) {
+    used++;
+    if (d.bad) continue;
+    rawBits += Math.log2(d.base);
+    V = V * BigInt(d.base) + BigInt(d.value);
+    R = R * BigInt(d.base);
+    released = 0;
+    peel(FLOOR);
+    d.released = released;
+    if (out.length >= needed) return { bits: out.slice(0, needed), used, rawBits, collapses, complete: true };
+  }
+  peel(2n);   // digits exhausted: squeeze the last bits out of the residual
+  return { bits: out.slice(0, needed), used, rawBits, collapses, complete: out.length >= needed };
+}
+
+/* Fold one or more independent records into the seed. The result is
+   uniform if ANY single stream carries enough min-entropy, which is why
+   mixing two unrelated sources removes the argument about dice quality
+   instead of trying to win it. Surplus is the whole point: folding 130
+   bits into 128 buys nothing. */
+function canon(digits) {
+  return digits.filter((d) => !d.bad).map((d) => d.base + ':' + d.value).join(',');
+}
+function compressStreams(streams, needed) {
+  const h = sha256(utf8(streams.map(canon).join('||')));
+  return Array.from(h).map((b) => b.toString(2).padStart(8, '0')).join('').slice(0, needed);
+}
+function rawBitsOf(digits) {
+  let r = 0;
+  for (const d of digits) if (!d.bad) r += Math.log2(d.base);
+  return r;
+}
+
+/* von Neumann debias, for one-bit-per-throw sources only */
+function vonNeumann(digits) {
+  const out = [];
+  for (let i = 0; i + 1 < digits.length; i += 2) {
+    if (digits[i].value === digits[i + 1].value) continue;
+    out.push({ label: digits[i].label, value: digits[i].value, base: 2 });
+  }
+  return out;
+}
+
+/* ---- BIP-39 assembly ---- */
+function bitsToBytes(bits) {
+  const out = new Uint8Array(bits.length / 8);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(bits.slice(i * 8, i * 8 + 8), 2);
+  return out;
+}
+function buildMnemonic(entropyBits, wordlist) {
+  const ENT = entropyBits.length;
+  if (ENT % 32 !== 0 || ENT < 128 || ENT > 256) throw new Error('entropy must be 128..256 bits, multiple of 32');
+  const entropy = bitsToBytes(entropyBits);
+  const csLen = ENT / 32;
+  const checksumBits = Array.from(sha256(entropy).slice(0, 4))
+    .map((b) => b.toString(2).padStart(8, '0')).join('').slice(0, csLen);
+  const full = entropyBits + checksumBits;
+  const words = [], rows = [];
+  for (let i = 0; i < full.length / 11; i++) {
+    const chunk = full.slice(i * 11, i * 11 + 11);
+    const idx = parseInt(chunk, 2);
+    words.push(wordlist[idx]);
+    rows.push({ chunk, idx, word: wordlist[idx] });
+  }
+  return { words, rows, checksumBits, entropyHex: toHex(entropy), csLen };
+}
+
+/* ---- Self-tests. Any failure means this copy must not be used. ---- */
+function selfTest(wordlist, vectors) {
+  const results = [];
+  const ok = (name, pass) => results.push({ name, pass });
+
+  ok('SHA-256 empty string',
+     toHex(sha256(utf8(''))) === 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
+  ok('SHA-256 "abc"',
+     toHex(sha256(utf8('abc'))) === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+  ok('SHA-256 one million bytes',
+     toHex(sha256(utf8('a'.repeat(1000000)))) === 'cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0');
+
+  ok('Wordlist holds 2048 entries', wordlist.length === 2048);
+  ok('Wordlist is sorted', wordlist.every((w, i) => i === 0 || wordlist[i - 1] < w));
+  ok('First four letters are unique', new Set(wordlist.map((w) => w.slice(0, 4))).size === 2048);
+  ok('Wordlist digest matches BIP-0039',
+     toHex(sha256(utf8(wordlist.join('\n') + '\n'))) === '2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda');
+
+  let vecPass = 0;
+  for (const [hex, phrase] of vectors) {
+    const b = hex.split('').map((c) => parseInt(c, 16).toString(2).padStart(4, '0')).join('');
+    if (buildMnemonic(b, wordlist).words.join(' ') === phrase) vecPass++;
+  }
+  ok(`BIP-39 reference vectors (${vecPass}/${vectors.length})`, vecPass === vectors.length);
+
+  // Coin bits must survive the extractor untouched.
+  ok('Extractor passes binary through',
+     extract(bits01('1011000111010010'), 16, 1).bits === '1011000111010010');
+
+  // Exhaustive uniformity: every three-dice throw, grouped by how many bits
+  // it released. Inside each group every bit pattern must appear equally
+  // often, which is what "no bias" means for a variable-length extractor.
+  const groups = {};
+  for (let a = 0; a < 6; a++) for (let b = 0; b < 6; b++) for (let c = 0; c < 6; c++) {
+    const r = extract([a,b,c].map((v) => ({ value: v, base: 6 })), 99, 1).bits;
+    (groups[r.length] = groups[r.length] || []).push(r);
+  }
+  let uniform = true, covered = 0;
+  for (const len of Object.keys(groups)) {
+    const seen = {};
+    for (const s of groups[len]) seen[s] = (seen[s] || 0) + 1;
+    const counts = Object.values(seen);
+    covered += groups[len].length;
+    if (len > 0 && (Object.keys(seen).length !== Math.pow(2, +len) ||
+        counts.some((n) => n !== counts[0]))) uniform = false;
+  }
+  ok('Extractor is unbiased over all 216 three-dice throws', uniform && covered === 216);
+
+  ok('Fold of one stream matches SHA-256("6:0")',
+     compressStreams([[{ base: 6, value: 0 }]], 16) ===
+     Array.from(sha256(utf8('6:0'))).map((b) => b.toString(2).padStart(8, '0')).join('').slice(0, 16));
+  ok('Two streams are joined, not added',
+     compressStreams([[{ base: 6, value: 0 }], [{ base: 2, value: 1 }]], 32) !==
+     compressStreams([[{ base: 6, value: 0 }, { base: 2, value: 1 }]], 32));
+  ok('A bad entry never reaches the fold', canon(cards('AS AS')) === '52:39');
+  ok('Deck is 52 distinct cards', new Set(DECK).size === 52);
+  ok('Repeated card is rejected', cards('AS AS')[1].bad === 'already dealt');
+  ok('Debias filter', vonNeumann(bits01('0110001101')).map((d) => d.value).join('') === '010');
+  return results;
+}
+
+
+/* ============================================================
+   APP v3 — wiring only. All computation lives in CORE above.
+   ============================================================ */
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var state = { ent: 128, srcA: 'd6', srcB: 'cards', pool: 10, vn: false, hash: true, mix: true };
+  var mnemonic = null, timer = null, deadline = 0, testsOk = false;
+
+  var HINT = {
+    d6: 'Throw the whole handful into a tray and read the dice <b>where they lie</b>, left to right. Type all of them, then throw again. Fifty dice carry 128 bits; a hundred carry 256.',
+    d8: 'Eight-sided dice give exactly three bits each and waste nothing. Forty-three cover 128 bits, eighty-six cover 256.',
+    d10: 'Ten-sided dice, typed as numbers separated by spaces. Read <code>0</code> as ten.',
+    d20: 'Twenty-sided dice, typed as numbers separated by spaces. Thirty cover 128 bits.',
+    coin: 'One flip, one bit. Slow, but the only source you can check by hand: <code>H</code> is 1, <code>T</code> is 0.',
+    bits: 'Zeros and ones from a source you already trust. Anything else in the box is ignored.',
+    cards: 'Wash a used deck face down for thirty seconds, riffle it seven times, cut it, then deal. Type each card as it comes: <code>AS 7H 10D QC</code>. Twenty-five cards carry 128 bits; a whole deck carries 225.6, which is short of 256. The page refuses a card you have already dealt, which catches typing errors on the spot.'
+  };
+  var PLACEHOLDER = {
+    d6: '4 2 6 1 1 5 3 6 2 4\n1 1 4 6 3 2 5 5 1 3\n\u2026',
+    d8: '4 2 8 1 7 5 3 6 2 4\n\u2026', d10: '4 2 10 1 7 5 3 6 2 4 \u2026',
+    d20: '17 3 20 8 11 1 14 \u2026', coin: 'H T T H T H H \u2026',
+    bits: '1 0 0 1 1 0 1 \u2026', cards: 'AS 7H 10D QC 3S \u2026'
+  };
+  var POOLED = { d6: 1, d8: 1, d10: 1, d20: 1 };
+  var UNIT = { d6: 'dice', d8: 'dice', d10: 'dice', d20: 'dice', coin: 'flips', bits: 'bits typed', cards: 'cards dealt' };
+  var NAME = { d6: 'dice', d8: 'd8', d10: 'd10', d20: 'd20', coin: 'coin', bits: 'bits', cards: 'cards' };
+  var DECK_BITS = 225.6;
+
+  /* ---------- self-test banner ---------- */
+  (function () {
+    var box = $('tests'), allPass = true;
+    selfTest(WORDLIST, VECTORS).forEach(function (r) {
+      if (!r.pass) allPass = false;
+      var el = document.createElement('span');
+      el.className = 'chip ' + (r.pass ? 'pass' : 'fail');
+      el.textContent = (r.pass ? '\u2713 ' : '\u2717 ') + r.name;
+      box.appendChild(el);
+    });
+    testsOk = allPass;
+    var results = box.querySelectorAll('.chip').length;
+    $('tstat').textContent = allPass ? results + '/' + results : 'FAIL';
+    $('tdot').className = 'live-dot' + (allPass ? '' : ' off');
+    if (!allPass) {
+      var bad = document.createElement('span');
+      bad.className = 'chip fail';
+      bad.textContent = 'DO NOT USE THIS COPY OF THE PAGE';
+      box.appendChild(bad);
+    }
+  })();
+
+  /* ---------- environment ---------- */
+  (function () {
+    var bar = $('envbar'), problems = [];
+    try { if (window.top !== window.self) problems.push('this page is embedded in another site'); }
+    catch (e) { problems.push('this page is embedded in another site'); }
+    if (navigator.onLine) problems.push('the machine reports a network connection');
+    if (location.protocol !== 'file:') problems.push('the page was served over ' + location.protocol.replace(':', '') + ' rather than opened from disk');
+    if (problems.length) {
+      bar.className = 'warn';
+      bar.innerHTML = '<b>PRACTICE ONLY \u2014</b> ' + problems.join('; ') + '. Save this file, disconnect the machine, and open it from disk before you enter throws you intend to keep.';
+    } else {
+      bar.className = 'ok';
+      bar.innerHTML = '<b>OFFLINE \u2014</b> opened from disk with no reported network connection.';
+    }
+  })();
+
+  /* ---------- theme (session only — this page writes nothing) ---------- */
+  $('theme-toggle').addEventListener('click', function () {
+    var el = document.documentElement;
+    el.setAttribute('data-theme', el.getAttribute('data-theme') === 'light' ? 'dark' : 'light');
+  });
+
+  /* ---------- controls ---------- */
+  function segment(id, onPick) {
+    var box = $(id);
+    box.addEventListener('click', function (e) {
+      var b = e.target.closest('button');
+      if (!b || b.disabled) return;
+      Array.prototype.forEach.call(box.querySelectorAll('button'), function (x) {
+        x.setAttribute('aria-pressed', String(x === b));
+      });
+      onPick(b.dataset.v);
+    });
+  }
+  segment('len', function (v) { state.ent = +v; buildGrid(); refresh(); });
+  segment('pool', function (v) { state.pool = +v; refresh(); });
+  segment('src', function (v) {
+    state.srcA = v;
+    $('srchint').innerHTML = HINT[v];
+    $('in1').placeholder = PLACEHOLDER[v];
+    $('poolwrap').style.display = POOLED[v] ? '' : 'none';
+    var binary = (v === 'coin' || v === 'bits');
+    $('vnwrap').style.display = binary ? '' : 'none';
+    if (!binary) { $('vn').checked = false; state.vn = false; }
+    refresh();
+  });
+  segment('srcB', function (v) {
+    state.srcB = v;
+    $('srchintB').innerHTML = HINT[v];
+    $('inB').placeholder = PLACEHOLDER[v];
+    refresh();
+  });
+  $('srchint').innerHTML = HINT[state.srcA];
+  $('in1').placeholder = PLACEHOLDER[state.srcA];
+  $('srchintB').innerHTML = HINT[state.srcB];
+  $('inB').placeholder = PLACEHOLDER[state.srcB];
+
+  $('vn').addEventListener('change', function () { state.vn = this.checked; refresh(); });
+  $('hash').addEventListener('change', function () { state.hash = this.checked; refresh(); });
+  function syncHash() {
+    var h = $('hash');
+    h.disabled = state.mix;
+    if (state.mix) { h.checked = true; state.hash = true; }
+    h.parentNode.style.opacity = state.mix ? .45 : 1;
+  }
+  $('mix').addEventListener('change', function () {
+    state.mix = this.checked;
+    $('mixwrap').style.display = this.checked ? '' : 'none';
+    syncHash();
+    refresh();
+  });
+
+  /* ---------- ledger ---------- */
+  var cells = [];
+  function buildGrid() {
+    var grid = $('grid');
+    grid.innerHTML = ''; cells = [];
+    var words = (state.ent + state.ent / 32) / 11;
+    for (var r = 0; r < words; r++) {
+      var row = document.createElement('div');
+      row.className = 'grow';
+      var idx = document.createElement('div');
+      idx.className = 'gidx'; idx.textContent = r + 1;
+      row.appendChild(idx);
+      for (var c = 0; c < 11; c++) {
+        var cell = document.createElement('div');
+        cell.className = 'cell';
+        row.appendChild(cell);
+        cells.push(cell);
+      }
+      var w = document.createElement('div');
+      w.className = 'gword'; w.textContent = '\u2014';
+      row.appendChild(w);
+      grid.appendChild(row);
+    }
+  }
+
+  /* ---------- reading ---------- */
+  function read(text, src, debias) {
+    var digits = SOURCES[src].read(text);
+    if (debias) digits = vonNeumann(digits);
+    return { digits: digits, raw: rawBitsOf(digits), bad: digits.filter(function (d) { return d.bad; }) };
+  }
+  function moreNeeded(src, raw, target, dealt, pool) {
+    if (raw >= target) return 0;
+    if (src === 'cards') {
+      var n = 0, got = raw;
+      while (got < target && dealt + n < 52) { got += Math.log2(52 - dealt - n); n++; }
+      return n;
+    }
+    return Math.ceil((target - raw) / (Math.log2(SOURCES[src].base) * (POOLED[src] ? pool : 1)));
+  }
+  function meter(fillId, countId, leftId, src, got, target, dealt, pool, unitThrows) {
+    $(fillId).style.width = Math.min(100, (got / target) * 100) + '%';
+    $(fillId).className = 'fill' + (got >= target ? ' done' : '');
+    $(countId).innerHTML = '<b>' + Math.min(Math.floor(got), Math.round(target)) + '</b> of ' + Math.round(target) + ' bits';
+    var left = moreNeeded(src, got, target, dealt, pool);
+    $(leftId).textContent = left === 0 ? 'complete'
+      : '\u2248' + left + (src === 'cards' ? ' more cards' : unitThrows ? ' more throws' : ' more');
+  }
+
+  function refresh() {
+    var ent = state.ent;
+    var A = read($('in1').value, state.srcA, state.vn);
+    var B = state.mix ? read($('inB').value, state.srcB, false) : null;
+    var folding = state.mix || state.hash;
+
+    /* what each source has to supply */
+    var needA = state.mix ? ent : (state.hash ? ent * 2 : ent);
+    var needB = ent;
+
+    /* meters */
+    var keptA = A.digits.length - A.bad.length;
+    if (folding) meter('fill', 'count', 'left', state.srcA, A.raw, needA, keptA, state.pool, POOLED[state.srcA] && state.pool > 1);
+    var extracted = folding ? '' : extract(A.digits, ent).bits;
+    if (!folding) {
+      $('fill').style.width = Math.min(100, (A.raw / ent) * 100) + '%';
+      $('fill').className = 'fill' + (extracted.length >= ent ? ' done' : '');
+      $('count').innerHTML = '<b>' + Math.min(extracted.length, ent) + '</b> of ' + ent + ' bits';
+      var l = moreNeeded(state.srcA, A.raw, ent + 2, keptA, state.pool);
+      $('left').textContent = l === 0 ? 'complete' : '\u2248' + l + (state.srcA === 'cards' ? ' more cards' : (POOLED[state.srcA] && state.pool > 1) ? ' more throws' : ' more');
+    }
+    if (B) meter('fillB', 'countB', 'leftB', state.srcB, B.raw, needB, B.digits.length - B.bad.length, 1, false);
+
+    /* the bits themselves */
+    var bits = '';
+    if (folding) {
+      if (A.raw >= needA && (!B || B.raw >= needB)) {
+        bits = compressStreams(B ? [A.digits, B.digits] : [A.digits], ent);
+      }
+    } else bits = extracted;
+    var usable = Math.min(bits.length, ent);
+
+    /* combining explanation */
+    var txt;
+    if (!folding) {
+      txt = 'Bits are peeled straight from your throws \u2014 no hash except the checksum at the end. Every cell in the ledger is traceable to something you rolled, and any bias in your dice passes through untouched.';
+    } else if (!state.mix) {
+      txt = 'One record, folded into ' + ent + ' bits by SHA-256. It asks for ' + (ent * 2) + ' bits of raw material because a hash concentrates entropy and cannot create it \u2014 you have ' + A.raw.toFixed(0) + '.';
+    } else {
+      txt = 'Two records folded together by SHA-256. Each is asked for the full ' + ent + ' bits on its own, so either one alone would have been enough: '
+          + NAME[state.srcA] + ' ' + Math.min(A.raw, ent).toFixed(0) + '/' + ent + ', '
+          + NAME[state.srcB] + ' ' + Math.min(B.raw, ent).toFixed(0) + '/' + ent + '. The seed is sound unless <em>both</em> failed.';
+    }
+    $('combine').innerHTML = txt;
+
+    /* ledger */
+    for (var i = 0; i < cells.length; i++) {
+      if (i < usable) { cells[i].className = 'cell b' + bits[i]; cells[i].textContent = bits[i]; }
+      else if (!mnemonic) { cells[i].className = 'cell'; cells[i].textContent = ''; }
+    }
+    if (!mnemonic) {
+      var rows = document.querySelectorAll('.gword');
+      for (var r = 0; r < rows.length; r++) {
+        var end = (r + 1) * 11;
+        rows[r].className = 'gword';
+        if (end <= usable) {
+          var wd = WORDLIST[parseInt(bits.slice(r * 11, end), 2)];
+          rows[r].innerHTML = '<b>' + wd.slice(0, 4) + '</b>' + wd.slice(4);
+        } else rows[r].textContent = '\u2014';
+      }
+    }
+
+    var note = [];
+    if (keptA) note.push(keptA + ' ' + UNIT[state.srcA] + ' \u00b7 ' + A.raw.toFixed(1) + ' bits');
+    if (B && B.digits.length) note.push(NAME[state.srcB] + ': ' + (B.digits.length - B.bad.length) + ' \u00b7 ' + B.raw.toFixed(1) + ' bits');
+    if (state.vn) note.push('debiased in pairs');
+    $('ledgerhint').innerHTML = note.length ? note.join(' \u00b7 ') + '.'
+      : 'Each row is one word: eleven bits read as a number from 0 to 2047, looked up in the BIP-39 English list. The dashed cells at the end are the only ones this page contributes.';
+
+    /* gate */
+    var why = '';
+    var deckShort = function (src, target) { return src === 'cards' && target > DECK_BITS; };
+    if (!testsOk) why = 'Self-tests failed. This copy of the page is not safe to use.';
+    else if (A.bad.length) why = 'Entry ' + (A.digits.indexOf(A.bad[0]) + 1) + ' in the first record: ' + A.bad[0].label + ' \u2014 ' + A.bad[0].bad + '.';
+    else if (B && B.bad.length) why = 'Entry ' + (B.digits.indexOf(B.bad[0]) + 1) + ' in the second record: ' + B.bad[0].label + ' \u2014 ' + B.bad[0].bad + '.';
+    else if (deckShort(state.srcA, needA)) why = 'One deck holds 225.6 bits and this setting asks it for ' + Math.round(needA) + '. Use cards as the second source, choose 12 words, or drop the fold.';
+    else if (B && deckShort(state.srcB, needB)) why = 'One deck holds 225.6 bits, short of the ' + ent + ' a 24-word phrase asks of each source. Choose 12 words or use dice for both.';
+    else if (folding && A.raw < needA) why = 'First record is ' + Math.ceil(needA - A.raw) + ' bits short.';
+    else if (B && B.raw < needB) why = 'Second record is ' + Math.ceil(needB - B.raw) + ' bits short.';
+    else if (!folding && bits.length < ent) why = 'Keep going \u2014 ' + Math.ceil(ent - A.raw) + ' bits short.';
+    $('build').disabled = !!why;
+    $('blocker').textContent = why;
+    return bits;
+  }
+
+  $('in1').addEventListener('input', function () { if (mnemonic) clearOutput(); refresh(); });
+  $('inB').addEventListener('input', function () { if (mnemonic) clearOutput(); refresh(); });
+
+  /* ---------- build ---------- */
+  $('build').addEventListener('click', function () {
+    var bits = refresh();
+    if (bits.length < state.ent) return;
+    mnemonic = buildMnemonic(bits.slice(0, state.ent), WORDLIST);
+    paintChecksum();
+    render();
+    deadline = Date.now() + 600000;
+    tick();
+    try { $('out').scrollIntoView({ block: 'nearest', behavior: 'smooth' }); } catch (e) {}
+  });
+
+  function paintChecksum() {
+    var full = mnemonic.rows.map(function (r) { return r.chunk; }).join('');
+    for (var i = 0; i < cells.length; i++) {
+      cells[i].textContent = full[i];
+      cells[i].className = 'cell b' + full[i] + (i >= state.ent ? ' cs' : '');
+    }
+    var rows = document.querySelectorAll('.gword');
+    mnemonic.rows.forEach(function (r, i) {
+      rows[i].className = 'gword set';
+      rows[i].innerHTML = '<b>' + r.word.slice(0, 4) + '</b>' + r.word.slice(4);
+    });
+  }
+
+  function render() {
+    var m = mnemonic;
+    var html = '<div class="card"><h2>Write these down by hand</h2>' +
+      '<p class="note">Paper and pen only. The first four letters are all a wallet needs, which is why they are marked \u2014 but write the whole word. This is the step where a mistake actually costs you, so check every line twice.</p><div class="words">';
+    m.words.forEach(function (w, i) {
+      html += '<div class="wd"><span class="n">' + (i + 1) + '</span><span class="w"><b>' + w.slice(0, 4) + '</b>' + w.slice(4) + '</span><span class="ix">#' + m.rows[i].idx + '</span></div>';
+    });
+    html += '</div><div class="cardfoot"><span>entropy <code>' + m.entropyHex + '</code></span>' +
+      '<span>checksum <code>' + m.checksumBits + '</code></span>' +
+      '<span class="timer"><span id="cd">10:00</span><button id="hold">Keep showing</button><button id="hide">Hide now</button></span></div></div>';
+    $('out').innerHTML = html;
+    $('hold').addEventListener('click', function () { deadline = Date.now() + 600000; });
+    $('hide').addEventListener('click', mask);
+  }
+
+  function mask() {
+    clearInterval(timer); timer = null;
+    $('out').innerHTML = '<div class="masked">Phrase hidden. <button class="ghost" id="show" style="margin-left:12px">Show again</button></div>';
+    $('show').addEventListener('click', function () { if (mnemonic) { render(); deadline = Date.now() + 600000; tick(); } });
+  }
+
+  function tick() {
+    clearInterval(timer);
+    timer = setInterval(function () {
+      var cd = $('cd');
+      if (!cd) { clearInterval(timer); return; }
+      var left = Math.max(0, deadline - Date.now()), s = Math.ceil(left / 1000);
+      cd.textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+      if (left <= 0) mask();
+    }, 500);
+  }
+  function clearOutput() { mnemonic = null; clearInterval(timer); timer = null; $('out').innerHTML = ''; }
+
+  $('wipe').addEventListener('click', function () {
+    $('in1').value = ''; $('inB').value = '';
+    clearOutput(); buildGrid(); refresh();
+    $('blocker').textContent = 'Wiped. Nothing was ever written to disk \u2014 close the tab when you are finished.';
+    $('in1').focus();
+  });
+
+  $('mix').checked = state.mix;
+  $('mixwrap').style.display = state.mix ? '' : 'none';
+  syncHash();
+  buildGrid();
+  refresh();
+})();
+
+</script>
+</body>
+</html>
