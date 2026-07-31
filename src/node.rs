@@ -2547,6 +2547,12 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
         let mut health_check_interval = time::interval(Duration::from_secs(600)); // Every 10 mins
         health_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // --- Periodic Phonebook Announcement ---
+        // Refreshes the node's TTL in the serverless seed registry.
+        // Set to 45 minutes (2700s) to comfortably beat the 1-hour registry expiration.
+        let mut phonebook_interval = time::interval(Duration::from_secs(45 * 60));
+        phonebook_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         // Phase 3: Periodic MMR Gossip Challenges for license retrievability (every 5 minutes)
         let mut license_challenge_interval = time::interval(Duration::from_secs(300));
         license_challenge_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2652,6 +2658,19 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
 
                         // Phase 3: (advertising of our own licenses happens via the dedicated
                         // license_challenge_interval or can be triggered manually)
+                    }
+                }
+                
+                _ = phonebook_interval.tick() => {
+                    // Nodes periodically refresh their presence in the stateless phonebook.
+                    // This ensures that if a node's dynamic IP changes, the registry is updated,
+                    // and prevents the node from expiring out of the Cloudflare KV (1hr TTL).
+                    //
+                    // We explicitly check NatStatus::Public to guarantee we don't spam the 
+                    // registry with un-routable private nodes.
+                    if self.network.nat_status() == crate::network::NatStatus::Public {
+                        tracing::debug!("Refreshing node presence in the public seed registry...");
+                        self.network.publish_to_phonebook();
                     }
                 }
 

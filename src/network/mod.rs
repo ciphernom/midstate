@@ -739,6 +739,69 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
         addrs.dedup();
         addrs
     }
+    
+    /// Publishes this node's public addresses to the stateless seed registry.
+    ///
+    /// # Reasoning
+    /// Allows the network to organically sustain its bootstrap mechanism without
+    /// central coordination. Once AutoNAT confirms the node is publicly routable,
+    /// it registers its addresses so new nodes booting up can discover it.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:
+    ///   - Node is confirmed Public by AutoNAT
+    ///
+    /// Post:
+    ///   - Fire-and-forget HTTP POST containing public addresses is sent to registry.
+    ///   - Node state remains completely unchanged.
+    /// ```
+    ///
+    /// ```zed
+    ///     PublishToPhonebook
+    ///     ------------------
+    ///     public_addrs : seq String
+    ///     registry_url : String
+    ///
+    ///     pre  #public_addrs > 0
+    ///     post HTTP POST payload { "addresses": public_addrs } to registry_url
+    /// ```
+    ///
+    /// # Safety / Invariants
+    /// - **Non-blocking:** The HTTP request is spawned in a detached Tokio task.
+    ///   It MUST NOT await on the main network reactor thread, as a stalled
+    ///   HTTP request would freeze the entire p2p event loop.
+    /// - **Strict Routability:** Only addresses passing `is_routable` are sent. 
+    ///   This prevents leaking local/private IPs (e.g., 10.x, 192.168.x) to the 
+    ///   public registry, which would bloat the phonebook with unreachable nodes.
+    pub fn publish_to_phonebook(&self) {
+        // Strictly filter out any local/private IPs before publishing
+        let addrs: Vec<String> = self.advertisable_addrs()
+            .into_iter()
+            .filter(|addr_str| {
+                if let Ok(ma) = addr_str.parse::<libp2p::Multiaddr>() {
+                    crate::network::is_routable(&ma)
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        if addrs.is_empty() { return; }
+        
+        tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+            
+            let _ = client.post("https://seeds.midstate.cash/announce")
+                .json(&serde_json::json!({ "addresses": addrs }))
+                .send()
+                .await;
+        });
+    }
 
     /// Multiaddrs of connected peers (from Kademlia routing table).
     /// These are candidates to send in PEX Addr messages.
@@ -1068,6 +1131,11 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                             tracing::info!(
                                 "Node is PUBLIC — Kademlia server mode, serving as relay"
                             );
+
+                            // --- PUBLISH TO PHONEBOOK ---
+                            // We are publicly dialable! Announce ourselves to the registry
+                            // so new nodes booting up can bootstrap from us.
+                            self.publish_to_phonebook();
                         }
                         autonat::NatStatus::Private => {
                             self.nat_status = NatStatus::Private;

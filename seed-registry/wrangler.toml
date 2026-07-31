@@ -1,0 +1,8 @@
+name = "midstate-seeds"
+main = "src/index.js"
+compatibility_date = "2024-03-20"
+
+[[kv_namespaces]]
+binding= "PEERS_KV"
+id= "693984700b4641cf8a3f5da1aeac6e8b"
+
