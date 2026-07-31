@@ -4803,7 +4803,51 @@ async fn check_coin_rpc(client: &reqwest::Client, rpc_port: u16, rpc_host: &str,
     Ok(resp.exists)
 }
 
-// ── Original commands ───────────────────────────────────────────────────────
+/// Fetches a list of active network peers from the stateless seed registry.
+///
+/// # Reasoning
+/// Eliminates the dependency on hardcoded, centralized bootstrap VPS nodes.
+/// When a node boots with an empty peer list, it queries a highly-available, 
+/// stateless Key-Value registry to discover live nodes.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Pre:
+///   - local_peers is empty
+///
+/// Post:
+///   result = Ok(peers)  ⇒ peers contains valid multiaddrs from the registry
+///   result = Err(_)     ⇒ registry unreachable or returned invalid data
+/// ```
+///
+/// ```zed
+///     FetchPhonebookPeers
+///     -------------------
+///     registry_url? : String
+///     peers! : seq String
+///
+///     pre  true
+///     post result = Ok(peers!) ⇒ peers! = fetch(registry_url?)
+///     post result = Err(_) ⇒ peers! = ⟨⟩
+/// ```
+///
+/// # Safety / Invariants
+/// - **Bounded Execution:** Enforces a strict 5-second timeout to ensure
+///   node startup does not hang if the registry is offline or blocked.
+async fn fetch_phonebook_peers(url: &str) -> Result<Vec<String>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    
+    let resp = client.get(format!("{}/peers", url)).send().await?;
+    if resp.status().is_success() {
+        let peers: Vec<String> = resp.json().await?;
+        Ok(peers)
+    } else {
+        bail!("Phonebook returned status: {}", resp.status())
+    }
+}
 
 pub async fn run_node(
     data_dir: PathBuf, 
@@ -4859,7 +4903,16 @@ pub async fn run_node(
     all_peers.dedup();
 
     if all_peers.is_empty() {
-        tracing::warn!("No bootstrap peers configured. Add peers to {} or use --peer", config_file.display());
+        tracing::info!("No local bootstrap peers found. Querying live phonebook...");
+        match fetch_phonebook_peers("https://midstate-seeds.ejnagynikbloski.workers.dev").await {
+            Ok(live_peers) => {
+                tracing::info!("Discovered {} peers from phonebook", live_peers.len());
+                all_peers.extend(live_peers);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to reach phonebook: {}. Waiting for inbound connections...", e);
+            }
+        }
     } else {
         tracing::info!("Bootstrap peers: {} (config: {})", all_peers.len(), config_file.display());
     }
