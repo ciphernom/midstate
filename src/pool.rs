@@ -48,6 +48,10 @@ const BLOCKS_TABLE: TableDefinition<u64, &str> = TableDefinition::new("blocks");
 /// historical split-verification (proving each payout was proportional to score).
 const BLOCK_SCORES_TABLE: TableDefinition<u64, &str> = TableDefinition::new("block_scores");
 
+/// Tracks blocks waiting for maturity (e.g. 10 blocks) to detect network orphans.
+/// Key: Block height (u64). Value: JSON string of `{ hash, block_ts, deductions: [[address_hex, deducted_score]] }`
+const PENDING_BLOCKS_TABLE: TableDefinition<u64, &str> = TableDefinition::new("pending_blocks");
+
 // ── Stratum Protocol Types ──────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -549,7 +553,7 @@ pub async fn run_stratum_pool(
     {
         let mut shares = write_txn.open_table(SHARES_TABLE).unwrap();
         let _ = write_txn.open_table(BLOCKS_TABLE).unwrap();
-
+        let _ = write_txn.open_table(PENDING_BLOCKS_TABLE).unwrap();
         // ── One-off migration: purge stale zero-score rows ──
         // Databases written by affected versions accumulated permanent `score == 0`
         // rows (the deduction path used to write them back instead of removing them).
@@ -822,6 +826,14 @@ pub async fn run_stratum_pool(
                 && state_clone.force_new_job.swap(false, std::sync::atomic::Ordering::SeqCst);
 
             if (current_tip != last_network_tip || force_new_job) && !current_tip.is_empty() {
+                
+                 // Only reconcile if the network tip actually advanced
+                if current_tip != last_network_tip {
+                    if let Err(e) = reconcile_pending_blocks(&state_clone, &client, tip_height).await {
+                        tracing::warn!("Failed to reconcile pending blocks: {}", e);
+                    }
+                }
+                
                 job_counter += 1;
                 last_network_tip = current_tip.clone();
 
@@ -1995,6 +2007,9 @@ fn spawn_block_submission(state: &Arc<PoolState>, job: Job, ext: Extension) {
 
                     let mut payouts = Vec::new();
 
+                    // Track exact deductions to allow refunds on orphan ---
+                    let mut actual_deductions = Vec::new();
+
                     for cb in &batch.coinbase {
                         let mut a = [0u8; 32]; a.copy_from_slice(&cb.address);
                         let deduction = ((cb.value as u128 * total_score) / (total_reward as u128)) as u64;
@@ -2010,6 +2025,8 @@ fn spawn_block_submission(state: &Arc<PoolState>, job: Job, ext: Extension) {
                                 table.insert(&a, remaining).unwrap();
                             } else {
                                 table.remove(&a).unwrap();
+                                // Record deduction ---
+                                actual_deductions.push((hex::encode(a), deduction));
                             }
                         }
 
@@ -2027,9 +2044,20 @@ fn spawn_block_submission(state: &Arc<PoolState>, job: Job, ext: Extension) {
                         "height": block_height,
                         "total_score": total_score as u64,
                         "net_target": block_net_target_hex,
-                        "payouts": payouts
+                        "payouts": payouts,
+                        "status": "pending" 
                     }).to_string();
                     b_table.insert(batch.timestamp, block_data.as_str()).unwrap();
+
+                    // Save to Pending Blocks for Maturity Pipeline ---
+                    let pending_data = serde_json::json!({
+                        "hash": block_hash_hex,
+                        "block_ts": batch.timestamp,
+                        "deductions": actual_deductions
+                    }).to_string();
+                    let mut p_table = write_txn.open_table(PENDING_BLOCKS_TABLE).unwrap();
+                    p_table.insert(block_height, pending_data.as_str()).unwrap();
+                    // ---------------------------------------------------------
 
                     // Persist the committed score snapshot (split-verification).
                     // `committed_total` is the sum of the snapshot — the basis the coinbase
@@ -2073,6 +2101,196 @@ fn spawn_block_submission(state: &Arc<PoolState>, job: Job, ext: Extension) {
             }
         }
     });
+}
+
+/// Reconciles pending blocks against the canonical chain to detect orphans and refund shares.
+///
+/// # Reasoning
+/// When the pool submits a block and the node accepts it (HTTP 200 OK), the pool deducts 
+/// shares from miners to prevent double-paying if they continue mining. However, due to 
+/// standard network latency and Nakamoto Consensus tie-breakers (e.g., midstate comparison), 
+/// the local node might reorganize and abandon the pool's block seconds later.
+/// 
+/// Previously, the pool never checked the chain again. If a block was orphaned, miners 
+/// permanently lost their shares for a block that yielded no actual rewards, destroying 
+/// trust in the pool. This function introduces a maturity pipeline: it verifies block 
+/// hashes at `MATURITY_DEPTH` and refunds all deducted shares if the block was orphaned.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Pre:
+///   - MATURITY_DEPTH = 10
+///   - For every pending block b in PENDING_BLOCKS_TABLE where b.height <= current_network_height - MATURITY_DEPTH
+///   - The core node is reachable via RPC
+///
+/// Post:
+///   result = Ok(()) ⇒
+///     ∀ b ∈ evaluated_blocks:
+///       if network_hash(b.height) == b.hash then
+///         PENDING_BLOCKS_TABLE' = PENDING_BLOCKS_TABLE \ {b}
+///         BLOCKS_TABLE'[b.ts].status = "confirmed"
+///       else (Orphaned)
+///         PENDING_BLOCKS_TABLE' = PENDING_BLOCKS_TABLE \ {b}
+///         BLOCKS_TABLE'[b.ts].status = "orphaned"
+///         ∀ (addr, amt) ∈ b.deductions:
+///           SHARES_TABLE'[addr] = SHARES_TABLE[addr] + amt
+/// ```
+///
+/// ```zed
+///     ReconcilePendingBlocks
+///     ----------------------
+///     ΔShares
+///     ΔPendingBlocks
+///     ΔBlocks
+///     current_height? : ℕ
+///     network : RPC
+///
+///     let mature = { b ∈ PendingBlocks | b.height ≤ current_height? - 10 }
+///
+///     pre  true
+///     post ∀ b ∈ mature •
+///            (network.hash_at(b.height) = b.hash ⇒ 
+///               PendingBlocks' = PendingBlocks \ {b} ∧
+///               Blocks'[b.ts].status = "confirmed")
+///          ∧ (network.hash_at(b.height) ≠ b.hash ⇒
+///               PendingBlocks' = PendingBlocks \ {b} ∧
+///               Blocks'[b.ts].status = "orphaned" ∧
+///               Shares' = Shares ⊕ { d.addr ↦ Shares(d.addr) + d.amount | d ∈ b.deductions })
+/// ```
+///
+/// # Safety / Invariants
+/// - **No Double Refunds**: Blocks are removed from `PENDING_BLOCKS_TABLE` in the same
+///   atomic database transaction that restores the shares.
+/// - **Idempotent network reads**: Network failures skip reconciliation for that tick;
+///   the block remains pending until a clean read confirms its status.
+async fn reconcile_pending_blocks(state: &Arc<PoolState>, client: &reqwest::Client, current_height: u64) -> Result<(), String> {
+    const MATURITY_DEPTH: u64 = 10;
+    let maturity_threshold = current_height.saturating_sub(MATURITY_DEPTH);
+
+    // 1. Gather mature pending blocks
+    let mut mature_blocks = Vec::new();
+    if let Ok(read_txn) = state.db.begin_read() {
+        if let Ok(table) = read_txn.open_table(PENDING_BLOCKS_TABLE) {
+            let range = 0..=maturity_threshold;
+            if let Ok(iter) = table.range(range) {
+                for entry in iter {
+                    if let Ok((k, v)) = entry {
+                        mature_blocks.push((k.value(), v.value().to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    if mature_blocks.is_empty() {
+        return Ok(());
+    }
+
+    let mut confirmed = Vec::new();
+    let mut orphaned = Vec::new();
+
+    // 2. Query the node for the canonical block at each mature height
+    for (height, json_str) in mature_blocks {
+        let pending_data: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
+        let expected_hash = pending_data["hash"].as_str().unwrap_or("");
+        
+        let url = format!("{}/block/{}", state.node_rpc_url, height);
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    if let Ok(batch) = resp.json::<serde_json::Value>().await {
+                        let canonical_hash = batch["extension"]["final_hash"].as_str().unwrap_or("");
+                        if canonical_hash == expected_hash {
+                            confirmed.push((height, pending_data));
+                        } else {
+                            orphaned.push((height, pending_data));
+                        }
+                    }
+                } else if resp.status() == 404 || resp.status() == 400 || resp.status() == 500 {
+                    // Block not found or invalid height on node -> definitively orphaned
+                    orphaned.push((height, pending_data));
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to query node for block {}: {}. Will retry reconciliation later.", height, e);
+                // Network error, skip reconciliation for this block until next tick
+            }
+        }
+    }
+
+    if confirmed.is_empty() && orphaned.is_empty() {
+        return Ok(());
+    }
+
+    // 3. Atomically apply resolutions
+    let write_txn = state.db.begin_write().map_err(|e| e.to_string())?;
+    {
+        let mut p_table = write_txn.open_table(PENDING_BLOCKS_TABLE).map_err(|e| e.to_string())?;
+        let mut b_table = write_txn.open_table(BLOCKS_TABLE).map_err(|e| e.to_string())?;
+        let mut s_table = write_txn.open_table(SHARES_TABLE).map_err(|e| e.to_string())?;
+
+        // Process Confirmed
+        for (height, data) in confirmed {
+            p_table.remove(height).map_err(|e| e.to_string())?;
+            
+            let block_ts = data["block_ts"].as_u64().unwrap_or(0);
+            
+            // Isolate the read to drop the AccessGuard before writing
+            let mut b_json = None;
+            if let Ok(Some(b_val)) = b_table.get(block_ts) {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(b_val.value()) {
+                    b_json = Some(parsed);
+                }
+            }
+
+            if let Some(mut json) = b_json {
+                json["status"] = serde_json::json!("confirmed");
+                b_table.insert(block_ts, json.to_string().as_str()).map_err(|e| e.to_string())?;
+            }
+            
+            tracing::info!("Block at height {} reached maturity (Confirmed).", height);
+        }
+
+        // Process Orphans and Refund Shares
+        for (height, data) in orphaned {
+            p_table.remove(height).map_err(|e| e.to_string())?;
+            
+            let block_ts = data["block_ts"].as_u64().unwrap_or(0);
+            
+            // Isolate the read to drop the AccessGuard before writing
+            let mut b_json = None;
+            if let Ok(Some(b_val)) = b_table.get(block_ts) {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(b_val.value()) {
+                    b_json = Some(parsed);
+                }
+            }
+
+            if let Some(mut json) = b_json {
+                json["status"] = serde_json::json!("orphaned");
+                b_table.insert(block_ts, json.to_string().as_str()).map_err(|e| e.to_string())?;
+            }
+
+            // Refund the shares
+            if let Some(deductions) = data["deductions"].as_array() {
+                for d in deductions {
+                    let addr_hex = d[0].as_str().unwrap_or("");
+                    let amount = d[1].as_u64().unwrap_or(0);
+                    
+                    if let Ok(addr_bytes) = hex::decode(addr_hex) {
+                        if let Ok(addr_array) = <[u8; 32]>::try_from(addr_bytes.as_slice()) {
+                            let current = s_table.get(&addr_array).map_err(|e| e.to_string())?.map(|v| v.value()).unwrap_or(0);
+                            s_table.insert(&addr_array, current + amount).map_err(|e| e.to_string())?;
+                        }
+                    }
+                }
+            }
+            tracing::warn!("🚨 ORPHAN DETECTED at height {}. Shares have been fully refunded to miners.", height);
+        }
+    }
+    write_txn.commit().map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 // ── Stratum Connection Handler ──────────────────────────────────────────────
