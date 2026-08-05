@@ -1,5 +1,6 @@
 pub mod protocol;
 pub mod light_protocol;
+pub mod amino;
 use light_protocol::{LightRequest, LightResponse, LIGHT_PROTOCOL, LIGHT_PUSH_PROTOCOL, LightNotification};
 
 pub use protocol::{Message, MidstateCodec, MIDSTATE_PROTOCOL, MAX_GETBATCHES_COUNT, MAX_GETHEADERS_COUNT};
@@ -313,16 +314,58 @@ pub enum NetworkEvent {
                 libp2p::multiaddr::Protocol::Ip4(ip) => {
                     // Reject Loopback, Private (RFC 1918), and Link-local
                     if ip.is_loopback() || ip.is_private() || ip.is_link_local() { return false; }
+                    // 0.0.0.0 is caught by none of the above — is_private() only
+                    // covers 10/8, 172.16/12 and 192.168/16 — so a wildcard listen
+                    // address would otherwise be gossiped as if it were dialable.
+                    if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() { return false; }
+                    // Carrier-grade NAT (RFC 6598). A node behind CGNAT sees a
+                    // non-RFC1918 address and wrongly believes it is public.
+                    let o = ip.octets();
+                    if o[0] == 100 && (64..128).contains(&o[1]) { return false; }
+                    // Benchmarking (RFC 2544) and TEST-NET documentation ranges.
+                    if o[0] == 198 && (o[1] == 18 || o[1] == 19) { return false; }
                 }
                 libp2p::multiaddr::Protocol::Ip6(ip) => {
                     // Reject Loopback and Link-local
                     if ip.is_loopback() || (ip.segments()[0] & 0xff00 == 0xfe00) { return false; }
+                    // Unspecified (::) and Unique Local Addresses (fc00::/7).
+                    if ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00 { return false; }
                 }
+                // A relayed address describes a path through someone else's node,
+                // not a routable identity for this one. Treating it as routable is
+                // what let relay IPs leak into the seed registry.
+                libp2p::multiaddr::Protocol::P2pCircuit => return false,
                 _ => {}
             }
         }
         true
     }
+
+/// Canonical URL of the stateless seed registry (Cloudflare Worker).
+pub const PHONEBOOK_URL: &str = "https://seeds.midstate.cash";
+
+/// Fetches the current live peer set from the seed registry.
+///
+/// # Reasoning
+/// Lives in the library (not `main.rs`) so the running node event loop can
+/// re-query the registry periodically, rather than reading it exactly once at
+/// process startup.
+///
+/// # Safety / Invariants
+/// - **Bounded Execution:** A 5s timeout ensures neither startup nor the node
+///   event loop can stall on a registry that is offline, censored, or
+///   blackholed.
+pub async fn fetch_phonebook_peers(url: &str) -> anyhow::Result<Vec<String>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+
+    let resp = client.get(format!("{}/peers", url)).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Phonebook returned status: {}", resp.status());
+    }
+    Ok(resp.json::<Vec<String>>().await?)
+}
 
 pub struct MidstateNetwork {
     swarm: Swarm<MidstateBehaviour>,
@@ -511,12 +554,16 @@ let autonat = autonat::Behaviour::new(
         for addr in &bootstrap_peers {
             if let Some(peer) = extract_peer_id(addr) {
                 net.swarm.behaviour_mut().kademlia.add_address(&peer, addr.clone());
-                let relay_addr = addr.clone()
-                    .with(libp2p::multiaddr::Protocol::P2pCircuit);
-                match net.swarm.listen_on(relay_addr.clone()) {
-                    Ok(_) => tracing::info!("Relay-listening through {}", addr),
-                    Err(e) => tracing::debug!("Relay listen failed (non-fatal): {}", e),
-                }
+                // NOTE: we deliberately do NOT request a relay reservation here.
+                // Doing it unconditionally at startup — before AutoNAT has any
+                // verdict — makes a publicly routable node reserve circuits
+                // through every bootstrap peer, which pollutes listen_addrs and
+                // external_addrs with /p2p-circuit addresses. Because extract_ip()
+                // returns the *first* IP in a multiaddr, a circuit address makes
+                // the node believe its external IP is the relay's, and it then
+                // advertises every one of its addresses under someone else's IP.
+                // maintain_relays() handles this properly, on demand, and only
+                // once AutoNAT has actually confirmed we are Private.
             }
             if let Err(e) = net.swarm.dial(addr.clone()) {
                 tracing::warn!("Failed to dial {}: {}", addr, e);
@@ -705,39 +752,58 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
         let local_id = *self.swarm.local_peer_id();
         let p2p_suffix = libp2p::multiaddr::Protocol::P2p(local_id);
 
-        // Get the confirmed external IP from external_addrs if available
+        // Only a *direct* external address describes this node's own identity.
+        // A relayed one describes a path through someone else's node and would
+        // hand us the relay's IP via extract_ip().
         let external_ip = self.external_addrs.iter()
+            .filter(|a| !a.iter().any(|p| p == libp2p::multiaddr::Protocol::P2pCircuit))
             .find_map(|a| extract_ip(a));
 
         let mut addrs: Vec<String> = self.listen_addrs.iter()
             .filter_map(|a| {
-                let a_str = a.to_string();
-                
-                if let Some(ip) = external_ip {
-                    let replaced = replace_ip(a, ip);
-                    let rep_str = replaced.to_string();
-                    if rep_str.contains("/p2p/") {
-                        Some(rep_str)
-                    } else {
-                        Some(replaced.with(p2p_suffix.clone()).to_string())
-                    }
+                let candidate = match external_ip {
+                    Some(ip) => replace_ip(a, ip),
+                    None => a.clone(),
+                };
+
+                // One routability gate covering both branches. Previously the
+                // external_ip branch skipped this check entirely, so loopback and
+                // 0.0.0.0 listeners were IP-rewritten and then advertised, and
+                // /p2p-circuit addresses passed through untouched.
+                if !crate::network::is_routable(&candidate) {
+                    return None;
+                }
+
+                let s = candidate.to_string();
+                if s.contains("/p2p/") {
+                    Some(s)
                 } else {
-                    // Fall back to local listen addrs. 
-                    // Do not gossip 0.0.0.0 or localhost as peers cannot dial them.
-                    if is_localhost(a) || a_str.contains("0.0.0.0") { 
-                        return None; 
-                    }
-                    if a_str.contains("/p2p/") {
-                        Some(a_str)
-                    } else {
-                        Some(a.clone().with(p2p_suffix.clone()).to_string())
-                    }
+                    Some(candidate.with(p2p_suffix.clone()).to_string())
                 }
             })
             .collect();
 
+        // dedup() only removes *consecutive* duplicates, so it must be sorted
+        // first — otherwise dupes silently eat into the registry's 20-address cap.
+        addrs.sort();
         addrs.dedup();
         addrs
+    }
+
+    /// The subset of `advertisable_addrs()` that another *server* node can
+    /// actually dial.
+    ///
+    /// # Reasoning
+    /// `dial_addr` deliberately refuses webrtc-direct (it is a browser transport),
+    /// so those addresses are dead weight in the seed registry: they consume
+    /// slots in the registry's 50-address response and cause wasted dial attempts.
+    /// They remain in `advertisable_addrs()` so browser light clients can still
+    /// learn them via identify/PEX — only the registry gets the filtered set.
+    pub fn dialable_addrs(&self) -> Vec<String> {
+        self.advertisable_addrs()
+            .into_iter()
+            .filter(|a| !a.contains("/webrtc-direct"))
+            .collect()
     }
     
     /// Publishes this node's public addresses to the stateless seed registry.
@@ -751,7 +817,8 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
     ///
     /// ```text
     /// Pre:
-    ///   - Node is confirmed Public by AutoNAT
+    ///   - AutoNAT has NOT positively confirmed us as Private
+    ///     (Unknown is permitted — see the deadlock note in the body)
     ///
     /// Post:
     ///   - Fire-and-forget HTTP POST containing public addresses is sent to registry.
@@ -776,15 +843,35 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
     ///   This prevents leaking local/private IPs (e.g., 10.x, 192.168.x) to the 
     ///   public registry, which would bloat the phonebook with unreachable nodes.
     pub fn publish_to_phonebook(&self) {
-        let addrs: Vec<String> = self.advertisable_addrs()
+        // The NAT gate lives here, not at the call sites. Only a *positive*
+        // AutoNAT Private verdict blocks publishing. Requiring `Public`
+        // deadlocks the network: AutoNAT can only reach `Public` by probing
+        // connected peers, and peers are only discoverable through this
+        // registry. A node that drops to zero connections loses its probe
+        // servers, falls off `Public`, silently stops refreshing, and TTLs out
+        // of the registry an hour later.
+        if self.nat_status == NatStatus::Private {
+            tracing::debug!("Phonebook publish skipped: AutoNAT confirmed we are behind a NAT.");
+            return;
+        }
+
+        let addrs: Vec<String> = self.dialable_addrs()
             .into_iter()
             .filter(|addr_str| {
-                if let Ok(ma) = addr_str.parse::<libp2p::Multiaddr>() {
-                    crate::network::is_routable(&ma)
-                } else {
-                    false
+                // The deployed registry silently drops any address >= 200 chars
+                // and 400s the whole request above 20 addresses. If every
+                // address is dropped it stores an empty list under our IP, which
+                // is indistinguishable from "node offline". Pre-filter to match
+                // the registry's contract exactly.
+                if addr_str.len() >= 200 {
+                    return false;
+                }
+                match addr_str.parse::<libp2p::Multiaddr>() {
+                    Ok(ma) => crate::network::is_routable(&ma),
+                    Err(_) => false,
                 }
             })
+            .take(20)
             .collect();
 
         if addrs.is_empty() { 
@@ -869,7 +956,15 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
         }
         match addr_str.parse::<Multiaddr>() {
             Ok(addr) => {
-                if !is_routable(&addr) {
+                // A /p2p-circuit address is a *path* through a relay rather than a
+                // direct address, so it correctly fails is_routable() — which is
+                // what keeps relay paths out of the seed registry and the PEX
+                // pool. It is still dialable, and dialing one is precisely how
+                // DCUtR hole-punching to a NAT'd peer begins, so permit it here.
+                let is_relayed = addr
+                    .iter()
+                    .any(|p| p == libp2p::multiaddr::Protocol::P2pCircuit);
+                if !is_relayed && !is_routable(&addr) {
                     tracing::debug!("PEX ignoring non-routable address: {}", addr_str);
                     return;
                 }
@@ -1112,6 +1207,24 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                 SwarmEvent::Behaviour(MidstateBehaviourEvent::Identify(
                     identify::Event::Received { peer_id, info, .. },
                 )) => {
+                    // FOREIGN NETWORK ISOLATION:
+                    // Our Kademlia uses libp2p's default protocol name,
+                    // "/ipfs/kad/1.0.0". Once this node announces itself on the
+                    // public Amino DHT, IPFS peers learn our address and dial in
+                    // — and without this check their listen addrs would enter the
+                    // Midstate routing table and then be gossiped to other
+                    // Midstate nodes via PEX (connected_peer_addrs reads the
+                    // kbuckets). Only peers that actually speak the Midstate
+                    // protocol may populate our address graph.
+                    if !info.protocols.iter().any(|p| *p == MIDSTATE_PROTOCOL) {
+                        tracing::debug!(
+                            "Ignoring identify from non-Midstate peer {} ({} protocols)",
+                            peer_id,
+                            info.protocols.len()
+                        );
+                        continue;
+                    }
+
                     for addr in &info.listen_addrs {
                         // SERVER-TO-SERVER WEBRTC LEAK FIX:
                         // Prevent Kademlia from learning and autonomously dialing WebRTC addresses.
@@ -1395,14 +1508,31 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                 }
                 SwarmEvent::ExternalAddrConfirmed { address } => {
                     tracing::info!("External address confirmed: {}", address);
-                    if !self.external_addrs.contains(&address) {
-                        self.external_addrs.push(address);
-                    }
-                    
-                    // --- PUBLISH TO PHONEBOOK ---
-                    // Now that we officially know our external IP, publish it!
-                    // We only do this if AutoNAT already marked us as Public.
-                    if self.nat_status == NatStatus::Public {
+
+                    // A confirmed *relayed* address tells us the relay's IP, not
+                    // ours. extract_ip() returns the first IP in a multiaddr, so
+                    // letting one into external_addrs makes advertisable_addrs()
+                    // rewrite every address we own to the relay's IP — publishing
+                    // someone else's server under our peer id.
+                    let is_relayed = address
+                        .iter()
+                        .any(|p| p == libp2p::multiaddr::Protocol::P2pCircuit);
+
+                    if is_relayed {
+                        tracing::debug!(
+                            "Ignoring relayed address as external identity: {}",
+                            address
+                        );
+                    } else {
+                        if !self.external_addrs.contains(&address) {
+                            self.external_addrs.push(address);
+                        }
+
+                        // --- PUBLISH TO PHONEBOOK ---
+                        // A confirmed external address is the strongest routability
+                        // signal libp2p gives us, so publish unconditionally here.
+                        // publish_to_phonebook() self-gates on a positive AutoNAT
+                        // Private verdict.
                         self.publish_to_phonebook();
                     }
                 }
@@ -1617,6 +1747,40 @@ mod tests {
     fn is_localhost_ipv4_loopback() {
         let addr: Multiaddr = "/ip4/127.0.0.1/tcp/9333".parse().unwrap();
         assert!(is_localhost(&addr));
+    }
+
+    #[test]
+    fn routable_rejects_unspecified_and_cgnat() {
+        // 0.0.0.0 is matched by none of is_loopback/is_private/is_link_local,
+        // so it previously passed and could be gossiped as a dialable address.
+        let wildcard: Multiaddr = "/ip4/0.0.0.0/tcp/9333".parse().unwrap();
+        assert!(!is_routable(&wildcard));
+
+        // RFC 6598 carrier-grade NAT: looks public, is not.
+        let cgnat: Multiaddr = "/ip4/100.64.12.9/tcp/9333".parse().unwrap();
+        assert!(!is_routable(&cgnat));
+
+        let ula: Multiaddr = "/ip6/fd00::1/tcp/9333".parse().unwrap();
+        assert!(!is_routable(&ula));
+    }
+
+    #[test]
+    fn routable_rejects_relay_paths() {
+        // A circuit address describes a path through a relay. Accepting it is
+        // what let a relay's IP be published as this node's own identity.
+        let circuit: Multiaddr =
+            "/ip4/1.2.3.4/tcp/9333/p2p/12D3KooWPbR63SQg1UBLpAMiNngqrRHGM4LaMP8ieAJUxhfw7dxv/p2p-circuit"
+                .parse()
+                .unwrap();
+        assert!(!is_routable(&circuit));
+    }
+
+    #[test]
+    fn routable_still_accepts_ordinary_public_addrs() {
+        let tcp: Multiaddr = "/ip4/74.208.253.44/tcp/9333".parse().unwrap();
+        assert!(is_routable(&tcp));
+        let quic: Multiaddr = "/ip4/74.208.253.44/udp/9333/quic-v1".parse().unwrap();
+        assert!(is_routable(&quic));
     }
 
     #[test]

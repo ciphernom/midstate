@@ -280,6 +280,121 @@ pub fn verify(sig: &MssSignature, message: &[u8; 32], master_pk: &MasterPublicKe
     current == *master_pk
 }
 
+/// The master public key an MSS signature commits to.
+///
+/// # Reasoning
+///
+/// `Predicate::owner_pk()` recognises exactly one bytecode shape — the 40-byte
+/// P2PK script — and returns `None` for everything else. But
+/// `script::verify_signature` accepts an MSS signature at ANY `OP_CHECKSIG` /
+/// `OP_CHECKSIGVERIFY`, so a leaf is equally burnable through `compile_htlc`,
+/// `compile_covenant_htlc`, `compile_limit_order_covenant` and both multisig
+/// scripts. Attributing a leaf by predicate SHAPE therefore recorded the burn in
+/// `SPENT_ADDRESSES_TABLE` while silently skipping `MSS_LEAF_INDEX_TABLE`:
+/// `/mss_state` under-reported the high-water leaf for every covenant spend, a
+/// wallet that lost its local counter could not recover it from any source,
+/// re-signed a burned leaf, and the node evicted the reveal on every block with
+/// no error surfaced at any layer.
+///
+/// The signature already determines the key. `verify` folds `wots_pk` up the
+/// `auth_path` and requires the result to equal the master public key; this is
+/// that fold exposed on its own, so a leaf can be attributed to the key that
+/// ACTUALLY authorised the spend rather than the one the predicate advertised.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Pre:  true   (total over well-formed MssSignature; empty auth_path ⇒ wots_pk)
+///
+/// Post: result! = fold of sig.auth_path over sig.wots_pk under the
+///                 leaf-index parity rule, and
+///       verify(sig, m, pk) = true  ⇒  result! = pk
+///       result! ≠ pk               ⇒  verify(sig, m, pk) = false
+///       state unchanged (pure — no Z schema; §2.2 requires one only where the
+///       operation has non-trivial state impact)
+/// ```
+///
+/// # Safety / Invariants
+///
+/// - **No widening of trust.** `script::verify_signature` passes the pubkey off
+///   the script stack into `verify`, which succeeds only when this same root
+///   equals it. On any signature that cleared consensus the recovered root IS
+///   the key the script checked against, for every predicate type.
+/// - **Authenticates nothing on its own.** The WOTS signature is not checked
+///   here. Call it only on consensus-verified signatures, or compare the result
+///   against a caller-supplied key — that comparison is self-validating, since a
+///   forged path cannot match a key it does not hash to without a Merkle second
+///   preimage.
+/// - **Must mirror the fold in `verify` exactly.** `verify` is deliberately NOT
+///   refactored to call this function: it is consensus code and this change is
+///   an indexing fix. `recover_master_pk_matches_verify` below is what keeps the
+///   two honest. If either fold changes, change both and keep that test green.
+pub fn recover_master_pk(sig: &MssSignature) -> MasterPublicKey {
+    let mut current = sig.wots_pk;
+    let mut current_idx = sig.leaf_index;
+    for node_hash in &sig.auth_path {
+        let is_right = current_idx % 2 == 0;
+        current = if is_right {
+            hash_concat(&current, node_hash)
+        } else {
+            hash_concat(node_hash, &current)
+        };
+        current_idx /= 2;
+    }
+    current
+}
+
+/// Every MSS signature in one witness stack.
+///
+/// # Reasoning
+///
+/// Burn accounting, the reuse pre-flight check and the spent-address oracle all
+/// read only `wit_inputs.first()`. That is correct for P2PK, where the stack is
+/// `[signature]`, and wrong for `compile_multisig_2of2` / `compile_multisig_2of3`,
+/// where the second signer's one-time leaf is never recorded as spent and its
+/// reuse is therefore never detected.
+///
+/// Exists as ONE function so the six call sites that walk a witness stack cannot
+/// drift apart again — the same rationale as `search_index::block_level_items`.
+/// Two independent copies of this walk is exactly how the `owner_pk()` hole
+/// survived in both `storage.rs` and `node.rs`.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Pre:  true   (stack items are untrusted bytes)
+///
+/// Post: result! = ⟨MssSignature::from_bytes(item)
+///                  | item ∈ stack?, #item ≠ wots::SIG_SIZE,
+///                    from_bytes(item) succeeds⟩,  in stack order
+///       state unchanged (pure)
+/// ```
+///
+/// # Safety / Invariants
+///
+/// - **Length discriminator must match `script::verify_signature`**: exactly
+///   `wots::SIG_SIZE` ⇒ legacy WOTS and skipped here; anything else is tried as
+///   MSS. If consensus and this function disagree about what a stack item is,
+///   the burn tables silently diverge from what was actually verified.
+/// - **Bounded work.** `from_bytes` rejects `auth_len > MAX_HEIGHT`, so each
+///   recovered path folds at most `MAX_HEIGHT` hashes. Callers may run this on
+///   unvalidated mempool bytes without an unbounded-work exposure.
+/// - Returns signatures, not nullifiers: WOTS nullifiers are derived from the
+///   input's predicate and cannot be recovered from a stack item alone, so WOTS
+///   handling deliberately stays at the call site.
+pub fn mss_sigs_in_stack(stack: &[Vec<u8>]) -> Vec<MssSignature> {
+    let mut out = Vec::new();
+    for item in stack {
+        if item.len() == wots::SIG_SIZE {
+            continue; // legacy one-time WOTS — nullifier comes from the predicate
+        }
+        if let Ok(sig) = MssSignature::from_bytes(item) {
+            out.push(sig);
+        }
+    }
+    out
+}
+
 // ── Serialization ───────────────────────────────────────────────────────────
 
 impl MssSignature {
@@ -561,4 +676,55 @@ mod tests {
         assert!(MssSignature::from_bytes(&[0u8; 10]).is_err());
     }
     
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    /// `recover_master_pk` must agree with the fold inside `verify` for every
+    /// leaf of a real tree. `verify` is left untouched (consensus code), so this
+    /// test is the only thing preventing the two folds from drifting apart.
+    #[test]
+    fn recover_master_pk_matches_verify() {
+        let seed = [7u8; 32];
+        let mut kp = keygen(&seed, 4).unwrap();
+        let master_pk = kp.public_key();
+        for i in 0..16u8 {
+            let msg = [i; 32];
+            let sig = kp.sign(&msg).unwrap();
+            assert!(verify(&sig, &msg, &master_pk), "setup: signature must verify");
+            assert_eq!(
+                recover_master_pk(&sig),
+                master_pk,
+                "recovered root disagrees with verify at leaf {}",
+                i
+            );
+        }
+    }
+
+    /// A stack holding two MSS signatures must yield both. This is the multisig
+    /// case where only the first was ever burned.
+    #[test]
+    fn mss_sigs_in_stack_finds_every_signature() {
+        let mut a = keygen(&[1u8; 32], 3).unwrap();
+        let mut b = keygen(&[2u8; 32], 3).unwrap();
+        let msg = [9u8; 32];
+        let sa = a.sign(&msg).unwrap();
+        let sb = b.sign(&msg).unwrap();
+
+        let stack = vec![sa.to_bytes(), sb.to_bytes(), vec![0x01]];
+        let found = mss_sigs_in_stack(&stack);
+        assert_eq!(found.len(), 2, "both signers' leaves must be visible");
+        assert_eq!(recover_master_pk(&found[0]), a.public_key());
+        assert_eq!(recover_master_pk(&found[1]), b.public_key());
+    }
+
+    /// A raw WOTS signature is not an MSS signature and must not be reported as
+    /// one, or its nullifier would be attributed to the wrong key space.
+    #[test]
+    fn mss_sigs_in_stack_skips_raw_wots() {
+        let stack = vec![vec![0u8; wots::SIG_SIZE]];
+        assert!(mss_sigs_in_stack(&stack).is_empty());
+    }
 }
