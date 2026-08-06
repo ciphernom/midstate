@@ -18,6 +18,7 @@
 //! into MDXF fragments and all of them ride as separate burns inside the *same*
 //! funding transaction, landing in one block and reassembling trivially.
 
+
 use super::script;
 use super::types::{hash, InputReveal, Predicate, Witness, MAX_BURN_DATA_SIZE};
 use anyhow::{bail, Result};

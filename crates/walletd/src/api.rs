@@ -135,6 +135,60 @@ pub struct NodeInfo {
     pub safe_depth: u64,
 }
 
+/// Local mining status. The desktop supervises child processes — optionally a
+/// loopback Stratum pool, always a hasher — rather than mining in-process; see
+/// `walletd::mining` for why.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MiningView {
+    /// "idle" | "starting" | "running" | "stopping" | "error".
+    ///
+    /// Deliberately not a bool: the UI must distinguish "not mining" from
+    /// "starting, please wait" from "failed, here is why", and startup can take
+    /// several seconds while the pool binds.
+    pub phase: String,
+    /// Progress detail while starting or stopping, e.g. "waiting for the pool
+    /// to accept connections…".
+    pub message: Option<String>,
+    /// Whether the `midstate` binary needed to mine could be located.
+    pub available: bool,
+    /// Checksummed hex address coinbase rewards are paid to.
+    pub payout_address: String,
+    /// Stratum URL in effect. Empty when idle.
+    pub pool_url: String,
+    /// Default to prefill the pool field with (this machine's own pool).
+    pub default_pool_url: String,
+    /// True when this process is also running the pool.
+    pub local_pool: bool,
+    /// Hasher threads; 0 means every core.
+    pub threads: usize,
+    /// Cores available, for bounding the thread control.
+    pub max_threads: usize,
+    /// Estimated hashes per second. Local pool only.
+    pub hashrate: f64,
+    /// Whole-network hash rate, from the pool's live block target.
+    pub network_hashrate: f64,
+    /// This wallet's estimated share of network hashrate, 0.0..=1.0.
+    pub network_share: f64,
+    /// Shares accepted / rejected this round. Local pool only.
+    pub shares: u64,
+    pub rejected: u64,
+    /// Round score, and the pool's total, for the payout split.
+    pub score: u64,
+    pub total_score: u64,
+    /// Blocks this wallet has found, and the pool's recent total.
+    pub blocks_found: u64,
+    pub pool_blocks: u64,
+    pub active_miners: u64,
+    /// Chain height and reward as the pool sees them.
+    pub network_height: u64,
+    pub block_reward: u64,
+    /// Per-rig accepted-share tallies.
+    pub workers: Vec<(String, u64)>,
+    pub uptime_secs: u64,
+    /// Set when a child process exited unexpectedly or startup failed.
+    pub last_error: Option<String>,
+}
+
 /// Stages of the two-phase send. Persisted implicitly via the wallet's
 /// PendingCommit records; walletd re-derives the stage on resume.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

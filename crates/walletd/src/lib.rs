@@ -20,6 +20,7 @@ pub mod channels;
 pub mod dex;
 pub mod evm;
 pub mod ledger;
+pub mod mining;
 pub mod node_host;
 pub mod sendplan;
 pub mod swap;
@@ -27,8 +28,8 @@ pub mod swapbook;
 pub mod service;
 
 pub use api::{
-    AddressInfo, Balance, CoinView, HistoryView, NodeInfo, SendProgress, SendStage, SyncStatus,
-    WalletEvent, WalletStatus,
+    AddressInfo, Balance, CoinView, HistoryView, MiningView, NodeInfo, SendProgress, SendStage,
+    SyncStatus, WalletEvent, WalletStatus,
 };
 pub use node_host::{start_node, NodeConfig};
 pub use service::{spawn, WalletdHandle};

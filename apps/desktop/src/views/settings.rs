@@ -209,7 +209,7 @@ pub fn show(app: &mut App, ui: &mut Ui, status: &WalletStatus) {
         ui.set_width(ui.available_width());
         theme::hint(
             ui,
-            "Mixing, pruning-license management, mining, and multiple wallets still live \
+            "Mixing, pruning-license management and multiple wallets still live \
              in the midstate CLI. They share this wallet's format — close this app before \
              pointing the CLI at the same wallet file.",
         );

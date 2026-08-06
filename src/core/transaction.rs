@@ -259,8 +259,9 @@ pub fn verify_transaction_sigs(
                 bail!("Phase 1 validation failed: Reveal transaction references an unknown commitment");
             }
 
+            let sums = covenant_input_sums(inputs);
             for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
-                if !verify_predicate(&input.predicate, witness, &commitment, height, outputs, input.value, input.commitment) {
+                if !verify_predicate(&input.predicate, witness, &commitment, height, outputs, input.value, input.commitment, &sums) {
                     bail!("Predicate execution failed for input {}", i);
                 }
             }
@@ -285,7 +286,8 @@ pub fn verify_transaction_sigs(
                 }
             }
 
-            if !verify_predicate(&inputs[0].predicate, witness, &commitment, height, outputs, inputs[0].value, inputs[0].commitment) {
+            let sums = covenant_input_sums(inputs);
+            if !verify_predicate(&inputs[0].predicate, witness, &commitment, height, outputs, inputs[0].value, inputs[0].commitment, &sums) {
                 bail!("Predicate execution failed for Consolidate witness");
             }
             Ok(())
@@ -692,6 +694,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
 
             // 5. Verify each input coin exists and executes cleanly against its Predicate
             //    (ALL checks must pass before any accumulator mutation)
+            let sums = covenant_input_sums(inputs);
             for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
                 let coin_id = input.coin_id();
                 if !state.coins.contains(&coin_id) {
@@ -699,7 +702,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 }
 
                 // Script Execution Engine
-                if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs, input.value, input.commitment) {
+                if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs, input.value, input.commitment, &sums) {
                     bail!("Predicate execution failed for input {}", i);
                 }
             }
@@ -817,7 +820,8 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 }
             }
 
-            if !verify_predicate(&inputs[0].predicate, witness, &expected, state.height, outputs, inputs[0].value, inputs[0].commitment) {
+            let sums = covenant_input_sums(inputs);
+            if !verify_predicate(&inputs[0].predicate, witness, &expected, state.height, outputs, inputs[0].value, inputs[0].commitment, &sums) {
                 bail!("Predicate execution failed for Consolidate witness");
             }
 
@@ -858,6 +862,41 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
     }
 }
 
+/// Per-predicate input totals for a transaction, keyed by predicate address.
+///
+/// # Reasoning
+/// `OP_SUM_INPUT_VALUE` needs "how much value does this transaction spend from
+/// coins guarded by *my* predicate". Computing that inside `verify_predicate`
+/// would rescan every input for every input — O(n^2) address hashes, and with
+/// `MAX_BATCH_INPUTS = 1024` that is a cheap denial-of-service. Building the
+/// map once per transaction keeps verification linear.
+///
+/// Only `Predicate::Script` inputs are counted; nothing else can observe the
+/// value, so hashing their addresses would be wasted work.
+///
+/// # Formal Specification
+/// ```text
+/// Pre:  true
+/// Post: ∀ a ∈ dom(m) • m(a) = Σ { i.value | i ∈ inputs ∧ i.predicate.address() = a
+///                                           ∧ i.predicate is Script }
+///       overflow ⇒ m(a) = u64::MAX  (saturating; see below)
+/// ```
+///
+/// # Safety / Invariants
+/// - **Saturating, not wrapping.** A sum that overflows `u64` saturates to
+///   `u64::MAX`, which makes remainder rules demand *more* value, never less.
+///   Failure is always in the direction that protects the covenant's owner.
+fn covenant_input_sums(inputs: &[InputReveal]) -> std::collections::HashMap<[u8; 32], u64> {
+    let mut sums: std::collections::HashMap<[u8; 32], u64> = std::collections::HashMap::new();
+    for input in inputs {
+        if matches!(input.predicate, Predicate::Script { .. }) {
+            let entry = sums.entry(input.predicate.address()).or_insert(0);
+            *entry = entry.saturating_add(input.value);
+        }
+    }
+    sums
+}
+
 /// Execute a Witness against a Predicate via the MidstateScript VM.
 fn verify_predicate(
     predicate: &Predicate,
@@ -867,10 +906,14 @@ fn verify_predicate(
     outputs: &[OutputData],
     input_value: u64,
     input_state: Option<[u8; 32]>,
+    sums: &std::collections::HashMap<[u8; 32], u64>,
 ) -> bool {
     match (predicate, witness) {
         (Predicate::Script { bytecode }, Witness::ScriptInputs(inputs)) => {
             let this_address = predicate.address();
+            // Falls back to this input's own value so a single-coin spend
+            // behaves identically whether or not the map was populated.
+            let sum_input_value = sums.get(&this_address).copied().unwrap_or(input_value);
             let ctx = script::ExecContext {
                 commitment,
                 height: current_height,
@@ -878,6 +921,7 @@ fn verify_predicate(
                 input_value,
                 input_state,
                 this_address,
+                sum_input_value,
             };
             script::execute_script(bytecode, inputs, &ctx).is_ok()
         }
@@ -969,12 +1013,13 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                 }
             }
             // 5. Verify each Witness executes cleanly against its Predicate
+            let sums = covenant_input_sums(inputs);
             for (i, (input, witness)) in inputs.iter().zip(witnesses.iter()).enumerate() {
                 let coin_id = input.coin_id();
                 if !state.coins.contains(&coin_id) {
                     bail!("Coin {} not found", hex::encode(coin_id));
                 }
-                if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs, input.value, input.commitment) {
+                if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs, input.value, input.commitment, &sums) {
                     bail!("Predicate execution failed for input {}", i);
                 }
             }
@@ -1026,7 +1071,8 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                 let coin_id = input.coin_id();
                 if !state.coins.contains(&coin_id) { bail!("Coin {} not found", hex::encode(coin_id)); }
             }
-            if !verify_predicate(&inputs[0].predicate, witness, &expected, state.height, outputs, inputs[0].value, inputs[0].commitment) {
+            let sums = covenant_input_sums(inputs);
+            if !verify_predicate(&inputs[0].predicate, witness, &expected, state.height, outputs, inputs[0].value, inputs[0].commitment, &sums) {
                 bail!("Predicate execution failed for Consolidate witness");
             }
             Ok(())

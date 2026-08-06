@@ -389,6 +389,11 @@ pub struct MidstateNetwork {
     connected: HashMap<PeerId, ConnectedPoint>,
     pending_requests: HashMap<OutboundRequestId, PeerId>,
     nat_status: NatStatus,
+    /// Set when the operator has declared this node publicly reachable in
+    /// config. Overrides AutoNAT, which has been observed flapping
+    /// Public → Private on demonstrably reachable hosts and silently stopping
+    /// registry and DHT announcements as a result.
+    declared_public: bool,
     relay_reservations: HashSet<PeerId>,
     listen_addrs: Vec<Multiaddr>,
     external_addrs: Vec<Multiaddr>,
@@ -525,6 +530,7 @@ let autonat = autonat::Behaviour::new(
             connected: HashMap::new(),
             pending_requests: HashMap::new(),
             nat_status: NatStatus::Unknown,
+            declared_public: false,
             relay_reservations: HashSet::new(),
             listen_addrs: Vec::new(),
             external_addrs: Vec::new(),
@@ -656,6 +662,69 @@ let autonat = autonat::Behaviour::new(
 
     pub fn nat_status(&self) -> NatStatus {
         self.nat_status
+    }
+
+    /// Declares this node publicly reachable at `addr`, overriding AutoNAT.
+    ///
+    /// # Reasoning
+    /// AutoNAT infers reachability by asking connected peers to dial back. That
+    /// inference is unreliable: a node with a public IP, an open port, and live
+    /// inbound connections has been observed transitioning
+    /// `Public → Private` after several minutes of healthy operation. Because
+    /// registry publication and DHT announcement are both gated on
+    /// `nat_status != Private`, a false Private verdict silently stops both, and
+    /// the node TTLs out of the seed registry an hour later with nothing in the
+    /// logs to explain it.
+    ///
+    /// On a host where the operator *knows* the answer — a VPS with a static
+    /// public IP and a forwarded port — inference should not get a vote. This is
+    /// a deliberate, explicit, config-only override; the default remains
+    /// AutoNAT.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:  addr is a directly routable multiaddr owned by this node
+    /// Post:
+    ///   declared_public' = true
+    ///   nat_status'      = Public
+    ///   addr ∈ external_addrs'
+    ///   kademlia mode'   = Server
+    ///   ∀ later AutoNAT verdicts v • nat_status' = Public   (override is sticky)
+    /// ```
+    ///
+    /// # Safety / Invariants
+    /// - **Operator responsibility:** declaring an unreachable address publishes
+    ///   an undialable entry to the registry and DHT. It wastes other nodes'
+    ///   dial budget; it cannot corrupt consensus.
+    /// - **Sticky:** once set it is never cleared, so a later AutoNAT probe
+    ///   failure cannot re-introduce the silent-stop failure this exists to
+    ///   prevent.
+    pub fn declare_public(&mut self, addr: Multiaddr) {
+        if !crate::network::is_routable(&addr) {
+            tracing::warn!(
+                "Ignoring public_address {}: not a routable public address",
+                addr
+            );
+            return;
+        }
+
+        tracing::info!("Operator-declared public address: {} (AutoNAT overridden)", addr);
+
+        self.declared_public = true;
+        self.nat_status = NatStatus::Public;
+
+        self.swarm.add_external_address(addr.clone());
+        if !self.external_addrs.contains(&addr) {
+            self.external_addrs.push(addr);
+        }
+
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .set_mode(Some(kad::Mode::Server));
+
+        self.publish_to_phonebook();
     }
 
     pub fn send(&mut self, peer: PeerId, msg: Message) {
@@ -850,7 +919,7 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
         // registry. A node that drops to zero connections loses its probe
         // servers, falls off `Public`, silently stops refreshing, and TTLs out
         // of the registry an hour later.
-        if self.nat_status == NatStatus::Private {
+        if self.nat_status == NatStatus::Private && !self.declared_public {
             tracing::debug!("Phonebook publish skipped: AutoNAT confirmed we are behind a NAT.");
             return;
         }
@@ -1252,6 +1321,17 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     autonat::Event::StatusChanged { old, new },
                 )) => {
                     tracing::info!("AutoNAT status: {:?} → {:?}", old, new);
+
+                    // An operator declaration wins. AutoNAT flapping back to
+                    // Private on a known-reachable host would otherwise stop
+                    // registry publication and DHT announcement silently.
+                    if self.declared_public {
+                        tracing::debug!(
+                            "Ignoring AutoNAT verdict: public address declared in config"
+                        );
+                        continue;
+                    }
+
                     match new {
                         autonat::NatStatus::Public(_addr) => {
                             self.nat_status = NatStatus::Public;
