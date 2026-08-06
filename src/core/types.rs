@@ -247,16 +247,53 @@ pub struct State {
     pub burned_wots: UtxoAccumulator,
 }
 
+/// The Bitcoin block this chain is anchored to.
+///
+/// # Reasoning
+/// Promoted out of `State::genesis()` so that code which must identify the
+/// network *without any chain state* — notably DHT rendezvous key derivation,
+/// which runs on a node with an empty database and zero peers — can reference
+/// the same constant rather than duplicating the literal. A second copy would
+/// be free to drift and silently partition discovery.
+pub const BITCOIN_BLOCK_HASH: &str =
+    "000000000000000000018f5ad5625d43356136c2e50c6dc18967a90a18f0af2e";
+
+/// Height of the anchoring Bitcoin block.
+pub const BITCOIN_BLOCK_HEIGHT: u64 = 938708;
+
+/// Timestamp of the anchoring Bitcoin block.
+pub const BITCOIN_BLOCK_TIME: u64 = 1772274770;
+
+/// Stable 32-byte network identity.
+///
+/// # Reasoning
+/// Compile-time constant derived solely from the Bitcoin anchor. Requires no
+/// database, no peers, and no clock, which is precisely what makes it usable by
+/// a node that has never synced. Testnets and hard forks that change the anchor
+/// obtain a distinct identity with no further coordination.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Pre:  true
+/// Post: anchor! = BLAKE3(BITCOIN_BLOCK_HASH as bytes)
+///       #anchor! = 32
+///       anchor! is constant across every node on the network
+/// ```
+///
+/// # Safety / Invariants
+/// - **Determinism:** any divergence in this value silently partitions peer
+///   discovery, so it must never depend on local state or configuration.
+pub fn network_anchor() -> [u8; 32] {
+    hash(BITCOIN_BLOCK_HASH.as_bytes())
+}
+
 impl State {
     pub fn genesis() -> (Self, Vec<CoinbaseOutput>) {
-        // Bitcoin block anchor
+        // Bitcoin block anchor — see the module-level constants above.
         // Height: 938708
         // Hash: 000000000000000000018f5ad5625d43356136c2e50c6dc18967a90a18f0af2e
-        const BITCOIN_BLOCK_HASH: &str = "000000000000000000018f5ad5625d43356136c2e50c6dc18967a90a18f0af2e";
-        const BITCOIN_BLOCK_HEIGHT: u64 = 938708;
-        const BITCOIN_BLOCK_TIME: u64 = 1772274770;
-
-        let anchor = hash(BITCOIN_BLOCK_HASH.as_bytes());
+        let anchor = network_anchor();
 
         // --- The Genesis Inscription ---
         // We embed this plaintext directly into the address and salt fields of 

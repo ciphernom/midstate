@@ -27,6 +27,10 @@ const SIGNATURE_ARCHIVE_TABLE: TableDefinition<&[u8; 32], &[u8]> =
 const MSS_LEAF_INDEX_TABLE: TableDefinition<&[u8; 32], u64> =
     TableDefinition::new("mss_leaf_index");
 
+/// Persistent address book: single key "book" -> bincode Vec<(multiaddr, alpha, beta)>.
+/// The on-disk equivalent of Bitcoin's peers.dat.
+const PEERS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("peers");
+
 /// Block storage tables
 pub const BATCHES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("batches");
 pub const HEADERS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("headers");
@@ -620,6 +624,48 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
         }
     }
 
+    /// Persists the node's address book (the `peers.dat` analogue).
+    ///
+    /// # Reasoning
+    /// Without an on-disk address book, a node re-derives its entire view of the
+    /// network from the seed registry on every restart. That makes the registry
+    /// load-bearing on every single boot rather than a cold-start fallback, and
+    /// it means the network cannot survive the registry going away. Persisting
+    /// peers is what lets the seed registry become optional.
+    ///
+    /// Stored as one bincode blob under a single key rather than one row per
+    /// peer, so a save is a single write transaction regardless of book size.
+    ///
+    /// # Safety / Invariants
+    /// - **Bounded Growth:** The caller passes an already-truncated top-N slice.
+    /// - **Full Replacement:** The blob is overwritten wholesale, so entries the
+    ///   caller dropped do not survive as orphans.
+    pub fn save_peers(&self, peers: &[(String, u32, u32)]) -> Result<()> {
+        let bytes = bincode::serialize(peers)?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(PEERS_TABLE)?;
+            table.insert("book", bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Loads the persisted address book. Returns an empty vec on first run or if
+    /// the blob is corrupt — a bad address book must never prevent startup.
+    pub fn load_peers(&self) -> Result<Vec<(String, u32, u32)>> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(PEERS_TABLE) {
+            Ok(t) => t,
+            // Table absent: first run on an existing database.
+            Err(_) => return Ok(Vec::new()),
+        };
+        match table.get("book")? {
+            Some(bytes) => Ok(bincode::deserialize(bytes.value()).unwrap_or_default()),
+            None => Ok(Vec::new()),
+        }
+    }
+
     pub fn save_batch(&self, height: u64, batch: &crate::core::Batch) -> Result<()> {
         self.batches.save(height, batch)
     }
@@ -636,8 +682,54 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
         self.batches.highest()
     }
 
-    /// Reverts the burning of WOTS addresses from an abandoned chain segment.
-    /// Called during a reorg to prevent "ghost" database entries.
+    /// Reverts the burning of one-time keys from an abandoned chain segment.
+    ///
+    /// # Reasoning
+    ///
+    /// A reorg un-mines the spends in the orphaned segment. If their keys stayed
+    /// burned, the identical transaction could not be re-mined on the new chain:
+    /// `Mempool::add` would reject it as reuse and the bounty hunter would treat
+    /// an honest re-broadcast as a punishable double-signature.
+    ///
+    /// The counterpart of `burn_batch_addresses` and MUST cover exactly the same
+    /// keys. It previously read only `wit_inputs.first()`, matching the burn side
+    /// only because the burn side had the same defect; widening one without the
+    /// other is what leaves ghosts.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:  batch was previously burned by burn_batch_addresses
+    ///
+    /// Post: ∀ s ∈ mss_sigs(batch) •
+    ///         s.wots_pk ∉ dom(spent')  ∧  s.wots_pk ∉ dom(archive')
+    ///       ∀ w ∈ wots_first_sigs(batch) •
+    ///         address(w) ∉ dom(spent') ∧ address(w) ∉ dom(archive')
+    ///       mss_idx' = mss_idx        (deliberately untouched)
+    ///       result = Err(_) ⇒ state unchanged (single write transaction)
+    /// ```
+    ///
+    /// ```zed
+    ///     UnburnBatchAddresses
+    ///     --------------------
+    ///     ΔSpentAddresses
+    ///     ΔSignatureArchive
+    ///     ΞMssLeafIndex
+    ///     batch? : Batch
+    ///
+    ///     post dom(spent') = dom(spent) \ nullifiers(batch?)
+    ///     post dom(archive') = dom(archive) \ nullifiers(batch?)
+    ///     post mss_idx' = mss_idx
+    /// ```
+    ///
+    /// # Safety / Invariants
+    ///
+    /// - **Must remain symmetric with `burn_batch_addresses`.** Same stack walk,
+    ///   same nullifiers. Asymmetry in either direction is a live bug: too narrow
+    ///   leaves ghosts, too wide un-burns a key another batch legitimately spent.
+    /// - **The leaf counter is NOT rolled back**, by design. Leaving it high skips
+    ///   one leaf out of `2^H`; lowering it hands back a leaf a wallet may
+    ///   re-sign, which is the failure this whole subsystem exists to prevent.
     pub fn unburn_batch_addresses(&self, batch: &crate::core::Batch) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
@@ -657,10 +749,15 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
                                     let addr = input.predicate.address();
                                     spent_table.remove(&addr)?;
                                     sig_archive_table.remove(&addr)?;
-                                } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                                    spent_table.remove(&mss_sig.wots_pk)?;
-                                    sig_archive_table.remove(&mss_sig.wots_pk)?;
                                 }
+                            }
+                            // Must mirror burn_batch_addresses exactly: every MSS
+                            // signature in the stack, not just the first. An unburn
+                            // narrower than the burn leaves ghost entries after a
+                            // reorg, which read as reuse and get the key swept.
+                            for mss_sig in crate::core::mss::mss_sigs_in_stack(wit_inputs) {
+                                spent_table.remove(&mss_sig.wots_pk)?;
+                                sig_archive_table.remove(&mss_sig.wots_pk)?;
                             }
                         }
                     }
@@ -671,11 +768,12 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
                             if sig.len() == crate::core::wots::SIG_SIZE {
                                 let addr = inputs[0].predicate.address();
                                 spent_table.remove(&addr)?;
-                                 sig_archive_table.remove(&addr)?;
-                            } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                                spent_table.remove(&mss_sig.wots_pk)?;
-                                sig_archive_table.remove(&mss_sig.wots_pk)?;
+                                sig_archive_table.remove(&addr)?;
                             }
+                        }
+                        for mss_sig in crate::core::mss::mss_sigs_in_stack(wit_inputs) {
+                            spent_table.remove(&mss_sig.wots_pk)?;
+                            sig_archive_table.remove(&mss_sig.wots_pk)?;
                         }
                     }
                     _ => {}
@@ -686,12 +784,98 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
         Ok(())
     }
 
-    /// Burn every WOTS input address from a committed batch, mapping each to the
-    /// commitment hash that authorised the spend.
+    /// Burn every one-time key a committed batch spent, map each to the
+    /// commitment that authorised it, and advance the MSS leaf high-water mark
+    /// for every master key involved.
     ///
-    /// - For standard WOTS: burns the address hash.
-    /// - For MSS (post-activation): burns the specific leaf's WOTS public key.
-    /// - Idempotent: reorg replays of the same batch write the same value.
+    /// # Reasoning
+    ///
+    /// Three records come out of one batch and they must agree.
+    /// `SPENT_ADDRESSES_TABLE` is what `Mempool::add` rejects reuse against and
+    /// what the bounty hunter sweeps on. `SIGNATURE_ARCHIVE_TABLE` holds the
+    /// evidence for that sweep. `MSS_LEAF_INDEX_TABLE` is advisory: the only
+    /// answer `/mss_state` can give a wallet asking which leaf to sign next.
+    ///
+    /// Two defects made the third disagree with the first:
+    ///
+    ///   1. The leaf counter was gated on `input.predicate.owner_pk()`, which is
+    ///      `Some` only for the 40-byte P2PK bytecode — while
+    ///      `script::verify_signature` accepts an MSS signature at any
+    ///      `OP_CHECKSIG`. Every leaf burned through `compile_htlc`,
+    ///      `compile_covenant_htlc`, `compile_limit_order_covenant` or either
+    ///      multisig script was recorded as spent but advanced no counter.
+    ///   2. Only `wit_inputs.first()` was inspected, so in a 2-of-N spend the
+    ///      second signer's one-time leaf was never burned at all.
+    ///
+    /// Consequence of (1): a wallet's local counter advanced while the node's did
+    /// not, silently and permanently. Once the wallet lost its counter — rescan,
+    /// import, second device — `max(local, node)` could not recover the truth,
+    /// so it re-signed a burned leaf. The mempool accepted the reveal and
+    /// `prune_on_new_block` evicted it against the chain on every block, forever,
+    /// with no error returned at any layer.
+    ///
+    /// Attribution is therefore by `mss::recover_master_pk` — the key that
+    /// actually signed — never by the shape of the predicate.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:  batch has passed consensus validation (apply_batch returned Ok)
+    ///
+    /// Post: ∀ s ∈ mss_sigs(batch) •
+    ///         spent'[s.wots_pk]   = commitment(tx of s)
+    ///         archive'[s.wots_pk] = wots_sig_bytes(s)
+    ///         mss_idx'[recover_master_pk(s)]
+    ///                             = max(mss_idx[recover_master_pk(s)], s.leaf_index + 1)
+    ///       ∀ w ∈ wots_first_sigs(batch) •
+    ///         spent'[address(w)]  = commitment(tx of w)
+    ///         archive'[address(w)]= w
+    ///       ∀ pk • mss_idx'(pk) ≥ mss_idx(pk)
+    ///       result = Err(_)       ⇒ state unchanged (single write transaction)
+    /// ```
+    ///
+    /// ```zed
+    ///     BurnBatchAddresses
+    ///     ------------------
+    ///     ΔSpentAddresses
+    ///     ΔSignatureArchive
+    ///     ΔMssLeafIndex
+    ///     batch? : Batch
+    ///
+    ///     pre  valid(batch?)
+    ///
+    ///     post ∀ s ∈ mss_sigs(batch?) •
+    ///            spent'(s.wots_pk) = commitment(s) ∧
+    ///            mss_idx'(recover_master_pk(s))
+    ///              = max(mss_idx(recover_master_pk(s)), s.leaf_index + 1)
+    ///     post ∀ pk ∉ { recover_master_pk(s) | s ∈ mss_sigs(batch?) } •
+    ///            mss_idx'(pk) = mss_idx(pk)
+    ///     post ∀ pk • mss_idx'(pk) ≥ mss_idx(pk)
+    /// ```
+    ///
+    /// # Safety / Invariants
+    ///
+    /// - **Monotonic.** `if next > current` is the entire safety argument for the
+    ///   counter. A value left too high skips one leaf out of `2^H`; a value
+    ///   allowed to fall hands back a leaf a wallet may re-sign.
+    /// - **Not rolled back on reorg.** `unburn_batch_addresses` reverts the spent
+    ///   set so an orphaned spend can be re-mined; the counter deliberately does
+    ///   not move. See the note there.
+    /// - **`unburn_batch_addresses` must stay symmetric with this function.** Both
+    ///   walk the stack through `mss::mss_sigs_in_stack`; an unburn narrower than
+    ///   the burn leaves ghost entries that read as key reuse.
+    /// - **Idempotent.** Reorg replay of the same batch writes identical values in
+    ///   all three tables.
+    /// - **Not consensus.** None of these tables is read by `apply_batch`, which
+    ///   only warns on reuse (`core/state.rs`). Widening what is burned changes
+    ///   mempool policy and local evidence, never block acceptance.
+    /// - **WOTS remains first-item-only, deliberately.** A raw WOTS nullifier is
+    ///   `input.predicate.address()`, which for a multisig script is the script
+    ///   hash rather than the signer's key. Burning per stack item would re-insert
+    ///   that same script address, not the second signer's key. Fixing WOTS
+    ///   multisig properly needs public-key recovery from the signature AND a
+    ///   matching change in `core/state.rs`'s oracle key space — a consensus-path
+    ///   edit, out of scope here. See the module note in `mss::mss_sigs_in_stack`.
     pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, _block_height: u64) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
@@ -713,16 +897,25 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
                                     let addr = input.predicate.address();
                                     spent_table.insert(&addr, &commitment)?;
                                     sig_archive_table.insert(&addr, sig.as_slice())?;
-                                } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                                    spent_table.insert(&mss_sig.wots_pk, &commitment)?;
-                                    let wots_sig_bytes = crate::core::wots::sig_to_bytes(&mss_sig.wots_sig);
-                                    sig_archive_table.insert(&mss_sig.wots_pk, wots_sig_bytes.as_slice())?;
-                                    if let Some(master_pk) = input.predicate.owner_pk() {
-                                        let next = mss_sig.leaf_index + 1;
-                                        let current = mss_idx_table.get(&master_pk)?.map(|v: redb::AccessGuard<'_, u64>| v.value()).unwrap_or(0);
-                                        if next > current { mss_idx_table.insert(&master_pk, next)?; }
-                                    }
                                 }
+                            }
+                            // Every MSS signature in the stack, attributed by the
+                            // key that SIGNED rather than by the predicate's shape.
+                            // The old code took wit_inputs.first() only (missing the
+                            // second signer of a 2-of-N) and gated the leaf counter
+                            // on input.predicate.owner_pk(), which is Some only for
+                            // the 40-byte P2PK script — so every leaf burned through
+                            // an HTLC, covenant or multisig predicate advanced no
+                            // counter and /mss_state under-reported it forever.
+                            for mss_sig in crate::core::mss::mss_sigs_in_stack(wit_inputs) {
+                                spent_table.insert(&mss_sig.wots_pk, &commitment)?;
+                                let wots_sig_bytes = crate::core::wots::sig_to_bytes(&mss_sig.wots_sig);
+                                sig_archive_table.insert(&mss_sig.wots_pk, wots_sig_bytes.as_slice())?;
+
+                                let master_pk = crate::core::mss::recover_master_pk(&mss_sig);
+                                let next = mss_sig.leaf_index.saturating_add(1);
+                                let current = mss_idx_table.get(&master_pk)?.map(|v: redb::AccessGuard<'_, u64>| v.value()).unwrap_or(0);
+                                if next > current { mss_idx_table.insert(&master_pk, next)?; }
                             }
                         }
                     }
@@ -738,17 +931,17 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
                                 let addr = inputs[0].predicate.address();
                                 spent_table.insert(&addr, &commitment)?;
                                 sig_archive_table.insert(&addr, sig.as_slice())?;
-                            } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                                spent_table.insert(&mss_sig.wots_pk, &commitment)?;
-                                let wots_sig_bytes = crate::core::wots::sig_to_bytes(&mss_sig.wots_sig);
-                                sig_archive_table.insert(&mss_sig.wots_pk, wots_sig_bytes.as_slice())?;
-                                
-                                if let Some(master_pk) = inputs[0].predicate.owner_pk() {
-                                    let next = mss_sig.leaf_index + 1;
-                                    let current = mss_idx_table.get(&master_pk)?.map(|v: redb::AccessGuard<'_, u64>| v.value()).unwrap_or(0);
-                                    if next > current { mss_idx_table.insert(&master_pk, next)?; }
-                                }
                             }
+                        }
+                        for mss_sig in crate::core::mss::mss_sigs_in_stack(wit_inputs) {
+                            spent_table.insert(&mss_sig.wots_pk, &commitment)?;
+                            let wots_sig_bytes = crate::core::wots::sig_to_bytes(&mss_sig.wots_sig);
+                            sig_archive_table.insert(&mss_sig.wots_pk, wots_sig_bytes.as_slice())?;
+
+                            let master_pk = crate::core::mss::recover_master_pk(&mss_sig);
+                            let next = mss_sig.leaf_index.saturating_add(1);
+                            let current = mss_idx_table.get(&master_pk)?.map(|v: redb::AccessGuard<'_, u64>| v.value()).unwrap_or(0);
+                            if next > current { mss_idx_table.insert(&master_pk, next)?; }
                         }
                     }
                     _ => {}
@@ -760,9 +953,64 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
     }
 
 
-    /// One-time backfill of the signature archive + spent-address tables
-    /// from every historical batch that is still on disk.
-    /// Safe to re-run (idempotent). Returns the number of batches processed.
+    /// One-time replay of every historical batch still on disk through
+    /// `burn_batch_addresses`, repairing the spent-address, signature-archive and
+    /// MSS leaf-index tables in a single pass.
+    ///
+    /// # Reasoning
+    ///
+    /// Fixing `burn_batch_addresses` only corrects blocks mined from the upgrade
+    /// onward. Every historical covenant spend is still missing from
+    /// `MSS_LEAF_INDEX_TABLE`, and every historical second-signer leaf is still
+    /// missing from `SPENT_ADDRESSES_TABLE`. Shipping the code fix alone leaves
+    /// those holes on disk permanently — and a hole in the leaf index is exactly
+    /// what makes a wallet re-sign a burned leaf.
+    ///
+    /// This calls `burn_batch_addresses` itself rather than reimplementing the
+    /// walk, so the repair cannot diverge from the writer.
+    ///
+    /// `PRUNE_DEPTH` bounds what is recoverable: batches below the pruned floor
+    /// are gone and their burns cannot be re-derived from any local source. For
+    /// keys last used down there the tables remain a LOWER BOUND, which is why
+    /// wallets must keep taking `max(local, node)` rather than assigning.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:  true (safe to re-run; gated by a marker file in Node::new)
+    ///
+    /// Post: ∀ h ∈ available_heights • burn_batch_addresses(batch(h)) applied
+    ///       ∀ pk • mss_idx'(pk) ≥ mss_idx(pk)
+    ///       spent' ⊇ spent  ∧  archive' ⊇ archive
+    ///       a failure at height h ⇒ that height skipped, later heights still
+    ///                               processed (never aborts the whole pass)
+    /// ```
+    ///
+    /// ```zed
+    ///     BackfillSignatureArchive
+    ///     ------------------------
+    ///     ΔSpentAddresses
+    ///     ΔSignatureArchive
+    ///     ΔMssLeafIndex
+    ///
+    ///     post ∀ pk • mss_idx'(pk) ≥ mss_idx(pk)
+    ///     post dom(spent') ⊇ dom(spent)
+    ///     post dom(archive') ⊇ dom(archive)
+    /// ```
+    ///
+    /// # Safety / Invariants
+    ///
+    /// - **Purely additive.** It never clears a table first, and every write it
+    ///   makes is an insert or a forward max-merge. An interrupted run therefore
+    ///   leaves the database strictly no worse than it found it, and re-running is
+    ///   a no-op.
+    /// - **Not atomic across heights.** Each `burn_batch_addresses` call is its
+    ///   own write transaction. Acceptable precisely because of the point above;
+    ///   the marker file is only written on a clean full pass, so an interrupted
+    ///   run repeats from genesis on the next boot.
+    /// - **Blocking at startup, by choice.** Serving `/mss_state` from a partially
+    ///   repaired index means answering too LOW, which is the dangerous direction.
+    /// - Returns the number of batches processed.
     pub fn backfill_signature_archive(&self) -> Result<usize> {
         let highest = self.highest_batch()?;
         if highest == 0 {
@@ -817,9 +1065,12 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
                             if sig.len() == SIG_SIZE {
                                 let addr = input.predicate.address();
                                 if let Some(existing) = table.get(&addr)? { result.insert(addr, *existing.value()); }
-                            } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                                if let Some(existing) = table.get(&mss_sig.wots_pk)? { result.insert(mss_sig.wots_pk, *existing.value()); }
                             }
+                        }
+                        // Oracle must cover exactly what burn_batch_addresses writes,
+                        // or a reuse that IS recorded goes undetected at admission.
+                        for mss_sig in crate::core::mss::mss_sigs_in_stack(wit_inputs) {
+                            if let Some(existing) = table.get(&mss_sig.wots_pk)? { result.insert(mss_sig.wots_pk, *existing.value()); }
                         }
                     }
                 }
@@ -830,9 +1081,10 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
                         if sig.len() == SIG_SIZE {
                             let addr = inputs[0].predicate.address();
                             if let Some(existing) = table.get(&addr)? { result.insert(addr, *existing.value()); }
-                        } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                            if let Some(existing) = table.get(&mss_sig.wots_pk)? { result.insert(mss_sig.wots_pk, *existing.value()); }
                         }
+                    }
+                    for mss_sig in crate::core::mss::mss_sigs_in_stack(wit_inputs) {
+                        if let Some(existing) = table.get(&mss_sig.wots_pk)? { result.insert(mss_sig.wots_pk, *existing.value()); }
                     }
                 }
                 _ => {}
@@ -862,9 +1114,10 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
                         if sig.len() == SIG_SIZE {
                             let addr = input.predicate.address();
                             if let Some(existing) = table.get(&addr)? { result.insert(addr, *existing.value()); }
-                        } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                            if let Some(existing) = table.get(&mss_sig.wots_pk)? { result.insert(mss_sig.wots_pk, *existing.value()); }
                         }
+                    }
+                    for mss_sig in crate::core::mss::mss_sigs_in_stack(wit_inputs) {
+                        if let Some(existing) = table.get(&mss_sig.wots_pk)? { result.insert(mss_sig.wots_pk, *existing.value()); }
                     }
                 }
             }
@@ -875,9 +1128,10 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
                     if sig.len() == SIG_SIZE {
                         let addr = inputs[0].predicate.address();
                         if let Some(existing) = table.get(&addr)? { result.insert(addr, *existing.value()); }
-                    } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                        if let Some(existing) = table.get(&mss_sig.wots_pk)? { result.insert(mss_sig.wots_pk, *existing.value()); }
                     }
+                }
+                for mss_sig in crate::core::mss::mss_sigs_in_stack(wit_inputs) {
+                    if let Some(existing) = table.get(&mss_sig.wots_pk)? { result.insert(mss_sig.wots_pk, *existing.value()); }
                 }
             }
             _ => {}
@@ -892,5 +1146,267 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(MSS_LEAF_INDEX_TABLE)?;
         Ok(table.get(master_pk)?.map(|v| v.value()).unwrap_or(0))
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Burn-path tests
+//
+// `storage.rs` previously had no test module, which is how two defects in
+// `burn_batch_addresses` survived: MSS leaves were attributed via
+// `Predicate::owner_pk()` (Some only for the 40-byte P2PK script) and only
+// `wit_inputs.first()` was inspected. Together they meant a leaf spent through
+// a covenant, HTLC or multisig predicate was recorded as spent but advanced no
+// counter, so `/mss_state` under-reported it and wallets re-signed burned
+// leaves. Everything below pins the properties that make that impossible.
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod burn_tests {
+    use super::*;
+    use crate::core::mss;
+    use crate::core::script;
+    use crate::core::types::{
+        Batch, Extension, InputReveal, OutputData, Predicate, Transaction, Witness,
+    };
+    use tempfile::tempdir;
+
+    fn store(dir: &tempfile::TempDir) -> Storage {
+        Storage::open(dir.path()).expect("open storage")
+    }
+
+    /// A batch carrying exactly the transactions given. Only the fields the burn
+    /// path reads matter; the rest is inert filler.
+    fn batch_of(txs: Vec<Transaction>) -> Batch {
+        Batch {
+            prev_midstate: [0u8; 32],
+            transactions: txs,
+            extension: Extension { nonce: 0, final_hash: [0u8; 32] },
+            coinbase: vec![],
+            timestamp: 1_700_000_000,
+            target: [0xFFu8; 32],
+            state_root: [0u8; 32],
+            prev_header_hash: [0u8; 32],
+        }
+    }
+
+    fn reveal(predicate: Predicate, witness: Witness, salt: u8) -> Transaction {
+        Transaction::Reveal {
+            inputs: vec![InputReveal { predicate, value: 1_000, salt: [salt; 32], commitment: None }],
+            witnesses: vec![witness],
+            outputs: vec![OutputData::Standard { address: [0xAAu8; 32], value: 900, salt: [salt; 32] }],
+            salt: [salt; 32],
+        }
+    }
+
+    /// A predicate `owner_pk()` cannot see through — the shape that used to make
+    /// the leaf counter silently skip a burn.
+    fn htlc_predicate(receiver_pk: &[u8; 32]) -> Predicate {
+        Predicate::Script {
+            bytecode: script::compile_htlc(&[0x11u8; 32], receiver_pk, 500_000, &[0x22u8; 32]),
+        }
+    }
+
+    /// THE regression test. An MSS leaf spent through an HTLC predicate must
+    /// advance `MSS_LEAF_INDEX_TABLE`, even though `owner_pk()` returns None.
+    #[test]
+    fn covenant_spend_advances_the_leaf_index() {
+        let dir = tempdir().unwrap();
+        let st = store(&dir);
+
+        let mut kp = mss::keygen(&[3u8; 32], 4).unwrap();
+        let master_pk = kp.public_key();
+        let sig = kp.sign(&[0x42u8; 32]).unwrap();
+
+        let predicate = htlc_predicate(&master_pk);
+        assert!(
+            predicate.owner_pk().is_none(),
+            "test is meaningless if the predicate is P2PK-shaped"
+        );
+
+        // Realistic HTLC claim stack: [signature, preimage, 1]. Only the first
+        // item is a signature; the others must not be mistaken for one.
+        let witness = Witness::ScriptInputs(vec![sig.to_bytes(), vec![0x99u8; 32], vec![0x01]]);
+        let batch = batch_of(vec![reveal(predicate, witness, 1)]);
+
+        st.burn_batch_addresses(&batch, 1).unwrap();
+
+        assert_eq!(
+            st.query_mss_leaf_index(&master_pk).unwrap(),
+            sig.leaf_index + 1,
+            "leaf burned through a covenant must advance the index"
+        );
+    }
+
+    /// Every signature in the stack burns, not just the first. This is the
+    /// 2-of-N case where the second signer's one-time leaf was never recorded.
+    #[test]
+    fn multisig_burns_every_signature_in_the_stack() {
+        let dir = tempdir().unwrap();
+        let st = store(&dir);
+
+        let mut a = mss::keygen(&[4u8; 32], 4).unwrap();
+        let mut b = mss::keygen(&[5u8; 32], 4).unwrap();
+        let (pk_a, pk_b) = (a.public_key(), b.public_key());
+        let sig_a = a.sign(&[0x43u8; 32]).unwrap();
+        let sig_b = b.sign(&[0x43u8; 32]).unwrap();
+
+        assert_ne!(pk_a, pk_b, "distinct trees");
+        assert_ne!(sig_a.wots_pk, sig_b.wots_pk, "distinct leaves");
+
+        let stack = vec![sig_a.to_bytes(), sig_b.to_bytes()];
+
+        // ── Stage 1: does the stack walk see both signatures? ──
+        let parsed = mss::mss_sigs_in_stack(&stack);
+        assert_eq!(parsed.len(), 2, "STAGE 1: stack walk lost a signature");
+
+        // ── Stage 2: does recovery attribute each to the right tree? ──
+        assert_eq!(mss::recover_master_pk(&parsed[0]), pk_a, "STAGE 2: wrong root for signer A");
+        assert_eq!(mss::recover_master_pk(&parsed[1]), pk_b, "STAGE 2: wrong root for signer B");
+
+        let predicate = Predicate::Script { bytecode: script::compile_multisig_2of2(&pk_a, &pk_b) };
+        let batch = batch_of(vec![reveal(predicate, Witness::ScriptInputs(stack), 2)]);
+        st.burn_batch_addresses(&batch, 1).unwrap();
+
+        // ── Stage 3: did both nullifiers burn? ──
+        let oracle = st.query_spent_addresses(&batch).unwrap();
+        assert!(oracle.contains_key(&sig_a.wots_pk), "STAGE 3: signer A missing from spent table");
+        assert!(oracle.contains_key(&sig_b.wots_pk), "STAGE 3: signer B missing from spent table");
+
+        // ── Stage 4: did both counters advance? ──
+        assert_eq!(
+            st.query_mss_leaf_index(&pk_a).unwrap(),
+            sig_a.leaf_index + 1,
+            "STAGE 4: signer A counter"
+        );
+        assert_eq!(
+            st.query_mss_leaf_index(&pk_b).unwrap(),
+            sig_b.leaf_index + 1,
+            "STAGE 4: signer B counter — burned but not counted"
+        );
+    }
+
+    /// `unburn_batch_addresses` must cover exactly what the burn covered — an
+    /// unburn narrower than the burn leaves ghost entries that read as reuse
+    /// after a reorg. The leaf counter must NOT be rolled back.
+    #[test]
+    fn unburn_is_symmetric_and_leaves_the_counter_high() {
+        let dir = tempdir().unwrap();
+        let st = store(&dir);
+
+        let mut a = mss::keygen(&[6u8; 32], 4).unwrap();
+        let mut b = mss::keygen(&[7u8; 32], 4).unwrap();
+        let (pk_a, pk_b) = (a.public_key(), b.public_key());
+        let sig_a = a.sign(&[0x44u8; 32]).unwrap();
+        let sig_b = b.sign(&[0x44u8; 32]).unwrap();
+
+        let predicate = Predicate::Script { bytecode: script::compile_multisig_2of2(&pk_a, &pk_b) };
+        let witness = Witness::ScriptInputs(vec![sig_a.to_bytes(), sig_b.to_bytes()]);
+        let batch = batch_of(vec![reveal(predicate, witness, 3)]);
+
+        st.burn_batch_addresses(&batch, 1).unwrap();
+        assert_eq!(st.query_spent_addresses(&batch).unwrap().len(), 2);
+
+        st.unburn_batch_addresses(&batch).unwrap();
+        assert!(
+            st.query_spent_addresses(&batch).unwrap().is_empty(),
+            "every nullifier the burn wrote must be removed, or a reorg leaves ghosts"
+        );
+
+        assert_eq!(
+            st.query_mss_leaf_index(&pk_a).unwrap(),
+            sig_a.leaf_index + 1,
+            "the leaf counter is deliberately NOT rolled back: skipping a leaf is \
+             free, handing one back invites reuse"
+        );
+    }
+
+    /// The counter only ever moves forward. An out-of-order or replayed batch
+    /// carrying a lower leaf must not lower it.
+    #[test]
+    fn leaf_index_is_monotonic() {
+        let dir = tempdir().unwrap();
+        let st = store(&dir);
+
+        let mut kp = mss::keygen(&[8u8; 32], 4).unwrap();
+        let master_pk = kp.public_key();
+
+        let mut sigs = Vec::new();
+        for i in 0..6u8 {
+            sigs.push(kp.sign(&[i; 32]).unwrap());
+        }
+        let high = sigs.pop().unwrap(); // leaf 5
+        let low = sigs[2].clone(); // leaf 2
+
+        let p = || htlc_predicate(&master_pk);
+        st.burn_batch_addresses(&batch_of(vec![reveal(p(), Witness::sig(high.to_bytes()), 4)]), 1)
+            .unwrap();
+        assert_eq!(st.query_mss_leaf_index(&master_pk).unwrap(), high.leaf_index + 1);
+
+        st.burn_batch_addresses(&batch_of(vec![reveal(p(), Witness::sig(low.to_bytes()), 5)]), 2)
+            .unwrap();
+        assert_eq!(
+            st.query_mss_leaf_index(&master_pk).unwrap(),
+            high.leaf_index + 1,
+            "a lower leaf must never pull the high-water mark down"
+        );
+    }
+
+    /// The repair pass is re-runnable. It is gated by a marker file, but a crash
+    /// between the last write and the marker means it runs again — that must be
+    /// a no-op, not a corruption.
+    #[test]
+    fn backfill_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let st = store(&dir);
+
+        let mut kp = mss::keygen(&[9u8; 32], 4).unwrap();
+        let master_pk = kp.public_key();
+        let sig = kp.sign(&[0x45u8; 32]).unwrap();
+
+        let batch = batch_of(vec![reveal(
+            htlc_predicate(&master_pk),
+            Witness::ScriptInputs(vec![sig.to_bytes(), vec![0x01]]),
+            6,
+        )]);
+        st.save_batch(1, &batch).unwrap();
+
+        st.backfill_signature_archive().unwrap();
+        let after_first = st.query_mss_leaf_index(&master_pk).unwrap();
+        assert_eq!(
+            after_first,
+            sig.leaf_index + 1,
+            "backfill must repair history the old writer skipped"
+        );
+        assert_eq!(st.query_spent_addresses(&batch).unwrap().len(), 1);
+
+        st.backfill_signature_archive().unwrap();
+        assert_eq!(
+            st.query_mss_leaf_index(&master_pk).unwrap(),
+            after_first,
+            "re-running the backfill must change nothing"
+        );
+        assert_eq!(st.query_spent_addresses(&batch).unwrap().len(), 1);
+    }
+
+    /// Non-regression: the P2PK path must behave exactly as it did before.
+    #[test]
+    fn p2pk_spend_still_advances_the_leaf_index() {
+        let dir = tempdir().unwrap();
+        let st = store(&dir);
+
+        let mut kp = mss::keygen(&[10u8; 32], 4).unwrap();
+        let master_pk = kp.public_key();
+        let sig = kp.sign(&[0x46u8; 32]).unwrap();
+
+        let batch = batch_of(vec![reveal(
+            Predicate::p2pk(&master_pk),
+            Witness::sig(sig.to_bytes()),
+            7,
+        )]);
+        st.burn_batch_addresses(&batch, 1).unwrap();
+
+        assert_eq!(st.query_mss_leaf_index(&master_pk).unwrap(), sig.leaf_index + 1);
+        assert!(st.query_spent_addresses(&batch).unwrap().contains_key(&sig.wots_pk));
     }
 }

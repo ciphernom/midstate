@@ -405,19 +405,20 @@ async function awaitRevealMined(inputCoinId, revealStr, commitmentHex, onStatus,
                     if (rebroadcasts >= 3) {
                         // Inputs exist and the commitment is live, so by the node's
                         // own prune_invalid the only remaining cause is a BURNED
-                        // ONE-TIME LEAF. We cannot prove it from here: the exact
-                        // authority is the chain's burned_wots accumulator, which
-                        // has no RPC, and getMssState is unreliable — its HTTP
-                        // handler scans only the last ~2000 blocks and answers 0
-                        // for older keys, so a reconcile that moves nothing proves
-                        // nothing. Say what's actually known.
+                        // ONE-TIME LEAF. The reconcile above moved nothing, which
+                        // now carries information: getMssState answers from
+                        // MSS_LEAF_INDEX_TABLE over full history, so silence means
+                        // either the node predates the recover_master_pk fix (and
+                        // never recorded non-P2PK burns) or the spending block is
+                        // below PRUNE_DEPTH. Say what's actually known.
                         throw new Error(
                             'The node keeps evicting this reveal even though its inputs exist and its commitment is live. '
                             + 'That leaves one cause: it is signed with a one-time signature leaf that an earlier transaction already burned — '
                             + 'the mempool accepts it, then prunes it against the chain on every block. '
-                            + 'The wallet cannot confirm this itself: the authoritative burned-leaf set has no RPC, and /mss_state over HTTP '
-                            + 'only scans the last ~2000 blocks (it answers 0 for older keys, so its silence means nothing). '
-                            + 'Fix the node\'s get_mss_state to use storage.query_mss_leaf_index, then reload — the leaf counters will re-sync and a fresh send will use an unburned leaf. '
+                            + 'Re-syncing the leaf counters against the node did not move them, so the node has no record of the burn either. '
+                            + 'That happens when the leaf was spent through a covenant, HTLC, channel or multisig script on a node that '
+                            + 'predates the mss_leaf_index fix, or when the block it was spent in has been pruned. '
+                            + 'Ask your node operator to upgrade and re-run the signature-archive backfill, or point the wallet at an upgraded node, then retry. '
                             + 'These coins were never spent and remain yours.'
                         );
                     }
@@ -839,10 +840,11 @@ async function loadMssCaches() {
     // never cause reuse — it only ever catches a counter that is BEHIND what the
     // chain has witnessed (another device, a lost local view).
     //
-    // Deliberately NOT treated as authoritative: the node's HTTP /mss_state
-    // scans only the last ~2000 blocks and answers 0 for older keys, while its
-    // light/WebRTC path answers exactly from MSS_LEAF_INDEX_TABLE. The transport
-    // is chosen at random on a flaky link, so a low answer proves nothing.
+    // Deliberately NOT treated as authoritative. Both transports now answer from
+    // MSS_LEAF_INDEX_TABLE, but that table is a LOWER BOUND, not the truth: it is
+    // missing every leaf burned through a non-P2PK predicate on a node predating
+    // the recover_master_pk fix, and everything below the node's PRUNE_DEPTH floor
+    // is unrecoverable. A low answer therefore still proves nothing.
     reconcileMssLeavesWithNode().catch(() => {});
 }
 
@@ -886,13 +888,16 @@ async function reconcileMssLeavesWithNode() {
  * sign, then persist the post-increment value atomically. Taking the max can
  * only ever skip forward, never reuse.
  *
- * The node is a CROSS-CHECK, NOT a source of truth. Its two transports disagree:
- * the light/WebRTC path answers from MSS_LEAF_INDEX_TABLE (O(1), full history —
- * correct), while HTTP /mss_state still scans only the last 2000 blocks and
- * returns 0 for any key untouched for ~33 h. We cannot tell which answered, so a
- * LOW answer must never be trusted — hence max(), never assignment. The locally
- * persisted counter remains the primary record; the node can only ever push it
- * forward.
+ * The node is a CROSS-CHECK, NOT a source of truth. Both transports answer from
+ * MSS_LEAF_INDEX_TABLE (O(1)), but that table is only ever a LOWER BOUND on what
+ * the chain has witnessed: nodes predating the recover_master_pk fix never
+ * recorded leaves burned through covenant, HTLC, channel or multisig predicates,
+ * and history below PRUNE_DEPTH cannot be rebuilt. A LOW answer must therefore
+ * never be trusted — hence max(), never assignment. The locally persisted counter
+ * remains the primary record; the node can only ever push it forward.
+ *
+ * Query by MASTER PUBKEY. An address is also 32 bytes, so passing one returns a
+ * well-formed {next_index: 0} that looks exactly like a virgin key.
  */
 async function signMssAndSync(pkHex, commitmentHex) {
     const addrHex = compute_p2pk_address_hex(pkHex);
@@ -1342,8 +1347,15 @@ async function sendRevealWithMssLeafRetry(prebuiltPayload, ctxStrOrObj, commitme
             const cur = (wState.mssAddrs[addr] && wState.mssAddrs[addr].next_leaf) || 0;
             let useLeaf = cur + STEP;
             try {
-                const st = await rpc.getMssState(addr);
-                if (st && (st.next_index + STEP) > useLeaf) useLeaf = st.next_index + STEP;
+                // Keyed by master pubkey, not address — see verifyMssSafetyIndices.
+                // Non-fatal here: the local `cur + STEP` already guarantees forward
+                // progress, so a missing tree or an offline node just means this
+                // retry leans on the local step instead of the network's view.
+                const pk = wallet.get_mss_pubkey(addr);
+                if (pk) {
+                    const st = await rpc.getMssState(pk);
+                    if (st && (st.next_index + STEP) > useLeaf) useLeaf = st.next_index + STEP;
+                }
             } catch (e) { /* keep the local step-forward */ }
             // Re-tag this address's inputs (one leaf per address per tx) and advance
             // the persistent counter past it.
@@ -5647,7 +5659,18 @@ async function verifyMssSafetyIndices(onProgress) {
         let mssState = null, lastErr = null, got = false;
         for (let i = 0; i < ATTEMPTS; i++) {
             if (BACKOFF_MS[i]) await new Promise(r => setTimeout(r, BACKOFF_MS[i]));
-            try { mssState = await rpc.getMssState(addr); got = true; break; }
+            try {
+                // The node's /mss_state is keyed by MASTER PUBKEY. `addr` is
+                // hash(compile_p2pk(pk)) — also 32 bytes, so it passes the node's
+                // parse_hex32 cleanly and comes back as {next_index: 0} with HTTP
+                // 200, indistinguishable from "this key has never signed". That
+                // made the guard below (`next_index > next_leaf`) always false and
+                // this entire safety check a silent no-op, while still printing
+                // "Verifying MSS safety indices…". Query by pubkey or not at all.
+                const pk = wallet.get_mss_pubkey(addr);
+                if (!pk) throw new Error(`MSS tree not loaded for ${addr.substring(0, 12)}…`);
+                mssState = await rpc.getMssState(pk); got = true; break;
+            }
             catch (e) {
                 lastErr = e;
                 if (onProgress && i < ATTEMPTS - 1) onProgress(`Network hiccup verifying MSS state \u2014 retry ${i + 1}/${ATTEMPTS - 1}\u2026`);

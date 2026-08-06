@@ -319,11 +319,18 @@ impl Mempool {
                                                 anyhow::bail!("Mempool rejected: WOTS address {} already spent", hex::encode(addr));
                                             }
                                         }
-                                    } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                                        if let Some(&prior_commitment) = spent_oracle.get(&mss_sig.wots_pk) {
-                                            if prior_commitment != this_commitment {
-                                                anyhow::bail!("Mempool rejected: MSS leaf {} already spent", hex::encode(mss_sig.wots_pk));
-                                            }
+                                    }
+                                }
+                                // Check every MSS signature in the stack, not just
+                                // the first: in a 2-of-N spend the second signer's
+                                // leaf is a one-time key too, and reusing it is the
+                                // same fault. Must cover exactly what
+                                // Storage::burn_batch_addresses records, or a reuse
+                                // that IS on disk sails through admission.
+                                for mss_sig in crate::core::mss::mss_sigs_in_stack(wit_inputs) {
+                                    if let Some(&prior_commitment) = spent_oracle.get(&mss_sig.wots_pk) {
+                                        if prior_commitment != this_commitment {
+                                            anyhow::bail!("Mempool rejected: MSS leaf {} already spent", hex::encode(mss_sig.wots_pk));
                                         }
                                     }
                                 }
@@ -343,11 +350,12 @@ impl Mempool {
                                             anyhow::bail!("Mempool rejected: WOTS address {} already spent", hex::encode(addr));
                                         }
                                     }
-                                } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                                    if let Some(&prior_commitment) = spent_oracle.get(&mss_sig.wots_pk) {
-                                        if prior_commitment != this_commitment {
-                                            anyhow::bail!("Mempool rejected: MSS leaf {} already spent", hex::encode(mss_sig.wots_pk));
-                                        }
+                                }
+                            }
+                            for mss_sig in crate::core::mss::mss_sigs_in_stack(wit_inputs) {
+                                if let Some(&prior_commitment) = spent_oracle.get(&mss_sig.wots_pk) {
+                                    if prior_commitment != this_commitment {
+                                        anyhow::bail!("Mempool rejected: MSS leaf {} already spent", hex::encode(mss_sig.wots_pk));
                                     }
                                 }
                             }

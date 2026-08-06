@@ -921,6 +921,26 @@ async fn wallet_scan(path: &PathBuf, rpc_port: u16, rpc_host: String, from_genes
 
     // Phase 2: Targeted scan — only fetch full data for matching blocks
     let imported = targeted_scan(&client, &base_url, &mut wallet, &addresses, &matching_heights).await?;
+    
+    // don't forget to kill the dead coins
+    let mut dead_coins = Vec::new();
+    for wc in wallet.coins() {
+        // We use unwrap_or(true) so that if the node connection drops midway, 
+        // we default to keeping the coin (safe fallback).
+        if !check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await.unwrap_or(true) {
+            dead_coins.push(wc.coin_id);
+        }
+    }
+
+    if !dead_coins.is_empty() {
+        // Mark them in the temporary session cache just to be thorough...
+        wallet.mark_spent(dead_coins.clone());
+        
+        // ...but we MUST physically remove them from the persistent array!
+        wallet.data.coins.retain(|c| !dead_coins.contains(&c.coin_id));
+        
+        println!("  Cleaned up {} already-spent ghost coin(s).", dead_coins.len());
+    }
 
     wallet.data.last_scan_height = chain_height;
     
@@ -4836,17 +4856,9 @@ async fn check_coin_rpc(client: &reqwest::Client, rpc_port: u16, rpc_host: &str,
 /// - **Bounded Execution:** Enforces a strict 5-second timeout to ensure
 ///   node startup does not hang if the registry is offline or blocked.
 async fn fetch_phonebook_peers(url: &str) -> Result<Vec<String>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-    
-    let resp = client.get(format!("{}/peers", url)).send().await?;
-    if resp.status().is_success() {
-        let peers: Vec<String> = resp.json().await?;
-        Ok(peers)
-    } else {
-        bail!("Phonebook returned status: {}", resp.status())
-    }
+    // Implementation moved into the library so the node event loop can re-query
+    // the registry at runtime, not just once here at startup.
+    midstate::network::fetch_phonebook_peers(url).await
 }
 
 pub async fn run_node(
@@ -4901,7 +4913,7 @@ pub async fn run_node(
     all_peers.extend(cli_peers);
 
     tracing::info!("Querying live phonebook for active network peers...");
-    match fetch_phonebook_peers("https://seeds.midstate.cash").await {
+    match fetch_phonebook_peers(midstate::network::PHONEBOOK_URL).await {
         Ok(live_peers) => {
             tracing::info!("Discovered {} peers from phonebook", live_peers.len());
             all_peers.extend(live_peers);

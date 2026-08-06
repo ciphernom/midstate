@@ -13,6 +13,10 @@ use crate::network::{Message, MidstateNetwork, NetworkEvent, MAX_GETBATCHES_COUN
 use crate::storage::Storage;
 // coinbase_seed / coinbase_salt moved to crate::mining (wrappers still available via coordinator)
 use crate::core::mss;
+// Only the test modules below still reference `wots::` unqualified; non-test
+// code uses the fully-qualified path. Gated rather than deleted because the
+// `mod tests` blocks pick this up through `use super::*`.
+#[cfg(test)]
 use crate::core::wots;
 
 use crate::sync::{SyncPhase, MAX_PREFETCH_DISTANCE, MAX_PREFETCH_BUFFER, MAX_PREFETCH_RAM_BYTES};
@@ -143,6 +147,10 @@ pub struct Node {
     mempool: Mempool,
     storage: Storage,
     network: MidstateNetwork,
+    /// Identity for the isolated Amino DHT rendezvous swarm. Deliberately the
+    /// same keypair as the main swarm so published provider records point at
+    /// our real Midstate listener.
+    amino_keypair: Keypair,
     metrics: Metrics,
     mining: MiningCoordinator,
     license: LicenseManager,
@@ -678,42 +686,66 @@ pub fn scan_mss_index(&self, master_pk: &[u8; 32], start: u64, end: u64) -> Resu
     
 }
 
+/// Highest `leaf_index + 1` that unconfirmed transactions imply for `master_pk`.
+///
+/// # Reasoning
+///
+/// Chain state alone is not a safe answer: a reveal sitting in the mempool has
+/// already committed its leaf, and telling a wallet a number that ignores it
+/// invites a same-block collision. This is the mempool half of `/mss_state`,
+/// maxed against `Storage::query_mss_leaf_index`.
+///
+/// Previously filtered on `input.predicate.owner_pk()`, so — exactly like the
+/// storage burn path — it could not see a leaf spent through an HTLC, covenant
+/// or multisig predicate, and it only ever looked at `wit_inputs.first()`.
+/// Attribution is now by `mss::recover_master_pk`, over every signature in every
+/// stack.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Pre:  true — txs? need not be validated (see Safety)
+///
+/// Post: result! = max({0} ∪ { s.leaf_index + 1
+///                            | s ∈ mss_sigs(txs?),
+///                              recover_master_pk(s) = master_pk? })
+///       state unchanged (pure — no Z schema per §2.2)
+/// ```
+///
+/// # Safety / Invariants
+///
+/// - **Self-validating against unverified input.** An attacker cannot inflate
+///   another key's counter without an auth path that folds to that key's root,
+///   i.e. a Merkle second preimage.
+/// - **Bounded work per signature.** `MssSignature::from_bytes` rejects
+///   `auth_len > MAX_HEIGHT`, so each recovery folds at most `MAX_HEIGHT` hashes.
+///   Note this runs per `/mss_state` call over the whole mempool and that
+///   endpoint is not PoW-gated — if mempool size grows, cache the map per
+///   mempool mutation rather than recomputing it per request.
+/// - **Returns 0 for "nothing pending"**, indistinguishable from "unknown".
+///   Callers must combine it with the chain index; wallets must treat the result
+///   as a floor and take `max(local, node)`, never assign.
 pub fn scan_txs_for_mss_index(txs: &[Transaction], master_pk: &[u8; 32]) -> u64 {
     let mut max_idx: u64 = 0;
     for tx in txs {
-        match tx {
-            Transaction::Reveal { inputs, witnesses, .. } => {
-                for (input, witness) in inputs.iter().zip(witnesses.iter()) {
-                    if let Some(owner_pk) = input.predicate.owner_pk() {
-                        if &owner_pk == master_pk {
-                            let Witness::ScriptInputs(wit_inputs) = witness; 
-                            if let Some(sig_bytes) = wit_inputs.first() {
-                                if sig_bytes.len() > wots::SIG_SIZE {
-                                    if let Ok(mss_sig) = mss::MssSignature::from_bytes(sig_bytes) {
-                                        max_idx = max_idx.max(mss_sig.leaf_index.saturating_add(1));
-                                    }
-                                }
-                            }                        
-                        }
-                    }
-                }
-            }
+        let stacks: Vec<&Vec<Vec<u8>>> = match tx {
+            Transaction::Reveal { witnesses, .. } => witnesses
+                .iter()
+                .map(|w| { let Witness::ScriptInputs(items) = w; items })
+                .collect(),
             Transaction::Consolidate { inputs, witness, .. } => {
                 if inputs.is_empty() { continue; }
-                if let Some(owner_pk) = inputs[0].predicate.owner_pk() {
-                    if &owner_pk == master_pk {
-                        let Witness::ScriptInputs(wit_inputs) = witness; 
-                        if let Some(sig_bytes) = wit_inputs.first() {
-                            if sig_bytes.len() > wots::SIG_SIZE {
-                                if let Ok(mss_sig) = mss::MssSignature::from_bytes(sig_bytes) {
-                                    max_idx = max_idx.max(mss_sig.leaf_index.saturating_add(1));
-                                }
-                            }
-                        }                        
-                    }
+                let Witness::ScriptInputs(items) = witness;
+                vec![items]
+            }
+            _ => continue,
+        };
+        for stack in stacks {
+            for sig in mss::mss_sigs_in_stack(stack) {
+                if &mss::recover_master_pk(&sig) == master_pk {
+                    max_idx = max_idx.max(sig.leaf_index.saturating_add(1));
                 }
             }
-            _ => {}
         }
     }
     max_idx
@@ -1129,18 +1161,24 @@ fn extract_sig_infos(tx: &Transaction) -> Vec<SigInfo> {
                         });
                     }
                 }
-            } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                // FIX: mss_sig.wots_sig is ALREADY parsed into [[u8; 32]; CHAINS] by MssSignature::from_bytes
-                infos.push(SigInfo {
-                    wots_pk: mss_sig.wots_pk,
-                    wots_sig: mss_sig.wots_sig, 
-                    commitment,
-                    is_mss: true,
-                    auth_path: mss_sig.auth_path,
-                    leaf_index: mss_sig.leaf_index,
-                    input_reveal: input.clone(),
-                });
             }
+        }
+
+        // MSS: every signature in the stack. The old code read only
+        // wit_inputs.first(), so the second signer of a 2-of-N multisig was
+        // invisible to reuse detection and the bounty hunter.
+        let input = if matches!(tx, Transaction::Consolidate { .. }) { &inputs[0] } else { &inputs[i] };
+        for mss_sig in crate::core::mss::mss_sigs_in_stack(wit_inputs) {
+            // mss_sig.wots_sig is ALREADY parsed into [[u8; 32]; CHAINS] by MssSignature::from_bytes
+            infos.push(SigInfo {
+                wots_pk: mss_sig.wots_pk,
+                wots_sig: mss_sig.wots_sig,
+                commitment,
+                is_mss: true,
+                auth_path: mss_sig.auth_path,
+                leaf_index: mss_sig.leaf_index,
+                input_reveal: input.clone(),
+            });
         }
     }
     infos
@@ -1314,7 +1352,16 @@ pub async fn new(
         // --- ONE-TIME SIGNATURE ARCHIVE BACKFILL ---
         // Makes the bounty hunter able to punish reuses of keys that were spent
         // before the SIGNATURE_ARCHIVE_TABLE existed.
-        let archive_marker = data_dir.join(".signature_archive_backfilled");
+        // v2: bumped when burn_batch_addresses was corrected to (a) attribute MSS
+        // leaves by mss::recover_master_pk instead of Predicate::owner_pk(), which
+        // is Some only for the 40-byte P2PK script, and (b) walk every signature in
+        // the witness stack instead of only the first. Nodes upgraded before that
+        // fix carry two classes of hole: MSS_LEAF_INDEX_TABLE is missing every
+        // covenant/HTLC/multisig spend, and SPENT_ADDRESSES_TABLE is missing every
+        // second-signer leaf. Bumping the marker re-runs the replay through the
+        // corrected writer and repairs both, for as much history as PRUNE_DEPTH has
+        // left on disk.
+        let archive_marker = data_dir.join(".signature_archive_backfilled_v2");
         if !archive_marker.exists() {
             tracing::info!("Running one-time signature archive backfill from historical blocks...");
             match storage.backfill_signature_archive() {
@@ -1441,6 +1488,11 @@ pub async fn new(
         // Convert Multiaddrs to Strings BEFORE we move them into the network
         let bootstrap_strings: Vec<String> = bootstrap_peers.iter().map(|a| a.to_string()).collect();
 
+        // The Amino rendezvous swarm runs on the SAME identity as the main
+        // swarm, so the PeerId it publishes in DHT provider records resolves to
+        // our real Midstate listener. Cloned before `keypair` is moved below.
+        let amino_keypair = keypair.clone();
+
         let network = MidstateNetwork::new(keypair, listen_addr, bootstrap_peers, banned_peers).await?;
 
         let mut recent_headers = VecDeque::new();
@@ -1463,6 +1515,7 @@ pub async fn new(
             mempool: Mempool::new(),
             storage: storage.clone(),
             network,
+            amino_keypair,
             metrics: Metrics::new(),
             mining,
             license,
@@ -1480,7 +1533,30 @@ pub async fn new(
             chain_history: VecDeque::new(),
             finality: crate::core::finality::FinalityEstimator::new(2, 8),
             cached_safe_depth: crate::core::finality::FinalityEstimator::new(2, 8).calculate_safe_depth(1e-6),
-            known_pex_addrs: HashMap::new(),
+            known_pex_addrs: {
+                // Restore the on-disk address book before any network activity.
+                // connection_maintenance (every 15s) dials out of this map, so
+                // simply populating it is enough to bootstrap from disk without
+                // touching the seed registry at all.
+                let mut book: HashMap<String, (u32, u32)> = HashMap::new();
+                match storage.load_peers() {
+                    Ok(saved) => {
+                        for (addr, alpha, beta) in saved {
+                            book.insert(addr, (alpha, beta));
+                        }
+                        if !book.is_empty() {
+                            tracing::info!(
+                                "Loaded {} peers from persistent address book",
+                                book.len()
+                            );
+                        }
+                    }
+                    // A corrupt or unreadable book must never block startup;
+                    // the seed registry remains as the fallback.
+                    Err(e) => tracing::warn!("Could not load peer address book: {}", e),
+                }
+                book
+            },
             connected_peers: HashSet::new(),
             mining_cancel: None,
             mined_batch_rx,
@@ -2545,13 +2621,68 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
         let mut stem_flush_interval = time::interval(Duration::from_secs(5));
         const TARGET_OUTBOUND_PEERS: usize = 8;
         let mut health_check_interval = time::interval(Duration::from_secs(600)); // Every 10 mins
+
+        // Flush the address book to disk every 5 minutes. Cheap (one write txn,
+        // one blob) and it is what allows a restarted node to rejoin without
+        // consulting the seed registry.
+        let mut peer_book_interval = time::interval(Duration::from_secs(300));
+        peer_book_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         health_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // --- Periodic Phonebook Announcement ---
         // Refreshes the node's TTL in the serverless seed registry.
-        // Set to 45 minutes (2700s) to comfortably beat the 1-hour registry expiration.
-        let mut phonebook_interval = time::interval(Duration::from_secs(45 * 60));
+        // 30 min against the registry's 3600s TTL gives 2x margin, so a single
+        // transient failure (the publish is fire-and-forget, with no retry)
+        // cannot expire us. Shorter is tempting but the registry runs on
+        // Cloudflare KV, whose free tier allows 1000 writes/day total across the
+        // whole network: at 30 min each node consumes 48/day, capping the network
+        // at ~20 public nodes. 15 min would cap it at ~10.
+        // Delayed first tick: at t=0 the swarm has not yet reported any listen
+        // addresses, so an immediate publish always finds nothing to advertise.
+        // 60s in, the transports are up and AutoNAT has had time to run.
+        let mut phonebook_interval = time::interval_at(
+            time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(30 * 60),
+        );
         phonebook_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Peers discovered from the registry at runtime. Deliberately kept
+        // separate from `self.bootstrap_peers` (the immutable startup config
+        // snapshot) so each refresh replaces the set wholesale and dead
+        // addresses age out instead of accumulating forever.
+        let mut live_peers: Vec<String> = Vec::new();
+
+        // The registry was previously queried exactly once, in run_node(). A
+        // node that booted while the registry was empty could never learn about
+        // anyone who registered afterwards.
+        // interval_at (not interval) so the first tick is delayed. A plain
+        // interval fires immediately, which would duplicate the fetch run_node()
+        // already performed seconds earlier — two registry hits per boot.
+        let mut discovery_interval = time::interval_at(
+            time::Instant::now() + Duration::from_secs(10 * 60),
+            Duration::from_secs(10 * 60),
+        );
+        discovery_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let (phonebook_tx, mut phonebook_rx) = tokio::sync::mpsc::channel::<Vec<String>>(4);
+
+        // Borrowed-commons discovery. Runs as an isolated swarm in its own task,
+        // sharing no behaviour or routing table with MidstateBehaviour, so a
+        // failure here can never affect block or transaction processing. If it
+        // cannot start we simply fall back to the address book, PEX, and the
+        // registry.
+        let (amino, mut amino_rx) = match crate::network::amino::spawn(
+            self.amino_keypair.clone(),
+            crate::core::types::network_anchor(),
+        ) {
+            Ok((handle, rx)) => (Some(handle), rx),
+            Err(e) => {
+                tracing::warn!("Amino DHT rendezvous unavailable: {}", e);
+                // A dangling receiver whose sender is dropped: recv() resolves
+                // to None immediately and the select arm disables itself.
+                let (_tx, rx) = tokio::sync::mpsc::channel::<Vec<String>>(1);
+                (None, rx)
+            }
+        };
 
         // Phase 3: Periodic MMR Gossip Challenges for license retrievability (every 5 minutes)
         let mut license_challenge_interval = time::interval(Duration::from_secs(300));
@@ -2661,16 +2792,122 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                     }
                 }
                 
+                _ = peer_book_interval.tick() => {
+                    // Persist the highest-scoring peers. Capped at 500 so a node
+                    // that has been up for months does not accumulate an
+                    // unbounded book of long-dead addresses.
+                    const MAX_PERSISTED_PEERS: usize = 500;
+                    let mut book: Vec<(String, u32, u32)> = self.known_pex_addrs
+                        .iter()
+                        // Relay paths are tied to a reservation that will not
+                        // survive our restart, so persisting them just wastes
+                        // dial attempts on the next boot.
+                        .filter(|(addr, _)| !addr.contains("/p2p-circuit"))
+                        .map(|(addr, (a, b))| (addr.clone(), *a, *b))
+                        .collect();
+                    book.sort_by(|x, y| {
+                        let p_x = x.1 as f32 / (x.1 + x.2) as f32;
+                        let p_y = y.1 as f32 / (y.1 + y.2) as f32;
+                        p_y.partial_cmp(&p_x).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    book.truncate(MAX_PERSISTED_PEERS);
+
+                    let storage_clone = self.storage.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = storage_clone.save_peers(&book) {
+                            tracing::debug!("Failed to persist address book: {}", e);
+                        }
+                    });
+                }
+
                 _ = phonebook_interval.tick() => {
                     // Nodes periodically refresh their presence in the stateless phonebook.
                     // This ensures that if a node's dynamic IP changes, the registry is updated,
                     // and prevents the node from expiring out of the Cloudflare KV (1hr TTL).
                     //
-                    // We explicitly check NatStatus::Public to guarantee we don't spam the 
-                    // registry with un-routable private nodes.
-                    if self.network.nat_status() == crate::network::NatStatus::Public {
-                        tracing::debug!("Refreshing node presence in the public seed registry...");
-                        self.network.publish_to_phonebook();
+                    // The NAT gate now lives inside publish_to_phonebook(). Gating
+                    // here on `== Public` meant that losing our last peer stripped
+                    // AutoNAT of its probe servers, silently stopped the refresh,
+                    // and let our entry expire — the "node adds itself, then
+                    // vanishes an hour later" symptom.
+                    tracing::debug!("Refreshing node presence in the public seed registry...");
+                    self.network.publish_to_phonebook();
+
+                    // Announce on the DHT with the same address set. dialable_addrs()
+                    // has already excluded circuit paths, webrtc-direct, and
+                    // non-routable ranges, so the announce precondition holds by
+                    // construction. Unlike the registry there is no write quota,
+                    // and libp2p republishes the provider record automatically.
+                    if let Some(a) = &amino {
+                        let addrs: Vec<libp2p::Multiaddr> = self.network
+                            .dialable_addrs()
+                            .iter()
+                            .filter_map(|s| s.parse().ok())
+                            .collect();
+                        a.announce(addrs);
+                    }
+                }
+
+                _ = discovery_interval.tick() => {
+                    // Only consult the registry when we actually need peers. A
+                    // healthy node with a full outbound set never polls at all,
+                    // which is what keeps registry load proportional to churn
+                    // rather than to network size. Polling unconditionally costs
+                    // O(N) KV reads per request x N nodes = O(N^2) reads/day.
+                    //
+                    // The address book on disk and PEX are the primary discovery
+                    // paths; this is the fallback when both have run dry.
+                    if self.network.outbound_peer_count() >= TARGET_OUTBOUND_PEERS {
+                        tracing::debug!("Skipping registry poll: outbound peer set is healthy.");
+                        continue;
+                    }
+
+                    // Query the borrowed commons first: it depends on no
+                    // Midstate-run infrastructure, unlike the registry below.
+                    if let Some(a) = &amino {
+                        a.discover();
+                    }
+
+                    // Fetch off the event loop: a 5s HTTP timeout must never stall
+                    // block or transaction processing.
+                    let tx = phonebook_tx.clone();
+                    tokio::spawn(async move {
+                        match crate::network::fetch_phonebook_peers(
+                            crate::network::PHONEBOOK_URL
+                        ).await {
+                            Ok(peers) if !peers.is_empty() => { let _ = tx.send(peers).await; }
+                            Ok(_)  => tracing::debug!("Phonebook refresh: registry is empty."),
+                            Err(e) => tracing::debug!("Phonebook refresh failed: {}", e),
+                        }
+                    });
+                }
+
+                Some(addrs) = amino_rx.recv() => {
+                    // Straight into dial_addr, which applies subnet caps, ban
+                    // checks, routability filtering, and self-exclusion. The DHT
+                    // is granted no special trust: every peer it names must still
+                    // pass the full Midstate handshake.
+                    tracing::info!("Amino rendezvous returned {} candidates", addrs.len());
+                    for addr in addrs {
+                        self.network.dial_addr(&addr);
+                    }
+                }
+
+                Some(fresh) = phonebook_rx.recv() => {
+                    let local = self.network.local_peer_id().to_string();
+                    live_peers = fresh
+                        .into_iter()
+                        .filter(|a| !a.contains(&local))
+                        .take(200)
+                        .collect();
+                    tracing::info!("Phonebook refresh: {} live peers known", live_peers.len());
+
+                    // If we are eclipsed right now, dial immediately rather than
+                    // waiting out a full connection_maintenance period.
+                    if self.network.outbound_peer_count() == 0 {
+                        for addr in &live_peers {
+                            self.network.dial_addr(addr);
+                        }
                     }
                 }
 
@@ -2977,6 +3214,14 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                                     tracing::debug!("Outbound connections low ({} inbound). Dialing bootstrap peers.", self.network.peer_count());
                                 }
                                 for addr in &self.bootstrap_peers {
+                                    self.network.dial_addr(addr);
+                                }
+                                // Also retry anyone the registry has told us about
+                                // since startup. `self.bootstrap_peers` is a frozen
+                                // snapshot from process start, so on its own it can
+                                // never recover a node that booted into an empty
+                                // registry.
+                                for addr in &live_peers {
                                     self.network.dial_addr(addr);
                                 }
                             }
@@ -3371,6 +3616,12 @@ async fn handle_message(
                 
                 // 1. Cap intake: Do not let one peer flood the table in a single message
                 for addr_str in addrs.into_iter().take(20) {
+                    // dial_addr refuses webrtc-direct (browser transport), so
+                    // admitting these would fill the pool with entries that
+                    // connection_maintenance can never turn into a connection.
+                    if addr_str.contains("/webrtc-direct") {
+                        continue;
+                    }
                     let is_valid = addr_str.parse::<Multiaddr>()
                         .map(|ma| crate::network::is_routable(&ma)) 
                         .unwrap_or(false);
@@ -7039,9 +7290,14 @@ pub(crate) fn extract_spent_addresses(batch: &crate::core::Batch) -> Vec<[u8; 32
                     if let Some(sig) = wit_inputs.first() {
                         if sig.len() == crate::core::wots::SIG_SIZE {
                             addrs.push(input.predicate.address());
-                        } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                            addrs.push(mss_sig.wots_pk);
                         }
+                    }
+                    // Must match Storage::burn_batch_addresses: every MSS
+                    // signature in the stack. Feeds Mempool::prune_on_new_block,
+                    // so a nullifier missing here leaves a now-invalid tx sitting
+                    // in the mempool being re-mined and re-evicted.
+                    for mss_sig in crate::core::mss::mss_sigs_in_stack(wit_inputs) {
+                        addrs.push(mss_sig.wots_pk);
                     }
                 }
             }
@@ -7051,9 +7307,10 @@ pub(crate) fn extract_spent_addresses(batch: &crate::core::Batch) -> Vec<[u8; 32
                 if let Some(sig) = wit_inputs.first() {
                     if sig.len() == crate::core::wots::SIG_SIZE {
                         addrs.push(inputs[0].predicate.address());
-                    } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                        addrs.push(mss_sig.wots_pk);
                     }
+                }
+                for mss_sig in crate::core::mss::mss_sigs_in_stack(wit_inputs) {
+                    addrs.push(mss_sig.wots_pk);
                 }
             }
             _ => {}
