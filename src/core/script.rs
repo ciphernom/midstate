@@ -62,6 +62,27 @@ pub const OP_INPUT_VALUE: u8      = 0x53;
 pub const OP_OUTPUT_ADDRESS: u8   = 0x54;
 pub const OP_THIS_ADDRESS: u8     = 0x55;
 
+/// Sum of the values of every input in this transaction that shares the
+/// currently-executing predicate. The multi-input counterpart of
+/// `OP_INPUT_VALUE`, and the mirror of `OP_SUM_TO_ADDR` on the output side.
+///
+/// # Reasoning
+/// Without this, a covenant can only reason about the coin it is guarding, so
+/// any rule of the form "leave a remainder behind" fails to compose: a taker
+/// spending several covenant coins in one transaction satisfies each of them
+/// against the same shared remainder output and keeps the difference. Making
+/// the sum available turns a per-coin rule into a per-transaction one.
+///
+/// # Safety / Invariants
+/// - **Consensus-gated.** Only valid at or after
+///   `COVENANT_SUM_ACTIVATION_HEIGHT`; before that it is `InvalidOpcode`, so a
+///   node running older rules and one running newer rules agree on every block
+///   below the activation height.
+/// - **Saturating.** An overflowing sum saturates to `u64::MAX`, which makes
+///   remainder comparisons demand more, never less — failure is in the safe
+///   direction.
+pub const OP_SUM_INPUT_VALUE: u8  = 0x56;
+
 // ── Consensus limits ───────────────────────────────────────────────────────
 
 pub const MAX_SCRIPT_SIZE: usize  = 1_024;
@@ -131,12 +152,17 @@ pub struct ExecContext<'a> {
     /// Address of the predicate currently executing.
     /// Equals `Predicate::Script { bytecode }.address()` for the input being verified.
     pub this_address: [u8; 32],
+    /// Total value of every input in this transaction guarded by the same
+    /// predicate as the one executing. Equals `input_value` for a single-coin
+    /// spend. Read by `OP_SUM_INPUT_VALUE`; computed once per transaction by
+    /// the caller so verification stays O(n) rather than O(n^2).
+    pub sum_input_value: u64,
 }
 
 // ── AOT validation ─────────────────────────────────────────────────────────
 
 /// Ahead-of-time structural validation. O(N) single pass.
-pub fn validate_structure(bytecode: &[u8], _height: u64) -> Result<(), ScriptError> {
+pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<(), ScriptError> {
 
     if bytecode.len() > MAX_SCRIPT_SIZE {
         return Err(ScriptError::ScriptTooLarge);
@@ -181,6 +207,13 @@ pub fn validate_structure(bytecode: &[u8], _height: u64) -> Result<(), ScriptErr
             OP_READ_INPUT_STATE | OP_READ_OUTPUT_STATE => {}
             OP_PICK | OP_SIZE | OP_MOD | OP_INPUT_VALUE => {}
             OP_OUTPUT_ADDRESS | OP_THIS_ADDRESS => {}
+            // Height-gated: rejecting this below the activation height is what
+            // keeps pre-fork and post-fork nodes agreeing on historical blocks.
+            OP_SUM_INPUT_VALUE => {
+                if height < crate::core::types::COVENANT_SUM_ACTIVATION_HEIGHT {
+                    return Err(ScriptError::InvalidOpcode(op));
+                }
+            }
             _ => return Err(ScriptError::InvalidOpcode(op)),
         }
     }
@@ -478,6 +511,12 @@ pub fn execute_script(
                 }
                 stack_push(&mut stack, from_u64(sum))?;
             }
+            OP_SUM_INPUT_VALUE => {
+                if ctx.height < crate::core::types::COVENANT_SUM_ACTIVATION_HEIGHT {
+                    return Err(ScriptError::InvalidOpcode(OP_SUM_INPUT_VALUE));
+                }
+                stack_push(&mut stack, from_u64(ctx.sum_input_value))?;
+            }
             OP_READ_INPUT_STATE => {
                 if let Some(state_bytes) = ctx.input_state {
                     stack_push(&mut stack, SmallVec::from_slice(&state_bytes))?;
@@ -642,20 +681,32 @@ pub fn compile_covenant_htlc(
 ///   (b) route the untouched remainder back to THIS covenant address (OP_THIS_ADDRESS),
 ///       keeping the order alive on the book.
 ///
-/// `max_claim` caps how much a single fill may extract FROM ONE COIN. The remainder
+/// `max_claim` caps how much a single fill may extract from the covenant coins
+/// spent by one transaction (see SOUNDNESS below). The remainder
 /// rule is written as `(value_back_to_self + max_claim) >= INPUT_VALUE` using OP_ADD
 /// (NOT OP_SUB) on purpose: with OP_SUB, any coin whose value is below `max_claim`
 /// would underflow and abort the script, making that coin permanently unspendable.
-/// The OP_ADD form instead makes a sub-`max_claim` coin simply fully claimable.
+/// The OP_ADD form instead makes a sub-`max_claim` spend simply fully claimable.
 ///
-/// ── SECURITY (read before deploying) ───────────────────────────────────────
-/// This VM has no "sum of the inputs that share this address" opcode; OP_INPUT_VALUE
-/// is per-coin. So the per-coin remainder rule does NOT compose across a multi-coin
-/// spend: a taker who spends several covenant coins in ONE transaction satisfies
-/// every input with a single shared remainder output and walks away with the rest.
-/// Until there is an OP_SUM_INPUT_VALUE (or a consensus "one covenant input per tx"
-/// rule), fills MUST be constrained to a single covenant input by the node/relayer.
-/// Also note a hashlock alone does NOT prove the Base ETH lock.
+/// ── SOUNDNESS ──────────────────────────────────────────────────────────────
+/// The remainder rule is written against `OP_SUM_INPUT_VALUE`, not
+/// `OP_INPUT_VALUE`, and this is the whole point. The per-coin form did not
+/// compose: a taker spending several covenant coins in ONE transaction
+/// satisfied every input against the same shared remainder output and kept the
+/// difference. Because a maker's ask is split into several independently
+/// sellable coins, all guarded by this identical predicate, that was a live
+/// fund-loss path rather than a theoretical one.
+///
+/// Summing over every input that shares this predicate makes the rule
+/// per-transaction: however many coins a taker sweeps, the remainder owed is
+/// computed against their total.
+///
+/// Requires height >= `COVENANT_SUM_ACTIVATION_HEIGHT`. Coins locked under the
+/// pre-activation script keep the old per-coin rule — makers with live orders
+/// from before the fork should cancel and re-post.
+///
+/// Note a hashlock alone still does NOT prove the Base ETH lock; that is the
+/// swap protocol's job, not this covenant's.
 ///
 /// Witnesses (pushed bottom -> top):
 ///   claim : [secret, 0x01]
@@ -672,12 +723,13 @@ pub fn compile_limit_order_covenant(
         bc.push(OP_HASH);
         push_data(&mut bc, secret_hash);
         bc.push(OP_EQUALVERIFY);
-        // (b) remainder continuation: (back_to_self + max_claim) >= input_value
+        // (b) remainder continuation, summed across every covenant coin this
+        //     transaction spends: (back_to_self + max_claim) >= sum(inputs)
         bc.push(OP_THIS_ADDRESS);
         bc.push(OP_SUM_TO_ADDR);          // sum of outputs paying back into this covenant
         push_int(&mut bc, max_claim);
         bc.push(OP_ADD);
-        bc.push(OP_INPUT_VALUE);
+        bc.push(OP_SUM_INPUT_VALUE);      // sum of THIS transaction's coins at this address
         bc.push(OP_GREATER_OR_EQUAL);
         bc.push(OP_VERIFY);
     bc.push(OP_ELSE);
@@ -691,15 +743,6 @@ pub fn compile_limit_order_covenant(
     bc
 }
 
-/// True 2-of-2 multisig. Witness: [Sig1, Sig2]  (Sig1 = sig over pk1, bottom of stack).
-///
-/// Replaces the channel code's previous reuse of `compile_multisig_2of3(pk1, pk2, pk2)`,
-/// which emitted THREE OP_CHECKSIG slots and therefore required THREE witness items.
-/// The cooperative close only ever supplies two (alice_sig, bob_sig), so the old script
-/// underflowed the stack and NO channel could ever be cooperatively closed.
-///
-/// Witness ordering: the first comma-element produced by build_channel_reveal (alice_sig)
-/// must land at the BOTTOM of the stack (Sig1), matching the existing 2-of-3 convention.
 pub fn compile_multisig_2of2(pk1: &[u8; 32], pk2: &[u8; 32]) -> Vec<u8> {
     let mut bc = Vec::new();
     push_data(&mut bc, pk2);
@@ -842,7 +885,108 @@ mod tests {
             input_value: 0,
             input_state: None,
             this_address: [0u8; 32],
+            sum_input_value: 0,
         }
+    }
+
+    /// The multi-input fund-loss regression.
+    ///
+    /// A maker's ask is split into several covenant coins sharing one predicate.
+    /// Under the old per-coin rule a taker could spend all of them in one
+    /// transaction and satisfy every input against a single shared remainder
+    /// output. The summed rule makes the remainder owed proportional to the
+    /// whole set.
+    #[test]
+    fn limit_order_covenant_resists_multi_input_sweep() {
+        use crate::core::types::OutputData;
+
+        let secret = [7u8; 32];
+        let secret_hash = hash(&secret);
+        let max_claim: u64 = 100;
+
+        let bc = compile_limit_order_covenant(&secret_hash, max_claim, 10_000, &[0u8; 32]);
+        let this_address = crate::core::types::Predicate::Script { bytecode: bc.clone() }.address();
+
+        // Taker sweeps three 500-unit coins (1500 total) and returns 1400,
+        // which satisfies max_claim=100 against the whole set.
+        let honest = vec![OutputData::Standard {
+            address: this_address,
+            value: 1400u64,
+            salt: [0u8; 32],
+        }];
+        let ctx_ok = ExecContext {
+            commitment: &[0u8; 32],
+            height: crate::core::types::COVENANT_SUM_ACTIVATION_HEIGHT,
+            outputs: &honest,
+            input_value: 500,
+            input_state: None,
+            this_address,
+            sum_input_value: 1500,
+        };
+        let witness = vec![secret.to_vec(), vec![0x01]];
+        assert!(
+            execute_script(&bc, &witness, &ctx_ok).is_ok(),
+            "an honest multi-coin fill must still succeed"
+        );
+
+        // The attack: same three coins, but only 400 returned — enough to pass
+        // the per-coin rule for a 500-unit coin, far short of the summed rule.
+        let cheating = vec![OutputData::Standard {
+            address: this_address,
+            value: 400u64,
+            salt: [0u8; 32],
+        }];
+        let ctx_bad = ExecContext {
+            commitment: &[0u8; 32],
+            height: crate::core::types::COVENANT_SUM_ACTIVATION_HEIGHT,
+            outputs: &cheating,
+            input_value: 500,
+            input_state: None,
+            this_address,
+            sum_input_value: 1500,
+        };
+        assert!(
+            execute_script(&bc, &witness, &ctx_bad).is_err(),
+            "sweeping several covenant coins against one remainder must fail"
+        );
+    }
+
+    /// The opcode must not exist before its activation height, or nodes on old
+    /// and new rules would disagree about historical blocks.
+    #[test]
+    fn sum_input_value_is_height_gated() {
+        let bc = vec![OP_SUM_INPUT_VALUE];
+        assert_eq!(
+            validate_structure(&bc, crate::core::types::COVENANT_SUM_ACTIVATION_HEIGHT - 1),
+            Err(ScriptError::InvalidOpcode(OP_SUM_INPUT_VALUE))
+        );
+        assert!(
+            validate_structure(&bc, crate::core::types::COVENANT_SUM_ACTIVATION_HEIGHT).is_ok()
+        );
+    }
+
+    /// A single-coin spend must behave exactly as before.
+    #[test]
+    fn sum_equals_input_value_for_single_coin_spend() {
+        use crate::core::types::OutputData;
+        let secret = [3u8; 32];
+        let bc = compile_limit_order_covenant(&hash(&secret), 100, 10_000, &[0u8; 32]);
+        let this_address = crate::core::types::Predicate::Script { bytecode: bc.clone() }.address();
+        let outs = vec![OutputData::Standard {
+            address: this_address,
+            value: 400u64,
+            salt: [0u8; 32],
+        }];
+        let ctx = ExecContext {
+            commitment: &[0u8; 32],
+            height: crate::core::types::COVENANT_SUM_ACTIVATION_HEIGHT,
+            outputs: &outs,
+            input_value: 500,
+            input_state: None,
+            this_address,
+            sum_input_value: 500,
+        };
+        assert!(execute_script(&bc, &vec![secret.to_vec(), vec![0x01]], &ctx).is_ok());
     }
 
     #[test]
@@ -975,7 +1119,7 @@ mod tests {
         let sig = wots::sign(&seed, &commitment);
         let sig_bytes = wots::sig_to_bytes(&sig);
         let bytecode = compile_p2pk(&pk);
-        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
+        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32], sum_input_value: 0 };
         assert!(execute_script(&bytecode, &[sig_bytes], &ctx).is_ok());
     }
 
@@ -986,7 +1130,7 @@ mod tests {
         let commitment = hash(b"test commitment");
         let wrong_sig = vec![0u8; wots::SIG_SIZE];
         let bytecode = compile_p2pk(&pk);
-        let ctx = ExecContext { commitment: &commitment, height: 31000, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
+        let ctx = ExecContext { commitment: &commitment, height: 31000, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32], sum_input_value: 0 };
         assert!(execute_script(&bytecode, &[wrong_sig], &ctx).is_err());
     }
 
@@ -1042,7 +1186,7 @@ mod tests {
         let sig = wots::sign(&receiver_seed, &commitment);
         let sig_bytes = wots::sig_to_bytes(&sig);
         let witness = vec![sig_bytes, secret.to_vec(), vec![1u8]];
-        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
+        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32], sum_input_value: 0 };
         assert!(execute_script(&bytecode, &witness, &ctx).is_ok());
     }
 
@@ -1057,7 +1201,7 @@ mod tests {
         let sig = wots::sign(&refund_seed, &commitment);
         let sig_bytes = wots::sig_to_bytes(&sig);
         let witness = vec![sig_bytes, vec![0u8; 32], vec![0u8]];
-        let ctx = ExecContext { commitment: &commitment, height: 31000, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
+        let ctx = ExecContext { commitment: &commitment, height: 31000, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32], sum_input_value: 0 };
         assert!(execute_script(&bytecode, &witness, &ctx).is_ok());
     }
 
@@ -1072,7 +1216,7 @@ mod tests {
         let sig = wots::sign(&refund_seed, &commitment);
         let sig_bytes = wots::sig_to_bytes(&sig);
         let witness = vec![sig_bytes, vec![0u8; 32], vec![0u8]];
-        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
+        let ctx = ExecContext { commitment: &commitment, height: 100, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32], sum_input_value: 0 };
         assert!(execute_script(&bytecode, &witness, &ctx).is_err());
     }
 
@@ -1093,7 +1237,7 @@ mod tests {
         bc.push(OP_VERIFY);
         push_int(&mut bc, 1);
         let commitment = [0u8; 32];
-        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &outputs, input_value: 0, input_state: None, this_address: [0u8; 32] };
+        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &outputs, input_value: 0, input_state: None, this_address: [0u8; 32], sum_input_value: 0 };
         assert!(execute_script(&bc, &[], &ctx).is_ok());
     }
 
@@ -1109,7 +1253,7 @@ mod tests {
         bc.push(OP_VERIFY);
         push_int(&mut bc, 1);
         let commitment = [0u8; 32];
-        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &outputs, input_value: 0, input_state: None, this_address: [0u8; 32] };
+        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &outputs, input_value: 0, input_state: None, this_address: [0u8; 32], sum_input_value: 0 };
         assert!(execute_script(&bc, &[], &ctx).is_err());
     }
 
@@ -1147,7 +1291,7 @@ mod tests {
         let sig1 = wots::sig_to_bytes(&wots::sign(&seed1, &commitment));
         let sig2 = wots::sig_to_bytes(&wots::sign(&seed2, &commitment));
         let witness = vec![sig1, sig2, vec![0u8]];
-        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
+        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32], sum_input_value: 0 };
         assert!(execute_script(&bytecode, &witness, &ctx).is_ok());
     }
 
@@ -1163,7 +1307,7 @@ mod tests {
         let bytecode = compile_multisig_2of3(&pk1, &pk2, &pk3);
         let sig1 = wots::sig_to_bytes(&wots::sign(&seed1, &commitment));
         let witness = vec![sig1, vec![0u8], vec![0u8]];
-        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
+        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32], sum_input_value: 0 };
         assert!(execute_script(&bytecode, &witness, &ctx).is_err());
     }
 
@@ -1238,7 +1382,7 @@ mod tests {
         let sig2 = wots::sig_to_bytes(&wots::sign(&seed2, &commitment));
         let sig3 = wots::sig_to_bytes(&wots::sign(&seed3, &commitment));
         let witness = vec![sig1, sig2, sig3];
-        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32] };
+        let ctx = ExecContext { commitment: &commitment, height: 0, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32], sum_input_value: 0 };
         assert!(execute_script(&bytecode, &witness, &ctx).is_ok());
     }
     
@@ -1340,6 +1484,7 @@ mod tests {
         let ctx = ExecContext {
             commitment: &[0u8; 32], height: 0, outputs: &outputs,
             input_value: 0, input_state: None, this_address: [0u8; 32],
+            sum_input_value: 0,
         };
         assert!(execute_script(&bc, &[], &ctx).is_ok());
     }
@@ -1353,6 +1498,7 @@ mod tests {
         let ctx = ExecContext {
             commitment: &[0u8; 32], height: 0, outputs: &outputs,
             input_value: 0, input_state: None, this_address: [0u8; 32],
+            sum_input_value: 0,
         };
         assert_eq!(execute_script(&bc, &[], &ctx), Err(ScriptError::InvalidStateRead));
     }
@@ -1371,6 +1517,7 @@ mod tests {
         let ctx = ExecContext {
             commitment: &[0u8; 32], height: 0, outputs: &outputs,
             input_value: 0, input_state: None, this_address: [0u8; 32],
+            sum_input_value: 0,
         };
         assert!(execute_script(&bc, &[], &ctx).is_ok());
     }
@@ -1388,7 +1535,8 @@ mod tests {
             OutputData::Standard { address: [0xEE;32], value: 8,  salt: [2; 32] },
         ];
         let ctx = ExecContext { commitment: &[0u8;32], height: 0, outputs: &outputs,
-                                input_value: 0, input_state: None, this_address: [0u8;32] };
+                                input_value: 0, input_state: None, this_address: [0u8;32],
+                                sum_input_value: 0 };
         let witness = vec![secret.to_vec(), vec![0x01]]; // [secret, selector] — no signature
         assert!(execute_script(&bc, &witness, &ctx).is_ok());
     }
@@ -1401,7 +1549,8 @@ mod tests {
         let bc = compile_covenant_htlc(&secret_hash, &buyer, 48, 500, &[0xCC; 32]);
         let outputs = vec![ OutputData::Standard { address: buyer, value: 16, salt: [0;32] } ]; // < 48
         let ctx = ExecContext { commitment: &[0u8;32], height: 0, outputs: &outputs,
-                                input_value: 0, input_state: None, this_address: [0u8;32] };
+                                input_value: 0, input_state: None, this_address: [0u8;32],
+                                sum_input_value: 0 };
         let witness = vec![secret.to_vec(), vec![0x01]];
         assert!(execute_script(&bc, &witness, &ctx).is_err()); // covenant blocks short-paying the buyer
     }
@@ -1413,7 +1562,8 @@ mod tests {
         let bc = compile_covenant_htlc(&secret_hash, &buyer, 16, 500, &[0xCC; 32]);
         let outputs = vec![ OutputData::Standard { address: buyer, value: 16, salt: [0;32] } ];
         let ctx = ExecContext { commitment: &[0u8;32], height: 0, outputs: &outputs,
-                                input_value: 0, input_state: None, this_address: [0u8;32] };
+                                input_value: 0, input_state: None, this_address: [0u8;32],
+                                sum_input_value: 0 };
         let witness = vec![[0x99u8;32].to_vec(), vec![0x01]]; // wrong preimage
         assert!(execute_script(&bc, &witness, &ctx).is_err());
     }
@@ -1429,7 +1579,8 @@ mod tests {
         let sig = wots::sig_to_bytes(&wots::sign(&refund_seed, &commitment));
         let witness = vec![sig, vec![0u8; 32], vec![0u8]]; // [sig, dummy, selector=0]
         let ctx = ExecContext { commitment: &commitment, height: 600, outputs: &[],
-                                input_value: 0, input_state: None, this_address: [0u8;32] };
+                                input_value: 0, input_state: None, this_address: [0u8;32],
+                                sum_input_value: 0 };
         assert!(execute_script(&bc, &witness, &ctx).is_ok());
     }
 }

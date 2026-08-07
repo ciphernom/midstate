@@ -810,6 +810,67 @@ pub const COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT: u64 = 110_000;
 pub const V2_ACTIVATION_HEIGHT: u64 = 100_000; 
 pub const COMMIT_WEIGHT_ACTIVATION_HEIGHT: u64 = 101_000; //ties commits pow to block weight, preventing tragedy of commons. 
 
+/// Activation height for the commit-weight cap (see `COMMIT_WEIGHT_CAP_NUM`).
+///
+/// # Reasoning
+/// The uncapped commit bonus introduced at `COMMIT_WEIGHT_ACTIVATION_HEIGHT`
+/// lets a fork's weight be dominated by re-included Commits rather than by
+/// Proof-of-Work. Commits are gossiped in cleartext and cost an attacker
+/// nothing to collect, and a commitment already sealed in one fork is still
+/// absent from a competing fork's `commitments` set — so the same Commit work
+/// can be counted on both sides of a reorg. The honest chain accrues those
+/// bonuses spread over up to `COMMITMENT_TTL` blocks; an attacker can pack the
+/// identical set into a handful of private blocks and claim the same weight.
+///
+/// Measured on mainnet at ~height 232_600, a block carried ~1.05e8 work while
+/// one Commit was credited 2^24 = 1.68e7 — about 16% of a full block. A block
+/// filled to `MAX_BATCH_COMMITS` would therefore carry ~3.35e10, equivalent to
+/// roughly 318 blocks of Proof-of-Work. The attack is unavailable at current
+/// transaction volume simply because too few live Commits exist; it becomes
+/// available precisely when the chain succeeds.
+///
+/// # Safety / Invariants
+/// - **Consensus-critical:** every node must apply the cap at exactly this
+///   height or the chain splits. Scheduled far ahead of the current tip to give
+///   operators a long upgrade window.
+pub const COMMIT_WEIGHT_CAP_ACTIVATION_HEIGHT: u64 = 300_000;
+
+/// Numerator/denominator of the maximum Commit bonus, as a fraction of the
+/// block's own Proof-of-Work.
+///
+/// # Reasoning
+/// Set to 1/4. The bonus exists to break ties in favour of Commit-including
+/// blocks and to remove the free-rider incentive to omit them, and 25% of a
+/// block's work is decisive for both. It is far too small to let banked or
+/// re-included Commits outrun honest hashpower: after the cap, out-weighting
+/// the honest chain requires a majority of Proof-of-Work again, as Nakamoto
+/// consensus intends.
+pub const COMMIT_WEIGHT_CAP_NUM: u128 = 1;
+pub const COMMIT_WEIGHT_CAP_DEN: u128 = 4;
+
+/// Activation height for `OP_SUM_INPUT_VALUE`.
+///
+/// # Reasoning
+/// Before this height the opcode is `InvalidOpcode`, so a node on old rules and
+/// a node on new rules agree byte-for-byte about every historical block. From
+/// this height covenants can express per-transaction value rules instead of
+/// per-coin ones.
+///
+/// This closes a fund-loss bug in the limit-order covenant. The old script
+/// required `outputs_back_to_self + max_claim >= OP_INPUT_VALUE`, which held
+/// for each coin individually but not for a set: a taker spending several of a
+/// maker's covenant coins in one transaction satisfied every input against the
+/// same single remainder output and kept the difference. The desktop wallet
+/// splits one ask into several covenant coins, so the exposure was real rather
+/// than theoretical.
+///
+/// Shares the activation height of the commit-weight cap so operators have one
+/// upgrade deadline rather than two.
+///
+/// # Safety / Invariants
+/// - **Consensus-critical:** every node must gate at exactly this height.
+pub const COVENANT_SUM_ACTIVATION_HEIGHT: u64 = COMMIT_WEIGHT_CAP_ACTIVATION_HEIGHT;
+
 /// True iff a state at the given height should hash with V2 rules.
 /// Single source of truth for V2 activation across the codebase.
 #[inline]

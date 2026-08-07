@@ -61,6 +61,9 @@ enum Cmd {
     ValidateAddress { addr: String, resp: oneshot::Sender<Result<()>> },
     SyncStatus(oneshot::Sender<SyncStatus>),
     NodeInfo(oneshot::Sender<NodeInfo>),
+    MiningStatus(oneshot::Sender<MiningView>),
+    StartMining { threads: usize, pool_url: String, resp: oneshot::Sender<Result<()>> },
+    StopMining { resp: oneshot::Sender<Result<()>> },
     RescanFrom { height: u64, resp: oneshot::Sender<Result<()>> },
     Consolidate { address: String, resp: oneshot::Sender<Result<String>> },
     Defrag { max_inputs: usize, resp: oneshot::Sender<Result<String>> },
@@ -221,6 +224,21 @@ impl WalletdHandle {
     }
     pub async fn node_info(&self) -> Result<NodeInfo> {
         Ok(ask!(self, NodeInfo))
+    }
+    pub async fn mining_status(&self) -> Result<MiningView> {
+        Ok(ask!(self, MiningStatus))
+    }
+    /// `threads = 0` means every core, matching the CLI's `--threads` default.
+    /// `pool_url` may be blank or a loopback address to use this machine's own
+    /// pool; anything else points the hasher at a remote pool.
+    ///
+    /// Returns as soon as startup is *scheduled* — poll `mining_status` for
+    /// progress. Bringing a pool up takes seconds and must never block the actor.
+    pub async fn start_mining(&self, threads: usize, pool_url: String) -> Result<()> {
+        ask!(self, StartMining { threads: threads, pool_url: pool_url })
+    }
+    pub async fn stop_mining(&self) -> Result<()> {
+        ask!(self, StopMining {})
     }
     pub async fn rescan_from(&self, height: u64) -> Result<()> {
         ask!(self, RescanFrom { height: height })
@@ -406,6 +424,19 @@ pub fn spawn(
     let (events, _) = broadcast::channel(256);
     let handle = WalletdHandle { tx: tx.clone(), events: events.clone() };
 
+    // The pool reads block templates from the embedded node's loopback RPC.
+    // Parse the port back out of rpc_url rather than threading a second
+    // parameter through; node_host always formats it as http://host:port.
+    let node_rpc_port = rpc_url
+        .as_deref()
+        .and_then(|u| u.rsplit(':').next())
+        .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+        .unwrap_or(8545);
+    let mining = crate::mining::MiningSupervisor::new(
+        crate::mining::work_dir_for(&data_dir),
+        node_rpc_port,
+    );
+
     let svc = Service {
         node,
         wallet_path,
@@ -424,6 +455,7 @@ pub fn spawn(
         dex_error: None,
         ledger: Ledger::default(),
         swaps: SwapBook::default(),
+        mining,
         events,
         self_tx: tx,
     };
@@ -463,6 +495,10 @@ struct Service {
     /// Live cross-chain swaps. Persisted, because the gap between the two legs
     /// is exactly where losing state loses money.
     swaps: SwapBook,
+    /// Supervises the local Stratum pool and hasher child processes. Mining is
+    /// deliberately out-of-process; see `crate::mining` for the payout and
+    /// working-directory reasons.
+    mining: crate::mining::MiningSupervisor,
     events: broadcast::Sender<WalletEvent>,
     self_tx: mpsc::Sender<Cmd>,
 }
@@ -552,6 +588,16 @@ impl Service {
             }
             Cmd::SyncStatus(resp) => {
                 let _ = resp.send(self.sync_status().await);
+            }
+            Cmd::MiningStatus(resp) => {
+                let _ = resp.send(self.mining_status_cmd().await);
+            }
+            Cmd::StartMining { threads, pool_url, resp } => {
+                let _ = resp.send(self.start_mining_cmd(threads, pool_url).await);
+            }
+            Cmd::StopMining { resp } => {
+                self.mining.stop().await;
+                let _ = resp.send(Ok(()));
             }
             Cmd::NodeInfo(resp) => {
                 let peers = self.node.get_peers().await;
@@ -1696,6 +1742,144 @@ impl Service {
             let _ = self.events.send(WalletEvent::WalletChanged);
         }
         Ok(removed)
+    }
+
+    /// Resolves (creating if needed) the address mining rewards are paid to.
+    ///
+    /// # Reasoning
+    /// **This must be an MSS address, never WOTS.** A WOTS key signs exactly
+    /// once. Mining accumulates many coinbase outputs at the payout address, and
+    /// each input carries its own witness — so spending two coins that share a
+    /// WOTS address means signing twice with the same key. That is key reuse,
+    /// and the node's punishment-burn protocol confiscates the funds. MSS at
+    /// `DEFAULT_MSS_HEIGHT` provides 2^h signatures, which is what makes an
+    /// address safe to receive at repeatedly.
+    ///
+    /// The choice is persisted to a file rather than to a wallet label, because
+    /// `Wallet::generate_mss` takes a `_label` and discards it — MSS keypairs
+    /// carry no label field, so there is nothing in the wallet to search on.
+    /// The stored address is re-validated against the wallet's own MSS keys on
+    /// every load, so a restored or replaced wallet regenerates instead of
+    /// silently mining to an address it cannot spend from.
+    ///
+    /// # Formal Specification
+    /// ```text
+    /// Pre:  wallet is unlocked
+    /// Post: Ok(a) ⇒ a is an MSS address owned by this wallet
+    ///               ∧ a was persisted, so later calls return the same a
+    ///       stored address ∉ wallet ⇒ a fresh address is generated
+    /// ```
+    ///
+    /// # Safety / Invariants
+    /// - **Ownership is checked, not assumed.** An address read from disk is
+    ///   only reused if it corresponds to a live MSS key in the open wallet.
+    fn mining_payout_address(&mut self) -> Result<String> {
+        let path = crate::mining::work_dir_for(&self.data_dir).join("payout_address");
+
+        // Scoped so the immutable wallet borrow ends before new_address().
+        let stored = {
+            let w = self.wallet.as_ref().ok_or_else(|| anyhow!("wallet is locked"))?;
+            let owned: Vec<[u8; 32]> = w
+                .mss_keys()
+                .iter()
+                .map(|m| midstate::core::compute_address(&m.master_pk))
+                .collect();
+
+            std::fs::read_to_string(&path).ok().and_then(|raw| {
+                let addr = raw.trim().to_string();
+                match midstate::core::types::parse_address_flexible(&addr) {
+                    Ok(bytes) if owned.contains(&bytes) => Some(addr),
+                    Ok(_) => {
+                        tracing::warn!(
+                            "stored mining payout address is not in this wallet; \
+                             generating a new one"
+                        );
+                        None
+                    }
+                    Err(_) => None,
+                }
+            })
+        };
+
+        if let Some(addr) = stored {
+            return Ok(addr);
+        }
+
+        // Label is passed as None deliberately: generate_mss discards it, and a
+        // label that silently vanishes is worse than no label at all.
+        let info = self.new_address(true, None)?;
+
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(&path, &info.address) {
+            // Non-fatal: mining still works, the address just won't be stable
+            // across restarts.
+            tracing::warn!("could not persist mining payout address: {e}");
+        }
+
+        let _ = self.events.send(WalletEvent::WalletChanged);
+        Ok(info.address)
+    }
+
+    /// Schedules mining startup. Returns as soon as the request is accepted —
+    /// the supervisor publishes progress through `mining_status`, because
+    /// bringing a pool up and waiting for it to answer takes seconds and must
+    /// not freeze every other wallet query while it happens.
+    async fn start_mining_cmd(&mut self, threads: usize, pool_url: String) -> Result<()> {
+        if self.wallet.is_none() {
+            bail!("unlock the wallet before mining — rewards need somewhere to go");
+        }
+        let payout = self.mining_payout_address()?;
+        self.mining.start(payout, threads, pool_url).await;
+        Ok(())
+    }
+
+    /// Builds the status view, folding in live figures from the local pool's
+    /// audit API. Child liveness is reaped here so a crashed hasher surfaces in
+    /// the UI instead of showing "running" indefinitely.
+    async fn mining_status_cmd(&mut self) -> MiningView {
+        self.mining.poll().await;
+        let st = self.mining.state().await;
+
+        let last_error = match &st.phase {
+            crate::mining::MiningPhase::Error(e) => Some(e.clone()),
+            _ => None,
+        };
+
+        let mut view = MiningView {
+            phase: st.phase.as_str().to_string(),
+            message: st.message.clone(),
+            available: crate::mining::MiningSupervisor::find_binary().is_ok(),
+            payout_address: st.payout_address.clone(),
+            pool_url: st.pool_url.clone(),
+            default_pool_url: crate::mining::MiningSupervisor::default_pool_url(),
+            local_pool: st.local_pool,
+            threads: st.threads,
+            max_threads: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+            uptime_secs: st.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+            last_error,
+            ..Default::default()
+        };
+
+        if let Some(ps) = self.mining.audit_stats().await {
+            view.hashrate = ps.hashrate;
+            view.network_hashrate = ps.network_hashrate;
+            view.network_share = ps.network_share;
+            view.shares = ps.accepted;
+            view.rejected = ps.rejected;
+            view.score = ps.score;
+            view.total_score = ps.total_score;
+            view.blocks_found = ps.blocks_found;
+            view.pool_blocks = ps.pool_blocks;
+            view.active_miners = ps.active_miners;
+            view.network_height = ps.network_height;
+            view.block_reward = ps.block_reward;
+            view.workers = ps.workers;
+        }
+        view
     }
 
     fn import_coin_cmd(

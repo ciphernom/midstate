@@ -94,6 +94,15 @@ pub struct App {
     pub history: Vec<HistoryView>,
     pub sends: Vec<SendProgress>,
     pub node: Option<NodeInfo>,
+    /// Local mining status. `None` until the Node tab has been opened once.
+    pub mining: Option<MiningView>,
+    /// Hasher thread count the user has dialled in. 0 = every core.
+    pub mining_threads: usize,
+    /// Pool the hasher should connect to. Blank means this machine's own pool.
+    pub mining_pool: String,
+    /// True once the user has edited the pool field, so a status refresh stops
+    /// overwriting what they are typing.
+    pub mining_pool_touched: bool,
 
     // UI state
     pub tab: Tab,
@@ -289,6 +298,10 @@ impl App {
             history: Vec::new(),
             sends: Vec::new(),
             node: None,
+            mining: None,
+            mining_threads: 0,
+            mining_pool: String::new(),
+            mining_pool_touched: false,
             tab: Tab::Dashboard,
             onboard: Onboard::Menu,
             busy: false,
@@ -546,6 +559,21 @@ impl App {
             Msg::History(h) => self.history = h,
             Msg::Sends(s) => self.sends = s,
             Msg::Node(n) => self.node = Some(n),
+            Msg::Mining(m) => {
+                // Adopt the daemon's settings on first load so the controls
+                // reflect a session that was already running when we attached.
+                if self.mining.is_none() {
+                    self.mining_threads = m.threads;
+                }
+                if !self.mining_pool_touched && self.mining_pool.is_empty() {
+                    self.mining_pool = if m.pool_url.is_empty() {
+                        m.default_pool_url.clone()
+                    } else {
+                        m.pool_url.clone()
+                    };
+                }
+                self.mining = Some(m);
+            }
             Msg::PhraseVerified(ok) => {
                 self.busy = false;
                 self.verify_result = Some(ok);
@@ -913,6 +941,7 @@ impl eframe::App for App {
             if t - self.node_last_poll > 3.0 {
                 self.node_last_poll = t;
                 self.go(ctx, Action::LoadNodeInfo);
+                self.go(ctx, Action::LoadMining);
             }
         }
 

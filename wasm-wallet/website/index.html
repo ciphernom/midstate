@@ -770,7 +770,7 @@ td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); 
             <h2>System Overview</h2>
             <p>Midstate is a peer-to-peer electronic cash system engineered from the ground up for constrained edge environments (specifically Cortex-A53/A72/A76 architectures). It entirely abandons elliptic curve mathematics in favor of post-quantum hash functions.</p>
             
-            <p>By enforcing sequential CPU mining, forcing all UTXOs into uniform power-of-2 denominations, it creates a robust, relatively private financial network that cannot be dominated by parallel ASICs or dismantled by blockchain surveillance firms.</p>
+            <p>By keeping proof-of-work in commodity silicon and forcing all UTXOs into uniform power-of-2 denominations, it creates a robust, relatively private financial network that a hobbyist can still mine and that resists blockchain surveillance firms.</p>
 
             <div class="callout">
                 <h4>Why the name "Midstate"?</h4>
@@ -788,7 +788,7 @@ td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); 
             <h3>How is Midstate Different?</h3>
             <ul>
                 <li><strong>No Elliptic Curves (Post-Quantum):</strong> It uses zero ECC math (no secp256k1). Every signature, commitment, and script relies solely on the BLAKE3 hash function, immunizing the network against Shor's algorithm.</li>
-                <li><strong>Sequential vs. Parallel Mining:</strong> Typical PoW allows ASICs to run trillions of hashes in parallel. Midstate forces miners to compute hashes in a strict, unrollable sequence, shifting the bottleneck from parallel throughput to single-thread latency.</li>
+                <li><strong>Commodity-Silicon Mining:</strong> Bitcoin's hobbyist-to-network gap is roughly 1 : 10<sup>9</sup>. Midstate's is about 1 : 17,600, because no ASIC has been built for it and the fastest miner remains a consumer GPU. A single-board computer is still meaningfully in the game.</li>
                 <li><strong>Power-of-2 UTXOs:</strong> Standard UTXOs use exact amounts, creating unique cryptographic fingerprints. Midstate forces all coins into identical power-of-2 denominations, fracturing surveillance graphs.</li>
                 <li><strong>Commit-Reveal Mempool:</strong> Standard mempools broadcast cleartext trades. Midstate blinds transactions in the mempool until a miner cryptographically commits to processing them.</li>
                 <li><strong>Bounded State (Sparse Merkle Trees):</strong> Instead of an infinitely growing LevelDB database, Midstate accumulates UTXOs into a rolling Sparse Merkle Tree, heavily capping the RAM required to run a full node.</li>
@@ -955,24 +955,26 @@ for step in 0..max_iters {
                 </div>
 
                 <div class="tab-content active" id="seq-hash">
-                    <h3>Neutralizing Parallel ASICs</h3>
-                    <p>Traditional Proof-of-Work (like SHA-256) operates in <code>O(1)</code> time and <code>O(N)</code> space. Finding a nonce is like buying lottery tickets: if you buy 100,000 tickets at once, you find the winner 100,000 times faster. ASICs achieve massive hashrates by stamping millions of parallel hash cores onto a single silicon die.</p>
-                    
-                    <p>Midstate inverts this model using <strong>Sequential Hashing</strong>. Finding a nonce is no longer a lottery; it is a marathon.</p>
+                    <h3>Sequential Hashing &amp; the Hardware Gap</h3>
+                    <p>To mine a block, a node picks a nonce and computes 1,000,000 BLAKE3 hashes in a strict sequence: <code>H_n = BLAKE3(H_{n-1})</code>. Each hash depends entirely on the one before it, so a <em>single</em> chain cannot be split across cores or pipelined — its latency is bounded by clock speed alone.</p>
 
-                    <p>To mine a block, a node must calculate 1,000,000 BLAKE3 hashes in a strict sequence: <code>H_n = BLAKE3(H_{n-1})</code>. Because the input of the next hash relies entirely on the output of the previous, the computation cannot be unrolled or divided across multiple cores.</p>
-                    
+                    <p>What that does <strong>not</strong> do is stop parallel hardware. Every nonce starts its own independent chain, so the <em>search</em> parallelises even though each trial does not: a miner simply runs many chains at once. Midstate's own AVX2 path advances 8 chains per core in SIMD lanes, and the GPU miner keeps tens of thousands in flight. Difficulty retargeting then cancels the per-trial cost exactly, so mining share tracks raw BLAKE3 throughput — the same quantity it would track with one hash per trial.</p>
+
+                    <p>The honest claim is narrower and more useful than "ASIC-proof":</p>
+
                     <div class="callout stark">
-                        <h4>The Ratio of Power (ASIC Resistance Bound)</h4>
-                        <p>In Bitcoin, parallel hashrate is <em>H = C / L</em> (where <em>C</em> is cores, <em>L</em> is latency). ASICs win by scaling <em>C</em> to millions.</p>
-                        <p>In Midstate, a trial requires <em>S</em> sequential hashes. The time for one trial is <em>S × L_core</em>. An ASIC designer must optimize <em>L_core</em> (clock speed) because increasing parallel cores requires duplicating the entire 1,000,000-step state machine per core, demanding massive silicon area.</p>
-                        <p>Because silicon physics caps clock speeds around 4–5 GHz, an ASIC cannot physically be millions of times faster than a standard CPU. The advantage is strictly bounded by single-thread execution limits, creating a provable ~1000:1 hardware ceiling between a supercomputer and a Raspberry Pi.</p>
+                        <h4>The Hardware Gap, Measured</h4>
+                        <p>The fastest Midstate miner is a GPU. A Raspberry Pi 5 on the 8-way NEON path does roughly 100 nonces per second; the whole network runs at around 1.7 million. That puts a hobbyist board at about <strong>1 : 17,600</strong> against the entire network.</p>
+                        <p>The comparable figure for a hobbyist Bitaxe against Bitcoin is 1 : 1,200,000,000 — and for commodity silicon (a CPU or GPU) it is worse than 1 : 10<sup>13</sup>. Midstate's hardware advantage currently sits in the commodity band, five to eight orders of magnitude tighter than Bitcoin's.</p>
+                        <p><strong>Why, precisely:</strong> no Midstate ASIC exists. That is an economic fact, not a cryptographic guarantee — a BLAKE3 chain core is comparatively easy silicon (one compression unit, 32 bytes of state, no pipeline), so a sufficiently valuable chain would attract one. The gap holds while it is not worth building, and the design accepts that trade deliberately rather than claiming immunity.</p>
                     </div>
+
+                    <p><strong>Why GPU dominance is a choice, not a failure.</strong> Pushing mining down toward CPUs and single-board computers was designed, built, and tested. Every version of it ended up favouring cheap cloud ARM instances and botnets, which is a worse outcome: a swarm of compromised phones is not decentralisation. GPUs cost capital, power, and floor space — all visible, all constrained. Keeping the advantage in commodity graphics silicon, where a Pi is still 1:17,600 rather than 1:10<sup>13</sup>, is the better of the available trades.</p>
                 </div>
 
                 <div class="tab-content" id="hw-accel">
                     <h3>Hardware Acceleration (SIMD & GPU)</h3>
-                    <p>While the sequential nature of the PoW chain prevents ASICs from collapsing the computation into a single cycle, nodes must still maximize hardware utilization to search multiple nonces concurrently. Midstate achieves this via bare-metal hardware integrations.</p>
+                    <p>A single chain cannot be collapsed into fewer cycles, so throughput comes entirely from searching many nonces concurrently — each one an independent chain. Midstate achieves this via bare-metal hardware integrations.</p>
 
                     <h4>CPU SIMD: The Dual-Issue NEON Exploit</h4>
                     <p>On x86_64 architectures, Midstate uses handwritten AVX2 intrinsics to process 8 nonces concurrently in 256-bit registers. However, ARM NEON registers are only 128-bit (4 lanes).</p>
@@ -2179,8 +2181,8 @@ Script:
                     </tr>
                     <tr>
                         <td><strong>Mining Hardware</strong></td>
-                        <td>Parallel ASICs / GPUs</td>
-                        <td class="hl">Sequential Hashing (CPUs)</td>
+                        <td>Purpose-built ASICs (1 : 10<sup>9</sup> gap)</td>
+                        <td class="hl">Commodity GPUs / CPUs (1 : 17,600 gap)</td>
                     </tr>
                     <tr>
                         <td><strong>Transaction Ordering</strong></td>
@@ -2249,7 +2251,7 @@ Script:
                     <div class="rm-status">[ SHIPPED ]</div>
                     <div class="rm-body">
                         <span class="rm-title">Sequential BLAKE3 proof-of-work</span>
-                        <div class="rm-note">One million sequential compression cycles per header. Simple, verifiable against a single scalar implementation, and hostile to parallel ASICs.</div>
+                        <div class="rm-note">One million sequential compression cycles per header. Simple, and verifiable against a single scalar implementation.</div>
                     </div>
                 </div>
 
@@ -2326,7 +2328,7 @@ Script:
                     <div class="rm-status">[ SHIPPED ]</div>
                     <div class="rm-body">
                         <span class="rm-title">8-way NEON SIMD miner</span>
-                        <div class="rm-note">A Raspberry Pi 5 does roughly 100 nonces per second. Against a GPU farm that is a gap of about 1 to 5,000 — compared with 1 to 1.2 billion for a hobbyist on Bitcoin. The hardware advantage is trapped in the commodity silicon band on purpose.</div>
+                        <div class="rm-note">A Raspberry Pi 5 does roughly 100 nonces per second against a network of about 1.7 million — a gap of roughly 1 to 17,600, compared with 1 to 1.2 billion for a hobbyist on Bitcoin. The hardware advantage sits in the commodity silicon band, and stays there while no ASIC is worth building.</div>
                     </div>
                 </div>
 

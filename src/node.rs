@@ -151,6 +151,9 @@ pub struct Node {
     /// same keypair as the main swarm so published provider records point at
     /// our real Midstate listener.
     amino_keypair: Keypair,
+    /// Gates subsystems with known unfixed exploits (CoinJoin dark pool, DEX
+    /// limit-order covenants). Off unless the operator opts in via config.
+    experimental: bool,
     metrics: Metrics,
     mining: MiningCoordinator,
     license: LicenseManager,
@@ -202,6 +205,12 @@ pub struct Node {
     chat_history: Arc<RwLock<VecDeque<ChatMessage>>>,
     seen_chats: HashSet<u64>,
     seen_chats_queue: VecDeque<u64>,
+    /// Dedup cache for inbound transaction gossip, keyed by BLAKE3 of the
+    /// serialized transaction. Every peer relays the same tx, so without this
+    /// a single broadcast costs one full `validate_transaction` (WOTS
+    /// verification + a storage query for spent addresses) per connected peer.
+    seen_txs: HashSet<[u8; 32]>,
+    seen_txs_queue: VecDeque<[u8; 32]>,
     
     outbox_chat_limiter: Arc<tokio::sync::Mutex<(u32, std::time::Instant)>>,
     light_chat_limits: Arc<tokio::sync::Mutex<std::collections::HashMap<PeerId, (u32, std::time::Instant)>>>,
@@ -1516,6 +1525,7 @@ pub async fn new(
             storage: storage.clone(),
             network,
             amino_keypair,
+            experimental: false,
             metrics: Metrics::new(),
             mining,
             license,
@@ -1575,6 +1585,8 @@ pub async fn new(
             chat_history: Arc::new(RwLock::new(VecDeque::new())),
             seen_chats: HashSet::new(),
             seen_chats_queue: VecDeque::with_capacity(5001),
+            seen_txs: HashSet::new(),
+            seen_txs_queue: VecDeque::with_capacity(4097),
             outbox_chat_limiter: Arc::new(tokio::sync::Mutex::new((0, std::time::Instant::now()))),
             light_chat_limits: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             active_burns: HashSet::new(),
@@ -1587,6 +1599,51 @@ pub async fn new(
     /// being punished by peers for GetBatches failures, as long as the license Issuer remains reputable).
     pub fn register_my_licenses(&mut self, ranges: Vec<([u8; 32], u64, u64)>) {
         self.license.register_my_licenses(ranges);
+    }
+
+    /// True for messages belonging to subsystems that are not safe to expose by
+    /// default.
+    ///
+    /// Currently the CoinJoin dark pool only. Kept as one classifier rather
+    /// than a guard per match arm so a future experimental subsystem cannot be
+    /// added to the protocol and left ungated by omission.
+    fn is_experimental_message(msg: &Message) -> bool {
+        matches!(
+            msg,
+            Message::MixAnnounce { .. }
+                | Message::MixJoin { .. }
+                | Message::MixFee { .. }
+                | Message::MixProposal { .. }
+                | Message::MixSign { .. }
+        )
+    }
+
+    /// Enables experimental subsystems (CoinJoin dark pool, DEX limit-order
+    /// covenants). Off by default; see `experimental` in config.toml.
+    pub fn set_experimental(&mut self, enabled: bool) {
+        self.experimental = enabled;
+        if enabled {
+            tracing::warn!(
+                "EXPERIMENTAL subsystems enabled: CoinJoin dark pool and DEX \
+                 limit-order covenants have known unfixed exploits. See \
+                 docs/EXPERIMENTAL.md before using these with real funds."
+            );
+        }
+    }
+
+    /// Declares this node publicly reachable, overriding AutoNAT inference.
+    ///
+    /// Called once at startup from the `public_address` config key. See
+    /// [`MidstateNetwork::declare_public`] for why inference alone is not
+    /// trusted on hosts where the operator knows the answer.
+    ///
+    /// Malformed addresses are logged and ignored rather than aborting startup:
+    /// a typo in config should degrade to AutoNAT, not prevent the node running.
+    pub fn declare_public_address(&mut self, addr: &str) {
+        match addr.parse::<Multiaddr>() {
+            Ok(ma) => self.network.declare_public(ma),
+            Err(e) => tracing::warn!("Invalid public_address {:?} in config: {}", addr, e),
+        }
     }
 
     /// Register licenses this node has *issued* as an Archiver (the 'issuer' field in LicenseMetadata).
@@ -2421,6 +2478,66 @@ async fn handle_light_request(
         if self.seen_chats_queue.len() > CHAT_DEDUP_CAPACITY {
             if let Some(old) = self.seen_chats_queue.pop_front() {
                 self.seen_chats.remove(&old);
+            }
+        }
+        true
+    }
+
+    /// Marks a gossiped transaction as seen. Returns `true` if it was novel
+    /// (caller should validate and relay), `false` if already cached.
+    ///
+    /// # Reasoning
+    /// Gossip is a flood: with N connected peers, one broadcast transaction
+    /// arrives N times. Before this cache each arrival ran the full
+    /// `validate_transaction` path — post-quantum WOTS/MSS signature
+    /// verification plus a `query_spent_addresses_for_tx` storage read — only to
+    /// be rejected by the mempool at the very end with "already in mempool".
+    /// On a 1-vCPU node with ~15 peers that is 15x the necessary verification
+    /// work per transaction, and it is attacker-amplifiable: replaying one valid
+    /// transaction costs the sender nothing and the network a full verification
+    /// each time.
+    ///
+    /// Keyed on BLAKE3 of the serialized transaction rather than a commitment or
+    /// coin id, so that Commit and Reveal forms, and any two byte-distinct
+    /// transactions, are always distinguishable.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:  true
+    /// Post:
+    ///   id ∉ seen_txs  ⇒ seen_txs' = seen_txs ∪ {id} ∧ result = true
+    ///   id ∈ seen_txs  ⇒ seen_txs' = seen_txs         ∧ result = false
+    ///   #seen_txs' ≤ TX_DEDUP_CAPACITY
+    ///   #seen_txs' = #seen_txs_queue'   (set and FIFO stay in step)
+    /// ```
+    ///
+    /// # Safety / Invariants
+    /// - **Strict FIFO eviction:** when full the oldest id is dropped from BOTH
+    ///   the set and the queue. A bulk `.clear()` would let still-circulating
+    ///   gossip re-enter and produce a broadcast storm.
+    /// - **Dedup is not validation.** A cached id means "already processed",
+    ///   never "known good"; every novel transaction still runs the full
+    ///   validation path.
+    fn mark_tx_seen(&mut self, tx: &Transaction) -> bool {
+        // Sized so a full mempool's worth of gossip stays recognised as
+        // duplicate. Each entry is 32 bytes, so the cache costs ~128 KB.
+        const TX_DEDUP_CAPACITY: usize = 4096;
+
+        let id = match bincode::serialize(tx) {
+            Ok(bytes) => crate::core::types::hash(&bytes),
+            // A transaction that will not serialize cannot be relayed either;
+            // let it through so the normal validation path rejects it.
+            Err(_) => return true,
+        };
+
+        if !self.seen_txs.insert(id) {
+            return false;
+        }
+        self.seen_txs_queue.push_back(id);
+        if self.seen_txs_queue.len() > TX_DEDUP_CAPACITY {
+            if let Some(old) = self.seen_txs_queue.pop_front() {
+                self.seen_txs.remove(&old);
             }
         }
         true
@@ -3400,7 +3517,22 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                     match event {
                         NetworkEvent::MessageReceived { peer, message, channel } => {
                             if let Err(e) = self.handle_message(peer, message, channel).await {
-                                tracing::warn!("Error from peer {}: {}", peer, e);
+                                // Mempool contention is normal gossip, not peer
+                                // misbehaviour: several peers relay the same
+                                // transaction and all but the first lose the
+                                // race. Logging these at warn buries real
+                                // protocol faults in noise — which matters most
+                                // to whoever reads these logs without having
+                                // written the code.
+                                let msg = e.to_string();
+                                let benign = msg.contains("already in mempool")
+                                    || msg.contains("RBF rejected")
+                                    || msg.contains("already being punished");
+                                if benign {
+                                    tracing::debug!("Gossip contention from {}: {}", peer, msg);
+                                } else {
+                                    tracing::warn!("Error from peer {}: {}", peer, msg);
+                                }
                             }
                         }
                         NetworkEvent::LightRequest { peer, request, respond } => {
@@ -3535,7 +3667,27 @@ async fn handle_message(
         msg: Message,
         channel: Option<ResponseChannel<Message>>,
     ) -> Result<()> {
-        
+        // ── EXPERIMENTAL SUBSYSTEM GATE ─────────────────────────────────────
+        //
+        // The CoinJoin dark pool has a known, documented griefing vector: mix
+        // registration deliberately skips signature verification (see the note
+        // in `mix.rs`, which is required to avoid a double-use of a WOTS key),
+        // so a third party can register someone else's coins. The stated
+        // mitigation — banning the PeerId on signing timeout — does not hold,
+        // because libp2p PeerIds are free to generate. An attacker with
+        // ephemeral identities can register other people's UTXOs indefinitely
+        // and leave every session hanging for signatures that never arrive.
+        //
+        // Until registration can bind to something the registrant must own,
+        // this stays off by default. Operators who accept the risk can set
+        // `experimental = true` in config.toml. Peers that have it disabled
+        // simply ignore the traffic; this is not a consensus rule and no fork
+        // results from nodes disagreeing about it.
+        if !self.experimental && Self::is_experimental_message(&msg) {
+            self.ack(channel);
+            tracing::debug!("Ignoring experimental-subsystem message from {}", from);
+            return Ok(());
+        }
 
         match msg {
             Message::Transaction(tx) => {
@@ -5150,6 +5302,16 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
                 tracing::debug!("Rate-limiting peer {}: {} txs in window", peer, entry.0);
                 return Ok(()); 
             }
+        }
+
+        // Cheap duplicate check BEFORE the expensive work below. Every peer
+        // relays the same transaction, and validate_transaction runs PQ
+        // signature verification plus a storage read. Only *gossip* is deduped:
+        // locally originated transactions (from == None) always proceed so a
+        // wallet can deliberately rebroadcast its own transaction.
+        if from.is_some() && !self.mark_tx_seen(&tx) {
+            tracing::trace!("Ignoring duplicate gossiped transaction");
+            return Ok(());
         }
 
         let wots_oracle = self.storage.query_spent_addresses_for_tx(&tx).unwrap_or_default();

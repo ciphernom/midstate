@@ -519,6 +519,26 @@ fn apply_batch_internal(
     if state.height >= crate::core::types::COMMIT_WEIGHT_ACTIVATION_HEIGHT {
         // 2^24 hashes = 16,777,216 base work per Commit
         let commit_bonus = (commit_count as u128) * 16_777_216; 
+
+        // COMMIT WEIGHT CAP (see COMMIT_WEIGHT_CAP_ACTIVATION_HEIGHT).
+        //
+        // Uncapped, this bonus can exceed the block's own PoW by orders of
+        // magnitude, and Commit work is NOT exclusive to one fork: a Commit
+        // sealed in an honest block is still absent from a competing fork's
+        // `commitments` set, so an attacker can re-include the same freely
+        // gossiped Commits and claim weight the honest chain took hundreds of
+        // blocks to accrue. Capping the bonus at a fraction of the block's own
+        // work keeps the tie-break incentive while restoring the invariant that
+        // out-weighting the chain requires majority Proof-of-Work.
+        let commit_bonus = if state.height >= crate::core::types::COMMIT_WEIGHT_CAP_ACTIVATION_HEIGHT {
+            let cap = block_work
+                .saturating_mul(crate::core::types::COMMIT_WEIGHT_CAP_NUM)
+                / crate::core::types::COMMIT_WEIGHT_CAP_DEN;
+            commit_bonus.min(cap)
+        } else {
+            commit_bonus
+        };
+
         block_work = block_work.saturating_add(commit_bonus);
     }
 
@@ -610,6 +630,78 @@ mod tests {
 
     fn easy_target() -> [u8; 32] {
         [0xff; 32]
+    }
+
+    /// Mirrors the bonus arithmetic in `apply_batch` so the cap can be exercised
+    /// without constructing thousands of Commits.
+    fn commit_bonus_at(height: u64, commit_count: u64, block_work: u128) -> u128 {
+        if height < crate::core::types::COMMIT_WEIGHT_ACTIVATION_HEIGHT {
+            return 0;
+        }
+        let raw = (commit_count as u128) * 16_777_216;
+        if height >= crate::core::types::COMMIT_WEIGHT_CAP_ACTIVATION_HEIGHT {
+            let cap = block_work.saturating_mul(crate::core::types::COMMIT_WEIGHT_CAP_NUM)
+                / crate::core::types::COMMIT_WEIGHT_CAP_DEN;
+            raw.min(cap)
+        } else {
+            raw
+        }
+    }
+
+    /// A full block of Commits must never out-weigh the block's own PoW after
+    /// the cap activates. Uses the mainnet work-per-block observed around
+    /// height 232_600 (~1.05e8), where the uncapped bonus was ~318 blocks'
+    /// worth of work.
+    #[test]
+    fn commit_bonus_is_capped_after_activation() {
+        let block_work: u128 = 105_466_415;
+        let full = crate::core::types::MAX_BATCH_COMMITS as u64;
+
+        let before = commit_bonus_at(
+            crate::core::types::COMMIT_WEIGHT_CAP_ACTIVATION_HEIGHT - 1,
+            full,
+            block_work,
+        );
+        let after = commit_bonus_at(
+            crate::core::types::COMMIT_WEIGHT_CAP_ACTIVATION_HEIGHT,
+            full,
+            block_work,
+        );
+
+        // Pre-cap: a single block carries hundreds of blocks of weight.
+        assert!(before > block_work * 100, "pre-cap bonus should dwarf block work");
+        // Post-cap: strictly a minority of the block's own Proof-of-Work.
+        assert!(after < block_work, "capped bonus must not exceed block work");
+        assert_eq!(after, block_work / 4);
+    }
+
+    /// The cap must not change behaviour for ordinary blocks — the tie-break
+    /// incentive has to survive, or miners go back to omitting Commits.
+    #[test]
+    fn typical_commit_counts_are_unaffected_by_cap() {
+        let block_work: u128 = 105_466_415;
+        // A handful of Commits, as seen on the live chain.
+        for count in [1u64, 2, 5] {
+            let capped = commit_bonus_at(
+                crate::core::types::COMMIT_WEIGHT_CAP_ACTIVATION_HEIGHT,
+                count,
+                block_work,
+            );
+            assert_eq!(
+                capped,
+                (count as u128) * 16_777_216,
+                "cap must not bite at realistic Commit counts"
+            );
+        }
+    }
+
+    /// More Commits must still mean strictly more weight up to the cap, so the
+    /// free-rider fix keeps working.
+    #[test]
+    fn commit_bonus_remains_monotonic() {
+        let block_work: u128 = 105_466_415;
+        let h = crate::core::types::COMMIT_WEIGHT_CAP_ACTIVATION_HEIGHT;
+        assert!(commit_bonus_at(h, 2, block_work) > commit_bonus_at(h, 1, block_work));
     }
 
     fn genesis_state() -> State {

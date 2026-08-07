@@ -314,6 +314,9 @@ pub fn register(
                     input_value: input.value,
                     input_state: input.commitment,
                     this_address,
+                    // Mix verification checks one input at a time against a
+                    // proposal, so there is no wider input set to sum over.
+                    sum_input_value: input.value,
                 };
                 crate::core::script::execute_script(bytecode, &[signature.clone()], &ctx).is_ok()
             }

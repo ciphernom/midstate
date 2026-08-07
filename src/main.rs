@@ -37,6 +37,31 @@ struct Config {
     /// List of Peer IDs to block from connecting
     #[serde(default)]
     banned_peers: Vec<String>,
+    /// Operator declaration that this node is publicly reachable at this
+    /// multiaddr, e.g. "/ip4/134.199.148.215/udp/9333/quic-v1".
+    ///
+    /// Overrides AutoNAT, which infers reachability from peer dial-backs and has
+    /// been observed reporting Private on hosts with a public IP, an open port
+    /// and live inbound connections. A false Private verdict silently stops both
+    /// seed-registry publication and DHT announcement, and the node disappears
+    /// from discovery an hour later with nothing in the logs to explain it.
+    ///
+    /// Leave unset on NAT'd or dynamic-IP hosts; AutoNAT is the right default
+    /// there. Only set this where you know the address is reachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_address: Option<String>,
+    /// Enable subsystems with known, unfixed exploits.
+    ///
+    /// Currently gates the CoinJoin dark pool. Mix registration deliberately
+    /// skips signature verification (avoiding a fatal double-use of a WOTS key),
+    /// which means a third party can register someone else's coins into a
+    /// session. The intended mitigation — banning the PeerId on signing timeout
+    /// — does not hold, because libp2p PeerIds cost nothing to generate.
+    ///
+    /// This is a local policy flag, not a consensus rule: nodes that disagree
+    /// about it simply ignore each other's mix traffic. No fork results.
+    #[serde(default)]
+    experimental: bool,
     /// Enable automatic pruning of old historical blocks.
     /// When true, the node will only retain the most recent PRUNE_DEPTH blocks.
     #[serde(default)]
@@ -87,6 +112,29 @@ impl Config {
 
             # List of Peer IDs to block from connecting
             banned_peers = []
+
+            # Operator declaration that this node is publicly reachable.
+            # Overrides AutoNAT, which infers reachability from peer dial-backs
+            # and can wrongly report "Private" on a host with a public IP and an
+            # open port — which silently stops seed-registry publication and DHT
+            # announcement, so the node vanishes from discovery an hour later.
+            #
+            # Set this ONLY on a host you know is reachable (static public IP,
+            # port open). Leave it unset behind NAT or on a dynamic IP.
+            #
+            # public_address = "/ip4/203.0.113.10/udp/9333/quic-v1"
+
+            # Enable subsystems with known, unfixed exploits. Leave false.
+            #
+            # Currently gates the CoinJoin dark pool: mix registration cannot
+            # verify signatures (doing so would double-use a WOTS key), so a
+            # third party can register someone else's coins and hang the session
+            # waiting for a signature that never comes. Banning the PeerId does
+            # not help — libp2p identities are free to generate.
+            #
+            # Local policy only, not consensus. Nodes that disagree just ignore
+            # each other's mix traffic.
+            experimental = false
 
             # Enable pruning of old block data (keeps only the last PRUNE_DEPTH blocks).
             # Default is false (full archival mode). Set to true to save disk space.
@@ -4958,6 +5006,14 @@ pub async fn run_node(
     }
 
     let mut node = node::Node::new(data_dir.clone(), mining_threads, listen_addr, bootstrap, banned_peers, effective_prune).await?;
+
+    // Operator override for AutoNAT. Applied before the event loop starts so the
+    // very first publish already carries the declared address.
+    if let Some(pa) = config.public_address.as_deref() {
+        node.declare_public_address(pa);
+    }
+
+    node.set_experimental(config.experimental);
 
     // --- Pruning License wallet auto-registration (startup wiring) ---
     // If a license wallet is configured, register:
