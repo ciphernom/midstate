@@ -1119,13 +1119,13 @@ impl eframe::App for App {
 /// MIDSTATE_P2P_PORT=9334
 /// MIDSTATE_RPC_PORT=8546          # "none" disables the RPC listener
 /// ```
-struct Profile {
-    base: std::path::PathBuf,
+pub(crate) struct Profile {
+    pub(crate) base: std::path::PathBuf,
     p2p_port: u16,
     rpc_port: Option<u16>,
 }
 
-fn profile() -> Profile {
+pub(crate) fn profile() -> Profile {
     let name = std::env::var("MIDSTATE_PROFILE").ok().filter(|s| !s.is_empty());
     let base = match std::env::var("MIDSTATE_DATA_DIR") {
         Ok(d) if !d.is_empty() => std::path::PathBuf::from(d),
