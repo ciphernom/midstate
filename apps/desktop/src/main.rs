@@ -47,6 +47,13 @@ impl Write for Tee {
 /// having launched. A message box is the only surface left.
 #[cfg(windows)]
 fn fatal_dialog(title: &str, body: &str) {
+    // A modal box with nobody to click it never returns. Under CI, headless
+    // sessions, or any automation, that turns a clean failure into a process
+    // that hangs forever — worse than the silence it was added to replace.
+    if std::env::var_os("MIDSTATE_NO_DIALOG").is_some() {
+        return;
+    }
+
     #[link(name = "user32")]
     extern "system" {
         fn MessageBoxW(
@@ -57,6 +64,10 @@ fn fatal_dialog(title: &str, body: &str) {
         ) -> i32;
     }
     const MB_ICONERROR: u32 = 0x0000_0010;
+    // Without these the box can open behind whatever currently has focus,
+    // which looks exactly like the silent failure we are trying to fix.
+    const MB_SETFOREGROUND: u32 = 0x0001_0000;
+    const MB_TOPMOST: u32 = 0x0004_0000;
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -64,7 +75,12 @@ fn fatal_dialog(title: &str, body: &str) {
     let text = wide(body);
     let caption = wide(title);
     unsafe {
-        MessageBoxW(std::ptr::null_mut(), text.as_ptr(), caption.as_ptr(), MB_ICONERROR);
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
+        );
     }
 }
 
@@ -133,9 +149,13 @@ fn main() -> eframe::Result {
             &format!(
                 "Midstate Desktop could not start.\n\n\
                  {e}\n\n\
-                 This is usually a graphics driver problem — the app needs \
-                 OpenGL 3.3, which some older or missing display drivers do \
-                 not provide.\n\n\
+                 This is almost always a graphics problem. The app needs \
+                 OpenGL 2.0, which every working display driver provides — so \
+                 this usually means no graphics driver is installed at all \
+                 (Windows falls back to \"Microsoft Basic Display Adapter\"), \
+                 or you are running over Remote Desktop or in a virtual \
+                 machine without 3D support.\n\n\
+                 Installing your graphics driver normally fixes it.\n\n\
                  A log was written to:\n{}",
                 log_path.display()
             ),
