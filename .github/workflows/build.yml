@@ -9,9 +9,12 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
-    name: Build on ${{ matrix.os }} (${{ matrix.artifact_name || matrix.target }})
+    name: Build on ${{ matrix.os }} (${{ matrix.pkg_name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -20,54 +23,52 @@ jobs:
           # Linux (x86_64) — node + desktop GUI
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: midstate-linux-amd64
-            bin_name: midstate
-            desktop_bin: midstate-desktop
-            desktop_name: midstate-desktop-linux-amd64
+            pkg_name: midstate-linux-amd64
+            desktop: true
 
           # Raspberry Pi 3 & Zero 2 W (Cortex-A53) — node only
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            artifact_name: midstate-rpi3-arm64
-            bin_name: midstate
+            pkg_name: midstate-rpi3-arm64
             rustflags: "-C target-cpu=cortex-a53 -C link-arg=-lgcc"
 
           # Raspberry Pi 4 (Cortex-A72) — node only
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            artifact_name: midstate-rpi4-arm64
-            bin_name: midstate
+            pkg_name: midstate-rpi4-arm64
             rustflags: "-C target-cpu=cortex-a72 -C link-arg=-lgcc"
 
           # Raspberry Pi 5 (Cortex-A76) — node only
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            artifact_name: midstate-rpi5-arm64
-            bin_name: midstate
+            pkg_name: midstate-rpi5-arm64
             rustflags: "-C target-cpu=cortex-a76 -C link-arg=-lgcc"
 
           # Windows (x86_64) — node + desktop GUI
+          #
+          # crt-static links the MSVC runtime into the binary instead of
+          # importing VCRUNTIME140.dll from the Visual C++ Redistributable.
+          # We ship a bare .exe with no installer, so there is nothing to
+          # carry that redist along; a user without it gets a loader error
+          # before main() ever runs. Costs a few hundred KB.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: midstate-windows-amd64.exe
-            bin_name: midstate.exe
-            desktop_bin: midstate-desktop.exe
-            desktop_name: midstate-desktop-windows-amd64.exe
+            pkg_name: midstate-windows-amd64
+            desktop: true
+            rustflags: "-C target-feature=+crt-static"
 
           # macOS (Intel) — node + desktop GUI shipped as a .app bundle
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact_name: midstate-macos-amd64
-            bin_name: midstate
-            desktop_bin: midstate-desktop
+            pkg_name: midstate-macos-amd64
+            desktop: true
             bundle_name: Midstate-Desktop-macos-amd64.app.zip
 
           # macOS (Apple Silicon / M1 / M2)
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: midstate-macos-arm64
-            bin_name: midstate
-            desktop_bin: midstate-desktop
+            pkg_name: midstate-macos-arm64
+            desktop: true
             bundle_name: Midstate-Desktop-macos-arm64.app.zip
 
     steps:
@@ -87,7 +88,7 @@ jobs:
     - name: Install Desktop GUI Dependencies (Linux)
       # eframe/winit links against X11, Wayland, xkbcommon and GL at build
       # time. Only the native x86_64 desktop build needs these.
-      if: matrix.os == 'ubuntu-latest' && matrix.desktop_bin != ''
+      if: matrix.os == 'ubuntu-latest' && matrix.desktop
       run: |
         sudo apt-get install -y \
           libgl1-mesa-dev libegl1-mesa-dev \
@@ -104,8 +105,9 @@ jobs:
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
       with:
-        # Cache keyed by artifact name to prevent the Pi builds from thrashing each other
-        key: ${{ matrix.target }}-${{ matrix.artifact_name }}
+        # Cache keyed by package name to prevent the Pi builds from thrashing
+        # each other (they share a target triple, differing only in RUSTFLAGS).
+        key: ${{ matrix.target }}-${{ matrix.pkg_name }}
 
     - name: Build Release (node)
       env:
@@ -116,31 +118,98 @@ jobs:
       run: cargo build --release --target ${{ matrix.target }} -p midstate
 
     - name: Build Release (desktop GUI)
-      if: matrix.desktop_bin != ''
+      if: matrix.desktop
       env:
         CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         RUSTFLAGS: ${{ matrix.rustflags || '' }}
       run: cargo build --release --target ${{ matrix.target }} -p midstate-desktop
 
-    - name: Rename Binaries for Artifacts (Linux/macOS)
+    # ── Smoke test ────────────────────────────────────────────────────────
+    # The desktop build is `windows_subsystem = "windows"` in release, so it
+    # has no console and any startup failure is invisible: no window, no
+    # message, exit code only. This launches it, waits, and fails the step if
+    # the process is already gone — which is the exact symptom users report as
+    # "I double-clicked it and nothing happened".
+    #
+    # Output is captured via redirection: a GUI-subsystem process inherits
+    # redirected standard handles from its parent even though Windows gives it
+    # no console of its own.
+    #
+    # NOTE: these runners have no GPU and no vendor OpenGL ICD, so the only
+    # OpenGL available is Windows' GDI Generic 1.1 implementation. eframe is
+    # built with the `glow` backend and needs a real 3.3 context, so this step
+    # may legitimately fail here while working fine on a machine with drivers.
+    # That is informative, not a bug in the workflow — see the notes at the
+    # bottom. `continue-on-error` keeps it from blocking releases until you
+    # have decided what the failure means.
+    - name: Smoke test (desktop GUI)
+      if: matrix.os == 'windows-latest' && matrix.desktop
+      shell: pwsh
+      continue-on-error: true
+      run: |
+        $exe = "target\${{ matrix.target }}\release\midstate-desktop.exe"
+        $out = "$env:RUNNER_TEMP\smoke-out.txt"
+        $err = "$env:RUNNER_TEMP\smoke-err.txt"
+
+        # Keep the run self-contained: scratch data dir, no RPC listener.
+        # Both are read by the app's profile() at boot.
+        $env:MIDSTATE_DATA_DIR = "$env:RUNNER_TEMP\midstate-smoke"
+        $env:MIDSTATE_RPC_PORT = "none"
+        $env:RUST_LOG = "debug"
+        $env:RUST_BACKTRACE = "1"
+
+        $p = Start-Process -FilePath $exe -PassThru `
+               -RedirectStandardOutput $out -RedirectStandardError $err
+        Start-Sleep -Seconds 30
+
+        $died = $p.HasExited
+        $code = if ($died) { $p.ExitCode } else { "still running" }
+        if (-not $died) { Stop-Process -Id $p.Id -Force }
+
+        Write-Host "--- exit: $code"
+        Write-Host "--- stdout ---"; if (Test-Path $out) { Get-Content $out }
+        Write-Host "--- stderr ---"; if (Test-Path $err) { Get-Content $err }
+
+        if ($died) {
+          Write-Host "::error::midstate-desktop.exe exited within 30s (code $code)"
+          exit 1
+        }
+        Write-Host "midstate-desktop.exe survived 30s"
+
+    # ── Packaging ─────────────────────────────────────────────────────────
+    # Binaries keep their canonical names inside an archive rather than being
+    # renamed per platform. MiningSupervisor::find_binary() looks for a file
+    # named exactly `midstate` / `midstate.exe` beside the running executable
+    # or on PATH, so a release that ships `midstate-windows-amd64.exe` can
+    # never start the hasher. Shipping the pair together in one archive fixes
+    # mining on every platform.
+    - name: Package (Linux / macOS)
       if: matrix.os != 'windows-latest'
       run: |
-        cd target/${{ matrix.target }}/release
-        mv ${{ matrix.bin_name }} ${{ matrix.artifact_name }}
-        # The macOS desktop binary keeps its name — it goes inside the bundle
-        # as CFBundleExecutable, so only Linux renames it.
-        if [ -n "${{ matrix.desktop_name }}" ]; then
-          mv ${{ matrix.desktop_bin }} ${{ matrix.desktop_name }}
+        set -euo pipefail
+        REL="target/${{ matrix.target }}/release"
+        STAGE="$RUNNER_TEMP/${{ matrix.pkg_name }}"
+        rm -rf "$STAGE"; mkdir -p "$STAGE"
+        cp "$REL/midstate" "$STAGE/"
+        if [ "${{ matrix.desktop }}" = "true" ]; then
+          cp "$REL/midstate-desktop" "$STAGE/"
         fi
+        chmod +x "$STAGE"/*
+        tar -czf "$RUNNER_TEMP/${{ matrix.pkg_name }}.tar.gz" \
+          -C "$RUNNER_TEMP" "${{ matrix.pkg_name }}"
 
-    - name: Rename Binaries for Artifacts (Windows)
+    - name: Package (Windows)
       if: matrix.os == 'windows-latest'
+      shell: pwsh
       run: |
-        Set-Location "target\${{ matrix.target }}\release"
-        Rename-Item -Path "${{ matrix.bin_name }}" -NewName "${{ matrix.artifact_name }}"
-        if ("${{ matrix.desktop_name }}" -ne "") {
-          Rename-Item -Path "${{ matrix.desktop_bin }}" -NewName "${{ matrix.desktop_name }}"
-        }
+        $rel   = "target\${{ matrix.target }}\release"
+        $stage = "$env:RUNNER_TEMP\${{ matrix.pkg_name }}"
+        Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force -Path $stage | Out-Null
+        Copy-Item "$rel\midstate.exe" $stage
+        Copy-Item "$rel\midstate-desktop.exe" $stage
+        Compress-Archive -Path "$stage\*" `
+          -DestinationPath "$env:RUNNER_TEMP\${{ matrix.pkg_name }}.zip" -Force
 
     - name: Bundle macOS .app
       if: matrix.bundle_name != ''
@@ -152,8 +221,12 @@ jobs:
         if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then VERSION="${GITHUB_REF_NAME#v}"; fi
 
         mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-        cp "$REL/${{ matrix.desktop_bin }}" "$APP/Contents/MacOS/midstate-desktop"
-        chmod +x "$APP/Contents/MacOS/midstate-desktop"
+        cp "$REL/midstate-desktop" "$APP/Contents/MacOS/midstate-desktop"
+        # The node binary rides along inside the bundle: find_binary() resolves
+        # current_exe().parent(), which is Contents/MacOS, so mining only works
+        # if `midstate` sits right here next to the GUI.
+        cp "$REL/midstate" "$APP/Contents/MacOS/midstate"
+        chmod +x "$APP/Contents/MacOS/midstate-desktop" "$APP/Contents/MacOS/midstate"
 
         # Build the .icns from the checked-in 1024px source. Every size macOS
         # asks for is generated — iconutil rejects an iconset with gaps.
@@ -196,19 +269,20 @@ jobs:
         # symlinks, which yields a bundle macOS refuses to launch.
         ditto -c -k --keepParent "$APP" "$REL/${{ matrix.bundle_name }}"
 
-    - name: Upload Artifact (node)
+    - name: Upload Artifact (archive, Linux/macOS)
+      if: matrix.os != 'windows-latest'
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ matrix.artifact_name }}
-        path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+        name: ${{ matrix.pkg_name }}
+        path: ${{ runner.temp }}/${{ matrix.pkg_name }}.tar.gz
         if-no-files-found: error
 
-    - name: Upload Artifact (desktop GUI)
-      if: matrix.desktop_name != ''
+    - name: Upload Artifact (archive, Windows)
+      if: matrix.os == 'windows-latest'
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ matrix.desktop_name }}
-        path: target/${{ matrix.target }}/release/${{ matrix.desktop_name }}
+        name: ${{ matrix.pkg_name }}
+        path: ${{ runner.temp }}/${{ matrix.pkg_name }}.zip
         if-no-files-found: error
 
     - name: Upload Artifact (macOS .app bundle)
@@ -245,6 +319,29 @@ jobs:
 # Pi targets build the node only, by design — cross-compiling the GUI to
 # arm64 would need arm64 X11/Wayland/GL libraries in the linker sysroot,
 # which apt on an amd64 runner does not provide.
+#
+# WINDOWS SMOKE TEST. If it fails with an OpenGL / context-creation error,
+# that is a real reproduction of the "nothing happens when I run it" reports,
+# not a runner artefact: eframe is configured with `glow` and no wgpu
+# fallback, so it needs an OpenGL 3.3 context, and a machine with no vendor
+# ICD only offers Windows' GDI Generic 1.1. The fix belongs in the app, not
+# here — at minimum, catch the Err from run_native and put it in front of the
+# user (a MessageBoxW works and needs no new crates), since right now that
+# error goes to a stderr that does not exist. Shipping Mesa's software
+# opengl32.dll beside the binary is the usual way to make such machines work
+# at all; app-local DLLs win the search order, so no install step is needed.
+# If it fails for some other reason, treat the runner as a confound and
+# confirm on real hardware before chasing it.
+#
+# CRT-STATIC. If the Windows build starts failing to link after this change,
+# the cause is a C dependency compiled against the dynamic runtime (mimalloc
+# is the likely candidate). cc-rs normally follows the crt-static flag on its
+# own; if something does not, drop the flag and go back to documenting the
+# VC++ Redistributable as a prerequisite.
+#
+# ASSET NAMES CHANGED. Releases now carry archives (midstate-windows-amd64.zip,
+# midstate-linux-amd64.tar.gz, …) rather than bare renamed binaries, so any
+# install docs or download links pointing at the old names need updating.
 #
 # The macOS bundle is UNSIGNED. Gatekeeper will refuse it on first launch
 # ("unidentified developer", or "damaged" once the download carries a
