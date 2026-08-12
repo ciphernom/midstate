@@ -1502,7 +1502,20 @@ pub async fn new(
         // our real Midstate listener. Cloned before `keypair` is moved below.
         let amino_keypair = keypair.clone();
 
-        let network = MidstateNetwork::new(keypair, listen_addr, bootstrap_peers, banned_peers).await?;
+        // Same reasoning as the peer identity above: the certhash in our
+        // /webrtc-direct/ addresses is this certificate's fingerprint, so
+        // regenerating it each boot invalidates every saved multiaddr —
+        // browser wallets pointed at their own node, bootstrap lists, the lot.
+        let webrtc_cert = load_or_create_webrtc_cert(&data_dir);
+
+        let network = MidstateNetwork::new(
+            keypair,
+            listen_addr,
+            bootstrap_peers,
+            banned_peers,
+            webrtc_cert,
+        )
+        .await?;
 
         let mut recent_headers = VecDeque::new();
         let window = DIFFICULTY_LOOKBACK as u64;
@@ -7429,7 +7442,78 @@ fn save_keypair(data_dir: &PathBuf, keypair: &Keypair) {
     let path = data_dir.join("peer_key");
     if let Ok(ed_kp) = keypair.clone().try_into_ed25519() {
         let _ = std::fs::write(&path, ed_kp.to_bytes());
+        restrict_permissions(&path);
     }
+}
+
+// ── WebRTC certificate persistence ──────────────────────────────────────────
+
+/// Best-effort owner-only permissions for files holding private keys.
+///
+/// No-op on Windows, where the default ACL on a per-user data directory
+/// already excludes other users.
+fn restrict_permissions(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Load the node's WebRTC DTLS certificate, generating and saving one on first
+/// run.
+///
+/// The `/certhash/` component of a `/webrtc-direct/` multiaddr is this
+/// certificate's fingerprint, which is how a browser authenticates the node
+/// without a CA. Generating it afresh each start changes the node's published
+/// address every restart, so anything that saved the address — a browser
+/// wallet configured to use its own node, a hardcoded bootstrap entry — breaks
+/// silently until someone re-copies it.
+///
+/// Returns `None` only if generation itself fails, in which case the caller
+/// falls back to an ephemeral certificate rather than refusing to start.
+fn load_or_create_webrtc_cert(data_dir: &PathBuf) -> Option<libp2p_webrtc::tokio::Certificate> {
+    use libp2p_webrtc::tokio::Certificate;
+
+    let path = data_dir.join("webrtc_cert.pem");
+
+    if let Ok(pem) = std::fs::read_to_string(&path) {
+        match Certificate::from_pem(&pem) {
+            Ok(cert) => {
+                tracing::info!("Loaded persistent WebRTC certificate");
+                return Some(cert);
+            }
+            // Corrupt, truncated, or written by an incompatible version.
+            // Losing the old certhash is bad; refusing to start is worse.
+            Err(e) => tracing::warn!(
+                "WebRTC certificate at {} is unusable ({e}); generating a new one \
+                 — the node's certhash will change",
+                path.display()
+            ),
+        }
+    }
+
+    let cert = match Certificate::generate(&mut rand::rngs::OsRng) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("WebRTC certificate generation failed: {e}");
+            return None;
+        }
+    };
+
+    match std::fs::write(&path, cert.serialize_pem()) {
+        Ok(()) => {
+            restrict_permissions(&path);
+            tracing::info!("Generated new persistent WebRTC certificate");
+        }
+        Err(e) => tracing::warn!(
+            "could not save the WebRTC certificate to {} ({e}) — it will change on restart",
+            path.display()
+        ),
+    }
+    Some(cert)
 }
 
 impl Drop for Node {

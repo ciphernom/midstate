@@ -127,21 +127,14 @@ jobs:
     # ── Smoke test ────────────────────────────────────────────────────────
     # The desktop build is `windows_subsystem = "windows"` in release, so it
     # has no console and any startup failure is invisible: no window, no
-    # message, exit code only. This launches it, waits, and fails the step if
-    # the process is already gone — which is the exact symptom users report as
-    # "I double-clicked it and nothing happened".
+    # message, exit code only. This launches it, waits, then judges the run
+    # from the captured log rather than from liveness alone — see the NOTES
+    # at the bottom for the three outcomes and for why MIDSTATE_NO_DIALOG
+    # has to be set.
     #
     # Output is captured via redirection: a GUI-subsystem process inherits
-    # redirected standard handles from its parent even though Windows gives it
-    # no console of its own.
-    #
-    # NOTE: these runners have no GPU and no vendor OpenGL ICD, so the only
-    # OpenGL available is Windows' GDI Generic 1.1 implementation. eframe is
-    # built with the `glow` backend and needs a real 3.3 context, so this step
-    # may legitimately fail here while working fine on a machine with drivers.
-    # That is informative, not a bug in the workflow — see the notes at the
-    # bottom. `continue-on-error` keeps it from blocking releases until you
-    # have decided what the failure means.
+    # redirected standard handles from its parent even though Windows gives
+    # it no console of its own.
     - name: Smoke test (desktop GUI)
       if: matrix.os == 'windows-latest' && matrix.desktop
       shell: pwsh
@@ -221,6 +214,75 @@ jobs:
         Copy-Item "$rel\midstate-desktop.exe" $stage
         Compress-Archive -Path "$stage\*" `
           -DestinationPath "$env:RUNNER_TEMP\${{ matrix.pkg_name }}.zip" -Force
+
+
+    - name: Package software OpenGL (Windows)
+      if: matrix.os == 'windows-latest'
+      shell: pwsh
+      # Depends on an external release layout, so a break here should not
+      # block shipping the actual binaries.
+      continue-on-error: true
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; 'User-Agent' = 'midstate-ci' }
+        $rel = Invoke-RestMethod -Headers $headers `
+                 -Uri 'https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest'
+        $asset = $rel.assets | Where-Object { $_.name -like '*-release-msvc.7z' } | Select-Object -First 1
+        if (-not $asset) { throw "no release-msvc.7z asset in $($rel.tag_name)" }
+        Write-Host "Mesa $($rel.tag_name): $($asset.name)"
+
+        $archive = "$env:RUNNER_TEMP\mesa.7z"
+        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive
+        $extract = "$env:RUNNER_TEMP\mesa"
+        & 7z x $archive "-o$extract" -y | Out-Null
+
+        # Take opengl32.dll's whole directory: current Mesa splits the driver
+        # across several DLLs (libgallium_wgl, dxil, ...) and opengl32.dll on
+        # its own will not load.
+        $dll = Get-ChildItem $extract -Recurse -Filter opengl32.dll |
+               Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+        if (-not $dll) { throw 'no x64 opengl32.dll in the Mesa archive' }
+
+        $sw = "$env:RUNNER_TEMP\midstate-windows-software-gl"
+        Remove-Item -Recurse -Force $sw -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force -Path $sw | Out-Null
+        Copy-Item "$($dll.Directory)\*" -Destination $sw -Recurse
+
+        # Array-joined rather than a here-string: PowerShell requires the "@
+        # terminator at column 0, which YAML block indentation breaks.
+        $readme = @(
+          'Software OpenGL for Midstate Desktop',
+          '====================================',
+          '',
+          'Only needed if Midstate Desktop refuses to start with an OpenGL error.',
+          'That happens when no graphics driver is installed: a virtual machine',
+          'with no GPU passed through, a Remote Desktop session, or a Windows',
+          'install running on "Microsoft Basic Display Adapter".',
+          '',
+          'To use it: copy EVERY file in this folder into the folder containing',
+          'midstate-desktop.exe, then start the app normally.',
+          '',
+          'Do NOT do this on a machine with working graphics. Windows loads an',
+          'opengl32.dll sitting beside the executable in preference to the real',
+          'driver, so these files would replace your GPU with software rendering.',
+          '',
+          "Mesa $($rel.tag_name) - https://github.com/pal1000/mesa-dist-win"
+        ) -join "`r`n"
+        Set-Content "$sw\README.txt" -Value $readme -Encoding UTF8
+
+        Compress-Archive -Path "$sw\*" `
+          -DestinationPath "$env:RUNNER_TEMP\midstate-windows-software-gl.zip" -Force
+
+    - name: Upload Artifact (software OpenGL)
+      if: matrix.os == 'windows-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: midstate-windows-software-gl
+        path: ${{ runner.temp }}/midstate-windows-software-gl.zip
+        if-no-files-found: warn
+
 
     - name: Bundle macOS .app
       if: matrix.bundle_name != ''
@@ -352,12 +414,15 @@ jobs:
 # alive and a failed start reads as a pass — which is exactly what happened
 # on this step's first run.
 #
-# SOFTWARE OPENGL. Mesa's llvmpipe opengl32.dll gives such machines a working
-# GL 4.5, and egui is light enough to be usable on it. Do NOT ship it beside
-# the executable: app-local DLLs win the DLL search order unconditionally, so
-# every user with a real GPU would silently drop to software rendering. Put
-# it in a software-gl\ subfolder with a README, and let anyone who cannot
-# install a driver copy it up one level themselves.
+# SOFTWARE OPENGL. Mesa's llvmpipe opengl32.dll gives driverless machines a
+# working GL 4.5, and egui is light enough to be usable on it. It ships as a
+# SEPARATE release asset (midstate-windows-software-gl.zip), not inside the
+# main archive: it is ~100 MB and only users whose hardware path already
+# failed need it. It must NOT be unpacked beside the executable by default —
+# an app-local opengl32.dll wins the DLL search order unconditionally, so
+# every user with a real GPU would silently drop to software rendering. The
+# README in the zip says to copy the files in only when the app refuses to
+# start, and the error dialog points there.
 #
 # CRT-STATIC. The Windows target links the MSVC runtime statically so the
 # shipped .exe needs no Visual C++ Redistributable — there is no installer to

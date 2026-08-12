@@ -404,14 +404,24 @@ pub struct MidstateNetwork {
 }
 
 impl MidstateNetwork {
+    /// `webrtc_cert` is the DTLS certificate whose fingerprint becomes the
+    /// `/certhash/` component of every `/webrtc-direct/` listen address.
+    /// Pass `Some` to keep that address stable across restarts; `None`
+    /// generates an ephemeral one, which is fine for short-lived tooling but
+    /// means saved multiaddrs stop resolving after a restart.
     pub async fn new(
         keypair: Keypair,
         listen_addr: Multiaddr,
         bootstrap_peers: Vec<Multiaddr>,
         static_banned_peers: HashSet<PeerId>,
+        webrtc_cert: Option<libp2p_webrtc::tokio::Certificate>,
     ) -> Result<Self> {
         let peer_id = keypair.public().to_peer_id();
         tracing::info!("Local peer id: {}", peer_id);
+
+        // Consumed inside the transport closure below. `take()` rather than a
+        // move so this compiles whether the builder wants FnOnce or FnMut.
+        let mut webrtc_cert = webrtc_cert;
 
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
             .with_tokio()
@@ -421,10 +431,14 @@ impl MidstateNetwork {
                 yamux::Config::default,
             )?
             .with_quic()
-.with_other_transport(|keypair| {
-                let certificate = libp2p_webrtc::tokio::Certificate::generate(&mut rand::rngs::OsRng)
-                    .expect("WebRTC certificate generation");
-                    
+.with_other_transport(move |keypair| {
+                let certificate = match webrtc_cert.take() {
+                    Some(cert) => cert,
+                    None => libp2p_webrtc::tokio::Certificate::generate(&mut rand::rngs::OsRng)
+                        .expect("WebRTC certificate generation"),
+                };
+
+
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
                     libp2p_webrtc::tokio::Transport::new(keypair.clone(), certificate)
                         .map(|(peer_id, conn), _| (peer_id, StreamMuxerBox::new(conn)))

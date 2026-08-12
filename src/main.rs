@@ -5254,7 +5254,9 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
        .context("Invalid peer multiaddr (expected e.g. /ip4/1.2.3.4/tcp/9333/p2p/12D3KooW...)")?;
 
     let keypair = libp2p::identity::Keypair::generate_ed25519();
-    let mut network = MidstateNetwork::new(keypair, listen_addr, vec![peer_multiaddr], std::collections::HashSet::new()).await?;
+    // Ephemeral certificate: this is a one-shot dial, not a listening node, so
+    // nothing will ever have saved its address.
+    let mut network = MidstateNetwork::new(keypair, listen_addr, vec![peer_multiaddr], std::collections::HashSet::new(), None).await?;
 
     println!("Dialing peer...");
     
