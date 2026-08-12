@@ -155,7 +155,10 @@ fn main() -> eframe::Result {
                  (Windows falls back to \"Microsoft Basic Display Adapter\"), \
                  or you are running over Remote Desktop or in a virtual \
                  machine without 3D support.\n\n\
-                 Installing your graphics driver normally fixes it.\n\n\
+                 Installing your graphics driver normally fixes it. If there is \
+                 no GPU to install a driver for (a virtual machine, for \
+                 example), download midstate-windows-software-gl.zip from the \
+                 releases page and follow the README inside.\n\n\
                  A log was written to:\n{}",
                 log_path.display()
             ),
