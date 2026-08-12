@@ -145,16 +145,16 @@ jobs:
     - name: Smoke test (desktop GUI)
       if: matrix.os == 'windows-latest' && matrix.desktop
       shell: pwsh
-      continue-on-error: true
       run: |
         $exe = "target\${{ matrix.target }}\release\midstate-desktop.exe"
         $out = "$env:RUNNER_TEMP\smoke-out.txt"
         $err = "$env:RUNNER_TEMP\smoke-err.txt"
 
-        # Keep the run self-contained: scratch data dir, no RPC listener.
-        # Both are read by the app's profile() at boot.
         $env:MIDSTATE_DATA_DIR = "$env:RUNNER_TEMP\midstate-smoke"
         $env:MIDSTATE_RPC_PORT = "none"
+        # Without this the error dialog blocks forever and the process looks
+        # alive, so a failed start reads as a pass.
+        $env:MIDSTATE_NO_DIALOG = "1"
         $env:RUST_LOG = "debug"
         $env:RUST_BACKTRACE = "1"
 
@@ -166,10 +166,21 @@ jobs:
         $code = if ($died) { $p.ExitCode } else { "still running" }
         if (-not $died) { Stop-Process -Id $p.Id -Force }
 
+        $log = ((Get-Content $out -Raw -ErrorAction SilentlyContinue) + "`n" +
+                (Get-Content $err -Raw -ErrorAction SilentlyContinue))
         Write-Host "--- exit: $code"
-        Write-Host "--- stdout ---"; if (Test-Path $out) { Get-Content $out }
-        Write-Host "--- stderr ---"; if (Test-Path $err) { Get-Content $err }
+        Write-Host $log
 
+        # Most specific first: the one failure this environment cannot avoid,
+        # then "never started at all", then any other early exit.
+        if ($log -match 'egui_glow requires opengl') {
+          Write-Host "::warning::runner has no OpenGL (GDI Generic) - expected, not a regression"
+          exit 0
+        }
+        if ($log -notmatch 'starting on windows') {
+          Write-Host "::error::no startup banner - died before logging began"
+          exit 1
+        }
         if ($died) {
           Write-Host "::error::midstate-desktop.exe exited within 30s (code $code)"
           exit 1
@@ -320,24 +331,42 @@ jobs:
 # arm64 would need arm64 X11/Wayland/GL libraries in the linker sysroot,
 # which apt on an amd64 runner does not provide.
 #
-# WINDOWS SMOKE TEST. If it fails with an OpenGL / context-creation error,
-# that is a real reproduction of the "nothing happens when I run it" reports,
-# not a runner artefact: eframe is configured with `glow` and no wgpu
-# fallback, so it needs an OpenGL 3.3 context, and a machine with no vendor
-# ICD only offers Windows' GDI Generic 1.1. The fix belongs in the app, not
-# here — at minimum, catch the Err from run_native and put it in front of the
-# user (a MessageBoxW works and needs no new crates), since right now that
-# error goes to a stderr that does not exist. Shipping Mesa's software
-# opengl32.dll beside the binary is the usual way to make such machines work
-# at all; app-local DLLs win the search order, so no install step is needed.
-# If it fails for some other reason, treat the runner as a confound and
-# confirm on real hardware before chasing it.
+# WINDOWS SMOKE TEST. Launches the release GUI, waits 30s, then reads the
+# captured log rather than trusting the exit code alone. Three outcomes:
 #
-# CRT-STATIC. If the Windows build starts failing to link after this change,
-# the cause is a C dependency compiled against the dynamic runtime (mimalloc
-# is the likely candidate). cc-rs normally follows the crt-static flag on its
-# own; if something does not, drop the flag and go back to documenting the
-# VC++ Redistributable as a prerequisite.
+#   * "egui_glow requires opengl" — expected here, NOT a regression. These
+#     runners have no GPU and no vendor ICD, so Windows serves its built-in
+#     GDI Generic 1.1 path, and the glow backend (eframe is built with
+#     `glow` and no wgpu fallback) refuses it. The step warns and passes.
+#   * No startup banner — the process died before tracing initialised. That
+#     is a loader or packaging failure, and always a real bug.
+#   * Any other early exit — a real regression. Read the dumped log.
+#
+# Confirmed 2026-08-12: this is the same failure users hit on machines with
+# no graphics driver installed, where Windows falls back to "Microsoft Basic
+# Display Adapter". main.rs catches the Err from run_native and shows a
+# MessageBoxW, so those users now get an explanation instead of silence.
+#
+# That dialog is why this step sets MIDSTATE_NO_DIALOG=1. A modal box with
+# nobody to click it never returns, so without the variable the process stays
+# alive and a failed start reads as a pass — which is exactly what happened
+# on this step's first run.
+#
+# SOFTWARE OPENGL. Mesa's llvmpipe opengl32.dll gives such machines a working
+# GL 4.5, and egui is light enough to be usable on it. Do NOT ship it beside
+# the executable: app-local DLLs win the DLL search order unconditionally, so
+# every user with a real GPU would silently drop to software rendering. Put
+# it in a software-gl\ subfolder with a README, and let anyone who cannot
+# install a driver copy it up one level themselves.
+#
+# CRT-STATIC. The Windows target links the MSVC runtime statically so the
+# shipped .exe needs no Visual C++ Redistributable — there is no installer to
+# carry one along. This links cleanly as of 2026-08-12; if it ever stops,
+# suspect a C dependency built against the dynamic runtime (mimalloc is the
+# likely candidate; cc-rs normally follows the crt-static flag on its own).
+# To confirm the dependency is actually gone, check a downloaded artifact's
+# import table for VCRUNTIME140.dll:
+#     x86_64-w64-mingw32-objdump -p midstate-desktop.exe | grep 'DLL Name'
 #
 # ASSET NAMES CHANGED. Releases now carry archives (midstate-windows-amd64.zip,
 # midstate-linux-amd64.tar.gz, …) rather than bare renamed binaries, so any
