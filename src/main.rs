@@ -165,19 +165,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run a full node: P2P networking, JSON-RPC, and optionally mining.
+    /// Wallet commands need a node reachable on --rpc-port, so this is usually
+    /// the first thing you start.
     Node {
+        /// Directory holding the block database, chain state, and mining seed.
         #[arg(long, default_value = "./data")]
         data_dir: PathBuf,
+        /// TCP port for the P2P listener.
         #[arg(long, default_value = "9333")]
         port: u16,
+        /// TCP port for the HTTP JSON-RPC server that wallet commands connect to.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// Address the RPC server binds to. Keep this on localhost unless you
+        /// intend to expose RPC to other machines — the interface is unauthenticated,
+        /// so anything that can reach it can drive this node.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_bind: String,
+        /// Multiaddr of a peer to dial on startup. Repeat the flag to add several.
         #[arg(long)]
         peer: Vec<String>,
+        /// Mine blocks on this node, crediting rewards to its local mining seed.
         #[arg(long)]
         mine: bool,
+        /// Number of mining threads. Defaults to the detected core count.
         #[arg(long)] 
         threads: Option<usize>,
         
@@ -185,10 +197,15 @@ enum Command {
         #[arg(long, default_value = "auto")]
         backend: String,
         
+        /// Number of threads used to verify incoming blocks and signatures.
+        /// Defaults to the detected core count.
         #[arg(long)]
         verify_threads: Option<usize>,
+        /// Full multiaddr to listen on, overriding --port
+        /// (e.g. /ip4/0.0.0.0/tcp/9333 to accept connections from other machines).
         #[arg(long)]
         listen: Option<String>,
+        /// Path to a config file supplying values in place of the defaults above.
         #[arg(long)]
         config: Option<PathBuf>,
 
@@ -203,68 +220,105 @@ enum Command {
         #[arg(long)]
         license_wallet: Option<PathBuf>,
     },
+    /// Create, restore, inspect, and spend from a local wallet.dat.
     Wallet {
         #[command(subcommand)]
         action: WalletAction,
     },
+    /// Submit a commitment for coins held outside this wallet, supplying raw
+    /// coin IDs and destination hashes. Wallet users should prefer `wallet send`,
+    /// which builds and reveals the transaction for you.
     Commit {
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
+        /// Coin ID (hex) to spend. Repeat the flag for multiple inputs.
         #[arg(long)]
         coin: Vec<String>,
+        /// Destination address hash (hex). Repeat the flag for multiple outputs.
         #[arg(long)]
         dest: Vec<String>,
     },
+    /// Query a node for the on-chain value of a single coin.
     Balance {
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
+        /// Coin ID (hex) to look up.
         #[arg(long)]
         coin: String,
     },
+    /// Print the node's current chain state (tip height and consensus fields).
     State {
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
     },
+    /// List the transactions a node is currently holding in its mempool.
     Mempool {
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
     },
+    /// List the peers a node is currently connected to.
     Peers {
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
     },
+    /// Generate a standalone WOTS keypair and print its seed and address.
+    /// The keypair is NOT added to any wallet — if you lose the printed seed,
+    /// anything sent to the address is unspendable. For everyday use prefer
+    /// `wallet receive`, which stores the key for you.
     Keygen {
+        /// Ask a node on this port to generate the keypair instead of generating
+        /// it locally. Omit to generate offline with no node running.
         #[arg(long)]
         rpc_port: Option<u16>,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
     },
+    /// Download and verify the chain from a single peer into a fresh data
+    /// directory, starting at genesis.
     Sync {
+        /// Directory to write the synced chain into.
         #[arg(long, default_value = "./data")]
         data_dir: PathBuf,
+        /// Multiaddr of the peer to sync from.
         #[arg(long)]
         peer: String,
+        /// Local P2P port to use for the duration of the sync.
         #[arg(long, default_value = "9333")]
         port: u16,
     },
  /// Run the Provably Fair Stratum Pool Server
     Pool {
+        /// Address that receives block rewards found by this pool.
         #[arg(long)]
         pool_address: String,
+        /// Host:port the Stratum listener binds to.
         #[arg(long, default_value = "0.0.0.0:3333")]
         bind_addr: String,
+        /// RPC port of the node this pool pulls block templates from.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node this pool pulls block templates from.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
         /// The percentage fee the pool takes from block rewards (e.g. 1.0 for 1%)
@@ -286,12 +340,16 @@ enum Command {
     },
     /// Pure Hasher: Connect to a Stratum pool without running a full node
     Miner {
+        /// Stratum URL of the pool to connect to.
         #[arg(long)]
         pool_url: String,
+        /// Address the pool should credit your shares to.
         #[arg(long)]
         payout_address: String,
+        /// Worker name reported to the pool, so multiple rigs show separately.
         #[arg(long, default_value = "default")]
         worker: String,
+        /// Number of hashing threads. 0 uses every detected core.
         #[arg(long, default_value = "0")]
         threads: usize,
     },
@@ -299,51 +357,88 @@ enum Command {
 
 #[derive(Subcommand)]
 enum WalletAction {
+    /// Create a new HD wallet and print its 24-word BIP39 recovery phrase.
+    /// The phrase is displayed exactly once and is the only way to recover the
+    /// wallet — write it down before continuing.
     Create {
+        /// Where to write the new encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// Create a non-HD legacy wallet with no recovery phrase. Its keys cannot
+        /// be regenerated from a seed, so the wallet.dat file itself becomes the
+        /// only backup. Use only for compatibility with pre-HD wallets.
         #[arg(long)]
         legacy: bool,
     },
+    /// Rebuild an HD wallet from its 24-word recovery phrase and rediscover its
+    /// coins on-chain.
+    ///
+    /// Requires a running node: the gap-limit chain scan runs automatically as
+    /// part of this command, so no separate `wallet scan` is needed afterwards.
     Restore {
+        /// Where to write the restored wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// The 24-word recovery phrase. Omit this flag to be prompted for it
+        /// instead, which keeps the phrase out of your shell history.
         #[arg(long)]
         phrase: Option<String>,
+        /// RPC port of the node used for the recovery scan.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node used for the recovery scan.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
     },
+    /// Generate one new receiving address and print it.
+    /// WOTS addresses are single-use: request a fresh one for every payment.
     Receive {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// Label stored alongside the address. Defaults to "receive #N".
         #[arg(long)]
         label: Option<String>,
     },
+    /// Generate one or more keys in the wallet and print their addresses.
+    /// To hand a single address to a sender, `wallet receive` is friendlier.
     Generate {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// How many keys to generate.
         #[arg(long, short, default_value = "1")]
         count: usize,
+        /// Label for the new keys. With --count above 1, an index is appended.
         #[arg(long)]
         label: Option<String>,
     },
+    /// Generate a reusable MSS address backed by a Merkle signature tree.
+    /// Unlike a single-use WOTS address, it can be spent from up to 2^height times.
     GenerateMss {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// Tree height. Capacity is 2^height signatures — height 10 gives 1024.
+        /// Each extra level doubles both capacity and generation time.
         #[arg(long, default_value = "10")]
         height: u32,
+        /// Label stored alongside the address.
         #[arg(long)]
         label: Option<String>,
     },
+    /// List the coins this wallet holds.
     List {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// RPC port of the node used to check which coins are still live.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node used to check which coins are still live.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
+        /// Show full coin IDs and addresses instead of truncated ones.
         #[arg(long)]
         full: bool,
         /// Only show coins that are confirmed live on-chain
@@ -356,91 +451,155 @@ enum WalletAction {
         #[arg(long, value_name = "TYPE")]
         addr_type: Option<String>,
     },
+    /// Assemble a MidstateScript source file and print its bytecode and script
+    /// address. Touches neither the wallet nor the chain — safe to run offline.
     Compile {
+        /// Path to the MidstateScript source file to assemble.
         #[arg(long)]
         file: PathBuf,
     },
+    /// Print this wallet's spendable balance.
     Balance {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
     },
+    /// Drop the wallet's record of every coin at an address.
+    /// Local bookkeeping only: nothing is spent or destroyed on-chain, and a later
+    /// `wallet scan` will find the coins again.
     Abandon {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// Address whose coins should be forgotten by this wallet.
         #[arg(long)]
         address: String,
     },
+    /// Send coins to one or more recipients. Requires a running node.
     Send {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
+        /// Coin to spend, as a wallet index or coin-ID prefix.
+        /// Indexes are the numbers shown by `wallet list`.
+        /// Repeat the flag to spend several coins in one transaction, or omit it
+        /// entirely to let the wallet select coins for you.
         #[arg(long)]
         coin: Vec<String>,
+        /// Recipient, as <address>:<value>. Repeat the flag for multiple outputs.
+        /// A third field makes it a Confidential state output
+        /// (<address>:0:<state_hex>), which must carry a value of exactly 0.
         #[arg(long)]
         to: Vec<String>,
+        /// Seconds to wait for the transaction to confirm before giving up.
         #[arg(long, default_value = "120")]
         timeout: u64,
+        /// Split the payment into several independent transactions so the inputs
+        /// cannot be trivially linked to one sender. Slower, and it produces more
+        /// on-chain transactions than a normal send.
         #[arg(long)]
         private: bool,
     },
+    /// Spend coins locked by a MidstateScript contract, supplying the bytecode
+    /// and the witness values the script expects.
     SpendScript {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
+        /// Coin to spend, as a wallet index or coin-ID prefix.
+        /// Indexes are the numbers shown by `wallet list`.
+        /// Repeat the flag for multiple inputs.
         #[arg(long)]
         coin: Vec<String>,             // <--- NOW AN ARRAY
+        /// Hex bytecode of the script being satisfied, as printed by `wallet compile`.
         #[arg(long)]
         bytecode: String,
+        /// A witness value for the script. Repeat the flag once per value, in the
+        /// order the script consumes them.
         #[arg(long)]
         inputs: Vec<String>,           // <--- NOW AN ARRAY
+        /// Current state value for a stateful input. Repeat once per stateful coin.
         #[arg(long)]
         input_state: Vec<String>,      // <--- NOW AN ARRAY
+        /// Hex payload to attach to the transaction as a DataBurn output.
         #[arg(long)]
         burn_data: Option<String>,
+        /// Recipient, as <address>:<value>. Repeat the flag for multiple outputs.
         #[arg(long)]
         to: Vec<String>,
+        /// Seconds to wait for the transaction to confirm before giving up.
         #[arg(long, default_value = "120")]
         timeout: u64,
     },
+    /// Import a coin that was exported from another wallet.
+    /// Seed, value, and salt must all match exactly or the coin ID will not resolve.
     Import {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// 32-byte coin seed (hex), as printed by `wallet export`.
         #[arg(long)]
         seed: String,
+        /// Coin value, exactly as printed by `wallet export`.
         #[arg(long)]
         value: u64,
+        /// 32-byte coin salt (hex), as printed by `wallet export`.
         #[arg(long)]
         salt: String,
+        /// Label to store with the imported coin.
         #[arg(long)]
         label: Option<String>,
     },
+    /// Print the seed, value, and salt of one coin so another wallet can import it.
+    /// Treat the output as key material: anyone who sees all three can spend the coin.
     Export {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// Coin to spend, as a wallet index or coin-ID prefix.
+        /// Indexes are the numbers shown by `wallet list`.
         #[arg(long)]
         coin: String,
     },
+    /// List commits this wallet has submitted but not yet revealed.
+    /// Finish them with `wallet reveal`.
     Pending {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
     },
+    /// Sweep every live coin at one address into a single output.
+    /// The address is spent in the process and can never be used again, so the
+    /// wallet first rescans the chain for coins at that address it may have missed.
     Consolidate {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
+        /// Address to sweep. Every live coin held there is spent.
         #[arg(long)]
         address: String,
         /// Skip the chain-side completeness check before sweeping. DANGEROUS: any
@@ -452,29 +611,43 @@ enum WalletAction {
     /// Sweep highly-fragmented one-time WOTS coins across multiple addresses 
     /// into a fresh, reusable MSS destination.
     Defrag {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
         /// Maximum number of inputs to include in this batch (max 256)
         #[arg(long, default_value = "256")]
         max_inputs: usize,
+        /// Seconds to wait for the sweep to confirm before giving up.
         #[arg(long, default_value = "120")]
         timeout: u64,
     },
+    /// Broadcast the reveal for a commit, completing the transaction.
+    /// Use this to finish a send whose reveal did not land — check `wallet pending`
+    /// first to see what is outstanding.
     Reveal {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
+        /// Commitment (hex) to reveal. Omit to reveal every pending commit
+        /// in the wallet.
         #[arg(long)]
         commitment: Option<String>,
     },
+    /// Show this wallet's transaction history, newest first.
     History {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
         /// Number of transactions to show
@@ -492,51 +665,86 @@ enum WalletAction {
     },
     /// Import coinbase rewards from mining log
     ImportRewards {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// Path to the node's coinbase log listing rewards it mined.
         #[arg(long)]
         coinbase_file: PathBuf,
         /// Path to the node's data directory to read the mining seed
         #[arg(long, default_value = "./data")]
         data_dir: PathBuf,
     },
+    /// Scan the chain for coins belonging to this wallet's addresses and import
+    /// any it is missing. Run this if a balance looks wrong after importing keys
+    /// or after an interrupted scan.
     Scan {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
+        /// Rescan from block 0 instead of resuming from the wallet's last scan
+        /// height. Much slower, but recovers coins an interrupted scan skipped.
         #[arg(long)]
         from_genesis: bool,
     },
+    /// Join a CoinJoin session to break the on-chain link between a coin and its
+    /// history. Other participants must be mixing the same denomination.
     Mix {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
+        /// Value of each mixed output. Must be a non-zero power of two, and every
+        /// participant in a session has to use the same one.
         #[arg(long)]
         denomination: u64,
+        /// Coin to spend, as a wallet index or coin-ID prefix.
+        /// Indexes are the numbers shown by `wallet list`.
+        /// Omit to let the wallet choose a coin for you.
         #[arg(long)]
         coin: Option<String>,
+        /// Mix ID of an existing session to join. Omit to open a new session and
+        /// wait for other participants to register.
         #[arg(long)]
         join: Option<String>,
+        /// Pay this session's coordination fee from this wallet.
         #[arg(long)]
         pay_fee: bool,
+        /// Seconds to wait for the session to fill and complete.
         #[arg(long, default_value = "300")]
         timeout: u64,
     },
+    /// Mix a coin through repeated CoinJoin rounds without further prompting.
+    ///
+    /// Any WOTS siblings of the chosen coin are consolidated first, which is what
+    /// keeps the rounds from tripping a co-spend violation partway through.
+    /// Note the command is `auto-mix`, with a hyphen.
     AutoMix {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
+        /// Coin to spend, as a wallet index or coin-ID prefix.
+        /// Indexes are the numbers shown by `wallet list`.
         #[arg(long)]
         coin: String,
+        /// Total seconds to keep mixing before stopping.
         #[arg(long, default_value = "1200")]
         timeout: u64,
     },
@@ -544,6 +752,7 @@ enum WalletAction {
     /// Issue a new Pruning License as a Confidential State Thread.
     /// Primary usage: provide --bundle from `poaw-generate`.
     IssueLicense {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
         /// Path to the .poaw-bundle.json produced by `poaw-generate` (recommended)
@@ -556,20 +765,26 @@ enum WalletAction {
         /// This is the recommended model (harder to evade than percentage royalties).
         #[arg(long, default_value = "100")]
         fixed_fee: u64,
+        /// Lowest block height this license covers.
         #[arg(long)]
         min_height: Option<u64>,
+        /// Highest block height this license covers.
         #[arg(long)]
         max_height: Option<u64>,
+        /// Weight claimed for the archival range, used when valuing the license.
         #[arg(long)]
         archival_weight: Option<u64>,
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
     },
     /// Purchase an existing Pruning License from another holder.
     /// The transaction will include the required royalty payment + burn-to-boost output.
     BuyLicense {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
         /// The coin_id (or address) of the license being purchased
@@ -582,16 +797,20 @@ enum WalletAction {
         /// (not an address). This is required for the HTLC atomic swap.
         #[arg(long)]
         seller_pk: String,
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
+        /// Seconds to wait for the swap to confirm before giving up.
         #[arg(long, default_value = "120")]
         timeout: u64,
     },
     /// After revealing a license on-chain, re-key its metadata from the old
     /// issuance commitment to the real coin_id of the Confidential output.
     RekeyLicense {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
         /// The old key (usually the on-chain commitment used at issuance)
@@ -603,6 +822,7 @@ enum WalletAction {
     },
     /// List all Pruning Licenses this wallet knows about (with their royalty terms).
     ListLicenses {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
     },
@@ -612,6 +832,7 @@ enum WalletAction {
     /// With --secret: Claim mode — perform the license transfer Reveal and provide the preimage
     /// to claim the buyer's HTLC payment (full atomic multi-input claim is deeper integration).
     SellLicense {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
         /// The coin_id of the license you are selling
@@ -624,8 +845,10 @@ enum WalletAction {
         /// Required in claim mode.
         #[arg(long)]
         buyer_pk: Option<String>,
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
     },
@@ -634,6 +857,7 @@ enum WalletAction {
     /// The tool scans the block outputs for a DataBurn payload that deserializes as LicenseMetadata
     /// and restores it into your encrypted wallet.dat so you can spend/transfer the license again.
     RecoverLicenseMetadata {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
         /// Tx hash / commitment of the transaction containing the DataBurn
@@ -642,8 +866,10 @@ enum WalletAction {
         /// Height of the block containing the DataBurn transaction
         #[arg(long)]
         height: u64,
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
     },
@@ -652,6 +878,7 @@ enum WalletAction {
     /// This is the expensive step required before you can issue a valuable
     /// Pruning License.
     PoawGenerate {
+        /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
         path: PathBuf,
         /// Start block height (inclusive)
@@ -672,8 +899,10 @@ enum WalletAction {
         /// If set, automatically submit a Transaction::Commit with the PoAW root
         #[arg(long)]
         submit_commit: bool,
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+        /// RPC host of the node to talk to.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
     },
