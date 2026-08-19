@@ -1746,7 +1746,7 @@ function asUint8Array$1(buf) {
 /**
  * Returns a new Uint8Array created by concatenating the passed Uint8Arrays
  */
-function concat$1(arrays, length) {
+function concat$2(arrays, length) {
     if (length == null) {
         length = arrays.reduce((acc, curr) => acc + curr.length, 0);
     }
@@ -2015,7 +2015,7 @@ class Uint8ArrayList {
      */
     slice(beginInclusive, endExclusive) {
         const { bufs, length } = this._subList(beginInclusive, endExclusive);
-        return concat$1(bufs, length);
+        return concat$2(bufs, length);
     }
     /**
      * Returns a alloc from the given start and end element index.
@@ -2028,7 +2028,7 @@ class Uint8ArrayList {
         if (bufs.length === 1) {
             return bufs[0];
         }
-        return concat$1(bufs, length);
+        return concat$2(bufs, length);
     }
     /**
      * Returns a new Uint8ArrayList from the given start and end element index.
@@ -3121,7 +3121,7 @@ const hexes = /* @__PURE__ */ Array.from({ length: 256 }, (_, i) => i.toString(1
  * bytesToHex(Uint8Array.from([0xca, 0xfe, 0x01, 0x23])); // 'cafe0123'
  * ```
  */
-function bytesToHex$1(bytes) {
+function bytesToHex$2(bytes) {
     abytes$2(bytes);
     // @ts-ignore
     if (hasHexBuiltin)
@@ -3156,7 +3156,7 @@ function asciiToBase16(ch) {
  * hexToBytes('cafe0123'); // Uint8Array.from([0xca, 0xfe, 0x01, 0x23])
  * ```
  */
-function hexToBytes$1(hex) {
+function hexToBytes$2(hex) {
     if (typeof hex !== 'string')
         throw new TypeError('hex string expected, got ' + typeof hex);
     if (hasHexBuiltin) {
@@ -3876,7 +3876,7 @@ const anumber$1 = anumber$2;
  * bytesToHex(Uint8Array.of(1, 2, 3));
  * ```
  */
-const bytesToHex = bytesToHex$1;
+const bytesToHex$1 = bytesToHex$2;
 /**
  * Concatenates byte arrays.
  * @param arrays - Byte arrays to join.
@@ -3900,7 +3900,7 @@ const concatBytes = (...arrays) => concatBytes$1(...arrays);
  * hexToBytes('0102');
  * ```
  */
-const hexToBytes = (hex) => hexToBytes$1(hex);
+const hexToBytes$1 = (hex) => hexToBytes$2(hex);
 /**
  * Checks whether a value is a Uint8Array.
  * @param a - Value to inspect.
@@ -4042,7 +4042,7 @@ function hexToNumber(hex) {
  * ```
  */
 function bytesToNumberBE(bytes) {
-    return hexToNumber(bytesToHex$1(bytes));
+    return hexToNumber(bytesToHex$2(bytes));
 }
 /**
  * Parses little-endian bytes into bigint.
@@ -4057,7 +4057,7 @@ function bytesToNumberBE(bytes) {
  * ```
  */
 function bytesToNumberLE(bytes) {
-    return hexToNumber(bytesToHex$1(copyBytes$1(abytes$2(bytes)).reverse()));
+    return hexToNumber(bytesToHex$2(copyBytes$1(abytes$2(bytes)).reverse()));
 }
 /**
  * Encodes a bigint into fixed-length big-endian bytes.
@@ -4081,7 +4081,7 @@ function numberToBytesBE(n, len) {
     // Detect overflow before hex parsing so oversized values don't leak the shared odd-hex error.
     if (hex.length > len * 2)
         throw new RangeError('number too large');
-    return hexToBytes$1(hex.padStart(len * 2, '0'));
+    return hexToBytes$2(hex.padStart(len * 2, '0'));
 }
 /**
  * Encodes a bigint into fixed-length little-endian bytes.
@@ -5637,7 +5637,7 @@ function edwards(params, extraOpts = {}) {
             return Point.fromAffine({ x, y });
         }
         static fromHex(hex, zip215 = false) {
-            return Point.fromBytes(hexToBytes(hex), zip215);
+            return Point.fromBytes(hexToBytes$1(hex), zip215);
         }
         get x() {
             return this.toAffine().x;
@@ -5817,7 +5817,7 @@ function edwards(params, extraOpts = {}) {
             return bytes;
         }
         toHex() {
-            return bytesToHex(this.toBytes());
+            return bytesToHex$1(this.toBytes());
         }
         toString() {
             return `<Point ${this.is0() ? 'ZERO' : this.toHex()}>`;
@@ -5905,7 +5905,7 @@ class PrimeEdwardsPoint {
         return this.ep.toAffine(invertedZ);
     }
     toHex() {
-        return bytesToHex(this.toBytes());
+        return bytesToHex$1(this.toBytes());
     }
     toString() {
         return this.toHex();
@@ -6574,7 +6574,7 @@ class _RistrettoPoint extends PrimeEdwardsPoint {
      * @param hex - Ristretto-encoded 32 bytes. Not every 32-byte string is valid ristretto encoding
      */
     static fromHex(hex) {
-        return _RistrettoPoint.fromBytes(hexToBytes$1(hex));
+        return _RistrettoPoint.fromBytes(hexToBytes$2(hex));
     }
     /**
      * Encodes ristretto point to Uint8Array.
@@ -9150,7 +9150,7 @@ function weierstrass(params, extraOpts = {}) {
             return P;
         }
         static fromHex(hex) {
-            return Point.fromBytes(hexToBytes(hex));
+            return Point.fromBytes(hexToBytes$1(hex));
         }
         get x() {
             return this.toAffine().x;
@@ -9441,7 +9441,7 @@ function weierstrass(params, extraOpts = {}) {
             return encodePoint(Point, this, isCompressed);
         }
         toHex(isCompressed = true) {
-            return bytesToHex(this.toBytes(isCompressed));
+            return bytesToHex$1(this.toBytes(isCompressed));
         }
         toString() {
             return `<Point ${this.is0() ? 'ZERO' : this.toHex()}>`;
@@ -9703,7 +9703,7 @@ function ecdsa(Point, hash, ecdsaOpts = {}) {
             return new Signature(Fn.fromBytes(r), Fn.fromBytes(s), recid);
         }
         static fromHex(hex, format) {
-            return this.fromBytes(hexToBytes(hex), format);
+            return this.fromBytes(hexToBytes$1(hex), format);
         }
         assertRecovery() {
             const { recovery } = this;
@@ -9742,7 +9742,7 @@ function ecdsa(Point, hash, ecdsaOpts = {}) {
         toBytes(format = defaultSigOpts.format) {
             validateSigFormat(format);
             if (format === 'der')
-                return hexToBytes(DER.hexFromSig(this));
+                return hexToBytes$1(DER.hexFromSig(this));
             const { r, s } = this;
             const rb = Fn.toBytes(r);
             const sb = Fn.toBytes(s);
@@ -9753,7 +9753,7 @@ function ecdsa(Point, hash, ecdsaOpts = {}) {
             return concatBytes(rb, sb);
         }
         toHex(format) {
-            return bytesToHex(this.toBytes(format));
+            return bytesToHex$1(this.toBytes(format));
         }
     }
     Object.freeze(Signature.prototype);
@@ -11839,7 +11839,7 @@ function getNetConfig(ma) {
 }
 
 /* eslint-disable @typescript-eslint/no-unsafe-return */
-class Parser {
+let Parser$1 = class Parser {
     index = 0;
     input = "";
     new(input) {
@@ -12037,12 +12037,12 @@ class Parser {
     readIPAddr() {
         return this.readIPv4Addr() ?? this.readIPv6Addr();
     }
-}
+};
 
 // See https://stackoverflow.com/questions/166132/maximum-length-of-the-textual-representation-of-an-ipv6-address
 const MAX_IPV6_LENGTH = 45;
 const MAX_IPV4_LENGTH = 15;
-const parser = new Parser();
+const parser = new Parser$1();
 /** Parse `input` into IPv4 bytes. */
 function parseIPv4(input) {
     if (input.length > MAX_IPV4_LENGTH) {
@@ -13217,7 +13217,7 @@ function asUint8Array(buf) {
 /**
  * Returns a new Uint8Array created by concatenating the passed Uint8Arrays
  */
-function concat(arrays, length) {
+function concat$1(arrays, length) {
     if (length == null) {
         length = arrays.reduce((acc, curr) => acc + curr.length, 0);
     }
@@ -14592,7 +14592,7 @@ function onion2bytes(str) {
         throw new Error('Port number is not in range(1, 65536)');
     }
     const portBuf = port2bytes(port);
-    return concat([buf, portBuf], buf.length + portBuf.length);
+    return concat$1([buf, portBuf], buf.length + portBuf.length);
 }
 function onion32bytes(str) {
     const addr = str.split(':');
@@ -14610,7 +14610,7 @@ function onion32bytes(str) {
         throw new Error('Port number is not in range(1, 65536)');
     }
     const portBuf = port2bytes(port);
-    return concat([buf, portBuf], buf.length + portBuf.length);
+    return concat$1([buf, portBuf], buf.length + portBuf.length);
 }
 function bytes2onion(buf) {
     const addrBytes = buf.subarray(0, buf.length - 2);
@@ -15061,7 +15061,7 @@ function componentsToBytes(components) {
         bytes.push(component.bytes);
         length += component.bytes.byteLength;
     }
-    return concat(bytes, length);
+    return concat$1(bytes, length);
 }
 function stringToComponents(string) {
     if (string.charAt(0) !== '/') {
@@ -29850,7 +29850,7 @@ class Libp2p extends TypedEventEmitter {
                 throw err;
             }
         }
-        const peerKey = concat$1([
+        const peerKey = concat$2([
             fromString$2('/pk/'),
             peer.toMultihash().bytes
         ]);
@@ -29964,56 +29964,34 @@ async function createLibp2p(options = {}) {
     return node;
 }
 
-/**
- * @fileoverview Universal P2P Transport Layer
- * Dynamically uses TCP (Node.js) or WebRTC (Browser) to connect to the Midstate network.
- *
- * js-libp2p v3 MessageStream API (shipped): streams are EventTargets.
- *   - write:     stream.send(bytes)  (returns false => wait for 'drain')
- *   - read:      'message' events; evt.data is a Uint8ArrayList
- *   - teardown:  await stream.close()  (graceful, flushes) / stream.abort(err) (reset)
- * NOTE: there is no closeWrite()/closeRead() — that was a v3 design draft that did
- * not ship. The Midstate light protocol reads a fixed-length frame server-side, so
- * no write-side half-close is needed; we send the request and read the response.
- * The transport handles WebRTC datachannel framing below the Stream interface,
- * so no manual protobuf decoding is needed — evt.data is application bytes.
- */
-
-
-const LIGHT_PROTOCOL = '/midstate/light/2.0.0';
-const LIGHT_PUSH_PROTOCOL = '/midstate/light-push/2.0.0';
-const FULL_NODE_PROTOCOL = '/midstate/2.0.0';
-const REQUEST_TIMEOUT_MS = 15_000;
-const RECONNECT_DELAY_MS = 3_000;
-const MAX_RECONNECT_ATTEMPTS = 5;
-
-// Set MIDSTATE_P2P_DEBUG=1 to trace the request/stream lifecycle. Helps diagnose
-// "stream closed before full response": shows bytes sent, bytes received, and the
-// close/error reason so we can tell "server sent no response" from a transport reset.
-const DEBUG = (typeof process !== 'undefined' && process.env && process.env.MIDSTATE_P2P_DEBUG === '1');
-const dlog = (...a) => { if (DEBUG) console.log('[P2P:debug]', ...a); };
-const WRITE_CHUNK_SIZE = 16_384; // keep individual sends under the WebRTC SCTP limit
-
-const isBrowser = typeof window !== 'undefined' && typeof window.document !== 'undefined';
-
-// ── PEX peer discovery over the binary /midstate/2.0.0 protocol ──────────────
+// bincode.js — Wire codec for the Midstate native P2P protocol (/midstate/2.0.0).
 //
-// The full node gossips peer addresses via PEX: a `GetAddr` request (Message
-// enum discriminant 5) is answered on the same request_response stream with
-// `Addr(Vec<String>)` (discriminant 6) — see node.rs `Message::GetAddr =>
-// send_response(Addr(pex_addrs()))`. We use this so the SDK isn't pinned to a
-// single hardcoded bootstrap node.
+// The node serializes `Message` with `bincode::DefaultOptions::new()`, which is
+// bincode's *varint* configuration: every integer, every collection length and
+// every enum discriminant is varint-encoded. This module implements exactly
+// that encoding and nothing else.
 //
-// The binary protocol is bincode with `DefaultOptions` = little-endian VARINT
-// encoding (NOT fixed width). Per bincode 1.3 config/int.rs: a value <= 250 is
-// a single byte; otherwise a marker byte (251=u16, 252=u32, 253=u64) precedes
-// the LE integer. Enum discriminants are varint-encoded too. So `GetAddr` is
-// the single byte 0x05; an `Addr` reply is [disc 6][vec-len][len+utf8 per str].
-// Framing is the same [4-byte LE length][payload] used by the light protocol.
+// It is deliberately free of transport dependencies. The wire format is the
+// part most likely to drift against the node and the part most worth testing,
+// and it should not require a libp2p install to exercise. Everything here is a
+// pure function over bytes.
+//
+// Reference: node src/network/protocol.rs (`Message`) and src/chat.rs
+// (`ChatAttachment`, hand-written Serialize/Deserialize impls).
+
+// ── Varint ───────────────────────────────────────────────────────────────────
+//
+// bincode varint layout:
+//   0..=250  → that single byte
+//   251      → u16 little-endian follows
+//   252      → u32 little-endian follows
+//   253      → u64 little-endian follows
+//   254      → u128 (not produced by this protocol)
+
 const SINGLE_BYTE_MAX = 250;
 
 function encodeVarint(n) {
-    const v = BigInt(n);
+    const v = typeof n === 'bigint' ? n : BigInt(n);
     if (v < 0n) throw new Error('varint must be non-negative');
     if (v <= 250n) return Uint8Array.of(Number(v));
     if (v < (1n << 16n)) { const b = new Uint8Array(3); b[0] = 251; new DataView(b.buffer).setUint16(1, Number(v), true); return b; }
@@ -30022,41 +30000,24 @@ function encodeVarint(n) {
     throw new Error('varint too large');
 }
 
-// Decode a varint at byte offset; returns { value: BigInt, size }.
 function decodeVarint(buf, off = 0) {
     const first = buf[off];
-    if (first === undefined) throw new Error('varint: out of bytes');
+    if (first === undefined) throw new RangeError('varint: out of bytes');
     if (first <= SINGLE_BYTE_MAX) return { value: BigInt(first), size: 1 };
     const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-    if (first === 251) return { value: BigInt(dv.getUint16(off + 1, true)), size: 3 };
-    if (first === 252) return { value: BigInt(dv.getUint32(off + 1, true)), size: 5 };
-    if (first === 253) return { value: dv.getBigUint64(off + 1, true), size: 9 };
-    if (first === 254) throw new Error('varint: u128 not supported');
-    throw new Error('varint: byte 255 is an extension point (invalid)');
+    // Each multi-byte form must fit entirely inside the buffer; a truncated
+    // frame would otherwise read adjacent heap bytes as protocol data.
+    if (first === 251) { if (off + 3 > buf.length) throw new RangeError('varint: truncated u16'); return { value: BigInt(dv.getUint16(off + 1, true)), size: 3 }; }
+    if (first === 252) { if (off + 5 > buf.length) throw new RangeError('varint: truncated u32'); return { value: BigInt(dv.getUint32(off + 1, true)), size: 5 }; }
+    if (first === 253) { if (off + 9 > buf.length) throw new RangeError('varint: truncated u64'); return { value: dv.getBigUint64(off + 1, true), size: 9 }; }
+    throw new Error('varint invalid');
 }
 
-// Message::GetAddr → discriminant 5 (single varint byte).
-function encodeGetAddr() { return encodeVarint(5); }
+// ── Framing ──────────────────────────────────────────────────────────────────
+//
+// Both the native and light protocols frame payloads as a 4-byte little-endian
+// length followed by the payload itself.
 
-// Decode Message::Addr(Vec<String>) from a binary payload (frame already stripped).
-function decodeAddr(payload) {
-    let off = 0;
-    const disc = decodeVarint(payload, off); off += disc.size;
-    if (disc.value !== 6n) throw new Error(`expected Addr discriminant 6, got ${disc.value}`);
-    const count = decodeVarint(payload, off); off += count.size;
-    if (count.value > 1000n) throw new Error(`Addr count ${count.value} exceeds sane max`);
-    const out = [];
-    const dec = new TextDecoder();
-    for (let i = 0; i < Number(count.value); i++) {
-        const len = decodeVarint(payload, off); off += len.size;
-        const n = Number(len.value);
-        if (off + n > payload.length) throw new Error('Addr payload truncated: string length exceeds remaining bytes');
-        out.push(dec.decode(payload.subarray(off, off + n))); off += n;
-    }
-    return out;
-}
-
-// Frame a raw binary payload as [4-byte LE length][payload].
 function encodeBinaryFrame(payload) {
     const msg = new Uint8Array(4 + payload.length);
     new DataView(msg.buffer).setUint32(0, payload.length, true);
@@ -30064,10 +30025,236 @@ function encodeBinaryFrame(payload) {
     return msg;
 }
 
-// A TCP multiaddr we can actually dial: has /tcp/ and /p2p/, and is neither
-// webrtc-direct nor localhost. The node's own dial_addr applies the same
-// filter — its PEX list legitimately contains webrtc-direct addrs (served for
-// the browser UI) that a TCP-only client must skip.
+function encodeFrame(obj) {
+    return encodeBinaryFrame(new TextEncoder().encode(JSON.stringify(obj)));
+}
+
+// ── Message discriminants ────────────────────────────────────────────────────
+//
+// Index into `enum Message` in src/network/protocol.rs. The node's own comment
+// warns that reordering shifts every discriminant and breaks the whole
+// protocol, so these are stable by contract.
+
+const MSG_GET_ADDR = 5;
+const MSG_ADDR = 6;
+const MSG_PONG = 8;
+const MSG_CHAT_V2 = 19;
+
+function encodeGetAddr() { return encodeVarint(MSG_GET_ADDR); }
+
+/** `Message::Pong { nonce }` — the ACK for an inbound native-protocol message. */
+function encodePong(nonce = 0) {
+    const disc = encodeVarint(MSG_PONG);
+    const n = encodeVarint(nonce);
+    const out = new Uint8Array(disc.length + n.length);
+    out.set(disc, 0); out.set(n, disc.length);
+    return out;
+}
+
+function decodeAddr(payload) {
+    let off = 0;
+    const disc = decodeVarint(payload, off); off += disc.size;
+    if (disc.value !== BigInt(MSG_ADDR)) throw new Error('expected Addr discriminant');
+    const count = decodeVarint(payload, off); off += count.size;
+    // The node caps Addr at 1000 entries in deserialize_bin; refuse anything
+    // claiming more rather than trying to allocate for it.
+    if (count.value > 1000n) throw new Error(`Addr count ${count.value} exceeds max 1000`);
+    const out = [];
+    const dec = new TextDecoder();
+    for (let i = 0; i < Number(count.value); i++) {
+        const len = decodeVarint(payload, off); off += len.size;
+        const n = Number(len.value);
+        // A truncated payload must be rejected, not silently decoded into a
+        // short string. subarray() clamps rather than throwing, so without this
+        // check a peer could send a length that overruns the buffer and get a
+        // quietly wrong multiaddr back — which then gets dialed.
+        if (off + n > payload.length) {
+            throw new RangeError(`Addr entry ${i} claims ${n} bytes, only ${payload.length - off} remain`);
+        }
+        out.push(dec.decode(payload.subarray(off, off + n))); off += n;
+    }
+    return out;
+}
+
+// ── ChatAttachment ───────────────────────────────────────────────────────────
+//
+// Mirrors the hand-written `impl Serialize for ChatAttachment` in src/chat.rs —
+// specifically the `BincodeHelper` branch, taken whenever the serializer is not
+// human-readable. Variant order there IS the wire tag, and chat.rs documents
+// the tags as immutable, so this table is the contract:
+//
+//   tag 0 address            [u8; 32]
+//   tag 1 coin_id            [u8; 32]
+//   tag 2 mix_id             [u8; 32]
+//   tag 3 commitment         [u8; 32]
+//   tag 4 block_hash         [u8; 32]
+//   tag 5 midstate           [u8; 32]
+//   tag 6 data_hash          [u8; 32]
+//   tag 7 license_challenge  [u8; 32] ⌢ varint(u64 height) ⌢ [u8; 32]
+//   tag 8 signature          varint(len) ⌢ len bytes
+//
+// Three things were wrong in the previous decoder, and because attachments are
+// parsed in sequence each one corrupted every attachment that followed it
+// rather than only the one it mis-read:
+//
+//  1. Signature was read at tag 9. There is no tag 9 — Signature is the ninth
+//     variant but the eighth index, so a real signature fell through to the
+//     catch-all and was dropped.
+//  2. Its length was read as a fixed 4-byte LE u32. bincode varint-encodes
+//     collection lengths, so a 576-byte WOTS signature is `251 40 02`.
+//  3. The catch-all advanced a flat 32 bytes, but license_challenge is
+//     32 + varint + 32.
+//
+// Unknown future tags remain genuinely unskippable — their width is unknowable
+// — so decoding stops cleanly and says so rather than inventing a width.
+
+const ATTACHMENT_KINDS_32 = [
+    'address', 'coin_id', 'mix_id', 'commitment',
+    'block_hash', 'midstate', 'data_hash',
+];
+const ATT_TAG_LICENSE_CHALLENGE = 7n;
+const ATT_TAG_SIGNATURE = 8n;
+
+/** Max attachments per message, from MAX_CHAT_ATTACHMENTS in the node. */
+const MAX_CHAT_ATTACHMENTS = 4;
+
+const toHex$1 = (bytes) => Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+
+/**
+ * Decode a bincode `Vec<ChatAttachment>` beginning at `offset`.
+ *
+ * @param {Uint8Array} payload
+ * @param {number} offset - Index of the attachment-count varint.
+ * @returns {{attachments: Object[], offset: number, truncated: boolean}}
+ *   `offset` is the first byte past the attachments. `truncated` is true when
+ *   decoding stopped early (unknown tag, or the buffer ran short).
+ */
+function decodeChatAttachments(payload, offset) {
+    let off = offset;
+    const need = (n) => {
+        if (n < 0 || off + n > payload.length) throw new RangeError('attachment truncated');
+    };
+
+    const countVi = decodeVarint(payload, off); off += countVi.size;
+    const count = Number(countVi.value);
+
+    const attachments = [];
+    let truncated = false;
+
+    try {
+        for (let i = 0; i < count; i++) {
+            const tagVi = decodeVarint(payload, off); off += tagVi.size;
+            const tag = tagVi.value;
+
+            if (tag < BigInt(ATTACHMENT_KINDS_32.length)) {
+                need(32);
+                attachments.push({ kind: ATTACHMENT_KINDS_32[Number(tag)], value: toHex$1(payload.subarray(off, off + 32)) });
+                off += 32;
+            } else if (tag === ATT_TAG_LICENSE_CHALLENGE) {
+                need(32);
+                const commitment = toHex$1(payload.subarray(off, off + 32)); off += 32;
+                const heightVi = decodeVarint(payload, off); off += heightVi.size;
+                need(32);
+                const salt = toHex$1(payload.subarray(off, off + 32)); off += 32;
+                attachments.push({ kind: 'license_challenge', value: { commitment, height: heightVi.value, salt } });
+            } else if (tag === ATT_TAG_SIGNATURE) {
+                const lenVi = decodeVarint(payload, off); off += lenVi.size;
+                const len = Number(lenVi.value);
+                need(len);
+                attachments.push({ kind: 'signature', value: toHex$1(payload.subarray(off, off + len)) });
+                off += len;
+            } else {
+                truncated = true;
+                break;
+            }
+        }
+    } catch (e) {
+        if (!(e instanceof RangeError)) throw e;
+        truncated = true;
+    }
+
+    return { attachments, offset: off, truncated };
+}
+
+/**
+ * Decode a full `Message::ChatV2` payload (discriminant byte included).
+ *
+ * Field order, from `enum Message` in protocol.rs:
+ *   sender: String, timestamp: u64, nonce: u64,
+ *   reply_to: Option<u64>, words: Vec<u8>, attachments: Vec<ChatAttachment>
+ *
+ * @param {Uint8Array} payload
+ * @returns {Object|null} The decoded message, or null if this isn't a ChatV2.
+ */
+function decodeChatV2(payload) {
+    if (!payload || payload.length === 0 || payload[0] !== MSG_CHAT_V2) return null;
+
+    let off = 1;
+    const senderLen = decodeVarint(payload, off); off += senderLen.size;
+    const senderBytes = Number(senderLen.value);
+    if (off + senderBytes > payload.length) throw new RangeError('chat: sender truncated');
+    const sender = new TextDecoder().decode(payload.subarray(off, off + senderBytes));
+    off += senderBytes;
+
+    const tsVi = decodeVarint(payload, off); off += tsVi.size;
+    const nonceVi = decodeVarint(payload, off); off += nonceVi.size;
+
+    // Option<u64>: one tag byte, then the value only when the tag is 1.
+    let replyTo = null;
+    if (payload[off] === 1) {
+        const repVi = decodeVarint(payload, off + 1);
+        replyTo = Number(repVi.value);
+        off += 1 + repVi.size;
+    } else {
+        off += 1;
+    }
+
+    const wordsLen = decodeVarint(payload, off); off += wordsLen.size;
+    const wordCount = Number(wordsLen.value);
+    if (off + wordCount > payload.length) throw new RangeError('chat: words truncated');
+    const words = Array.from(payload.subarray(off, off + wordCount));
+    off += wordCount;
+
+    const { attachments, truncated } = decodeChatAttachments(payload, off);
+
+    return {
+        sender,
+        timestamp: Number(tsVi.value),
+        nonce: Number(nonceVi.value),
+        reply_to: replyTo,
+        words,
+        attachments,
+        truncated,
+    };
+}
+
+var bincode = /*#__PURE__*/Object.freeze({
+    __proto__: null,
+    MAX_CHAT_ATTACHMENTS: MAX_CHAT_ATTACHMENTS,
+    MSG_ADDR: MSG_ADDR,
+    MSG_CHAT_V2: MSG_CHAT_V2,
+    MSG_GET_ADDR: MSG_GET_ADDR,
+    MSG_PONG: MSG_PONG,
+    decodeAddr: decodeAddr,
+    decodeChatAttachments: decodeChatAttachments,
+    decodeChatV2: decodeChatV2,
+    decodeVarint: decodeVarint,
+    encodeBinaryFrame: encodeBinaryFrame,
+    encodeFrame: encodeFrame,
+    encodeGetAddr: encodeGetAddr,
+    encodePong: encodePong,
+    encodeVarint: encodeVarint
+});
+
+const LIGHT_PROTOCOL = '/midstate/light/2.0.0';
+const LIGHT_PUSH_PROTOCOL = '/midstate/light-push/2.0.0';
+const FULL_NODE_PROTOCOL = '/midstate/2.0.0';
+const REQUEST_TIMEOUT_MS$1 = 15_000;
+const RECONNECT_DELAY_MS = 3_000;
+const MAX_RECONNECT_ATTEMPTS = 5;
+
+const isBrowser = typeof window !== 'undefined' && typeof window.document !== 'undefined';
+
 function isDialableTcpAddr(addr) {
     if (typeof addr !== 'string') return false;
     if (addr.includes('webrtc')) return false;
@@ -30076,63 +30263,32 @@ function isDialableTcpAddr(addr) {
     return true;
 }
 
-// Frame a JSON value as [4-byte little-endian length][utf8 JSON].
-function encodeFrame(obj) {
-    const jsonBytes = new TextEncoder().encode(JSON.stringify(obj));
-    const msg = new Uint8Array(4 + jsonBytes.length);
-    new DataView(msg.buffer).setUint32(0, jsonBytes.length, true);
-    msg.set(jsonBytes, 4);
-    return msg;
-}
-
-// Wait for a 'drain' event (back pressure relief), rejecting if the stream dies first.
 function waitForDrain(stream) {
     return new Promise((resolve, reject) => {
-        const cleanup = () => {
-            stream.removeEventListener('drain', onDrain);
-            stream.removeEventListener('close', onClose);
-            stream.removeEventListener('error', onClose);
-        };
+        const cleanup = () => { stream.removeEventListener('drain', onDrain); stream.removeEventListener('close', onClose); stream.removeEventListener('error', onClose); };
         const onDrain = () => { cleanup(); resolve(); };
         const onClose = (evt) => { cleanup(); reject(evt?.reason ?? new Error('stream closed while draining')); };
-        stream.addEventListener('drain', onDrain);
-        stream.addEventListener('close', onClose);
-        stream.addEventListener('error', onClose);
+        stream.addEventListener('drain', onDrain); stream.addEventListener('close', onClose); stream.addEventListener('error', onClose);
     });
 }
 
-// Send all bytes, honoring back pressure. Tolerates send() returning either a
-// boolean (v3 release API) or a promise (defensive against minor version drift).
 async function sendAll(stream, bytes) {
     let last = true;
-    for (let i = 0; i < bytes.length; i += WRITE_CHUNK_SIZE) {
-        const slice = bytes.subarray(i, i + WRITE_CHUNK_SIZE);
+    for (let i = 0; i < bytes.length; i += 16384) {
+        const slice = bytes.subarray(i, i + 16384);
         const res = stream.send(slice);
-        if (res === false) {
-            last = false;
-            await waitForDrain(stream);
-        } else if (res && typeof res.then === 'function') {
-            await res;
-        } else {
-            last = res;
-        }
+        if (res === false) { last = false; await waitForDrain(stream); }
+        else if (res && typeof res.then === 'function') { await res; }
+        else { last = res; }
     }
     return last;
 }
 
-// Read incoming bytes until one complete [len][JSON] frame is assembled, then resolve.
 function readFrame(stream, timeoutMs) {
     return new Promise((resolve, reject) => {
         const chunks = [];
         let total = 0;
-
-        const assemble = () => {
-            const raw = new Uint8Array(total);
-            let off = 0;
-            for (const c of chunks) { raw.set(c, off); off += c.length; }
-            return raw;
-        };
-
+        const assemble = () => { const raw = new Uint8Array(total); let off = 0; for (const c of chunks) { raw.set(c, off); off += c.length; } return raw; };
         const tryComplete = () => {
             if (total < 4) return false;
             const raw = assemble();
@@ -30143,51 +30299,21 @@ function readFrame(stream, timeoutMs) {
             try { resolve(JSON.parse(json)); } catch (e) { reject(e); }
             return true;
         };
-
-        const onMessage = (evt) => {
-            const part = evt.data.subarray ? evt.data.subarray() : new Uint8Array(evt.data);
-            chunks.push(part);
-            total += part.length;
-            dlog(`recv message: +${part.length}B (total ${total}B)`);
-            tryComplete();
-        };
-        const onClose = (evt) => {
-            dlog(`recv 'close' event; reason=${evt?.reason?.message ?? 'none'}; bytes so far=${total}`);
-            if (!tryComplete()) { cleanup(); reject(evt?.reason ?? new Error('stream closed before full response')); }
-        };
-        const onError = (evt) => {
-            dlog(`recv 'error' event; reason=${evt?.reason?.message ?? 'unknown'}; bytes so far=${total}`);
-            cleanup(); reject(evt?.reason ?? new Error('stream error'));
-        };
-        const onRemoteCloseWrite = () => dlog(`recv 'remoteCloseWrite' (server finished sending); bytes so far=${total}`);
-        const cleanup = () => {
-            clearTimeout(timer);
-            stream.removeEventListener('message', onMessage);
-            stream.removeEventListener('close', onClose);
-            stream.removeEventListener('error', onError);
-            stream.removeEventListener('remoteCloseWrite', onRemoteCloseWrite);
-        };
-
-        const timer = setTimeout(() => { dlog(`read TIMEOUT after ${timeoutMs}ms; bytes=${total}`); cleanup(); reject(new Error('Stream read timeout')); }, timeoutMs);
-        stream.addEventListener('message', onMessage);
-        stream.addEventListener('close', onClose);
-        stream.addEventListener('error', onError);
-        stream.addEventListener('remoteCloseWrite', onRemoteCloseWrite);
+        const onMessage = (evt) => { chunks.push(evt.data.subarray ? evt.data.subarray() : new Uint8Array(evt.data)); total += chunks[chunks.length-1].length; tryComplete(); };
+        const onClose = (evt) => { if (!tryComplete()) { cleanup(); reject(evt?.reason ?? new Error('stream closed')); } };
+        const onError = (evt) => { cleanup(); reject(evt?.reason ?? new Error('stream error')); };
+        const onRemoteCloseWrite = () => {};
+        const cleanup = () => { clearTimeout(timer); stream.removeEventListener('message', onMessage); stream.removeEventListener('close', onClose); stream.removeEventListener('error', onError); stream.removeEventListener('remoteCloseWrite', onRemoteCloseWrite); };
+        const timer = setTimeout(() => { cleanup(); reject(new Error('timeout')); }, timeoutMs);
+        stream.addEventListener('message', onMessage); stream.addEventListener('close', onClose); stream.addEventListener('error', onError); stream.addEventListener('remoteCloseWrite', onRemoteCloseWrite);
     });
 }
 
-// Like readFrame, but resolves with the raw payload bytes (no JSON parse) — used
-// for the bincode binary protocol (PEX). Same [4-byte LE length][payload] framing.
 function readBinaryFrame(stream, timeoutMs) {
     return new Promise((resolve, reject) => {
         const chunks = [];
         let total = 0;
-        const assemble = () => {
-            const raw = new Uint8Array(total);
-            let off = 0;
-            for (const c of chunks) { raw.set(c, off); off += c.length; }
-            return raw;
-        };
+        const assemble = () => { const raw = new Uint8Array(total); let off = 0; for (const c of chunks) { raw.set(c, off); off += c.length; } return raw; };
         const tryComplete = () => {
             if (total < 4) return false;
             const raw = assemble();
@@ -30197,23 +30323,12 @@ function readBinaryFrame(stream, timeoutMs) {
             resolve(raw.subarray(4, 4 + len));
             return true;
         };
-        const onMessage = (evt) => {
-            const part = evt.data.subarray ? evt.data.subarray() : new Uint8Array(evt.data);
-            chunks.push(part); total += part.length;
-            tryComplete();
-        };
-        const onClose = (evt) => { if (!tryComplete()) { cleanup(); reject(evt?.reason ?? new Error('stream closed before full response')); } };
+        const onMessage = (evt) => { chunks.push(evt.data.subarray ? evt.data.subarray() : new Uint8Array(evt.data)); total += chunks[chunks.length-1].length; tryComplete(); };
+        const onClose = (evt) => { if (!tryComplete()) { cleanup(); reject(evt?.reason ?? new Error('stream closed')); } };
         const onError = (evt) => { cleanup(); reject(evt?.reason ?? new Error('stream error')); };
-        const cleanup = () => {
-            clearTimeout(timer);
-            stream.removeEventListener('message', onMessage);
-            stream.removeEventListener('close', onClose);
-            stream.removeEventListener('error', onError);
-        };
-        const timer = setTimeout(() => { cleanup(); reject(new Error('Stream read timeout')); }, timeoutMs);
-        stream.addEventListener('message', onMessage);
-        stream.addEventListener('close', onClose);
-        stream.addEventListener('error', onError);
+        const cleanup = () => { clearTimeout(timer); stream.removeEventListener('message', onMessage); stream.removeEventListener('close', onClose); stream.removeEventListener('error', onError); };
+        const timer = setTimeout(() => { cleanup(); reject(new Error('timeout')); }, timeoutMs);
+        stream.addEventListener('message', onMessage); stream.addEventListener('close', onClose); stream.addEventListener('error', onError);
     });
 }
 
@@ -30264,17 +30379,33 @@ class P2PClient {
             services: Object.keys(services).length > 0 ? services : undefined
         });
 
-        // v3 handler signature: (stream, connection) — NOT ({ stream }).
-        this.node.handle(FULL_NODE_PROTOCOL, (stream) => {
-            stream.close();
+        // ── NATIVE SDK BINARY HANDLER ──
+        this.node.handle(FULL_NODE_PROTOCOL, async (data) => {
+            const stream = data.stream || data;
+            try {
+                const payload = await readBinaryFrame(stream, 5000);
+
+                // ChatV2 pushes arrive on the native protocol. decodeChatV2
+                // returns null for any other discriminant, which we simply ACK
+                // and ignore — a newer node may send messages we don't model,
+                // and dropping the connection over one would be wrong.
+                const chat = decodeChatV2(payload);
+                if (chat && this._onPushEvent) {
+                    this._onPushEvent({ ChatMessage: chat });
+                }
+
+                // ACK with Message::Pong { nonce: 0 }.
+                await sendAll(stream, encodeBinaryFrame(encodePong(0)));
+                try { await stream.close(); } catch(e){}
+            } catch (e) {
+                try { stream.abort(e); } catch(err){}
+            }
         });
 
-        // Incoming Light Push Notifications. Parse complete [len][JSON] frames out
-        // of the message stream as they arrive (handles one-shot or streamed pushes).
+        // Incoming Light Push Notifications (WebRTC)
         this.node.handle(LIGHT_PUSH_PROTOCOL, (stream) => {
             const chunks = [];
             let total = 0;
-
             const drainFrames = () => {
                 let raw = new Uint8Array(total);
                 let off = 0;
@@ -30287,7 +30418,7 @@ class P2PClient {
                     const json = new TextDecoder().decode(raw.subarray(consumed + 4, consumed + 4 + len));
                     consumed += 4 + len;
                     try { if (this._onPushEvent) this._onPushEvent(JSON.parse(json)); }
-                    catch (e) { console.warn('[P2P] Bad push frame', e); }
+                    catch (e) {}
                 }
                 if (consumed > 0) {
                     const remainder = raw.subarray(consumed);
@@ -30296,24 +30427,17 @@ class P2PClient {
                     if (remainder.length) chunks.push(new Uint8Array(remainder));
                 }
             };
-
             stream.addEventListener('message', (evt) => {
-                const part = evt.data.subarray ? evt.data.subarray() : new Uint8Array(evt.data);
-                chunks.push(part);
-                total += part.length;
+                chunks.push(evt.data.subarray ? evt.data.subarray() : new Uint8Array(evt.data));
+                total += chunks[chunks.length-1].length;
                 drainFrames();
             });
             stream.addEventListener('close', () => { try { stream.close(); } catch (_) {} });
-            stream.addEventListener('error', () => {});
         });
 
         await this.node.start();
 
         this.node.addEventListener('peer:connect', (evt) => {
-            // Only adopt a new primary on a real disconnected→connected transition.
-            // PEX dials extra peers; without this guard every extra (and every
-            // inbound) connection would reassign connectedPeer and thrash the
-            // primary that request() depends on.
             if (!this.isConnected || !this.connectedPeer) {
                 this.connectedPeer = evt.detail;
                 this.isConnected = true;
@@ -30323,14 +30447,8 @@ class P2PClient {
         });
 
         this.node.addEventListener('peer:disconnect', (evt) => {
-            // During an intentional stop(), don't promote spares or schedule
-            // reconnects — that would flap the status mid-teardown. Let stop()
-            // drive the final state.
             if (this._stopping) return;
             if (this.connectedPeer?.toString() === evt.detail.toString()) {
-                // Primary dropped. Promote any other live connection as the new
-                // primary before falling back to a timed reconnect — PEX may have
-                // left us several warm peers to choose from.
                 const spare = this._anyConnectedPeer(evt.detail);
                 if (spare) {
                     this.connectedPeer = spare;
@@ -30353,21 +30471,10 @@ class P2PClient {
                 this.connectedAddr = addr;
                 this.connectedPeer = connection.remotePeer;
                 this.isConnected = true;
-
-                console.log(`[P2P] libp2p started. Engine: ${isBrowser ? 'WebRTC' : 'TCP'}. Local PeerId:`, this.node.peerId.toString());
-                console.log('[P2P] Successfully secured connection to Node:', this.connectedPeer.toString());
-
                 this._emitStatus('connected');
-
-                // Best-effort: ask this peer for more peers and warm a few spare
-                // connections so we're not pinned to one bootstrap node. Never let
-                // a discovery failure affect the primary connection we just made.
-                this._discoverPeers().catch((e) => dlog(`peer discovery failed (non-fatal): ${e?.message}`));
-
+                this._discoverPeers().catch(()=>{});
                 return;
-            } catch (e) {
-                console.warn(`[P2P] Failed to connect to ${addr}:`, e.message);
-            }
+            } catch (e) {}
         }
         throw new Error("Could not connect to any P2P peers");
     }
@@ -30392,8 +30499,6 @@ class P2PClient {
         }, RECONNECT_DELAY_MS * this.reconnectAttempts);
     }
 
-    // Return a connected PeerId other than `exceptPeer` (used to promote a spare
-    // when the primary drops). Returns null if no other peer is connected.
     _anyConnectedPeer(exceptPeer) {
         const except = exceptPeer?.toString();
         try {
@@ -30405,11 +30510,7 @@ class P2PClient {
         return null;
     }
 
-    // Send one binary /midstate/2.0.0 request to `peer` and read the framed
-    // bincode response payload. Mirrors the proven light-protocol request flow:
-    // open stream → attach reader → send framed payload → half-close (FIN) → read.
-    // TCP/Node only — the browser build doesn't speak this protocol to nodes.
-    async _rawBinaryRequest(peer, payload, timeoutMs = REQUEST_TIMEOUT_MS) {
+    async _rawBinaryRequest(peer, payload, timeoutMs = REQUEST_TIMEOUT_MS$1) {
         const conns = this.node.getConnections(peer);
         if (!conns || conns.length === 0) throw new Error('no connection for binary request');
         const stream = await conns[0].newStream(FULL_NODE_PROTOCOL, { signal: AbortSignal.timeout(timeoutMs) });
@@ -30425,47 +30526,29 @@ class P2PClient {
         }
     }
 
-    // PEX: ask the current peer for more peers, then warm a few spare TCP
-    // connections so the SDK isn't pinned to one bootstrap node. Entirely
-    // best-effort — every failure is swallowed and never disturbs the primary.
     async _discoverPeers({ maxDial = 3 } = {}) {
-        if (isBrowser) return;                 // TCP-only: node won't gossip dialable WebRTC addrs
-        if (!this.connectedPeer) return;
-
+        if (isBrowser || !this.connectedPeer) return;
         let addrs;
         try {
             const resp = await this._rawBinaryRequest(this.connectedPeer, encodeGetAddr());
             addrs = decodeAddr(resp);
-        } catch (e) {
-            dlog(`GetAddr failed (non-fatal): ${e?.message}`);
-            return;
-        }
-        dlog(`PEX: peer returned ${addrs.length} addr(s)`);
+        } catch (e) { return; }
 
         const myId = this.node.peerId.toString();
         const fresh = [];
         for (const addr of addrs) {
-            if (!isDialableTcpAddr(addr)) continue;
-            if (addr.includes(myId)) continue;             // don't dial ourselves
-            if (this.knownMultiaddrs.has(addr)) continue;  // already known/seeded
+            if (!isDialableTcpAddr(addr) || addr.includes(myId) || this.knownMultiaddrs.has(addr)) continue;
             this.knownMultiaddrs.add(addr);
             fresh.push(addr);
         }
-        dlog(`PEX: ${fresh.length} new dialable TCP addr(s) added to pool (pool size ${this.knownMultiaddrs.size})`);
 
-        // Warm a handful of spares. These extras must NOT become the primary
-        // (the peer:connect guard handles that); we only want them connected so
-        // a primary drop can promote one instantly.
         let dialed = 0;
         for (const addr of fresh) {
             if (dialed >= maxDial) break;
             try {
                 await this.node.dial(multiaddr(addr), { signal: AbortSignal.timeout(5000) });
                 dialed++;
-                dlog(`PEX: warmed spare connection to ${addr}`);
-            } catch (e) {
-                dlog(`PEX: dial ${addr} failed (non-fatal): ${e?.message}`);
-            }
+            } catch (e) {}
         }
     }
 
@@ -30473,8 +30556,6 @@ class P2PClient {
         if (!this.isConnected || !this.connectedPeer) throw new Error('Not connected to any peer');
         let conns = this.node.getConnections(this.connectedPeer);
         if (!conns || conns.length === 0) {
-            // Primary has no live connection right now — promote any other
-            // connected peer (PEX may have warmed spares) instead of failing.
             const spare = this._anyConnectedPeer(this.connectedPeer);
             if (spare) {
                 this.connectedPeer = spare;
@@ -30483,45 +30564,16 @@ class P2PClient {
             if (!conns || conns.length === 0) throw new Error('No active connection to peer');
         }
 
-        const stream = await conns[0].newStream(LIGHT_PROTOCOL, {
-            signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-        });
-        dlog(`stream opened for ${req.method}; protocol=${stream.protocol}; typeof close=${typeof stream.close}, typeof abort=${typeof stream.abort}`);
-
-        // Attach the reader BEFORE writing so we never miss an early response chunk.
-        // (In v3, inbound bytes are buffered until a 'message' listener exists, but
-        // attaching first avoids any microtask-ordering surprises.)
-        const responsePromise = readFrame(stream, REQUEST_TIMEOUT_MS);
-        // Mark the promise as handled so an early bail-out (e.g. a write error before
-        // we await) doesn't surface as an unhandledRejection.
+        const stream = await conns[0].newStream(LIGHT_PROTOCOL, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS$1) });
+        const responsePromise = readFrame(stream, REQUEST_TIMEOUT_MS$1);
         responsePromise.catch(() => {});
 
         try {
             const frame = encodeFrame(req);
-            const sent = await sendAll(stream, frame);
-            dlog(`sent request ${req.method}: ${frame.length}B (send() => ${sent})`);
-
-            // Half-close our write side: flush the request and send a FIN. In v3,
-            // close() is a *graceful write-close* — it resolves once our unsent data
-            // is written and signals end-of-write to the peer, while our read side
-            // stays open so we can still read the response. This mirrors the working
-            // browser client's sendCloseWrite(), and some server stream readers only
-            // complete (or flush) once they observe this FIN. Bounded by a signal so a
-            // dead connection can't hang us here.
-            try {
-                await stream.close({ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-                dlog('write side half-closed (FIN sent); awaiting response');
-            } catch (e) {
-                dlog(`close() (half-close) threw: ${e?.message}; continuing to read anyway`);
-            }
-
-            const result = await responsePromise;
-            dlog(`response received for ${req.method}`);
-            return result;
+            await sendAll(stream, frame);
+            try { await stream.close({ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS$1) }); } catch (e) {}
+            return await responsePromise;
         } catch (e) {
-            dlog(`request ${req.method} failed: ${e?.message}; retries left=${_retries}`);
-            // Discard the stream on any failure; abort() resets it and frees the
-            // server-side per-peer stream slot immediately.
             try { stream.abort(e instanceof Error ? e : new Error(String(e))); } catch (_) {}
             if (_retries > 0) return this.request(req, _retries - 1);
             throw e;
@@ -30873,6 +30925,60 @@ class MidstateClient {
         });
         return { ok: r.ok, body: r.ok ? null : await r.text() };
     }
+
+    /**
+     * Submit a chat message whose PoW has already been mined locally.
+     *
+     * The difference from {@link sendChat} is who does the work and whose
+     * identity the message carries. `send_chat` asks the node to mine v2 PoW on
+     * your behalf and broadcast under its own light-peer id. `submit_chat`
+     * carries a nonce you mined yourself — via `mine_chat_pow_v2_wasm` — so the
+     * message goes out under the `sender` you name. The node's ChatV2
+     * validation accepts either a libp2p PeerId or a 64-char hex MSS pubkey
+     * there, which is what lets a wallet identity originate chat without
+     * borrowing the node's.
+     *
+     * The `timestamp` and `nonce` must be exactly the pair the PoW was mined
+     * over, or verification fails and the node drops the message.
+     *
+     * # Formal Specification
+     * ```text
+     * pre  words.length ≤ 10
+     * pre  attachments.length ≤ 4
+     * pre  verify_chat_pow_v2(sender, timestamp, nonce, reply_to, words, attachments)
+     * post Node broadcasts Message::ChatV2 verbatim
+     * ```
+     *
+     * @param {string}   sender      libp2p PeerId, or 64-char hex MSS pubkey.
+     * @param {number}   timestamp   Unix seconds used when mining the PoW.
+     * @param {number|bigint} nonce  The mined PoW nonce.
+     * @param {number[]} words       Dictionary indices (≤ 10).
+     * @param {number|null} replyTo  Parent message nonce, or null.
+     * @param {Object[]} attachments Typed attachments (≤ 4).
+     */
+    async submitChat(sender, timestamp, nonce, words, replyTo = null, attachments = []) {
+        // nonce is a u64 server-side and arrives here as a BigInt from
+        // mine_chat_pow_v2_wasm. JSON.stringify throws on BigInt, so normalize
+        // to Number — safe because the PoW search space is far below 2^53.
+        const params = {
+            sender,
+            timestamp: Number(timestamp),
+            nonce: Number(nonce),
+            reply_to: replyTo,
+            words,
+            attachments,
+        };
+        if (this.isP2P) {
+            const resp = await this.p2pClient.request({ method: 'submit_chat', params });
+            return { ok: resp.ok, body: resp.ok ? null : (resp.error || "Chat rejected") };
+        }
+        const r = await fetch(`${this.rpcUrl}/api/chat/submit`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params)
+        });
+        return { ok: r.ok, body: r.ok ? null : await r.text() };
+    }
 }
 
 /* @ts-self-types="./wasm_wallet.d.ts" */
@@ -30946,6 +31052,91 @@ class WebWallet {
         }
     }
     /**
+     * Build coinbase outputs for web solo mining.
+     *
+     * Decomposes `total_value` into power-of-2 denominations and assigns
+     * them directly to the user's reusable MSS address.
+     * @param {bigint} total_value
+     * @param {string} address_hex
+     * @returns {string}
+     */
+    build_coinbase_to_mss(total_value, address_hex) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(address_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.webwallet_build_coinbase_to_mss(retptr, this.__wbg_ptr, total_value, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
+     * Assemble the Reveal payload for a Consolidate transaction.
+     *
+     * # Reasoning
+     * Standard `build_reveal` generates a 1.5 KB signature for *every* input. For 5000+ dust
+     * UTXOs, computing 5000 WOTS signatures requires billions of BLAKE3 hashes (freezing
+     * the browser for 10+ seconds) and generates megabytes of useless signature data.
+     * A Consolidate transaction strictly requires only ONE signature covering all inputs.
+     * This function bypasses the redundant signing, keeping the browser lightning fast.
+     *
+     * # Formal Specification
+     * ```text
+     * Pre:
+     *   - ctx_json is a valid SpendContext.
+     *   - ctx_json.selected_inputs is not empty.
+     *
+     * Post:
+     *   result = Ok(reveal_json) ⇒
+     *     reveal_json.signatures contains EXACTLY ONE signature (the first input's signature).
+     *     reveal_json.inputs contains all inputs without signatures.
+     * ```
+     * @param {string} ctx_json
+     * @returns {string}
+     */
+    build_consolidate_reveal(ctx_json) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(ctx_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.webwallet_build_consolidate_reveal(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
      * Build the reveal payload (inputs + signatures + outputs) for a committed transaction.
      *
      * # Safety Check
@@ -30983,6 +31174,48 @@ class WebWallet {
             const ptr2 = passStringToWasm0(server_salt_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
             const len2 = WASM_VECTOR_LEN;
             wasm.webwallet_build_reveal(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr4 = r0;
+            var len4 = r1;
+            if (r3) {
+                ptr4 = 0; len4 = 0;
+                throw takeObject(r2);
+            }
+            deferred5_0 = ptr4;
+            deferred5_1 = len4;
+            return getStringFromWasm0(ptr4, len4);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred5_0, deferred5_1, 1);
+        }
+    }
+    /**
+     * Phase 2: sign the wallet fee-inputs over the committed commitment and emit
+     * the wire `reveal` payload. Mirrors `build_reveal` but (a) splices contract
+     * witnesses verbatim, (b) hashes confidential outputs, (c) leaves contract
+     * inputs unsigned. `commitment_hex` / `salt_hex` are the ctx values returned
+     * by `prepare_script_spend` (pass ctx.commitment and ctx.tx_salt — there is
+     * no server-side salt contribution in this protocol).
+     * @param {string} ctx_json
+     * @param {string} commitment_hex
+     * @param {string} salt_hex
+     * @returns {string}
+     */
+    build_script_reveal(ctx_json, commitment_hex, salt_hex) {
+        let deferred5_0;
+        let deferred5_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(ctx_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(commitment_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            const ptr2 = passStringToWasm0(salt_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len2 = WASM_VECTOR_LEN;
+            wasm.webwallet_build_script_reveal(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
             var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
             var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -31235,6 +31468,28 @@ class WebWallet {
         }
     }
     /**
+     * @param {string} address_hex
+     * @returns {string | undefined}
+     */
+    get_mss_pubkey(address_hex) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(address_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.webwallet_get_mss_pubkey(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v2;
+            if (r0 !== 0) {
+                v2 = getStringFromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v2;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * Derive the WOTS address at a given HD index.
      *
      * Returns the hex-encoded 32-byte address. This is a pure computation
@@ -31346,8 +31601,257 @@ class WebWallet {
         }
     }
     /**
-     * Select coins and build a transaction for the given send amount.
+     * Prepare a Consolidate transaction (dust sweeping) for the Web Wallet.
      *
+     * # Reasoning
+     * Standard transactions (`prepare_spend`) budget for a 1.5 KB WOTS/MSS signature
+     * *per input*. For dust sweeping (e.g., 100+ inputs), this overestimates the fee
+     * massively, leading to false "Insufficient funds" errors. A `Consolidate`
+     * transaction mathematically requires only *one* signature for the entire batch
+     * of inputs (as long as they share the same address). This function applies
+     * the heavily discounted single-signature fee calculation, enabling users to
+     * sweep thousands of dust UTXOs affordably.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - available_utxos contains ≥ 2 UTXOs.
+     *   - All UTXOs in available_utxos share the exact same address.
+     *   - The sum of UTXO values > calculated_fee.
+     *
+     * Post:
+     *   result = Ok(ctx_json) ⇒
+     *     ctx_json.fee is calculated based on a 1-signature size budget.
+     *     ctx_json.outputs contains power-of-2 denominations of (total - fee) at dest_address.
+     *   result = Err(_) ⇒ state unchanged.
+     * ```
+     *
+     * ```zed
+     *     PrepareConsolidate
+     *     ------------------
+     *     ΔWebWallet
+     *     available? : seq WasmUtxo
+     *     dest_address? : String
+     *     next_wots_index? : ℕ₃₂
+     *     ctx! : String
+     *
+     *     pre  #available? ≥ 2
+     *     pre  ∀ u, v ∈ available? • u.address = v.address
+     *     let total = ∑ u ∈ available? • u.value
+     *     let fee = (((600 + 3000 + 100 + #available? * 125) * 10) / 1024) + 20
+     *     pre  total > fee
+     *     post ctx! = JSON(SpendContext)
+     * ```
+     *
+     * # Safety / Invariants
+     * - Output values strictly conform to consensus power-of-2 requirements via `decompose_value`.
+     * - Inputs are verified to share the same address to satisfy the `Transaction::Consolidate` rule.
+     * @param {string} available_utxos_json
+     * @param {string} dest_address_hex
+     * @param {number} next_wots_index
+     * @returns {string}
+     */
+    prepare_consolidate(available_utxos_json, dest_address_hex, next_wots_index) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(available_utxos_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(dest_address_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.webwallet_prepare_consolidate(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, next_wots_index);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr3 = r0;
+            var len3 = r1;
+            if (r3) {
+                ptr3 = 0; len3 = 0;
+                throw takeObject(r2);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
+     * Plans a defragmentation batch: moves up to `max_inputs` fragmented
+     * WOTS coins to a fresh MSS destination address (minus shape-dependent fee).
+     * @param {string} available_utxos_json
+     * @param {string} dest_address_hex
+     * @param {number} max_inputs
+     * @param {number} next_wots_index
+     * @returns {string}
+     */
+    prepare_defrag(available_utxos_json, dest_address_hex, max_inputs, next_wots_index) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(available_utxos_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(dest_address_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.webwallet_prepare_defrag(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, max_inputs, next_wots_index);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr3 = r0;
+            var len3 = r1;
+            if (r3) {
+                ptr3 = 0; len3 = 0;
+                throw takeObject(r2);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
+     * Fund MANY contract addresses in ONE transaction.
+     *
+     * Identical to [`prepare_fund_tx`] but takes a list of `{address, amount}`
+     * fundings instead of a single address. Every funding's amount is split into
+     * power-of-two coins paid to its address; wallet inputs cover the SUM plus a
+     * size-scaled fee, with change returned to deterministic wallet addresses.
+     * Used to fund a bundle of independent limit-order covenants (one fresh
+     * secret/address each) in a single ~2-block commit/reveal rather than N of them.
+     *
+     * `fundings_json` — JSON array: `[{ "address": <64-hex>, "amount": <u64> }, ...]`.
+     * Returns the same `ScriptSpendContext` JSON as `prepare_fund_tx`; the caller
+     * recovers each covenant's coin by matching `outputs[].address`.
+     * @param {string} available_utxos_json
+     * @param {string} fundings_json
+     * @param {number} next_wots_index
+     * @param {string | null} [databurns_json]
+     * @returns {string}
+     */
+    prepare_fund_many(available_utxos_json, fundings_json, next_wots_index, databurns_json) {
+        let deferred5_0;
+        let deferred5_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(available_utxos_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(fundings_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            var ptr2 = isLikeNone(databurns_json) ? 0 : passStringToWasm0(databurns_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            var len2 = WASM_VECTOR_LEN;
+            wasm.webwallet_prepare_fund_many(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, next_wots_index, ptr2, len2);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr4 = r0;
+            var len4 = r1;
+            if (r3) {
+                ptr4 = 0; len4 = 0;
+                throw takeObject(r2);
+            }
+            deferred5_0 = ptr4;
+            deferred5_1 = len4;
+            return getStringFromWasm0(ptr4, len4);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred5_0, deferred5_1, 1);
+        }
+    }
+    /**
+     * Phase 1 for FUNDING a contract. Pays `amount` to the contract address as
+     * power-of-two "value" coins, optionally seeds a confidential "state" coin,
+     * returns change to the wallet, and reuses `build_script_reveal` for phase 2
+     * (its `contract_inputs` list is simply empty here — the wallet pays).
+     *
+     * Mirrors the CLI fund instruction:  `--to addr:amount` (+ `--to addr:0:state`).
+     * `state_hex` = None for a plain value-only funding.
+     * @param {string} available_utxos_json
+     * @param {string} contract_addr_hex
+     * @param {bigint} amount
+     * @param {string | null | undefined} state_hex
+     * @param {number} next_wots_index
+     * @returns {string}
+     */
+    prepare_fund_tx(available_utxos_json, contract_addr_hex, amount, state_hex, next_wots_index) {
+        let deferred5_0;
+        let deferred5_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(available_utxos_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(contract_addr_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            var ptr2 = isLikeNone(state_hex) ? 0 : passStringToWasm0(state_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            var len2 = WASM_VECTOR_LEN;
+            wasm.webwallet_prepare_fund_tx(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, amount, ptr2, len2, next_wots_index);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr4 = r0;
+            var len4 = r1;
+            if (r3) {
+                ptr4 = 0; len4 = 0;
+                throw takeObject(r2);
+            }
+            deferred5_0 = ptr4;
+            deferred5_1 = len4;
+            return getStringFromWasm0(ptr4, len4);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred5_0, deferred5_1, 1);
+        }
+    }
+    /**
+     * @param {string} available_utxos_json
+     * @param {string} contract_bytecode_hex
+     * @param {string} contract_inputs_json
+     * @param {string} outputs_json
+     * @param {number} next_wots_index
+     * @returns {string}
+     */
+    prepare_script_spend(available_utxos_json, contract_bytecode_hex, contract_inputs_json, outputs_json, next_wots_index) {
+        let deferred6_0;
+        let deferred6_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(available_utxos_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(contract_bytecode_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            const ptr2 = passStringToWasm0(contract_inputs_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len2 = WASM_VECTOR_LEN;
+            const ptr3 = passStringToWasm0(outputs_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len3 = WASM_VECTOR_LEN;
+            wasm.webwallet_prepare_script_spend(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, next_wots_index);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr5 = r0;
+            var len5 = r1;
+            if (r3) {
+                ptr5 = 0; len5 = 0;
+                throw takeObject(r2);
+            }
+            deferred6_0 = ptr5;
+            deferred6_1 = len5;
+            return getStringFromWasm0(ptr5, len5);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred6_0, deferred6_1, 1);
+        }
+    }
+    /**
      * This implements the full coin selection algorithm:
      *
      * 1. **Greedy selection**: picks largest coins first until the amount + fee is covered.
@@ -31447,8 +31951,104 @@ class WebWallet {
         const len0 = WASM_VECTOR_LEN;
         wasm.webwallet_set_watchlist(this.__wbg_ptr, ptr0, len0);
     }
+    /**
+     * Sign a raw commitment hash using a cached MSS key for Layer 2 Payment Channels.
+     *
+     * # Reasoning
+     * Payment channels require users to sign off-chain state updates (commitments)
+     * without immediately broadcasting a `Reveal` transaction. This exposes the raw
+     * MSS signature mechanism to JavaScript to facilitate trustless Hub-and-Spoke
+     * L2 networks.
+     *
+     * # Formal Specification
+     * ```text
+     * Pre:  ∃ kp ∈ self.mss_cache.values() s.t. kp.master_pk == mss_pk_hex
+     *       commitment_hex is a valid 64-character hex string (32 bytes)
+     *       kp.remaining() > 0
+     * Post: kp.next_leaf' = kp.next_leaf + 1
+     *       result is Ok(signature_hex)
+     * ```
+     *
+     * ```zed
+     *     SignMssHex
+     *     ----------
+     *     ΔWebWallet
+     *     mss_pk_hex? : String
+     *     commitment_hex? : String
+     *     sig! : String
+     *
+     *     let kp == (μ k ∈ ran(mss_cache) | hex(k.master_pk) = mss_pk_hex?)
+     *
+     *     pre  kp exists
+     *     pre  kp.next_leaf < 2^{kp.height}
+     *     post kp'.next_leaf = kp.next_leaf + 1
+     *     post sig! = hex(sign(kp.master_seed, commitment))
+     * ```
+     * @param {string} mss_pk_hex
+     * @param {string} commitment_hex
+     * @returns {string}
+     */
+    sign_mss_hex(mss_pk_hex, commitment_hex) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(mss_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(commitment_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.webwallet_sign_mss_hex(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr3 = r0;
+            var len3 = r1;
+            if (r3) {
+                ptr3 = 0; len3 = 0;
+                throw takeObject(r2);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
+        }
+    }
 }
 if (Symbol.dispose) WebWallet.prototype[Symbol.dispose] = WebWallet.prototype.free;
+
+/**
+ * @param {string} address_hex
+ * @returns {string}
+ */
+function address_to_checksummed_hex(address_hex) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(address_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.address_to_checksummed_hex(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr2 = r0;
+        var len2 = r1;
+        if (r3) {
+            ptr2 = 0; len2 = 0;
+            throw takeObject(r2);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+    }
+}
 
 /**
  * Hash a hex-encoded byte string with BLAKE3.
@@ -31473,6 +32073,238 @@ function blake3_hash_hex(hex_data) {
     } finally {
         wasm.__wbindgen_add_to_stack_pointer(16);
         wasm.__wbindgen_export4(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * @param {bigint} channel_value
+ * @param {string} channel_salt_hex
+ * @param {string} alice_pk_hex
+ * @param {string} bob_pk_hex
+ * @param {string} state_json
+ * @param {string} alice_sig_hex
+ * @param {string} bob_sig_hex
+ * @returns {string}
+ */
+function build_channel_reveal(channel_value, channel_salt_hex, alice_pk_hex, bob_pk_hex, state_json, alice_sig_hex, bob_sig_hex) {
+    let deferred8_0;
+    let deferred8_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(channel_salt_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(alice_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(bob_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(state_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passStringToWasm0(alice_sig_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len4 = WASM_VECTOR_LEN;
+        const ptr5 = passStringToWasm0(bob_sig_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len5 = WASM_VECTOR_LEN;
+        wasm.build_channel_reveal(retptr, channel_value, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr7 = r0;
+        var len7 = r1;
+        if (r3) {
+            ptr7 = 0; len7 = 0;
+            throw takeObject(r2);
+        }
+        deferred8_0 = ptr7;
+        deferred8_1 = len7;
+        return getStringFromWasm0(ptr7, len7);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred8_0, deferred8_1, 1);
+    }
+}
+
+/**
+ * @param {string} channel_coin_id_hex
+ * @param {string} alice_pk_hex
+ * @param {string} bob_pk_hex
+ * @param {bigint} alice_amount
+ * @param {bigint} bob_amount
+ * @param {number} nonce
+ * @param {string} htlcs_json
+ * @returns {string}
+ */
+function build_channel_state(channel_coin_id_hex, alice_pk_hex, bob_pk_hex, alice_amount, bob_amount, nonce, htlcs_json) {
+    let deferred6_0;
+    let deferred6_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(channel_coin_id_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(alice_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(bob_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(htlcs_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        wasm.build_channel_state(retptr, ptr0, len0, ptr1, len1, ptr2, len2, alice_amount, bob_amount, nonce, ptr3, len3);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr5 = r0;
+        var len5 = r1;
+        if (r3) {
+            ptr5 = 0; len5 = 0;
+            throw takeObject(r2);
+        }
+        deferred6_0 = ptr5;
+        deferred6_1 = len5;
+        return getStringFromWasm0(ptr5, len5);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred6_0, deferred6_1, 1);
+    }
+}
+
+/**
+ * @param {string} secret_hash_hex
+ * @param {string} receiver_addr_hex
+ * @param {bigint} min_payout
+ * @param {bigint} timeout_height
+ * @param {string} refund_pk_hex
+ * @returns {string}
+ */
+function build_covenant_htlc_bytecode_hex(secret_hash_hex, receiver_addr_hex, min_payout, timeout_height, refund_pk_hex) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(secret_hash_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(receiver_addr_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(refund_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        wasm.build_covenant_htlc_bytecode_hex(retptr, ptr0, len0, ptr1, len1, min_payout, timeout_height, ptr2, len2);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr4 = r0;
+        var len4 = r1;
+        if (r3) {
+            ptr4 = 0; len4 = 0;
+            throw takeObject(r2);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred5_0, deferred5_1, 1);
+    }
+}
+
+/**
+ * Builds the Midstate HTLC bytecode for cross-chain atomic swaps.
+ * @param {string} secret_hash_hex
+ * @param {string} receiver_pk_hex
+ * @param {bigint} timeout_height
+ * @param {string} refund_pk_hex
+ * @returns {string}
+ */
+function build_htlc_bytecode_hex(secret_hash_hex, receiver_pk_hex, timeout_height, refund_pk_hex) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(secret_hash_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(receiver_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(refund_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        wasm.build_htlc_bytecode_hex(retptr, ptr0, len0, ptr1, len1, timeout_height, ptr2, len2);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr4 = r0;
+        var len4 = r1;
+        if (r3) {
+            ptr4 = 0; len4 = 0;
+            throw takeObject(r2);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred5_0, deferred5_1, 1);
+    }
+}
+
+/**
+ * Builds the limit-order covenant bytecode (Feature 1). See
+ * `midstate::core::script::compile_limit_order_covenant` for the security notes.
+ * @param {string} secret_hash_hex
+ * @param {bigint} max_claim
+ * @param {bigint} timeout_height
+ * @param {string} refund_pk_hex
+ * @returns {string}
+ */
+function build_limit_order_covenant_bytecode_hex(secret_hash_hex, max_claim, timeout_height, refund_pk_hex) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(secret_hash_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(refund_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.build_limit_order_covenant_bytecode_hex(retptr, ptr0, len0, max_claim, timeout_height, ptr1, len1);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr3 = r0;
+        var len3 = r1;
+        if (r3) {
+            ptr3 = 0; len3 = 0;
+            throw takeObject(r2);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
+    }
+}
+
+/**
+ * @param {string} pk1_hex
+ * @param {string} pk2_hex
+ * @returns {string}
+ */
+function build_multisig_2of2_address(pk1_hex, pk2_hex) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(pk1_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(pk2_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.build_multisig_2of2_address(retptr, ptr0, len0, ptr1, len1);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred3_0 = r0;
+        deferred3_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
     }
 }
 
@@ -31520,6 +32352,82 @@ function compute_coin_id_hex(address_hex, value, salt_hex) {
 }
 
 /**
+ * Compute a transaction commitment hash directly from WASM.
+ *
+ * # Formal Specification
+ * ```text
+ * Pre:  input_ids_json and output_hashes_json are valid JSON arrays of 64-char hex strings.
+ *       salt_hex is a valid 64-character hex string.
+ * Post: result = BLAKE3(MAGIC || len(inputs) || inputs || len(outputs) || outputs || salt)
+ * ```
+ * @param {string} input_ids_json
+ * @param {string} output_hashes_json
+ * @param {string} salt_hex
+ * @returns {string}
+ */
+function compute_commitment_hex(input_ids_json, output_hashes_json, salt_hex) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(input_ids_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(output_hashes_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(salt_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        wasm.compute_commitment_hex(retptr, ptr0, len0, ptr1, len1, ptr2, len2);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr4 = r0;
+        var len4 = r1;
+        if (r3) {
+            ptr4 = 0; len4 = 0;
+            throw takeObject(r2);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred5_0, deferred5_1, 1);
+    }
+}
+
+/**
+ * @param {string} owner_pk_hex
+ * @returns {string}
+ */
+function compute_p2pk_address_hex(owner_pk_hex) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(owner_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.compute_p2pk_address_hex(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr2 = r0;
+        var len2 = r1;
+        if (r3) {
+            ptr2 = 0; len2 = 0;
+            throw takeObject(r2);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
  * Decompose an amount into canonical power-of-2 denominations.
  *
  * The Midstate UTXO model requires all coin values to be exact powers of 2.
@@ -31534,6 +32442,49 @@ function compute_coin_id_hex(address_hex, value, salt_hex) {
 function decompose_amount(amount) {
     const ret = wasm.decompose_amount(amount);
     return takeObject(ret);
+}
+
+/**
+ * Decrypt a native CLI wallet file (`.dat`) using its password.
+ *
+ * Returns the decrypted JSON string containing the full wallet data
+ * (master_seed, coins, mss_keys, history, etc.).
+ *
+ * # Errors
+ *
+ * Returns `Err` if decryption fails (wrong password) or the decrypted
+ * data is not valid UTF-8.
+ * @param {Uint8Array} data
+ * @param {string} password
+ * @returns {string}
+ */
+function decrypt_cli_wallet(data, password) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(password, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.decrypt_cli_wallet(retptr, ptr0, len0, ptr1, len1);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr3 = r0;
+        var len3 = r1;
+        if (r3) {
+            ptr3 = 0; len3 = 0;
+            throw takeObject(r2);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
+    }
 }
 
 /**
@@ -31565,22 +32516,79 @@ function generate_phrase() {
 }
 
 /**
- * Mine a spam-proof PoW nonce for a transaction commitment.
+ * Mine the Anti-Spam Proof of Work for a P2P Chat Message directly in the browser.
  *
- * Searches sequentially for a nonce `n` such that:
- *   `leading_zeros(BLAKE3(commitment || n_le_bytes)) >= required_pow`
+ * # Reasoning
+ * Pushing PoW to the client prevents node CPU exhaustion and enables true
+ * decentralized P2P dApps (like L2 Lightning Hubs) over WebRTC without relying
+ * on central RPC servers to mine on the user's behalf.
  *
- * This is a CPU-bound loop that runs synchronously. At difficulty 24,
- * it typically takes 0.5–5 seconds in WASM SIMD.
+ * # Formal Specification
+ * ```text
+ * Pre:  sender is a valid PeerId string
+ *       words_json is a JSON array of u8 (0-255)
+ *       attachments_json is a JSON array of valid ChatAttachment objects
+ * Post: result = Ok(nonce) where verify_chat_pow_v2(..., nonce) == true
+ * ```
+ * @param {string} sender
+ * @param {bigint} timestamp
+ * @param {string} reply_to_json
+ * @param {string} words_json
+ * @param {string} attachments_json
+ * @returns {bigint}
+ */
+function mine_chat_pow_v2_wasm(sender, timestamp, reply_to_json, words_json, attachments_json) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(sender, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(reply_to_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(words_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(attachments_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        wasm.mine_chat_pow_v2_wasm(retptr, ptr0, len0, timestamp, ptr1, len1, ptr2, len2, ptr3, len3);
+        var r0 = getDataViewMemory0().getBigInt64(retptr + 8 * 0, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        if (r3) {
+            throw takeObject(r2);
+        }
+        return BigInt.asUintN(64, r0);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * Safely mines the Commitment PoW in the WebAssembly context.
  *
- * # Arguments
+ * # Reasoning
+ * Intercepts invalid or missing hex strings (e.g., from an out-of-sync RPC cache)
+ * and handles them gracefully. Replacing `.unwrap()` with silent fallbacks prevents
+ * the Web Worker from panicking and permanently hanging the UI on "Mining PoW...".
  *
- * * `commitment_hex` — 64-char hex string of the 32-byte commitment hash.
- * * `required_pow` — minimum number of leading zero bits required.
+ * # Formal Specification
+ * ```text
+ * Pre:  true
+ * Post: result = mine_pow(commitment, required_pow, target_height, header_hash) if hex valid
+ *       result = 0 if commitment_hex invalid
+ * ```
  *
- * # Panics
+ * ```zed
+ *     MineCommitmentPowWasm
+ *     ---------------------
+ *     commitment_hex? : String
+ *     required_pow? : ℕ₃₂
+ *     target_height? : ℕ₆₄
+ *     header_hash_hex? : String
+ *     nonce! : ℕ₆₄
  *
- * Panics if `commitment_hex` is not exactly 64 valid hex characters.
+ *     pre  true
+ *     post (isHex32(commitment_hex?) ⇒ nonce! = MinePow(...))
+ *        ∧ (¬isHex32(commitment_hex?) ⇒ nonce! = 0)
+ * ```
  * @param {string} commitment_hex
  * @param {number} required_pow
  * @param {bigint} target_height
@@ -31594,6 +32602,363 @@ function mine_commitment_pow(commitment_hex, required_pow, target_height, header
     const len1 = WASM_VECTOR_LEN;
     const ret = wasm.mine_commitment_pow(ptr0, len0, required_pow, target_height, ptr1, len1);
     return BigInt.asUintN(64, ret);
+}
+
+/**
+ * Cooperative / unilateral-receiver close reveal.
+ * Witness per input: [sender_sig, receiver_sig, 0x01].
+ * @param {string} sender_pk_hex
+ * @param {string} receiver_pk_hex
+ * @param {bigint} expiry
+ * @param {string} funding_json
+ * @param {string} state_json
+ * @param {string} sender_sig_hex
+ * @param {string} receiver_sig_hex
+ * @returns {string}
+ */
+function qbolt_build_close_reveal(sender_pk_hex, receiver_pk_hex, expiry, funding_json, state_json, sender_sig_hex, receiver_sig_hex) {
+    let deferred8_0;
+    let deferred8_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(sender_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(receiver_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(funding_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(state_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passStringToWasm0(sender_sig_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len4 = WASM_VECTOR_LEN;
+        const ptr5 = passStringToWasm0(receiver_sig_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len5 = WASM_VECTOR_LEN;
+        wasm.qbolt_build_close_reveal(retptr, ptr0, len0, ptr1, len1, expiry, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr7 = r0;
+        var len7 = r1;
+        if (r3) {
+            ptr7 = 0; len7 = 0;
+            throw takeObject(r2);
+        }
+        deferred8_0 = ptr7;
+        deferred8_1 = len7;
+        return getStringFromWasm0(ptr7, len7);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred8_0, deferred8_1, 1);
+    }
+}
+
+/**
+ * @param {string} alice_pk_hex
+ * @param {string} bob_pk_hex
+ * @param {string} funding_json
+ * @param {string} state_json
+ * @param {string} alice_sig_hex
+ * @param {string} bob_sig_hex
+ * @returns {string}
+ */
+function qbolt_build_legacy_close_reveal(alice_pk_hex, bob_pk_hex, funding_json, state_json, alice_sig_hex, bob_sig_hex) {
+    let deferred8_0;
+    let deferred8_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(alice_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(bob_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(funding_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(state_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passStringToWasm0(alice_sig_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len4 = WASM_VECTOR_LEN;
+        const ptr5 = passStringToWasm0(bob_sig_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len5 = WASM_VECTOR_LEN;
+        wasm.qbolt_build_legacy_close_reveal(retptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr7 = r0;
+        var len7 = r1;
+        if (r3) {
+            ptr7 = 0; len7 = 0;
+            throw takeObject(r2);
+        }
+        deferred8_0 = ptr7;
+        deferred8_1 = len7;
+        return getStringFromWasm0(ptr7, len7);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred8_0, deferred8_1, 1);
+    }
+}
+
+/**
+ * LEGACY RESCUE — v1 channels funded a bare 2-of-2 with NO timeout branch,
+ * and the v1 close never committed its commitment on-chain (so it could not
+ * confirm) and assumed a single funding coin (funding was actually split
+ * into power-of-2 denominations). These two builders produce a CORRECT
+ * cooperative close for that legacy covenant: multi-coin aware, and meant
+ * to be driven through the full commit → reveal engine. Both parties must
+ * still cooperate — a bare 2-of-2 has no unilateral path, ever.
+ * @param {string} channel_id_hex
+ * @param {string} alice_pk_hex
+ * @param {string} bob_pk_hex
+ * @param {string} funding_json
+ * @param {bigint} alice_amt
+ * @param {bigint} bob_amt
+ * @param {number} attempt
+ * @returns {string}
+ */
+function qbolt_build_legacy_close_state(channel_id_hex, alice_pk_hex, bob_pk_hex, funding_json, alice_amt, bob_amt, attempt) {
+    let deferred6_0;
+    let deferred6_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(channel_id_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(alice_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(bob_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(funding_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        wasm.qbolt_build_legacy_close_state(retptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, alice_amt, bob_amt, attempt);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr5 = r0;
+        var len5 = r1;
+        if (r3) {
+            ptr5 = 0; len5 = 0;
+            throw takeObject(r2);
+        }
+        deferred6_0 = ptr5;
+        deferred6_1 = len5;
+        return getStringFromWasm0(ptr5, len5);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred6_0, deferred6_1, 1);
+    }
+}
+
+/**
+ * Sender's post-expiry refund reveal.
+ * Witness per input: [sender_sig, 0x00].
+ * @param {string} sender_pk_hex
+ * @param {string} receiver_pk_hex
+ * @param {bigint} expiry
+ * @param {string} funding_json
+ * @param {string} state_json
+ * @param {string} sender_sig_hex
+ * @returns {string}
+ */
+function qbolt_build_refund_reveal(sender_pk_hex, receiver_pk_hex, expiry, funding_json, state_json, sender_sig_hex) {
+    let deferred7_0;
+    let deferred7_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(sender_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(receiver_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(funding_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(state_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passStringToWasm0(sender_sig_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len4 = WASM_VECTOR_LEN;
+        wasm.qbolt_build_refund_reveal(retptr, ptr0, len0, ptr1, len1, expiry, ptr2, len2, ptr3, len3, ptr4, len4);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr6 = r0;
+        var len6 = r1;
+        if (r3) {
+            ptr6 = 0; len6 = 0;
+            throw takeObject(r2);
+        }
+        deferred7_0 = ptr6;
+        deferred7_1 = len6;
+        return getStringFromWasm0(ptr6, len6);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred7_0, deferred7_1, 1);
+    }
+}
+
+/**
+ * Build the sender's post-expiry refund state: everything (minus fee) back
+ * to the sender. Uses nonce = u32::MAX so its salts can never collide with
+ * a payment state.
+ * @param {string} channel_id_hex
+ * @param {string} sender_pk_hex
+ * @param {string} receiver_pk_hex
+ * @param {bigint} expiry
+ * @param {string} funding_json
+ * @param {number} attempt
+ * @returns {string}
+ */
+function qbolt_build_refund_state(channel_id_hex, sender_pk_hex, receiver_pk_hex, expiry, funding_json, attempt) {
+    let deferred6_0;
+    let deferred6_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(channel_id_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(sender_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(receiver_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(funding_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        wasm.qbolt_build_refund_state(retptr, ptr0, len0, ptr1, len1, ptr2, len2, expiry, ptr3, len3, attempt);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr5 = r0;
+        var len5 = r1;
+        if (r3) {
+            ptr5 = 0; len5 = 0;
+            throw takeObject(r2);
+        }
+        deferred6_0 = ptr5;
+        deferred6_1 = len5;
+        return getStringFromWasm0(ptr5, len5);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred6_0, deferred6_1, 1);
+    }
+}
+
+/**
+ * Build the canonical close state for a Q-Bolt v2 channel.
+ * `channel_id_hex` is the channel's stable identifier (the lexicographically
+ * smallest funding coin id) — used only for salt derivation.
+ * @param {string} channel_id_hex
+ * @param {string} sender_pk_hex
+ * @param {string} receiver_pk_hex
+ * @param {bigint} expiry
+ * @param {string} funding_json
+ * @param {bigint} sender_amt
+ * @param {bigint} receiver_amt
+ * @param {number} nonce
+ * @param {string} htlcs_json
+ * @param {number} attempt
+ * @returns {string}
+ */
+function qbolt_build_state(channel_id_hex, sender_pk_hex, receiver_pk_hex, expiry, funding_json, sender_amt, receiver_amt, nonce, htlcs_json, attempt) {
+    let deferred7_0;
+    let deferred7_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(channel_id_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(sender_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(receiver_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(funding_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passStringToWasm0(htlcs_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len4 = WASM_VECTOR_LEN;
+        wasm.qbolt_build_state(retptr, ptr0, len0, ptr1, len1, ptr2, len2, expiry, ptr3, len3, sender_amt, receiver_amt, nonce, ptr4, len4, attempt);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr6 = r0;
+        var len6 = r1;
+        if (r3) {
+            ptr6 = 0; len6 = 0;
+            throw takeObject(r2);
+        }
+        deferred7_0 = ptr6;
+        deferred7_1 = len6;
+        return getStringFromWasm0(ptr6, len6);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred7_0, deferred7_1, 1);
+    }
+}
+
+/**
+ * @param {string} sender_pk_hex
+ * @param {string} receiver_pk_hex
+ * @param {bigint} expiry
+ * @returns {string}
+ */
+function qbolt_channel_address(sender_pk_hex, receiver_pk_hex, expiry) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(sender_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(receiver_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.qbolt_channel_address(retptr, ptr0, len0, ptr1, len1, expiry);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr3 = r0;
+        var len3 = r1;
+        if (r3) {
+            ptr3 = 0; len3 = 0;
+            throw takeObject(r2);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
+    }
+}
+
+/**
+ * @param {string} sender_pk_hex
+ * @param {string} receiver_pk_hex
+ * @param {bigint} expiry
+ * @returns {string}
+ */
+function qbolt_channel_bytecode_hex(sender_pk_hex, receiver_pk_hex, expiry) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(sender_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(receiver_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.qbolt_channel_bytecode_hex(retptr, ptr0, len0, ptr1, len1, expiry);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr3 = r0;
+        var len3 = r1;
+        if (r3) {
+            ptr3 = 0; len3 = 0;
+            throw takeObject(r2);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
+    }
 }
 
 /**
@@ -31637,6 +33002,23 @@ function search_nonces(midstate_hex, target_hex, start_nonce, iterations) {
     } finally {
         wasm.__wbindgen_add_to_stack_pointer(16);
     }
+}
+
+/**
+ * @param {string} sig_hex
+ * @param {string} msg_hex
+ * @param {string} pk_hex
+ * @returns {boolean}
+ */
+function verify_mss_sig_wasm(sig_hex, msg_hex, pk_hex) {
+    const ptr0 = passStringToWasm0(sig_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(msg_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.verify_mss_sig_wasm(ptr0, len0, ptr1, len1, ptr2, len2);
+    return ret !== 0;
 }
 
 function __wbg_get_imports() {
@@ -31964,6 +33346,26 @@ async function __wbg_load(module, imports) {
     }
 }
 
+function initSync(module) {
+    if (wasm !== undefined) return wasm;
+
+
+    if (module !== undefined) {
+        if (Object.getPrototypeOf(module) === Object.prototype) {
+            ({module} = module);
+        } else {
+            console.warn('using deprecated parameters for `initSync()`; pass a single object instead');
+        }
+    }
+
+    const imports = __wbg_get_imports();
+    if (!(module instanceof WebAssembly.Module)) {
+        module = new WebAssembly.Module(module);
+    }
+    const instance = new WebAssembly.Instance(module, imports);
+    return __wbg_finalize_init(instance);
+}
+
 async function __wbg_init(module_or_path) {
     if (wasm !== undefined) return wasm;
 
@@ -32078,6 +33480,716 @@ var storage = /*#__PURE__*/Object.freeze({
     StorageProvider: StorageProvider
 });
 
+// reorg.js — Reuse-safe chain-reorganisation handling for the Midstate SDK.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+//  Notation (per the Midstate Coding & Documentation Standard)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//   Hash          ≜ BLAKE3 output ([u8; 32]), carried here as 64-char hex
+//   Height        ≜ ℕ
+//   ℙ T           ≜ power set of T
+//   A ⇸ B         ≜ partial function (a JS object used as a map)
+//   dom f, ran f  ≜ domain / range of f
+//   #s            ≜ cardinality
+//   x'            ≜ value of x AFTER the operation
+//   x?            ≜ input parameter, y! ≜ output
+//   𝔹             ≜ {true, false}
+//   ⊕             ≜ functional override (map update)
+//   ◁, ⩤          ≜ domain restriction / domain anti-restriction
+//
+// State space shared by every schema in this module:
+//
+//   Coin ≜ (coin_id : Hash, address : Hash, value : ℕ, salt : Hash,
+//           is_mss : 𝔹, created_at : Height, reuse_locked : 𝔹)
+//
+//   ContractCoin ≜ (coin_id : Hash, address : Hash, value : ℕ, salt : Hash,
+//                   state : Hash ∪ {null}, created_at : Height)
+//     — script-locked, held at a CONTRACT address. `state ≠ null` marks a state
+//       thread, which consensus requires to have value 0.
+//
+//     WalletState
+//     ─────────────────────────────────────────────────────────────
+//     utxos        : ℙ Coin
+//     spent_log    : Height ⇸ ℙ Coin
+//     block_hashes : Height ⇸ Hash
+//     spent_wots   : Hash ⇸ (height : Height, commitment : Hash ∪ {null})
+//     sent_reveals : Hash ⇸ (commitment : Hash, payload : String,
+//                            coin_ids : ℙ Hash, sent_at : Height)
+//     reuse_locked : Hash ⇸ (address : Hash, prior_commitment : Hash ∪ {null})
+//     contract_coins : Hash ⇸ ContractCoin
+//     scanned      : Height
+//
+//     INV-1  ∀ c ∈ utxos • ¬c.is_mss ∧ c.address ∈ dom spent_wots
+//                        ⇒ c.reuse_locked
+//            (a coin at a published one-time key is never freely spendable)
+//     INV-2  dom reuse_locked ⊆ { c.coin_id | c ∈ utxos }
+//     INV-3  ∀ h ∈ dom spent_log • h ≤ scanned
+//     INV-4  #(dom block_hashes) ≤ REORG_DEPTH + RETAIN_SLACK
+//     INV-5  dom contract_coins ∩ { c.coin_id | c ∈ utxos } = ∅
+//            (a script-locked coin is never in the wallet-key spend set)
+//     INV-6  ∀ c ∈ ran contract_coins • c.state ≠ null ⇒ c.value = 0
+//
+// ═══════════════════════════════════════════════════════════════════════════
+//  Reasoning (module level)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Before this module the wallet applied blocks forward-only and irreversibly:
+// a spend deleted its input coins, purged WOTS siblings, and set
+// spent_wots[addr] permanently. An orphaned block therefore
+//
+//   (a) left phantom credits for outputs that only ever existed on the dead
+//       branch, and — far worse —
+//   (b) stranded real coins. A spend that got reorged out had already had its
+//       inputs deleted and its address poisoned, and addUtxo refuses a poisoned
+//       address forever, so not even a full rescan could re-credit the coin.
+//
+// The naive repair — clear spent_wots on rollback and restore the coin — is
+// UNSAFE. A WOTS key signs exactly one message. When a spend is orphaned its
+// signature, over that transaction's commitment, is already public and may
+// still confirm on the winning branch or be replayed by anyone. If the address
+// were simply un-poisoned and the restored coin spent into ANY different
+// transaction, the wallet would produce a SECOND signature over a DIFFERENT
+// commitment from the same key. That is textbook one-time-key reuse: it leaks
+// the private key, and the node ships a Key Reuse Punishment Burn Protocol
+// that lets any observer burn the funds.
+//
+// So a restored coin must be spendable ONLY by re-sending the identical
+// original signature (same commitment), never by re-signing. Every mutation is
+// height-tagged; on reorg we roll back to the fork and resolve each restored
+// spend three ways:
+//
+//   CASE 1  The verbatim signed reveal is still held (within COMMITMENT_TTL):
+//           clear the poison and re-arm the pending transaction so the SAME
+//           signature is re-broadcast. Reuse-safe and automatic.
+//   CASE 2  The reveal is no longer held but the address is poisoned: restore
+//           the coin REUSE-LOCKED. It counts toward a separate locked balance,
+//           is never offered to coin selection, and is surfaced to the caller.
+//   CASE 3  MSS inputs: leaf counters are reconciled against the node and each
+//           leaf is distinct, so there is no per-key reuse cliff. Restored
+//           normally.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+//  Fork detection against this node
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// `LightNotification::NewBlockTip` carries height, target, filter_hex,
+// block_hash and element_count — but NO parent hash. Parent-linkage detection
+// is therefore unavailable to a light client on protocol /midstate/light/2.0.0,
+// and any check written against `prev_hash` is dead code against this node.
+//
+// What IS available is a per-height block identity from two independent
+// sources that agree: `get_filters` returns `block_hashes[i]` =
+// `batch.extension.final_hash`, and `get_block(h)` returns the batch whose
+// `extension.final_hash` is the same value. Detection therefore keys on hash
+// CONFLICT at a height we have already recorded, confirmed by descending until
+// a recorded hash still matches the node's.
+//
+// `get_filters` is used for the descent rather than `get_block`: it is a far
+// smaller response, and a single-height range costs one request either way.
+// The descent is bounded by REORG_DEPTH so a pathological peer cannot walk us
+// to genesis one request at a time.
+
+/**
+ * Depth of hash history retained, and the maximum reorg this module can heal
+ * precisely. Deeper divergence falls back to a rescan from the floor.
+ */
+const REORG_DEPTH = 200;
+
+/** Slack above REORG_DEPTH before pruning runs, to avoid pruning every block. */
+const RETAIN_SLACK = 8;
+
+/**
+ * Blocks a commitment survives in chain state (`COMMITMENT_TTL` in
+ * core/types.rs). A retained reveal older than this can no longer be revealed,
+ * so it is pruned and its address falls to CASE 2.
+ */
+const COMMITMENT_TTL = 1000;
+
+const normalizeHex$1 = (h) => (typeof h === 'string' ? h.replace(/^0x/, '').toLowerCase() : '');
+
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Record the canonical block identity observed at a height.
+ *
+ * # Reasoning
+ *
+ * Reorg detection is only possible if the wallet remembers what it believed the
+ * chain looked like. This is the sole writer of that memory. It is deliberately
+ * cheap and total: it is called for every scanned height, including heights
+ * with no wallet-relevant activity, because a fork can occur at a block that
+ * paid us nothing and we still need to notice it.
+ *
+ * Heights whose hash the node could not supply (the undecidable placeholder,
+ * an empty string) are skipped rather than stored as a sentinel. Storing a
+ * sentinel would make the descent in {@link findForkHeight} treat that height
+ * as a confirmed match and stop early at a block we never actually verified.
+ *
+ * # Formal Specification
+ *
+ * ```text
+ * Pre:
+ *   - height? ∈ Height
+ *
+ * Post:
+ *   hash? ≠ ""  ⇒  block_hashes' = block_hashes ⊕ {height? ↦ hash?}
+ *   hash? = ""  ⇒  block_hashes' = block_hashes
+ *   utxos' = utxos ∧ spent_log' = spent_log ∧ spent_wots' = spent_wots
+ * ```
+ *
+ * ```zed
+ *     RecordBlockHash
+ *     ─────────────────────────────
+ *     ΔWalletState
+ *     height? : Height
+ *     hash?   : Hash ∪ {""}
+ *
+ *     post hash? ≠ "" ⇒ block_hashes' = block_hashes ⊕ {height? ↦ hash?}
+ *     post hash? = "" ⇒ block_hashes' = block_hashes
+ *     post utxos' = utxos
+ *     post spent_log' = spent_log
+ *     post spent_wots' = spent_wots
+ *     post scanned' = scanned
+ * ```
+ *
+ * # Safety / Invariants
+ *
+ * - Maintains INV-4 by delegating to {@link pruneHistory}, which the caller
+ *   invokes once per batch rather than once per height.
+ * - Never widens spendability: touches no coin state.
+ *
+ * @param {Object} w      Wallet instance.
+ * @param {number} height Block height.
+ * @param {string} hash   `extension.final_hash`, or "" if unavailable.
+ */
+function recordBlockHash(w, height, hash) {
+    const h = normalizeHex$1(hash);
+    if (!h) return;
+    w.blockHashes[height] = h;
+}
+
+/**
+ * Drop history that can no longer participate in a heal.
+ *
+ * # Reasoning
+ *
+ * Three structures grow without bound as the chain advances, and each has a
+ * different, principled cutoff:
+ *
+ *  - `block_hashes` and `spent_log` are bounded by REORG_DEPTH. Below that
+ *    depth a reorg is not healable precisely anyway, so retaining the data
+ *    buys nothing; a spend that deep is final.
+ *  - `sent_reveals` is bounded by COMMITMENT_TTL instead, because its purpose
+ *    is different: it exists so CASE 1 can re-broadcast a verbatim signature.
+ *    Once the commitment has expired from chain state that reveal is dead —
+ *    the node would reject it — so retaining it would only mislead the CASE 1
+ *    test into promising a re-send that cannot succeed.
+ *
+ * Pruning `sent_reveals` on the REORG_DEPTH clock instead would be a
+ * correctness bug in the unsafe direction: it would discard signatures that are
+ * still re-sendable and demote recoverable coins to reuse-locked.
+ *
+ * # Formal Specification
+ *
+ * ```text
+ * Pre:
+ *   - tip? ∈ Height   (current network height)
+ *
+ * Post:
+ *   let cutoff = max(dom block_hashes) − REORG_DEPTH
+ *   #(dom block_hashes) > REORG_DEPTH + RETAIN_SLACK ⇒
+ *     block_hashes' = { h ↦ v ∈ block_hashes | h ≥ cutoff }
+ *     spent_log'    = { h ↦ v ∈ spent_log    | h ≥ cutoff }
+ *   sent_reveals' = { a ↦ r ∈ sent_reveals | tip? − r.sent_at ≤ COMMITMENT_TTL }
+ *   utxos' = utxos
+ * ```
+ *
+ * ```zed
+ *     PruneHistory
+ *     ─────────────────────────────
+ *     ΔWalletState
+ *     tip? : Height
+ *
+ *     pre  tip? ≥ 0
+ *
+ *     post ∀ h ∈ dom block_hashes' • h ≥ max(dom block_hashes) − REORG_DEPTH
+ *     post dom spent_log' ⊆ dom spent_log
+ *     post ∀ h ∈ dom spent_log' • h ≥ max(dom block_hashes) − REORG_DEPTH
+ *     post ∀ a ∈ dom sent_reveals' • tip? − sent_reveals'(a).sent_at ≤ COMMITMENT_TTL
+ *     post utxos' = utxos
+ *     post reuse_locked' = reuse_locked
+ * ```
+ *
+ * # Safety / Invariants
+ *
+ * - Establishes INV-4.
+ * - Does NOT prune `spent_wots`. A published one-time key stays published
+ *   forever; forgetting it would re-open the address to admission by addUtxo
+ *   and hand a reuse opportunity back to coin selection.
+ *
+ * @param {Object} w    Wallet instance.
+ * @param {number} tip  Current network height.
+ */
+function pruneHistory(w, tip) {
+    const heights = Object.keys(w.blockHashes).map(Number);
+    if (heights.length > REORG_DEPTH + RETAIN_SLACK) {
+        const cutoff = Math.max(...heights) - REORG_DEPTH;
+        for (const h of heights) if (h < cutoff) delete w.blockHashes[h];
+        for (const h of Object.keys(w.spentLog).map(Number)) {
+            if (h < cutoff) delete w.spentLog[h];   // buried spends are final
+        }
+    }
+    for (const addr of Object.keys(w.sentReveals)) {
+        const r = w.sentReveals[addr];
+        if (r && typeof r.sentAtHeight === 'number' && tip - r.sentAtHeight > COMMITMENT_TTL) {
+            delete w.sentReveals[addr];
+        }
+    }
+}
+
+/**
+ * Locate the highest height at which our recorded chain still agrees with the
+ * node's.
+ *
+ * # Reasoning
+ *
+ * A reorg is only actionable if we can say precisely where the branches
+ * diverge: rolling back too far needlessly discards confirmed state, and
+ * rolling back too little leaves dead-branch coins credited. This descends from
+ * the tip comparing recorded hashes against the node's until one matches.
+ *
+ * The descent is bounded by REORG_DEPTH. Without a bound a peer that answers
+ * every probe with a mismatch would walk the client to genesis one request per
+ * height — a self-inflicted rate-limit violation driven entirely by a remote
+ * party, which is precisely the amplification shape the node's own rate-limiter
+ * comments warn about. On exhaustion we return the floor and let the caller
+ * rescan that window; correctness is preserved because a rescan re-derives
+ * everything above the floor from the winning branch.
+ *
+ * Heights we never recorded are skipped, not treated as mismatches: absence of
+ * evidence is not divergence.
+ *
+ * # Formal Specification
+ *
+ * ```text
+ * Pre:
+ *   - tip? ≤ scanned
+ *   - client? answers getFilters(h, h+1) with the canonical hash at h, or ""
+ *
+ * Post:
+ *   floor = max(0, tip? − REORG_DEPTH)
+ *   fork! = max { h ∈ [floor, tip?] | h ∈ dom block_hashes
+ *                                   ∧ node_hash(h) = block_hashes(h) }
+ *   if that set is empty then fork! = floor ∧ exhausted! = true
+ *   0 ≤ fork! ≤ tip?
+ *   state unchanged (this is a query, not a transition)
+ * ```
+ *
+ * ```zed
+ *     FindForkHeight
+ *     ─────────────────────────────
+ *     ΞWalletState
+ *     tip?       : Height
+ *     fork!      : Height
+ *     exhausted! : 𝔹
+ *
+ *     pre  tip? ≤ scanned
+ *
+ *     post floor = max(0, tip? − REORG_DEPTH)
+ *     post floor ≤ fork! ≤ tip?
+ *     post ¬exhausted! ⇒ block_hashes(fork!) = node_hash(fork!)
+ *     post exhausted!  ⇒ fork! = floor
+ * ```
+ *
+ * # Safety / Invariants
+ *
+ * - Ξ (no state change): this function must never mutate wallet state, because
+ *   it runs before the caller has decided whether a rollback is warranted.
+ * - Bounded request count: at most REORG_DEPTH + 1 getFilters calls.
+ *
+ * @param {Object} w      Wallet instance.
+ * @param {Object} client Connected MidstateClient.
+ * @param {number} tip    Height to start descending from.
+ * @returns {Promise<{fork:number, exhausted:boolean, probes:number}>}
+ */
+async function findForkHeight(w, client, tip) {
+    const floor = Math.max(0, tip - REORG_DEPTH);
+    let probes = 0;
+
+    for (let h = tip; h >= floor; h--) {
+        const recorded = w.blockHashes[h];
+        if (!recorded) continue;               // never observed — not evidence of divergence
+        let nodeHash = null;
+        try {
+            const fd = await client.getFilters(h, h + 1);
+            probes++;
+            const raw = fd?.block_hashes?.[0];
+            nodeHash = raw ? normalizeHex$1(raw) : null;
+        } catch {
+            continue;                          // transient failure — keep descending
+        }
+        if (nodeHash && nodeHash === recorded) {
+            return { fork: h, exhausted: false, probes };
+        }
+    }
+    return { fork: floor, exhausted: true, probes };
+}
+
+/**
+ * Roll wallet state back to `forkHeight` — whose own effects are RETAINED —
+ * undoing every mutation above it, restoring orphaned spends reuse-safely.
+ *
+ * # Reasoning
+ *
+ * This is the heart of the module and the only place where a coin at a
+ * published one-time key can be returned to the UTXO set. See the module
+ * header for why the obvious implementation leaks keys.
+ *
+ * The ordering below is not incidental. Dead-branch credits are removed BEFORE
+ * spends are restored, so that a coin which was both created and spent above
+ * the fork is not resurrected: it never existed on the winning branch. The
+ * `created_at ≤ forkHeight` guard in step 2 enforces the same thing from the
+ * other side.
+ *
+ * Classification in step 3 is per ADDRESS, not per coin, because the reuse
+ * cliff is a property of the key: if one coin at an address is re-sendable they
+ * all are, and if the signature is gone they are all locked together.
+ *
+ * # Formal Specification
+ *
+ * ```text
+ * Pre:
+ *   - 0 ≤ fork? ≤ scanned
+ *   - tip? ≥ fork?
+ *
+ * Post (all simultaneous):
+ *   -- 1. dead-branch credits removed
+ *   utxos₁ = { c ∈ utxos | c.created_at ≤ fork? }
+ *
+ *   contract_coins₁ = { id ↦ c ∈ contract_coins | c.created_at ≤ fork? }
+ *
+ *   -- 2. orphaned spends restored, partitioned by lock type
+ *   R = { c ∈ ran(spent_log ▷ heights > fork?) | c.created_at ≤ fork?
+ *                                              ∧ c.coin_id ∉ live_ids }
+ *   R_w = { c ∈ R | ¬c.is_contract }      R_c = { c ∈ R | c.is_contract }
+ *   utxos'          = utxos₁ ∪ R_w
+ *   contract_coins' = contract_coins₁ ∪ R_c
+ *   spent_log' = { h ↦ v ∈ spent_log | h ≤ fork? }
+ *
+ *   -- 3. per-address reuse resolution, for each a ∈ addresses(R)
+ *   --    with spent_wots(a).height > fork?
+ *   CASE 1  a ∈ dom sent_reveals ∧ fresh(sent_reveals(a))
+ *             spent_wots' = {a} ⩤ spent_wots
+ *             pending'    = sent_reveals(a)          (verbatim re-send armed)
+ *   CASE 2  otherwise
+ *             spent_wots'(a) = spent_wots(a) ⊕ {reuse_locked ↦ true}
+ *             ∀ c ∈ R with c.address = a • c.reuse_locked' = true
+ *             reuse_locked' = reuse_locked ∪ { c.coin_id ↦ (a, prior) }
+ *   CASE 3  a ∉ dom spent_wots  (MSS)  — no action; already restored by step 2
+ *
+ *   -- 4..6 bookkeeping
+ *   block_hashes' = { h ↦ v ∈ block_hashes | h ≤ fork? }
+ *   scanned'      = min(scanned, fork?)
+ *
+ * Post (error): this operation does not fail; it is total over its precondition.
+ * ```
+ *
+ * ```zed
+ *     RollbackTo
+ *     ─────────────────────────────
+ *     ΔWalletState
+ *     fork? : Height
+ *     tip?  : Height
+ *     restored!, removed!, resendable!, locked! : ℕ
+ *
+ *     pre  0 ≤ fork? ≤ scanned
+ *     pre  tip? ≥ fork?
+ *
+ *     post ∀ c ∈ utxos' • c.created_at ≤ fork?
+ *     post ∀ c ∈ ran contract_coins' • c.created_at ≤ fork?
+ *     post dom contract_coins' ∩ { c.coin_id | c ∈ utxos' } = ∅
+ *     post dom spent_log' = { h ∈ dom spent_log | h ≤ fork? }
+ *     post dom block_hashes' = { h ∈ dom block_hashes | h ≤ fork? }
+ *     post scanned' = min(scanned, fork?)
+ *     post ∀ c ∈ utxos' • ¬c.is_mss ∧ c.address ∈ dom spent_wots'
+ *                       ⇒ c.reuse_locked
+ *     post removed! + restored! ≥ 0
+ * ```
+ *
+ * # Safety / Invariants
+ *
+ * - **Re-establishes INV-1.** This is the critical obligation. Every restored
+ *   WOTS coin leaves this function either (CASE 1) at an address whose poison
+ *   was cleared because the only way it can be spent is a verbatim re-send of
+ *   the existing signature, or (CASE 2) flagged `reuse_locked`. There is no
+ *   third outcome for a poisoned address.
+ * - **Establishes INV-2**: every id added to `reuse_locked` is added to `utxos`
+ *   in the same step.
+ * - **Maintains INV-5**: restored coins are routed by `is_contract`, so a
+ *   script-locked coin can never land in `utxos` and be offered to
+ *   `prepare_spend`, and a wallet coin can never land in `contract_coins`.
+ * - **State-thread convergence.** Chained advances resolve correctly without
+ *   special handling: for S₀→S₁ at h₁ and S₁→S₂ at h₂ (both above the fork),
+ *   step 1 discards S₁ and S₂ as dead-branch, and step 2 restores only S₀
+ *   because S₁'s `created_at` is itself above the fork. The wallet is left
+ *   holding exactly the state the winning branch has.
+ * - **Never clears `spent_wots` without a held signature.** CASE 1 is gated on
+ *   possessing the reveal AND its commitment matching AND it still being within
+ *   COMMITMENT_TTL. Weakening any of the three re-opens key reuse.
+ * - `scanned` is rewound so the caller re-applies the winning branch.
+ *
+ * @param {Object} w     Wallet instance.
+ * @param {number} fork  Fork height (its effects are kept).
+ * @param {number} tip   Current network height, for reveal freshness.
+ * @returns {{restored:number, removed:number, resendable:number, locked:number, alerts:Object[]}}
+ */
+function rollbackTo(w, fork, tip) {
+    let restored = 0, removed = 0, resendable = 0, locked = 0, restoredContract = 0;
+    const alerts = [];
+
+    // 1. Remove coins credited above the fork — they exist only on the dead
+    //    branch. Done first so step 2 cannot resurrect a coin that was both
+    //    created and spent above the fork.
+    const survivors = [];
+    for (const c of w.utxos) {
+        if ((c.createdAtHeight || 0) > fork) { removed++; continue; }
+        survivors.push(c);
+    }
+    w.utxos = survivors;
+
+    // Contract coins are height-tagged the same way and die on the same branch.
+    // A state thread advanced above the fork must be discarded along with the
+    // execution that advanced it, or the wallet keeps a state the winning chain
+    // never had and every subsequent execution is rejected as stale.
+    for (const [id, c] of Object.entries(w.contractCoins)) {
+        if ((c.createdAtHeight || 0) > fork) { delete w.contractCoins[id]; removed++; }
+    }
+
+    const liveIds = new Set([
+        ...w.utxos.map((c) => c.coin_id),
+        ...Object.keys(w.contractCoins),
+    ]);
+
+    // 2. Restore coins SPENT above the fork, grouped by address so each key is
+    //    classified once.
+    const restoredByAddr = new Map();
+    for (const hStr of Object.keys(w.spentLog)) {
+        const h = Number(hStr);
+        if (h <= fork) continue;
+        for (const coin of w.spentLog[h]) {
+            // A coin created above the fork is dead-branch, not ours to revive.
+            if ((coin.createdAtHeight || 0) > fork) continue;
+            if (liveIds.has(coin.coin_id)) continue;
+            const revived = { ...coin, value: BigInt(coin.value) };
+
+            // Contract coins go back to `contractCoins`, never to `utxos`, and
+            // never enter the per-address reuse classification below: they are
+            // script-locked, so no one-time key was published by spending them
+            // and there is nothing to lock. Restoring one to `utxos` would offer
+            // a script-locked coin to prepare_spend.
+            if (revived.isContract) {
+                w.contractCoins[revived.coin_id] = revived;
+                liveIds.add(revived.coin_id);
+                restoredContract++;
+                restored++;
+                continue;
+            }
+
+            w.utxos.push(revived);
+            liveIds.add(revived.coin_id);
+            if (!restoredByAddr.has(revived.address)) restoredByAddr.set(revived.address, []);
+            restoredByAddr.get(revived.address).push(revived);
+            restored++;
+        }
+        delete w.spentLog[h];
+    }
+
+    // 3. Resolve each address that had an orphaned spend.
+    for (const [addr, coins] of restoredByAddr) {
+        const poison = w.spentWots[addr];
+        const poisonedAboveFork =
+            poison && typeof poison.height === 'number' && poison.height > fork;
+
+        // CASE 3 — MSS addresses are never in spentWots. Each spend consumes a
+        // distinct leaf and the counter is reconciled with the node, so there is
+        // no reuse cliff. Already restored by step 2; nothing further to do.
+        if (!poisonedAboveFork) continue;
+
+        const reveal = w.sentReveals[addr];
+        const freshEnough = reveal && (tip - (reveal.sentAtHeight || 0) <= COMMITMENT_TTL);
+        const commitmentMatches =
+            reveal && (!poison.commitment || reveal.commitment === poison.commitment);
+
+        if (reveal && freshEnough && commitmentMatches) {
+            // CASE 1 — re-sendable. Clearing the poison is safe ONLY because the
+            // coin can now leave exclusively via the identical signature we
+            // still hold; no new signature is ever produced over a different
+            // commitment.
+            delete w.spentWots[addr];
+            for (const c of coins) delete c.reuseLocked;
+            w.pendingResend = w.pendingResend || {
+                commitment: reveal.commitment,
+                revealPayload: reveal.revealPayload,
+                inputCoinIds: reveal.inputCoinIds,
+                armedAtHeight: tip,
+            };
+            resendable++;
+            alerts.push({
+                kind: 'reorg_resend',
+                address: addr,
+                commitment: reveal.commitment,
+                message:
+                    `Reorg: re-sending the original signed transaction for ${addr.slice(0, 8)}… ` +
+                    `(same signature; no key reuse).`,
+            });
+        } else {
+            // CASE 2 — the signature is gone and the key is published. Restore
+            // the coins REUSE-LOCKED: excluded from spendable balance and from
+            // coin selection. The poison is demoted, not cleared, so addUtxo
+            // still refuses arbitrary new dust at this address.
+            for (const c of coins) {
+                c.reuseLocked = true;
+                w.reuseLocked[c.coin_id] = {
+                    address: addr,
+                    priorCommitment: poison.commitment || null,
+                };
+            }
+            w.spentWots[addr] = { ...poison, reuseLocked: true };
+            locked++;
+            alerts.push({
+                kind: 'reuse_lock',
+                address: addr,
+                coinIds: coins.map((c) => c.coin_id),
+                priorCommitment: poison.commitment || null,
+                message:
+                    `A confirmed transaction was reversed by a chain reorganization, but its ` +
+                    `signature is no longer held by this wallet. The coin(s) at ${addr.slice(0, 10)}… ` +
+                    `are back, but this one-time key already signed once, so they are locked to ` +
+                    `prevent key reuse. Do not attempt to move them manually.`,
+            });
+        }
+    }
+
+    // 4. Drop per-height block hashes above the fork.
+    for (const hStr of Object.keys(w.blockHashes)) {
+        if (Number(hStr) > fork) delete w.blockHashes[hStr];
+    }
+
+    // 5. Rewind the scan marker so the winning branch is re-applied.
+    w.lastScannedHeight = Math.min(w.lastScannedHeight, fork);
+
+    return { restored, removed, resendable, locked, restoredContract, alerts };
+}
+
+/**
+ * Decide whether the chain has diverged from what the wallet recorded and, if
+ * so, roll back to the fork.
+ *
+ * # Reasoning
+ *
+ * Detection runs before each sync extends the chain, and on demand when a push
+ * notification arrives. The trigger is a hash CONFLICT at a height we recorded:
+ * the node reports a different `extension.final_hash` than we stored. As noted
+ * in the module header, parent-linkage detection is impossible here because
+ * `NewBlockTip` carries no parent hash, so conflict is the only signal that
+ * this protocol actually affords.
+ *
+ * A wallet with no recorded history cannot detect anything and must not guess —
+ * it returns "no reorg" rather than rolling back to zero, which would be a
+ * spurious full rescan on every fresh wallet.
+ *
+ * # Formal Specification
+ *
+ * ```text
+ * Pre:
+ *   - client? is connected
+ *
+ * Post:
+ *   probe = max(dom block_hashes) ∩ [0, scanned]
+ *   probe undefined  ⇒  result! = ⊥ ∧ state unchanged
+ *   node_hash(probe) = block_hashes(probe)  ⇒  result! = ⊥ ∧ state unchanged
+ *   node_hash(probe) ≠ block_hashes(probe)  ⇒
+ *     result! = RollbackTo(FindForkHeight(probe).fork)
+ * ```
+ *
+ * ```zed
+ *     MaybeHandleReorg
+ *     ─────────────────────────────
+ *     ΔWalletState
+ *     client? : Client
+ *     tip?    : Height
+ *     result! : RollbackReport ∪ {⊥}
+ *
+ *     post result! = ⊥ ⇒ θWalletState' = θWalletState
+ *     post result! ≠ ⊥ ⇒ scanned' ≤ scanned
+ *     post result! ≠ ⊥ ⇒ ∀ c ∈ utxos' • ¬c.is_mss ∧ c.address ∈ dom spent_wots'
+ *                                     ⇒ c.reuse_locked
+ * ```
+ *
+ * # Safety / Invariants
+ *
+ * - On the no-reorg path this is Ξ: nothing is written, so a routine sync pays
+ *   one extra cheap request and no state churn.
+ * - Preserves INV-1 by delegating every mutation to {@link rollbackTo}.
+ *
+ * @param {Object} w      Wallet instance.
+ * @param {Object} client Connected MidstateClient.
+ * @param {number} tip    Current network height.
+ * @returns {Promise<Object|null>} Rollback report, or null if the chain agrees.
+ */
+async function maybeHandleReorg(w, client, tip) {
+    const recorded = Object.keys(w.blockHashes).map(Number).filter((h) => h <= w.lastScannedHeight);
+    if (recorded.length === 0) return null;      // nothing to compare against
+
+    // Probe from the highest recorded height downwards until one is DECIDABLE.
+    //
+    // A single probe at the tip is not enough. The node caps `end_height` at its
+    // own height, so if it has reorged to a SHORTER chain the height we last
+    // recorded is no longer servable and comes back as an undecidable
+    // placeholder — indistinguishable, to a single-probe check, from a chain
+    // that agrees. That is exactly the case where a rollback is most needed, so
+    // giving up there would leave the wallet permanently ahead of the network.
+    //
+    // The walk is capped: this is a cheap conflict check, not the fork descent,
+    // and an unreachable peer should cost a handful of requests rather than a
+    // scan of our whole history.
+    const PROBE_LIMIT = 8;
+    const descending = recorded.sort((a, b) => b - a).slice(0, PROBE_LIMIT);
+
+    let probe = null, nodeHash = null;
+    for (const h of descending) {
+        try {
+            const fd = await client.getFilters(h, h + 1);
+            const raw = fd?.block_hashes?.[0];
+            const hash = raw ? normalizeHex$1(raw) : null;
+            if (hash) { probe = h; nodeHash = hash; break; }
+        } catch {
+            return null;                         // cannot verify — do not guess
+        }
+    }
+    if (probe === null || !nodeHash) return null;   // wholly undecidable
+    if (nodeHash === w.blockHashes[probe]) return null;
+
+    const { fork, exhausted, probes } = await findForkHeight(w, client, probe);
+    const report = rollbackTo(w, fork, tip);
+    report.fork = fork;
+    report.exhausted = exhausted;
+    report.probes = probes + 1;
+    if (exhausted) {
+        report.alerts.push({
+            kind: 'deep_reorg',
+            message:
+                `Reorg deeper than ${REORG_DEPTH} blocks; rescanning from height ${fork}. ` +
+                `Coins spent below that depth are treated as final.`,
+        });
+    }
+    return report;
+}
+
+/** Max inputs in a single Consolidate, from MAX_CONSOLIDATE_INPUTS in the node. */
+const MAX_CONSOLIDATE_INPUTS = 8192;
+
 // ── Hex helper ────────────────────────────────────────────────────────────────
 // Block fields (addresses, salts) may arrive as hex strings OR as byte arrays
 // depending on how the node serialized them, so normalize both to lowercase hex.
@@ -32090,6 +34202,40 @@ function normalizeHex(data) {
     return '';
 }
 
+// Coin ID for a state-thread coin.
+//
+// ── On the name `Confidential` ──
+//
+// The enum variant is called `OutputData::Confidential` and the domain tag is
+// the literal ASCII string "CONFIDENTIAL", but **nothing here is confidential**.
+// The name is vestigial: an earlier design had zk-STARK confidential
+// transactions, those were removed, and state threads were retconned into the
+// same variant. The node's own source calls the name "a trap" and notes it has
+// already caused one incorrect fix, with a regression test
+// (`state_thread_output_contributes_no_value_to_the_fee`) replacing an older one
+// written on the assumption that the value was hidden.
+//
+// So the correct model is:
+//
+//   value(Confidential{..}) = 0        — known to be zero, NOT unknown
+//
+// It carries a 32-byte data commitment that scripts read through
+// `OP_READ_INPUT_STATE`. It carries data, not money. A covenant spending 100
+// into `[Standard 96, Confidential(state)]` really does pay a fee of 4 — the
+// state thread does not absorb the missing 4 into a hidden amount.
+//
+// Treating the value as *hidden* rather than *zero* would be wrong in the
+// opposite direction to the bug this module already fixed: it would make the
+// wallet skip these coins from conservation instead of counting them as zero.
+//
+// `InputReveal::coin_id()` hashes that tag followed by address, commitment and
+// salt — distinct from the standard (address, value, salt) form, because a state
+// thread has no value to hash.
+const STATE_THREAD_TAG_HEX = '434f4e464944454e5449414c';   // ASCII "CONFIDENTIAL"
+function computeStateThreadCoinId(addrHex, commitmentHex, saltHex) {
+    return blake3_hash_hex(STATE_THREAD_TAG_HEX + addrHex + commitmentHex + saltHex);
+}
+
 class Wallet {
     static async init(wasmPathOrBuffer) {
         // Initializes the WASM runtime.
@@ -32097,9 +34243,19 @@ class Wallet {
         await __wbg_init({ module_or_path: wasmPathOrBuffer });
     }
 
-    static async create(storageProvider = new MemoryStorage()) {
-        const phrase = generate_phrase();
-        const wallet = new Wallet(phrase, storageProvider);
+    /**
+     * Create a wallet, optionally from an existing recovery phrase.
+     *
+     * Without a phrase a fresh one is generated. Passing one is how you open an
+     * existing wallet from seed — previously impossible through this entry
+     * point, which meant any tool built on it could only ever look at a brand
+     * new, empty wallet.
+     *
+     * @param {Object} [storageProvider]
+     * @param {string} [phrase] Existing 24-word recovery phrase.
+     */
+    static async create(storageProvider = new MemoryStorage(), phrase = null) {
+        const wallet = new Wallet(phrase || generate_phrase(), storageProvider);
         await wallet.save();
         return wallet;
     }
@@ -32112,12 +34268,31 @@ class Wallet {
         const wallet = new Wallet(data.phrase, storageProvider);
         wallet.nextWotsIndex = data.nextWotsIndex;
         wallet.nextMssIndex = data.nextMssIndex;
-        // Rehydrate persisted decimal-string values back to BigInt. Tolerate
-        // legacy wallets that stored values as JSON numbers.
         wallet.utxos = (data.utxos || []).map(u => ({ ...u, value: BigInt(u.value) }));
         wallet.wotsAddrs = data.wotsAddrs;
         wallet.mssAddrs = data.mssAddrs;
         wallet.lastScannedHeight = data.lastScannedHeight || 0;
+        wallet.spentWots = data.spentWots || {};
+        wallet.blockHashes = data.blockHashes || {};
+        wallet.spentLog = Object.fromEntries(Object.entries(data.spentLog || {}).map(
+            ([h, coins]) => [h, coins.map(c => ({ ...c, value: BigInt(c.value) }))]));
+        wallet.sentReveals = data.sentReveals || {};
+        wallet.reuseLocked = data.reuseLocked || {};
+        wallet.pendingResend = data.pendingResend || null;
+        wallet.fullScanCompleted = !!data.fullScanCompleted;
+        wallet.watchedContracts = data.watchedContracts || {};
+        wallet.contractCoins = Object.fromEntries(Object.entries(data.contractCoins || {}).map(
+            ([id, c]) => [id, { ...c, value: BigInt(c.value) }]));
+
+        // --- HEAL MISSING CHANGE ADDRESSES ---
+        // If previous versions forgot to add change addresses to the watchlist,
+        // this loop regenerates them and adds them back.
+        for (let i = 0; i < wallet.nextWotsIndex; i++) {
+            const addr = wallet.inner.get_wots_address(i);
+            if (wallet.wotsAddrs[addr] === undefined) {
+                wallet.wotsAddrs[addr] = i;
+            }
+        }
 
         for (const addr of Object.keys(wallet.mssAddrs)) {
             const treeBytes = await storageProvider.loadMssTree(addr);
@@ -32141,8 +34316,107 @@ class Wallet {
         // Highest block height fully scanned by sync(). Persisted so subsequent
         // syncs are incremental instead of re-scanning the whole chain.
         this.lastScannedHeight = 0;
+        // WOTS addresses whose one-time key has been published by a spend.
+        // Coins arriving at these addresses are unspendable without reusing the
+        // key, so they are never admitted to the UTXO set.
+        this.spentWots = {};
+
+        // ── Reorg support (see reorg.js) ────────────────────────────────────
+        // Every mutation below the tip is height-tagged so a rollback can undo
+        // it precisely. Without this the wallet applies blocks irreversibly and
+        // an orphaned spend strands its inputs permanently.
+        /** Height ⇸ Hash — canonical `extension.final_hash` per scanned height. */
+        this.blockHashes = {};
+        /** Height ⇸ Coin[] — coins removed at that height, for restoration. */
+        this.spentLog = {};
+        /** Address ⇸ verbatim signed reveal, retained while re-sendable. */
+        this.sentReveals = {};
+        /** CoinId ⇸ lock record — restored coins pinned by one-time-key reuse. */
+        this.reuseLocked = {};
+        /** A verbatim re-send armed by a rollback, or null. */
+        this.pendingResend = null;
+        /** True once a scan has run from genesis; gates gap extension. */
+        this.fullScanCompleted = false;
+
+        // ── Contract / state-thread tracking ────────────────────────────────
+        // State threads live at CONTRACT addresses, not wallet addresses, and
+        // are consumed through prepare_script_spend's contract_inputs argument
+        // rather than the wallet UTXO array. They are therefore held separately:
+        // putting them in `utxos` would offer them to prepare_spend, which would
+        // try to sign a script-locked coin with a wallet key.
+        /** Address ⇸ metadata for contracts this wallet follows. */
+        this.watchedContracts = {};
+        /** CoinId ⇸ contract coin (state thread when `state` is non-null). */
+        this.contractCoins = {};
     }
 
+    /**
+     * Persist the full wallet state, including all key-lifecycle counters.
+     *
+     * # Reasoning
+     *
+     * Persistence is a key-safety mechanism, not merely a convenience. Three
+     * classes of state here are load-bearing:
+     *
+     *  - **HD counters** (`next_wots_index`, per-address `next_leaf`). Losing or
+     *    rewinding these re-derives a key that may already have signed. They are
+     *    written before a broadcast, not after, so a crash leaves them ahead of
+     *    reality rather than behind it.
+     *  - **`spent_wots`**, the published-key set. Losing it re-opens those
+     *    addresses to {@link Wallet#addUtxo} and hands a reuse opportunity back
+     *    to coin selection.
+     *  - **Reorg state** (`spent_log`, `block_hashes`, `sent_reveals`,
+     *    `reuse_locked`). Losing `sent_reveals` silently demotes recoverable
+     *    coins to reuse-locked on the next rollback; losing `reuse_locked`
+     *    silently *promotes* locked coins back to spendable, which is the unsafe
+     *    direction.
+     *
+     * BigInt is not JSON-serializable, so every currency value — in `utxos` and
+     * in the coin records inside `spent_log` — is written as a decimal string
+     * and rehydrated by {@link Wallet.restore}. Letting either degrade to Number
+     * would put the money path back on a lossy representation.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - storage is writable
+     *
+     * Post:
+     *   ∃ D • D = encode(θWalletState)
+     *     ∧ storage' = storage ⊕ { metadata ↦ D }
+     *     ∧ decode(D) = θWalletState        (round-trip fidelity)
+     *   θWalletState' = θWalletState        (Δ on storage only)
+     * ```
+     *
+     * ```zed
+     *     Save
+     *     ─────────────────────────────
+     *     ΞWalletState
+     *     ΔStorage
+     *
+     *     post decode(storage'.metadata) = θWalletState
+     *     post ∀ c ∈ utxos • decode(storage'.metadata).utxos(c.coin_id).value = c.value
+     *     post ∀ h ∈ dom spent_log • ∀ c ∈ spent_log(h) •
+     *            decode(storage'.metadata).spent_log(h)(c.coin_id).value = c.value
+     * ```
+     *
+     * # Safety / Invariants
+     *
+     * - **Round-trip fidelity**: `restore ∘ save = id` over every field that
+     *   gates spendability — `utxos`, `spent_wots`, `reuse_locked`,
+     *   `sent_reveals`, `spent_log`, `mss_addrs` and the HD counters. The
+     *   value-as-string treatment exists to make that hold for currency.
+     * - **Exception, by design**: `restore` is *monotonic* on `wots_addrs`
+     *   rather than exact. It re-derives indices `[0, next_wots_index)` and
+     *   backfills any missing entry, repairing wallets written before change
+     *   addresses were added to the watchlist. So the guarantee is
+     *   `wots_addrs ⊆ (restore ∘ save)(wots_addrs)`, never `⊋`. Widening the
+     *   watchlist can only cause the wallet to *notice* more of its own coins,
+     *   so this direction is safe; narrowing it would hide funds.
+     * - Never writes a narrower view than it holds. Omitting a field here is
+     *   equivalent to deleting it on the next restore.
+     */
     async save() {
         await this.storage.saveMetadata(JSON.stringify({
             phrase: this.phrase,
@@ -32154,7 +34428,20 @@ class Wallet {
             utxos: this.utxos.map(u => ({ ...u, value: u.value.toString() })),
             wotsAddrs: this.wotsAddrs,
             mssAddrs: this.mssAddrs,
-            lastScannedHeight: this.lastScannedHeight
+            lastScannedHeight: this.lastScannedHeight,
+            spentWots: this.spentWots,
+            // Reorg state. spentLog holds full coin records, so its BigInt
+            // values need the same decimal-string treatment as utxos.
+            blockHashes: this.blockHashes,
+            spentLog: Object.fromEntries(Object.entries(this.spentLog).map(
+                ([h, coins]) => [h, coins.map(c => ({ ...c, value: c.value.toString() }))])),
+            sentReveals: this.sentReveals,
+            reuseLocked: this.reuseLocked,
+            pendingResend: this.pendingResend,
+            fullScanCompleted: this.fullScanCompleted,
+            watchedContracts: this.watchedContracts,
+            contractCoins: Object.fromEntries(Object.entries(this.contractCoins).map(
+                ([id, c]) => [id, { ...c, value: c.value.toString() }])),
         }));
     }
 
@@ -32165,8 +34452,76 @@ class Wallet {
         return addr;
     }
 
-    async getNewReusableAddress(height = 10) {
-        const addr = this.inner.get_mss_address(this.nextMssIndex, height);
+    /**
+     * Derive a new reusable (MSS) address and persist its signing tree.
+     *
+     * # Reasoning
+     *
+     * An MSS address is a Merkle tree over 2^height one-time WOTS keypairs. It
+     * "tolerates reuse" only in the sense that each spend consumes a *different*
+     * leaf; the tree is a finite budget of 2^height signatures and every leaf is
+     * still one-time. Two things follow.
+     *
+     * First, the tree must be exported and persisted here, at creation. It
+     * cannot be cheaply regenerated on demand, and without it the address can
+     * receive but never spend.
+     *
+     * Second, `next_leaf` starts at 0 and is the authority for signing — see
+     * {@link Wallet#_utxosForWasm}, which re-reads it at spend time rather than
+     * trusting the value stamped onto a UTXO at discovery.
+     *
+     * Generation is the slowest operation in the wallet (2^height keypairs), so
+     * `get_mss_address` takes a progress callback; it is surfaced rather than
+     * hidden because a height-20 tree is ~1M keypairs.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - height? ≥ 1
+     *
+     * Post:
+     *   addr! = mss_address(next_mss_index, height?)
+     *   mss_addrs' = mss_addrs ⊕ { addr! ↦ (index ↦ next_mss_index,
+     *                                       height ↦ height?, next_leaf ↦ 0) }
+     *   next_mss_index' = next_mss_index + 1
+     *   storage'.mss_tree(addr!) = export_mss_bytes(addr!)
+     *   utxos' = utxos ∧ spent_wots' = spent_wots
+     * ```
+     *
+     * ```zed
+     *     GetNewReusableAddress
+     *     ─────────────────────────────
+     *     ΔWalletState
+     *     ΔStorage
+     *     height? : ℕ
+     *     addr!   : Hash
+     *
+     *     pre  height? ≥ 1
+     *     pre  addr! ∉ dom mss_addrs
+     *
+     *     post next_mss_index' = next_mss_index + 1
+     *     post mss_addrs'(addr!).next_leaf = 0
+     *     post mss_addrs'(addr!).height = height?
+     *     post addr! ∈ dom storage'.mss_trees
+     *     post utxos' = utxos
+     * ```
+     *
+     * # Safety / Invariants
+     *
+     * - `next_leaf` starts at 0 and only ever increases; it is decremented
+     *   nowhere in this module. A rewind would re-sign with a consumed leaf.
+     * - The tree is persisted before the address is recorded as usable, so a
+     *   crash cannot leave a receivable address whose tree is unrecoverable.
+     * - MSS addresses are never entered into `spent_wots`; their reuse safety
+     *   comes from leaf distinctness, not from address retirement.
+     *
+     * @param {number}   [height=10]  Tree height; the address can sign 2^height times.
+     * @param {Function} [onProgress] Called as (current, total) during generation.
+     * @returns {Promise<string>} Hex-encoded address.
+     */
+    async getNewReusableAddress(height = 10, onProgress = null) {
+        const addr = this.inner.get_mss_address(this.nextMssIndex, height, onProgress ?? undefined);
         const treeBytes = this.inner.export_mss_bytes(addr);
         await this.storage.saveMssTree(addr, treeBytes);
         this.mssAddrs[addr] = { index: this.nextMssIndex++, height, next_leaf: 0 };
@@ -32178,9 +34533,94 @@ class Wallet {
      * Add a UTXO to local wallet state.
      * @returns {boolean} true if newly added, false if it was a duplicate.
      */
-    addUtxo(address, value, salt, coinId) {
+    /**
+     * Admit a coin to the UTXO set if it belongs to this wallet and its key is
+     * still safe to use.
+     *
+     * # Reasoning
+     *
+     * This is the only entry point for credits, so it is where the wallet
+     * decides what it is willing to call spendable. The decision is not simply
+     * "is this address mine": a WOTS address whose one-time key has already been
+     * published is mine and can still receive coins, but redeeming anything
+     * there would produce a second signature from a burned key. The node ships a
+     * Key Reuse Punishment Burn Protocol that lets any observer exploit exactly
+     * that, so such a coin is refused rather than silently risked.
+     *
+     * Refusal is the conservative direction: the coin is real and remains on
+     * chain, it is simply not offered. Admitting it and hoping coin selection
+     * avoids it would put the guarantee in the wrong place.
+     *
+     * Every credit is height-stamped so a later rollback can distinguish a coin
+     * that exists on the winning branch from one that only ever existed on a
+     * branch being discarded.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - address? ∈ dom wots_addrs ∪ dom mss_addrs      (else raises)
+     *
+     * Post (admitted):
+     *   address? ∈ dom wots_addrs ∧ address? ∉ dom spent_wots
+     *     ∨ address? ∈ dom mss_addrs
+     *   ∧ coin_id? ∉ ids(utxos)
+     *   ⇒ utxos' = utxos ∪ { (coin_id?, address?, value?, salt?,
+     *                         is_mss, created_at ↦ height?) }
+     *     ∧ result! = true
+     *
+     * Post (refused):
+     *   address? ∈ dom spent_wots  ∨  coin_id? ∈ ids(utxos)
+     *   ⇒ utxos' = utxos ∧ result! = false
+     *
+     * Post (error):
+     *   address? ∉ dom wots_addrs ∪ dom mss_addrs ⇒ raises, utxos' = utxos
+     * ```
+     *
+     * ```zed
+     *     AddUtxo
+     *     ─────────────────────────────
+     *     ΔWalletState
+     *     address?, salt?, coin_id? : Hash
+     *     value?   : ℕ
+     *     height?  : Height
+     *     result!  : 𝔹
+     *
+     *     pre  address? ∈ dom wots_addrs ∪ dom mss_addrs
+     *
+     *     post address? ∈ dom spent_wots ⇒ utxos' = utxos ∧ ¬result!
+     *     post result! ⇒ #utxos' = #utxos + 1
+     *     post ¬result! ⇒ utxos' = utxos
+     *     post ∀ c ∈ utxos' • ¬c.is_mss ∧ c.address ∈ dom spent_wots ⇒ c.reuse_locked
+     * ```
+     *
+     * # Safety / Invariants
+     *
+     * - **Maintains INV-1.** A free (unlocked) coin is never admitted at an
+     *   address in `spent_wots`. The only path by which a coin at a published
+     *   key enters `utxos` is {@link rollbackTo}, which flags it `reuse_locked`.
+     * - Idempotent on `coin_id`: re-scanning a block cannot double-credit.
+     * - `mss_leaf` stamped here is a discovery-time snapshot and is NOT
+     *   authoritative for signing; see {@link Wallet#_utxosForWasm}.
+     *
+     * @param {string} address
+     * @param {bigint|number|string} value
+     * @param {string} salt
+     * @param {string} coinId
+     * @param {number|null} [createdAtHeight] Height of the crediting block.
+     * @returns {boolean} true if the coin was admitted.
+     */
+    addUtxo(address, value, salt, coinId, createdAtHeight = null) {
         let is_mss = false, index = 0, mss_height = 0, mss_leaf = 0;
         if (this.wotsAddrs[address] !== undefined) {
+            // A WOTS address whose key has already been published cannot safely
+            // sign again. Admitting a coin that landed here after the spend
+            // would offer it to coin selection as spendable, and redeeming it
+            // would reveal enough of the one-time key for anyone to forge
+            // against it — the node ships a Key Reuse Punishment Burn Protocol
+            // that does exactly that. The coin is real but unspendable; it is
+            // excluded from the balance rather than silently risked.
+            if (this.spentWots[address] !== undefined) return false;
             index = this.wotsAddrs[address];
         } else if (this.mssAddrs[address] !== undefined) {
             is_mss = true;
@@ -32200,15 +34640,17 @@ class Wallet {
             // bounded powers of 2 (safe individually), but balances are summed
             // and can exceed Number's 2^53 safe-integer ceiling, so the whole
             // money path uses BigInt to avoid silent precision loss.
-            this.utxos.push({ address, value: BigInt(value), salt, coin_id: coinId, index, is_mss, mss_height, mss_leaf });
+            this.utxos.push({
+                address, value: BigInt(value), salt, coin_id: coinId,
+                index, is_mss, mss_height, mss_leaf,
+                // Height-tag every credit so a rollback can tell a coin that
+                // exists on the winning branch from one that only ever existed
+                // on the branch being discarded.
+                createdAtHeight: createdAtHeight ?? this._reorgHeight ?? 0,
+            });
             return true;
         }
         return false;
-    }
-
-    /** @returns {bigint} total spendable balance in base units (MDS). */
-    getBalance() {
-        return this.utxos.reduce((sum, u) => sum + BigInt(u.value), 0n);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -32221,11 +34663,1013 @@ class Wallet {
      * against them. Must be refreshed whenever the watch set changes.
      * @private
      */
+    /**
+     * Serialize the UTXO set into the shape `WasmUtxo` expects, refreshing the
+     * MSS leaf index from live wallet state and withholding reuse-locked coins.
+     *
+     * # Reasoning
+     *
+     * This is the single choke point where wallet UTXOs reach the signer, which
+     * makes it the right place to enforce two distinct one-time-key properties.
+     *
+     * **Leaf freshness.** `build_reveal` signs with `kp.next_leaf =
+     * inp.mss_leaf` — the leaf comes from the UTXO record handed to it, NOT from
+     * a counter inside WASM. Passing `utxos` through untouched meant every coin
+     * carried the `mss_leaf` stamped onto it by `addUtxo` at discovery time. Two
+     * coins received at the same MSS address before either was spent both carry
+     * leaf 0, so spending them in separate transactions signs twice with leaf 0.
+     * An MSS leaf is a one-time WOTS key inside the Merkle tree: "MSS tolerates
+     * reuse" refers to the *address*, since each spend consumes a different
+     * leaf. Reusing a *leaf* is exactly as fatal as reusing a bare WOTS key.
+     *
+     * **Lock enforcement.** A coin carrying `reuse_locked` was restored by a
+     * rollback at an address whose key already signed a transaction we no longer
+     * hold (reorg.js CASE 2). Offering it to coin selection would let a spend
+     * produce a second signature over a different commitment from that key.
+     * Filtering here means no spend path can reach one by accident.
+     *
+     * **On `Number(value)`.** `WasmUtxo.value` is a u64 that serde parses from a
+     * JSON number, so the BigInt must be narrowed. That is safe rather than
+     * lucky: coin values are always powers of two and total supply is bounded
+     * near 2^50 (`INITIAL_REWARD` = 2^30, halving yearly at
+     * `TARGET_BLOCK_TIME` = 60s), while JSON round-trips integers exactly
+     * through 2^53. The guard fails loudly rather than corrupting a value if
+     * that ever stops holding.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - ∀ c ∈ utxos • c.value ≤ MAX_SAFE_INTEGER   (else Err)
+     *
+     * Post:
+     *   out! = { serialize(c) | c ∈ utxos ∧ ¬c.reuse_locked }
+     *   ∀ c ∈ out! • c.is_mss ⇒ c.mss_leaf   = mss_addrs(c.address).next_leaf
+     *                        ∧ c.mss_height = mss_addrs(c.address).height
+     *   state unchanged  (Ξ — this is a projection, not a transition)
+     *
+     * Post (error):
+     *   ∃ c ∈ utxos • c.value > MAX_SAFE_INTEGER ⇒ raises, state unchanged
+     * ```
+     *
+     * ```zed
+     *     UtxosForWasm
+     *     ─────────────────────────────
+     *     ΞWalletState
+     *     out! : seq WasmUtxo
+     *
+     *     pre  ∀ c ∈ utxos • c.value ≤ 2^53 − 1
+     *
+     *     post #out! = #{ c ∈ utxos | ¬c.reuse_locked }
+     *     post ∀ c ∈ out! • ¬c.reuse_locked
+     *     post ∀ c ∈ out! • c.is_mss ⇒ c.mss_leaf = mss_addrs(c.address).next_leaf
+     *     post θWalletState' = θWalletState
+     * ```
+     *
+     * # Safety / Invariants
+     *
+     * - **Enforces INV-1 at the boundary.** Even if a reuse-locked coin somehow
+     *   reached `utxos` unflagged elsewhere, this filter is the last line before
+     *   a signature is produced.
+     * - Ξ: must never mutate. Callers invoke it speculatively (to size a spend)
+     *   as well as to execute one, and a mutation here would advance key
+     *   material for a transaction that never happens.
+     * - The leaf refresh must read `mss_addrs`, never the UTXO's stored value;
+     *   reading the stored value is the bug this function exists to prevent.
+     *
+     * @private
+     * @returns {Object[]} UTXOs in `WasmUtxo` shape, locked coins excluded.
+     */
+    _utxosForWasm() {
+        // Reuse-locked coins are withheld from the signer entirely.
+        //
+        // A coin carrying `reuseLocked` was restored by a rollback at an
+        // address whose one-time key has already signed a transaction we no
+        // longer hold. Handing it to prepare_spend would let coin selection
+        // pick it, and signing it would produce a SECOND signature over a
+        // DIFFERENT commitment from that key — the exact condition the node's
+        // Key Reuse Punishment Burn Protocol exists to punish. Filtering here,
+        // at the single choke point where UTXOs reach WASM, means no spend path
+        // can reach them by accident.
+        return this.utxos.filter((u) => !u.reuseLocked).map((u) => {
+            const value = BigInt(u.value);
+            if (value > Number.MAX_SAFE_INTEGER) {
+                throw new Error(
+                    `Coin value ${value} exceeds the safe JSON integer range; ` +
+                    `refusing to narrow it and risk a corrupted spend.`
+                );
+            }
+            const out = { ...u, value: Number(value) };
+            if (u.is_mss) {
+                const meta = this.mssAddrs[u.address];
+                if (meta) {
+                    out.mss_leaf = meta.next_leaf;
+                    out.mss_height = meta.height;
+                }
+            }
+            return out;
+        });
+    }
+
+    /**
+     * Record coins being removed from the UTXO set, bucketed by the height at
+     * which the removal happened.
+     *
+     * # Reasoning
+     *
+     * A rollback can only restore what was written down. This is the sole
+     * writer of that record, and it stores the FULL coin object rather than an
+     * id: after a reorg the coin must be re-credited with its original address,
+     * value, salt, key index and MSS leaf intact, and none of that is
+     * recoverable from an id alone once the coin has left `utxos`.
+     *
+     * Coins are cloned on the way in. Storing a live reference would let a
+     * later mutation of the UTXO object silently rewrite history, which is
+     * exactly the kind of aliasing bug that turns a rollback into a
+     * key-reuse incident.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - coins? ⊆ utxos
+     *   - _reorgHeight ∈ Height
+     *
+     * Post:
+     *   spent_log' = spent_log ⊕ { _reorgHeight ↦
+     *                              spent_log(_reorgHeight) ∪ copy(coins?) }
+     *   utxos' = utxos            (removal is the caller's responsibility)
+     * ```
+     *
+     * ```zed
+     *     LogSpent
+     *     ─────────────────────────────
+     *     ΔWalletState
+     *     coins? : ℙ Coin
+     *     h      : Height = _reorgHeight
+     *
+     *     pre  coins? ⊆ utxos
+     *
+     *     post spent_log'(h) = spent_log(h) ∪ coins?
+     *     post ∀ k ∈ dom spent_log \ {h} • spent_log'(k) = spent_log(k)
+     *     post utxos' = utxos
+     * ```
+     *
+     * # Safety / Invariants
+     *
+     * - Maintains INV-3 (`∀ h ∈ dom spent_log • h ≤ scanned`) because
+     *   `_reorgHeight` is always the height currently being applied.
+     * - Writes no key state; poisoning is the caller's job so that the spend
+     *   log stays a pure record of removals.
+     *
+     * @private
+     * @param {Object[]} coins Coins about to be removed.
+     */
+    _logSpent(coins) {
+        if (!coins || coins.length === 0) return;
+        const h = this._reorgHeight ?? 0;
+        if (!this.spentLog[h]) this.spentLog[h] = [];
+        for (const c of coins) this.spentLog[h].push({ ...c });
+    }
+
+    /**
+     * Spendable balance: the sum of every coin coin selection may legally use.
+     *
+     * # Reasoning
+     *
+     * After a reorg the UTXO set can contain coins that are genuinely ours and
+     * genuinely unspent, yet must never be spent, because their one-time key
+     * already signed a transaction whose signature we no longer hold. Counting
+     * them in the headline balance would invite exactly the spend that leaks
+     * the key. They are reported separately by {@link getLockedBalance} so the
+     * money is visible without being offered.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Post:
+     *   balance! = Σ { c.value | c ∈ utxos ∧ ¬c.reuse_locked }
+     *   state unchanged
+     * ```
+     *
+     * @returns {bigint} Spendable balance.
+     */
+    getBalance() {
+        return this.utxos.reduce((a, u) => (u.reuseLocked ? a : a + BigInt(u.value)), 0n);
+    }
+
+    /**
+     * Balance held in coins pinned by one-time-key reuse risk.
+     *
+     * These are recoverable only by re-sending the original signature, which
+     * the wallet no longer holds. They are surfaced so the total is auditable;
+     * they are never offered to coin selection.
+     *
+     * @returns {bigint} Reuse-locked balance.
+     */
+    getLockedBalance() {
+        return this.utxos.reduce((a, u) => (u.reuseLocked ? a + BigInt(u.value) : a), 0n);
+    }
+
+    /**
+     * Push the set of addresses and coin ids this wallet cares about into the
+     * WASM compact-filter matcher.
+     *
+     * Watched contract addresses are included because `CompactFilter::items_in`
+     * indexes BOTH coin ids and addresses for every input and output. Omitting
+     * them meant a block that advanced a followed state thread produced no
+     * filter hit, so the block was never fetched and the state update was never
+     * seen — leaving the wallet holding a stale state that the node will reject
+     * on the next contract execution.
+     */
+    /**
+     * Follow a contract so its coins and state thread are tracked by sync.
+     *
+     * # Reasoning
+     *
+     * A contract's state thread is not addressed to any wallet key, so nothing
+     * in the ordinary output-matching path would ever notice it. Following the
+     * contract explicitly is what puts its address into the compact-filter
+     * watchlist and its coins into `contractCoins`.
+     *
+     * This matters because `prepare_script_spend` validates the caller's
+     * `coin_id` against the canonical derivation from
+     * `(address, value, salt, state)` and rejects a mismatch outright. A wallet
+     * that does not track the thread cannot supply the current state, and every
+     * execution it builds is rejected as stale.
+     *
+     * @param {string} contractAddrHex 32-byte hex contract address.
+     * @param {Object} [meta] Optional caller metadata (label, bytecode, …).
+     * @returns {boolean} true if newly followed.
+     */
+    watchContract(contractAddrHex, meta = {}) {
+        const addr = normalizeHex(contractAddrHex);
+        if (this.watchedContracts[addr] !== undefined) return false;
+        this.watchedContracts[addr] = { ...meta };
+        this._setWatchlist();
+        return true;
+    }
+
+    /**
+     * Stop following a contract and forget its coins.
+     *
+     * The coins are dropped rather than retained: they were never spendable by
+     * this wallet's keys, so there is nothing to protect, and keeping them would
+     * leave stale state that a later re-follow would have to reconcile.
+     *
+     * @param {string} contractAddrHex
+     * @returns {boolean} true if it had been followed.
+     */
+    unwatchContract(contractAddrHex) {
+        const addr = normalizeHex(contractAddrHex);
+        if (this.watchedContracts[addr] === undefined) return false;
+        delete this.watchedContracts[addr];
+        for (const [id, c] of Object.entries(this.contractCoins)) {
+            if (c.address === addr) delete this.contractCoins[id];
+        }
+        this._setWatchlist();
+        return true;
+    }
+
+    /**
+     * Admit a contract coin (state thread or contract-owned funds).
+     *
+     * # Reasoning
+     *
+     * Held separately from `utxos` on purpose. A contract coin is script-locked;
+     * placing it in the wallet UTXO set would offer it to
+     * {@link Wallet#_utxosForWasm} and thence to `prepare_spend`, which would
+     * try to sign it with a wallet key it cannot satisfy.
+     *
+     * Consensus requires a state-thread output to have value exactly 0
+     * (`apply_transaction` bails on `commitment.is_some() && value != 0`), so
+     * that is asserted here rather than discovered later inside WASM.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - address? ∈ dom watched_contracts
+     *   - state? ≠ null ⇒ value? = 0
+     *
+     * Post:
+     *   coin_id? ∉ dom contract_coins ⇒
+     *     contract_coins' = contract_coins ⊕
+     *       { coin_id? ↦ (address?, value?, salt?, state?, created_at ↦ height) }
+     *     ∧ result! = true
+     *   coin_id? ∈ dom contract_coins ⇒ contract_coins' = contract_coins ∧ ¬result!
+     *   utxos' = utxos
+     * ```
+     *
+     * ```zed
+     *     AddContractCoin
+     *     ─────────────────────────────
+     *     ΔWalletState
+     *     address?, salt?, coin_id? : Hash
+     *     state?  : Hash ∪ {null}
+     *     value?  : ℕ
+     *     result! : 𝔹
+     *
+     *     pre  address? ∈ dom watched_contracts
+     *     pre  state? ≠ null ⇒ value? = 0
+     *
+     *     post result! ⇒ coin_id? ∈ dom contract_coins'
+     *     post ¬result! ⇒ contract_coins' = contract_coins
+     *     post utxos' = utxos
+     *     post spent_wots' = spent_wots
+     * ```
+     *
+     * # Safety / Invariants
+     *
+     * - Contract coins never enter `utxos`, so INV-1 is untouched by this path.
+     * - Never writes `spent_wots`: contract coins carry no one-time key.
+     * - Height-stamped like wallet coins so rollback can discard dead-branch
+     *   state.
+     *
+     * @private
+     */
+    _addContractCoin(address, value, salt, state, coinId) {
+        if (state !== null && BigInt(value) !== 0n) {
+            throw new Error(
+                `State-thread coin at ${address.slice(0, 10)}… must have value 0 (got ${value}); ` +
+                `contract funds belong in a separate standard coin.`
+            );
+        }
+        if (this.contractCoins[coinId]) return false;
+        this.contractCoins[coinId] = {
+            address, value: BigInt(value), salt, state, coin_id: coinId,
+            createdAtHeight: this._reorgHeight ?? 0,
+            isContract: true,
+        };
+        return true;
+    }
+
+    /**
+     * Current state thread for a followed contract.
+     *
+     * A contract has at most one live state thread; if scanning ever produced
+     * more, the newest by height wins, since an older one can only be a record
+     * this wallet failed to retire.
+     *
+     * @param {string} contractAddrHex
+     * @returns {Object|null} The state coin, or null if none is tracked.
+     */
+    getStateThread(contractAddrHex) {
+        const addr = normalizeHex(contractAddrHex);
+        const threads = Object.values(this.contractCoins)
+            .filter((c) => c.address === addr && c.state !== null)
+            .sort((a, b) => (b.createdAtHeight || 0) - (a.createdAtHeight || 0));
+        return threads[0] ?? null;
+    }
+
+    /**
+     * All tracked coins for a followed contract (state thread plus funds).
+     *
+     * @param {string} contractAddrHex
+     * @returns {Object[]}
+     */
+    getContractCoins(contractAddrHex) {
+        const addr = normalizeHex(contractAddrHex);
+        return Object.values(this.contractCoins).filter((c) => c.address === addr);
+    }
+
+    /**
+     * Build the `contract_inputs` argument for `prepare_script_spend` from
+     * tracked state.
+     *
+     * Supplies `coin_id`, `value`, `salt` and `state` from what sync actually
+     * observed, so the caller cannot accidentally pass a stale state that the
+     * node rejects. The witness is caller-supplied since only the caller knows
+     * what satisfies the script.
+     *
+     * @param {string} contractAddrHex
+     * @param {string} [witness=''] Comma-separated hex witness stack.
+     * @param {boolean} [includeFunds=true] Include the contract's standard coin.
+     * @returns {Object[]} ScriptInputArg-shaped entries.
+     */
+    buildContractInputs(contractAddrHex, witness = '', includeFunds = true) {
+        const coins = this.getContractCoins(contractAddrHex);
+        const chosen = includeFunds ? coins : coins.filter((c) => c.state !== null);
+        if (chosen.length === 0) {
+            throw new Error(
+                `No tracked coins for contract ${contractAddrHex.slice(0, 10)}…. ` +
+                `Call watchContract() and sync before building an execution.`
+            );
+        }
+        // State thread first: the script reads it via OP_READ_INPUT_STATE and
+        // the emulator's input ordering is what witnesses are written against.
+        const ordered = [
+            ...chosen.filter((c) => c.state !== null),
+            ...chosen.filter((c) => c.state === null),
+        ];
+        return ordered.map((c) => ({
+            coin_id: c.coin_id,
+            witness,
+            value: Number(c.value),
+            salt: c.salt,
+            ...(c.state !== null ? { state: c.state } : {}),
+        }));
+    }
+
+    /**
+     * Complete a verbatim re-send armed by a rollback.
+     *
+     * # Reasoning
+     *
+     * {@link rollbackTo} CASE 1 clears an address's poison and stages the
+     * original signed reveal in `pendingResend`. Clearing the poison is only
+     * defensible because the coin can leave exclusively via that identical
+     * signature — so something must actually send it. Until this ran, a CASE 1
+     * recovery left the coins spendable-in-principle and stuck in practice.
+     *
+     * The dead-commitment branch is where this deliberately diverges from the
+     * browser wallet. There, a dead commitment means a transaction that never
+     * confirmed, and the correct advice is "the coins are still yours, re-send".
+     * Here the transaction *did* confirm once — that is why the key was poisoned
+     * — and was then orphaned. The signature is public. Re-sending would mean
+     * re-signing over a fresh commitment with a key that has already signed, so
+     * the coins are demoted to CASE 2 (reuse-locked) instead. Telling the caller
+     * to "just re-send" would be an instruction to leak the key.
+     *
+     * A missing input coin is treated the same way: the reveal can never
+     * confirm, so the verbatim path is exhausted and the lock applies.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - client? is connected
+     *
+     * Post (no armed re-send):
+     *   state unchanged ∧ status! = 'idle'
+     *
+     * Post (commitment live, inputs live):
+     *   node receives pending_resend.payload verbatim
+     *   ∧ pending_resend' = null ∧ status! = 'resent'
+     *   ∧ no new signature was produced
+     *
+     * Post (commitment dead ∨ an input coin absent):
+     *   ∀ a ∈ addresses(pending_resend.input_coin_ids) •
+     *     spent_wots'(a) = (…, reuse_locked ↦ true)
+     *   ∧ ∀ c ∈ utxos' with c.address = a • c.reuse_locked
+     *   ∧ pending_resend' = null ∧ status! = 'dead'
+     * ```
+     *
+     * ```zed
+     *     RecoverPendingTx
+     *     ─────────────────────────────
+     *     ΔWalletState
+     *     client?  : Client
+     *     status!  : {idle, resent, dead, retry}
+     *
+     *     post status! = resent ⇒ pending_resend' = null
+     *     post status! = dead   ⇒ pending_resend' = null
+     *          ∧ ∀ c ∈ utxos' • c.coin_id ∈ pending_resend.input_coin_ids
+     *                         ∧ ¬c.is_mss ⇒ c.reuse_locked
+     *     post status! = idle   ⇒ θWalletState' = θWalletState
+     *     post ¬∃ new signature produced by this operation
+     * ```
+     *
+     * # Safety / Invariants
+     *
+     * - **Produces no signature.** It transmits a payload built earlier and
+     *   nothing else. Any change that made this call a signing path would
+     *   reintroduce the reuse it exists to avoid.
+     * - **Re-establishes INV-1 on the dead path.** Coins whose verbatim route is
+     *   gone are locked rather than left free at a published key.
+     * - Idempotent: clearing `pendingResend` on both terminal outcomes means a
+     *   repeated call cannot double-send or double-lock.
+     *
+     * @param {MidstateClient} client
+     * @returns {Promise<{status:string, alerts?:Object[], error?:string}>}
+     */
+    async recoverPendingTx(client) {
+        const pending = this.pendingResend;
+        if (!pending) return { status: 'idle' };
+
+        const dead = async (reason) => {
+            const alerts = [];
+            const ids = new Set(pending.inputCoinIds || []);
+            const addrs = new Set(
+                this.utxos.filter((c) => ids.has(c.coin_id) && !c.is_mss).map((c) => c.address)
+            );
+            for (const addr of addrs) {
+                const prior = this.spentWots[addr] || {};
+                this.spentWots[addr] = {
+                    height: prior.height ?? null,
+                    commitment: pending.commitment,
+                    reuseLocked: true,
+                };
+                for (const c of this.utxos) {
+                    if (c.address !== addr) continue;
+                    c.reuseLocked = true;
+                    this.reuseLocked[c.coin_id] = { address: addr, priorCommitment: pending.commitment };
+                }
+                alerts.push({
+                    kind: 'reuse_lock',
+                    address: addr,
+                    priorCommitment: pending.commitment,
+                    message:
+                        `The original signed transaction can no longer be re-sent (${reason}). ` +
+                        `The coin(s) at ${addr.slice(0, 10)}… are locked: this one-time key has ` +
+                        `already signed, so re-sending would require a new signature and leak it. ` +
+                        `Do not attempt to move them manually.`,
+                });
+            }
+            this.pendingResend = null;
+            await this.save();
+            return { status: 'dead', reason, alerts };
+        };
+
+        // The commitment must still be in chain state or the reveal is dead.
+        let commitAlive = null;
+        try {
+            const r = await client.checkCommitment(pending.commitment);
+            commitAlive = !!(r && r.exists);
+        } catch {
+            return { status: 'retry', error: 'could not reach the node to verify the commitment' };
+        }
+        if (commitAlive === false) return dead('its commitment has expired from chain state');
+
+        // Every input must still exist on-chain, or the node will prune the
+        // reveal on every rebroadcast.
+        for (const id of pending.inputCoinIds || []) {
+            try {
+                const c = await client.checkCoin(id);
+                if (c && c.exists === false) return dead(`input coin ${id.slice(0, 12)}… no longer exists`);
+            } catch {
+                return { status: 'retry', error: 'could not reach the node to verify inputs' };
+            }
+        }
+
+        const resp = await client.send(pending.revealPayload);
+        if (!resp || resp.ok === false) {
+            return { status: 'retry', error: resp?.body || resp?.error || 'node rejected the re-send' };
+        }
+        this.pendingResend = null;
+        await this.save();
+        return { status: 'resent', commitment: pending.commitment };
+    }
+
+    /**
+     * Reconcile wallet state against a `NewBlockTip` push notification.
+     *
+     * # Reasoning
+     *
+     * Detection previously only ran inside {@link Wallet#sync}, so a wallet
+     * sitting idle on an open push subscription would not notice a fork until
+     * something else prompted a scan. `NewBlockTip` carries `height` and
+     * `block_hash`, which is exactly the pair needed to spot a conflict against
+     * recorded history — no extra request required for the common case.
+     *
+     * Note the notification carries no parent hash, so this cannot detect a fork
+     * at a height it has not already recorded; it compares the announced hash
+     * against our own record at that height and defers to
+     * {@link maybeHandleReorg} for the descent when they disagree.
+     *
+     * @param {MidstateClient} client
+     * @param {{height:number, block_hash?:string}} notif
+     * @returns {Promise<Object|null>} Rollback report, or null if consistent.
+     */
+    async handleBlockTip(client, notif) {
+        if (!notif || typeof notif.height !== 'number') return null;
+        const h = notif.height;
+        const announced = normalizeHex(notif.block_hash || '');
+        const recorded = this.blockHashes[h];
+
+        // Consistent, or nothing recorded at that height to compare against.
+        if (!announced || !recorded || announced === recorded) return null;
+
+        const report = await maybeHandleReorg(this, client, Math.max(h, this.lastScannedHeight));
+        if (report) {
+            this._setWatchlist();
+            await this.save();
+        }
+        return report;
+    }
+
+    /** @returns {bigint} Total value held in tracked coins of a followed contract. */
+    getContractBalance(contractAddrHex) {
+        return this.getContractCoins(contractAddrHex)
+            .reduce((a, c) => a + BigInt(c.value), 0n);
+    }
+
+    /**
+     * Consolidate every coin at a single address into one output.
+     *
+     * # Reasoning
+     *
+     * `Transaction::Consolidate` requires all inputs to share one predicate
+     * address — the node bails on a mismatch — which is the WOTS co-spend rule
+     * made explicit at the transaction level. Callers therefore need to pick an
+     * address, not just an amount, so this takes the source address and gathers
+     * its coins rather than running general coin selection.
+     *
+     * It is still a two-phase transaction: the node checks the commitment is in
+     * chain state exactly as it does for a Reveal. Only the reveal encoding
+     * differs, carrying a single signature for the shared address.
+     *
+     * # Safety / Invariants
+     *
+     * - Consuming every coin at a WOTS address is exactly what the one-time key
+     *   permits: one signature, all coins. {@link Wallet#_broadcastTwoPhaseTx}
+     *   retires the address afterwards.
+     * - Reuse-locked coins are excluded upstream by
+     *   {@link Wallet#_utxosForWasm}, so a locked coin cannot be swept in here.
+     *
+     * @param {MidstateClient} client
+     * @param {string} sourceAddrHex Address whose coins are consolidated.
+     * @param {string} destAddrHex   Destination for the consolidated output.
+     */
+    async consolidate(client, sourceAddrHex, destAddrHex) {
+        const src = normalizeHex(sourceAddrHex);
+        const coins = this._utxosForWasm().filter((u) => u.address === src);
+        if (coins.length < 2) {
+            throw new Error(
+                `Consolidate needs at least two coins at ${src.slice(0, 10)}…; found ${coins.length}.`
+            );
+        }
+        if (coins.length > MAX_CONSOLIDATE_INPUTS) {
+            throw new Error(
+                `Consolidate accepts at most ${MAX_CONSOLIDATE_INPUTS} inputs; ` +
+                `${src.slice(0, 10)}… has ${coins.length}. Consolidate in batches.`
+            );
+        }
+        const ctxStr = this.inner.prepare_consolidate(
+            JSON.stringify(coins), normalizeHex(destAddrHex), this.nextWotsIndex
+        );
+        return this._broadcastTwoPhaseTx(client, ctxStr, 'consolidate');
+    }
+
+    /**
+     * Sweep fragmented WOTS coins into a fresh reusable (MSS) address.
+     *
+     * Unlike {@link Wallet#consolidate} this spans addresses: it is an ordinary
+     * Reveal that happens to have many inputs, so the co-spend constraint is
+     * handled by WASM's sibling bundling rather than by a single-address rule.
+     *
+     * @param {MidstateClient} client
+     * @param {string} destAddrHex  Destination address (typically a new MSS one).
+     * @param {number} [maxInputs=50] Cap on coins swept in one transaction.
+     */
+    async defrag(client, destAddrHex, maxInputs = 50) {
+        const ctxStr = this.inner.prepare_defrag(
+            JSON.stringify(this._utxosForWasm()),
+            normalizeHex(destAddrHex),
+            maxInputs,
+            this.nextWotsIndex
+        );
+        return this._broadcastTwoPhaseTx(client, ctxStr, 'standard');
+    }
+
+    /**
+     * Fund several addresses in one commit/reveal.
+     *
+     * Each funding's amount is split into power-of-two coins paid to its
+     * address, with wallet inputs covering the sum plus a size-scaled fee. The
+     * point is latency: funding N covenants becomes one ~2-block round trip
+     * instead of N.
+     *
+     * @param {MidstateClient} client
+     * @param {Array<{address:string, amount:bigint|number|string}>} fundings
+     * @param {string|null} [databurnsJson] Optional data-burn outputs.
+     */
+    async fundMany(client, fundings, databurnsJson = null) {
+        if (!Array.isArray(fundings) || fundings.length === 0) {
+            throw new Error('fundMany requires at least one { address, amount } entry.');
+        }
+        const payload = fundings.map((f) => {
+            const amount = BigInt(f.amount);
+            if (amount > Number.MAX_SAFE_INTEGER) {
+                throw new Error(`Funding amount ${amount} exceeds the safe JSON integer range.`);
+            }
+            return { address: normalizeHex(f.address), amount: Number(amount) };
+        });
+        const ctxStr = this.inner.prepare_fund_many(
+            JSON.stringify(this._utxosForWasm()),
+            JSON.stringify(payload),
+            this.nextWotsIndex,
+            databurnsJson
+        );
+        return this._broadcastTwoPhaseTx(client, ctxStr, 'script');
+    }
+
+    /**
+     * Advance a followed contract's state thread.
+     *
+     * # Reasoning
+     *
+     * `build_state_thread_tx` needs the thread's current state, coin id and
+     * salt, and rejects a mismatch against the canonical derivation. Requiring
+     * the caller to supply those by hand is exactly how stale state creeps in —
+     * particularly after a reorg, where a caller working from its own notes has
+     * no way to know the thread was rolled back. This reads them from what sync
+     * actually observed.
+     *
+     * Passing `null` for the current thread creates one, which is the correct
+     * shape for a contract's first state transition.
+     *
+     * # Safety / Invariants
+     *
+     * - Reads the thread through {@link Wallet#getStateThread}, so a rollback is
+     *   automatically reflected and a superseded state can never be submitted.
+     * - Maintains INV-6: the new state output is zero-value by construction in
+     *   WASM; this never fabricates a value-bearing thread.
+     *
+     * @param {MidstateClient} client
+     * @param {string} contractBytecodeHex
+     * @param {string} newStateHex 32-byte hex commitment for the new state.
+     * @param {Object[]} [extraOutputs=[]] Additional outputs (e.g. covenant payments).
+     */
+    async advanceStateThread(client, contractBytecodeHex, newStateHex, extraOutputs = []) {
+        const contractAddr = blake3_hash_hex(normalizeHex(contractBytecodeHex));
+        if (this.watchedContracts[contractAddr] === undefined) {
+            throw new Error(
+                `Contract ${contractAddr.slice(0, 10)}… is not followed. ` +
+                `Call watchContract() and sync so the current state is known.`
+            );
+        }
+        const cur = this.getStateThread(contractAddr);
+        const ctxStr = this.inner.build_state_thread_tx(
+            JSON.stringify(this._utxosForWasm()),
+            normalizeHex(contractBytecodeHex),
+            cur ? cur.state : null,
+            cur ? cur.coin_id : null,
+            cur ? cur.salt : null,
+            normalizeHex(newStateHex),
+            JSON.stringify(extraOutputs),
+            this.nextWotsIndex
+        );
+        return this._broadcastTwoPhaseTx(client, ctxStr, 'script');
+    }
+
+    /**
+     * Subscribe to the node's push stream and keep wallet state reconciled.
+     *
+     * # Reasoning
+     *
+     * The pieces for live reconciliation all existed but nothing joined them:
+     * `onPushEvent` delivered `NewBlockTip`, {@link Wallet#handleBlockTip} could
+     * act on it, and {@link Wallet#recoverPendingTx} could finish an armed
+     * re-send — but a caller had to wire all three by hand, and a caller who
+     * didn't would sit on a stale or forked view indefinitely.
+     *
+     * Recovery is attempted after a rollback because that is exactly when a
+     * CASE 1 re-send gets armed; running it there closes the loop in one pass
+     * instead of waiting for the next manual call.
+     *
+     * Errors in a push handler are reported through `onError` rather than
+     * thrown, because throwing inside the subscription would tear down the
+     * stream and leave the wallet worse off than the fork it was reacting to.
+     *
+     * @param {MidstateClient} client
+     * @param {Object}   [handlers]
+     * @param {Function} [handlers.onReorg]  Rollback report, after it is applied.
+     * @param {Function} [handlers.onRecover] Result of an attempted re-send.
+     * @param {Function} [handlers.onChat]   Chat pushes, passed through.
+     * @param {Function} [handlers.onTip]    Every NewBlockTip, after reconciliation.
+     * @param {Function} [handlers.onError]  Any error raised while handling a push.
+     * @returns {Function} Unsubscribe.
+     */
+    autoReconcile(client, handlers = {}) {
+        const { onReorg, onRecover, onChat, onTip, onError } = handlers;
+        let stopped = false;
+
+        client.onPushEvent(async (event) => {
+            if (stopped || !event) return;
+            try {
+                if (event.ChatMessage && onChat) { onChat(event.ChatMessage); return; }
+
+                const tip = event.NewBlockTip || event.newBlockTip;
+                if (!tip) return;
+
+                const report = await this.handleBlockTip(client, tip);
+                if (report) {
+                    if (onReorg) onReorg(report);
+                    // A rollback is the moment a verbatim re-send gets armed.
+                    if (this.pendingResend) {
+                        const rec = await this.recoverPendingTx(client);
+                        if (onRecover) onRecover(rec);
+                    }
+                }
+                if (onTip) onTip(tip, report);
+            } catch (e) {
+                if (onError) onError(e);
+            }
+        });
+
+        return () => { stopped = true; };
+    }
+
+    /**
+     * Reconcile local MSS leaf counters against the chain.
+     *
+     * # Reasoning
+     *
+     * `next_leaf` is a local guess at how much of a Merkle signature tree has
+     * been consumed. It can fall *behind* reality — a spend confirmed from
+     * another device or another install of the same seed, or a local state file
+     * restored from an older backup. When it does, the wallet signs with a leaf
+     * the chain has already seen.
+     *
+     * That failure is invisible at admission and permanent afterwards. The
+     * mempool only compares a new reveal against the live mempool, so the node
+     * accepts it; `prune_on_new_block` then evicts it against the chain's burned
+     * leaf accumulator, every block, forever. From the caller's side the
+     * transaction simply never confirms and re-sending never helps, because each
+     * attempt signs with the same exhausted leaf.
+     *
+     * `mss_state` answers this in one O(1) lookup, and deliberately returns
+     * `max(chain, mempool)` so an in-flight unmined spend is counted too.
+     *
+     * Counters only ever move FORWARD here. Trusting a lower remote value would
+     * rewind onto leaves this wallet has already used — the exact reuse this
+     * exists to prevent — so a node reporting a smaller index is ignored.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - client? is connected
+     *
+     * Post:
+     *   ∀ a ∈ dom mss_addrs •
+     *     mss_addrs'(a).next_leaf = max(mss_addrs(a).next_leaf, node_next_index(a))
+     *   ∧ mss_addrs'(a).next_leaf ≥ mss_addrs(a).next_leaf     (monotonic)
+     *   moved! = #{ a | mss_addrs'(a).next_leaf > mss_addrs(a).next_leaf }
+     *   utxos' = utxos
+     * ```
+     *
+     * ```zed
+     *     ReconcileMssLeaves
+     *     ─────────────────────────────
+     *     ΔWalletState
+     *     client? : Client
+     *     moved!  : ℕ
+     *
+     *     post ∀ a ∈ dom mss_addrs • mss_addrs'(a).next_leaf ≥ mss_addrs(a).next_leaf
+     *     post ∀ a ∈ dom mss_addrs • mss_addrs'(a).next_leaf ≥ node_next_index(a)
+     *     post utxos' = utxos
+     *     post spent_wots' = spent_wots
+     * ```
+     *
+     * # Safety / Invariants
+     *
+     * - **Monotonic by construction.** `max` is the whole mechanism; any path
+     *   that could lower a counter would re-open leaf reuse.
+     * - Mirrors each advance into the WASM cache via `set_mss_leaf_index`, so
+     *   the two views cannot drift.
+     * - An address whose public key is unavailable (tree not loaded) is skipped
+     *   rather than reset — absence of evidence is not evidence of zero.
+     *
+     * @param {MidstateClient} client
+     * @returns {Promise<{checked:number, moved:number, details:Object[]}>}
+     */
+    async reconcileMssLeaves(client) {
+        const details = [];
+        let checked = 0, moved = 0;
+
+        for (const [addr, meta] of Object.entries(this.mssAddrs)) {
+            let pk;
+            try { pk = this.inner.get_mss_pubkey(addr); } catch { pk = null; }
+            if (!pk) continue;                       // tree not resident — cannot ask
+            checked++;
+
+            let remote;
+            try {
+                const st = await client.getMssState(pk);
+                remote = Number(st?.next_index ?? 0);
+            } catch {
+                continue;                            // transient; leave the counter alone
+            }
+
+            if (Number.isFinite(remote) && remote > meta.next_leaf) {
+                const from = meta.next_leaf;
+                meta.next_leaf = remote;
+                this.inner.set_mss_leaf_index(addr, remote);
+                moved++;
+                details.push({ address: addr, from, to: remote });
+            }
+        }
+
+        if (moved > 0) await this.save();
+        return { checked, moved, details };
+    }
+
+    /**
+     * Ensure at least `gap` unused WOTS addresses sit above the highest index
+     * that has ever held a coin.
+     *
+     * # Reasoning
+     *
+     * A wallet does not use its key indices contiguously. Change addresses,
+     * multi-output spends and coinbase payouts all consume indices in bursts, so
+     * a real history leaves coins scattered across a range far wider than the
+     * number of coins. Observed on a live wallet: 320 coins spread over WOTS
+     * indices 0..1728.
+     *
+     * A FIXED derivation window cannot cope with that. Whatever ceiling is
+     * chosen, a wallet whose coins reach past it is scanned to completion and
+     * reports a confident, wrong, too-small balance — the worst failure shape
+     * available, because nothing signals that anything was missed. The previous
+     * implementation pre-derived `gapLimit` addresses once and never grew.
+     *
+     * So the window is anchored to evidence rather than to a guess: it always
+     * extends `gap` indices past the highest index actually seen holding a coin.
+     * The node's own CLI does the same thing, reporting each step as
+     * `Extended to WOTS index N (last coin by index N)`.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - gap? > 0
+     *
+     * Post:
+     *   let used = max({ wots_addrs(c.address) | c ∈ utxos ∧ ¬c.is_mss } ∪ {-1})
+     *   next_wots_index' ≥ used + 1 + gap?
+     *   next_wots_index' ≥ next_wots_index            (monotonic; never rewinds)
+     *   ∀ i ∈ [0, next_wots_index') • wots_address(i) ∈ dom wots_addrs'
+     *   utxos' = utxos                                (derivation credits nothing)
+     *   added! = next_wots_index' − next_wots_index
+     * ```
+     *
+     * ```zed
+     *     ExtendGap
+     *     ─────────────────────────────
+     *     ΔWalletState
+     *     gap?   : ℕ₁
+     *     added! : ℕ
+     *
+     *     pre  gap? > 0
+     *
+     *     post next_wots_index' ≥ next_wots_index
+     *     post next_wots_index' ≥ highest_used_index + 1 + gap?
+     *     post added! = next_wots_index' − next_wots_index
+     *     post utxos' = utxos
+     *     post spent_wots' = spent_wots
+     * ```
+     *
+     * # Safety / Invariants
+     *
+     * - **Monotonic.** `next_wots_index` only ever increases. Rewinding it would
+     *   re-issue an index that may already have signed, which is the one-time
+     *   key failure the whole wallet is built to avoid.
+     * - Derivation alone credits nothing and touches no key state: it widens
+     *   what the wallet can *notice*, never what it can spend.
+     * - Includes burned addresses in the "used" set so a retired index still
+     *   pushes the window forward; a gap measured only from spendable coins
+     *   would shrink after a sweep.
+     *
+     * @private
+     * @param {number} gap Unused addresses to keep above the highest used index.
+     * @returns {Promise<number>} How many addresses were newly derived.
+     */
+    async _extendGap(gap) {
+        let highestUsed = -1;
+        for (const c of this.utxos) {
+            if (c.is_mss) continue;
+            const idx = this.wotsAddrs[c.address];
+            if (typeof idx === 'number' && idx > highestUsed) highestUsed = idx;
+        }
+        // A burned address is still evidence the wallet reached that index.
+        for (const addr of Object.keys(this.spentWots)) {
+            const idx = this.wotsAddrs[addr];
+            if (typeof idx === 'number' && idx > highestUsed) highestUsed = idx;
+        }
+
+        const target = Math.max(this.nextWotsIndex, highestUsed + 1 + gap);
+        const before = this.nextWotsIndex;
+        while (this.nextWotsIndex < target) {
+            const addr = this.inner.get_wots_address(this.nextWotsIndex);
+            this.wotsAddrs[addr] = this.nextWotsIndex++;
+        }
+        if (this.nextWotsIndex !== before) await this.save();
+        return this.nextWotsIndex - before;
+    }
+
+    /** @returns {number} Highest WOTS index known to have held a coin, or -1. */
+    highestUsedWotsIndex() {
+        let hi = -1;
+        for (const c of this.utxos) {
+            if (c.is_mss) continue;
+            const idx = this.wotsAddrs[c.address];
+            if (typeof idx === 'number' && idx > hi) hi = idx;
+        }
+        for (const addr of Object.keys(this.spentWots)) {
+            const idx = this.wotsAddrs[addr];
+            if (typeof idx === 'number' && idx > hi) hi = idx;
+        }
+        return hi;
+    }
+
     _setWatchlist() {
         const watch = [
             ...Object.keys(this.wotsAddrs),
             ...Object.keys(this.mssAddrs),
+            ...Object.keys(this.watchedContracts),
             ...this.utxos.map(u => u.coin_id),
+            ...Object.keys(this.contractCoins),
         ];
         this.inner.set_watchlist(JSON.stringify(watch));
     }
@@ -32237,7 +35681,99 @@ class Wallet {
      * @private
      * @returns {boolean} true if the block touched our wallet.
      */
-    _processBlock(block) {
+    /**
+     * Apply one block to wallet state: credit outputs we own, retire inputs we
+     * spent, and poison any WOTS key the block published.
+     *
+     * # Reasoning
+     *
+     * Two things here were wrong before and both lost money silently.
+     *
+     * **Only `Reveal` was scanned.** `Transaction` also has a `Consolidate`
+     * variant carrying its own inputs and outputs, used for dust sweeps. Every
+     * spend and receipt through that path was invisible.
+     *
+     * **Spends were matched on salt alone.** `InputReveal` has no `address`
+     * field: it carries a `predicate`, and `Predicate::address()` is
+     * `BLAKE3(bytecode)` — every address is pay-to-script-hash. A coin's
+     * identity is `(address, value, salt)`, or the domain-separated
+     * `"CONFIDENTIAL" ⌢ address ⌢ commitment ⌢ salt` form for state threads
+     * (the tag is a vestigial name; nothing about them is confidential).
+     * Salt matching happened to work because salts are random, but it cannot
+     * distinguish a confidential coin from a standard one and relied on a
+     * collision-free accident. The coin id is now recomputed from the predicate,
+     * with salt lookup demoted to a fallback for malformed block data.
+     *
+     * **WOTS sibling purge.** Spending any coin at a WOTS address publishes that
+     * one-time key, so every sibling at the same address is burned with it. The
+     * node enforces co-spend, so in a well-formed block siblings appear as
+     * inputs anyway — but purging by address rather than by matched input also
+     * covers coins that arrived at the address after the spend. MSS addresses
+     * tolerate reuse (each spend consumes a distinct leaf) and are retired
+     * singly.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - height? ∈ Height
+     *   - block? is a Batch as returned by get_block (witnesses stripped)
+     *
+     * Post:
+     *   let O = coinbase outputs ∪ { o ∈ tx.outputs | tx ∈ Reveal ∪ Consolidate }
+     *   let I = { i ∈ tx.inputs  | tx ∈ Reveal ∪ Consolidate }
+     *
+     *   -- credits
+     *   ∀ o ∈ O • o.address ∈ dom wots_addrs ∪ dom mss_addrs ⇒
+     *       AddUtxo(o.address, o.value, o.salt, coin_id(o), height?)
+     *
+     *   -- spends
+     *   ∀ i ∈ I • coin_id(i) ∈ ids(utxos) ⇒
+     *     ¬is_mss(i) ⇒ spent_wots'(i.address) = (height ↦ height?)
+     *                ∧ utxos' = utxos \ { c | c.address = i.address }
+     *                ∧ spent_log'(height?) ⊇ { c | c.address = i.address }
+     *     is_mss(i)  ⇒ utxos' = utxos \ { c | c.coin_id = coin_id(i) }
+     *                ∧ spent_log'(height?) ⊇ { c | c.coin_id = coin_id(i) }
+     *
+     *   result! = true ⟺ utxos' ≠ utxos ∨ spent_wots' ≠ spent_wots
+     * ```
+     *
+     * ```zed
+     *     ProcessBlock
+     *     ─────────────────────────────
+     *     ΔWalletState
+     *     block?  : Batch
+     *     height? : Height
+     *     result! : 𝔹
+     *
+     *     pre  height? ≥ 0
+     *
+     *     post ∀ c ∈ utxos' \ utxos • c.created_at = height?
+     *     post ∀ i ∈ spent_inputs(block?) • ¬is_mss(i) ∧ matched(i) ⇒
+     *            i.address ∈ dom spent_wots'
+     *          ∧ ¬∃ c ∈ utxos' • c.address = i.address ∧ ¬c.reuse_locked
+     *     post dom spent_log' ⊆ dom spent_log ∪ {height?}
+     * ```
+     *
+     * # Safety / Invariants
+     *
+     * - **Maintains INV-1**: an address is added to `spent_wots` and all its
+     *   free coins removed in the same step.
+     * - **Maintains INV-3**: removals are logged under `height?`, which is the
+     *   height being applied and therefore ≤ `scanned` once the batch commits.
+     * - Every removal is recorded in `spent_log` before it happens, so a
+     *   rollback can restore it. A removal that skips the log is unrecoverable.
+     *
+     * @private
+     * @param {Object} block
+     * @param {number|null} [height]
+     * @returns {boolean} true if the block touched wallet state.
+     */
+    _processBlock(block, height = null) {
+        // Height under which this block's mutations are recorded. Falls back to
+        // the block's own field so callers that already have the batch need not
+        // pass it twice.
+        this._reorgHeight = height ?? block?.height ?? 0;
         if (!block) throw new Error('block fetch returned null');
         let matched = false;
 
@@ -32258,34 +35794,127 @@ class Wallet {
             }
         }
 
-        // Transaction reveals: spent inputs first, then created outputs.
+        // Spends and receipts. Both Reveal and Consolidate carry inputs and
+        // outputs and both move our coins, so both must be scanned — reading
+        // only `Reveal` made every dust-sweep invisible to the wallet.
         if (Array.isArray(block.transactions)) {
             for (const tx of block.transactions) {
-                const reveal = tx.Reveal || tx.reveal;
-                if (!reveal) continue;
+                const action = tx.Reveal || tx.reveal || tx.Consolidate || tx.consolidate;
+                if (!action) continue;
 
-                if (Array.isArray(reveal.inputs)) {
-                    for (const inp of reveal.inputs) {
+                if (Array.isArray(action.inputs)) {
+                    for (const inp of action.inputs) {
                         const saltHex = normalizeHex(inp.salt);
-                        const cid = ourSalts.get(saltHex);
-                        if (cid) {
+
+                        // Recompute the coin ID from the block data rather than
+                        // trusting a salt lookup.
+                        //
+                        // InputReveal has no `address` field: it carries a
+                        // `predicate`, and Predicate::address() is
+                        // BLAKE3(bytecode) — every address is pay-to-script-hash.
+                        // A coin's identity is (address, value, salt), or the
+                        // domain-separated CONFIDENTIAL form when the input
+                        // carries a state commitment. Matching on salt alone
+                        // happened to work because salts are random, but it
+                        // cannot distinguish a state-thread coin from a standard
+                        // one and silently relies on a collision-free accident.
+                        // Salt lookup stays only as a fallback for malformed
+                        // block data.
+                        const bytecode = inp.predicate?.Script?.bytecode ?? inp.bytecode;
+                        let cid = null;
+                        if (bytecode) {
+                            const addrHex = blake3_hash_hex(normalizeHex(bytecode));
+                            cid = inp.commitment
+                                ? computeStateThreadCoinId(addrHex, normalizeHex(inp.commitment), saltHex)
+                                : compute_coin_id_hex(addrHex, BigInt(inp.value), saltHex);
+                        }
+                        if (!cid) cid = ourSalts.get(saltHex);
+                        if (!cid) continue;
+
+                        // A contract coin is consumed by satisfying its script,
+                        // not by a one-time signature, so it carries no key-reuse
+                        // risk and skips the WOTS poisoning below entirely. It
+                        // still MUST be logged and removed: a state thread that
+                        // stays in `contractCoins` after being spent is a stale
+                        // state, and the node rejects the next execution built on
+                        // it ("coin_id does not match (address,value,salt,state)").
+                        const contractCoin = this.contractCoins[cid];
+                        if (contractCoin) {
+                            this._logSpent([{ ...contractCoin, isContract: true }]);
+                            delete this.contractCoins[cid];
+                            matched = true;
+                            continue;
+                        }
+
+                        const spent = this.utxos.find(u => u.coin_id === cid);
+                        if (!spent) continue;
+
+                        // Spending any coin at a one-time WOTS address publishes
+                        // that key, so every sibling coin at the same address is
+                        // burned with it. The node enforces the co-spend rule, so
+                        // in a well-formed block the siblings appear as inputs
+                        // here too and would be removed individually — but a coin
+                        // that arrived at the address *after* the spend never
+                        // will be, and leaving it in the UTXO set offers it to
+                        // the next coin selection as if it were spendable.
+                        // Redeeming it would reuse the one-time key, which the
+                        // node punishes with the Key Reuse Burn Protocol. MSS
+                        // addresses tolerate reuse and are removed singly.
+                        if (!spent.is_mss) {
+                            this.spentWots[spent.address] = { height: this._reorgHeight };
+                            this._logSpent(this.utxos.filter(u => u.address === spent.address));
+                            this.utxos = this.utxos.filter(u => u.address !== spent.address);
+                            for (const [s, id] of ourSalts) {
+                                if (!this.utxos.some(u => u.coin_id === id)) ourSalts.delete(s);
+                            }
+                        } else {
+                            this._logSpent([spent]);
                             this.utxos = this.utxos.filter(u => u.coin_id !== cid);
                             ourSalts.delete(saltHex);
-                            matched = true;
                         }
+                        matched = true;
                     }
                 }
 
-                if (Array.isArray(reveal.outputs)) {
-                    for (const out of reveal.outputs) {
+                if (Array.isArray(action.outputs)) {
+                    for (const out of action.outputs) {
+                        // ── Standard output ──
                         const outData = out.Standard || out.standard;
-                        if (!outData) continue;
-                        const addrHex = normalizeHex(outData.address);
-                        const saltHex = normalizeHex(outData.salt);
-                        if (this.wotsAddrs[addrHex] !== undefined || this.mssAddrs[addrHex] !== undefined) {
-                            const coinId = compute_coin_id_hex(addrHex, BigInt(outData.value), saltHex);
-                            if (this.addUtxo(addrHex, outData.value, saltHex, coinId)) ourSalts.set(saltHex, coinId);
-                            matched = true;
+                        if (outData) {
+                            const addrHex = normalizeHex(outData.address);
+                            const saltHex = normalizeHex(outData.salt);
+                            if (this.wotsAddrs[addrHex] !== undefined || this.mssAddrs[addrHex] !== undefined) {
+                                const coinId = compute_coin_id_hex(addrHex, BigInt(outData.value), saltHex);
+                                if (this.addUtxo(addrHex, outData.value, saltHex, coinId)) ourSalts.set(saltHex, coinId);
+                                matched = true;
+                            } else if (this.watchedContracts[addrHex] !== undefined) {
+                                // A contract's spendable funds live in a standard
+                                // coin at the contract address, separate from its
+                                // state thread (which must have value 0).
+                                const coinId = compute_coin_id_hex(addrHex, BigInt(outData.value), saltHex);
+                                if (this._addContractCoin(addrHex, outData.value, saltHex, null, coinId)) matched = true;
+                            }
+                            continue;
+                        }
+
+                        // ── State thread (the `Confidential` variant) ──
+                        //
+                        // Zero-value by consensus, carrying a 32-byte commitment
+                        // that scripts read via OP_READ_INPUT_STATE. Its coin id
+                        // uses the domain-separated CONFIDENTIAL form, not the
+                        // standard (address, value, salt) hash. These were
+                        // ignored entirely before, so a followed contract's state
+                        // was never recorded and every subsequent execution
+                        // supplied a stale state that the node rejected.
+                        const conf = out.Confidential || out.confidential;
+                        if (conf) {
+                            const cAddr = normalizeHex(conf.address);
+                            if (this.watchedContracts[cAddr] !== undefined) {
+                                const cSalt = normalizeHex(conf.salt);
+                                const cState = normalizeHex(conf.commitment);
+                                const cId = computeStateThreadCoinId(cAddr, cState, cSalt);
+                                if (this._addContractCoin(cAddr, 0, cSalt, cState, cId)) matched = true;
+                            }
                         }
                     }
                 }
@@ -32317,44 +35946,168 @@ class Wallet {
      * @param {Function} [opts.onProgress]    Called as ({height, chainHeight, balance, note?}).
      * @param {number}   [opts.filterIntervalMs=550] Minimum spacing between getFilters
      *   requests. The node rate-limits "expensive" requests (get_filters and
-     *   block_template share one budget) to ~120/60s for a fresh peer, and each
-     *   rejection counts as a violation — 10 violations triggers a 5-minute ban.
-     *   Pacing at >500ms keeps a full-chain scan under that budget so it never
-     *   trips the limiter. Set to 0 to disable pacing (only safe for short scans).
+     *   block_template share one budget) to ~120 per 60s window for a fresh
+     *   peer — `current_expensive_limit()` is `20 + 200 * P(honest)`, and a new
+     *   peer sits at P=0.5 under the Beta(1,1) prior. Each rejection counts as
+     *   a violation; LIGHT_BAN_THRESHOLD (20) violations triggers a
+     *   LIGHT_BAN_DURATION_SECS (500s) ban. Pacing at >500ms keeps a full-chain
+     *   scan inside that budget. Set to 0 to disable pacing (only safe for
+     *   short scans).
      * @param {number}   [opts.rateLimitCooldownMs=62000] If the limiter still fires
      *   (e.g. reduced reputation), wait roughly one window before retrying.
      * @param {number}   [opts.maxRateLimitRetries=6] Cap on consecutive cooldowns
-     *   per batch (stays well under the 10-violation ban threshold).
-     * @returns {Promise<{height:number, found:number, balance:number, utxos:number}>}
+     *   per batch (stays well under the 20-violation ban threshold).
+     * @param {number}   [opts.maxStalledBatches=20] Give up after this many
+     *   consecutive batches in which the peer returned no filters at all.
+     * @param {Function} [opts.onReorg] Called with the rollback report if a
+     *   chain reorganisation is detected and healed.
+     * @param {boolean}  [opts.skipReorgCheck=false] Skip divergence detection.
+     * @returns {Promise<{height:number, found:number, balance:bigint,
+     *   lockedBalance:bigint, utxos:number, reorg:Object|null}>}
+     *
+     * # Reasoning
+     *
+     * Sync is the wallet's only source of truth about the chain, so it carries
+     * three obligations that are easy to get subtly wrong.
+     *
+     * **Undecidable filters must be fetched, not skipped.** The node emits
+     * `element_count = 0` with an empty filter to mean "I could not build a
+     * filter for this height — fetch it yourself", never "this block is empty":
+     * every block has coinbase outputs, so a genuine filter is never empty.
+     * Treating zero as "nothing here" silently skipped any block whose filter
+     * failed to load, losing coins paid to us in it.
+     *
+     * **Short batches must not be walked block-by-block.** The node now emits
+     * placeholders instead of truncating, so a short batch means the peer cannot
+     * serve the range. Grinding the remainder turns one request into up to 1000
+     * and is indistinguishable from deliberate rate-limit evasion.
+     *
+     * **The reorg check runs before the early return.** A reorg that replaces
+     * blocks without advancing the tip leaves `chainHeight` unchanged, so
+     * checking after the "nothing to do" return misses exactly the case where
+     * our view is wrong but our height is right.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - client? is connected
+     *
+     * Post:
+     *   -- reorg reconciliation first
+     *   diverged ⇒ RollbackTo(fork) applied before any extension
+     *
+     *   -- then forward scan
+     *   ∀ h ∈ [scanned, chain_height) •
+     *     h ∈ dom block_hashes'                      (recorded unconditionally)
+     *     ∧ (undecidable(h) ∨ filter_hit(h) ⇒ ProcessBlock(h) applied)
+     *   scanned' = chain_height
+     *   ∀ c ∈ utxos' • ¬c.is_mss ∧ c.address ∈ dom spent_wots' ⇒ c.reuse_locked
+     *
+     * Post (peer cannot serve the range):
+     *   raises after maxStalledBatches consecutive empty batches; scanned' is
+     *   checkpointed at the last fully-processed height, so a re-run resumes
+     *   rather than rescanning from genesis.
+     * ```
+     *
+     * # Safety / Invariants
+     *
+     * - Maintains INV-1 and INV-3 by delegating every mutation to
+     *   {@link Wallet#_processBlock} and {@link rollbackTo}.
+     * - Maintains INV-4 via {@link pruneHistory}, called once per batch.
+     * - Checkpoints `scanned` only after a batch is fully applied, so an
+     *   interruption never marks unscanned heights as done.
      */
     async sync(client, {
         gapLimit = 0,
+        mssGap = 0,
+        mssHeight = 10,
+        maxGapPasses = 12,
+        cacheFilters = true,
+        maxCachedBatches = 4096,
+        allowPartialGapScan = false,
         batchSize = 1000,
         rescan = false,
         onProgress,
         filterIntervalMs = 550,
         rateLimitCooldownMs = 62_000,
         maxRateLimitRetries = 6,
+        maxStalledBatches = 20,
+        skipReorgCheck = false,
+        deepRescan = false,
+        onReorg,
     } = {}) {
         if (rescan) {
+            // Chain-derived state is discarded and rebuilt from blocks.
+            //
+            // `spentWots`, `reuseLocked` and `sentReveals` are deliberately NOT
+            // cleared. They record which one-time keys this wallet has published
+            // — a fact about our own signing history, not about any particular
+            // chain. A rescan re-derives the published-key set only for spends
+            // that appear on the branch being scanned; a key burned by a spend
+            // that was later orphaned appears nowhere, so clearing these would
+            // silently re-admit its coins as spendable and hand back the exact
+            // reuse the burn protocol punishes.
             this.utxos = [];
+            this.contractCoins = {};
+            this.blockHashes = {};
+            this.spentLog = {};
             this.lastScannedHeight = 0;
         }
 
-        if (gapLimit > 0) {
-            const target = this.nextWotsIndex + gapLimit;
-            while (this.nextWotsIndex < target) {
-                const addr = this.inner.get_wots_address(this.nextWotsIndex);
-                this.wotsAddrs[addr] = this.nextWotsIndex++;
-            }
-            await this.save();
+        // Ensure a gap window exists above the highest index we already watch.
+        // Extension after each pass is what makes this adaptive; see
+        // {@link Wallet#_extendGap}.
+        if (gapLimit > 0) await this._extendGap(gapLimit);
+        if (mssGap > 0) {
+            while (this.nextMssIndex < mssGap) await this.getNewReusableAddress(mssHeight);
         }
 
         const state = await client.getState();
         const chainHeight = state.height;
 
+        // ── Reorg check, before anything else ───────────────────────────────
+        //
+        // This runs BEFORE the "nothing to do" early return on purpose. A reorg
+        // that replaces blocks without advancing the tip leaves chainHeight
+        // unchanged, so checking after the early return would miss exactly the
+        // case where our view is wrong but our height is right. See reorg.js for
+        // why an undetected fork can strand coins permanently.
+        let reorg = null;
+        if (!rescan && !skipReorgCheck) {
+            reorg = await maybeHandleReorg(this, client, chainHeight);
+            if (reorg && reorg.exhausted && !deepRescan) {
+                // The fork is deeper than REORG_DEPTH, so `spentLog` no longer
+                // holds the records needed to restore what was spent down there
+                // and the UTXO set cannot be repaired incrementally. Rebuild it
+                // from chain data instead. Published-key state survives the
+                // rebuild (see the rescan branch above), so this heals the coin
+                // set without widening what is spendable.
+                reorg.escalatedToRescan = true;
+                this.utxos = [];
+                this.contractCoins = {};
+                this.blockHashes = {};
+                this.spentLog = {};
+                this.lastScannedHeight = 0;
+            }
+            if (reorg) {
+                this._setWatchlist();
+                await this.save();
+                if (onReorg) onReorg(reorg);
+                if (onProgress) {
+                    onProgress({
+                        height: this.lastScannedHeight, chainHeight,
+                        balance: this.getBalance(), reorg,
+                    });
+                }
+            }
+        }
+
         if (chainHeight <= this.lastScannedHeight) {
-            return { height: chainHeight, found: 0, balance: this.getBalance(), utxos: this.utxos.length };
+            return {
+                height: chainHeight, found: 0, balance: this.getBalance(),
+                lockedBalance: this.getLockedBalance(), utxos: this.utxos.length, reorg,
+            };
         }
 
         this._setWatchlist();
@@ -32393,12 +36146,74 @@ class Wallet {
             }
         };
 
+        // ── Adaptive gap passes ──
+        //
+        // Widening the derivation window mid-scan is not enough on its own:
+        // blocks already examined were filtered against the OLD watchlist, so a
+        // coin paid to a newly derived address in one of them was never seen.
+        // The window has to widen and the range be re-examined until a pass
+        // discovers nothing new — which is why the node's CLI reports a run of
+        // `Extended to WOTS index …` lines rather than one.
+        //
+        // Bounded by maxGapPasses so a pathological wallet cannot loop forever;
+        // exhausting the bound is reported rather than silently accepted,
+        // because the alternative is a confident, too-small balance.
+        const scanFrom = this.lastScannedHeight;
+        let gapPasses = 0;
+        let gapExhausted = false;
+
+        // ── Gap extension needs the whole history ──
+        //
+        // The walk chains from one discovered index to the next, so an index
+        // whose only activity lies below the scan floor is invisible — and a
+        // hole wider than `gapLimit` stops the walk early, producing a balance
+        // that is too small and carries no indication of it.
+        //
+        // Observed live: a 200k-block window ending at 251,015 walked to index
+        // 1412 and stopped, where a full-chain scan reached 1472.
+        //
+        // So a partial range is refused unless the wallet has already completed
+        // a scan from genesis (the normal incremental case, where earlier
+        // passes established the index space) or the caller opts out knowingly.
+        if (gapLimit > 0 && scanFrom > 0 && !this.fullScanCompleted && !allowPartialGapScan) {
+            throw new Error(
+                `Gap extension needs a full-chain scan: this run starts at height ${scanFrom} and ` +
+                `this wallet has never scanned from genesis, so indices used below that height are ` +
+                `invisible and the walk can stop early with a too-small balance. Scan from 0, or ` +
+                `pass allowPartialGapScan: true if an incomplete result is acceptable.`
+            );
+        }
+
+        // Filters are immutable per height; only the watchlist changes between
+        // passes. Bounded so a full-chain scan cannot exhaust memory.
+        const filterCache = (gapLimit > 0 && cacheFilters) ? new Map() : null;
+        let cacheHits = 0;
+
         let current = this.lastScannedHeight;
         let found = 0;
+        // Consecutive batches where the peer returned zero filters. Bounded so
+        // a node that cannot serve this range costs a handful of requests
+        // rather than thousands.
+        let stalledBatches = 0;
 
+        scanPass:
         while (current < chainHeight) {
             const end = Math.min(current + batchSize, chainHeight);
-            const filterData = await fetchFilters(current, end);
+            // Filters do not change between gap passes — only the watchlist
+            // does — so they are fetched once and re-tested locally thereafter.
+            // Without this a 200k-block scan with 10 extensions re-fetched every
+            // filter eleven times: measured at 2087s against a live node, of
+            // which all but the first pass was avoidable.
+            let filterData;
+            if (filterCache && filterCache.has(current)) {
+                filterData = filterCache.get(current);
+                cacheHits++;
+            } else {
+                filterData = await fetchFilters(current, end);
+                if (filterCache && filterCache.size < maxCachedBatches) {
+                    filterCache.set(current, filterData);
+                }
+            }
             const filters = filterData.filters || [];
             const counts = filterData.element_counts || [];
             const hashes = filterData.block_hashes || [];
@@ -32410,17 +36225,42 @@ class Wallet {
                 const n = counts[i] || 0;
                 const blockHash = hashes[i];
 
-                let fetch = false;
-                if (n === 0) {
-                    fetch = false;                       // empty block — nothing to match
-                } else if (!blockHash) {
-                    fetch = true;                        // node gave no hash → can't filter, fetch
-                } else if (this.inner.check_filter(filters[i], blockHash, n)) {
-                    fetch = true;                        // filter hit (may be a false positive)
+                // `element_count === 0` does NOT mean "nothing here".
+                //
+                // The node builds every filter from `CompactFilter::items_in`,
+                // which always inserts each coinbase output — so a real block
+                // ALWAYS has a non-zero count. Zero is emitted by exactly two
+                // branches of the node's GetFilters handler, both meaning
+                // "undecidable, fetch it yourself":
+                //   - the block loaded but its filter did not (hash present,
+                //     filter string empty), and
+                //   - the height was unreadable (hash and filter both empty).
+                //
+                // Treating zero as "empty block, skip" — and testing it BEFORE
+                // the missing-hash fallback, which made that fallback dead code
+                // — silently skipped every such block. Any coin paid to us in a
+                // block whose filter failed to load was never seen. That is a
+                // funds-visibility bug, not a performance one.
+                //
+                // So: an absent hash, an empty filter, or a zero count all mean
+                // "must fetch". Only a genuine, non-empty filter may rule a
+                // block out.
+                const filterHex = filters[i];
+                let fetch;
+                if (!blockHash || !filterHex || n === 0) {
+                    fetch = true;                        // undecidable → fetch
+                } else {
+                    fetch = this.inner.check_filter(filterHex, blockHash, n); // may false-positive
                 }
 
+                // Record this height's canonical identity before applying it.
+                // Recorded for EVERY height, not just ones that paid us: a fork
+                // can occur at a block irrelevant to this wallet, and the
+                // recorded hash is the only thing that later reveals it.
+                recordBlockHash(this, height, blockHash);
+
                 if (fetch) {
-                    const mutated = this._processBlock(await client.getBlock(height));
+                    const mutated = this._processBlock(await client.getBlock(height), height);
                     if (mutated) { found++; this._setWatchlist(); }
                 }
 
@@ -32431,23 +36271,199 @@ class Wallet {
 
             current += numFilters;
 
-            // If the node returned fewer filters than the requested span (some
-            // blocks have no filter), fetch the remainder of this batch directly.
-            while (current < end) {
-                const mutated = this._processBlock(await client.getBlock(current));
+            // ── Short batch handling ──
+            //
+            // This used to be `while (current < end) getBlock(current)`, walking
+            // the whole remainder of the batch one block at a time. That is a
+            // 1000x request amplification: a single get_filters covering 1000
+            // blocks becomes up to 1000 get_block calls. The node budgets a
+            // scan at "120 requests * 1000 blocks = 120,000 blocks synced per
+            // minute" — the filter path IS the sync path — and an unknown peer
+            // gets ~275 general requests per minute. Grinding the tail blew
+            // that budget continuously, and the node's own comment notes the
+            // pattern is indistinguishable from deliberate rate-limit evasion.
+            // At LIGHT_BAN_THRESHOLD (20) violations it earns a
+            // LIGHT_BAN_DURATION_SECS (500s) ban.
+            //
+            // The current node no longer truncates on an unreadable height: it
+            // emits an undecidable placeholder and keeps going, so all four
+            // arrays span the full request and numFilters === end - start. A
+            // short batch therefore means the peer could not serve this range
+            // at all. Step over one height directly and re-request from there;
+            // if the peer keeps returning nothing, surface it so the caller can
+            // pick another node rather than hammering this one.
+            if (numFilters === 0) {
+                if (++stalledBatches > maxStalledBatches) {
+                    throw new Error(
+                        `Scan stalled at height ${current}: peer returned no filters ` +
+                        `${stalledBatches} times. Try a different node.`
+                    );
+                }
+                const mutated = this._processBlock(await client.getBlock(current), current);
                 if (mutated) { found++; this._setWatchlist(); }
                 current++;
+            } else {
+                stalledBatches = 0;
             }
 
             // Checkpoint after each fully-processed batch so progress survives an
             // interruption and a re-run resumes instead of rescanning from genesis.
             this.lastScannedHeight = current;
+            // Bound the reorg structures once per batch rather than per block.
+            pruneHistory(this, chainHeight);
             await this.save();
+
+            // End of range: widen the window against what we actually found and,
+            // if that derived anything, re-examine the range with it.
+            if (current >= chainHeight && gapLimit > 0) {
+                const added = await this._extendGap(gapLimit);
+                if (added > 0) {
+                    if (++gapPasses >= maxGapPasses) {
+                        gapExhausted = true;
+                        break scanPass;
+                    }
+                    if (onProgress) {
+                        onProgress({
+                            height: current, chainHeight, balance: this.getBalance(),
+                            note: `extended to WOTS index ${this.nextWotsIndex} ` +
+                                  `(last coin by index ${this.highestUsedWotsIndex()}); rescanning`,
+                        });
+                    }
+                    this._setWatchlist();
+                    this.lastScannedHeight = scanFrom;
+                    current = scanFrom;
+                }
+            }
         }
 
         if (onProgress) onProgress({ height: chainHeight, chainHeight, balance: this.getBalance() });
 
-        return { height: chainHeight, found, balance: this.getBalance(), utxos: this.utxos.length };
+        if (scanFrom === 0) {
+            // Records that the index space has been established from genesis,
+            // which is what makes later incremental gap extension trustworthy.
+            this.fullScanCompleted = true;
+            await this.save();
+        }
+
+        if (gapExhausted) {
+            throw new Error(
+                `Gap extension did not settle after ${maxGapPasses} passes (now at WOTS index ` +
+                `${this.nextWotsIndex}). The balance below this point is INCOMPLETE — raise ` +
+                `maxGapPasses or gapLimit and re-run rather than trusting it.`
+            );
+        }
+
+        return {
+            height: chainHeight, found, balance: this.getBalance(),
+            lockedBalance: this.getLockedBalance(), utxos: this.utxos.length, reorg,
+            wotsDerived: this.nextWotsIndex, highestUsedWots: this.highestUsedWotsIndex(),
+            gapPasses, filterCacheHits: cacheHits, fullScan: scanFrom === 0,
+        };
+    }
+    
+    /**
+     * Compute and sign an off-chain Layer 2 Channel state update.
+     * 
+     * # Reasoning
+     * Trustless Hub-and-Spoke channels require the user to sign a new balance distribution
+     * between themselves and the hub (Bot). This function computes the exact commitment
+     * hash the Midstate blockchain expects, signs it, and securely persists the incremented
+     * MSS leaf index to prevent key reuse.
+     * 
+     * # Formal Specification
+     * ```text
+     * Pre:  params contains { channelId, botAddress, newBotAmount, userAddress, newUserAmount, salt }
+     *       wState.mssAddrs[userAddress] exists
+     * Post: wState.mssAddrs[userAddress].next_leaf' = wState.mssAddrs[userAddress].next_leaf + 1
+     *       wallet.dat is saved to disk
+     *       result is the hex-encoded MSS signature
+     * ```
+     * 
+     * @param {Object} params - The channel state parameters
+     * @returns {Promise<string>} The hex-encoded MSS signature
+     */
+    /**
+     * Sign a Q-Bolt payment-channel state with an MSS key.
+     *
+     * # Reasoning
+     *
+     * This previously opened with `if (!mssCachesReady) await loadMssCaches();`
+     * — neither identifier exists in this module, so it raised a ReferenceError
+     * before reaching any logic. The intent was to guarantee the signing tree is
+     * resident before signing, which the explicit checks below now do.
+     *
+     * The tree is loaded on demand rather than assumed present: a wallet that
+     * generated the key in a previous process and never re-imported would
+     * otherwise fail inside WASM with a far less actionable message.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - params.userAddress ∈ dom mss_addrs           (else raises)
+     *   - has_mss_cache(userAddress) ∨ storage holds the tree  (else raises)
+     *
+     * Post:
+     *   mss cache contains userAddress
+     *   ∧ cache leaf index = mss_addrs(userAddress).next_leaf
+     *   ∧ sig! = MSS_sign(userAddress, channel_state)
+     *   mss_addrs' = mss_addrs                 (leaf advanced by the spend path,
+     *                                           not by signing a channel state)
+     * ```
+     *
+     * # Safety / Invariants
+     *
+     * - The leaf index is synced from `mss_addrs` on import, never left at the
+     *   tree's serialized default. Importing a tree and signing without setting
+     *   the index would re-sign from leaf 0.
+     * - This does not itself advance `next_leaf`; channel-state signing and
+     *   on-chain spending consume leaves through different paths and conflating
+     *   them would either waste or reuse leaves.
+     */
+    async signChannelState(params) {
+        // This previously opened with `if (!mssCachesReady) await loadMssCaches();`
+        // — neither identifier exists in this module, so the function threw a
+        // ReferenceError before reaching any of its logic. The intent was to
+        // guarantee the MSS signing tree is resident before signing, which is
+        // what the explicit check below does.
+        if (this.mssAddrs[params.userAddress] === undefined) {
+            throw new Error("User MSS address not found in wallet.");
+        }
+
+        // sign_mss_hex signs from the in-memory tree cache. restore() reloads
+        // trees from storage, but a wallet that generated its key in a previous
+        // process and never re-imported would fail inside WASM with a less
+        // obvious message, so load it here on demand.
+        if (!this.inner.has_mss_cache(params.userAddress)) {
+            const treeBytes = await this.storage.loadMssTree(params.userAddress);
+            if (!treeBytes) {
+                throw new Error(
+                    `MSS signing tree for ${params.userAddress} is not loaded and not present in storage.`
+                );
+            }
+            this.inner.import_mss_bytes(params.userAddress, new Uint8Array(treeBytes));
+            this.inner.set_mss_leaf_index(params.userAddress, this.mssAddrs[params.userAddress].next_leaf);
+        }
+
+        // 1. Reconstruct the output hashes for the new channel state
+        const outBot = compute_coin_id_hex(params.botAddress, BigInt(params.newBotAmount), params.salt);
+        const outUser = compute_coin_id_hex(params.userAddress, BigInt(params.newUserAmount), params.salt);
+        
+        // 2. Compute the exact commitment hash
+        const commitmentHash = compute_commitment_hex(
+            JSON.stringify([params.channelId]), 
+            JSON.stringify([outBot, outUser]), 
+            params.salt
+        );
+
+        // 3. Sign it with the user's MSS key
+        const signatureHex = this.inner.sign_mss_hex(params.userAddress, commitmentHash);
+
+        // 4. Update the leaf counter locally and save to disk to prevent key reuse
+        this.mssAddrs[params.userAddress].next_leaf++;
+        await this.save();
+
+        return signatureHex;
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -32458,59 +36474,242 @@ class Wallet {
      * Internal helper to execute the 2-phase Commit/Reveal protocol.
      * @private
      */
-    async _broadcastTwoPhaseTx(client, spendCtxStr, isScript = false) {
+    /**
+     * Execute the commit–reveal lifecycle for a prepared spend context.
+     *
+     * # Reasoning
+     *
+     * This function advances and persists HD key material (WOTS indices and MSS
+     * leaf counters) and is therefore the wallet's most dangerous state
+     * transition: every one-time key it consumes can be consumed exactly once,
+     * for ever. Two orderings matter, and both are chosen to fail in the safe
+     * direction.
+     *
+     * **Reservation before broadcast.** Counters are advanced and persisted
+     * BEFORE the commit is sent. If the process dies mid-flight the counters
+     * have already moved, so the next run derives fresh keys rather than
+     * rewinding onto a key this attempt may have signed with. Skipping a key
+     * costs nothing; reusing one leaks it.
+     *
+     * **Retirement before transmission.** The moment `build_reveal` returns,
+     * real signatures exist over real one-time keys. Those keys are burned
+     * whether or not the node accepts the transaction and whether or not this
+     * process survives the next line. Retiring them first means a crash during
+     * `send`, or a rejection followed by a user retry, cannot re-select the same
+     * coins and sign a second time over a different commitment.
+     *
+     * The signed reveal is retained in `sent_reveals` keyed by input address.
+     * This is what makes reorg CASE 1 possible: if the transaction is later
+     * orphaned, the wallet can re-broadcast the IDENTICAL signature instead of
+     * re-signing. Without this retention every orphaned WOTS spend would fall to
+     * CASE 2 and its coins would be permanently reuse-locked.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - ctx.selected_inputs ⊆ utxos
+     *   - ∀ i ∈ ctx.selected_inputs • ¬i.reuse_locked
+     *   - ctx.next_wots_index ≥ next_wots_index
+     *
+     * Post (success):
+     *   next_wots_index' = ctx.next_wots_index
+     *   ∀ a ∈ mss_addrs(ctx.selected_inputs) •
+     *       mss_addrs'(a).next_leaf = mss_addrs(a).next_leaf + 1
+     *       (exactly +1 per ADDRESS, never per input)
+     *   ∀ i ∈ ctx.selected_inputs • ¬i.is_mss ⇒
+     *       spent_wots'(i.address) = (height ↦ tip, commitment ↦ ctx.commitment)
+     *       sent_reveals'(i.address) = (ctx.commitment, payload, ids, tip)
+     *   utxos' = utxos \ (ctx.selected_inputs ∪ siblings(wots inputs))
+     *   spent_log'(tip) ⊇ removed coins
+     *
+     * Post (commit timeout):
+     *   spent_wots' = spent_wots  ∧  utxos' = utxos
+     *   (no reveal was built, so no key was touched; only the PoW is lost)
+     *
+     * Post (reveal rejected by node):
+     *   identical to Post(success) — the signature exists regardless of the
+     *   node's verdict, so the key must still be retired.
+     * ```
+     *
+     * ```zed
+     *     BroadcastTwoPhaseTx
+     *     ─────────────────────────────
+     *     ΔWalletState
+     *     ΔHdCounters
+     *     ctx?  : SpendContext
+     *     tip?  : Height
+     *     resp! : NodeResponse
+     *
+     *     pre  ctx?.selected_inputs ⊆ utxos
+     *     pre  ∀ i ∈ ctx?.selected_inputs • ¬i.reuse_locked
+     *
+     *     post next_wots_index' = ctx?.next_wots_index
+     *     post ∀ a ∈ { i.address | i ∈ ctx?.selected_inputs ∧ i.is_mss } •
+     *            mss_addrs'(a).next_leaf = mss_addrs(a).next_leaf + 1
+     *     post ∀ i ∈ ctx?.selected_inputs • ¬i.is_mss ⇒
+     *            i.address ∈ dom spent_wots' ∧ i.address ∈ dom sent_reveals'
+     *     post ∀ c ∈ utxos' • c.coin_id ∉ { i.coin_id | i ∈ ctx?.selected_inputs }
+     *     post ∀ c ∈ utxos' • ¬c.is_mss ∧ c.address ∈ dom spent_wots' ⇒ c.reuse_locked
+     * ```
+     *
+     * # Safety / Invariants
+     *
+     * - **Maintains INV-1.** Every WOTS input address is added to `spent_wots`
+     *   and all its coins removed in the same step, so no free coin is left at
+     *   a published key.
+     * - **One leaf per MSS address per transaction.** `build_reveal` caches the
+     *   signature per address and reuses it across that address's inputs — they
+     *   all sign the same commitment — so incrementing per input would silently
+     *   burn a multiple of the tree capacity actually consumed.
+     * - **Retirement is unconditional on `send`'s verdict.** Making it
+     *   conditional would reintroduce the retry-reuse path.
+     * - The reveal retained in `sent_reveals` is the verbatim payload. It must
+     *   never be regenerated on recovery; see reorg.js CASE 1.
+     *
+     * @private
+     */
+    async _broadcastTwoPhaseTx(client, spendCtxStr, revealKind = 'standard') {
         const ctx = JSON.parse(spendCtxStr);
-        this.nextWotsIndex = ctx.next_wots_index;
-
-        // Advance MSS indices for any used inputs
         const inputs = ctx.selected_inputs || ctx.wallet_inputs || [];
-        for (const inp of inputs) {
-            if (inp.is_mss && this.mssAddrs[inp.address]) {
-                this.mssAddrs[inp.address].next_leaf++;
-            }
+
+        // ── Reserve key material BEFORE anything is broadcast ───────────────
+        //
+        // Derived change addresses and consumed MSS leaves are persisted up
+        // front, on purpose. If the process dies here the counters have already
+        // moved forward, so the next run derives fresh keys instead of rewinding
+        // onto keys this attempt may have signed with. Skipping a key is free;
+        // reusing one is not.
+        while (this.nextWotsIndex < ctx.next_wots_index) {
+            const addr = this.inner.get_wots_address(this.nextWotsIndex);
+            this.wotsAddrs[addr] = this.nextWotsIndex;
+            this.nextWotsIndex++;
+        }
+
+        // One MSS leaf is consumed per ADDRESS per transaction, not per input.
+        // build_reveal caches the signature for an address and reuses it across
+        // every input at that address, because they all sign the same
+        // commitment. Incrementing once per input over-consumed the tree — a
+        // height-10 address has only 1024 leaves, so a 3-input spend burned
+        // three times the capacity it actually used. Dedupe by address.
+        const mssAddrsUsed = new Set(
+            inputs.filter((i) => i.is_mss && this.mssAddrs[i.address]).map((i) => i.address)
+        );
+        for (const addr of mssAddrsUsed) {
+            const next = this.mssAddrs[addr].next_leaf + 1;
+            this.mssAddrs[addr].next_leaf = next;
+            // Keep the WASM cache's counter in step with ours. build_reveal sets
+            // the leaf from the UTXO record, but other entry points read the
+            // cache, and letting the two drift is how leaf reuse creeps back in.
+            this.inner.set_mss_leaf_index(addr, next);
         }
         await this.save();
 
         const state = await client.getState();
         const requiredPow = state.required_pow || 24;
 
-        // 1. Mine PoW
+        // 1. Mine the anti-spam PoW for the commitment.
         const spamNonce = mine_commitment_pow(
-            ctx.commitment, 
-            requiredPow, 
-            BigInt(state.height), 
+            ctx.commitment,
+            requiredPow,
+            BigInt(state.height),
             state.header_hash
         );
 
-        // 2. Commit
+        // 2. Commit (phase 1).
         const commitReq = await client.commit(ctx.commitment, Number(spamNonce));
         if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
 
-        // 3. Wait for confirmation
+        // 3. Wait for the commitment to appear in chain state.
+        //
+        // Poll spacing is well inside the node's budget: check_commitment is a
+        // cheap request (only block_template and get_filters count against the
+        // expensive limit), and one call per 10s is 6/min against a ~275/min
+        // allowance for a fresh peer. The commitment itself lives COMMITMENT_TTL
+        // (1000 blocks, ~16.7h) once mined, so this window is generous.
         let mined = false;
-        for (let i = 0; i < 24; i++) {
-            await new Promise(r => setTimeout(r, 5000));
+        for (let i = 0; i < 120; i++) {
+            await new Promise((r) => setTimeout(r, 10_000));
             const res = await client.checkCommitment(ctx.commitment).catch(() => ({}));
             if (res?.exists) { mined = true; break; }
         }
-        if (!mined) throw new Error("Timed out waiting for Commit to be mined.");
+        if (!mined) {
+            // Funds are not at risk: commits neither lock nor modify UTXOs, so
+            // an unmined commitment costs the PoW effort and nothing else. The
+            // reveal was never built, so no signing key was touched and the
+            // coins remain spendable.
+            throw new Error(
+                "Timed out waiting for Commit to be mined. No funds were spent and no signing key was used; retry when the network catches up."
+            );
+        }
 
-        // 4. Reveal
+        // 4. Reveal (phase 2). Building the reveal is the point of no return:
+        //    it produces real signatures over real one-time keys.
+        //
+        // All three kinds are two-phase: Consolidate also references a
+        // commitment in chain state (`apply_transaction` bails on an unknown
+        // one). Only the reveal encoding differs — a Consolidate carries a
+        // single signature for the shared input address, which is why its
+        // builder takes no commitment arguments and reads them from the context.
         let revealPayloadStr;
-        if (isScript) {
+        if (revealKind === 'script') {
             revealPayloadStr = this.inner.build_script_reveal(spendCtxStr, ctx.commitment, ctx.tx_salt);
+        } else if (revealKind === 'consolidate') {
+            revealPayloadStr = this.inner.build_consolidate_reveal(spendCtxStr);
         } else {
             revealPayloadStr = this.inner.build_reveal(spendCtxStr, ctx.commitment, ctx.tx_salt);
         }
-        
-        const response = await client.send(revealPayloadStr);
 
-        // 5. Cleanup Local State
-        const spentIds = inputs.map(i => i.coin_id);
-        this.utxos = this.utxos.filter(u => !spentIds.includes(u.coin_id));
+        // ── Retire the consumed keys BEFORE transmitting ────────────────────
+        //
+        // The signatures now exist. A WOTS key that has signed is burned whether
+        // or not the node accepts the transaction, and whether or not this
+        // process survives the next line. Recording that first means a crash
+        // during send, or a rejected reveal followed by a user retry, cannot
+        // re-select the same coins and sign a second time over a different
+        // commitment — which is precisely what the node's Key Reuse Punishment
+        // Burn Protocol exists to exploit.
+        //
+        // This deliberately runs before send() and regardless of its outcome.
+        // Dropping a coin the network never accepted is recoverable with a
+        // rescan; signing it twice is not.
+        const spentIds = new Set(inputs.map((i) => i.coin_id));
+        const wotsAddrsUsed = new Set();
+        for (const inp of inputs) {
+            if (!inp.is_mss) {
+                wotsAddrsUsed.add(inp.address);
+                // Record the commitment alongside the height. A rollback uses it
+                // to confirm that a retained reveal belongs to the spend being
+                // undone before it dares clear the poison (reorg.js CASE 1).
+                this.spentWots[inp.address] = {
+                    height: state.height,
+                    commitment: ctx.commitment,
+                };
+                for (const u of this.utxos) {
+                    if (u.address === inp.address) spentIds.add(u.coin_id);
+                }
+            }
+        }
+
+        // Retain the verbatim signed reveal so an orphaned spend can be
+        // re-broadcast rather than re-signed. Keyed by address because the
+        // reuse cliff is a property of the key, not of the individual coin.
+        for (const addr of wotsAddrsUsed) {
+            this.sentReveals[addr] = {
+                commitment: ctx.commitment,
+                revealPayload: revealPayloadStr,
+                inputCoinIds: [...spentIds],
+                sentAtHeight: state.height,
+            };
+        }
+
+        // Log the removals under the current tip so a rollback can restore them.
+        this._reorgHeight = state.height;
+        this._logSpent(this.utxos.filter((u) => spentIds.has(u.coin_id)));
+        this.utxos = this.utxos.filter((u) => !spentIds.has(u.coin_id));
         await this.save();
 
-        return response;
+        return client.send(revealPayloadStr);
     }
 
     /**
@@ -32528,7 +36727,7 @@ class Wallet {
         // Minor check, real check happens in WASM based on fees
         if (this.getBalance() <= (amount + bValue)) throw new Error("Insufficient funds (need extra for fees)");
 
-        const utxosForWasm = this.utxos.map(u => ({ ...u, value: Number(u.value) }));
+        const utxosForWasm = this._utxosForWasm();
         const spendCtxStr = this.inner.prepare_spend(
             JSON.stringify(utxosForWasm),
             toAddressHex,
@@ -32538,7 +36737,7 @@ class Wallet {
             burnDataHex ? bValue : null
         );
         
-        return this._broadcastTwoPhaseTx(client, spendCtxStr, false);
+        return this._broadcastTwoPhaseTx(client, spendCtxStr, 'standard');
     }
 
     /**
@@ -32550,7 +36749,7 @@ class Wallet {
      */
     async fundContract(client, contractAddrHex, amountMDS, stateHex = null) {
         const amount = BigInt(amountMDS);
-        const utxosForWasm = this.utxos.map(u => ({ ...u, value: Number(u.value) }));
+        const utxosForWasm = this._utxosForWasm();
         
         const ctxStr = this.inner.prepare_fund_tx(
             JSON.stringify(utxosForWasm),
@@ -32560,7 +36759,7 @@ class Wallet {
             this.nextWotsIndex
         );
 
-        return this._broadcastTwoPhaseTx(client, ctxStr, true);
+        return this._broadcastTwoPhaseTx(client, ctxStr, 'script');
     }
 
     /**
@@ -32571,7 +36770,7 @@ class Wallet {
      * @param {Array<Object>} outputsArray - Array of { out_type: "standard"|"confidential", address, value, state, salt }
      */
     async executeContract(client, contractBytecodeHex, contractInputsArray, outputsArray) {
-        const utxosForWasm = this.utxos.map(u => ({ ...u, value: Number(u.value) }));
+        const utxosForWasm = this._utxosForWasm();
         
         const ctxStr = this.inner.prepare_script_spend(
             JSON.stringify(utxosForWasm),
@@ -32581,13 +36780,42 @@ class Wallet {
             this.nextWotsIndex
         );
 
-        return this._broadcastTwoPhaseTx(client, ctxStr, true);
+        return this._broadcastTwoPhaseTx(client, ctxStr, 'script');
     }
 }
 
 const MDS_KILO = 1024;
 const MDS_MEGA = 1048576;
 const MDS_GIGA = 1073741824;
+
+const CHAT_DICTIONARY = [
+    "midstate", "network", "node", "peer", "block", "blocks", "tx", "transaction", "mempool", "hash",
+    "pow", "mine", "mining", "miner", "sync", "wallet", "address", "key", "seed", "utxo",
+    "airdrop", "incoming", "post", "claim", "free", "giveaway", "reward", "bounty", "pool", "liquidity",
+    "buy", "sell", "trade", "swap", "market", "price", "fiat", "dex", "cex", "value",
+    "send", "receive", "give", "take", "make", "do", "get", "need", "want", "have",
+    "check", "verify", "update", "upgrade", "restart", "connect", "drop", "build", "fix", "run",
+    "is", "are", "was", "were", "be", "been", "has", "had", "will", "can",
+    "could", "should", "would", "might", "must", "stop", "wait", "see", "look", "know",
+    "I", "you", "we", "they", "he", "she", "it", "this", "that", "these",
+    "those", "who", "what", "where", "when", "why", "how", "which", "my", "your",
+    "at", "to", "from", "in", "out", "on", "off", "for", "by", "about",
+    "as", "but", "if", "then", "else", "and", "or", "not", "with", "without",
+    "good", "bad", "fast", "slow", "full", "empty", "high", "low", "urgent", "ready",
+    "online", "offline", "hot", "cold", "big", "small", "hard", "easy", "safe", "new",
+    "all", "none", "some", "any", "many", "much", "more", "less", "every", "only",
+    "now", "later", "soon", "early", "today", "tomorrow", "yesterday", "time", "always", "never",
+    "gm", "gn", "lol", "lfg", "wagmi", "ngmi", "ser", "anon", "mate", "based",
+    "wtf", "omg", "moon", "pump", "dump", "bull", "bear", "scam", "rug", "fren",
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "10", "20", "50", "100", "200", "500", "1k", "10k", "100k", "1m",
+    "wots", "mss", "smt", "sig", "data", "disk", "linux", "pi", "hardware", "software",
+    "code", "rust", "server", "client", "ip", "webrtc", "error", "bug", "issue", "help",
+    "please", "thanks", "ok", "yes", "no", "maybe", "here", "there", "again", "done",
+    "first", "last", "old", "true", "false", "up", "down", "left", "right", "back",
+    "?", "!", ".", ",", "...", ":)", ":(", "🔥", "🚀", "💀",
+    "💎", "👀", "🤝", "📈", "📉", "⚡"
+];
 
 const MidstateUtils = {
     formatMDS(n) {
@@ -32603,8 +36831,3677 @@ const MidstateUtils = {
     },
     hash(hexData) {
         return blake3_hash_hex(hexData);
+    },
+    // Convert array of indices [160, 168] -> "gm mate"
+    indicesToWords(indices) {
+        return indices.map(i => CHAT_DICTIONARY[i] || "???").join(" ");
+    },
+    // Convert string "gm mate" -> [160, 168]
+    textToIndices(text) {
+        return text.split(/\s+/).map(w => CHAT_DICTIONARY.indexOf(w)).filter(i => i !== -1);
     }
 };
+
+// miner.js — Solo block mining for the Midstate SDK.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+//  Reasoning (module level)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Mining on this chain is a Verifiable Delay Function, not a throughput race.
+// `create_extension` hashes a (midstate ⌢ nonce) seed and then iterates BLAKE3
+// EXTENSION_ITERATIONS (1,000,000) times sequentially. One nonce costs ~130 ms
+// of unavoidable serial work; SIMD gives four lanes at once, so a single worker
+// lands around 15–30 nonces/second and no amount of batching changes that.
+//
+// Three properties of the template follow from the node's own code, and the
+// browser wallet gets at least the first two wrong in ways that fail silently —
+// blocks are found and then rejected, which looks exactly like "mining doesn't
+// work".
+//
+// ── 1. Grind on `mining_midstate`, never on `post_tx_midstate` ──
+//
+// `finish_template` returns `mining_midstate = compute_header_hash(header)`.
+// The node's comment is explicit that grinding on `post_tx_midstate` instead is
+// "the bug that silently rejected every block the web wallet ever mined over
+// WebRTC". `verify_extension` recomputes from the header hash on receipt, so a
+// nonce found against anything else simply does not validate. This module only
+// ever passes `template.mining_midstate` to the search.
+//
+// ── 2. The template expires; the timestamp is locked inside the hash ──
+//
+// `finish_template` locks `actual_timestamp` into the header BEFORE computing
+// `mining_midstate`, precisely so a miner "cannot bump it post-grind without
+// invalidating the header hash they searched on". The submitted batch must
+// therefore carry the template's timestamp verbatim.
+//
+// But `validate_timestamp` requires a new block's timestamp to exceed the median
+// of the last MEDIAN_TIME_PAST_WINDOW (11) blocks. At TARGET_BLOCK_TIME = 60s
+// that median trails the tip by roughly five blocks, so a template older than
+// about five minutes produces a block the node rejects on arrival — and the
+// miner cannot fix it by touching the timestamp, because that invalidates the
+// PoW. The only correct response is to abandon the template and fetch a fresh
+// one. This module refreshes on every tip change and on a hard age cap.
+//
+// ── 3. The coinbase total must equal block_reward + total_fees ──
+//
+// The node rejects any other total with a `CoinbaseTotalMismatch` carrying
+// `expected_total`. Fees are only knowable from a template, and a template needs
+// a coinbase, so the first request of a session is a guess. The browser wallet
+// guesses `block_reward` alone, which mismatches on every non-empty mempool and
+// costs a round trip each time. This module carries `expected_total` forward
+// between templates, so it guesses correctly after the first block and treats
+// the retry as the exception rather than the norm.
+
+/** Locked-in timestamp goes stale against MEDIAN_TIME_PAST_WINDOW; refresh well before. */
+const TEMPLATE_MAX_AGE_MS = 120_000;
+
+/** Nonces tested per `search_nonces` call: `iterations × 4` SIMD lanes. */
+const DEFAULT_ITERATIONS = 1;
+
+/**
+ * A nonce range large enough that two workers starting at random offsets will
+ * not collide within any realistic session. Kept under 2^53 so the value
+ * survives JSON transport to a pool without precision loss.
+ */
+const NONCE_SPACE = Number.MAX_SAFE_INTEGER - 1_000_000_000;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Solo miner.
+ *
+ * Drives the full lifecycle: build a coinbase, request a template, grind
+ * nonces against `mining_midstate`, splice the winning extension into the
+ * template's batch, and submit. Refreshes the template whenever the tip moves
+ * or the timestamp risks going stale.
+ *
+ * @example
+ * const miner = new Miner(wallet, client);
+ * miner.on('found',    (b) => console.log('block at', b.height));
+ * miner.on('rejected', (b) => console.log('rejected:', b.reason));
+ * await miner.start();
+ */
+class Miner {
+    /**
+     * @param {Object} wallet  A `Wallet` (needs `.inner` for the WASM methods).
+     * @param {Object} client  A connected `MidstateClient`.
+     * @param {Object} [opts]
+     * @param {number} [opts.iterations=1]      SIMD batches per search call (×4 nonces).
+     * @param {number} [opts.throttleMs=0]      Sleep between search calls.
+     * @param {number} [opts.tipPollMs=15000]   How often to re-check the tip.
+     * @param {number} [opts.templateMaxAgeMs]  Force a refresh after this long.
+     * @param {string} [opts.payoutMssAddress]  Pay coinbase to this MSS address
+     *   instead of consuming a fresh WOTS index per block.
+     * @param {Object} [opts.pool]              A connected `PoolClient`. Switches
+     *   to pool mining: grind the pool's share target, submit shares, and keep
+     *   going on a hit (see below).
+     * @param {string} [opts.poolAddress]       Payout address registered with the pool.
+     * @param {string} [opts.workerName='sdk']  Worker label reported on shares.
+     * @param {Function} [opts.searchFn]        Override the nonce search. Defaults
+     *   to the WASM SIMD `search_nonces`; injectable so a GPU backend or a test
+     *   can substitute one without touching the loop.
+     */
+    constructor(wallet, client, opts = {}) {
+        this.wallet = wallet;
+        this.client = client;
+        this.iterations = opts.iterations ?? DEFAULT_ITERATIONS;
+        this.throttleMs = opts.throttleMs ?? 0;
+        this.tipPollMs = opts.tipPollMs ?? 15_000;
+        this.templateMaxAgeMs = opts.templateMaxAgeMs ?? TEMPLATE_MAX_AGE_MS;
+        this.payoutMssAddress = opts.payoutMssAddress ?? null;
+        this.searchFn = opts.searchFn ?? search_nonces;
+
+        // ── Pool mode ──
+        //
+        // A share is not a block. Finding one leaves `mining_midstate`
+        // unchanged, so the template stays valid and the search must continue
+        // from the next nonce. Halting — the correct solo behaviour, where a hit
+        // means the tip moved — leaves a pool miner idle until the next network
+        // block, because the "restart on new midstate" path never fires.
+        this.pool = opts.pool ?? null;
+        this.poolAddress = opts.poolAddress ?? null;
+        this.workerName = opts.workerName ?? 'sdk';
+        this.continueOnFound = !!this.pool;
+        this._poolJobDirty = false;
+
+        this.mining = false;
+        this.template = null;
+        this.templateAt = 0;
+        this.stats = {
+            nonces: 0, found: 0, accepted: 0, rejected: 0, templates: 0,
+            shares: 0, sharesAccepted: 0, startedAt: 0,
+        };
+
+        /** Carried between templates so the coinbase total is right first try. */
+        this._expectedTotal = null;
+        this._listeners = {};
+    }
+
+    /** Subscribe to `template`, `progress`, `found`, `accepted`, `rejected`, `error`. */
+    on(event, cb) {
+        (this._listeners[event] = this._listeners[event] || []).push(cb);
+        return this;
+    }
+
+    _emit(event, payload) {
+        for (const cb of this._listeners[event] || []) {
+            try { cb(payload); } catch { /* a listener must not kill the loop */ }
+        }
+    }
+
+    /**
+     * Build a coinbase and fetch a template for it.
+     *
+     * # Reasoning
+     *
+     * The coinbase total must equal `block_reward + total_fees` exactly. Fees
+     * are only visible in a template response, and a template needs a coinbase,
+     * so the first attempt of a session is necessarily a guess. `expected_total`
+     * from a previous mismatch (or a previous template) is carried forward, so
+     * steady-state mining guesses right and the retry is exceptional.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - client? is connected
+     *
+     * Post (success):
+     *   template!.mining_midstate = compute_header_hash(candidate_header)
+     *   ∧ Σ template!.batch_template.coinbase[].value
+     *       = template!.block_reward + template!.total_fees
+     *   ∧ template!.mining_addrs ≠ ∅
+     *
+     * Post (failure): raises after `retries` mismatches; wallet state unchanged
+     *   (mining addresses are only committed on acceptance).
+     * ```
+     *
+     * # Safety / Invariants
+     *
+     * - Does NOT advance `nextWotsIndex`. The indices in `mining_addrs` are
+     *   reserved, not consumed: an unaccepted block must not burn key material,
+     *   and coinbase addresses are only ever paid to by a block that lands.
+     * - Returns the template verbatim. Nothing here may alter `timestamp`,
+     *   which is bound into `mining_midstate`.
+     *
+     * @param {number} [retries=4]
+     * @returns {Promise<Object>} The template, augmented with mining metadata.
+     */
+    async fetchTemplate(retries = 4) {
+        // Pool mode: the pool owns the block. It builds the coinbase (paying the
+        // registered address), rebuilds the block from its own copy on a winning
+        // share, and submits it. There is nothing for this client to negotiate,
+        // so the whole coinbase-total dance below is skipped.
+        if (this.pool) {
+            if (!this.poolAddress) throw new Error('Pool mining requires opts.poolAddress.');
+            const job = await this.pool.getTemplate(this.poolAddress);
+            if (!job || !job.mining_midstate) throw new Error('Pool returned no job.');
+            this.stats.templates++;
+            this._poolJobDirty = false;
+            return {
+                mining_midstate: job.mining_midstate,
+                // The SHARE target, not the network target. Grinding the network
+                // target here would find one share per several million years.
+                target: job.target,
+                network_target: job.network_target ?? null,
+                job_id: job.job_id,
+                chain_height: job.height,
+                total_fees: 0,
+                block_reward: 0,
+                mining_addrs: [],
+                batch_template: job.batch_template ?? { transactions: [] },
+                isPoolJob: true,
+            };
+        }
+
+        const state = await this.client.getState();
+        let total = this._expectedTotal ?? BigInt(state.block_reward ?? 0);
+
+        for (let attempt = 0; attempt < retries; attempt++) {
+            const cbStr = this.payoutMssAddress
+                ? this.wallet.inner.build_coinbase_to_mss(BigInt(total), this.payoutMssAddress)
+                : this.wallet.inner.build_coinbase(BigInt(total), this.wallet.nextWotsIndex);
+            if (!cbStr) throw new Error('build_coinbase returned nothing.');
+            const cb = JSON.parse(cbStr);
+
+            const resp = await this.client.getBlockTemplate(cb.coinbase);
+            if (resp.ok) {
+                const tmpl = await resp.json();
+                tmpl.mining_addrs = cb.mining_addrs || [];
+                tmpl.next_wots_index = cb.next_wots_index ?? this.wallet.nextWotsIndex;
+                tmpl.chain_height = state.height;
+                // Remember the correct total for the next template.
+                this._expectedTotal = BigInt(tmpl.block_reward ?? 0) + BigInt(tmpl.total_fees ?? 0);
+                this.stats.templates++;
+                return tmpl;
+            }
+
+            // Fee mismatch: the node hands back the total it wants.
+            //
+            // Read the body defensively. The P2P client returns { ok, status,
+            // json } with no `text()`, so calling resp.text() here — as the
+            // browser wallet does on the unknown-error path — throws a
+            // TypeError that masks the real error.
+            let body = null;
+            try { body = await resp.json(); } catch { /* not JSON */ }
+            if (typeof body === 'string') { try { body = JSON.parse(body); } catch { /* leave */ } }
+
+            if (body && body.expected_total !== undefined) {
+                total = BigInt(body.expected_total);
+                this._expectedTotal = total;
+                continue;
+            }
+            throw new Error(`Block template rejected: ${body?.error || JSON.stringify(body) || resp.status}`);
+        }
+        throw new Error(`Could not agree a coinbase total after ${retries} attempts (fees kept moving).`);
+    }
+
+    /**
+     * Assemble and submit a block for a winning nonce.
+     *
+     * # Reasoning
+     *
+     * The extension is recomputed here rather than trusted from the search.
+     * `search_nonces` returns only the nonce, and a GPU or remote searcher can
+     * return a nonce whose hash does not actually reproduce — re-deriving it
+     * with `build_solo_extension` costs one VDF evaluation (~130 ms) and turns a
+     * would-be invalid submission into a local no-op.
+     *
+     * The batch is cloned and ONLY `extension` is written. In particular
+     * `timestamp` is left exactly as the template set it: it is folded into
+     * `mining_midstate`, so changing it would invalidate the very PoW being
+     * submitted.
+     *
+     * # Formal Specification
+     *
+     * ```text
+     * Pre:
+     *   - nonce? was found against template.mining_midstate
+     *
+     * Post (accepted):
+     *   batch.extension = create_extension(mining_midstate, nonce?)
+     *   ∧ batch.timestamp = template.batch_template.timestamp   (unchanged)
+     *   ∧ ∀ a ∈ template.mining_addrs • a.address ∈ dom wots_addrs'
+     *   ∧ next_wots_index' = template.next_wots_index
+     *
+     * Post (rejected):
+     *   wots_addrs' = wots_addrs ∧ next_wots_index' = next_wots_index
+     *   (a rejected block burns no key material)
+     * ```
+     *
+     * # Safety / Invariants
+     *
+     * - Key material is committed only on acceptance. Registering coinbase
+     *   addresses for a rejected block would advance `next_wots_index` past
+     *   indices that were never paid to, wasting them for no benefit.
+     * - Never mutates `timestamp`; see above.
+     *
+     * @param {Object} template
+     * @param {bigint|string|number} nonce
+     * @returns {Promise<Object>} Submission outcome.
+     */
+    async submitBlock(template, nonce) {
+        const n = BigInt(nonce);
+
+        // Pool mode: submit a share, not a block. The pool re-derives the hash
+        // from (job_id, nonce) against its own copy of the template, so there is
+        // no extension to build and no batch to assemble here.
+        if (template.isPoolJob) {
+            this.stats.shares++;
+            try {
+                const res = await this.pool.submitShare(this.poolAddress, template.job_id, n, this.workerName);
+                this.stats.sharesAccepted++;
+                return {
+                    accepted: true, isShare: true, nonce: n.toString(),
+                    jobId: template.job_id, height: template.chain_height,
+                    blockFound: !!(res && (res.block_found || res.is_block)),
+                    reason: null,
+                };
+            } catch (e) {
+                // A stale share means the job rotated under us — refresh rather
+                // than keep grinding a superseded midstate.
+                if (/stale|unknown job|job_id/i.test(e.message || '')) this._poolJobDirty = true;
+                return { accepted: false, isShare: true, nonce: n.toString(), reason: e.message };
+            }
+        }
+
+        const extStr = this.wallet.inner.build_solo_extension(template.mining_midstate, n);
+        if (!extStr) {
+            return { accepted: false, reason: 'extension did not reproduce for this nonce', nonce: n.toString() };
+        }
+
+        const batch = JSON.parse(JSON.stringify(template.batch_template));
+        batch.extension = JSON.parse(extStr);
+
+        const resp = await this.client.submitBatch(batch);
+        const accepted = !!(resp && resp.ok);
+
+        if (accepted) {
+            // Commit the reserved coinbase addresses now that a block paid them.
+            for (const entry of template.mining_addrs || []) {
+                this.wallet.wotsAddrs[entry.address] = entry.index;
+            }
+            if (typeof template.next_wots_index === 'number') {
+                this.wallet.nextWotsIndex = Math.max(this.wallet.nextWotsIndex, template.next_wots_index);
+            }
+            this.wallet._setWatchlist();
+            await this.wallet.save();
+            this.stats.accepted++;
+        } else {
+            this.stats.rejected++;
+        }
+
+        const ext = batch.extension;
+        const finalHash = Array.isArray(ext.final_hash)
+            ? ext.final_hash.map((b) => b.toString(16).padStart(2, '0')).join('')
+            : String(ext.final_hash);
+
+        return {
+            accepted,
+            reason: accepted ? null : (resp?.body || resp?.error || 'rejected'),
+            nonce: n.toString(),
+            finalHash,
+            height: template.chain_height,
+            reward: BigInt(template.block_reward ?? 0) + BigInt(template.total_fees ?? 0),
+            fees: BigInt(template.total_fees ?? 0),
+            txCount: batch.transactions?.length ?? 0,
+        };
+    }
+
+    /** True when the current template must be abandoned. */
+    _templateStale(tipHeight) {
+        if (!this.template) return true;
+        if (this.template.isPoolJob) {
+            // The pool tells us when a job rotates; height is its own signal.
+            if (this._poolJobDirty) return true;
+            if (typeof tipHeight === 'number' && tipHeight !== this.template.chain_height) return true;
+            return Date.now() - this.templateAt > this.templateMaxAgeMs;
+        }
+        if (Date.now() - this.templateAt > this.templateMaxAgeMs) return true;
+        if (typeof tipHeight === 'number' && tipHeight !== this.template.chain_height) return true;
+        return false;
+    }
+
+    /**
+     * Run the mining loop until {@link Miner#stop}.
+     *
+     * # Reasoning
+     *
+     * The loop is structured around template freshness rather than hash count,
+     * because on this chain a stale template is the dominant failure mode: the
+     * PoW is expensive enough that a naive miner spends most of its time
+     * grinding a header the network has already moved past, and every block it
+     * finds is rejected for building on a stale parent or carrying a timestamp
+     * below the median of the last 11 blocks.
+     *
+     * Each worker starts at a random nonce offset so that several instances
+     * against the same template do not retrace each other's work.
+     *
+     * # Safety / Invariants
+     *
+     * - Only ever searches against `template.mining_midstate`.
+     * - Never mutates the template's `timestamp` or `transactions`.
+     * - A failed submission does not stop mining; it refreshes and continues.
+     *
+     * @returns {Promise<Object>} Final stats, once stopped.
+     */
+    async start() {
+        if (this.mining) throw new Error('Miner is already running.');
+        this.mining = true;
+        this.stats.startedAt = Date.now();
+
+        let nonce = BigInt(Math.floor(Math.random() * NONCE_SPACE));
+        let lastTipCheck = 0;
+        let tipHeight = null;
+        let reportAt = Date.now();
+        let noncesSinceReport = 0;
+
+        try {
+            while (this.mining) {
+                // Re-check the tip on a timer; a moved tip invalidates the template.
+                if (Date.now() - lastTipCheck > this.tipPollMs) {
+                    lastTipCheck = Date.now();
+                    try {
+                        const st = await this.client.getState();
+                        tipHeight = st.height;
+                    } catch (e) {
+                        this._emit('error', e);
+                    }
+                }
+
+                if (this._templateStale(tipHeight)) {
+                    try {
+                        this.template = await this.fetchTemplate();
+                        this.templateAt = Date.now();
+                        nonce = BigInt(Math.floor(Math.random() * NONCE_SPACE));
+                        this._emit('template', {
+                            height: this.template.chain_height,
+                            target: this.template.target,
+                            txCount: this.template.batch_template?.transactions?.length ?? 0,
+                            fees: BigInt(this.template.total_fees ?? 0),
+                        });
+                    } catch (e) {
+                        this._emit('error', e);
+                        await sleep(5_000);
+                        continue;
+                    }
+                }
+
+                const found = this._search(this.template, nonce);
+
+                const perCall = this.iterations * 4;
+                nonce += BigInt(perCall);
+                this.stats.nonces += perCall;
+                noncesSinceReport += perCall;
+
+                if (found !== undefined && found !== null) {
+                    this.stats.found++;
+                    this._emit('found', { nonce: found.toString(), height: this.template.chain_height });
+                    let result;
+                    try {
+                        result = await this.submitBlock(this.template, found);
+                    } catch (e) {
+                        this._emit('error', e);
+                        result = { accepted: false, reason: e.message };
+                    }
+                    this._emit(result.isShare ? 'share' : (result.accepted ? 'accepted' : 'rejected'), result);
+
+                    // A share leaves the job valid, so keep grinding from the
+                    // next nonce (already advanced above). Dropping the template
+                    // here would idle this miner until the next network block.
+                    if (!this.continueOnFound) {
+                        this.template = null;
+                    }
+                    continue;
+                }
+
+                const elapsed = Date.now() - reportAt;
+                if (elapsed >= 1000) {
+                    this._emit('progress', {
+                        nonces: this.stats.nonces,
+                        rate: noncesSinceReport / (elapsed / 1000),
+                        height: this.template?.chain_height ?? null,
+                    });
+                    noncesSinceReport = 0;
+                    reportAt = Date.now();
+                }
+
+                // Always yield, even at zero throttle.
+                //
+                // `search_nonces` is a synchronous WASM call that blocks for
+                // ~250 ms, and with no await in the loop the event loop never
+                // runs — so a timer calling stop(), an inbound push, or any
+                // other I/O is starved until some other branch happens to
+                // await. Observed live: a 1-second mining run kept going for
+                // 15.75 s, because the only await on the path was the 15 s tip
+                // poll. A zero-delay yield is free against a 250 ms VDF and
+                // makes stop() take effect within one search call.
+                await sleep(this.throttleMs);
+            }
+        } finally {
+            this.mining = false;
+        }
+        return this.getStats();
+    }
+
+    /** Isolated so tests can substitute a search without a real VDF. */
+    _search(template, nonce) {
+        return this.searchFn(template.mining_midstate, template.target, nonce, this.iterations);
+    }
+
+    /** Stop the loop after the current search call returns. */
+    stop() { this.mining = false; }
+
+    /** @returns {Object} Cumulative statistics. */
+    getStats() {
+        const secs = this.stats.startedAt ? (Date.now() - this.stats.startedAt) / 1000 : 0;
+        return {
+            ...this.stats,
+            elapsedSecs: secs,
+            noncesPerSec: secs > 0 ? this.stats.nonces / secs : 0,
+        };
+    }
+}
+
+// pool.js — Client for the Midstate mining pool.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+//  Reasoning (module level)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Solo mining on this chain is a lottery a light client cannot realistically
+// win. `create_extension` is a 1,000,000-iteration sequential BLAKE3 chain, so a
+// browser or laptop lands 15–30 nonces/second against a network target set for
+// the whole hashrate. Pool mining is how such a client actually earns: the pool
+// hands out an easier `share_target`, credits work against it, and rebuilds and
+// submits the block itself when a share also clears `network_target`.
+//
+// Three consequences shape this module.
+//
+// ── A share is not a block, and the job survives it ──
+//
+// Finding a share does NOT invalidate the template. The `mining_midstate` is
+// unchanged, so a miner that halts on a hit — correct solo behaviour, since
+// there the tip has moved — will sit idle until the next network block, because
+// the "restart on new midstate" path never fires. Pool mining must continue from
+// the next nonce. This is the `continueOnFound` distinction, and getting it
+// wrong looks like a miner that works for one share and then stops.
+//
+// ── The pool rebuilds the block, so submission is tiny ──
+//
+// A share is `(address, job_id, nonce, worker)`. `job_id` is what lets the pool
+// reject work mined against a superseded template; it must be echoed back
+// exactly. The `batch_template` in a job is informational — for showing a
+// transaction count — and is not what gets submitted.
+//
+// ── "The pool said no" is not "the request failed" ──
+//
+// `requestRaw` returns the envelope rather than throwing on `ok: false`. A miner
+// absent from the precommitment tree is an *answer* to `get_proof`, not an
+// exception; collapsing both into a thrown Error is what lets a dropped stream
+// masquerade as the pool omitting a miner, which halts mining for the wrong
+// reason. `request` throws, and is for calls where absence really is fatal.
+//
+// Wire format is the same as the light protocol: a 4-byte little-endian length
+// prefix followed by JSON, one request/response per stream.
+
+
+const POOL_PROTOCOL = '/midstate/pool/1.0.0';
+const POOL_PUSH_PROTOCOL = '/midstate/pool-push/1.0.0';
+const REQUEST_TIMEOUT_MS = 15_000;
+
+/**
+ * Pool client.
+ *
+ * The transport is injected rather than built here: the SDK runs under Node
+ * (TCP) and in browsers (WebRTC-direct), and the pool protocol itself is
+ * identical over both. `MidstateP2P` supplies a compatible dialer; tests supply
+ * a stub. This also keeps the framing independently testable without libp2p.
+ */
+class PoolClient {
+    /**
+     * @param {Object} transport Must provide
+     *   `openStream(protocol) => { send(bytes), onMessage(cb), onClose(cb), close() }`.
+     */
+    constructor(transport) {
+        this.transport = transport;
+        this.isConnected = false;
+        this._onNotify = null;
+        this._onStatus = null;
+    }
+
+    onNotify(cb) { this._onNotify = cb; return this; }
+    onStatus(cb) { this._onStatus = cb; return this; }
+
+    _emit(status, detail) {
+        if (this._onStatus) { try { this._onStatus(status, detail); } catch { /* never fatal */ } }
+    }
+
+    async connect(addr) {
+        const id = await this.transport.dial(addr, {
+            // The pool pushes `notify` the instant a job rotates, so the client
+            // does not have to poll for a template it already has.
+            [POOL_PUSH_PROTOCOL]: (json) => {
+                if (this._onNotify) { try { this._onNotify(json); } catch { /* never fatal */ } }
+            },
+        });
+        this.isConnected = true;
+        this._emit('connected', id);
+        return id;
+    }
+
+    async disconnect() {
+        this.isConnected = false;
+        try { await this.transport.close(); } catch { /* already gone */ }
+        this._emit('disconnected');
+    }
+
+    /**
+     * One request, one stream, returning the raw envelope.
+     *
+     * Retries once on a stream reset. libp2p streams are reset under entirely
+     * normal conditions (peer churn, the remote closing early), and a single
+     * retry on a fresh stream turns a routine blip into a non-event.
+     *
+     * @returns {Promise<{ok:boolean, data?:Object, error?:string}>}
+     */
+    async requestRaw(method, params = {}, retry = 1) {
+        if (!this.isConnected) throw new Error('Not connected to pool');
+        try {
+            const bytes = await this.transport.request(
+                POOL_PROTOCOL, encodeFrame({ method, params }), REQUEST_TIMEOUT_MS
+            );
+            return JSON.parse(new TextDecoder().decode(bytes));
+        } catch (e) {
+            if (retry > 0 && /reset|closed|abort/i.test(e.message || '')) {
+                return this.requestRaw(method, params, retry - 1);
+            }
+            throw e;
+        }
+    }
+
+    /** Throws on a pool-reported error. For calls where absence is fatal. */
+    async request(method, params = {}) {
+        const parsed = await this.requestRaw(method, params);
+        if (!parsed.ok) throw new Error(parsed.error || 'Pool returned an error');
+        return parsed.data;
+    }
+
+    /**
+     * Current job.
+     *
+     * @returns {Promise<Object>} `{ job_id, mining_midstate, target,
+     *   network_target, batch_template, height, merkle_root, ... }`. Note
+     *   `target` is the SHARE target; `network_target` is informational, for
+     *   showing the real block odds behind a share.
+     */
+    getTemplate(address) { return this.request('get_template', { address }); }
+
+    /**
+     * Precommitment proof for an address.
+     *
+     * Raw envelope on purpose: a miner absent from the tree is an answer.
+     */
+    getProof(address) { return this.requestRaw('get_proof', { address }); }
+
+    /**
+     * Submit a share.
+     *
+     * The nonce goes as a decimal STRING. It is a u64, and a JSON number loses
+     * precision above 2^53 — a silently corrupted nonce is a share the pool
+     * cannot reproduce and therefore rejects.
+     */
+    /**
+     * Fetch and verify this miner's inclusion in the pool's precommitment.
+     *
+     * Returns a structured verdict rather than throwing, because "the pool has
+     * not recorded you yet" is a normal state for a miner that has just
+     * connected — distinguishing it from "the pool is lying" is the whole point.
+     *
+     * @param {string} address Payout address.
+     * @param {string} rootHex `merkle_root` from the current job.
+     * @returns {Promise<{included:boolean, verified:boolean, score:number|null, reason:string|null}>}
+     */
+    async auditInclusion(address, rootHex) {
+        const env = await this.getProof(address);
+        if (!env.ok) {
+            return { included: false, verified: false, score: null, reason: env.error || 'not in tree' };
+        }
+        const d = env.data || {};
+        const proof = d.proof || [];
+        const index = d.index ?? d.leaf_index;
+        const score = d.score ?? 0;
+        if (index === undefined || index === null) {
+            return { included: true, verified: false, score, reason: 'proof carried no leaf index' };
+        }
+        const verified = verifyPoolProof(address, score, index, proof, rootHex);
+        return {
+            included: true,
+            verified,
+            score: Number(score),
+            reason: verified ? null : 'proof does not reconstruct the job merkle_root',
+        };
+    }
+
+    submitShare(address, jobId, nonce, worker = 'sdk') {
+        return this.request('submit_share', {
+            address, job_id: jobId, nonce: String(nonce), worker,
+        });
+    }
+}
+
+/**
+ * Verify a pool inclusion proof against a job's precommitment root.
+ *
+ * # Reasoning
+ *
+ * `get_proof` is only useful if someone checks it. Without verification a pool
+ * can hand a miner a plausible-looking proof, or omit it from the tree entirely,
+ * and the miner keeps grinding shares it will never be paid for. The proof is
+ * cheap to check — O(log N) hashes — and the root it must reach is already in
+ * every job, so there is no reason not to.
+ *
+ * The reconstruction mirrors `ShareMerkleTree::build` in the node exactly:
+ *
+ *   leaf      = BLAKE3(address ⌢ le64(score))
+ *   parent    = BLAKE3(left ⌢ right)
+ *   odd node  = BLAKE3(node ⌢ node)      (a lone node is paired with itself)
+ *
+ * The odd case matters: `generate_proof` clamps the sibling index to the last
+ * element, so a lone right-most node lists *itself* as its sibling. Verifying
+ * with a conventional "promote the odd node unchanged" rule would fail on
+ * exactly the miners at the end of the tree.
+ *
+ * Leaves are sorted by address before hashing, so `index` is a position in that
+ * sorted order and the caller cannot choose it.
+ *
+ * # Formal Specification
+ *
+ * ```text
+ * Pre:
+ *   - #proof? = ceil(log2(#leaves))
+ *
+ * Post:
+ *   ok! = (fold_up(leaf(address?, score?), index?, proof?) = root?)
+ * ```
+ *
+ * @param {string} addressHex  64-hex miner address.
+ * @param {number|bigint} score  Share score claimed in the leaf.
+ * @param {number} index       Leaf index in the sorted tree.
+ * @param {string[]} proof     Sibling hashes, leaf level upward.
+ * @param {string} rootHex     Expected root (from the job's `merkle_root`).
+ * @returns {boolean}
+ */
+function verifyPoolProof(addressHex, score, index, proof, rootHex) {
+    const addr = String(addressHex).replace(/^0x/, '').toLowerCase();
+    if (addr.length !== 64) return false;
+    if (!Array.isArray(proof)) return false;
+
+    // leaf = BLAKE3(address ⌢ score as little-endian u64)
+    const scoreLe = new Uint8Array(8);
+    new DataView(scoreLe.buffer).setBigUint64(0, BigInt(score), true);
+    const scoreHex = Array.from(scoreLe).map((b) => b.toString(16).padStart(2, '0')).join('');
+
+    let node = blake3_hash_hex(addr + scoreHex);
+    let idx = Number(index);
+
+    for (const sibRaw of proof) {
+        const sib = String(sibRaw).replace(/^0x/, '').toLowerCase();
+        if (sib.length !== 64) return false;
+        // A lone right-most node is its own sibling, so sib === node there and
+        // the order below still produces BLAKE3(node ⌢ node).
+        node = (idx % 2 === 1) ? blake3_hash_hex(sib + node) : blake3_hash_hex(node + sib);
+        idx = Math.floor(idx / 2);
+    }
+    return node === String(rootHex).replace(/^0x/, '').toLowerCase();
+}
+
+/**
+ * Adapts a `MidstateP2P` instance to the transport shape `PoolClient` expects.
+ *
+ * Kept separate so the pool protocol does not depend on the SDK's libp2p setup,
+ * and so tests can drive `PoolClient` without a network.
+ */
+function libp2pPoolTransport(p2p) {
+    return {
+        async dial(addr, pushHandlers) {
+            return p2p.dialPeer(addr, pushHandlers);
+        },
+        async request(protocol, frameBytes, timeoutMs) {
+            return p2p.requestRawFramed(protocol, frameBytes, timeoutMs);
+        },
+        async close() { return p2p.disconnect(); },
+    };
+}
+
+// dex.js — On-chain DEX order announcements and the limit-order covenant flow.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+//  Reasoning (module level)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Ported from `core/dex.rs`, which is itself the canonical port of the browser
+// wallet, so all three read and write the same order book. Every integer here is
+// **big-endian**, unlike the Q-Bolt channel wire and unlike the bincode codec in
+// `bincode.js`, both of which are little-endian. Mixing them produces
+// announcements that decode to plausible garbage rather than failing, which is
+// why this lives in its own module and why the tests below assert byte layouts
+// against hand-built vectors rather than round-tripping only against themselves.
+//
+// ── Why announcements exist ──
+//
+// A swap's coin salt is the one piece of state a wallet cannot re-derive from
+// its seed. Lose it and the funds are stranded even though the key is intact.
+// Publishing the salt — never the preimage — in a zero-value `DataBurn` makes
+// every order recoverable from seed alone. That is the entire purpose: this is a
+// recovery channel first and an order book second.
+//
+// ── Why fragmentation exists ──
+//
+// Consensus caps a burn payload at `MAX_BURN_DATA_SIZE` = 80 bytes. A
+// self-contained MDXA is a 72-byte header plus 81 bytes per unit, so it can
+// never fit in one burn. An announcement is therefore split into MDXF fragments
+// and all of them ride as separate burns inside the SAME funding transaction, so
+// they land in one block and reassemble trivially. The pool is nonetheless
+// tolerant of fragments arriving apart, because a reorg or a partial scan can
+// split them.
+//
+// ── One order, one secret, one coin ──
+//
+// A single hashlock backs exactly one trustless fill: the maker reveals the
+// preimage to claim the counter-leg, and from that moment H is public. So a
+// "large order" is N separate units, each with its own fresh secret and its own
+// power-of-two covenant coin. Unit values are powers of two because a coin is,
+// and because `max_claim` equal to the full unit value means the whole coin is
+// claimed atomically with no remainder to drain.
+
+
+const ANN_MAGIC = '4d445841';   // "MDXA" — maker order
+const FRAG_MAGIC = '4d445846';  // "MDXF" — fragment
+const TAKER_MAGIC = '4d445854'; // "MDXT" — taker lock
+const ANN_VER = 1;
+const TAKER_VER = 1;
+
+/** Consensus cap on a burn payload (`MAX_BURN_DATA_SIZE`). Do not raise. */
+const MAX_BURN_DATA_SIZE = 80;
+/** magic 4 + groupId 6 + idx 1 + total 1 */
+const FRAG_HEADER_BYTES = 12;
+const FRAG_PAYLOAD_BYTES = MAX_BURN_DATA_SIZE - FRAG_HEADER_BYTES; // 68
+
+/** Chat opcodes the wallets use for fast (non-durable) order gossip. */
+const CHAT_OPCODES = {
+    OFFER:     [255, 200],
+    ACCEPT:    [255, 201],
+    LOCKING:   [255, 202],
+    LOCKED:    [255, 203],
+    SUBMARINE: [255, 204],
+    BIDFILL:   [255, 205],
+    BIDSECRET: [255, 206],
+};
+
+// ── byte helpers (big-endian) ───────────────────────────────────────────────
+
+const hexToBytes = (h) => {
+    const s = String(h || '').replace(/^0x/, '').toLowerCase();
+    if (s.length % 2) throw new Error('dex: odd-length hex');
+    const a = new Uint8Array(s.length / 2);
+    for (let i = 0; i < a.length; i++) a[i] = parseInt(s.substr(i * 2, 2), 16);
+    return a;
+};
+const bytesToHex = (b) => Array.from(b).map((x) => x.toString(16).padStart(2, '0')).join('');
+const beBytes$1 = (v, n) => {
+    const a = new Uint8Array(n);
+    let x = BigInt(v);
+    for (let i = n - 1; i >= 0; i--) { a[i] = Number(x & 0xffn); x >>= 8n; }
+    return a;
+};
+const beRead$1 = (a, o, n) => {
+    let v = 0n;
+    for (let i = 0; i < n; i++) v = (v << 8n) | BigInt(a[o + i]);
+    return v;
+};
+const concat = (...parts) => {
+    const len = parts.reduce((s, p) => s + p.length, 0);
+    const out = new Uint8Array(len);
+    let o = 0;
+    for (const p of parts) { out.set(p, o); o += p.length; }
+    return out;
+};
+
+/**
+ * Exact base-2 logarithm.
+ *
+ * Unit values are stored on the wire as a single exponent byte, so a value that
+ * is not a power of two cannot be represented at all. Failing here rather than
+ * rounding is deliberate: a silently rounded value produces an announcement
+ * whose coin cannot be found, which looks like a lost order.
+ */
+function log2Exact(v) {
+    let n = BigInt(v), e = 0;
+    if (n <= 0n) throw new Error(`dex: unit value ${v} must be positive`);
+    while (n > 1n) {
+        if (n & 1n) throw new Error(`dex: unit value ${v} is not a power of two`);
+        n >>= 1n; e++;
+    }
+    return e;
+}
+
+// ── MDXA: maker orders ──────────────────────────────────────────────────────
+
+/**
+ * Encode a maker announcement: 72-byte header + 81 bytes per unit.
+ *
+ * Layout (all big-endian):
+ *   MAGIC(4) VER(1) makerEvmAddr(20) makerMdsPk(32) timeoutHeight(8)
+ *   groupId(6) unitCount(1), then per unit:
+ *   secretHash(32) salt(32) valueExponent(1) weiAmount(16)
+ *
+ * The covenant address and coin id are NOT stored: a reader recomputes them
+ * from (secretHash, value, timeoutHeight, makerMdsPk), so putting them on the
+ * wire would only create a second, disagreeable source of truth.
+ */
+function encodeMakerAnnouncement({ makerEvmAddr, makerMdsPk, timeoutHeight, groupId, units }) {
+    if (!Array.isArray(units) || units.length === 0 || units.length > 255) {
+        throw new Error('dex: unit count out of range (1..=255)');
+    }
+    const parts = [
+        hexToBytes(ANN_MAGIC),
+        Uint8Array.of(ANN_VER),
+        hexToBytes(makerEvmAddr),
+        hexToBytes(makerMdsPk),
+        beBytes$1(timeoutHeight, 8),
+        hexToBytes(String(groupId || '').padStart(12, '0')).slice(0, 6),
+        Uint8Array.of(units.length),
+    ];
+    for (const u of units) {
+        parts.push(hexToBytes(u.secretHash), hexToBytes(u.salt),
+            Uint8Array.of(log2Exact(u.value)), beBytes$1(u.weiAmount, 16));
+    }
+    return bytesToHex(concat(...parts));
+}
+
+/** @returns {Object|null} Decoded maker announcement, or null if this isn't one. */
+function decodeMakerAnnouncement(hexOrBytes) {
+    const b = typeof hexOrBytes === 'string' ? hexToBytes(hexOrBytes) : hexOrBytes;
+    let o = 0;
+    const need = (n) => { if (o + n > b.length) throw new RangeError('short'); };
+    try {
+        need(4); if (bytesToHex(b.subarray(0, 4)) !== ANN_MAGIC) return null; o += 4;
+        need(1); if (b[o++] !== ANN_VER) return null;
+        need(20); const makerEvmAddr = bytesToHex(b.subarray(o, o + 20)); o += 20;
+        need(32); const makerMdsPk = bytesToHex(b.subarray(o, o + 32)); o += 32;
+        need(8); const timeoutHeight = beRead$1(b, o, 8); o += 8;
+        need(6); const groupId = bytesToHex(b.subarray(o, o + 6)); o += 6;
+        need(1); const n = b[o++];
+        if (n === 0) return null;
+
+        const units = [];
+        for (let i = 0; i < n; i++) {
+            need(32); const secretHash = bytesToHex(b.subarray(o, o + 32)); o += 32;
+            need(32); const salt = bytesToHex(b.subarray(o, o + 32)); o += 32;
+            need(1); const exp = b[o++];
+            if (exp >= 64) return null;      // would overflow a u64 coin value
+            need(16); const weiAmount = beRead$1(b, o, 16); o += 16;
+            units.push({ secretHash, salt, value: 1n << BigInt(exp), weiAmount });
+        }
+        return { makerEvmAddr, makerMdsPk, timeoutHeight, groupId, units };
+    } catch {
+        return null;
+    }
+}
+
+// ── MDXT: taker locks ───────────────────────────────────────────────────────
+
+function encodeTakerAnnouncement({ takerMdsPk, secretHash, salt, receiverAddr, timeoutHeight, value, weiAmount }) {
+    return bytesToHex(concat(
+        hexToBytes(TAKER_MAGIC), Uint8Array.of(TAKER_VER),
+        hexToBytes(takerMdsPk), hexToBytes(secretHash), hexToBytes(salt), hexToBytes(receiverAddr),
+        beBytes$1(timeoutHeight, 8), Uint8Array.of(log2Exact(value)), beBytes$1(weiAmount, 16),
+    ));
+}
+
+/** @returns {Object|null} */
+function decodeTakerAnnouncement(hexOrBytes) {
+    const b = typeof hexOrBytes === 'string' ? hexToBytes(hexOrBytes) : hexOrBytes;
+    let o = 0;
+    const need = (n) => { if (o + n > b.length) throw new RangeError('short'); };
+    try {
+        need(4); if (bytesToHex(b.subarray(0, 4)) !== TAKER_MAGIC) return null; o += 4;
+        need(1); if (b[o++] !== TAKER_VER) return null;
+        need(32); const takerMdsPk = bytesToHex(b.subarray(o, o + 32)); o += 32;
+        need(32); const secretHash = bytesToHex(b.subarray(o, o + 32)); o += 32;
+        need(32); const salt = bytesToHex(b.subarray(o, o + 32)); o += 32;
+        need(32); const receiverAddr = bytesToHex(b.subarray(o, o + 32)); o += 32;
+        need(8); const timeoutHeight = beRead$1(b, o, 8); o += 8;
+        need(1); const exp = b[o++];
+        if (exp >= 64) return null;
+        need(16); const weiAmount = beRead$1(b, o, 16); o += 16;
+        return { takerMdsPk, secretHash, salt, receiverAddr, timeoutHeight, value: 1n << BigInt(exp), weiAmount };
+    } catch {
+        return null;
+    }
+}
+
+// ── MDXF: fragmentation ─────────────────────────────────────────────────────
+
+/**
+ * Split an encoded announcement into burn-sized fragments.
+ *
+ * All fragments MUST be published in the same transaction. They are separate
+ * zero-value burns, which consensus already permits, so this needs no protocol
+ * change — but split across transactions they can land in different blocks, or
+ * one can be dropped, leaving the group unreassemblable.
+ */
+function fragment(bodyHex, groupId) {
+    const g6 = bytesToHex(hexToBytes(String(groupId || '').padStart(12, '0')).slice(0, 6));
+    const body = String(bodyHex).toLowerCase();
+    const step = FRAG_PAYLOAD_BYTES * 2;
+    const total = Math.max(1, Math.ceil(body.length / step));
+    if (total > 255) throw new Error(`dex: announcement needs ${total} fragments (max 255)`);
+    const out = [];
+    for (let i = 0; i < total; i++) {
+        out.push(FRAG_MAGIC + g6
+            + i.toString(16).padStart(2, '0')
+            + total.toString(16).padStart(2, '0')
+            + body.slice(i * step, (i + 1) * step));
+    }
+    return out;
+}
+
+/** @returns {{groupId:string, idx:number, total:number, chunk:string}|null} */
+function parseFragment(hexOrBytes) {
+    const hex = (typeof hexOrBytes === 'string' ? hexOrBytes : bytesToHex(hexOrBytes))
+        .replace(/^0x/, '').toLowerCase();
+    if (hex.length <= FRAG_HEADER_BYTES * 2 || hex.slice(0, 8) !== FRAG_MAGIC) return null;
+    const groupId = hex.slice(8, 20);
+    const idx = parseInt(hex.slice(20, 22), 16);
+    const total = parseInt(hex.slice(22, 24), 16);
+    if (!total || idx >= total) return null;
+    return { groupId, idx, total, chunk: hex.slice(24) };
+}
+
+/**
+ * Accumulates fragments until a group is complete.
+ *
+ * Fragments from one announcement normally arrive together, but a reorg or a
+ * partial scan can split them, so this is deliberately tolerant. It is also
+ * bounded: a long-running scan would otherwise grow without limit on fragments
+ * whose siblings never arrive.
+ */
+class FragmentPool {
+    constructor(maxGroups = 512) {
+        this.groups = new Map();
+        this.maxGroups = maxGroups;
+    }
+
+    /** @returns {string|null} The reassembled body hex once every piece is in. */
+    add(frag) {
+        const key = `${frag.groupId}:${frag.total}`;
+        let slots = this.groups.get(key);
+        if (!slots) {
+            if (this.groups.size >= this.maxGroups) {
+                // Drop the oldest incomplete group rather than grow unbounded.
+                this.groups.delete(this.groups.keys().next().value);
+            }
+            slots = new Array(frag.total).fill(null);
+            this.groups.set(key, slots);
+        }
+        slots[frag.idx] = frag.chunk;
+        if (slots.some((s) => s === null)) return null;
+        this.groups.delete(key);
+        return slots.join('');
+    }
+
+    get pending() { return this.groups.size; }
+    clear() { this.groups.clear(); }
+}
+
+/**
+ * Classify one burn payload.
+ *
+ * Order matters: a taker announcement is tried before a maker one because both
+ * are fixed-prefix formats and only the magic distinguishes them, and fragments
+ * are tried last because a fragment's chunk can begin with anything at all.
+ *
+ * @returns {{kind:'maker'|'taker', value:Object}|null}
+ */
+function ingest(payloadHex, pool) {
+    const t = decodeTakerAnnouncement(payloadHex);
+    if (t) return { kind: 'taker', value: t };
+    const m = decodeMakerAnnouncement(payloadHex);
+    if (m) return { kind: 'maker', value: m };
+
+    const f = parseFragment(payloadHex);
+    if (f && pool) {
+        const body = pool.add(f);
+        if (body) {
+            const tm = decodeTakerAnnouncement(body);
+            if (tm) return { kind: 'taker', value: tm };
+            const mm = decodeMakerAnnouncement(body);
+            if (mm) return { kind: 'maker', value: mm };
+        }
+    }
+    return null;
+}
+
+// ── Covenant derivation ─────────────────────────────────────────────────────
+
+/**
+ * Rebuild a limit-order covenant address from its announced parameters.
+ *
+ * # Reasoning
+ *
+ * This is what makes an announcement self-sufficient. A reader has
+ * (secretHash, value, timeoutHeight, makerMdsPk) from the wire and derives the
+ * address itself, so a maker cannot announce one set of terms and fund a
+ * different covenant — the address either matches a real funded coin or it does
+ * not.
+ *
+ * `maxClaim` is the full unit value so the whole coin is claimed atomically
+ * with no remainder, which is also why unit values must be powers of two.
+ */
+function deriveCovenantAddress({ secretHash, value, timeoutHeight, makerMdsPk }) {
+    const script = build_limit_order_covenant_bytecode_hex(
+        String(secretHash).replace(/^0x/, ''),
+        BigInt(value),
+        BigInt(timeoutHeight),
+        String(makerMdsPk).replace(/^0x/, ''),
+    );
+    return { script, address: blake3_hash_hex(script) };
+}
+
+/**
+ * Expand an announcement into resolvable orders.
+ *
+ * Each unit becomes one order with its covenant address and coin id derived
+ * locally, so a caller can look the coin up on-chain and confirm the order is
+ * actually funded before acting on it.
+ *
+ * @param {Object} ann Decoded maker announcement.
+ * @param {Function} computeCoinId `(addressHex, value, saltHex) => coinIdHex`.
+ */
+function expandOrders(ann, computeCoinId) {
+    return ann.units.map((u, i) => {
+        const { script, address } = deriveCovenantAddress({
+            secretHash: u.secretHash,
+            value: u.value,
+            timeoutHeight: ann.timeoutHeight,
+            makerMdsPk: ann.makerMdsPk,
+        });
+        return {
+            groupId: ann.groupId,
+            unitIndex: i,
+            makerEvmAddr: ann.makerEvmAddr,
+            makerMdsPk: ann.makerMdsPk,
+            timeoutHeight: ann.timeoutHeight,
+            secretHash: u.secretHash,
+            salt: u.salt,
+            value: u.value,
+            weiAmount: u.weiAmount,
+            covenantScript: script,
+            covenantAddress: address,
+            coinId: computeCoinId ? computeCoinId(address, u.value, u.salt) : null,
+            // Price in wei per base unit, for sorting an order book.
+            priceWeiPerUnit: u.value > 0n ? Number(u.weiAmount) / Number(u.value) : Infinity,
+        };
+    });
+}
+
+/**
+ * Pull every DataBurn payload out of a block, whatever shape serde produced.
+ *
+ * `LightRequest::GetBlock` serializes core types with `derive(Serialize)`:
+ * externally-tagged enums with `Vec<u8>` as JSON **number arrays** —
+ * `{"DataBurn":{"payload":[77,68,...]}}` — which no hex-run regex will ever
+ * match. So this walks the object tree and accepts either shape.
+ */
+function extractBurnPayloads(node, out = []) {
+    if (!node || typeof node !== 'object') return out;
+    const push = (p) => {
+        if (Array.isArray(p)) out.push(bytesToHex(Uint8Array.from(p)));
+        else if (typeof p === 'string') out.push(p.replace(/^0x/, '').toLowerCase());
+    };
+    if (node.DataBurn && node.DataBurn.payload !== undefined) push(node.DataBurn.payload);
+    if (node.data_burn && node.data_burn.payload !== undefined) push(node.data_burn.payload);
+    if (node.type === 'data_burn' && node.payload !== undefined) push(node.payload);
+    for (const k of Object.keys(node)) {
+        const v = node[k];
+        if (v && typeof v === 'object') extractBurnPayloads(v, out);
+    }
+    return out;
+}
+
+/**
+ * Generate a fresh secret and its hash.
+ *
+ * The MAKER generates the secret, matching the counter-chain contract's
+ * protocol. One secret backs exactly one unit: reusing it across units would
+ * let the first fill unlock all of them.
+ */
+function newSecret() {
+    const bytes = new Uint8Array(32);
+    (globalThis.crypto || require('node:crypto').webcrypto).getRandomValues(bytes);
+    const secret = bytesToHex(bytes);
+    return { secret, secretHash: blake3_hash_hex(secret) };
+}
+
+/** A random 6-byte group id, linking the units of one announcement. */
+function newGroupId() {
+    const b = new Uint8Array(6);
+    (globalThis.crypto || require('node:crypto').webcrypto).getRandomValues(b);
+    return bytesToHex(b);
+}
+
+var dex = /*#__PURE__*/Object.freeze({
+    __proto__: null,
+    ANN_MAGIC: ANN_MAGIC,
+    ANN_VER: ANN_VER,
+    CHAT_OPCODES: CHAT_OPCODES,
+    FRAG_HEADER_BYTES: FRAG_HEADER_BYTES,
+    FRAG_MAGIC: FRAG_MAGIC,
+    FRAG_PAYLOAD_BYTES: FRAG_PAYLOAD_BYTES,
+    FragmentPool: FragmentPool,
+    MAX_BURN_DATA_SIZE: MAX_BURN_DATA_SIZE,
+    TAKER_MAGIC: TAKER_MAGIC,
+    TAKER_VER: TAKER_VER,
+    decodeMakerAnnouncement: decodeMakerAnnouncement,
+    decodeTakerAnnouncement: decodeTakerAnnouncement,
+    deriveCovenantAddress: deriveCovenantAddress,
+    encodeMakerAnnouncement: encodeMakerAnnouncement,
+    encodeTakerAnnouncement: encodeTakerAnnouncement,
+    expandOrders: expandOrders,
+    extractBurnPayloads: extractBurnPayloads,
+    fragment: fragment,
+    ingest: ingest,
+    log2Exact: log2Exact,
+    newGroupId: newGroupId,
+    newSecret: newSecret,
+    parseFragment: parseFragment
+});
+
+// launcher.js — Token, AMM and bonding-curve state for Midstate contracts.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+//  Reasoning (module level)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Midstate has no native token type. A token is a **coloured coin**: a state
+// thread whose 32-byte commitment carries `[balance u64][assetID 24]`, with a
+// script enforcing conservation of mass across the outputs. An AMM is the same
+// idea with `[reserveX u64][reserveY u64][padding 16]`. Both layouts, and the
+// contracts that read them, come from the Midstate IDE templates.
+//
+// Two things make this easy to get catastrophically wrong, and both are the
+// reason this module exists rather than leaving callers to build state by hand.
+//
+// ── 1. State fields are LITTLE-endian ──
+//
+// `OP_SLICE` hands bytes to `to_u64`, which is `u64::from_le_bytes`. So a
+// balance of 10 is `0a00000000000000`, not `000000000000000a`. This is the exact
+// opposite of the DEX announcement wire in `dex.js`, which is big-endian
+// throughout. Getting it backwards does not fail loudly — it produces a state
+// the contract reads as an astronomically large number, so a `conservation of
+// mass` assert passes or fails for reasons that look nothing like the bug.
+//
+// ── 2. The SDK's arithmetic must match the contract's exactly ──
+//
+// The constant-product contract asserts, in integers, with no floats anywhere:
+//
+//     dx = max(0, new_x - x);  dy = max(0, new_y - y)
+//     x_adj = new_x*1000 - dx*3
+//     y_adj = new_y*1000 - dy*3
+//     assert(x_adj * y_adj >= (x * y) * 1000000)
+//
+// A quote computed in floating point, or with the fee applied in a different
+// order, lands one unit on the wrong side of that inequality and the trade is
+// rejected on-chain after the user has paid for a commit. Every quote here is
+// BigInt and is checked against a literal transcription of the contract's own
+// assertion before being returned.
+//
+// ── What is NOT here ──
+//
+// No bytecode. The contracts are authored and compiled in the IDE; this module
+// handles the state those contracts read and the arithmetic that keeps a
+// proposed trade on the legal side of their asserts. `deployToken` and friends
+// take a compiled `bytecode` argument for that reason.
+
+
+/** Contract state is exactly 32 bytes — one BLAKE3-sized commitment. */
+const STATE_BYTES = 32;
+
+/** Fee numerator/denominator for the IDE's constant-product template (0.3%). */
+const FEE_NUM = 997n;
+const FEE_DEN = 1000n;
+
+// ── Layouts ─────────────────────────────────────────────────────────────────
+//
+// A layout is an ordered list of `[name, byteLength, kind]`. `u64` fields are
+// little-endian numbers; `bytes` fields are raw and carried as hex.
+
+const LAYOUTS = {
+    /** `state Token { balance: 8, assetID: 24 }` */
+    TOKEN: [['balance', 8, 'u64'], ['assetID', 24, 'bytes']],
+    /** `state AMM { reserveX: 8, reserveY: 8, padding: 16 }` */
+    AMM: [['reserveX', 8, 'u64'], ['reserveY', 8, 'u64'], ['padding', 16, 'bytes']],
+    /** `state Curve { supply: 8, padding: 24 }` */
+    CURVE: [['supply', 8, 'u64'], ['padding', 24, 'bytes']],
+};
+
+const toHex = (b) => Array.from(b).map((x) => x.toString(16).padStart(2, '0')).join('');
+const fromHex = (h) => {
+    const s = String(h || '').replace(/^0x/, '').toLowerCase();
+    const a = new Uint8Array(s.length / 2);
+    for (let i = 0; i < a.length; i++) a[i] = parseInt(s.substr(i * 2, 2), 16);
+    return a;
+};
+
+/**
+ * Encode named fields into a 32-byte state commitment.
+ *
+ * `u64` fields are written little-endian to match `to_u64` in the VM. `bytes`
+ * fields are right-padded with zeros, which is how the IDE's own examples encode
+ * an ASCII asset id.
+ *
+ * @param {Array} layout One of {@link LAYOUTS}, or a compatible list.
+ * @param {Object} values Field name → BigInt/number (u64) or hex/string (bytes).
+ * @returns {string} 64-char hex.
+ */
+function encodeState(layout, values) {
+    const total = layout.reduce((s, [, len]) => s + len, 0);
+    if (total !== STATE_BYTES) throw new Error(`launcher: layout is ${total} bytes, must be ${STATE_BYTES}`);
+
+    const out = new Uint8Array(STATE_BYTES);
+    let off = 0;
+    for (const [name, len, kind] of layout) {
+        const v = values[name];
+        if (kind === 'u64') {
+            let x = BigInt(v ?? 0);
+            if (x < 0n) throw new Error(`launcher: ${name} must be non-negative`);
+            if (x > (1n << 64n) - 1n) throw new Error(`launcher: ${name} exceeds u64`);
+            // Little-endian: the VM reads these with u64::from_le_bytes.
+            for (let i = 0; i < len; i++) { out[off + i] = Number(x & 0xffn); x >>= 8n; }
+        } else {
+            let bytes;
+            if (v === undefined || v === null) bytes = new Uint8Array(0);
+            else if (typeof v === 'string' && /^[0-9a-fA-F]*$/.test(v.replace(/^0x/, '')) && v.replace(/^0x/, '').length % 2 === 0) {
+                bytes = fromHex(v);
+            } else if (typeof v === 'string') {
+                bytes = new TextEncoder().encode(v);      // ASCII asset ids, as in the IDE
+            } else {
+                bytes = Uint8Array.from(v);
+            }
+            if (bytes.length > len) throw new Error(`launcher: ${name} is ${bytes.length} bytes, field is ${len}`);
+            out.set(bytes, off);                           // right-padded with zeros
+        }
+        off += len;
+    }
+    return toHex(out);
+}
+
+/**
+ * Decode a 32-byte state commitment into named fields.
+ *
+ * `bytes` fields come back as hex and, when they decode cleanly as
+ * zero-terminated ASCII, also as `<name>Ascii` — the IDE stores asset ids that
+ * way and reading them back as hex alone makes them unrecognisable.
+ */
+function decodeState(layout, stateHex) {
+    const b = fromHex(stateHex);
+    if (b.length !== STATE_BYTES) throw new Error(`launcher: state is ${b.length} bytes, expected ${STATE_BYTES}`);
+    const out = {};
+    let off = 0;
+    for (const [name, len, kind] of layout) {
+        if (kind === 'u64') {
+            let v = 0n;
+            for (let i = len - 1; i >= 0; i--) v = (v << 8n) | BigInt(b[off + i]);   // little-endian
+            out[name] = v;
+        } else {
+            const raw = b.subarray(off, off + len);
+            out[name] = toHex(raw);
+            const trimmed = raw.subarray(0, raw.indexOf(0) === -1 ? raw.length : raw.indexOf(0));
+            if (trimmed.length && trimmed.every((c) => c >= 0x20 && c < 0x7f)) {
+                out[`${name}Ascii`] = new TextDecoder().decode(trimmed);
+            }
+        }
+        off += len;
+    }
+    return out;
+}
+
+// ── Constant-product AMM ────────────────────────────────────────────────────
+
+/**
+ * Literal transcription of the IDE constant-product contract's assertion.
+ *
+ * Kept as its own function so every quote can be checked against the *contract's*
+ * rule rather than against the formula used to produce it. A quote that satisfies
+ * its own derivation but not this is a rejected transaction, and finding that out
+ * here costs nothing while finding it out on-chain costs a commit.
+ */
+function satisfiesConstantProduct(x, y, newX, newY) {
+    const X = BigInt(x), Y = BigInt(y), NX = BigInt(newX), NY = BigInt(newY);
+    const dx = NX > X ? NX - X : 0n;
+    const dy = NY > Y ? NY - Y : 0n;
+    const xAdj = NX * 1000n - dx * 3n;
+    const yAdj = NY * 1000n - dy * 3n;
+    return xAdj * yAdj >= X * Y * 1_000_000n;
+}
+
+/**
+ * Output amount for a constant-product swap, after the 0.3% fee.
+ *
+ * Derived from the contract's own inequality rather than assumed: with `dy = 0`
+ * the assert reduces to `new_y >= ceil(x*y*1000 / (x*1000 + dx*997))`, and the
+ * largest legal payout is `y` minus that, which simplifies to the familiar
+ * `floor(dx*997*y / (x*1000 + dx*997))`. The result is verified against
+ * {@link satisfiesConstantProduct} before it is returned.
+ *
+ * @param {bigint|number} reserveIn   Reserve of the asset being paid in.
+ * @param {bigint|number} reserveOut  Reserve of the asset being paid out.
+ * @param {bigint|number} amountIn
+ * @returns {bigint} Output amount, floored. Zero if the trade is not viable.
+ */
+function getAmountOut(reserveIn, reserveOut, amountIn) {
+    const x = BigInt(reserveIn), y = BigInt(reserveOut), dx = BigInt(amountIn);
+    if (dx <= 0n) return 0n;
+    if (x <= 0n || y <= 0n) throw new Error('launcher: pool has no liquidity');
+    const num = dx * FEE_NUM * y;
+    const den = x * FEE_DEN + dx * FEE_NUM;
+    let out = num / den;                                  // floor
+    if (out >= y) out = y - 1n;                           // never drain the pool
+    if (out < 0n) return 0n;
+
+    // Correct an off-by-one from the floor division.
+    //
+    // Bounded deliberately. The closed form is exact for this fee, so at most a
+    // unit or two of slack is ever needed; if the loop runs longer than that,
+    // the formula and the contract have genuinely diverged and grinding down one
+    // unit at a time would spin for billions of iterations before admitting it.
+    // Failing loudly is the only useful behaviour there.
+    const SLACK = 4n;
+    for (let i = 0n; i <= SLACK && out > 0n; i++) {
+        if (satisfiesConstantProduct(x, y, x + dx, y - out)) return out;
+        out -= 1n;
+    }
+    if (out <= 0n) return 0n;
+    throw new Error(
+        'launcher: quote does not satisfy the constant-product assert within tolerance; ' +
+        'the fee constants here and in the contract have diverged'
+    );
+}
+
+/**
+ * Input required to receive exactly `amountOut`.
+ *
+ * Rounds UP and then confirms against the contract, because rounding down here
+ * produces a quote that is one unit short and rejected on-chain.
+ */
+function getAmountIn(reserveIn, reserveOut, amountOut) {
+    const x = BigInt(reserveIn), y = BigInt(reserveOut), out = BigInt(amountOut);
+    if (out <= 0n) return 0n;
+    if (out >= y) throw new Error('launcher: output exceeds pool reserves');
+    const num = x * out * FEE_DEN;
+    const den = (y - out) * FEE_NUM;
+    let dx = num / den + 1n;                              // ceil
+    const SLACK = 4n;
+    for (let i = 0n; i <= SLACK; i++) {
+        if (satisfiesConstantProduct(x, y, x + dx, y - out)) return dx;
+        dx += 1n;
+    }
+    throw new Error(
+        'launcher: required input does not satisfy the constant-product assert within ' +
+        'tolerance; the fee constants here and in the contract have diverged'
+    );
+}
+
+/**
+ * Quote a swap and produce the AMM state the contract expects afterwards.
+ *
+ * The contract also asserts `input_value() == reserveX` and
+ * `sum_to_addr(CONTRACT) == new_x`, so `reserveX` is not bookkeeping — it must
+ * equal the physical MDS held by the contract coin. `newReserveX` is therefore
+ * what the funding output must actually carry.
+ *
+ * @param {Object} p
+ * @param {bigint|number} p.reserveX  Native MDS held by the contract.
+ * @param {bigint|number} p.reserveY  Token balance in the paired state.
+ * @param {bigint|number} p.amountIn
+ * @param {'x'|'y'} [p.direction='x']  Which side is paid in.
+ * @param {string} [p.padding]         Preserved padding bytes.
+ */
+function quoteSwap({ reserveX, reserveY, amountIn, direction = 'x', padding = '' }) {
+    const x = BigInt(reserveX), y = BigInt(reserveY), dx = BigInt(amountIn);
+    const payingX = direction === 'x';
+    const out = payingX ? getAmountOut(x, y, dx) : getAmountOut(y, x, dx);
+    if (out <= 0n) throw new Error('launcher: trade too small to yield any output');
+
+    const newX = payingX ? x + dx : x - out;
+    const newY = payingX ? y - out : y + dx;
+    if (!satisfiesConstantProduct(x, y, newX, newY)) {
+        throw new Error('launcher: computed trade violates the constant-product assert');
+    }
+    return {
+        amountIn: dx,
+        amountOut: out,
+        newReserveX: newX,
+        newReserveY: newY,
+        // Effective price paid, for display only — never used in the arithmetic.
+        effectivePrice: Number(dx) / Number(out),
+        newState: encodeState(LAYOUTS.AMM, { reserveX: newX, reserveY: newY, padding }),
+    };
+}
+
+// ── Linear bonding curve ────────────────────────────────────────────────────
+
+/**
+ * Cost of minting `count` units on the IDE's linear curve.
+ *
+ * The template asserts `sum_to_addr(TREASURY) == Curve.supply` and
+ * `new_supply == supply + 1`: price equals current supply, and **one unit per
+ * transaction**. Minting N units is therefore N transactions costing
+ * `supply + (supply+1) + … + (supply+N-1)`, which is what this returns — the
+ * closed form, so a caller can show a total without simulating each step.
+ *
+ * Note this is a mint price, not a swap: the payment goes to the treasury and no
+ * reserve is held by the curve contract.
+ */
+function bondingCurveCost(supply, count = 1) {
+    const s = BigInt(supply), n = BigInt(count);
+    if (n <= 0n) return 0n;
+    // Σ from s to s+n-1  =  n*s + n(n-1)/2
+    return n * s + (n * (n - 1n)) / 2n;
+}
+
+/** State after one mint on the linear curve. */
+function bondingCurveNextState(supply, padding = '') {
+    const s = BigInt(supply);
+    return {
+        price: s,                                   // price == current supply
+        newSupply: s + 1n,
+        newState: encodeState(LAYOUTS.CURVE, { supply: s + 1n, padding }),
+    };
+}
+
+// ── Token helpers ───────────────────────────────────────────────────────────
+
+/**
+ * Split a token balance across two output states.
+ *
+ * The IDE token contract asserts asset-id equality on BOTH outputs and
+ * `balance == out0 + out1`. Producing states that do not sum exactly is the
+ * single most common way to author an unspendable token coin, so the split is
+ * computed here rather than left to the caller.
+ */
+function splitTokenState({ balance, assetID, amount, padding }) {
+    const bal = BigInt(balance), amt = BigInt(amount);
+    if (amt <= 0n) throw new Error('launcher: split amount must be positive');
+    if (amt > bal) throw new Error(`launcher: cannot split ${amt} from a balance of ${bal}`);
+    const rest = bal - amt;
+    return {
+        sent: encodeState(LAYOUTS.TOKEN, { balance: amt, assetID }),
+        change: encodeState(LAYOUTS.TOKEN, { balance: rest, assetID }),
+        conserved: amt + rest === bal,
+    };
+}
+
+/**
+ * Asset id for a launched token.
+ *
+ * Derived from a name plus a caller-supplied nonce so two launches of the same
+ * name do not collide — the token contract's forgery check is asset-id equality,
+ * so two tokens sharing an id are mutually spendable.
+ *
+ * Truncated to 24 bytes because that is the field width; the collision domain is
+ * 192 bits, which is ample.
+ */
+function deriveAssetId(name, nonceHex = '') {
+    const nameHex = toHex(new TextEncoder().encode(String(name)));
+    return blake3_hash_hex(nameHex + String(nonceHex).replace(/^0x/, '')).slice(0, 48);
+}
+
+/**
+ * Contract address for compiled bytecode.
+ *
+ * Every Midstate address is pay-to-script-hash: `Predicate::address()` is
+ * `BLAKE3(bytecode)`. Compile in the IDE, pass the bytecode here.
+ */
+function contractAddress(bytecodeHex) {
+    return blake3_hash_hex(String(bytecodeHex).replace(/^0x/, ''));
+}
+
+// ── Contract templates ──────────────────────────────────────────────────────
+
+/**
+ * Bonding-curve contract source: batch buy/sell, contract holds its reserve.
+ *
+ * # Reasoning
+ *
+ * The IDE's `stateful` template asserts `new_supply == supply + 1`, so it mints
+ * exactly one unit per transaction. At two blocks per commit/reveal that is
+ * minutes per token, which is unusable for a launcher. It also keeps no reserve,
+ * so there is nothing to sell back into — payment goes to a treasury and the
+ * curve is buy-only.
+ *
+ * This version fixes both. It takes a batch delta and holds its own MDS, which
+ * is what makes a sell possible:
+ *
+ *   buy  n:  cost   = n*s  + n*(n-1)/2      (linear price = supply)
+ *   sell n:  refund = n*ns + n*(n-1)/2      (exact mirror, so a round trip is
+ *                                            lossless and the reserve can never
+ *                                            be drained below what was paid in)
+ *
+ * `input_value() == reserve` and `sum_to_addr(this_address()) == new_reserve`
+ * are what stop the state lying about the MDS it claims to back: the reserve
+ * field must equal the coin's real value both before and after.
+ *
+ * `this_address()` rather than a baked-in constant avoids the obvious
+ * chicken-and-egg — the address is the hash of the bytecode, so bytecode cannot
+ * contain it.
+ *
+ * Verified in `test-launcher.mjs` by executing it: exact-cost buys and sells are
+ * accepted, underpayment and over-refund are rejected, and a buy/sell round trip
+ * returns the reserve to its starting value.
+ */
+const CURVE_CONTRACT_SOURCE = `// Pump-style bonding curve: batch buy/sell, contract holds its own reserve.\nstate Curve { supply: 8, reserve: 8, pad: 16 }\n\nmacro new_supply() { read_output_state(0); 0; 8; slice(); 0; add(); }\nmacro new_reserve() { read_output_state(0); 8; 8; slice(); 0; add(); }\n\n{\n    var s = Curve.supply;\n    var r = Curve.reserve;\n    var ns = new_supply();\n    var nr = new_reserve();\n\n    // The state cannot lie about the MDS it claims to hold.\n    // Reserve lives in a SEPARATE standard output at this address: consensus
+    // gives OutputData::Confidential no value field at all, so a state thread
+    // cannot also hold the MDS it describes. sum_input_value() rather than
+    // input_value() because the script runs once per input and the state
+    // thread's own value is 0.
+    assert(sum_input_value() == r);\n    assert(sum_to_addr(this_address()) == nr);\n\n    if (ns > s) {\n        // BUY n: cost = n*s + n*(n-1)/2   (linear price = supply)\n        var n = ns - s;\n        var cost = n * s + (n * (n - 1)) / 2;\n        assert(nr == r + cost);\n    } else {\n        // SELL n: refund = n*ns + n*(n-1)/2  (mirror of the buy leg)\n        var n = s - ns;\n        var refund = n * ns + (n * (n - 1)) / 2;\n        assert(r == nr + refund);\n    }\n}\ntrue;\n`;
+
+/** Layout the curve contract reads: `{supply, reserve, pad}`. */
+const CURVE_STATE_LAYOUT = [['supply', 8, 'u64'], ['reserve', 8, 'u64'], ['pad', 16, 'bytes']];
+
+/**
+ * Cost to buy `n` units starting from `supply`, on the batch curve.
+ *
+ * Identical to {@link bondingCurveCost} — kept as a named pair with
+ * {@link curveSellRefund} so the two legs are obviously mirrors, which is the
+ * property that makes a round trip lossless.
+ */
+function curveBuyCost(supply, n) {
+    const s = BigInt(supply), k = BigInt(n);
+    if (k <= 0n) return 0n;
+    return k * s + (k * (k - 1n)) / 2n;
+}
+
+/** Refund for selling `n` units from `supply`. Mirrors {@link curveBuyCost}. */
+function curveSellRefund(supply, n) {
+    const s = BigInt(supply), k = BigInt(n);
+    if (k <= 0n) return 0n;
+    if (k > s) throw new Error(`launcher: cannot sell ${k} from a supply of ${s}`);
+    const ns = s - k;
+    return k * ns + (k * (k - 1n)) / 2n;
+}
+
+/**
+ * Build the state pair for a curve buy or sell.
+ *
+ * @param {Object} p
+ * @param {bigint|number} p.supply    Current supply.
+ * @param {bigint|number} p.reserve   Current reserve (must equal the coin value).
+ * @param {bigint|number} p.amount    Units to buy (positive) or sell.
+ * @param {'buy'|'sell'} p.side
+ */
+function curveTrade({ supply, reserve, amount, side = 'buy' }) {
+    const s = BigInt(supply), r = BigInt(reserve), n = BigInt(amount);
+    if (n <= 0n) throw new Error('launcher: trade amount must be positive');
+
+    if (side === 'buy') {
+        const cost = curveBuyCost(s, n);
+        const ns = s + n, nr = r + cost;
+        return {
+            side, amount: n, cost, newSupply: ns, newReserve: nr,
+            inputValue: r, outputValue: nr,
+            newState: encodeState(CURVE_STATE_LAYOUT, { supply: ns, reserve: nr }),
+            currentState: encodeState(CURVE_STATE_LAYOUT, { supply: s, reserve: r }),
+        };
+    }
+    const refund = curveSellRefund(s, n);
+    if (refund > r) throw new Error(`launcher: refund ${refund} exceeds reserve ${r}`);
+    const ns = s - n, nr = r - refund;
+    return {
+        side, amount: n, refund, newSupply: ns, newReserve: nr,
+        inputValue: r, outputValue: nr,
+        newState: encodeState(CURVE_STATE_LAYOUT, { supply: ns, reserve: nr }),
+        currentState: encodeState(CURVE_STATE_LAYOUT, { supply: s, reserve: r }),
+    };
+}
+
+var launcher = /*#__PURE__*/Object.freeze({
+    __proto__: null,
+    CURVE_CONTRACT_SOURCE: CURVE_CONTRACT_SOURCE,
+    CURVE_STATE_LAYOUT: CURVE_STATE_LAYOUT,
+    FEE_DEN: FEE_DEN,
+    FEE_NUM: FEE_NUM,
+    LAYOUTS: LAYOUTS,
+    STATE_BYTES: STATE_BYTES,
+    bondingCurveCost: bondingCurveCost,
+    bondingCurveNextState: bondingCurveNextState,
+    contractAddress: contractAddress,
+    curveBuyCost: curveBuyCost,
+    curveSellRefund: curveSellRefund,
+    curveTrade: curveTrade,
+    decodeState: decodeState,
+    deriveAssetId: deriveAssetId,
+    encodeState: encodeState,
+    getAmountIn: getAmountIn,
+    getAmountOut: getAmountOut,
+    quoteSwap: quoteSwap,
+    satisfiesConstantProduct: satisfiesConstantProduct,
+    splitTokenState: splitTokenState
+});
+
+// pump.js — Bonding-curve token launcher with an unforgeable holder ledger.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+//  Reasoning (module level)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Midstate has no native token type and no minting policy, so a launcher has to
+// build one out of scripts alone. Two designs look obvious and both are broken;
+// understanding why is the whole reason this module is shaped the way it is.
+//
+// ── Why "token coins" do not work ──
+//
+// The natural eUTXO design gives each holder a coin whose state carries a
+// balance, and has the curve verify balances on sale. It cannot be made sound:
+//
+//   1. A script only runs when ITS OWN coin is spent, and READ_INPUT_STATE
+//      reads only its own input. On a sale the curve sees its own supply but
+//      not the token coin's balance, and the token sees its balance but not the
+//      curve's supply. Neither can verify the other's delta.
+//   2. Creating an output at an address does NOT run that address's script.
+//      So anyone can fabricate a coin at the token address claiming any balance,
+//      then "sell" it and drain the reserve down to the real supply.
+//
+//  A same-transaction receipt fixes (1) — both scripts assert the delta against
+//  their own knowledge, so they are forced to agree — but nothing fixes (2)
+//  without a consensus-level minting rule, which is off the table.
+//
+// ── What does work: a Merkle ledger ──
+//
+// Balances live in a fixed-depth Merkle tree whose root is in the curve's own
+// state. A trade must present a Merkle path proving its CURRENT balance against
+// the CURRENT root, and the contract recomputes both the old and the new root in
+// one pass (`merkle_update_step` from the IDE standard library). A balance that
+// was never bought has no valid path, so it cannot be sold. Fabrication is
+// impossible because there is nothing to fabricate — there are no token coins,
+// only tree leaves.
+//
+// This is the same pattern as the IDE's `merkle_ledger` template, applied to a
+// bonding curve.
+//
+// ── Contract invariants, all verified by execution in test-pump.mjs ──
+//
+//   reserve  = the contract coin's own MDS value (never stored, so it cannot lie)
+//   buy  n:  cost   = n*s  + n*(n-1)/2
+//   sell n:  refund = n*ns + n*(n-1)/2        (exact mirror; round trip lossless)
+//   leaf     = BLAKE3(minimal_LE(balance) ⌢ owner24)
+//
+// The contract BUILDS both leaves from (owner, old_balance, n) rather than
+// trusting leaves supplied in the witness. That binding is what stops a buyer
+// paying for 4 and writing 400 into the tree.
+//
+// ── Known limits ──
+//
+//   * Depth 10 (1024 holder slots) is the largest that fits MAX_SCRIPT_SIZE.
+//     Deeper trees need the language to emit a loop rather than unrolled steps.
+//   * Every trade spends the single curve coin, so trades are serialised — and
+//     each trade invalidates every other holder's path. A front end needs to
+//     rebuild paths from the current tree between trades. This is inherent to
+//     a single-UTXO curve, not to the ledger.
+//   * Owner is a 24-byte truncated identifier. It is an identity slot, not an
+//     authorisation check: this contract does not verify a signature, so slot
+//     ownership must be enforced by whatever controls tree updates. Adding
+//     `require_signed_by` costs ~40 B and one witness item.
+
+
+/**
+ * Largest tree depth that fits MAX_SCRIPT_SIZE (1024 B) — 512 holder slots.
+ *
+ * Signature verification costs about 235 bytes of script, which is two tree
+ * levels. That is the price of the ledger being authorised rather than merely
+ * proven, and it is not optional: without it the owner field is a password
+ * published in plain sight and any observer can drain any slot.
+ *
+ * 512 slots is a per-LAUNCH limit, not a global one — each token is its own
+ * contract. A launch expecting more holders needs the language to emit a loop
+ * for the Merkle steps rather than unrolling them.
+ */
+const MAX_DEPTH = 9;
+
+/**
+ * Contract source, with pick-depth placeholders.
+ *
+ * The placeholders are stack offsets that depend on tree depth, because the
+ * witness carries `owner, old_balance, n` BELOW the sibling pairs — the Merkle
+ * macro reaches down for its own siblings, so anything it must not disturb has
+ * to sit under them.
+ */
+const PUMP_CONTRACT_TEMPLATE = String.raw`
+// PUMP CURVE — bonding curve with an unforgeable, AUTHORISED holder ledger.
+//
+// State: [supply 8][root 24].  Reserve is implied: (s*s - s) / 2.
+// Witness (bottom -> top):
+//   owner_old, owner_new, pk, old_bal, n, sig, sib_{D-1},dir_{D-1} ... sib_0,dir_0, route
+//
+// A leaf is BLAKE3(minimal_LE(balance) || owner24), where owner24 is the first
+// 24 bytes of BLAKE3(pubkey). The Merkle proof shows WHAT a slot holds; the
+// signature shows WHO may move it. An earlier version had only the proof, so
+// the owner field was a password published in plain sight and any observer
+// could drain any slot.
+//
+// Slot lifecycle, enforced below:  owner = 0  <=>  balance = 0
+//   The signer ALWAYS proves owner_new's key, and owner_new may only differ from
+//   owner_old when the slot was empty. So:
+//     claim  (0 -> b) : anyone may take a free slot, naming themselves owner
+//     spend  (a -> b) : owner_new == owner_old is forced, so the signer is
+//                       proving the key the tree already commits to
+//   Authorising against one owner rather than branching on two keeps the
+//   signature check off the conditional path, where the stack discipline for
+//   CHECKSIGVERIFY is fragile: 'var' claims stack slots without popping, so the
+//   signature has to be the top of stack at exactly the right moment.
+state Pump { supply: 8, root: 24 }
+
+macro new_supply() { read_output_state(0); 0; 8; slice(); 0; add(); }
+macro new_root24() { read_output_state(0); 8; 24; slice(); }
+
+macro build_leaves() {
+    pick({OLD});               // old_bal
+    pick({N});                 // n
+    add();                     // new_bal
+    pick({OWN_NEW});           // owner_new
+    concat(); hash();          // new_leaf
+    pick({OLD_B});             // old_bal
+    pick({OWN_OLD});           // owner_old
+    concat(); hash();          // old_leaf
+    swap();
+}
+
+macro build_leaves_sell() {
+    pick({OLD});
+    pick({N});
+    sub();                     // new_bal = old_bal - n
+    pick({OWN_NEW});
+    concat(); hash();
+    pick({OLD_B});
+    pick({OWN_OLD});
+    concat(); hash();
+    swap();
+}
+
+route {
+  case 0: {
+    build_leaves();
+    repeat({D}) { merkle_update_step(); }
+    assert(slice(pop_hex(), 0, 24) == new_root24());
+    assert(slice(pop_hex(), 0, 24) == Pump.root);
+    {
+        // AUTHORISE FIRST, on raw stack positions.
+        //
+        // 'var' claims a stack slot without popping it, so locals sit on the
+        // stack and the deepest is declared first. CHECKSIGVERIFY needs the
+        // signature on TOP, which is why sig is the last witness item and why
+        // this runs before any local exists. Depths from the top here are
+        // sig=0, n=1, old_bal=2, pk=3, owner_new=4, owner_old=5.
+        // Raw ops, NOT require_signed_by(). That macro binds its argument as a
+        // local, which leaves the argument itself on the stack above the
+        // signature — so CHECKSIGVERIFY consumes the pubkey twice, compares it
+        // against itself, and passes vacuously while the real signature is
+        // dropped unverified. Emitting the two opcodes directly keeps the
+        // signature on top where CHECKSIGVERIFY expects it.
+        assert(slice(hash(pick(3)), 0, 24) == pick(5));
+        pick(3);
+        CHECKSIGVERIFY;
+
+        var owner_old = pop_hex();
+        var owner_new = pop_hex();
+        var pk = pop_hex();
+        var old_bal = pop_int();
+        var n = pop_int();
+
+        // A funded slot's owner is immutable, so proving owner_new is proving the
+        // key the tree already commits to. Only an empty slot may name a new one.
+        if (old_bal >= 1) { assert(owner_new == owner_old); }
+        // Claiming an empty slot is open to anyone, so the signer proves the key
+        // they are claiming WITH. Spending an occupied slot requires the key the
+        // tree already commits to.
+        var ns = new_supply();
+        assert(ns == Pump.supply + n);
+        assert(output_address(0) == this_address());
+        assert(sum_to_addr(this_address()) == (ns * ns - ns) / 2);
+    }
+  }
+  case 1: {
+    build_leaves_sell();
+    repeat({D}) { merkle_update_step(); }
+    assert(slice(pop_hex(), 0, 24) == new_root24());
+    assert(slice(pop_hex(), 0, 24) == Pump.root);
+    {
+        // AUTHORISE FIRST, on raw stack positions.
+        //
+        // 'var' claims a stack slot without popping it, so locals sit on the
+        // stack and the deepest is declared first. CHECKSIGVERIFY needs the
+        // signature on TOP, which is why sig is the last witness item and why
+        // this runs before any local exists. Depths from the top here are
+        // sig=0, n=1, old_bal=2, pk=3, owner_new=4, owner_old=5.
+        // Raw ops, NOT require_signed_by(). That macro binds its argument as a
+        // local, which leaves the argument itself on the stack above the
+        // signature — so CHECKSIGVERIFY consumes the pubkey twice, compares it
+        // against itself, and passes vacuously while the real signature is
+        // dropped unverified. Emitting the two opcodes directly keeps the
+        // signature on top where CHECKSIGVERIFY expects it.
+        assert(slice(hash(pick(3)), 0, 24) == pick(5));
+        pick(3);
+        CHECKSIGVERIFY;
+
+        var owner_old = pop_hex();
+        var owner_new = pop_hex();
+        var pk = pop_hex();
+        var old_bal = pop_int();
+        var n = pop_int();
+
+        assert(owner_new == owner_old);
+        var ns = new_supply();
+        assert(Pump.supply == ns + n);
+        assert(output_address(0) == this_address());
+        assert(sum_to_addr(this_address()) == (ns * ns - ns) / 2);
+    }
+  }
+  default: { fail(); }
+}
+true;
+`;
+
+function pumpContractSource(depth = MAX_DEPTH) {
+    const d = Number(depth);
+    if (!Number.isInteger(d) || d < 1 || d > MAX_DEPTH) {
+        throw new Error(`pump: depth must be 1..${MAX_DEPTH} (got ${depth})`);
+    }
+    // Stack offsets are computed from the witness LAYOUT, not written down.
+    //
+    // After the route byte is consumed the stack is the witness items with the
+    // sibling pairs stacked above them, and every intermediate push shifts the
+    // lot by one. A wrong offset does not fail to compile — it silently picks a
+    // neighbouring slot. That has now caused two separate bugs here: one made
+    // both Merkle leaves identical (passing every forgery test while rejecting
+    // every honest trade), and one survived adding `sig` to the witness because
+    // the constants were hand-written and nobody re-derived them.
+    //
+    // So the layout is declared once and the offsets fall out of it. Adding or
+    // reordering a witness field now updates every pick automatically.
+    const LAYOUT = ['owner_old', 'owner_new', 'pk', 'old_bal', 'n', 'sig']; // bottom → top
+    const base = LAYOUT.length + 2 * d;          // stack depth once the route byte is gone
+    const at = (field, pushed) => (base + pushed) - 1 - LAYOUT.indexOf(field);
+
+    const subs = {
+        // build_leaves, in order. `pushed` is how many temporaries are already
+        // on top at that point in the sequence.
+        '{OLD}': at('old_bal', 0),      // pick old_bal
+        '{N}': at('n', 1),              // pick n, with old_bal on top
+        '{OWN_NEW}': at('owner_new', 1),// pick owner_new, with new_bal on top
+        '{OLD_B}': at('old_bal', 1),    // pick old_bal again, with new_leaf on top
+        '{OWN_OLD}': at('owner_old', 2),// pick owner_old, with new_leaf + old_bal on top
+        '{D}': d,
+    };
+    let out = PUMP_CONTRACT_TEMPLATE;
+    for (const [k, v] of Object.entries(subs)) out = out.split(k).join(String(v));
+    return out;
+}
+
+// ── Ledger ──────────────────────────────────────────────────────────────────
+
+const H = (a, b) => blake3_hash_hex(a + b);
+
+/** An unowned slot. `owner = 0 <=> balance = 0` is the canonical free form. */
+const ZERO_OWNER = '00'.repeat(24);
+
+/**
+ * Owner commitment for a public key: the first 24 bytes of BLAKE3(pk).
+ *
+ * # Reasoning
+ *
+ * The contract checks `slice(hash(pk), 0, 24) == owner` and then
+ * CHECKSIGVERIFYs against that same pk, so the owner field is a COMMITMENT to a
+ * key, not a secret. That distinction is the whole security model: the field is
+ * published on chain in every ledger burn, and an earlier version treated it as
+ * if publishing it were harmless because the contract compared it directly.
+ * Anyone who read a burn could then spend the slot it described.
+ *
+ * 24 bytes is what the 32-byte state leaves after an 8-byte balance. 192 bits of
+ * second-preimage resistance is ample; the truncation is a space constraint, not
+ * a security choice.
+ */
+function ownerFromPubkey(pubkeyHex) {
+    return blake3_hash_hex(String(pubkeyHex).replace(/^0x/, '').toLowerCase()).slice(0, 48);
+}
+
+/** Minimal little-endian encoding, matching the VM's `from_u64`. */
+function minimalLE(v) {
+    let x = BigInt(v);
+    if (x === 0n) return '00';
+    let h = x.toString(16);
+    if (h.length % 2) h = '0' + h;
+    return h.match(/.{2}/g).reverse().join('');
+}
+
+/** Fixed-width little-endian, for the 8-byte supply field. */
+function fixedLE(v, bytes = 8) {
+    let x = BigInt(v), s = '';
+    for (let i = 0; i < bytes; i++) { s += Number(x & 0xffn).toString(16).padStart(2, '0'); x >>= 8n; }
+    return s;
+}
+
+/**
+ * Leaf hash for a holder slot.
+ *
+ * `minimal_LE(balance) ⌢ owner24` is unambiguous despite the variable-width
+ * balance: the owner is fixed at 24 bytes, so two different balances always
+ * produce different total lengths or different leading bytes.
+ */
+function leafHash(balance, owner24) {
+    return blake3_hash_hex(minimalLE(balance) + String(owner24).replace(/^0x/, '').toLowerCase());
+}
+
+/**
+ * A holder ledger: a fixed-depth Merkle tree over balance leaves.
+ *
+ * Fixed depth rather than sparse, because the contract unrolls exactly `depth`
+ * verification steps — a shorter path simply would not verify.
+ */
+class PumpLedger {
+    /**
+     * @param {number} depth
+     * @param {string[]} owners One 24-byte hex id per slot; defaults to zeros.
+     */
+    constructor(depth = MAX_DEPTH, owners = []) {
+        this.depth = depth;
+        this.size = 2 ** depth;
+        this.owners = Array.from({ length: this.size }, (_, i) => (owners[i] || '00'.repeat(24)).toLowerCase());
+        this.balances = Array(this.size).fill(0n);
+        this._rebuild();
+    }
+
+    _rebuild() {
+        this.leaves = this.balances.map((b, i) => leafHash(b, this.owners[i]));
+        let cur = this.leaves.slice();
+        this.layers = [cur.slice()];
+        while (cur.length > 1) {
+            const next = [];
+            for (let i = 0; i < cur.length; i += 2) next.push(H(cur[i], cur[i + 1]));
+            this.layers.push(next.slice());
+            cur = next;
+        }
+        this.root = cur[0];
+    }
+
+    /** Sibling/direction pairs from the leaf upward. `dir = '01'` means the sibling is on the left. */
+    proof(slot) {
+        const out = [];
+        let i = slot;
+        for (const layer of this.layers.slice(0, -1)) {
+            const isRight = i % 2 === 1;
+            out.push([layer[isRight ? i - 1 : i + 1], isRight ? '01' : '00']);
+            i >>= 1;
+        }
+        return out;
+    }
+
+    /**
+     * Record a slot's owner locally, ahead of the trade that commits it.
+     *
+     * # Reasoning
+     *
+     * This is bookkeeping, NOT a chain operation. On chain a slot's owner is
+     * only ever written by a trade — the claim branch of the contract sets it as
+     * part of the first buy — so calling this does not by itself change what the
+     * network believes.
+     *
+     * An earlier version rebuilt the tree here, which made a locally claimed but
+     * never-traded slot diverge from any tree reconstructed from chain data.
+     * Every trade publishes its slot in a burn; a bare claim publishes nothing,
+     * so there is nothing for a replay to apply. The tree is therefore left
+     * alone and the owner is staged for {@link buildTrade} to use.
+     *
+     * @param {number} slot
+     * @param {string} owner24 24-byte owner commitment, from {@link ownerFromPubkey}.
+     */
+    claim(slot, owner24) {
+        if (this.balances[slot] !== 0n) throw new Error(`pump: slot ${slot} is already in use`);
+        this.pendingOwners = this.pendingOwners || {};
+        this.pendingOwners[slot] = String(owner24).replace(/^0x/, '').toLowerCase();
+        return this;
+    }
+
+    /** Owner the next trade on `slot` will present: staged, else committed. */
+    ownerFor(slot) {
+        return (this.pendingOwners && this.pendingOwners[slot]) || this.owners[slot];
+    }
+
+    /** Apply a balance change and rebuild. Call only after the trade is accepted. */
+    set(slot, balance) {
+        this.balances[slot] = BigInt(balance);
+        this._rebuild();
+        return this;
+    }
+
+    /** Slot index for an owner, or -1. */
+    slotOf(owner24) {
+        return this.owners.indexOf(String(owner24).replace(/^0x/, '').toLowerCase());
+    }
+
+    /** First slot with no balance, no committed owner and no staged claim. */
+    freeSlot() {
+        return this.owners.findIndex((o, i) =>
+            this.balances[i] === 0n && /^0+$/.test(o) && !(this.pendingOwners && this.pendingOwners[i]));
+    }
+}
+
+// ── Curve arithmetic ────────────────────────────────────────────────────────
+
+/**
+ * Reserve implied by a supply.
+ *
+ * The contract stores no reserve and reads no input value. Every buy adds
+ * exactly the curve cost and every sell removes exactly the mirror, so the MDS
+ * held at the contract address is always `0 + 1 + ... + (s-1)`. Asserting
+ * `sum_to_addr(this) == impliedReserve(new_supply)` on both legs is therefore
+ * the whole money rule — and it needs no `sum_input_value()`, which is gated
+ * behind COVENANT_SUM_ACTIVATION_HEIGHT (300,000).
+ *
+ * Written as `(s*s - s)/2` rather than `s*(s-1)/2` because the latter underflows
+ * at `s = 0`, and SUB below zero is an error on this VM rather than a wrap.
+ */
+function impliedReserve(supply) {
+    const s = BigInt(supply);
+    return (s * s - s) / 2n;
+}
+
+/** Cost to buy `n` units at supply `s`: the arithmetic series s..s+n-1. */
+function buyCost(supply, n) {
+    const s = BigInt(supply), k = BigInt(n);
+    if (k <= 0n) throw new Error('pump: amount must be positive');
+    return k * s + (k * (k - 1n)) / 2n;
+}
+
+/** Refund for selling `n` units at supply `s`. Exact mirror of {@link buyCost}. */
+function sellRefund(supply, n) {
+    const s = BigInt(supply), k = BigInt(n);
+    if (k <= 0n) throw new Error('pump: amount must be positive');
+    if (k > s) throw new Error(`pump: cannot sell ${k} of a supply of ${s}`);
+    const ns = s - k;
+    return k * ns + (k * (k - 1n)) / 2n;
+}
+
+/** Curve state commitment: `[supply 8][root 24]`. */
+function encodePumpState(supply, root32) {
+    return fixedLE(supply, 8) + String(root32).replace(/^0x/, '').toLowerCase().slice(0, 48);
+}
+
+/**
+ * Build the witness and the expected outputs for a trade.
+ *
+ * # Reasoning
+ *
+ * The witness order is not cosmetic. `merkle_update_step` reaches DOWN past the
+ * two accumulators for its own sibling and direction, so the sibling pairs must
+ * sit directly beneath the leaves — which means `owner`, `old_balance` and `n`
+ * have to go at the very bottom, and the contract reaches back down for them
+ * once the Merkle pass has consumed everything above.
+ *
+ * Siblings are pushed top-of-tree first so that the leaf-level pair ends up
+ * closest to the accumulators, where the first step expects it.
+ *
+ * @param {Object} p
+ * @param {PumpLedger} p.ledger
+ * @param {number} p.slot
+ * @param {bigint|number} p.amount
+ * @param {'buy'|'sell'} p.side
+ * @param {bigint|number} p.supply
+ * @param {bigint|number} p.reserve
+ */
+function buildTrade({ ledger, slot, amount, side, supply, reserve, pubkey, sig, newOwner = null }) {
+    const n = BigInt(amount);
+    const s = BigInt(supply), r = BigInt(reserve);
+    const oldBal = ledger.balances[slot];
+    const committedOwner = ledger.owners[slot];
+
+    if (side !== 'buy' && side !== 'sell') throw new Error("pump: side must be 'buy' or 'sell'");
+    if (side === 'sell' && n > oldBal) throw new Error(`pump: slot holds ${oldBal}, cannot sell ${n}`);
+    if (!pubkey) throw new Error('pump: a trade needs the pubkey whose hash the slot commits to');
+    if (!sig) throw new Error('pump: a trade needs a signature — the contract CHECKSIGVERIFYs it');
+
+    const newBal = side === 'buy' ? oldBal + n : oldBal - n;
+    const claiming = oldBal === 0n;
+
+    // Resolve the owner the new leaf will carry.
+    //
+    // The contract asserts `owner_new == owner_old` whenever the slot is funded,
+    // so a funded slot's owner is IMMUTABLE — including when selling out. A slot
+    // emptied by a full sell keeps its owner and simply becomes reclaimable,
+    // because the claim branch only requires `old_bal == 0`. An earlier version
+    // tried to zero the owner on release and produced plans the contract
+    // rejected on the honest path.
+    let ownerNew;
+    if (claiming) {
+        ownerNew = String(newOwner || ledger.ownerFor(slot) || '').replace(/^0x/, '').toLowerCase();
+        // A funded slot with a zero owner needs a pubkey hashing to zeros to
+        // spend, which nobody can produce — the coins would be unspendable.
+        // Enforced here rather than in the contract, where the check costs ~116
+        // bytes of script (two whole tree levels) and only ever prevents a
+        // caller locking THEIR OWN coins. Theft is prevented by the signature,
+        // which stays on chain.
+        if (!ownerNew || ownerNew === ZERO_OWNER) {
+            throw new Error(
+                `pump: claiming slot ${slot} needs an owner — pass one via claim() or newOwner, ` +
+                `or its coins will be unspendable.`
+            );
+        }
+    } else {
+        if (newOwner && String(newOwner).replace(/^0x/, '').toLowerCase() !== committedOwner) {
+            throw new Error(
+                `pump: slot ${slot} is funded, so its owner is immutable. Sell out first; ` +
+                `the slot can then be claimed afresh.`
+            );
+        }
+        ownerNew = committedOwner;
+    }
+
+    // The owner the OLD leaf carries is whatever the tree already commits to.
+    const ownerOld = committedOwner;
+
+    // The contract always authorises against owner_new. On a funded slot that is
+    // forced equal to owner_old, so the signer is proving the key the tree
+    // already commits to; only an empty slot may name a new one. Checked here as
+    // well so a mismatch fails before the caller pays for a commit.
+    const expected = ownerNew;
+    const derived = ownerFromPubkey(pubkey);
+    if (derived !== expected) {
+        throw new Error(
+            `pump: pubkey hashes to ${derived.slice(0, 12)}… but the contract requires ` +
+            `${expected.slice(0, 12)}… for this ${claiming ? 'claim' : 'spend'}.`
+        );
+    }
+
+    const amountMds = side === 'buy' ? buyCost(s, n) : sellRefund(s, n);
+    const newSupply = side === 'buy' ? s + n : s - n;
+    const newReserve = impliedReserve(newSupply);
+    if (newReserve < 0n) throw new Error('pump: refund exceeds the reserve');
+
+    // Project the tree forward without touching the caller's ledger; it is only
+    // advanced once the trade is actually accepted on chain.
+    const projected = new PumpLedger(ledger.depth, ledger.owners);
+    projected.balances = ledger.balances.slice();
+    projected.balances[slot] = newBal;
+    projected.owners[slot] = ownerNew;
+    projected._rebuild();
+
+    // Witness order is dictated by the Merkle macro, which reaches DOWN past the
+    // two accumulators for its own sibling and direction. Anything it must not
+    // disturb therefore sits beneath the sibling pairs, and the contract reaches
+    // back down for it once the Merkle pass has consumed everything above.
+    // Siblings go top-of-tree first so the leaf-level pair ends up closest to
+    // the accumulators, where the first step expects it.
+    const path = ledger.proof(slot);
+    const witness = [
+        ownerOld,
+        ownerNew,
+        String(pubkey).replace(/^0x/, ''),
+        minimalLE(oldBal),
+        minimalLE(n),
+        // Last, so it is the top of stack when CHECKSIGVERIFY runs. A `var`
+        // claims a stack slot without popping, so anything declared as a local
+        // sits above the signature and puts it permanently out of reach.
+        String(sig).replace(/^0x/, ''),
+    ];
+    for (let i = path.length - 1; i >= 0; i--) witness.push(path[i][0], path[i][1]);
+    witness.push(side === 'buy' ? '00' : '01');
+
+    const stateOutput = { index: 0, kind: 'confidential', address: null, value: 0n,
+                          state: encodePumpState(newSupply, projected.root) };
+    const reserveOutput = { index: 1, kind: 'standard', address: null, value: newReserve };
+
+    return {
+        slot, owner: ownerNew, ownerOld, claiming,
+        side, amount: n, amountMds, oldBalance: oldBal, newBalance: newBal,
+        newSupply, newReserve, witness,
+        currentState: encodePumpState(s, ledger.root),
+        newState: stateOutput.state,
+        newRoot: projected.root,
+        sumInputValue: r,
+        outputs: [stateOutput, reserveOutput],
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Transaction layer
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ── Why the ledger is published on chain ──
+//
+// The contract commits only to the tree's ROOT. The balances themselves live
+// nowhere on chain, and every trade moves the root, so each trade invalidates
+// every other holder's Merkle proof. A holder who cannot rebuild a current proof
+// cannot trade — and nobody else can build one for them either, because nobody
+// has the tree.
+//
+// That is fatal for a public launcher: it makes coins unreachable after a lost
+// cache, and it makes the whole thing depend on one privileged indexer.
+//
+// So every trade carries a zero-value `DataBurn` recording the slot it changed.
+// Replaying those burns rebuilds the tree exactly, from chain data alone, by
+// anyone. The burn is 47 bytes against a `MAX_BURN_DATA_SIZE` of 80, so it never
+// needs the DEX's fragmentation.
+//
+// It does not disturb the contract: `DataBurn` carries no address, so it
+// contributes nothing to `sum_to_addr`, and it sits after the two outputs the
+// contract inspects by index.
+
+const LEDGER_MAGIC = '4d504d50';   // "MPMP"
+const LEDGER_VER = 1;
+/** magic 4 + ver 1 + contract 8 + slot 2 + balance 8 + owner 24 */
+const LEDGER_BURN_BYTES = 47;
+
+const beBytes = (v, n) => {
+    const a = new Uint8Array(n);
+    let x = BigInt(v);
+    for (let i = n - 1; i >= 0; i--) { a[i] = Number(x & 0xffn); x >>= 8n; }
+    return Array.from(a).map((b) => b.toString(16).padStart(2, '0')).join('');
+};
+const beRead = (hex, off, n) => BigInt('0x' + hex.slice(off * 2, (off + n) * 2));
+
+/** Short, collision-resistant handle for a contract address (8 bytes). */
+function contractShortId(contractAddrHex) {
+    return String(contractAddrHex).replace(/^0x/, '').toLowerCase().slice(0, 16);
+}
+
+/**
+ * Encode one ledger update for publication in a burn.
+ *
+ * Big-endian, matching the DEX announcement wire rather than contract state —
+ * these are announcements, read by scanners, not values read by scripts.
+ */
+function encodeLedgerUpdate({ contractAddr, slot, balance, owner }) {
+    return LEDGER_MAGIC
+        + beBytes(LEDGER_VER, 1)
+        + contractShortId(contractAddr)
+        + beBytes(slot, 2)
+        + beBytes(balance, 8)
+        + String(owner).replace(/^0x/, '').toLowerCase().padStart(48, '0').slice(0, 48);
+}
+
+/** @returns {Object|null} Decoded update, or null if this burn isn't one. */
+function decodeLedgerUpdate(payloadHex) {
+    const h = String(payloadHex || '').replace(/^0x/, '').toLowerCase();
+    if (h.length < LEDGER_BURN_BYTES * 2) return null;
+    if (h.slice(0, 8) !== LEDGER_MAGIC) return null;
+    if (Number(beRead(h, 4, 1)) !== LEDGER_VER) return null;
+    return {
+        contractId: h.slice(10, 26),
+        slot: Number(beRead(h, 13, 2)),
+        balance: beRead(h, 15, 8),
+        owner: h.slice(46, 94),
+    };
+}
+
+/**
+ * Rebuild a ledger by replaying published updates in chain order.
+ *
+ * # Reasoning
+ *
+ * This is what makes the launcher trustless to read. Anyone with the chain can
+ * reconstruct the exact tree the contract is committed to, so a holder never
+ * depends on a service to produce their proof.
+ *
+ * The rebuilt root is checked against the on-chain state where the caller
+ * supplies it. A mismatch means the replay is incomplete — a missed block, a
+ * burn from a fork, or an update this version cannot parse — and continuing on a
+ * wrong tree would produce proofs the contract silently rejects. So it is
+ * reported rather than absorbed.
+ *
+ * @param {Object} p
+ * @param {number} p.depth
+ * @param {string} p.contractAddr
+ * @param {Object[]} p.updates Decoded updates, oldest first.
+ * @param {string} [p.expectedRoot] On-chain root to verify against.
+ */
+function replayLedger({ depth, contractAddr, updates, expectedRoot = null }) {
+    const id = contractShortId(contractAddr);
+    const ledger = new PumpLedger(depth);
+    let applied = 0;
+    for (const u of updates) {
+        if (!u || u.contractId !== id) continue;      // another launch's burn
+        if (u.slot >= ledger.size) continue;          // out of range for this depth
+        ledger.owners[u.slot] = u.owner;
+        ledger.balances[u.slot] = BigInt(u.balance);
+        applied++;
+    }
+    ledger._rebuild();
+    const supply = ledger.balances.reduce((a, b) => a + b, 0n);
+    const rootMatches = expectedRoot === null
+        ? null
+        : ledger.root.slice(0, 48) === String(expectedRoot).replace(/^0x/, '').toLowerCase().slice(0, 48);
+    return { ledger, applied, supply, reserve: impliedReserve(supply), rootMatches };
+}
+
+/**
+ * Outputs that deploy a new curve.
+ *
+ * # Reasoning
+ *
+ * The reserve invariant `r = impliedReserve(s)` is inductive from `s = 0,
+ * r = 0`, so the launch MUST start empty. Seeding the address with a balance
+ * makes every later trade fail the money assertion, with the contract's funds
+ * locked behind an assertion that can never again hold. The zero reserve is
+ * therefore expressed here rather than left to the caller.
+ *
+ * The state thread's salt is fixed and returned, because the wallet has to spend
+ * that exact coin on the first trade and cannot rediscover a random salt.
+ *
+ * @param {Object} p
+ * @param {number} [p.depth]
+ * @param {string} p.saltHex 32-byte salt for the state-thread coin.
+ * @returns {{address, bytecode, outputs, initialState, ledger, depth}}
+ */
+function deployPlan({ depth = MAX_DEPTH, saltHex, compileFn }) {
+    if (!compileFn) throw new Error('pump: deployPlan needs a compile function (from src/compiler.js)');
+    if (!saltHex || String(saltHex).replace(/^0x/, '').length !== 64) {
+        throw new Error('pump: deployPlan needs a 32-byte hex salt for the state coin');
+    }
+    const source = pumpContractSource(depth);
+    const compiled = compileFn(source);
+    const address = blake3_hash_hex(compiled.bytecode);
+    const ledger = new PumpLedger(depth);
+    const initialState = encodePumpState(0n, ledger.root);
+
+    return {
+        address,
+        bytecode: compiled.bytecode,
+        depth,
+        initialState,
+        ledger,
+        // One output only: the state thread. The reserve starts at zero, which
+        // impliedReserve(0) requires, so there is no coin to create yet.
+        outputs: [
+            { out_type: 'confidential', address, value: 0, state: initialState, salt: String(saltHex).replace(/^0x/, '') },
+        ],
+    };
+}
+
+/**
+ * Contract inputs and outputs for one trade, ready for `Wallet.executeContract`.
+ *
+ * # Reasoning
+ *
+ * Output ORDER is consensus-relevant here, not cosmetic. The contract reads
+ * `read_output_state(0)` and asserts `output_address(0) == this_address()`, so
+ * the state thread must be index 0 and the reserve coin index 1. The ledger burn
+ * follows, where it cannot disturb either check.
+ *
+ * Salts are explicit for both contract-owned outputs so the wallet can spend
+ * them on the next trade; a random salt would strand the coin.
+ *
+ * @param {Object} p
+ * @param {Object} p.plan        From {@link buildTrade}.
+ * @param {string} p.address     Contract address.
+ * @param {string} p.stateSalt   Salt for the NEW state-thread coin.
+ * @param {string} p.reserveSalt Salt for the NEW reserve coin.
+ * @param {Object} p.current     `{ stateCoinId, stateSalt, reserveCoinId, reserveSalt }` of the coins being spent.
+ * @param {string} p.witnessJoin Separator the caller's witness format expects.
+ */
+function tradeTx({ plan, address, stateSalt, reserveSalt, current, witnessJoin = ',' }) {
+    const addr = String(address).replace(/^0x/, '').toLowerCase();
+    const witness = plan.witness.join(witnessJoin);
+
+    // The state thread is always spent. The reserve coin only exists once the
+    // curve holds something, so a first buy has no reserve input to consume.
+    const contractInputs = [
+        { coin_id: current.stateCoinId, witness, value: 0, salt: current.stateSalt, state: plan.currentState },
+    ];
+    if (current.reserveCoinId && plan.sumInputValue > 0n) {
+        contractInputs.push({
+            coin_id: current.reserveCoinId, witness,
+            value: Number(plan.sumInputValue), salt: current.reserveSalt,
+        });
+    }
+
+    const outputs = [
+        { out_type: 'confidential', address: addr, value: 0, state: plan.newState, salt: String(stateSalt).replace(/^0x/, '') },
+    ];
+    if (plan.newReserve > 0n) {
+        outputs.push({ out_type: 'standard', address: addr, value: Number(plan.newReserve), salt: String(reserveSalt).replace(/^0x/, '') });
+    }
+
+    return {
+        contractInputs,
+        outputs,
+        ledgerBurn: encodeLedgerUpdate({
+            contractAddr: addr, slot: plan.slot, balance: plan.newBalance, owner: plan.owner,
+        }),
+    };
+}
+
+var pump = /*#__PURE__*/Object.freeze({
+    __proto__: null,
+    LEDGER_BURN_BYTES: LEDGER_BURN_BYTES,
+    LEDGER_MAGIC: LEDGER_MAGIC,
+    LEDGER_VER: LEDGER_VER,
+    MAX_DEPTH: MAX_DEPTH,
+    PUMP_CONTRACT_TEMPLATE: PUMP_CONTRACT_TEMPLATE,
+    PumpLedger: PumpLedger,
+    ZERO_OWNER: ZERO_OWNER,
+    buildTrade: buildTrade,
+    buyCost: buyCost,
+    contractShortId: contractShortId,
+    decodeLedgerUpdate: decodeLedgerUpdate,
+    deployPlan: deployPlan,
+    encodeLedgerUpdate: encodeLedgerUpdate,
+    encodePumpState: encodePumpState,
+    fixedLE: fixedLE,
+    impliedReserve: impliedReserve,
+    leafHash: leafHash,
+    minimalLE: minimalLE,
+    ownerFromPubkey: ownerFromPubkey,
+    pumpContractSource: pumpContractSource,
+    replayLedger: replayLedger,
+    sellRefund: sellRefund,
+    tradeTx: tradeTx
+});
+
+// compiler.js — Midstate contract compiler.
+//
+// Lifted from the Midstate IDE (Lexer → Parser → CodeGen → assembleBytecode)
+// with no changes to the language, so a contract that compiles here produces the
+// same bytecode the IDE shows and therefore the same P2SH address.
+//
+// # Reasoning
+//
+// A launcher cannot pre-compile its contracts. Every token needs its own curve
+// with that token's asset id, treasury and parameters baked in, which means a
+// distinct script and a distinct address per launch. Compiling by hand in the
+// IDE works for one contract and not for a thousand, so the compiler has to be
+// callable from code.
+//
+// The opcode table is checked against the node's `core/script.rs` at load rather
+// than trusted: a table that has drifted produces bytecode that assembles
+// cleanly, hashes to a plausible address, and fails at execution — after funds
+// are already locked at that address.
+//
+// Note the node also defines `OP_SUM_INPUT_VALUE = 0x56`, which this language
+// does not expose. Contracts needing it must be written in assembly.
+
+const STD_LIB = `
+// ═════════════════════════════════════════════════════════════════════
+// MIDSTATE STANDARD LIBRARY (Auto-injected)
+// ═════════════════════════════════════════════════════════════════════
+
+// ── MATH ──
+macro min(x, y) { if (x < y) { x; } else { y; } }
+macro max(x, y) { if (x > y) { x; } else { y; } }
+
+// ── SECURITY PRIMITIVES ──
+macro require_signed_by(pk) {
+    pk; CHECKSIGVERIFY;
+}
+macro require_length(data, expected_len) {
+    assert(size(data) == expected_len);
+}
+
+macro require_timelock(blocks) {
+    blocks; CHECKTIMEVERIFY;
+}
+
+macro require_funds_transferred(amount, address) {
+    assert(sum_to_addr(address) >= amount);
+}
+
+// ── CRYPTO: MERKLE TREES ──
+// Standard step for verifying a static Merkle Proof
+// Expected Stack: [..., Sibling, Dir, Current]
+macro merkle_step() {
+    swap();
+    if (pop_int() == 1) { } else { swap(); }
+    concat();
+    hash();
+}
+
+// Advanced step for SIMULTANEOUSLY verifying an old root and calculating a new root.
+// Expected Stack: [..., Sibling, Dir, Old_Acc, New_Acc] (New_Acc is on top)
+macro merkle_update_step() {
+    swap(); 
+    rot();
+    if (pop_int() == 1) { 
+        rot(); dup(); rot(); concat(); hash(); 
+        rot(); rot(); swap(); concat(); hash();
+    } else { 
+        rot(); dup(); rot(); swap(); concat(); hash(); 
+        rot(); rot(); concat(); hash();
+    }
+}
+// ═════════════════════════════════════════════════════════════════════
+`;
+
+// ── Numeric helpers ─────────────────────────────────────────────────────────
+//
+// The VM's math opcodes are little-endian and capped at 8 bytes (`to_u64`
+// rejects anything wider), so both of these enforce that rather than silently
+// producing a value the VM will refuse.
+
+function intToHexLE$1(n) {
+    if (typeof n !== 'bigint') n = BigInt(n);
+    if (n === 0n) return '00';
+    let h = n.toString(16);
+    if (h.length % 2) h = '0' + h;
+    return h.match(/.{2}/g).reverse().join('');
+}
+
+const OPS={PUSH_DATA:0x01,DROP:0x10,DUP:0x11,SWAP:0x12,OVER:0x13,ROT:0x14,SLICE:0x15,CONCAT:0x16,PICK:0x17,EQUAL:0x20,VERIFY:0x21,EQUALVERIFY:0x22,ADD:0x23,GREATER_OR_EQUAL:0x24,SUB:0x25,MUL:0x26,DIV:0x27,MOD:0x28,SIZE:0x29,HASH:0x30,CHECKSIG:0x31,CHECKSIGVERIFY:0x32,CHECKTIMEVERIFY:0x33,IF:0x40,ELSE:0x41,ENDIF:0x42,SUM_TO_ADDR:0x50,READ_INPUT_STATE:0x51,READ_OUTPUT_STATE:0x52,INPUT_VALUE:0x53,OUTPUT_ADDRESS:0x54,THIS_ADDRESS:0x55,SUM_INPUT_VALUE:0x56};
+function assembleBytecode(asm) {
+  let bc=[];
+  for(let inst of asm){
+    let [op,...rest]=inst.split(' ');
+    if(op==='PUSH_HEX'||op==='PUSH_INT'){
+      bc.push(OPS.PUSH_DATA);
+      let hex=op==='PUSH_INT'?intToHexLE$1(BigInt(rest[0])):rest[0].toLowerCase();
+      if (hex.length % 2 !== 0) throw `Syntax Error: Hex string must have an even number of characters ('${hex}')`;
+      if (!/^[0-9a-f]*$/.test(hex)) throw `Syntax Error: Invalid hex characters in '${hex}'`;
+      let len=hex.length/2, lh=len.toString(16).padStart(4,'0');
+      bc.push(parseInt(lh.slice(2,4),16),parseInt(lh.slice(0,2),16));
+      for(let i=0;i<hex.length;i+=2)bc.push(parseInt(hex.slice(i,i+2),16));
+    } else {
+      if(OPS[op]===undefined)throw `Unknown opcode: ${op}`;
+      bc.push(OPS[op]);
+    }
+  }
+  return bc.map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+
+// ═══════════════════════════════════════════
+// LEXER
+// ═══════════════════════════════════════════
+class Lexer {
+  constructor(src){
+    this.src=src.replace(/\/\*[\s\S]*?\*\//g,'').replace(/\/\/.*/g,'');
+    this.pos=0;this.line=1;this.col=1;
+  }
+  adv(){let c=this.src[this.pos++];if(c==='\n'){this.line++;this.col=1;}else this.col++;return c;}
+  tokenize(){
+    const toks=[];
+    // ONLY true raw opcodes that never take (args) in high-level code
+    const RAW_OPS=['PUSH_INT','PUSH_HEX','DUP','DROP','SWAP','OVER','ROT','PICK','SLICE','CONCAT','EQUAL','EQUALVERIFY','CHECKSIG','CHECKSIGVERIFY','ADD','SUB','MUL','DIV','MOD','SIZE','GREATER_OR_EQUAL','HASH','CHECKTIMEVERIFY','VERIFY','INPUT_VALUE','SUM_INPUT_VALUE','OUTPUT_ADDRESS','THIS_ADDRESS'];
+    const KWS=['if','else','repeat','true','false','macro','let','var','state','struct','switch','case','default','assert','route','test'];
+    while(this.pos<this.src.length){
+      let c=this.src[this.pos];
+      if(/\s/.test(c)){this.adv();continue;}
+      let sl=this.line,sc=this.col;
+      if(/\d/.test(c)){let n='';while(this.pos<this.src.length&&/\d/.test(this.src[this.pos]))n+=this.adv();toks.push({t:'NUM',v:parseInt(n),l:sl,c:sc});continue;}
+      if(c==='"'||c==="'"){let q=this.adv(),s='';while(this.pos<this.src.length&&this.src[this.pos]!==q)s+=this.adv();if(this.pos>=this.src.length)throw `Unterminated string at ${sl}:${sc}`;this.adv();toks.push({t:'HEX',v:s,l:sl,c:sc});continue;}
+      if(c==='='&&this.src[this.pos+1]==='='){toks.push({t:'OP',v:'==',l:sl,c:sc});this.adv();this.adv();continue;}
+      if(c==='>'&&this.src[this.pos+1]==='='){toks.push({t:'OP',v:'>=',l:sl,c:sc});this.adv();this.adv();continue;}
+      if(c==='&'&&this.src[this.pos+1]==='&'){toks.push({t:'OP',v:'&&',l:sl,c:sc});this.adv();this.adv();continue;}
+      if(c==='|'&&this.src[this.pos+1]==='|'){toks.push({t:'OP',v:'||',l:sl,c:sc});this.adv();this.adv();continue;}
+      // FIXED: Added ':' to punctuation list (required for "field: size" in state/struct)
+      if(['+','-','*','/','%','{','}','(',')','.',';',',',':'].includes(c)){
+        if(c==='.') toks.push({t:'DOT',v:'.',l:sl,c:sc});
+        else toks.push({t:'P',v:c,l:sl,c:sc});
+        this.adv();continue;
+      }
+      if(c==='='||c==='>'||c==='<'){let op=this.adv();if(this.src[this.pos]==='=')op+=this.adv();toks.push({t:'ROP',v:op,l:sl,c:sc});continue;}
+      if(/[a-zA-Z_]/.test(c)){let id='';while(this.pos<this.src.length&&/[a-zA-Z0-9_]/.test(this.src[this.pos]))id+=this.adv();
+        if(RAW_OPS.includes(id))toks.push({t:'ASM',v:id,l:sl,c:sc});
+        else if(KWS.includes(id))toks.push({t:'KW',v:id,l:sl,c:sc});
+        else toks.push({t:'ID',v:id,l:sl,c:sc});continue;}
+      throw `Unknown char '${c}' at ${this.line}:${this.col}`;
+    }
+    return toks;
+  }
+}
+
+// ═══════════════════════════════════════════
+// PARSER
+// ═══════════════════════════════════════════
+
+class Parser {
+  constructor(toks){this.toks=toks;this.pos=0;}
+  pk(){return this.toks[this.pos];}
+  consume(et,ev){let t=this.toks[this.pos];if(!t)throw 'Unexpected EOF';if(et&&t.t!==et)throw `Syntax Error at ${t.l}:${t.c}: Expected ${et}, got '${t.v}'`;if(ev&&t.v!==ev)throw `Syntax Error at ${t.l}:${t.c}: Expected '${ev}', got '${t.v}'`;return this.toks[this.pos++];}
+  match(v){if(this.pk()&&this.pk().v===v){this.pos++;return true;}return false;}
+  parse(){let s=[];while(this.pos<this.toks.length){let st=this.parseStmt();if(st)s.push(st);}return s;}
+
+  parseStmt(){
+    let t=this.pk();if(!t)return null;
+
+    if(t.t==='KW'&&t.v==='let'){
+      this.consume();
+      let id=this.consume('ID').v;
+      this.consume('ROP','=');
+      let expr=this.parseExpr();
+      this.match(';');
+      return {type:'LetStmt', id, expr};
+    }
+
+    if(t.t==='KW'&&t.v==='var'){
+      this.consume();
+      let id=this.consume('ID').v;
+      this.consume('ROP','=');
+      let expr=this.parseExpr();
+      this.match(';');
+      return {type:'VarDecl', id, expr};
+    }
+// Check for bare assignment: identifier = expr
+if (t.t === 'ID' && this.toks[this.pos + 1]?.v === '=') {
+    const id = this.consume('ID').v;
+    this.consume('ROP', '=');
+    const expr = this.parseExpr();
+    this.match(';');
+    return { type: 'AssignStmt', id, expr, l: t.l, c: t.c }; 
+}
+    if(t.t==='KW'&&t.v==='macro'){
+      this.consume();
+      let name=this.consume('ID').v;
+      this.consume('P','(');
+      let params = [];
+      while(this.pk() && this.pk().v !== ')') {
+          params.push(this.consume('ID').v);
+          if (this.match(',')) continue;
+      }
+      this.consume('P',')');
+      let body=this.parseBlock();
+      return {type:'MacroDefStmt', name, params, body};
+    }
+
+    if(t.t==='KW'&&t.v==='state'){
+      this.consume();
+      let name=this.consume('ID').v;
+      this.consume('P','{');
+      let fields={}; let offset=0;
+      while(this.pk()&&this.pk().v!=='}'){
+        let fname=this.consume('ID').v;
+        this.consume('P',':');
+        let size=this.consume('NUM').v;
+        fields[fname]={offset, size};
+        offset += size;
+        this.match(',');
+      }
+      this.consume('P','}');
+      return {type:'StateDef', name, fields};
+    }
+
+    if(t.t==='KW'&&t.v==='struct'){
+      this.consume();
+      let name=this.consume('ID').v;
+      this.consume('P','{');
+      let fields={}; let offset=0;
+      while(this.pk()&&this.pk().v!=='}'){
+        let fname=this.consume('ID').v;
+        this.consume('P',':');
+        let size=this.consume('NUM').v;
+        fields[fname]={offset, size};
+        offset += size;
+        this.match(',');
+      }
+      this.consume('P','}');
+      return {type:'StructDef', name, fields};
+    }
+
+    if(t.t==='KW'&&t.v==='if')return this.parseIf();
+    if(t.t==='KW'&&t.v==='repeat')return this.parseRepeat();
+    if(t.t==='KW'&&t.v==='switch')return this.parseSwitch();
+    if(t.t==='KW'&&t.v==='route')return this.parseRoute();
+    if(t.t==='KW'&&t.v==='test') {
+      this.consume();
+      let name = this.consume('HEX').v; // Reusing your string tokenizer for the description
+      let body = this.parseBlock();
+      return {type: 'TestDef', name, body};
+    }
+if(t.t==='KW'&&t.v==='assert'){
+      this.consume();
+      this.consume('P','(');
+      let expr=this.parseExpr();
+      this.consume('P',')');
+      this.match(';');
+      return {type:'AssertStmt', expr, l: t.l, c: t.c}; 
+    }
+    if(t.t==='P'&&t.v==='{')return this.parseBlock();
+    if(t.t==='P'&&t.v===';'){this.consume();return null;}
+
+    if(t.t==='ASM'){
+      this.consume();
+      if(t.v==='PUSH_HEX'||t.v==='PUSH_INT'){
+        if(this.match('(')){let a=this.consume();if(!this.match(')'))throw `Expected ')' after ${t.v} arg`;this.match(';');return {type:'RawASM',op:t.v,arg:a.v.toString()};}
+        let a=this.consume();this.match(';');return {type:'RawASM',op:t.v,arg:a.v.toString()};
+      }
+      if(this.match('(')){if(!this.match(')'))throw `ASM '${t.v}' takes no args — expected ')'`;}
+      this.match(';');return {type:'RawASM',op:t.v};
+    }
+    if(t.t==='P'&&t.v==='+'){this.consume();this.match(';');return {type:'RawASM',op:'ADD'};}
+    if(t.t==='ROP'&&t.v==='=='){this.consume();this.match(';');return {type:'RawASM',op:'EQUAL'};}
+    if(t.t==='ROP'&&t.v==='>='){this.consume();this.match(';');return {type:'RawASM',op:'GREATER_OR_EQUAL'};}
+
+    let expr=this.parseExpr();this.match(';');return {type:'ExprStmt',expr};
+  }
+
+  parseSwitch(){
+    let t = this.consume('KW','switch');
+    if(!this.match('('))throw `Expected '(' after 'switch'`;
+    let expr=this.parseExpr();
+    if(!this.match(')'))throw `Expected ')'`;
+    if(!this.match('{'))throw `Expected '{' after switch`;
+    let cases=[];
+    while(this.pk()&&this.pk().v!=='}'){
+      if(this.match('case')){
+        let val=this.parseExpr();
+        this.consume('P',':');
+        let body=this.parseBlock()||this.parseStmt();
+        cases.push({val,body});
+      } else if(this.match('default')){
+        this.consume('P',':');
+        let body=this.parseBlock()||this.parseStmt();
+        cases.push({isDefault:true,body});
+      } else break;
+    }
+    if(!this.match('}'))throw `Missing '}' for switch`;
+    return {type:'SwitchStmt',expr,cases, l: t.l, c: t.c}; 
+  }
+  parseRoute(){
+    let t = this.consume('KW','route'); // <-- Capture token t here
+    if(!this.match('{'))throw `Expected '{' after route`;
+    let cases=[];
+    while(this.pk()&&this.pk().v!=='}'){
+      if(this.match('case')){
+        let val=this.parseExpr();
+        this.consume('P',':');
+        let body=this.parseBlock()||this.parseStmt();
+        cases.push({val,body});
+      } else if(this.match('default')){
+        this.consume('P',':');
+        let body=this.parseBlock()||this.parseStmt();
+        cases.push({isDefault:true,body});
+      } else break;
+    }
+    this.consume('P','}');
+    
+    return {type:'SwitchStmt', expr: {type:'ImplicitTop'}, cases, l: t.l, c: t.c}; 
+  }
+
+  parseBlock(){let s=this.consume('P','{');let stmts=[];while(this.pos<this.toks.length&&(!this.pk()||this.pk().v!=='}')){let st=this.parseStmt();if(st)stmts.push(st);}if(!this.match('}'))throw `Missing '}' for block at ${s.l}`;return {type:'BlockStmt',stmts};}
+  parseIf(){this.consume('KW','if');if(!this.match('('))throw `Expected '(' after 'if'`;let cond=this.parseExpr();if(!this.match(')'))throw `Expected ')' after if condition`;let thenB=this.parseBlock(),elseB=null;if(this.match('else')){if(this.pk()&&this.pk().v==='if')elseB=this.parseIf();else elseB=this.parseBlock();}return {type:'IfStmt',cond,thenB,elseB};}
+  parseRepeat(){this.consume('KW','repeat');if(!this.match('('))throw `Expected '(' after 'repeat'`;let n=this.consume('NUM');if(!this.match(')'))throw `Expected ')'`;return {type:'RepeatStmt',count:n.v,body:this.parseBlock()};}
+  parseExpr(){return this.parseLOr();}
+  parseLOr(){let e=this.parseLAnd();while(this.match('||'))e={type:'Bin',l:e,op:'||',r:this.parseLAnd()};return e;}
+  parseLAnd(){let e=this.parseEq();while(this.match('&&'))e={type:'Bin',l:e,op:'&&',r:this.parseEq()};return e;}
+  parseEq(){
+    let e=this.parseAdd();
+    while(this.match('==')||this.match('>=')||this.match('>')||this.match('<=')||this.match('<')){   
+      let op=this.toks[this.pos-1].v;
+      e={type:'Bin',l:e,op,r:this.parseAdd()};
+    }
+    return e;
+  }
+  parseAdd(){
+    let e=this.parseMul();
+    while(this.match('+')||this.match('-')){
+      let op=this.toks[this.pos-1].v;
+      let r=this.parseMul();
+      // Fold constants if both sides are static integers
+      if(e.type==='Lit' && r.type==='Lit' && e.k==='int' && r.k==='int') {
+          e = {type:'Lit', v: op==='+' ? e.v+r.v : e.v-r.v, k:'int'};
+      } else {
+          e={type:'Bin',l:e,op,r};
+      }
+    }
+    return e;
+  }
+  
+  parseMul(){
+    let e=this.parsePrim();
+    while(this.match('*')||this.match('/')||this.match('%')){
+      let op=this.toks[this.pos-1].v;
+      let r=this.parsePrim();
+      // Fold constants if both sides are static integers
+      if(e.type==='Lit' && r.type==='Lit' && e.k==='int' && r.k==='int') {
+          let val = 0;
+          if (op === '*') val = e.v * r.v;
+          else if (op === '/') val = Math.floor(e.v / r.v);
+          else if (op === '%') val = e.v % r.v;
+          e = {type:'Lit', v: val, k:'int'};
+      } else {
+          e={type:'Bin',l:e,op,r};
+      }
+    }
+    return e;
+  }
+parsePrim(){
+    let t=this.pk();if(!t)throw 'Unexpected EOF in expression';
+    if(this.match('(')){let e=this.parseExpr();if(!this.match(')'))throw `Missing ')' at ${t.l}:${t.c}`;return e;}
+    t=this.consume();
+    if(t.t==='NUM')return {type:'Lit',v:t.v,k:'int',l:t.l,c:t.c};
+    if(t.t==='HEX')return {type:'Lit',v:t.v,k:'hex',l:t.l,c:t.c};
+    if(t.t==='KW'&&t.v==='true')return {type:'Lit',v:1,k:'int',l:t.l,c:t.c};
+    if(t.t==='KW'&&t.v==='false')return {type:'Lit',v:0,k:'int',l:t.l,c:t.c};
+    if(t.t==='ID'){
+      if(this.match('.')){
+        let field=this.consume('ID').v;
+        return {type:'FieldAccess', base:t.v, field, l:t.l, c:t.c};
+      }
+      if(this.match('(')){
+          let args=[];
+          while(this.pk()&&this.pk().v!==')'){
+              args.push(this.parseExpr());this.match(',');
+          }
+          if(!this.match(')'))throw `Missing ')' for '${t.v}'`;
+          return {type:'Call',name:t.v,args,l:t.l,c:t.c};
+      }
+      return {type:'Lit',v:t.v,k:'hex',l:t.l,c:t.c};
+    }
+    throw `Syntax Error at ${t.l}:${t.c}: Unexpected token '${t.v}'`;
+  }
+}
+
+// ═══════════════════════════════════════════
+// CODE GEN
+// ═══════════════════════════════════════════
+class CodeGen {
+  constructor(){
+    this.asm = [];
+    this.sourceMap = [];
+    this.macros = {};
+    this.constants = {};
+    this.structs = {};
+    this.locals = [];           // list of active var names (stack order)
+    this.stateDefs = {};
+    this.stackDepthOffset = 0;
+    this.simulatedStackDepth = 0;
+  }
+  emit(op, line){
+    this.asm.push(op);
+    this.sourceMap.push(line || 0);
+    
+    // Calculate stack effect of this operation
+    let baseOp = op.split(' ')[0];
+    
+    if (baseOp.startsWith('PUSH_') || baseOp === 'DUP' || baseOp === 'READ_INPUT_STATE' || baseOp === 'SIZE' || baseOp === 'INPUT_VALUE' || baseOp === 'SUM_INPUT_VALUE' || baseOp === 'THIS_ADDRESS') {
+        this.simulatedStackDepth += 1;
+    } else if (baseOp === 'DROP' || baseOp === 'ADD' || baseOp === 'SUB' || baseOp === 'MUL' || baseOp === 'DIV' || baseOp === 'MOD' || baseOp === 'EQUAL' || baseOp === 'EQUALVERIFY' || baseOp === 'GREATER_OR_EQUAL' || baseOp === 'CONCAT' || baseOp === 'CHECKSIG' || baseOp === 'CHECKSIGVERIFY' || baseOp === 'CHECKTIMEVERIFY' || baseOp === 'VERIFY') {
+        this.simulatedStackDepth -= 1;
+    } else if (baseOp === 'SLICE') {
+        this.simulatedStackDepth -= 2; 
+    }
+    // SWAP, OVER, ROT, PICK, HASH, SUM_TO_ADDR, READ_OUTPUT_STATE, OUTPUT_ADDRESS have a net 0 effect.
+    // (OUTPUT_ADDRESS pops index, pushes address — net 0.)
+
+    if (this.simulatedStackDepth > 64) {
+        throw `Fatal Compiler Error: Maximum stack depth of 64 exceeded at line ${line || 'unknown'}. (Current depth: ${this.simulatedStackDepth})`;
+    }
+  }
+  
+  generate(ast) {
+    for(let n of ast) if(n) this.genStmt(n);
+    return this.optimize(this.asm);
+  }
+
+  optimize(asm) {
+    let opt = [];
+    for(let i=0; i<asm.length; i++) {
+      let curr = asm[i];
+      let next = asm[i+1];
+      
+      // Strip ONLY pure stack redundancies, leave math alone (used for type-casting)
+      if (curr === 'SWAP' && next === 'SWAP') { i++; continue; }
+      if (curr === 'DUP' && next === 'DROP') { i++; continue; }
+      
+      opt.push(curr);
+    }
+    return opt;
+  }
+
+  genStmt(s){
+    if(s.type==='TestDef') {
+      this.tests = this.tests || {};
+      this.tests[s.name] = s.body;
+      return; 
+    }
+    if(s.type==='MacroDefStmt'){this.macros[s.name]={params: s.params, body: s.body};}
+    else if(s.type==='LetStmt'){this.constants[s.id]=s.expr;}
+    else if(s.type==='VarDecl'){
+      // Prevent Shadowing
+      const existing = this.locals.find(l => l.id === s.id);
+      if (existing) {
+          throw `Semantic Error at ${s.l}:${s.c}: Cannot redeclare variable '${s.id}'. Shadowing is forbidden in Midscript.`;
+      }
+
+      let tType = this.genExpr(s.expr); 
+      this.locals.push({id: s.id, type: tType});
+    }
+    else if(s.type==='StateDef' || s.type==='StructDef'){
+      this.structs[s.name]=s.fields;
+      if(s.type==='StateDef') this.stateDefs[s.name]=s.fields;
+    }
+    else if(s.type==='BlockStmt') {
+      let initialLocals = this.locals.length; 
+      for(let c of s.stmts) this.genStmt(c);
+      let toDrop = this.locals.length - initialLocals;
+      for(let i=0; i<toDrop; i++) {
+        this.emit('DROP', s.l); // Pass line
+        this.locals.pop(); 
+      }
+    }
+    else if (s.type === 'AssignStmt') {
+        const idx = this.locals.findIndex(l => l.id === s.id);
+        if (idx === -1) throw `Semantic Error at ${s.l}:${s.c}: Assignment to undeclared variable '${s.id}'`;
+        
+        // Push the new value to the top of the stack
+        let newType = this.genExpr(s.expr);
+        
+        // Calculate depth to the old variable (remember we just pushed 1 new item!)
+        const depth = this.locals.length - idx; 
+
+        if (depth === 1) {
+            // It was already on top. Just swap the new one in and drop the old.
+            this.emit('SWAP', s.l);
+            this.emit('DROP', s.l);
+        } else if (depth === 2) {
+            // It's the second item. ROT pulls it to the top so we can drop it, 
+            // then we SWAP to put the new value in its place.
+            this.emit('ROT', s.l);
+            this.emit('DROP', s.l);
+            this.emit('SWAP', s.l);
+        } else {
+            // Deep assignment. We have to pull it up with a targeted ROT, 
+            // drop it, and push the new value down. 
+            // Midstate script doesn't have OP_ROLL, so deep mutable state 
+            // is restricted. Best practice: shadow variables instead of mutating them.
+            throw `Semantic Error at ${s.l}:${s.c}: Cannot reassign '${s.id}' (depth ${depth}). To mutate deep variables, redeclare them (e.g. 'var ${s.id} = ...').`;
+        }
+        this.locals[idx].type = newType;
+    }
+    else if(s.type==='AssertStmt'){
+      this.genExpr(s.expr);
+      this.emit('VERIFY', s.l); // VERIFY is usually where runtime errors happen!
+    }
+    else if(s.type==='ExprStmt')this.genExpr(s.expr);
+    else if(s.type==='RawASM')this.emit(s.arg!==undefined?`${s.op} ${s.arg}`:s.op, s.l);
+    else if(s.type==='IfStmt'){
+      this.genExpr(s.cond);
+      this.emit('IF', s.l);
+      this.genStmt(s.thenB);
+      if(s.elseB){this.emit('ELSE', s.l); this.genStmt(s.elseB);}
+      this.emit('ENDIF', s.l);
+    }
+    else if(s.type==='RepeatStmt'){for(let i=0;i<s.count;i++)this.genStmt(s.body);}
+    else if(s.type==='SwitchStmt'){this.genSwitch(s);}
+  } 
+
+genSwitch(sw) {
+  this.genExpr(sw.expr); // Push routing value
+  let cases = sw.cases.filter(c => !c.isDefault);
+  let def = sw.cases.find(c => c.isDefault);
+  
+  for(let i=0; i<cases.length; i++) {
+    this.emit('DUP', sw.l); 
+    this.genExpr(cases[i].val);
+    this.emit('EQUAL', sw.l); 
+    this.emit('IF', sw.l); 
+    this.emit('DROP', sw.l); 
+    this.genStmt(cases[i].body);
+    this.emit('ELSE', sw.l); 
+  }
+  
+  this.emit('DROP', sw.l); 
+  if (def) this.genStmt(def.body);
+  
+  for(let i=0; i<cases.length; i++) {
+    this.emit('ENDIF', sw.l); 
+  }
+}
+
+  genExpr(e){
+    if(e.type==='ImplicitTop') return 'unknown'; 
+    
+    if(e.type==='Lit'){
+      const idx = this.locals.findIndex(l => l.id === e.v);
+      if (idx !== -1) {
+          const depth = this.locals.length - 1 - idx + this.stackDepthOffset;
+          const varType = this.locals[idx].type;
+          
+          if (depth === 0) {
+              this.emit('DUP', e.l);
+          } else if (depth === 1) {
+              this.emit('OVER', e.l);
+          } else {
+              this.emit(`PUSH_INT ${depth}`, e.l);
+              this.emit('PICK', e.l);
+          }
+          return varType;
+      }
+      
+      if (e.v === 'READ_INPUT_STATE') { this.emit('READ_INPUT_STATE', e.l); return 'hex'; }
+      if (e.v === 'READ_OUTPUT_STATE') { this.emit('READ_OUTPUT_STATE', e.l); return 'hex'; }
+
+      if(this.constants[e.v]) {
+        return this.genExpr(this.constants[e.v]);
+      } else {
+        if (e.k === 'hex' && !/^[0-9a-fA-F]*$/.test(e.v)) {
+          throw `Semantic Error at ${e.l}:${e.c}: Undeclared identifier or invalid hex '${e.v}'`;
+        }
+        this.emit(e.k==='int'?`PUSH_INT ${e.v}`:`PUSH_HEX ${e.v}`, e.l);
+        return e.k;
+      }
+    }
+    else if(e.type==='Bin'){
+      let lType = this.genExpr(e.l);
+      this.stackDepthOffset++; 
+      let rType = this.genExpr(e.r);
+      this.stackDepthOffset--; 
+
+      const isMath = ['+', '-', '*', '/'].includes(e.op);
+      const isComparison = ['==', '>=', '>', '<=', '<'].includes(e.op);
+      const isLogical = ['&&', '||'].includes(e.op);
+      
+      const line = e.l.l || 'unknown';
+      const col = e.l.c || 'unknown';
+
+      if (isMath && ((lType !== 'int' && lType !== 'unknown') || (rType !== 'int' && rType !== 'unknown'))) {
+          throw `Semantic Error at ${line}:${col}: Type Mismatch. Math ('${e.op}') requires both sides to be integers.`;
+      }
+      
+      if (isComparison && lType !== rType && lType !== 'unknown' && rType !== 'unknown') {
+          throw `Semantic Error at ${line}:${col}: Type Mismatch. Cannot compare an '${lType}' with an '${rType}'.`;
+      }
+
+      if (isLogical && (lType === 'hex' || rType === 'hex')) {
+          throw `Semantic Error at ${line}:${col}: Type Mismatch. Logical operators ('${e.op}') require evaluated boolean/int expressions, not raw hex.`;
+      }
+      
+      if(e.op==='==')this.emit('EQUAL', e.l);
+      if(e.op==='>=')this.emit('GREATER_OR_EQUAL', e.l);
+      if(e.op==='>'){
+        this.emit('PUSH_INT 1', e.l); 
+        this.emit('ADD', e.l); 
+        this.emit('GREATER_OR_EQUAL', e.l);
+      }
+      if(e.op==='<='){
+        this.emit('SWAP', e.l); 
+        this.emit('GREATER_OR_EQUAL', e.l);
+      }
+      if(e.op==='<'){
+        this.emit('SWAP', e.l); 
+        this.emit('PUSH_INT 1', e.l); 
+        this.emit('ADD', e.l); 
+        this.emit('GREATER_OR_EQUAL', e.l);
+      }
+      
+      
+      if(e.op==='+')this.emit('ADD', e.l);
+      if(e.op==='-')this.emit('SUB', e.l);
+      if(e.op==='*')this.emit('MUL', e.l);
+      if(e.op==='/')this.emit('DIV', e.l);
+      if(e.op==='%')this.emit('MOD', e.l);
+      if(e.op==='&&'){this.emit('ADD', e.l); this.emit('PUSH_INT 2', e.l); this.emit('EQUAL', e.l);}
+      if(e.op==='||'){this.emit('ADD', e.l); this.emit('PUSH_INT 1', e.l); this.emit('GREATER_OR_EQUAL', e.l);}
+      
+      return 'int';
+    }
+    else if(e.type==='Call'){
+      const fn=e.name;
+      if(this.macros[fn]){
+        const mac = this.macros[fn];
+        if (e.args.length !== mac.params.length) throw `Semantic Error at ${e.l}:${e.c}: Macro '${fn}' expects ${mac.params.length} arguments.`;
+
+        let macroLocalsSnapshot = this.locals.length; 
+        
+        for (let i = 0; i < e.args.length; i++) {
+            let argType = this.genExpr(e.args[i]);
+            this.locals.push({id: mac.params[i], type: argType});
+        }
+        
+        this.genStmt(mac.body);
+        
+        let toDrop = this.locals.length - macroLocalsSnapshot;
+        for(let i=0; i<toDrop; i++) {
+            this.emit('DROP', e.l);
+            this.locals.pop();
+        }
+        return 'unknown';
+      }
+      else if(fn==='pop') {
+          throw `Semantic Error at ${e.l}:${e.c}: Use 'pop_int()' or 'pop_hex()' to ensure type safety. Generic 'pop()' is unsafe.`;
+      }
+      else if(fn==='pop_int') {
+          return 'int';
+      }
+      else if(fn==='pop_hex') {
+          return 'hex';
+      }
+      else if(fn==='size') { 
+          this.genExpr(e.args[0]); 
+          this.emit('SIZE', e.l); 
+          this.emit('SWAP', e.l); 
+          this.emit('DROP', e.l); 
+          return 'int'; 
+      }
+      else if(fn==='input_value') { 
+          this.emit('INPUT_VALUE', e.l); 
+          return 'int'; 
+      }
+      else if(fn==='pick') {
+          this.genExpr(e.args[0]);
+          this.emit('PICK', e.l);
+          return 'unknown';
+      }
+      else if(fn==='peek') { this.emit('DUP', e.l); return 'unknown'; }
+      else if(fn==='dup') { this.emit('DUP', e.l); return 'unknown'; }
+      else if(fn==='drop') { this.emit('DROP', e.l); return 'unknown'; }
+      else if(fn==='swap') { this.emit('SWAP', e.l); return 'unknown'; }
+      else if(fn==='over') { this.emit('OVER', e.l); return 'unknown'; }
+      else if(fn==='rot') { this.emit('ROT', e.l); return 'unknown'; }
+      else if(fn==='slice') { 
+          // Slice usually pops: [value, offset, length]
+          // We need to generate expressions for arguments if they exist
+          if(e.args.length === 3) {
+             this.genExpr(e.args[0]); this.stackDepthOffset++;
+             this.genExpr(e.args[1]); this.stackDepthOffset++;
+             this.genExpr(e.args[2]); this.stackDepthOffset -= 2;
+          }
+          this.emit('SLICE', e.l); return 'hex'; 
+      }
+      else if(fn==='concat') {
+          if (e.args && e.args.length === 2) {
+              this.genExpr(e.args[0]);
+              this.stackDepthOffset++;
+              this.genExpr(e.args[1]);
+              this.stackDepthOffset--;
+          }
+          this.emit('CONCAT', e.l); return 'hex';
+      }
+      else if(fn==='add') { this.emit('ADD', e.l); return 'int'; }
+      else if(fn==='sub') { this.emit('SUB', e.l); return 'int'; }
+      else if(fn==='mul') { this.emit('MUL', e.l); return 'int'; }
+      else if(fn==='div') { this.emit('DIV', e.l); return 'int'; }
+      else if(fn==='hash') {
+          if (e.args && e.args.length > 0) this.genExpr(e.args[0]);
+          this.emit('HASH', e.l); return 'hex';
+      }
+      else if(fn==='fail'){
+          this.emit('PUSH_INT 0', e.l);
+          this.emit('VERIFY', e.l);   
+          return 'unknown';
+      }
+      else if(fn==='verify_gte'){
+          this.genExpr(e.args[0]);
+          this.emit('GREATER_OR_EQUAL', e.l);
+          this.emit('VERIFY', e.l); 
+          return 'unknown';
+      }
+      else if(fn==='require_preimage'){
+          this.emit('HASH', e.l);
+          this.genExpr(e.args[0]);
+          this.emit('EQUALVERIFY', e.l); 
+          return 'unknown';
+      }
+      else if(fn==='require_time'){
+          this.genExpr(e.args[0]);
+          this.emit('CHECKTIMEVERIFY', e.l); 
+          return 'unknown';
+      }
+      else if(fn==='require_sig'){
+          this.genExpr(e.args[0]);
+          this.emit('CHECKSIGVERIFY', e.l); 
+          return 'unknown';
+      }
+      else if(fn==='check_sig'){
+          this.genExpr(e.args[0]);
+          this.emit('CHECKSIG', e.l); 
+          return 'int';
+      }
+      else if(fn==='require_transfer'){
+        this.genExpr(e.args[0]);
+        this.emit('SUM_TO_ADDR', e.l); 
+        this.stackDepthOffset++;
+        this.genExpr(e.args[1]);
+        this.stackDepthOffset--;
+        this.emit('EQUALVERIFY', e.l);
+        return 'unknown';
+      }
+      else if(fn==='sum_to_addr'){this.genExpr(e.args[0]); this.emit('SUM_TO_ADDR', e.l); return 'int';}
+      else if(fn==='read_input_state'){this.emit('READ_INPUT_STATE', e.l); return 'hex';}
+      else if(fn==='read_output_state'){this.genExpr(e.args[0]); this.emit('READ_OUTPUT_STATE', e.l); return 'hex';}
+      else if(fn==='output_address'){this.genExpr(e.args[0]); this.emit('OUTPUT_ADDRESS', e.l); return 'hex';}
+      else if(fn==='this_address'){this.emit('THIS_ADDRESS', e.l); return 'hex';}
+      else if(fn==='sum_input_value'){this.emit('SUM_INPUT_VALUE', e.l); return 'int';}
+      else throw `Semantic Error at ${e.l}:${e.c}: Unknown function or macro '${fn}'`;
+    }
+    else if(e.type==='FieldAccess'){
+      let def = this.structs[e.base] || this.stateDefs[e.base];
+      if(!def || !def[e.field]) throw `Semantic Error at ${e.l}:${e.c}: Unknown field '${e.field}' on '${e.base}'`;
+      let f = def[e.field];
+      this.emit('READ_INPUT_STATE', e.l);
+      this.emit(`PUSH_INT ${f.offset}`, e.l);
+      this.emit(`PUSH_INT ${f.size}`, e.l);
+      this.emit('SLICE', e.l);
+      
+      if (f.size <= 8) {
+          this.emit('PUSH_INT 0', e.l);
+          this.emit('ADD', e.l);
+          return 'int';
+      }
+      return 'hex';
+    }
+  }
+}
+
+// ── Public API ──────────────────────────────────────────────────────────────
+
+/**
+ * Compile Midstate contract source to bytecode.
+ *
+ * The standard library is prepended, exactly as the IDE does, so `min`, `max`,
+ * `require_signed_by` and friends are available without an import.
+ *
+ * @param {string} source
+ * @returns {{bytecode: string, asm: string[], sizeBytes: number, sigops: number}}
+ * @throws If the source does not compile, or the result exceeds MAX_SCRIPT_SIZE.
+ */
+function compile(source) {
+    const stdAst = new Parser(new Lexer(STD_LIB).tokenize()).parse();
+    const userAst = new Parser(new Lexer(String(source)).tokenize()).parse();
+    const gen = new CodeGen();
+    const asm = gen.generate([...stdAst, ...userAst]);
+    const bytecode = assembleBytecode(asm);
+    const sizeBytes = bytecode.length / 2;
+    // Consensus caps a script at 1024 bytes. Failing here is much cheaper than
+    // discovering it when the funding transaction is rejected.
+    if (sizeBytes > MAX_SCRIPT_SIZE) {
+        throw new Error(`compiler: script is ${sizeBytes} B, MAX_SCRIPT_SIZE is ${MAX_SCRIPT_SIZE} B`);
+    }
+    return {
+        bytecode,
+        asm,
+        sizeBytes,
+        sigops: asm.filter((i) => i === 'CHECKSIG' || i === 'CHECKSIGVERIFY').length,
+    };
+}
+
+/** Consensus limit on compiled script length. */
+const MAX_SCRIPT_SIZE = 1024;
+
+// vm.js — Headless Midstate script VM.
+//
+// # Reasoning
+//
+// Ported from the IDE's step emulator with the DOM lookups replaced by an
+// explicit context, so a contract can be executed from code instead of by hand.
+//
+// This exists because a launcher funds a *fresh* contract address for every
+// token, and a contract that is wrong locks its funds at an address nobody can
+// spend from. There is no second chance and no upgrade path. Being able to run a
+// candidate transaction against the script before paying for a commit turns that
+// class of mistake from "funds gone" into "assertion failed on line 12".
+//
+// # Fidelity, and where it deliberately stops
+//
+// The arithmetic, stack, slicing, state reads and value sums are faithful to
+// `core/script.rs`. Two things are emulator conveniences inherited from the IDE
+// and MUST NOT be relied on as security properties:
+//
+//   - `CHECKSIG` / `CHECKSIGVERIFY` compare strings. The real VM verifies a WOTS
+//     or MSS signature. A contract that "passes" here on signature checks has
+//     proved nothing about signatures.
+//   - `HASH` uses BLAKE3, which is correct, but a non-hex operand is UTF-8
+//     encoded first, matching the IDE rather than any on-chain behaviour.
+//
+// So: use this to prove *arithmetic and state* correctness, which is where
+// bonding-curve and AMM bugs actually live. Do not use it to prove authorisation.
+
+
+/** State threads activate at this height; reads below it are rejected. */
+const STATE_THREAD_ACTIVATION_HEIGHT = 65_000n;
+/** The VM rejects a script that performs more than this many signature ops. */
+const MAX_SIGOPS_PER_SCRIPT = 3;
+
+/**
+ * `OP_SUM_INPUT_VALUE` is consensus-gated. Below this height a node returns
+ * `InvalidOpcode`, so any contract using it is unspendable until activation.
+ *
+ * This is NOT the same as the state-thread activation height (65,000) — an easy
+ * conflation, and one that makes a contract simulate cleanly at a height where
+ * the real VM would refuse the opcode outright.
+ */
+const COVENANT_SUM_ACTIVATION_HEIGHT = 300_000n;
+
+const intToHexLE = (n) => {
+    let v = typeof n === 'bigint' ? n : BigInt(n);
+    if (v === 0n) return '00';
+    let h = v.toString(16);
+    if (h.length % 2) h = '0' + h;
+    return h.match(/.{2}/g).reverse().join('');
+};
+
+const hexLEToInt = (h) => {
+    if (!h) return 0n;
+    // `to_u64` in the VM refuses operands wider than 8 bytes.
+    if (h.length > 16) throw new Error('InvalidOpcode: math operands are limited to 8 bytes');
+    return BigInt('0x' + h.match(/.{2}/g).reverse().join(''));
+};
+
+const isTrue = (h) => !!h && h.match(/.{2}/g).some((b) => parseInt(b, 16) !== 0);
+
+/**
+ * Execute a compiled contract.
+ *
+ * @param {Array} asm            Instruction list from `compile()`.
+ * @param {Object} ctx
+ * @param {string[]} [ctx.witness=[]]      Witness stack, pushed left→right.
+ * @param {string}  [ctx.inputState]       64-hex state of the consumed thread.
+ * @param {bigint}  [ctx.inputValue=0n]    Value of the coin being spent.
+ * @param {bigint}  [ctx.sumInputValue]    Total value of all inputs sharing this
+ *   predicate. Defaults to `inputValue` (the single-input case).
+ * @param {boolean} [ctx.allowValueBearingState=false] Permit one output to carry
+ *   BOTH a state commitment and value. Consensus forbids this; the flag exists
+ *   only to reproduce the IDE emulator, whose `address:value:state` context
+ *   format allows it. Never enable it to validate a contract you intend to
+ *   deploy — that is precisely the mistake it is here to document.
+ * @param {string}  [ctx.thisAddress]      64-hex address of this contract.
+ * @param {bigint}  [ctx.height]           Block height, for timelocks.
+ * @param {Array}   [ctx.outputs=[]]       `{address, value, state}` per output.
+ * @param {number}  [ctx.maxSteps=100000]  Guard against a runaway script.
+ * @returns {{ok:boolean, stack:string[], steps:number, error:string|null, trace:Array}}
+ */
+function execute(asm, ctx = {}) {
+    const {
+        witness = [], inputState = null, inputValue = 0n,
+        thisAddress = null, height = 100_000n, outputs = [], sumInputValue = null,
+        allowValueBearingState = false,
+        maxSteps = 100_000, trace: wantTrace = false,
+    } = ctx;
+
+    const stack = witness.map((w) => String(w).replace(/^0x/, '').toLowerCase());
+    const execStack = [];
+    const trace = [];
+    let sigops = 0, steps = 0;
+
+    const push = (v) => stack.push(String(v).toLowerCase());
+    const pop = () => {
+        if (!stack.length) throw new Error('Stack underflow');
+        return stack.pop();
+    };
+    const requireState = () => {
+        if (BigInt(height) < STATE_THREAD_ACTIVATION_HEIGHT) {
+            throw new Error(`InvalidOpcode: state threads activate at height ${STATE_THREAD_ACTIVATION_HEIGHT}`);
+        }
+    };
+    const outAt = (i) => {
+        if (i < 0 || i >= outputs.length) throw new Error(`InvalidStateRead: output index ${i} out of bounds`);
+        return outputs[i];
+    };
+
+    // ── Consensus precondition the script VM itself does not enforce ──
+    //
+    // `OutputData::Confidential` has NO value field: a state thread carries state
+    // and nothing else, and `apply_transaction` rejects any attempt to give one a
+    // value ("To send value AND state, create two outputs"). That rule lives in
+    // transaction application, not in the script VM, so a contract that assumes a
+    // state-carrying output can also hold a reserve executes perfectly here and is
+    // rejected on chain. Checking it up front is the whole point of simulating.
+    //
+    // The variant name is vestigial and misleading. It predates the removal of
+    // zk-STARK confidential transactions; state threads were retconned into the
+    // same variant. Its value is **zero and known**, not hidden — the node's own
+    // source calls the name "a trap" and carries a regression test for exactly
+    // the wrong reading. Anyone tempted to treat these outputs as carrying an
+    // unknown amount should read `value(Confidential{..}) = 0` in core/types.rs
+    // first.
+    for (let i = 0; i < outputs.length && !allowValueBearingState; i++) {
+        const o = outputs[i];
+        if (o && o.state && BigInt(o.value ?? 0) !== 0n) {
+            return {
+                ok: false, stack: [], steps: 0, trace: [],
+                error: `output ${i} carries both a state commitment and value ${o.value}; ` +
+                       'state threads must have value 0 — use a separate standard output for value',
+            };
+        }
+    }
+
+    try {
+        for (let pc = 0; pc < asm.length; pc++) {
+            if (++steps > maxSteps) throw new Error(`Step limit (${maxSteps}) exceeded`);
+            const raw = asm[pc];
+            const sp = String(raw).split(' ');
+            const op = sp[0];
+            const arg = sp.length > 1 ? sp.slice(1).join(' ') : undefined;
+            const live = execStack.every((e) => e === true);
+
+            if (wantTrace) trace.push({ pc, op, arg, live, stack: stack.slice() });
+
+            // Branch bookkeeping runs even in a dead branch, or nesting breaks.
+            if (op === 'IF') {
+                execStack.push(live ? isTrue(pop()) : false);
+                continue;
+            }
+            if (op === 'ELSE') {
+                const parentLive = execStack.length <= 1 || execStack.slice(0, -1).every((e) => e === true);
+                if (parentLive) execStack[execStack.length - 1] = !execStack[execStack.length - 1];
+                continue;
+            }
+            if (op === 'ENDIF') { execStack.pop(); continue; }
+            if (!live) continue;
+
+            if (op === 'CHECKSIG' || op === 'CHECKSIGVERIFY') {
+                if (++sigops > MAX_SIGOPS_PER_SCRIPT) {
+                    throw new Error('VerifyFailed: MAX_SIGOPS_PER_SCRIPT exceeded');
+                }
+            }
+
+            switch (op) {
+                case 'PUSH_HEX': push(arg); break;
+                case 'PUSH_INT': push(intToHexLE(BigInt(arg))); break;
+                case 'DROP': pop(); break;
+                case 'DUP': { const a = pop(); push(a); push(a); break; }
+                case 'SWAP': { const a = pop(), b = pop(); push(a); push(b); break; }
+                case 'OVER': {
+                    if (stack.length < 2) throw new Error('Stack underflow (OVER)');
+                    push(stack[stack.length - 2]); break;
+                }
+                case 'ROT': {
+                    if (stack.length < 3) throw new Error('Stack underflow (ROT)');
+                    push(stack.splice(stack.length - 3, 1)[0]); break;
+                }
+                case 'PICK': {
+                    const n = Number(hexLEToInt(pop()));
+                    if (n < 0 || n >= stack.length) throw new Error('Stack underflow (PICK)');
+                    push(stack[stack.length - 1 - n]); break;
+                }
+                case 'SIZE': { const a = pop(); push(a); push(intToHexLE(BigInt(a.length / 2))); break; }
+                case 'SLICE': {
+                    const len = Number(hexLEToInt(pop()));
+                    const off = Number(hexLEToInt(pop()));
+                    const a = pop();
+                    if (off * 2 + len * 2 > a.length) throw new Error('SLICE out of bounds');
+                    push(a.slice(off * 2, off * 2 + len * 2)); break;
+                }
+                case 'CONCAT': { const b = pop(), a = pop(); push(a + b); break; }
+                case 'EQUAL': { const b = pop(), a = pop(); push(a === b ? '01' : '00'); break; }
+                case 'VERIFY': if (!isTrue(pop())) throw new Error('VERIFY failed'); break;
+                case 'EQUALVERIFY': {
+                    const b = pop(), a = pop();
+                    if (a !== b) throw new Error(`EQUALVERIFY failed (${a} != ${b})`);
+                    break;
+                }
+                case 'ADD': { const b = pop(), a = pop(); push(intToHexLE(hexLEToInt(a) + hexLEToInt(b))); break; }
+                case 'SUB': {
+                    const b = pop(), a = pop();
+                    const d = hexLEToInt(a) - hexLEToInt(b);
+                    // Values are unsigned on this VM; a negative result is a bug
+                    // in the contract, not a wrapped number.
+                    if (d < 0n) throw new Error('Math overflow (SUB went negative)');
+                    push(intToHexLE(d)); break;
+                }
+                case 'MUL': { const b = pop(), a = pop(); push(intToHexLE(hexLEToInt(a) * hexLEToInt(b))); break; }
+                case 'DIV': {
+                    const b = pop(), a = pop(); const bv = hexLEToInt(b);
+                    if (bv === 0n) throw new Error('Division by zero');
+                    push(intToHexLE(hexLEToInt(a) / bv)); break;
+                }
+                case 'MOD': {
+                    const b = pop(), a = pop(); const bv = hexLEToInt(b);
+                    if (bv === 0n) throw new Error('Modulo by zero');
+                    push(intToHexLE(hexLEToInt(a) % bv)); break;
+                }
+                case 'GREATER_OR_EQUAL': {
+                    const b = pop(), a = pop();
+                    push(hexLEToInt(a) >= hexLEToInt(b) ? '01' : '00'); break;
+                }
+                case 'HASH': {
+                    const a = pop();
+                    const hex = (/^[0-9a-f]*$/.test(a) && a.length % 2 === 0)
+                        ? a
+                        : Array.from(new TextEncoder().encode(a)).map((b) => b.toString(16).padStart(2, '0')).join('');
+                    push(blake3_hash_hex(hex)); break;
+                }
+                // Emulator bypass — see the module header. Proves nothing.
+                case 'CHECKSIG': { const pk = pop(), sig = pop(); push(pk === sig ? '01' : '00'); break; }
+                case 'CHECKSIGVERIFY': {
+                    const pk = pop(), sig = pop();
+                    if (pk !== sig) throw new Error('CHECKSIGVERIFY failed');
+                    break;
+                }
+                case 'CHECKTIMEVERIFY': {
+                    const r = hexLEToInt(pop());
+                    if (BigInt(height) < r) throw new Error(`CHECKTIMEVERIFY failed (height ${height} < ${r})`);
+                    break;
+                }
+                case 'INPUT_VALUE': push(intToHexLE(BigInt(inputValue))); break;
+                case 'SUM_INPUT_VALUE': {
+                    if (BigInt(height) < COVENANT_SUM_ACTIVATION_HEIGHT) {
+                        throw new Error('InvalidOpcode: OP_SUM_INPUT_VALUE is not active at this height');
+                    }
+                    push(intToHexLE(BigInt(sumInputValue ?? inputValue))); break;
+                }
+                case 'THIS_ADDRESS': {
+                    if (!thisAddress || thisAddress.length !== 64) {
+                        throw new Error('InvalidStateRead: this_address must be 32 bytes');
+                    }
+                    push(thisAddress); break;
+                }
+                case 'OUTPUT_ADDRESS': {
+                    const o = outAt(Number(hexLEToInt(pop())));
+                    const addr = String(o.address || '').toLowerCase();
+                    if (addr.length !== 64) throw new Error('InvalidStateRead: output address must be 32 bytes');
+                    push(addr); break;
+                }
+                case 'SUM_TO_ADDR': {
+                    const addr = pop();
+                    if (addr.length !== 64) throw new Error('VerifyFailed: SUM_TO_ADDR requires a 32-byte address');
+                    let sum = 0n;
+                    for (const o of outputs) {
+                        if (String(o.address || '').toLowerCase() === addr) sum += BigInt(o.value ?? 0);
+                    }
+                    push(intToHexLE(sum)); break;
+                }
+                case 'READ_INPUT_STATE': {
+                    requireState();
+                    if (!inputState) throw new Error('InvalidStateRead: no input state provided');
+                    if (inputState.length !== 64) throw new Error('InvalidStateRead: state must be 32 bytes');
+                    push(inputState.toLowerCase()); break;
+                }
+                case 'READ_OUTPUT_STATE': {
+                    requireState();
+                    const o = outAt(Number(hexLEToInt(pop())));
+                    const s = String(o.state || '');
+                    if (s.length !== 64) throw new Error('InvalidStateRead: output state must be 32 bytes');
+                    push(s.toLowerCase()); break;
+                }
+                default: throw new Error(`Unknown opcode: ${op}`);
+            }
+        }
+
+        // A script succeeds on a truthy top of stack, as the node requires.
+        const top = stack.length ? stack[stack.length - 1] : null;
+        return {
+            ok: top !== null && isTrue(top),
+            stack: stack.slice(),
+            steps,
+            error: top === null ? 'script ended with an empty stack' : null,
+            trace,
+        };
+    } catch (e) {
+        return { ok: false, stack: stack.slice(), steps, error: e.message, trace };
+    }
+}
+
+/**
+ * Compile and execute in one call.
+ *
+ * The convenience form for "does this transaction satisfy this contract",
+ * which is the question a launcher needs answered before it funds anything.
+ */
+function simulate(compileFn, source, ctx) {
+    const compiled = compileFn(source);
+    const result = execute(compiled.asm, { ...ctx, thisAddress: ctx.thisAddress ?? blake3_hash_hex(compiled.bytecode) });
+    return { ...result, compiled };
+}
 
 var Message;
 (function (Message) {
@@ -36328,7 +44225,7 @@ async function decodeHandshakePayload(payloadBytes, remoteStaticKey, remoteIdent
 function getSignaturePayload(publicKey) {
     const prefix = fromString$2('noise-libp2p-static-key:');
     if (publicKey instanceof Uint8Array) {
-        return concat$1([prefix, publicKey], prefix.length + publicKey.length);
+        return concat$2([prefix, publicKey], prefix.length + publicKey.length);
     }
     publicKey.prepend(prefix);
     return publicKey;
@@ -36895,9 +44792,9 @@ function generateNoisePrologue(localFingerprint, remoteAddr, role) {
     const remote = multibaseDecoder.decode(certhash(remoteAddr));
     const byteLength = PREFIX.byteLength + local.bytes.byteLength + remote.byteLength;
     if (role === 'server') {
-        return concat$1([PREFIX, remote, local.bytes], byteLength);
+        return concat$2([PREFIX, remote, local.bytes], byteLength);
     }
-    return concat$1([PREFIX, local.bytes, remote], byteLength);
+    return concat$2([PREFIX, local.bytes, remote], byteLength);
 }
 
 function isServer(options, peerConnection) {
@@ -39254,4 +47151,4 @@ var index = /*#__PURE__*/Object.freeze({
     ping: ping
 });
 
-export { MidstateClient, MidstateUtils, storage as Storage, Wallet, decompose_amount, mine_commitment_pow, search_nonces };
+export { bincode as Bincode, CHAT_DICTIONARY, COMMITMENT_TTL, dex as Dex, launcher as Launcher, MAX_SCRIPT_SIZE, MAX_SIGOPS_PER_SCRIPT, MidstateClient, MidstateUtils, Miner, OPS, POOL_PROTOCOL, POOL_PUSH_PROTOCOL, PoolClient, pump as Pump, REORG_DEPTH, STATE_THREAD_ACTIVATION_HEIGHT, STD_LIB, storage as Storage, TEMPLATE_MAX_AGE_MS, Wallet, address_to_checksummed_hex, blake3_hash_hex, build_channel_reveal, build_channel_state, build_covenant_htlc_bytecode_hex, build_htlc_bytecode_hex, build_limit_order_covenant_bytecode_hex, build_multisig_2of2_address, compile, compute_coin_id_hex, compute_commitment_hex, compute_p2pk_address_hex, decompose_amount, decrypt_cli_wallet, execute as executeContract, findForkHeight, generate_phrase, __wbg_init as initWasm, initSync as initWasmSync, libp2pPoolTransport, maybeHandleReorg, mine_chat_pow_v2_wasm, mine_commitment_pow, pruneHistory, qbolt_build_close_reveal, qbolt_build_legacy_close_reveal, qbolt_build_legacy_close_state, qbolt_build_refund_reveal, qbolt_build_refund_state, qbolt_build_state, qbolt_channel_address, qbolt_channel_bytecode_hex, rollbackTo, search_nonces, simulate as simulateContract, verifyPoolProof, verify_mss_sig_wasm };

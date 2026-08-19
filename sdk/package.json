@@ -1,6 +1,6 @@
 {
   "name": "midstate-sdk",
-  "version": "2.9.0",
+  "version": "2.9.1",
   "description": "Official JavaScript SDK for the Midstate Blockchain",
   "main": "src/index.js",
   "type": "module",
@@ -17,12 +17,12 @@
     "./launcher": "./src/launcher.js",
     "./compiler": "./src/compiler.js",
     "./vm": "./src/vm.js",
-    "./pump": "./src/pump.js"
+    "./pump": "./src/pump.js",
+    "./bundle": "./dist/midstate-sdk.bundle.js"
   },
-  "files": [
-    "pkg",
-    "src"
-  ],
+  "files": ["pkg",
+             "src",
+             "dist"],
   "scripts": {
     "test": "node test-bincode.mjs && node test-wallet.mjs && node test-reorg.mjs && node test-miner.mjs && node test-dex.mjs && node test-launcher.mjs && node test-compiler.mjs && node test-pump.mjs",
     "test:codec": "node test-bincode.mjs",
@@ -56,5 +56,10 @@
     "@multiformats/multiaddr": "^13.0.3",
     "it-pipe": "^3.0.1",
     "libp2p": "^3.3.2"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^29.0.3",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "rollup": "^4.62.4"
   }
 }

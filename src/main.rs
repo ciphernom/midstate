@@ -4041,6 +4041,32 @@ fn wallet_import_rewards(path: &PathBuf, coinbase_file: &PathBuf, data_dir: &Pat
         })
         .collect();
 
+    // The coinbase log is append-only, and coinbase derivation is fully
+    // deterministic in (mining_seed, height, index) — see wallet::coinbase_seed
+    // and wallet::coinbase_salt. So a height mined more than once (a reorg, a
+    // restart, a re-mine) appends byte-identical entries: same address, same
+    // salt, same coin_id. The `existing_coins` guard below is a snapshot of the
+    // wallet taken *before* the insert loop and is never updated inside it, so
+    // it catches duplicates against coins already held but not duplicates
+    // occurring within this file. On a freshly created wallet that snapshot is
+    // empty, so every duplicate line imports unchecked.
+    let file_entries = new_coins.len();
+    let new_coins: Vec<wallet::WalletCoin> = {
+        let mut seen_in_file = std::collections::HashSet::new();
+        new_coins
+            .into_iter()
+            .filter(|wc| seen_in_file.insert(wc.coin_id))
+            .collect()
+    };
+    let dupes_in_file = file_entries - new_coins.len();
+    if dupes_in_file > 0 {
+        println!(
+            "Collapsed {} duplicate entr{} in the coinbase log (height mined more than once).",
+            dupes_in_file,
+            if dupes_in_file == 1 { "y" } else { "ies" }
+        );
+    }
+
     let existing_coins: std::collections::HashSet<_> = wallet.data.coins
         .iter()
         .map(|c| c.coin_id)
