@@ -1,19 +1,41 @@
 {
   "name": "midstate-sdk",
-  "version": "1.0.8",
+  "version": "2.9.0",
   "description": "Official JavaScript SDK for the Midstate Blockchain",
   "main": "src/index.js",
   "type": "module",
   "exports": {
     ".": "./src/index.js",
-    "./pkg/*": "./pkg/*"
+    "./bincode": "./src/bincode.js",
+    "./pkg/*": "./pkg/*",
+    "./reorg": "./src/reorg.js",
+    "./miner": "./src/miner.js",
+    "./pool": "./src/pool.js",
+    "./miner-pool": "./src/miner-pool.js",
+    "./miner-worker": "./src/miner-worker.js",
+    "./dex": "./src/dex.js",
+    "./launcher": "./src/launcher.js",
+    "./compiler": "./src/compiler.js",
+    "./vm": "./src/vm.js",
+    "./pump": "./src/pump.js"
   },
   "files": [
     "pkg",
     "src"
   ],
   "scripts": {
-    "test": "node test.js"
+    "test": "node test-bincode.mjs && node test-wallet.mjs && node test-reorg.mjs && node test-miner.mjs && node test-dex.mjs && node test-launcher.mjs && node test-compiler.mjs && node test-pump.mjs",
+    "test:codec": "node test-bincode.mjs",
+    "test:wallet": "node test-wallet.mjs",
+    "test:live": "node test.js",
+    "build": "rollup -c",
+    "test:reorg": "node test-reorg.mjs",
+    "test:miner": "node test-miner.mjs",
+    "smoke": "node smoke-live.mjs",
+    "test:dex": "node test-dex.mjs",
+    "test:launcher": "node test-launcher.mjs",
+    "test:compiler": "node test-compiler.mjs",
+    "test:pump": "node test-pump.mjs"
   },
   "keywords": [
     "midstate",

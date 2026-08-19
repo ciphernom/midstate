@@ -10,52 +10,33 @@ const MAX_RECONNECT_ATTEMPTS = 5;
 
 const isBrowser = typeof window !== 'undefined' && typeof window.document !== 'undefined';
 
-// --- Binary Parsing Helpers ---
-const SINGLE_BYTE_MAX = 250;
-export function encodeVarint(n) {
-    const v = typeof n === 'bigint' ? n : BigInt(n);
-    if (v < 0n) throw new Error('varint must be non-negative');
-    if (v <= 250n) return Uint8Array.of(Number(v));
-    if (v < (1n << 16n)) { const b = new Uint8Array(3); b[0] = 251; new DataView(b.buffer).setUint16(1, Number(v), true); return b; }
-    if (v < (1n << 32n)) { const b = new Uint8Array(5); b[0] = 252; new DataView(b.buffer).setUint32(1, Number(v), true); return b; }
-    if (v < (1n << 64n)) { const b = new Uint8Array(9); b[0] = 253; new DataView(b.buffer).setBigUint64(1, v, true); return b; }
-    throw new Error('varint too large');
-}
+// --- Binary wire codec ---
+// The bincode/varint codec lives in ./bincode.js so the wire format can be
+// tested without pulling in libp2p. Re-exported here because test.js and
+// downstream consumers import these names from the transport module.
+import {
+    encodeVarint,
+    decodeVarint,
+    encodeGetAddr,
+    decodeAddr,
+    encodeBinaryFrame,
+    encodeFrame,
+    encodePong,
+    decodeChatV2,
+    decodeChatAttachments,
+} from './bincode.js';
 
-function decodeVarint(buf, off = 0) {
-    const first = buf[off];
-    if (first === undefined) throw new Error('varint: out of bytes');
-    if (first <= SINGLE_BYTE_MAX) return { value: BigInt(first), size: 1 };
-    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-    if (first === 251) return { value: BigInt(dv.getUint16(off + 1, true)), size: 3 };
-    if (first === 252) return { value: BigInt(dv.getUint32(off + 1, true)), size: 5 };
-    if (first === 253) return { value: dv.getBigUint64(off + 1, true), size: 9 };
-    throw new Error('varint invalid');
-}
-
-export function encodeGetAddr() { return encodeVarint(5); }
-
-export function decodeAddr(payload) {
-    let off = 0;
-    const disc = decodeVarint(payload, off); off += disc.size;
-    if (disc.value !== 6n) throw new Error(`expected Addr discriminant`);
-    const count = decodeVarint(payload, off); off += count.size;
-    const out = [];
-    const dec = new TextDecoder();
-    for (let i = 0; i < Number(count.value); i++) {
-        const len = decodeVarint(payload, off); off += len.size;
-        const n = Number(len.value);
-        out.push(dec.decode(payload.subarray(off, off + n))); off += n;
-    }
-    return out;
-}
-
-function encodeBinaryFrame(payload) {
-    const msg = new Uint8Array(4 + payload.length);
-    new DataView(msg.buffer).setUint32(0, payload.length, true);
-    msg.set(payload, 4);
-    return msg;
-}
+export {
+    encodeVarint,
+    decodeVarint,
+    encodeGetAddr,
+    decodeAddr,
+    encodeBinaryFrame,
+    encodeFrame,
+    encodePong,
+    decodeChatV2,
+    decodeChatAttachments,
+};
 
 function isDialableTcpAddr(addr) {
     if (typeof addr !== 'string') return false;
@@ -63,14 +44,6 @@ function isDialableTcpAddr(addr) {
     if (!addr.includes('/tcp/') || !addr.includes('/p2p/')) return false;
     if (addr.includes('/127.0.0.1/') || addr.includes('/::1/') || addr.includes('/0.0.0.0/')) return false;
     return true;
-}
-
-function encodeFrame(obj) {
-    const jsonBytes = new TextEncoder().encode(JSON.stringify(obj));
-    const msg = new Uint8Array(4 + jsonBytes.length);
-    new DataView(msg.buffer).setUint32(0, jsonBytes.length, true);
-    msg.set(jsonBytes, 4);
-    return msg;
 }
 
 function waitForDrain(stream) {
@@ -194,53 +167,18 @@ export class P2PClient {
             const stream = data.stream || data;
             try {
                 const payload = await readBinaryFrame(stream, 5000);
-                if (payload.length > 0 && payload[0] === 19) {
-                    let off = 1;
-                    const senderLen = decodeVarint(payload, off); off += senderLen.size;
-                    const sender = new TextDecoder().decode(payload.subarray(off, off + Number(senderLen.value))); off += Number(senderLen.value);
-                    const timestampVi = decodeVarint(payload, off); off += timestampVi.size;
-                    const timestamp = Number(timestampVi.value);
 
-                    const nonceVi = decodeVarint(payload, off); off += nonceVi.size;
-                    const nonce = Number(nonceVi.value);
-                                    
-                    let replyTo = null;
-                    if (payload[off] === 1) { 
-                        const repVi = decodeVarint(payload, off + 1); 
-                        replyTo = Number(repVi.value); 
-                        off += 1 + repVi.size; 
-                    } else { off += 1; }
-
-                    const wordsLen = decodeVarint(payload, off); off += wordsLen.size;
-                    const words = Array.from(payload.subarray(off, off + Number(wordsLen.value))); off += Number(wordsLen.value);
-                    
-                    const attLen = decodeVarint(payload, off); off += attLen.size;
-                    const attachments = [];
-                    for (let i = 0; i < Number(attLen.value); i++) {
-                        const attTag = decodeVarint(payload, off); off += attTag.size;
-                        if (attTag.value === 0n) {
-                            const addrBytes = payload.subarray(off, off + 32); off += 32;
-                            attachments.push({ kind: "address", value: Array.from(addrBytes).map(b => b.toString(16).padStart(2,'0')).join('') });
-                        } else if (attTag.value === 9n) {
-                            // L2 Crypto Signature (Variable Length, prefixed by 4-byte LE u32)
-                            const sigLen = new DataView(payload.buffer, payload.byteOffset + off).getUint32(0, true);
-                            off += 4;
-                            const sigBytes = payload.subarray(off, off + sigLen);
-                            off += sigLen;
-                            attachments.push({ kind: "signature", value: Array.from(sigBytes).map(b => b.toString(16).padStart(2,'0')).join('') });
-                        } else {
-                            off += 32; // Skip other fixed 32-byte types to prevent crash
-                        }
-                    }
-
-                    if (this._onPushEvent) {
-                        this._onPushEvent({ ChatMessage: { sender, timestamp, nonce, reply_to: replyTo, words, attachments } });
-                    }
+                // ChatV2 pushes arrive on the native protocol. decodeChatV2
+                // returns null for any other discriminant, which we simply ACK
+                // and ignore — a newer node may send messages we don't model,
+                // and dropping the connection over one would be wrong.
+                const chat = decodeChatV2(payload);
+                if (chat && this._onPushEvent) {
+                    this._onPushEvent({ ChatMessage: chat });
                 }
-                
-                // ACK
-                const ackPayload = new Uint8Array([8, 0]);
-                await sendAll(stream, encodeBinaryFrame(ackPayload));
+
+                // ACK with Message::Pong { nonce: 0 }.
+                await sendAll(stream, encodeBinaryFrame(encodePong(0)));
                 try { await stream.close(); } catch(e){}
             } catch (e) {
                 try { stream.abort(e); } catch(err){}
