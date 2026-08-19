@@ -335,4 +335,58 @@ export class MidstateClient {
         });
         return { ok: r.ok, body: r.ok ? null : await r.text() };
     }
+
+    /**
+     * Submit a chat message whose PoW has already been mined locally.
+     *
+     * The difference from {@link sendChat} is who does the work and whose
+     * identity the message carries. `send_chat` asks the node to mine v2 PoW on
+     * your behalf and broadcast under its own light-peer id. `submit_chat`
+     * carries a nonce you mined yourself — via `mine_chat_pow_v2_wasm` — so the
+     * message goes out under the `sender` you name. The node's ChatV2
+     * validation accepts either a libp2p PeerId or a 64-char hex MSS pubkey
+     * there, which is what lets a wallet identity originate chat without
+     * borrowing the node's.
+     *
+     * The `timestamp` and `nonce` must be exactly the pair the PoW was mined
+     * over, or verification fails and the node drops the message.
+     *
+     * # Formal Specification
+     * ```text
+     * pre  words.length ≤ 10
+     * pre  attachments.length ≤ 4
+     * pre  verify_chat_pow_v2(sender, timestamp, nonce, reply_to, words, attachments)
+     * post Node broadcasts Message::ChatV2 verbatim
+     * ```
+     *
+     * @param {string}   sender      libp2p PeerId, or 64-char hex MSS pubkey.
+     * @param {number}   timestamp   Unix seconds used when mining the PoW.
+     * @param {number|bigint} nonce  The mined PoW nonce.
+     * @param {number[]} words       Dictionary indices (≤ 10).
+     * @param {number|null} replyTo  Parent message nonce, or null.
+     * @param {Object[]} attachments Typed attachments (≤ 4).
+     */
+    async submitChat(sender, timestamp, nonce, words, replyTo = null, attachments = []) {
+        // nonce is a u64 server-side and arrives here as a BigInt from
+        // mine_chat_pow_v2_wasm. JSON.stringify throws on BigInt, so normalize
+        // to Number — safe because the PoW search space is far below 2^53.
+        const params = {
+            sender,
+            timestamp: Number(timestamp),
+            nonce: Number(nonce),
+            reply_to: replyTo,
+            words,
+            attachments,
+        };
+        if (this.isP2P) {
+            const resp = await this.p2pClient.request({ method: 'submit_chat', params });
+            return { ok: resp.ok, body: resp.ok ? null : (resp.error || "Chat rejected") };
+        }
+        const r = await fetch(`${this.rpcUrl}/api/chat/submit`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params)
+        });
+        return { ok: r.ok, body: r.ok ? null : await r.text() };
+    }
 }
