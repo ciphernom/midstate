@@ -941,8 +941,21 @@ pub fn import_scanned(
         // far below u64::MAX, but a corrupt wallet file must not wrap arithmetic.
         let mut total_available = 0u64;
 
+        // Defensive: a wallet file may hold more than one entry for the same
+        // coin_id. Both entries necessarily share an address, so the co-spend
+        // rule below forces them into a single bundle, producing a transaction
+        // with duplicate inputs. That is rejected at reveal by the "Duplicate
+        // input coin" check — *after* the commit is mined and the commitment
+        // permanently bound to that input list, making the commit unrevealable
+        // until it expires. Counting each coin_id once here also keeps
+        // total_available and Bundle::total_value honest.
+        let mut seen_coin_ids = std::collections::HashSet::new();
+
         for coin in &self.data.coins {
             if !live_set.contains(&coin.coin_id) {
+                continue;
+            }
+            if !seen_coin_ids.insert(coin.coin_id) {
                 continue;
             }
             total_available = total_available.saturating_add(coin.value);
