@@ -2213,7 +2213,29 @@ async fn handle_light_request(
                 let size = self.mempool.len();
                 let txs = self.mempool.transactions_cloned();
                 let tx_json: Vec<serde_json::Value> = txs.iter()
-                    .filter_map(|tx| serde_json::to_value(tx).ok())
+                    .filter_map(|tx| {
+                        let mut v = serde_json::to_value(tx).ok()?;
+                        
+                        // Inject dynamic fields so WebRTC clients can parse them
+                        // exactly like the HTTP /mempool endpoint
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert("fee".to_string(), serde_json::json!(tx.fee()));
+                            
+                            match tx {
+                                Transaction::Reveal { inputs, outputs, salt, .. } 
+                                | Transaction::Consolidate { inputs, outputs, salt, .. } => {
+                                    let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+                                    let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+                                    let commitment = crate::core::types::compute_commitment(&input_ids, &output_hashes, salt);
+                                    obj.insert("commitment".to_string(), serde_json::json!(hex::encode(commitment)));
+                                }
+                                Transaction::Commit { commitment, .. } => {
+                                    obj.insert("commitment".to_string(), serde_json::json!(hex::encode(commitment)));
+                                }
+                            }
+                        }
+                        Some(v)
+                    })
                     .collect();
                 LightResponse::success(serde_json::json!({
                     "size": size,

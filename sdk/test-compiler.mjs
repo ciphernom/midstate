@@ -186,7 +186,11 @@ await t('division by zero is caught', () => {
 
 await t('SUM_TO_ADDR totals only matching outputs', () => {
     const A = 'aa'.repeat(32), B = 'bb'.repeat(32);
+    // An opcode probe: it finishes on the sum rather than on 0x01, which is
+    // not a valid contract ending, so the consensus end-of-script rule is
+    // relaxed for this one assertion.
     const res = execute(['PUSH_HEX ' + A, 'SUM_TO_ADDR'], {
+        allowDirtyStack: true,
         outputs: [{ address: A, value: 30n }, { address: B, value: 500n }, { address: A, value: 12n }],
     });
     assert(res.ok, `failed: ${res.error}`);
@@ -207,32 +211,34 @@ await t('an empty final stack is a failure, not a pass', () => {
     assert(execute(['PUSH_INT 1', 'DROP'], {}).ok === false, 'empty stack reported ok');
 });
 
-await t('require_signed_by() binds its argument as a local — do not use it with a stack signature', () => {
-    // A macro parameter is pushed as a LOCAL, so `require_signed_by(x)` leaves x
-    // on the stack ABOVE the signature. CHECKSIGVERIFY then consumes the pubkey
-    // twice, compares it against itself, passes vacuously, and the real
-    // signature is dropped unverified at macro exit.
+await t('require_signed_by() verifies the signature (was: bound its arg as a local)', () => {
+    // HISTORY: require_signed_by was a STD_LIB macro whose body re-referenced
+    // its own parameter, so the pubkey was pushed twice. CHECKSIGVERIFY then
+    // compared the pubkey against itself, passed vacuously, and the real
+    // signature was dropped unverified at macro exit. It silently disarmed
+    // authorisation, which is why the pump contract emits the two opcodes
+    // directly instead of using it.
     //
-    // This is not hypothetical: it silently disarmed the authorisation in the
-    // pump contract, which is why that contract emits the two opcodes directly.
-    // Any contract combining require_signed_by with a witness-supplied signature
-    // has the same latent hole.
+    // It is now a compiler builtin aliased to require_sig, so it behaves the
+    // same as emitting CHECKSIGVERIFY by hand.
     const viaMacro = compile('require_signed_by(pick(1)); true;');
     const direct = compile('pick(1); CHECKSIGVERIFY; true;');
 
-    // Witness: [payload, pk, sig]. Only the direct form should consume the sig.
-    const wit = ['07', 'aa'.repeat(32), 'bb'.repeat(32)];
-    const m = execute(viaMacro.asm, { witness: wit.slice(), height: TEST_HEIGHT });
-    const d = execute(direct.asm, { witness: wit.slice(), height: TEST_HEIGHT });
+    const good = ['07', 'aa'.repeat(32), 'aa'.repeat(32)];
+    const bad = ['07', 'aa'.repeat(32), 'bb'.repeat(32)];
 
-    assert(!d.ok, 'the direct form accepted a signature that does not match the pubkey');
-    assert(m.ok, 'macro form unexpectedly failed — the trap may have been fixed upstream');
+    assert(!execute(viaMacro.asm, { allowDirtyStack: true, witness: bad.slice(), height: TEST_HEIGHT }).ok,
+        'require_signed_by accepted a signature that does not match the pubkey');
+    assert(execute(viaMacro.asm, { allowDirtyStack: true, witness: good.slice(), height: TEST_HEIGHT }).ok,
+        'require_signed_by rejected a matching signature');
+    assert(!execute(direct.asm, { allowDirtyStack: true, witness: bad.slice(), height: TEST_HEIGHT }).ok,
+        'the direct form accepted a signature that does not match the pubkey');
 });
 
 await t('emitting CHECKSIGVERIFY directly does verify the signature', () => {
     const c = compile('pick(1); CHECKSIGVERIFY; true;');
-    const good = execute(c.asm, { witness: ['07', 'aa'.repeat(32), 'aa'.repeat(32)], height: TEST_HEIGHT });
-    const bad = execute(c.asm, { witness: ['07', 'aa'.repeat(32), 'bb'.repeat(32)], height: TEST_HEIGHT });
+    const good = execute(c.asm, { allowDirtyStack: true, witness: ['07', 'aa'.repeat(32), 'aa'.repeat(32)], height: TEST_HEIGHT });
+    const bad = execute(c.asm, { allowDirtyStack: true, witness: ['07', 'aa'.repeat(32), 'bb'.repeat(32)], height: TEST_HEIGHT });
     assert(good.ok, `a matching signature was rejected: ${good.error}`);
     assert(!bad.ok, 'a mismatched signature was accepted');
 });
