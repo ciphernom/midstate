@@ -311,15 +311,21 @@ pub async fn get_mempool(State(node): State<AppState>) -> Json<GetMempoolRespons
                 pow_zeros: crate::core::transaction::evaluate_commit_pow(commitment, *spam_nonce, &state).ok(),
                 ..Default::default()
             },
-            Transaction::Reveal { inputs, outputs, .. }
-            | Transaction::Consolidate { inputs, outputs, .. } => {
+            Transaction::Reveal { inputs, outputs, salt, .. }
+            | Transaction::Consolidate { inputs, outputs, salt, .. } => {
                 let (ins, outs, total_in, total_out) = describe_io(inputs, outputs);
                 let fee = tx.fee();
                 let size_bytes = bincode::serialized_size(tx).unwrap_or(0);
                 let fee_per_kb = if size_bytes > 0 {
                     ((fee as u128 * 1024) / size_bytes as u128) as u64
                 } else { 0 };
+                
+                let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+                let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+                let commitment = crate::core::types::compute_commitment(&input_ids, &output_hashes, salt);
+
                 TransactionInfo {
+                    commitment: Some(hex::encode(commitment)),
                     input_coins: Some(ins.iter().map(|i| i.coin_id.clone()).collect()),
                     output_coins: Some(outs.iter().filter_map(|o| o.coin_id.clone()).collect()),
                     fee: Some(fee),

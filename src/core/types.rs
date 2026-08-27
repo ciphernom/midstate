@@ -871,6 +871,27 @@ pub const COMMIT_WEIGHT_CAP_DEN: u128 = 4;
 /// - **Consensus-critical:** every node must gate at exactly this height.
 pub const COVENANT_SUM_ACTIVATION_HEIGHT: u64 = COMMIT_WEIGHT_CAP_ACTIVATION_HEIGHT;
 
+/// Activation height for the v6 opcode bank: `OP_NIP`, `OP_TUCK`, `OP_NOT`,
+/// `OP_LESS_THAN` and `OP_MERKLE_VERIFY`.
+///
+/// # Reasoning
+/// `OP_MERKLE_VERIFY` is the reason this bank exists. A Merkle proof written in
+/// script costs a flat 60 bytes per level, because the language has no jumps
+/// and must unroll the walk. Measured against the pump ledger: depth 1 compiles
+/// to 486 B and each further level adds exactly 60, reaching 966 B of the
+/// 1024 B limit at depth 9. That is what caps a token launch at 512 holders —
+/// a script-size artifact, not a protocol rule. Verifying a proof in one opcode
+/// makes depth a function of witness size instead, and returns roughly half the
+/// script budget to the contract.
+///
+/// The four stack and comparison opcodes ride along because they are cheap and
+/// the bank costs one upgrade deadline either way. `OP_NIP` in particular lets
+/// the compiler clean up macro arguments in one byte instead of two.
+///
+/// # Safety / Invariants
+/// - **Consensus-critical:** every node must gate at exactly this height.
+pub const V6_ACTIVATION_HEIGHT: u64 = 400_000;
+
 /// True iff a state at the given height should hash with V2 rules.
 /// Single source of truth for V2 activation across the codebase.
 #[inline]

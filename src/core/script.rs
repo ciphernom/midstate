@@ -83,6 +83,61 @@ pub const OP_THIS_ADDRESS: u8     = 0x55;
 ///   direction.
 pub const OP_SUM_INPUT_VALUE: u8  = 0x56;
 
+///v6 opcodes — stack, comparison and Merkle verification
+///
+/// Gated on `V6_ACTIVATION_HEIGHT`. See that constant for why the bank exists.
+
+/// Remove the item beneath the top of stack. `a b -> b`.
+///
+/// Saves a byte over `SWAP DROP` everywhere a value must be kept while
+/// something underneath it is discarded, which is the shape of every macro
+/// argument cleanup the compiler emits.
+pub const OP_NIP: u8              = 0x18;
+
+/// Copy the top of stack beneath the second item. `a b -> b a b`.
+pub const OP_TUCK: u8             = 0x19;
+
+/// Boolean inversion. `a -> !a`.
+///
+/// Without it `!=` has to be spelled `EQUAL PUSH 0 EQUAL`, and there is no way
+/// to negate a condition at all without an empty `IF/ELSE` pair.
+pub const OP_NOT: u8              = 0x2A;
+
+/// Strict less-than. `a b -> a < b`.
+///
+/// The VM has only `OP_GREATER_OR_EQUAL`, so the compiler synthesises `<` as
+/// `SWAP PUSH 1 ADD GREATER_OR_EQUAL`, which is four opcodes and an addition
+/// that can overflow at `u64::MAX`.
+pub const OP_LESS_THAN: u8        = 0x2B;
+
+/// Fold a Merkle proof and push the root it implies. `leaf proof -> root`.
+///
+/// `proof` is a flat blob of 33-byte records, each a 32-byte sibling hash
+/// followed by a one-byte direction flag; `1` places the sibling on the left.
+/// Records are walked from the leaf upward. An empty proof returns the leaf
+/// unchanged, which is a well-formed depth-0 tree.
+///
+/// # Reasoning
+/// Returning the root rather than a pass/fail against a supplied one costs one
+/// extra `OP_EQUAL` to check inclusion, and buys two things the boolean form
+/// cannot express. A contract with fewer than 32 bytes of state to spare can
+/// compare against a truncated root. And a ledger can derive its NEXT root by
+/// folding the same path with an updated leaf: checking old-leaf-to-old-root
+/// and new-leaf-to-new-root over one proof shows the update was a single-leaf
+/// replacement, which is a complete Merkle ledger update in two opcodes rather
+/// than a per-level unrolled walk.
+///
+/// # Safety / Invariants
+/// - **Consensus-gated.** `InvalidOpcode` below `V6_ACTIVATION_HEIGHT`.
+/// - **Bounded work.** Deeper than `MAX_MERKLE_DEPTH` is rejected outright, so
+///   a malformed witness cannot make a verifier hash longer than the bound.
+/// - **Ragged proofs are invalid**, not truncated: a length that is not a
+///   multiple of 33 is `VerifyFailed`, so two nodes cannot disagree about what
+///   a trailing partial record means.
+/// - **Direction flags are 0 or 1.** Any other byte is `VerifyFailed` rather
+///   than coerced, for the same reason.
+pub const OP_MERKLE_ROOT: u8      = 0x57;
+
 // ── Consensus limits ───────────────────────────────────────────────────────
 
 pub const MAX_SCRIPT_SIZE: usize  = 1_024;
@@ -91,6 +146,14 @@ pub const MAX_STACK_DEPTH: usize  = 64;
 /// Large enough for WOTS and MSS signatures (max ~1.5 KB).
 pub const MAX_ITEM_SIZE: usize    = 1_536;
 pub const MAX_SIGOPS_PER_SCRIPT: usize = 3;
+
+/// Deepest Merkle proof `OP_MERKLE_ROOT` will walk.
+///
+/// 32 levels addresses 4.3 billion leaves and needs a 1,056-byte proof, which
+/// already exceeds what fits alongside anything else in a witness. The bound is
+/// stated explicitly so the work an opcode can demand is legible from the
+/// consensus limits rather than implied by `MAX_ITEM_SIZE`.
+pub const MAX_MERKLE_DEPTH: usize = 32;
 
 
 
@@ -211,6 +274,11 @@ pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<(), ScriptErro
             // keeps pre-fork and post-fork nodes agreeing on historical blocks.
             OP_SUM_INPUT_VALUE => {
                 if height < crate::core::types::COVENANT_SUM_ACTIVATION_HEIGHT {
+                    return Err(ScriptError::InvalidOpcode(op));
+                }
+            }
+            OP_NIP | OP_TUCK | OP_NOT | OP_LESS_THAN | OP_MERKLE_ROOT => {
+                if height < crate::core::types::V6_ACTIVATION_HEIGHT {
                     return Err(ScriptError::InvalidOpcode(op));
                 }
             }
@@ -574,6 +642,81 @@ pub fn execute_script(
             }
             OP_THIS_ADDRESS => {
                 stack_push(&mut stack, SmallVec::from_slice(&ctx.this_address))?;
+            }
+            OP_NIP => {
+                if ctx.height < crate::core::types::V6_ACTIVATION_HEIGHT {
+                    return Err(ScriptError::InvalidOpcode(OP_NIP));
+                }
+                let top = stack_pop(&mut stack)?;
+                let _discarded = stack_pop(&mut stack)?;
+                stack_push(&mut stack, top)?;
+            }
+            OP_TUCK => {
+                if ctx.height < crate::core::types::V6_ACTIVATION_HEIGHT {
+                    return Err(ScriptError::InvalidOpcode(OP_TUCK));
+                }
+                let top = stack_pop(&mut stack)?;
+                let second = stack_pop(&mut stack)?;
+                // Depth grows by one, so push the copy first and let
+                // `stack_push` enforce MAX_STACK_DEPTH before the rest land.
+                stack_push(&mut stack, top.clone())?;
+                stack_push(&mut stack, second)?;
+                stack_push(&mut stack, top)?;
+            }
+            OP_NOT => {
+                if ctx.height < crate::core::types::V6_ACTIVATION_HEIGHT {
+                    return Err(ScriptError::InvalidOpcode(OP_NOT));
+                }
+                let a = stack_pop(&mut stack)?;
+                let inverted: StackItem = if is_true(&a) {
+                    SmallVec::from_slice(&[0u8])
+                } else {
+                    SmallVec::from_slice(&[1u8])
+                };
+                stack_push(&mut stack, inverted)?;
+            }
+            OP_LESS_THAN => {
+                if ctx.height < crate::core::types::V6_ACTIVATION_HEIGHT {
+                    return Err(ScriptError::InvalidOpcode(OP_LESS_THAN));
+                }
+                let b_val = to_u64(&stack_pop(&mut stack)?)?;
+                let a_val = to_u64(&stack_pop(&mut stack)?)?;
+                let res: StackItem = if a_val < b_val {
+                    SmallVec::from_slice(&[1u8])
+                } else {
+                    SmallVec::from_slice(&[0u8])
+                };
+                stack_push(&mut stack, res)?;
+            }
+            OP_MERKLE_ROOT => {
+                if ctx.height < crate::core::types::V6_ACTIVATION_HEIGHT {
+                    return Err(ScriptError::InvalidOpcode(OP_MERKLE_ROOT));
+                }
+                let proof_item = stack_pop(&mut stack)?;
+                let leaf_item = stack_pop(&mut stack)?;
+
+                if leaf_item.len() != 32 {
+                    return Err(ScriptError::VerifyFailed);
+                }
+                if proof_item.len() % 33 != 0 {
+                    return Err(ScriptError::VerifyFailed);
+                }
+                let levels = proof_item.len() / 33;
+                if levels > MAX_MERKLE_DEPTH {
+                    return Err(ScriptError::VerifyFailed);
+                }
+
+                let mut acc: [u8; 32] = leaf_item.as_slice().try_into().unwrap();
+                for level in 0..levels {
+                    let rec = &proof_item[level * 33..level * 33 + 33];
+                    let sibling = &rec[..32];
+                    match rec[32] {
+                        0 => acc = crate::core::types::hash_concat(&acc, sibling),
+                        1 => acc = crate::core::types::hash_concat(sibling, &acc),
+                        _ => return Err(ScriptError::VerifyFailed),
+                    }
+                }
+                stack_push(&mut stack, SmallVec::from_slice(&acc))?;
             }
             _ => return Err(ScriptError::InvalidOpcode(op)),
         }
