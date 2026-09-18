@@ -719,6 +719,7 @@ td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); 
             <a href="./ide.html" target="_blank" class="btn">Midscript IDE</a>
             <a href="https://rpc.cypherpunk.gold" target="_blank" class="btn">Explorer</a>
             <a href="https://github.com/ciphernom/midstate/blob/main/whypaper.md" target="_blank" class="btn">Whypaper</a>
+            <a href="https://ciphernom.github.io/midwimble/" target="_blank" class="btn">Midwimble ↗</a>
             <a href="https://github.com/ciphernom/midstate" target="_blank" class="btn">GitHub</a>
         </div>
         
@@ -745,6 +746,7 @@ td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); 
             <a href="./wallet/" target="_blank" class="btn">Web Wallet</a>
             <a href="./ide.html" target="_blank" class="btn">Midscript IDE</a>
             <a href="https://rpc.cypherpunk.gold" target="_blank" class="btn">Explorer</a>
+            <a href="https://ciphernom.github.io/midwimble/" target="_blank" class="btn">Midwimble ↗</a>
             <a href="https://github.com/ciphernom/midstate" target="_blank" class="btn">GitHub</a>
         </div>
 
@@ -756,6 +758,7 @@ td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); 
         <div class="menu-item" data-target="consensus">Mining & Consensus <span>→</span></div>
         <div class="menu-item" data-target="economics">Economics & Supply <span>→</span></div>
         <div class="menu-item" data-target="privacy">Privacy & Fungibility <span>→</span></div>
+        <div class="menu-item" data-target="midwimble">Midwimble Sidechain <span>→</span></div>
         <div class="menu-item" data-target="state">State Mgmt & Sync <span>→</span></div>
         <div class="menu-item" data-target="vm">Virtual Machine <span>→</span></div>
         <div class="menu-item" data-target="axe-hw">MidstateAxe Hardware <span>→</span></div>
@@ -808,6 +811,13 @@ td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); 
                     <div class="stat-label">UTXO Model</div>
                     <div class="stat-value">Powers of 2 Only</div>
                 </div>
+            </div>
+
+            <div class="callout stark">
+                <h4>New companion chain: Midwimble</h4>
+                <p><strong>Midwimble</strong> is a MimbleWimble-inspired privacy sidechain being developed alongside Midstate. Private transaction activity remains on its own chain, while compact Midwimble state checkpoints can be anchored back into Midstate as durable external reference points.</p>
+                <p>Midstate does not need to understand or validate Midwimble's private transactions. The two protocols remain separate: Midwimble handles the private present; Midstate provides the durable anchor.</p>
+                <p style="margin-top: 18px;"><a href="https://ciphernom.github.io/midwimble/" target="_blank" class="btn">Explore Midwimble ↗</a></p>
             </div>
 
             <div class="terminal">
@@ -1273,6 +1283,68 @@ for step in 0..max_iters {
                     <h4>Dandelion++ Stem Routing (Post-Mix Privacy)</h4>
                     <p>After the reveal is constructed, the wallet routes the final <code>Reveal</code> transaction through Dandelion++ to decouple the broadcasting node’s IP from the transaction payload.</p>
                 </div>
+            </div>
+        </div>
+
+        <!-- ── MIDWIMBLE SIDECHAIN ── -->
+        <div class="content-pane" id="midwimble">
+            <h2>Midwimble Sidechain</h2>
+
+            <p><strong>Midwimble</strong> is a companion privacy chain designed around Midstate rather than a modification of Midstate itself. It explores a simple division of labour: use MimbleWimble-style cryptography for highly private day-to-day transactions, then periodically commit compact state checkpoints into Midstate.</p>
+
+            <div class="callout stark">
+                <h4>Two chains, separate jobs</h4>
+                <p><strong>Midwimble:</strong> private transaction execution, confidential values, stealth-style ownership, transaction aggregation and a compact live state.</p>
+                <p><strong>Midstate:</strong> durable hash-based settlement context and an external place to record Midwimble checkpoints.</p>
+                <p>The relationship is deliberately one-way at the consensus boundary. Midstate does not need to validate Midwimble kernels, range proofs or private transaction history.</p>
+            </div>
+
+            <div class="flow-diagram">
+                <div class="flow-box stark">MIDWIMBLE<br><span style="color: var(--text-muted); font-size: 11px;">private state</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box">checkpoint<br><span style="color: var(--text-muted); font-size: 11px;">state root + chain reference</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box stark">MIDSTATE<br><span style="color: var(--text-muted); font-size: 11px;">durable anchor</span></div>
+            </div>
+
+            <h3>How the anchor works</h3>
+            <p>A Midwimble checkpoint commits to a particular Midwimble height and cryptographic state. The current design supports two ways for that commitment to cross into Midstate:</p>
+
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Anchor Path 01</div>
+                    <div class="stat-value" style="font-size: 18px; margin-bottom: 12px;">Commit Transaction</div>
+                    <p style="font-size: 13.5px; margin-bottom: 0;">An explicit Midstate commitment records the Midwimble checkpoint identifier using normal Midstate machinery.</p>
+                </div>
+
+                <div class="stat-card">
+                    <div class="stat-label">Anchor Path 02</div>
+                    <div class="stat-value" style="font-size: 18px; margin-bottom: 12px;">Merged Mining</div>
+                    <p style="font-size: 13.5px; margin-bottom: 0;">A Midwimble header or state commitment is bound into the Midstate parent block while the two chains are mined together.</p>
+                </div>
+            </div>
+
+            <h3>Why anchor a privacy chain?</h3>
+            <ul>
+                <li><strong>Recovery reference:</strong> if Midwimble's normal cryptography is ever considered unsafe, an earlier checkpoint recorded in Midstate provides an externally committed candidate state from which recovery can begin.</li>
+                <li><strong>Reorg boundary:</strong> sufficiently confirmed anchors can provide a durable floor beneath the fast-moving privacy chain.</li>
+                <li><strong>Anchored cut-through:</strong> the planned pruning model uses finalized checkpoints as horizons below which old spent history can eventually be discarded without asking every new node to replay the chain from genesis.</li>
+                <li><strong>Protocol separation:</strong> Midstate remains a standalone protocol. Midwimble can evolve its privacy machinery without forcing Midstate consensus to understand it.</li>
+            </ul>
+
+            <h3>A dormant recovery path</h3>
+            <p>Midwimble's normal transaction path currently uses classical elliptic-curve cryptography, so it is <strong>not</strong> post-quantum in ordinary operation. The design therefore gives outputs a separate dormant recovery commitment intended for use only if a future network upgrade has to migrate ownership away from broken classical keys.</p>
+
+            <p>The important distinction is that anchoring and recovery are separate mechanisms: the Midstate anchor identifies an externally recorded state; the dormant recovery path supplies a different form of ownership for moving value out of that state.</p>
+
+            <div class="callout warn">
+                <h4>Research status</h4>
+                <p>Midwimble is currently research/devnet software. Checkpoint construction, anchoring paths and dormant recovery machinery are implemented far enough to test, but the protocol has not been security-audited and should not be treated as production financial infrastructure. Anchored cut-through remains under development.</p>
+            </div>
+
+            <div style="display: flex; gap: 12px; flex-wrap: wrap; margin-top: 28px;">
+                <a href="https://ciphernom.github.io/midwimble/" target="_blank" class="btn">Midwimble Project Site ↗</a>
+                <a href="https://github.com/ciphernom/midwimble" target="_blank" class="btn">Source on GitHub ↗</a>
             </div>
         </div>
 
