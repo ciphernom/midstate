@@ -117,6 +117,8 @@ impl RpcServer {
             .route("/health", get(health))
             .route("/filters", post(get_filters))
             .route("/state", get(get_state))
+            .route("/utxo_proof/:coin_id", get(get_utxo_proof))
+            .route("/headers/:start/:count", get(get_headers))
             .route("/stats/history", get(get_chain_stats))
             .route("/commit", post(commit_transaction))
             .route("/send", post(send_transaction))

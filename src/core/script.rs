@@ -749,6 +749,31 @@ pub fn compile_p2pk(owner_pk: &[u8; 32]) -> Vec<u8> {
 }
 
 /// HTLC script. Claim: [Sig, Preimage, 1], Refund: [Sig, <dummy>, 0]
+/// Midwimble mining bond, for bonded proof of work:
+///
+/// ```text
+/// PUSH_DATA <mining key>    DROP              binds the key into the address
+/// PUSH_INT  <bonded_until>  CHECKTIMEVERIFY   unspendable below that height
+/// PUSH_DATA <owner key>     CHECKSIGVERIFY    only the owner can spend it
+/// PUSH_INT  1
+/// ```
+///
+/// To midstate this is an ordinary P2SH coin; consensus never needs to know
+/// what it is for. Midwimble recognises the exact byte layout (its
+/// `core/bond.rs` carries the same vector as `mining_bond_golden_vector`), so
+/// the encoding must not change.
+pub fn compile_mining_bond(mining_key: &[u8; 32], bonded_until: u64, owner_pk: &[u8; 32]) -> Vec<u8> {
+    let mut bc = Vec::with_capacity(83);
+    push_data(&mut bc, mining_key);
+    bc.push(OP_DROP);
+    push_int(&mut bc, bonded_until);
+    bc.push(OP_CHECKTIMEVERIFY);
+    push_data(&mut bc, owner_pk);
+    bc.push(OP_CHECKSIGVERIFY);
+    push_int(&mut bc, 1);
+    bc
+}
+
 pub fn compile_htlc(
     secret_hash: &[u8; 32],
     receiver_pk: &[u8; 32],
@@ -1315,6 +1340,55 @@ mod tests {
         push_int(&mut bc, 1);
         bc.push(OP_ENDIF);
         assert!(execute_script(&bc, &[vec![0u8]], &empty_ctx()).is_ok());
+    }
+
+    fn bond_ctx(commitment: &[u8; 32], height: u64) -> ExecContext<'_> {
+        ExecContext { commitment, height, outputs: &[], input_value: 0, input_state: None, this_address: [0u8; 32], sum_input_value: 0 }
+    }
+
+    #[test]
+    fn mining_bond_golden_vector() {
+        let bc = compile_mining_bond(&[0x11; 32], 400_000, &[0x22; 32]);
+        assert_eq!(
+            hex::encode(&bc),
+            "0120001111111111111111111111111111111111111111111111111111111111111111\
+             10010300801a0633012000222222222222222222222222222222222222222222222222\
+             22222222222222223201010001"
+        );
+        assert_eq!(
+            hex::encode(crate::core::types::Predicate::Script { bytecode: bc }.address()),
+            "22fd4a4255a093856e1b4a714deb228676742accbe4e3145a6fbcb50f757b67f"
+        );
+    }
+
+    #[test]
+    fn mining_bond_unlocks_for_its_owner_at_the_lock_height() {
+        let owner_seed = hash(b"bond owner");
+        let owner_pk = wots::keygen(&owner_seed);
+        let commitment = hash(b"bond spend");
+        let bc = compile_mining_bond(&[0x11; 32], 400_000, &owner_pk);
+        assert!(validate_structure(&bc, 400_000).is_ok());
+        let sig = wots::sig_to_bytes(&wots::sign(&owner_seed, &commitment));
+        assert!(execute_script(&bc, &[sig.clone()], &bond_ctx(&commitment, 400_000)).is_ok());
+        assert!(execute_script(&bc, &[sig], &bond_ctx(&commitment, 399_999)).is_err());
+    }
+
+    #[test]
+    fn mining_bond_is_not_spendable_by_anyone_else() {
+        let owner_pk = wots::keygen(&hash(b"bond owner"));
+        let commitment = hash(b"bond spend");
+        let bc = compile_mining_bond(&[0x11; 32], 400_000, &owner_pk);
+        let thief = wots::sig_to_bytes(&wots::sign(&hash(b"thief"), &commitment));
+        assert!(execute_script(&bc, &[thief], &bond_ctx(&commitment, 900_000)).is_err());
+        // No witness at all, even long after unlocking.
+        assert!(execute_script(&bc, &[], &bond_ctx(&commitment, 900_000)).is_err());
+    }
+
+    #[test]
+    fn mining_bond_address_commits_to_the_mining_key() {
+        let a = compile_mining_bond(&[0x11; 32], 400_000, &[0x22; 32]);
+        let b = compile_mining_bond(&[0x12; 32], 400_000, &[0x22; 32]);
+        assert_ne!(hash(&a), hash(&b));
     }
 
     #[test]
