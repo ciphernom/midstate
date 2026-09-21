@@ -539,6 +539,15 @@ impl MerkleMountainRange {
     /// caller is `storage::deserialize_state`'s legacy-format path, which
     /// loads bytes that were themselves produced by this same MMR layout.
     #[doc(hidden)]
+    /// The MMR as it stood with only its first `n` leaves (ported from
+    /// midwimble's copy of this file). A header's `state_root` commits to the
+    /// chain root from *before* that block appended itself; the RPC uses this
+    /// to rebuild it for `/utxo_proof`.
+    pub fn truncated(&self, n: u64) -> Self {
+        let n = n.min(self.leaf_count);
+        Self::from_raw_parts(self.nodes.take(mmr_size(n) as usize), n)
+    }
+
     pub fn from_raw_parts(nodes: im::Vector<[u8; 32]>, leaf_count: u64) -> Self {
         Self { nodes, leaf_count }
     }

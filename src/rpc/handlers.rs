@@ -1753,3 +1753,26 @@ pub async fn midstate_css() -> impl IntoResponse {
         include_str!("midstate.css"),
     )
 }
+
+/// `GET /utxo_proof/:coin_id` — inclusion proof against the tip header, for
+/// midwimble bond registrations. See `NodeHandle::tip_utxo_proof`.
+pub async fn get_utxo_proof(
+    State(node): State<AppState>,
+    axum::extract::Path(coin_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let bytes = hex::decode(&coin_id).map_err(|e| ErrorResponse { error: format!("bad coin id: {e}") })?;
+    let coin: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| ErrorResponse { error: "coin id must be 32 bytes".to_string() })?;
+    let proof = node.tip_utxo_proof(coin).await.map_err(|e| ErrorResponse { error: e.to_string() })?;
+    Ok(Json(serde_json::to_value(proof).map_err(|e| ErrorResponse { error: e.to_string() })?))
+}
+
+/// `GET /headers/:start/:count` — up to 2,000 consecutive block headers.
+pub async fn get_headers(
+    State(node): State<AppState>,
+    axum::extract::Path((start, count)): axum::extract::Path<(u64, u64)>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let headers = node.load_headers(start, count).await.map_err(|e| ErrorResponse { error: e.to_string() })?;
+    Ok(Json(serde_json::json!({ "start": start, "headers": headers })))
+}

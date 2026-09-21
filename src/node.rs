@@ -340,6 +340,22 @@ pub struct ScannedCoin {
     pub height: u64,
 }
 
+/// See [`NodeHandle::tip_utxo_proof`].
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct TipUtxoProof {
+    /// Height of the tip block whose header commits to these roots.
+    pub height: u64,
+    pub header_hash: String,
+    pub state_root: String,
+    pub coins_root: String,
+    pub commitments_root: String,
+    /// Chain MMR root from before the tip block appended itself.
+    pub chain_mmr_root: String,
+    /// Present from V4 activation onwards.
+    pub burned_wots_root: Option<String>,
+    pub proof: crate::core::mmr::UtxoProof,
+}
+
 impl NodeHandle {
     pub async fn get_state(&self) -> State {
         self.state.read().await.clone()
@@ -373,6 +389,78 @@ impl NodeHandle {
 
     pub async fn check_coin(&self, coin: [u8; 32]) -> bool {
         self.state.read().await.coins.contains(&coin)
+    }
+
+    /// An SMT inclusion proof for `coin` against the tip header, with the four
+    /// roots its `state_root` commits to: `H(H(H(coins, commitments),
+    /// chain_mmr), burned_wots)`, where the chain root is from before the tip
+    /// appended itself and the burned-WOTS term exists from V4 activation.
+    ///
+    /// This node keeps only the current UTXO tree, so it can only prove
+    /// against the tip, and it checks its own answer against the stored tip
+    /// header before returning it. When a commitment expired in the tip block
+    /// the current commitments root no longer matches the committed one, and
+    /// the caller is asked to retry after the next block rather than handed a
+    /// proof that verifies against nothing.
+    pub async fn tip_utxo_proof(&self, coin: [u8; 32]) -> anyhow::Result<TipUtxoProof> {
+        use crate::core::types::{hash_concat, is_v2_at, V4_ACTIVATION_HEIGHT};
+        let state = self.state.read().await;
+        // The height the tip block saw while it was being validated (midstate
+        // increments `height` after the state-root check).
+        let validated_at = state
+            .height
+            .checked_sub(1)
+            .ok_or_else(|| anyhow::anyhow!("no blocks beyond genesis yet"))?;
+        let v2 = is_v2_at(validated_at);
+        let proof = state
+            .coins
+            .prove(&coin, v2)
+            .map_err(|e| anyhow::anyhow!("coin is not unspent at the tip: {e}"))?;
+        let coins_root = state.coins.root(v2);
+        let commitments_root = state.commitments.root(v2);
+        let chain_mmr = state.chain_mmr.truncated(state.chain_mmr.leaf_count().saturating_sub(1));
+        let chain_mmr_root = chain_mmr.root(v2);
+        let burned_wots_root =
+            (validated_at >= V4_ACTIVATION_HEIGHT).then(|| state.burned_wots.root(v2));
+        let mut state_root = hash_concat(&hash_concat(&coins_root, &commitments_root), &chain_mmr_root);
+        if let Some(burned) = &burned_wots_root {
+            state_root = hash_concat(&state_root, burned);
+        }
+        // Find the stored tip without assuming a height convention: it is the
+        // block whose hash the state records as its tip.
+        let (height, tip) = [state.height, validated_at]
+            .into_iter()
+            .find_map(|h| match self.storage.batches.load(h) {
+                Ok(Some(b)) if b.extension.final_hash == state.header_hash => Some((h, b)),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("tip block is not in storage"))?;
+        if tip.state_root != state_root {
+            anyhow::bail!(
+                "the tip's committed state cannot be rebuilt (a commitment expired in block {height}); retry after the next block"
+            );
+        }
+        Ok(TipUtxoProof {
+            height,
+            header_hash: hex::encode(state.header_hash),
+            state_root: hex::encode(state_root),
+            coins_root: hex::encode(coins_root),
+            commitments_root: hex::encode(commitments_root),
+            chain_mmr_root: hex::encode(chain_mmr_root),
+            burned_wots_root: burned_wots_root.map(hex::encode),
+            proof,
+        })
+    }
+
+    /// Up to 2,000 consecutive headers from `start`, for light clients. A
+    /// midwimble bond registration carries the run above its proof's header.
+    pub async fn load_headers(&self, start: u64, count: u64) -> anyhow::Result<Vec<crate::core::types::BatchHeader>> {
+        let limit = self.state.read().await.height + 1;
+        let end = start.saturating_add(count.min(2_000)).min(limit);
+        if end <= start {
+            return Ok(Vec::new());
+        }
+        self.storage.batches.load_headers(start, end)
     }
 
     pub async fn check_commitment(&self, commitment: [u8; 32]) -> bool {
