@@ -2962,6 +2962,26 @@ async fn wallet_send(
             final_fee
         );
 
+        // Outputs paid to others, with what it takes to refer to each one
+        // later. A midwimble mining bond is registered by its value and salt.
+        {
+            let change: std::collections::HashSet<usize> =
+                change_seeds.iter().map(|(i, _)| *i).collect();
+            for (i, out) in all_outputs.iter().enumerate() {
+                if let midstate::core::OutputData::Standard { address, value, salt } = out {
+                    if !change.contains(&i) {
+                        println!(
+                            "  → {}:{}  salt {}  coin {}",
+                            hex::encode(address),
+                            value,
+                            hex::encode(salt),
+                            hex::encode(midstate::core::types::compute_coin_id(address, *value, salt))
+                        );
+                    }
+                }
+            }
+        }
+
 let (commitment, _salt) = wallet.prepare_commit(
             &input_coin_ids, &all_outputs, change_seeds.clone(), false, false
         )?;
@@ -5083,6 +5103,12 @@ fn wallet_generate_mss(path: &PathBuf, height: u32, label: Option<String>) -> Re
     let root = wallet.generate_mss(height, label.clone())?;
 
 println!("\n✓ MSS Address Generated!");
+    if let Some(key) = wallet.data.mss_keys.last() {
+        println!(
+            "  Public key: {}  (scripts such as a midwimble bond need this, not the address)",
+            hex::encode(key.master_pk)
+        );
+    }
     if let Some(l) = label {
         println!("  Label:    {}", l);
     }
