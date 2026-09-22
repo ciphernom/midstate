@@ -1458,6 +1458,45 @@ async fn targeted_scan(
     Ok(imported)
 }
 
+/// The height a script's timelocks require, if any: the largest value pushed
+/// immediately before a CHECKTIMEVERIFY. Covers the shapes `compile_htlc`,
+/// `compile_timelock` and `compile_mining_bond` produce.
+fn script_timelock_height(bytecode: &[u8]) -> Option<u64> {
+    use midstate::core::script::{OP_CHECKTIMEVERIFY, OP_PUSH_DATA};
+    let (mut i, mut pushed, mut required) = (0usize, None, None);
+    while i < bytecode.len() {
+        match bytecode[i] {
+            OP_PUSH_DATA => {
+                if i + 3 > bytecode.len() {
+                    break;
+                }
+                let len = u16::from_le_bytes([bytecode[i + 1], bytecode[i + 2]]) as usize;
+                let (start, end) = (i + 3, i + 3 + len);
+                if end > bytecode.len() {
+                    break;
+                }
+                pushed = (len <= 8).then(|| {
+                    let mut le = [0u8; 8];
+                    le[..len].copy_from_slice(&bytecode[start..end]);
+                    u64::from_le_bytes(le)
+                });
+                i = end;
+            }
+            OP_CHECKTIMEVERIFY => {
+                if let Some(height) = pushed.take() {
+                    required = Some(required.map_or(height, |r: u64| r.max(height)));
+                }
+                i += 1;
+            }
+            _ => {
+                pushed = None;
+                i += 1;
+            }
+        }
+    }
+    required
+}
+
 async fn wallet_spend_script(
     path: &PathBuf,
     rpc_port: u16,
@@ -1575,6 +1614,22 @@ async fn wallet_spend_script(
     }
 
     let bytecode = hex::decode(&bytecode_hex).context("Invalid bytecode hex")?;
+
+    // Fail before doing any work if the script cannot run yet. CHECKTIMEVERIFY
+    // is only evaluated when the reveal is validated, so without this the
+    // wallet mines a commit's proof of work and spends an MSS leaf before
+    // reporting "Predicate execution failed for input 0".
+    if let Some(required) = script_timelock_height(&bytecode) {
+        let (_, current_height, _) = fetch_state_info(&client, rpc_port, &rpc_host).await?;
+        if current_height + 1 < required {
+            let blocks = required - current_height;
+            anyhow::bail!(
+                "this script is timelocked until height {required}; the chain is at {current_height}, \
+                 {blocks} blocks away (about {:.1} days). Nothing was spent.",
+                blocks as f64 / 1440.0
+            );
+        }
+    }
     let script_address = midstate::core::types::hash(&bytecode);
 
     // Verify all spending coins match the bytecode address OR belong to the wallet (Co-spend)
@@ -5704,4 +5759,39 @@ async fn sync_from_genesis(data_dir: PathBuf, peer_addr: String, port: u16) -> R
     println!("  Commitments: {}", state.commitments.len());
     println!("  Midstate:    {}", hex::encode(state.midstate));
     Ok(())
+}
+
+#[cfg(test)]
+mod spend_script_tests {
+    use super::script_timelock_height;
+
+    /// Vectors from a live midwimble mining bond and its exit drill.
+    #[test]
+    fn reads_the_height_a_script_waits_for() {
+        let bond = hex::decode(
+            "0120005c68dd74a874407f79752c1889e652325fefa14d5160c5e69a2a5be925ce7063\
+             100103006b5c053301200041e59033f288723bf2972b7cfaa252105650733a4f684ab\
+             ccc514df90583cbf83201010001",
+        )
+        .unwrap();
+        assert_eq!(script_timelock_height(&bond), Some(351_339));
+
+        let drill = hex::decode(
+            "012000687829804184d36704fc22dcc53f52ff274b771f2f084809ce76e6186239fc65\
+             10010300fb90043301200041e59033f288723bf2972b7cfaa252105650733a4f684abc\
+             cc514df90583cbf83201010001",
+        )
+        .unwrap();
+        assert_eq!(script_timelock_height(&drill), Some(299_259));
+    }
+
+    #[test]
+    fn scripts_without_a_timelock_and_malformed_ones_say_nothing() {
+        let p2pk = hex::decode(format!("012000{}3201010001", "11".repeat(32))).unwrap();
+        assert_eq!(script_timelock_height(&p2pk), None);
+        assert_eq!(script_timelock_height(&hex::decode("0120001111").unwrap()), None);
+        assert_eq!(script_timelock_height(&[]), None);
+        // A timelock with nothing pushed before it commits to no height.
+        assert_eq!(script_timelock_height(&[0x33]), None);
+    }
 }
