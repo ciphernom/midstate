@@ -553,7 +553,9 @@ enum WalletAction {
         #[arg(long)]
         to: Vec<String>,
         /// Seconds to wait for the transaction to confirm before giving up.
-        #[arg(long, default_value = "120")]
+        /// Blocks are a minute apart, so the default allows for ten of them:
+        /// a script spend cannot be resumed, only redone.
+        #[arg(long, default_value = "600")]
         timeout: u64,
     },
     /// Import a coin that was exported from another wallet.
@@ -1726,7 +1728,13 @@ async fn wallet_spend_script(
     submit_commit(&client, rpc_port, &rpc_host, &commitment).await?;
 
     if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &hex::encode(commitment), timeout_secs).await {
-        anyhow::bail!("Timed out waiting for Commit to be mined.");
+        anyhow::bail!(
+            "the commit was submitted but no block carried it within {timeout_secs}s. \
+             Nothing was spent and the coin is untouched; the commitment expires by \
+             itself after {} blocks. Run the same command again to retry (it costs one \
+             MSS leaf and one local proof of work), or raise --timeout.",
+            midstate::core::types::COMMITMENT_TTL
+        );
     }
     println!("✓ Commit mined!");
 
@@ -2513,8 +2521,14 @@ async fn wallet_consolidate(
     println!("Submitting Phase 1: Consolidate Commit...");
     submit_commit(&client, rpc_port, &rpc_host, &commitment).await?;
 
-    if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &hex::encode(commitment), 120).await {
-        anyhow::bail!("Timed out waiting for Commit to be mined.");
+    // Ten blocks, as elsewhere: one minute was not enough for a commit to be
+    // carried when the network is slow to propagate.
+    if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &hex::encode(commitment), 600).await {
+        anyhow::bail!(
+            "the commit was submitted but no block carried it within 600s. \
+             Nothing was spent. Finish it with `midstate wallet reveal` once the commit \
+             is mined, or run this again to start over."
+        );
     }
     println!("✓ Commit mined!");
 
@@ -2758,7 +2772,11 @@ async fn wallet_defrag(
     submit_commit(&client, rpc_port, &rpc_host, &commitment).await?;
 
     if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &hex::encode(commitment), timeout_secs).await {
-        anyhow::bail!("Timed out waiting for Commit to be mined.");
+        anyhow::bail!(
+            "the commit was submitted but no block carried it within {timeout_secs}s. \
+             Nothing was spent. Finish it with `midstate wallet reveal` once the commit \
+             is mined, or run this again to start over."
+        );
     }
     println!("✓ Commit mined!");
 
@@ -3956,7 +3974,20 @@ async fn wallet_reveal(
         let (input_reveals, signatures) = match sign_result {
             Ok(res) => res,
             Err(e) => {
-                println!("  {} — dropping stale commit ({})", hex::encode(&commitment), e);
+                // A script spend's coin is never in the wallet, so `reveal`
+                // cannot rebuild its witness: the script, its inputs and its
+                // outputs live only in the command that made the commit.
+                let why = e.to_string();
+                if why.contains("not found in wallet") {
+                    println!(
+                        "  {} — not this wallet's coin, so it cannot be revealed here. If it \
+                         was a script spend, run `wallet spend-script` again; the old \
+                         commitment expires on its own.",
+                        hex::encode(&commitment)
+                    );
+                } else {
+                    println!("  {} — dropping stale commit ({why})", hex::encode(&commitment));
+                }
                 // Delete the garbage commit to unblock the queue
                 wallet.data.pending.retain(|p| p.commitment != commitment);
                 let _ = wallet.save();
