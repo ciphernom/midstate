@@ -324,6 +324,13 @@ enum Command {
         /// The percentage fee the pool takes from block rewards (e.g. 1.0 for 1%)
         #[arg(long, default_value = "1.0")]
         fee: f64,
+        /// Merge-mine midwimble against this node (host:port). It needs a
+        /// mining bond; see docs/POOL_MERGED_MINING.md in midwimble.
+        #[arg(long)]
+        midwimble_rpc: Option<String>,
+        /// Midwimble address this pool's midwimble rewards are paid to.
+        #[arg(long)]
+        midwimble_address: Option<String>,
         /// Share difficulty in leading zero bits (default 12 = one share per
         /// 2^12 nonces). Raise it for a pool fronting fast hardware to cut
         /// submission volume; lower it for small/mobile miners to cut variance.
@@ -1016,11 +1023,11 @@ async fn main() -> Result<()> {
         Command::Peers { rpc_port, rpc_host } => get_peers(rpc_port, rpc_host).await,
         Command::Keygen { rpc_port, rpc_host } => keygen(rpc_port, rpc_host).await,
         Command::Sync { data_dir, peer, port } => sync_from_genesis(data_dir, peer, port).await,
-        Command::Pool { pool_address, bind_addr, rpc_port, rpc_host, fee, share_bits, webrtc_port } => {
+        Command::Pool { pool_address, bind_addr, rpc_port, rpc_host, fee, share_bits, webrtc_port, midwimble_rpc, midwimble_address } => {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let node_rpc_url = format!("http://{}:{}", rpc_host, rpc_port);
-                midstate::pool::run_stratum_pool(pool_address, bind_addr, node_rpc_url, fee, share_bits, webrtc_port).await;
+                midstate::pool::run_stratum_pool(pool_address, bind_addr, node_rpc_url, fee, share_bits, webrtc_port, midwimble_rpc, midwimble_address).await;
                 Ok(())
             }
             #[cfg(target_arch = "wasm32")]

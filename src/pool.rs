@@ -68,6 +68,20 @@ struct StratumResponse {
     error: Option<String>,
 }
 
+/// What a job commits to on midwimble, when this pool merge-mines. The
+/// commitment rides in a coinbase output's salt, beside the pool's own score
+/// root in another output; neither knows about the other. See
+/// `docs/POOL_MERGED_MINING.md` in midwimble.
+#[derive(Clone, Debug)]
+struct MergeCommit {
+    /// The midwimble template this job's coinbase commits to.
+    mining_hash: String,
+    /// A share below this target is also a midwimble block.
+    target: [u8; 32],
+    /// Which coinbase output carries the commitment in its salt.
+    commit_index: usize,
+}
+
 /// Represents an active mining job broadcast to all connected Stratum clients.
 #[derive(Clone, Debug)]
 struct Job {
@@ -87,6 +101,8 @@ struct Job {
     /// found block can be split-verified against the precommitment it actually used.
     /// Arc so cloning the Job onto the broadcast channel stays cheap.
     committed_scores: Arc<Vec<([u8; 32], u64)>>,
+    /// Set when this pool is merge-mining midwimble.
+    midwimble: Option<MergeCommit>,
 }
 
 // ── Merkle Tree Logic for Share Proofs ──────────────────────────────────────
@@ -192,6 +208,10 @@ struct PoolState {
     valid_shares: RwLock<HashSet<u64>>, 
     /// Dynamic RPC URL of the core node, provided at startup.
     node_rpc_url: String,
+    /// A midwimble node with a mining bond, to merge-mine against.
+    midwimble_rpc: Option<String>,
+    /// Where midwimble pays this pool's blocks.
+    midwimble_address: Option<String>,
     /// The percentage fee the pool takes from block rewards (e.g., 1.0 for 1%).
     pool_fee_percent: f64,
     /// The most recent network block reward seen from the node, relayed to the
@@ -543,6 +563,8 @@ pub async fn run_stratum_pool(
     pool_fee_percent: f64,
     share_bits: Option<u32>,
     webrtc_port: Option<u16>,
+    midwimble_rpc: Option<String>,
+    midwimble_address: Option<String>,
 ) {
     tracing::info!("starting stratum pool server");
     
@@ -611,6 +633,11 @@ pub async fn run_stratum_pool(
         current_tree: RwLock::new(ShareMerkleTree::build(vec![])),
         valid_shares: RwLock::new(HashSet::new()),
         node_rpc_url,
+        midwimble_rpc: midwimble_rpc.map(|u| {
+            let u = u.trim_end_matches('/').to_string();
+            if u.starts_with("http") { u } else { format!("http://{u}") }
+        }),
+        midwimble_address,
         pool_fee_percent,
         current_block_reward: std::sync::atomic::AtomicU64::new(0),
         current_height: std::sync::atomic::AtomicU64::new(0),
@@ -889,6 +916,10 @@ pub async fn run_stratum_pool(
                 // across all miners strictly proportional to their accumulated scores.
                 // Output values MUST be powers of 2. It iteratively assigns the largest 
                 // possible power-of-2 denomination to the miner with the highest current score.
+                // Merged mining: ask midwimble for a commitment and plant it
+                // in the salt of the last coinbase output. Every failure here
+                // is soft — the pool simply mines midstate alone.
+                let mut merge_commit: Option<MergeCommit> = None;
                 let template_data = loop {
                     let mut coinbase_json = Vec::new();
                     
@@ -940,6 +971,49 @@ pub async fn run_stratum_pool(
                         }
                     }
 
+                    // A retry rebuilds the coinbase, so last attempt's commitment
+                    // must not survive into a job whose salt no longer carries it.
+                    merge_commit.take();
+                    if let (Some(mw_rpc), Some(mw_addr)) = (
+                        state_clone.midwimble_rpc.as_ref(),
+                        state_clone.midwimble_address.as_ref(),
+                    ) {
+                        let body =
+                            serde_json::json!({ "payouts": [{ "address": mw_addr, "weight": 1 }] });
+                        match client.post(&format!("{}/merge/job", mw_rpc)).json(&body).send().await {
+                            Ok(r) => match r.json::<serde_json::Value>().await {
+                                Ok(mw_job) => {
+                                    let commitment =
+                                        mw_job["commitment"].as_str().unwrap_or_default().to_string();
+                                    let mining_hash =
+                                        mw_job["mining_hash"].as_str().unwrap_or_default().to_string();
+                                    let target = hex::decode(
+                                        mw_job["target"].as_str().unwrap_or_default(),
+                                    )
+                                    .unwrap_or_default();
+                                    if commitment.len() == 64 && target.len() == 32 {
+                                        if let Some(last) = coinbase_json.last_mut() {
+                                            last["salt"] = serde_json::json!(commitment);
+                                            let mut t = [0u8; 32];
+                                            t.copy_from_slice(&target);
+                                            merge_commit = Some(MergeCommit {
+                                                mining_hash,
+                                                target: t,
+                                                commit_index: coinbase_json.len() - 1,
+                                            });
+                                        }
+                                    } else {
+                                        tracing::warn!("midwimble job unusable: {mw_job}");
+                                    }
+                                }
+                                Err(e) => tracing::warn!("midwimble job unreadable: {e}"),
+                            },
+                            Err(e) => tracing::warn!(
+                                "midwimble node unreachable, mining midstate alone: {e}"
+                            ),
+                        }
+                    }
+
                     let req = serde_json::json!({ "coinbase": coinbase_json });
                     let post_res = client.post(&format!("{}/block_template", rpc_url)).json(&req).send().await;
                     if let Err(ref e) = post_res {
@@ -982,6 +1056,7 @@ pub async fn run_stratum_pool(
                             mining_hash: m_hash,
                             share_target: state_clone.share_target,
                             network_target: n_target,
+                            midwimble: merge_commit.clone(),
                             batch_template: template["batch_template"].clone(),
                             height: tip_height.saturating_add(1),
                             committed_scores: std::sync::Arc::new(shares_vec.clone()),
@@ -1940,7 +2015,13 @@ async fn process_share(
             "block found by miner {}. submitting to network.",
             hex::encode(&miner_addr[..8])
         );
-        spawn_block_submission(state, job, ext);
+        spawn_block_submission(state, job.clone(), ext.clone());
+    }
+    if let Some(merge) = job.midwimble.clone() {
+        if ext.final_hash < merge.target {
+            tracing::info!("that share is also a midwimble block; submitting it");
+            spawn_midwimble_submission(state, &job, merge, &ext);
+        }
     }
 
     Ok(ShareOutcome::Accepted { is_block })
@@ -1960,6 +2041,41 @@ async fn bump_rejected(state: &Arc<PoolState>, miner_addr: [u8; 32]) {
 /// generated and broadcast. Nothing block-shaped supplied by a miner is ever
 /// used: a share submission carries only a `job_id` and a `nonce`, so a miner
 /// cannot rewrite the coinbase to redirect the reward to themselves.
+/// A share that also cleared midwimble's target is a midwimble block. The
+/// midwimble node rebuilds the parent proof from this template, seals the
+/// block and applies it; the pool never touches midwimble's block format.
+fn spawn_midwimble_submission(
+    state: &Arc<PoolState>,
+    job: &Job,
+    merge: MergeCommit,
+    ext: &Extension,
+) {
+    let Some(rpc) = state.midwimble_rpc.clone() else {
+        return;
+    };
+    let body = serde_json::json!({
+        "mining_hash": merge.mining_hash,
+        "batch_template": job.batch_template,
+        "commit_index": merge.commit_index,
+        "nonce": ext.nonce,
+        "final_hash": hex::encode(ext.final_hash),
+    });
+    tokio::spawn(async move {
+        match reqwest::Client::new()
+            .post(&format!("{rpc}/merge/found"))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => tracing::info!(
+                "midwimble block submitted: {}",
+                r.text().await.unwrap_or_default()
+            ),
+            Err(e) => tracing::warn!("midwimble submission failed: {e}"),
+        }
+    });
+}
+
 fn spawn_block_submission(state: &Arc<PoolState>, job: Job, ext: Extension) {
     // Capture block identity for the dashboard BEFORE `job` is consumed: the PoW
     // hash (for the Explorer hyperlink) and the network target in force for this
