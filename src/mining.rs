@@ -249,6 +249,10 @@ pub async fn run_stratum_client(
                             let job_id = params[0].as_u64().unwrap();
                             let hash_hex = params[1].as_str().unwrap();
                             let template_val = &params[2];
+                            if let Some(t) = params.get(3).and_then(|v| v.as_str()) {
+                                let mut bytes = [0u8; 32];
+                                if hex::decode_to_slice(t, &mut bytes).is_ok() { s_target = bytes; }
+                            }
 
                             let mut m_hash = [0u8; 32];
                             hex::decode_to_slice(hash_hex, &mut m_hash).unwrap();
