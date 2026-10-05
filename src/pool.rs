@@ -2463,7 +2463,8 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                     params: vec![
                                         serde_json::json!(job.job_id),
                                         serde_json::json!(hex::encode(job.mining_hash)),
-                                        serde_json::json!(job.batch_template) 
+                                        serde_json::json!(job.batch_template),
+                                        serde_json::json!(hex::encode(job.share_target)),
                                     ]
                                 };
                                 write_half.write_all(format!("{}\n", serde_json::to_string(&notif)?).as_bytes()).await?;
@@ -2520,7 +2521,8 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                     params: vec![
                         serde_json::json!(job.job_id),
                         serde_json::json!(hex::encode(job.mining_hash)),
-                        serde_json::json!(job.batch_template)
+                        serde_json::json!(job.batch_template),
+                        serde_json::json!(hex::encode(job.share_target)),
                     ]
                 };
                 write_half.write_all(format!("{}\n", serde_json::to_string(&notif)?).as_bytes()).await?;
