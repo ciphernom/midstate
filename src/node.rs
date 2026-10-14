@@ -6899,6 +6899,7 @@ async fn try_apply_orphans(&mut self) {
                 if config.mining.mode == "stratum" {
                     // Captured before the tuple move below consumes pool_url/payout_address.
                     let worker = config.mining.worker.clone().unwrap_or_else(|| "default".to_string());
+                    let midwimble = config.mining.midwimble_address.clone().filter(|a| !a.trim().is_empty());
                     if let (Some(url), Some(addr)) = (config.mining.pool_url, config.mining.payout_address) {
                         let hc = self.hash_counter.clone();
                         
@@ -6911,7 +6912,7 @@ async fn try_apply_orphans(&mut self) {
                         let dummy_stats = Arc::new(std::sync::RwLock::new(crate::mining::StratumStats::default()));
                         
                         tokio::spawn(async move {
-                            crate::mining::run_stratum_client(url, addr, worker, threads, hc, dummy_stats).await;
+                            crate::mining::run_stratum_client(url, addr, worker, midwimble, threads, hc, dummy_stats).await;
                         });
                         return Ok(());
                     } else {

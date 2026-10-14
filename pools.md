@@ -48,6 +48,16 @@ The server will attempt to bind the Stratum TCP service to port `3333` and the H
 
 You must open/port-forward the Stratum TCP port (e.g., `3333`) on your firewall to accept external miners.
 
+### 4. Merge-Mine Midwimble (Optional)
+The pool can mine midwimble with the same work and pay its miners in both coins. Run a midwimble node that holds the pool's mining bonds (see `docs/BONDED_POW.md` in midwimble), then point the pool at it:
+```bash
+midwimble node --mining-bond bond.json --co-bond cobond.json
+midstate pool --pool-address <POOL_ADDRESS> --midwimble-rpc 127.0.0.1:9434 --midwimble-address <POOL_MW_ADDRESS>
+```
+`<POOL_MW_ADDRESS>` (`mw1…`) receives the pool's fee in midwimble, plus the midwimble share of any miner who hasn't given a midwimble address. If the midwimble node can't be reached or has no usable bond, the pool mines midstate alone.
+
+Every accepted share earns a point of midwimble score for its miner's midwimble address. Each midwimble block the pool finds pays those scores, then clears them. A midwimble coinbase has room for 31 miners: a miner with at least 1/31 of the score is paid exactly, and the rest share the remaining outputs by a draw seeded with both chains' tips, so each one's expected payout is exactly its share.
+
 ---
 
 ## Part 2: Mining on a Pool
@@ -84,6 +94,13 @@ The miner runs silently by default. Press `[ENTER]` in the terminal at any time 
 ║ Session Luck:  3.46% ⏳
 ╚══════════════════════════════════════╝
 ```
+
+### 4. Get Paid in Midwimble (Optional)
+If the pool merge-mines midwimble, give it your midwimble address (`midwimble wallet address`) to be paid your share of every midwimble block it finds:
+```bash
+midstate miner --pool-url stratum+tcp://<POOL_IP_ADDRESS>:3333 --payout-address <PAYOUT_ADDRESS> --midwimble-address <MW_ADDRESS>
+```
+A node mining in pool mode reads it from `midwimble_address` in `miner.toml`. Other Stratum miners send it as the third `mining.authorize` parameter, after the worker name. Without one, the pool keeps your midwimble share.
 
 ---
 

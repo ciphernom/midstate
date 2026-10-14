@@ -3888,6 +3888,7 @@ dependencies = [
  "blake3",
  "bytemuck",
  "clap",
+ "curve25519-dalek",
  "dirs",
  "futures",
  "hex",

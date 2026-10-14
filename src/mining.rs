@@ -40,6 +40,10 @@ pub struct MiningConfig {
     /// Optional rig name reported to the pool in mining.authorize for the per-worker
     /// breakdown. Absent in older miner.toml files -> deserializes to None -> "default".
     pub worker: Option<String>,
+    /// Optional midwimble address, sent in mining.authorize, so a pool that
+    /// merge-mines midwimble pays this miner's share of midwimble there.
+    #[serde(default)]
+    pub midwimble_address: Option<String>,
 }
 
 pub enum MinedResult {
@@ -191,9 +195,10 @@ impl MiningCoordinator {
 }
 
 pub async fn run_stratum_client(
-    pool_url: String, 
+    pool_url: String,
     payout_address: String,
     worker: String,
+    midwimble_address: Option<String>,
     threads: usize,
     hash_counter: Arc<AtomicU64>,
     stats: Arc<std::sync::RwLock<StratumStats>> 
@@ -223,8 +228,14 @@ pub async fn run_stratum_client(
             let (read_half, mut write_half) = stream.split();
             let mut reader = BufReader::new(read_half);
 
+            // A pool that merge-mines midwimble reads an optional third
+            // parameter: the midwimble address to pay this miner's share to.
+            let mut auth_params = vec![serde_json::json!(payout_address), serde_json::json!(worker)];
+            if let Some(mw) = &midwimble_address {
+                auth_params.push(serde_json::json!(mw));
+            }
             let auth_req = serde_json::json!({
-                "id": 1, "method": "mining.authorize", "params": [payout_address.clone(), worker.clone()]
+                "id": 1, "method": "mining.authorize", "params": auth_params
             });
             let _ = write_half.write_all(format!("{}\n", auth_req).as_bytes()).await;
 
@@ -359,6 +370,15 @@ pub async fn run_stratum_client(
                                     }
                                 }
                             });
+                        } else if msg["id"].as_u64() == Some(1) && msg["result"].as_bool() == Some(false) {
+                            // The pool refused the login (a bad payout or
+                            // midwimble address). Retrying can't fix that.
+                            tracing::error!(
+                                "pool refused this miner: {}. fix the address and restart.",
+                                msg["error"].as_str().unwrap_or("no reason given")
+                            );
+                            mining_cancel.store(true, Ordering::Relaxed);
+                            return;
                         } else if msg["result"].as_bool() == Some(true) && msg["id"].as_u64() == Some(2) {
                             tracing::info!("share accepted");
                             stats.write().unwrap().accepted_shares += 1; 

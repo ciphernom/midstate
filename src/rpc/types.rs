@@ -427,6 +427,9 @@ pub struct AxeConfigRequest {
     /// `default` keeps requests from older dashboards (no field) parsing.
     #[serde(default)]
     pub worker: Option<String>,
+    /// Optional midwimble address, for a pool that merge-mines midwimble.
+    #[serde(default)]
+    pub midwimble_address: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

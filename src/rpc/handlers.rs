@@ -1260,6 +1260,7 @@ pub async fn axe_save_config(
             pool_address: req.pool_address.clone(), // <-- NEW
             // Optional rig name for per-worker pool stats; blank means "default".
             worker: req.worker.clone().filter(|w| !w.trim().is_empty()),
+            midwimble_address: req.midwimble_address.clone().filter(|a| !a.trim().is_empty()),
         }
     };
 

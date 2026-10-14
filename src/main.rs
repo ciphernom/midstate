@@ -356,6 +356,10 @@ enum Command {
         /// Worker name reported to the pool, so multiple rigs show separately.
         #[arg(long, default_value = "default")]
         worker: String,
+        /// Midwimble address (mw1…) to be paid in midwimble by a pool that
+        /// merge-mines it. Without one, the pool keeps your midwimble share.
+        #[arg(long)]
+        midwimble_address: Option<String>,
         /// Number of hashing threads. 0 uses every detected core.
         #[arg(long, default_value = "0")]
         threads: usize,
@@ -1037,9 +1041,15 @@ async fn main() -> Result<()> {
                 anyhow::bail!("Pool server cannot run in WebAssembly");
             }
         }
-        Command::Miner { pool_url, payout_address, worker, threads } => {
+        Command::Miner { pool_url, payout_address, worker, midwimble_address, threads } => {
             #[cfg(not(target_arch = "wasm32"))]
             {
+                // Checked here so a typo fails now, not as a refused login.
+                let midwimble_address = match midwimble_address {
+                    Some(a) => Some(midstate::pool::parse_midwimble_address(&a)
+                        .map_err(|e| anyhow::anyhow!("invalid --midwimble-address: {e}"))?),
+                    None => None,
+                };
                 let hash_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let stats = std::sync::Arc::new(std::sync::RwLock::new(midstate::mining::StratumStats::default()));
                 
@@ -1140,7 +1150,7 @@ async fn main() -> Result<()> {
                 tracing::info!("starting hasher (threads: {})", if threads == 0 { "max".to_string() } else { threads.to_string() });
                 tracing::info!("press [ENTER] at any time to view dashboard");
                 
-                midstate::mining::run_stratum_client(pool_url, payout_address, worker, threads, hash_counter, stats).await;
+                midstate::mining::run_stratum_client(pool_url, payout_address, worker, midwimble_address, threads, hash_counter, stats).await;
                 Ok(())
             }
             #[cfg(target_arch = "wasm32")]
