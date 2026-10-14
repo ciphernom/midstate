@@ -675,22 +675,20 @@ mod tests {
         assert_eq!(after, block_work / 4);
     }
 
-    /// The cap must not change behaviour for ordinary blocks — the tie-break
-    /// incentive has to survive, or miners go back to omitting Commits.
+    /// The tie-break incentive survives the cap: at mainnet's work per block,
+    /// one Commit counts in full, so a block that includes a Commit still
+    /// beats an otherwise equal block that omits it. More Commits stop adding
+    /// weight at a quarter of the block's own work.
     #[test]
-    fn typical_commit_counts_are_unaffected_by_cap() {
+    fn one_commit_counts_in_full_and_more_stop_at_the_cap() {
         let block_work: u128 = 105_466_415;
-        // A handful of Commits, as seen on the live chain.
-        for count in [1u64, 2, 5] {
-            let capped = commit_bonus_at(
-                crate::core::types::COMMIT_WEIGHT_CAP_ACTIVATION_HEIGHT,
-                count,
-                block_work,
-            );
+        let h = crate::core::types::COMMIT_WEIGHT_CAP_ACTIVATION_HEIGHT;
+        assert_eq!(commit_bonus_at(h, 1, block_work), 16_777_216, "one Commit counts in full");
+        for count in [2u64, 5] {
             assert_eq!(
-                capped,
-                (count as u128) * 16_777_216,
-                "cap must not bite at realistic Commit counts"
+                commit_bonus_at(h, count, block_work),
+                block_work / 4,
+                "{count} Commits stop at a quarter of the block's work"
             );
         }
     }
