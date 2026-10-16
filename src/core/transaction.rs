@@ -287,6 +287,23 @@ pub fn verify_transaction_sigs(
             }
 
             let sums = covenant_input_sums(inputs);
+            // From V5, a Consolidate whose shared predicate reads per-input
+            // context (OP_INPUT_VALUE / OP_READ_INPUT_STATE) is rejected. All
+            // inputs share one predicate (enforced above) and one witness, and
+            // the predicate is evaluated ONCE; that is sound only when every
+            // input yields the same verdict. A covenant reading per-input value
+            // or state does not, so checking only inputs[0] let coins 2..N be
+            // swept without their own condition being evaluated. Such predicates
+            // must be spent via Reveal (which checks each input); context-free
+            // predicates (P2PK, MSS, dust sweeps) keep the one-signature model.
+            // Pre-V5: unchanged (inputs[0] only), so historical blocks stay valid.
+            if height >= crate::core::types::V5_ACTIVATION_HEIGHT {
+                if let crate::core::types::Predicate::Script { bytecode } = &inputs[0].predicate {
+                    if crate::core::script::reads_per_input_context(bytecode) {
+                        bail!("Consolidate predicate reads per-input context; spend via Reveal");
+                    }
+                }
+            }
             if !verify_predicate(&inputs[0].predicate, witness, &commitment, height, outputs, inputs[0].value, inputs[0].commitment, &sums) {
                 bail!("Predicate execution failed for Consolidate witness");
             }
@@ -874,6 +891,16 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             }
 
             let sums = covenant_input_sums(inputs);
+            // From V5, reject a Consolidate whose shared predicate reads per-input
+            // context (see verify_transaction_sigs for the rationale). Pre-V5:
+            // unchanged.
+            if state.height >= crate::core::types::V5_ACTIVATION_HEIGHT {
+                if let crate::core::types::Predicate::Script { bytecode } = &inputs[0].predicate {
+                    if crate::core::script::reads_per_input_context(bytecode) {
+                        bail!("Consolidate predicate reads per-input context; spend via Reveal");
+                    }
+                }
+            }
             if !verify_predicate(&inputs[0].predicate, witness, &expected, state.height, outputs, inputs[0].value, inputs[0].commitment, &sums) {
                 bail!("Predicate execution failed for Consolidate witness");
             }
@@ -1127,6 +1154,16 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                 if !state.coins.contains(&coin_id) { bail!("Coin {} not found", hex::encode(coin_id)); }
             }
             let sums = covenant_input_sums(inputs);
+            // From V5, reject a Consolidate whose shared predicate reads per-input
+            // context (see verify_transaction_sigs for the rationale). Pre-V5:
+            // unchanged.
+            if state.height >= crate::core::types::V5_ACTIVATION_HEIGHT {
+                if let crate::core::types::Predicate::Script { bytecode } = &inputs[0].predicate {
+                    if crate::core::script::reads_per_input_context(bytecode) {
+                        bail!("Consolidate predicate reads per-input context; spend via Reveal");
+                    }
+                }
+            }
             if !verify_predicate(&inputs[0].predicate, witness, &expected, state.height, outputs, inputs[0].value, inputs[0].commitment, &sums) {
                 bail!("Predicate execution failed for Consolidate witness");
             }

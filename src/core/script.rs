@@ -224,6 +224,45 @@ pub struct ExecContext<'a> {
 
 // ── AOT validation ─────────────────────────────────────────────────────────
 
+/// Returns true if `bytecode` can read context that differs between inputs of
+/// the same transaction — currently `OP_INPUT_VALUE` (0x53) or
+/// `OP_READ_INPUT_STATE` (0x51). These are the only `ExecContext` fields that
+/// vary per input; `this_address` and `sum_input_value` are transaction-wide.
+///
+/// Push-data aware (mirrors `validate_structure`) so payload bytes are never
+/// mistaken for opcodes. Over-approximates safely: anything it cannot parse is
+/// reported as reading per-input context (`true`), which can only cause a
+/// Consolidate to be rejected, never wrongly accepted.
+///
+/// A Consolidate applies one witness to many same-address inputs and evaluates
+/// the predicate once. That is sound only when the predicate returns the same
+/// verdict for every input, i.e. it does not read per-input context. Predicates
+/// that do must be spent via Reveal, which evaluates each input. See the V5 gate
+/// in `transaction.rs`.
+pub fn reads_per_input_context(bytecode: &[u8]) -> bool {
+    let mut pc = 0usize;
+    while pc < bytecode.len() {
+        let op = bytecode[pc];
+        pc += 1;
+        match op {
+            OP_PUSH_DATA => {
+                if pc + 2 > bytecode.len() {
+                    return true; // malformed — be conservative
+                }
+                let len = u16::from_le_bytes([bytecode[pc], bytecode[pc + 1]]) as usize;
+                pc += 2;
+                if pc + len > bytecode.len() {
+                    return true; // malformed — be conservative
+                }
+                pc += len;
+            }
+            OP_INPUT_VALUE | OP_READ_INPUT_STATE => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Ahead-of-time structural validation. O(N) single pass.
 pub fn validate_structure(bytecode: &[u8], height: u64) -> Result<(), ScriptError> {
 
