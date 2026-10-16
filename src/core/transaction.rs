@@ -766,20 +766,23 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 state.commitment_heights.remove(&expected);
             }
 
-            // 6. Remove spent coins and update Epoch 2 Oracle
-            for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+            // 6. Remove spent coins.
+            //
+            // NOTE: this must NOT write `state.burned_wots`. The validator path
+            // (apply_batch_internal -> apply_transaction_no_sig_check) never
+            // populates burned_wots, yet the V4 state root commits to it. The
+            // block-template builder (finish_template) applies via this function,
+            // so burning here made the template's state root include this block's
+            // keys while every validator computed the root over an empty
+            // burned_wots -> guaranteed "state root mismatch" for every
+            // template-built block at height >= V4. Keeping this function's state
+            // effect identical to apply_transaction_no_sig_check restores the
+            // invariant the two are documented to share. burned_wots therefore
+            // stays empty everywhere (its root is a constant in the state-root
+            // formula), so this changes no accepted block and needs no fork.
+            // One-time-key reuse is enforced separately (see apply_batch_internal).
+            for input in inputs.iter() {
                 state.coins.remove(&input.coin_id(), v2);
-                
-                if state.height >= crate::core::types::V4_ACTIVATION_HEIGHT {
-                    let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
-                    if let Some(sig) = wit_inputs.first() {
-                        if sig.len() == crate::core::wots::SIG_SIZE {
-                            state.burned_wots.insert(input.predicate.address(), v2);
-                        } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                            state.burned_wots.insert(mss_sig.wots_pk, v2);
-                        }
-                    }
-                }
             }
 
             // 7. Add new coins (Ignore DataBurns, protecting the SMT!)
@@ -885,18 +888,13 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             }
 
             for coin_id in &input_coin_ids { state.coins.remove(coin_id, v2); }
-            
-            if state.height >= crate::core::types::V4_ACTIVATION_HEIGHT {
-                let crate::core::types::Witness::ScriptInputs(wit_inputs) = witness;
-                if let Some(sig) = wit_inputs.first() {
-                    if sig.len() == crate::core::wots::SIG_SIZE {
-                        state.burned_wots.insert(inputs[0].predicate.address(), v2);
-                    } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
-                        state.burned_wots.insert(mss_sig.wots_pk, v2);
-                    }
-                }
-            }
-            
+
+            // Do NOT write state.burned_wots here — see the matching note in the
+            // Reveal arm. Burning in this function (used by the block-template
+            // builder) but not in apply_transaction_no_sig_check (used by the
+            // validator) is exactly what diverged the template state root from
+            // consensus at height >= V4.
+
             for out in outputs {
                 if let Some(coin_id) = out.coin_id() {
                     if !state.coins.insert(coin_id, v2) { bail!("Duplicate coin created"); }
