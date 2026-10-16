@@ -1839,4 +1839,29 @@ mod tests {
                                 sum_input_value: 0 };
         assert!(execute_script(&bc, &witness, &ctx).is_ok());
     }
+
+    #[test]
+    fn per_input_context_detector_matches_opcodes() {
+        // P2PK reads no per-input context: safe to Consolidate.
+        let p2pk = compile_p2pk(&[0x11; 32]);
+        assert!(!reads_per_input_context(&p2pk));
+
+        // Scripts touching per-input value/state must be flagged.
+        assert!(reads_per_input_context(&[OP_INPUT_VALUE]));
+        assert!(reads_per_input_context(&[OP_READ_INPUT_STATE]));
+
+        // Transaction-wide context does NOT vary per input, so it is fine.
+        assert!(!reads_per_input_context(&[OP_SUM_INPUT_VALUE]));
+        assert!(!reads_per_input_context(&[OP_THIS_ADDRESS]));
+
+        // A PUSH_DATA payload whose bytes equal the per-input opcodes must NOT be
+        // mistaken for them (push-data awareness). PUSH_DATA len=2, bytes 0x53,0x51.
+        assert!(!reads_per_input_context(&[OP_PUSH_DATA, 0x02, 0x00, OP_INPUT_VALUE, OP_READ_INPUT_STATE]));
+
+        // The real opcode following a well-formed push is still detected.
+        assert!(reads_per_input_context(&[OP_PUSH_DATA, 0x01, 0x00, 0xFF, OP_INPUT_VALUE]));
+
+        // Malformed push (declared length runs past end) fails closed (true).
+        assert!(reads_per_input_context(&[OP_PUSH_DATA, 0x10, 0x00, 0x00]));
+    }
 }

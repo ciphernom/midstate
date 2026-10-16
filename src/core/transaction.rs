@@ -298,10 +298,9 @@ pub fn verify_transaction_sigs(
             // predicates (P2PK, MSS, dust sweeps) keep the one-signature model.
             // Pre-V5: unchanged (inputs[0] only), so historical blocks stay valid.
             if height >= crate::core::types::V5_ACTIVATION_HEIGHT {
-                if let crate::core::types::Predicate::Script { bytecode } = &inputs[0].predicate {
-                    if crate::core::script::reads_per_input_context(bytecode) {
-                        bail!("Consolidate predicate reads per-input context; spend via Reveal");
-                    }
+                let crate::core::types::Predicate::Script { bytecode } = &inputs[0].predicate;
+                if crate::core::script::reads_per_input_context(bytecode) {
+                    bail!("Consolidate predicate reads per-input context; spend via Reveal");
                 }
             }
             if !verify_predicate(&inputs[0].predicate, witness, &commitment, height, outputs, inputs[0].value, inputs[0].commitment, &sums) {
@@ -895,10 +894,9 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             // context (see verify_transaction_sigs for the rationale). Pre-V5:
             // unchanged.
             if state.height >= crate::core::types::V5_ACTIVATION_HEIGHT {
-                if let crate::core::types::Predicate::Script { bytecode } = &inputs[0].predicate {
-                    if crate::core::script::reads_per_input_context(bytecode) {
-                        bail!("Consolidate predicate reads per-input context; spend via Reveal");
-                    }
+                let crate::core::types::Predicate::Script { bytecode } = &inputs[0].predicate;
+                if crate::core::script::reads_per_input_context(bytecode) {
+                    bail!("Consolidate predicate reads per-input context; spend via Reveal");
                 }
             }
             if !verify_predicate(&inputs[0].predicate, witness, &expected, state.height, outputs, inputs[0].value, inputs[0].commitment, &sums) {
@@ -1158,10 +1156,9 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
             // context (see verify_transaction_sigs for the rationale). Pre-V5:
             // unchanged.
             if state.height >= crate::core::types::V5_ACTIVATION_HEIGHT {
-                if let crate::core::types::Predicate::Script { bytecode } = &inputs[0].predicate {
-                    if crate::core::script::reads_per_input_context(bytecode) {
-                        bail!("Consolidate predicate reads per-input context; spend via Reveal");
-                    }
+                let crate::core::types::Predicate::Script { bytecode } = &inputs[0].predicate;
+                if crate::core::script::reads_per_input_context(bytecode) {
+                    bail!("Consolidate predicate reads per-input context; spend via Reveal");
                 }
             }
             if !verify_predicate(&inputs[0].predicate, witness, &expected, state.height, outputs, inputs[0].value, inputs[0].commitment, &sums) {
