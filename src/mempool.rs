@@ -775,6 +775,14 @@ impl Mempool {
                         } else {
                             return true;
                         }
+                        // Evict transactions whose outputs can never be inserted
+                        // (duplicate output coin, or collision with an existing
+                        // unspent coin). The apply path now rejects these cleanly
+                        // before mutating, so they would otherwise sit here being
+                        // re-tried and skipped on every block template.
+                        if crate::core::transaction::check_output_coin_ids(state, &input_ids, outputs).is_err() {
+                            return true;
+                        }
                         false
                     }
                     _ => true,

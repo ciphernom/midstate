@@ -295,6 +295,46 @@ pub fn verify_transaction_sigs(
     }
 }
 
+/// Read-only pre-check that the output coin IDs can be inserted without
+/// collision: no duplicate within the outputs, and no output equal to a coin
+/// that already exists and is not being spent by this same transaction.
+///
+/// # Reasoning
+/// `apply_transaction` and `apply_transaction_no_sig_check` remove the spent
+/// coins (and, before the replay-fix height, the commitment) and only THEN
+/// insert the outputs, bailing with "Duplicate coin created" the moment an
+/// insert collides — i.e. *after* state has already been mutated. Rust performs
+/// no rollback, so a transaction that fails this late leaves the caller's state
+/// partially modified. The block builders apply to a shared candidate with
+/// `if apply_transaction(..).is_ok()`, so one such transaction corrupts the
+/// candidate (its state root then mismatches every validator) even though it is
+/// excluded from the block.
+///
+/// Running this check before any mutation makes both apply functions
+/// all-or-nothing from the caller's perspective. It is a pure refactor of an
+/// existing late failure to an early one: a transaction that would have bailed
+/// still bails, a valid transaction is entirely unaffected, and the set of
+/// valid blocks is unchanged — so this carries no consensus/fork implications.
+pub fn check_output_coin_ids(
+    state: &State,
+    input_coin_ids: &[[u8; 32]],
+    outputs: &[OutputData],
+) -> Result<()> {
+    let spent: std::collections::HashSet<[u8; 32]> = input_coin_ids.iter().copied().collect();
+    let mut seen = std::collections::HashSet::new();
+    for out in outputs {
+        if let Some(cid) = out.coin_id() {
+            if !seen.insert(cid) {
+                bail!("Duplicate coin created");
+            }
+            if state.coins.contains(&cid) && !spent.contains(&cid) {
+                bail!("Duplicate coin created");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Apply a transaction that has already passed signature verification.
 /// Skips the verify_predicate call — all other validation still runs.
 ///
@@ -397,6 +437,9 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
 
             // NOTE: verify_predicate intentionally skipped here — already done in parallel
 
+            // Final read-only gate before any mutation (see check_output_coin_ids).
+            check_output_coin_ids(state, &input_coin_ids, outputs)?;
+
             for coin_id in &input_coin_ids {
                 state.coins.remove(coin_id, v2);
             }
@@ -490,6 +533,8 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
                     bail!("Coin {} not found or already spent", hex::encode(input.coin_id()));
                 }
             }
+            // Final read-only gate before any mutation (see check_output_coin_ids).
+            check_output_coin_ids(state, &input_coin_ids, outputs)?;
             for coin_id in &input_coin_ids {
                 state.coins.remove(coin_id, v2);
             }
@@ -707,6 +752,11 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 }
             }
 
+            // Final read-only gate: outputs must be insertable. Checked here,
+            // before any mutation, so a collision cannot leave state partially
+            // modified (see check_output_coin_ids).
+            check_output_coin_ids(state, &input_coin_ids, outputs)?;
+
             // === ALL CHECKS PASSED — NOW PERFORM MUTATIONS (atomic from the caller's perspective) ===
 
             // PREVENT COMMIT REPLAY ATTACK: Do not delete commitments after activation height.
@@ -824,6 +874,9 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
             if !verify_predicate(&inputs[0].predicate, witness, &expected, state.height, outputs, inputs[0].value, inputs[0].commitment, &sums) {
                 bail!("Predicate execution failed for Consolidate witness");
             }
+
+            // Final read-only gate before any mutation (see check_output_coin_ids).
+            check_output_coin_ids(state, &input_coin_ids, outputs)?;
 
             // === ALL CHECKS PASSED — NOW PERFORM MUTATIONS ===
             if state.height < crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
@@ -1024,6 +1077,10 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                 }
             }
 
+            // Reject structurally-unappliable output coin IDs at validation time
+            // too, so relay/re-add/prune agree with apply (see check_output_coin_ids).
+            check_output_coin_ids(state, &input_coin_ids, outputs)?;
+
             Ok(())
         }
         Transaction::Consolidate { inputs, witness, outputs, salt, .. } => {
@@ -1075,6 +1132,7 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
             if !verify_predicate(&inputs[0].predicate, witness, &expected, state.height, outputs, inputs[0].value, inputs[0].commitment, &sums) {
                 bail!("Predicate execution failed for Consolidate witness");
             }
+            check_output_coin_ids(state, &input_coin_ids, outputs)?;
             Ok(())
         }
     }
