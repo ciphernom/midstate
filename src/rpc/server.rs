@@ -34,33 +34,67 @@ fn is_lan_ip(ip: IpAddr) -> bool {
 }
 
 /// Axum middleware to drop requests originating from the public internet.
+///
+/// SECURITY: `X-Forwarded-For` is attacker-controlled. The previous version
+/// read the FIRST entry of `X-Forwarded-For` (falling back to `X-Real-IP`) and
+/// allowed the request whenever that parsed as loopback/LAN. Because the header
+/// is supplied by the client, anyone who could reach this port could send
+/// `X-Forwarded-For: 127.0.0.1` and reach the `/axe` hardware-management routes
+/// (Wi-Fi setup, overclock, config, rewards) from the public internet.
+///
+/// The correct model (identical to `handlers::send_chat`) is:
+///   1. The IMMEDIATE peer — the real TCP socket address, which the client
+///      cannot forge — must itself be LAN/loopback. A WAN socket is rejected
+///      outright no matter what headers it carries.
+///   2. Only then, if a *trusted local* reverse proxy forwarded the request,
+///      EVERY hop in the `X-Forwarded-For` chain must also be LAN. A single
+///      public IP anywhere in the chain proves the request crossed the WAN at
+///      some hop; a malformed entry fails closed.
+///
+/// This still supports the intended deployment (a loopback/LAN Nginx fronting
+/// the node) while making header spoofing from a non-local socket ineffective.
 async fn lan_only_middleware(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // Check real client IP, honoring reverse proxies (Nginx, etc.)
-    let real_ip = req
+    // 1. The real socket must be local. This is the gate the client cannot spoof.
+    if !is_lan_ip(addr.ip()) {
+        tracing::warn!("Blocked direct WAN access to hardware endpoint from {}", addr.ip());
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // 2. The socket is local (e.g. a loopback/LAN reverse proxy, or localhost
+    //    itself). If that proxy is forwarding on behalf of someone, require the
+    //    entire forwarded chain to be LAN as well — one public hop means the
+    //    request originated off-LAN and must be rejected.
+    if let Some(forwarded) = req
         .headers()
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .or_else(|| req.headers().get("x-real-ip").and_then(|v| v.to_str().ok()))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| addr.ip().to_string());
-
-    // Parse the IP (handle possible port in some proxies, though rare for X-Forwarded-For)
-    let ip_str = real_ip.split(':').next().unwrap_or(&real_ip);
-    if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
-        if is_lan_ip(ip) {
-            return Ok(next.run(req).await);
+    {
+        for ip_str in forwarded.split(',') {
+            match ip_str.trim().parse::<IpAddr>() {
+                Ok(ip) if !is_lan_ip(ip) => {
+                    tracing::warn!(
+                        "Blocked proxied WAN access to hardware endpoint: XFF chain contains {}",
+                        ip
+                    );
+                    return Err(StatusCode::FORBIDDEN);
+                }
+                Ok(_) => {} // LAN hop — keep checking the rest
+                Err(_) => {
+                    tracing::warn!(
+                        "Blocked hardware endpoint: malformed XFF entry {:?}",
+                        ip_str.trim()
+                    );
+                    return Err(StatusCode::FORBIDDEN);
+                }
+            }
         }
-        tracing::warn!("Blocked WAN access to hardware endpoint from {} (via proxy)", ip);
-    } else {
-        tracing::warn!("Blocked request with unparsable client IP: {}", real_ip);
     }
 
-    Err(StatusCode::FORBIDDEN)
+    Ok(next.run(req).await)
 }
 
 pub struct RpcServer {
