@@ -1732,10 +1732,17 @@ async function loadBlock(h) {
         let finalityBadge = '';
         if (chainState) {
             const confirmations = Math.max(0, chainState.height - h);
-            const isFinal = confirmations >= chainState.safe_depth;
-            finalityBadge = isFinal 
-                ? `<span class="badge-final">✓ FINALIZED (Depth: ${confirmations})</span>` 
-                : `<span class="badge-pend">⧗ PENDING (Depth: ${confirmations} / ${chainState.safe_depth} req)</span>`;
+            // safe_depth == u64::MAX (SAFE_DEPTH_UNATTAINABLE) means the node
+            // cannot establish the requested finality risk at any depth. Never
+            // mark anything final in that case; `>= huge` would already be false,
+            // but guard explicitly so the UI shows an honest state.
+            const unattainable = chainState.safe_depth >= Number.MAX_SAFE_INTEGER;
+            const isFinal = !unattainable && confirmations >= chainState.safe_depth;
+            finalityBadge = unattainable
+                ? `<span class="badge-pend">⧗ UNVERIFIED (Depth: ${confirmations}; finality unattainable at current confidence)</span>`
+                : (isFinal
+                    ? `<span class="badge-final">✓ FINALIZED (Depth: ${confirmations})</span>`
+                    : `<span class="badge-pend">⧗ PENDING (Depth: ${confirmations} / ${chainState.safe_depth} req)</span>`);
         }
 
         let html = `<div class="block-hdr">

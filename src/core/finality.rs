@@ -1,5 +1,22 @@
 //! Bayesian Finality Estimation using a Beta-Binomial Model.
 
+/// Sentinel returned by [`FinalityEstimator::calculate_safe_depth`] when the
+/// requested risk cannot be met at *any* depth within the search range.
+///
+/// This happens whenever the posterior mass on "attacker holds >= 50% of the
+/// hashpower" (`p <= 0.5`, where the per-block catch-up probability is `1.0`
+/// and therefore depth-independent) already exceeds `target_risk`: no number of
+/// confirmations can drive the expected reorg probability below the target.
+///
+/// It is deliberately `u64::MAX` so that callers which do not special-case it
+/// are still fail-safe: `confirmations >= SAFE_DEPTH_UNATTAINABLE` is always
+/// false, so nothing is ever declared final, and depth-subtraction
+/// (`height.saturating_sub(safe_depth)`) saturates to 0 (prune nothing). The
+/// previous behaviour returned the finite 10,000 cap here, which looked like a
+/// real "safe depth" and could cause a transaction to be shown as final at a
+/// depth whose true reorg risk was far above the requested threshold.
+pub const SAFE_DEPTH_UNATTAINABLE: u64 = u64::MAX;
+
 /// Dynamically estimates the safe re-organization depth using a Beta-Binomial model.
 ///
 /// The probability of a successful deep reorg of length `z` by an attacker with
@@ -54,6 +71,11 @@ impl FinalityEstimator {
     /// Calculates the required block depth `z` to ensure the expected probability
     /// of a successful reorg is below `target_risk`.
     ///
+    /// Returns [`SAFE_DEPTH_UNATTAINABLE`] if no depth in the search range meets
+    /// `target_risk` (e.g. the posterior already places more than `target_risk`
+    /// mass on an attacker majority). Callers MUST treat that value as "finality
+    /// cannot be established at this confidence", not as a literal depth.
+    ///
     /// # Examples
     /// ```
     /// use midstate::core::finality::FinalityEstimator;
@@ -96,32 +118,38 @@ impl FinalityEstimator {
         let mut low = 1;
         let mut high = 10_000;
         let mut ans = 10_000;
+        // Whether ANY depth in [low, high] actually met the target. Without this
+        // the loop returns its initial `ans` (10,000) even when nothing passed,
+        // reporting a "safe depth" that is not safe. See SAFE_DEPTH_UNATTAINABLE.
+        let mut found = false;
 
         while low <= high {
             let mid = low + (high - low) / 2;
             let mut expected_risk = 0.0;
-            
+
             for i in 1..STEPS {
                 let p = i as f64 / STEPS as f64;
                 let w = weights[i] / total_weight;
-                
+
                 let catchup_prob = if p > 0.5 {
                     ((1.0 - p) / p).powi(mid as i32)
                 } else {
                     1.0
                 };
-                
+
                 expected_risk += catchup_prob * w;
             }
 
             if expected_risk <= target_risk {
                 ans = mid;
+                found = true;
                 high = mid - 1; // Try to find a tighter/smaller safe depth
             } else {
                 low = mid + 1;  // Not safe enough, increase depth
             }
         }
-        ans
+
+        if found { ans } else { SAFE_DEPTH_UNATTAINABLE }
     }
 }
 #[cfg(test)]
@@ -180,11 +208,25 @@ mod tests {
     }
 
     #[test]
-    fn test_extreme_adversarial_hits_cap() {
-        // If the prior strongly suggests the attacker has the majority of the hash power (beta > alpha),
-        // the catchup probability is effectively 1.0. It should hit the 10,000 safety cap.
-        let est = FinalityEstimator::new(2, 50); 
+    fn test_extreme_adversarial_is_unattainable() {
+        // If the prior strongly suggests the attacker has the majority of the
+        // hash power (beta > alpha), the catch-up probability on the p <= 0.5
+        // mass is 1.0 and depth-independent, so the target risk cannot be met at
+        // ANY depth. The estimator must say so explicitly rather than returning
+        // the 10,000 cap as if it were a real safe depth.
+        let est = FinalityEstimator::new(2, 50);
         let depth = est.calculate_safe_depth(1e-6);
-        assert_eq!(depth, 10_000);
+        assert_eq!(depth, SAFE_DEPTH_UNATTAINABLE);
+    }
+
+    #[test]
+    fn test_attainable_returns_finite_depth() {
+        // An honest-majority posterior must still yield a real, finite depth
+        // (regression guard: the unattainable sentinel must not leak into the
+        // normal case).
+        let est = FinalityEstimator::new(200, 2);
+        let depth = est.calculate_safe_depth(1e-6);
+        assert_ne!(depth, SAFE_DEPTH_UNATTAINABLE);
+        assert!(depth >= 1 && depth <= 10_000);
     }
 }

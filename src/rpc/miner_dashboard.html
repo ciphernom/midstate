@@ -460,7 +460,7 @@ async function pollStats() {
     // ── Header ───────────────────────────────────────────────
     document.getElementById('h-height').textContent = state.height.toLocaleString();
     if (peers) document.getElementById('h-peers').textContent = peers.peers.length;
-    document.getElementById('h-safedepth').textContent = state.safe_depth.toLocaleString();
+    document.getElementById('h-safedepth').textContent = state.safe_depth >= Number.MAX_SAFE_INTEGER ? 'N/A' : state.safe_depth.toLocaleString();
     if (axe) document.getElementById('h-uptime').textContent = fmtUptime(axe.uptime_s);
 
     // ── Mining Performance ───────────────────────────────────
@@ -557,7 +557,7 @@ async function pollStats() {
     document.getElementById('target').textContent      = state.target.substring(0,10) + '…';
     document.getElementById('reward').textContent      = state.block_reward.toLocaleString();
     document.getElementById('chain-depth').textContent = fmtDepth(state.depth);
-    document.getElementById('safe-depth-val').textContent = state.safe_depth.toLocaleString();
+    document.getElementById('safe-depth-val').textContent = state.safe_depth >= Number.MAX_SAFE_INTEGER ? 'N/A' : state.safe_depth.toLocaleString();
     if (mempool) {
         document.getElementById('mempool').textContent = mempool.size.toLocaleString();
         const txs = mempool.transactions || [];
