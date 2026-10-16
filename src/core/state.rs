@@ -309,6 +309,19 @@ fn apply_batch_internal(
     
     // WOTS & MSS address/leaf-reuse consensus check.
     // Uses the pre-built oracle so state.rs stays pure (no storage I/O here).
+    //
+    // From V5_ACTIVATION_HEIGHT reuse of a one-time key — the same WOTS address
+    // or MSS leaf authenticating two DIFFERENT commitments — makes the block
+    // invalid. Reusing a one-time signature is the precondition for signature
+    // forgery, so consensus must reject it rather than merely logging and
+    // leaving it to the economic "Bounty Hunter" sweep. Before V5 the behaviour
+    // is unchanged (diagnostic log only) so every historical block stays valid;
+    // because this only ever removes transactions from the valid set, upgraded
+    // and non-upgraded nodes do not partition on pre-V5 history — a soft fork.
+    //
+    // The same-commitment case is NOT reuse: it is the identical transaction
+    // (e.g. idempotent re-application) and is always allowed.
+    let enforce_key_reuse = state.height >= crate::core::types::V5_ACTIVATION_HEIGHT;
     for tx in &batch.transactions {
         match tx {
             Transaction::Reveal { inputs, witnesses, outputs, salt } => {
@@ -321,15 +334,21 @@ fn apply_batch_internal(
                     if let Some(sig) = wit_inputs.first() {
                         if sig.len() == crate::core::wots::SIG_SIZE {
                             let addr = input.predicate.address();
-                                if let Some(&prior_commitment) = spent_oracle.get(&addr) {
-                                    if prior_commitment != this_commitment {
-                                        tracing::warn!("WOTS address {} reused. The Bounty Hunter will sweep this.", hex::encode(addr));
+                            if let Some(&prior_commitment) = spent_oracle.get(&addr) {
+                                if prior_commitment != this_commitment {
+                                    if enforce_key_reuse {
+                                        bail!("WOTS address {} reused for a second commitment (one-time key): block invalid", hex::encode(addr));
                                     }
+                                    tracing::warn!("WOTS address {} reused. The Bounty Hunter will sweep this.", hex::encode(addr));
                                 }
+                            }
                             spent_oracle.insert(addr, this_commitment);
                         } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
                             if let Some(&prior_commitment) = spent_oracle.get(&mss_sig.wots_pk) {
                                 if prior_commitment != this_commitment {
+                                    if enforce_key_reuse {
+                                        bail!("MSS leaf {} reused for a second commitment (one-time key): block invalid", hex::encode(mss_sig.wots_pk));
+                                    }
                                     tracing::warn!("MSS leaf {} reused. The Bounty Hunter will sweep this.", hex::encode(mss_sig.wots_pk));
                                 }
                             }
@@ -349,17 +368,23 @@ fn apply_batch_internal(
                     if sig.len() == crate::core::wots::SIG_SIZE {
                         let addr = inputs[0].predicate.address();
                         if let Some(&prior_commitment) = spent_oracle.get(&addr) {
-                                    if prior_commitment != this_commitment {
-                                        tracing::warn!("WOTS address {} reused. The Bounty Hunter will sweep this.", hex::encode(addr));
-                                    }
+                            if prior_commitment != this_commitment {
+                                if enforce_key_reuse {
+                                    bail!("WOTS address {} reused for a second commitment (one-time key): block invalid", hex::encode(addr));
                                 }
+                                tracing::warn!("WOTS address {} reused. The Bounty Hunter will sweep this.", hex::encode(addr));
+                            }
+                        }
                         spent_oracle.insert(addr, this_commitment);
                     } else if let Ok(mss_sig) = crate::core::mss::MssSignature::from_bytes(sig) {
                         if let Some(&prior_commitment) = spent_oracle.get(&mss_sig.wots_pk) {
-                                if prior_commitment != this_commitment {
-                                    tracing::warn!("MSS leaf {} reused. The Bounty Hunter will sweep this.", hex::encode(mss_sig.wots_pk));
+                            if prior_commitment != this_commitment {
+                                if enforce_key_reuse {
+                                    bail!("MSS leaf {} reused for a second commitment (one-time key): block invalid", hex::encode(mss_sig.wots_pk));
                                 }
+                                tracing::warn!("MSS leaf {} reused. The Bounty Hunter will sweep this.", hex::encode(mss_sig.wots_pk));
                             }
+                        }
                         spent_oracle.insert(mss_sig.wots_pk, this_commitment);
                     }
                 }

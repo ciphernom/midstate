@@ -945,7 +945,28 @@ pub const PRUNE_DEPTH: u64 = 1000;
 
 
 pub const V4_ACTIVATION_HEIGHT: u64 = 163_675;
-pub const TIMEWARP_FIX_ACTIVATION_HEIGHT: u64 = 250_000; 
+pub const TIMEWARP_FIX_ACTIVATION_HEIGHT: u64 = 250_000;
+
+/// Soft-fork activation for two consensus tightenings:
+///
+///   * **One-time-key reuse rejection** — reusing a WOTS address or MSS leaf
+///     for two different commitments (the signature-forgery precondition) was
+///     detected in `apply_batch_internal` but only logged; from this height a
+///     block containing such reuse is invalid.
+///   * **Per-input Consolidate predicate evaluation** — a Consolidate executed
+///     its shared predicate only against `inputs[0]`'s context, so coins 2..N
+///     guarded by a covenant reading per-input value/state were spent without
+///     their own conditions being checked; from this height the predicate is
+///     evaluated against every input.
+///
+/// Both are *tightenings*: every block valid under the new rules is valid under
+/// the old ones, so non-upgraded nodes continue to follow the upgraded
+/// majority chain — a soft fork, not a hard fork. No state-root formula changes.
+///
+/// IMPORTANT: set this to a height comfortably ahead of the network tip at
+/// release time so the super-majority of hashpower upgrades before activation.
+/// The placeholder below MUST be reviewed before deployment.
+pub const V5_ACTIVATION_HEIGHT: u64 = 300_000;
 
 pub const COMMIT_POW_WINDOW: u64 = 1000;
 
