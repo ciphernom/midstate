@@ -5451,8 +5451,14 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
         }
 
         // ── KEY REUSE PUNISHMENT BURN PROTOCOL ─────────────────────────────────
+        // Audit BH1: this burn never actually landed (it reads the always-empty
+        // `burned_wots`, is injected only into light-protocol templates, and its own
+        // `active_burns` entry rejects its reveal once the commit is mined), and from
+        // V5_ACTIVATION_HEIGHT it is itself invalid — a second signature by the reused
+        // key. Gate it below V5; at/above V5 the plain mempool refusal of a second
+        // spend is the behaviour.
         let tx_sig_infos = extract_sig_infos(&tx);
-        if !tx_sig_infos.is_empty() {
+        if !tx_sig_infos.is_empty() && self.state.height < crate::core::types::V5_ACTIVATION_HEIGHT {
             let mempool_txs = self.mempool.transactions_cloned();
             for tx_info in &tx_sig_infos {
                 // Prevent redundant grinding DoS if we are already burning this key
