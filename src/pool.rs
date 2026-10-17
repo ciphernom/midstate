@@ -2829,14 +2829,18 @@ fn spawn_block_submission(state: &Arc<PoolState>, job: Job, ext: Extension) {
                         // rows then leaked into the allocator and captured block rewards. redb has
                         // no delete-if-absent, so guard the remove on the row existing.
                         if let Some(current) = table.get(&a).unwrap().map(|v| v.value()) {
-                            let remaining = current.saturating_sub(deduction);
+                            // Audit M1: record what was ACTUALLY removed (min(current,
+                            // deduction)) in BOTH branches, so an orphan refund restores
+                            // exactly the pre-block score instead of over-crediting an
+                            // emptied row by the larger coin-sized deduction.
+                            let removed = current.min(deduction);
+                            let remaining = current - removed;
                             if remaining > 0 {
                                 table.insert(&a, remaining).unwrap();
                             } else {
                                 table.remove(&a).unwrap();
-                                // Record deduction ---
-                                actual_deductions.push((hex::encode(a), deduction));
                             }
+                            actual_deductions.push((hex::encode(a), removed));
                         }
 
                         payouts.push(serde_json::json!({
