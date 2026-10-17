@@ -690,7 +690,7 @@ function disassembleScript(hexOrBytes) {
     }
 
     const ascii = data.every(x => x >= 32 && x <= 126)
-      ? ` <span class="comment">"${String.fromCharCode(...data)}"</span>`
+      ? ` <span class="comment">"${escHtml(String.fromCharCode(...data))}"</span>`
       : '';
 
     return `<span class="data">${data.length} 0x${dataHex}</span>${ascii}${annotation}`;
