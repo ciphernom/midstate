@@ -1419,9 +1419,10 @@ pub async fn run_stratum_pool(
                 );
             }
 
-            // The node's reported height is the confirmed tip; the block a found job
-            // produces is the next one (tip + 1). Refreshed every poll so the dashboard
-            // can show the live chain height even between our own block finds.
+            // `/state.height` is already the height the NEXT mined block will have:
+            // the node increments state.height after applying a block and stores that
+            // block at height-1. So a job we find IS this height, not height+1 (audit
+            // M2). Refreshed every poll so the dashboard can show the live chain height.
             let tip_height = net_state["height"].as_u64().unwrap_or(0);
             state_clone.current_height.store(tip_height, std::sync::atomic::Ordering::Relaxed);
 
@@ -1677,7 +1678,7 @@ pub async fn run_stratum_pool(
                             network_target: n_target,
                             midwimble: merge_commit.clone(),
                             batch_template: template["batch_template"].clone(),
-                            height: tip_height.saturating_add(1),
+                            height: tip_height,
                             committed_scores: std::sync::Arc::new(shares_vec.clone()),
                         };
 
@@ -3008,16 +3009,31 @@ async fn reconcile_pending_blocks(state: &Arc<PoolState>, client: &reqwest::Clie
             Ok(resp) => {
                 if resp.status().is_success() {
                     if let Ok(batch) = resp.json::<serde_json::Value>().await {
-                        let canonical_hash = batch["extension"]["final_hash"].as_str().unwrap_or("");
-                        if canonical_hash == expected_hash {
+                        // `final_hash` is `[u8; 32]` with a plain serde derive, so it
+                        // serialises as a JSON array of numbers, not a hex string:
+                        // `as_str()` was always None and every block was judged orphaned
+                        // (audit M2). Decode the array and hex-encode to match the stored
+                        // hash, which was written as `hex::encode(final_hash)`.
+                        let canonical_hash = batch["extension"]["final_hash"]
+                            .as_array()
+                            .map(|a| a.iter()
+                                .filter_map(|v| v.as_u64())
+                                .map(|b| format!("{:02x}", b as u8))
+                                .collect::<String>())
+                            .unwrap_or_default();
+                        if canonical_hash.is_empty() {
+                            // Unparseable body: keep the block pending and retry later.
+                        } else if canonical_hash == expected_hash {
                             confirmed.push((height, pending_data));
                         } else {
                             orphaned.push((height, pending_data));
                         }
                     }
-                } else if resp.status() == 404 || resp.status() == 400 || resp.status() == 500 {
-                    // Block not found or invalid height on node -> definitively orphaned
-                    orphaned.push((height, pending_data));
+                } else {
+                    // Any non-success status is ambiguous (the node answers 400 for
+                    // not-found and for storage errors alike), so keep the block pending
+                    // and retry on a later tick rather than orphaning and refunding on a
+                    // transient error (audit M2).
                 }
             }
             Err(e) => {
