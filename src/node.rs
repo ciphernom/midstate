@@ -6478,6 +6478,18 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
 
                     self.storage.save_batch(pre_height, &batch)?;
 
+                    // Audit G1: the gossip tip-extension path previously recorded the
+                    // block but never its spent keys / MSS leaves, unlike the mined,
+                    // linear-sync, orphan and reorg branches. A gossip-following node
+                    // therefore under-reported /mss_state and held a stale spent-address
+                    // table. Persist them here too, as the other branches do.
+                    if let Err(e) = self.storage.burn_batch_addresses(&batch, pre_height) {
+                        tracing::warn!("burn_batch_addresses failed on gossip apply at height {}: {}", pre_height, e);
+                    }
+                    if let Err(e) = self.storage.save_state(&self.state) {
+                        tracing::error!("Failed to save state on gossip apply: {}", e);
+                    }
+
                     // Close the MMR Gossip Challenge exploit: now that the batch is cryptographically
                     // validated and persisted, credit (or slash) any peers who previously replied
                     // to our LicenseChallenge for this height with a DataHash claim.
