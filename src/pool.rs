@@ -3139,7 +3139,7 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                         write_half.write_all(format!("{}\n", serde_json::to_string(&res)?).as_bytes()).await?;
                     }
                     "mining.authorize" => {
-                        let address = req.params[0].as_str().unwrap_or("").to_string();
+                        let address = req.params.get(0).and_then(|v| v.as_str()).unwrap_or("").to_string();
                         // params[1] is the worker name by stratum convention (the reference
                         // miner sends "worker1"); record it for this connection's breakdown.
                         if let Some(w) = req.params.get(1).and_then(|v| v.as_str()) {
