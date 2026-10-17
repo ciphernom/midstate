@@ -821,6 +821,12 @@ pub fn compile_htlc(
 ) -> Vec<u8> {
     let mut bc = Vec::new();
     bc.push(OP_IF);
+    // Audit W2: require a 32-byte preimage before hashing. A hashlock set to the hash
+    // of a non-32-byte secret can be satisfied here but never through the Base
+    // contract's claimBid (which takes a bytes32), stranding the counterparty.
+    bc.push(OP_SIZE);
+    push_int(&mut bc, 32);
+    bc.push(OP_EQUALVERIFY);
     bc.push(OP_HASH);
     push_data(&mut bc, secret_hash);
     bc.push(OP_EQUALVERIFY);
@@ -859,6 +865,10 @@ pub fn compile_covenant_htlc(
 ) -> Vec<u8> {
     let mut bc = Vec::new();
     bc.push(OP_IF);
+        // Audit W2: require a 32-byte preimage before hashing (see compile_htlc).
+        bc.push(OP_SIZE);
+        push_int(&mut bc, 32);
+        bc.push(OP_EQUALVERIFY);
         bc.push(OP_HASH);
         push_data(&mut bc, secret_hash);
         bc.push(OP_EQUALVERIFY);                 // secret matches the hashlock
@@ -927,6 +937,10 @@ pub fn compile_limit_order_covenant(
     let mut bc = Vec::new();
     bc.push(OP_IF);
         // (a) hashlock — the preimage the maker harvests to sweep ETH on Base
+        // Audit W2: require a 32-byte preimage before hashing (see compile_htlc).
+        bc.push(OP_SIZE);
+        push_int(&mut bc, 32);
+        bc.push(OP_EQUALVERIFY);
         bc.push(OP_HASH);
         push_data(&mut bc, secret_hash);
         bc.push(OP_EQUALVERIFY);
