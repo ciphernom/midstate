@@ -4800,6 +4800,28 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
         let end_h = cursor + chunk_size as u64 - 1;
         tracing::info!("Received headers {}..{} ({} total). Verifying Proof-of-Work...", start_h, end_h, chunk_size);
 
+        // Audit P1: a cheap structural pass BEFORE the 1,000,000-iteration-per-header
+        // PoW verification below. A chunk whose headers do not link, or whose targets
+        // do not follow ASERT, is rejected for O(n) comparisons instead of
+        // n * 1,000,000 BLAKE3 iterations. These are the same linkage/target checks the
+        // full verify_header_chain pass applies (its MTP step and header[0]'s own target
+        // still run once the chunk is accumulated), so this only rejects chunks that
+        // would fail that pass anyway — it never drops a chunk the node would accept.
+        for i in 1..headers.len() {
+            let h = &headers[i];
+            let prev = &headers[i - 1];
+            let ok = h.prev_header_hash == prev.extension.final_hash
+                && h.prev_midstate == prev.post_tx_midstate
+                && h.height == prev.height + 1
+                && h.target == crate::core::state::calculate_target(prev.height + 1, prev.timestamp);
+            if !ok {
+                tracing::warn!("Header chunk fails cheap linkage/target pre-check at index {}; rejecting before PoW", i);
+                self.network.disconnect_peer(from);
+                self.abort_sync_session("header chunk failed linkage/target pre-check");
+                return Ok(());
+            }
+        }
+
         // --- NEW: NON-BLOCKING PIPELINED VERIFICATION ---
         // Verify the PoW of this specific chunk immediately as it arrives on a background thread.
         let chunk_owned = headers.clone();
