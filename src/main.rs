@@ -2414,6 +2414,45 @@ async fn wallet_consolidate(
     let mut wallet = Wallet::open(path, &password)?;
     let client = reqwest::Client::new();
 
+    // Audit WT1: `wallet consolidate` signs an MSS input but, unlike `wallet send`,
+    // never consulted /mss_state. After a restore (every tree re-derives at
+    // next_leaf = 0) that re-signs already-spent leaves — key reuse before block
+    // 340,000, a failed/burned send after it. Run the same leaf-safety check here
+    // before signing. (The fuller WT1 fix moves this into the signing functions so
+    // `wallet reveal` and mix inputs cannot bypass it either.)
+    if !wallet.data.mss_keys.is_empty() {
+        println!("Connecting to node to verify MSS safety indices...");
+        let mss_url = format!("http://{}:{}/mss_state", rpc_host, rpc_port);
+        for i in 0..wallet.data.mss_keys.len() {
+            let master_pk = wallet.data.mss_keys[i].master_pk;
+            let current_leaf = wallet.data.mss_keys[i].next_leaf;
+            let req = rpc::GetMssStateRequest { master_pk: hex::encode(master_pk) };
+            // Strict: if the node is unreachable, abort rather than risk reuse.
+            let response = client.post(&mss_url).json(&req).send().await
+                .context("CRITICAL: Could not connect to node. Aborting to prevent MSS key reuse.")?;
+            if !response.status().is_success() {
+                anyhow::bail!("Safety Check Failed: Node returned error checking MSS state.");
+            }
+            let mss_resp: rpc::GetMssStateResponse = response.json().await
+                .context("Safety Check Failed: Invalid response from node.")?;
+            if mss_resp.next_index > current_leaf {
+                const SAFETY_MARGIN: u64 = 20;
+                // Audit N9: never fast-forward past the tree capacity (2^height).
+                let capacity = 1u64 << wallet.data.mss_keys[i].height;
+                if mss_resp.next_index > capacity {
+                    println!("  ⚠️  MSS Key {}: node-reported leaf {} exceeds capacity {} — clamping",
+                        hex::encode(&master_pk), mss_resp.next_index, capacity);
+                }
+                let new_leaf = mss_resp.next_index.saturating_add(SAFETY_MARGIN).min(capacity);
+                println!("  ⚠️  MSS Key {}: advancing leaf {} -> {} before consolidate",
+                    hex::encode(&master_pk), current_leaf, new_leaf);
+                wallet.data.mss_keys[i].set_next_leaf(new_leaf);
+                wallet.save().context("Failed to save updated wallet state")?;
+            }
+        }
+        println!("  ✓ MSS indices verified safe.");
+    }
+
     let target_addr = midstate::core::types::parse_address_flexible(&address_str)
         .map_err(|e| anyhow::anyhow!(e))?;
 
