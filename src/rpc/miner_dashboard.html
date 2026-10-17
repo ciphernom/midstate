@@ -239,7 +239,11 @@ function log(msg, color = 'var(--text-bright)') {
     el.className = 'term-line';
     el.style.color = color;
     const ts = new Date().toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
-    el.innerHTML = `<span class="log-time">[${ts}]</span> ${msg}`;
+    const timeSpan = document.createElement('span');
+    timeSpan.className = 'log-time';
+    timeSpan.textContent = `[${ts}]`;
+    el.appendChild(timeSpan);
+    el.appendChild(document.createTextNode(` ${msg}`));
     const box = document.getElementById('term-log');
     box.appendChild(el);
     box.scrollTop = box.scrollHeight;
