@@ -912,10 +912,18 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
                                 let wots_sig_bytes = crate::core::wots::sig_to_bytes(&mss_sig.wots_sig);
                                 sig_archive_table.insert(&mss_sig.wots_pk, wots_sig_bytes.as_slice())?;
 
-                                let master_pk = crate::core::mss::recover_master_pk(&mss_sig);
-                                let next = mss_sig.leaf_index.saturating_add(1);
-                                let current = mss_idx_table.get(&master_pk)?.map(|v: redb::AccessGuard<'_, u64>| v.value()).unwrap_or(0);
-                                if next > current { mss_idx_table.insert(&master_pk, next)?; }
+                                // Audit N9: `mss_sigs_in_stack` parses without verifying,
+                                // and `mss::verify` rejects leaf_index >= 2^auth_len, so
+                                // bound by the same rule before recording — otherwise a
+                                // crafted blob could advance an arbitrary master key's
+                                // high-water leaf and strand a victim's wallet.
+                                let capacity = 1u64.checked_shl(mss_sig.auth_path.len() as u32).unwrap_or(u64::MAX);
+                                if mss_sig.leaf_index < capacity {
+                                    let master_pk = crate::core::mss::recover_master_pk(&mss_sig);
+                                    let next = mss_sig.leaf_index.saturating_add(1);
+                                    let current = mss_idx_table.get(&master_pk)?.map(|v: redb::AccessGuard<'_, u64>| v.value()).unwrap_or(0);
+                                    if next > current { mss_idx_table.insert(&master_pk, next)?; }
+                                }
                             }
                         }
                     }
@@ -938,10 +946,15 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
                             let wots_sig_bytes = crate::core::wots::sig_to_bytes(&mss_sig.wots_sig);
                             sig_archive_table.insert(&mss_sig.wots_pk, wots_sig_bytes.as_slice())?;
 
-                            let master_pk = crate::core::mss::recover_master_pk(&mss_sig);
-                            let next = mss_sig.leaf_index.saturating_add(1);
-                            let current = mss_idx_table.get(&master_pk)?.map(|v: redb::AccessGuard<'_, u64>| v.value()).unwrap_or(0);
-                            if next > current { mss_idx_table.insert(&master_pk, next)?; }
+                            // Audit N9: bound by the same rule mss::verify enforces
+                            // (leaf_index < 2^auth_len) before recording.
+                            let capacity = 1u64.checked_shl(mss_sig.auth_path.len() as u32).unwrap_or(u64::MAX);
+                            if mss_sig.leaf_index < capacity {
+                                let master_pk = crate::core::mss::recover_master_pk(&mss_sig);
+                                let next = mss_sig.leaf_index.saturating_add(1);
+                                let current = mss_idx_table.get(&master_pk)?.map(|v: redb::AccessGuard<'_, u64>| v.value()).unwrap_or(0);
+                                if next > current { mss_idx_table.insert(&master_pk, next)?; }
+                            }
                         }
                     }
                     _ => {}

@@ -1253,7 +1253,14 @@ async fn wallet_scan(path: &PathBuf, rpc_port: u16, rpc_host: String, from_genes
                     if let Ok(mss_resp) = resp.json::<rpc::GetMssStateResponse>().await {
                         if mss_resp.next_index > mss_key.next_leaf {
                             const SAFETY_MARGIN: u64 = 20;
-                            let new_leaf = mss_resp.next_index + SAFETY_MARGIN;
+                            // Audit N9: cap the fast-forward at the tree capacity (2^height)
+                            // and flag an impossible node answer rather than trusting it.
+                            let capacity = 1u64 << mss_key.height;
+                            if mss_resp.next_index > capacity {
+                                println!("  MSS {}: node-reported leaf {} exceeds capacity {} — clamping (treating as suspect)",
+                                    hex::encode(&mss_key.master_pk), mss_resp.next_index, capacity);
+                            }
+                            let new_leaf = mss_resp.next_index.saturating_add(SAFETY_MARGIN).min(capacity);
                             println!("  MSS {}: advancing leaf {} -> {}",
                                 hex::encode(&mss_key.master_pk), mss_key.next_leaf, new_leaf);
                             mss_key.next_leaf = new_leaf;
@@ -2849,7 +2856,14 @@ async fn wallet_send(
             // If the node has seen more signatures than we have locally, FAST FORWARD.
             if mss_resp.next_index > current_leaf {
                 const SAFETY_MARGIN: u64 = 20;
-                let new_leaf = mss_resp.next_index + SAFETY_MARGIN;
+                // Audit N9: never fast-forward past the tree capacity (2^height); treat
+                // an implausibly large node answer as suspect, not authoritative.
+                let capacity = 1u64 << wallet.data.mss_keys[i].height;
+                if mss_resp.next_index > capacity {
+                    println!("  ⚠️  MSS Key {}: node-reported leaf {} exceeds capacity {} — clamping",
+                        hex::encode(&master_pk), mss_resp.next_index, capacity);
+                }
+                let new_leaf = mss_resp.next_index.saturating_add(SAFETY_MARGIN).min(capacity);
                 
                 println!("  ⚠️  MSS Key {}: Old state detected (Node: {}, Local: {})", 
                     hex::encode(&master_pk), mss_resp.next_index, current_leaf);
