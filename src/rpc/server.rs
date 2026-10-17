@@ -26,11 +26,49 @@ fn is_lan_ip(ip: IpAddr) -> bool {
             ipv4.is_loopback() || ipv4.is_private() || ipv4.is_link_local()
         }
         IpAddr::V6(ipv6) => {
-            ipv6.is_loopback() || 
+            ipv6.is_loopback() ||
             (ipv6.segments()[0] & 0xfe00) == 0xfc00 || // Unique local (fc00::/7)
             (ipv6.segments()[0] & 0xffc0) == 0xfe80    // Link local (fe80::/10)
         }
     }
+}
+
+/// True if `host` (a Host header value, optionally with a port) names loopback, a
+/// private/link-local address, or `localhost`.
+fn host_is_local(host: &str) -> bool {
+    let h = host.trim();
+    let h = if h.starts_with('[') {
+        // IPv6 literal: [::1] or [::1]:port
+        h.trim_start_matches('[').split(']').next().unwrap_or(h)
+    } else {
+        h.rsplit_once(':').map(|(a, _)| a).unwrap_or(h)
+    };
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    IpAddr::from_str(h).map(is_lan_ip).unwrap_or(false)
+}
+
+/// Audit MW1: under a remote-only web-wallet model, no first-party site needs to
+/// reach a visitor's LOCAL node. Reject a cross-origin request (Origin present and
+/// not matching Host) whenever the Host is loopback/LAN — exactly a public page
+/// reaching into a local node, which the CORS allowlist otherwise permits (the
+/// /axe payout-redirect among them). Same-origin requests (the node's own served
+/// pages, which send no Origin or a matching one) and cross-origin requests to a
+/// public node (non-local Host) are unaffected.
+async fn block_cross_origin_to_local(req: Request, next: Next) -> Result<Response, StatusCode> {
+    if let Some(origin) = req.headers().get("origin").and_then(|v| v.to_str().ok()) {
+        let host = req.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let origin_authority = origin.split("://").nth(1).unwrap_or(origin);
+        if origin_authority != host && host_is_local(host) {
+            tracing::warn!(
+                "Blocked cross-origin request to a local node (Origin {:?}, Host {:?}) — audit MW1",
+                origin, host
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+    Ok(next.run(req).await)
 }
 
 /// Axum middleware to drop requests originating from the public internet.
@@ -208,6 +246,7 @@ impl RpcServer {
             .layer(TimeoutLayer::new(Duration::from_secs(30))) // Forcefully drop stalled requests
             .layer(TraceLayer::new_for_http())
             .layer(cors)
+            .layer(middleware::from_fn(block_cross_origin_to_local))
             .with_state(node_handle);
 
         tracing::info!("RPC server listening on {}", self.addr);
