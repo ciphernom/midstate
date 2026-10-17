@@ -310,18 +310,22 @@ fn apply_batch_internal(
     // WOTS & MSS address/leaf-reuse consensus check.
     // Uses the pre-built oracle so state.rs stays pure (no storage I/O here).
     //
-    // From V5_ACTIVATION_HEIGHT reuse of a one-time key — the same WOTS address
-    // or MSS leaf authenticating two DIFFERENT commitments — makes the block
-    // invalid. Reusing a one-time signature is the precondition for signature
-    // forgery, so consensus must reject it rather than merely logging and
-    // leaving it to the economic "Bounty Hunter" sweep. Before V5 the behaviour
-    // is unchanged (diagnostic log only) so every historical block stays valid;
-    // because this only ever removes transactions from the valid set, upgraded
-    // and non-upgraded nodes do not partition on pre-V5 history — a soft fork.
+    // From REUSE_ENFORCE_ACTIVATION_HEIGHT, reuse of a one-time key — the same
+    // WOTS address or MSS leaf authenticating two DIFFERENT commitments — makes
+    // the block invalid. Reusing a one-time signature is the precondition for
+    // signature forgery.
+    //
+    // This enforcement is DEFERRED (the constant is u64::MAX): the oracle it
+    // reads is each node's LOCAL spent-address table, not consensus state folded
+    // into the state root, and it is populated inconsistently across the sync,
+    // orphan and peer-relay paths. Enforcing it as a soft fork before that set is
+    // committed to the state root would partition the network (audit K1), so
+    // until then reuse stays a diagnostic log only — exactly the behaviour below
+    // the original V5 height — and no node partitions on it.
     //
     // The same-commitment case is NOT reuse: it is the identical transaction
     // (e.g. idempotent re-application) and is always allowed.
-    let enforce_key_reuse = state.height >= crate::core::types::V5_ACTIVATION_HEIGHT;
+    let enforce_key_reuse = state.height >= crate::core::types::REUSE_ENFORCE_ACTIVATION_HEIGHT;
     for tx in &batch.transactions {
         match tx {
             Transaction::Reveal { inputs, witnesses, outputs, salt } => {
