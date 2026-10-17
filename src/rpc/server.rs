@@ -94,6 +94,28 @@ async fn lan_only_middleware(
         }
     }
 
+    // Audit J27: on a state-changing request, reject a cross-origin `Origin`. A page
+    // on another site that tries to POST to /axe/config (CSRF, or DNS-rebinding to
+    // loopback) carries its own Origin; the loopback dashboard is same-origin and
+    // sends none or a matching one. The LAN gate above admits the loopback socket, so
+    // without this a malicious page in the operator's browser could redirect the
+    // miner. Reads (GET/HEAD/OPTIONS) are unaffected.
+    let is_write = !matches!(req.method().as_str(), "GET" | "HEAD" | "OPTIONS");
+    if is_write {
+        if let Some(origin) = req.headers().get("origin").and_then(|v| v.to_str().ok()) {
+            let host = req.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+            // Origin is scheme://authority; compare its authority to the Host header.
+            let origin_authority = origin.split("://").nth(1).unwrap_or(origin);
+            if origin_authority != host {
+                tracing::warn!(
+                    "Blocked cross-origin state-changing request to hardware endpoint (Origin {:?} vs Host {:?})",
+                    origin, host
+                );
+                return Err(StatusCode::FORBIDDEN);
+            }
+        }
+    }
+
     Ok(next.run(req).await)
 }
 
