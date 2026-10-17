@@ -78,6 +78,10 @@ const BATCH_REQ_WINDOW_SECS: u64 = 60;
 const MAX_TX_PER_PEER_PER_WINDOW: u32 = 50;
 /// Rate-limit window duration in seconds.
 const TX_RATE_WINDOW_SECS: u64 = 10;
+/// Audit N1: per-peer cap on unsolicited `Batch` (block) gossip. Each such message
+/// can force a 1,000,000-iteration PoW verification, so a flood must be bounded.
+const BLOCK_RATE_WINDOW_SECS: u64 = 10;
+const MAX_BLOCKS_PER_PEER: u32 = 50;
 
 /// Dandelion++: if a stem tx hasn't been fluffed within this many seconds,
 /// we fluff it ourselves as a safety net.
@@ -194,6 +198,8 @@ pub struct Node {
     peer_batch_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     /// Rate-limit counter for GetHeaders (cheap normally, expensive on fallback path).
     peer_header_req_counts: HashMap<PeerId, (u32, std::time::Instant)>,
+    /// Audit N1: per-peer counter for unsolicited `Batch` (block) gossip.
+    peer_block_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     peer_chat_counts: HashMap<PeerId, (u32, std::time::Instant)>,
     hash_counter: Arc<AtomicU64>,
 
@@ -1679,6 +1685,7 @@ pub async fn new(
             stem_pool: HashMap::new(),
             peer_batch_req_counts: HashMap::new(),
             peer_header_req_counts: HashMap::new(),
+            peer_block_counts: HashMap::new(),
             peer_chat_counts: HashMap::new(),
             hash_counter: Arc::new(AtomicU64::new(0)),
             state_cache: VecDeque::with_capacity(STATE_CACHE_SIZE + 1),
@@ -3823,6 +3830,18 @@ async fn handle_message(
             }
             Message::Batch(batch) => {
                 self.ack(channel);
+                // Audit N1: bound unsolicited block gossip per peer. Each Batch can
+                // force a 1,000,000-iteration PoW verify, so a flood must be capped.
+                let now = std::time::Instant::now();
+                let entry = self.peer_block_counts.entry(from).or_insert((0, now));
+                if now.duration_since(entry.1).as_secs() >= BLOCK_RATE_WINDOW_SECS {
+                    *entry = (0, now);
+                }
+                entry.0 += 1;
+                if entry.0 > MAX_BLOCKS_PER_PEER {
+                    tracing::debug!("Rate-limiting unsolicited blocks from peer {} ({} in window)", from, entry.0);
+                    return Ok(());
+                }
                 self.handle_new_batch(batch, Some(from)).await?;
             }
             Message::GetState => {
@@ -6390,8 +6409,16 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
             // --- FIX: Prevent Orphan OOM Attack ---
             // 1. Verify the sequential PoW is valid (forces attacker to compute 1M hashes)
             let header = batch.header();
-            let mining_hash = crate::core::types::compute_header_hash(&header); // <-- FIX: Add this
-            if crate::core::extension::verify_extension(mining_hash, &batch.extension, &batch.target).is_err() {
+            let mining_hash = crate::core::types::compute_header_hash(&header);
+            // Audit N1: the 1,000,000-iteration sequential PoW verify must not run on
+            // the single event-loop task, or a flood of tiny unsolicited orphan blocks
+            // stalls the whole node. Offload it to the blocking pool.
+            let orphan_ext = batch.extension.clone();
+            let orphan_target = batch.target;
+            let pow_ok = tokio::task::spawn_blocking(move || {
+                crate::core::extension::verify_extension(mining_hash, &orphan_ext, &orphan_target).is_ok()
+            }).await.unwrap_or(false);
+            if !pow_ok {
                 tracing::debug!("Rejected invalid orphan block (PoW failed)");
                 if let Some(peer) = from {
                     self.network.disconnect_peer(peer);
