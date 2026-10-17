@@ -966,7 +966,7 @@ pub const TIMEWARP_FIX_ACTIVATION_HEIGHT: u64 = 250_000;
 /// IMPORTANT: set this to a height comfortably ahead of the network tip at
 /// release time so the super-majority of hashpower upgrades before activation.
 /// The placeholder below MUST be reviewed before deployment.
-pub const V5_ACTIVATION_HEIGHT: u64 = 300_000;
+pub const V5_ACTIVATION_HEIGHT: u64 = 340_000;
 
 pub const COMMIT_POW_WINDOW: u64 = 1000;
 
