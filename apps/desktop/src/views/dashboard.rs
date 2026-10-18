@@ -69,6 +69,20 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         primer(app, ui);
     }
 
+    if let Some(s) = app.sync.as_ref().filter(|s| s.restore_pass > 0) {
+        theme::hint(
+            ui,
+            &format!(
+                "Restoring: scanning the chain for coins this recovery phrase received before \
+                 (pass {}, block {} of {}). Sending is paused until it finishes, so that no \
+                 one-time key the original wallet used is signed with again.",
+                s.restore_pass,
+                units(s.restore_scan_pos),
+                units(s.height)
+            ),
+        );
+    }
+
     // ── What needs attention ────────────────────────────────────────────
     let active: Vec<_> = app
         .sends

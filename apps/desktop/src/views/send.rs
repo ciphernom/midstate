@@ -9,6 +9,9 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     theme::heading(ui, "Send");
 
     let syncing = app.sync.as_ref().map(|s| s.is_syncing).unwrap_or(true);
+    // A restored wallet signs nothing until its restore scan has found every
+    // key the phrase used before (walletd refuses too; this just says so).
+    let restoring = app.sync.as_ref().map(|s| s.restore_pass > 0).unwrap_or(false);
 
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -152,12 +155,14 @@ pub fn show(app: &mut App, ui: &mut Ui) {
 
         ui.add_space(10.0);
         let amount: Option<u64> = parsed.ok().filter(|v| *v > 0);
-        let can = app.addr_ok == Some(true) && amount.is_some() && !app.busy && !syncing;
+        let can = app.addr_ok == Some(true) && amount.is_some() && !app.busy && !syncing && !restoring;
         theme::right_aligned(ui, |ui| {
             let label = if app.busy {
                 "Committing…"
             } else if syncing {
                 "Waiting for sync…"
+            } else if restoring {
+                "Finding earlier coins…"
             } else {
                 "Send"
             };

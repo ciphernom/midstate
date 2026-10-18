@@ -169,7 +169,12 @@ fn holdings(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
 // ── Housekeeping ────────────────────────────────────────────────────────
 
 fn housekeeping(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
-    let syncing = app.sync.as_ref().map(|s| s.is_syncing).unwrap_or(true);
+    // Housekeeping signs, so it also waits for a restore scan to finish.
+    let syncing = app
+        .sync
+        .as_ref()
+        .map(|s| s.is_syncing || s.restore_pass > 0)
+        .unwrap_or(true);
 
     ui.columns(2, |cols| {
         // Defrag
@@ -268,7 +273,11 @@ fn housekeeping(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
     });
 
     if syncing {
-        theme::hint(ui, "Coin housekeeping unlocks when the node reaches the chain tip.");
+        theme::hint(
+            ui,
+            "Coin housekeeping unlocks when the node reaches the chain tip and any restore \
+             scan has finished.",
+        );
     }
 
     ui.add_space(8.0);
