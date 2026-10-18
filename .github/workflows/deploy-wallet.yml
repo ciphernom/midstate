@@ -7,6 +7,9 @@ on:
       - 'wasm-wallet/**'
       - 'src/core/**'
       - 'src/wallet/**'
+      - '.github/workflows/deploy-wallet.yml'
+  # Lets a failed or skipped deploy be re-run from the Actions tab.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -42,7 +45,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # wrangler 4 (used by the Cloudflare step below) needs Node >= 22.
+          node-version: '22'
 
       - name: Build WebRTC Light Client
         run: |
@@ -72,15 +76,19 @@ jobs:
           echo "Final Deployment Structure:"
           ls -R staging
 
-      # --> WE MOVED THIS STEP HERE! <--
-      # Deploy the raw, unzipped files to Cloudflare first
+      # Deploy the raw, unzipped files to Cloudflare first.
+      #
+      # cloudflare/pages-action was deprecated in 2024 and removed from GitHub
+      # in September 2026 (unpatched CVE-2026-11325). A job that names a
+      # missing action fails at "Set up job", before any step runs, so every
+      # deploy since then failed in ~5s and neither Cloudflare nor GitHub
+      # Pages got a new build. wrangler-action is Cloudflare's replacement.
       - name: Deploy to Cloudflare Pages
-        uses: cloudflare/pages-action@v1
+        uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          projectName: 'midstate' 
-          directory: './staging'
+          command: pages deploy ./staging --project-name=midstate
 
       # NOW zip it up for GitHub Pages
       - name: Upload Pages artifact
