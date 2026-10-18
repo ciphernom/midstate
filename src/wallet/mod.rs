@@ -208,6 +208,12 @@ pub struct Wallet {
     /// themselves are left untouched, so a wrong answer costs a refused spend
     /// rather than a lost coin.
     known_spent: std::collections::HashSet<[u8; 32]>,
+    /// While set, `allocate_next_wots_seed` hands out no one-time key and
+    /// fails with this reason. Session-only, like `known_spent`. A restore
+    /// sets it until it has found every key the recovery phrase used before:
+    /// until then the next index may be a key the original device already
+    /// received on or signed with.
+    wots_hold: Option<String>,
 }
 
 impl Wallet {
@@ -217,6 +223,7 @@ impl Wallet {
         }
         let wallet = Self {
             known_spent: Default::default(),
+            wots_hold: None,
             path: path.to_path_buf(),
             password: password.to_vec(),
             data: WalletData::empty(),
@@ -237,6 +244,7 @@ impl Wallet {
         data.master_seed = Some(master_seed);
         let wallet = Self {
             known_spent: Default::default(),
+            wots_hold: None,
             path: path.to_path_buf(),
             password: password.to_vec(),
             data,
@@ -256,6 +264,7 @@ impl Wallet {
         data.master_seed = Some(master_seed);
         let wallet = Self {
             known_spent: Default::default(),
+            wots_hold: None,
             path: path.to_path_buf(),
             password: password.to_vec(),
             data,
@@ -343,12 +352,19 @@ impl Wallet {
     ///     post result = Err(_) ⇒ next_wots_index' = next_wots_index
     /// ```
     pub fn allocate_next_wots_seed(&mut self) -> Result<[u8; 32]> {
+        if let (Some(reason), Some(_)) = (&self.wots_hold, &self.data.master_seed) {
+            bail!("{reason}");
+        }
         let _lock = self.acquire_lock()?;
 
         if let Some(ref master) = self.data.master_seed {
             let idx = self.data.next_wots_index;
             self.data.next_wots_index += 1;
             let seed = hd::derive_wots_seed(master, idx);
+            // After a restore settles its counters (walletd `restore::settle_counters`)
+            // this index can already be a derived watch key in the receive list.
+            // It is being handed out now, so it must stop looking unused there.
+            self.data.keys.retain(|k| k.seed != seed);
 
             self.save()?;
             Ok(seed)
@@ -505,6 +521,7 @@ pub fn import_scanned(
         let data: WalletData = serde_json::from_slice(&plaintext)?;
         Ok(Self {
             known_spent: Default::default(),
+            wots_hold: None,
             path: path.to_path_buf(),
             password: password.to_vec(),
             data,
@@ -700,7 +717,19 @@ pub fn import_scanned(
     /// Generate a new MSS tree (reusable address).
     /// HD wallets derive the tree seed deterministically; legacy wallets use random.
     pub fn generate_mss(&mut self, height: u32, _label: Option<String>) -> Result<[u8; 32]> {
-        let seed = self.allocate_next_mss_seed()?;
+        let seed = loop {
+            let seed = self.allocate_next_mss_seed()?;
+            // A restore may already have derived this tree (its counter is
+            // moved back once the restore settles): hand that tree out, leaf
+            // counter intact, rather than pushing a duplicate of it. Never
+            // build a tree of another height on the same seed: its leaves
+            // would be the same one-time keys as the existing tree's.
+            match self.data.mss_keys.iter().find(|k| k.master_seed == seed) {
+                Some(k) if k.height == height => return Ok(compute_address(&k.master_pk)),
+                Some(_) => continue,
+                None => break seed,
+            }
+        };
         let keypair = mss::keygen(&seed, height)?;
         let address = compute_address(&keypair.master_pk);
         self.data.mss_keys.push(keypair);
@@ -1729,11 +1758,30 @@ pub fn import_scanned(
     /// Call this in a loop with increasing counts until a full scan finds
     /// no new coins within the last `gap_limit` keys (typically 20-50).
     pub fn restore_generate_keys(&mut self, count: u64) -> Result<()> {
-        if self.data.master_seed.is_none() {
+        let Some(master) = self.data.master_seed else {
             bail!("restore_generate_keys requires an HD wallet");
-        }
-        for _ in 0..count {
-            let seed = self.allocate_next_wots_seed()?;
+        };
+        // One counter advance and one save for the whole batch, instead of
+        // `allocate_next_wots_seed` per key: every save re-encrypts the wallet
+        // under Argon2id, so a 1,000-key restore floor cost 1,000 KDF runs.
+        // Still crash-safe: these are watch keys nobody has been given yet, so
+        // a crash before the save just derives the same keys again.
+        let _lock = self.acquire_lock()?;
+        // A key can already be present when counters were moved back after an
+        // earlier restore; never list one twice, nor list a key that holds coins.
+        let have: std::collections::HashSet<[u8; 32]> = self
+            .data
+            .keys
+            .iter()
+            .map(|k| k.seed)
+            .chain(self.data.coins.iter().map(|c| c.seed))
+            .collect();
+        let start = self.data.next_wots_index;
+        for idx in start..start + count {
+            let seed = hd::derive_wots_seed(&master, idx);
+            if have.contains(&seed) {
+                continue;
+            }
             let owner_pk = wots::keygen(&seed);
             let address = compute_address(&owner_pk);
             self.data.keys.push(WalletKey {
@@ -1743,6 +1791,7 @@ pub fn import_scanned(
                 label: None,
             });
         }
+        self.data.next_wots_index = start + count;
         self.save()?;
         Ok(())
     }
@@ -1761,6 +1810,54 @@ pub fn import_scanned(
         Ok(removed)
     }
     
+    /// Move the HD counters back after a restore scan has settled (see walletd
+    /// `restore::settle_counters`). Only ever lowers them. The caller must pass
+    /// values above every index the chain has seen, the wallet holds, or a
+    /// pending commit has reserved: everything at or above them is a derived
+    /// watch key that never received an output, so it has never signed and
+    /// can be handed out again.
+    pub fn rewind_hd_counters(&mut self, next_wots: u64, next_mss: u64) -> Result<()> {
+        if self.data.master_seed.is_none() {
+            return Ok(());
+        }
+        let _lock = self.acquire_lock()?;
+        if next_wots < self.data.next_wots_index {
+            self.data.next_wots_index = next_wots;
+        }
+        if next_mss < self.data.next_mss_index {
+            self.data.next_mss_index = next_mss;
+        }
+        self.save()
+    }
+
+    /// Derive the tree at HD index `index` and add it, unless the wallet holds
+    /// it already. The counter does not move. `generate_mss` saves the counter
+    /// before it runs the keygen, so a keygen that never finished (the app was
+    /// closed mid-restore, say) leaves that index allocated with no tree, and
+    /// nothing would ever watch it. A restore fills such holes with this.
+    /// Returns the tree's address if it was derived now.
+    pub fn restore_mss_tree(&mut self, index: u64, height: u32) -> Result<Option<[u8; 32]>> {
+        let Some(master) = self.data.master_seed else {
+            bail!("restore_mss_tree requires an HD wallet");
+        };
+        let seed = hd::derive_mss_seed(&master, index);
+        if self.data.mss_keys.iter().any(|k| k.master_seed == seed) {
+            return Ok(None);
+        }
+        let keypair = mss::keygen(&seed, height)?;
+        let address = compute_address(&keypair.master_pk);
+        let _lock = self.acquire_lock()?;
+        self.data.mss_keys.push(keypair);
+        self.save()?;
+        Ok(Some(address))
+    }
+
+    /// Stop (`Some(reason)`) or resume (`None`) handing out one-time keys:
+    /// receive addresses, change, mix outputs. See `wots_hold`.
+    pub fn hold_wots_allocation(&mut self, reason: Option<String>) {
+        self.wots_hold = reason;
+    }
+
     /// How many WOTS keys have been derived so far (HD wallets only).
     pub fn wots_index(&self) -> u64 {
         self.data.next_wots_index
@@ -2474,6 +2571,50 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
         // All 50 addresses should be watchable
         let addrs = w.watched_addresses();
         assert_eq!(addrs.len(), 50);
+    }
+
+    #[test]
+    fn hd_rewound_wots_counter_never_lists_a_key_twice() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let (mut w, _phrase) = Wallet::create_hd(&path, b"pass").unwrap();
+        w.restore_generate_keys(3).unwrap();
+        w.rewind_hd_counters(1, w.mss_index()).unwrap();
+        assert_eq!(w.wots_index(), 1);
+        // Indices 1..5, of which 1 and 2 are already listed.
+        w.restore_generate_keys(4).unwrap();
+        assert_eq!(w.wots_index(), 5);
+        let seeds: std::collections::HashSet<_> = w.keys().iter().map(|k| k.seed).collect();
+        assert_eq!((w.keys().len(), seeds.len()), (5, 5));
+        // Rewinding never moves a counter up.
+        w.rewind_hd_counters(9, w.mss_index()).unwrap();
+        assert_eq!(w.wots_index(), 5);
+    }
+
+    #[test]
+    fn hd_mss_never_builds_two_trees_on_one_seed() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let (mut w, _phrase) = Wallet::create_hd(&path, b"pass").unwrap();
+        let t0 = w.generate_mss(1, None).unwrap();
+        let t1 = w.generate_mss(1, None).unwrap();
+        // A settled restore moves the counter back over trees it derived.
+        w.rewind_hd_counters(w.wots_index(), 0).unwrap();
+        assert_eq!(w.mss_index(), 0);
+        // Same height: the existing tree comes back, not a duplicate of it.
+        assert_eq!(w.generate_mss(1, None).unwrap(), t0);
+        assert_eq!(w.mss_keys().len(), 2);
+        // Another height: seed 1 already has a tree, so it is skipped rather
+        // than rebuilt over the same one-time leaf keys.
+        let t2 = w.generate_mss(2, None).unwrap();
+        assert_ne!(t2, t1);
+        assert_eq!(w.mss_index(), 3);
+        let seeds: std::collections::HashSet<_> = w.mss_keys().iter().map(|k| k.master_seed).collect();
+        assert_eq!(seeds.len(), w.mss_keys().len());
     }
 
     #[test]
