@@ -88,6 +88,43 @@ struct MergeCommit {
     /// would only be a rival block at the same height, and would take the same
     /// scores twice.
     claimed: Arc<std::sync::atomic::AtomicBool>,
+    /// The midwimble height of the block this job makes, as the node said.
+    height: Option<u64>,
+    /// What this job's midwimble block pays, as (address, weight): each
+    /// address's share is its weight out of their sum.
+    payouts: Arc<Vec<(String, u64)>>,
+    /// Why the block pays only the pool's own address, when it does.
+    note: Option<String>,
+}
+
+/// What the pool is doing about midwimble, for the dashboard. Set each time a
+/// job is built.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct MergeStatus {
+    /// Whether the current job commits to a midwimble block.
+    active: bool,
+    /// Why not; or, while active, why its block pays only the pool.
+    note: Option<String>,
+    /// The midwimble height of the block the current job makes.
+    height: Option<u64>,
+    /// When this was set (unix seconds); 0 before the first job.
+    updated: u64,
+}
+
+impl MergeStatus {
+    /// The status of a job just built with `merge` (its midwimble commitment,
+    /// if it has one) after planning failed with `error`, if it did.
+    fn of_job(merge: Option<&MergeCommit>, error: Option<&str>, now: u64) -> Self {
+        match merge {
+            Some(m) => MergeStatus { active: true, note: m.note.clone(), height: m.height, updated: now },
+            None => MergeStatus {
+                active: false,
+                note: Some(error.unwrap_or("this job's coinbase had no room for the commitment").to_string()),
+                height: None,
+                updated: now,
+            },
+        }
+    }
 }
 
 /// Represents an active mining job broadcast to all connected Stratum clients.
@@ -218,6 +255,13 @@ impl ShareMerkleTree {
 /// Midwimble score per midwimble address (canonical, lowercase).
 const MW_SHARES_TABLE: TableDefinition<&str, u64> = TableDefinition::new("midwimble_shares");
 
+/// Midwimble blocks this pool found, for the dashboard, keyed by when (unix
+/// milliseconds): JSON `{ height, timestamp, payouts: [{ address, weight }] }`.
+const MW_BLOCKS_TABLE: TableDefinition<u64, &str> = TableDefinition::new("midwimble_blocks");
+
+/// How many found midwimble blocks `/pool/stats` lists.
+const MW_RECENT_BLOCKS: usize = 10;
+
 /// A midwimble coinbase pays at most this many outputs (its `MAX_GROUP_OUTPUTS`).
 const MW_MAX_OUTPUTS: usize = 32;
 
@@ -310,6 +354,114 @@ fn bech32_polymod(values: &[u8]) -> u32 {
         }
     }
     chk
+}
+
+/// Coins smaller than 1/2^this of the block are not split any further by
+/// [`split_with_floor`]: that is as close to proportional as a block gets.
+const SPLIT_GRANULARITY_SHIFT: u32 = 8;
+/// The most coinbase outputs [`split_with_floor`] makes by splitting coins.
+const MAX_SPLIT_OUTPUTS: usize = 1_000;
+
+/// Splits `distributable` among `shares` (address, score) in power-of-2 coins,
+/// paying every miner with a positive score at least one coin.
+///
+/// # Reasoning
+/// The greedy split handed out only `popcount(distributable)` coins (about 17
+/// for a block reward), largest score first, so a miner with a few shares next
+/// to larger miners often got no coin at all. Its own audit then reports
+/// "omitted from payout array despite score" and disconnects, and while
+/// disconnected it can never earn the score that would get it paid: it stays
+/// locked out until the pool's next block. Paying everyone in the committed
+/// tree something also keeps the audit's promise: score means a payout.
+///
+/// 1. Each miner's entitlement is `distributable * score / total`, rounded
+///    down, the units left over going to the largest fractional parts (exact
+///    largest-remainder apportionment). A miner whose share rounds to nothing
+///    is lent one unit by the miner owed the most.
+/// 2. Each miner first gets the largest power-of-2 coin within its
+///    entitlement, so every miner is in the coinbase with at least half of what
+///    it is owed.
+/// 3. The rest goes out largest coin first, each to the miner still owed the
+///    most. A coin worth more than that miner is owed is split in two (one more
+///    output) until it fits, or until it is under 1/2^[`SPLIT_GRANULARITY_SHIFT`]
+///    of the block. Every payout ends within that of its exact share (give or
+///    take a few units of rounding). The coinbase holds one output per miner,
+///    up to 64 more for the rest, and one per split; splitting stops at
+///    [`MAX_SPLIT_OUTPUTS`].
+///
+/// Score deductions after a found block follow the coins actually paid, so
+/// what rounding remains still evens out over later blocks.
+///
+/// Returns `None` (the caller keeps the greedy split) only when there is
+/// nothing to split, or more miners than units to pay, which no real block
+/// reward reaches.
+fn split_with_floor(distributable: u64, shares: &[([u8; 32], u64)]) -> Option<Vec<([u8; 32], u64)>> {
+    let miners: Vec<([u8; 32], u64)> = shares.iter().copied().filter(|(_, s)| *s > 0).collect();
+    if miners.is_empty() || distributable == 0 || miners.len() as u64 > distributable {
+        return None;
+    }
+    let d = distributable as u128;
+    let total: u128 = miners.iter().map(|(_, s)| *s as u128).sum();
+
+    // 1. Entitlements: the floor of each exact share, remainder by largest fraction.
+    let mut owed: Vec<u128> = miners.iter().map(|(_, s)| d * *s as u128 / total).collect();
+    let mut spare = d - owed.iter().sum::<u128>();
+    let mut by_fraction: Vec<usize> = (0..miners.len()).collect();
+    by_fraction.sort_by(|&a, &b| {
+        let fa = d * miners[a].1 as u128 % total;
+        let fb = d * miners[b].1 as u128 % total;
+        fb.cmp(&fa).then(miners[a].0.cmp(&miners[b].0))
+    });
+    for &i in &by_fraction {
+        if spare == 0 {
+            break;
+        }
+        owed[i] += 1;
+        spare -= 1;
+    }
+    // Ties go to the lower address, so the split is the same on every run.
+    let most_owed = |owed: &[u128]| {
+        (0..miners.len())
+            .max_by(|&a, &b| owed[a].cmp(&owed[b]).then(miners[b].0.cmp(&miners[a].0)))
+            .expect("miners is not empty")
+    };
+    // There are no more miners than units, so while anyone is owed nothing,
+    // someone else is owed at least two.
+    for i in 0..miners.len() {
+        if owed[i] == 0 {
+            let j = most_owed(&owed);
+            owed[j] -= 1;
+            owed[i] = 1;
+        }
+    }
+
+    // 2. A floor coin each: the largest power of two within the entitlement.
+    let mut coins = Vec::with_capacity(2 * miners.len() + 64);
+    let mut left = d;
+    for (i, (addr, _)) in miners.iter().enumerate() {
+        let coin = 1u128 << (127 - owed[i].leading_zeros());
+        coins.push((*addr, coin as u64));
+        left -= coin;
+        owed[i] -= coin;
+    }
+
+    // 3. The rest, largest coin first, to whoever is still owed the most.
+    let small = (d >> SPLIT_GRANULARITY_SHIFT).max(1);
+    let mut pending: std::collections::BinaryHeap<u128> = crate::core::types::decompose_value(left as u64)
+        .into_iter()
+        .map(u128::from)
+        .collect();
+    while let Some(coin) = pending.pop() {
+        let i = most_owed(&owed);
+        if coin > owed[i] && coin > small && coins.len() + pending.len() + 2 <= MAX_SPLIT_OUTPUTS {
+            pending.push(coin / 2);
+            pending.push(coin / 2);
+            continue;
+        }
+        coins.push((miners[i].0, coin as u64));
+        owed[i] = owed[i].saturating_sub(coin);
+    }
+    Some(coins)
 }
 
 /// Splits `total` among `owners` (sorted by address) in proportion to score,
@@ -438,6 +590,7 @@ struct MergeJobReply {
     commitment: String,
     mining_hash: String,
     target: [u8; 32],
+    height: Option<u64>,
 }
 
 /// Asks the midwimble node for a block paying `payouts`.
@@ -468,7 +621,7 @@ async fn request_merge_job(
     if commitment.len() != 64 || mining_hash.len() != 64 || hex::decode_to_slice(field("target"), &mut target).is_err() {
         return Err(format!("unusable job: {job}"));
     }
-    Ok(MergeJobReply { commitment, mining_hash, target })
+    Ok(MergeJobReply { commitment, mining_hash, target, height: job["height"].as_u64() })
 }
 
 /// Gets this job's midwimble block from the midwimble node, paying the score
@@ -476,8 +629,9 @@ async fn request_merge_job(
 /// job's merge details (`commit_index` is set where it is planted).
 ///
 /// Every failure is soft. If the node refuses the miners' payouts, the job
-/// pays the pool's own address, as before per-miner payouts; if it refuses
-/// that too, or can't be reached, `None`: the pool mines midstate alone.
+/// pays the pool's own address, as before per-miner payouts, and says why in
+/// its `note`; if it refuses that too, or can't be reached, the reason: the
+/// pool mines midstate alone.
 async fn plan_merge(
     db: &Database,
     client: &reqwest::Client,
@@ -485,28 +639,32 @@ async fn plan_merge(
     pool: &str,
     fee_percent: f64,
     seed: &[u8; 32],
-) -> Option<(String, MergeCommit)> {
+) -> Result<(String, MergeCommit), String> {
     let scores = midwimble_scores(db);
     let payouts = merge_payouts(fee_percent, pool, &scores, seed);
     let pool_only = payouts.len() == 1 && payouts[0].0 == pool;
-    let (reply, paid) = match request_merge_job(client, rpc, &payouts).await {
-        Ok(reply) => (reply, scores),
+    let (reply, paid, payouts, note) = match request_merge_job(client, rpc, &payouts).await {
+        Ok(reply) => (reply, scores, payouts, None),
         Err(e) if pool_only => {
             tracing::warn!("midwimble job refused ({e}); mining midstate alone");
-            return None;
+            return Err(e);
         }
         Err(e) => {
             tracing::warn!("midwimble refused this job's payouts ({e}); paying the pool's own address instead");
-            match request_merge_job(client, rpc, &[(pool.to_string(), 1)]).await {
-                Ok(reply) => (reply, Vec::new()),
+            let fallback = vec![(pool.to_string(), 1)];
+            match request_merge_job(client, rpc, &fallback).await {
+                Ok(reply) => {
+                    let note = format!("the node refused the miners' payouts ({e}), so this block pays the pool's own address");
+                    (reply, Vec::new(), fallback, Some(note))
+                }
                 Err(e) => {
                     tracing::warn!("midwimble job refused ({e}); mining midstate alone");
-                    return None;
+                    return Err(e);
                 }
             }
         }
     };
-    Some((
+    Ok((
         reply.commitment,
         MergeCommit {
             mining_hash: reply.mining_hash,
@@ -514,8 +672,75 @@ async fn plan_merge(
             commit_index: 0,
             paid: Arc::new(paid),
             claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            height: reply.height,
+            payouts: Arc::new(payouts),
+            note,
         },
     ))
+}
+
+/// Records a midwimble block this pool found, at `height`, for the dashboard.
+fn record_midwimble_block(db: &Database, height: Option<u64>, merge: &MergeCommit) -> anyhow::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let payouts: Vec<serde_json::Value> = merge
+        .payouts
+        .iter()
+        .map(|(address, weight)| serde_json::json!({ "address": address, "weight": weight }))
+        .collect();
+    let row = serde_json::json!({ "height": height, "timestamp": now.as_secs(), "payouts": payouts }).to_string();
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(MW_BLOCKS_TABLE)?;
+        let mut key = now.as_millis() as u64;
+        while table.get(key)?.is_some() {
+            key += 1;
+        }
+        table.insert(key, row.as_str())?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+/// The dashboard's midwimble section: `null` unless this pool merge-mines.
+async fn midwimble_stats(state: &PoolState) -> serde_json::Value {
+    let (Some(_), Some(pool_mw)) = (&state.midwimble_rpc, &state.midwimble_address) else {
+        return serde_json::Value::Null;
+    };
+    let status = state.merge_status.read().await.clone();
+    let mut scores = midwimble_scores(&state.db);
+    scores.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let total_score: u64 = scores.iter().map(|(_, s)| *s).sum();
+    let (mut blocks_found, mut recent) = (0usize, Vec::new());
+    if let Ok(txn) = state.db.begin_read() {
+        if let Ok(table) = txn.open_table(MW_BLOCKS_TABLE) {
+            if let Ok(rows) = table.iter() {
+                for row in rows.rev().flatten() {
+                    blocks_found += 1;
+                    if recent.len() < MW_RECENT_BLOCKS {
+                        if let Ok(block) = serde_json::from_str::<serde_json::Value>(row.1.value()) {
+                            recent.push(block);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    serde_json::json!({
+        "pool_address": pool_mw,
+        "active": status.active,
+        "note": status.note,
+        "height": status.height,
+        "updated": status.updated,
+        "scores": scores
+            .iter()
+            .map(|(address, score)| serde_json::json!({ "address": address, "score": score }))
+            .collect::<Vec<_>>(),
+        "total_score": total_score,
+        "blocks_found": blocks_found,
+        "recent_blocks": recent,
+    })
 }
 
 // ── App State ───────────────────────────────────────────────────────────────
@@ -539,6 +764,9 @@ struct PoolState {
     midwimble_rpc: Option<String>,
     /// Where midwimble pays this pool's blocks.
     midwimble_address: Option<String>,
+    /// Whether the current job merge-mines midwimble, and why not if it
+    /// doesn't, for the dashboard.
+    merge_status: RwLock<MergeStatus>,
     /// The percentage fee the pool takes from block rewards (e.g., 1.0 for 1%).
     pool_fee_percent: f64,
     /// The most recent network block reward seen from the node, relayed to the
@@ -840,6 +1068,9 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
         "active_miners": miners.len(),
         "miners": miners,
         "recent_blocks": blocks,
+        // Merge-mining: status, the midwimble score table and found blocks;
+        // null when this pool doesn't merge-mine.
+        "midwimble": midwimble_stats(&state).await,
         // Provably-fair anchor + raw targets for local BigInt math:
         "merkle_root": merkle_root_hex,
         "network_target": network_target_hex,
@@ -904,6 +1135,7 @@ pub async fn run_stratum_pool(
         let _ = write_txn.open_table(BLOCKS_TABLE).unwrap();
         let _ = write_txn.open_table(PENDING_BLOCKS_TABLE).unwrap();
         let _ = write_txn.open_table(MW_SHARES_TABLE).unwrap();
+        let _ = write_txn.open_table(MW_BLOCKS_TABLE).unwrap();
         // ── One-off migration: purge stale zero-score rows ──
         // Databases written by affected versions accumulated permanent `score == 0`
         // rows (the deduction path used to write them back instead of removing them).
@@ -995,6 +1227,7 @@ pub async fn run_stratum_pool(
             std::thread::available_parallelism().map(|n| n.get().saturating_sub(1).max(1)).unwrap_or(1),
         )),
         http_throttle: RwLock::new(HashMap::new()),
+        merge_status: RwLock::new(MergeStatus::default()),
     });
 
     let api_state = state.clone();
@@ -1285,10 +1518,11 @@ pub async fn run_stratum_pool(
                 state_clone.current_block_reward.store(expected_total, std::sync::atomic::Ordering::Relaxed);
                 
                 // ── Proportional Reward Distribution Algorithm ──
-                // Calculates the pool fee, then distributes the remaining reward 
-                // across all miners strictly proportional to their accumulated scores.
-                // Output values MUST be powers of 2. It iteratively assigns the largest 
-                // possible power-of-2 denomination to the miner with the highest current score.
+                // Calculates the pool fee, then distributes the remaining reward
+                // across all miners proportional to their accumulated scores.
+                // Output values MUST be powers of 2. `split_with_floor` gives every
+                // miner with score at least one coin and splits coins until each
+                // payout is within 1/256 of the block of its exact share.
                 // Merged mining: one midwimble job per template, paying the
                 // midwimble score table, its commitment planted in the salt of
                 // the last coinbase output (the score root keeps the first fee
@@ -1296,6 +1530,8 @@ pub async fn run_stratum_pool(
                 // midstate alone. The draw that picks which small miners a
                 // midwimble block pays is seeded by both tips and the score
                 // root, none of which the pool can re-roll.
+                let merging = state_clone.midwimble_rpc.is_some() && state_clone.midwimble_address.is_some();
+                let mut merge_error: Option<String> = None;
                 let merge_plan = match (state_clone.midwimble_rpc.as_deref(), state_clone.midwimble_address.as_deref()) {
                     (Some(mw_rpc), Some(mw_pool)) => {
                         let mut seed_data = b"midstate.pool.midwimble-draw.v1".to_vec();
@@ -1311,6 +1547,8 @@ pub async fn run_stratum_pool(
                             &hash(&seed_data),
                         )
                         .await
+                        .map_err(|e| merge_error = Some(e))
+                        .ok()
                     }
                     _ => None,
                 };
@@ -1339,7 +1577,23 @@ pub async fn run_stratum_pool(
                     }
 
                     if actual_distributable > 0 {
-                        if total_score > 0 {
+                        // Every miner in the committed tree gets at least one
+                        // coin: a miner's audit disconnects it when it has score
+                        // but no payout, which locked small miners out.
+                        let floor_split = if total_score > 0 {
+                            split_with_floor(actual_distributable, &shares_vec)
+                        } else {
+                            None
+                        };
+                        if let Some(coins) = floor_split {
+                            for (addr, coin) in coins {
+                                coinbase_json.push(serde_json::json!({
+                                    "address": hex::encode(addr),
+                                    "value": coin,
+                                    "salt": hex::encode(rand::random::<[u8; 32]>())
+                                }));
+                            }
+                        } else if total_score > 0 {
                             let mut scores: HashMap<_, i64> = shares_vec.clone().into_iter().map(|(k,v)| (k, v as i64)).collect();
                             for coin in crate::core::types::decompose_value(actual_distributable).into_iter().rev() {
                                 let mut best_miner = [0u8; 32];
@@ -1427,6 +1681,13 @@ pub async fn run_stratum_pool(
                             committed_scores: std::sync::Arc::new(shares_vec.clone()),
                         };
 
+                        if merging {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_secs());
+                            *state_clone.merge_status.write().await =
+                                MergeStatus::of_job(merge_commit.as_ref(), merge_error.as_deref(), now);
+                        }
                         *state_clone.current_job.write().await = Some(job.clone());
                         let _ = state_clone.job_notifier.send(job);
                         tracing::info!("new job {}: root {}", job_counter, hex::encode(&tree.root[..8]));
@@ -2479,6 +2740,9 @@ fn spawn_midwimble_submission(
         match answer {
             Ok(reply) => {
                 tracing::info!("midwimble block accepted at height {}", reply["height"]);
+                if let Err(e) = record_midwimble_block(&state.db, reply["height"].as_u64().or(merge.height), &merge) {
+                    tracing::warn!("could not record the midwimble block for the dashboard: {e}");
+                }
                 // Midwimble's tip has moved, so this job's commitment is spent.
                 state.force_new_job.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -3210,6 +3474,9 @@ mod tests {
         assert_eq!(sorted(plan.paid.to_vec()), sorted(vec![(ALICE.into(), 3), (BOB.into(), 1)]));
         let asked: Vec<String> = mock.lock().unwrap().jobs[0].iter().map(|(a, _)| a.clone()).collect();
         assert!(asked.contains(&ALICE.to_string()) && asked.contains(&BOB.to_string()) && asked.contains(&pool));
+        // The job remembers what its block pays, for the dashboard.
+        assert_eq!(plan.payouts.to_vec(), mock.lock().unwrap().jobs[0]);
+        assert_eq!((plan.height, plan.note.clone()), (Some(7), None));
 
         // The node refuses the miners' payouts: the job pays the pool alone,
         // as before per-miner payouts, and takes nobody's score.
@@ -3217,12 +3484,19 @@ mod tests {
         let (_, plan) = plan_merge(&db, &client, &rpc, &pool, 1.0, &[0; 32]).await.unwrap();
         assert!(plan.paid.is_empty());
         assert_eq!(mock.lock().unwrap().jobs.last().unwrap(), &vec![(pool.clone(), 1)]);
+        assert_eq!(plan.payouts.to_vec(), vec![(pool.clone(), 1)]);
+        assert!(plan.note.as_deref().is_some_and(|n| n.contains("invalid scan key")), "{:?}", plan.note);
 
         // No node at all: no merge-mining this job, and nothing breaks.
-        assert!(plan_merge(&db, &client, "http://127.0.0.1:9", &pool, 1.0, &[0; 32]).await.is_none());
+        let refused = plan_merge(&db, &client, "http://127.0.0.1:9", &pool, 1.0, &[0; 32]).await;
+        assert!(refused.as_ref().is_err_and(|e| e.contains("unreachable")), "{:?}", refused.map(|r| r.0));
     }
 
     fn test_state(db: Arc<Database>, rpc: String, pool: String) -> Arc<PoolState> {
+        test_state_with(db, Some(rpc), Some(pool))
+    }
+
+    fn test_state_with(db: Arc<Database>, rpc: Option<String>, pool: Option<String>) -> Arc<PoolState> {
         let (job_notifier, _) = broadcast::channel(4);
         Arc::new(PoolState {
             db,
@@ -3233,8 +3507,9 @@ mod tests {
             current_tree: RwLock::new(ShareMerkleTree::build(vec![])),
             valid_shares: RwLock::new(HashSet::new()),
             node_rpc_url: "http://127.0.0.1:9".into(),
-            midwimble_rpc: Some(rpc),
-            midwimble_address: Some(pool),
+            midwimble_rpc: rpc,
+            midwimble_address: pool,
+            merge_status: RwLock::new(MergeStatus::default()),
             pool_fee_percent: 1.0,
             current_block_reward: AtomicU64::new(0),
             current_height: AtomicU64::new(0),
@@ -3253,8 +3528,11 @@ mod tests {
             mining_hash: "22".repeat(32),
             target: [0xff; 32],
             commit_index: 1,
+            payouts: Arc::new(paid.clone()),
             paid: Arc::new(paid),
             claimed: Arc::new(AtomicBool::new(false)),
+            height: Some(7),
+            note: None,
         };
         *state.current_job.write().await = Some(Job {
             job_id,
@@ -3330,5 +3608,192 @@ mod tests {
         assert_eq!(sorted(midwimble_scores(&db)), sorted(vec![(ALICE.into(), 3), (BOB.into(), 2)]));
         assert!(!merge.claimed.load(Ordering::SeqCst), "the job may still win with another share");
         assert!(!state.force_new_job.load(Ordering::SeqCst));
+    }
+
+    // ── The dashboard's midwimble section ───────────────────────────────
+
+    #[tokio::test]
+    async fn the_dashboard_lists_found_midwimble_blocks_and_the_score_table() {
+        let (_dir, db) = test_db();
+        let pool = pool_mw();
+        let mock: Shared = Default::default();
+        let rpc = stand_in_midwimble(pool.clone(), mock.clone()).await;
+        let state = test_state(db.clone(), rpc, pool.clone());
+        settle_midwimble_scores(&db, &[(ALICE.into(), 3), (BOB.into(), 1)], true).unwrap();
+
+        let before = midwimble_stats(&state).await;
+        assert_eq!(before["pool_address"], pool.as_str());
+        assert_eq!(before["active"], false, "no job built yet");
+        assert_eq!(before["blocks_found"], 0);
+        assert_eq!(before["total_score"], 4);
+        assert_eq!(before["scores"][0]["address"], ALICE, "highest score first");
+
+        serve_winning_job(&state, 1, midwimble_scores(&db)).await;
+        process_share(&state, [1; 32], "rig", Some(ALICE), 1, 11).await.unwrap();
+        settled(&mock, 1).await;
+
+        let after = midwimble_stats(&state).await;
+        assert_eq!(after["blocks_found"], 1);
+        let block = &after["recent_blocks"][0];
+        assert_eq!(block["height"], 7);
+        assert!(block["timestamp"].as_u64().unwrap() > 0);
+        let paid: Vec<(String, u64)> = block["payouts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p["address"].as_str().unwrap().to_string(), p["weight"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(sorted(paid), sorted(vec![(ALICE.into(), 3), (BOB.into(), 1)]));
+        // The block took the scores it paid; ALICE's winning share is still hers.
+        assert_eq!(after["total_score"], 1);
+        assert_eq!(after["scores"][0]["address"], ALICE);
+    }
+
+    #[tokio::test]
+    async fn a_refused_midwimble_block_is_not_listed() {
+        let (_dir, db) = test_db();
+        let pool = pool_mw();
+        let mock: Shared = Default::default();
+        mock.lock().unwrap().refuse_blocks = true;
+        let rpc = stand_in_midwimble(pool.clone(), mock.clone()).await;
+        let state = test_state(db.clone(), rpc, pool.clone());
+        settle_midwimble_scores(&db, &[(ALICE.into(), 3)], true).unwrap();
+        serve_winning_job(&state, 1, midwimble_scores(&db)).await;
+        process_share(&state, [1; 32], "rig", Some(ALICE), 1, 11).await.unwrap();
+        settled(&mock, 1).await;
+        let stats = midwimble_stats(&state).await;
+        assert_eq!(stats["blocks_found"], 0);
+        assert_eq!(stats["recent_blocks"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_pool_that_does_not_merge_mine_has_no_midwimble_section() {
+        let (_dir, db) = test_db();
+        let state = test_state_with(db, None, None);
+        assert_eq!(midwimble_stats(&state).await, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn merge_status_says_why_a_job_does_not_merge_mine() {
+        let refused = MergeStatus::of_job(None, Some("bonded mining is required from height 1"), 5);
+        assert_eq!(
+            refused,
+            MergeStatus { active: false, note: Some("bonded mining is required from height 1".into()), height: None, updated: 5 }
+        );
+        let no_room = MergeStatus::of_job(None, None, 6);
+        assert!(!no_room.active && no_room.note.is_some());
+
+        let merge = MergeCommit {
+            mining_hash: "22".repeat(32),
+            target: [0xff; 32],
+            commit_index: 1,
+            paid: Arc::new(Vec::new()),
+            claimed: Arc::new(AtomicBool::new(false)),
+            height: Some(9),
+            payouts: Arc::new(vec![(pool_mw(), 1)]),
+            note: Some("the node refused the miners' payouts".into()),
+        };
+        let live = MergeStatus::of_job(Some(&merge), None, 7);
+        assert_eq!(
+            live,
+            MergeStatus { active: true, note: merge.note.clone(), height: Some(9), updated: 7 }
+        );
+    }
+
+    // ── split_with_floor ────────────────────────────────────────────────
+
+    fn miner(i: u64) -> [u8; 32] {
+        let mut a = [0u8; 32];
+        a[..8].copy_from_slice(&i.to_be_bytes());
+        a[31] = 0xa5;
+        a
+    }
+
+    /// Checks the split's guarantees and returns the worst miner's distance
+    /// from its exact share, as a fraction of the block.
+    fn check_split(d: u64, shares: &[([u8; 32], u64)]) -> f64 {
+        let coins = split_with_floor(d, shares).expect("a split");
+        assert_eq!(coins.iter().map(|(_, c)| *c as u128).sum::<u128>(), d as u128, "pays the block exactly");
+        assert!(coins.iter().all(|(_, c)| c.is_power_of_two()), "power-of-2 coins only");
+        assert_eq!(split_with_floor(d, shares), Some(coins.clone()), "the same split every time");
+        let total: f64 = shares.iter().map(|(_, s)| *s as f64).sum();
+        let mut worst = 0f64;
+        for (a, s) in shares {
+            let paid: u64 = coins.iter().filter(|(x, _)| x == a).map(|(_, c)| *c).sum();
+            if *s == 0 {
+                assert_eq!(paid, 0, "no score, no coin");
+                continue;
+            }
+            assert!(paid > 0, "a miner with score {s} got no coin");
+            worst = worst.max((paid as f64 - d as f64 * *s as f64 / total).abs() / d as f64);
+        }
+        assert!(coins.iter().all(|(a, _)| shares.iter().any(|(x, s)| x == a && *s > 0)), "only miners are paid");
+        worst
+    }
+
+    #[test]
+    fn a_small_miner_next_to_large_ones_is_still_paid() {
+        // The greedy split paid these 17 coins to the two large miners, and the
+        // third miner's audit disconnected it for being left out.
+        let d = 1_063_009_584;
+        let shares = [(miner(1), 5_000), (miner(2), 300), (miner(3), 2)];
+        assert!(check_split(d, &shares) < 1.0 / 256.0);
+    }
+
+    #[test]
+    fn split_holds_its_guarantees_on_random_pools() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for round in 0..2_000u64 {
+            let n = 1 + (next() % 60) as usize;
+            let d = 1_063_009_584 + next() % 50_000;
+            let shares: Vec<_> = (0..n as u64)
+                .map(|i| {
+                    let score = match next() % 5 {
+                        0 => 0,
+                        1 => 1 + next() % 3,
+                        2 => 1 + next() % 100,
+                        3 => 1 + next() % 10_000,
+                        _ => 1 + next() % 5_000_000,
+                    };
+                    (miner(round * 100 + i), score)
+                })
+                .collect();
+            if shares.iter().all(|(_, s)| *s == 0) {
+                assert!(split_with_floor(d, &shares).is_none());
+                continue;
+            }
+            // Within 1/256 of the block of each exact share, give or take a
+            // unit per miner of rounding.
+            let worst = check_split(d, &shares) * d as f64;
+            let bound = (d >> SPLIT_GRANULARITY_SHIFT) as f64 + n as f64 + 1.0;
+            assert!(worst <= bound, "round {round}: {worst} units off, bound {bound}");
+            let outputs = split_with_floor(d, &shares).unwrap().len();
+            assert!(outputs <= 3 * n + 64, "round {round}: {outputs} outputs for {n} miners");
+        }
+    }
+
+    #[test]
+    fn shares_that_round_to_nothing_still_get_a_coin() {
+        let mut shares = vec![(miner(0), 10_000_000)];
+        shares.extend((1..=10).map(|i| (miner(i), 1)));
+        check_split(1_000, &shares);
+        check_split(11, &shares);
+    }
+
+    #[test]
+    fn split_declines_only_without_units_to_pay() {
+        let shares: Vec<_> = (0..10).map(|i| (miner(i), 1)).collect();
+        assert!(split_with_floor(9, &shares).is_none());
+        assert!(split_with_floor(0, &shares).is_none());
+        assert!(split_with_floor(1_000, &[]).is_none());
+        assert!(split_with_floor(1_000, &[(miner(1), 0)]).is_none());
+        let coins = split_with_floor(1_063_009_584, &[(miner(1), 7)]).unwrap();
+        assert!(coins.iter().all(|(a, _)| *a == miner(1)));
     }
 }

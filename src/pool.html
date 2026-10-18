@@ -187,6 +187,12 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
 .verify-meta.bad { color: var(--text-max); font-weight: 700; }
 .verify-panel td.dev-mid { color: var(--text-bright); }
 .verify-panel td.dev-hi { color: var(--text-max); font-weight: 700; }
+
+/* Midwimble (merged mining) */
+.pool-box h3 { font-family: 'Inter', sans-serif; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin: 18px 0 8px; }
+.mw-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.mw-note { font-size: 12px; color: var(--text-muted); word-break: break-word; }
+.badge.wait .mark { color: var(--text-faint); }
 </style>
 
 <!-- Canonical stylesheet (served by the pool binary). Overrides the mirror above. -->
@@ -297,10 +303,50 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
       <div id="verify-panel" class="verify-panel" hidden></div>
     </div>
 
+    <div class="pool-box" id="mw-box" hidden>
+      <h2>Midwimble Merge-Mining</h2>
+      <div class="mw-head">
+        <span class="badge" id="mw-badge"><span class="mark">&middot;</span><span id="mw-badge-text">checking&hellip;</span></span>
+        <span class="mw-note" id="mw-note"></span>
+      </div>
+      <div class="cards">
+        <div class="card">
+          <div class="card-k">Midwimble Height</div>
+          <div class="card-v" id="mw-height">--</div>
+          <div class="card-sub">of the block being mined</div>
+        </div>
+        <div class="card">
+          <div class="card-k">Blocks Found</div>
+          <div class="card-v" id="mw-found">--</div>
+          <div class="card-sub" id="mw-found-sub">merge-mined by this pool</div>
+        </div>
+        <div class="card">
+          <div class="card-k">Midwimble Miners</div>
+          <div class="card-v" id="mw-miners">--</div>
+          <div class="card-sub" id="mw-shares">-- shares toward the next block</div>
+        </div>
+      </div>
+      <h3>Next midwimble block pays</h3>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Midwimble Address</th><th class="num">Shares</th><th class="num">Weight</th></tr></thead>
+          <tbody id="mw-scores"><tr class="empty-row"><td colspan="3">Loading...</td></tr></tbody>
+        </table>
+      </div>
+      <h3>Midwimble blocks found</h3>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th class="num">Age</th><th class="num">Height</th><th>Paid (share of block)</th></tr></thead>
+          <tbody id="mw-blocks"><tr class="empty-row"><td colspan="3">Loading...</td></tr></tbody>
+        </table>
+      </div>
+      <div class="ref-note">Every share also earns midwimble score for the address your miner gives with <span class="mono">--midwimble-address</span>; shares without one count for the pool. A midwimble block pays at most 31 addresses: anyone with 1/31 of the score is paid exactly, the rest by a draw that gives each its share on average. Midwimble amounts are confidential, so blocks show each address's share.</div>
+    </div>
+
     <div class="pool-box">
       <h2>How to Connect</h2>
       <p class="hint">Provably-fair SPV pool. Your miner mathematically audits the pool every block.</p>
-      <div class="code">./midstate miner --pool-url stratum+tcp://rpc.cypherpunk.gold:3333 --payout-address &lt;YOUR_WALLET_ADDRESS&gt;</div>
+      <div class="code">./midstate miner --pool-url stratum+tcp://rpc.cypherpunk.gold:3333 --payout-address &lt;YOUR_WALLET_ADDRESS&gt;<span id="connect-mw" hidden> --midwimble-address &lt;YOUR_MW1_ADDRESS&gt;</span></div>
     </div>
 
   </section>
@@ -445,6 +491,7 @@ if (haveChart) {
 const activity = [];                    // [{t, type, text}] recent events (capped)
 const auditTallies = {};                // tallyKey -> { blocks, bad, lastRoot }
 let lastSeenBlockKey = null;            // newest block hash/ts, to detect new blocks
+let lastMwFound = null;                 // midwimble blocks found, to detect new ones
 const BANNER_MS = 12000;                // how long the block-found banner stays up
 let bannerTimer = null;
 
@@ -957,6 +1004,16 @@ async function fetchStats() {
     }
     if (blockKey) lastSeenBlockKey = blockKey;
 
+    // ---- midwimble block detection (merged mining) ----
+    const mwFound = data.midwimble ? (Number(data.midwimble.blocks_found) || 0) : null;
+    if (mwFound != null && lastMwFound != null && mwFound > lastMwFound) {
+      const mb = (data.midwimble.recent_blocks || [])[0];
+      const mh = (mb && mb.height != null) ? (' #' + fmtInt(mb.height)) : '';
+      showBlockBanner('<span class="h">⬢ MIDWIMBLE BLOCK FOUND</span>' + mh);
+      pushActivity('block', '⬢ MIDWIMBLE BLOCK FOUND' + mh);
+    }
+    lastMwFound = mwFound;
+
     // ---- share-gain activity ----
     if (prevSnap && snap.total > prevSnap.total) {
       const gained = Number(snap.total - prevSnap.total);
@@ -1120,8 +1177,59 @@ function renderPool(data) {
     }).join('');
   }
 
+  renderMidwimble(data);
   renderHashrateChart();
   renderEffortChart(blocks, eff);
+}
+
+// Merged mining: status, the midwimble score table, and blocks found.
+// `data.midwimble` is null when this pool doesn't merge-mine.
+function renderMidwimble(data) {
+  const mw = data.midwimble;
+  $('mw-box').hidden = !mw;
+  $('connect-mw').hidden = !mw;
+  if (!mw) return;
+
+  const starting = !Number(mw.updated);
+  $('mw-badge').className = 'badge ' + (mw.active ? 'ok' : (starting ? 'wait' : 'bad'));
+  $('mw-badge-text').textContent = mw.active ? 'merge-mining' : (starting ? 'starting' : 'paused · mining midstate alone');
+  $('mw-note').textContent = mw.note || (mw.active ? 'every share is also a chance at a midwimble block' : '');
+
+  $('mw-height').textContent = (mw.height != null) ? ('#' + fmtInt(mw.height)) : '--';
+  const blocks = mw.recent_blocks || [];
+  $('mw-found').textContent = fmtInt(mw.blocks_found);
+  $('mw-found-sub').textContent = blocks.length ? ('last ' + relAge(blocks[0].timestamp)) : 'merge-mined by this pool';
+
+  const scores = mw.scores || [];
+  const total = Number(mw.total_score) || 0;
+  $('mw-miners').textContent = fmtInt(scores.length);
+  $('mw-shares').textContent = fmtInt(total) + ' shares toward the next block';
+
+  const label = (addr) => '<span class="addr" title="' + esc(addr) + '">' + esc(shortAddr(addr)) + '</span>' +
+    (addr === mw.pool_address ? '<span class="fee-tag">pool</span>' : '');
+
+  $('mw-scores').innerHTML = scores.length
+    ? scores.map((s) => {
+        const pct = total > 0 ? (Number(s.score) / total * 100) : 0;
+        return '<tr><td>' + label(s.address) + '</td>' +
+          '<td class="num">' + fmtInt(s.score) + '</td>' +
+          '<td class="num">' + pct.toFixed(2) + '%</td></tr>';
+      }).join('')
+    : '<tr class="empty-row"><td colspan="3">No midwimble shares yet.</td></tr>';
+
+  $('mw-blocks').innerHTML = blocks.length
+    ? blocks.map((b) => {
+        const pays = b.payouts || [];
+        const sum = pays.reduce((a, p) => a + (Number(p.weight) || 0), 0);
+        const paid = pays.map((p) => {
+          const pct = sum > 0 ? (Number(p.weight) / sum * 100) : 0;
+          return '<div class="pay"><span>' + label(p.address) + '</span><span class="amt">' + pct.toFixed(2) + '%</span></div>';
+        }).join('') || '--';
+        return '<tr><td class="num">' + relAge(b.timestamp) + '</td>' +
+          '<td class="num">' + ((b.height != null) ? ('#' + fmtInt(b.height)) : '--') + '</td>' +
+          '<td>' + paid + '</td></tr>';
+      }).join('')
+    : '<tr class="empty-row"><td colspan="3">No midwimble blocks found yet.</td></tr>';
 }
 
 // ---------------------------------------------------------------------------
@@ -1317,7 +1425,7 @@ function renderVerify(panel, block, snap, poolAddr) {
       '<thead><tr><th>Miner</th><th class="num">Committed %</th><th class="num">Expected</th><th class="num">Paid</th><th class="num">\u0394 pp</th></tr></thead>' +
       '<tbody>' + rows + '</tbody>' +
     '</table></div>' +
-    '<div class="card-sub" style="margin-top:8px;">Payouts are power-of-2 coins assigned greedily to the highest committed scores, so small &Delta; is quantization rounding, not unfairness. The exact guarantees: no address was paid without committed shares, and every payout is a real coin in this block\'s coinbase.</div>';
+    '<div class="card-sub" style="margin-top:8px;">Payouts are power-of-2 coins, so a small &Delta; is coin rounding, not unfairness. The exact guarantees: no address was paid without committed shares, and every payout is a real coin in this block\'s coinbase.</div>';
 }
 window.addEventListener('hashchange', renderRoute);
 
