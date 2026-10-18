@@ -328,6 +328,21 @@
         .nav-btn.active { color: var(--text-max); }
         .nav-btn svg { display: block; width: 20px; height: 20px; stroke: currentColor; }
         .nav-icon { font-size: 18px; line-height: 1; }
+        /* The phone bar has no room for another tab: Bonds is reached from Settings there. */
+        .nav-btn.nav-wide-only { display: none; }
+
+        /* ── Mining bonds ───────────────────────────────────────────── */
+        .bond-hint { font-size: 11px; color: #888; line-height: 1.5; margin: -4px 0 10px 0; }
+        .bond-quick { display: flex; gap: 6px; flex-wrap: wrap; margin: -4px 0 10px 0; }
+        .bond-quick button { width: auto; margin: 0; padding: 4px 10px; font-size: 11px; min-height: 0; }
+        /* Two classes, so it outranks the wide-screen .list-item row layout. */
+        .list-item.bond-card { display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
+        .bond-kv { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; font-size: 11px; }
+        .bond-kv .k { color: var(--text-muted); min-width: 110px; }
+        .bond-kv .v { font-family: monospace; color: var(--text-max); word-break: break-all; flex: 1 1 0; min-width: 0; }
+        .bond-cmd { font-family: monospace; font-size: 10px; color: var(--text-bright); background: var(--bg); border: 1px solid var(--border); padding: 8px; word-break: break-all; user-select: all; }
+        .bond-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+        .bond-actions button { width: auto; margin: 0; padding: 6px 12px; font-size: 11px; }
 
         /* ── Developer terminal ──────────────────────────────────────── */
         .terminal { border: 1px solid var(--border); background: var(--bg); }
@@ -684,6 +699,7 @@
             }
             .nav-btn:hover:not(:disabled) { color: var(--text-bright); }
             .nav-btn.active { color: var(--text-max); border-left: 2px solid var(--text-max); }
+            .nav-btn.nav-wide-only { display: flex; }
             .nav-btn svg { width: 16px; height: 16px; }
             .nav-icon { font-size: 15px; }
 
@@ -1363,9 +1379,61 @@
         </main>
         
 
+        <!-- MINING BONDS -->
+        <main id="view-bonds" class="page">
+            <h2>Mining Bonds</h2>
+            <div style="font-size: 11px; color: #888; margin-top: -10px; margin-bottom: 20px; line-height: 1.5;">
+                Lock MDS for midwimble's bonded mining. A bond is one coin, locked until a block height, naming a midwimble mining key: midwimble lets that key sign blocks while enough of the lock remains. Only your recovery phrase can spend the coin, and only once it unlocks.
+            </div>
+
+            <div class="panel">
+                <h3 style="font-size: 14px;">Lock a bond</h3>
+                <label style="font-size: 11px; color: #666; text-transform: uppercase;">Mining key</label>
+                <input type="text" id="bondMiningKey" placeholder="from `midwimble bond new`, or your pool's key to co-bond" autocomplete="off" spellcheck="false">
+                <label style="font-size: 11px; color: #666; text-transform: uppercase;">Amount (one coin)</label>
+                <select id="bondAmount"></select>
+                <label style="font-size: 11px; color: #666; text-transform: uppercase;">Unlocks at block</label>
+                <input type="number" id="bondUntil" placeholder="block height" min="1" step="1">
+                <div class="bond-quick">
+                    <span style="font-size: 11px; color: #666; align-self: center;">or count for</span>
+                    <button type="button" onclick="bondUntilForDays(30)">30 days</button>
+                    <button type="button" onclick="bondUntilForDays(90)">90 days</button>
+                    <button type="button" onclick="bondUntilForDays(180)">180 days</button>
+                    <button type="button" onclick="bondUntilForDays(360)">360 days</button>
+                </div>
+                <div id="bondReadout" class="bond-hint"></div>
+                <input type="text" id="bondLabel" placeholder="Label (optional)">
+                <div style="display: flex; gap: 8px;">
+                    <button id="btnBondLock" style="flex: 2; background: var(--text-max); color: #000; margin: 0;">Lock bond</button>
+                    <button id="btnBondRehearse" style="flex: 1; background: transparent; margin: 0;">Rehearse the exit</button>
+                </div>
+                <div class="bond-hint" style="margin-top: 10px;">Before locking a real bond, rehearse the exit: lock a small coin a few blocks out and unbond it, to see this wallet open its own bonds.</div>
+                <div id="bondStatus" class="bond-hint" style="color: var(--accent);"></div>
+            </div>
+
+            <h3 style="margin-top: 1.5rem; font-size: 12px; color: #666; text-transform: uppercase;">Your bonds</h3>
+            <div class="list-container" id="bondList">
+                <div class="list-item" style="text-align: center; color: #555;">No bonds yet.</div>
+            </div>
+
+            <div class="panel" style="margin-top: 1.5rem;">
+                <h3 style="font-size: 14px;">Import a bond</h3>
+                <div class="bond-hint">A bond this phrase made elsewhere (after a restore, or in the desktop wallet): paste midwimble's bond.json once <code>bond register</code> has filled it in, or the <code>&lt;script&gt; &lt;value&gt; &lt;salt&gt;</code> line another wallet copied.</div>
+                <textarea id="bondImportText" rows="3" placeholder="bond.json, or: script value salt" spellcheck="false" style="font-family: monospace; font-size: 11px;"></textarea>
+                <input type="text" id="bondImportLabel" placeholder="Label (optional)">
+                <button id="btnBondImport" style="margin-bottom: 0;">Import</button>
+            </div>
+        </main>
+
         <!-- SETTINGS -->
         <main id="view-settings" class="page">
             <h2>Settings</h2>
+
+            <div class="panel">
+                <h3 style="font-size: 14px;">Mining Bonds</h3>
+                <p style="font-size: 11px; color: #888; margin-bottom: 12px;">Lock MDS as a midwimble mining bond, register it, and unbond it once it unlocks.</p>
+                <button class="nav-trigger" data-target="view-bonds" style="margin: 0;">Open Mining Bonds</button>
+            </div>
             
             <div class="panel">
                 <h3 style="font-size: 14px;">Wallet Maintenance</h3>
@@ -1421,6 +1489,7 @@
             <button class="nav-btn" data-target="view-send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M5 19L19 5M9 5h10v10"/></svg><span>Send</span></button>
             <button class="nav-btn" data-target="view-receive"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M12 4v12M6 12l6 6 6-6"/></svg><span>Receive</span></button>
             <button class="nav-btn" data-target="view-lightning"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg><span>Q-Bolt L2</span></button>
+            <button class="nav-btn nav-wide-only" data-target="view-bonds"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><rect x="5" y="11" width="14" height="10"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span>Bonds</span></button>
             <button class="nav-btn" data-target="view-chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M21 15a2 2 0 0 1-2 2H8l-4 4V5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2z"/></svg><span>Chat</span></button>
             <button class="nav-btn" data-target="view-settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="8" cy="18" r="1.6"/></svg><span>Settings</span></button>
         </nav>
@@ -1731,6 +1800,7 @@ if ('serviceWorker' in navigator) {
             document.querySelectorAll('.nav-btn').forEach(btn => {
                 btn.classList.toggle('active', btn.dataset.target === targetId);
             });
+            if (targetId === 'view-bonds') bondOnShow(); else bondOnHide();
         }
 
         document.querySelectorAll('.nav-btn').forEach(btn => {
@@ -1738,6 +1808,200 @@ if ('serviceWorker' in navigator) {
         });
         document.querySelectorAll('.nav-trigger').forEach(btn => {
             btn.addEventListener('click', () => switchTab(btn.dataset.target));
+        });
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Mining bonds (the worker does the work: see worker.js "Mining bonds")
+        // ═══════════════════════════════════════════════════════════════
+
+        // Midwimble's launch parameters, as in worker.js: guidance for the form only.
+        const BOND_MW_MIN = 2 ** 24, BOND_MW_REMAIN = 2880, BOND_MW_MARGIN = 10080,
+              BOND_MW_HORIZON = 525600, BOND_GENESIS_TS = 1772274770;
+        const bondMwEst = (ts) => Math.floor(Math.max(0, ts - BOND_GENESIS_TS) / 60) + BOND_MW_MARGIN;
+        const bondMwCountsUntil = (u) => { const h = u - BOND_MW_REMAIN - BOND_MW_MARGIN; return h < 0 ? null : BOND_GENESIS_TS + h * 60 + 59; };
+        let bondState = { height: 0, spendable: 0, bonds: [] };
+        let bondPollTimer = null;
+
+        function bondHuman(secs) {
+            const h = Math.floor(secs / 3600);
+            if (h < 1) return `${Math.max(1, Math.floor(secs / 60))} minutes`;
+            if (h < 48) return `${h} hours`;
+            return `${Math.floor(h / 24)} days`;
+        }
+        function bondFmt(n) { const f = formatMDS(n); return `${f.value} ${f.prefix}`; }
+        function bondHeight() { return bondState.height || networkHeight || 0; }
+        function bondSay(text) { document.getElementById('bondStatus').textContent = text || ''; }
+
+        function bondOnShow() {
+            bondFillAmounts();
+            worker.postMessage({ type: 'BONDS_LIST' });
+            if (!bondPollTimer) bondPollTimer = setInterval(() => worker.postMessage({ type: 'BONDS_LIST' }), 30000);
+        }
+        function bondOnHide() {
+            if (bondPollTimer) { clearInterval(bondPollTimer); bondPollTimer = null; }
+        }
+
+        function bondFillAmounts() {
+            const sel = document.getElementById('bondAmount');
+            const keep = sel.value || String(BOND_MW_MIN);
+            const top = Math.max(24, Math.floor(Math.log2(Math.max(1, bondState.spendable))));
+            sel.innerHTML = '';
+            for (let e = 10; e <= top; e++) {
+                const v = 2 ** e;
+                const note = v < BOND_MW_MIN ? '  ·  rehearsal only' : (v > bondState.spendable ? '  ·  more than you hold' : '');
+                const o = document.createElement('option');
+                o.value = String(v);
+                o.textContent = bondFmt(v) + note;
+                sel.appendChild(o);
+            }
+            sel.value = [...sel.options].some(o => o.value === keep) ? keep : String(BOND_MW_MIN);
+        }
+
+        function bondUntilForDays(days) {
+            const now = Math.floor(Date.now() / 1000);
+            document.getElementById('bondUntil').value = bondMwEst(now) + BOND_MW_REMAIN + 1440 + days * 1440;
+            bondReadout();
+        }
+
+        /** What the chosen unlock height means, in a sentence or two. */
+        function bondReadout() {
+            const el = document.getElementById('bondReadout');
+            const u = parseInt(document.getElementById('bondUntil').value, 10);
+            const v = Number(document.getElementById('bondAmount').value);
+            const h = bondHeight(), now = Math.floor(Date.now() / 1000);
+            if (!Number.isFinite(u)) { el.textContent = ''; return; }
+            const horizon = bondMwEst(now) + BOND_MW_HORIZON;
+            const lines = [];
+            if (u <= h) lines.push(`That is not in the future: the chain is at block ${h}.`);
+            else if (u > horizon) lines.push(`Too far ahead: midwimble registers bonds locked at most a year out (block ${horizon} today).`);
+            else {
+                lines.push(`Unlocks in about ${bondHuman((u - h) * 60)} (block ${u}).`);
+                if (v < BOND_MW_MIN) {
+                    lines.push(`Below midwimble's minimum bond of ${bondFmt(BOND_MW_MIN)}: it will never count for mining. Fine for a rehearsal.`);
+                } else {
+                    const t = bondMwCountsUntil(u), registered = now + 1440 * 60;
+                    lines.push(t && t > registered
+                        ? `Midwimble counts it for mining for about ${bondHuman(t - registered)} after it registers (about a day from now). It stops counting two days before unlocking, by a clock that runs a week ahead.`
+                        : `Too short to count for mining: midwimble stops counting a bond once fewer than two days of its lock remain, by a clock that runs a week ahead. Fine for a rehearsal.`);
+                }
+            }
+            el.textContent = lines.join(' ');
+        }
+
+        const BOND_STATUS_TEXT = {
+            locking: 'Locking: the send is on its way. Register it with midwimble once it confirms.',
+            unlocked: 'Unlocked: unbond it to bring the coin back to this wallet.',
+            unbonding: 'Unbonding: the spend is on its way.',
+            unbonded: "Spent: the bond's coin has left the chain (unbonded).",
+            not_funded: 'Not on chain: the send that locks it never confirmed, or it was spent before this wallet saw it.',
+        };
+
+        function bondCopy(text, what) {
+            navigator.clipboard.writeText(text).then(() => showToast(`${what} copied`, 'success'), () => showToast('Could not copy', 'error'));
+        }
+
+        function bondRender(p) {
+            if (p) bondState = p;
+            bondFillAmounts();
+            const list = document.getElementById('bondList');
+            list.innerHTML = '';
+            if (!bondState.bonds.length) {
+                const empty = document.createElement('div');
+                empty.className = 'list-item'; empty.style.cssText = 'text-align: center; color: #555;';
+                empty.textContent = 'No bonds yet.';
+                list.appendChild(empty);
+                return;
+            }
+            const now = Math.floor(Date.now() / 1000);
+            const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
+            const btn = (label, onclick, primary) => {
+                const b = el('button', null, label);
+                if (primary) { b.style.background = 'var(--text-max)'; b.style.color = '#000'; }
+                b.onclick = onclick;
+                return b;
+            };
+            for (const b of bondState.bonds) {
+                const item = el('div', 'list-item bond-card');
+                const head = el('div', 'flex-row');
+                head.appendChild(el('span', null, `${b.label || 'Bond'} · ${bondFmt(b.value)}`)).style.fontWeight = '600';
+                head.appendChild(el('span', null, String(b.status).replace('_', ' ').toUpperCase())).style.cssText = 'font-size: 10px; color: var(--accent); letter-spacing: 1px;';
+                item.appendChild(head);
+                let text = BOND_STATUS_TEXT[b.status] || b.status;
+                if (b.status === 'locked') {
+                    const left = Math.max(0, b.until - bondHeight());
+                    text = `Locked until block ${b.until} (about ${bondHuman(left * 60)}).` + (b.belowMin
+                        ? " Below midwimble's minimum bond, so it never counts for mining (fine for a rehearsal)."
+                        : (b.countsUntil && b.countsUntil > now
+                            ? ` Midwimble counts it for mining for about ${bondHuman(b.countsUntil - now)} more, once registered.`
+                            : ' Midwimble no longer counts it: less than two days of its lock remain by its clock.'));
+                }
+                item.appendChild(el('div', 'bond-hint', text)).style.margin = '0';
+                const kv = (k, v, copyWhat) => {
+                    const row = el('div', 'bond-kv');
+                    row.appendChild(el('span', 'k', k));
+                    row.appendChild(el('span', 'v', v));
+                    if (copyWhat) {
+                        const c = el('a', null, 'copy');
+                        c.href = '#'; c.style.cssText = 'font-size: 10px; color: var(--accent); margin-left: 6px;';
+                        c.onclick = (ev) => { ev.preventDefault(); bondCopy(v, copyWhat); };
+                        row.appendChild(c);
+                    }
+                    return row;
+                };
+                item.appendChild(kv('unlocks at block', String(b.until)));
+                item.appendChild(kv('mining key', b.miningKey, 'Mining key'));
+                item.appendChild(kv('owner key', b.ownerPk, 'Owner key'));
+                item.appendChild(kv('bond id', b.coinId, 'Bond id'));
+                item.appendChild(kv('salt', b.salt, 'Salt'));
+                if ((b.status === 'locking' || b.status === 'locked') && !b.belowMin) {
+                    item.appendChild(el('div', 'bond-hint',
+                        'Register it with midwimble: run this once the lock confirms, and again a day later to finish. For a co-bond, use the file `midwimble bond new --mining-pubkey` made, then give that file to the pool.')).style.margin = '6px 0 4px 0';
+                    item.appendChild(el('div', 'bond-cmd', b.registerCmd));
+                }
+                const actions = el('div', 'bond-actions');
+                if (b.status === 'unlocked') actions.appendChild(btn('Unbond', () => {
+                    bondSay('Unbonding…');
+                    worker.postMessage({ type: 'BOND_UNBOND', payload: { id: b.coinId } });
+                }, true));
+                if ((b.status === 'locking' || b.status === 'locked') && !b.belowMin) actions.appendChild(btn('Copy register command', () => bondCopy(b.registerCmd, 'Command')));
+                actions.appendChild(btn('Copy for another wallet', () => bondCopy(b.exportLine, 'Bond')));
+                if (b.status === 'unbonded' || b.status === 'not_funded') actions.appendChild(btn('Forget', () => {
+                    if (confirm('Forget this bond? Its record holds the salt needed to spend it, so only forget a bond whose coin is gone.')) {
+                        worker.postMessage({ type: 'BOND_REMOVE', payload: { id: b.coinId } });
+                    }
+                }));
+                item.appendChild(actions);
+                list.appendChild(item);
+            }
+        }
+
+        document.getElementById('bondUntil').addEventListener('input', bondReadout);
+        document.getElementById('bondAmount').addEventListener('change', bondReadout);
+        document.getElementById('btnBondRehearse').addEventListener('click', () => {
+            bondFillAmounts();
+            document.getElementById('bondAmount').value = '1024';
+            document.getElementById('bondUntil').value = bondHeight() + 10;
+            document.getElementById('bondLabel').value = 'rehearsal';
+            bondReadout();
+        });
+        document.getElementById('btnBondLock').addEventListener('click', () => {
+            const key = document.getElementById('bondMiningKey').value.trim().replace(/^mining key\s*/i, '');
+            const value = document.getElementById('bondAmount').value;
+            const until = parseInt(document.getElementById('bondUntil').value, 10);
+            const label = document.getElementById('bondLabel').value.trim();
+            if (!/^[0-9a-fA-F]{64}$/.test(key)) { showToast('Paste the 64-character mining key from `midwimble bond new` (or your pool).', 'error'); return; }
+            if (!Number.isFinite(until) || until <= bondHeight()) { showToast('Choose an unlock height above the current block.', 'error'); return; }
+            const ok = confirm(`Lock ${bondFmt(Number(value))} until block ${until} on mining key ${key.slice(0, 10)}…${key.slice(-6)}?\n\n`
+                + 'The coin cannot move before then. Check the key: a bond on the wrong key is locked money that cannot mine.');
+            if (!ok) return;
+            bondSay('Locking…');
+            worker.postMessage({ type: 'BOND_CREATE', payload: { miningKey: key, value, until, label } });
+        });
+        document.getElementById('btnBondImport').addEventListener('click', () => {
+            const text = document.getElementById('bondImportText').value.trim();
+            if (!text) return;
+            bondSay('Importing…');
+            worker.postMessage({ type: 'BOND_IMPORT', payload: { text, label: document.getElementById('bondImportLabel').value.trim() } });
         });
 
         // ═══════════════════════════════════════════════════════════════
@@ -4004,6 +4268,29 @@ if ('serviceWorker' in navigator) {
                     break;
                 }
 
+                case 'BONDS':
+                    bondRender(payload);
+                    break;
+                case 'BOND_PROGRESS':
+                    bondSay(payload && payload.msg);
+                    break;
+                case 'BOND_DONE':
+                    bondSay(payload && payload.text);
+                    showToast(payload && payload.text, 'success');
+                    if (/^Bond locked/.test((payload && payload.text) || '')) {
+                        ['bondMiningKey', 'bondUntil', 'bondLabel'].forEach(id => { document.getElementById(id).value = ''; });
+                        bondReadout();
+                    }
+                    if (/^Imported/.test((payload && payload.text) || '')) {
+                        document.getElementById('bondImportText').value = '';
+                        document.getElementById('bondImportLabel').value = '';
+                    }
+                    worker.postMessage({ type: 'BONDS_LIST' });
+                    break;
+                case 'BOND_ERROR':
+                    bondSay(payload && payload.error);
+                    showToast(payload && payload.error, 'error');
+                    break;
                 case 'SEND_PROGRESS':
                     showActivity(payload.msg);
                     if (dexBroadcastInFlight && typeof dexSetProgress === 'function') dexSetProgress('Announcing order on-chain \u2014 ' + payload.msg, null);

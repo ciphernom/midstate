@@ -4372,6 +4372,43 @@ else if (type === 'L2_OPEN_CHANNEL') {
             try { await performContractTx({ kind: 'spend', ...payload }); }
             finally { releaseSendLock(); }
         }
+        // ── Mining bonds ─────────────────────────────────────────────────────
+        else if (type === 'BONDS_LIST') {
+            try {
+                await refreshBondStatus();
+                self.postMessage({ type: 'BONDS', payload: bondsPayload() });
+            } catch (err) {
+                self.postMessage({ type: 'BOND_ERROR', payload: { error: (err && err.message) || String(err) } });
+            }
+        }
+        else if (type === 'BOND_CREATE' || type === 'BOND_UNBOND') {
+            await acquireSendLock(type === 'BOND_CREATE' ? 'bond' : 'unbond');
+            try {
+                if (type === 'BOND_CREATE') {
+                    const id = await performBondCreate(payload || {});
+                    self.postMessage({ type: 'BOND_DONE', payload: { id, text: "Bond locked. Register it with midwimble using the command on its card." } });
+                } else {
+                    await performBondUnbond(payload || {});
+                    self.postMessage({ type: 'BOND_DONE', payload: { text: "Unbonded: the coin is back in your wallet." } });
+                }
+            } catch (err) {
+                self.postMessage({ type: 'BOND_ERROR', payload: { error: (err && err.message) || String(err) } });
+            } finally {
+                releaseSendLock();
+                self.postMessage({ type: 'BONDS', payload: bondsPayload() });
+                self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+            }
+        }
+        else if (type === 'BOND_IMPORT' || type === 'BOND_REMOVE') {
+            try {
+                const text = type === 'BOND_IMPORT' ? await performBondImport(payload || {}) : (await performBondRemove(payload || {}), "Bond forgotten.");
+                self.postMessage({ type: 'BOND_DONE', payload: { text } });
+            } catch (err) {
+                self.postMessage({ type: 'BOND_ERROR', payload: { error: (err && err.message) || String(err) } });
+            } finally {
+                self.postMessage({ type: 'BONDS', payload: bondsPayload() });
+            }
+        }
         else if (type === 'SIGN_CHANNEL') {
             await acquireSendLock();
             try {
@@ -6457,6 +6494,403 @@ function buildContractInputs(req, contractAddr) {
     }
     return inputs;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Mining bonds (midwimble bonded proof of work)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// A bond is one coin locked by midstate's `script::compile_mining_bond`:
+//
+//   PUSH_DATA <mining key>    DROP              binds the key into the address
+//   PUSH_INT  <bonded_until>  CHECKTIMEVERIFY   unspendable below that height
+//   PUSH_DATA <owner key>     CHECKSIGVERIFY    only the owner can spend it
+//   PUSH_INT  1
+//
+// Midwimble registers it (`midwimble bond register`) and lets the mining key
+// sign blocks while enough of the lock remains (midwimble docs/BONDED_POW.md).
+// Each bond gets its own owner key: an MSS tree derived from the phrase at an
+// HD index hashed from (mining key, unlock height), exactly as the desktop
+// wallet derives it (walletd `bond.rs`). Either wallet can unbond the other's
+// bonds, and after a restore the bond's terms alone give the key back.
+
+const BOND_OWNER_HEIGHT = 4;               // 16 signatures: one unbond plus retries
+const BOND_OWNER_INDEX_BASE = 0x80000000;  // above every index this wallet's own trees use
+const BOND_OWNER_DOMAIN_HEX = Array.from(new TextEncoder().encode("midstate/bond-owner/v1"))
+    .map(b => b.toString(16).padStart(2, '0')).join('');
+// Midwimble's launch parameters (midwimble core/types.rs, core/bond.rs): guidance
+// only, since midstate consensus knows nothing of them.
+const MW_MIN_MINING_BOND = 2 ** 24;
+const MW_MIN_REMAINING_BOND_LOCK = 2 * 1440;
+const MW_CLOCK_MARGIN = 7 * 1440;
+const MW_MAX_BOND_HORIZON = 365 * 1440;
+const MIDSTATE_GENESIS_TIMESTAMP = 1772274770;
+/** A never-seen bond can only be forgotten after this long. */
+const BOND_FORGET_AFTER_MS = 60 * 60 * 1000;
+
+/** Midwimble's estimate of midstate's height at unix time `ts`. */
+function mwEstHeight(ts) {
+    return Math.floor(Math.max(0, ts - MIDSTATE_GENESIS_TIMESTAMP) / 60) + MW_CLOCK_MARGIN;
+}
+/** Last unix time midwimble counts a bond locked until `until`, or null if never. */
+function mwCountsUntil(until) {
+    const h = until - MW_MIN_REMAINING_BOND_LOCK - MW_CLOCK_MARGIN;
+    return h < 0 ? null : MIDSTATE_GENESIS_TIMESTAMP + h * 60 + 59;
+}
+
+/** n as `bytes` little-endian bytes, hex. */
+function leHex(n, bytes) {
+    let v = BigInt(n), out = '';
+    for (let i = 0; i < bytes; i++) { out += Number(v & 0xffn).toString(16).padStart(2, '0'); v >>= 8n; }
+    return out;
+}
+/** midstate `script::from_u64`: little-endian with trailing zero bytes dropped (at least one byte). */
+function minimalLeHex(n) {
+    let v = BigInt(n), out = '';
+    do { out += Number(v & 0xffn).toString(16).padStart(2, '0'); v >>= 8n; } while (v > 0n);
+    return out;
+}
+
+/**
+ * The bond script, byte for byte as `compile_mining_bond` writes it. Midwimble
+ * recognises only this exact encoding (a padded integer is not a bond), and the
+ * self-tests pin it to the vector both codebases carry.
+ */
+function bondScriptHex(miningKeyHex, until, ownerPkHex) {
+    const intHex = minimalLeHex(until);
+    return '012000' + normalizeHex(miningKeyHex) + '10'
+        + '01' + leHex(intHex.length / 2, 2) + intHex + '33'
+        + '012000' + normalizeHex(ownerPkHex) + '32'
+        + '01' + '0100' + '01';
+}
+
+/** Read a bond script back into its terms, or null if it is not exactly one. */
+function parseBondScript(hex) {
+    const h = normalizeHex(hex);
+    const m = /^012000([0-9a-f]{64})1001([0-9a-f]{2})00([0-9a-f]*)33012000([0-9a-f]{64})3201010001$/.exec(h);
+    if (!m) return null;
+    const len = parseInt(m[2], 16);
+    if (len < 1 || len > 8 || m[3].length !== len * 2) return null;
+    let until = 0n;
+    for (let i = len - 1; i >= 0; i--) until = (until << 8n) | BigInt(parseInt(m[3].slice(i * 2, i * 2 + 2), 16));
+    if (until > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+    const terms = { miningKey: m[1], until: Number(until), ownerPk: m[4] };
+    return bondScriptHex(terms.miningKey, terms.until, terms.ownerPk) === h ? terms : null;
+}
+
+/** HD index of a bond's owner key (walletd `bond::owner_index`). */
+function bondOwnerIndex(miningKeyHex, until) {
+    const h = blake3_hash_hex(BOND_OWNER_DOMAIN_HEX + normalizeHex(miningKeyHex) + leHex(until, 8));
+    const x = parseInt(h.slice(6, 8) + h.slice(4, 6) + h.slice(2, 4) + h.slice(0, 2), 16);
+    return BOND_OWNER_INDEX_BASE + (x % 0x40000000);
+}
+
+/** Derive a bond's owner tree into the WASM cache; returns { address, pk }. */
+function deriveBondOwner(miningKeyHex, until) {
+    const address = wallet.get_mss_address(bondOwnerIndex(miningKeyHex, until), BOND_OWNER_HEIGHT, null);
+    return { address, pk: wallet.get_mss_pubkey(address) };
+}
+
+/** 32 bytes of hex for a mining key; refuses a pasted midstate address. */
+function parseMiningKeyHex(text) {
+    let t = String(text || '').trim().toLowerCase().replace(/^mining key\s*/, '').trim();
+    if (!/^[0-9a-f]*$/.test(t)) throw new Error("The mining key must be hex.");
+    if (t.length === 72) throw new Error("That looks like a midstate address. Paste the mining key `midwimble bond new` printed (or your pool's mining key), not an address.");
+    if (t.length !== 64) throw new Error(`The mining key must be 32 bytes of hex; this is ${t.length / 2}.`);
+    return t;
+}
+
+function bondFind(coinId) {
+    return (wState.bonds || []).find(b => b.coinId === normalizeHex(coinId)) || null;
+}
+
+/** Ask the network which bond coins exist; remember the ones seen on chain. */
+async function refreshBondStatus() {
+    wState.bonds = wState.bonds || [];
+    let dirty = false;
+    for (const b of wState.bonds) {
+        try {
+            const r = await rpc.checkCoin(b.coinId);
+            b.live = !!(r && r.exists);
+            if (b.live && !b.seenLive) { b.seenLive = true; dirty = true; }
+        } catch (_) { /* keep the last answer */ }
+    }
+    if (dirty) await saveState();
+}
+
+function bondStatus(b) {
+    if (b.unbonding) return 'unbonding';
+    if (b.live && networkHeight >= b.until) return 'unlocked';
+    if (b.live) return 'locked';
+    if (b.funding) return 'locking';
+    return b.seenLive ? 'unbonded' : 'not_funded';
+}
+
+function bondsPayload() {
+    const held = Object.values(wState.utxos || {}).reduce((s, u) => s + Number(u.value), 0);
+    const pending = pendingSends.reduce((s, tx) => s + tx.value + tx.fee, 0);
+    return {
+        height: networkHeight || 0,
+        spendable: Math.max(0, held - pending),
+        bonds: (wState.bonds || []).slice().reverse().map(b => {
+            const scriptHex = bondScriptHex(b.miningKey, b.until, b.ownerPk);
+            return {
+                ...b,
+                status: bondStatus(b),
+                address: blake3_hash_hex(scriptHex),
+                script: scriptHex,
+                belowMin: b.value < MW_MIN_MINING_BOND,
+                countsUntil: b.value < MW_MIN_MINING_BOND ? null : mwCountsUntil(b.until),
+                registerCmd: `midwimble bond register --file bond.json --owner-pk ${b.ownerPk} --until ${b.until} `
+                    + `--value ${b.value} --salt ${b.salt} --midstate-rpc <your midstate node, e.g. 127.0.0.1:8545>`,
+                exportLine: `${scriptHex} ${b.value} ${b.salt}`,
+            };
+        }),
+    };
+}
+
+/** Commit, wait, reveal, wait: shared by locking and unbonding. */
+async function bondBroadcast(ctx, revealPayloadStr, firstInputId, prog) {
+    prog("Fetching network difficulty...");
+    const stateData = await rpc.getState();
+    prog(`Mining PoW [Commit: ${ctx.commitment.substring(0, 8)}...]`);
+    await new Promise(r => setTimeout(r, 50));
+    const spamNonce = Number(mine_commitment_pow(ctx.commitment, stateData.required_pow || 24, BigInt(stateData.height), stateData.header_hash));
+    const commitReq = await rpc.commit(ctx.commitment, spamNonce);
+    if (!commitReq.ok) throw new Error(`Commit rejected: ${commitReq.body || commitReq.error}`);
+    prog("Commit broadcast — waiting to be mined (1/2)…");
+    await awaitCommitmentMined(ctx.commitment, prog);
+    const revealReq = await rpc.send(revealPayloadStr);
+    if (!revealReq.ok) throw new Error(`Reveal rejected: ${revealReq.body || revealReq.error}`);
+    prog("Reveal broadcast — waiting to be mined (2/2)…");
+    if (firstInputId) await awaitCoinSpent(firstInputId, prog);
+}
+
+/**
+ * Lock one coin as a bond. The record, holding the salt nothing else keeps,
+ * is saved (by reserveAndLock) before the commit is broadcast.
+ */
+async function performBondCreate({ miningKey, value, until, label }) {
+    const prog = (msg) => self.postMessage({ type: 'BOND_PROGRESS', payload: { msg } });
+    if (wState.restoreScan) throw new Error("The wallet is still scanning for this recovery phrase's earlier coins. Bonds can be locked once the scan finishes.");
+    const mk = parseMiningKeyHex(miningKey);
+    const v = BigInt(value);
+    if (v <= 0n || (v & (v - 1n)) !== 0n) throw new Error("A bond is one coin, and every coin is a power of two: choose one of the listed amounts.");
+    const u = Number(until);
+    if (!Number.isSafeInteger(u) || u <= networkHeight) throw new Error(`The unlock height must be above the current height (${networkHeight}).`);
+    const horizon = mwEstHeight(Math.floor(Date.now() / 1000)) + MW_MAX_BOND_HORIZON;
+    if (u > horizon) throw new Error(`Block ${u} is more than a year ahead by midwimble's clock (the most it accepts is ${horizon}). Midwimble would refuse to register the bond, and the coin would stay locked all that time.`);
+
+    prog("Deriving the bond's owner key…");
+    const owner = deriveBondOwner(mk, u);
+    const scriptHex = bondScriptHex(mk, u, owner.pk);
+    const bondAddr = blake3_hash_hex(scriptHex);
+
+    if (!mssCachesReady) await loadMssCaches();
+    prog("Verifying MSS safety indices...");
+    await verifyMssSafetyIndices(prog);
+    const utxoArray = getSpendableUtxos().map(x => (x.is_mss && wState.mssAddrs[x.address]) ? { ...x, mss_leaf: wState.mssAddrs[x.address].next_leaf } : x);
+
+    prog("Building transaction...");
+    let ctxStr;
+    try { ctxStr = wallet.prepare_fund_tx(JSON.stringify(utxoArray), bondAddr, v, null, wState.nextWotsIndex); }
+    catch (e) { throw new Error(`Failed to prepare transaction: ${e.toString()}`); }
+    const ctx = JSON.parse(ctxStr);
+    const locked = (ctx.outputs || []).filter(o => normalizeHex(o.address) === bondAddr);
+    if (locked.length !== 1 || BigInt(locked[0].value) !== v) throw new Error("Internal error: the transaction does not lock exactly one coin.");
+    const salt = normalizeHex(locked[0].salt);
+    const coinId = normalizeHex(compute_coin_id_hex(bondAddr, v, salt));
+
+    wState.bonds = wState.bonds || [];
+    const rec = {
+        miningKey: mk, until: u, ownerPk: normalizeHex(owner.pk), owner: 'derived', value: Number(v), salt, coinId,
+        label: String(label || '').trim(), createdAt: Date.now(), funding: ctx.commitment, seenLive: false, ownerNextLeaf: 0,
+    };
+    wState.bonds.push(rec);
+    pendingSends.push({ kind: 'pending', timestamp: Math.floor(Date.now() / 1000), fee: ctx.fee, inputs: (ctx.wallet_inputs || []).map(i => i.coin_id), outputs: [], value: Number(v) });
+    self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+    try {
+        await reserveAndLock(ctx, "Saving wallet state...");   // persists the record too
+    } catch (e) {
+        wState.bonds = wState.bonds.filter(b => b !== rec);
+        pendingSends = [];
+        await saveState();
+        throw e;
+    }
+
+    const revealPayloadStr = wallet.build_script_reveal(ctxStr, ctx.commitment, ctx.tx_salt);
+    try {
+        await bondBroadcast(ctx, revealPayloadStr, ctx.input_coin_ids && ctx.input_coin_ids[0], prog);
+    } catch (e) {
+        // The lock may still confirm (a timeout is not a refusal), so the record
+        // stays: the status check finds the coin if it lands.
+        rec.funding = null;
+        pendingSends = [];
+        await saveState();
+        throw e;
+    }
+    rec.funding = null;
+    rec.seenLive = true;
+    rec.live = true;
+    pendingSends = [];
+    await performScan();
+    await saveState();
+    return coinId;
+}
+
+/**
+ * The owner's signature for an unbond. The leaf is the higher of this wallet's
+ * record and the network's, and is saved before the signature goes anywhere.
+ */
+async function signBondOwner(b, commitmentHex) {
+    if (b.owner === 'wallet') {
+        if (!Object.keys(wState.mssAddrs).some(a => wallet.get_mss_pubkey(a) === b.ownerPk)) {
+            throw new Error("The bond's owner key is no longer in this wallet.");
+        }
+        return await signMssAndSync(b.ownerPk, commitmentHex);
+    }
+    const owner = deriveBondOwner(b.miningKey, b.until);
+    if (normalizeHex(owner.pk) !== b.ownerPk) throw new Error("This wallet's recovery phrase does not hold the bond's owner key.");
+    const address = owner.address;
+    let leaf = b.ownerNextLeaf || 0;
+    try {
+        const st = await rpc.getMssState(b.ownerPk);
+        if (st && Number.isFinite(st.next_index)) leaf = Math.max(leaf, st.next_index);
+    } catch (_) { /* offline: the local record still guards reuse */ }
+    if (leaf >= (1 << BOND_OWNER_HEIGHT)) throw new Error("The bond's owner key has no signatures left.");
+    wallet.set_mss_leaf_index(address, leaf);
+    const sig = wallet.sign_mss_hex(b.ownerPk, commitmentHex);
+    b.ownerNextLeaf = leaf + 1;
+    await saveState();
+    return sig;
+}
+
+/** Spend an unlocked bond back to this wallet's receiving address. */
+async function performBondUnbond({ id }) {
+    const prog = (msg) => self.postMessage({ type: 'BOND_PROGRESS', payload: { msg } });
+    const b = bondFind(id);
+    if (!b) throw new Error("No such bond in this wallet.");
+    if (wState.restoreScan) throw new Error("The wallet is still scanning for this recovery phrase's earlier coins. Unbond once the scan finishes.");
+    const st = await rpc.checkCoin(b.coinId);
+    if (!(st && st.exists)) throw new Error("The bond's coin is not on chain: it is still being locked, or it has been spent.");
+    if (networkHeight < b.until) {
+        const left = b.until - networkHeight;
+        throw new Error(`Locked until block ${b.until}: ${left} blocks to go (about ${Math.max(1, Math.round(left / 1440))} day(s)).`);
+    }
+    const mssList = Object.keys(wState.mssAddrs);
+    if (!mssList.length) throw new Error("This wallet has no receiving address to unbond to.");
+    const dest = mssList[mssList.length - 1];
+
+    if (!mssCachesReady) await loadMssCaches();
+    prog("Verifying MSS safety indices...");
+    await verifyMssSafetyIndices(prog);
+    const utxoArray = getSpendableUtxos().map(x => (x.is_mss && wState.mssAddrs[x.address]) ? { ...x, mss_leaf: wState.mssAddrs[x.address].next_leaf } : x);
+    const scriptHex = bondScriptHex(b.miningKey, b.until, b.ownerPk);
+    const inputs = JSON.stringify([{ coin_id: b.coinId, witness: "", value: b.value, salt: b.salt, state: null }]);
+    const pow2 = (n) => { const out = []; let x = BigInt(n), bit = 0n; while (x > 0n) { if (x & 1n) out.push(Number(1n << bit)); x >>= 1n; bit += 1n; } return out; };
+
+    // The whole coin back, with the fee from a reusable-key coin when there is
+    // one, and otherwise out of the bond itself. Never from a one-time-key
+    // coin: if the reveal were refused, that key's signature over a commitment
+    // that never confirms would be out, and nothing on chain would show it (a
+    // refused reveal costs an MSS tree one tracked leaf, and nothing else).
+    prog("Building transaction...");
+    let ctx;
+    try {
+        ctx = JSON.parse(wallet.prepare_script_spend(JSON.stringify(utxoArray.filter(x => x.is_mss)), scriptHex, inputs,
+            JSON.stringify([{ out_type: "standard", address: dest, value: b.value, salt: null }]), wState.nextWotsIndex));
+    } catch (_) {
+        const reserve = 4096;
+        if (b.value <= reserve) throw new Error("The wallet has no coins to pay the fee, and the bond is too small to pay it.");
+        ctx = JSON.parse(wallet.prepare_script_spend("[]", scriptHex, inputs,
+            JSON.stringify(pow2(b.value - reserve).map(v => ({ out_type: "standard", address: dest, value: v, salt: null }))),
+            wState.nextWotsIndex));
+    }
+
+    prog("Signing with the bond's owner key…");
+    const sigHex = await signBondOwner(b, ctx.commitment);
+    ctx.contract_inputs[0].witness = sigHex;
+    const revealPayloadStr = wallet.build_script_reveal(JSON.stringify(ctx), ctx.commitment, ctx.tx_salt);
+
+    pendingSends.push({ kind: 'pending', timestamp: Math.floor(Date.now() / 1000), fee: ctx.fee, inputs: (ctx.wallet_inputs || []).map(i => i.coin_id), outputs: [], value: 0 });
+    b.unbonding = ctx.commitment;
+    try {
+        await reserveAndLock(ctx, "Saving wallet state...");
+        await bondBroadcast(ctx, revealPayloadStr, b.coinId, prog);
+    } finally {
+        b.unbonding = null;
+        pendingSends = [];
+    }
+    b.live = false;
+    await performScan();
+    await saveState();
+}
+
+/** Add a bond made elsewhere (midwimble's bond.json, or `<script> <value> <salt>`). */
+async function performBondImport({ text, label }) {
+    const t = String(text || '').trim();
+    let terms, value, salt;
+    const hex32 = (x, what) => {
+        if (typeof x === 'string' && /^[0-9a-fA-F]{64}$/.test(x)) return x.toLowerCase();
+        if (Array.isArray(x) && x.length === 32 && x.every(n => Number.isInteger(n) && n >= 0 && n <= 255)) return normalizeHex(x);
+        throw new Error(`"${what}" must be 32 bytes.`);
+    };
+    if (t.startsWith('{')) {
+        let j;
+        try { j = JSON.parse(t); } catch (_) { throw new Error("That is not valid JSON."); }
+        const coin = j.coin !== undefined ? j.coin : j;
+        if (!coin) throw new Error("This bond file has no coin yet: run `midwimble bond register` on it first.");
+        const sc = coin.script;
+        if (!sc) throw new Error('No "script" in the bond.');
+        terms = { miningKey: hex32(sc.mining_key, 'mining_key'), until: Number(sc.bonded_until), ownerPk: hex32(sc.owner_pk, 'owner_pk') };
+        if (!Number.isSafeInteger(terms.until)) throw new Error('No "bonded_until" in the bond.');
+        value = Number(coin.value);
+        salt = hex32(coin.salt, 'salt');
+    } else {
+        const parts = t.split(/[\s,:]+/).filter(Boolean);
+        if (parts.length !== 3) throw new Error("Paste midwimble's bond.json, or `<script hex> <value> <salt hex>`.");
+        terms = parseBondScript(parts[0]);
+        if (!terms) throw new Error("That script is not a mining bond.");
+        value = Number(parts[1]);
+        salt = hex32(parts[2], 'salt');
+    }
+    if (!Number.isSafeInteger(value) || value <= 0) throw new Error("The bond's value is not a whole number of units.");
+
+    let owner = null;
+    if (normalizeHex(deriveBondOwner(terms.miningKey, terms.until).pk) === terms.ownerPk) owner = 'derived';
+    else if (Object.keys(wState.mssAddrs).some(a => wallet.get_mss_pubkey(a) === terms.ownerPk)) owner = 'wallet';
+    if (!owner) throw new Error("This wallet cannot sign for that bond: its owner key is neither derived from this recovery phrase nor one of this wallet's keys.");
+
+    const addr = blake3_hash_hex(bondScriptHex(terms.miningKey, terms.until, terms.ownerPk));
+    const coinId = normalizeHex(compute_coin_id_hex(addr, BigInt(value), salt));
+    wState.bonds = wState.bonds || [];
+    if (bondFind(coinId)) throw new Error("This wallet already has that bond.");
+    let live = false;
+    try { const r = await rpc.checkCoin(coinId); live = !!(r && r.exists); } catch (_) {}
+    wState.bonds.push({
+        miningKey: terms.miningKey, until: terms.until, ownerPk: terms.ownerPk, owner, value, salt, coinId,
+        label: String(label || '').trim(), createdAt: Date.now(), funding: null, seenLive: live, live, ownerNextLeaf: 0,
+    });
+    await saveState();
+    return live
+        ? `Imported: the bond is on chain, locked until block ${terms.until}.`
+        : "Imported, but its coin is not on chain: it is not confirmed yet, or it has been spent.";
+}
+
+/** Forget a bond whose coin is gone. One still on chain is refused: its record holds the only salt. */
+async function performBondRemove({ id }) {
+    const b = bondFind(id);
+    if (!b) throw new Error("No such bond in this wallet.");
+    const r = await rpc.checkCoin(b.coinId);
+    if (r && r.exists) throw new Error("This bond's coin is still on chain: unbond it once it unlocks, rather than forget it.");
+    // A lock that has not shown up yet may still confirm, and then this record
+    // would be the only copy of its salt.
+    if (!b.seenLive && (b.funding || Date.now() - (b.createdAt || 0) < BOND_FORGET_AFTER_MS)) {
+        throw new Error("Its locking transaction may still confirm. Forget it once an hour has passed without it appearing.");
+    }
+    wState.bonds = wState.bonds.filter(x => x !== b);
+    await saveState();
+}
+
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -8633,6 +9067,43 @@ async function runSelfTests() {
         const many = mk({ htlcs: new Array(QB.MAX_HTLCS + 1).fill(0).map((_, i) => ({ amount: 1, timeout: 900, secret_hash: String(i).padStart(64, '0') })) });
         v = qbValidateInbound(chan, many, 500);
         assert(!v.ok && v.code === 5, 'HTLC count cap must be code 5');
+    });
+
+    // ── Mining bonds ────────────────────────────────────────────────────
+
+    await test('bond_script_matches_midwimble_vector', async () => {
+        // midwimble docs/BONDED_POW.md, carried by both codebases.
+        const script = bondScriptHex('11'.repeat(32), 400000, '22'.repeat(32));
+        assertEqual(script, '012000' + '11'.repeat(32) + '10010300801a0633012000' + '22'.repeat(32) + '3201010001', 'script');
+        assertEqual(blake3_hash_hex(script), '22fd4a4255a093856e1b4a714deb228676742accbe4e3145a6fbcb50f757b67f', 'address');
+        const t = parseBondScript(script);
+        assert(t && t.miningKey === '11'.repeat(32) && t.until === 400000 && t.ownerPk === '22'.repeat(32), 'parse round trip');
+        for (const u of [0, 1, 255, 256, 65535, 340000, 2 ** 40]) {
+            const p = parseBondScript(bondScriptHex('33'.repeat(32), u, '44'.repeat(32)));
+            assert(p && p.until === u, `round trip at ${u}`);
+        }
+        // The same script with a padded integer is not a bond.
+        const padded = '012000' + '11'.repeat(32) + '10010800801a060000000000' + '33012000' + '22'.repeat(32) + '3201010001';
+        assert(parseBondScript(padded) === null, 'padded integer refused');
+    });
+
+    await test('bond_owner_index_matches_desktop', async () => {
+        // walletd bond::owner_index pins the same three vectors.
+        assertEqual(bondOwnerIndex('33'.repeat(32), 360000), 0x8ee2a687, '33…/360000');
+        assertEqual(bondOwnerIndex('11'.repeat(32), 400000), 0x99a110a8, '11…/400000');
+        const ramp = Array.from({ length: 32 }, (_, i) => i.toString(16).padStart(2, '0')).join('');
+        assertEqual(bondOwnerIndex(ramp, 123456789), 0x9704d7d0, 'ramp/123456789');
+    });
+
+    await test('bond_midwimble_clock', async () => {
+        assertEqual(mwEstHeight(MIDSTATE_GENESIS_TIMESTAMP), MW_CLOCK_MARGIN, 'genesis');
+        const last = mwCountsUntil(400000);
+        assert(mwEstHeight(last) + MW_MIN_REMAINING_BOND_LOCK <= 400000, 'counts at its last second');
+        assert(mwEstHeight(last + 1) + MW_MIN_REMAINING_BOND_LOCK > 400000, 'and not after');
+        assert(mwCountsUntil(MW_MIN_REMAINING_BOND_LOCK + MW_CLOCK_MARGIN - 1) === null, 'never counted');
+        let msg = '';
+        try { parseMiningKeyHex('ab'.repeat(36)); } catch (e) { msg = e.message; }
+        assert(/address/.test(msg), 'a pasted address is refused');
     });
 
 
