@@ -1,3 +1,4 @@
+pub mod bonds;
 pub mod channels;
 pub mod chat;
 pub mod coins;

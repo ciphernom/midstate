@@ -19,12 +19,13 @@ pub enum Tab {
     Chat,
     Channels,
     Trade,
+    Bonds,
     Node,
     Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 10] = [
+    pub const ALL: [Tab; 11] = [
         Tab::Dashboard,
         Tab::Send,
         Tab::Receive,
@@ -33,6 +34,7 @@ impl Tab {
         Tab::Chat,
         Tab::Channels,
         Tab::Trade,
+        Tab::Bonds,
         Tab::Node,
         Tab::Settings,
     ];
@@ -46,6 +48,7 @@ impl Tab {
             Tab::Chat => "Chat",
             Tab::Channels => "Channels",
             Tab::Trade => "Trade",
+            Tab::Bonds => "Bonds",
             Tab::Node => "Node",
             Tab::Settings => "Settings",
         }
@@ -238,6 +241,20 @@ pub struct App {
     pub import_salt: String,
     pub import_label: String,
     pub abandon_addr: String,
+
+    // Mining bonds (Bonds tab)
+    pub bonds: Vec<BondView>,
+    pub bond_key: String,
+    /// The bond's value is `1 << bond_exp`: one coin, so a power of two.
+    pub bond_exp: u32,
+    pub bond_until: String,
+    pub bond_label: String,
+    /// "Lock bond" was pressed once; the next press locks.
+    pub bond_confirm: bool,
+    pub bond_import: String,
+    pub bond_import_label: String,
+    pub bond_notice: String,
+    pub bonds_last_poll: f64,
 }
 
 impl App {
@@ -405,6 +422,16 @@ impl App {
             import_salt: String::new(),
             import_label: String::new(),
             abandon_addr: String::new(),
+            bonds: Vec::new(),
+            bond_key: String::new(),
+            bond_exp: midstate_walletd::bond::midwimble::MIN_MINING_BOND.trailing_zeros(),
+            bond_until: String::new(),
+            bond_label: String::new(),
+            bond_confirm: false,
+            bond_import: String::new(),
+            bond_import_label: String::new(),
+            bond_notice: String::new(),
+            bonds_last_poll: 0.0,
         }
     }
 
@@ -638,6 +665,8 @@ impl App {
                 self.hub_draft = None;
                 self.evm = None;
                 self.book = None;
+                self.bonds.clear();
+                self.bond_confirm = false;
                 self.tab = Tab::Dashboard;
                 self.onboard = Onboard::Unlock;
                 self.go(ctx, Action::LoadStatus);
@@ -819,6 +848,24 @@ impl App {
                 self.dex_cfg_saved = Some(v.clone());
                 self.dex_cfg = Some(v);
             }
+            Msg::Bonds(b) => self.bonds = b,
+            Msg::BondDone(text) => {
+                self.busy = false;
+                self.bond_notice = text;
+                self.bond_confirm = false;
+                if self.bond_notice.starts_with("Locking") {
+                    self.bond_key.clear();
+                    self.bond_until.clear();
+                    self.bond_label.clear();
+                }
+                if self.bond_notice.starts_with("Imported") {
+                    self.bond_import.clear();
+                    self.bond_import_label.clear();
+                }
+                self.go(ctx, Action::LoadBonds);
+                self.go(ctx, Action::LoadSends);
+                self.go(ctx, Action::LoadBalance);
+            }
             Msg::DexConfigSaved => {
                 self.busy = false;
                 self.book = None;
@@ -849,7 +896,7 @@ impl App {
                 // Background loads fail benignly while locked; don't banner those.
                 let background = matches!(
                     what,
-                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs"
+                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs" | "bonds"
                 );
                 if background {
                     tracing::debug!("{what}: {err}");
@@ -983,6 +1030,16 @@ impl eframe::App for App {
                 }
             }
         }
+        if self.tab == Tab::Bonds && self.handle.is_some() {
+            let t = self.t0.elapsed().as_secs_f64();
+            if t - self.bonds_last_poll > 3.0 {
+                self.bonds_last_poll = t;
+                self.go(ctx, Action::LoadBonds);
+                if self.balance.is_none() {
+                    self.go(ctx, Action::LoadBalance);
+                }
+            }
+        }
         if self.tab == Tab::Channels && self.handle.is_some() {
             let t = self.t0.elapsed().as_secs_f64();
             if t - self.chan_last_poll > 2.0 {
@@ -1094,6 +1151,7 @@ impl eframe::App for App {
                                 Tab::Chat => views::chat::show(self, ui),
                                 Tab::Channels => views::channels::show(self, ui),
                                 Tab::Trade => views::trade::show(self, ui),
+                                Tab::Bonds => views::bonds::show(self, ui),
                                 Tab::Node => views::node::show(self, ui),
                                 Tab::Settings => views::settings::show(self, ui, &status),
                             }

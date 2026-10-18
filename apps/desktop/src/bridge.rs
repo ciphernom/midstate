@@ -78,6 +78,11 @@ pub enum Action {
     SyncOrderBook,
     LoadDexConfig,
     SetDexConfig { cfg: DexConfigView },
+    LoadBonds,
+    CreateBond { mining_key: String, value: u64, until: u64, label: String },
+    Unbond { id: String },
+    ImportBond { text: String, label: String },
+    RemoveBond { id: String },
 }
 
 pub enum Msg {
@@ -138,6 +143,9 @@ pub enum Msg {
     OrderBookSynced,
     DexConfig(DexConfigView),
     DexConfigSaved,
+    Bonds(Vec<BondView>),
+    /// A bond action finished; the text says what happened.
+    BondDone(String),
     /// `what` names the action for the error banner; wallet state is unchanged
     /// unless the message says otherwise.
     Err { what: &'static str, err: String },
@@ -315,6 +323,25 @@ pub fn dispatch(
             Action::LoadDexConfig => run!("dex settings", h.dex_config(), Msg::DexConfig),
             Action::SetDexConfig { cfg } => {
                 run!("dex settings", h.set_dex_config(cfg), |_| Msg::DexConfigSaved)
+            }
+            Action::LoadBonds => run!("bonds", h.bonds(), Msg::Bonds),
+            Action::CreateBond { mining_key, value, until, label } => {
+                run!("lock bond", h.create_bond(mining_key, value, until, label), |_| {
+                    Msg::BondDone(
+                        "Locking the bond: follow the send on the Send tab, then register it with \
+                         midwimble using the command on its card."
+                            .into(),
+                    )
+                })
+            }
+            Action::Unbond { id } => run!("unbond", h.unbond(id), |_| {
+                Msg::BondDone("Unbonding: follow it on the Send tab.".into())
+            }),
+            Action::ImportBond { text, label } => {
+                run!("import bond", h.import_bond(text, label), Msg::BondDone)
+            }
+            Action::RemoveBond { id } => {
+                run!("forget bond", h.remove_bond(id), |_| Msg::BondDone("Bond forgotten.".into()))
             }
         }
     });
