@@ -5202,7 +5202,23 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
 
                 let mut expected_mining_hash = crate::core::types::compute_header_hash(header);
 
-                // Integrity: batch PoW must match the already-verified header
+                // Integrity: batch PoW must match the already-verified header.
+                //
+                // SECURITY: compare the NONCE as well as final_hash. The header's
+                // proof (nonce -> final_hash) was fully verified, but the batch is
+                // then applied via apply_batch_skip_pow, whose only PoW check is
+                // compute_header_hash() — which does not cover the extension. A
+                // peer could therefore send a batch with the verified final_hash
+                // but a different nonce; it would be accepted and persisted, and
+                // the stored header (nonce', final_hash) fails verify_extension
+                // for every peer that later syncs from this node.
+                if batch.extension.final_hash == header.extension.final_hash
+                    && batch.extension.nonce != header.extension.nonce
+                {
+                    error_msg = format!("Batch at height {} nonce does not match verified header", height);
+                    is_valid = false;
+                    break;
+                }
                 if batch.extension.final_hash != header.extension.final_hash {
                     // Legacy blocks mined before state_root was added have state_root = [0;32].
                     // Re-check with zeroed state_root to allow syncing pre-migration blocks.

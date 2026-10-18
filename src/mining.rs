@@ -288,53 +288,97 @@ pub async fn run_stratum_client(
                                 break;
                             }
 
-                            if let Some(pool_cb) = batch.coinbase.first() {
-                                let claimed_root = hex::encode(pool_cb.salt);
-                                
-                                if let Ok(res) = http_client.get(format!("http://{}/api/proof?address={}", api_host, payout_address)).send().await {
-                                    if let Ok(proof_data) = res.json::<serde_json::Value>().await {
-                                        if proof_data.get("error").is_none() {
-                                            
-                                            let payout_bytes = crate::core::types::parse_address_flexible(&payout_address).unwrap();
-                                            let score = proof_data["score"].as_u64().unwrap_or(0);
-                                            let mut data = [0u8; 40];
-                                            data[0..32].copy_from_slice(&payout_bytes);
-                                            data[32..40].copy_from_slice(&score.to_le_bytes());
-                                            let mut current_hash = crate::core::types::hash(&data);
+                            // SECURITY: the payout audit must fail CLOSED. If the
+                            // pool's proof cannot be fetched, does not parse, carries
+                            // an `error`, or is malformed, the miner must DISCONNECT
+                            // rather than fall through to "audit passed" — otherwise a
+                            // dishonest pool disables the audit at will by erroring its
+                            // own proof endpoint, and keeps the miner working on a
+                            // template that never pays it. Every failure path below
+                            // `break`s the message loop instead of being skipped.
+                            let pool_cb = match batch.coinbase.first() {
+                                Some(cb) => cb,
+                                None => {
+                                    tracing::error!("audit failed: template has no coinbase outputs. disconnecting.");
+                                    break;
+                                }
+                            };
+                            let claimed_root = hex::encode(pool_cb.salt);
 
-                                            if let (Some(proof_array), Some(mut current_idx)) = (proof_data["proof"].as_array(), proof_data["index"].as_u64()) {
-                                                for sibling_hex in proof_array {
-                                                    let mut sibling = [0u8; 32];
-                                                    hex::decode_to_slice(sibling_hex.as_str().unwrap(), &mut sibling).unwrap();
-                                                    if current_idx % 2 == 1 {
-                                                        current_hash = crate::core::types::hash_concat(&sibling, &current_hash);
-                                                    } else {
-                                                        current_hash = crate::core::types::hash_concat(&current_hash, &sibling);
-                                                    }
-                                                    current_idx /= 2;
-                                                }
-                                            }
+                            let res = match http_client.get(format!("http://{}/api/proof?address={}", api_host, payout_address)).send().await {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::error!("audit failed: pool proof request failed ({}). disconnecting.", e);
+                                    break;
+                                }
+                            };
+                            let proof_data = match res.json::<serde_json::Value>().await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::error!("audit failed: pool proof response not valid JSON ({}). disconnecting.", e);
+                                    break;
+                                }
+                            };
+                            if let Some(err) = proof_data.get("error") {
+                                tracing::error!("audit failed: pool proof returned error: {}. disconnecting.", err);
+                                break;
+                            }
 
-                                            if hex::encode(current_hash) != claimed_root {
-                                                tracing::error!("audit failed: merkle root mismatch (computed {}, claimed {}). disconnecting.", hex::encode(current_hash), claimed_root);
-                                                break;
-                                            }
-                                            
-                                            if score > 0 {
-                                                let mut found_payout = false;
-                                                for cb in &batch.coinbase {
-                                                    if cb.address == payout_bytes {
-                                                        found_payout = true;
-                                                        break;
-                                                    }
-                                                }
-                                                if !found_payout {
-                                                    tracing::error!("audit failed: omitted from payout array despite score of {}. disconnecting.", score);
-                                                    break;
-                                                }
-                                            }
+                            let payout_bytes = match crate::core::types::parse_address_flexible(&payout_address) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    tracing::error!("audit failed: invalid payout address ({}). disconnecting.", e);
+                                    break;
+                                }
+                            };
+                            let score = proof_data["score"].as_u64().unwrap_or(0);
+                            let mut data = [0u8; 40];
+                            data[0..32].copy_from_slice(&payout_bytes);
+                            data[32..40].copy_from_slice(&score.to_le_bytes());
+                            let mut current_hash = crate::core::types::hash(&data);
+
+                            // Walk the Merkle proof. Malformed entries (non-string or
+                            // bad hex) are a failed audit, not a panic.
+                            let mut proof_ok = true;
+                            match (proof_data["proof"].as_array(), proof_data["index"].as_u64()) {
+                                (Some(proof_array), Some(mut current_idx)) => {
+                                    for sibling_hex in proof_array {
+                                        let mut sibling = [0u8; 32];
+                                        match sibling_hex.as_str() {
+                                            Some(s) if hex::decode_to_slice(s, &mut sibling).is_ok() => {}
+                                            _ => { proof_ok = false; break; }
                                         }
+                                        if current_idx % 2 == 1 {
+                                            current_hash = crate::core::types::hash_concat(&sibling, &current_hash);
+                                        } else {
+                                            current_hash = crate::core::types::hash_concat(&current_hash, &sibling);
+                                        }
+                                        current_idx /= 2;
                                     }
+                                }
+                                _ => { proof_ok = false; }
+                            }
+                            if !proof_ok {
+                                tracing::error!("audit failed: pool proof malformed or missing merkle path/index. disconnecting.");
+                                break;
+                            }
+
+                            if hex::encode(current_hash) != claimed_root {
+                                tracing::error!("audit failed: merkle root mismatch (computed {}, claimed {}). disconnecting.", hex::encode(current_hash), claimed_root);
+                                break;
+                            }
+
+                            if score > 0 {
+                                let mut found_payout = false;
+                                for cb in &batch.coinbase {
+                                    if cb.address == payout_bytes {
+                                        found_payout = true;
+                                        break;
+                                    }
+                                }
+                                if !found_payout {
+                                    tracing::error!("audit failed: omitted from payout array despite score of {}. disconnecting.", score);
+                                    break;
                                 }
                             }
                            tracing::info!("audit passed. starting job {}", job_id);
