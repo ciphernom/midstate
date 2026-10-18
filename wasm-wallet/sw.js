@@ -2,7 +2,15 @@
 // index.html only when a miner configures a multiaddr pool, exactly as
 // light_client.bundle.js is. Precaching it would push the libp2p bundle onto
 // every user including solo miners who never touch it.
-const CACHE_NAME = 'midstate-wallet-v99';
+//
+// CACHE_NAME must change whenever a precached file changes: the fetch handler
+// serves everything except HTML cache-first, so a returning user keeps running
+// the worker.js and WASM from their first visit until this name changes and the
+// service worker reinstalls. It stayed at v99 from 2026-07-30 while worker.js
+// changed (08-05, 08-16, 08-27 and since), so returning users never received
+// those changes. The deploy workflow now stamps the commit hash over this value
+// on every deploy; the literal here only matters when serving the repo directly.
+const CACHE_NAME = 'midstate-wallet-v100';
 
 const ASSETS = [
   'index.html',

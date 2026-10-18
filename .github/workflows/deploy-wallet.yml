@@ -71,7 +71,15 @@ jobs:
           cp wasm-wallet/miner.js staging/wallet/
           cp wasm-wallet/light_client.bundle.js staging/wallet/
           cp -r wasm-wallet/pkg staging/wallet/
-          
+
+          # 3b. Give every deploy its own service-worker cache. sw.js serves
+          #     worker.js and the WASM cache-first, so returning users only pick
+          #     up a new build when CACHE_NAME changes (see the note in sw.js).
+          STAMP="midstate-wallet-${GITHUB_SHA:0:12}"
+          sed -i "s/const CACHE_NAME = 'midstate-wallet-[^']*';/const CACHE_NAME = '${STAMP}';/" staging/wallet/sw.js
+          grep -q "const CACHE_NAME = '${STAMP}';" staging/wallet/sw.js \
+            || { echo "::error::could not stamp CACHE_NAME in sw.js"; exit 1; }
+
           # 4. Verification for logs
           echo "Final Deployment Structure:"
           ls -R staging
