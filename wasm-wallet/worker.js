@@ -560,11 +560,27 @@ async function awaitCoinSpent(coinId, onStatus) {
 let pendingSends = [];
 
 /**
- * @const {number} Number of WOTS addresses to pre-derive ahead of the
- * highest known index. Prevents missed coins if the user receives to
- * addresses beyond the currently synced range.
+ * @const {number} WOTS indices derived and watched past the next index the
+ * wallet will hand out (`nextWotsIndex`) and past the highest index seen on
+ * chain (`wotsHighSeen`). The scan only recognises coins at derived addresses,
+ * so this must exceed the longest run of unused indices a wallet can leave
+ * between two of its coins; a restore stops at the first longer run and never
+ * sees the coins beyond it.
+ *
+ * Earlier versions used ONE counter for both jobs: each coin found at index i
+ * pushed the allocation counter to i + 101 while the watch window ended at
+ * i + 100. A web wallet's first change went to index 100 (just past the 100
+ * keys derived at create), and every later coin sat ~101 past the previous one,
+ * one index outside a restore's window each time. A restore therefore found
+ * none of its change or solo-mined coins, then handed out change from index 100
+ * again: one-time keys the original device had already signed with.
+ *
+ * The window is now separate from the allocation counter, which only moves past
+ * indices actually used. 256 (the CLI restore's gap limit) bridges the ~101-index
+ * runs that existing wallets carry, with room for the indices a few failed sends
+ * reserved and never used (one per power-of-two change output).
  */
-const GAP_LIMIT = 100;
+const WOTS_LOOKAHEAD = 256;
 
 
 
@@ -572,7 +588,15 @@ const GAP_LIMIT = 100;
 /**
  * @typedef {Object} WalletState
  * @property {string|null} phrase - BIP39 mnemonic (null for imported CLI wallets).
- * @property {number} nextWotsIndex - Next unused WOTS HD derivation index.
+ * @property {number} nextWotsIndex - Allocation counter: the next WOTS index
+ *   handed out for change or a coinbase. Always > wotsHighSeen.
+ * @property {number} wotsWatchEnd - WOTS indices [0, wotsWatchEnd) are derived
+ *   into wotsAddrs and watched by the scan (see WOTS_LOOKAHEAD).
+ * @property {number} wotsHighSeen - Highest WOTS index that has received an
+ *   on-chain output (spent or not); -1 if none.
+ * @property {?{pass:number, wotsAtStart?:number, mssAtStart?:number}} restoreScan -
+ *   Set while a from-genesis scan (create/restore, rescan, upgrade) has not yet
+ *   converged. Signing is refused while it is set.
  * @property {number} nextMssIndex - Next unused MSS HD derivation index.
  * @property {Object<string, number>} wotsAddrs - Map of hex address → derivation index.
  * @property {Object<string, MssMetadata>} mssAddrs - Map of hex address → MSS metadata.
@@ -631,6 +655,9 @@ const GAP_LIMIT = 100;
 let wState = {
     phrase: null,
     nextWotsIndex: 0,
+    wotsWatchEnd: 0,
+    wotsHighSeen: -1,
+    restoreScan: null,
     nextMssIndex: 0,
     wotsAddrs: {},
     spentWots: {},   // CRITICAL FIX: Tracks completely dead WOTS addresses to prevent dusting attacks
@@ -1432,6 +1459,36 @@ async function loadState(pwd, bundleStr) {
             if (wState.lastScannedHeight > 0) { wState.lastScannedHeight = 0; wState.utxos = {}; }
         }
 
+        // Migrate wallets saved before the WOTS watch window was split from the
+        // allocation counter (see WOTS_LOOKAHEAD). Their wotsAddrs held exactly
+        // 0..nextWotsIndex-1. Any restore they went through watched too few keys,
+        // so it may have missed coins and recorded none of the spends of keys
+        // that had already signed. Rescan once from genesis with the wider window
+        // (pausing sends until it converges) so those coins appear and those keys
+        // are known before this wallet signs again.
+        if (typeof wState.wotsWatchEnd !== 'number') {
+            wState.wotsAddrs = wState.wotsAddrs || {};
+            let maxDerived = -1, highSeen = -1;
+            for (const idx of Object.values(wState.wotsAddrs)) if (idx > maxDerived) maxDerived = idx;
+            for (const u of Object.values(wState.utxos || {})) {
+                if (!u.is_mss && !u.watch_only && wState.wotsAddrs[u.address] !== undefined && u.index > highSeen) highSeen = u.index;
+            }
+            for (const addr of Object.keys(wState.spentWots)) {
+                const idx = wState.wotsAddrs[addr];
+                if (idx !== undefined && idx > highSeen) highSeen = idx;
+            }
+            wState.wotsWatchEnd = wState.nextWotsIndex || 0;
+            wState.wotsHighSeen = highSeen;
+            // Never allocate below anything already derived: a solo-mining accept
+            // could leave coinbase addresses at or above the old counter.
+            wState.nextWotsIndex = Math.max(wState.nextWotsIndex || 0, maxDerived + 1, highSeen + 1);
+            wState.restoreScan = { pass: 1 };
+            scanResetPending = true;
+            self.postMessage({ type: 'LOG', payload:
+                'Wallet scanner upgraded: rescanning the chain once with a wider key window, so coins an '
+                + 'earlier restore of this phrase missed show up. Sending is paused until the rescan finishes.' });
+        }
+
         // Restore embedded MSS trees to IndexedDB (from complete backups)
         if (wState._mss_trees) {
             for (const [addr, hexBytes] of Object.entries(wState._mss_trees)) {
@@ -1950,6 +2007,13 @@ async function handleGetTemplate() {
             await performScan();
         }
 
+        // The solo coinbase pays WOTS keys from the allocation counter, which is
+        // only known to be past every used key once a from-genesis scan converges.
+        if (wState.restoreScan) {
+            throw new Error("Solo mining starts once the wallet finishes scanning for this phrase's earlier coins "
+                + "(until then its next one-time keys may already be in use). Pool mining is unaffected.");
+        }
+
         const template = await buildMiningTemplate(stateObj);
         if (!template) return null;
 
@@ -2062,8 +2126,13 @@ async function handleSubmitMinedBlock(template, nonce) {
             rejectReason = accepted ? null : (submitReq.body || 'rejected');
 
             if (accepted) {
-                for (const entry of template.mining_addrs) wState.wotsAddrs[entry.address] = entry.index;
-                wState.nextWotsIndex = template.next_wots_index;
+                for (const entry of template.mining_addrs) {
+                    wState.wotsAddrs[entry.address] = entry.index;
+                    noteWotsSeen(entry.index);   // its coinbase output now exists
+                }
+                // Forward only: a send since this template was built may already
+                // have moved the counter further.
+                wState.nextWotsIndex = Math.max(wState.nextWotsIndex, template.next_wots_index);
                 self.postMessage({ type: 'LOG', payload: `✅ Solo Block accepted! Height: ${template.chainHeight}` });
                 await saveState();
                 await performScan();
@@ -3964,7 +4033,12 @@ self.onmessage = async (e) => {
             password = payload.password;
             wState = {
                 phrase: payload.phrase,
-                nextWotsIndex: 0, nextMssIndex: 0,
+                nextWotsIndex: 0, wotsWatchEnd: 0, wotsHighSeen: -1,
+                // CREATE is also the restore path (a typed-in phrase may have
+                // history), so scan from genesis until the key window stops
+                // growing before anything is signed. See finishRestorePass().
+                restoreScan: { pass: 1 },
+                nextMssIndex: 0,
                 wotsAddrs: {}, spentWots: {},pendingSpends: {}, mssAddrs: {}, utxos: {}, history: [],
                 lastScannedHeight: 0,
                 l2_channels: {}, l2_secrets: {}, l2_routes: {},
@@ -3976,14 +4050,12 @@ self.onmessage = async (e) => {
             wallet = new WebWallet(payload.phrase);
             mssCachesReady = false;
 
-            // Pre-derive GAP_LIMIT WOTS addresses for chain scanning
-            for (let i = 0; i < GAP_LIMIT; i++) {
-                deriveNextWots();
-                if (i % 10 === 0) {
-                    self.postMessage({ type: 'MSS_PROGRESS', payload: { current: i, total: GAP_LIMIT, label: `Deriving base keys (${i}/${GAP_LIMIT})...` } });
-                    await new Promise(r => setTimeout(r, 0));
-                }
-            }
+            // Pre-derive the first WOTS_LOOKAHEAD WOTS addresses for chain scanning.
+            // New wallets hand out change from index 0, so later restores of
+            // them find a coin within the first few keys.
+            await ensureWotsLookahead((done, total) => {
+                self.postMessage({ type: 'MSS_PROGRESS', payload: { current: done, total, label: `Deriving base keys (${done}/${total})...` } });
+            });
 
             // Generate the first MSS (reusable) address
             self.postMessage({ type: 'MSS_PROGRESS', payload: { current: 0, total: 100, label: "Generating Post-Quantum MSS Address..." } });
@@ -4016,6 +4088,10 @@ self.onmessage = async (e) => {
             // wipe-then-scan in its next iteration.
             scanGeneration++;
             scanResetPending = true;
+            // A rescan rebuilds the coin set from nothing: until it converges a
+            // WOTS address can hold coins the scan has not reached yet, and
+            // spending a partly-rebuilt address re-signs its key. Pause signing.
+            wState.restoreScan = { pass: 1 };
             await performScan();
         }
 
@@ -4314,10 +4390,30 @@ else if (type === 'L2_OPEN_CHANNEL') {
         }
         else if (type === 'NEW_ADDRESS') {
             self.postMessage({ type: 'LOG', payload: "Deriving new receiving address..." });
-            await deriveNextMss(10);
+            const newAddr = await deriveNextMss(10);
             await saveState();
             self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
             self.postMessage({ type: 'LOG', payload: "New address generated successfully." });
+            // A restored phrase regenerates the same MSS trees the original device
+            // made, but only tree 0 at restore. If this tree has already signed, it
+            // has history the scan never checked it against: rescan from genesis so
+            // its coins show up. (During a restore pass finishRestorePass() already
+            // repeats the pass for a newly added address.) Best effort.
+            if (!wState.restoreScan) {
+                try {
+                    const pk = wallet.get_mss_pubkey(newAddr);
+                    const st = pk ? await rpc.getMssState(pk) : null;
+                    if (st && Number.isFinite(st.next_index) && st.next_index > 0) {
+                        self.postMessage({ type: 'LOG', payload:
+                            `This address was already used by this recovery phrase (${st.next_index} signature(s) on chain). `
+                            + 'Rescanning so its coins show up; sending is paused until the rescan finishes.' });
+                        wState.restoreScan = { pass: 1 };
+                        scanResetPending = true;
+                        scanGeneration++;
+                        performScan().catch(() => {});
+                    }
+                } catch (_) { /* best effort: a missed check leaves the old behaviour */ }
+            }
         }
 
         else if (type === 'REVEAL_SEED') {
@@ -4489,9 +4585,9 @@ else if (type === 'L2_OPEN_CHANNEL') {
         //      importing a wallet that scans but cannot sign.
         //   3. Syncs next_leaf BEFORE exporting, then persists the tree to IndexedDB
         //      under mss_<address>, exactly mirroring deriveNextMss().
-        //   4. Re-derives all historically used WOTS addresses + GAP_LIMIT lookahead,
-        //      restoring the native invariant (wotsAddrs = indices 0..nextWotsIndex-1)
-        //      that performSend and addUtxo's gap extension rely on.
+        //   4. Re-derives all historically used WOTS addresses plus a 100-index skip,
+        //      so wotsAddrs covers 0..wotsWatchEnd-1 (the first scan extends it by
+        //      WOTS_LOOKAHEAD) and this wallet's change starts past the CLI's.
         //   5. Recovers true per-coin metadata (WOTS index via the address map;
         //      per-key MSS height/leaf) instead of hardcoding.
         //   6. Builds everything into locals and commits wState/wallet atomically at
@@ -4558,11 +4654,15 @@ else if (type === 'L2_OPEN_CHANNEL') {
                     newMssAddrs[addr] = { index: i, height: mss.height, next_leaf: mss.next_leaf };
                 }
 
-                // ── WOTS addresses: all historically used indices + gap-limit lookahead ──
-                // Restores the native invariant wotsAddrs = {0 .. nextWotsIndex-1}, so
-                // historical change addresses are watched and coin indices are recoverable.
+                // ── WOTS addresses: all historically used indices + a skip ──
+                // Derives {0 .. wotsTarget-1}, so historical change addresses are
+                // watched and coin indices are recoverable. This wallet's own change
+                // starts CLI_IMPORT_SKIP past the CLI's counter, so a CLI copy still in
+                // use keeps its next indices; the first scan then extends the watched
+                // window WOTS_LOOKAHEAD further (ensureWotsLookahead).
+                const CLI_IMPORT_SKIP = 100;
                 const cliNextWots = cliData.next_wots_index || 0;
-                const wotsTarget  = cliNextWots + GAP_LIMIT;
+                const wotsTarget  = cliNextWots + CLI_IMPORT_SKIP;
                 let newWotsAddrs  = {};
                 for (let i = 0; i < wotsTarget; i++) {
                     newWotsAddrs[importWallet.get_wots_address(i)] = i;
@@ -4620,7 +4720,13 @@ else if (type === 'L2_OPEN_CHANNEL') {
                 wState = {
                     phrase: null,
                     master_seed: normalizeHex(cliData.master_seed),
-                    nextWotsIndex: wotsTarget,   
+                    nextWotsIndex: wotsTarget,
+                    wotsWatchEnd:  wotsTarget,
+                    // Every index below the CLI's counter may have been used.
+                    wotsHighSeen:  Math.max(cliNextWots - 1, ...Object.values(newUtxos)
+                        .filter(u => !u.is_mss && !u.watch_only).map(u => u.index)),
+                    // The CLI's coin set is imported directly, so no from-genesis pass.
+                    restoreScan:   null,
                     nextMssIndex:  Math.max(cliData.next_mss_index || 0, mssKeys.length),
                     wotsAddrs: newWotsAddrs,
                     spentWots: {},
@@ -4676,13 +4782,55 @@ else if (type === 'L2_OPEN_CHANNEL') {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Derive the next WOTS address and add it to the watchlist.
- * Increments `wState.nextWotsIndex`.
+ * Extend the derived, watched WOTS window to WOTS_LOOKAHEAD past both the
+ * allocation counter and the highest index seen on chain. Never moves the
+ * allocation counter (`nextWotsIndex`): watching an index does not hand it out.
+ *
+ * Each address is a full WOTS keygen (~25 ms on desktop, several times that on
+ * mobile), so this yields to the event loop as it goes.
+ *
+ * @param {function(number, number)} [onProgress] - (done, total) callback.
+ * @returns {Promise<boolean>} true if any address was added.
  */
-function deriveNextWots() {
-    const addr = wallet.get_wots_address(wState.nextWotsIndex);
-    wState.wotsAddrs[addr] = wState.nextWotsIndex;
-    wState.nextWotsIndex++;
+async function ensureWotsLookahead(onProgress) {
+    const target = Math.max(wState.nextWotsIndex || 0, (wState.wotsHighSeen ?? -1) + 1) + WOTS_LOOKAHEAD;
+    const start = wState.wotsWatchEnd || 0;
+    if (start >= target) return false;
+    const total = target - start;
+    // Re-read the window end on every step: a send and the scan can both be
+    // extending it across an await, and each step derives the next missing index.
+    while ((wState.wotsWatchEnd || 0) < target) {
+        const i = wState.wotsWatchEnd || 0;
+        wState.wotsAddrs[wallet.get_wots_address(i)] = i;
+        wState.wotsWatchEnd = i + 1;
+        const done = i + 1 - start;
+        if (done % 16 === 0 || done >= total) {
+            if (onProgress) onProgress(Math.min(done, total), total);
+            await new Promise(r => setTimeout(r, 0));
+        }
+    }
+    return true;
+}
+
+/**
+ * Record that WOTS index `index` has appeared on chain: an output paid to it,
+ * or a spend signed by its key. The allocation counter moves past it, so change
+ * and coinbase outputs are never handed an index the chain has already seen
+ * (whose key may already have signed). The next ensureWotsLookahead() keeps
+ * watching WOTS_LOOKAHEAD past it.
+ *
+ * @param {number} index
+ */
+function noteWotsSeen(index) {
+    if (!Number.isInteger(index) || index < 0) return;
+    if (index > (wState.wotsHighSeen ?? -1)) wState.wotsHighSeen = index;
+    if ((wState.nextWotsIndex || 0) <= index) wState.nextWotsIndex = index + 1;
+}
+
+/** Re-derive the look-ahead if it fell behind, then push the watchlist to WASM. */
+async function refreshWatchlist(onProgress) {
+    await ensureWotsLookahead(onProgress);
+    updateWasmWatchlist();
 }
 
 /** Safe list of spendable UTXOs: excludes any coin already locked by an in-flight send. */
@@ -4715,8 +4863,45 @@ function getSpendableUtxos() {
  * and persists everything so a crash cannot cause WOTS key reuse.
  */
 async function reserveAndLock(ctx, progressMsg) {
-    // 1. Advance HD counters for any new change addresses
-    while (wState.nextWotsIndex < (ctx.next_wots_index || 0)) deriveNextWots();
+    // 0. Refuse to sign until a from-genesis scan has converged. Before that the
+    //    wallet does not know which of its keys already signed: a restored
+    //    phrase's history is still being found, and a rescan rebuilds coin sets
+    //    address by address. Nothing has been broadcast yet, so this is free.
+    if (wState.restoreScan) {
+        throw new Error("The wallet is still scanning the chain for this recovery phrase's earlier coins. "
+            + "Sending is paused until the scan finishes, because signing before then could reuse a "
+            + "one-time key. Nothing was broadcast; try again once syncing completes.");
+    }
+
+    // 0b. Every output this wallet will own must sit on a WOTS index the chain
+    //     has never seen and no coin of ours occupies. The allocation counter
+    //     guarantees this when it is current; a scan crediting coins while the
+    //     transaction was being prepared (or a regressed counter) can break it.
+    //     Abort before any broadcast and move the counter past the stale range.
+    const staleChange = [];
+    for (const o of (ctx.outputs || [])) {
+        if (!o || !o.address || o.type === 'data_burn') continue;
+        const addr = normalizeHex(o.address);
+        const idx = wState.wotsAddrs[addr];
+        if (idx === undefined) continue;   // not one of our WOTS addresses
+        const occupied = Object.values(wState.utxos).some(u => u.address === addr);
+        if (idx <= (wState.wotsHighSeen ?? -1) || (wState.spentWots && wState.spentWots[addr] !== undefined) || occupied) {
+            staleChange.push(idx);
+        }
+    }
+    if (staleChange.length) {
+        for (const i of staleChange) noteWotsSeen(i);
+        if ((ctx.next_wots_index || 0) > wState.nextWotsIndex) wState.nextWotsIndex = ctx.next_wots_index;
+        await saveState();
+        throw new Error(`Aborted before signing: change would have gone to one-time key index ${staleChange.join(', ')}, `
+            + `which this wallet has already seen used on chain. The key counter has been moved past it; `
+            + `nothing was broadcast, so please retry.`);
+    }
+
+    // 1. Advance the allocation counter past the new change addresses, and keep
+    //    the watched window WOTS_LOOKAHEAD beyond it.
+    if ((ctx.next_wots_index || 0) > wState.nextWotsIndex) wState.nextWotsIndex = ctx.next_wots_index;
+    await refreshWatchlist();
 
     // 2. Advance MSS leaf counters for any MSS inputs that will be signed
     const usedMss = new Set();
@@ -4951,6 +5136,25 @@ async function _performScanInner(myGen) {
     if (!mssCachesReady) await loadMssCaches();
     if (myGen !== scanGeneration) return;
 
+    // Keep the watched WOTS window WOTS_LOOKAHEAD ahead before reading any filter.
+    await ensureWotsLookahead(lookaheadProgress);
+    if (myGen !== scanGeneration) return;
+
+    // A from-genesis pass records the window it starts with; finishRestorePass()
+    // compares against it. A pass resumed mid-way keeps its recorded start. One
+    // whose start was never recorded (interrupted between passes) restarts.
+    if (wState.restoreScan) {
+        if (wState.lastScannedHeight === 0) {
+            wState.restoreScan.wotsAtStart = wState.wotsWatchEnd || 0;
+            wState.restoreScan.mssAtStart = Object.keys(wState.mssAddrs).length;
+            _refusedSignedKeyCoins.clear();
+        } else if (wState.restoreScan.wotsAtStart === undefined) {
+            scanResetPending = true;
+            scanRequested = true;
+            return;
+        }
+    }
+
     self.postMessage({ type: 'LOG', payload: "Fetching chain state..." });
     const state       = await rpc.getState();
     const chainHeight = state.height;
@@ -4976,6 +5180,9 @@ async function _performScanInner(myGen) {
         for (const [addr, mss] of Object.entries(wState.mssAddrs)) {
             wallet.set_mss_leaf_index(addr, mss.next_leaf);
         }
+        const pass = finishRestorePass();
+        if (pass !== 'none') await saveState();
+        if (pass === 'again') return;
         self.postMessage({ type: 'SCAN_COMPLETE', payload: buildDashboardPayload() });
         return;
     }
@@ -4990,7 +5197,7 @@ async function _performScanInner(myGen) {
     // that cannot serve this range costs a handful of requests, not thousands.
     let stalledBatches = 0;
     const MAX_STALLED_BATCHES = 20;
-    updateWasmWatchlist();
+    await refreshWatchlist(lookaheadProgress);
 
     while (currentHeight < chainHeight) {
         if (myGen !== scanGeneration) return; // cancelled — drop partial work
@@ -5032,12 +5239,12 @@ async function _performScanInner(myGen) {
             // allowed to rule a block out.
             if (!blockHash || !filterHex || n === 0) {
                 const mutated = await processFullBlock(height);
-                if (mutated) updateWasmWatchlist();
+                if (mutated) await refreshWatchlist(lookaheadProgress);
                 continue;
             }
             if (wallet.check_filter(filterHex, blockHash, n)) {
                 const mutated = await processFullBlock(height);
-                if (mutated) updateWasmWatchlist();
+                if (mutated) await refreshWatchlist(lookaheadProgress);
             }
         }
 
@@ -5076,7 +5283,7 @@ async function _performScanInner(myGen) {
             // One direct fetch to step over a single unreadable height, then
             // re-request filters from the next block.
             const mutated = await processFullBlock(currentHeight);
-            if (mutated) updateWasmWatchlist();
+            if (mutated) await refreshWatchlist(lookaheadProgress);
             currentHeight++;
         } else {
             stalledBatches = 0;
@@ -5098,9 +5305,63 @@ async function _performScanInner(myGen) {
     }
 
     wState.lastScannedHeight = chainHeight;
+    const pass = finishRestorePass();
     await saveState();
+    if (pass === 'again') return;   // performScan's loop runs the next pass
     self.postMessage({ type: 'SCAN_COMPLETE', payload: buildDashboardPayload() });
 }
+
+/** Progress callback for look-ahead derivation during a scan (large extensions only). */
+function lookaheadProgress(done, total) {
+    if (total >= 64 && (done === 16 || done === total)) {
+        self.postMessage({ type: 'LOG', payload: `Deriving one-time keys up to index ${wState.wotsWatchEnd} (${done}/${total})…` });
+    }
+}
+
+/** Upper bound on from-genesis passes; each extra pass is a full filter scan. */
+const MAX_RESTORE_PASSES = 8;
+
+/**
+ * Called when a scan reaches the tip. While `wState.restoreScan` is set, the
+ * scan is a from-genesis pass whose job is to find everything this phrase ever
+ * received or signed. If the watched window grew during the pass (the scan found
+ * coins further along the key chain, or a new MSS address was added), blocks
+ * scanned before it grew were never checked against the new addresses, so the
+ * pass is repeated from genesis with the full window. Passes stop when the
+ * window holds still: every block has then been checked against every address,
+ * and signing is allowed again. Typical restores of a used wallet take two passes.
+ *
+ * @returns {'none'|'again'|'done'} 'again' if another pass was scheduled.
+ */
+function finishRestorePass() {
+    const rs = wState.restoreScan;
+    if (!rs || rs.wotsAtStart === undefined) return 'none';
+    const grew = (wState.wotsWatchEnd || 0) > rs.wotsAtStart
+        || Object.keys(wState.mssAddrs).length > (rs.mssAtStart || 0);
+    if (grew && rs.pass < MAX_RESTORE_PASSES) {
+        wState.restoreScan = { pass: rs.pass + 1 };
+        scanResetPending = true;
+        scanRequested = true;
+        self.postMessage({ type: 'LOG', payload:
+            `Found coins further along this phrase's keys (watching up to index ${wState.wotsWatchEnd}). `
+            + `Scanning once more from the start so nothing before them is missed (pass ${rs.pass + 1})…` });
+        return 'again';
+    }
+    wState.restoreScan = null;
+    self.postMessage({ type: 'LOG', payload: grew
+        ? `Chain scan finished after ${rs.pass} passes (key window still growing; rescan later if a balance looks short).`
+        : `Chain scan complete${rs.pass > 1 ? ` after ${rs.pass} passes` : ''}. Sending is enabled.` });
+    if (_refusedSignedKeyCoins.size) {
+        const total = [..._refusedSignedKeyCoins.values()].reduce((a, b) => a + b, 0);
+        self.postMessage({ type: 'LOG', payload:
+            `⚠️ ${_refusedSignedKeyCoins.size} coin(s) worth ${total} MDS were paid to one-time keys that had already `
+            + `signed (for example, change that an earlier restore of this phrase sent to used keys). They are not `
+            + `counted in the balance, because spending them would make those keys sign a second time.` });
+        _refusedSignedKeyCoins.clear();
+    }
+    return 'done';
+}
+
 
 function compute_confidential_coin_id(addrHex, commitmentHex, saltHex) {
     return blake3_hash_hex("434f4e464944454e5449414c" + addrHex + commitmentHex + saltHex);
@@ -5154,6 +5415,9 @@ const COMMITMENT_TTL = 1000;          // blocks; matches recoverPendingTx expiry
 
 let _reorgHeight = 0;                  // thread-local: height being applied by processFullBlock
 let _restoringCoinId = null;           // thread-local: coin addUtxo is allowed to re-credit to a poisoned addr
+/** Coins refused during the current from-genesis pass because their WOTS key had
+ *  already signed (coinId → value); summarised when the pass converges. */
+const _refusedSignedKeyCoins = new Map();
 
 function pruneBlockHashes() {
     if (!wState.blockHashes) return;
@@ -5427,9 +5691,11 @@ async function processFullBlock(height) {
                     const bytecode = inp.predicate?.Script?.bytecode || inp.bytecode;
                     
                     let cid = null;
+                    let inAddrHex = null;
                     if (bytecode) {
                         // Recompute the exact Coin ID from the blockchain data
                         const addrHex = blake3_hash_hex(normalizeHex(bytecode));
+                        inAddrHex = addrHex;
                         if (inp.commitment) {
                             cid = compute_confidential_coin_id(addrHex, normalizeHex(inp.commitment), saltHex);
                         } else {
@@ -5439,6 +5705,39 @@ async function processFullBlock(height) {
 
                     // Fallback to the salt map only if the block data is severely malformed
                     if (!cid) cid = ourSalts.get(saltHex);
+
+                    // A refused coin that is later spent is not stranded: drop it from the
+                    // end-of-restore report.
+                    if (cid) _refusedSignedKeyCoins.delete(cid);
+
+                    // A spend FROM one of our WOTS addresses means that key has signed,
+                    // whether or not we ever credited the coin it spent (a restore that
+                    // reached the coin's creation before watching its address, or another
+                    // device using this phrase). Record the key as spent so this wallet
+                    // never signs with it again, refuses later payments to it, and never
+                    // hands its index out as change.
+                    if (inAddrHex && wState.wotsAddrs[inAddrHex] !== undefined
+                        && !(cid && wState.utxos[cid])) {
+                        noteWotsSeen(wState.wotsAddrs[inAddrHex]);
+                        wState.spentWots = wState.spentWots || {};
+                        if (wState.spentWots[inAddrHex] === undefined) {
+                            wState.spentWots[inAddrHex] = { height: _reorgHeight, commitment: txId || null };
+                            // Coins we hold at that address can no longer be spent without a
+                            // second signature. Move them to the spend log (as the credited-coin
+                            // branch below does) so a reorg can still bring them back.
+                            wState.spentLog = wState.spentLog || {};
+                            const bucket = (wState.spentLog[_reorgHeight] = wState.spentLog[_reorgHeight] || []);
+                            for (const key of Object.keys(wState.utxos)) {
+                                if (wState.utxos[key].address === inAddrHex) {
+                                    bucket.push(wState.utxos[key]);
+                                    delete wState.utxos[key];
+                                    if (wState.pendingSpends) delete wState.pendingSpends[key];
+                                }
+                            }
+                            self.postMessage({ type: 'LOG', payload: `⚠️ One-time key ${wState.wotsAddrs[inAddrHex]} (${inAddrHex.substring(0, 8)}…) signed a spend this wallet had no record of; it will not be used again.` });
+                        }
+                        matchFound = true;
+                    }
 
                     // Safely delete the accurately identified coin
                     if (cid && wState.utxos[cid]) {
@@ -5592,6 +5891,7 @@ function addUtxo(address, value, salt, coinId, commitment = null) {
     if (wState.spentWots && wState.spentWots[address] !== undefined) {
         if (coinId !== _restoringCoinId) {
             self.postMessage({ type: 'LOG', payload: `⚠️ SECURITY: Ignored dust payment to already-spent WOTS address ${address.substring(0,8)}...`});
+            if (wState.restoreScan) _refusedSignedKeyCoins.set(coinId, Number(value) || 0);
             return false;
         }
     }
@@ -5599,7 +5899,9 @@ function addUtxo(address, value, salt, coinId, commitment = null) {
     let index = 0, is_mss = false, mss_height = 0, mss_leaf = 0;
     if (wState.wotsAddrs[address] !== undefined) {
         index = wState.wotsAddrs[address];
-        while (wState.nextWotsIndex <= index + GAP_LIMIT) deriveNextWots();
+        // Never hand this index out again; the scan loop's refreshWatchlist()
+        // then extends the watched window WOTS_LOOKAHEAD past it.
+        noteWotsSeen(index);
     } else {
         const mss = wState.mssAddrs[address];
         index = mss.index; is_mss = true; mss_height = mss.height; mss_leaf = mss.next_leaf;
@@ -8204,6 +8506,45 @@ async function runSelfTests() {
         wState = JSON.parse(JSON.stringify(saved));
     });
 
+    // ── WOTS allocation counter / restore safety ────────────────────────
+
+    await test('noteWotsSeen_only_moves_forward', async () => {
+        const saved = JSON.parse(JSON.stringify(wState));
+        wState.nextWotsIndex = 5; wState.wotsHighSeen = -1;
+        noteWotsSeen(9);
+        assertEqual(wState.nextWotsIndex, 10, 'counter moves past a seen index');
+        assertEqual(wState.wotsHighSeen, 9, 'high-water mark recorded');
+        noteWotsSeen(2);
+        assertEqual(wState.nextWotsIndex, 10, 'a lower index never moves the counter back');
+        assertEqual(wState.wotsHighSeen, 9, 'nor the high-water mark');
+        wState = JSON.parse(JSON.stringify(saved));
+    });
+
+    await test('reserveAndLock_refuses_while_restore_scan_pending', async () => {
+        const saved = JSON.parse(JSON.stringify(wState));
+        wState.restoreScan = { pass: 1 };
+        let msg = '';
+        try { await reserveAndLock({ outputs: [], selected_inputs: [], next_wots_index: wState.nextWotsIndex || 0 }); }
+        catch (e) { msg = e.message; }
+        assert(/still scanning/.test(msg), `must refuse to sign mid-restore (got: ${msg})`);
+        wState = JSON.parse(JSON.stringify(saved));
+    });
+
+    await test('reserveAndLock_refuses_change_on_seen_index', async () => {
+        const saved = JSON.parse(JSON.stringify(wState));
+        wState.restoreScan = null;
+        wState.wotsAddrs = { ['aa'.repeat(32)]: 7 };
+        wState.spentWots = {}; wState.utxos = {};
+        wState.wotsHighSeen = 7; wState.nextWotsIndex = 8;
+        let msg = '';
+        try {
+            await reserveAndLock({ outputs: [{ type: 'standard', address: 'aa'.repeat(32), value: 4, salt: '00' }],
+                                   selected_inputs: [], next_wots_index: 8 });
+        } catch (e) { msg = e.message; }
+        assert(/already seen used on chain/.test(msg), `change on a seen index must abort (got: ${msg})`);
+        wState = JSON.parse(JSON.stringify(saved));
+    });
+
     // ── Q-Bolt v2: wire codecs ──────────────────────────────────────────
 
     await test('qbolt_open_codec_roundtrip', async () => {
@@ -8295,6 +8636,7 @@ async function runSelfTests() {
     });
 
 
+    const passed = results.filter(r => r.ok).length;
     const failed = results.filter(r => !r.ok).length;
     return { passed, failed, results };
 }
