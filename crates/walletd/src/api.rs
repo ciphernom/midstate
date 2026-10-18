@@ -105,6 +105,13 @@ pub struct SyncStatus {
     pub sync_cursor: u64,
     #[serde(default)]
     pub sync_target: u64,
+    /// Non-zero while a restore scan is finding this recovery phrase's earlier
+    /// coins: the pass number. Signing is paused until it returns to zero.
+    #[serde(default)]
+    pub restore_pass: u32,
+    /// Height the restore pass has scanned up to (0 when not restoring).
+    #[serde(default)]
+    pub restore_scan_pos: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

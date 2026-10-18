@@ -6,6 +6,7 @@ use crate::base::{BaseClient, ChainConfig};
 use crate::channels::{self, ChanStatus, ChannelBook, ChannelRecord, PendingOpen, Role};
 use crate::dex::OrderBook;
 use crate::ledger::{Ledger, SendRecord};
+use crate::restore::{self, PassEnd, RestoreScan};
 use crate::swap::{self, Rail, Side};
 use crate::swapbook::{Phase, Swap, SwapBook};
 use crate::sendplan::{self, SendPlan};
@@ -31,9 +32,6 @@ const SCAN_CHUNK: u64 = 2_000;
 const MSS_SAFETY_MARGIN: u64 = 20;
 /// MSS tree height for new receive addresses: 2^10 = 1024 signatures.
 const DEFAULT_MSS_HEIGHT: u32 = 10;
-/// HD indices derived up-front on restore before scanning (upstream floor
-/// semantics; gap-limit extension beyond the floor is a v1.x follow-up).
-const RESTORE_KEY_FLOOR: u64 = 1_000;
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
@@ -444,6 +442,8 @@ pub fn spawn(
         rpc_url,
         wallet: None,
         scan_pos: 0,
+        restore: None,
+        mss_checked: 0,
         sends: HashMap::new(),
         book: ChannelBook::default(),
         dex: OrderBook::new(),
@@ -482,6 +482,13 @@ struct Service {
     wallet: Option<Wallet>,
     /// Highest block height already scanned for incoming coins.
     scan_pos: u64,
+    /// Set while a from-genesis restore scan has not converged (see
+    /// `crate::restore`). Persisted beside the wallet; signing is refused
+    /// until it clears.
+    restore: Option<RestoreScan>,
+    /// MSS trees below this index have been checked for history that predates
+    /// this wallet (see `check_new_mss_trees`).
+    mss_checked: u64,
     sends: HashMap<[u8; 32], SendMeta>,
     book: ChannelBook,
     /// Cross-chain order book. Read-only: it never signs or moves value.
@@ -557,6 +564,8 @@ impl Service {
                 // underlying buffers is the plan §8 upstream change (zeroize on
                 // WalletKey/MssKeypair) — tracked, not yet in the vendored crate.
                 self.wallet = None;
+                // Reloaded from the sidecar on unlock.
+                self.restore = None;
                 let _ = resp.send(r);
             }
             Cmd::NewAddress { mss, label, resp } => {
@@ -864,6 +873,12 @@ impl Service {
             wallet.data.evm_secret = Some(k.secret_bytes());
             wallet.save()?;
         }
+        // A fresh phrase has no history to find: no restore scan, and nothing
+        // left over from a wallet that used to live at this path.
+        RestoreScan::clear(&self.wallet_path);
+        RestoreScan::mark_done(&self.wallet_path);
+        self.restore = None;
+        self.mss_checked = wallet.mss_keys().len() as u64;
         self.wallet = Some(wallet);
         // Fresh wallet: nothing historical can belong to it — start scanning
         // from the current tip instead of genesis.
@@ -898,16 +913,46 @@ impl Service {
         if let Some(parent) = self.wallet_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut wallet =
-            Wallet::restore_from_mnemonic(&self.wallet_path, password.as_bytes(), phrase.trim())?;
-        // Derive the unconditional key floor, then let the scan tick walk the
-        // chain from genesis. (Gap-limit extension past the floor: v1.x.)
-        wallet.restore_generate_keys(RESTORE_KEY_FLOOR)?;
-        if let Ok(k) = crate::evm::EvmKey::from_mnemonic(phrase) {
-            wallet.data.evm_secret = Some(k.secret_bytes());
-        }
-        wallet.save()?;
+        // Record the restore BEFORE the wallet file exists, so no state of the
+        // disk has a restored wallet that is allowed to sign before its scan
+        // has converged.
+        let rs = RestoreScan::new();
+        rs.save(&self.wallet_path).context("could not record the restore scan")?;
+        let built = (|| -> Result<Wallet> {
+            let mut wallet = Wallet::restore_from_mnemonic(
+                &self.wallet_path,
+                password.as_bytes(),
+                phrase.trim(),
+            )?;
+            // Derive the floors, then let the scan tick walk the chain from
+            // genesis under crate::restore's gap limit, repeating passes until
+            // the key window holds still (audit W6). The old restore stopped at
+            // 1,000 WOTS keys and derived no MSS tree at all, so a wallet that
+            // had used more keys, or mined, consolidated or defragged, came back
+            // missing coins and handed out change on keys it had already signed.
+            wallet.restore_generate_keys(restore::WOTS_FLOOR)?;
+            for _ in 0..restore::MSS_FLOOR {
+                wallet.generate_mss(DEFAULT_MSS_HEIGHT, Some("Recovered MSS".into()))?;
+            }
+            if let Ok(k) = crate::evm::EvmKey::from_mnemonic(phrase) {
+                wallet.data.evm_secret = Some(k.secret_bytes());
+            }
+            wallet.save()?;
+            Ok(wallet)
+        })();
+        let wallet = match built {
+            Ok(w) => w,
+            Err(e) => {
+                if !self.wallet_path.exists() {
+                    RestoreScan::clear(&self.wallet_path);
+                }
+                return Err(e);
+            }
+        };
+        self.mss_checked = wallet.mss_keys().len() as u64;
         self.wallet = Some(wallet);
+        self.restore = Some(rs);
+        self.sync_wots_hold();
         self.scan_pos = 0;
         self.persist_scan_pos();
         Ok(())
@@ -920,12 +965,74 @@ impl Service {
         let wallet = Wallet::open(&self.wallet_path, password.as_bytes())?;
         self.wallet = Some(wallet);
         self.scan_pos = self.load_scan_pos();
+        self.restore = RestoreScan::load(&self.wallet_path);
+        if self.restore.is_some() {
+            // A restore interrupted while deriving its floors finishes them.
+            self.ensure_restore_floors();
+        } else if !RestoreScan::is_done(&self.wallet_path) {
+            self.check_wallet_from_old_restore();
+        }
+        self.sync_wots_hold();
+        // Trees that exist now are covered by the restore scan or predate it.
+        self.mss_checked = self.wallet.as_ref().map_or(0, |w| w.mss_keys().len() as u64);
+        // Keys this wallet holds coins on may have signed elsewhere (a restored
+        // copy, or this one before an upgrade that added the check).
+        self.quarantine_signed_keys().await;
         self.book = ChannelBook::load(&self.wallet_path);
         self.ledger = Ledger::load(&self.wallet_path);
         self.swaps = SwapBook::load(&self.wallet_path);
         self.resume_pendings().await;
         let _ = self.events.send(WalletEvent::WalletChanged);
         Ok(())
+    }
+
+    /// A wallet saved before restore discovery existed. If it is large enough
+    /// to have come from that code's restore (which always derived exactly
+    /// 1,000 WOTS keys and no MSS tree, so it missed coins and could hand out
+    /// change on keys the original device had used), derive the MSS trees it
+    /// skipped and run the discovery scan once. Smaller wallets cannot have
+    /// come from it and are just marked done.
+    fn check_wallet_from_old_restore(&mut self) {
+        let Some(w) = self.wallet.as_ref() else { return };
+        if !(w.is_hd() && w.wots_index() >= restore::WOTS_FLOOR) {
+            RestoreScan::mark_done(&self.wallet_path);
+            return;
+        }
+        // Recorded first, so a crash while deriving the trees still resumes
+        // the scan on the next unlock.
+        self.start_restore_scan(
+            "Wallet updated: scanning the chain once for coins an earlier restore of this \
+             recovery phrase may have missed. Sending is paused until it finishes.",
+        );
+        self.ensure_restore_floors();
+    }
+
+    /// Derive the restore floors ([`restore::WOTS_FLOOR`] keys and
+    /// [`restore::MSS_FLOOR`] trees) where they are missing. Only while a
+    /// restore is under way: its counters only grow until it settles.
+    fn ensure_restore_floors(&mut self) {
+        if self.restore.is_none() {
+            return;
+        }
+        let Some(w) = self.wallet.as_mut().filter(|w| w.is_hd()) else { return };
+        match restore::fill_mss_holes(w, DEFAULT_MSS_HEIGHT) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("restore: derived {n} MSS tree(s) an interrupted keygen left out"),
+            Err(e) => tracing::error!("restore: could not derive a missing MSS tree: {e:#}"),
+        }
+        if w.wots_index() < restore::WOTS_FLOOR {
+            let missing = restore::WOTS_FLOOR - w.wots_index();
+            if let Err(e) = w.restore_generate_keys(missing) {
+                tracing::error!("could not derive the WOTS restore floor: {e:#}");
+            }
+        }
+        while w.mss_index() < restore::MSS_FLOOR {
+            if let Err(e) = w.generate_mss(DEFAULT_MSS_HEIGHT, Some("Recovered MSS".into())) {
+                // Scan anyway: the trees that exist still get checked.
+                tracing::error!("could not derive the MSS restore floor: {e:#}");
+                break;
+            }
+        }
     }
 
     fn save_wallet(&mut self) -> Result<()> {
@@ -938,6 +1045,14 @@ impl Service {
     // ── Addresses ───────────────────────────────────────────────────────
 
     fn new_address(&mut self, mss: bool, label: Option<String>) -> Result<AddressInfo> {
+        if !mss && self.restore.is_some() {
+            // The next one-time key may be one the original device used; it is
+            // only known to be fresh once the restore scan has converged.
+            bail!(
+                "new one-time addresses are available once the restore scan finishes; \
+                 receive to a reusable address meanwhile"
+            );
+        }
         let w = self.wallet.as_mut().ok_or_else(|| anyhow!("wallet is locked"))?;
         let (addr, kind, remaining) = if mss {
             let a = w.generate_mss(DEFAULT_MSS_HEIGHT, label.clone())?;
@@ -1005,10 +1120,20 @@ impl Service {
         let state = self.node.get_state().await;
         let in_flight_ids = self.in_flight_inputs();
         let mut b = Balance { coin_count: w.coins().len(), ..Default::default() };
+        let mss_addrs: HashSet<[u8; 32]> = w
+            .mss_keys()
+            .iter()
+            .map(|m| midstate::core::compute_address(&m.master_pk))
+            .collect();
         for c in w.coins() {
             let live = state.coins.contains(&c.coin_id);
             if in_flight_ids.contains(&c.coin_id) {
                 b.in_flight += c.value;
+            } else if c.wots_signed && !mss_addrs.contains(&c.address) {
+                // On a one-time key that has already signed. Still unspent, it
+                // is real but cannot be spent without signing with that key
+                // again (see Coins); gone, that signature spent it. Neither is
+                // money on its way in.
             } else if live {
                 b.confirmed += c.value;
             } else {
@@ -1108,6 +1233,8 @@ impl Service {
                 sync_phase: phase,
                 sync_cursor: cursor,
                 sync_target: target,
+                restore_pass: self.restore.as_ref().map(|r| r.pass).unwrap_or(0),
+                restore_scan_pos: if self.restore.is_some() { self.scan_pos } else { 0 },
         }
     }
 
@@ -1153,6 +1280,193 @@ impl Service {
         let _ = self.events.send(WalletEvent::SendUpdate { progress });
     }
 
+    // ── Restore discovery and one-time-key safety (audit W6) ────────────
+
+    /// Refuse to sign while a restore scan is still finding this phrase's
+    /// history (see `crate::restore`). Until it converges the wallet does not
+    /// know which of its keys the original device used.
+    fn ensure_restore_done(&self) -> Result<()> {
+        if let Some(rs) = &self.restore {
+            bail!(
+                "still scanning the chain for coins this recovery phrase received before \
+                 (pass {}). Sending is paused until that finishes, because signing before \
+                 then could reuse a one-time key the original wallet already used.",
+                rs.pass
+            );
+        }
+        Ok(())
+    }
+
+    /// Has this WOTS address's one-time key signed on chain? The in-process
+    /// node records every WOTS signature it applies, keyed by address
+    /// (`SPENT_ADDRESSES_TABLE`). This replaces `state.burned_wots`, which
+    /// nothing writes, so every check that read it passed.
+    fn key_signed_on_chain(&self, address: &[u8; 32]) -> bool {
+        matches!(self.node.storage.get_spent_commitment(address), Ok(Some(_)))
+    }
+
+    fn save_restore(&self) {
+        if let Some(rs) = &self.restore {
+            if let Err(e) = rs.save(&self.wallet_path) {
+                tracing::error!("could not persist restore scan progress: {e:#}");
+            }
+        }
+    }
+
+    /// Begin a from-genesis restore scan on an already-open wallet.
+    fn start_restore_scan(&mut self, why: &str) {
+        self.restore = Some(RestoreScan {
+            counters_before: self.wallet.as_ref().map(restore::window),
+            ..RestoreScan::new()
+        });
+        self.save_restore();
+        self.sync_wots_hold();
+        self.scan_pos = 0;
+        self.persist_scan_pos();
+        let _ = self.events.send(WalletEvent::Warning { text: why.to_string() });
+    }
+
+    /// Mirror `self.restore` into the wallet: while a restore scan is still
+    /// finding the keys the phrase used before, no one-time key is handed out
+    /// at all (a receive address, change, a peer's address request), because
+    /// the next index may be one the original device already used.
+    fn sync_wots_hold(&mut self) {
+        let hold = self.restore.as_ref().map(|_| {
+            "one-time addresses are handed out again once the restore scan has finished".to_string()
+        });
+        if let Some(w) = self.wallet.as_mut() {
+            w.hold_wots_allocation(hold);
+        }
+    }
+
+    /// Mark coins whose WOTS key has already signed on chain as signed, so
+    /// coin selection never offers them. A restored wallet has no record of
+    /// the original device's signatures; this takes them from the chain. Live
+    /// coins it quarantines are reported: they are real money that cannot be
+    /// spent without a second signature from that key.
+    async fn quarantine_signed_keys(&mut self) -> usize {
+        let candidates: HashSet<[u8; 32]> = {
+            let Some(w) = self.wallet.as_ref() else { return 0 };
+            let mss_addrs: HashSet<[u8; 32]> = w
+                .mss_keys()
+                .iter()
+                .map(|m| midstate::core::compute_address(&m.master_pk))
+                .collect();
+            w.coins()
+                .iter()
+                .filter(|c| !c.wots_signed && !mss_addrs.contains(&c.address))
+                .map(|c| c.address)
+                .collect()
+        };
+        let signed: HashSet<[u8; 32]> =
+            candidates.into_iter().filter(|a| self.key_signed_on_chain(a)).collect();
+        if signed.is_empty() {
+            return 0;
+        }
+        let state = self.node.get_state().await;
+        let in_flight = self.in_flight_inputs();
+        let Some(w) = self.wallet.as_mut() else { return 0 };
+        let mut stranded: Vec<(u64, [u8; 32])> = Vec::new();
+        for c in w.data.coins.iter_mut() {
+            if signed.contains(&c.address) && !c.wots_signed {
+                c.wots_signed = true;
+                if state.coins.contains(&c.coin_id) && !in_flight.contains(&c.coin_id) {
+                    stranded.push((c.value, c.address));
+                }
+            }
+        }
+        if let Err(e) = w.save() {
+            tracing::error!("saving quarantined coins failed: {e:#}");
+        }
+        for (value, addr) in &stranded {
+            let _ = self.events.send(WalletEvent::Warning {
+                text: format!(
+                    "{} units at {} sit on a one-time key that has already signed on chain, \
+                     probably from another copy of this wallet. They cannot be spent without \
+                     signing with that key a second time, so they are no longer counted as \
+                     spendable.",
+                    value,
+                    &midstate::core::encode_address_with_checksum(addr)[..12]
+                ),
+            });
+        }
+        if !stranded.is_empty() {
+            let _ = self.events.send(WalletEvent::WalletChanged);
+        }
+        signed.len()
+    }
+
+    /// Called when a restore pass has scanned up to the tip.
+    async fn finish_restore_pass(&mut self) {
+        let Some(win) = self.wallet.as_ref().map(restore::window) else { return };
+        let Some(rs) = self.restore.as_mut() else { return };
+        match rs.end(win) {
+            PassEnd::Again => {
+                let pass = rs.pass;
+                self.save_restore();
+                self.scan_pos = 0;
+                self.persist_scan_pos();
+                tracing::info!(
+                    "restore: watch window grew to {:?}; scanning from genesis again (pass {pass})",
+                    win
+                );
+            }
+            end @ (PassEnd::Done | PassEnd::GaveUp) => {
+                let rs = self.restore.take().unwrap();
+                self.sync_wots_hold();
+                if let Some(w) = self.wallet.as_mut() {
+                    if let Err(e) = restore::settle_counters(w, &rs) {
+                        tracing::error!("restore: could not settle HD counters: {e:#}");
+                    }
+                    self.mss_checked = w.mss_keys().len() as u64;
+                }
+                RestoreScan::clear(&self.wallet_path);
+                RestoreScan::mark_done(&self.wallet_path);
+                self.quarantine_signed_keys().await;
+                let text = if end == PassEnd::Done {
+                    format!(
+                        "Restore scan complete after {} pass(es): every coin this recovery \
+                         phrase holds has been found. Sending is enabled.",
+                        rs.pass
+                    )
+                } else {
+                    format!(
+                        "Restore scan stopped after {} passes while still finding keys. \
+                         Sending is enabled; rescan later if the balance looks short.",
+                        rs.pass
+                    )
+                };
+                let _ = self.events.send(WalletEvent::Warning { text });
+                let _ = self.events.send(WalletEvent::WalletChanged);
+            }
+        }
+    }
+
+    /// A tree generated after a restore is the phrase's next index, which the
+    /// original device may already have used: a mining payout, a receive
+    /// address, a sweep destination. If the chain shows it signed before this
+    /// wallet made it, it has history the scan never looked for, so rescan.
+    /// Runs from the tick: a tree made since the last tick cannot carry a
+    /// signature of ours on chain yet.
+    fn check_new_mss_trees(&mut self) {
+        let Some(w) = self.wallet.as_ref() else { return };
+        let n = w.mss_keys().len() as u64;
+        if n <= self.mss_checked {
+            self.mss_checked = n;
+            return;
+        }
+        let used_before = w.mss_keys()[self.mss_checked as usize..].iter().any(|m| {
+            self.node.storage.query_mss_leaf_index(&m.master_pk).unwrap_or(0) > 0
+        });
+        self.mss_checked = n;
+        if used_before && self.restore.is_none() {
+            self.start_restore_scan(
+                "A new reusable address turned out to have been used before by this recovery \
+                 phrase. Rescanning the chain for its coins; sending is paused until it finishes.",
+            );
+        }
+    }
+
     // ── Send machine ────────────────────────────────────────────────────
 
     /// STRICT SAFETY (ported from the CLI): before any signing session,
@@ -1193,7 +1507,7 @@ impl Service {
     /// problem surfaces before any value moves.
     async fn validate_address(&self, addr: &str) -> Result<()> {
         let dest = sendplan::decode_address(addr)?;
-        if self.node.get_state().await.burned_wots.contains(&dest) {
+        if self.key_signed_on_chain(&dest) {
             bail!(
                 "this address has already spent its one-time key — anything sent to it \
                  cannot be recovered"
@@ -1210,16 +1524,18 @@ impl Service {
             bail!("node is still syncing — sending against a stale coin set would fail");
         }
         let dest = sendplan::decode_address(to)?;
+        self.ensure_restore_done()?;
         self.verify_mss_indices().await?;
 
         let state = self.node.get_state().await;
 
         // A one-time key that has already signed can never sign again, so
-        // coins sent to it are unspendable forever. Burning is CONSENSUS
-        // state (`burned_wots` is folded into the state root), so this is a
-        // local, deterministic lookup — no message from the recipient is
-        // needed, and nothing about the payment is revealed to anyone.
-        if state.burned_wots.contains(&dest) {
+        // coins sent to it are unspendable forever. The in-process node
+        // records every WOTS key that has signed (`key_signed_on_chain`), so
+        // this is a local lookup — no message from the recipient is needed,
+        // and nothing about the payment is revealed to anyone. (This used to
+        // read `state.burned_wots`, which nothing writes, so it never fired.)
+        if self.key_signed_on_chain(&dest) {
             bail!(
                 "that address has already spent its one-time key — anything sent there \
                  cannot be recovered. Ask the recipient for a fresh address."
@@ -1458,6 +1774,66 @@ impl Service {
 
         self.set_stage(commitment, SendStage::WaitingReveal, "signing reveal");
 
+        // Last line of defence against one-time-key reuse (audit W6): never
+        // sign for a WOTS input whose key the chain has already seen sign a
+        // different commitment. A restored wallet has no record of the original
+        // device's signatures, and coin selection only knows what this wallet
+        // recorded. Re-signing the SAME commitment is safe (WOTS is
+        // deterministic), so a resumed reveal still goes through.
+        let reused: Vec<[u8; 32]> = {
+            let w = self.wallet.as_ref().unwrap();
+            let mss_addrs: HashSet<[u8; 32]> = w
+                .mss_keys()
+                .iter()
+                .map(|m| midstate::core::compute_address(&m.master_pk))
+                .collect();
+            let mut v: Vec<[u8; 32]> = pending
+                .input_coin_ids
+                .iter()
+                .filter_map(|id| w.find_coin(id))
+                .filter(|c| !mss_addrs.contains(&c.address))
+                .map(|c| c.address)
+                .filter(|a| {
+                    matches!(
+                        self.node.storage.get_spent_commitment(a),
+                        Ok(Some(prev)) if prev != commitment
+                    )
+                })
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        if !reused.is_empty() {
+            let w = self.wallet.as_mut().unwrap();
+            for c in w.data.coins.iter_mut() {
+                if reused.contains(&c.address) {
+                    c.wots_signed = true;
+                }
+            }
+            // Nothing is signed, so dropping the commit loses nothing: the
+            // other inputs stay spendable and the commitment simply expires.
+            w.data.pending.retain(|p| p.commitment != commitment);
+            let _ = w.save();
+            let which = reused
+                .iter()
+                .map(|a| midstate::core::encode_address_with_checksum(a)[..12].to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.set_stage(
+                commitment,
+                SendStage::Failed,
+                format!(
+                    "refused to sign: the one-time key at {which} has already signed a different \
+                     transaction on chain (most likely from another copy of this wallet). Signing \
+                     again would expose it. Its coins are set aside; nothing was spent — send \
+                     again to use your other coins."
+                ),
+            );
+            let _ = self.events.send(WalletEvent::WalletChanged);
+            return;
+        }
+
         let w = self.wallet.as_mut().unwrap();
         let (input_reveals, witnesses) = match w.sign_reveal(&pending) {
             Ok(r) => r,
@@ -1531,9 +1907,12 @@ impl Service {
         let found = tokio::task::spawn_blocking(move || node.scan_addresses(&addrs, 0, end))
             .await
             .context("scan task panicked")??;
+        // Unspent coins only: a long-spent coin is not a sibling that needs
+        // co-spending, and imported it would sit in the balance forever.
+        let state = self.node.get_state().await;
         let w = self.wallet.as_mut().ok_or_else(|| anyhow!("wallet is locked"))?;
         let mut imported = 0usize;
-        for sc in &found {
+        for sc in found.iter().filter(|sc| state.coins.contains(&sc.coin_id)) {
             if let Ok(Some(_)) = w.import_scanned(sc.address, sc.value, sc.salt, None) {
                 imported += 1;
             }
@@ -1556,6 +1935,7 @@ impl Service {
             bail!("node is still syncing — consolidating against a stale coin set could burn coins");
         }
         let addr = midstate::core::types::parse_address_flexible(address).map_err(|e| anyhow!(e))?;
+        self.ensure_restore_done()?;
         self.verify_mss_indices().await?;
 
         let state = self.node.get_state().await;
@@ -1564,11 +1944,27 @@ impl Service {
             tracing::info!("consolidate guard imported {imported} previously-unknown sibling coin(s)");
         }
 
+        let is_mss_addr = self
+            .wallet
+            .as_ref()
+            .unwrap()
+            .mss_keys()
+            .iter()
+            .any(|m| midstate::core::compute_address(&m.master_pk) == addr);
+        if !is_mss_addr && self.key_signed_on_chain(&addr) {
+            bail!(
+                "the one-time key at that address has already signed on chain; consolidating \
+                 would sign with it a second time"
+            );
+        }
         let w = self.wallet.as_mut().unwrap();
         let mut live: Vec<[u8; 32]> = Vec::new();
         let mut total = 0u64;
         for c in w.coins() {
-            if c.address == addr && state.coins.contains(&c.coin_id) {
+            if c.address == addr
+                && state.coins.contains(&c.coin_id)
+                && (is_mss_addr || !c.wots_signed)
+            {
                 live.push(c.coin_id);
                 total += c.value;
             }
@@ -1631,6 +2027,7 @@ impl Service {
         if self.node.is_syncing() {
             bail!("node is still syncing — defragmenting against a stale coin set could burn coins");
         }
+        self.ensure_restore_done()?;
         self.verify_mss_indices().await?;
         let state = self.node.get_state().await;
 
@@ -2047,6 +2444,7 @@ impl Service {
             bail!("channel capacity must be at least {} units", channels::MIN_CAPACITY);
         }
         let lifetime = lifetime.clamp(channels::MIN_LIFETIME, channels::MAX_LIFETIME);
+        self.ensure_restore_done()?;
         self.verify_mss_indices().await?;
         let state = self.node.get_state().await;
         let expiry = state.height + lifetime;
@@ -4339,6 +4737,7 @@ impl Service {
         if self.node.is_syncing() {
             bail!("node is still syncing — an order placed against a stale coin set would fail");
         }
+        self.ensure_restore_done()?;
         let wei_total: u128 = wei_s.parse().unwrap_or(0);
         if mds_amount == 0 || wei_total == 0 {
             bail!("both the MDS amount and the asking price must be greater than zero");
@@ -5712,7 +6111,25 @@ impl Service {
             tracing::warn!("swap tick: {e:#}");
         }
         let tip = status.height;
+        self.check_new_mss_trees();
+
+        // A restore pass records the window it starts with at height 0; one
+        // whose start was never recorded (interrupted between passes) restarts.
+        if self.restore.as_ref().is_some_and(|rs| rs.start.is_none()) {
+            if self.scan_pos != 0 {
+                self.scan_pos = 0;
+                self.persist_scan_pos();
+            }
+            let win = restore::window(self.wallet.as_ref().unwrap());
+            if let Some(rs) = self.restore.as_mut() {
+                rs.begin(win);
+            }
+            self.save_restore();
+        }
         if tip <= self.scan_pos {
+            if self.restore.is_some() && restore::tip_is_current(status.timestamp, now_secs()) {
+                self.finish_restore_pass().await;
+            }
             return;
         }
         // `scan_pos` is the first height NOT yet scanned (it is assigned `end`,
@@ -5747,6 +6164,45 @@ impl Service {
             }
         };
 
+        // During a restore, every output ever paid to one of our keys (spent
+        // or not) shows how far the phrase's history reaches: keep WOTS_GAP
+        // keys and MSS_GAP trees watched past the highest one. If that grew
+        // the window, scan this chunk again before moving on: keys added now
+        // were not watched for its later blocks.
+        let mut rescan_chunk = false;
+        if self.restore.is_some() && !found.is_empty() {
+            let addrs: Vec<[u8; 32]> = found.iter().map(|sc| sc.address).collect();
+            let used = restore::highest_used(self.wallet.as_ref().unwrap(), &addrs);
+            let moved = self.restore.as_mut().map(|rs| rs.note_used(used)).unwrap_or(false);
+            if moved {
+                let target = self
+                    .restore
+                    .as_ref()
+                    .map(|rs| (rs.highest_wots, rs.highest_mss))
+                    .unwrap_or((None, None));
+                let w = self.wallet.as_mut().unwrap();
+                match restore::extend(w, target, DEFAULT_MSS_HEIGHT) {
+                    Ok(true) => {
+                        rescan_chunk = true;
+                        tracing::info!(
+                            "restore: highest used key {:?}, watching {:?}",
+                            target,
+                            restore::window(w)
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!("restore: could not extend the watch window: {e:#}"),
+                }
+                self.save_restore();
+            }
+        }
+
+        // Only coins still unspent are imported. The scan returns every output
+        // ever paid to a watched address, and a coin spent long ago is not
+        // money: imported, it sat in the balance as "unconfirmed" forever.
+        let state = self.node.get_state().await;
+        let found: Vec<_> = found.into_iter().filter(|sc| state.coins.contains(&sc.coin_id)).collect();
+
         // Coins arriving at a key we already spent from are quarantined by
         // `import_scanned` (a second signature would leak the key), so they
         // never reach the balance. Say so explicitly rather than dropping them
@@ -5765,8 +6221,14 @@ impl Service {
                 .filter(|c| c.wots_signed)
                 .map(|c| c.address)
                 .collect();
+            let held: HashSet<[u8; 32]> = w.coins().iter().map(|c| c.coin_id).collect();
             for sc in &found {
-                if burned.contains(&sc.address) && !mss_addrs.contains(&sc.address) {
+                // Only payments new to the wallet: a restore scans chunks more
+                // than once, and a coin already set aside was reported then.
+                if burned.contains(&sc.address)
+                    && !mss_addrs.contains(&sc.address)
+                    && !held.contains(&sc.coin_id)
+                {
                     stranded.push((sc.value, sc.address));
                 }
             }
@@ -5803,9 +6265,16 @@ impl Service {
                 }
             }
         }
+        // A key the wallet has no record of signing may still have signed on
+        // chain (a restore, or another copy of this phrase).
+        if !new_ids.is_empty() {
+            self.quarantine_signed_keys().await;
+        }
 
-        self.scan_pos = end;
-        self.persist_scan_pos();
+        if !rescan_chunk {
+            self.scan_pos = end;
+            self.persist_scan_pos();
+        }
 
         if !new_ids.is_empty() {
             let _ = self.events.send(WalletEvent::Incoming {

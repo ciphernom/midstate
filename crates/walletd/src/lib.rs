@@ -22,6 +22,7 @@ pub mod evm;
 pub mod ledger;
 pub mod mining;
 pub mod node_host;
+pub mod restore;
 pub mod sendplan;
 pub mod swap;
 pub mod swapbook;
