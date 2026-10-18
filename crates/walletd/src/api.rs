@@ -277,6 +277,43 @@ pub struct CoinExport {
     pub salt: String,
 }
 
+/// One midwimble mining bond (see walletd `bond`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BondView {
+    /// The bond coin's id (hex). Midwimble uses it as the bond's id too.
+    pub id: String,
+    pub label: String,
+    pub value: u64,
+    pub mining_key: String,
+    /// The bond's owner key (hex): what `midwimble bond register` calls
+    /// `--owner-pk`. Only this wallet's phrase can sign for it.
+    pub owner_pk: String,
+    pub bonded_until: u64,
+    /// The address the coin is locked at, and the script behind it (hex).
+    pub address: String,
+    pub script: String,
+    pub salt: String,
+    /// One of "locking", "locked", "unlocked", "unbonding", "unbonded",
+    /// "not_funded".
+    pub status: String,
+    /// The status in a sentence, including what midwimble makes of it.
+    pub status_text: String,
+    /// Blocks until it can be unbonded (0 once it can).
+    pub blocks_left: u64,
+    /// Unix time until which midwimble counts the bond for mining, if it
+    /// ever does (0 if it never does).
+    pub counts_until: u64,
+    /// Below midwimble's minimum bond: never counts (a rehearsal).
+    pub below_min: bool,
+    /// `midwimble bond register …` with this bond's values filled in.
+    pub register_cmd: String,
+    /// `<script> <value> <salt>`, for importing into another wallet with the
+    /// same recovery phrase.
+    pub export_line: String,
+    pub can_unbond: bool,
+    pub can_remove: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IdentityView {
     /// This wallet's channel identity: an MSS master public key (hex).

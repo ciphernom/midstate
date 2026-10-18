@@ -16,6 +16,7 @@
 
 pub mod api;
 pub mod base;
+pub mod bond;
 pub mod channels;
 pub mod dex;
 pub mod evm;

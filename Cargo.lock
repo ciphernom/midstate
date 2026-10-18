@@ -3943,8 +3943,10 @@ name = "midstate-walletd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "bip32",
  "bip39",
+ "curve25519-dalek",
  "dirs",
  "hex",
  "k256",

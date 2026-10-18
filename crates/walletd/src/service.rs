@@ -6,6 +6,7 @@ use crate::base::{BaseClient, ChainConfig};
 use crate::channels::{self, ChanStatus, ChannelBook, ChannelRecord, PendingOpen, Role};
 use crate::dex::OrderBook;
 use crate::ledger::{Ledger, SendRecord};
+use crate::bond::{self, BondBook, BondRecord, OwnerKind};
 use crate::restore::{self, PassEnd, RestoreScan};
 use crate::swap::{self, Rail, Side};
 use crate::swapbook::{Phase, Swap, SwapBook};
@@ -122,6 +123,17 @@ enum Cmd {
     SyncOrderBook(oneshot::Sender<Result<()>>),
     GetDexConfig(oneshot::Sender<DexConfigView>),
     SetDexConfig { cfg: DexConfigView, resp: oneshot::Sender<Result<()>> },
+    Bonds(oneshot::Sender<Result<Vec<BondView>>>),
+    CreateBond {
+        mining_key: String,
+        value: u64,
+        until: u64,
+        label: String,
+        resp: oneshot::Sender<Result<String>>,
+    },
+    Unbond { id: String, resp: oneshot::Sender<Result<String>> },
+    ImportBond { text: String, label: String, resp: oneshot::Sender<Result<String>> },
+    RemoveBond { id: String, resp: oneshot::Sender<Result<()>> },
     Internal(Internal),
 }
 
@@ -408,6 +420,28 @@ impl WalletdHandle {
     pub async fn set_dex_config(&self, cfg: DexConfigView) -> Result<()> {
         ask!(self, SetDexConfig { cfg: cfg })
     }
+    /// Every mining bond this wallet made or imported.
+    pub async fn bonds(&self) -> Result<Vec<BondView>> {
+        ask!(self, Bonds)
+    }
+    /// Lock one coin of `value` (a power of two) as a midwimble mining bond on
+    /// `mining_key` until block `until`. Returns the bond's id.
+    pub async fn create_bond(&self, mining_key: String, value: u64, until: u64, label: String) -> Result<String> {
+        ask!(self, CreateBond { mining_key: mining_key, value: value, until: until, label: label })
+    }
+    /// Spend an unlocked bond back to this wallet. Returns the send's id.
+    pub async fn unbond(&self, id: String) -> Result<String> {
+        ask!(self, Unbond { id: id })
+    }
+    /// Add a bond made elsewhere: midwimble's bond.json, or
+    /// `<script> <value> <salt>`.
+    pub async fn import_bond(&self, text: String, label: String) -> Result<String> {
+        ask!(self, ImportBond { text: text, label: label })
+    }
+    /// Forget a bond whose coin is gone (unbonded, or never locked).
+    pub async fn remove_bond(&self, id: String) -> Result<()> {
+        ask!(self, RemoveBond { id: id })
+    }
 }
 
 /// Spawn the actor. `wallet_path` is the single managed wallet file
@@ -455,6 +489,7 @@ pub fn spawn(
         dex_error: None,
         ledger: Ledger::default(),
         swaps: SwapBook::default(),
+        bonds: BondBook::default(),
         mining,
         events,
         self_tx: tx,
@@ -502,6 +537,9 @@ struct Service {
     /// Live cross-chain swaps. Persisted, because the gap between the two legs
     /// is exactly where losing state loses money.
     swaps: SwapBook,
+    /// Mining bonds (see `crate::bond`). Persisted: a bond's salt exists
+    /// nowhere else once its locking send completes.
+    bonds: BondBook,
     /// Supervises the local Stratum pool and hasher child processes. Mining is
     /// deliberately out-of-process; see `crate::mining` for the payout and
     /// working-directory reasons.
@@ -564,8 +602,9 @@ impl Service {
                 // underlying buffers is the plan §8 upstream change (zeroize on
                 // WalletKey/MssKeypair) — tracked, not yet in the vendored crate.
                 self.wallet = None;
-                // Reloaded from the sidecar on unlock.
+                // Reloaded from the sidecars on unlock.
                 self.restore = None;
+                self.bonds = BondBook::default();
                 let _ = resp.send(r);
             }
             Cmd::NewAddress { mss, label, resp } => {
@@ -847,6 +886,21 @@ impl Service {
                 }
                 let _ = resp.send(r);
             }
+            Cmd::Bonds(resp) => {
+                let _ = resp.send(self.bonds_view().await);
+            }
+            Cmd::CreateBond { mining_key, value, until, label, resp } => {
+                let _ = resp.send(self.create_bond(&mining_key, value, until, label).await);
+            }
+            Cmd::Unbond { id, resp } => {
+                let _ = resp.send(self.unbond(&id).await);
+            }
+            Cmd::ImportBond { text, label, resp } => {
+                let _ = resp.send(self.import_bond(&text, label).await);
+            }
+            Cmd::RemoveBond { id, resp } => {
+                let _ = resp.send(self.remove_bond(&id).await);
+            }
             Cmd::Internal(i) => self.internal(i).await,
         }
     }
@@ -879,6 +933,14 @@ impl Service {
         RestoreScan::mark_done(&self.wallet_path);
         self.restore = None;
         self.mss_checked = wallet.mss_keys().len() as u64;
+        // Bond records left by a wallet that used to live here belong to
+        // another phrase. Keep them (they may hold a salt nothing else has),
+        // but out of this wallet's way.
+        let old_bonds = BondBook::path(&self.wallet_path);
+        if old_bonds.exists() {
+            let _ = std::fs::rename(&old_bonds, old_bonds.with_extension(format!("bonds.previous-{}", now_secs())));
+        }
+        self.bonds = BondBook::default();
         self.wallet = Some(wallet);
         // Fresh wallet: nothing historical can belong to it — start scanning
         // from the current tip instead of genesis.
@@ -953,6 +1015,7 @@ impl Service {
         self.wallet = Some(wallet);
         self.restore = Some(rs);
         self.sync_wots_hold();
+        self.bonds = BondBook::load(&self.wallet_path).0;
         self.scan_pos = 0;
         self.persist_scan_pos();
         Ok(())
@@ -981,6 +1044,11 @@ impl Service {
         self.book = ChannelBook::load(&self.wallet_path);
         self.ledger = Ledger::load(&self.wallet_path);
         self.swaps = SwapBook::load(&self.wallet_path);
+        let (bonds, warning) = BondBook::load(&self.wallet_path);
+        self.bonds = bonds;
+        if let Some(text) = warning {
+            let _ = self.events.send(WalletEvent::Warning { text });
+        }
         self.resume_pendings().await;
         let _ = self.events.send(WalletEvent::WalletChanged);
         Ok(())
@@ -1467,6 +1535,497 @@ impl Service {
         }
     }
 
+    // ── Mining bonds (see `crate::bond`) ───────────────────────────────
+
+    /// `host:port` of this node's RPC, for `midwimble bond register`.
+    fn midstate_rpc_addr(&self) -> String {
+        self.rpc_url
+            .as_deref()
+            .map(|u| u.trim_start_matches("http://").trim_start_matches("https://").trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| "127.0.0.1:8545".to_string())
+    }
+
+    /// Mark bonds whose coin is on chain, so a coin that later leaves the
+    /// chain reads as spent rather than as never locked.
+    async fn refresh_bonds_live(&mut self) {
+        if self.bonds.bonds.iter().all(|b| b.seen_live) {
+            return;
+        }
+        let state = self.node.get_state().await;
+        let mut changed = false;
+        for b in self.bonds.bonds.iter_mut().filter(|b| !b.seen_live) {
+            if state.coins.contains(&b.coin_id()) {
+                b.seen_live = true;
+                changed = true;
+            }
+        }
+        if changed {
+            if let Err(e) = self.bonds.save(&self.wallet_path) {
+                tracing::warn!("saving bond records: {e:#}");
+            }
+        }
+    }
+
+    async fn bonds_view(&mut self) -> Result<Vec<BondView>> {
+        if self.wallet.is_none() {
+            bail!("wallet is locked");
+        }
+        self.refresh_bonds_live().await;
+        let state = self.node.get_state().await;
+        let now = now_secs();
+        let rpc = self.midstate_rpc_addr();
+        let w = self.wallet.as_ref().unwrap();
+        let pending = |c: &Option<[u8; 32]>| c.is_some_and(|c| w.find_pending(&c).is_some());
+        Ok(self
+            .bonds
+            .bonds
+            .iter()
+            .rev()
+            .map(|b| {
+                let id = b.coin_id();
+                let live = state.coins.contains(&id);
+                let blocks_left = b.bonded_until.saturating_sub(state.height);
+                let status = if pending(&b.unbond_commitment) {
+                    "unbonding"
+                } else if live && blocks_left == 0 {
+                    "unlocked"
+                } else if live {
+                    "locked"
+                } else if pending(&b.fund_commitment) {
+                    "locking"
+                } else if b.seen_live {
+                    "unbonded"
+                } else {
+                    "not_funded"
+                };
+                let below_min = b.value < bond::midwimble::MIN_MINING_BOND;
+                let counts_until = if below_min { None } else { bond::midwimble::counts_until(b.bonded_until) };
+                let midwimble = match counts_until {
+                    _ if below_min => " Below midwimble's minimum bond, so it never counts for mining \
+                                       (fine for a rehearsal)."
+                        .to_string(),
+                    Some(t) if t > now => format!(
+                        " Midwimble counts it for mining for about {} more, once registered.",
+                        bond::secs_human(t - now)
+                    ),
+                    _ => " Midwimble no longer counts it: less than two days of its lock remain by \
+                          midwimble's clock."
+                        .to_string(),
+                };
+                let status_text = match status {
+                    "locking" => "Locking: the send is on its way (see the Send tab). Register it with \
+                                  midwimble once it confirms."
+                        .to_string(),
+                    "locked" => format!(
+                        "Locked until block {} (about {}).{}",
+                        b.bonded_until,
+                        bond::blocks_human(blocks_left),
+                        midwimble
+                    ),
+                    "unlocked" => "Unlocked: unbond it to bring the coin back to this wallet.".to_string(),
+                    "unbonding" => "Unbonding: the spend is on its way (see the Send tab).".to_string(),
+                    "unbonded" => "Spent: the bond's coin has left the chain (unbonded).".to_string(),
+                    _ => "Not on chain: the send that locks it never confirmed, or it was spent before \
+                          this wallet saw it."
+                        .to_string(),
+                };
+                BondView {
+                    id: hex::encode(id),
+                    label: b.label.clone(),
+                    value: b.value,
+                    mining_key: hex::encode(b.mining_key),
+                    owner_pk: hex::encode(b.owner_pk),
+                    bonded_until: b.bonded_until,
+                    address: hex::encode(b.address()),
+                    script: hex::encode(b.script()),
+                    salt: hex::encode(b.salt),
+                    status: status.to_string(),
+                    status_text,
+                    blocks_left,
+                    counts_until: counts_until.unwrap_or(0),
+                    below_min,
+                    register_cmd: b.register_command(&rpc),
+                    export_line: b.export_line(),
+                    can_unbond: status == "unlocked",
+                    can_remove: matches!(status, "unbonded" | "not_funded"),
+                }
+            })
+            .collect())
+    }
+
+    /// Lock one coin as a mining bond. The send runs through the ordinary
+    /// send machine; the bond's record (with the salt nothing else keeps) is
+    /// written before its commit is broadcast.
+    async fn create_bond(&mut self, mining_key: &str, value: u64, until: u64, label: String) -> Result<String> {
+        if self.wallet.is_none() {
+            bail!("wallet is locked");
+        }
+        if self.node.is_syncing() {
+            bail!("node is still syncing — locking a bond against a stale coin set would fail");
+        }
+        self.ensure_restore_done()?;
+        let mining_key = bond::parse_mining_key(mining_key)?;
+        if value == 0 || !value.is_power_of_two() {
+            bail!("a bond is one coin, and every coin is a power of two: choose one of the listed amounts");
+        }
+        let state = self.node.get_state().await;
+        if until <= state.height {
+            bail!("the unlock height must be above the current height ({})", state.height);
+        }
+        let horizon = bond::midwimble::horizon(now_secs());
+        if until > horizon {
+            bail!(
+                "block {until} is more than a year ahead by midwimble's clock (the most it accepts is \
+                 {horizon}). Midwimble would refuse to register the bond, and the coin would stay \
+                 locked all that time"
+            );
+        }
+        let master = self
+            .wallet
+            .as_ref()
+            .unwrap()
+            .data
+            .master_seed
+            .ok_or_else(|| anyhow!("bonds need a wallet with a recovery phrase, and this one predates them"))?;
+        self.verify_mss_indices().await?;
+
+        // The bond's own owner key, from the recovery phrase.
+        let owner = tokio::task::spawn_blocking(move || bond::derive_owner(&master, &mining_key, until))
+            .await
+            .context("owner key task panicked")??;
+        let terms = bond::BondTerms { mining_key, bonded_until: until, owner_pk: owner.master_pk };
+        let address = terms.address();
+
+        let in_flight_ids = self.in_flight_inputs();
+        let w = self.wallet.as_mut().unwrap();
+        let live: Vec<[u8; 32]> = w
+            .coins()
+            .iter()
+            .filter(|c| !c.wots_signed && !in_flight_ids.contains(&c.coin_id) && state.coins.contains(&c.coin_id))
+            .map(|c| c.coin_id)
+            .collect();
+        let SendPlan { input_coin_ids, outputs, change_seeds, fee, .. } =
+            sendplan::plan_send(w, &live, address, value)?;
+        let salt = outputs
+            .iter()
+            .find_map(|o| match o {
+                midstate::core::OutputData::Standard { address: a, value: v, salt } if *a == address && *v == value => {
+                    Some(*salt)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("internal error: the send plan has no bond output"))?;
+        let (commitment, _) = w.prepare_commit(&input_coin_ids, &outputs, change_seeds, false, false)?;
+        w.save()?;
+
+        let rec = BondRecord {
+            mining_key,
+            bonded_until: until,
+            owner_pk: owner.master_pk,
+            owner: OwnerKind::Derived,
+            value,
+            salt,
+            label: label.trim().to_string(),
+            created_at: now_secs(),
+            fund_commitment: Some(commitment),
+            unbond_commitment: None,
+            unbond_sig: None,
+            owner_next_leaf: 0,
+            seen_live: false,
+        };
+        let id = rec.coin_id();
+        self.bonds.bonds.push(rec);
+        if let Err(e) = self.bonds.save(&self.wallet_path) {
+            // Nothing is broadcast yet: undo, rather than lock a coin whose
+            // salt would be lost.
+            self.bonds.bonds.retain(|b| b.coin_id() != id);
+            let w = self.wallet.as_mut().unwrap();
+            w.data.pending.retain(|p| p.commitment != commitment);
+            let _ = w.save();
+            return Err(e.context("could not record the bond, so nothing was sent"));
+        }
+
+        self.sends.insert(
+            commitment,
+            SendMeta {
+                stage: SendStage::Committing,
+                detail: "locking a mining bond — solving commit proof-of-work".into(),
+                amount: value,
+                fee,
+                to: "mining bond".into(),
+                updated_at: now_secs(),
+            },
+        );
+        self.set_stage(commitment, SendStage::Committing, "locking a mining bond");
+        self.broadcast_commit(commitment).await?;
+        let _ = self.events.send(WalletEvent::WalletChanged);
+        Ok(hex::encode(id))
+    }
+
+    /// Spend an unlocked bond back to fresh one-time keys of this wallet, the
+    /// fee coming out of the bond. Committed here; `reveal_unbond` signs it
+    /// once the commit is mined.
+    async fn unbond(&mut self, id: &str) -> Result<String> {
+        if self.wallet.is_none() {
+            bail!("wallet is locked");
+        }
+        if self.node.is_syncing() {
+            bail!("node is still syncing");
+        }
+        self.ensure_restore_done()?;
+        let coin_id = parse_hex32(id)?;
+        let rec = self.bonds.find(&coin_id).cloned().ok_or_else(|| anyhow!("no such bond in this wallet"))?;
+        if rec.unbond_commitment.is_some_and(|c| self.wallet.as_ref().unwrap().find_pending(&c).is_some()) {
+            bail!("this bond is already being unbonded: its progress is on the Send tab");
+        }
+        let state = self.node.get_state().await;
+        if !state.coins.contains(&coin_id) {
+            bail!("the bond's coin is not on chain: it is still being locked, or it has been spent");
+        }
+        if state.height < rec.bonded_until {
+            let left = rec.bonded_until - state.height;
+            bail!(
+                "locked until block {}: {left} blocks to go (about {})",
+                rec.bonded_until,
+                bond::blocks_human(left)
+            );
+        }
+        let sig_len = match rec.owner {
+            OwnerKind::Derived => bond::mss_sig_len(bond::OWNER_HEIGHT),
+            OwnerKind::WalletTree => {
+                self.verify_mss_indices().await?;
+                let w = self.wallet.as_ref().unwrap();
+                let kp = w
+                    .mss_keys()
+                    .iter()
+                    .find(|k| k.master_pk == rec.owner_pk)
+                    .ok_or_else(|| anyhow!("the bond's owner key is no longer in this wallet"))?;
+                bond::mss_sig_len(kp.height)
+            }
+        };
+        let script = rec.script();
+        let (fee, denoms) = bond::resolve_unbond_fee(script.len(), sig_len, rec.value)
+            .ok_or_else(|| anyhow!("this bond is too small to pay the fee to unbond it"))?;
+
+        let w = self.wallet.as_mut().unwrap();
+        let seeds = w.allocate_next_wots_seeds(denoms.len())?;
+        let mut outputs = Vec::with_capacity(denoms.len());
+        let mut change_seeds = Vec::with_capacity(denoms.len());
+        for (i, (denom, seed)) in denoms.iter().zip(seeds).enumerate() {
+            let address = midstate::core::compute_address(&midstate::core::wots::keygen(&seed));
+            outputs.push(midstate::core::OutputData::Standard { address, value: *denom, salt: rand::random() });
+            change_seeds.push((i, seed));
+        }
+        let salt: [u8; 32] = rand::random();
+        let hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+        let commitment = midstate::core::compute_commitment(&[coin_id], &hashes, &salt);
+        let now = now_secs();
+        w.data.pending.push(midstate::wallet::PendingCommit {
+            commitment,
+            salt,
+            input_coin_ids: vec![coin_id],
+            outputs,
+            change_seeds,
+            created_at: now,
+            reveal_not_before: now + 5 + rand::random::<u64>() % 11,
+            is_consolidate: false,
+        });
+        w.save()?;
+
+        if let Some(r) = self.bonds.find_mut(&coin_id) {
+            r.unbond_commitment = Some(commitment);
+            r.unbond_sig = None;
+        }
+        if let Err(e) = self.bonds.save(&self.wallet_path) {
+            let w = self.wallet.as_mut().unwrap();
+            w.data.pending.retain(|p| p.commitment != commitment);
+            let _ = w.save();
+            return Err(e.context("could not record the unbond, so nothing was sent"));
+        }
+
+        self.sends.insert(
+            commitment,
+            SendMeta {
+                stage: SendStage::Committing,
+                detail: "unbonding — solving commit proof-of-work".into(),
+                amount: rec.value - fee,
+                fee,
+                to: "this wallet (unbonded)".into(),
+                updated_at: now,
+            },
+        );
+        self.set_stage(commitment, SendStage::Committing, "unbonding");
+        self.broadcast_commit(commitment).await?;
+        Ok(hex::encode(commitment))
+    }
+
+    /// The owner's signature over an unbond's commitment. A derived owner
+    /// key starts at the higher of this wallet's record and the chain's, and
+    /// the leaf it used is saved before the signature goes anywhere.
+    async fn sign_bond_owner(&mut self, commitment: &[u8; 32]) -> Result<Vec<u8>> {
+        let rec = self.bonds.by_unbond(commitment).cloned().ok_or_else(|| anyhow!("no bond for this unbond"))?;
+        let (sig, next_leaf) = match rec.owner {
+            OwnerKind::Derived => {
+                let master = self
+                    .wallet
+                    .as_ref()
+                    .and_then(|w| w.data.master_seed)
+                    .ok_or_else(|| anyhow!("this wallet has no recovery phrase"))?;
+                let (mk, until) = (rec.mining_key, rec.bonded_until);
+                let mut kp = tokio::task::spawn_blocking(move || bond::derive_owner(&master, &mk, until))
+                    .await
+                    .context("owner key task panicked")??;
+                if kp.master_pk != rec.owner_pk {
+                    bail!("this wallet's recovery phrase does not hold the bond's owner key");
+                }
+                let chain_next = self.node.storage.query_mss_leaf_index(&rec.owner_pk).unwrap_or(0);
+                let leaf = chain_next.max(rec.owner_next_leaf);
+                if leaf >= 1u64 << bond::OWNER_HEIGHT {
+                    bail!("the bond's owner key has no signatures left");
+                }
+                kp.set_next_leaf(leaf);
+                (kp.sign(commitment)?.to_bytes(), leaf + 1)
+            }
+            OwnerKind::WalletTree => {
+                self.verify_mss_indices().await?;
+                let w = self.wallet.as_mut().ok_or_else(|| anyhow!("wallet is locked"))?;
+                (w.auto_sign(&rec.owner_pk, commitment)?, rec.owner_next_leaf)
+            }
+        };
+        let r = self.bonds.by_unbond_mut(commitment).expect("bond record present");
+        r.owner_next_leaf = r.owner_next_leaf.max(next_leaf);
+        r.unbond_sig = Some(hex::encode(&sig));
+        self.bonds
+            .save(&self.wallet_path)
+            .context("could not record the owner key's signature, so it was not broadcast")?;
+        Ok(sig)
+    }
+
+    /// `try_reveal` for an unbond: the bond input is a script coin, which
+    /// `Wallet::sign_reveal` cannot sign, so build the reveal here.
+    async fn reveal_unbond(&mut self, commitment: [u8; 32], pending: midstate::wallet::PendingCommit) {
+        let Some(rec) = self.bonds.by_unbond(&commitment).cloned() else { return };
+        let coin_id = rec.coin_id();
+        let hashes: Vec<[u8; 32]> = pending.outputs.iter().map(|o| o.hash_for_commitment()).collect();
+        if pending.input_coin_ids != [coin_id]
+            || midstate::core::compute_commitment(&pending.input_coin_ids, &hashes, &pending.salt) != commitment
+        {
+            self.set_stage(commitment, SendStage::Failed, "the unbond's commit does not match its bond");
+            return;
+        }
+        // A retry reuses the signature already made for this commitment.
+        let sig = match rec.unbond_sig.as_deref().and_then(|h| hex::decode(h).ok()) {
+            Some(sig) => sig,
+            None => match self.sign_bond_owner(&commitment).await {
+                Ok(sig) => sig,
+                Err(e) => {
+                    self.set_stage(
+                        commitment,
+                        SendStage::Failed,
+                        format!("could not sign the unbond: {e:#}. Nothing was spent."),
+                    );
+                    return;
+                }
+            },
+        };
+        let tx = bond::unbond_reveal(&rec, sig, pending.outputs.clone(), pending.salt);
+        match self.node.send_transaction(tx).await {
+            Ok(()) => {
+                self.set_stage(commitment, SendStage::RevealPending, "unbond broadcast — waiting for confirmation");
+                self.spawn_reveal_monitor(commitment, coin_id);
+            }
+            Err(e) => {
+                self.set_stage(
+                    commitment,
+                    SendStage::Failed,
+                    format!("unbond broadcast failed: {e}. The signed unbond is kept; retry when the node recovers."),
+                );
+            }
+        }
+    }
+
+    /// Add a bond made elsewhere, if this wallet can sign for it.
+    async fn import_bond(&mut self, text: &str, label: String) -> Result<String> {
+        let w = self.wallet.as_ref().ok_or_else(|| anyhow!("wallet is locked"))?;
+        let imp = bond::parse_import(text)?;
+        let master = w.data.master_seed;
+        let in_wallet = w.mss_keys().iter().any(|k| k.master_pk == imp.terms.owner_pk);
+        let derived = match master {
+            Some(master) => {
+                let (mk, until) = (imp.terms.mining_key, imp.terms.bonded_until);
+                let kp = tokio::task::spawn_blocking(move || bond::derive_owner(&master, &mk, until))
+                    .await
+                    .context("owner key task panicked")??;
+                kp.master_pk == imp.terms.owner_pk
+            }
+            None => false,
+        };
+        let owner = if derived {
+            OwnerKind::Derived
+        } else if in_wallet {
+            OwnerKind::WalletTree
+        } else {
+            bail!(
+                "this wallet cannot sign for that bond: its owner key is neither derived from this \
+                 recovery phrase nor one of this wallet's reusable keys"
+            );
+        };
+        let mut rec = BondRecord {
+            mining_key: imp.terms.mining_key,
+            bonded_until: imp.terms.bonded_until,
+            owner_pk: imp.terms.owner_pk,
+            owner,
+            value: imp.value,
+            salt: imp.salt,
+            label: label.trim().to_string(),
+            created_at: now_secs(),
+            fund_commitment: None,
+            unbond_commitment: None,
+            unbond_sig: None,
+            owner_next_leaf: 0,
+            seen_live: false,
+        };
+        let id = rec.coin_id();
+        if self.bonds.find(&id).is_some() {
+            bail!("this wallet already has that bond");
+        }
+        let live = self.node.get_state().await.coins.contains(&id);
+        rec.seen_live = live;
+        let until = rec.bonded_until;
+        self.bonds.bonds.push(rec);
+        self.bonds.save(&self.wallet_path)?;
+        Ok(if live {
+            format!("Imported: the bond is on chain, locked until block {until}.")
+        } else {
+            "Imported, but its coin is not on chain: it is not confirmed yet, or it has been spent.".into()
+        })
+    }
+
+    /// Forget a bond whose coin is gone. A bond still on chain is refused:
+    /// its record is the only place this wallet keeps its salt.
+    async fn remove_bond(&mut self, id: &str) -> Result<()> {
+        let coin_id = parse_hex32(id)?;
+        let rec = self.bonds.find(&coin_id).cloned().ok_or_else(|| anyhow!("no such bond in this wallet"))?;
+        if self.node.get_state().await.coins.contains(&coin_id) {
+            bail!("this bond's coin is still on chain: unbond it once it unlocks, rather than forget it");
+        }
+        let w = self.wallet.as_ref().ok_or_else(|| anyhow!("wallet is locked"))?;
+        let busy = [rec.fund_commitment, rec.unbond_commitment]
+            .iter()
+            .any(|c| c.is_some_and(|c| w.find_pending(&c).is_some()));
+        if busy {
+            bail!("its send is still in progress");
+        }
+        // A lock abandoned from the Send tab may still be in a mempool, and
+        // would then confirm with this record its only copy of the salt.
+        if !rec.seen_live && now_secs().saturating_sub(rec.created_at) < 3600 {
+            bail!("its locking transaction may still confirm: forget it once an hour has passed without it appearing");
+        }
+        self.bonds.bonds.retain(|b| b.coin_id() != coin_id);
+        self.bonds.save(&self.wallet_path)
+    }
+
     // ── Send machine ────────────────────────────────────────────────────
 
     /// STRICT SAFETY (ported from the CLI): before any signing session,
@@ -1686,11 +2245,18 @@ impl Service {
         for (commitment, reveal_not_before, inputs, outputs) in pendings {
             // Reconstruct meta for the UI: recipient amount = outputs minus
             // change; fee = input values minus output values (best effort).
-            let (amount, fee) = self
-                .wallet
-                .as_ref()
-                .map(|w| reconstruct_meta(w, &inputs, &outputs, &commitment))
-                .unwrap_or((0, 0));
+            let (amount, fee) = match self.bonds.by_unbond(&commitment) {
+                // The bond is not a wallet coin, so price it from its record.
+                Some(b) => {
+                    let out: u64 = outputs.iter().map(|o| o.value()).sum();
+                    (out, b.value.saturating_sub(out))
+                }
+                None => self
+                    .wallet
+                    .as_ref()
+                    .map(|w| reconstruct_meta(w, &inputs, &outputs, &commitment))
+                    .unwrap_or((0, 0)),
+            };
             self.sends.insert(
                 commitment,
                 SendMeta {
@@ -1732,6 +2298,7 @@ impl Service {
             }
             Internal::TryReveal(c) => self.try_reveal(c).await,
             Internal::RevealConfirmed(c) => {
+                let unbonded = self.bonds.by_unbond(&c).map(|b| b.value);
                 if let Some(w) = self.wallet.as_mut() {
                     let spent: Vec<[u8; 32]> = w
                         .find_pending(&c)
@@ -1739,10 +2306,25 @@ impl Service {
                         .unwrap_or_default();
                     match w.complete_reveal(&c) {
                         Ok(()) => {
+                            if let Some(value) = unbonded {
+                                // Coins coming back, not going out: the bond was
+                                // never a wallet coin, so complete_reveal saw no
+                                // inputs and recorded a send of nothing.
+                                if let Some(h) = w.data.history.last_mut() {
+                                    let out: u64 = h
+                                        .outputs
+                                        .iter()
+                                        .filter_map(|id| w.data.coins.iter().find(|c| &c.coin_id == id))
+                                        .map(|c| c.value)
+                                        .sum();
+                                    h.kind = "received".into();
+                                    h.fee = value.saturating_sub(out);
+                                }
+                            }
                             let _ = w.save();
                             // The recipient's outputs were never ours to price,
                             // so this is the only moment the real amount exists.
-                            if let Some(m) = self.sends.get(&c) {
+                            if let Some(m) = self.sends.get(&c).filter(|_| unbonded.is_none()) {
                                 if !spent.is_empty() {
                                     self.ledger.record_send(
                                         &spent,
@@ -1773,6 +2355,11 @@ impl Service {
         let Some(pending) = w.find_pending(&commitment).cloned() else { return };
 
         self.set_stage(commitment, SendStage::WaitingReveal, "signing reveal");
+
+        if self.bonds.by_unbond(&commitment).is_some() {
+            self.reveal_unbond(commitment, pending).await;
+            return;
+        }
 
         // Last line of defence against one-time-key reuse (audit W6): never
         // sign for a WOTS input whose key the chain has already seen sign a
@@ -6112,6 +6699,7 @@ impl Service {
         }
         let tip = status.height;
         self.check_new_mss_trees();
+        self.refresh_bonds_live().await;
 
         // A restore pass records the window it starts with at height 0; one
         // whose start was never recorded (interrupted between passes) restarts.

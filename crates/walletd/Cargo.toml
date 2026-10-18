@@ -16,6 +16,9 @@ thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 hex = "0.4"
+bincode = "1.3"
+# Mining keys are Ristretto points: decoding one catches a mistyped key.
+curve25519-dalek = "4"
 rand = "0.8"
 tokio = { version = "1.35", features = ["full"] }
 tracing = "0.1"
