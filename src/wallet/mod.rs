@@ -373,6 +373,25 @@ impl Wallet {
         }
     }
 
+    /// `allocate_next_wots_seed` for `n` keys at once: one lock and one save
+    /// instead of `n`, since every save re-encrypts the wallet.
+    pub fn allocate_next_wots_seeds(&mut self, n: usize) -> Result<Vec<[u8; 32]>> {
+        if let (Some(reason), Some(_)) = (&self.wots_hold, &self.data.master_seed) {
+            bail!("{reason}");
+        }
+        let _lock = self.acquire_lock()?;
+        let Some(master) = self.data.master_seed else {
+            return Ok((0..n).map(|_| rand::random()).collect());
+        };
+        let start = self.data.next_wots_index;
+        self.data.next_wots_index += n as u64;
+        let seeds: Vec<[u8; 32]> =
+            (start..start + n as u64).map(|i| hd::derive_wots_seed(&master, i)).collect();
+        self.data.keys.retain(|k| !seeds.contains(&k.seed));
+        self.save()?;
+        Ok(seeds)
+    }
+
     /// Same safety contract as `allocate_next_wots_seed` for MSS trees.
     pub fn allocate_next_mss_seed(&mut self) -> Result<[u8; 32]> {
         let _lock = self.acquire_lock()?;
@@ -2591,6 +2610,24 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
         // Rewinding never moves a counter up.
         w.rewind_hd_counters(9, w.mss_index()).unwrap();
         assert_eq!(w.wots_index(), 5);
+    }
+
+    #[test]
+    fn hd_bulk_allocation_matches_one_at_a_time() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let (mut w, _phrase) = Wallet::create_hd(&path, b"pass").unwrap();
+        let one = w.allocate_next_wots_seed().unwrap();
+        let many = w.allocate_next_wots_seeds(3).unwrap();
+        let master = w.data.master_seed.unwrap();
+        assert_eq!(one, hd::derive_wots_seed(&master, 0));
+        assert_eq!(many, (1..4).map(|i| hd::derive_wots_seed(&master, i)).collect::<Vec<_>>());
+        assert_eq!(w.wots_index(), 4);
+        w.hold_wots_allocation(Some("held".into()));
+        assert!(w.allocate_next_wots_seeds(1).is_err());
+        assert_eq!(w.wots_index(), 4);
     }
 
     #[test]
