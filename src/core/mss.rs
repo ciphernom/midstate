@@ -110,7 +110,7 @@ pub fn keygen(master_seed: &[u8; 32], height: u32) -> Result<MssKeypair> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         // Native: Multi-threaded with Rayon, checkpoints, and time tracking
-        let checkpoint_path = std::path::PathBuf::from(format!("mss_h{}.checkpoint", height));
+        let checkpoint_path = checkpoint_path(master_seed, height);
         let mut leaves_completed = 0usize;
 
         if checkpoint_path.exists() {
@@ -184,6 +184,24 @@ pub fn keygen(master_seed: &[u8; 32], height: u32) -> Result<MssKeypair> {
         tree,
         next_leaf: 0,
     })
+}
+
+/// Where `keygen` checkpoints the leaves of the tree for `master_seed`.
+///
+/// Named after the tree it belongs to. It used to be `mss_h{height}.checkpoint`
+/// for every seed, so a file left behind by a keygen interrupted between its
+/// final save and its removal (or written by a second keygen in the same
+/// directory) was loaded into the NEXT tree of that height: the new tree got
+/// another seed's leaves, its address no longer matched its signing keys, and
+/// coins sent there could never be spent. The tag is a hash of the seed, never
+/// the seed itself.
+#[cfg(not(target_arch = "wasm32"))]
+fn checkpoint_path(master_seed: &[u8; 32], height: u32) -> std::path::PathBuf {
+    let mut h = blake3::Hasher::new();
+    h.update(b"MSS_KEYGEN_CHECKPOINT");
+    h.update(master_seed);
+    let tag = hex::encode(&h.finalize().as_bytes()[..8]);
+    std::path::PathBuf::from(format!("mss_h{}_{}.checkpoint", height, tag))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -675,7 +693,38 @@ mod tests {
     fn from_bytes_too_short_fails() {
         assert!(MssSignature::from_bytes(&[0u8; 10]).is_err());
     }
-    
+
+    /// A checkpoint left behind by one tree's keygen must never be loaded into
+    /// another tree of the same height.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_checkpoint_belongs_to_one_tree() {
+        let a = hash(b"mss checkpoint test: tree A");
+        let b = hash(b"mss checkpoint test: tree B");
+        let path_a = checkpoint_path(&a, 2);
+        assert_eq!(path_a, checkpoint_path(&a, 2));
+        assert_ne!(path_a, checkpoint_path(&b, 2));
+        assert_ne!(path_a, checkpoint_path(&a, 3));
+        assert!(!path_a.to_string_lossy().contains(&hex::encode(&a[..8])), "the name never carries the seed");
+
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(path_a.clone());
+
+        let clean_b = keygen(&b, 2).unwrap().master_pk;
+        // Tree A's finished leaves, left on disk as if its keygen had died
+        // before removing the file.
+        let tree_a = keygen(&a, 2).unwrap();
+        save_checkpoint(&path_a, &tree_a.tree[4..]);
+        assert_eq!(keygen(&b, 2).unwrap().master_pk, clean_b, "tree B must not pick up tree A's leaves");
+        // Tree A itself still resumes from its own checkpoint, then removes it.
+        assert_eq!(keygen(&a, 2).unwrap().master_pk, tree_a.master_pk);
+        assert!(!path_a.exists());
+    }
 }
 
 #[cfg(test)]
