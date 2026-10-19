@@ -1,4 +1,5 @@
 mod batch_store;
+pub mod balance_index;
 pub mod search_index;
 pub use batch_store::BatchStore;
 
@@ -304,6 +305,21 @@ impl Storage {
     /// callers can read, they cannot swap the handle out from under BatchStore.
     pub fn db(&self) -> &Arc<Database> {
         &self.db
+    }
+
+    /// The rich-list index (address balances and checked supply).
+    pub fn balance_index(&self) -> &balance_index::BalanceIndex {
+        self.batches.balances()
+    }
+
+    /// Turn on the rich-list index for a chain of `chain_len` blocks and start
+    /// its backfill worker. Returns immediately; the worker builds the index in
+    /// the background, and the RPC reports progress until it is current.
+    pub fn enable_balance_index(&self, chain_len: u64) -> Result<balance_index::Enabled> {
+        let index = self.batches.balances();
+        let outcome = index.enable(&self.db, chain_len)?;
+        index.spawn_worker(self.db.clone());
+        Ok(outcome)
     }
 
     /// Build the search index up to `tip`, resuming if a previous run was

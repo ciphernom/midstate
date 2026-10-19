@@ -30,12 +30,20 @@ pub struct BatchStore {
     /// The old flat-file path. Preserved so we can clean it up after migration, 
     /// and so upstream logic can locate the adjacent `snapshots/` directory.
     legacy_fs_path: PathBuf, 
+    /// Address balances and supply, kept in step with every write below when
+    /// the node runs with `--rich-list`. Off (its hooks do nothing) otherwise.
+    balances: super::balance_index::BalanceIndex,
 }
 
 impl BatchStore {
     pub fn new(db: Arc<Database>, legacy_fs_path: PathBuf) -> Result<Self> {
-        let store = Self { db, legacy_fs_path };
+        let store = Self { db, legacy_fs_path, balances: Default::default() };
         Ok(store)
+    }
+
+    /// The rich-list index's switch and worker, shared by every clone of this store.
+    pub fn balances(&self) -> &super::balance_index::BalanceIndex {
+        &self.balances
     }
 
     
@@ -65,6 +73,9 @@ impl BatchStore {
         }
 
         let write_txn = self.db.begin_write()?;
+        // Before the deletes: the balance index unapplies the doomed blocks,
+        // reading them from the batch table in this same transaction.
+        self.balances.on_truncate(&write_txn, new_tip_height)?;
         {
             let mut b = write_txn.open_table(super::BATCHES_TABLE)?;
             let mut h = write_txn.open_table(super::HEADERS_TABLE)?;
@@ -144,6 +155,10 @@ impl BatchStore {
     /// its extracted Header, and its generated Neutrino Filter.
     pub fn save(&self, height: u64, batch: &Batch) -> Result<()> {
         let write_txn = self.db.begin_write()?;
+        // First, while whatever is stored at `height` is still there: a reorg
+        // overwrites heights in place, and the balance index must unapply the
+        // old block before the new one replaces it.
+        self.balances.on_save(&write_txn, height, batch)?;
         {
             let mut b = write_txn.open_table(super::BATCHES_TABLE)?;
             let mut h = write_txn.open_table(super::HEADERS_TABLE)?;

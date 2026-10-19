@@ -27,6 +27,22 @@ midstate node --data-dir ./data --port 9333 --rpc-port 8545 --mine --threads 3
 **Native Batch Explorer**
 Access the native explorer at `http://localhost:8545` to view detailed info - mempool, batches, height etc.
 
+**Circulating Supply & Rich List**
+Start the node with `--rich-list` (or `rich_list = true` in `config.toml`) to keep an index of every unspent coin's address and value. The explorer's SUPPLY tab (`http://localhost:8545/?richlist`) then shows the circulating supply and the top 100 holders. The index builds from genesis in the background on first start, costs about 100 bytes per unspent coin, and needs an archival node (no `--prune`).
+
+The same figures are served for listing sites (CoinGecko, CoinMarketCap, LiveCoinWatch). Amounts are in MDS, the base unit (1 gMDS = 2^30 MDS):
+
+| Endpoint | Returns |
+|---|---|
+| `GET /supply/circulating` | Circulating supply, as a bare number |
+| `GET /supply/total` | Total supply (issued minus burned), as a bare number |
+| `GET /supply/max` | Max supply: the halving schedule's total, 1,128,717,404,337,600 |
+| `GET /supply` | All supply figures as JSON, with a check that the unspent coins add up to issuance minus burns |
+| `GET /richlist?limit=100` | The largest holders as JSON (up to 1000) |
+| `GET /richlist/<address>` | One address's balance and rank |
+
+Circulating supply equals total supply: there is no premine, treasury or team allocation. It counts every block reward issued, minus the genesis reward (paid to the genesis inscription, which no key can spend) and value destroyed by data burns. After the halvings end at block 15,768,000, a tail of 1 MDS per block continues. The plain-number endpoints answer 503 until the index has caught up, rather than publish a figure that might be wrong.
+
 **Midstate Axe Dashboard:**
 For hardware nodes (or local testing), access the web dashboard at `http://127.0.0.1:8545/axe` to configure Wi-Fi, view live telemetry, and set up pool mining.
 
