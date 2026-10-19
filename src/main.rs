@@ -66,6 +66,10 @@ struct Config {
     /// When true, the node will only retain the most recent PRUNE_DEPTH blocks.
     #[serde(default)]
     prune: bool,
+    /// Keep the rich-list index (address balances, circulating supply) behind
+    /// the explorer's SUPPLY tab and the /supply and /richlist endpoints.
+    #[serde(default)]
+    rich_list: bool,
     /// Optional path to a wallet whose Pruning Licenses should be auto-registered
     /// at node startup. Both held licenses (pruning exemption rights) and issued licenses
     /// (storage audit obligations as the original Issuer) are registered.
@@ -140,6 +144,13 @@ impl Config {
             # Default is false (full archival mode). Set to true to save disk space.
             # prune = false
 
+            # Keep the rich-list index: every unspent coin's address and value, for
+            # the explorer's SUPPLY tab (circulating supply, top 100 holders) and the
+            # /supply and /richlist endpoints listing sites read. Costs about 100
+            # bytes per unspent coin and a one-time background pass over all
+            # history, and needs an archival node (prune = false).
+            # rich_list = false
+
             # Optional: auto-register Pruning Licenses from a wallet at startup.
             # Registers held ranges (for exemption when pruning) + issued ranges (audit obligations as the original Issuer).
             # The password is never stored in the config; provide it via env var.
@@ -213,6 +224,13 @@ enum Command {
         /// Default is false (archival mode - full history is retained).
         #[arg(long)]
         prune: bool,
+
+        /// Keep the rich-list index: every unspent coin's address and value, for
+        /// the explorer's circulating supply and top-100 holders and the /supply
+        /// and /richlist endpoints. Built from genesis in the background on first
+        /// start; needs an archival (unpruned) node.
+        #[arg(long)]
+        rich_list: bool,
 
         /// Optional wallet to auto-register Pruning Licenses from at startup.
         /// Registers both held licenses (pruning exemption) and issued licenses (audit obligations as Issuer).
@@ -1006,7 +1024,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Node { data_dir, port, rpc_port, rpc_bind, peer, mine, threads,
-                verify_threads, listen, config, prune, license_wallet, backend } => {
+                verify_threads, listen, config, prune, rich_list, license_wallet, backend } => {
                     midstate::core::gpu_mining::set_backend(match backend.to_ascii_lowercase().as_str() {
                         "gpu"  => midstate::core::gpu_mining::Backend::Gpu,
                         "cpu"  => midstate::core::gpu_mining::Backend::Cpu,
@@ -1017,7 +1035,7 @@ async fn main() -> Result<()> {
                         }
                     });
                     run_node(data_dir, port, rpc_port, rpc_bind, peer, mine, threads,
-                             verify_threads, listen, config, prune, license_wallet).await
+                             verify_threads, listen, config, prune, rich_list, license_wallet).await
                 }
         Command::Wallet { action } => handle_wallet(action).await,
         Command::Commit { rpc_port, rpc_host, coin, dest } => {
@@ -5358,6 +5376,7 @@ pub async fn run_node(
     listen: Option<String>, 
     config_path: Option<PathBuf>,
     prune: bool,
+    rich_list: bool,
     license_wallet_cli: Option<PathBuf>,
 ) -> Result<()> {
 
@@ -5451,6 +5470,13 @@ pub async fn run_node(
     }
 
     node.set_experimental(config.experimental);
+
+    // Optional, so a failure here is reported and the node runs without it.
+    if rich_list || config.rich_list {
+        if let Err(e) = node.enable_rich_list() {
+            tracing::warn!("Rich-list index could not be enabled: {}", e);
+        }
+    }
 
     // --- Pruning License wallet auto-registration (startup wiring) ---
     // If a license wallet is configured, register:

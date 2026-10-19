@@ -19,6 +19,7 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
             <a class="tab-link active" onclick="switchTab('explorer')">BATCHES</a>
             <a class="tab-link" onclick="switchTab('mempool')">MEMPOOL</a>
             <a class="tab-link" onclick="switchTab('analytics')">ANALYTICS</a>
+            <a class="tab-link" onclick="switchTab('supply')">SUPPLY</a>
         </div>
     </div>
     <div class="hdr-center">
@@ -41,6 +42,7 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
         <div class="sidebar-section">
             <div class="title">Chain State</div>
             <div class="metric"><span class="k">utxo set</span><span class="v" id="s-coins">-</span></div>
+            <div class="metric"><span class="k">circulating</span><a class="v" id="s-supply" onclick="switchTab('supply')">-</a></div>
             <div class="metric"><span class="k">commitments</span><span class="v" id="s-commits">-</span></div>
             <div class="metric"><span class="k">safe depth</span><span class="v" id="s-safe">-</span></div>
             <div class="metric"><span class="k">peers</span><span class="v" id="s-peers">-</span></div>
@@ -84,7 +86,7 @@ let lastState = null;
 const mpExpanded = new Set();
 // One-shot flag: scroll the mempool view to the search match on next render.
 let mpScrollPending = false;
-// What the main panel currently shows: 'welcome' | 'mempool' | 'block' | 'analytics'.
+// What the main panel currently shows: 'welcome' | 'mempool' | 'block' | 'analytics' | 'address' | 'supply'.
 // Guards the mempool renderer's skip-identical logic against stale snapshots.
 let mainViewContent = 'welcome';
 let lastMempoolHtml = '';
@@ -926,6 +928,11 @@ async function loadAddress(addr) {
 
     setActiveTab('explorer');
 
+    // From here on use the raw 64-char form: /scan only parses that, so a
+    // checksummed (72-char) address used to come back with no coins. Show and
+    // copy the checksummed form, as wallets do.
+    const shown = addr.length === 72 ? addr.toLowerCase() : canonical;
+    addr = canonical;
     activeAddress = addr;
     activeBatch = null;
     renderBatchList(); // clear active highlight
@@ -933,6 +940,14 @@ async function loadAddress(addr) {
     mv.innerHTML = `<div style="padding:40px 20px; text-align:center; color:var(--text-faint);">Scanning address…</div>`;
 
     try {
+        // 0. Full-history balance from the rich-list index, when this node keeps
+        //    one. Instant, and not limited to the scan window below.
+        let indexed = null;
+        try {
+            const r = await fetch(`/richlist/${addr}`);
+            if (r.ok) indexed = await r.json();
+        } catch (e) { /* no index: the scan below is all we have */ }
+
         // 1. Use search to find recent activity (blocks where address appears)
         const searchRes = await searchWithPow(addr);
         const searchData = searchRes.ok ? await searchRes.json() : { results: [] };
@@ -979,14 +994,26 @@ async function loadAddress(addr) {
 
         let html = `
             <div class="block-hdr">
-                <h2>ADDRESS <span style="font-family:monospace; font-size:13px;">${shortHex(addr)}</span></h2>
+                <h2>ADDRESS <span style="font-family:monospace; font-size:13px;">${shortHex(indexed ? indexed.address : shown)}</span></h2>
                 <div class="block-nav">
-                    <a onclick="copyToClipboard('${addr}', this)">Copy Full</a>
+                    <a onclick="copyToClipboard('${indexed ? indexed.address : shown}', this)">Copy Full</a>
                 </div>
             </div>
 
             <div class="address-view">
                 <div class="meta-grid" style="margin-bottom:16px;">
+                    ${indexed ? `
+                    <div class="field">
+                        <div class="lbl">BALANCE · ALL HISTORY</div>
+                        <div class="balance">${fmtGShort(indexed.balance)} <span style="font-size:14px; color:var(--text-muted);">gMDS</span></div>
+                        <div class="hex" style="color:var(--text-muted);">${fmtInt(indexed.balance)} MDS</div>
+                    </div>
+                    <div class="field">
+                        <div class="lbl">LIVE COINS · RANK</div>
+                        <div class="hex" style="font-size:20px; color:var(--text-max);">${fmtInt(indexed.coins)}
+                            <span style="font-size:12px; color:var(--text-muted);">${indexed.rank ? '#' + fmtInt(indexed.rank) + ' · ' + fmtShare(indexed.share) + ' of supply' : (indexed.note ? 'burned' : 'unranked')}</span></div>
+                        ${indexed.note ? `<div class="hex" style="color:var(--text-muted);">${escHtml(indexed.note)}</div>` : ''}
+                    </div>` : `
                     <div class="field">
                         <div class="lbl">LIVE BALANCE</div>
                         <div class="balance">${liveBalance.toLocaleString()} <span style="font-size:14px; color:var(--text-muted);">units</span></div>
@@ -994,7 +1021,7 @@ async function loadAddress(addr) {
                     <div class="field">
                         <div class="lbl">LIVE COINS</div>
                         <div class="hex" style="font-size:20px; color:var(--text-max);">${utxos.length}</div>
-                    </div>
+                    </div>`}
                     <div class="field">
                         <div class="lbl">FIRST SEEN</div>
                         <div class="hex">${firstSeen ? 'Block ' + firstSeen : '—'}</div>
@@ -1006,7 +1033,7 @@ async function loadAddress(addr) {
                 </div>
 
                 <div class="section">
-                    <div class="section-title">LIVE UTXOs (${utxos.length}) — click coin_id to verify</div>
+                    <div class="section-title">LIVE UTXOs${indexed ? ' FROM THE LAST 5000 BLOCKS' : ''} (${utxos.length}) — click coin_id to verify</div>
                     ${utxos.length === 0 ? 
                         `<div style="color:var(--text-faint); padding:12px 0;">No live coins found in last 5000 blocks.</div>` :
                         `<table class="utxo-table">
@@ -1199,6 +1226,10 @@ async function poll() {
 
         renderBatchList();
         if (currentTab === 'mempool') renderMempoolView();
+        if (supplyDue()) {
+            const onTab = currentTab === 'supply';
+            loadSupply(onTab).then(() => { if (onTab && currentTab === 'supply') paintSupplyView(); });
+        }
     } catch(e) {
         document.getElementById('live-dot').style.background = 'var(--red)';
     }
@@ -1236,6 +1267,8 @@ async function execCmd(cmd) {
 
     if (cmd.toLowerCase() === 'mempool') {
         switchTab('mempool');
+    } else if (/^(supply|rich ?list|holders)$/i.test(cmd)) {
+        switchTab('supply');
     } else if (/^[0-9]+$/.test(cmd)) {
         switchTab('explorer');
         await loadBlock(parseInt(cmd));
@@ -1276,7 +1309,7 @@ async function execCmd(cmd) {
             log('Usage: decompile <bytecode-hex>', 'var(--red)');
         }
     } else {
-        log('Enter height, hash, address, "mempool", or "decompile <hex>"', 'var(--red)');
+        log('Enter height, hash, address, "mempool", "supply", or "decompile <hex>"', 'var(--red)');
     }
 }
 
@@ -1408,6 +1441,8 @@ function switchTab(tab) {
         renderMempoolView();
     } else if (tab === 'analytics') {
         renderAnalyticsView();
+    } else if (tab === 'supply') {
+        showSupplyView();
     } else {
         if (activeBatch !== null) loadBlock(activeBatch);
         else {
@@ -1703,6 +1738,194 @@ async function renderAnalyticsView() {
 
         mv.innerHTML = html;
     } catch(e) { mv.innerHTML = `<div style="color:var(--red);padding:20px;">Error: ${e.message}</div>`; }
+}
+
+// ── Supply & rich list ──────────────────────────────────────────────────
+// Figures come from the node's rich-list index (--rich-list), via /supply and
+// /richlist. Amounts are base MDS; 1 gMDS = 2^30 MDS. Every amount the chain
+// can hold is below 2^53, so plain Numbers are exact.
+const MDS_PER_GMDS = 1073741824;
+let lastSupply = null;
+let lastRichList = null;
+let supplyFetched = { tip: -1, at: 0 };
+let lastSupplyHtml = '';
+
+function fmtInt(n) { return Number(n).toLocaleString('en'); }
+
+// gMDS with a fixed number of decimals (tables line up).
+function fmtG(n, dp = 2) {
+    return (Number(n) / MDS_PER_GMDS).toLocaleString('en', { minimumFractionDigits: dp, maximumFractionDigits: dp });
+}
+
+// gMDS with only the decimals it needs: 1, 0.5, 0.0001.
+function fmtGShort(n) {
+    return (Number(n) / MDS_PER_GMDS).toLocaleString('en', { maximumFractionDigits: 6 });
+}
+
+function fmtShare(f) {
+    const p = f * 100;
+    if (p === 0) return '0%';
+    if (p < 0.01) return '<0.01%';
+    return (p >= 10 ? p.toFixed(1) : p.toFixed(2)) + '%';
+}
+
+function fmtDuration(blocks) {
+    const days = blocks * 60 / 86400;
+    if (days >= 2) return `~${Math.round(days).toLocaleString('en')} days`;
+    const hours = blocks / 60;
+    return hours >= 2 ? `~${Math.round(hours)} hours` : `~${blocks} min`;
+}
+
+// Is it time to refetch? On every new block, and every 10s while the index builds.
+function supplyDue() {
+    const s = lastSupply;
+    const building = s && (s.index.status === 'building' || s.index.status === 'rebuilding');
+    return supplyFetched.tip !== tipHeight || (building && Date.now() - supplyFetched.at > 10000);
+}
+
+async function loadSupply(withRichList) {
+    supplyFetched = { tip: tipHeight, at: Date.now() };
+    try {
+        const r = await fetch('/supply');
+        if (r.ok) lastSupply = await r.json();
+    } catch (e) { /* keep the last figures */ }
+    if (withRichList && lastSupply && lastSupply.index.status === 'ready') {
+        try {
+            const r = await fetch('/richlist?limit=100');
+            lastRichList = r.ok ? await r.json() : null;
+        } catch (e) { /* keep the last list */ }
+    }
+    renderSupplyMetric();
+}
+
+function renderSupplyMetric() {
+    const el = document.getElementById('s-supply');
+    const s = lastSupply;
+    if (!el || !s) return;
+    if (s.circulating_supply != null) {
+        el.textContent = fmtG(s.circulating_supply, 0) + ' gMDS';
+        el.title = `${fmtInt(s.circulating_supply)} MDS at block ${fmtInt(s.height)}`;
+    } else {
+        el.textContent = s.index.status === 'disabled' ? 'index off' : s.index.status;
+        el.title = s.index.detail || '';
+    }
+}
+
+async function showSupplyView() {
+    mainViewContent = 'supply';
+    lastSupplyHtml = '';
+    if (lastSupply) paintSupplyView();
+    else document.getElementById('main-view').innerHTML =
+        `<div style="padding:20px; color:var(--text-faint);">Loading supply…</div>`;
+    await loadSupply(true);
+    if (currentTab === 'supply') paintSupplyView();
+}
+
+function paintSupplyView() {
+    const s = lastSupply;
+    if (!s || currentTab !== 'supply') return;
+    const mv = document.getElementById('main-view');
+    const ix = s.index;
+    const ready = ix.status === 'ready';
+    const origin = window.location.origin;
+    const circ = s.circulating_supply;
+
+    let html = `<div class="block-hdr"><h2>SUPPLY</h2>
+        <span class="supply-asof">block ${fmtInt(s.height)} · index ${escHtml(ix.status)}</span></div>`;
+
+    const box = (lbl, val, sub) =>
+        `<div class="stat-box"><div class="lbl">${lbl}</div><div class="val">${val}</div><div class="sub">${sub}</div></div>`;
+    html += `<div class="stat-grid">`;
+    html += circ != null
+        ? box('Circulating', fmtG(circ), `gMDS · ${fmtInt(circ)} MDS`)
+        : box('Circulating', '—', ix.status === 'disabled' ? 'needs the rich-list index' : `index ${escHtml(ix.status)}`);
+    html += box('Max supply', fmtG(s.max_supply, 0), `gMDS · ${fmtInt(s.max_supply)} MDS`);
+    html += box('Issued', fmtG(s.issued), `gMDS · ${(s.issued / s.max_supply * 100).toFixed(2)}% of max`);
+    html += s.burned != null
+        ? box('Burned', fmtG(s.burned), `gMDS · genesis ${fmtGShort(s.burned_genesis)} + data burns ${fmtGShort(s.burned_data)}`)
+        : box('Burned', fmtG(s.burned_genesis), 'gMDS genesis · data burns need the index');
+    html += `</div>`;
+
+    const pct = Math.min(100, s.issued / s.max_supply * 100);
+    html += `<div class="supply-bar" title="${pct.toFixed(2)}% of the scheduled supply issued"><div style="width:${pct.toFixed(3)}%"></div></div>`;
+
+    const facts = [['Block reward', `${fmtGShort(s.block_reward)} gMDS`]];
+    if (s.next_halving_height != null) {
+        const left = s.next_halving_height - (s.height + 1);
+        facts.push(['Next halving', `block ${fmtInt(s.next_halving_height)} · in ${fmtInt(left)} blocks (${fmtDuration(left)})`]);
+    }
+    facts.push(['Tail emission', `${s.tail_emission.per_block} MDS per block from block ${fmtInt(s.tail_emission.from_height)}`]);
+    if (s.unspent_coins != null) facts.push(['Unspent coins', fmtInt(s.unspent_coins)]);
+    if (s.holders != null) facts.push(['Holders', fmtInt(s.holders)]);
+    if (s.verified != null) facts.push(['Supply check', s.verified
+        ? '✓ unspent coins add up to issued − burned'
+        : '✗ unspent coins do not add up to issued − burned']);
+    html += `<div class="meta-grid">` + facts.map(([k, v]) =>
+        `<div class="field"><div class="lbl">${k}</div><div class="hex supply-fact">${v}</div></div>`).join('') + `</div>`;
+
+    if (!ready) {
+        let note;
+        if (ix.status === 'disabled') {
+            note = `Circulating supply and the rich list come from the rich-list index, which this node does not keep.
+                Start it with <code>--rich-list</code> (or <code>rich_list = true</code> in config.toml) on an archival node;
+                it builds from genesis in the background.`;
+        } else if (ix.status === 'building' && ix.chain_blocks > 0) {
+            const p = ix.indexed_blocks / ix.chain_blocks * 100;
+            note = `Building the rich-list index: block ${fmtInt(ix.indexed_blocks)} of ${fmtInt(ix.chain_blocks)} (${p.toFixed(1)}%).
+                Circulating supply and the top 100 appear when it finishes.`;
+        } else {
+            note = escHtml(ix.detail || `The rich-list index is ${ix.status}.`);
+        }
+        html += `<div class="supply-note">${note}</div>`;
+    }
+
+    const rl = ready ? lastRichList : null;
+    if (rl) {
+        html += `<div class="supply-title">Top ${rl.entries.length} holders
+            <span class="dim">· ${fmtInt(rl.holders)} holders · top 10 hold ${fmtShare(rl.top_10_share)} · top 100 hold ${fmtShare(rl.top_100_share)}</span></div>`;
+        html += `<table class="rich-table"><thead><tr>
+            <th>#</th><th>Address</th><th class="num">gMDS</th><th class="num wide">MDS</th><th class="num">Share</th><th class="num wide">Coins</th>
+            </tr></thead><tbody>`;
+        for (const e of rl.entries) {
+            const a = escHtml(e.address);
+            html += `<tr>
+                <td class="rank">${e.rank}</td>
+                <td><a onclick="loadAddress('${a}')" title="${a}"><span class="addr-long">${a.substring(0, 20)}…${a.substring(60)}</span><span class="addr-short">${a.substring(0, 8)}…${a.substring(66)}</span></a></td>
+                <td class="num">${fmtG(e.balance)}</td>
+                <td class="num wide">${fmtInt(e.balance)}</td>
+                <td class="num">${fmtShare(e.share)}</td>
+                <td class="num wide">${fmtInt(e.coins)}</td>
+            </tr>`;
+        }
+        html += `</tbody></table>`;
+        if (rl.excluded.length) {
+            const g = rl.excluded.reduce((t, x) => t + x.balance, 0);
+            html += `<div class="supply-dim-note">Not listed: ${rl.excluded.length} genesis outputs (${fmtGShort(g)} gMDS) paid to the
+                genesis inscription. No key can spend them, so supply counts them as burned.</div>`;
+        }
+    }
+
+    const ep = (label, path, value) => `<div class="api-row">
+        <span class="api-k">${label}</span><code>${escHtml(origin + path)}</code>
+        ${value != null ? `<span class="api-v">${value}</span>` : ''}
+        <button class="btn" onclick="copyToClipboard('${escHtml(origin + path)}', this)">Copy</button></div>`;
+    html += `<div class="supply-title">For listing sites</div><div class="api-box">`;
+    html += ep('Circulating supply', '/supply/circulating', circ != null ? circ : 'not ready');
+    html += ep('Total supply', '/supply/total', s.total_supply != null ? s.total_supply : 'not ready');
+    html += ep('Max supply', '/supply/max', s.max_supply);
+    html += ep('All figures (JSON)', '/supply', null);
+    html += ep('Rich list (JSON)', '/richlist?limit=100', null);
+    html += ep('Rich list page', '/?richlist', null);
+    html += `<div class="api-note">The three supply URLs answer with a bare number, in MDS: the unit MDS trades in
+        (1 gMDS = 2<sup>30</sup> MDS). There is no premine, treasury or team allocation, so circulating supply equals total
+        supply: everything issued, minus the burned genesis reward and value destroyed by data burns. Max supply is the
+        halving schedule's total; a tail of 1 MDS per block follows it.</div></div>`;
+
+    if (html === lastSupplyHtml) return;
+    lastSupplyHtml = html;
+    const top = mv.scrollTop;
+    mv.innerHTML = html;
+    mv.scrollTop = top;
 }
 
 async function loadBlock(h) {

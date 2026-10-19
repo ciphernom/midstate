@@ -1726,6 +1726,42 @@ pub async fn new(
         )
     }
 
+    /// Keep the rich-list index: every unspent coin's address and value, so the
+    /// explorer and `/supply`, `/richlist` can report address balances and a
+    /// circulating supply checked against the emission schedule. Off by default
+    /// (`--rich-list` / `rich_list` in config.toml): it costs disk and a one-time
+    /// pass over all history, which runs in the background.
+    ///
+    /// Call after `new()` and before `run()`, so the index sees every block the
+    /// node stores from here on.
+    pub fn enable_rich_list(&mut self) -> Result<()> {
+        use crate::storage::balance_index::Enabled;
+        let blocks = self.state.height;
+        match self.storage.enable_balance_index(blocks)? {
+            Enabled::Fresh => tracing::info!(
+                "Rich-list index: building from genesis in the background ({} blocks)",
+                blocks
+            ),
+            Enabled::Resumed { next } if next >= blocks => {
+                tracing::info!("Rich-list index: current at block {}", blocks.saturating_sub(1))
+            }
+            Enabled::Resumed { next } => {
+                tracing::info!("Rich-list index: resuming at block {} of {}", next, blocks)
+            }
+            Enabled::Rebuild { reason } => {
+                tracing::warn!("Rich-list index: rebuilding from genesis ({})", reason)
+            }
+        }
+        if self.prune {
+            tracing::warn!(
+                "Rich-list index on a pruned node: it needs every block from genesis, so it can only \
+                 be built if they are all still stored, and a deep reorg will force a rebuild it \
+                 cannot complete. Run the explorer on an archival node."
+            );
+        }
+        Ok(())
+    }
+
     /// Enables experimental subsystems (CoinJoin dark pool, DEX limit-order
     /// covenants). Off by default; see `experimental` in config.toml.
     pub fn set_experimental(&mut self, enabled: bool) {

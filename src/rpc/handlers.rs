@@ -2,6 +2,7 @@ use super::types::*;
 use crate::core::{compute_coin_id, compute_address, wots,
                   block_reward, Transaction, InputReveal, OutputData, Predicate, Witness};
 use crate::node::NodeHandle;
+use crate::storage::balance_index;
 use blake3;
 use axum::{
     extract::{ConnectInfo, State},
@@ -1776,4 +1777,276 @@ pub async fn get_headers(
 ) -> Result<Json<serde_json::Value>, ErrorResponse> {
     let headers = node.load_headers(start, count).await.map_err(|e| ErrorResponse { error: e.to_string() })?;
     Ok(Json(serde_json::json!({ "start": start, "headers": headers })))
+}
+
+// ── Supply and rich list ────────────────────────────────────────────────
+//
+// Served from the rich-list index (storage::balance_index), which a node keeps
+// only when started with --rich-list. `/supply/circulating`, `/supply/total`
+// and `/supply/max` answer with a bare number for listing sites (CoinGecko,
+// CoinMarketCap, LiveCoinWatch); a bare number is also valid JSON.
+
+/// How far down the ranking `/richlist/:address` will count to find a rank.
+const RANK_SCAN_CAP: usize = 10_000;
+
+/// The genesis coinbase: two outputs paid to plaintext "addresses" (the
+/// genesis inscription) that no key can ever spend. They stay in the coin set
+/// forever, so supply counts them as burned and the rich list leaves them out.
+fn genesis_outputs() -> &'static [([u8; 32], u64)] {
+    static OUTPUTS: std::sync::OnceLock<Vec<([u8; 32], u64)>> = std::sync::OnceLock::new();
+    OUTPUTS.get_or_init(|| {
+        crate::core::State::genesis().1.iter().map(|o| (o.address, o.value)).collect()
+    })
+}
+
+fn is_genesis_address(address: &[u8; 32]) -> bool {
+    genesis_outputs().iter().any(|(a, _)| a == address)
+}
+
+fn genesis_burn() -> u64 {
+    genesis_outputs().iter().map(|(_, v)| v).sum()
+}
+
+/// Distinct genesis addresses — they count as holders inside the index.
+fn genesis_holders() -> u64 {
+    let mut seen: Vec<&[u8; 32]> = Vec::new();
+    for (a, _) in genesis_outputs() {
+        if !seen.contains(&a) {
+            seen.push(a);
+        }
+    }
+    seen.len() as u64
+}
+
+fn index_status(node: &NodeHandle, meta: Option<&balance_index::Meta>) -> BalanceIndexStatus {
+    let (indexed, chain) = meta.map(|m| (m.next, m.chain_len)).unwrap_or((0, 0));
+    let status = |status: &str, detail: Option<String>| BalanceIndexStatus {
+        status: status.into(),
+        indexed_blocks: indexed,
+        chain_blocks: chain,
+        detail,
+    };
+    if !node.storage.balance_index().is_enabled() {
+        return status(
+            "disabled",
+            Some("This node does not keep the rich-list index. Start it with --rich-list \
+                  (or set rich_list = true in config.toml)."
+                .into()),
+        );
+    }
+    match meta {
+        None => status("building", Some("The index is starting.".into())),
+        Some(m) if m.missing > 0 => status(
+            "unavailable",
+            Some(format!(
+                "Block {} is not stored on this node (pruned history?). The index needs every \
+                 block from genesis, so it needs an archival node.",
+                m.missing - 1
+            )),
+        ),
+        Some(m) if m.stale => status("rebuilding", Some("The index is being rebuilt from genesis.".into())),
+        Some(m) if m.is_current() => status("ready", None),
+        Some(m) => status(
+            "building",
+            Some(format!("Indexing block {} of {}.", m.next, m.chain_len)),
+        ),
+    }
+}
+
+fn next_halving_height(blocks: u64) -> Option<u64> {
+    let era = blocks / crate::core::BLOCKS_PER_YEAR;
+    (era < 30).then(|| (era + 1) * crate::core::BLOCKS_PER_YEAR)
+}
+
+/// Supply figures. With the index current they describe exactly the blocks it
+/// holds (one read transaction); otherwise only the schedule-derived figures
+/// are filled in, for the node's own chain height.
+async fn supply_report(node: &NodeHandle) -> SupplyResponse {
+    let meta = balance_index::meta(node.storage.db()).ok().flatten();
+    let index = index_status(node, meta.as_ref());
+    let current = meta.filter(|_| index.status == "ready");
+    let blocks = match &current {
+        Some(m) => m.next,
+        None => node.get_state().await.height,
+    };
+    let issued = crate::core::cumulative_reward(blocks);
+    let burned_genesis = if blocks > 0 { genesis_burn() } else { 0 };
+    let burned_data = current.as_ref().map(|m| m.burned);
+    let burned = burned_data.map(|d| d.saturating_add(burned_genesis));
+    let total = burned.map(|b| issued.saturating_sub(b));
+    SupplyResponse {
+        unit: "MDS".into(),
+        height: blocks.saturating_sub(1),
+        issued,
+        burned_genesis,
+        burned_data,
+        burned,
+        total_supply: total,
+        circulating_supply: total,
+        max_supply: crate::core::SCHEDULED_SUPPLY,
+        tail_emission: TailEmission { per_block: 1, from_height: crate::core::TAIL_EMISSION_HEIGHT },
+        block_reward: block_reward(blocks),
+        next_halving_height: next_halving_height(blocks),
+        unspent_value: current.as_ref().map(|m| m.unspent_value),
+        unspent_coins: current.as_ref().map(|m| m.unspent_coins),
+        holders: current.as_ref().map(|m| m.holders.saturating_sub(genesis_holders())),
+        verified: current
+            .as_ref()
+            .map(|m| m.anomalies == 0 && m.unspent_value == issued.saturating_sub(m.burned)),
+        index,
+    }
+}
+
+fn plain_number(n: u64) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=60"),
+        ],
+        n.to_string(),
+    )
+        .into_response()
+}
+
+fn plain_unavailable(msg: String) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::RETRY_AFTER, "60")],
+        msg,
+    )
+        .into_response()
+}
+
+fn json_unavailable(index: BalanceIndexStatus) -> Response {
+    let error = index.detail.clone().unwrap_or_else(|| "The rich-list index is not ready.".into());
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "60")],
+        Json(serde_json::json!({ "error": error, "index": index })),
+    )
+        .into_response()
+}
+
+/// A figure only when it is known and the supply check passes. A number that
+/// might be wrong is worse for a listing site than no number: they keep the
+/// last good one.
+async fn plain_supply(node: &NodeHandle, pick: fn(&SupplyResponse) -> Option<u64>) -> Response {
+    let report = supply_report(node).await;
+    match (pick(&report), report.verified) {
+        (Some(n), Some(true)) => plain_number(n),
+        (Some(_), _) => plain_unavailable(
+            "Supply check failed: the unspent coins do not add up to issuance minus burns.".into(),
+        ),
+        (None, _) => plain_unavailable(
+            report.index.detail.unwrap_or_else(|| "The rich-list index is not ready.".into()),
+        ),
+    }
+}
+
+/// `GET /supply` — all supply figures as JSON. Always answers; fields that need
+/// the index are `null` until it is current.
+pub async fn get_supply(State(node): State<AppState>) -> Json<SupplyResponse> {
+    Json(supply_report(&node).await)
+}
+
+/// `GET /supply/circulating` — circulating supply in MDS, as a bare number.
+pub async fn get_supply_circulating(State(node): State<AppState>) -> Response {
+    plain_supply(&node, |r| r.circulating_supply).await
+}
+
+/// `GET /supply/total` — total supply (issued minus burned) in MDS, as a bare number.
+pub async fn get_supply_total(State(node): State<AppState>) -> Response {
+    plain_supply(&node, |r| r.total_supply).await
+}
+
+/// `GET /supply/max` — the halving schedule's total in MDS, as a bare number.
+pub async fn get_supply_max() -> Response {
+    plain_number(crate::core::SCHEDULED_SUPPLY)
+}
+
+/// `GET /richlist?limit=N` — the N largest holders (default 100, at most 1000).
+pub async fn get_richlist(
+    State(node): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<RichListQuery>,
+) -> Response {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    // Read at least 100 so the top-100 share is always over 100 holders.
+    let snap = match balance_index::snapshot(node.storage.db(), limit.max(100), is_genesis_address) {
+        Ok(s) => s,
+        Err(e) => return ErrorResponse { error: e.to_string() }.into_response(),
+    };
+    let index = index_status(&node, snap.as_ref().map(|s| &s.meta));
+    let Some(snap) = snap.filter(|_| index.status == "ready") else {
+        return json_unavailable(index);
+    };
+    let m = &snap.meta;
+    let issued = crate::core::cumulative_reward(m.next);
+    let circulating = issued.saturating_sub(genesis_burn()).saturating_sub(m.burned);
+    let share = |balance: u64| if circulating == 0 { 0.0 } else { balance as f64 / circulating as f64 };
+    let held_by = |n: usize| share(snap.top.iter().take(n).map(|h| h.balance).sum());
+    let entries = snap
+        .top
+        .iter()
+        .take(limit)
+        .enumerate()
+        .map(|(i, h)| RichListEntry {
+            rank: i as u64 + 1,
+            address: crate::core::types::encode_address_with_checksum(&h.address),
+            balance: h.balance,
+            coins: h.coins,
+            share: share(h.balance),
+        })
+        .collect();
+    let excluded = genesis_outputs()
+        .iter()
+        .map(|(a, v)| RichListExcluded {
+            address: crate::core::types::encode_address_with_checksum(a),
+            balance: *v,
+            reason: "genesis inscription: no key can spend it, counted as burned".into(),
+        })
+        .collect();
+    Json(RichListResponse {
+        unit: "MDS".into(),
+        height: m.next.saturating_sub(1),
+        circulating_supply: circulating,
+        holders: m.holders.saturating_sub(genesis_holders()),
+        top_10_share: held_by(10),
+        top_100_share: held_by(100),
+        entries,
+        excluded,
+    })
+    .into_response()
+}
+
+/// `GET /richlist/:address` — one address's balance and rank, from the index.
+/// Takes the 72-character checksummed form or the raw 64.
+pub async fn get_richlist_address(
+    State(node): State<AppState>,
+    axum::extract::Path(address): axum::extract::Path<String>,
+) -> Response {
+    let addr = match crate::core::types::parse_address_flexible(address.trim()) {
+        Ok(a) => a,
+        Err(e) => return ErrorResponse { error: e }.into_response(),
+    };
+    let found = match balance_index::holder(node.storage.db(), &addr, RANK_SCAN_CAP, is_genesis_address) {
+        Ok(f) => f,
+        Err(e) => return ErrorResponse { error: e.to_string() }.into_response(),
+    };
+    let index = index_status(&node, found.as_ref().map(|(_, _, m)| m));
+    let Some((h, rank, m)) = found.filter(|_| index.status == "ready") else {
+        return json_unavailable(index);
+    };
+    let issued = crate::core::cumulative_reward(m.next);
+    let circulating = issued.saturating_sub(genesis_burn()).saturating_sub(m.burned);
+    let genesis = is_genesis_address(&addr);
+    Json(AddressBalanceResponse {
+        address: crate::core::types::encode_address_with_checksum(&addr),
+        height: m.next.saturating_sub(1),
+        balance: h.balance,
+        coins: h.coins,
+        rank,
+        share: if circulating == 0 || genesis { 0.0 } else { h.balance as f64 / circulating as f64 },
+        note: genesis.then(|| "Genesis inscription: no key can spend these coins; supply counts them as burned.".into()),
+    })
+    .into_response()
 }

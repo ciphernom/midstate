@@ -583,3 +583,119 @@ pub struct BlockStat {
 pub struct ChainStatsResponse {
     pub blocks: Vec<BlockStat>,
 }
+
+// ── Supply and rich list ────────────────────────────────────────────────
+
+/// Where the rich-list index behind `/supply` and `/richlist` stands.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalanceIndexStatus {
+    /// "ready", "building", "rebuilding", "unavailable" or "disabled".
+    pub status: String,
+    /// Blocks indexed so far.
+    pub indexed_blocks: u64,
+    /// Blocks in the chain the index is following.
+    pub chain_blocks: u64,
+    /// What is wrong, or what to do, when the index is not ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Issuance after the halvings end.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TailEmission {
+    pub per_block: u64,
+    pub from_height: u64,
+}
+
+/// `GET /supply`. Every amount is in base MDS units (1 gMDS = 2^30 MDS).
+///
+/// The `Option` fields need the rich-list index (`--rich-list`); they are
+/// `null` while it is off or still building, and `index` says why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupplyResponse {
+    pub unit: String,
+    /// Highest block these figures include.
+    pub height: u64,
+    /// Block rewards of every block from genesis to `height`.
+    pub issued: u64,
+    /// The genesis reward, paid to plaintext "addresses" no key can spend.
+    pub burned_genesis: u64,
+    /// Value destroyed by DataBurn outputs.
+    pub burned_data: Option<u64>,
+    /// `burned_genesis + burned_data`.
+    pub burned: Option<u64>,
+    /// `issued − burned`.
+    pub total_supply: Option<u64>,
+    /// Equal to `total_supply`: no premine, treasury or team allocation exists to
+    /// hold back.
+    pub circulating_supply: Option<u64>,
+    /// Everything the halving schedule issues before the tail emission begins.
+    pub max_supply: u64,
+    pub tail_emission: TailEmission,
+    /// Reward for the next block.
+    pub block_reward: u64,
+    /// First block of the next halving era, if any are left.
+    pub next_halving_height: Option<u64>,
+    /// Sum of every unspent coin, the genesis outputs included.
+    pub unspent_value: Option<u64>,
+    pub unspent_coins: Option<u64>,
+    /// Addresses holding coins (genesis outputs excluded).
+    pub holders: Option<u64>,
+    /// `unspent_value == issued − burned_data`: the coins on chain add up to the
+    /// emission schedule minus burns, with nothing unaccounted for.
+    pub verified: Option<bool>,
+    pub index: BalanceIndexStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RichListEntry {
+    pub rank: u64,
+    /// Checksummed (72 hex characters), as wallets display it.
+    pub address: String,
+    pub balance: u64,
+    pub coins: u64,
+    /// Fraction of the circulating supply.
+    pub share: f64,
+}
+
+/// Coins the rich list leaves out, and why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RichListExcluded {
+    pub address: String,
+    pub balance: u64,
+    pub reason: String,
+}
+
+/// `GET /richlist?limit=N`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RichListResponse {
+    pub unit: String,
+    pub height: u64,
+    pub circulating_supply: u64,
+    pub holders: u64,
+    /// Fractions of the circulating supply held by the largest 10 and 100.
+    pub top_10_share: f64,
+    pub top_100_share: f64,
+    pub entries: Vec<RichListEntry>,
+    pub excluded: Vec<RichListExcluded>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RichListQuery {
+    pub limit: Option<usize>,
+}
+
+/// `GET /richlist/:address`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddressBalanceResponse {
+    pub address: String,
+    pub height: u64,
+    pub balance: u64,
+    pub coins: u64,
+    /// Position among holders; `null` if it holds nothing or is beyond the
+    /// first 10,000.
+    pub rank: Option<u64>,
+    pub share: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}

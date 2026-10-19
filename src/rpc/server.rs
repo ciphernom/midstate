@@ -214,6 +214,14 @@ impl RpcServer {
             .route("/utxo_proof/:coin_id", get(get_utxo_proof))
             .route("/headers/:start/:count", get(get_headers))
             .route("/stats/history", get(get_chain_stats))
+            // Circulating supply and the rich list, for the explorer and for
+            // listing sites. Need --rich-list (except /supply/max).
+            .route("/supply", get(get_supply))
+            .route("/supply/circulating", get(get_supply_circulating))
+            .route("/supply/total", get(get_supply_total))
+            .route("/supply/max", get(get_supply_max))
+            .route("/richlist", get(get_richlist))
+            .route("/richlist/:address", get(get_richlist_address))
             .route("/commit", post(commit_transaction))
             .route("/send", post(send_transaction))
             .route("/check", post(check_coin))

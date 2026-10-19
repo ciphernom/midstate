@@ -1011,6 +1011,46 @@ pub fn block_reward(height: u64) -> u64 {
     INITIAL_REWARD >> halvings.min(30)
 }
 
+/// First height paid the floor reward of 1 unit. The halvings end here, and
+/// issuance continues as a tail of 1 unit per block, forever.
+pub const TAIL_EMISSION_HEIGHT: u64 = 30 * BLOCKS_PER_YEAR;
+
+/// Everything the halving schedule issues before the tail begins, genesis
+/// included: 525,600 × (2^31 − 2) = 1,128,717,404,337,600 units, about
+/// 1,051,200 gMDS. This is the figure listing sites ask for as "max supply";
+/// strictly the tail makes supply unbounded, by 525,600 units a year.
+pub const SCHEDULED_SUPPLY: u64 = cumulative_reward(TAIL_EMISSION_HEIGHT);
+
+/// Sum of the block rewards of heights `0..blocks`: everything issued by a
+/// chain of `blocks` blocks, the (burned) genesis reward included. Fees are not
+/// issuance — they move existing value to the miner — so this is the chain's
+/// gross supply before burns.
+///
+/// Closed form, one step per halving era rather than one per block: the reward
+/// is constant within an era, and from era 30 on it sits at the floor of 1.
+///
+/// ```text
+/// Pre:  true
+/// Post: result = Σ_{h=0}^{blocks-1} block_reward(h), saturating at u64::MAX
+/// ```
+pub const fn cumulative_reward(blocks: u64) -> u64 {
+    let mut total: u64 = 0;
+    let mut era: u64 = 0;
+    loop {
+        let start = era * BLOCKS_PER_YEAR;
+        if start >= blocks {
+            return total;
+        }
+        if era >= 30 {
+            // Floor reward of 1 from here on: one unit per remaining block.
+            return total.saturating_add(blocks - start);
+        }
+        let end = if blocks < start + BLOCKS_PER_YEAR { blocks } else { start + BLOCKS_PER_YEAR };
+        total = total.saturating_add((end - start) * (INITIAL_REWARD >> era));
+        era += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1188,6 +1228,42 @@ mod tests {
             assert!(r <= prev);
             prev = r;
         }
+    }
+
+    // ── cumulative_reward / SCHEDULED_SUPPLY ────────────────────────────
+
+    #[test]
+    fn cumulative_reward_matches_summing_every_block() {
+        // Walk every height through the last halving and two years of tail,
+        // checking the closed form at era boundaries and inside eras.
+        let last = TAIL_EMISSION_HEIGHT + 2 * BLOCKS_PER_YEAR;
+        let mut sum: u64 = 0;
+        for h in 0..=last {
+            let at_boundary = h % BLOCKS_PER_YEAR <= 1 || h % BLOCKS_PER_YEAR == BLOCKS_PER_YEAR - 1;
+            if at_boundary || h % 99_991 == 0 {
+                assert_eq!(cumulative_reward(h), sum, "blocks = {h}");
+            }
+            sum += block_reward(h);
+        }
+        assert_eq!(cumulative_reward(last + 1), sum);
+    }
+
+    #[test]
+    fn scheduled_supply_is_the_halving_total() {
+        assert_eq!(BLOCKS_PER_YEAR, 525_600);
+        assert_eq!(SCHEDULED_SUPPLY, 525_600 * ((1u64 << 31) - 2));
+        assert_eq!(SCHEDULED_SUPPLY, 1_128_717_404_337_600);
+        assert_eq!(block_reward(TAIL_EMISSION_HEIGHT - 1), 2);
+        assert_eq!(block_reward(TAIL_EMISSION_HEIGHT), 1);
+        // The tail adds exactly one unit per block.
+        assert_eq!(cumulative_reward(TAIL_EMISSION_HEIGHT + 1000), SCHEDULED_SUPPLY + 1000);
+    }
+
+    #[test]
+    fn cumulative_reward_saturates_instead_of_overflowing() {
+        assert_eq!(cumulative_reward(0), 0);
+        assert_eq!(cumulative_reward(1), INITIAL_REWARD);
+        assert_eq!(cumulative_reward(u64::MAX), u64::MAX);
     }
 
     // ── OutputData / InputReveal / CoinbaseOutput coin_id ───────────────
