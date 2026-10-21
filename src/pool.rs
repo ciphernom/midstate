@@ -24,7 +24,7 @@
 
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -755,6 +755,10 @@ struct PoolState {
     pool_address: String,
     share_target: [u8; 32],
     current_tree: RwLock<ShareMerkleTree>,
+    /// The trees behind the last [`RECENT_TREES`] jobs, newest last, so a miner
+    /// auditing a job gets that job's own proof (`/api/proof?root=`) even when
+    /// a newer job has come out since.
+    recent_trees: RwLock<VecDeque<ShareMerkleTree>>,
     /// The Share Replay Cache. Tracks successfully submitted nonces for the *current* job.
     /// Wiped clean every time a new block is detected to prevent OOM.
     valid_shares: RwLock<HashSet<u64>>, 
@@ -850,6 +854,9 @@ fn target_from_leading_zero_bits(bits: u32) -> [u8; 32] {
 #[derive(Deserialize)]
 struct ProofQuery {
     address: String,
+    /// The root of the job being audited (the salt of its first fee output).
+    /// Without it, the current job's tree answers.
+    root: Option<String>,
 }
 
 // ── HTTP API for Miner Audits ───────────────────────────────────────────────
@@ -874,18 +881,43 @@ async fn get_proof(
         Err(_) => return Json(serde_json::json!({ "error": "Invalid address" })),
     };
     
-    let tree = state.current_tree.read().await;
-    let score = tree.leaves.iter().find(|(a, _)| a == &addr).map(|(_, s)| *s).unwrap_or(0);
-    
-    if let Some((idx, proof)) = tree.generate_proof(&addr) {
-        Json(serde_json::json!({
+    match proof_for(&state, &addr, query.root.as_deref()).await {
+        Ok(proof) => Json(proof),
+        Err(e) => Json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// How many jobs back a miner can ask for the proof behind (`root`).
+const RECENT_TREES: usize = 8;
+
+/// The inclusion proof for `addr` in the tree behind `root`, which must be the
+/// root of one of the last [`RECENT_TREES`] jobs; without a root (miners from
+/// before it existed), in the current job's tree.
+async fn proof_for(state: &PoolState, addr: &[u8; 32], root: Option<&str>) -> Result<serde_json::Value, String> {
+    let root = root.map(|r| r.trim().to_ascii_lowercase()).filter(|r| !r.is_empty());
+    // Cloned out, so that no lock is held while the other is taken.
+    let current = state.current_tree.read().await.clone();
+    let tree = match root {
+        Some(r) if r != hex::encode(current.root) => state
+            .recent_trees
+            .read()
+            .await
+            .iter()
+            .rev()
+            .find(|t| hex::encode(t.root) == r)
+            .cloned()
+            .ok_or_else(|| format!("Unknown precommitment root {r}: not one of the pool's last {RECENT_TREES} jobs"))?,
+        _ => current,
+    };
+    let score = tree.leaves.iter().find(|(a, _)| a == addr).map(|(_, s)| *s).unwrap_or(0);
+    match tree.generate_proof(addr) {
+        Some((idx, proof)) => Ok(serde_json::json!({
             "root": hex::encode(tree.root),
             "score": score,
-            "index": idx, 
+            "index": idx,
             "proof": proof.iter().map(hex::encode).collect::<Vec<_>>()
-        }))
-    } else {
-        Json(serde_json::json!({ "error": "Miner not found in current block precommitment" }))
+        })),
+        None => Err("Miner not found in current block precommitment".into()),
     }
 }
 
@@ -1208,6 +1240,7 @@ pub async fn run_stratum_pool(
         pool_address: clean_pool_address,
         share_target,
         current_tree: RwLock::new(ShareMerkleTree::build(vec![])),
+        recent_trees: RwLock::new(VecDeque::new()),
         valid_shares: RwLock::new(HashSet::new()),
         node_rpc_url,
         midwimble_rpc: midwimble_rpc.map(|u| {
@@ -1512,8 +1545,8 @@ pub async fn run_stratum_pool(
                     }
                 }
 
+                // Published with the job below, not here: see there.
                 let tree = ShareMerkleTree::build(shares_vec.clone());
-                *state_clone.current_tree.write().await = tree.clone();
 
                 let mut expected_total = net_state["block_reward"].as_u64().unwrap_or(0);
                 state_clone.current_block_reward.store(expected_total, std::sync::atomic::Ordering::Relaxed);
@@ -1689,6 +1722,20 @@ pub async fn run_stratum_pool(
                             *state_clone.merge_status.write().await =
                                 MergeStatus::of_job(merge_commit.as_ref(), merge_error.as_deref(), now);
                         }
+                        // The job and the tree behind its root go out together.
+                        // The tree used to be swapped in before the template was
+                        // even requested, so /api/proof served it while miners
+                        // were still on the previous job (and, when the request
+                        // failed, until the next job): their audit computed a
+                        // root the job did not claim, and they disconnected.
+                        {
+                            let mut recent = state_clone.recent_trees.write().await;
+                            recent.push_back(tree.clone());
+                            while recent.len() > RECENT_TREES {
+                                recent.pop_front();
+                            }
+                        }
+                        *state_clone.current_tree.write().await = tree.clone();
                         *state_clone.current_job.write().await = Some(job.clone());
                         let _ = state_clone.job_notifier.send(job);
                         tracing::info!("new job {}: root {}", job_counter, hex::encode(&tree.root[..8]));
@@ -2215,16 +2262,10 @@ async fn handle_pool_stream(
             let address = params.get("address").and_then(|a| a.as_str()).unwrap_or("");
             match crate::core::types::parse_address_flexible(address) {
                 Ok(addr) => {
-                    let tree = state.current_tree.read().await;
-                    let score = tree.leaves.iter().find(|(a, _)| a == &addr).map(|(_, s)| *s).unwrap_or(0);
-                    match tree.generate_proof(&addr) {
-                        Some((idx, proof)) => serde_json::json!({ "ok": true, "data": {
-                            "root": hex::encode(tree.root),
-                            "score": score,
-                            "index": idx,
-                            "proof": proof.iter().map(hex::encode).collect::<Vec<_>>()
-                        }}),
-                        None => serde_json::json!({ "ok": false, "error": "Miner not found in current block precommitment" }),
+                    let root = params.get("root").and_then(|r| r.as_str());
+                    match proof_for(&state, &addr, root).await {
+                        Ok(proof) => serde_json::json!({ "ok": true, "data": proof }),
+                        Err(e) => serde_json::json!({ "ok": false, "error": e }),
                     }
                 }
                 Err(e) => serde_json::json!({ "ok": false, "error": format!("Invalid address: {}", e) }),
@@ -3131,8 +3172,12 @@ async fn reconcile_pending_blocks(state: &Arc<PoolState>, client: &reqwest::Clie
 /// 3. **Orphan Theft Defense**: Miner scores are only wiped if the core node accepts the block.
 async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::Result<()> {
     let (read_half, mut write_half) = socket.split();
-    let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
+    // A line at a time, through `Lines`: its `next_line` keeps a half-read line
+    // between calls, so it can wait in the select! below beside the job
+    // broadcast. `read_line` could not (tokio: "not cancel safe"): a job going
+    // out while a submit was half-received threw the first half away, and the
+    // share was lost without an answer.
+    let mut lines = BufReader::new(read_half).lines();
     let mut job_rx = state.job_notifier.subscribe();
     let mut authorized_address = None;
     // Worker name from mining.authorize params[1] (stratum convention). Scopes this
@@ -3145,13 +3190,15 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
 
     loop {
         tokio::select! {
-            res = reader.read_line(&mut line) => {
-                if res? == 0 { break; } 
+            res = lines.next_line() => {
+                let Some(line) = res? else { break };
                 let req: StratumRequest = match serde_json::from_str(&line) {
                     Ok(r) => r,
-                    Err(_) => { line.clear(); continue; }
+                    Err(e) => {
+                        tracing::debug!("unreadable stratum request ({} bytes): {}", line.len(), e);
+                        continue;
+                    }
                 };
-                line.clear();
 
                 match req.method.as_str() {
                     "mining.subscribe" => {
@@ -3525,6 +3572,7 @@ mod tests {
             pool_address: hex::encode([7u8; 32]),
             share_target: [0xff; 32],
             current_tree: RwLock::new(ShareMerkleTree::build(vec![])),
+            recent_trees: RwLock::new(VecDeque::new()),
             valid_shares: RwLock::new(HashSet::new()),
             node_rpc_url: "http://127.0.0.1:9".into(),
             midwimble_rpc: rpc,
@@ -3815,5 +3863,99 @@ mod tests {
         assert!(split_with_floor(1_000, &[(miner(1), 0)]).is_none());
         let coins = split_with_floor(1_063_009_584, &[(miner(1), 7)]).unwrap();
         assert!(coins.iter().all(|(a, _)| *a == miner(1)));
+    }
+
+    fn stand_in_job(job_id: u64) -> Job {
+        Job {
+            job_id,
+            mining_hash: [3; 32],
+            share_target: [0xff; 32],
+            network_target: [0; 32],
+            batch_template: serde_json::json!({ "stand_in": true }),
+            height: 8,
+            committed_scores: Arc::new(Vec::new()),
+            midwimble: None,
+        }
+    }
+
+    /// A submit that arrives in pieces, with a job going out in between, is
+    /// still read whole and answered. With `read_line` the job's broadcast
+    /// cancelled the half-done read, its first half was thrown away, and the
+    /// share was lost without an answer.
+    #[tokio::test]
+    async fn a_submit_arriving_in_pieces_survives_a_job_going_out() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (_dir, db) = test_db();
+        let state = test_state_with(db, None, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        let serving = state.clone();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = handle_miner(socket, serving).await;
+        });
+
+        let (from_pool, mut to_pool) = tokio::net::TcpStream::connect(at).await.unwrap().into_split();
+        let mut replies = BufReader::new(from_pool).lines();
+        async fn next(
+            replies: &mut tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+        ) -> serde_json::Value {
+            let line = tokio::time::timeout(Duration::from_secs(5), replies.next_line())
+                .await
+                .expect("an answer from the pool")
+                .unwrap()
+                .expect("the connection stays open");
+            serde_json::from_str(&line).unwrap()
+        }
+        let miner = hex::encode([9u8; 32]);
+        let authorize = serde_json::json!({ "id": 1, "method": "mining.authorize", "params": [miner, "rig"] });
+        to_pool.write_all(format!("{authorize}\n").as_bytes()).await.unwrap();
+        assert_eq!(next(&mut replies).await["result"], true);
+
+        let submit = serde_json::json!({ "id": 2, "method": "mining.submit", "params": [miner, 41, 7] });
+        let submit = format!("{submit}\n");
+        let (first, rest) = submit.split_at(submit.len() / 2);
+        to_pool.write_all(first.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        state.job_notifier.send(stand_in_job(42)).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        to_pool.write_all(rest.as_bytes()).await.unwrap();
+
+        let (a, b) = (next(&mut replies).await, next(&mut replies).await);
+        assert!([&a, &b].iter().any(|m| m["method"] == "mining.notify" && m["params"][0] == 42));
+        let answer = [&a, &b].into_iter().find(|m| m["id"] == 2).expect("the submit was answered");
+        // Job 41 is not the pool's job: stale, and said so.
+        assert_eq!(answer["error"], "Stale job");
+    }
+
+    /// A miner auditing a job gets the proof from that job's own tree, even
+    /// after a newer job has gone out; without a root, the current job's.
+    #[tokio::test]
+    async fn proofs_come_from_the_tree_of_the_root_asked_for() {
+        let (_dir, db) = test_db();
+        let state = test_state_with(db, None, None);
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let old = ShareMerkleTree::build(vec![(a, 5), (b, 3)]);
+        let current = ShareMerkleTree::build(vec![(a, 9), (b, 3)]);
+        assert_ne!(old.root, current.root);
+        state.recent_trees.write().await.extend([old.clone(), current.clone()]);
+        *state.current_tree.write().await = current.clone();
+
+        let proof = proof_for(&state, &a, Some(&hex::encode(old.root))).await.unwrap();
+        assert_eq!(proof["root"], hex::encode(old.root));
+        assert_eq!(proof["score"], 5);
+        let proof = proof_for(&state, &a, Some(&hex::encode(old.root).to_uppercase())).await.unwrap();
+        assert_eq!(proof["root"], hex::encode(old.root));
+        for root in [None, Some(""), Some("  ")] {
+            let proof = proof_for(&state, &a, root).await.unwrap();
+            assert_eq!((proof["root"].clone(), proof["score"].clone()), (serde_json::json!(hex::encode(current.root)), serde_json::json!(9)));
+        }
+        let proof = proof_for(&state, &a, Some(&hex::encode(current.root))).await.unwrap();
+        assert_eq!(proof["score"], 9);
+
+        let unknown = proof_for(&state, &a, Some(&hex::encode([0xee_u8; 32]))).await.unwrap_err();
+        assert!(unknown.contains("Unknown precommitment root"), "{unknown}");
+        let absent = proof_for(&state, &[3u8; 32], None).await.unwrap_err();
+        assert!(absent.contains("not found"), "{absent}");
     }
 }

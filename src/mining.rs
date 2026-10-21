@@ -15,7 +15,7 @@ use crate::core::wots;
 use std::path::PathBuf;
 use rayon::prelude::*;
 use tokio::net::TcpStream;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -226,7 +226,16 @@ pub async fn run_stratum_client(
         tracing::info!("stratum client connecting to {} (api: {})", host, api_host);
         if let Ok(mut stream) = TcpStream::connect(&host).await {
             let (read_half, mut write_half) = stream.split();
-            let mut reader = BufReader::new(read_half);
+            // A line at a time, through `Lines`: its `next_line` keeps a
+            // half-read line between calls, so it can wait in the select!
+            // below beside the share channel. `read_line` could not: when a
+            // share was ready while a notify was half-received (a notify
+            // carries the whole block template, so it arrives in pieces), the
+            // read was cancelled and its first half thrown away (tokio: "not
+            // cancel safe"). The rest failed to parse and was skipped without
+            // a word, the miner kept grinding the job it had, and every share
+            // after the first few was a "Stale job".
+            let mut lines = BufReader::new(read_half).lines();
 
             // A pool that merge-mines midwimble reads an optional third
             // parameter: the midwimble address to pay this miner's share to.
@@ -239,7 +248,6 @@ pub async fn run_stratum_client(
             });
             let _ = write_half.write_all(format!("{}\n", auth_req).as_bytes()).await;
 
-            let mut line = String::new();
             let current_job_id = Arc::new(std::sync::RwLock::new(0u64));
             
             // Create a fresh channel for shares on each successful connection
@@ -250,23 +258,29 @@ pub async fn run_stratum_client(
 
             loop {
                 tokio::select! {
-                    res = reader.read_line(&mut line) => {
-                        if res.unwrap_or(0) == 0 { break; } 
-                        let msg: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
-                        line.clear();
+                    message = next_pool_message(&mut lines) => {
+                        let msg = match message {
+                            PoolMessage::Message(msg) => msg,
+                            PoolMessage::Unreadable(why) => {
+                                tracing::warn!("unreadable message from the pool, skipped: {}", why);
+                                continue;
+                            }
+                            PoolMessage::Closed(why) => {
+                                tracing::warn!("stratum connection closed: {}", why);
+                                break;
+                            }
+                        };
 
                         if msg["method"] == "mining.notify" {
-                            let params = msg["params"].as_array().unwrap();
-                            let job_id = params[0].as_u64().unwrap();
-                            let hash_hex = params[1].as_str().unwrap();
-                            let template_val = &params[2];
-                            if let Some(t) = params.get(3).and_then(|v| v.as_str()) {
+                            let Some((job_id, m_hash, template_val)) = parse_notify(&msg) else {
+                                tracing::warn!("malformed mining.notify from the pool, skipped: {:.200}", msg.to_string());
+                                continue;
+                            };
+                            let template_val = &template_val;
+                            if let Some(t) = msg["params"].get(3).and_then(|v| v.as_str()) {
                                 let mut bytes = [0u8; 32];
                                 if hex::decode_to_slice(t, &mut bytes).is_ok() { s_target = bytes; }
                             }
-
-                            let mut m_hash = [0u8; 32];
-                            hex::decode_to_slice(hash_hex, &mut m_hash).unwrap();
 
                             let batch: crate::core::Batch = match serde_json::from_value(template_val.clone()) {
                                 Ok(b) => b,
@@ -291,7 +305,10 @@ pub async fn run_stratum_client(
                             if let Some(pool_cb) = batch.coinbase.first() {
                                 let claimed_root = hex::encode(pool_cb.salt);
                                 
-                                if let Ok(res) = http_client.get(format!("http://{}/api/proof?address={}", api_host, payout_address)).send().await {
+                                // Ask for the proof behind this job's own root: a pool
+                                // that keeps its last few trees serves it even if a
+                                // newer job came out meanwhile (older pools ignore it).
+                                if let Ok(res) = http_client.get(format!("http://{}/api/proof?address={}&root={}", api_host, payout_address, claimed_root)).send().await {
                                     if let Ok(proof_data) = res.json::<serde_json::Value>().await {
                                         if proof_data.get("error").is_none() {
                                             
@@ -398,5 +415,105 @@ pub async fn run_stratum_client(
         }
         tracing::warn!("disconnected from stratum pool. reconnecting in 5s...");
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// What the pool sent: a message, a line that is not one (logged and skipped,
+/// where it used to vanish silently), or the end of the connection.
+enum PoolMessage {
+    Message(serde_json::Value),
+    Unreadable(String),
+    Closed(String),
+}
+
+/// The pool's next message. Cancel-safe, so it can wait in a `select!`: the
+/// only await is `Lines::next_line`, which keeps a half-read line for the
+/// next call.
+async fn next_pool_message<R: AsyncBufRead + Unpin>(lines: &mut tokio::io::Lines<R>) -> PoolMessage {
+    match lines.next_line().await {
+        Ok(Some(line)) => match serde_json::from_str(&line) {
+            Ok(msg) => PoolMessage::Message(msg),
+            Err(e) => PoolMessage::Unreadable(format!("{} ({} bytes: {:.80})", e, line.len(), line)),
+        },
+        Ok(None) => PoolMessage::Closed("the pool closed it".into()),
+        Err(e) => PoolMessage::Closed(e.to_string()),
+    }
+}
+
+/// A notify's job id, mining hash and block template, or `None` if any is
+/// missing or malformed (it used to panic the miner).
+fn parse_notify(msg: &serde_json::Value) -> Option<(u64, [u8; 32], serde_json::Value)> {
+    let params = msg["params"].as_array()?;
+    let job_id = params.first()?.as_u64()?;
+    let mut m_hash = [0u8; 32];
+    hex::decode_to_slice(params.get(1)?.as_str()?, &mut m_hash).ok()?;
+    Some((job_id, m_hash, params.get(2)?.clone()))
+}
+
+#[cfg(test)]
+mod stratum_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    /// A notify that arrives in pieces while shares keep the select! busy is
+    /// still read whole. With `read_line`, each share ready mid-notify threw
+    /// the first part of the line away, and the rest was skipped as unreadable.
+    #[tokio::test]
+    async fn a_notify_arriving_in_pieces_survives_a_busy_select() {
+        let (pool_side, miner_side) = tokio::io::duplex(64);
+        let notify = serde_json::json!({
+            "id": null,
+            "method": "mining.notify",
+            "params": [7, hex::encode([0xab_u8; 32]), {"pad": "x".repeat(20_000)}, hex::encode([0x0f_u8; 32])],
+        })
+        .to_string();
+        let sent = notify.clone();
+        tokio::spawn(async move {
+            let mut pool_side = pool_side;
+            for piece in sent.as_bytes().chunks(4_000) {
+                pool_side.write_all(piece).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            pool_side.write_all(b"\nnot json at all\n").await.unwrap();
+        });
+
+        let mut lines = BufReader::new(miner_side).lines();
+        // Shares, ready every millisecond: they win the select! many times
+        // while the notify is in flight.
+        let mut shares = tokio::time::interval(Duration::from_millis(1));
+        let (mut shares_sent, mut received) = (0, Vec::new());
+        while received.len() < 2 {
+            tokio::select! {
+                message = next_pool_message(&mut lines) => received.push(message),
+                _ = shares.tick() => shares_sent += 1,
+            }
+        }
+        assert!(shares_sent > 5, "the select! was busy ({shares_sent} shares)");
+        match &received[0] {
+            PoolMessage::Message(msg) => {
+                assert_eq!(msg.to_string(), notify);
+                let (job_id, m_hash, template) = parse_notify(msg).expect("a whole notify");
+                assert_eq!((job_id, m_hash), (7, [0xab; 32]));
+                assert_eq!(template["pad"].as_str().map(str::len), Some(20_000));
+            }
+            _ => panic!("the notify was lost"),
+        }
+        assert!(matches!(&received[1], PoolMessage::Unreadable(why) if why.contains("not json at all")));
+    }
+
+    #[test]
+    fn malformed_notifies_are_refused_not_panicked_on() {
+        let ok = serde_json::json!({"method": "mining.notify", "params": [1, hex::encode([1u8; 32]), {}]});
+        assert!(parse_notify(&ok).is_some());
+        for bad in [
+            serde_json::json!({"method": "mining.notify"}),
+            serde_json::json!({"method": "mining.notify", "params": []}),
+            serde_json::json!({"method": "mining.notify", "params": ["one", hex::encode([1u8; 32]), {}]}),
+            serde_json::json!({"method": "mining.notify", "params": [1, "zz", {}]}),
+            serde_json::json!({"method": "mining.notify", "params": [1, hex::encode([1u8; 32])]}),
+        ] {
+            assert!(parse_notify(&bad).is_none(), "{bad}");
+        }
     }
 }
