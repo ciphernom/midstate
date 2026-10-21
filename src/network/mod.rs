@@ -300,10 +300,24 @@ pub enum NetworkEvent {
     OutgoingConnectionFailed(String),
     RequestFailed(PeerId),
     /// Peer completed a libp2p handshake but advertises none of our
-    /// request-response protocols — a fork or an incompatible release.
-    /// Handled as a ban: it will never answer, and the subnet is as good a
-    /// signal as the peer id.
+    /// request-response protocols: an incompatible release, or a node of
+    /// another network ([`NetworkEvent::ForeignPeer`]). It will never answer.
     ProtocolMismatch(PeerId),
+    /// A peer identified itself as a Midstate node (identify lists
+    /// `MIDSTATE_PROTOCOL`), with the address of the connection to it, once
+    /// per connection. Only now is that address worth keeping: whatever
+    /// connects is not known to be one of ours until it says so.
+    PeerIdentified(PeerId, String),
+    /// A peer identified itself and lists none of our protocols: a node of
+    /// another network sharing our transports, such as a midwimble node
+    /// (they run beside Midstate nodes, often on the same machine) or an
+    /// IPFS peer that found us on the Amino DHT. Not hostile, just not ours.
+    ForeignPeer(PeerId),
+    /// A peer we dialled closed the connection before identifying itself:
+    /// it has banned us, is full, or is not one of ours. The connection
+    /// opened, so no `OutgoingConnectionFailed` came, but the address did
+    /// not prove itself either.
+    HungUpBeforeIdentify(String),
 }
 
 // ── Network API ─────────────────────────────────────────────────────────────
@@ -401,6 +415,10 @@ pub struct MidstateNetwork {
     pub banned_subnets: HashMap<IpAddr, std::time::Instant>,
     pub static_banned_peers: HashSet<PeerId>,
      pending_dials: HashSet<PeerId>,
+    /// Connected peers that have identified as Midstate nodes.
+    identified: HashSet<PeerId>,
+    /// Events to hand out before the next swarm event.
+    queued: std::collections::VecDeque<NetworkEvent>,
 }
 
 impl MidstateNetwork {
@@ -552,6 +570,8 @@ let autonat = autonat::Behaviour::new(
             banned_subnets: HashMap::new(),
             static_banned_peers,
             pending_dials: HashSet::new(), 
+            identified: HashSet::new(),
+            queued: std::collections::VecDeque::new(),
         };
 
         net.swarm.listen_on(listen_addr.clone())?;
@@ -816,6 +836,13 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
 
     pub fn add_kad_address(&mut self, peer: PeerId, addr: Multiaddr) {
         self.swarm.behaviour_mut().kademlia.add_address(&peer, addr);
+    }
+
+    /// Takes `peer` out of Kademlia, so that no query dials it. A banned
+    /// peer left there was redialled by Kademlia, and refused, for as long
+    /// as the node ran.
+    pub fn remove_kad_peer(&mut self, peer: &PeerId) {
+        self.swarm.behaviour_mut().kademlia.remove_peer(peer);
     }
 
     pub fn random_peer(&self) -> Option<PeerId> {
@@ -1096,6 +1123,9 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
 
     pub async fn next_event(&mut self) -> NetworkEvent {
         loop {
+            if let Some(event) = self.queued.pop_front() {
+                return event;
+            }
             tokio::select! {
                 // ── Incoming raw stream from a browser light client ──────
                 Some((peer, stream)) = self.light_incoming.next() => {
@@ -1299,13 +1329,31 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     // Midstate nodes via PEX (connected_peer_addrs reads the
                     // kbuckets). Only peers that actually speak the Midstate
                     // protocol may populate our address graph.
+                    //
+                    // The same goes for the peer's own address. Midwimble nodes
+                    // share our transports and run beside Midstate nodes, often
+                    // on the same machine, so they connect to us and we to them.
+                    // Their connection address used to go into Kademlia and the
+                    // PEX book (rewarded as an honest peer) before anything
+                    // showed what they spoke: they were saved, dialled first,
+                    // and handed on to other Midstate nodes. Now a peer's
+                    // addresses are kept only once it identifies as ours, and a
+                    // peer that identifies as something else is reported, to be
+                    // dropped (`Node::drop_foreign_peer`).
+                    //
+                    // Browser wallets speak only the light protocols, and a
+                    // connection refused at ConnectionEstablished is on its way
+                    // out: neither is judged here.
+                    if self.light_peers.contains(&peer_id) || !self.connected.contains_key(&peer_id) {
+                        continue;
+                    }
                     if !info.protocols.iter().any(|p| *p == MIDSTATE_PROTOCOL) {
                         tracing::debug!(
-                            "Ignoring identify from non-Midstate peer {} ({} protocols)",
+                            "Identify from non-Midstate peer {} ({} protocols)",
                             peer_id,
                             info.protocols.len()
                         );
-                        continue;
+                        return NetworkEvent::ForeignPeer(peer_id);
                     }
 
                     for addr in &info.listen_addrs {
@@ -1324,6 +1372,21 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                         .behaviour_mut()
                         .autonat
                         .add_server(peer_id, Some(info.observed_addr.clone()));
+
+                    // Identify repeats while the connection lasts. The
+                    // connection's own address is given to Kademlia, as
+                    // ConnectionEstablished used to, and reported to the
+                    // node, once.
+                    if self.identified.insert(peer_id) {
+                        if let Some(endpoint) = self.connected.get(&peer_id) {
+                            let remote_addr = endpoint.get_remote_address().clone();
+                            self.swarm
+                                .behaviour_mut()
+                                .kademlia
+                                .add_address(&peer_id, remote_addr.clone());
+                            return NetworkEvent::PeerIdentified(peer_id, with_peer_id(&remote_addr, peer_id));
+                        }
+                    }
                 }
 
                 // ── libp2p_stream produces no swarm events for light ─────
@@ -1489,11 +1552,11 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                         }
                     }
 
-                    // Track WebRTC peers separately (don't add to Kademlia)
+                    // Track WebRTC peers separately (don't add to Kademlia).
+                    // Others enter Kademlia once they identify as Midstate
+                    // nodes (see the identify handler), not before.
                     if is_webrtc {
                         self.light_peers.insert(peer_id);
-                    } else {
-                        self.swarm.behaviour_mut().kademlia.add_address(&peer_id, remote_addr.clone());
                     }
 
                     self.connected.insert(peer_id, endpoint.clone());
@@ -1530,6 +1593,7 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     peer_id,
                     endpoint,
                     num_established,
+                    cause,
                     ..
                 } => {
                     // --- Ignore closures of self-connections ---
@@ -1541,7 +1605,13 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     // ------------------------------------------------
                     
                     if num_established == 0 {
-                        self.connected.remove(&peer_id);
+                        let was_connected = self.connected.remove(&peer_id).is_some();
+                        let identified = self.identified.remove(&peer_id);
+                        // A peer we dialled that hung up before identifying.
+                        if was_connected && !identified && cause.is_some() && endpoint.is_dialer() {
+                            let addr = with_peer_id(endpoint.get_remote_address(), peer_id);
+                            self.queued.push_back(NetworkEvent::HungUpBeforeIdentify(addr));
+                        }
                         self.relay_reservations.remove(&peer_id); 
                         
                         // --- Light peer cleanup ---
@@ -1727,6 +1797,15 @@ fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
 
 /// Extracts the /24 (IPv4) or /32 (IPv6) subnet prefix from a multiaddr.
 /// Returns None for localhost addresses so local testing isn't restricted.
+/// `addr` with `/p2p/<peer>` at the end, as a string, as the PEX book keys it.
+fn with_peer_id(addr: &Multiaddr, peer: PeerId) -> String {
+    if extract_peer_id(addr).is_some() {
+        addr.to_string()
+    } else {
+        addr.clone().with(libp2p::multiaddr::Protocol::P2p(peer)).to_string()
+    }
+}
+
 fn extract_subnet(addr: &Multiaddr) -> Option<IpAddr> {
     if is_localhost(addr) {
         return None;
@@ -1922,5 +2001,139 @@ mod tests {
         // Sanity: the limit should be between 10 and 1000
         assert!(MAX_PEX_ADDRS >= 10);
         assert!(MAX_PEX_ADDRS <= 1000);
+    }
+
+    // ── Telling peers apart ─────────────────────────────────────────
+
+    /// A loopback node and its TCP address, once it listens.
+    async fn listening_node(bootstrap: Vec<Multiaddr>) -> (MidstateNetwork, Multiaddr) {
+        let mut net = MidstateNetwork::new(
+            Keypair::generate_ed25519(),
+            "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            bootstrap,
+            HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let id = net.local_peer_id();
+        for _ in 0..100 {
+            if let Some(a) = net.listen_addrs.iter().find(|a| a.to_string().contains("/tcp/")) {
+                let addr = a.clone().with(libp2p::multiaddr::Protocol::P2p(id));
+                return (net, addr);
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(50), net.next_event()).await;
+        }
+        panic!("the node never listened");
+    }
+
+    /// What identify tells apart. A Midstate peer is reported once, with the
+    /// address of its connection; a peer that lists none of our protocols (a
+    /// midwimble node: same transports, often the same machine) is foreign;
+    /// and a peer we dialled that hangs up before identifying is reported as
+    /// such, though its connection opened.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identify_tells_midstate_peers_from_foreign_ones() {
+        use libp2p::swarm::dummy;
+
+        let (mut node, node_addr) = listening_node(vec![]).await;
+
+        // A Midstate peer dials in.
+        let (mut midstate_peer, _) = listening_node(vec![node_addr.clone()]).await;
+        let midstate_id = midstate_peer.local_peer_id();
+        let driving = tokio::spawn(async move {
+            loop {
+                midstate_peer.next_event().await;
+            }
+        });
+
+        // A midwimble node dials in: identify, but none of our protocols.
+        let mut foreign = libp2p::SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
+            .unwrap()
+            .with_behaviour(|key| {
+                identify::Behaviour::new(identify::Config::new(
+                    "/midwimble/id/1.0.0".to_string(),
+                    key.public(),
+                ))
+            })
+            .unwrap()
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build();
+        let foreign_id = *foreign.local_peer_id();
+        foreign.dial(node_addr.clone()).unwrap();
+        let foreigning = tokio::spawn(async move {
+            loop {
+                foreign.select_next_some().await;
+            }
+        });
+
+        // A peer that accepts our connection and closes it, saying nothing.
+        let mut refuser = libp2p::SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
+            .unwrap()
+            .with_behaviour(|_| dummy::Behaviour)
+            .unwrap()
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build();
+        refuser.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+        let refuser_id = *refuser.local_peer_id();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Multiaddr>();
+        let refusing = tokio::spawn(async move {
+            let mut tx = Some(tx);
+            loop {
+                match refuser.select_next_some().await {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        if let Some(tx) = tx.take() {
+                            let _ = tx.send(address);
+                        }
+                    }
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        let _ = refuser.disconnect_peer_id(peer_id);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let refuser_addr = rx.await.unwrap().with(libp2p::multiaddr::Protocol::P2p(refuser_id));
+        node.swarm.dial(refuser_addr.clone()).unwrap();
+
+        let (mut identified, mut foreign_seen, mut hung_up) = (Vec::new(), Vec::new(), Vec::new());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while identified.is_empty() || foreign_seen.is_empty() || hung_up.is_empty() {
+            let event = tokio::time::timeout_at(deadline, node.next_event())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("missing: identified {identified:?}, foreign {foreign_seen:?}, hung up {hung_up:?}")
+                });
+            match event {
+                NetworkEvent::PeerIdentified(peer, addr) => identified.push((peer, addr)),
+                NetworkEvent::ForeignPeer(peer) => foreign_seen.push(peer),
+                NetworkEvent::HungUpBeforeIdentify(addr) => hung_up.push(addr),
+                _ => {}
+            }
+        }
+        assert_eq!(identified.len(), 1, "{identified:?}");
+        assert_eq!(identified[0].0, midstate_id);
+        assert!(identified[0].1.ends_with(&format!("/p2p/{midstate_id}")), "{}", identified[0].1);
+        assert_eq!(foreign_seen, vec![foreign_id]);
+        assert_eq!(hung_up, vec![refuser_addr.to_string()]);
+        // Only the Midstate peer entered Kademlia.
+        let in_kad: Vec<PeerId> = node
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .kbuckets()
+            .flat_map(|b| b.iter().map(|e| *e.node.key.preimage()).collect::<Vec<_>>())
+            .collect();
+        assert!(in_kad.contains(&midstate_id), "{in_kad:?}");
+        assert!(!in_kad.contains(&foreign_id), "{in_kad:?}");
+        assert!(!in_kad.contains(&refuser_id), "{in_kad:?}");
+
+        driving.abort();
+        foreigning.abort();
+        refusing.abort();
     }
 }
