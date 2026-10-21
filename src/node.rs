@@ -3705,13 +3705,11 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                             let resp = self.handle_light_request(peer, request).await;
                             let _ = respond.send(resp);
                         }
-                        NetworkEvent::PeerConnected(peer, full_addr) => {
-                            // --- BAYESIAN ECLIPSE DEFENSE (REWARD) ---
-                            // Successfully connecting proves this is a routable, honest peer.
-                            // We reward them heavily to ensure they stay at the top of the PEX pool.
-                            let stats = self.known_pex_addrs.entry(full_addr).or_insert((1, 1));
-                            stats.0 = stats.0.saturating_add(10); // +10 to Alpha
-                            // -----------------------------------------
+                        NetworkEvent::PeerConnected(peer, _) => {
+                            // The Bayesian reward for a connection waits until the
+                            // peer identifies as a Midstate node (PeerIdentified):
+                            // a connection alone proves nothing about what is on
+                            // the other end.
 
                             // --- BANNED SUBNET DEFENSE ---
                             if let Some(subnet) = self.network.peer_subnet(&peer) {
@@ -3783,9 +3781,15 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                                 }
                             }
                         }
-                        NetworkEvent::ProtocolMismatch(peer) => {
-                            self.ban_peer(peer, "speaks none of our protocols — incompatible fork");
-                       }
+                        NetworkEvent::PeerIdentified(_, full_addr) => {
+                            self.reward_identified_addr(full_addr);
+                        }
+                        NetworkEvent::ProtocolMismatch(peer) | NetworkEvent::ForeignPeer(peer) => {
+                            self.drop_foreign_peer(peer);
+                        }
+                        NetworkEvent::HungUpBeforeIdentify(addr_str) => {
+                            self.penalise_early_hang_up(&addr_str);
+                        }
                         NetworkEvent::RequestFailed(peer) => {
                             if self.sync.is_sync_peer(peer) {
                                 self.abort_sync_session("Outbound request failed (timeout or disconnected)");
@@ -4717,6 +4721,66 @@ fn fire_batch_lookahead(&mut self) {
         // Don't clear last_sync_cursor here — keep it so the next attempt resumes
     }
 
+    // --- BAYESIAN ECLIPSE DEFENSE (REWARD) ---
+    /// A peer identified itself as a Midstate node at `full_addr`: proof that
+    /// this is a routable, honest peer. Reward it heavily so it stays at the
+    /// top of the PEX pool.
+    fn reward_identified_addr(&mut self, full_addr: String) {
+        let stats = self.known_pex_addrs.entry(full_addr).or_insert((1, 1));
+        stats.0 = stats.0.saturating_add(10); // +10 to Alpha
+    }
+
+    /// A peer we dialled hung up before identifying itself: it has banned us,
+    /// is full, or is a node of another network that has banned us. The
+    /// connection opened, so this is no transport failure, but the address
+    /// did not prove itself either. A heavier penalty than a failed dial: an
+    /// address heard in PEX goes at once, one that has served us before
+    /// after several.
+    fn penalise_early_hang_up(&mut self, addr_str: &str) {
+        if let Some(stats) = self.known_pex_addrs.get_mut(addr_str) {
+            stats.1 = stats.1.saturating_add(10);
+            let prob = stats.0 as f32 / (stats.0 + stats.1) as f32;
+            if prob < 0.1 {
+                self.known_pex_addrs.remove(addr_str);
+                tracing::debug!("Purged PEX address that hangs up before identifying: {}", addr_str);
+            }
+        }
+    }
+
+    /// A peer of another network (a midwimble node, which runs beside a
+    /// Midstate node and often on the same machine; an IPFS peer that found us
+    /// on the Amino DHT) is not hostile, just not ours: drop it, do not dial it
+    /// or let it back in this session, and forget every address it has in the
+    /// PEX book.
+    ///
+    /// Unlike `ban_peer`, its subnet is not banned. A foreign peer used to be
+    /// banned like a malicious one, subnet and all, so every Midstate node a
+    /// midwimble node touched refused the whole /24 of that machine for an
+    /// hour: the operator's own Midstate node included, and Midstate's
+    /// bootstrap node, which shares a machine with midwimble's seed.
+    fn drop_foreign_peer(&mut self, peer: PeerId) {
+        if self.network.is_light_peer(&peer) {
+            return;
+        }
+        if !self.network.static_banned_peers.insert(peer) {
+            // Already dropped: a second request that failed, or a redial.
+            self.network.disconnect_peer(peer);
+            return;
+        }
+        self.network.drop_relay_reservation(peer);
+        self.network.remove_kad_peer(&peer);
+        self.network.disconnect_peer(peer);
+        let peer_str = peer.to_string();
+        let before = self.known_pex_addrs.len();
+        self.known_pex_addrs.retain(|addr, _| !addr.contains(&peer_str));
+        tracing::info!(
+            "Dropped {}: it speaks none of Midstate's protocols (another network's node, such as midwimble's); \
+             not dialling it again this session ({} address(es) forgotten)",
+            peer,
+            before - self.known_pex_addrs.len()
+        );
+    }
+
     /// Instantly drop a malicious peer and penalize their Bayesian reputation.
     /// We do not waste CPU or RAM holding the connection open.
     ///
@@ -4737,8 +4801,10 @@ fn fire_batch_lookahead(&mut self) {
         // external addresses.
         self.network.drop_relay_reservation(peer);
         
-        // 1. Immediately sever the TCP connection (Frees RAM/FDs)
+        // 1. Immediately sever the TCP connection (Frees RAM/FDs), and take the
+        // peer out of Kademlia, whose queries would otherwise keep dialling it.
         self.network.disconnect_peer(peer);
+        self.network.remove_kad_peer(&peer);
 
         // 2. Ban the subnet so they can't spam reconnects
         if let Some(subnet) = self.network.peer_subnet(&peer) {
@@ -9254,4 +9320,61 @@ fn build_divergent_chain(
             "mining_midstate diverged from compute_header_hash — the original bug is back");
     }
     
+
+    /// A midwimble node (or any peer of another network) is dropped and
+    /// forgotten, but its subnet is not banned: the operator's own Midstate
+    /// node, and Midstate's bootstrap node, share machines with midwimble's.
+    #[tokio::test]
+    async fn a_foreign_peer_is_dropped_without_banning_its_subnet() {
+        let dir = tempdir().unwrap();
+        let mut node = create_test_node(dir.path()).await;
+        let foreign = PeerId::random();
+        let neighbour = PeerId::random();
+        node.known_pex_addrs.insert(format!("/ip4/134.199.148.215/tcp/9433/p2p/{foreign}"), (51, 1));
+        node.known_pex_addrs.insert(format!("/ip4/134.199.148.215/udp/9433/quic-v1/p2p/{foreign}"), (1, 1));
+        let neighbour_addr = format!("/ip4/134.199.148.215/tcp/9333/p2p/{neighbour}");
+        node.known_pex_addrs.insert(neighbour_addr.clone(), (11, 1));
+
+        node.drop_foreign_peer(foreign);
+        assert!(node.network.static_banned_peers.contains(&foreign));
+        assert!(node.network.banned_subnets.is_empty(), "no subnet ban");
+        let left: Vec<&String> = node.known_pex_addrs.keys().collect();
+        assert_eq!(left, vec![&neighbour_addr], "every address of the foreign peer is forgotten");
+        assert!(!node.network.static_banned_peers.contains(&neighbour));
+
+        // Its second failed request changes nothing.
+        node.drop_foreign_peer(foreign);
+        assert_eq!(node.known_pex_addrs.len(), 1);
+        assert!(node.network.banned_subnets.is_empty());
+    }
+
+    /// An address is rewarded when its peer identifies as a Midstate node,
+    /// and one whose peer hangs up before identifying is penalised: an
+    /// address only heard in PEX goes at once, one that has served before
+    /// survives a few.
+    #[tokio::test]
+    async fn addresses_are_rewarded_on_identify_and_penalised_for_hanging_up() {
+        let dir = tempdir().unwrap();
+        let mut node = create_test_node(dir.path()).await;
+        let honest = format!("/ip4/5.6.7.8/tcp/9333/p2p/{}", PeerId::random());
+        node.reward_identified_addr(honest.clone());
+        assert_eq!(node.known_pex_addrs.get(&honest), Some(&(11, 1)));
+
+        let heard = format!("/ip4/1.2.3.4/tcp/9333/p2p/{}", PeerId::random());
+        node.known_pex_addrs.insert(heard.clone(), (1, 1));
+        node.penalise_early_hang_up(&heard);
+        assert!(!node.known_pex_addrs.contains_key(&heard));
+
+        node.penalise_early_hang_up(&honest);
+        assert_eq!(node.known_pex_addrs.get(&honest), Some(&(11, 11)));
+        for _ in 0..8 {
+            node.penalise_early_hang_up(&honest);
+        }
+        assert!(node.known_pex_addrs.contains_key(&honest), "p = 11/102 is still above 0.1");
+        node.penalise_early_hang_up(&honest);
+        assert!(!node.known_pex_addrs.contains_key(&honest));
+
+        // Unknown addresses are left alone.
+        node.penalise_early_hang_up("/ip4/9.9.9.9/tcp/9333");
+    }
 }
