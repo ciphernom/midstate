@@ -34,7 +34,7 @@ use axum::{extract::{State, Query}, http::Method, routing::{get, post}, Json, Ro
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::core::types::{hash, hash_concat, Batch, Extension};
-use crate::core::extension::create_extension;
+use crate::core::extension::create_extension_at;
 
 /// The database table storing the cumulative scores of all miners.
 /// Key: 32-byte cryptographic address hash. Value: u64 share count.
@@ -591,6 +591,19 @@ struct MergeJobReply {
     mining_hash: String,
     target: [u8; 32],
     height: Option<u64>,
+    /// The proof of work midwimble requires of that block. A node that
+    /// predates Midstate Walk does not say, and wants the BLAKE3 chain.
+    pow: crate::core::types::PowAlgo,
+}
+
+/// Reads the `pow` field of a midwimble job.
+fn parse_merge_pow(job: &serde_json::Value) -> Result<crate::core::types::PowAlgo, String> {
+    use crate::core::types::PowAlgo;
+    match job.get("pow").and_then(|v| v.as_str()) {
+        None | Some("blake3-chain") => Ok(PowAlgo::Blake3Chain),
+        Some("walk") => Ok(PowAlgo::Walk),
+        Some(other) => Err(format!("midwimble wants an unknown proof of work: {other}")),
+    }
 }
 
 /// Asks the midwimble node for a block paying `payouts`.
@@ -621,7 +634,8 @@ async fn request_merge_job(
     if commitment.len() != 64 || mining_hash.len() != 64 || hex::decode_to_slice(field("target"), &mut target).is_err() {
         return Err(format!("unusable job: {job}"));
     }
-    Ok(MergeJobReply { commitment, mining_hash, target, height: job["height"].as_u64() })
+    let pow = parse_merge_pow(&job)?;
+    Ok(MergeJobReply { commitment, mining_hash, target, height: job["height"].as_u64(), pow })
 }
 
 /// Gets this job's midwimble block from the midwimble node, paying the score
@@ -632,6 +646,10 @@ async fn request_merge_job(
 /// pays the pool's own address, as before per-miner payouts, and says why in
 /// its `note`; if it refuses that too, or can't be reached, the reason: the
 /// pool mines midstate alone.
+///
+/// One nonce's work counts for both chains only if both ask for the same
+/// proof of work. Around Midstate Walk's activation one chain may have
+/// switched before the other; until both have, the job mines midstate alone.
 async fn plan_merge(
     db: &Database,
     client: &reqwest::Client,
@@ -639,6 +657,7 @@ async fn plan_merge(
     pool: &str,
     fee_percent: f64,
     seed: &[u8; 32],
+    pow: crate::core::types::PowAlgo,
 ) -> Result<(String, MergeCommit), String> {
     let scores = midwimble_scores(db);
     let payouts = merge_payouts(fee_percent, pool, &scores, seed);
@@ -664,6 +683,16 @@ async fn plan_merge(
             }
         }
     };
+    if reply.pow != pow {
+        let e = format!(
+            "midwimble's next block takes the {} proof of work and this job's takes {}; \
+             merged mining resumes once both chains use the same one",
+            reply.pow.name(),
+            pow.name()
+        );
+        tracing::warn!("{e}; mining midstate alone");
+        return Err(e);
+    }
     Ok((
         reply.commitment,
         MergeCommit {
@@ -1579,6 +1608,7 @@ pub async fn run_stratum_pool(
                             mw_pool,
                             state_clone.pool_fee_percent,
                             &hash(&seed_data),
+                            crate::core::types::pow_algo_at(tip_height),
                         )
                         .await
                         .map_err(|e| merge_error = Some(e))
@@ -1866,6 +1896,9 @@ async fn build_template_payload(
             // Sent so the wallet can display the tx count for this template.
             "batch_template":   job.batch_template,
             "height":           job.height,
+            // Which proof of work to grind ("blake3-chain" or "walk"); it
+            // follows from the height, spelt out for clients.
+            "pow":              crate::core::types::pow_algo_at(job.height).name(),
             "shares_recorded":  shares_recorded,
             // Precommitment anchor, so the client can cross-check /api/proof.
             "merkle_root":      hex::encode(state.current_tree.read().await.root),
@@ -2405,6 +2438,7 @@ async fn run_pool_webrtc(state: Arc<PoolState>, udp_port: u16, data_dir: std::pa
                         "target":          hex::encode(job.share_target),
                         "network_target":  hex::encode(job.network_target),
                         "height":          job.height,
+                        "pow":             crate::core::types::pow_algo_at(job.height).name(),
                     }
                 });
 
@@ -2639,8 +2673,8 @@ async fn process_share(
         Err(_) => return Ok(ShareOutcome::Busy),
     };
 
-    let m_hash = job.mining_hash;
-    let ext = tokio::task::spawn_blocking(move || create_extension(m_hash, nonce)).await?;
+    let (m_hash, height) = (job.mining_hash, job.height);
+    let ext = tokio::task::spawn_blocking(move || create_extension_at(height, m_hash, nonce)).await?;
     drop(_permit);
 
     if ext.final_hash >= job.share_target {
@@ -3240,6 +3274,8 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                         serde_json::json!(hex::encode(job.mining_hash)),
                                         serde_json::json!(job.batch_template),
                                         serde_json::json!(hex::encode(job.share_target)),
+                                        // The block's height: it picks the proof of work.
+                                        serde_json::json!(job.height),
                                     ]
                                 };
                                 write_half.write_all(format!("{}\n", serde_json::to_string(&notif)?).as_bytes()).await?;
@@ -3299,6 +3335,8 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                         serde_json::json!(hex::encode(job.mining_hash)),
                         serde_json::json!(job.batch_template),
                         serde_json::json!(hex::encode(job.share_target)),
+                        // The block's height: it picks the proof of work.
+                        serde_json::json!(job.height),
                     ]
                 };
                 write_half.write_all(format!("{}\n", serde_json::to_string(&notif)?).as_bytes()).await?;
@@ -3536,7 +3574,8 @@ mod tests {
         let client = reqwest::Client::new();
         settle_midwimble_scores(&db, &[(ALICE.into(), 3), (BOB.into(), 1)], true).unwrap();
 
-        let (commitment, plan) = plan_merge(&db, &client, &rpc, &pool, 1.0, &[0; 32]).await.unwrap();
+        let chain = crate::core::types::PowAlgo::Blake3Chain;
+        let (commitment, plan) = plan_merge(&db, &client, &rpc, &pool, 1.0, &[0; 32], chain).await.unwrap();
         assert_eq!(commitment, "11".repeat(32));
         assert_eq!(sorted(plan.paid.to_vec()), sorted(vec![(ALICE.into(), 3), (BOB.into(), 1)]));
         let asked: Vec<String> = mock.lock().unwrap().jobs[0].iter().map(|(a, _)| a.clone()).collect();
@@ -3548,15 +3587,31 @@ mod tests {
         // The node refuses the miners' payouts: the job pays the pool alone,
         // as before per-miner payouts, and takes nobody's score.
         mock.lock().unwrap().refuse_miners = true;
-        let (_, plan) = plan_merge(&db, &client, &rpc, &pool, 1.0, &[0; 32]).await.unwrap();
+        let (_, plan) = plan_merge(&db, &client, &rpc, &pool, 1.0, &[0; 32], chain).await.unwrap();
         assert!(plan.paid.is_empty());
         assert_eq!(mock.lock().unwrap().jobs.last().unwrap(), &vec![(pool.clone(), 1)]);
         assert_eq!(plan.payouts.to_vec(), vec![(pool.clone(), 1)]);
         assert!(plan.note.as_deref().is_some_and(|n| n.contains("invalid scan key")), "{:?}", plan.note);
 
         // No node at all: no merge-mining this job, and nothing breaks.
-        let refused = plan_merge(&db, &client, "http://127.0.0.1:9", &pool, 1.0, &[0; 32]).await;
+        let refused = plan_merge(&db, &client, "http://127.0.0.1:9", &pool, 1.0, &[0; 32], chain).await;
         assert!(refused.as_ref().is_err_and(|e| e.contains("unreachable")), "{:?}", refused.map(|r| r.0));
+
+        // A midwimble node that predates Midstate Walk wants the BLAKE3 chain:
+        // a Walk job cannot carry its block, so the pool mines midstate alone.
+        mock.lock().unwrap().refuse_miners = false;
+        let walk = crate::core::types::PowAlgo::Walk;
+        let mismatched = plan_merge(&db, &client, &rpc, &pool, 1.0, &[0; 32], walk).await;
+        assert!(mismatched.as_ref().is_err_and(|e| e.contains("same one")), "{:?}", mismatched.map(|r| r.0));
+    }
+
+    #[test]
+    fn merge_jobs_say_which_proof_of_work_they_need() {
+        use crate::core::types::PowAlgo;
+        assert_eq!(parse_merge_pow(&serde_json::json!({})), Ok(PowAlgo::Blake3Chain));
+        assert_eq!(parse_merge_pow(&serde_json::json!({ "pow": "blake3-chain" })), Ok(PowAlgo::Blake3Chain));
+        assert_eq!(parse_merge_pow(&serde_json::json!({ "pow": "walk" })), Ok(PowAlgo::Walk));
+        assert!(parse_merge_pow(&serde_json::json!({ "pow": "sha256d" })).is_err());
     }
 
     fn test_state(db: Arc<Database>, rpc: String, pool: String) -> Arc<PoolState> {

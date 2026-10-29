@@ -3,6 +3,7 @@ pub mod types;
 pub mod wots;
 pub mod transaction;
 pub mod extension;
+pub mod walk;
 pub mod state;
 pub mod mmr;  
 pub mod mss;

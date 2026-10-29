@@ -213,6 +213,33 @@ pub fn search_nonces(midstate_hex: &str, target_hex: &str, start_nonce: u64, ite
     None
 }
 
+/// [`search_nonces`] for a named proof of work: `"blake3-chain"` (what
+/// `search_nonces` does) or `"walk"` (Midstate Walk, from
+/// `WALK_ACTIVATION_HEIGHT`). Templates say which in their `pow` field.
+///
+/// Tests `iterations × 4` nonces from `start_nonce` either way, so callers
+/// advance their nonce by the same amount. A Walk attempt costs a small
+/// fraction of a BLAKE3-chain one, so callers should size `iterations` by
+/// time rather than count.
+///
+/// Returns `None` for an unknown `pow` or malformed hex, as for no find.
+#[wasm_bindgen]
+pub fn search_nonces_pow(pow: &str, midstate_hex: &str, target_hex: &str, start_nonce: u64, iterations: u32) -> Option<u64> {
+    use midstate::core::types::PowAlgo;
+    match PowAlgo::from_name(pow)? {
+        PowAlgo::Blake3Chain => search_nonces(midstate_hex, target_hex, start_nonce, iterations),
+        PowAlgo::Walk => {
+            let mut midstate = [0u8; 32];
+            hex::decode_to_slice(midstate_hex, &mut midstate).ok()?;
+            let mut target = [0u8; 32];
+            hex::decode_to_slice(target_hex, &mut target).ok()?;
+            (0..iterations as u64 * 4)
+                .map(|i| start_nonce.wrapping_add(i))
+                .find(|&nonce| midstate::core::walk::walk_hash(&midstate, nonce) < target)
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct ScriptInputArg {
     /// 64-hex on-chain coin id of the contract UTXO being consumed.
@@ -986,10 +1013,22 @@ impl WebWallet {
     /// `None` if `midstate_hex` is not valid 64-character hex.
 #[wasm_bindgen]
 pub fn build_solo_extension(&self, midstate_hex: &str, nonce: u64) -> Option<String> {
+    self.build_solo_extension_pow("blake3-chain", midstate_hex, nonce)
+}
+
+    /// [`WebWallet::build_solo_extension`] for a named proof of work
+    /// (`"blake3-chain"` or `"walk"`, as the template's `pow` field says).
+    ///
+    /// # Returns
+    ///
+    /// `None` if `pow` is unknown or `midstate_hex` is not valid 64-character hex.
+#[wasm_bindgen]
+pub fn build_solo_extension_pow(&self, pow: &str, midstate_hex: &str, nonce: u64) -> Option<String> {
+    let algo = midstate::core::types::PowAlgo::from_name(pow)?;
     let mut midstate = [0u8; 32];
     hex::decode_to_slice(midstate_hex, &mut midstate).ok()?;
 
-    let ext = midstate::core::extension::create_extension(midstate, nonce);
+    let ext = midstate::core::extension::create_extension_with(algo, midstate, nonce);
 
     Some(serde_json::json!({
         "nonce": ext.nonce,

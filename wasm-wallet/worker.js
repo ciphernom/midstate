@@ -1976,6 +1976,9 @@ async function handleGetTemplate() {
                 next_wots_index: wState.nextWotsIndex, // We don't advance our counter
                 total_fees:      0, // Pool handles fees
                 chainHeight:     tmpl.height ?? networkHeight,
+                // The proof of work to grind. Pools that predate Midstate
+                // Walk do not say, and want the BLAKE3 chain.
+                pow:             tmpl.pow || 'blake3-chain',
                 blockReward:     tmpl.block_reward || 0,
                 poolShares:      tmpl.shares_recorded || 0,
                 // The pool's template already contains the transactions the block
@@ -2028,6 +2031,8 @@ async function handleGetTemplate() {
             next_wots_index: template.next_wots_index,
             total_fees:      template.total_fees,
             chainHeight:     stateObj.height,
+            // Nodes that predate Midstate Walk do not say, and want the chain.
+            pow:             template.pow || 'blake3-chain',
             blockReward:     stateObj.block_reward || 0,
             mempoolTxs,
             mempoolFees
@@ -2111,7 +2116,11 @@ async function handleSubmitMinedBlock(template, nonce) {
     }
     isSubmitting = true;
     try {
-        const extStr = wallet.build_solo_extension(template.mining_midstate, BigInt(nonce));
+        const pow = template.pow || 'blake3-chain';
+        // `build_solo_extension_pow` arrives with the Midstate Walk WASM build.
+        const extStr = wallet.build_solo_extension_pow
+            ? wallet.build_solo_extension_pow(pow, template.mining_midstate, BigInt(nonce))
+            : (pow === 'blake3-chain' ? wallet.build_solo_extension(template.mining_midstate, BigInt(nonce)) : null);
         if (!extStr) throw new Error("Failed to recompute extension hash.");
 
         const batch = JSON.parse(JSON.stringify(template.batch_template));

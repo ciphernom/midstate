@@ -904,6 +904,95 @@ pub const EXTENSION_ITERATIONS: u64 = 1_000_000;
 #[cfg(feature = "fast-mining")]
 pub const EXTENSION_ITERATIONS: u64 = 100;
 
+/// Activation height for Midstate Walk (`core::walk`), the proof of work that
+/// replaces the `EXTENSION_ITERATIONS` BLAKE3 chain.
+///
+/// # Reasoning
+/// The BLAKE3 chain needs 32 bytes of state per nonce, so a GPU runs tens of
+/// thousands of nonces at once and the network's hashrate became a GPU
+/// fleet's. Midstate Walk gives every attempt a 256 KiB scratchpad, a program
+/// drawn from the data, and 64-bit multiply, divide and AES rounds: what a
+/// CPU core (a Raspberry Pi 5's included) has and a GPU thread does not.
+///
+/// Every block keeps the proof of work in force at its height for ever: a
+/// node verifies block `h` with [`pow_algo_at`]`(h)`, so history below this
+/// height still validates with the BLAKE3 chain.
+///
+/// # Safety / Invariants
+/// - **Consensus-critical (hard fork):** every node must switch at exactly
+///   this height; nodes that have not upgraded reject the first Walk block.
+/// - Scheduled about 66,000 blocks (~46 days) past the tip at the time of
+///   writing (~354,000), after `V6_ACTIVATION_HEIGHT`.
+#[cfg(not(feature = "fast-mining"))]
+pub const WALK_ACTIVATION_HEIGHT: u64 = 420_000;
+/// Test builds switch after a handful of blocks, so tests cross the boundary.
+#[cfg(feature = "fast-mining")]
+pub const WALK_ACTIVATION_HEIGHT: u64 = 20;
+
+/// Difficulty reset at [`WALK_ACTIVATION_HEIGHT`]: from that height the ASERT
+/// target is multiplied by `2^WALK_TARGET_SHIFT`.
+///
+/// # Reasoning
+/// A new proof of work changes the network's attempts per second at a stroke
+/// (GPUs drop out; a CPU core tries hundreds of Walk nonces a second against
+/// ~15 BLAKE3-chain nonces). ASERT would absorb the change, but only at one
+/// doubling per `ASERT_HALF_LIFE` of drift, so the first blocks would take
+/// hours. Shifting the target is the same as moving ASERT's schedule by
+/// `WALK_TARGET_SHIFT` half-lives: it keeps the rule a pure function of
+/// (height, timestamp), and ASERT corrects whatever error the estimate has.
+///
+/// The value is `round(log2(chain attempts/s before the fork ÷ expected Walk
+/// attempts/s after it))`. At ~height 354,000 the network made ~9.2M chain
+/// attempts/s; 3 expects ~1.1M Walk attempts/s at the switch, about 3,500
+/// CPU cores at ~320 attempts/s each (4 expects half that). **Re-measure
+/// both sides before release.** Erring high gives fast blocks for an hour or
+/// two; erring low gives slow ones for several hours.
+#[cfg(not(feature = "fast-mining"))]
+pub const WALK_TARGET_SHIFT: i64 = 3;
+/// Test builds: a fast-mining Walk attempt costs about what a fast-mining
+/// chain attempt does, so no reset.
+#[cfg(feature = "fast-mining")]
+pub const WALK_TARGET_SHIFT: i64 = 0;
+
+/// Which proof of work a block uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PowAlgo {
+    /// `EXTENSION_ITERATIONS` sequential BLAKE3 hashes (`extension::create_extension`).
+    Blake3Chain,
+    /// Midstate Walk (`core::walk`).
+    Walk,
+}
+
+impl PowAlgo {
+    /// The name miners and RPC clients see (`"blake3-chain"`, `"walk"`).
+    pub fn name(self) -> &'static str {
+        match self {
+            PowAlgo::Blake3Chain => "blake3-chain",
+            PowAlgo::Walk => "walk",
+        }
+    }
+
+    /// The algorithm a [`PowAlgo::name`] names.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "blake3-chain" => Some(PowAlgo::Blake3Chain),
+            "walk" => Some(PowAlgo::Walk),
+            _ => None,
+        }
+    }
+}
+
+/// The proof of work that block `height` must carry. Single source of truth
+/// for the switch.
+#[inline]
+pub fn pow_algo_at(height: u64) -> PowAlgo {
+    if height >= WALK_ACTIVATION_HEIGHT {
+        PowAlgo::Walk
+    } else {
+        PowAlgo::Blake3Chain
+    }
+}
+
 /// Maximum number of Reveals (actual value transfers) per batch
 pub const MAX_BATCH_REVEALS: usize = 500;
 

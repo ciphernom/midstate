@@ -43,6 +43,10 @@ Midstate wallets are Hierarchical Deterministic (HD). A 24-word BIP39 mnemonic d
 
 Mining requires sequential iteration to prove time has passed. While miners can search for nonces in parallel, the computation of a single proof is strictly single-threaded, neutralizing ASIC advantages and enforcing "one CPU, one vote".
 
+### Midstate Walk (from block 420,000)
+
+Parallel nonce search let GPUs run tens of thousands of BLAKE3 chains at once. From `WALK_ACTIVATION_HEIGHT` every attempt is a dependent walk over its own 256 KiB scratchpad (an L2 cache's worth on a CPU core, a Raspberry Pi 5's included), four random reads and writes a step, with a per-attempt program of 64-bit multiply, multiply-high, divide and AES-round operations. Blocks below the height keep the BLAKE3 chain for ever. Specification, parameters and rollout: `docs/MIDSTATE_WALK.md`.
+
 ### Decentralized Pool Mining
 Midstate reverses traditional Stratum-style pools to eliminate censorship. 
 1. The local node autonomously selects transactions from its own mempool and builds the block template. 

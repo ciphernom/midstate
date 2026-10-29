@@ -512,6 +512,13 @@ pub struct BlockTemplateResponse {
     pub total_fees: u64,
     /// Block reward at the current height.
     pub block_reward: u64,
+    /// Height of the block this template makes. It selects the proof of work.
+    #[serde(default)]
+    pub height: u64,
+    /// The proof of work to grind: `"blake3-chain"` (the EXTENSION_ITERATIONS
+    /// BLAKE3 chain) or `"walk"` (Midstate Walk, from WALK_ACTIVATION_HEIGHT).
+    #[serde(default)]
+    pub pow: String,
 }
 
 /// Returned as a 409 when the miner's coinbase total doesn't match

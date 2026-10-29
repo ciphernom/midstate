@@ -2307,6 +2307,7 @@ if ('serviceWorker' in navigator) {
                                     payload: {
                                         midstate: currentTemplate.mining_midstate,
                                         target: currentTemplate.target,
+                                        pow: currentTemplate.pow,
                                         throttle_ms: currentThrottleMs,
                                         // Workers added mid-session need the same
                                         // share-mode behaviour as their peers.
@@ -2381,14 +2382,15 @@ if ('serviceWorker' in navigator) {
             worker.postMessage({ type: 'GET_TEMPLATE' });
         }
 
-        function broadcastToMiners(midstate, target) {
-            log(`Broadcasting to ${miners.length} miners (throttle=${currentThrottleMs}ms)`);
+        function broadcastToMiners(midstate, target, pow) {
+            log(`Broadcasting to ${miners.length} miners (pow=${pow || 'blake3-chain'}, throttle=${currentThrottleMs}ms)`);
             for (const m of miners) {
                 m.worker.postMessage({
                     type: 'START',
                     payload: {
                         midstate,
                         target,
+                        pow,
                         throttle_ms: currentThrottleMs,
                         // In pool mode a hit is a share and the template survives it,
                         // so the worker keeps grinding instead of halting.
@@ -4148,7 +4150,7 @@ if ('serviceWorker' in navigator) {
                             const txCount = payload.batch_template.transactions?.length || 0;
                             log(`Template updated (height ${payload.chainHeight}, ${txCount} txs). Broadcasting to ${miners.length} miners...`);
                             
-                            broadcastToMiners(payload.mining_midstate, payload.target);
+                            broadcastToMiners(payload.mining_midstate, payload.target, payload.pow);
                         }
                     } else if (!payload && isMiningActive) {
                         log('Template returned null — wallet may need sync.', 'var(--red)');
