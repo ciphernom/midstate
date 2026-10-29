@@ -1,6 +1,6 @@
 use super::types::*;
 use super::transaction::{apply_transaction_no_sig_check, verify_transaction_sigs};
-use super::extension::verify_extension;
+use super::extension::verify_extension_at;
 use anyhow::{bail, Result};
 use primitive_types::U256;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,8 +27,14 @@ pub fn calculate_target(height: u64, timestamp: u64) -> [u8; 32] {
 
     // 2. Fixed-point exponent: drift / half_life in 16.16
     let exponent = drift.saturating_mul(65536) / ASERT_HALF_LIFE;
-    let shifts = exponent >> 16;       // integer part (whole powers of 2)
+    let mut shifts = exponent >> 16;   // integer part (whole powers of 2)
     let frac = exponent & 0xFFFF;      // fractional part
+
+    // Midstate Walk difficulty reset: from the switch on, ASERT's schedule is
+    // moved by WALK_TARGET_SHIFT half-lives (see that constant).
+    if pow_algo_at(height) == PowAlgo::Walk {
+        shifts = shifts.saturating_add(WALK_TARGET_SHIFT);
+    }
 
     // 3. Taylor polynomial approximation of 2^frac (16.16 fixed-point)
     //    Coefficients match the BCH aserti3-2d reference implementation.
@@ -510,8 +516,8 @@ fn apply_batch_internal(
 
     match preverified_hash {
         None => {
-            // Standard path: verify the 1,000,000 hashes right now
-            verify_extension(mining_target, &batch.extension, &batch.target)?;
+            // Standard path: verify the proof of work in force at this height
+            verify_extension_at(state.height, mining_target, &batch.extension, &batch.target)?;
         }
         Some(expected_hash) => {
             // Fast path: explicit invariant check. Guarantees that the applied
@@ -653,7 +659,7 @@ pub fn choose_best_state<'a>(a: &'a State, b: &'a State) -> &'a State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::extension::create_extension;
+    use crate::core::extension::create_extension_at;
     use crate::core::mmr::UtxoAccumulator;
     use crate::core::wots;
 
@@ -768,7 +774,7 @@ mod tests {
 
         let mut nonce = 0u64;
         let extension = loop {
-            let ext = create_extension(mining_target, nonce);
+            let ext = create_extension_at(state.height, mining_target, nonce);
             if ext.final_hash < state.target {
                 break ext;
             }
@@ -1026,6 +1032,75 @@ mod tests {
 
         let result = adjust_difficulty(&state);
         assert_eq!(result, [0xff; 32], "Target must clamp to the 0xff ceiling");
+    }
+
+    // ── Midstate Walk activation ─────────────────────────────────────
+
+    #[test]
+    fn walk_activation_moves_the_target_by_the_shift() {
+        let genesis = genesis_state();
+        let on_schedule = |h: u64| genesis.timestamp + (h - genesis.height) * TARGET_BLOCK_TIME;
+        let last_chain = WALK_ACTIVATION_HEIGHT - 1;
+        let before = calculate_target(last_chain, on_schedule(last_chain));
+        let after = calculate_target(WALK_ACTIVATION_HEIGHT, on_schedule(WALK_ACTIVATION_HEIGHT));
+        assert_eq!(before, genesis.target, "on schedule, the chain keeps the genesis target");
+        let expected = U256::from_big_endian(&genesis.target) << (WALK_TARGET_SHIFT as usize);
+        assert_eq!(U256::from_big_endian(&after), expected, "on schedule, Walk starts {}x easier", 1u64 << WALK_TARGET_SHIFT);
+        // ASERT keeps correcting from there: a later on-schedule Walk block
+        // carries the same target, a fast run makes it harder.
+        let later = WALK_ACTIVATION_HEIGHT + 500;
+        assert_eq!(calculate_target(later, on_schedule(later)), after);
+        assert!(U256::from_big_endian(&calculate_target(later, on_schedule(later) - 3600)) < expected);
+    }
+
+    /// Mines and applies blocks from genesis to two past the switch: every
+    /// block from `WALK_ACTIVATION_HEIGHT` carries a Walk proof, and a block
+    /// there carrying the BLAKE3 chain instead is refused.
+    #[cfg(feature = "fast-mining")]
+    #[test]
+    fn a_chain_crosses_the_walk_activation() {
+        use crate::core::extension::create_extension;
+        let mut state = genesis_state();
+        let mut timestamps = vec![state.timestamp];
+        while state.height < WALK_ACTIVATION_HEIGHT + 2 {
+            let ts = state.timestamp + TARGET_BLOCK_TIME;
+            let batch = make_empty_batch(&state, block_reward(state.height), ts);
+            let mining_hash = compute_header_hash(&BatchHeader {
+                height: state.height,
+                prev_header_hash: state.header_hash,
+                prev_midstate: state.midstate,
+                post_tx_midstate: batch.header().post_tx_midstate,
+                extension: batch.extension.clone(),
+                timestamp: ts,
+                target: batch.target,
+                state_root: batch.state_root,
+            });
+            let walk = crate::core::walk::walk_hash(&mining_hash, batch.extension.nonce);
+            assert_eq!(
+                batch.extension.final_hash == walk,
+                state.height >= WALK_ACTIVATION_HEIGHT,
+                "height {}",
+                state.height
+            );
+
+            if state.height == WALK_ACTIVATION_HEIGHT {
+                // The same block with a BLAKE3-chain proof that meets the target.
+                let mut forged = batch.clone();
+                forged.extension = (0u64..)
+                    .map(|n| create_extension(mining_hash, n))
+                    .find(|e| e.final_hash < state.target)
+                    .unwrap();
+                let mut probe = state.clone();
+                let err = apply_batch(&mut probe, &forged, &timestamps, &mut std::collections::HashMap::new())
+                    .unwrap_err();
+                assert!(err.to_string().contains("Proof-of-work"), "{err}");
+            }
+
+            apply_batch(&mut state, &batch, &timestamps, &mut std::collections::HashMap::new()).unwrap();
+            timestamps.push(ts);
+            state.target = adjust_difficulty(&state);
+        }
+        assert_eq!(state.height, WALK_ACTIVATION_HEIGHT + 2);
     }
 
     // ── validate_timestamp ──────────────────────────────────────────────

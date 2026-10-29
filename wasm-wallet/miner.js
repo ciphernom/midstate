@@ -5,7 +5,16 @@
 // The main thread coordinates all miners and handles block submission
 // via the wallet worker.
 
-import init, { search_nonces } from './pkg/wasm_wallet.js';
+import init, * as wasm from './pkg/wasm_wallet.js';
+
+// `search_nonces_pow` arrives with the Midstate Walk build of the WASM package.
+// Until `pkg/` is rebuilt, the chain still mines through `search_nonces`; a
+// Walk template then fails loudly instead of grinding the wrong function.
+function searchNonces(pow, midstate, target, nonce, chunk) {
+    if (wasm.search_nonces_pow) return wasm.search_nonces_pow(pow, midstate, target, nonce, chunk);
+    if (pow === 'blake3-chain') return wasm.search_nonces(midstate, target, nonce, chunk);
+    throw new Error(`this WASM build cannot mine '${pow}': rebuild wasm-wallet/pkg`);
+}
 import { GpuMiner } from './gpu_miner.js';
 
 let mining = false;
@@ -111,6 +120,10 @@ self.onmessage = async (e) => {
         mining = true;
         loopRunning = true;
         const { midstate, target } = payload;
+        // Which proof of work this template wants: 'blake3-chain', or 'walk'
+        // (Midstate Walk) from its activation height. Nodes and pools that
+        // predate Walk do not say, and want the chain.
+        const pow = payload.pow || 'blake3-chain';
         if (payload.throttle_ms !== undefined) throttleMs = payload.throttle_ms;
 
         // Pool mode: a hit against the pool's share target is a *share*, not a
@@ -121,7 +134,7 @@ self.onmessage = async (e) => {
         // and this worker would sit idle until the next network block.
         const continueOnFound = !!payload.continue_on_found;
 
-        self.postMessage({ type: 'LOG', payload: `START received. midstate=${midstate?.substring(0,16)}… throttle=${throttleMs}ms` });
+        self.postMessage({ type: 'LOG', payload: `START received. pow=${pow} midstate=${midstate?.substring(0,16)}… throttle=${throttleMs}ms` });
 
         if (!midstate || !target) {
             self.postMessage({ type: 'ERROR', payload: 'START missing midstate or target' });
@@ -137,16 +150,16 @@ self.onmessage = async (e) => {
         let nonce = BigInt(startRange);
 
 
-        // CHUNK controls how many SIMD iterations per search_nonces() call.
-        // Each iteration = 4 SIMD lanes = 4 nonces. This chain uses expensive
-        // iterated hashing (EXTENSION_ITERATIONS), so each nonce takes ~200ms.
-        // CHUNK=1 → 4 nonces → ~0.8s per call. This keeps the worker responsive
-        // to STOP/THROTTLE messages and allows frequent hashrate reports.
-        // (The original single-threaded miner used CHUNK=5.)
-        const CHUNK = 1;
-        const NONCES_PER_CHUNK = CHUNK * 4;
+        // CHUNK controls how many iterations per search_nonces_pow() call;
+        // each iteration is 4 nonces. A BLAKE3-chain nonce takes ~200ms, so
+        // CHUNK=1 (~0.8s a call) keeps the worker responsive to STOP/THROTTLE
+        // and reports hashrate often. A Midstate Walk nonce takes a few ms, so
+        // CHUNK adapts to keep each call near the same ~0.8s: otherwise the
+        // throttle sleep, not the work, would set the pace.
+        let CHUNK = 1;
+        const CALL_TARGET_MS = 800;
 
-        let chunkCount = 0;
+        let noncesSinceReport = 0;
         let reportStart = Date.now();
 
         // ── GPU path ──
@@ -159,7 +172,8 @@ self.onmessage = async (e) => {
         // before being reported, so a driver that returns garbage costs a batch
         // rather than producing a rejected share. This is the browser counterpart
         // of the `create_extension` re-check in `mine_gpu`.
-        if (gpu && gpu.verified) {
+        // The GPU kernel computes the BLAKE3 chain only.
+        if (gpu && gpu.verified && pow === 'blake3-chain') {
             try {
                 while (mining) {
                     const candidates = await gpu.searchBatch({
@@ -211,10 +225,14 @@ self.onmessage = async (e) => {
 
         try {
             while (mining) {
-                const result = search_nonces(midstate, target, nonce, CHUNK);
+                const callStart = Date.now();
+                const result = searchNonces(pow, midstate, target, nonce, CHUNK);
+                const callMs = Date.now() - callStart;
 
-                chunkCount++;
-                nonce += BigInt(NONCES_PER_CHUNK);
+                noncesSinceReport += CHUNK * 4;
+                nonce += BigInt(CHUNK * 4);
+                if (callMs < CALL_TARGET_MS / 2 && CHUNK < 4096) CHUNK *= 2;
+                else if (callMs > CALL_TARGET_MS * 2 && CHUNK > 1) CHUNK = Math.max(1, CHUNK >> 1);
 
                 if (result !== undefined && result !== null) {
                     self.postMessage({ type: 'FOUND', payload: { nonce: result.toString() } });
@@ -231,16 +249,15 @@ self.onmessage = async (e) => {
                 const now = Date.now();
                 const elapsed = now - reportStart;
                 if (elapsed >= 1000) {
-                    const totalNonces = chunkCount * NONCES_PER_CHUNK;
-                    const nps = Math.floor(totalNonces / (elapsed / 1000));
-                    self.postMessage({ type: 'HASHRATE', payload: { nps, nonces: totalNonces } });
-                    chunkCount = 0;
+                    const nps = Math.floor(noncesSinceReport / (elapsed / 1000));
+                    self.postMessage({ type: 'HASHRATE', payload: { nps, nonces: noncesSinceReport } });
+                    noncesSinceReport = 0;
                     reportStart = now;
                 }
 
                 // Yield after every call to stay responsive to STOP/THROTTLE.
-                // Each search_nonces(1) already takes ~0.8s, so the throttle
-                // sleep on top of that is the total pause between chunks.
+                // Each call already takes ~0.8s, so the throttle sleep on top
+                // of that is the total pause between chunks.
                 await new Promise(r => setTimeout(r, throttleMs));
             }
         } catch (err) {

@@ -78,9 +78,10 @@ impl Syncer {
     ///               headers?[i].prev_midstate = headers?[i-1].post_tx_midstate ∧
     ///               validate_timestamp(headers?[i].timestamp) ∧
     ///               headers?[i].target = expected_target) ∧
+    ///            (∀ i ∈ 1..#headers?-1 • headers?[i].height = headers?[i-1].height + 1) ∧
     ///            (check_pow? ⇒ ∀ h ∈ headers? • 
     ///               h.extension.final_hash < h.target ∧ 
-    ///               h.extension.final_hash = ℋ^{ITERS}(ℋ(mining_hash ⌢ le8(h.extension.nonce))))
+    ///               h.extension.final_hash = create_extension_at(h.height, mining_hash, h.extension.nonce).final_hash)
     /// ```
     fn verify_header_chain_internal(headers: &[BatchHeader], prior_timestamps: &[u64], check_pow: bool) -> Result<()> {
         if headers.is_empty() {
@@ -112,6 +113,11 @@ impl Syncer {
             if header.prev_midstate != prev.post_tx_midstate {
                 bail!("Header chain linkage broken at index {}: prev_midstate mismatch", i);
             }
+            // Heights choose the proof of work (`pow_algo_at`), so they must be
+            // the chain's, not labels a peer picked: contiguous from the first.
+            if header.height != prev.height + 1 {
+                bail!("Header chain heights not contiguous at index {}: {} after {}", i, header.height, prev.height);
+            }
 
             // O(1) Sliding Window MTP Check
             crate::core::state::validate_timestamp(header.timestamp, recent_ts.make_contiguous(), current_time, header.height)
@@ -131,11 +137,34 @@ impl Syncer {
 
         // 2. Heavy parallel check: ONLY run if check_pow is true
         if check_pow {
+            // Headers from the Midstate Walk switch on carry the Walk: one walk
+            // per header, spread across cores. Below it, the BLAKE3 chain in
+            // SIMD batches as before. Heights were checked contiguous above.
+            let first_walk = headers
+                .iter()
+                .position(|h| crate::core::types::pow_algo_at(h.height) == crate::core::types::PowAlgo::Walk)
+                .unwrap_or(headers.len());
+            let (chain_headers, walk_headers) = headers.split_at(first_walk);
+
+            let walk_results: Vec<Result<(), String>> = walk_headers
+                .par_iter()
+                .map(|header| {
+                    let mining_hash = crate::core::types::compute_header_hash(header);
+                    crate::core::extension::verify_extension_at(header.height, mining_hash, &header.extension, &header.target)
+                        .map_err(|e| format!("{} at height {}", e, header.height))
+                })
+                .collect();
+            for res in walk_results {
+                if let Err(e) = res {
+                    bail!("{}", e);
+                }
+            }
+
             // Dynamically detect the optimal SIMD width (e.g., 8 for AVX2, 4 for NEON)
             let lane_width = crate::core::wots_simd::detected_level().lanes();
 
             // Chunk the headers into SIMD-sized batches, then process the chunks in parallel with Rayon
-            let results: Vec<Result<(), String>> = headers
+            let results: Vec<Result<(), String>> = chain_headers
                 .par_chunks(lane_width)
                 .flat_map(|chunk| {
                     // 1. Calculate the initial H(mining_hash || nonce) seed for each block in the SIMD chunk

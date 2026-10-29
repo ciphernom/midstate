@@ -4,7 +4,7 @@ use crate::core::*;
 // compute_address now reached via mining helpers or direct core::types when needed in node
 use crate::core::types::{CoinbaseOutput, BatchHeader};
 use crate::core::state::{apply_batch, choose_best_state};
-use crate::core::extension::create_extension;
+use crate::core::extension::create_extension_at;
 use crate::core::transaction::{apply_transaction, apply_transaction_no_sig_check, validate_transaction};
 use crate::mempool::Mempool;
 use crate::metrics::Metrics;
@@ -1168,6 +1168,8 @@ fn finish_template(
             .expect("Batch is always serde-serializable"),
         total_fees,
         block_reward: reward,
+        height,
+        pow: crate::core::types::pow_algo_at(height).name().to_string(),
     })
 }
 
@@ -1522,12 +1524,12 @@ pub async fn new(
                     let nonce = {
                         let mut n = 0;
                         loop {
-                            if create_extension(mining_hash, n).final_hash < state.target { break n; }
+                            if create_extension_at(0, mining_hash, n).final_hash < state.target { break n; }
                             n += 1;
                         }
                     };
                     
-                    let extension = create_extension(mining_hash, nonce);
+                    let extension = create_extension_at(0, mining_hash, nonce);
                     tracing::info!("Using Genesis Nonce: {}", nonce);
 
                     let genesis_batch = Batch {
@@ -4951,11 +4953,15 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
         tokio::spawn(async move {
             let chunk_valid = tokio::task::spawn_blocking(move || {
                 use rayon::prelude::*;
-                use crate::core::extension::verify_extension;
+                use crate::core::extension::verify_extension_at;
                 chunk_owned.par_iter().all(|header| {
                     // FIX: Compute the header hash here!
                     let mining_hash = crate::core::types::compute_header_hash(header);
-                    verify_extension(
+                    // The height picks the proof of work. The pre-check above made
+                    // the chunk's heights contiguous, and the batch phase checks
+                    // each header's height against the height it is applied at.
+                    verify_extension_at(
+                        header.height,
                         mining_hash,
                         &header.extension,
                         &header.target,
@@ -5301,6 +5307,17 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
                 }
 
                 let header = &headers[hdr_idx];
+
+                // The header's proof of work was verified under the algorithm its
+                // own height selects, and `apply_batch_skip_pow` below trusts that
+                // verification. A header labelled with another height (e.g. one
+                // below WALK_ACTIVATION_HEIGHT, to pass with the BLAKE3 chain)
+                // must not get through.
+                if header.height != height {
+                    error_msg = format!("Header at index {} claims height {} but applies at {}", hdr_idx, header.height, height);
+                    is_valid = false;
+                    break;
+                }
 
                 let mut expected_mining_hash = crate::core::types::compute_header_hash(header);
 
@@ -6517,8 +6534,12 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
             // stalls the whole node. Offload it to the blocking pool.
             let orphan_ext = batch.extension.clone();
             let orphan_target = batch.target;
+            // An orphan's height is unknown (its parent is not ours), so near the
+            // Midstate Walk switch it is checked against both proofs of work; it
+            // is checked properly, at its real height, when it is applied.
+            let tip_height = self.state.height;
             let pow_ok = tokio::task::spawn_blocking(move || {
-                crate::core::extension::verify_extension(mining_hash, &orphan_ext, &orphan_target).is_ok()
+                crate::core::extension::verify_extension_near(tip_height, mining_hash, &orphan_ext, &orphan_target).is_ok()
             }).await.unwrap_or(false);
             if !pow_ok {
                 tracing::debug!("Rejected invalid orphan block (PoW failed)");
@@ -6536,10 +6557,19 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
             // permanently. The PoW verification above is the real spam gate.
             let current_target = primitive_types::U256::from_big_endian(&self.state.target);
             let batch_target = primitive_types::U256::from_big_endian(&batch.target);
-            let (max_allowed, overflow) = current_target.overflowing_mul(primitive_types::U256::from(16u64));
+            // Near the Midstate Walk switch, a block past it legitimately carries
+            // a target WALK_TARGET_SHIFT doublings easier than ours.
+            use crate::core::extension::ORPHAN_POW_SLACK;
+            use crate::core::types::{pow_algo_at, WALK_TARGET_SHIFT};
+            let window = if pow_algo_at(self.state.height) != pow_algo_at(self.state.height + ORPHAN_POW_SLACK) {
+                16u64 << WALK_TARGET_SHIFT.clamp(0, 32)
+            } else {
+                16u64
+            };
+            let (max_allowed, overflow) = current_target.overflowing_mul(primitive_types::U256::from(window));
             if !overflow && batch_target > max_allowed {
                 tracing::debug!(
-                    "Dropped orphan block from {:?}: target is >16x easier than ours. Ignoring until synced.",
+                    "Dropped orphan block from {:?}: target is too much easier than ours. Ignoring until synced.",
                     from
                 );
                 // DO NOT BAN THE PEER. If we are syncing from genesis, the network's tip 
@@ -7259,7 +7289,7 @@ async fn try_apply_orphans(&mut self) {
             use crate::core::extension::MiningResult;
             // Mine against the secure header hash!
             if let Some(mining_result) = crate::core::gpu_mining::mine(
-                mining_hash, target, pool_target, threads, cancel, hash_counter
+                pre_mine_height, mining_hash, target, pool_target, threads, cancel, hash_counter
             ) {
                 match mining_result {
                     MiningResult::Block(extension) => {
@@ -7849,6 +7879,7 @@ pub(crate) fn extract_spent_addresses(batch: &crate::core::Batch) -> Vec<[u8; 32
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use crate::core::extension::create_extension;
     use crate::core::mss;
     use crate::core::types::hash;
     
@@ -8381,7 +8412,7 @@ mod complex_tests {
 
         let mut nonce = 0u64;
         let extension = loop {
-            let ext = create_extension(mining_hash, nonce);
+            let ext = create_extension_at(prev_state.height, mining_hash, nonce);
             if ext.final_hash < target { break ext; }
             nonce += 1;
         };

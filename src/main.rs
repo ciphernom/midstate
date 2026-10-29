@@ -382,6 +382,91 @@ enum Command {
         #[arg(long, default_value = "0")]
         threads: usize,
     },
+    /// Measure this machine's proof-of-work speed: Midstate Walk attempts per
+    /// second on one thread and on all of them, and the BLAKE3 chain it
+    /// replaces. Run it on a Raspberry Pi 5 and on a desktop to compare them.
+    BenchPow {
+        /// Seconds each measurement runs for.
+        #[arg(long, default_value = "10")]
+        seconds: u64,
+        /// Threads for the all-cores measurement. 0 uses every detected core.
+        #[arg(long, default_value = "0")]
+        threads: usize,
+    },
+}
+
+/// Midstate Walk attempts per second over `threads` threads for `duration`.
+fn walk_rate(mining_hash: [u8; 32], threads: usize, duration: std::time::Duration) -> f64 {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicU64::new(0));
+    let start = std::time::Instant::now();
+    let workers: Vec<_> = (0..threads as u64)
+        .map(|t| {
+            let (stop, done) = (stop.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut nonce = t << 40;
+                while !stop.load(Ordering::Relaxed) {
+                    std::hint::black_box(midstate::core::walk::walk_hash(&mining_hash, nonce));
+                    nonce += 1;
+                    done.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
+    std::thread::sleep(duration);
+    stop.store(true, Ordering::Relaxed);
+    for w in workers {
+        let _ = w.join();
+    }
+    done.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64()
+}
+
+/// `midstate bench-pow`.
+fn bench_pow(seconds: u64, threads: usize) {
+    use midstate::core::walk;
+    let threads = if threads == 0 {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    } else {
+        threads
+    };
+    let duration = std::time::Duration::from_secs(seconds.max(1));
+    let mining_hash = midstate::core::types::hash(b"midstate bench-pow");
+
+    println!(
+        "Midstate Walk v1 (from height {}): {} KiB scratchpad, {} steps, AES: {}",
+        midstate::core::types::WALK_ACTIVATION_HEIGHT,
+        walk::WALK_LINES * 64 / 1024,
+        walk::WALK_STEPS,
+        walk::backend_name()
+    );
+    let one = walk_rate(mining_hash, 1, duration);
+    println!("  1 thread   {:>10.1} attempts/s", one);
+    if threads > 1 {
+        let all = walk_rate(mining_hash, threads, duration);
+        println!(
+            "  {} threads {:>10.1} attempts/s  ({:.1} per thread, {:.0}% of {} × 1 thread)",
+            threads,
+            all,
+            all / threads as f64,
+            100.0 * all / (one * threads as f64),
+            threads
+        );
+    }
+
+    let start = std::time::Instant::now();
+    let mut nonce = 0u64;
+    while start.elapsed() < duration {
+        std::hint::black_box(midstate::core::extension::create_extension(mining_hash, nonce));
+        nonce += 1;
+    }
+    let chain = nonce as f64 / start.elapsed().as_secs_f64();
+    println!(
+        "BLAKE3 chain (below that height), 1 thread: {:.2} attempts/s; a Walk attempt costs {:.1}× less",
+        chain,
+        one / chain
+    );
 }
 
 #[derive(Subcommand)]
@@ -1058,6 +1143,10 @@ async fn main() -> Result<()> {
             {
                 anyhow::bail!("Pool server cannot run in WebAssembly");
             }
+        }
+        Command::BenchPow { seconds, threads } => {
+            bench_pow(seconds, threads);
+            Ok(())
         }
         Command::Miner { pool_url, payout_address, worker, midwimble_address, threads } => {
             #[cfg(not(target_arch = "wasm32"))]
@@ -5545,6 +5634,11 @@ pub async fn run_node(
     if mine {
         let simd = midstate::core::simd_mining::detected_level();
         tracing::info!("Mining SIMD: {} ({} nonces/batch)", simd.name(), simd.lanes());
+        tracing::info!(
+            "Midstate Walk (from height {}): AES backend {}",
+            midstate::core::types::WALK_ACTIVATION_HEIGHT,
+            midstate::core::walk::backend_name()
+        );
     }
 
     // Spawn the RPC server in a background task

@@ -2,6 +2,8 @@
 
 Midstate is a cryptocurrency implementing BLAKE3 sequential-time proof of work, post-quantum cryptography (WOTS and MSS), and strict power-of-2 coin denominations. Transactions operate on a two-phase commit-reveal protocol.
 
+From block 420,000 the proof of work is **Midstate Walk**: a dependent walk over a 256 KiB scratchpad with data-dependent 64-bit multiply, divide and AES operations, designed to run best on CPU cores, a Raspberry Pi 5's included, rather than GPUs. See [`docs/MIDSTATE_WALK.md`](docs/MIDSTATE_WALK.md); `midstate bench-pow` measures a machine.
+
 ## 1. Build
 
 Compilation requires the standard Rust toolchain.

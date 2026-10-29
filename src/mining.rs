@@ -276,6 +276,10 @@ pub async fn run_stratum_client(
                                 tracing::warn!("malformed mining.notify from the pool, skipped: {:.200}", msg.to_string());
                                 continue;
                             };
+                            // The block's height picks the proof of work. A pool that
+                            // predates Midstate Walk does not send it, and its node
+                            // (not having switched either) wants the BLAKE3 chain.
+                            let job_height = notify_height(&msg);
                             let template_val = &template_val;
                             if let Some(t) = msg["params"].get(3).and_then(|v| v.as_str()) {
                                 let mut bytes = [0u8; 32];
@@ -375,7 +379,7 @@ pub async fn run_stratum_client(
                                     if nc.load(Ordering::Relaxed) { break; }
                                     
                                     if let Some(res) = crate::core::gpu_mining::mine(
-                                        m_hash, n_target, Some(s_target), threads, nc.clone(), hc.clone()
+                                        job_height, m_hash, n_target, Some(s_target), threads, nc.clone(), hc.clone()
                                     ) {
                                         let nonce = match res {
                                             crate::core::extension::MiningResult::Block(ext) => ext.nonce,
@@ -440,6 +444,13 @@ async fn next_pool_message<R: AsyncBufRead + Unpin>(lines: &mut tokio::io::Lines
     }
 }
 
+/// The height of the block a notify's job mines (its fifth parameter), which
+/// selects the proof of work. Pools that predate Midstate Walk send four
+/// parameters; their jobs are BLAKE3-chain jobs, which height 0 selects.
+fn notify_height(msg: &serde_json::Value) -> u64 {
+    msg["params"].get(4).and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
 /// A notify's job id, mining hash and block template, or `None` if any is
 /// missing or malformed (it used to panic the miner).
 fn parse_notify(msg: &serde_json::Value) -> Option<(u64, [u8; 32], serde_json::Value)> {
@@ -500,6 +511,17 @@ mod stratum_tests {
             _ => panic!("the notify was lost"),
         }
         assert!(matches!(&received[1], PoolMessage::Unreadable(why) if why.contains("not json at all")));
+    }
+
+    #[test]
+    fn a_notify_carries_the_height_that_picks_the_proof_of_work() {
+        use crate::core::types::{pow_algo_at, PowAlgo, WALK_ACTIVATION_HEIGHT};
+        let m = hex::encode([1u8; 32]);
+        let old_pool = serde_json::json!({"method": "mining.notify", "params": [1, m, {}, "00"]});
+        assert_eq!(pow_algo_at(notify_height(&old_pool)), PowAlgo::Blake3Chain);
+        let walk = serde_json::json!({"method": "mining.notify", "params": [1, m, {}, "00", WALK_ACTIVATION_HEIGHT]});
+        assert_eq!(notify_height(&walk), WALK_ACTIVATION_HEIGHT);
+        assert_eq!(pow_algo_at(notify_height(&walk)), PowAlgo::Walk);
     }
 
     #[test]
