@@ -2,14 +2,16 @@
 //
 // # Reasoning
 //
-// Mining here is a VDF: one nonce is a 1,000,000-iteration sequential BLAKE3
-// chain costing ~130 ms, and no amount of batching or scheduling improves a
-// single thread. The work is embarrassingly parallel though — nonces are
-// independent — so cores are the only lever, and an 8-core machine really is
-// ~8× a one-core one.
+// Each nonce is a fixed amount of sequential work — a 1,000,000-iteration BLAKE3
+// chain (~130 ms) below height 420,000, one Midstate Walk (a few ms) from then
+// on — and no amount of batching or scheduling improves a single thread. The
+// work is embarrassingly parallel though — nonces are independent — so cores
+// are the only lever. Workers are told which proof of work to run with each
+// template (`pow`), and a change of `pow` restarts them like a change of
+// midstate does.
 //
-// The partition must satisfy two constraints at once. `search_nonces` tests four
-// SIMD lanes from a contiguous base, so a worker's own nonces must stay
+// The partition must satisfy two constraints at once. A search call tests four
+// lanes from a contiguous base, so a worker's own nonces must stay
 // contiguous within a call; and no two workers may ever test the same value, or
 // the extra cores buy nothing. Striding by `iterations × 4 × workerCount`
 // satisfies both: worker `k` takes the k-th block of four and then skips the
@@ -23,6 +25,8 @@ import { Worker } from 'node:worker_threads';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
+
+import { BLAKE3_CHAIN } from './pow.js';
 
 const WORKER_URL = new URL('./miner-worker.js', import.meta.url);
 
@@ -56,6 +60,8 @@ export class MinerPool {
         this._onFound = null;
         this._onError = null;
         this._current = null;
+        /** Numbers each searchTemplate; workers echo it on every find. */
+        this._job = 0;
     }
 
     onFound(cb) { this._onFound = cb; return this; }
@@ -91,6 +97,9 @@ export class MinerPool {
 
     _onMessage(index, m) {
         if (m.type === 'FOUND') {
+            // A find posted before the workers saw a template change belongs to
+            // a template nobody is mining any more.
+            if (!this._current || m.job !== this._current.job) return;
             this._found.push(BigInt(m.nonce));
             if (this._onFound) this._onFound(BigInt(m.nonce));
         } else if (m.type === 'PROGRESS') {
@@ -100,16 +109,17 @@ export class MinerPool {
         }
     }
 
-    /** Point every worker at a (midstate, target), from a fresh random base. */
-    searchTemplate(midstate, target) {
+    /** Point every worker at a (midstate, target, pow), from a fresh random base. */
+    searchTemplate(midstate, target, pow = BLAKE3_CHAIN) {
         if (!this.running) throw new Error('MinerPool is not started.');
         this._found = [];
         const base = Math.floor(Math.random() * (Number.MAX_SAFE_INTEGER - 1_000_000_000));
-        this._current = { midstate, target, base };
+        const job = ++this._job;
+        this._current = { midstate, target, pow, base, job };
         for (let i = 0; i < this.workers.length; i++) {
             this.workers[i].postMessage({
                 type: 'START',
-                midstate, target, base,
+                midstate, target, pow, base, job,
                 index: i, count: this.workers.length,
                 iterations: this.iterations,
             });
@@ -129,15 +139,16 @@ export class MinerPool {
      * pool is neither. The adaptation is to treat the pool as a background
      * producer: the first call for a given (midstate, target) starts every
      * worker, and each call drains whatever has been found since. `Miner`'s
-     * `nonce` argument is ignored because the pool owns the partition — letting
-     * the caller also advance a cursor would double-count and create overlap.
+     * `nonce` and `iterations` arguments are ignored because the pool owns the
+     * partition — letting the caller also advance a cursor would double-count
+     * and create overlap. Its fifth argument, `pow`, is honoured.
      */
     get searchFn() {
-        return (midstate, target) => {
+        return (midstate, target, _nonce, _iterations, pow = BLAKE3_CHAIN) => {
             const c = this._current;
-            if (!c || c.midstate !== midstate || c.target !== target) {
+            if (!c || c.midstate !== midstate || c.target !== target || c.pow !== pow) {
                 this.stopSearch();
-                this.searchTemplate(midstate, target);
+                this.searchTemplate(midstate, target, pow);
                 return undefined;
             }
             return this._found.length > 0 ? this._found.shift() : undefined;

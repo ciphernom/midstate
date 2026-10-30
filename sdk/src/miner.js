@@ -4,14 +4,16 @@
 //  Reasoning (module level)
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Mining on this chain is a Verifiable Delay Function, not a throughput race.
-// `create_extension` hashes a (midstate ⌢ nonce) seed and then iterates BLAKE3
-// EXTENSION_ITERATIONS (1,000,000) times sequentially. One nonce costs ~130 ms
-// of unavoidable serial work; SIMD gives four lanes at once, so a single worker
-// lands around 15–30 nonces/second and no amount of batching changes that.
+// Every nonce costs a fixed amount of sequential work, so mining here is not a
+// throughput race. Below height 420,000 that work is `create_extension`: a
+// (midstate ⌢ nonce) seed iterated through BLAKE3 EXTENSION_ITERATIONS
+// (1,000,000) times. One nonce costs ~130 ms, SIMD runs four lanes at once, and
+// a worker lands around 15–30 nonces/second. From 420,000 it is Midstate Walk,
+// a 256 KiB memory walk of 2^18 dependent steps that costs a few milliseconds
+// per nonce. The template says which one it wants (§4).
 //
-// Three properties of the template follow from the node's own code, and the
-// browser wallet gets at least the first two wrong in ways that fail silently —
+// Four properties of the template follow from the node's own code, and the
+// browser wallet has got the first two wrong in ways that fail silently —
 // blocks are found and then rejected, which looks exactly like "mining doesn't
 // work".
 //
@@ -48,11 +50,21 @@
 // costs a round trip each time. This module carries `expected_total` forward
 // between templates, so it guesses correctly after the first block and treats
 // the retry as the exception rather than the norm.
+//
+// ── 4. The template names its proof of work ──
+//
+// From WALK_ACTIVATION_HEIGHT (420,000) the node verifies Midstate Walk instead
+// of the BLAKE3 chain. Templates and pool jobs carry `pow` ("blake3-chain" or
+// "walk"), and the search and the extension rebuilt for submission must both
+// use it: a Walk nonce submitted with a BLAKE3-chain extension is a block the
+// node rejects. A custom `searchFn` receives `pow` as its fifth argument. A
+// template without the field comes from a server that predates the switch; see
+// pow.js.
 
 /** Locked-in timestamp goes stale against MEDIAN_TIME_PAST_WINDOW; refresh well before. */
 export const TEMPLATE_MAX_AGE_MS = 120_000;
 
-/** Nonces tested per `search_nonces` call: `iterations × 4` SIMD lanes. */
+/** Nonces tested per search call: `iterations × 4`, for either proof of work. */
 const DEFAULT_ITERATIONS = 1;
 
 /**
@@ -62,9 +74,15 @@ const DEFAULT_ITERATIONS = 1;
  */
 const NONCE_SPACE = Number.MAX_SAFE_INTEGER - 1_000_000_000;
 
-import { search_nonces } from '../pkg/wasm_wallet.js';
+import * as wasm from '../pkg/wasm_wallet.js';
+import { BLAKE3_CHAIN, templatePow, searchFor, buildExtension } from './pow.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** The default search: the WASM search for the template's proof of work. */
+function wasmSearch(midstate, target, nonce, iterations, pow = BLAKE3_CHAIN) {
+    return searchFor(wasm, pow)(midstate, target, nonce, iterations);
+}
 
 /**
  * Solo miner.
@@ -96,9 +114,11 @@ export class Miner {
      *   going on a hit (see below).
      * @param {string} [opts.poolAddress]       Payout address registered with the pool.
      * @param {string} [opts.workerName='sdk']  Worker label reported on shares.
-     * @param {Function} [opts.searchFn]        Override the nonce search. Defaults
-     *   to the WASM SIMD `search_nonces`; injectable so a GPU backend or a test
-     *   can substitute one without touching the loop.
+     * @param {Function} [opts.searchFn]        Override the nonce search:
+     *   `(midstate, target, nonce, iterations, pow) => nonce | undefined`, where
+     *   `pow` is the template's proof of work. Defaults to the WASM search for
+     *   `pow`; injectable so a GPU backend or a test can substitute one without
+     *   touching the loop. A backend that cannot compute `pow` must not search.
      */
     constructor(wallet, client, opts = {}) {
         this.wallet = wallet;
@@ -108,7 +128,7 @@ export class Miner {
         this.tipPollMs = opts.tipPollMs ?? 15_000;
         this.templateMaxAgeMs = opts.templateMaxAgeMs ?? TEMPLATE_MAX_AGE_MS;
         this.payoutMssAddress = opts.payoutMssAddress ?? null;
-        this.searchFn = opts.searchFn ?? search_nonces;
+        this.searchFn = opts.searchFn ?? wasmSearch;
 
         // ── Pool mode ──
         //
@@ -205,6 +225,7 @@ export class Miner {
                 network_target: job.network_target ?? null,
                 job_id: job.job_id,
                 chain_height: job.height,
+                pow: templatePow(job),
                 total_fees: 0,
                 block_reward: 0,
                 mining_addrs: [],
@@ -226,6 +247,7 @@ export class Miner {
             const resp = await this.client.getBlockTemplate(cb.coinbase);
             if (resp.ok) {
                 const tmpl = await resp.json();
+                tmpl.pow = templatePow(tmpl);
                 tmpl.mining_addrs = cb.mining_addrs || [];
                 tmpl.next_wots_index = cb.next_wots_index ?? this.wallet.nextWotsIndex;
                 tmpl.chain_height = state.height;
@@ -261,10 +283,10 @@ export class Miner {
      * # Reasoning
      *
      * The extension is recomputed here rather than trusted from the search.
-     * `search_nonces` returns only the nonce, and a GPU or remote searcher can
-     * return a nonce whose hash does not actually reproduce — re-deriving it
-     * with `build_solo_extension` costs one VDF evaluation (~130 ms) and turns a
-     * would-be invalid submission into a local no-op.
+     * A search returns only the nonce, so the extension is re-derived with the
+     * template's proof of work (`build_solo_extension_pow`), at the cost of
+     * one more evaluation. Re-deriving it with the other algorithm would give
+     * a final hash the node cannot reproduce.
      *
      * The batch is cloned and ONLY `extension` is written. In particular
      * `timestamp` is left exactly as the template set it: it is folded into
@@ -278,7 +300,7 @@ export class Miner {
      *   - nonce? was found against template.mining_midstate
      *
      * Post (accepted):
-     *   batch.extension = create_extension(mining_midstate, nonce?)
+     *   batch.extension = create_extension_with(template.pow, mining_midstate, nonce?)
      *   ∧ batch.timestamp = template.batch_template.timestamp   (unchanged)
      *   ∧ ∀ a ∈ template.mining_addrs • a.address ∈ dom wots_addrs'
      *   ∧ next_wots_index' = template.next_wots_index
@@ -324,9 +346,10 @@ export class Miner {
             }
         }
 
-        const extStr = this.wallet.inner.build_solo_extension(template.mining_midstate, n);
+        const pow = template.pow ?? BLAKE3_CHAIN;
+        const extStr = buildExtension(this.wallet.inner, pow, template.mining_midstate, n);
         if (!extStr) {
-            return { accepted: false, reason: 'extension did not reproduce for this nonce', nonce: n.toString() };
+            return { accepted: false, reason: `could not build a ${pow} extension for this nonce`, nonce: n.toString() };
         }
 
         const batch = JSON.parse(JSON.stringify(template.batch_template));
@@ -435,6 +458,7 @@ export class Miner {
                         nonce = BigInt(Math.floor(Math.random() * NONCE_SPACE));
                         this._emit('template', {
                             height: this.template.chain_height,
+                            pow: this.template.pow,
                             target: this.template.target,
                             txCount: this.template.batch_template?.transactions?.length ?? 0,
                             fees: BigInt(this.template.total_fees ?? 0),
@@ -505,7 +529,8 @@ export class Miner {
 
     /** Isolated so tests can substitute a search without a real VDF. */
     _search(template, nonce) {
-        return this.searchFn(template.mining_midstate, template.target, nonce, this.iterations);
+        return this.searchFn(template.mining_midstate, template.target, nonce, this.iterations,
+                             template.pow ?? BLAKE3_CHAIN);
     }
 
     /** Stop the loop after the current search call returns. */

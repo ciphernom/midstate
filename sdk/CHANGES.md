@@ -1,3 +1,63 @@
+# Midstate SDK 2.10.0 — Midstate Walk (node v6.0.0 "Anselmo")
+
+Version 2.9.1 → 2.10.0.
+
+From height 420,000 the node verifies Midstate Walk instead of the BLAKE3 chain
+(`docs/MIDSTATE_WALK.md` in the node repository). Templates and pool jobs from
+v6.0.0 nodes and pools name the algorithm in a `pow` field, `"blake3-chain"` or
+`"walk"`. The SDK now mines whatever that field says. Until this release it
+could only mine the BLAKE3 chain, so every block or share it found from height
+420,000 would have been rejected.
+
+Test suites: `npm test` — 22 codec + 34 wallet + 89 reorg/recovery/contract + 59 miner/pool + 30 DEX + 26 launcher + 30 compiler/VM + 44 pump launcher = **334 tests**, all offline. 13 of the miner/pool tests are new and cover the changes below.
+
+## Mining follows the template's `pow`
+
+- `Miner.fetchTemplate()` sets `template.pow` from the node template or the
+  pool job. A template without the field comes from a server that predates the
+  switch and builds only BLAKE3-chain blocks, so it means `"blake3-chain"`. An
+  unknown name is refused with an error rather than mined, because
+  `search_nonces_pow` answers "nothing found" for a name it does not know.
+- The search calls `search_nonces_pow(pow, …)`, and `submitBlock` rebuilds the
+  extension with `build_solo_extension_pow(pow, …)`. Both still cover
+  `iterations × 4` nonces per call, so the nonce partition is unchanged.
+- **`searchFn` gets a fifth argument, `pow`.** A custom search (a GPU backend,
+  say) that ignores it will mine the BLAKE3 chain at Walk heights, and every
+  find will be rejected. One that cannot compute the Walk should not search.
+- `MinerPool` passes `pow` to its workers and restarts them when it changes,
+  as it does for a new midstate.
+- The `template` event carries `pow`.
+- New exports: `search_nonces_pow`, plus `BLAKE3_CHAIN`, `WALK`, `POW_NAMES`
+  and `templatePow` (also importable as `midstate-sdk/pow`).
+
+## Fixed: a template change left the old worker loop running
+
+`MinerPool` changes template with a STOP and an immediate START. A worker
+handled both while its loop was parked between search calls, so the old loop
+woke to find `mining` true again and carried on beside the new one. Every
+template change added a loop. After N templates a worker took turns between N
+searches, N − 1 of them on dead templates, and finds from those were credited
+to the current one.
+
+Each START now carries a generation the loop must match, and each find carries
+its job number so the coordinator drops finds that crossed a change in flight.
+The regression test (`a template change stops the old search`) saw 4–5 stale
+finds in 1.5 s on the old worker and sees none now.
+
+## `pkg/` and `dist/`
+
+- `pkg/` is rebuilt from the node's `wasm-wallet` at v6.0.0. The only API change
+  is the two Walk functions, `search_nonces_pow` and
+  `WebWallet.build_solo_extension_pow`. WebAssembly has no AES instructions, so
+  the WASM Walk computes AES with tables; a new test checks it against the
+  node's golden vectors. Under Node on a 2-core cloud VM, one thread does about
+  270 Walk nonces/s, against about 22/s for the BLAKE3 chain with 4-lane SIMD.
+- `dist/midstate-sdk.bundle.js` is rebuilt. Besides the above it picks up the
+  compiler/VM and utils changes that were already in `src/` but not yet in the
+  bundle.
+
+---
+
 # Midstate SDK — update to match node `midstate-20260816`
 
 Version 1.0.8 → 2.3.0.

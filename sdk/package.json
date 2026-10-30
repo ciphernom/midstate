@@ -1,6 +1,6 @@
 {
   "name": "midstate-sdk",
-  "version": "2.9.1",
+  "version": "2.10.0",
   "description": "Official JavaScript SDK for the Midstate Blockchain",
   "main": "src/index.js",
   "type": "module",
@@ -10,6 +10,7 @@
     "./pkg/*": "./pkg/*",
     "./reorg": "./src/reorg.js",
     "./miner": "./src/miner.js",
+    "./pow": "./src/pow.js",
     "./pool": "./src/pool.js",
     "./miner-pool": "./src/miner-pool.js",
     "./miner-worker": "./src/miner-worker.js",

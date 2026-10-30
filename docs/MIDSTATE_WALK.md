@@ -149,9 +149,27 @@ The knobs, if it comes out worse than expected:
 - The miner worker passes each template's `pow` through and sizes its
   batches by time.
 - The browser GPU path runs only for BLAKE3-chain templates.
-- **`wasm-wallet/pkg` must be rebuilt (`wasm-pack build`) before
-  deploying.** Until it is, the worker keeps mining the chain through the old
-  `search_nonces` and refuses Walk templates with an error.
+- `wasm-wallet/pkg` is rebuilt with both functions (v6.0.0). The Pages
+  deploy rebuilds it from source anyway. A `pkg/` older than the Walk keeps
+  mining the chain through `search_nonces` and refuses Walk templates with an
+  error.
+- WebAssembly has no AES instructions, so the WASM Walk computes AES with
+  tables. It reproduces the golden vectors, and one thread runs about 270
+  attempts/s under Node on a 2-core cloud VM.
+
+## SDK
+
+`midstate-sdk` 2.10.0 (`sdk/`) mines whatever a template's `pow` says, solo
+and pooled, single- and multi-threaded:
+
+- `Miner` reads `pow` from node templates and pool jobs. A template without
+  one means the BLAKE3 chain, and an unknown name is refused.
+- A custom `searchFn` gets `pow` as its fifth argument.
+- `MinerPool` workers restart when `pow` changes.
+- `sdk/pkg` and `sdk/dist` are rebuilt.
+
+`sdk/CHANGES.md` has the details, including a fix for worker loops that
+outlived their template.
 
 ## Before release
 
@@ -167,9 +185,8 @@ The knobs, if it comes out worse than expected:
    - 420,000 is ~46 days after height ~354,000.
    - Midwimble mirrors it as `MIDSTATE_WALK_ACTIVATION_HEIGHT` and
      `MIDSTATE_WALK_TARGET_SHIFT`. Both must change together.
-5. **Rebuild `wasm-wallet/pkg`.** Update the SDK miner (`sdk/src/miner*.js`)
-   to pass `template.pow` to `search_nonces_pow`, then rebuild `sdk/pkg` and
-   `sdk/dist`.
+5. ~~Rebuild `wasm-wallet/pkg`, update the SDK miner, rebuild `sdk/pkg` and
+   `sdk/dist`.~~ Done in v6.0.0 (see [SDK](#sdk)).
 6. **Third-party miners** (MidstateAxe firmware, GPU miners, scripts) must
    switch to Walk at the height. They can tell from the template's `pow`.
 
@@ -183,4 +200,5 @@ definition rather than from the Rust:
   `qemu-aarch64 -cpu cortex-a76`.
 
 Both reproduce the golden vectors in `walk.rs`'s tests. So does the Rust code
-on x86 AES-NI and on its portable path.
+on x86 AES-NI, on its portable path, and compiled to WebAssembly (the SDK's
+`test-miner.mjs`).
