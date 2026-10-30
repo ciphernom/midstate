@@ -802,6 +802,8 @@ struct PoolState {
     merge_status: RwLock<MergeStatus>,
     /// The percentage fee the pool takes from block rewards (e.g., 1.0 for 1%).
     pool_fee_percent: f64,
+    /// The percentage of midwimble rewards the pool keeps.
+    midwimble_fee_percent: f64,
     /// The most recent network block reward seen from the node, relayed to the
     /// dashboard so it can estimate expected payouts / coins-per-day before the
     /// pool has found its first block. Lock-free; updated each polling cycle.
@@ -1125,6 +1127,7 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
 
     Json(serde_json::json!({
         "pool_fee_percent": state.pool_fee_percent,
+        "midwimble_fee_percent": state.midwimble_fee_percent,
         "total_score": total_score,
         "active_miners": miners.len(),
         "miners": miners,
@@ -1180,6 +1183,7 @@ pub async fn run_stratum_pool(
     bind_addr: String,
     node_rpc_url: String,
     pool_fee_percent: f64,
+    midwimble_fee_percent: f64,
     share_bits: Option<u32>,
     webrtc_port: Option<u16>,
     midwimble_rpc: Option<String>,
@@ -1278,6 +1282,7 @@ pub async fn run_stratum_pool(
         }),
         midwimble_address,
         pool_fee_percent,
+        midwimble_fee_percent,
         current_block_reward: std::sync::atomic::AtomicU64::new(0),
         current_height: std::sync::atomic::AtomicU64::new(0),
         share_stats: RwLock::new(HashMap::new()),
@@ -1606,7 +1611,7 @@ pub async fn run_stratum_pool(
                             &client,
                             mw_rpc,
                             mw_pool,
-                            state_clone.pool_fee_percent,
+                            state_clone.midwimble_fee_percent,
                             &hash(&seed_data),
                             crate::core::types::pow_algo_at(tip_height),
                         )
@@ -1908,6 +1913,7 @@ async fn build_template_payload(
             // committed to the block rather than merely reported over the wire.
             "pool_address":     state.pool_address,
             "pool_fee_percent": state.pool_fee_percent,
+            "midwimble_fee_percent": state.midwimble_fee_percent,
             "block_reward":     state.current_block_reward.load(std::sync::atomic::Ordering::Relaxed),
     }))
 }
@@ -3634,6 +3640,7 @@ mod tests {
             midwimble_address: pool,
             merge_status: RwLock::new(MergeStatus::default()),
             pool_fee_percent: 1.0,
+            midwimble_fee_percent: 1.0,
             current_block_reward: AtomicU64::new(0),
             current_height: AtomicU64::new(0),
             share_stats: RwLock::new(HashMap::new()),
