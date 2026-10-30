@@ -28,6 +28,10 @@ function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
 const MIDSTATE = 'a5'.repeat(32);
 const EASY = 'ff'.repeat(32);
 const IMPOSSIBLE = '00'.repeat(31) + '01';
+/** Half of all hashes meet it. */
+const HALF = '80' + '00'.repeat(31);
+const hex = (bytes) => bytes.map((b) => b.toString(16).padStart(2, '0')).join('');
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * A node that serves templates the way `finish_template` does: a locked
@@ -35,9 +39,10 @@ const IMPOSSIBLE = '00'.repeat(31) + '01';
  * total it will insist on.
  */
 class MockNode {
-    constructor({ height = 100, reward = 1073741824, fees = 0, midstate = MIDSTATE, target = EASY } = {}) {
+    /** `pow` is omitted from templates unless given, as by a node that predates the field. */
+    constructor({ height = 100, reward = 1073741824, fees = 0, midstate = MIDSTATE, target = EASY, pow } = {}) {
         this.height = height; this.reward = reward; this.fees = fees;
-        this.midstate = midstate; this.target = target;
+        this.midstate = midstate; this.target = target; this.pow = pow;
         this.templateRequests = []; this.submitted = []; this.acceptSubmissions = true;
         this.lockedTimestamp = 1_700_000_000;
     }
@@ -54,6 +59,7 @@ class MockNode {
         return { ok: true, status: 200, json: async () => ({
             mining_midstate: this.midstate,
             target: this.target,
+            ...(this.pow ? { height: this.height, pow: this.pow } : {}),
             total_fees: this.fees,
             block_reward: this.reward,
             batch_template: {
@@ -229,6 +235,58 @@ await t('coinbase addresses become watchable so the reward is credited', async (
         'the block reward could not be credited — the coinbase address is not in the wallet');
 });
 
+console.log('\n━━━ proof of work by height ━━━');
+
+await t('a template without pow is mined with the BLAKE3 chain', async () => {
+    // A node that predates the switch sends no `pow`, and builds only chain blocks.
+    const w = await mkWallet(); const node = new MockNode();
+    const tmpl = await new Miner(w, node).fetchTemplate();
+    assert(tmpl.pow === 'blake3-chain', `pow ${tmpl.pow}`);
+});
+
+await t('the template\'s pow reaches the search', async () => {
+    const w = await mkWallet(); const node = new MockNode({ pow: 'walk' });
+    const m = new Miner(w, node);
+    let seen = null;
+    m.searchFn = (ms, target, nonce, iterations, pow) => { seen = pow; return undefined; };
+    m.template = await m.fetchTemplate();
+    m._search(m.template, 0n);
+    assert(seen === 'walk', `searched with ${seen}, expected the template's walk`);
+});
+
+await t('an unknown pow is refused, not mined', async () => {
+    // search_nonces_pow answers "nothing found" for a name it does not know, so
+    // mining one would burn CPU on a search that can never succeed.
+    const w = await mkWallet(); const node = new MockNode({ pow: 'sha256d' });
+    let msg = null;
+    try { await new Miner(w, node).fetchTemplate(); } catch (e) { msg = e.message; }
+    assert(msg && /Unknown proof of work "sha256d"/.test(msg), `got "${msg}"`);
+});
+
+await t('a Walk block carries a Walk extension', async () => {
+    // Rebuilding the extension with the BLAKE3 chain would submit a final hash
+    // the node cannot reproduce at a Walk height.
+    const w = await mkWallet(); const node = new MockNode({ pow: 'walk' });
+    const m = new Miner(w, node);
+    const tmpl = await m.fetchTemplate();
+    await m.submitBlock(tmpl, 7n);
+    const sent = JSON.stringify(node.submitted[0].extension.final_hash);
+    const walk = JSON.parse(w.inner.build_solo_extension_pow('walk', MIDSTATE, 7n));
+    const chain = JSON.parse(w.inner.build_solo_extension(MIDSTATE, 7n));
+    assert(sent === JSON.stringify(walk.final_hash), 'the submitted final hash is not the Walk one');
+    assert(sent !== JSON.stringify(chain.final_hash), 'the Walk and chain final hashes coincide');
+});
+
+await t('the template event names the proof of work', async () => {
+    const w = await mkWallet(); const node = new MockNode({ pow: 'walk' });
+    const m = new Miner(w, node, { tipPollMs: 999_999, throttleMs: 0 });
+    m.searchFn = () => undefined;
+    let ev = null;
+    m.on('template', (e) => { ev = e; m.stop(); });
+    await m.start();
+    assert(ev && ev.pow === 'walk', `template event pow ${ev?.pow}`);
+});
+
 console.log('\n━━━ mining loop ━━━');
 
 await t('the loop refreshes the template when the tip moves', async () => {
@@ -329,6 +387,43 @@ await t('an unreachable target yields nothing (comparison is not inverted)', asy
     assert(found === undefined, `found nonce ${found} against a near-zero target — comparison is inverted`);
 });
 
+await t('the WASM Walk reproduces the node\'s golden vectors', async () => {
+    // Pinned in the node's src/core/walk.rs. The browser computes AES with
+    // tables rather than AES-NI or ARMv8 instructions, so this is what proves
+    // the three agree.
+    const w = await mkWallet();
+    const golden = [
+        ['00'.repeat(32), 0n, 'a934fced2d9a53fb09d6abe089f3d2f5bba9a421b41ee5726233a525cc7438e7'],
+        ['ff'.repeat(32), 18446744073709551615n, '65d237f595f07bee156c635ad45f721987ce38d79ea14c89e40c5555613d0768'],
+        ['374bf98b3b8f7f41a9e291154fc582a65bb3e14180cb9a07fef08e55f3006c50', 42n,
+         '5f2da9d320de391aef28bcaab63e3d1a25402b4541cdff8680059a87c7d515b7'],
+    ];
+    for (const [m, nonce, want] of golden) {
+        const ext = JSON.parse(w.inner.build_solo_extension_pow('walk', m, nonce));
+        assert(hex(ext.final_hash) === want, `nonce ${nonce}: ${hex(ext.final_hash).slice(0, 16)}…, expected ${want.slice(0, 16)}…`);
+    }
+});
+
+await t('a Walk nonce found by search_nonces_pow reproduces via build_solo_extension_pow', async () => {
+    const w = await mkWallet();
+    const found = W.search_nonces_pow('walk', MIDSTATE, HALF, 0n, 4);
+    assert(found !== undefined, 'search found nothing in 16 nonces against a target half of them meet');
+    const ext = JSON.parse(w.inner.build_solo_extension_pow('walk', MIDSTATE, found));
+    assert(ext.nonce === Number(found), `extension nonce ${ext.nonce} != searched ${found}`);
+    assert(hex(ext.final_hash) < HALF, `final_hash ${hex(ext.final_hash).slice(0, 16)}… not below target`);
+    assert(W.search_nonces_pow('walk', MIDSTATE, IMPOSSIBLE, 0n, 1) === undefined, 'found a Walk nonce against a near-zero target');
+});
+
+await t('search_nonces_pow for the BLAKE3 chain is search_nonces', async () => {
+    const a = W.search_nonces_pow('blake3-chain', MIDSTATE, HALF, 0n, 1);
+    const b = W.search_nonces(MIDSTATE, HALF, 0n, 1);
+    assert(a === b, `${a} vs ${b}`);
+    const w = await mkWallet();
+    assert(w.inner.build_solo_extension_pow('blake3-chain', MIDSTATE, 3n) === w.inner.build_solo_extension(MIDSTATE, 3n),
+        'the BLAKE3-chain extension differs between the two builders');
+    assert(W.search_nonces_pow('sha256d', MIDSTATE, EASY, 0n, 1) === undefined, 'an unknown pow found something');
+});
+
 await t('the mining loop yields to the event loop every iteration', async () => {
     // search_nonces blocks synchronously, so without an await in the loop the
     // event loop never runs: timers, inbound pushes and stop() are all starved.
@@ -371,8 +466,8 @@ await t('a throttled miner also yields', async () => {
 console.log('\n━━━ pool mining ━━━');
 
 class MockPool {
-    constructor({ shareTarget = EASY, jobId = 'job-1', height = 100 } = {}) {
-        this.shareTarget = shareTarget; this.jobId = jobId; this.height = height;
+    constructor({ shareTarget = EASY, jobId = 'job-1', height = 100, pow } = {}) {
+        this.shareTarget = shareTarget; this.jobId = jobId; this.height = height; this.pow = pow;
         this.templateCalls = 0; this.shares = []; this.rejectAs = null;
     }
     async getTemplate(address) {
@@ -383,6 +478,7 @@ class MockPool {
             target: this.shareTarget, network_target: '00' + 'ff'.repeat(31),
             height: this.height, batch_template: { transactions: [{}, {}] },
             merkle_root: 'aa'.repeat(32),
+            ...(this.pow ? { pow: this.pow } : {}),
         };
     }
     async submitShare(address, jobId, nonce, worker) {
@@ -477,6 +573,16 @@ await t('a stale-share rejection marks the job dirty', async () => {
     assert(m._templateStale(100) === true, 'dirty job not treated as stale');
 });
 
+await t('a pool job\'s pow reaches the search', async () => {
+    const w = await mkWallet(); const node = new MockNode();
+    const m = new Miner(w, node, { pool: new MockPool({ pow: 'walk' }), poolAddress: 'ab'.repeat(32) });
+    let seen = null;
+    m.searchFn = (ms, target, nonce, iterations, pow) => { seen = pow; return undefined; };
+    m.template = await m.fetchTemplate();
+    m._search(m.template, 0n);
+    assert(seen === 'walk', `searched with ${seen}, expected the job's walk`);
+});
+
 await t('pool mining without an address fails loudly', async () => {
     const w = await mkWallet(); const node = new MockNode();
     let msg = null;
@@ -561,6 +667,75 @@ await t('changing the template restarts the workers', async () => {
         fn('b6'.repeat(32), EASY);
         assert(pool._current.midstate === 'b6'.repeat(32), 'workers kept the old midstate');
         assert(pool._current.base !== first, 'base not re-randomised for the new template');
+    } finally { await pool.stop(); }
+});
+
+await t('a template change stops the old search, not just starts a new one', async () => {
+    // STOP then START used to leave the old loop running: START set `mining`
+    // back to true before the old loop next looked at it, so each template
+    // change added a loop, every old one kept grinding a dead template, and
+    // its finds were credited to the new one.
+    const { MinerPool } = await import('./src/miner-pool.js');
+    const pool = new MinerPool({ workers: 1 });
+    await pool.start();
+    try {
+        const fn = pool.searchFn;
+        fn(MIDSTATE, EASY);                    // every search call finds
+        await sleepMs(1500);
+        assert(pool._found.length > 0, 'the easy template found nothing');
+        fn('b6'.repeat(32), IMPOSSIBLE);       // no search call can find
+        await sleepMs(1500);
+        assert(pool._found.length === 0,
+            `${pool._found.length} nonce(s) arrived after the switch: the old loop is still mining`);
+    } finally { await pool.stop(); }
+});
+
+await t('workers mine the Walk when told to', async () => {
+    // At a target half of all hashes meet, a worker running the BLAKE3 chain
+    // would hand back nonces whose Walk hash misses half the time.
+    const { MinerPool } = await import('./src/miner-pool.js');
+    const pool = new MinerPool({ workers: 2 });
+    await pool.start();
+    try {
+        pool.searchTemplate(MIDSTATE, HALF, 'walk');
+        await sleepMs(1500);
+        const found = pool._found.slice(0, 12);
+        assert(found.length === 12, `only ${found.length} Walk finds in 1.5 s`);
+        const w = await mkWallet();
+        for (const n of found) {
+            const ext = JSON.parse(w.inner.build_solo_extension_pow('walk', MIDSTATE, n));
+            assert(hex(ext.final_hash) < HALF, `nonce ${n} misses the target under the Walk`);
+        }
+    } finally { await pool.stop(); }
+});
+
+await t('a change of pow restarts the workers', async () => {
+    const { MinerPool } = await import('./src/miner-pool.js');
+    const pool = new MinerPool({ workers: 1 });
+    await pool.start();
+    try {
+        const fn = pool.searchFn;
+        fn(MIDSTATE, EASY, 0n, 1, 'blake3-chain');
+        const first = pool._current.base;
+        fn(MIDSTATE, EASY, 0n, 1, 'walk');
+        assert(pool._current.pow === 'walk', `workers kept ${pool._current.pow}`);
+        assert(pool._current.base !== first, 'base not re-randomised for the new proof of work');
+    } finally { await pool.stop(); }
+});
+
+await t('an unknown pow ends the search with an error, and the worker serves the next one', async () => {
+    const { MinerPool } = await import('./src/miner-pool.js');
+    const pool = new MinerPool({ workers: 1 });
+    const errors = [];
+    pool.onError((e) => errors.push(e.message));
+    await pool.start();
+    try {
+        pool.searchTemplate(MIDSTATE, EASY, 'sha256d');
+        await sleepMs(300);
+        assert(errors.some((m) => /Unknown proof of work/.test(m)), `errors: ${errors.join('; ') || 'none'}`);
+        pool.searchTemplate(MIDSTATE, EASY, 'walk');
+        await sleepMs(500);
+        assert(pool._found.length > 0, 'the worker did not take the next template');
     } finally { await pool.stop(); }
 });
 

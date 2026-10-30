@@ -9,6 +9,9 @@ export * as Bincode from './bincode.js';
 
 // Mining: solo and pool, single- or multi-threaded.
 export { Miner, TEMPLATE_MAX_AGE_MS } from './miner.js';
+// Which proof of work a template asks for (the BLAKE3 chain, or Midstate Walk
+// from height 420,000).
+export { BLAKE3_CHAIN, WALK, POW_NAMES, templatePow } from './pow.js';
 export { PoolClient, verifyPoolProof, libp2pPoolTransport, POOL_PROTOCOL, POOL_PUSH_PROTOCOL } from './pool.js';
 // MinerPool uses node:worker_threads; import it directly under Node.
 // import { MinerPool } from '@midstate/sdk/miner-pool';
@@ -44,6 +47,7 @@ export {
     // Mining / proof of work
     mine_commitment_pow,
     search_nonces,
+    search_nonces_pow,
     mine_chat_pow_v2_wasm,
 
     // Value and identity helpers

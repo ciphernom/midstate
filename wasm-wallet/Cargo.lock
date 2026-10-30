@@ -2783,7 +2783,7 @@ dependencies = [
 
 [[package]]
 name = "midstate"
-version = "4.0.0"
+version = "5.0.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2795,6 +2795,7 @@ dependencies = [
  "blake3",
  "bytemuck",
  "clap",
+ "curve25519-dalek",
  "dirs",
  "futures",
  "hex",

@@ -283,6 +283,38 @@ export class WebWallet {
         }
     }
     /**
+     * [`WebWallet::build_solo_extension`] for a named proof of work
+     * (`"blake3-chain"` or `"walk"`, as the template's `pow` field says).
+     *
+     * # Returns
+     *
+     * `None` if `pow` is unknown or `midstate_hex` is not valid 64-character hex.
+     * @param {string} pow
+     * @param {string} midstate_hex
+     * @param {bigint} nonce
+     * @returns {string | undefined}
+     */
+    build_solo_extension_pow(pow, midstate_hex, nonce) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(pow, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(midstate_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.webwallet_build_solo_extension_pow(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, nonce);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v3;
+            if (r0 !== 0) {
+                v3 = getStringFromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v3;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * Universal DeFi Transaction Builder
      * Constructs a transaction that transitions a State Thread while securely attaching
      * physical UTXOs to satisfy covenants (like paying a Treasury).
@@ -2013,6 +2045,42 @@ export function search_nonces(midstate_hex, target_hex, start_nonce, iterations)
         const ptr1 = passStringToWasm0(target_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
         const len1 = WASM_VECTOR_LEN;
         wasm.search_nonces(retptr, ptr0, len0, ptr1, len1, start_nonce, iterations);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r2 = getDataViewMemory0().getBigInt64(retptr + 8 * 1, true);
+        return r0 === 0 ? undefined : BigInt.asUintN(64, r2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * [`search_nonces`] for a named proof of work: `"blake3-chain"` (what
+ * `search_nonces` does) or `"walk"` (Midstate Walk, from
+ * `WALK_ACTIVATION_HEIGHT`). Templates say which in their `pow` field.
+ *
+ * Tests `iterations × 4` nonces from `start_nonce` either way, so callers
+ * advance their nonce by the same amount. A Walk attempt costs a small
+ * fraction of a BLAKE3-chain one, so callers should size `iterations` by
+ * time rather than count.
+ *
+ * Returns `None` for an unknown `pow` or malformed hex, as for no find.
+ * @param {string} pow
+ * @param {string} midstate_hex
+ * @param {string} target_hex
+ * @param {bigint} start_nonce
+ * @param {number} iterations
+ * @returns {bigint | undefined}
+ */
+export function search_nonces_pow(pow, midstate_hex, target_hex, start_nonce, iterations) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(pow, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(midstate_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(target_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        wasm.search_nonces_pow(retptr, ptr0, len0, ptr1, len1, ptr2, len2, start_nonce, iterations);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r2 = getDataViewMemory0().getBigInt64(retptr + 8 * 1, true);
         return r0 === 0 ? undefined : BigInt.asUintN(64, r2);

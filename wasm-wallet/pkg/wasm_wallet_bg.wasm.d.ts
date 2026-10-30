@@ -26,6 +26,7 @@ export const qbolt_build_state: (a: number, b: number, c: number, d: number, e: 
 export const qbolt_channel_address: (a: number, b: number, c: number, d: number, e: number, f: bigint) => void;
 export const qbolt_channel_bytecode_hex: (a: number, b: number, c: number, d: number, e: number, f: bigint) => void;
 export const search_nonces: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => void;
+export const search_nonces_pow: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: number) => void;
 export const verify_mss_sig_wasm: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
 export const webwallet_build_coinbase: (a: number, b: number, c: bigint, d: number) => void;
 export const webwallet_build_coinbase_to_mss: (a: number, b: number, c: bigint, d: number, e: number) => void;
@@ -33,6 +34,7 @@ export const webwallet_build_consolidate_reveal: (a: number, b: number, c: numbe
 export const webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const webwallet_build_script_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const webwallet_build_solo_extension: (a: number, b: number, c: number, d: number, e: bigint) => void;
+export const webwallet_build_solo_extension_pow: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint) => void;
 export const webwallet_build_state_thread_tx: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number) => void;
 export const webwallet_check_filter: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
 export const webwallet_export_mss_bytes: (a: number, b: number, c: number, d: number) => void;

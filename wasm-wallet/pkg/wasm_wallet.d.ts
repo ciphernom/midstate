@@ -110,6 +110,15 @@ export class WebWallet {
      */
     build_solo_extension(midstate_hex: string, nonce: bigint): string | undefined;
     /**
+     * [`WebWallet::build_solo_extension`] for a named proof of work
+     * (`"blake3-chain"` or `"walk"`, as the template's `pow` field says).
+     *
+     * # Returns
+     *
+     * `None` if `pow` is unknown or `midstate_hex` is not valid 64-character hex.
+     */
+    build_solo_extension_pow(pow: string, midstate_hex: string, nonce: bigint): string | undefined;
+    /**
      * Universal DeFi Transaction Builder
      * Constructs a transaction that transitions a State Thread while securely attaching
      * physical UTXOs to satisfy covenants (like paying a Treasury).
@@ -624,6 +633,20 @@ export function qbolt_channel_bytecode_hex(sender_pk_hex: string, receiver_pk_he
  */
 export function search_nonces(midstate_hex: string, target_hex: string, start_nonce: bigint, iterations: number): bigint | undefined;
 
+/**
+ * [`search_nonces`] for a named proof of work: `"blake3-chain"` (what
+ * `search_nonces` does) or `"walk"` (Midstate Walk, from
+ * `WALK_ACTIVATION_HEIGHT`). Templates say which in their `pow` field.
+ *
+ * Tests `iterations × 4` nonces from `start_nonce` either way, so callers
+ * advance their nonce by the same amount. A Walk attempt costs a small
+ * fraction of a BLAKE3-chain one, so callers should size `iterations` by
+ * time rather than count.
+ *
+ * Returns `None` for an unknown `pow` or malformed hex, as for no find.
+ */
+export function search_nonces_pow(pow: string, midstate_hex: string, target_hex: string, start_nonce: bigint, iterations: number): bigint | undefined;
+
 export function verify_mss_sig_wasm(sig_hex: string, msg_hex: string, pk_hex: string): boolean;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
@@ -655,6 +678,7 @@ export interface InitOutput {
     readonly qbolt_channel_address: (a: number, b: number, c: number, d: number, e: number, f: bigint) => void;
     readonly qbolt_channel_bytecode_hex: (a: number, b: number, c: number, d: number, e: number, f: bigint) => void;
     readonly search_nonces: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => void;
+    readonly search_nonces_pow: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: number) => void;
     readonly verify_mss_sig_wasm: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
     readonly webwallet_build_coinbase: (a: number, b: number, c: bigint, d: number) => void;
     readonly webwallet_build_coinbase_to_mss: (a: number, b: number, c: bigint, d: number, e: number) => void;
@@ -662,6 +686,7 @@ export interface InitOutput {
     readonly webwallet_build_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly webwallet_build_script_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly webwallet_build_solo_extension: (a: number, b: number, c: number, d: number, e: bigint) => void;
+    readonly webwallet_build_solo_extension_pow: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint) => void;
     readonly webwallet_build_state_thread_tx: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number) => void;
     readonly webwallet_check_filter: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
     readonly webwallet_export_mss_bytes: (a: number, b: number, c: number, d: number) => void;
