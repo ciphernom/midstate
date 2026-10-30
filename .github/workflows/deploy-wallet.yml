@@ -8,6 +8,7 @@ on:
       - 'src/core/**'
       - 'src/wallet/**'
       - '.github/workflows/deploy-wallet.yml'
+      - '.github/scripts/check-site.js'
   # Lets a failed or skipped deploy be re-run from the Actions tab.
   workflow_dispatch:
 
@@ -69,7 +70,13 @@ jobs:
           cp wasm-wallet/sw.js staging/wallet/
           cp wasm-wallet/worker.js staging/wallet/
           cp wasm-wallet/miner.js staging/wallet/
+          # miner.js imports gpu_miner.js, which loads pow.wgsl: without them
+          # every mining thread fails to start. pool_client.bundle.js is the
+          # pool's WebRTC transport.
+          cp wasm-wallet/gpu_miner.js staging/wallet/
+          cp wasm-wallet/pow.wgsl staging/wallet/
           cp wasm-wallet/light_client.bundle.js staging/wallet/
+          cp wasm-wallet/pool_client.bundle.js staging/wallet/
           cp -r wasm-wallet/pkg staging/wallet/
 
           # 3b. Give every deploy its own service-worker cache. sw.js serves
@@ -83,6 +90,11 @@ jobs:
           # 4. Verification for logs
           echo "Final Deployment Structure:"
           ls -R staging
+
+      # A file the pages load but the list above leaves out is a 404 in
+      # production; this stops the deploy instead.
+      - name: Check the site has every file it loads
+        run: node .github/scripts/check-site.js staging
 
       # Deploy the raw, unzipped files to Cloudflare first.
       #
