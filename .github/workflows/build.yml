@@ -374,15 +374,36 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Before the download, because checkout cleans the workspace.
+      - name: Checkout release notes
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: docs/releases
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
+      # docs/releases/<tag>.md, when the tagged commit has one, names the
+      # release (its first line, less the leading "# ") and goes above the
+      # generated notes. Without one, the release is named after the tag.
+      - name: Release name and notes
+        id: notes
+        run: |
+          f="docs/releases/${GITHUB_REF_NAME}.md"
+          if [ -f "$f" ]; then
+            echo "name=$(head -n 1 "$f" | sed 's/^#[[:space:]]*//')" >> "$GITHUB_OUTPUT"
+            tail -n +2 "$f" > "$RUNNER_TEMP/release-notes.md"
+            echo "body_path=$RUNNER_TEMP/release-notes.md" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          name: ${{ steps.notes.outputs.name }}
+          body_path: ${{ steps.notes.outputs.body_path }}
           files: artifacts/*
           generate_release_notes: true
 
