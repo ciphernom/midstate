@@ -1980,6 +1980,8 @@ async function handleGetTemplate() {
                 // Walk do not say, and want the BLAKE3 chain.
                 pow:             tmpl.pow || 'blake3-chain',
                 blockReward:     tmpl.block_reward || 0,
+                // For the expected-earnings figure: what the pool keeps.
+                poolFeePercent:  Number(tmpl.pool_fee_percent) || 0,
                 poolShares:      tmpl.shares_recorded || 0,
                 // The pool's template already contains the transactions the block
                 // will carry, so the tx count is exact without a getMempool call.

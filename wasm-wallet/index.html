@@ -488,6 +488,41 @@
         .home-mine-indicator { width: 8px; height: 8px; background: var(--text-faint); border: 1px solid var(--border); flex-shrink: 0; }
         .home-mine-indicator.on { background: var(--stark-accent); }
 
+        /* "Mine in your browser": the one-tap path on the welcome screen */
+        .mine-onboard-cta { margin-bottom: 0.5rem; }
+        .mine-onboard-cta button { padding: 16px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 8px; }
+        .mine-onboard-sub, .onboard-note {
+            font-family: 'Inter', sans-serif; font-size: 12px; line-height: 1.6; color: var(--text-muted);
+        }
+        .mine-onboard-sub { text-align: center; }
+        /* All 24 words on the page: a scroll box inside the panel invites
+           writing down only the words that happen to be visible. */
+        #onboardSeedGrid { max-height: none; overflow: visible; margin-bottom: 12px; }
+        .onboard-note { color: var(--text-bright); margin-bottom: 12px; }
+        .onboard-check {
+            display: flex; gap: 10px; align-items: flex-start; cursor: pointer;
+            font-family: 'Inter', sans-serif; font-size: 12px; line-height: 1.5; color: var(--text-bright);
+            margin-bottom: 12px;
+        }
+        .onboard-check input { width: auto; margin: 2px 0 0 0; padding: 0; flex-shrink: 0; }
+        .auth-or {
+            display: flex; align-items: center; gap: 10px; margin: 1.5rem 0;
+            color: var(--text-faint); font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px;
+        }
+        .auth-or::before, .auth-or::after { content: ''; flex: 1; border-top: 1px solid var(--border); }
+
+        /* Countdown to Midstate Walk, and the earnings estimate */
+        .walk-countdown {
+            border: 1px solid var(--border); border-left: 3px solid var(--stark-accent);
+            background: var(--bg-panel); padding: 12px 14px; margin-bottom: 1rem;
+            font-family: 'Inter', sans-serif; font-size: 12px; line-height: 1.6; color: var(--text-bright);
+        }
+        .walk-countdown b { color: var(--text-max); }
+        .mine-earn-val { font-size: 15px; color: var(--text-max); font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
+        .mine-options { padding: 0 1rem; margin-bottom: 1.25rem; display: flex; flex-direction: column; gap: 8px; }
+        .mine-options .onboard-check { margin: 0; color: var(--text-muted); }
+        .mine-share button { margin-bottom: 1.5rem; }
+
         /* ── Chat ────────────────────────────────────────────────────── */
         #view-chat.active { display: flex; flex-direction: column; height: 100%; }
 
@@ -793,11 +828,27 @@
             <div class="panel">
                 <h2 style="text-align: center; margin-bottom: 2rem;">Authentication</h2>
                 <div id="createSection" class="hidden">
+                    <!-- One tap from here to mining: makes the wallet, then mines into it. -->
+                    <div id="mineOnboardCta" class="mine-onboard-cta">
+                        <button id="btnMineOnboard" style="background: var(--accent);">Mine in your browser</button>
+                        <p class="mine-onboard-sub">Creates a wallet in this browser and starts mining into it. Nothing to install.</p>
+                    </div>
+                    <div id="mineOnboardPanel" class="hidden">
+                        <p class="onboard-note">Write these 24 words down, in order. They are the only way to get your coins back if this browser loses them, and anyone who sees them can take your coins.</p>
+                        <div class="seed-grid" id="onboardSeedGrid"></div>
+                        <button id="btnOnboardCopy" style="background: transparent; border: 1px dashed var(--border-bright);">Copy the words</button>
+                        <label class="onboard-check"><input type="checkbox" id="onboardSaved"> I have written these words down</label>
+                        <input type="password" id="onboardPwd" placeholder="Set a password for this browser" autocomplete="new-password">
+                        <button id="btnOnboardGo" disabled style="background: var(--accent);">Create wallet &amp; start mining</button>
+                    </div>
+                    <div id="manualCreate">
+                    <div class="auth-or">or set up a wallet yourself</div>
                     <input type="text" id="seedPhrase" placeholder="Enter 24 words or Generate...">
                     <button id="btnGen" style="background: transparent; border: 1px dashed var(--border-bright);">Generate New Phrase</button>
                     <div style="height: 10px;"></div>
                     <input type="password" id="newPwd" placeholder="Set App Password">
                     <button id="btnCreate" disabled style="background: var(--text-max); color: #000;">Initialize Wallet</button>
+                    </div>
                     <div id="createProgressContainer" class="hidden" style="margin-top: 15px;">
                         <div id="createProgressLabel" style="font-size: 11px; color: var(--accent); margin-bottom: 6px; text-transform: uppercase; text-align: center;">Generating Post-Quantum Keys...</div>
                         <progress id="createProgress" value="0" max="100"></progress>
@@ -838,13 +889,13 @@
             </div>
 
             <!-- Compact mining widget -->
-            <div class="home-mine-widget" id="homeMineWidget" onclick="switchTab('view-mine')" style="display: none;">
+            <div class="home-mine-widget" id="homeMineWidget" onclick="switchTab('view-mine')">
                 <div class="flex-row">
                     <div style="display: flex; align-items: center; gap: 10px;">
                         <div class="home-mine-indicator" id="homeMineIndicator"></div>
                         <div>
                             <div style="font-weight: bold; color: var(--text-max); font-size: 14px;">Web Miner</div>
-                            <div style="font-size: 11px; color: #555;" id="homeMineStatus">Idle</div>
+                            <div style="font-size: 11px; color: #555;" id="homeMineStatus">Tap to start mining</div>
                         </div>
                     </div>
                     <div style="text-align: right;">
@@ -871,16 +922,17 @@
 
         <!-- MINING DASHBOARD -->
         <main id="view-mine" class="page">
+            <div class="walk-countdown hidden" id="walkCountdown"></div>
             <div class="panel" style="margin-bottom: 1rem; border-color: var(--border);">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                         <h3 style="margin: 0; font-size: 14px;">Mining Mode</h3>
                         <select id="mineModeSelect" style="width: auto; margin: 0; padding: 4px 8px; font-size: 12px; background: var(--bg); border: 1px solid var(--border-bright); color: var(--text-max); border-radius: 4px;">
-                            <option value="solo">Solo (WebRTC)</option>
-                            <option value="pool">Smart Pool</option>
+                            <option value="pool">Pool (steady payouts)</option>
+                            <option value="solo">Solo (needs a node link)</option>
                         </select>
                     </div>
                     <div id="poolConfigParams" class="hidden">
-                        <input type="text" id="poolUrlInput" placeholder="Pool multiaddr (/ip4/…/webrtc-direct/certhash/…) or URL" style="font-size: 12px; padding: 8px; margin-bottom: 0;">
+                        <input type="text" id="poolUrlInput" placeholder="Pool URL, or multiaddr (/ip4/…/webrtc-direct/certhash/…)" style="font-size: 12px; padding: 8px; margin-bottom: 0;">
                     </div>
                 </div>
             <div class="mine-hero">
@@ -905,7 +957,7 @@
             <div style="text-align: center; margin-bottom: 1.25rem;">
                 <div class="mine-hw-badge">
                     <div class="mine-hw-dot" id="mineHwDot"></div>
-                    <span id="mineBackendBadge">WASM SIMD128 · 4-Lane · <span id="minerCoreCount">?</span> Cores</span>
+                    <span id="mineBackendBadge"><span id="mineAlgoLabel">WASM SIMD128 · 4-Lane</span> · <span id="minerCoreCount">?</span> Cores</span>
                 </div>
             </div>
 
@@ -923,6 +975,10 @@
                 </div>
             </div>
 
+            <div class="mine-options">
+                <label class="onboard-check hidden" id="mineBatteryRow"><input type="checkbox" id="mineBatteryPause" checked> Pause on battery below 20%, and resume when plugged in</label>
+            </div>
+
             <button class="mine-toggle off" id="btnMineToggle">Start Mining</button>
 
             <!-- Time to Block estimate -->
@@ -930,6 +986,12 @@
                 <div id="mineStatEtaLabel" style="font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px; color: #555; margin-bottom: 4px;">Estimated Time to Block</div>
                 <div id="mineStatEta" style="font-size: 22px; font-weight: 700; color: var(--text-bright); font-variant-numeric: tabular-nums;">—</div>
                 <div style="font-size: 10px; color: #444; margin-top: 2px;">based on current hashrate &amp; difficulty</div>
+                <div class="mine-earn-val" id="mineStatEarn">—</div>
+                <div style="font-size: 10px; color: #444; margin-top: 2px;" id="mineStatEarnNote">expected earnings, at this speed</div>
+            </div>
+
+            <div class="mine-share">
+                <button id="btnShareMine" style="background: transparent; border: 1px dashed var(--border-bright);">Invite a friend to mine</button>
             </div>
 
             <div class="mine-stats">
@@ -1481,11 +1543,11 @@
 
         
 
-        <!-- NAV (7 tabs now) -->
+        <!-- NAV -->
         <nav id="bottom-nav" class="hidden">
             <button class="nav-btn active" data-target="view-home"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9v12h14V9"/></svg><span>Home</span></button>
             <!--button class="nav-btn" data-target="view-dex"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M7 7h13l-3-3M17 17H4l3 3"/></svg><span>P2P OTC DEX</span></button>-->
-            <!--<button class="nav-btn" data-target="view-mine"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/></svg><span>Mine</span></button>-->
+            <button class="nav-btn" data-target="view-mine"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/></svg><span>Mine</span></button>
             <button class="nav-btn" data-target="view-send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M5 19L19 5M9 5h10v10"/></svg><span>Send</span></button>
             <button class="nav-btn" data-target="view-receive"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M12 4v12M6 12l6 6 6-6"/></svg><span>Receive</span></button>
             <button class="nav-btn" data-target="view-lightning"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg><span>Q-Bolt L2</span></button>
@@ -1801,6 +1863,7 @@ if ('serviceWorker' in navigator) {
                 btn.classList.toggle('active', btn.dataset.target === targetId);
             });
             if (targetId === 'view-bonds') bondOnShow(); else bondOnHide();
+            if (targetId === 'view-mine') updateWalkCountdown();
         }
 
         document.querySelectorAll('.nav-btn').forEach(btn => {
@@ -2028,8 +2091,23 @@ if ('serviceWorker' in navigator) {
 
         const TEMPLATE_POLL_INTERVAL = 10_000;
         const MAX_CORES = Math.max(1, navigator.hardwareConcurrency || 4);
-        // Default: leave 2 cores free for main thread + wallet worker + OS
-        const DEFAULT_THREADS = Math.max(1, MAX_CORES - 2);
+        // Phones and tablets heat up and throttle under all-core load, and a
+        // casual miner who finds their phone hot stops mining for good, so they
+        // start on two threads. Everything else leaves 2 cores free for the
+        // main thread, the wallet worker and the OS.
+        const IS_MOBILE = (navigator.userAgentData && navigator.userAgentData.mobile)
+            || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
+        const DEFAULT_THREADS = IS_MOBILE
+            ? Math.max(1, Math.min(2, MAX_CORES - 1))
+            : Math.max(1, MAX_CORES - 2);
+
+        // Midstate Walk replaces the BLAKE3 chain at this height (the node's
+        // WALK_ACTIVATION_HEIGHT). The miner follows each template's `pow` on
+        // its own; this is only for the countdown shown before the switch.
+        const WALK_ACTIVATION_HEIGHT = 420000;
+        // The public pool new miners use until they pick another. The pool
+        // serves its browser API under /pool/api as well as /api.
+        const DEFAULT_POOL_URL = 'https://rpc.cypherpunk.gold/pool';
 
         // CPU throttle presets: [label, throttle_ms]
         // throttle_ms = how many ms to sleep between search_nonces() calls.
@@ -2083,6 +2161,8 @@ if ('serviceWorker' in navigator) {
 
         btnMineToggle.onclick = () => {
             if (isMiningActive) {
+                // A stop by hand is final: the battery guard must not undo it.
+                batteryPaused = false;
                 stopMining();
             } else {
                 startMining();
@@ -2126,10 +2206,14 @@ if ('serviceWorker' in navigator) {
                 mineModeSelect.value = savedMode;
                 if (mineModeSelect.value === 'pool') poolConfigParams.classList.remove('hidden');
             }
+        } else {
+            // Nothing chosen yet: pool mining, which pays a casual miner a little
+            // and often, where solo pays a whole block rarely and needs a direct
+            // node link. Not saved, so a later default still reaches this user.
+            mineModeSelect.value = 'pool';
+            poolConfigParams.classList.remove('hidden');
         }
-        if (localStorage.getItem('poolUrl')) {
-            poolUrlInput.value = localStorage.getItem('poolUrl');
-        }
+        poolUrlInput.value = localStorage.getItem('poolUrl') || DEFAULT_POOL_URL;
 
         mineModeSelect.addEventListener('change', (e) => {
             const mode = e.target.value;
@@ -2159,6 +2243,10 @@ if ('serviceWorker' in navigator) {
             }
             if (mode === 'pool' && !poolUrlInput.value.trim()) {
                 showToast('Please enter a Pool URL.', 'error');
+                return;
+            }
+            if (batteryTooLow()) {
+                showToast('Battery below 20%. Plug in to mine, or turn off the battery pause.', 'info');
                 return;
             }
 
@@ -2205,6 +2293,152 @@ if ('serviceWorker' in navigator) {
             setMiningUI(false, 0);
             log('Mining stopped.');
         }
+
+        // ─── Battery guard ──────────────────────────────────────────
+        //
+        // Casual mining happens on laptops and phones. Draining someone's
+        // battery to nothing is the fastest way to lose a miner, so below 20%
+        // and off the charger mining pauses, and it resumes once the device is
+        // charging (or back above 30%). Only Chromium exposes the Battery
+        // Status API; elsewhere the option is hidden and nothing changes.
+        let batteryState = null;
+        let batteryPaused = false;
+        const batteryPauseBox = document.getElementById('mineBatteryPause');
+        try {
+            const saved = localStorage.getItem('minePauseOnBattery');
+            if (saved !== null) batteryPauseBox.checked = saved === '1';
+        } catch (_) {}
+        batteryPauseBox.addEventListener('change', () => {
+            try { localStorage.setItem('minePauseOnBattery', batteryPauseBox.checked ? '1' : '0'); } catch (_) {}
+            checkBattery();
+        });
+
+        function batteryTooLow() {
+            return !!(batteryPauseBox.checked && batteryState
+                && !batteryState.charging && batteryState.level < 0.20);
+        }
+
+        function checkBattery() {
+            if (!batteryState) return;
+            if (isMiningActive && batteryTooLow()) {
+                batteryPaused = true;
+                stopMining();
+                document.getElementById('homeMineStatus').innerText = 'Paused: battery low';
+                showToast('Mining paused: battery below 20%. It resumes when you plug in.', 'info');
+            } else if (batteryPaused && !isMiningActive
+                       && (!batteryPauseBox.checked || batteryState.charging || batteryState.level >= 0.30)) {
+                batteryPaused = false;
+                startMining();
+            }
+        }
+
+        if (navigator.getBattery) {
+            navigator.getBattery().then((b) => {
+                batteryState = b;
+                document.getElementById('mineBatteryRow').classList.remove('hidden');
+                b.addEventListener('levelchange', checkBattery);
+                b.addEventListener('chargingchange', checkBattery);
+            }).catch(() => {});
+        }
+
+        // ─── Expected earnings ──────────────────────────────────────
+        //
+        // What a casual miner wants to know is what they earn, not their
+        // nonces per second. Expected blocks a day is attempts a day over the
+        // attempts one block needs (2^256 / network target), and a pool pays
+        // that share of each block less its fee.
+
+        /** Expected attempts to beat a 64-hex big-endian 256-bit target. */
+        function expectedAttempts(targetHex) {
+            const hex = String(targetHex || '').toLowerCase();
+            if (!/^[0-9a-f]{64}$/.test(hex)) return 0;
+            const lead = hex.replace(/^0+/, '');
+            if (!lead) return 0;
+            const zeros = hex.length - lead.length;
+            // 13 hex digits (52 bits) is all a double holds exactly.
+            const top = parseInt(lead.slice(0, 13).padEnd(13, '0'), 16) / Math.pow(16, 13);
+            const fraction = top * Math.pow(16, -zeros);
+            return fraction > 0 ? 1 / fraction : 0;
+        }
+
+        /** Expected MDS per day at `nps`, or null when there is not enough to say. */
+        function estimateEarningsPerDay(nps, tmpl) {
+            if (!tmpl || !(nps > 0)) return null;
+            const pooled = isPoolMode();
+            const attempts = expectedAttempts(pooled ? tmpl.network_target : tmpl.target);
+            const reward = Number(tmpl.blockReward) || 0;
+            if (!(attempts > 0) || !(reward > 0)) return null;
+            const fee = pooled ? Math.min(100, Math.max(0, Number(tmpl.poolFeePercent) || 0)) : 0;
+            return (nps * 86400 / attempts) * reward * (1 - fee / 100);
+        }
+
+        function renderEarnings(nps) {
+            const el = document.getElementById('mineStatEarn');
+            const note = document.getElementById('mineStatEarnNote');
+            const perDay = estimateEarningsPerDay(nps, currentTemplate);
+            if (perDay === null) {
+                el.innerText = '—';
+                note.innerText = 'expected earnings, at this speed';
+                return;
+            }
+            // Three significant figures: it is an estimate, not a balance.
+            let shown;
+            if (perDay >= 1024) {
+                const { value, prefix } = formatMDS(Math.round(perDay));
+                shown = `≈ ${Number(parseFloat(value).toPrecision(3))} ${prefix} / day`;
+            } else {
+                shown = `≈ ${Number(perDay.toPrecision(3))} MDS / day`;
+            }
+            el.innerText = shown;
+            note.innerText = isPoolMode()
+                ? 'expected earnings at this speed, after the pool fee'
+                : 'expected earnings at this speed, if you find blocks at the average rate';
+        }
+
+        // ─── Countdown to Midstate Walk ─────────────────────────────
+        //
+        // Before the switch a browser is a sliver of a GPU-heavy network; from
+        // it, the Walk runs in WebAssembly at close to native speed. Saying so
+        // keeps an early miner from deciding browser mining is pointless.
+        function updateWalkCountdown() {
+            const el = document.getElementById('walkCountdown');
+            if (!el) return;
+            const tip = Math.max(Number(networkHeight) || 0, Number(currentTemplate?.chainHeight) || 0);
+            if (!tip || tip >= WALK_ACTIVATION_HEIGHT) {
+                el.classList.add('hidden');
+                return;
+            }
+            const blocks = WALK_ACTIVATION_HEIGHT - tip;
+            const days = Math.max(1, Math.round(blocks * 60 / 86400));
+            el.innerHTML = `<b>Midstate Walk starts at block 420,000</b>, ${blocks.toLocaleString('en')} blocks from now `
+                + `(about ${days} day${days === 1 ? '' : 's'}). It is the new proof of work, and a browser mines it almost `
+                + `as fast as a native miner, so a browser's share of the network grows sharply then. Until it starts you can `
+                + `mine, but a browser earns very little against today's GPU miners.`;
+            el.classList.remove('hidden');
+        }
+
+        // ─── Sharing ────────────────────────────────────────────────
+        //
+        // The link opens this wallet straight into mining: a new visitor lands
+        // on "Mine in your browser", an existing one on this tab.
+        function mineShareUrl() {
+            return `${location.origin}${location.pathname}#mine`;
+        }
+
+        document.getElementById('btnShareMine').onclick = async () => {
+            const url = mineShareUrl();
+            const text = 'Mine Midstate in your browser: one tap, nothing to install.';
+            if (navigator.share) {
+                try { await navigator.share({ title: 'Mine Midstate', text, url }); return; }
+                catch (e) { if (e && e.name === 'AbortError') return; }
+            }
+            try {
+                await navigator.clipboard.writeText(url);
+                showToast('Mining link copied. Send it to a friend.', 'success');
+            } catch (_) {
+                showToast(url, 'info');
+            }
+        };
 
         function spawnMiners(count) {
             miners = [];
@@ -2384,6 +2618,8 @@ if ('serviceWorker' in navigator) {
 
         function broadcastToMiners(midstate, target, pow) {
             log(`Broadcasting to ${miners.length} miners (pow=${pow || 'blake3-chain'}, throttle=${currentThrottleMs}ms)`);
+            const algo = document.getElementById('mineAlgoLabel');
+            if (algo) algo.innerText = pow === 'walk' ? 'WASM · Midstate Walk' : 'WASM SIMD128 · BLAKE3 chain';
             for (const m of miners) {
                 m.worker.postMessage({
                     type: 'START',
@@ -2481,7 +2717,8 @@ if ('serviceWorker' in navigator) {
                 btnMineToggle.className = 'mine-toggle off';
                 btnMineToggle.innerText = 'Start Mining';
                 btnMineToggle.disabled = false;
-                document.getElementById('homeMineStatus').innerText = 'Idle';
+                document.getElementById('homeMineStatus').innerText = 'Tap to start mining';
+                renderEarnings(0);
                 document.getElementById('homeMineRate').innerText = '—';
                 document.getElementById('homeMineRate').style.color = '#333';
                 document.getElementById('mineStatEta').innerText = '—';
@@ -2807,6 +3044,8 @@ if ('serviceWorker' in navigator) {
 
             // Time to block estimate
             document.getElementById('mineStatEta').innerText = estimateTimeToBlock(p.nps, p.target);
+            renderEarnings(p.nps);
+            updateWalkCountdown();
 
             // Sparkline
             updateSparkline(p.nps);
@@ -3735,8 +3974,9 @@ if ('serviceWorker' in navigator) {
                 if (payload.lastScannedHeight !== undefined) document.getElementById('uiWalletHeight').innerText = payload.lastScannedHeight;
                 if (payload.networkHeight !== undefined) {
                     document.getElementById('uiNetworkHeight').innerText = payload.networkHeight;
-                    networkHeight = payload.networkHeight; 
+                    networkHeight = payload.networkHeight;
                     _blockCacheNoteTip(networkHeight);
+                    updateWalkCountdown();
                 }
                 if (payload.mempoolSize !== undefined) document.getElementById('uiMempoolSize').innerText = payload.mempoolSize;
 
@@ -4032,6 +4272,9 @@ if ('serviceWorker' in navigator) {
                     } else {
                         createSec.classList.remove('hidden');
                         document.getElementById('btnCreate').disabled = false;
+                        // Arrived on a shared mining link: skip straight to the
+                        // one-tap setup rather than making them find it.
+                        if (deepLinkMine) { deepLinkMine = false; openMineOnboarding(); }
                     }
                     break;
 
@@ -4105,6 +4348,10 @@ if ('serviceWorker' in navigator) {
                                 
                 case 'PHRASE_GENERATED':
                     document.getElementById('seedPhrase').value = payload;
+                    if (onboardWaitingForPhrase) {
+                        onboardWaitingForPhrase = false;
+                        showOnboardPhrase(payload);
+                    }
                     break;
 
                 case 'WALLET_LOADED':
@@ -4115,6 +4362,17 @@ if ('serviceWorker' in navigator) {
                     if (type === 'WALLET_LOADED') {
                         switchTab('view-home');
                         showToast("Wallet unlocked securely.", "success");
+                        if (autoMineAfterCreate) {
+                            // The one-tap path: the wallet exists, so mine into it.
+                            autoMineAfterCreate = false;
+                            switchTab('view-mine');
+                            startMining();
+                        } else if (deepLinkMine) {
+                            deepLinkMine = false;
+                            // A shared mining link, opened by someone who already
+                            // has a wallet: show them the miner, let them start it.
+                            switchTab('view-mine');
+                        }
                         // Migrate any legacy plaintext limit-order secrets into the worker's
                         // encrypted state (safe to run only now: saveState needs the password).
                         try { dexMigrateLegacySecrets(); } catch (_) {}
@@ -4386,6 +4644,10 @@ if ('serviceWorker' in navigator) {
                         showToast(payload, "error");
                         resetUIState();
                         if (!walletExists) {
+                            // Not the one-tap path's concern: background errors
+                            // (an unreachable chat or RPC gateway) arrive here while
+                            // the wallet is still being created, and the creation
+                            // carries on, so `autoMineAfterCreate` stays set.
                             document.getElementById('btnCreate').classList.remove('hidden');
                         } else {
                             document.getElementById('btnLogin').disabled = false;
@@ -4413,6 +4675,64 @@ if ('serviceWorker' in navigator) {
         // ═══════════════════════════════════════════════════════════════
 
         document.getElementById('btnGen').onclick = () => worker.postMessage({ type: 'GENERATE' });
+
+        // ═══════════════════════════════════════════════════════════════
+        //  "Mine in your browser": one tap from the welcome screen
+        // ═══════════════════════════════════════════════════════════════
+        //
+        // The shortest honest path from landing here to mining: generate the
+        // phrase, show it once with a plain warning, take a password, create
+        // the wallet, then start pool mining into it. The phrase must be
+        // acknowledged before the button unlocks, because a casual miner who
+        // skips it loses every coin they mine with this browser's storage.
+        // A link ending in #mine (the "Invite a friend" button) opens this.
+        let deepLinkMine = /^#\/?mine$/i.test(location.hash);
+        if (deepLinkMine) {
+            try { history.replaceState(null, '', location.pathname + location.search); } catch (_) {}
+        }
+        let autoMineAfterCreate = false;
+        let onboardWaitingForPhrase = false;
+        let onboardPhrase = '';
+
+        function openMineOnboarding() {
+            document.getElementById('mineOnboardCta').classList.add('hidden');
+            document.getElementById('manualCreate').classList.add('hidden');
+            document.getElementById('mineOnboardPanel').classList.remove('hidden');
+            onboardWaitingForPhrase = true;
+            worker.postMessage({ type: 'GENERATE' });
+        }
+
+        function showOnboardPhrase(phrase) {
+            onboardPhrase = phrase;
+            document.getElementById('onboardSeedGrid').innerHTML = phrase.split(' ').map((word, i) =>
+                `<div class="seed-word"><span>${String(i + 1).padStart(2, '0')}</span>${word}</div>`
+            ).join('');
+            updateOnboardGo();
+        }
+
+        function updateOnboardGo() {
+            document.getElementById('btnOnboardGo').disabled = !(onboardPhrase
+                && document.getElementById('onboardSaved').checked
+                && document.getElementById('onboardPwd').value.length > 0);
+        }
+
+        document.getElementById('btnMineOnboard').onclick = openMineOnboarding;
+        document.getElementById('onboardSaved').onchange = updateOnboardGo;
+        document.getElementById('onboardPwd').oninput = updateOnboardGo;
+        document.getElementById('btnOnboardCopy').onclick = () => {
+            if (!onboardPhrase) return;
+            navigator.clipboard.writeText(onboardPhrase)
+                .then(() => showToast('Words copied. Store them somewhere safe, then clear your clipboard.', 'success'))
+                .catch(() => showToast('Copy failed: write the words down instead.', 'error'));
+        };
+        document.getElementById('btnOnboardGo').onclick = () => {
+            const password = document.getElementById('onboardPwd').value;
+            if (!onboardPhrase || !password || !document.getElementById('onboardSaved').checked) return;
+            autoMineAfterCreate = true;
+            document.getElementById('btnOnboardGo').classList.add('hidden');
+            document.getElementById('createProgressContainer').classList.remove('hidden');
+            worker.postMessage({ type: 'CREATE', payload: { phrase: onboardPhrase, password, rpcUrl: getCleanRpcUrl() } });
+        };
 
         document.getElementById('btnConnectWebRTC').onclick = () => {
             const addr = document.getElementById('bootstrapAddr').value.trim();

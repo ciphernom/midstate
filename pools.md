@@ -48,6 +48,8 @@ The server will attempt to bind the Stratum TCP service to port `3333` and the H
 
 You must open/port-forward the Stratum TCP port (e.g., `3333`) on your firewall to accept external miners.
 
+**Browser miners.** The web wallet mines over the HTTP API: `/api/template`, `/api/submit` and `/api/proof`. The pool also serves them under `/pool/api/…`, so a reverse proxy that already forwards `/pool` (the dashboard) to the API port carries browser miners with no extra rule. A browser miner enters the pool's base URL, for example `https://your.host/pool`, and the web wallet's built-in default is `https://rpc.cypherpunk.gold/pool`. It must be HTTPS, because a wallet served over HTTPS cannot call an `http://` pool.
+
 ### Midstate Walk (from block 420,000)
 
 From block 420,000 the proof of work is Midstate Walk (`docs/MIDSTATE_WALK.md`). Pools and miners must run the release that knows it before then:
