@@ -123,6 +123,9 @@ let isMiningActive = false;
 
 let miningMode = 'solo'; // 'solo' | 'pool'
 let poolUrl = '';
+/** A midwimble address to be paid in midwimble too, when the pool merge-mines
+ *  it; '' for none (the pool then keeps that part). */
+let poolMidwimbleAddress = '';
 /** Last pool job_id whose precommitment we verified, so we audit once per job. */
 let lastAuditedJobId = null;
 /** Throttle state for the pool-mode background wallet rescan. */
@@ -1782,10 +1785,11 @@ async function ensurePoolTransport() {
 
 /** Fetches the current job over whichever transport is configured. */
 async function poolGetTemplate(address) {
-    if (poolTransport === 'webrtc') return poolRpc('getTemplate', { address });
+    if (poolTransport === 'webrtc') return poolRpc('getTemplate', { address, midwimble_address: poolMidwimbleAddress || undefined });
 
+    const mw = poolMidwimbleAddress ? `&midwimble_address=${encodeURIComponent(poolMidwimbleAddress)}` : '';
     const res = await fetch(
-        `${poolTransportAddr}/api/template?address=${encodeURIComponent(address)}`,
+        `${poolTransportAddr}/api/template?address=${encodeURIComponent(address)}${mw}`,
         { cache: 'no-store' }
     );
     if (!res.ok) {
@@ -1815,13 +1819,14 @@ async function poolGetProof(address) {
 
 /** Submits a share over whichever transport is configured. */
 async function poolSubmitShare(address, jobId, nonce, worker) {
+    const midwimble_address = poolMidwimbleAddress || undefined;
     if (poolTransport === 'webrtc') {
-        return poolRpc('submitShare', { address, job_id: jobId, nonce: String(nonce), worker });
+        return poolRpc('submitShare', { address, job_id: jobId, nonce: String(nonce), worker, midwimble_address });
     }
     const res = await fetch(`${poolTransportAddr}/api/submit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ job_id: jobId, nonce: String(nonce), address, worker }),
+        body: JSON.stringify({ job_id: jobId, nonce: String(nonce), address, worker, midwimble_address }),
     });
     try { return await res.json(); } catch (_) { return { error: await res.text() }; }
 }
@@ -1983,6 +1988,10 @@ async function handleGetTemplate() {
                 // For the expected-earnings figure: what the pool keeps.
                 poolFeePercent:  Number(tmpl.pool_fee_percent) || 0,
                 poolShares:      tmpl.shares_recorded || 0,
+                // Merged mining: whether this job makes a midwimble block too,
+                // and our midwimble score. `null` from a pool that doesn't
+                // merge-mine; absent from one that predates saying.
+                midwimble:       tmpl.midwimble,
                 // The pool's template already contains the transactions the block
                 // will carry, so the tx count is exact without a getMempool call.
                 // Fee totals are not exposed by the pool (and are not ours to
@@ -2105,6 +2114,7 @@ async function handleSubmitMinedBlock(template, nonce) {
             isShare:      true,
             isBlock:      !!respJson.is_block,
             poolShares:   respJson.score ?? template.poolShares ?? 0,
+            midwimbleScore: respJson.midwimble_score ?? null,
             rejectReason: respJson.accepted ? null : (respJson.reason || respJson.error || 'rejected'),
             reward:       0,
             height:       template.chainHeight
@@ -4539,6 +4549,7 @@ else if (type === 'L2_OPEN_CHANNEL') {
             // against its own coinbase and ignoring the pool entirely.
             const nextMode = payload?.mode === 'pool' ? 'pool' : 'solo';
             const nextUrl = (payload?.url || '').trim();
+            poolMidwimbleAddress = String(payload?.midwimble || '').trim().toLowerCase();
             if (nextMode !== miningMode || nextUrl !== poolUrl) {
                 // Any change invalidates the audit: a different pool (or a
                 // different mode) must re-prove its precommitment from scratch

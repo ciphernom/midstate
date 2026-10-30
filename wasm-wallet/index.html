@@ -520,6 +520,8 @@
         .walk-countdown b { color: var(--text-max); }
         .mine-earn-val { font-size: 15px; color: var(--text-max); font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
         .mine-options { padding: 0 1rem; margin-bottom: 1.25rem; display: flex; flex-direction: column; gap: 8px; }
+        .pool-mw-status { margin-top: 6px; font-size: 11px; line-height: 1.5; color: var(--text-muted); }
+        .pool-mw-status.warn { color: var(--yellow); }
         .mine-options .onboard-check { margin: 0; color: var(--text-muted); }
         .mine-share button { margin-bottom: 1.5rem; }
 
@@ -933,6 +935,8 @@
                     </div>
                     <div id="poolConfigParams" class="hidden">
                         <input type="text" id="poolUrlInput" placeholder="Pool URL, or multiaddr (/ip4/…/webrtc-direct/certhash/…)" style="font-size: 12px; padding: 8px; margin-bottom: 0;">
+                        <input type="text" id="poolMwInput" placeholder="Midwimble address (mw1…), optional: be paid in midwimble too" autocomplete="off" autocapitalize="off" spellcheck="false" style="font-size: 12px; padding: 8px; margin: 8px 0 0;">
+                        <div class="pool-mw-status hidden" id="poolMwStatus"></div>
                     </div>
                 </div>
             <div class="mine-hero">
@@ -1022,6 +1026,10 @@
                 <div class="mine-stat" id="mineStatSharesTile" style="display: none;">
                     <span class="mine-stat-label">Pool Score</span>
                     <span class="mine-stat-val" id="mineStatShares" style="color: var(--accent);">0</span>
+                </div>
+                <div class="mine-stat" id="mineStatMwTile" style="display: none;">
+                    <span class="mine-stat-label">Midwimble Score</span>
+                    <span class="mine-stat-val" id="mineStatMw" style="color: var(--accent);">—</span>
                 </div>
                 <div class="mine-stat">
                     <span class="mine-stat-label">Mempool Txs</span>
@@ -2215,6 +2223,60 @@ if ('serviceWorker' in navigator) {
         }
         poolUrlInput.value = localStorage.getItem('poolUrl') || DEFAULT_POOL_URL;
 
+        // A midwimble address to be paid in midwimble too, when the pool
+        // merge-mines it. Every share counts toward the pool's next midwimble
+        // block either way; without an address the pool keeps that part.
+        const poolMwInput = document.getElementById('poolMwInput');
+        const poolMwStatus = document.getElementById('poolMwStatus');
+        poolMwInput.value = localStorage.getItem('poolMidwimbleAddress') || '';
+        const poolMwAddress = () => poolMwInput.value.trim().toLowerCase();
+        const miningModePayload = () => ({ mode: mineModeSelect.value, url: poolUrlInput.value.trim(), midwimble: poolMwAddress() });
+        let lastMerge;   // the pool's last word on merged mining: undefined before any
+        let mwScoreSession = null;
+
+        poolMwInput.addEventListener('change', () => {
+            const a = poolMwAddress();
+            if (a && !/^mw1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{100,}$/.test(a)) {
+                showToast('That isn’t a midwimble address (mw1…).', 'error');
+                poolMwInput.value = localStorage.getItem('poolMidwimbleAddress') || '';
+                return;
+            }
+            poolMwInput.value = a;
+            try { a ? localStorage.setItem('poolMidwimbleAddress', a) : localStorage.removeItem('poolMidwimbleAddress'); } catch (_) {}
+            mwScoreSession = null;
+            worker.postMessage({ type: 'SET_MINING_MODE', payload: miningModePayload() });
+            renderMerge(lastMerge);
+        });
+
+        /** What the pool's template says about merged mining, under the
+         *  midwimble address field, and the midwimble score tile. */
+        function renderMerge(mw) {
+            lastMerge = mw;
+            const have = !!poolMwAddress();
+            let text = '';
+            let warn = false;
+            if (mw === null) {
+                text = have ? 'This pool doesn’t merge-mine midwimble, so the address goes unused.' : '';
+                warn = have;
+            } else if (mw && !mw.active) {
+                text = `Merged mining is paused${mw.note ? `: ${mw.note}` : ''}. Shares still count toward the pool’s next midwimble block.`;
+                warn = true;
+            } else if (mw && have) {
+                text = `Merged mining on${mw.height ? `, midwimble block ${Number(mw.height).toLocaleString()}` : ''}. Your shares earn midwimble too.`;
+            } else if (mw) {
+                text = 'This pool merge-mines midwimble: add a midwimble address to be paid in it too. Without one, the pool keeps that part.';
+            }
+            poolMwStatus.textContent = text;
+            poolMwStatus.classList.toggle('hidden', !text);
+            poolMwStatus.classList.toggle('warn', warn);
+            if (mw && have && mw.score != null) mwScoreSession = mw.score;
+            const tile = document.getElementById('mineStatMwTile');
+            tile.style.display = mw && have ? '' : 'none';
+            document.getElementById('mineStatMw').innerText = mwScoreSession == null ? '—'
+                : mw && mw.total_score ? `${mwScoreSession.toLocaleString()} / ${Number(mw.total_score).toLocaleString()}`
+                : mwScoreSession.toLocaleString();
+        }
+
         mineModeSelect.addEventListener('change', (e) => {
             const mode = e.target.value;
             localStorage.setItem('mineMode', mode);
@@ -2223,13 +2285,13 @@ if ('serviceWorker' in navigator) {
             } else {
                 poolConfigParams.classList.add('hidden');
             }
-            worker.postMessage({ type: 'SET_MINING_MODE', payload: { mode, url: poolUrlInput.value.trim() } });
+            worker.postMessage({ type: 'SET_MINING_MODE', payload: miningModePayload() });
         });
 
         poolUrlInput.addEventListener('change', (e) => {
             const url = e.target.value.trim();
             localStorage.setItem('poolUrl', url);
-            worker.postMessage({ type: 'SET_MINING_MODE', payload: { mode: mineModeSelect.value, url } });
+            worker.postMessage({ type: 'SET_MINING_MODE', payload: miningModePayload() });
         });
         async function startMining() {
             const mode = mineModeSelect.value;
@@ -2251,7 +2313,7 @@ if ('serviceWorker' in navigator) {
             }
 
             // Tell the worker our current settings before starting
-            worker.postMessage({ type: 'SET_MINING_MODE', payload: { mode, url: poolUrlInput.value.trim() } });
+            worker.postMessage({ type: 'SET_MINING_MODE', payload: miningModePayload() });
 
             isMiningActive = true;
             // Mirror the flag into the worker. worker.js's PUSH_NEW_BLOCK handler
@@ -3186,12 +3248,12 @@ if ('serviceWorker' in navigator) {
 
                 switch (method) {
                     case 'getTemplate':
-                        return reply(await poolClient.getTemplate(params.address));
+                        return reply(await poolClient.getTemplate(params.address, params.midwimble_address));
                     case 'getProof':
                         return reply(await poolClient.getProof(params.address));
                     case 'submitShare':
                         return reply(await poolClient.submitShare(
-                            params.address, params.job_id, params.nonce, params.worker));
+                            params.address, params.job_id, params.nonce, params.worker, params.midwimble_address));
                     default:
                         throw new Error(`Unknown pool method: ${method}`);
                 }
@@ -4399,6 +4461,7 @@ if ('serviceWorker' in navigator) {
                             poolScoreSession = payload.poolShares;
                             renderPoolScore();
                         }
+                        if (isPoolMode()) renderMerge(payload.midwimble);
                         const jobChanged = payload.job_id !== undefined
                             && payload.job_id !== currentTemplate?.job_id;
                         if (payload.mining_midstate !== currentTemplate?.mining_midstate || jobChanged) {
@@ -4442,6 +4505,10 @@ if ('serviceWorker' in navigator) {
                         if (typeof payload.poolShares === 'number') {
                             poolScoreSession = payload.poolShares;
                             renderPoolScore();
+                        }
+                        if (typeof payload.midwimbleScore === 'number') {
+                            mwScoreSession = payload.midwimbleScore;
+                            renderMerge(lastMerge);
                         }
                         if (payload.accepted) {
                             log(`Pool share accepted — total score: ${payload.poolShares}`);
