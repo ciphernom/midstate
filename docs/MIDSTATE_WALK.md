@@ -199,6 +199,13 @@ definition rather than from the Rust:
 - **C.** It uses the ARMv8 AES instructions and runs under
   `qemu-aarch64 -cpu cortex-a76`.
 
-Both reproduce the golden vectors in `walk.rs`'s tests. So does the Rust code
-on x86 AES-NI, on its portable path, and compiled to WebAssembly (the SDK's
-`test-miner.mjs`).
+Both reproduce the golden vectors in `walk.rs`'s tests. So does the Rust code:
+
+- on x86 AES-NI and on its portable path;
+- on ARMv8 AES instructions, with `walk.rs`'s tests cross-built for
+  `aarch64-unknown-linux-gnu` and run under `qemu-aarch64 -cpu cortex-a76`
+  (`backend_name()` reports `armv8-crypto`);
+- compiled to WebAssembly (the SDK's `test-miner.mjs`).
+
+Running `cargo test --lib core::walk` on a real Pi 5 is still worth doing
+once.

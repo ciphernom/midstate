@@ -752,6 +752,7 @@ td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); 
 
         <div class="menu-item active" data-target="overview">Overview <span>→</span></div>
         <div class="menu-item" data-target="get-started">Get Started <span>→</span></div>
+        <div class="menu-item" data-target="walk">Midstate Walk <span>→</span></div>
         <div class="menu-item" data-target="roadmap">Roadmap <span>→</span></div>
         <div class="menu-item" data-target="genesis">Genesis & Fair Launch <span>→</span></div>
         <div class="menu-item" data-target="crypto">Cryptography <span>→</span></div>
@@ -775,23 +776,31 @@ td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); 
             
             <p>By keeping proof-of-work in commodity silicon and forcing all UTXOs into uniform power-of-2 denominations, it creates a robust, relatively private financial network that a hobbyist can still mine and that resists blockchain surveillance firms.</p>
 
+            <div class="callout stark">
+                <h4>New proof of work: Midstate Walk, from block 420,000</h4>
+                <p>Midstate is moving mining back to the CPU. Each attempt becomes one long, dependent walk over a 256 KiB scratchpad of 64-bit multiplies, divides and AES rounds: work a CPU core does well and a GPU does badly. Every node needs v6.0.0 "Anselmo" before block 420,000, expected around mid-December 2026.</p>
+                <p style="margin-top: 18px;"><a href="#walk" class="btn">How the Walk works →</a></p>
+            </div>
+
             <div class="callout">
                 <h4>Why the name "Midstate"?</h4>
                 <p>In traditional blockchains, blocks are distinct data structures linked by their header hashes. Midstate elevates this by maintaining a continuous, mathematically chained <strong>BLAKE3 Midstate</strong> for transactions, while binding it to the chain using sequential header hashing.</p>
                 
                 <div class="math-block">
                     H_0 = Header Hash N-1<br>
-                    H_1 = BLAKE3_1M_Iters(H_0 || Midstate || State Root || Nonce)<br>
-                    H_2 = BLAKE3_1M_Iters(H_1 || Midstate || State Root || Nonce)
+                    H_1 = PoW(H_0 || Midstate || State Root || Nonce)<br>
+                    H_2 = PoW(H_1 || Midstate || State Root || Nonce)<br>
+                    // PoW below block 420,000: 1,000,000 sequential BLAKE3 iterations<br>
+                    // PoW from block 420,000: Midstate Walk
                 </div>
 
-                <p>The <code>midstate</code> tracks the continuous mathematical state of the UTXO set. When a miner processes a block, they construct a <strong>Block Header</strong> (containing the new midstate, the state root, and the previous header hash), and subject it to exactly 1,000,000 sequential BLAKE3 compression cycles. Every transaction permanently mutates this internal state, securely anchoring the ledger to a sequential proof of time.</p>
+                <p>The <code>midstate</code> tracks the continuous mathematical state of the UTXO set. When a miner processes a block, they construct a <strong>Block Header</strong> (containing the new midstate, the state root, and the previous header hash), and run it through the proof of work: 1,000,000 sequential BLAKE3 compression cycles for blocks before 420,000, and a <a href="#walk">Midstate Walk</a> from then on. Every transaction permanently mutates this internal state, securely anchoring the ledger to a sequential proof of time.</p>
             </div>
 
             <h3>How is Midstate Different?</h3>
             <ul>
                 <li><strong>No Elliptic Curves (Post-Quantum):</strong> It uses zero ECC math (no secp256k1). Every signature, commitment, and script relies solely on the BLAKE3 hash function, immunizing the network against Shor's algorithm.</li>
-                <li><strong>Commodity-Silicon Mining:</strong> Bitcoin's hobbyist-to-network gap is roughly 1 : 10<sup>9</sup>. Midstate's is about 1 : 17,600, because no ASIC has been built for it and the fastest miner remains a consumer GPU. A single-board computer is still meaningfully in the game.</li>
+                <li><strong>CPU Mining with Midstate Walk:</strong> From block 420,000 the proof of work is <a href="#walk">Midstate Walk</a>, a dependent walk over a 256 KiB scratchpad made of the operations CPU cores do fastest. It is designed so that a Raspberry Pi 5 can mine and a GPU has no special advantage.</li>
                 <li><strong>Power-of-2 UTXOs:</strong> Standard UTXOs use exact amounts, creating unique cryptographic fingerprints. Midstate forces all coins into identical power-of-2 denominations, fracturing surveillance graphs.</li>
                 <li><strong>Commit-Reveal Mempool:</strong> Standard mempools broadcast cleartext trades. Midstate blinds transactions in the mempool until a miner cryptographically commits to processing them.</li>
                 <li><strong>Bounded State (Sparse Merkle Trees):</strong> Instead of an infinitely growing LevelDB database, Midstate accumulates UTXOs into a rolling Sparse Merkle Tree, heavily capping the RAM required to run a full node.</li>
@@ -951,6 +960,128 @@ for step in 0..max_iters {
             </div>
         </div>
 
+        <!-- ── MIDSTATE WALK ── -->
+        <div class="content-pane" id="walk">
+            <h2>Midstate Walk</h2>
+            <p>From block <strong>420,000</strong>, Midstate's proof of work is <strong>Midstate Walk</strong>. Each attempt is one long walk over a 256 KiB scratchpad, built from the operations a CPU core does fastest and a GPU does worst. It is designed so that a Raspberry Pi 5 can mine and a graphics card has no special advantage. Blocks below 420,000 keep the BLAKE3 chain, so every block ever mined still verifies the way it always has.</p>
+
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Activates at block</div>
+                    <div class="stat-value">420,000</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Scratchpad</div>
+                    <div class="stat-value">256 KiB</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Dependent steps</div>
+                    <div class="stat-value">262,144</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">One attempt, x86 core</div>
+                    <div class="stat-value">~4 ms</div>
+                </div>
+            </div>
+
+            <h3>Why change the proof of work</h3>
+            <p>The BLAKE3 chain made each attempt sequential: 1,000,000 hashes, each waiting on the one before. It never made the <em>search</em> sequential. Every nonce starts its own chain, so a GPU simply runs tens of thousands of them at once. As GPU mining grew, the network climbed to about 9 million attempts a second, and a Raspberry Pi 5 on the 8-way NEON path, at about 100 a second, fell to roughly <strong>1 : 92,000</strong> of it.</p>
+            <p>Midstate Walk keeps every attempt sequential, and makes each one need what a CPU core has close at hand: a quarter of a megabyte of fast cache, and quick 64-bit multiply, divide and AES.</p>
+
+            <h3>One attempt</h3>
+            <div class="flow-diagram">
+                <div class="flow-box">header hash<br>+ nonce</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box">BLAKE3<br>seed</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box">256 KiB scratchpad<br>filled by 4 AES lanes</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box stark">262,144 dependent steps<br>re-mixed every 4,096</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box">BLAKE3<br>final hash</div>
+            </div>
+
+            <p>Eight 64-bit registers walk the scratchpad. Each step starts from the previous step's output, so no step can begin until the one before it has finished:</p>
+
+            <div class="math-block">
+                // c is the previous step's output; ^ is xor<br>
+                x = r[s] ^ c<br>
+                // four reads, at addresses taken from x<br>
+                m0, m1, m2, m3 = pad[x]<br>
+                // op: mul, mulhi, div, aes, rotr, add, sub, xor<br>
+                y = op(x ^ m0 ^ m2, r[t])<br>
+                r[s] = c = y ^ m1 ^ m3<br>
+                // then all four words are written back, changed
+            </div>
+
+            <p>Which operation each register runs is a small program the walk draws from its own state: an ordering of the eight operations, redrawn every 4,096 steps when BLAKE3 re-mixes the registers. Nobody knows the next program until the walk reaches it, so there is nothing to compile ahead of time.</p>
+
+            <h3>Why it suits a CPU</h3>
+            <ul>
+                <li><strong>Latency, not throughput.</strong> A step is a chain of dependent work: four reads, one operation, and the next step's addresses come from the result. A CPU core is built to run exactly that kind of chain quickly.</li>
+                <li><strong>The scratchpad fits in a core's cache.</strong> 256 KiB sits in the L2 cache of current desktop cores, and of each Cortex-A76 core in a Raspberry Pi 5, which has 512 KiB of L2 per core.</li>
+                <li><strong>The operations are CPU strengths.</strong> 64-bit multiply and divide are single instructions on a CPU, and AES rounds have their own instructions on x86 (AES-NI) and on the Pi 5 (ARMv8 crypto). GPU cores work in 32 bits, emulate 64-bit divide in software, and have no AES instructions.</li>
+                <li><strong>Parallelism costs memory.</strong> A GPU wins by keeping thousands of attempts in flight. Here each one carries its own 256 KiB, which overflows the card's on-chip memory into VRAM, and every one of the four reads per step waits on it.</li>
+                <li><strong>Branches stay predictable on a CPU.</strong> The program is fixed for 4,096 steps, so a CPU predicts which operation comes next. On a GPU, the threads of a warp each walk their own program and diverge.</li>
+            </ul>
+
+            <h3>Measured</h3>
+            <p>Attempts per second, from <code>midstate bench-pow</code>, which also times the BLAKE3 chain on the same machine. A Walk attempt costs about 20 times less than a single-threaded BLAKE3-chain attempt.</p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Machine</th>
+                        <th>Midstate Walk</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>x86 desktop, 1 thread</td>
+                        <td class="hl">264 / s</td>
+                    </tr>
+                    <tr>
+                        <td>x86 desktop, all 12 threads</td>
+                        <td class="hl">1,773 / s</td>
+                    </tr>
+                    <tr>
+                        <td>2.8 GHz Xeon cloud core</td>
+                        <td class="hl">~320 / s</td>
+                    </tr>
+                    <tr>
+                        <td>Browser wallet (WebAssembly), 1 thread</td>
+                        <td class="hl">~270 / s</td>
+                    </tr>
+                </tbody>
+            </table>
+            <p style="margin-top: 18px;">Run <code>midstate bench-pow</code> to measure your own machine.</p>
+
+            <div class="callout stark">
+                <h4>What about GPUs?</h4>
+                <p>A GPU can still run the Walk; it just stops being special. By our model, a high-end card lands roughly level with a 16-core desktop, and spends two to three times the power doing it. That is a model, not a measurement, because nobody has written a GPU Walk miner yet. The node's own GPU backend mines the Walk on the CPU.</p>
+            </div>
+
+            <div class="callout warn">
+                <h4>The trade-off</h4>
+                <p>A proof of work that suits CPU cores suits every CPU core, including rented cloud instances and botnets. For that reason Midstate used to accept GPU dominance as the lesser evil. Midstate Walk takes the trade the other way: with GPU mining setting the pace, a Raspberry Pi had fallen to 1 : 92,000 of the network, and the Walk is designed to hand the advantage back to the cores people already own.</p>
+                <p>No Walk ASIC exists. One would be a small CPU-like core with 256 KiB of memory beside it for each walk. That can be built, so, as with the BLAKE3 chain, this is an economic fact rather than a guarantee.</p>
+            </div>
+
+            <h3>Verification and cryptography</h3>
+            <p>Checking a block takes one attempt: about 4 ms on a desktop core, against roughly 70 ms for a BLAKE3-chain header, so headers after the switch verify faster. Blocks before the switch are still checked with the BLAKE3 chain, so a new node syncs from genesis as before.</p>
+            <p>The Walk adds no new cryptographic assumption. BLAKE3 seeds the scratchpad and produces the final hash, and the AES round is only a mixing step with no secret key.</p>
+            <p>Every path gives the same test vectors: the node's Rust code with x86 AES-NI, with ARMv8 AES instructions and with its table-based fallback; the same code compiled to WebAssembly for the browser wallet; and two implementations written independently from the specification, in Python and in C. The specification, measurements and vectors are in <a href="https://github.com/ciphernom/midstate/blob/main/docs/MIDSTATE_WALK.md" target="_blank">docs/MIDSTATE_WALK.md</a>.</p>
+
+            <h3>The switch</h3>
+            <ul>
+                <li><strong>When:</strong> block 420,000, expected around mid-December 2026 at 60-second blocks.</li>
+                <li><strong>Nodes:</strong> every node needs v6.0.0 "Anselmo" or later before then. A node still on v5 rejects the first Walk block and stays on a chain the rest of the network has left.</li>
+                <li><strong>Difficulty:</strong> the target eases 8× at the switch, and ASERT takes over from there.</li>
+                <li><strong>Miners and pools:</strong> <code>midstate miner</code>, pools, the web wallet and the SDK change over by themselves, because templates name the proof of work in a <code>pow</code> field. Third-party miners, including MidstateAxe firmware, must switch at 420,000.</li>
+                <li><strong>Midwimble</strong> switches at its block 86,400, a few hours earlier. Merged mining pauses between the two switches.</li>
+            </ul>
+            <p><a href="https://github.com/ciphernom/midstate/releases" target="_blank" class="btn">Releases on GitHub ↗</a></p>
+        </div>
+
         <!-- ── CONSENSUS ── -->
         <div class="content-pane" id="consensus">
             <h2>Mining & Consensus</h2>
@@ -966,6 +1097,9 @@ for step in 0..max_iters {
 
                 <div class="tab-content active" id="seq-hash">
                     <h3>Sequential Hashing &amp; the Hardware Gap</h3>
+                    <div class="callout">
+                        <p>This tab describes the BLAKE3 chain, which secures every block before 420,000. From block 420,000 the proof of work is <a href="#walk">Midstate Walk</a>.</p>
+                    </div>
                     <p>To mine a block, a node picks a nonce and computes 1,000,000 BLAKE3 hashes in a strict sequence: <code>H_n = BLAKE3(H_{n-1})</code>. Each hash depends entirely on the one before it, so a <em>single</em> chain cannot be split across cores or pipelined — its latency is bounded by clock speed alone.</p>
 
                     <p>What that does <strong>not</strong> do is stop parallel hardware. Every nonce starts its own independent chain, so the <em>search</em> parallelises even though each trial does not: a miner simply runs many chains at once. Midstate's own AVX2 path advances 8 chains per core in SIMD lanes, and the GPU miner keeps tens of thousands in flight. Difficulty retargeting then cancels the per-trial cost exactly, so mining share tracks raw BLAKE3 throughput — the same quantity it would track with one hash per trial.</p>
@@ -974,16 +1108,19 @@ for step in 0..max_iters {
 
                     <div class="callout stark">
                         <h4>The Hardware Gap, Measured</h4>
-                        <p>The fastest Midstate miner is a GPU. A Raspberry Pi 5 on the 8-way NEON path does roughly 100 nonces per second; the whole network runs at around 1.7 million. That puts a hobbyist board at about <strong>1 : 17,600</strong> against the entire network.</p>
-                        <p>The comparable figure for a hobbyist Bitaxe against Bitcoin is 1 : 1,200,000,000 — and for commodity silicon (a CPU or GPU) it is worse than 1 : 10<sup>13</sup>. Midstate's hardware advantage currently sits in the commodity band, five to eight orders of magnitude tighter than Bitcoin's.</p>
+                        <p>The fastest BLAKE3-chain miner is a GPU. A Raspberry Pi 5 on the 8-way NEON path does roughly 100 nonces per second. When this page was first written the whole network ran at around 1.7 million, putting a hobbyist board at about 1 : 17,600; as GPU mining grew it reached about 9 million, and the gap widened to roughly <strong>1 : 92,000</strong>.</p>
+                        <p>The comparable figure for a hobbyist Bitaxe against Bitcoin is 1 : 1,200,000,000 — and for commodity silicon (a CPU or GPU) it is worse than 1 : 10<sup>13</sup>. Even at 1 : 92,000, Midstate's hardware advantage sits in the commodity band, four to eight orders of magnitude tighter than Bitcoin's.</p>
                         <p><strong>Why, precisely:</strong> no Midstate ASIC exists. That is an economic fact, not a cryptographic guarantee — a BLAKE3 chain core is comparatively easy silicon (one compression unit, 32 bytes of state, no pipeline), so a sufficiently valuable chain would attract one. The gap holds while it is not worth building, and the design accepts that trade deliberately rather than claiming immunity.</p>
                     </div>
 
-                    <p><strong>Why GPU dominance is a choice, not a failure.</strong> Pushing mining down toward CPUs and single-board computers was designed, built, and tested. Every version of it ended up favouring cheap cloud ARM instances and botnets, which is a worse outcome: a swarm of compromised phones is not decentralisation. GPUs cost capital, power, and floor space — all visible, all constrained. Keeping the advantage in commodity graphics silicon, where a Pi is still 1:17,600 rather than 1:10<sup>13</sup>, is the better of the available trades.</p>
+                    <p><strong>Why this changes at block 420,000.</strong> Midstate long accepted GPU dominance as the lesser evil: a proof of work that favours CPUs also favours cheap cloud instances and botnets, while GPUs cost capital, power and floor space that are all visible. As GPU mining grew and a Pi slid from 1 : 17,600 to 1 : 92,000, that trade stopped paying. <a href="#walk">Midstate Walk</a> takes it the other way, and its page sets out the trade-off plainly.</p>
                 </div>
 
                 <div class="tab-content" id="hw-accel">
                     <h3>Hardware Acceleration (SIMD & GPU)</h3>
+                    <div class="callout">
+                        <p>These are the BLAKE3-chain miners, used for blocks before 420,000. <a href="#walk">Midstate Walk</a> runs one walk per CPU core and uses the CPU's AES instructions instead; the GPU backend mines it on the CPU.</p>
+                    </div>
                     <p>A single chain cannot be collapsed into fewer cycles, so throughput comes entirely from searching many nonces concurrently — each one an independent chain. Midstate achieves this via bare-metal hardware integrations.</p>
 
                     <h4>CPU SIMD: The Dual-Issue NEON Exploit</h4>
@@ -1049,7 +1186,7 @@ for step in 0..max_iters {
 
                 <div class="tab-content" id="pool-mining">
                     <h3>Provably Fair Stratum Pools</h3>
-                    <p>Because Midstate uses Sequential Hashing, traditional Bitcoin stratum protocols (where the pool builds the block and sends just the header to the miner) do not work. Miners must construct the block template locally to run the 1,000,000-hash state progression.</p>
+                    <p>Because Midstate uses Sequential Hashing, traditional Bitcoin stratum protocols (where the pool builds the block and sends just the header to the miner) do not work. Miners must construct the block template locally to run the proof of work over it.</p>
                     
                     <p>To enable pooled mining without requiring miners to blindly trust the pool operator, Midstate employs a <strong>Decentralized-Auditable Merkle Precommitment</strong>.</p>
 
@@ -1399,14 +1536,14 @@ for step in 0..max_iters {
 
                 <div class="tab-content" id="state-sync">
                     <h3>Fast-Forward Syncing</h3>
-                    <p>A major issue with sequential hashing is the sync time. If a node goes offline for a month, replaying 1,000,000 hashes per block to catch up would take days on a Raspberry Pi. Midstate solves this via cryptographic Fast-Forwarding.</p>
+                    <p>A major issue with sequential proof of work is the sync time. If a node goes offline for a month, replaying every block's proof of work to catch up (1,000,000 hashes per block before the switch to Midstate Walk) would take days on a Raspberry Pi. Midstate solves this via cryptographic Fast-Forwarding.</p>
 
                     <p>Nodes save full state snapshots to disk every 100 blocks. When a node is syncing, it can download a recent snapshot from a peer instead of starting from genesis.</p>
 
                     <div class="callout stark">
                         <h4>Snapshot Cryptographic Validation</h4>
                         <p>How does a node trust a peer's snapshot without replaying the history? It uses the headers. The node downloads the lightweight headers and verifies the Proof-of-Work. If the very first header mathematically builds exactly on top of the downloaded snapshot's <code>midstate</code>, the snapshot is authentic.</p>
-                        <p><strong>The Security Gate:</strong> To prevent an attacker from forging a fake snapshot and mining just 1 or 2 blocks on top of it, Midstate enforces a <code>PRUNE_DEPTH</code> rule. A node will only trust a snapshot if the peer can provide 1,000 valid blocks of Proof-of-Work natively built on top of it (1 billion sequential hashes). This makes state injection economically impossible.</p>
+                        <p><strong>The Security Gate:</strong> To prevent an attacker from forging a fake snapshot and mining just 1 or 2 blocks on top of it, Midstate enforces a <code>PRUNE_DEPTH</code> rule. A node will only trust a snapshot if the peer can provide 1,000 valid blocks of Proof-of-Work natively built on top of it, each at the network's difficulty. This makes state injection economically impossible.</p>
                     </div>
                 </div>
 
@@ -2137,6 +2274,11 @@ Script:
             <h2>The MidstateAxe Ecosystem</h2>
             <p>The Midstate node is highly optimized for the <strong>MidstateAxe</strong>—a custom OS image built via Buildroot for Raspberry Pi hardware (Zero 2 W, Pi 3, Pi 4). The node exposes exclusive hardware APIs when it detects the physical device.</p>
 
+            <div class="callout warn">
+                <h4>Midstate Walk and older boards</h4>
+                <p>From block 420,000, mining means <a href="#walk">Midstate Walk</a>. A Raspberry Pi 5 suits it: each core has its own 512 KiB of L2 cache to hold a scratchpad, and AES instructions. The Zero 2 W, Pi 3 and Pi 4 have neither. Four walks share their 512 KiB or 1 MiB of L2, and AES falls back to tables, so these boards keep running a full node but mine the Walk more slowly. MidstateAxe firmware must also switch to the Walk at block 420,000 to keep mining.</p>
+            </div>
+
             <div class="stat-grid">
                 <div class="stat-card">
                     <div class="stat-label">Memory Footprint</div>
@@ -2254,7 +2396,7 @@ Script:
                     <tr>
                         <td><strong>Mining Hardware</strong></td>
                         <td>Purpose-built ASICs (1 : 10<sup>9</sup> gap)</td>
-                        <td class="hl">Commodity GPUs / CPUs (1 : 17,600 gap)</td>
+                        <td class="hl">CPU cores, from a Raspberry Pi 5 up (Midstate Walk, from block 420,000)</td>
                     </tr>
                     <tr>
                         <td><strong>Transaction Ordering</strong></td>
@@ -2296,7 +2438,7 @@ Script:
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">In progress</div>
-                    <div class="stat-value">2</div>
+                    <div class="stat-value">3</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">Planned</div>
@@ -2323,7 +2465,7 @@ Script:
                     <div class="rm-status">[ SHIPPED ]</div>
                     <div class="rm-body">
                         <span class="rm-title">Sequential BLAKE3 proof-of-work</span>
-                        <div class="rm-note">One million sequential compression cycles per header. Simple, and verifiable against a single scalar implementation.</div>
+                        <div class="rm-note">One million sequential compression cycles per header. Simple, and verifiable against a single scalar implementation. It secures every block before 420,000, where Midstate Walk takes over.</div>
                     </div>
                 </div>
 
@@ -2394,13 +2536,21 @@ Script:
 
             <h3>Mining</h3>
             <div class="rm-group">
-                <h4>Hashing &amp; pools <span class="rm-tally">3 shipped · 1 planned</span></h4>
+                <h4>Hashing &amp; pools <span class="rm-tally">3 shipped · 1 building · 1 planned</span></h4>
+
+                <div class="rm-item wip">
+                    <div class="rm-status">[ BUILDING ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title"><a href="#walk">Midstate Walk</a> proof of work</span>
+                        <div class="rm-note">A dependent walk over a 256 KiB scratchpad, built so a Raspberry Pi 5 can mine and a GPU has no special advantage. Released in v6.0.0 "Anselmo"; it activates at block 420,000, expected around mid-December 2026.</div>
+                    </div>
+                </div>
 
                 <div class="rm-item done">
                     <div class="rm-status">[ SHIPPED ]</div>
                     <div class="rm-body">
                         <span class="rm-title">8-way NEON SIMD miner</span>
-                        <div class="rm-note">A Raspberry Pi 5 does roughly 100 nonces per second against a network of about 1.7 million — a gap of roughly 1 to 17,600, compared with 1 to 1.2 billion for a hobbyist on Bitcoin. The hardware advantage sits in the commodity silicon band, and stays there while no ASIC is worth building.</div>
+                        <div class="rm-note">The BLAKE3-chain miner for ARM. A Raspberry Pi 5 does roughly 100 nonces per second. Against a network of about 1.7 million that was a gap of roughly 1 to 17,600; as GPU mining grew the network reached about 9 million and the gap roughly 1 to 92,000, which is why Midstate Walk replaces the BLAKE3 chain at block 420,000.</div>
                     </div>
                 </div>
 
@@ -2408,7 +2558,7 @@ Script:
                     <div class="rm-status">[ SHIPPED ]</div>
                     <div class="rm-body">
                         <span class="rm-title">GPU miner with CPU re-verification</span>
-                        <div class="rm-note">The graphics card is treated as an untrusted oracle; every chain it returns is re-verified on the CPU before anything is broadcast.</div>
+                        <div class="rm-note">The graphics card is treated as an untrusted oracle; every chain it returns is re-verified on the CPU before anything is broadcast. It mines the BLAKE3 chain; from block 420,000 the GPU backend mines Midstate Walk on the CPU.</div>
                     </div>
                 </div>
 
