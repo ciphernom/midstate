@@ -229,10 +229,24 @@ self.onmessage = async (e) => {
                 const result = searchNonces(pow, midstate, target, nonce, CHUNK);
                 const callMs = Date.now() - callStart;
 
-                noncesSinceReport += CHUNK * 4;
-                nonce += BigInt(CHUNK * 4);
-                if (callMs < CALL_TARGET_MS / 2 && CHUNK < 4096) CHUNK *= 2;
-                else if (callMs > CALL_TARGET_MS * 2 && CHUNK > 1) CHUNK = Math.max(1, CHUNK >> 1);
+                // A find ends the call early: only the nonces up to it were
+                // tested, and the search resumes right after it instead of
+                // skipping the rest of the chunk. Counting the whole chunk
+                // inflated the hashrate (and with it the earnings estimate)
+                // whenever shares came often, and an early return is no
+                // measure of how long a full chunk takes, so only full calls
+                // resize CHUNK.
+                let tested = CHUNK * 4;
+                if (result !== undefined && result !== null) {
+                    const found = BigInt(result);
+                    tested = Math.max(1, Math.min(CHUNK * 4, Number(found - nonce) + 1));
+                    nonce = found + 1n;
+                } else {
+                    nonce += BigInt(CHUNK * 4);
+                    if (callMs < CALL_TARGET_MS / 2 && CHUNK < 4096) CHUNK *= 2;
+                    else if (callMs > CALL_TARGET_MS * 2 && CHUNK > 1) CHUNK = Math.max(1, CHUNK >> 1);
+                }
+                noncesSinceReport += tested;
 
                 if (result !== undefined && result !== null) {
                     self.postMessage({ type: 'FOUND', payload: { nonce: result.toString() } });
@@ -241,8 +255,8 @@ self.onmessage = async (e) => {
                         loopRunning = false;
                         return;
                     }
-                    // `nonce` was already advanced past this chunk above, so the
-                    // search resumes cleanly without re-finding the same share.
+                    // `nonce` already points just past this share, so the
+                    // search resumes without re-finding it.
                 }
 
                 // Report hashrate every ~1 second
@@ -256,9 +270,11 @@ self.onmessage = async (e) => {
                 }
 
                 // Yield after every call to stay responsive to STOP/THROTTLE.
-                // Each call already takes ~0.8s, so the throttle sleep on top
-                // of that is the total pause between chunks.
-                await new Promise(r => setTimeout(r, throttleMs));
+                // A full call takes ~0.8s and the throttle is the pause after
+                // one, so it is scaled to the work actually done: a call cut
+                // short by a share would otherwise pay the full pause, and
+                // frequent shares would idle the core far below its setting.
+                await new Promise(r => setTimeout(r, Math.round(throttleMs * Math.min(1, callMs / CALL_TARGET_MS))));
             }
         } catch (err) {
             self.postMessage({ type: 'ERROR', payload: `Mining loop error: ${err}` });

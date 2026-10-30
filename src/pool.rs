@@ -1357,6 +1357,13 @@ pub async fn run_stratum_pool(
             // HTTP mining protocol (browser miners / web wallet):
             .route("/api/template", get(get_http_template))
             .route("/api/submit", post(post_http_submit))
+            // The same API under /pool, the dashboard's path, so a reverse
+            // proxy that forwards /pool also serves browser miners. The web
+            // wallet's default pool is https://rpc.cypherpunk.gold/pool.
+            .route("/pool/api/proof", get(get_proof))
+            .route("/pool/api/block_scores", get(get_block_scores))
+            .route("/pool/api/template", get(get_http_template))
+            .route("/pool/api/submit", post(post_http_submit))
             .layer(cors)
             .with_state(api_state);
         axum::serve(api_listener, app).await.unwrap();
