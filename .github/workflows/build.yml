@@ -20,26 +20,33 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The Linux builds run on Ubuntu 24.04, not ubuntu-latest: a binary
+          # needs at least the glibc it was built against, and ubuntu-latest
+          # moved to 26.04 (glibc 2.43), whose binaries won't start on
+          # Raspberry Pi OS, Debian 13 or Ubuntu 24.04 ("version `GLIBC_2.43'
+          # not found"). v6.0.0's did exactly that. On 24.04 they need 2.39 at
+          # most; "Check the glibc it needs" below keeps it that way.
+
           # Linux (x86_64) — node + desktop GUI
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             pkg_name: midstate-linux-amd64
             desktop: true
 
           # Raspberry Pi 3 & Zero 2 W (Cortex-A53) — node only
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
             pkg_name: midstate-rpi3-arm64
             rustflags: "-C target-cpu=cortex-a53 -C link-arg=-lgcc"
 
           # Raspberry Pi 4 (Cortex-A72) — node only
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
             pkg_name: midstate-rpi4-arm64
             rustflags: "-C target-cpu=cortex-a72 -C link-arg=-lgcc"
 
           # Raspberry Pi 5 (Cortex-A76) — node only
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
             pkg_name: midstate-rpi5-arm64
             rustflags: "-C target-cpu=cortex-a76 -C link-arg=-lgcc"
@@ -76,7 +83,7 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Install Linux Dependencies
-      if: matrix.os == 'ubuntu-latest'
+      if: runner.os == 'Linux'
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential cmake pkg-config
@@ -88,7 +95,7 @@ jobs:
     - name: Install Desktop GUI Dependencies (Linux)
       # eframe/winit links against X11, Wayland, xkbcommon and GL at build
       # time. Only the native x86_64 desktop build needs these.
-      if: matrix.os == 'ubuntu-latest' && matrix.desktop
+      if: runner.os == 'Linux' && matrix.desktop
       run: |
         sudo apt-get install -y \
           libgl1-mesa-dev libegl1-mesa-dev \
@@ -123,6 +130,25 @@ jobs:
         CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         RUSTFLAGS: ${{ matrix.rustflags || '' }}
       run: cargo build --release --target ${{ matrix.target }} -p midstate-desktop
+
+    # A binary built against a newer glibc than a machine has stops at once
+    # there. This fails the build instead, if a runner image ever brings a
+    # newer one again. readelf reads the ARM builds' symbols too.
+    - name: Check the glibc it needs (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        set -euo pipefail
+        MAX=2.39
+        REL="target/${{ matrix.target }}/release"
+        for bin in "$REL/midstate" "$REL/midstate-desktop"; do
+          [ -f "$bin" ] || continue
+          need=$( { readelf -W --dyn-syms "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' || true; } | sed 's/GLIBC_//' | sort -uV | tail -n 1)
+          echo "$bin needs glibc ${need:-(none)}"
+          if [ -n "$need" ] && [ "$(printf '%s\n%s\n' "$need" "$MAX" | sort -V | tail -n 1)" != "$MAX" ]; then
+            echo "::error::$bin needs glibc $need, newer than $MAX: it won't start on Raspberry Pi OS, Debian 13 or Ubuntu 24.04"
+            exit 1
+          fi
+        done
 
     # ── Smoke test ────────────────────────────────────────────────────────
     # The desktop build is `windows_subsystem = "windows"` in release, so it
