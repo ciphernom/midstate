@@ -223,14 +223,18 @@ export class PoolClient {
         return parsed.data;
     }
 
-    getTemplate(address) { return this.request('get_template', { address }); }
+    /** `midwimble` is the miner's midwimble address, for a pool that merge-mines it. */
+    getTemplate(address, midwimble) {
+        return this.request('get_template', midwimble ? { address, midwimble_address: midwimble } : { address });
+    }
     /** Raw envelope: a miner absent from the tree is an ANSWER, not an exception. */
     getProof(address)    { return this.requestRaw('get_proof', { address }); }
-    submitShare(address, jobId, nonce, worker) {
+    submitShare(address, jobId, nonce, worker, midwimble) {
         // Nonce as a decimal string: it is a u64 and JSON numbers lose precision
         // above 2^53.
         return this.request('submit_share', {
             address, job_id: jobId, nonce: String(nonce), worker: worker || 'browser',
+            ...(midwimble ? { midwimble_address: midwimble } : {}),
         });
     }
 }

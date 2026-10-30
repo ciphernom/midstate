@@ -66,6 +66,8 @@ midstate pool --pool-address <POOL_ADDRESS> --midwimble-rpc 127.0.0.1:9434 --mid
 ```
 `<POOL_MW_ADDRESS>` (`mw1…`) receives the pool's fee in midwimble, plus the midwimble share of any miner who hasn't given a midwimble address. If the midwimble node can't be reached or has no usable bond, the pool mines midstate alone.
 
+A merge-mining pool also takes miners who give only a midwimble address, as the midwimble web wallet's miner does. Their shares earn midwimble score as usual, and the midstate part of each one goes to `<POOL_ADDRESS>`, the way the pool keeps the midwimble part of a miner who gives no midwimble address. A pool that doesn't merge-mine turns them away. In the dashboard's rig list they appear under the pool's own address, each named after its midwimble address.
+
 Every accepted share earns a point of midwimble score for its miner's midwimble address. Each midwimble block the pool finds pays those scores, then clears them. A midwimble coinbase has room for 31 miners: a miner with at least 1/31 of the score is paid exactly, and the rest share the remaining outputs by a draw seeded with both chains' tips, so each one's expected payout is exactly its share.
 
 ---
@@ -111,6 +113,8 @@ If the pool merge-mines midwimble, give it your midwimble address (`midwimble wa
 midstate miner --pool-url stratum+tcp://<POOL_IP_ADDRESS>:3333 --payout-address <PAYOUT_ADDRESS> --midwimble-address <MW_ADDRESS>
 ```
 A node mining in pool mode reads it from `midwimble_address` in `miner.toml`. Other Stratum miners send it as the third `mining.authorize` parameter, after the worker name. Without one, the pool keeps your midwimble share.
+
+Browser miners send `midwimble_address` with each share and template request over HTTP or WebRTC. The web wallet has a field for it under its pool settings, and the midwimble web wallet mines with its own address. A miner paid only in midwimble leaves `address` empty. Templates carry a `midwimble` section (`null` when the pool doesn't merge-mine) saying whether the job also makes a midwimble block (`active`), why not (`note`), its `height`, `target` and `reward`, the pool's `fee_percent` of it, and the miner's `score` out of `total_score`. Shares earn midwimble score while merged mining is paused, and the pool's next midwimble block pays it. Each accepted share reports `midwimble_score` beside the midstate `score`, which is `null` for a miner paid only in midwimble.
 
 ---
 

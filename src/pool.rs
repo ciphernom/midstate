@@ -90,6 +90,9 @@ struct MergeCommit {
     claimed: Arc<std::sync::atomic::AtomicBool>,
     /// The midwimble height of the block this job makes, as the node said.
     height: Option<u64>,
+    /// What that block mints, subsidy plus fees, as the node said (a node
+    /// from before it said doesn't). Browser wallets estimate earnings with it.
+    reward: Option<u64>,
     /// What this job's midwimble block pays, as (address, weight): each
     /// address's share is its weight out of their sum.
     payouts: Arc<Vec<(String, u64)>>,
@@ -565,6 +568,16 @@ fn midwimble_scores(db: &Database) -> Vec<(String, u64)> {
         .collect()
 }
 
+/// One midwimble address's score: what the pool's next midwimble block pays
+/// it in proportion to.
+fn midwimble_score(db: &Database, address: &str) -> u64 {
+    db.begin_read()
+        .ok()
+        .and_then(|txn| txn.open_table(MW_SHARES_TABLE).ok())
+        .and_then(|t| t.get(address).ok().flatten().map(|v| v.value()))
+        .unwrap_or(0)
+}
+
 /// Takes the scores a midwimble block paid out of the table, or, with
 /// `restore`, puts them back when that block wasn't accepted after all.
 fn settle_midwimble_scores(db: &Database, paid: &[(String, u64)], restore: bool) -> anyhow::Result<()> {
@@ -591,6 +604,8 @@ struct MergeJobReply {
     mining_hash: String,
     target: [u8; 32],
     height: Option<u64>,
+    /// What that block mints, if the node says.
+    reward: Option<u64>,
     /// The proof of work midwimble requires of that block. A node that
     /// predates Midstate Walk does not say, and wants the BLAKE3 chain.
     pow: crate::core::types::PowAlgo,
@@ -635,7 +650,7 @@ async fn request_merge_job(
         return Err(format!("unusable job: {job}"));
     }
     let pow = parse_merge_pow(&job)?;
-    Ok(MergeJobReply { commitment, mining_hash, target, height: job["height"].as_u64(), pow })
+    Ok(MergeJobReply { commitment, mining_hash, target, height: job["height"].as_u64(), reward: job["reward"].as_u64(), pow })
 }
 
 /// Gets this job's midwimble block from the midwimble node, paying the score
@@ -702,6 +717,7 @@ async fn plan_merge(
             paid: Arc::new(paid),
             claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             height: reply.height,
+            reward: reply.reward,
             payouts: Arc::new(payouts),
             note,
         },
@@ -1827,7 +1843,77 @@ struct HttpTemplateQuery {
     /// Raw 64-char hex or the 72-char checksummed UI address. Used only to
     /// report that miner's current score back to them; it is not registered or
     /// trusted at this point (score is credited on submit, never on request).
+    /// May be empty for a miner paid only in midwimble (see [`MinerId`]).
+    #[serde(default)]
     address: String,
+    /// The miner's midwimble address, to report its midwimble score.
+    #[serde(default)]
+    midwimble_address: Option<String>,
+}
+
+/// Who a template request or a share is for.
+///
+/// A miner names a midstate address, a midwimble address, or both. One that
+/// names only a midwimble address is paid only in midwimble: the midstate
+/// part of its shares goes to the pool's own address, the way the pool keeps
+/// the midwimble part of a miner who names no midwimble address. That takes
+/// a pool that merge-mines, or the work would pay its miner nothing.
+#[derive(Clone, Debug, PartialEq)]
+struct MinerId {
+    /// The midstate address its shares are credited to: its own, or the pool's.
+    midstate: [u8; 32],
+    /// Whether `midstate` is the miner's own address.
+    own_midstate: bool,
+    /// Its midwimble address in canonical form, if it named one.
+    midwimble: Option<String>,
+}
+
+impl MinerId {
+    /// Keys the submit throttle. Every miner paid only in midwimble credits
+    /// the pool's midstate address, so keying those by it would make the
+    /// throttle one interval for all of them together; they are keyed by
+    /// their midwimble address instead.
+    fn throttle_key(&self) -> [u8; 32] {
+        match (&self.midwimble, self.own_midstate) {
+            (Some(mw), false) => hash(&[b"midstate.pool.throttle.midwimble:".as_slice(), mw.as_bytes()].concat()),
+            _ => self.midstate,
+        }
+    }
+
+    /// The worker name a share is filed under. Miners paid only in midwimble
+    /// all share the pool's midstate address, so each is filed under its own
+    /// midwimble address to keep them apart in the dashboard's rig list.
+    fn worker_label(&self, worker: Option<&str>) -> String {
+        match (&self.midwimble, self.own_midstate) {
+            (Some(mw), false) if mw.len() > 24 => format!("{}…{}", &mw[..12], &mw[mw.len() - 6..]),
+            _ => worker.filter(|w| !w.is_empty()).unwrap_or("browser").to_string(),
+        }
+    }
+}
+
+/// Reads who a request is for from its `address` and `midwimble_address`.
+/// An error is the text to answer with.
+fn resolve_miner(state: &PoolState, address: &str, midwimble: Option<&str>) -> Result<MinerId, String> {
+    let midwimble = match midwimble.map(str::trim).filter(|a| !a.is_empty()) {
+        None => None,
+        Some(a) => Some(parse_midwimble_address(a).map_err(|e| format!("Invalid midwimble address: {e}"))?),
+    };
+    let address = address.trim();
+    if !address.is_empty() {
+        let midstate = crate::core::types::parse_address_flexible(address)
+            .map_err(|e| format!("Invalid address: {e}"))?;
+        return Ok(MinerId { midstate, own_midstate: true, midwimble });
+    }
+    let Some(midwimble) = midwimble else {
+        return Err("Invalid address: give a midstate address, a midwimble address, or both".into());
+    };
+    if state.midwimble_rpc.is_none() || state.midwimble_address.is_none() {
+        return Err("This pool doesn't merge-mine midwimble, so it needs a midstate address to pay".into());
+    }
+    let mut midstate = [0u8; 32];
+    hex::decode_to_slice(&state.pool_address, &mut midstate)
+        .map_err(|_| "Internal error: the pool's own address is unreadable".to_string())?;
+    Ok(MinerId { midstate, own_midstate: false, midwimble: Some(midwimble) })
 }
 
 /// Serves the current job to an HTTP miner.
@@ -1840,17 +1926,12 @@ async fn get_http_template(
     State(state): State<Arc<PoolState>>,
     Query(query): Query<HttpTemplateQuery>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    let addr = match crate::core::types::parse_address_flexible(&query.address) {
-        Ok(a) => a,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("Invalid address: {}", e) })),
-            )
-        }
+    let miner = match resolve_miner(&state, &query.address, query.midwimble_address.as_deref()) {
+        Ok(m) => m,
+        Err(e) => return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))),
     };
 
-    match build_template_payload(&state, addr).await {
+    match build_template_payload(&state, &miner).await {
         Ok(v) => (axum::http::StatusCode::OK, Json(v)),
         // No job means the backend node is syncing or unreachable. 503 (not
         // 500) so the client treats it as "retry shortly" rather than fatal.
@@ -1880,7 +1961,7 @@ async fn miner_score(state: &Arc<PoolState>, addr: &[u8; 32]) -> u64 {
 /// two transports could disagree about which root was committed.
 async fn build_template_payload(
     state: &Arc<PoolState>,
-    addr: [u8; 32],
+    miner: &MinerId,
 ) -> Result<serde_json::Value, String> {
     let job = match state.current_job.read().await.clone() {
         Some(j) => j,
@@ -1892,7 +1973,13 @@ async fn build_template_payload(
         }
     };
 
-    let shares_recorded = miner_score(state, &addr).await;
+    // A miner paid only in midwimble has no midstate score of its own.
+    let shares_recorded = if miner.own_midstate {
+        serde_json::json!(miner_score(state, &miner.midstate).await)
+    } else {
+        serde_json::Value::Null
+    };
+    let midwimble = midwimble_template(state, &job, miner.midwimble.as_deref()).await;
 
     Ok(serde_json::json!({
             // Identifies which template a later submission belongs to. The client
@@ -1922,7 +2009,43 @@ async fn build_template_payload(
             "pool_fee_percent": state.pool_fee_percent,
             "midwimble_fee_percent": state.midwimble_fee_percent,
             "block_reward":     state.current_block_reward.load(std::sync::atomic::Ordering::Relaxed),
+            // Merged mining, for wallets paid in midwimble: `null` unless
+            // this pool merge-mines.
+            "midwimble":        midwimble,
     }))
+}
+
+/// A template's midwimble section, `null` unless this pool merge-mines.
+///
+/// Whether the job also makes a midwimble block, which one and against what
+/// target, and the score `address` holds against the pool's next midwimble
+/// block, so a wallet paid in midwimble can show its odds and progress. When
+/// the job doesn't merge, `note` says why. Shares earn midwimble score all
+/// the same, paid by the next midwimble block the pool finds.
+async fn midwimble_template(state: &PoolState, job: &Job, address: Option<&str>) -> serde_json::Value {
+    let (Some(_), Some(pool_mw)) = (&state.midwimble_rpc, &state.midwimble_address) else {
+        return serde_json::Value::Null;
+    };
+    let scores = midwimble_scores(&state.db);
+    let total_score = scores.iter().fold(0u64, |sum, (_, s)| sum.saturating_add(*s));
+    let score = address.map(|a| scores.iter().find(|(x, _)| x == a).map_or(0, |(_, s)| *s));
+    let merge = job.midwimble.as_ref();
+    let note = match merge {
+        Some(m) => m.note.clone(),
+        None => state.merge_status.read().await.note.clone(),
+    };
+    serde_json::json!({
+        "active": merge.is_some(),
+        "note": note,
+        "height": merge.and_then(|m| m.height),
+        "target": merge.map(|m| hex::encode(m.target)),
+        "reward": merge.and_then(|m| m.reward),
+        // What the pool keeps of each midwimble block, in percent.
+        "fee_percent": state.midwimble_fee_percent,
+        "score": score,
+        "total_score": total_score,
+        "pool_address": pool_mw,
+    })
 }
 
 /// Body for `POST /api/submit`.
@@ -1933,6 +2056,8 @@ struct HttpSubmitBody {
     /// u64 without silent precision loss above 2^53, so the web wallet sends the
     /// nonce as a decimal string; `parse_nonce` handles both encodings.
     nonce: serde_json::Value,
+    /// May be empty for a miner paid only in midwimble (see [`MinerId`]).
+    #[serde(default)]
     address: String,
     #[serde(default)]
     worker: Option<String>,
@@ -1955,27 +2080,11 @@ async fn submit_share_payload(
     job_id: u64,
     nonce_raw: &serde_json::Value,
 ) -> (Option<ShareOutcome>, serde_json::Value) {
-    let addr = match crate::core::types::parse_address_flexible(address) {
-        Ok(a) => a,
-        Err(e) => {
-            return (
-                None,
-                serde_json::json!({ "accepted": false, "error": format!("Invalid address: {}", e) }),
-            )
-        }
+    let miner = match resolve_miner(state, address, midwimble_address) {
+        Ok(m) => m,
+        Err(e) => return (None, serde_json::json!({ "accepted": false, "error": e })),
     };
-    let midwimble = match midwimble_address.map(str::trim).filter(|a| !a.is_empty()) {
-        None => None,
-        Some(a) => match parse_midwimble_address(a) {
-            Ok(a) => Some(a),
-            Err(e) => {
-                return (
-                    None,
-                    serde_json::json!({ "accepted": false, "error": format!("Invalid midwimble address: {}", e) }),
-                )
-            }
-        },
-    };
+    let addr = miner.midstate;
 
     let nonce = match parse_nonce(nonce_raw) {
         Some(n) => n,
@@ -1993,8 +2102,9 @@ async fn submit_share_payload(
     // than an HTTP request.
     {
         let now = std::time::Instant::now();
+        let key = miner.throttle_key();
         let mut throttle = state.http_throttle.write().await;
-        if let Some(last) = throttle.get(&addr) {
+        if let Some(last) = throttle.get(&key) {
             if now.duration_since(*last) < HTTP_MIN_SUBMIT_INTERVAL {
                 return (
                     None,
@@ -2002,12 +2112,12 @@ async fn submit_share_payload(
                 );
             }
         }
-        throttle.insert(addr, now);
+        throttle.insert(key, now);
     }
 
-    let worker = worker.filter(|w| !w.is_empty()).unwrap_or("browser");
+    let worker = miner.worker_label(worker);
 
-    let outcome = match process_share(state, addr, worker, midwimble.as_deref(), job_id, nonce).await {
+    let outcome = match process_share(state, addr, &worker, miner.midwimble.as_deref(), job_id, nonce).await {
         Ok(o) => o,
         Err(e) => {
             tracing::error!("share processing failed: {}", e);
@@ -2018,11 +2128,21 @@ async fn submit_share_payload(
         }
     };
 
-    // Report the miner's post-credit score so the client can show progress
-    // without a second round trip.
-    let score = miner_score(state, &addr).await;
+    // Report the miner's post-credit scores so the client can show progress
+    // without a second round trip: its midstate score (`null` for a miner
+    // paid only in midwimble, which has none of its own) and, when it named
+    // a midwimble address to a pool that merge-mines, its midwimble score.
+    let score = if miner.own_midstate {
+        serde_json::json!(miner_score(state, &addr).await)
+    } else {
+        serde_json::Value::Null
+    };
+    let midwimble_score = match (&miner.midwimble, &state.midwimble_rpc, &state.midwimble_address) {
+        (Some(mw), Some(_), Some(_)) => serde_json::json!(midwimble_score(&state.db, mw)),
+        _ => serde_json::Value::Null,
+    };
 
-    let body = match outcome {
+    let mut body = match outcome {
         ShareOutcome::Accepted { is_block } => serde_json::json!({
             "accepted": true,
             "is_block": is_block,
@@ -2052,6 +2172,7 @@ async fn submit_share_payload(
             "reason": "busy", "message": "Pool verifier saturated — retry this nonce shortly."
         }),
     };
+    body["midwimble_score"] = midwimble_score;
 
     (Some(outcome), body)
 }
@@ -2283,12 +2404,13 @@ async fn handle_pool_stream(
     let response = match method {
         "get_template" => {
             let address = params.get("address").and_then(|a| a.as_str()).unwrap_or("");
-            match crate::core::types::parse_address_flexible(address) {
-                Ok(addr) => match build_template_payload(&state, addr).await {
+            let midwimble = params.get("midwimble_address").and_then(|a| a.as_str());
+            match resolve_miner(&state, address, midwimble) {
+                Ok(miner) => match build_template_payload(&state, &miner).await {
                     Ok(v) => serde_json::json!({ "ok": true, "data": v }),
                     Err(e) => serde_json::json!({ "ok": false, "error": e }),
                 },
-                Err(e) => serde_json::json!({ "ok": false, "error": format!("Invalid address: {}", e) }),
+                Err(e) => serde_json::json!({ "ok": false, "error": e }),
             }
         }
         "submit_share" => {
@@ -3554,7 +3676,7 @@ mod tests {
             }
             (StatusCode::OK, Json(serde_json::json!({
                 "commitment": "11".repeat(32), "target": "ff".repeat(32),
-                "mining_hash": "22".repeat(32), "height": 7,
+                "mining_hash": "22".repeat(32), "height": 7, "reward": 23_932_616u64,
             })))
         }
         async fn found(
@@ -3596,6 +3718,7 @@ mod tests {
         // The job remembers what its block pays, for the dashboard.
         assert_eq!(plan.payouts.to_vec(), mock.lock().unwrap().jobs[0]);
         assert_eq!((plan.height, plan.note.clone()), (Some(7), None));
+        assert_eq!(plan.reward, Some(23_932_616), "what the block mints, for wallets' estimates");
 
         // The node refuses the miners' payouts: the job pays the pool alone,
         // as before per-miner payouts, and takes nobody's score.
@@ -3669,6 +3792,7 @@ mod tests {
             paid: Arc::new(paid),
             claimed: Arc::new(AtomicBool::new(false)),
             height: Some(7),
+            reward: Some(23_932_616),
             note: None,
         };
         *state.current_job.write().await = Some(Job {
@@ -3810,6 +3934,162 @@ mod tests {
         assert_eq!(midwimble_stats(&state).await, serde_json::Value::Null);
     }
 
+    // ── Miners paid only in midwimble ───────────────────────────────────
+
+    /// Serves a job that merges with a midwimble block no share wins.
+    async fn serve_merged_job(state: &Arc<PoolState>, job_id: u64) {
+        let merge = MergeCommit {
+            mining_hash: "22".repeat(32),
+            target: [0; 32],
+            commit_index: 1,
+            payouts: Arc::new(Vec::new()),
+            paid: Arc::new(Vec::new()),
+            claimed: Arc::new(AtomicBool::new(false)),
+            height: Some(7),
+            reward: Some(23_932_616),
+            note: None,
+        };
+        *state.current_job.write().await = Some(Job {
+            job_id,
+            mining_hash: [3; 32],
+            share_target: [0xff; 32],
+            network_target: [0; 32],
+            batch_template: serde_json::json!({ "stand_in": true }),
+            height: 8,
+            committed_scores: Arc::new(Vec::new()),
+            midwimble: Some(merge),
+        });
+    }
+
+    #[test]
+    fn a_miner_names_a_midstate_address_a_midwimble_one_or_both() {
+        let (_dir, db) = test_db();
+        let state = test_state(db.clone(), "http://127.0.0.1:9".into(), pool_mw());
+        let own = hex::encode([5u8; 32]);
+
+        let both = resolve_miner(&state, &own, Some(ALICE)).unwrap();
+        assert_eq!(both, MinerId { midstate: [5; 32], own_midstate: true, midwimble: Some(ALICE.into()) });
+        assert_eq!(both.throttle_key(), [5; 32]);
+        assert_eq!(both.worker_label(Some("rig")), "rig");
+        assert_eq!(both.worker_label(Some("")), "browser");
+        assert_eq!(resolve_miner(&state, &own, Some("  ")).unwrap().midwimble, None);
+
+        // Midwimble only: the pool's own midstate address takes the midstate
+        // part, and each such miner is throttled and listed on its own.
+        let alice = resolve_miner(&state, "", Some(&ALICE.to_uppercase())).unwrap();
+        assert_eq!(alice, MinerId { midstate: [7; 32], own_midstate: false, midwimble: Some(ALICE.into()) });
+        let bob = resolve_miner(&state, " ", Some(BOB)).unwrap();
+        assert_ne!(alice.throttle_key(), bob.throttle_key());
+        assert_ne!(alice.throttle_key(), [7; 32]);
+        assert_eq!(alice.worker_label(Some("rig")), format!("{}…{}", &ALICE[..12], &ALICE[ALICE.len() - 6..]));
+
+        assert!(resolve_miner(&state, "", None).unwrap_err().contains("a midstate address, a midwimble address, or both"));
+        assert!(resolve_miner(&state, "", Some("mw1nonsense")).unwrap_err().starts_with("Invalid midwimble address"));
+        assert!(resolve_miner(&state, "zz", Some(ALICE)).unwrap_err().starts_with("Invalid address"));
+
+        // A pool that doesn't merge-mine would pay such a miner nothing.
+        let solo = test_state_with(db, None, None);
+        assert!(resolve_miner(&solo, "", Some(ALICE)).unwrap_err().contains("doesn't merge-mine"));
+        assert!(resolve_miner(&solo, &own, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_share_paid_only_in_midwimble_gives_the_pool_its_midstate_part() {
+        let (_dir, db) = test_db();
+        let state = test_state(db.clone(), "http://127.0.0.1:9".into(), pool_mw());
+        serve_merged_job(&state, 1).await;
+
+        let (outcome, body) = submit_share_payload(&state, "", Some("rig"), Some(ALICE), 1, &serde_json::json!("11")).await;
+        assert!(matches!(outcome, Some(ShareOutcome::Accepted { is_block: false })), "{body}");
+        assert_eq!(body["score"], serde_json::Value::Null, "it has no midstate score of its own");
+        assert_eq!(body["midwimble_score"], 1);
+        assert_eq!(miner_score(&state, &[7; 32]).await, 1, "the pool's midstate address took the midstate part");
+        assert_eq!(midwimble_scores(&db), vec![(ALICE.to_string(), 1)]);
+
+        // Each such miner is throttled by its midwimble address, not by the
+        // pool's midstate address that all of them share: ALICE submitting
+        // too fast doesn't hold BOB up.
+        let alice = resolve_miner(&state, "", Some(ALICE)).unwrap().throttle_key();
+        assert!(state.http_throttle.read().await.contains_key(&alice));
+        assert!(!state.http_throttle.read().await.contains_key(&[7; 32]));
+        state.http_throttle.write().await.insert(alice, std::time::Instant::now());
+        let (outcome, body) = submit_share_payload(&state, "", None, Some(ALICE), 1, &serde_json::json!("13")).await;
+        assert!(outcome.is_none() && body["reason"] == "throttled", "{body}");
+        let (outcome, body) = submit_share_payload(&state, "", None, Some(BOB), 1, &serde_json::json!("12")).await;
+        assert!(matches!(outcome, Some(ShareOutcome::Accepted { .. })), "{body}");
+
+        // A miner naming both addresses earns in both and is told both scores.
+        let own = hex::encode([5u8; 32]);
+        let (_, body) = submit_share_payload(&state, &own, None, Some(BOB), 1, &serde_json::json!("14")).await;
+        assert_eq!((body["score"].as_u64(), body["midwimble_score"].as_u64()), (Some(1), Some(2)), "{body}");
+        tokio::time::sleep(HTTP_MIN_SUBMIT_INTERVAL + Duration::from_millis(20)).await;
+        let (_, body) = submit_share_payload(&state, &own, None, None, 1, &serde_json::json!("15")).await;
+        assert_eq!((body["score"].as_u64(), &body["midwimble_score"]), (Some(2), &serde_json::Value::Null), "{body}");
+        assert_eq!(miner_score(&state, &[7; 32]).await, 2, "and BOB's midwimble-only share went to the pool too");
+
+        // Over HTTP, a body without a midstate address reads as one.
+        let body: HttpSubmitBody =
+            serde_json::from_value(serde_json::json!({ "job_id": 1, "nonce": "16", "midwimble_address": BOB })).unwrap();
+        assert_eq!(body.address, "");
+    }
+
+    #[tokio::test]
+    async fn a_pool_that_does_not_merge_mine_turns_away_midwimble_only_miners() {
+        let (_dir, db) = test_db();
+        let state = test_state_with(db, None, None);
+        serve_merged_job(&state, 1).await;
+        let (outcome, body) = submit_share_payload(&state, "", None, Some(ALICE), 1, &serde_json::json!("11")).await;
+        assert!(outcome.is_none() && body["error"].as_str().unwrap().contains("doesn't merge-mine"), "{body}");
+        let (status, _) = get_http_template(
+            State(state.clone()),
+            Query(HttpTemplateQuery { address: String::new(), midwimble_address: Some(ALICE.into()) }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn templates_tell_a_midwimble_miner_its_odds_and_score() {
+        let (_dir, db) = test_db();
+        let pool = pool_mw();
+        let state = test_state(db.clone(), "http://127.0.0.1:9".into(), pool.clone());
+        serve_merged_job(&state, 1).await;
+        settle_midwimble_scores(&db, &[(ALICE.into(), 3), (BOB.into(), 1)], true).unwrap();
+
+        let (status, Json(t)) = get_http_template(
+            State(state.clone()),
+            Query(HttpTemplateQuery { address: String::new(), midwimble_address: Some(ALICE.into()) }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{t}");
+        assert_eq!(t["shares_recorded"], serde_json::Value::Null);
+        let mw = &t["midwimble"];
+        assert_eq!((mw["active"].as_bool(), mw["height"].as_u64()), (Some(true), Some(7)));
+        assert_eq!(mw["target"], "00".repeat(32));
+        assert_eq!(mw["reward"], 23_932_616);
+        assert_eq!(mw["fee_percent"], 1.0);
+        assert_eq!((mw["score"].as_u64(), mw["total_score"].as_u64()), (Some(3), Some(4)));
+        assert_eq!(mw["pool_address"], pool.as_str());
+
+        // Paused: the job makes no midwimble block, and the note says why.
+        let why = "midwimble's next block takes the walk proof of work and this job's takes blake3-chain";
+        *state.merge_status.write().await = MergeStatus::of_job(None, Some(why), 9);
+        state.current_job.write().await.as_mut().unwrap().midwimble = None;
+        let own = resolve_miner(&state, &hex::encode([5u8; 32]), None).unwrap();
+        let t = build_template_payload(&state, &own).await.unwrap();
+        assert_eq!(t["shares_recorded"], 0);
+        assert_eq!(t["midwimble"]["active"], false);
+        assert_eq!(t["midwimble"]["note"], why);
+        assert_eq!(t["midwimble"]["target"], serde_json::Value::Null);
+        assert_eq!(t["midwimble"]["score"], serde_json::Value::Null, "it named no midwimble address");
+        assert_eq!(t["midwimble"]["total_score"], 4);
+
+        // A pool that doesn't merge-mine says nothing of midwimble.
+        let solo = test_state_with(db, None, None);
+        *solo.current_job.write().await = state.current_job.read().await.clone();
+        assert_eq!(build_template_payload(&solo, &own).await.unwrap()["midwimble"], serde_json::Value::Null);
+    }
+
     #[test]
     fn merge_status_says_why_a_job_does_not_merge_mine() {
         let refused = MergeStatus::of_job(None, Some("bonded mining is required from height 1"), 5);
@@ -3827,6 +4107,7 @@ mod tests {
             paid: Arc::new(Vec::new()),
             claimed: Arc::new(AtomicBool::new(false)),
             height: Some(9),
+            reward: None,
             payouts: Arc::new(vec![(pool_mw(), 1)]),
             note: Some("the node refused the miners' payouts".into()),
         };
