@@ -237,6 +237,83 @@ pub fn check_ordering(reveal_deadline: u64, act_deadline: u64) -> Result<()> {
     Ok(())
 }
 
+// ── MDS <-> MWB: two height clocks ──────────────────────────────────────
+//
+// With Base, one deadline is a height and the other a timestamp, so one
+// drift bound does. With midwimble both are heights (`OP_CHECKTIMEVERIFY`,
+// kernel `min_height`), both chains aim at 60-second blocks, and each can run
+// fast or slow independently, so each deadline gets the bound that hurts.
+//
+// The secret holder claims from the *reveal leg* (the lock its counterparty
+// funded), publishing the secret; the counterparty then claims the *follow
+// leg*. The worst case for the counterparty is a reveal at the last moment of
+// a reveal leg whose blocks ran slow, then a follow leg whose blocks ran fast:
+//
+//     late(reveal blocks) + SETTLE_MARGIN_SECS <= early(follow blocks)
+//
+// Selling MDS, the reveal leg is the midwimble lock; selling MWB, it is the
+// midstate lock. The maker funds the follow leg first, either way.
+
+/// Default life of the reveal leg: two hours of nominal blocks.
+pub const MWB_REVEAL_BLOCKS: u64 = 120;
+
+/// The secret holder does not start a reveal with fewer blocks than this left
+/// on the reveal leg: past it, its claim might not confirm before the
+/// counterparty's refund unlocks, and the counterparty would hold both the
+/// secret and its refund.
+pub const REVEAL_CUTOFF_BLOCKS: u64 = 30;
+
+/// The most wall-clock time `blocks` might take: slow blocks, 25% late.
+/// Used for a deadline we must not be caught *before*.
+pub fn blocks_to_secs_optimistic(blocks: u64) -> u64 {
+    blocks * BLOCK_SECS * 5 / 4
+}
+
+/// Refund heights for both legs of an MDS <-> MWB swap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MwbTimings {
+    /// Refund height of the reveal leg, on its own chain.
+    pub reveal_height: u64,
+    /// Refund height of the follow leg, on its own chain.
+    pub follow_height: u64,
+    /// Seconds left for the follow-leg claim in the worst case.
+    pub worst_margin_secs: u64,
+}
+
+/// Plan both deadlines from each chain's tip.
+pub fn plan_mwb_timings(reveal_tip: u64, follow_tip: u64, reveal_blocks: u64) -> Result<MwbTimings> {
+    if reveal_blocks <= REVEAL_CUTOFF_BLOCKS {
+        bail!("the reveal leg must outlast the {REVEAL_CUTOFF_BLOCKS}-block reveal cutoff");
+    }
+    let follow_blocks = secs_to_blocks_generous(blocks_to_secs_optimistic(reveal_blocks) + SETTLE_MARGIN_SECS);
+    check_mwb_timings(reveal_tip, reveal_tip + reveal_blocks, follow_tip, follow_tip + follow_blocks)
+}
+
+/// Check deadlines a counterparty proposed. Refuses rather than narrows.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Pre:  reveal_tip, follow_tip = each chain's current tip
+/// Post: Ok(t) ⇒ blocks_to_secs_optimistic(reveal_height − reveal_tip) + SETTLE_MARGIN_SECS
+///                 ≤ blocks_to_secs_pessimistic(follow_height − follow_tip)
+///       Err(_) ⇒ do not start this swap
+/// ```
+pub fn check_mwb_timings(reveal_tip: u64, reveal_height: u64, follow_tip: u64, follow_height: u64) -> Result<MwbTimings> {
+    if reveal_height <= reveal_tip || follow_height <= follow_tip {
+        bail!("a swap deadline has already passed");
+    }
+    let worst_reveal = blocks_to_secs_optimistic(reveal_height - reveal_tip);
+    let earliest_follow = blocks_to_secs_pessimistic(follow_height - follow_tip);
+    check_ordering(worst_reveal, earliest_follow)?;
+    Ok(MwbTimings { reveal_height, follow_height, worst_margin_secs: earliest_follow - worst_reveal })
+}
+
+/// May the secret holder still reveal, at this reveal-leg tip?
+pub fn may_reveal(reveal_tip: u64, reveal_height: u64) -> bool {
+    reveal_height.saturating_sub(reveal_tip) >= REVEAL_CUTOFF_BLOCKS
+}
+
 /// A channel must outlive the HTLC riding inside it. If the channel closes
 /// first, the hash-locked output settles on-chain and the neat instant path is
 /// gone — so refuse rather than rely on that fallback.
@@ -420,6 +497,28 @@ mod tests {
         assert!(plan_timings(NOW, TIP, 60).is_err()); // under the 10-minute floor
         assert!(plan_timings(NOW, TIP, 8 * 86_400).is_err()); // over the 7-day ceiling
         assert!(plan_timings(NOW, TIP, 600).is_ok());
+    }
+
+    #[test]
+    fn mwb_deadlines_survive_slow_reveals_and_fast_follows() {
+        let t = plan_mwb_timings(1_000, TIP, MWB_REVEAL_BLOCKS).unwrap();
+        assert_eq!(t.reveal_height, 1_120);
+        // 120 slow blocks (9,000 s) plus the margin must outlast fast blocks.
+        assert_eq!(t.follow_height, TIP + 280);
+        assert!(t.worst_margin_secs >= SETTLE_MARGIN_SECS);
+
+        // A counterparty's proposal: inverted, or a block too tight, refused.
+        assert!(check_mwb_timings(0, 300, 0, 120).is_err());
+        assert!(check_mwb_timings(0, 120, 0, 279).is_err());
+        assert!(check_mwb_timings(0, 120, 0, 280).is_ok());
+        assert!(plan_mwb_timings(0, 0, REVEAL_CUTOFF_BLOCKS).is_err());
+    }
+
+    #[test]
+    fn reveals_stop_at_the_cutoff() {
+        assert!(may_reveal(1_000, 1_000 + REVEAL_CUTOFF_BLOCKS));
+        assert!(!may_reveal(1_000, 1_000 + REVEAL_CUTOFF_BLOCKS - 1));
+        assert!(blocks_to_secs_optimistic(10) > blocks_to_secs_pessimistic(10));
     }
 
     #[test]
